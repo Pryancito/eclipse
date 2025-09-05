@@ -164,7 +164,12 @@ format_partitions() {
 # Función para instalar bootloader
 install_bootloader() {
     local disk=$1
-    local efi_partition="${disk}1"
+    local efi_partition="${disk}p1"
+    
+    # Ajustar nombres de particiones según el tipo de disco
+    if [ ! -b "$efi_partition" ]; then
+        efi_partition="${disk}1"
+    fi
     
     echo "🔧 Instalando bootloader UEFI..."
     
