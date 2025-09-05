@@ -272,7 +272,7 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<u64,
         }
     }
 
-    let entry = if ehdr.e_entry != 0 { ehdr.e_entry } else { 0x0010_0000 };
+    let entry = if ehdr.e_entry != 0 { ehdr.e_entry } else { 0x0020_0000 };
     Ok(entry)
 }
 

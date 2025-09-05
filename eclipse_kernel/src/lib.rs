@@ -14,6 +14,7 @@ pub mod network;
 pub mod gui;
 pub mod redox;  // Módulo de integración de Redox
 pub mod testing;  // Sistema de pruebas y validación
+pub mod main_simple;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

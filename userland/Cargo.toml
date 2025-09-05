@@ -1,0 +1,19 @@
+[package]
+name = "reactos-userland"
+version = "0.1.0"
+edition = "2021"
+authors = ["ReactOS Rust Team"]
+description = "Userland de ReactOS en Rust"
+
+[lib]
+name = "reactos_userland"
+crate-type = ["lib"]
+
+[dependencies]
+# Dependencias básicas
+libc = "0.2"
+anyhow = "1.0"
+log = "0.4"
+
+[features]
+default = []

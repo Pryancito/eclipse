@@ -11,7 +11,7 @@ crate-type = ["lib"]
 
 [[bin]]
 name = "eclipse_kernel"
-path = "src/main_simple.rs"
+path = "src/entry_simple.rs"
 
 [dependencies]
 heapless = "0.8"

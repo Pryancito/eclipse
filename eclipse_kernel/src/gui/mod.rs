@@ -68,11 +68,11 @@ pub fn update_display() {
         } else {
             compositor::render_frame();
         }
+        
+        // Actualizar estadísticas NVIDIA
+        nvidia::update_nvidia_stats();
     } else {
         // Usar compositor normal
         compositor::render_frame();
     }
-    
-    // Actualizar estadísticas NVIDIA
-    nvidia::update_nvidia_stats();
 }

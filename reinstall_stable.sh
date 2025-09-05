@@ -51,28 +51,28 @@ check_and_build_files() {
     fi
     
     # Verificar bootloader
-    if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi" ]; then
+    if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
         missing_files+=("bootloader")
     fi
     
-    # Si faltan archivos, compilar
+    # Verificar userland (opcional)
+    if [ -d "userland" ]; then
+        if [ ! -f "userland/module_loader/target/release/module_loader" ] || 
+           [ ! -f "userland/graphics_module/target/release/graphics_module" ] || 
+           [ ! -f "userland/app_framework/target/release/app_framework" ]; then
+            missing_files+=("userland")
+        fi
+    fi
+    
+    # Si faltan archivos, informar al usuario
     if [ ${#missing_files[@]} -gt 0 ]; then
-        echo "🔧 Archivos faltantes detectados: ${missing_files[*]}"
-        echo "   Compilando con build.sh..."
-        
-        if [ ! -f "build.sh" ]; then
-            echo "❌ Error: build.sh no encontrado"
-            echo "   Asegúrate de estar en el directorio raíz del proyecto"
-            exit 1
-        fi
-        
-        if ! ./build.sh; then
-            echo "❌ Error: Falló la compilación con build.sh"
-            exit 1
-        fi
-        
-        echo "✅ Compilación completada exitosamente"
+        echo "❌ Error: Archivos faltantes detectados: ${missing_files[*]}"
         echo ""
+        echo "🔧 Solución:"
+        echo "   1. Ejecuta: ./build.sh"
+        echo "   2. Luego ejecuta: sudo ./reinstall_stable.sh"
+        echo ""
+        exit 1
     fi
 }
 
@@ -183,6 +183,55 @@ fi
 echo "✅ Kernel instalado"
 echo ""
 
+# 7.5. Instalar módulos userland
+echo "🔧 Paso 7.5: Instalando módulos userland..."
+if [ -d "userland" ]; then
+    # Crear directorio para userland
+    mkdir -p /mnt/eclipse-efi/userland/{bin,lib,config}
+    
+    # Copiar binarios userland
+    if [ -f "userland/module_loader/target/release/module_loader" ]; then
+        cp userland/module_loader/target/release/module_loader /mnt/eclipse-efi/userland/bin/
+        echo "   ✓ Module Loader instalado"
+    fi
+    
+    if [ -f "userland/graphics_module/target/release/graphics_module" ]; then
+        cp userland/graphics_module/target/release/graphics_module /mnt/eclipse-efi/userland/bin/
+        echo "   ✓ Graphics Module instalado"
+    fi
+    
+    if [ -f "userland/app_framework/target/release/app_framework" ]; then
+        cp userland/app_framework/target/release/app_framework /mnt/eclipse-efi/userland/bin/
+        echo "   ✓ App Framework instalado"
+    fi
+    
+    # Crear configuración de userland
+    cat > /mnt/eclipse-efi/userland/config/system.conf << 'EOF'
+# Eclipse OS Userland Configuration
+# =================================
+
+# Module settings
+modules=graphics_module,audio_module,network_module,storage_module
+
+# Applications
+apps=terminal,filemanager,editor,monitor
+
+# Graphics settings
+graphics_mode=1920x1080x32
+vga_fallback=true
+
+# Memory settings
+kernel_memory=64M
+userland_memory=256M
+EOF
+    
+    echo "   ✓ Configuración de userland creada"
+    echo "✅ Módulos userland instalados"
+else
+    echo "⚠️  Advertencia: Directorio userland no encontrado"
+fi
+echo ""
+
 # 8. Crear archivos de configuración
 echo "🔧 Paso 8: Creando archivos de configuración..."
 
@@ -251,6 +300,7 @@ echo "  ✅ Bootloader estable instalado"
 echo "  ✅ Sin reseteo automático"
 echo "  ✅ Bucle infinito para mantener el sistema activo"
 echo "  ✅ Mensajes de estado periódicos"
+echo "  ✅ Módulos userland instalados (si disponibles)"
 echo ""
 echo "🔄 Reinicia el sistema para usar Eclipse OS estable"
 echo ""

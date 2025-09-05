@@ -111,7 +111,7 @@ impl Shell {
         
         unsafe {
             DEMO_DELAY += 1;
-            if DEMO_DELAY > 1000000 { // Simular delay
+            if DEMO_DELAY > 5000000 { // Simular delay más largo para mejor visualización
                 DEMO_DELAY = 0;
                 if DEMO_INDEX < demo_commands.len() {
                     let cmd = demo_commands[DEMO_INDEX];
@@ -120,6 +120,10 @@ impl Shell {
                 } else {
                     // Reiniciar demo
                     DEMO_INDEX = 0;
+                    // Mostrar mensaje de reinicio
+                    VGA.set_color(Color::LightCyan, Color::Black);
+                    VGA.write_string("\n--- Reiniciando demostración del shell ---\n");
+                    VGA.set_color(Color::White, Color::Black);
                 }
             }
         }

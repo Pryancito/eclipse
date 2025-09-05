@@ -1,0 +1,11 @@
+[package]
+name = "module_loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ipc_common = { path = "../ipc_common" }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

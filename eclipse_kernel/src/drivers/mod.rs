@@ -16,6 +16,7 @@ pub mod input;
 pub mod pci;
 pub mod usb;
 pub mod manager;
+pub mod modular;
 
 // Re-exportar componentes principales
 pub use device::{DeviceType, DeviceState, DeviceError};

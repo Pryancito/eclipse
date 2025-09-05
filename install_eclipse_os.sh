@@ -207,8 +207,8 @@ install_bootloader() {
     
     # Copiar kernel
     echo "   🧠 Instalando kernel..."
-    if [ -f "target_hardware/x86_64-unknown-none/release/eclipse_kernel" ]; then
-        if ! cp target_hardware/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel; then
+    if [ -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
+        if ! cp eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel; then
             echo "❌ Error: No se pudo copiar kernel"
             return 1
         fi
@@ -216,6 +216,54 @@ install_bootloader() {
         echo "❌ Error: Kernel no encontrado"
         echo "   Ejecuta: ./build.sh"
         return 1
+    fi
+    
+    # Instalar módulos userland
+    echo "   🖥️  Instalando módulos userland..."
+    if [ -d "userland" ]; then
+        # Crear directorio para userland
+        mkdir -p /mnt/eclipse-efi/userland/{bin,lib,config}
+        
+        # Copiar binarios userland
+        if [ -f "userland/module_loader/target/release/module_loader" ]; then
+            cp userland/module_loader/target/release/module_loader /mnt/eclipse-efi/userland/bin/
+            echo "     ✓ Module Loader instalado"
+        fi
+        
+        if [ -f "userland/graphics_module/target/release/graphics_module" ]; then
+            cp userland/graphics_module/target/release/graphics_module /mnt/eclipse-efi/userland/bin/
+            echo "     ✓ Graphics Module instalado"
+        fi
+        
+        if [ -f "userland/app_framework/target/release/app_framework" ]; then
+            cp userland/app_framework/target/release/app_framework /mnt/eclipse-efi/userland/bin/
+            echo "     ✓ App Framework instalado"
+        fi
+        
+        # Crear configuración de userland
+        cat > /mnt/eclipse-efi/userland/config/system.conf << 'EOF'
+# Eclipse OS Userland Configuration
+# =================================
+
+# Module settings
+modules=graphics_module,audio_module,network_module,storage_module
+
+# Applications
+apps=terminal,filemanager,editor,monitor
+
+# Graphics settings
+graphics_mode=1920x1080x32
+vga_fallback=true
+
+# Memory settings
+kernel_memory=64M
+userland_memory=256M
+EOF
+        
+        echo "     ✓ Configuración de userland creada"
+        echo "   ✅ Módulos userland instalados"
+    else
+        echo "   ⚠️  Advertencia: Directorio userland no encontrado"
     fi
     
     # Crear archivos de configuración
@@ -321,6 +369,7 @@ install_eclipse_os() {
     echo "  - Partición root: ${disk}2 (EXT4)"
     echo "  - Bootloader: UEFI"
     echo "  - Kernel: Eclipse OS v0.4.0"
+    echo "  - Userland: Módulos compilados e instalados"
     echo ""
     echo "🔄 Reinicia el sistema para usar Eclipse OS"
     echo ""
@@ -373,33 +422,33 @@ check_and_build_files() {
     local missing_files=()
     
     # Verificar kernel
-    if [ ! -f "target_hardware/x86_64-unknown-none/release/eclipse_kernel" ]; then
+    if [ ! -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
         missing_files+=("kernel")
     fi
     
     # Verificar bootloader
-    if [ ! -f "bootloader-uefi/target_hardware/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
+    if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
         missing_files+=("bootloader")
     fi
     
-    # Si faltan archivos, compilar
+    # Verificar userland (opcional)
+    if [ -d "userland" ]; then
+        if [ ! -f "userland/module_loader/target/release/module_loader" ] || 
+           [ ! -f "userland/graphics_module/target/release/graphics_module" ] || 
+           [ ! -f "userland/app_framework/target/release/app_framework" ]; then
+            missing_files+=("userland")
+        fi
+    fi
+    
+    # Si faltan archivos, informar al usuario
     if [ ${#missing_files[@]} -gt 0 ]; then
-        echo "🔧 Archivos faltantes detectados: ${missing_files[*]}"
-        echo "   Compilando con build.sh..."
-        
-        if [ ! -f "build.sh" ]; then
-            echo "❌ Error: build.sh no encontrado"
-            echo "   Asegúrate de estar en el directorio raíz del proyecto"
-            exit 1
-        fi
-        
-        if ! ./build.sh; then
-            echo "❌ Error: Falló la compilación con build.sh"
-            exit 1
-        fi
-        
-        echo "✅ Compilación completada exitosamente"
+        echo "❌ Error: Archivos faltantes detectados: ${missing_files[*]}"
         echo ""
+        echo "🔧 Solución:"
+        echo "   1. Ejecuta: ./build.sh"
+        echo "   2. Luego ejecuta: sudo ./install_eclipse_os.sh $1"
+        echo ""
+        exit 1
     fi
 }
 
