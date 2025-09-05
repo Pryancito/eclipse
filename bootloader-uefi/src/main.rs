@@ -400,18 +400,18 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         // Obtener todos los handles
         if let Ok(handles) = bs.locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) {
-            for handle in handles.iter() {
+            for proto_handle in handles.iter() {
                 if let Ok(gop) = unsafe { 
                     bs.open_protocol::<GraphicsOutput>(
                         uefi::table::boot::OpenProtocolParams {
-                            handle: *handle,
-                            agent: *handle,
+                            handle: *proto_handle,
+                            agent: handle,
                             controller: None,
                         },
                         uefi::table::boot::OpenProtocolAttributes::GetProtocol,
                     )
                 } {
-                    gop_handle = Some(*handle);
+                    gop_handle = Some(*proto_handle);
                     gop_protocol = Some(gop);
                     break;
                 }
@@ -482,10 +482,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Logs de depuración ANTES de salir de Boot Services
     {
         use core::fmt::Write as _;
-        let out = system_table.stdout();
-        let _ = out.write_str("Kernel ELF cargado\n");
+        let mut out = system_table.stdout();
+        let _ = out.write_str("Kernel ELF cargado\r\n");
         let _ = out.write_str("Entry ELF: 0x");
-        let _ = core::fmt::write(out, format_args!("{:016x}\n", entry_address));
+        let _ = core::fmt::write(&mut out, format_args!("{:016x}\r\n", entry_address));
         unsafe { serial_write_str("BL: entry="); }
         {
             // serial hex simple
@@ -500,16 +500,16 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
         // Volcado de los primeros 16 bytes en entry
         let _ = out.write_str("Bytes@entry: ");
-            unsafe {
+        unsafe {
             let ptr = entry_address as *const u8;
             for i in 0..16 {
                 let b = core::ptr::read_volatile(ptr.add(i));
-                let _ = core::fmt::write(out, format_args!("{:02x}", b));
+                let _ = core::fmt::write(&mut out, format_args!("{:02x}", b));
                 if i != 15 { let _ = out.write_str(" "); }
             }
         }
-        let _ = out.write_str("\n");
-        let _ = out.write_str("Saliendo de Boot Services...\n");
+        let _ = out.write_str("\r\n");
+        let _ = out.write_str("Saliendo de Boot Services...\r\n");
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
@@ -517,23 +517,8 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
     
-    // Cambiar a nuestras tablas y stack antes de saltar al kernel
+    // Saltar directamente al kernel (con el entorno actual)
     unsafe {
-        // Cargar CR3 con la PML4 propia (identidad 0..1GiB)
-        core::arch::asm!(
-            "mov cr3, {0}",
-            in(reg) pml4_phys,
-            options(nostack, preserves_flags)
-        );
-
-        // Cambiar el puntero de pila a la parte alta del stack reservado
-        core::arch::asm!(
-            "mov rsp, {0}",
-            in(reg) stack_top,
-            options(nostack, preserves_flags)
-        );
-
-        serial_write_str("BL: CR3 y stack configurados\r\n");
         serial_write_str("BL: saltando al kernel\r\n");
         jump_to_kernel(entry_address, framebuffer_info)
     }
