@@ -1,2 +1,4 @@
-eclipse-os-complete/eclipse-os.img
+eclipse-os-complete/
 test_disk.img
+eclipse-os-build/
+eclipse-os.img
