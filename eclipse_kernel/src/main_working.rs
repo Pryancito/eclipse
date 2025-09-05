@@ -53,7 +53,7 @@ static mut VGA: VgaWriter = VgaWriter::new();
 pub extern "C" fn _start() -> ! {
     unsafe {
         VGA.clear_screen();
-        VGA.write_string("🌙 Eclipse OS Kernel v0.4.0\n");
+        VGA.write_string("Eclipse OS Kernel v0.4.0\n");
         VGA.write_string("============================\n\n");
         
         VGA.write_string("✓ Kernel inicializado correctamente\n");

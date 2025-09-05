@@ -190,12 +190,12 @@ install_bootloader() {
     
     # Copiar bootloader
     echo "   📦 Instalando bootloader..."
-    if [ -f "bootloader-uefi/target_hardware/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
-        if ! cp bootloader-uefi/target_hardware/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI; then
+    if [ -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
+        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI; then
             echo "❌ Error: No se pudo copiar bootloader a EFI/BOOT/"
             return 1
         fi
-        if ! cp bootloader-uefi/target_hardware/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi; then
+        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi; then
             echo "❌ Error: No se pudo copiar bootloader a EFI/eclipse/"
             return 1
         fi
