@@ -14,6 +14,7 @@ name = "eclipse_kernel"
 path = "src/main_simple.rs"
 
 [dependencies]
+heapless = "0.8"
 
 [features]
 default = []

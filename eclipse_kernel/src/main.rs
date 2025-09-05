@@ -6,10 +6,8 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
-use eclipse_kernel::{initialize, process_events, KERNEL_VERSION, gui, testing as kernel_testing};
-use boot_messages::{boot_banner, boot_progress, boot_success, boot_info, boot_warning, boot_error, boot_summary};
+// Usar la versión mejorada del kernel
+mod main_improved;
 
 // Módulo Multiboot2
 mod multiboot2;

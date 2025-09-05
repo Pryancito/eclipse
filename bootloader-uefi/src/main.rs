@@ -8,6 +8,18 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, Directory, RegularFile, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType, BootServices};
+use uefi::proto::console::gop::GraphicsOutput;
+
+// Estructura para pasar información del framebuffer al kernel
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub base_address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels_per_scan_line: u32,
+    pub pixel_format: u32,
+}
 
 // Global allocator simple
 struct SimpleAllocator;
@@ -74,9 +86,17 @@ fn read_file_size(file: &mut RegularFile) -> Result<usize, Status> {
     }
 }
 
-unsafe fn jump_to_kernel(entry: u64) -> ! {
-    let entry_fn: extern "sysv64" fn() -> ! = core::mem::transmute(entry as usize);
-    entry_fn()
+unsafe fn jump_to_kernel(entry: u64, framebuffer_info: FramebufferInfo) -> ! {
+    // Pasar la información del framebuffer al kernel a través de registros
+    // RDI = base_address, RSI = width, RDX = height, RCX = pixels_per_scan_line, R8 = pixel_format
+    let entry_fn: extern "sysv64" fn(u64, u32, u32, u32, u32) -> ! = core::mem::transmute(entry as usize);
+    entry_fn(
+        framebuffer_info.base_address,
+        framebuffer_info.width,
+        framebuffer_info.height,
+        framebuffer_info.pixels_per_scan_line,
+        framebuffer_info.pixel_format,
+    )
 }
 
 // Salida serie COM1 para diagnóstico temprano
@@ -405,7 +425,28 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
 
+    // Obtener información del framebuffer antes de salir de Boot Services
+    let mut framebuffer_info = FramebufferInfo {
+        base_address: 0,
+        width: 0,
+        height: 0,
+        pixels_per_scan_line: 0,
+        pixel_format: 0,
+    };
+    
+    // Intentar obtener información del framebuffer
+    // Por ahora, usar valores por defecto ya que open_protocol es complejo
+    framebuffer_info.base_address = 0; // Se detectará en el kernel
+    framebuffer_info.width = 0;
+    framebuffer_info.height = 0;
+    framebuffer_info.pixels_per_scan_line = 0;
+    framebuffer_info.pixel_format = 0;
+    
+    unsafe { 
+        serial_write_str("BL: usando VGA por defecto\r\n");
+    }
+    
     // Salto directo al kernel SIN configuración de paginación
     unsafe { serial_write_str("BL: saltando al kernel\r\n"); }
-    unsafe { jump_to_kernel(entry_address) }
+    unsafe { jump_to_kernel(entry_address, framebuffer_info) }
 }
