@@ -17,19 +17,27 @@ fi
 
 # Compilar el kernel Eclipse (binario ELF)
 echo "🔨 Compilando kernel Eclipse (compatible con UEFI)..."
-cargo build --release
+# Compilar como ELF para x86_64-unknown-none usando linker.ld
+RUSTFLAGS="-Clink-arg=-Tlinker.ld" cargo build --release --target x86_64-unknown-none
 
 if [ $? -eq 0 ]; then
     echo ""
     echo "✅ Kernel Eclipse compilado exitosamente!"
     echo ""
     echo "📁 Archivo generado:"
-    echo "   - target/x86_64-unknown-linux-gnu/release/eclipse_kernel"
+    echo "   - target/x86_64-unknown-none/release/eclipse_kernel"
     echo ""
-    echo "🚀 Para usar con el bootloader UEFI:"
-    echo "   1. El bootloader UEFI cargará este kernel como binario ELF"
-    echo "   2. Copia el kernel: cp target/x86_64-unknown-linux-gnu/release/eclipse_kernel ../bootloader-uefi/vmlinuz-eclipse"
-    echo "   3. Compila el bootloader: cd ../bootloader-uefi && ./build.sh"
+    echo "🚀 Preparando copia a la partición ESP local de datos (data/EFI/BOOT):"
+    ESP_DIR="../data/EFI/BOOT"
+    mkdir -p "$ESP_DIR"
+    KERNEL_OUT="target/x86_64-unknown-none/release/eclipse_kernel"
+    # Copiar con varios nombres que el bootloader busca
+    cp "$KERNEL_OUT" "$ESP_DIR/eclipse_kernel" 2>/dev/null || true
+    cp "$KERNEL_OUT" "$ESP_DIR/vmlinuz-eclipse" 2>/dev/null || true
+    cp "$KERNEL_OUT" "../bootloader-uefi/vmlinuz-eclipse" 2>/dev/null || true
+    echo "   - Copiado a $ESP_DIR/eclipse_kernel y $ESP_DIR/vmlinuz-eclipse"
+    echo "   - Copiado también a ../bootloader-uefi/vmlinuz-eclipse"
+    echo "   3. Luego compila el bootloader: cd ../bootloader-uefi && ./build.sh"
     echo ""
     echo "💡 El kernel Eclipse incluye:"
     echo "   - Sistema de mensajes de boot"

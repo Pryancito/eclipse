@@ -129,7 +129,12 @@ impl VgaWriter {
 
     fn outb(&self, port: u16, value: u8) {
         unsafe {
-            core::arch::asm!("outb %al, %dx", in("al") value, in("dx") port);
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") port,
+                in("al") value,
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }
@@ -155,9 +160,38 @@ impl SerialWriter {
         self.outb(self.base_port + 4, 0x0B); // Habilitar DTR, RTS y OUT2
     }
 
+    #[inline]
+    pub fn write_byte(&self, b: u8) {
+        unsafe {
+            // Esperar a que el transmisor esté listo (LSR bit 5)
+            let lsr = self.base_port + 5;
+            let mut ready: u8 = 0;
+            loop {
+                core::arch::asm!(
+                    "in al, dx",
+                    in("dx") lsr,
+                    out("al") ready,
+                    options(nomem, nostack, preserves_flags)
+                );
+                if (ready & 0x20) != 0 { break; }
+            }
+            self.outb(self.base_port, b);
+        }
+    }
+
+    pub fn write_str(&self, s: &str) {
+        for &c in s.as_bytes() {
+            self.write_byte(c);
+        }
+    }
     fn outb(&self, port: u16, value: u8) {
         unsafe {
-            core::arch::asm!("outb %al, %dx", in("al") value, in("dx") port);
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") port,
+                in("al") value,
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }

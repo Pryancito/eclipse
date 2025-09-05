@@ -20,6 +20,10 @@ pub struct FramebufferInfo {
     pub height: u32,
     pub pixels_per_scan_line: u32,
     pub pixel_format: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub reserved_mask: u32,
 }
 
 // Global allocator simple
@@ -61,9 +65,22 @@ fn open_root_fs(bs: &BootServices, image_handle: Handle) -> uefi::Result<Directo
 }
 
 fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
+    // Ampliar rutas candidatas para localizar el kernel en la ESP
     let candidates = [
+        // Nombres base
         uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
+        uefi::cstr16!("eclipse_kernel.bin"),
+        uefi::cstr16!("\\eclipse_kernel.bin"),
+        uefi::cstr16!("vmlinuz-eclipse"),
+        uefi::cstr16!("\\vmlinuz-eclipse"),
+        // Subdirectorios comunes
+        uefi::cstr16!("\\boot\\eclipse_kernel"),
+        uefi::cstr16!("\\boot\\eclipse_kernel.bin"),
+        uefi::cstr16!("\\boot\\vmlinuz-eclipse"),
+        uefi::cstr16!("\\EFI\\BOOT\\eclipse_kernel"),
+        uefi::cstr16!("\\EFI\\BOOT\\eclipse_kernel.bin"),
+        uefi::cstr16!("\\EFI\\BOOT\\vmlinuz-eclipse"),
     ];
     for p in candidates.iter() {
         if let Ok(file) = root.open(p, FileMode::Read, FileAttribute::empty()) {
@@ -96,6 +113,13 @@ unsafe fn jump_to_kernel(entry: u64) -> ! {
     // El kernel usa extern "C" que en x86_64 es System V AMD64 ABI
     let entry_fn: extern "C" fn() -> ! = core::mem::transmute(entry as usize);
     entry_fn()
+}
+
+/// Salta al kernel pasando un argumento en RDI según SysV ABI
+unsafe fn jump_to_kernel_with_arg(entry: u64, arg_ptr: u64) -> ! {
+    let entry_fn: extern "C" fn(*const FramebufferInfo) -> ! = core::mem::transmute(entry as usize);
+    let arg = arg_ptr as *const FramebufferInfo;
+    entry_fn(arg)
 }
 
 // Salida serie COM1 para diagnóstico temprano
@@ -305,23 +329,26 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
-    // Configurar paginación identidad simple (1 GiB, páginas de 2 MiB)
-    // Allocate: 1 página para PML4, 1 para PDPT, 1 para PD
+    // Configurar paginación identidad simple (4 GiB, páginas de 2 MiB)
+    // Allocate: 1 página para PML4, 1 para PDPT, 4 para PD (1 por GiB)
     let pml4_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
     let pdpt_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
-    let pd_phys = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-        .map_err(|e| BootError::AllocPd(e.status()))?;
+    let mut pd_phys_arr: [u64; 4] = [0; 4];
+    for i in 0..4 {
+        pd_phys_arr[i] = bs
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .map_err(|e| BootError::AllocPd(e.status()))?;
+    }
 
         unsafe {
         // Limpiar tablas
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pd_phys as *mut u8, 0, 4096);
+        for i in 0..4 { core::ptr::write_bytes(pd_phys_arr[i] as *mut u8, 0, 4096); }
 
         // Flags
         let p_w = 0x003u64; // Present | Write
@@ -331,15 +358,15 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
         let pml4 = pml4_phys as *mut u64;
         *pml4 = (pdpt_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
 
-        // PDPT[0] -> PD
+        // PDPT[0..3] -> PDs (cada entrada mapea 1 GiB)
         let pdpt = pdpt_phys as *mut u64;
-        *pdpt = (pd_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
-
-        // PD entries: identidad 0..1GiB con 2MiB páginas
-        let pd = pd_phys as *mut u64;
-        for i in 0..512u64 {
-            let base = i * 0x20_0000u64; // 2 MiB
-            *pd.add(i as usize) = (base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+        for giB in 0..4u64 {
+            *pdpt.add(giB as usize) = (pd_phys_arr[giB as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+            let pd = pd_phys_arr[giB as usize] as *mut u64;
+            for i in 0..512u64 {
+                let base = giB * 0x4000_0000u64 + i * 0x20_0000u64; // 1GiB * giB + 2MiB * i
+                *pd.add(i as usize) = (base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+            }
         }
     }
 
@@ -393,7 +420,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         height: 0,
         pixels_per_scan_line: 0,
         pixel_format: 0,
+        red_mask: 0,
+        green_mask: 0,
+        blue_mask: 0,
+        reserved_mask: 0,
     };
+    let mut framebuffer_info_ptr: u64 = 0;
     
     // Intentar obtener información del framebuffer usando Graphics Output Protocol
     {
@@ -429,9 +461,33 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             framebuffer_info.height = mode.resolution().1 as u32;
             framebuffer_info.pixels_per_scan_line = mode.stride() as u32;
             framebuffer_info.pixel_format = mode.pixel_format() as u32;
+            if let Some(mask) = mode.pixel_bitmask() {
+                framebuffer_info.red_mask = mask.red;
+                framebuffer_info.green_mask = mask.green;
+                framebuffer_info.blue_mask = mask.blue;
+                framebuffer_info.reserved_mask = mask.reserved;
+            }
+            // Reservar memoria persistente para pasar al kernel
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
+                framebuffer_info_ptr = phys;
+                unsafe {
+                    let dst = phys as *mut FramebufferInfo;
+                    core::ptr::write_volatile(dst, framebuffer_info);
+                }
+            }
             
             unsafe { 
                 serial_write_str("BL: GOP encontrado\r\n");
+                // Log puntero de framebuffer_info reservado (si existe)
+                serial_write_str("BL: fbptr_pre=0x");
+                let mut h = [0u8; 18];
+                let mut m = 0usize;
+                for i in (0..16).rev() {
+                    let nyb = ((framebuffer_info_ptr >> (i*4)) & 0xF) as u8;
+                    h[m] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; m+=1;
+                }
+                h[m] = b'\r'; m+=1; h[m] = b'\n'; m+=1;
+                for i in 0..m { serial_write_byte(h[i]); }
                 // Log de información del framebuffer
                 let mut buf = [0u8; 32];
                 let mut n = 0usize;
@@ -535,24 +591,50 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
 
-    // Configurar paginación identidad y pila antes del salto
+    // Configurar paginación identidad y pila y saltar al kernel (sin usar la pila después de cambiarla)
     unsafe {
-        // Cargar PML4 identidad en CR3
-        core::arch::asm!(
-            "mov cr3, {0}",
-            in(reg) pml4_phys,
-            options(nostack, preserves_flags)
-        );
+        // Fallback: si no reservamos buffer para FramebufferInfo, ubicarlo en la pila (calculada respecto a stack_top)
+        if framebuffer_info_ptr == 0 && framebuffer_info.width != 0 && framebuffer_info.height != 0 {
+            let fb_slot = (stack_top - 256u64) & !0xFu64;
+            let dst = fb_slot as *mut FramebufferInfo;
+            core::ptr::write_volatile(dst, framebuffer_info);
+            framebuffer_info_ptr = fb_slot;
+            serial_write_str("BL: FB en pila\r\n");
+        }
 
-        // Alinear y cargar RSP (16 bytes)
-        let rsp_alineado = stack_top & !0xFu64;
-        core::arch::asm!(
-            "mov rsp, {0}",
-            in(reg) rsp_alineado,
-            options(nostack, preserves_flags)
-        );
+        // Log estado del puntero justo antes del salto
+        serial_write_str("BL: fbptr_post=0x");
+        {
+            let mut h = [0u8; 18];
+            let mut m = 0usize;
+            for i in (0..16).rev() {
+                let nyb = ((framebuffer_info_ptr >> (i*4)) & 0xF) as u8;
+                h[m] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; m+=1;
+            }
+            h[m] = b'\r'; m+=1; h[m] = b'\n'; m+=1;
+            for i in 0..m { serial_write_byte(h[i]); }
+        }
 
+        // Preparar registros ANTES de tocar RSP para no volver a leer variables en stack
+        let entry_reg = entry_address;
+        let arg_reg = framebuffer_info_ptr; // puede ser 0
+        if arg_reg != 0 { serial_write_str("BL: pasando framebuffer al kernel\r\n"); }
         serial_write_str("BL: CR3 y RSP configurados, saltando al kernel\r\n");
-        jump_to_kernel(entry_address)
+
+        let rsp_alineado = stack_top & !0xFu64;
+        // Cambiar CR3, RSP y saltar, todo en un único bloque sin retorno
+        core::arch::asm!(
+            "mov cr3, {cr3}",
+            "mov rsp, {rsp}",
+            // pasar argumento en RDI (aunque sea 0)
+            "mov rdi, {arg}",
+            // saltar a la entrada del kernel
+            "jmp {entry}",
+            cr3 = in(reg) pml4_phys,
+            rsp = in(reg) rsp_alineado,
+            arg = in(reg) arg_reg,
+            entry = in(reg) entry_reg,
+            options(noreturn)
+        );
     }
 }
