@@ -1,0 +1,25 @@
+[package]
+name = "redoxfs"
+version = "0.7.1"
+edition = "2021"
+authors = ["Jeremy Soller <jackpot51@gmail.com>", "Eclipse Team"]
+description = "RedoxFS adapted for Eclipse Kernel"
+license = "MIT"
+
+[lib]
+name = "redoxfs"
+path = "lib.rs"
+
+[dependencies]
+aes = { version = "0.8", default-features = false }
+argon2 = { version = "0.4", default-features = false, features = ["alloc"] }
+base64ct = { version = "1", default-features = false }
+endian-num = "0.1"
+getrandom = { version = "0.2.5", default-features = false, features = ["custom"] }
+seahash = { version = "4.1.0", default-features = false }
+uuid = { version = "1.4", default-features = false }
+xts-mode = { version = "0.5", default-features = false }
+
+[features]
+default = ["no_std"]
+no_std = []

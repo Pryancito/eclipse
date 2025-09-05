@@ -1,0 +1,11 @@
+#!/bin/bash
+echo "Instalando Eclipse OS..."
+echo "Este es un script de instalación placeholder."
+echo "En una implementación real, aquí se instalaría el sistema operativo."
+echo ""
+echo "Archivos disponibles:"
+echo "  - boot/eclipse_kernel (kernel del sistema)"
+echo "  - efi/boot/bootx64.efi (bootloader UEFI)"
+echo "  - eclipse-os.img (imagen de disco)"
+echo ""
+echo "Para probar el sistema: ./test_system.sh"

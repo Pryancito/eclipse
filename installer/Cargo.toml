@@ -1,0 +1,14 @@
+[package]
+name = "eclipse-installer"
+version = "1.0.0"
+edition = "2021"
+authors = ["Eclipse OS Team"]
+description = "Instalador para Eclipse OS"
+license = "MIT"
+
+[[bin]]
+name = "eclipse-installer"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

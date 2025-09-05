@@ -1,0 +1,30 @@
+[package]
+name = "eclipse-bootloader-uefi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "eclipse-bootloader"
+path = "src/bootloader_success.rs"
+
+[[bin]]
+name = "eclipse-bootloader-main"
+path = "src/main.rs"
+
+[dependencies]
+uefi = { version = "0.25", features = ["alloc"] }
+
+[profile.dev]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+
+[package.metadata.cargo-xbuild]
+sysroot_path = "sysroot"

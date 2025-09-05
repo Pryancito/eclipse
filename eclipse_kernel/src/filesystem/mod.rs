@@ -1,0 +1,99 @@
+//! Sistema de archivos para Eclipse OS
+//! 
+//! Este módulo implementa un sistema de archivos básico con soporte para:
+//! - Estructuras de directorios jerárquicos
+//! - Operaciones de archivos (crear, leer, escribir, eliminar)
+//! - Gestión de permisos básicos
+//! - Cache de archivos
+//! - Sistema de bloques para almacenamiento
+
+pub mod vfs;
+pub mod inode;
+pub mod superblock;
+pub mod directory;
+pub mod file;
+pub mod cache;
+pub mod block;
+pub mod utils;
+
+// Re-exportar componentes principales
+pub use vfs::VfsResult;
+pub use superblock::FileSystemType;
+// Constantes del sistema de archivos
+pub const MAX_FILENAME_LEN: usize = 255;
+pub const MAX_PATH_LEN: usize = 4096;
+pub const MAX_DIRECTORY_ENTRIES: usize = 1024;
+pub const BLOCK_SIZE: usize = 4096;
+pub const MAX_FILE_SIZE: u64 = 0xFFFFFFFF; // 4GB
+pub const ROOT_INODE: u32 = 1;
+
+// Tipos de archivo soportados
+pub const INODE_TYPE_FILE: u16 = 0x8000;
+pub const INODE_TYPE_DIR: u16 = 0x4000;
+pub const INODE_TYPE_SYMLINK: u16 = 0xA000;
+pub const INODE_TYPE_CHARDEV: u16 = 0x2000;
+pub const INODE_TYPE_BLOCKDEV: u16 = 0x6000;
+pub const INODE_TYPE_FIFO: u16 = 0x1000;
+pub const INODE_TYPE_SOCKET: u16 = 0xC000;
+
+// Permisos de archivo
+pub const PERM_READ: u16 = 0x4;
+pub const PERM_WRITE: u16 = 0x2;
+pub const PERM_EXECUTE: u16 = 0x1;
+
+// Modos de apertura de archivo
+pub const O_RDONLY: u32 = 0x0000;
+pub const O_WRONLY: u32 = 0x0001;
+pub const O_RDWR: u32 = 0x0002;
+pub const O_CREAT: u32 = 0x0040;
+pub const O_TRUNC: u32 = 0x0200;
+pub const O_APPEND: u32 = 0x0400;
+
+// Información del sistema de archivos
+#[derive(Debug, Clone, Copy)]
+pub struct FileSystemInfo {
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub used_blocks: u64,
+    pub total_inodes: u32,
+    pub free_inodes: u32,
+    pub used_inodes: u32,
+    pub block_size: u32,
+    pub max_file_size: u64,
+    pub filesystem_type: FileSystemType,
+}
+
+impl FileSystemInfo {
+    pub fn new() -> Self {
+        Self {
+            total_blocks: 0,
+            free_blocks: 0,
+            used_blocks: 0,
+            total_inodes: 0,
+            free_inodes: 0,
+            used_inodes: 0,
+            block_size: BLOCK_SIZE as u32,
+            max_file_size: MAX_FILE_SIZE,
+            filesystem_type: FileSystemType::EclipseFS,
+        }
+    }
+}
+
+// Inicialización del sistema de archivos
+pub fn init_filesystem() -> VfsResult<()> {
+    // Inicializar VFS
+    vfs::init_vfs()?;
+    
+    // Inicializar cache
+    cache::init_file_cache()?;
+    
+    // Inicializar dispositivo de bloques
+    block::init_block_device()?;
+    
+    Ok(())
+}
+
+// Obtener información del sistema de archivos
+pub fn get_filesystem_info() -> FileSystemInfo {
+    FileSystemInfo::new()
+}
