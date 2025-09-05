@@ -97,3 +97,5 @@ pub fn get_registered_driver_count() -> usize {
         AUTO_DRIVER_REGISTRAR.get_registered_count()
     }
 }
+
+

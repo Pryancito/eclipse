@@ -9,6 +9,7 @@ use uefi::proto::media::file::{File, Directory, RegularFile, FileAttribute, File
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType, BootServices};
 use uefi::proto::console::gop::GraphicsOutput;
+use uefi::Identify;
 
 // Estructura para pasar información del framebuffer al kernel
 #[repr(C)]
@@ -387,6 +388,103 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
     };
 
+    // Obtener información del framebuffer ANTES de salir de Boot Services
+    let mut framebuffer_info = FramebufferInfo {
+        base_address: 0,
+        width: 0,
+        height: 0,
+        pixels_per_scan_line: 0,
+        pixel_format: 0,
+    };
+    
+    // Intentar obtener información del framebuffer usando Graphics Output Protocol
+    {
+        let bs = system_table.boot_services();
+        // Buscar el protocolo GOP en todos los handles disponibles
+        let mut gop_handle = None;
+        let mut gop_protocol = None;
+        
+        // Obtener todos los handles
+        if let Ok(handles) = bs.locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) {
+            for handle in handles.iter() {
+                if let Ok(gop) = unsafe { 
+                    bs.open_protocol::<GraphicsOutput>(
+                        uefi::table::boot::OpenProtocolParams {
+                            handle: *handle,
+                            agent: *handle,
+                            controller: None,
+                        },
+                        uefi::table::boot::OpenProtocolAttributes::GetProtocol,
+                    )
+                } {
+                    gop_handle = Some(*handle);
+                    gop_protocol = Some(gop);
+                    break;
+                }
+            }
+        }
+        
+        if let Some(mut gop) = gop_protocol {
+            let mode = gop.current_mode_info();
+            // Obtener información del framebuffer desde el protocolo GOP
+            let mut frame_buffer = gop.frame_buffer();
+            framebuffer_info.base_address = frame_buffer.as_mut_ptr() as u64;
+            framebuffer_info.width = mode.resolution().0 as u32;
+            framebuffer_info.height = mode.resolution().1 as u32;
+            framebuffer_info.pixels_per_scan_line = mode.stride() as u32;
+            framebuffer_info.pixel_format = mode.pixel_format() as u32;
+            
+            unsafe { 
+                serial_write_str("BL: GOP encontrado\r\n");
+                // Log de información del framebuffer
+                let mut buf = [0u8; 32];
+                let mut n = 0usize;
+                
+                // Log base_address
+                unsafe { serial_write_str("BL: base=0x"); }
+                for i in (0..16).rev() {
+                    let nyb = ((framebuffer_info.base_address >> (i*4)) & 0xF) as u8;
+                    buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
+                }
+                buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
+                unsafe { for i in 0..n { serial_write_byte(buf[i]); } }
+                
+                // Log resolución
+                unsafe { 
+                    serial_write_str("BL: res="); 
+                    // Width
+                    n = 0;
+                    let w = framebuffer_info.width;
+                    if w == 0 { buf[n] = b'0'; n+=1; } else {
+                        let mut temp = w;
+                        while temp > 0 {
+                            buf[n] = b'0' + (temp % 10) as u8;
+                            temp /= 10;
+                            n += 1;
+                        }
+                    }
+                    buf[n] = b'x'; n+=1;
+                    // Height
+                    let h = framebuffer_info.height;
+                    if h == 0 { buf[n] = b'0'; n+=1; } else {
+                        let mut temp = h;
+                        while temp > 0 {
+                            buf[n] = b'0' + (temp % 10) as u8;
+                            temp /= 10;
+                            n += 1;
+                        }
+                    }
+                    buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
+                    for i in 0..n { serial_write_byte(buf[i]); }
+                }
+            }
+        } else {
+            unsafe { 
+                serial_write_str("BL: GOP no encontrado, usando VGA\r\n");
+            }
+        }
+    }
+
     // Logs de depuración ANTES de salir de Boot Services
     {
         use core::fmt::Write as _;
@@ -424,27 +522,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // ExitBootServices (uefi 0.25.0)
     let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
-
-    // Obtener información del framebuffer antes de salir de Boot Services
-    let mut framebuffer_info = FramebufferInfo {
-        base_address: 0,
-        width: 0,
-        height: 0,
-        pixels_per_scan_line: 0,
-        pixel_format: 0,
-    };
-    
-    // Intentar obtener información del framebuffer
-    // Por ahora, usar valores por defecto ya que open_protocol es complejo
-    framebuffer_info.base_address = 0; // Se detectará en el kernel
-    framebuffer_info.width = 0;
-    framebuffer_info.height = 0;
-    framebuffer_info.pixels_per_scan_line = 0;
-    framebuffer_info.pixel_format = 0;
-    
-    unsafe { 
-        serial_write_str("BL: usando VGA por defecto\r\n");
-    }
     
     // Salto directo al kernel SIN configuración de paginación
     unsafe { serial_write_str("BL: saltando al kernel\r\n"); }

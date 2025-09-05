@@ -178,6 +178,30 @@ build_userland() {
     fi
     cd ../..
     
+    # Compilar DRM Module
+    print_status "Compilando DRM Module..."
+    cd userland/drm_module
+    cargo build --release
+    if [ $? -eq 0 ]; then
+        print_success "DRM Module compilado exitosamente"
+    else
+        print_error "Error al compilar DRM Module"
+        return 1
+    fi
+    cd ../..
+    
+    # Compilar NVIDIA Module
+    print_status "Compilando NVIDIA Module..."
+    cd userland/nvidia_module
+    cargo build --release
+    if [ $? -eq 0 ]; then
+        print_success "NVIDIA Module compilado exitosamente"
+    else
+        print_error "Error al compilar NVIDIA Module"
+        return 1
+    fi
+    cd ../..
+    
     print_success "Todos los módulos userland compilados exitosamente"
 }
 
@@ -226,6 +250,16 @@ create_basic_distribution() {
             print_status "App Framework copiado"
         fi
         
+        if [ -f "userland/drm_module/target/release/drm_module" ]; then
+            cp "userland/drm_module/target/release/drm_module" "$BUILD_DIR/userland/bin/"
+            print_status "DRM Module copiado"
+        fi
+        
+        if [ -f "userland/nvidia_module/target/release/nvidia_module" ]; then
+            cp "userland/nvidia_module/target/release/nvidia_module" "$BUILD_DIR/userland/bin/"
+            print_status "NVIDIA Module copiado"
+        fi
+        
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
@@ -237,6 +271,8 @@ kernel = "/boot/eclipse_kernel"
 module_loader = "/userland/bin/module_loader"
 graphics_module = "/userland/bin/graphics_module"
 app_framework = "/userland/bin/app_framework"
+drm_module = "/userland/bin/drm_module"
+nvidia_module = "/userland/bin/nvidia_module"
 
 [ipc]
 socket_path = "/tmp/eclipse_ipc.sock"
