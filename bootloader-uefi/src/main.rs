@@ -243,10 +243,12 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
     // Cargar ELF64 y obtener entry
     let entry = load_elf64_segments(bs, &mut kernel_file)?;
 
-    // Reservar stack (64 KiB)
+    // Reservar stack (64 KiB) por debajo de 1 GiB para que esté mapeada (identidad 0..1GiB)
     let stack_pages: usize = 16;
+    let one_gib: u64 = 1u64 << 30;
+    let max_stack_addr: u64 = one_gib - 0x1000; // límite superior < 1GiB
     let stack_base = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, stack_pages)
+        .allocate_pages(AllocateType::MaxAddress(max_stack_addr), MemoryType::LOADER_DATA, stack_pages)
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
