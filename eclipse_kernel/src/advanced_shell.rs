@@ -150,6 +150,13 @@ impl AdvancedShell {
         self.add_command("lscpu", "Información de CPU", "lscpu", CommandCategory::Hardware, Self::cmd_lscpu);
         self.add_command("detect", "Detectar hardware", "detect", CommandCategory::Hardware, Self::cmd_detect);
         
+        // Comandos de gestión de energía
+        self.add_command("power", "Gestión de energía", "power <comando>", CommandCategory::System, Self::cmd_power);
+        self.add_command("cpufreq", "Frecuencia de CPU", "cpufreq [frecuencia]", CommandCategory::System, Self::cmd_cpufreq);
+        self.add_command("battery", "Estado de batería", "battery", CommandCategory::System, Self::cmd_battery);
+        self.add_command("thermal", "Estado térmico", "thermal", CommandCategory::System, Self::cmd_thermal);
+        self.add_command("powertop", "Monitor de energía", "powertop", CommandCategory::Monitor, Self::cmd_powertop);
+        
         // Comandos de utilidad
         self.add_command("clear", "Limpiar pantalla", "clear", CommandCategory::Utility, Self::cmd_clear);
         self.add_command("history", "Historial de comandos", "history [número]", CommandCategory::Utility, Self::cmd_history);
@@ -198,13 +205,13 @@ impl AdvancedShell {
         println!("╔══════════════════════════════════════════════════════════════╗");
         println!("║                Eclipse OS - Shell Avanzada                 ║");
         println!("║                                                              ║");
-        println!("║  🦀 Shell interactivo con sistema de comandos completo      ║");
-        println!("║  🚀 Escriba 'help' para ver comandos disponibles           ║");
-        println!("║  🔒 Sistema de seguridad integrado                          ║");
-        println!("║  🤖 IA integrada para asistencia inteligente                ║");
-        println!("║  🐳 Contenedores nativos del kernel                         ║");
+        println!("║  Shell interactivo con sistema de comandos completo        ║");
+        println!("║  Escriba 'help' para ver comandos disponibles              ║");
+        println!("║  Sistema de seguridad integrado                             ║");
+        println!("║  IA integrada para asistencia inteligente                   ║");
+        println!("║  Contenedores nativos del kernel                             ║");
         println!("║                                                              ║");
-        println!("║  Versión: 2.0.0 - Shell Avanzada                            ║");
+        println!("║  Versión: 0.4.0 - Shell Avanzada                            ║");
         println!("╚══════════════════════════════════════════════════════════════╝");
         println!();
     }
@@ -279,10 +286,10 @@ impl AdvancedShell {
         if let Some(cmd) = self.commands.get(cmd_name) {
             match (cmd.handler)(cmd_args, self) {
                 Ok(result) => println!("{}", result),
-                Err(error) => println!("❌ Error: {}", error),
+                Err(error) => println!("[ERROR] Error: {}", error),
             }
         } else {
-            println!("❌ Comando no encontrado: {}. Escriba 'help' para ver comandos disponibles.", cmd_name);
+            println!("[ERROR] Comando no encontrado: {}. Escriba 'help' para ver comandos disponibles.", cmd_name);
         }
     }
     

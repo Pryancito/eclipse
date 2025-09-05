@@ -27,8 +27,8 @@ pub fn cmd_help(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
             }
         }
         
-        writeln!(&mut help, "\n💡 Escriba 'help <comando>' para obtener ayuda detallada").unwrap();
-        writeln!(&mut help, "💡 Use 'alias' para ver alias disponibles").unwrap();
+        writeln!(&mut help, "\n Escriba 'help <comando>' para obtener ayuda detallada").unwrap();
+        writeln!(&mut help, " Use 'alias' para ver alias disponibles").unwrap();
         Ok(help)
     } else {
         // Mostrar ayuda específica
@@ -49,26 +49,26 @@ pub fn cmd_help(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_info(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut info = String::new();
-    writeln!(&mut info, "📊 Información del sistema Eclipse OS:").unwrap();
+    writeln!(&mut info, " Información del sistema Eclipse OS:").unwrap();
     writeln!(&mut info, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-    writeln!(&mut info, "  🏗️  Arquitectura: x86_64 microkernel híbrido").unwrap();
-    writeln!(&mut info, "  🦀 Lenguaje: 100% Rust con #![no_std]").unwrap();
-    writeln!(&mut info, "  💾 Memoria: Gestión avanzada con paginación").unwrap();
-    writeln!(&mut info, "  🔄 Procesos: PCB completo con 7 estados").unwrap();
-    writeln!(&mut info, "  📅 Scheduling: 5 algoritmos diferentes").unwrap();
-    writeln!(&mut info, "  🔧 Drivers: PCI, USB, almacenamiento, red, gráficos").unwrap();
-    writeln!(&mut info, "  📁 Sistema de archivos: VFS, FAT32, NTFS").unwrap();
-    writeln!(&mut info, "  🌐 Red: Stack completo TCP/IP con routing").unwrap();
+    writeln!(&mut info, "    Arquitectura: x86_64 microkernel híbrido").unwrap();
+    writeln!(&mut info, "   Lenguaje: 100% Rust con #![no_std]").unwrap();
+    writeln!(&mut info, "   Memoria: Gestión avanzada con paginación").unwrap();
+    writeln!(&mut info, "   Procesos: PCB completo con 7 estados").unwrap();
+    writeln!(&mut info, "   Scheduling: 5 algoritmos diferentes").unwrap();
+    writeln!(&mut info, "   Drivers: PCI, USB, almacenamiento, red, gráficos").unwrap();
+    writeln!(&mut info, "   Sistema de archivos: VFS, FAT32, NTFS").unwrap();
+    writeln!(&mut info, "   Red: Stack completo TCP/IP con routing").unwrap();
     writeln!(&mut info, "  🎨 GUI: Sistema de ventanas con compositor").unwrap();
-    writeln!(&mut info, "  🔒 Seguridad: Sistema avanzado con encriptación").unwrap();
+    writeln!(&mut info, "   Seguridad: Sistema avanzado con encriptación").unwrap();
     writeln!(&mut info, "  🤖 IA: Machine learning integrado").unwrap();
     writeln!(&mut info, "  🐳 Contenedores: Sistema nativo de contenedores").unwrap();
-    writeln!(&mut info, "  📈 Monitoreo: Tiempo real con métricas dinámicas").unwrap();
+    writeln!(&mut info, "   Monitoreo: Tiempo real con métricas dinámicas").unwrap();
     Ok(info)
 }
 
 pub fn cmd_version(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
-    Ok("Eclipse OS v2.0.0 - Kernel híbrido en Rust".to_string())
+    Ok("Eclipse OS v0.4.0 - Kernel híbrido en Rust".to_string())
 }
 
 pub fn cmd_uptime(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
@@ -93,7 +93,7 @@ pub fn cmd_hostname(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
 // Comandos del sistema de archivos
 pub fn cmd_ls(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "📁 Contenido del directorio {}:", shell.current_dir).unwrap();
+    writeln!(&mut result, " Contenido del directorio {}:", shell.current_dir).unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     
     let show_hidden = args.contains(&"-a".to_string()) || args.contains(&"--all".to_string());
@@ -200,7 +200,7 @@ pub fn cmd_ping(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_netstat(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "🌐 Conexiones de red activas:").unwrap();
+    writeln!(&mut result, " Conexiones de red activas:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "Proto  Local Address    Foreign Address   State").unwrap();
     writeln!(&mut result, "tcp    0.0.0.0:22       0.0.0.0:*         LISTEN").unwrap();
@@ -212,7 +212,7 @@ pub fn cmd_netstat(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult 
 
 pub fn cmd_ifconfig(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "🔌 Interfaces de red:").unwrap();
+    writeln!(&mut result, " Interfaces de red:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>").unwrap();
     writeln!(&mut result, "      inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255").unwrap();
@@ -234,7 +234,7 @@ pub fn cmd_wget(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 // Comandos de procesos
 pub fn cmd_ps(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "🔄 Procesos activos:").unwrap();
+    writeln!(&mut result, " Procesos activos:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "PID   USER    COMMAND").unwrap();
     writeln!(&mut result, "1     root    kernel_init").unwrap();
@@ -257,7 +257,7 @@ pub fn cmd_kill(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_top(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "📊 Monitor de procesos en tiempo real:").unwrap();
+    writeln!(&mut result, " Monitor de procesos en tiempo real:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "PID   USER    CPU%   MEM%   COMMAND").unwrap();
     writeln!(&mut result, "1     root    15.2   25.1   kernel_init").unwrap();
@@ -275,7 +275,7 @@ pub fn cmd_jobs(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 // Comandos de memoria
 pub fn cmd_free(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "💾 Uso de memoria:").unwrap();
+    writeln!(&mut result, " Uso de memoria:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "              total        used        free      shared  buff/cache   available").unwrap();
     writeln!(&mut result, "Mem:           2048M        512M       1536M         0M          0M       1536M").unwrap();
@@ -285,7 +285,7 @@ pub fn cmd_free(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_meminfo(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "💾 Información detallada de memoria:").unwrap();
+    writeln!(&mut result, " Información detallada de memoria:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "MemTotal:        2048 MB").unwrap();
     writeln!(&mut result, "MemFree:         1536 MB").unwrap();
@@ -300,15 +300,15 @@ pub fn cmd_meminfo(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult 
 // Comandos de seguridad
 pub fn cmd_security(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "🔒 Estado de seguridad del sistema:").unwrap();
+    writeln!(&mut result, " Estado de seguridad del sistema:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-    writeln!(&mut result, "  🛡️  Firewall: Activo").unwrap();
-    writeln!(&mut result, "  🔐 Encriptación: AES-256").unwrap();
-    writeln!(&mut result, "  🔑 Claves activas: 5").unwrap();
+    writeln!(&mut result, "    Firewall: Activo").unwrap();
+    writeln!(&mut result, "   Encriptación: AES-256").unwrap();
+    writeln!(&mut result, "   Claves activas: 5").unwrap();
     writeln!(&mut result, "  🏰 Sandboxes: 3 activos").unwrap();
-    writeln!(&mut result, "  📊 Encriptaciones: 1024").unwrap();
-    writeln!(&mut result, "  🚨 Alertas: 0").unwrap();
-    writeln!(&mut result, "  ✅ Estado: Seguro").unwrap();
+    writeln!(&mut result, "   Encriptaciones: 1024").unwrap();
+    writeln!(&mut result, "   Alertas: 0").unwrap();
+    writeln!(&mut result, "  [OK] Estado: Seguro").unwrap();
     Ok(result)
 }
 
@@ -342,13 +342,13 @@ pub fn cmd_ai(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
             let mut result = String::new();
             writeln!(&mut result, "🤖 Estado del sistema de IA:").unwrap();
             writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-            writeln!(&mut result, "  🧠 Modelos cargados: 3").unwrap();
-            writeln!(&mut result, "  📊 Inferencias totales: 1024").unwrap();
-            writeln!(&mut result, "  🎯 Precisión promedio: 95.2%").unwrap();
-            writeln!(&mut result, "  ⚡ Tiempo de inferencia: 2.3ms").unwrap();
-            writeln!(&mut result, "  🔄 Optimizaciones: Activas").unwrap();
-            writeln!(&mut result, "  📈 Aprendizaje: Continuo").unwrap();
-            writeln!(&mut result, "  🛡️  Privacidad: Datos locales").unwrap();
+            writeln!(&mut result, "   Modelos cargados: 3").unwrap();
+            writeln!(&mut result, "   Inferencias totales: 1024").unwrap();
+            writeln!(&mut result, "   Precisión promedio: 95.2%").unwrap();
+            writeln!(&mut result, "   Tiempo de inferencia: 2.3ms").unwrap();
+            writeln!(&mut result, "   Optimizaciones: Activas").unwrap();
+            writeln!(&mut result, "   Aprendizaje: Continuo").unwrap();
+            writeln!(&mut result, "    Privacidad: Datos locales").unwrap();
             Ok(result)
         },
         "help" => {
@@ -390,7 +390,7 @@ pub fn cmd_docker(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
         },
         "images" => {
             let mut result = String::new();
-            writeln!(&mut result, "🖼️  Imágenes disponibles:").unwrap();
+            writeln!(&mut result, "  Imágenes disponibles:").unwrap();
             writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
             writeln!(&mut result, "REPOSITORY   TAG      IMAGE ID      CREATED     SIZE").unwrap();
             writeln!(&mut result, "eclipse      latest   abc123def456  2h ago      256MB").unwrap();
@@ -405,28 +405,28 @@ pub fn cmd_container(_args: &[String], _shell: &mut AdvancedShell) -> ShellResul
     let mut result = String::new();
     writeln!(&mut result, "🐳 Información de contenedores:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-    writeln!(&mut result, "  📦 Contenedores totales: 2").unwrap();
-    writeln!(&mut result, "  ✅ Contenedores ejecutándose: 1").unwrap();
-    writeln!(&mut result, "  ⏸️  Contenedores pausados: 1").unwrap();
-    writeln!(&mut result, "  🖼️  Imágenes: 3").unwrap();
-    writeln!(&mut result, "  💾 Uso de memoria: 256 MB").unwrap();
-    writeln!(&mut result, "  💿 Uso de disco: 512 MB").unwrap();
-    writeln!(&mut result, "  🌐 Red: Bridge activo").unwrap();
+    writeln!(&mut result, "   Contenedores totales: 2").unwrap();
+    writeln!(&mut result, "  [OK] Contenedores ejecutándose: 1").unwrap();
+    writeln!(&mut result, "    Contenedores pausados: 1").unwrap();
+    writeln!(&mut result, "    Imágenes: 3").unwrap();
+    writeln!(&mut result, "   Uso de memoria: 256 MB").unwrap();
+    writeln!(&mut result, "   Uso de disco: 512 MB").unwrap();
+    writeln!(&mut result, "   Red: Bridge activo").unwrap();
     Ok(result)
 }
 
 // Comandos de monitoreo
 pub fn cmd_monitor(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "📈 Monitor en tiempo real:").unwrap();
+    writeln!(&mut result, " Monitor en tiempo real:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-    writeln!(&mut result, "  💾 Memoria: 75% usada").unwrap();
-    writeln!(&mut result, "  🔄 CPU: 25% usada").unwrap();
-    writeln!(&mut result, "  💿 Disco: 45% usado").unwrap();
-    writeln!(&mut result, "  🌐 Red: 10 Mbps").unwrap();
-    writeln!(&mut result, "  🌡️  Temperatura: 65°C").unwrap();
-    writeln!(&mut result, "  ⚡ Energía: 85%").unwrap();
-    writeln!(&mut result, "  📊 Uptime: 2h 15m").unwrap();
+    writeln!(&mut result, "   Memoria: 75% usada").unwrap();
+    writeln!(&mut result, "   CPU: 25% usada").unwrap();
+    writeln!(&mut result, "   Disco: 45% usado").unwrap();
+    writeln!(&mut result, "   Red: 10 Mbps").unwrap();
+    writeln!(&mut result, "    Temperatura: 65°C").unwrap();
+    writeln!(&mut result, "   Energía: 85%").unwrap();
+    writeln!(&mut result, "   Uptime: 2h 15m").unwrap();
     Ok(result)
 }
 
@@ -436,7 +436,7 @@ pub fn cmd_htop(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_iostat(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "💿 Estadísticas de I/O:").unwrap();
+    writeln!(&mut result, " Estadísticas de I/O:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "Device    tps    kB_read/s  kB_wrtn/s  kB_read  kB_wrtn").unwrap();
     writeln!(&mut result, "sda       15.2   1024.5     512.3      2048000  1024000").unwrap();
@@ -538,23 +538,23 @@ pub fn cmd_lshw(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut output = String::new();
     writeln!(&mut output, "🔍 Información de Hardware:").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-    writeln!(&mut output, "  💻 CPU: Intel Core i7-12700K (x86_64)").unwrap();
-    writeln!(&mut output, "  🧠 Memoria: 32GB DDR4 RAM").unwrap();
-    writeln!(&mut output, "  💾 Almacenamiento: Samsung NVMe SSD 1TB").unwrap();
-    writeln!(&mut output, "  🌐 Red: Intel WiFi 6 + Bluetooth 5.0").unwrap();
-    writeln!(&mut output, "  🔊 Audio: Intel HD Audio").unwrap();
-    writeln!(&mut output, "  🎮 Video: NVIDIA GeForce RTX 4080").unwrap();
-    writeln!(&mut output, "  ⌨️  Entrada: Logitech Keyboard + Mouse").unwrap();
-    writeln!(&mut output, "  🔌 USB: Intel USB 3.2 Controller").unwrap();
-    writeln!(&mut output, "  📡 PCI: Intel PCIe 4.0 Controller").unwrap();
-    writeln!(&mut output, "  🌡️  Sensores: Intel Sensor Hub").unwrap();
+    writeln!(&mut output, "   CPU: Intel Core i7-12700K (x86_64)").unwrap();
+    writeln!(&mut output, "   Memoria: 32GB DDR4 RAM").unwrap();
+    writeln!(&mut output, "   Almacenamiento: Samsung NVMe SSD 1TB").unwrap();
+    writeln!(&mut output, "   Red: Intel WiFi 6 + Bluetooth 5.0").unwrap();
+    writeln!(&mut output, "   Audio: Intel HD Audio").unwrap();
+    writeln!(&mut output, "   Video: NVIDIA GeForce RTX 4080").unwrap();
+    writeln!(&mut output, "    Entrada: Logitech Keyboard + Mouse").unwrap();
+    writeln!(&mut output, "   USB: Intel USB 3.2 Controller").unwrap();
+    writeln!(&mut output, "   PCI: Intel PCIe 4.0 Controller").unwrap();
+    writeln!(&mut output, "    Sensores: Intel Sensor Hub").unwrap();
     Ok(output)
 }
 
 /// Comando lspci - Listar dispositivos PCI
 pub fn cmd_lspci(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut output = String::new();
-    writeln!(&mut output, "🔌 Dispositivos PCI:").unwrap();
+    writeln!(&mut output, " Dispositivos PCI:").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut output, "  00:00.0 Host bridge: Intel Corporation 12th Gen Core Processor").unwrap();
     writeln!(&mut output, "  00:01.0 PCI bridge: Intel Corporation 12th Gen Core Processor PCIe").unwrap();
@@ -569,7 +569,7 @@ pub fn cmd_lspci(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 /// Comando lsusb - Listar dispositivos USB
 pub fn cmd_lsusb(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut output = String::new();
-    writeln!(&mut output, "🔌 Dispositivos USB:").unwrap();
+    writeln!(&mut output, " Dispositivos USB:").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut output, "  Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub").unwrap();
     writeln!(&mut output, "  Bus 001 Device 002: ID 046d:c52b Logitech, Inc. Unifying Receiver").unwrap();
@@ -582,7 +582,7 @@ pub fn cmd_lsusb(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 /// Comando lscpu - Información de CPU
 pub fn cmd_lscpu(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut output = String::new();
-    writeln!(&mut output, "💻 Información de CPU:").unwrap();
+    writeln!(&mut output, " Información de CPU:").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut output, "  Arquitectura: x86_64").unwrap();
     writeln!(&mut output, "  Modo de operación: 64-bit").unwrap();
@@ -611,17 +611,200 @@ pub fn cmd_detect(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     
     // Simular proceso de detección
-    writeln!(&mut output, "  ✅ CPU detectado: Intel Core i7-12700K").unwrap();
-    writeln!(&mut output, "  ✅ Memoria detectada: 32GB DDR4").unwrap();
-    writeln!(&mut output, "  ✅ Almacenamiento detectado: Samsung NVMe SSD 1TB").unwrap();
-    writeln!(&mut output, "  ✅ Red detectada: Intel WiFi 6 + Bluetooth").unwrap();
-    writeln!(&mut output, "  ✅ Audio detectado: Intel HD Audio").unwrap();
-    writeln!(&mut output, "  ✅ Video detectado: NVIDIA RTX 4080").unwrap();
-    writeln!(&mut output, "  ✅ Entrada detectada: Logitech Keyboard + Mouse").unwrap();
-    writeln!(&mut output, "  ✅ USB detectado: Intel USB 3.2 Controller").unwrap();
-    writeln!(&mut output, "  ✅ PCI detectado: Intel PCIe 4.0 Controller").unwrap();
-    writeln!(&mut output, "  ✅ Sensores detectados: Intel Sensor Hub").unwrap();
+    writeln!(&mut output, "  [OK] CPU detectado: Intel Core i7-12700K").unwrap();
+    writeln!(&mut output, "  [OK] Memoria detectada: 32GB DDR4").unwrap();
+    writeln!(&mut output, "  [OK] Almacenamiento detectado: Samsung NVMe SSD 1TB").unwrap();
+    writeln!(&mut output, "  [OK] Red detectada: Intel WiFi 6 + Bluetooth").unwrap();
+    writeln!(&mut output, "  [OK] Audio detectado: Intel HD Audio").unwrap();
+    writeln!(&mut output, "  [OK] Video detectado: NVIDIA RTX 4080").unwrap();
+    writeln!(&mut output, "  [OK] Entrada detectada: Logitech Keyboard + Mouse").unwrap();
+    writeln!(&mut output, "  [OK] USB detectado: Intel USB 3.2 Controller").unwrap();
+    writeln!(&mut output, "  [OK] PCI detectado: Intel PCIe 4.0 Controller").unwrap();
+    writeln!(&mut output, "  [OK] Sensores detectados: Intel Sensor Hub").unwrap();
     
-    writeln!(&mut output, "\n📊 Resumen: 10 dispositivos detectados, 10 funcionando correctamente").unwrap();
+    writeln!(&mut output, "\n Resumen: 10 dispositivos detectados, 10 funcionando correctamente").unwrap();
+    Ok(output)
+}
+
+// ============================================================================
+// COMANDOS DE GESTIÓN DE ENERGÍA
+// ============================================================================
+
+/// Comando power - Gestión de energía
+pub fn cmd_power(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
+    if args.is_empty() {
+        let mut output = String::new();
+        writeln!(&mut output, " Gestión de Energía - Comandos disponibles:").unwrap();
+        writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+        writeln!(&mut output, "  power status     - Estado actual de energía").unwrap();
+        writeln!(&mut output, "  power profile    - Cambiar perfil de energía").unwrap();
+        writeln!(&mut output, "  power info       - Información detallada").unwrap();
+        writeln!(&mut output, "  power save       - Activar modo ahorro").unwrap();
+        writeln!(&mut output, "  power performance - Activar modo rendimiento").unwrap();
+        writeln!(&mut output, "  power balanced   - Activar modo equilibrado").unwrap();
+        Ok(output)
+    } else {
+        match args[0].as_str() {
+            "status" => {
+                let mut output = String::new();
+                writeln!(&mut output, " Estado de Energía:").unwrap();
+                writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+                writeln!(&mut output, "   Perfil: Equilibrado").unwrap();
+                writeln!(&mut output, "   CPU: 3600 MHz").unwrap();
+                writeln!(&mut output, "   Consumo: 65W").unwrap();
+                writeln!(&mut output, "   Batería: 85%").unwrap();
+                writeln!(&mut output, "   AC: Conectado").unwrap();
+                writeln!(&mut output, "    Temperatura: 45°C").unwrap();
+                Ok(output)
+            },
+            "profile" => {
+                let mut output = String::new();
+                writeln!(&mut output, " Perfiles de Energía:").unwrap();
+                writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+                writeln!(&mut output, "   performance - Máximo rendimiento").unwrap();
+                writeln!(&mut output, "    balanced    - Equilibrado").unwrap();
+                writeln!(&mut output, "   powersaver  - Ahorro de energía").unwrap();
+                writeln!(&mut output, "    custom      - Personalizado").unwrap();
+                Ok(output)
+            },
+            "info" => {
+                let mut output = String::new();
+                writeln!(&mut output, " Información Detallada de Energía:").unwrap();
+                writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+                writeln!(&mut output, "   Perfil: Equilibrado").unwrap();
+                writeln!(&mut output, "   CPU: 3600 MHz (800-5000 MHz)").unwrap();
+                writeln!(&mut output, "   Memoria: 80% energía").unwrap();
+                writeln!(&mut output, "   Dispositivos: 85% energía").unwrap();
+                writeln!(&mut output, "    Temperatura: 45°C").unwrap();
+                writeln!(&mut output, "   Consumo: 65W").unwrap();
+                writeln!(&mut output, "   Batería: 85%").unwrap();
+                writeln!(&mut output, "   AC: Conectado").unwrap();
+                writeln!(&mut output, "   Auto-escala: Habilitado").unwrap();
+                writeln!(&mut output, "    Throttling térmico: Habilitado").unwrap();
+                writeln!(&mut output, "   Suspensión de dispositivos: Deshabilitado").unwrap();
+                writeln!(&mut output, "   Ahorro de memoria: Deshabilitado").unwrap();
+                Ok(output)
+            },
+            "save" => {
+                let mut output = String::new();
+                writeln!(&mut output, " Activando modo ahorro de energía...").unwrap();
+                writeln!(&mut output, "  [OK] CPU: 2000 MHz").unwrap();
+                writeln!(&mut output, "  [OK] Memoria: 60% energía").unwrap();
+                writeln!(&mut output, "  [OK] Dispositivos: 70% energía").unwrap();
+                writeln!(&mut output, "  [OK] Suspensión de dispositivos: Habilitado").unwrap();
+                writeln!(&mut output, "  [OK] Ahorro de memoria: Habilitado").unwrap();
+                Ok(output)
+            },
+            "performance" => {
+                let mut output = String::new();
+                writeln!(&mut output, " Activando modo rendimiento...").unwrap();
+                writeln!(&mut output, "  [OK] CPU: 5000 MHz").unwrap();
+                writeln!(&mut output, "  [OK] Memoria: 100% energía").unwrap();
+                writeln!(&mut output, "  [OK] Dispositivos: 100% energía").unwrap();
+                writeln!(&mut output, "  [OK] Auto-escala: Deshabilitado").unwrap();
+                writeln!(&mut output, "  [OK] Throttling térmico: Deshabilitado").unwrap();
+                Ok(output)
+            },
+            "balanced" => {
+                let mut output = String::new();
+                writeln!(&mut output, "  Activando modo equilibrado...").unwrap();
+                writeln!(&mut output, "  [OK] CPU: 3600 MHz").unwrap();
+                writeln!(&mut output, "  [OK] Memoria: 80% energía").unwrap();
+                writeln!(&mut output, "  [OK] Dispositivos: 85% energía").unwrap();
+                writeln!(&mut output, "  [OK] Auto-escala: Habilitado").unwrap();
+                writeln!(&mut output, "  [OK] Throttling térmico: Habilitado").unwrap();
+                Ok(output)
+            },
+            _ => Err(format!("Comando '{}' no reconocido. Use 'power' para ver opciones.", args[0]))
+        }
+    }
+}
+
+/// Comando cpufreq - Frecuencia de CPU
+pub fn cmd_cpufreq(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
+    if args.is_empty() {
+        let mut output = String::new();
+        writeln!(&mut output, " Frecuencia de CPU:").unwrap();
+        writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+        writeln!(&mut output, "  Frecuencia actual: 3600 MHz").unwrap();
+        writeln!(&mut output, "  Frecuencia mínima: 800 MHz").unwrap();
+        writeln!(&mut output, "  Frecuencia máxima: 5000 MHz").unwrap();
+        writeln!(&mut output, "  Gobernador: ondemand").unwrap();
+        writeln!(&mut output, "  Escalado automático: Habilitado").unwrap();
+        Ok(output)
+    } else {
+        let freq = args[0].parse::<u32>().unwrap_or(0);
+        if freq < 800 || freq > 5000 {
+            Err("Frecuencia debe estar entre 800 y 5000 MHz".to_string())
+        } else {
+            let mut output = String::new();
+            writeln!(&mut output, " Cambiando frecuencia de CPU a {} MHz...", freq).unwrap();
+            writeln!(&mut output, "  [OK] Frecuencia establecida: {} MHz", freq).unwrap();
+            writeln!(&mut output, "  [OK] Gobernador: ondemand").unwrap();
+            writeln!(&mut output, "  [OK] Escalado automático: Habilitado").unwrap();
+            Ok(output)
+        }
+    }
+}
+
+/// Comando battery - Estado de batería
+pub fn cmd_battery(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
+    let mut output = String::new();
+    writeln!(&mut output, " Estado de Batería:").unwrap();
+    writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+    writeln!(&mut output, "  Nivel: 85%").unwrap();
+    writeln!(&mut output, "  Estado: Cargando").unwrap();
+    writeln!(&mut output, "  Tiempo restante: 2h 30m").unwrap();
+    writeln!(&mut output, "  Tiempo hasta cargado: 45m").unwrap();
+    writeln!(&mut output, "  Capacidad: 5000 mAh").unwrap();
+    writeln!(&mut output, "  Voltaje: 12.6V").unwrap();
+    writeln!(&mut output, "  Corriente: 2.1A").unwrap();
+    writeln!(&mut output, "  Temperatura: 35°C").unwrap();
+    writeln!(&mut output, "  Ciclos: 150").unwrap();
+    writeln!(&mut output, "  Salud: Excelente").unwrap();
+    Ok(output)
+}
+
+/// Comando thermal - Estado térmico
+pub fn cmd_thermal(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
+    let mut output = String::new();
+    writeln!(&mut output, "  Estado Térmico:").unwrap();
+    writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+    writeln!(&mut output, "  CPU: 45°C").unwrap();
+    writeln!(&mut output, "  GPU: 52°C").unwrap();
+    writeln!(&mut output, "  Memoria: 38°C").unwrap();
+    writeln!(&mut output, "  SSD: 42°C").unwrap();
+    writeln!(&mut output, "  Placa base: 41°C").unwrap();
+    writeln!(&mut output, "  Temperatura máxima: 85°C").unwrap();
+    writeln!(&mut output, "  Temperatura crítica: 95°C").unwrap();
+    writeln!(&mut output, "  Throttling térmico: Habilitado").unwrap();
+    writeln!(&mut output, "  Ventiladores: 45%").unwrap();
+    writeln!(&mut output, "  Estado: Normal").unwrap();
+    Ok(output)
+}
+
+/// Comando powertop - Monitor de energía
+pub fn cmd_powertop(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
+    let mut output = String::new();
+    writeln!(&mut output, " Monitor de Energía (PowerTop):").unwrap();
+    writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
+    writeln!(&mut output, "  Consumo total: 65W").unwrap();
+    writeln!(&mut output, "  CPU: 25W (38%)").unwrap();
+    writeln!(&mut output, "  GPU: 15W (23%)").unwrap();
+    writeln!(&mut output, "  Memoria: 8W (12%)").unwrap();
+    writeln!(&mut output, "  Dispositivos: 12W (18%)").unwrap();
+    writeln!(&mut output, "  Otros: 5W (8%)").unwrap();
+    writeln!(&mut output, "").unwrap();
+    writeln!(&mut output, "   Batería: 85% (2h 30m restantes)").unwrap();
+    writeln!(&mut output, "   AC: Conectado").unwrap();
+    writeln!(&mut output, "    Temperatura: 45°C").unwrap();
+    writeln!(&mut output, "   Frecuencia CPU: 3600 MHz").unwrap();
+    writeln!(&mut output, "   Memoria: 80% energía").unwrap();
+    writeln!(&mut output, "   Dispositivos: 85% energía").unwrap();
+    writeln!(&mut output, "").unwrap();
+    writeln!(&mut output, "   Recomendaciones:").unwrap();
+    writeln!(&mut output, "    • Reducir brillo de pantalla").unwrap();
+    writeln!(&mut output, "    • Deshabilitar dispositivos no utilizados").unwrap();
+    writeln!(&mut output, "    • Usar modo ahorro de energía").unwrap();
     Ok(output)
 }

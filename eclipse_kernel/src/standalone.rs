@@ -18,7 +18,7 @@ pub extern "C" fn _start() -> ! {
     print_message("║  🚀 Kernel básico funcional                                 ║");
     print_message("║  🔒 Compilación exitosa                                     ║");
     print_message("║                                                              ║");
-    print_message("║  Versión: 2.0.0 (Standalone)                               ║");
+    print_message("║  Versión: 0.4.0 (Standalone)                               ║");
     print_message("║  Arquitectura: x86_64                                       ║");
     print_message("╚══════════════════════════════════════════════════════════════╝");
     

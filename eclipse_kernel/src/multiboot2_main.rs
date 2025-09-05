@@ -214,7 +214,7 @@ fn print_banner() {
     print_message("║  🐳 Sistema de contenedores + Virtualización               ║");
     print_message("║  🤖 Machine Learning + IA avanzada                         ║");
     print_message("║                                                              ║");
-    print_message("║  Versión: 2.0.0 (Next Gen)                                  ║");
+    print_message("║  Versión: 0.4.0 (Next Gen)                                  ║");
     print_message("║  Arquitectura: x86_64 Microkernel                           ║");
     print_message("║  API: Windows 10/11 + IA nativa                             ║");
     print_message("║  Bootloader: GRUB Multiboot2                                ║");

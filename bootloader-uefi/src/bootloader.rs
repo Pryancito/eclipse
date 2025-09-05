@@ -29,11 +29,11 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Buscar y cargar el kernel
     match load_kernel(boot_services) {
         Ok(()) => {
-            println!("✅ Kernel cargado exitosamente");
+            println!("[OK] Kernel cargado exitosamente");
             Status::SUCCESS
         }
         Err(e) => {
-            println!("❌ Error cargando kernel: {:?}", e);
+            println!("[ERROR] Error cargando kernel: {:?}", e);
             Status::LOAD_ERROR
         }
     }
@@ -41,17 +41,17 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
 /// Muestra el banner de Eclipse OS
 fn print_banner() {
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                    🌙 Eclipse OS Bootloader                  ║");
-    println!("║                    Bootloader UEFI Nativo                    ║");
-    println!("║                    Desarrollado en Rust                      ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("================================================================");
+    println!("                    Eclipse OS Bootloader                      ");
+    println!("                    Bootloader UEFI Nativo                    ");
+    println!("                    Desarrollado en Rust                      ");
+    println!("================================================================");
     println!();
 }
 
 /// Carga el kernel Linux de Eclipse OS
 fn load_kernel(boot_services: &BootServices) -> uefi::Result<()> {
-    println!("🔍 Buscando kernel de Eclipse OS...");
+    println!("Buscando kernel de Eclipse OS...");
     
     // Obtener la imagen cargada actual (nuestro bootloader)
     let loaded_image = boot_services
@@ -87,7 +87,7 @@ fn load_kernel(boot_services: &BootServices) -> uefi::Result<()> {
                     Ok(file) => {
                         kernel_file = Some(file);
                         kernel_path_found = path;
-                        println!("✅ Kernel encontrado en: {}", path);
+                        println!("[OK] Kernel encontrado en: {}", path);
                         break;
                     }
                     Err(_) => continue,
@@ -100,7 +100,7 @@ fn load_kernel(boot_services: &BootServices) -> uefi::Result<()> {
     let kernel_file = kernel_file.ok_or(uefi::Status::NOT_FOUND)?;
     
     // Leer el kernel completo en memoria
-    println!("📖 Leyendo kernel en memoria...");
+    println!("Leyendo kernel en memoria...");
     
     // Crear buffer para obtener información del archivo
     let mut file_info_buffer = [0u8; 1024];
@@ -118,12 +118,12 @@ fn load_kernel(boot_services: &BootServices) -> uefi::Result<()> {
     };
     kernel_file.read(&mut buffer)?;
     
-    println!("✅ Kernel leído: {} bytes", file_info);
+    println!("[OK] Kernel leido: {} bytes", file_info);
     
     // Preparar parámetros del kernel
     let cmdline = CString16::try_from("console=ttyS0 quiet")?;
     
-    println!("🚀 Iniciando kernel de Eclipse OS...");
+    println!("Iniciando kernel de Eclipse OS...");
     
     // Cargar el kernel como imagen EFI desde archivo
     let kernel_path_cstr = CString16::try_from(kernel_path_found)?;
@@ -142,8 +142,8 @@ fn load_kernel(boot_services: &BootServices) -> uefi::Result<()> {
 
 /// Maneja errores críticos del bootloader
 fn handle_critical_error(error: uefi::Status) {
-    println!("💥 Error crítico del bootloader: {:?}", error);
-    println!("🔄 Reiniciando sistema...");
+    println!("[CRITICAL] Error critico del bootloader: {:?}", error);
+    println!("Reiniciando sistema...");
     
     // Reiniciar el sistema
     unsafe {

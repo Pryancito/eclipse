@@ -1,0 +1,1 @@
+/home/moebius/eclipse/installer/target/release/eclipse-installer: /home/moebius/eclipse/installer/src/bootloader_installer.rs /home/moebius/eclipse/installer/src/disk_manager.rs /home/moebius/eclipse/installer/src/filesystem_manager.rs /home/moebius/eclipse/installer/src/main.rs /home/moebius/eclipse/installer/src/partition_manager.rs

@@ -1,4 +1,4 @@
-# Eclipse OS - Sistema Operativo Completo
+# Eclipse OS v0.4.0 - Sistema Operativo Completo
 
 Eclipse OS es un sistema operativo moderno basado en Rust con características avanzadas de IA, seguridad y personalización.
 
@@ -74,8 +74,11 @@ eclipse-os-complete/
 │   └── boot/
 │       └── bootx64.efi         # Bootloader UEFI
 ├── eclipse-os.img              # Imagen de disco del sistema
-├── test_system.sh              # Script de prueba en QEMU
+├── test_system.sh              # Script de prueba en QEMU (modo texto)
+├── test_gui.sh                 # Script de prueba en QEMU (modo gráfico)
+├── test_uefi.sh                # Script de prueba en QEMU (modo UEFI)
 ├── install.sh                  # Script de instalación
+├── install_uefi.sh             # Script de instalación UEFI
 └── README.md                   # Documentación
 ```
 
@@ -87,10 +90,33 @@ eclipse-os-complete/
 - **Almacenamiento**: Mínimo 100MB
 - **UEFI**: Soporte para UEFI (opcional)
 
+### Prueba en QEMU
+```bash
+# Modo texto (recomendado para desarrollo)
+./test_system.sh
+
+# Modo gráfico (requiere X11/Wayland)
+./test_gui.sh
+
+# Modo UEFI (requiere OVMF)
+./test_uefi.sh
+```
+
+### Instalación
+```bash
+# Instalación estándar
+sudo ./install.sh
+
+# Instalación UEFI
+sudo ./install_uefi.sh
+```
+
+## 🔧 Desarrollo
+
 ### Compilación desde Código Fuente
 ```bash
 # Compilar todo el sistema
-./build_complete_system.sh
+./build.sh
 
 # Compilar solo el kernel
 cd eclipse_kernel && cargo build --release
@@ -98,26 +124,6 @@ cd eclipse_kernel && cargo build --release
 # Compilar solo el bootloader
 cd bootloader-uefi && cargo build --release
 ```
-
-### Prueba en QEMU
-```bash
-cd eclipse-os-complete
-./test_system.sh
-```
-
-### Instalación
-```bash
-cd eclipse-os-complete
-./install.sh
-```
-
-## 🔧 Desarrollo
-
-### Estructura del Código
-- **Kernel**: `eclipse_kernel/` - Kernel principal en Rust
-- **Bootloader**: `bootloader-uefi/` - Bootloader UEFI
-- **Módulos**: Módulos del kernel organizados por funcionalidad
-- **Scripts**: Scripts de construcción y prueba
 
 ### Módulos del Kernel
 1. **AI System**: Inteligencia artificial avanzada
@@ -136,13 +142,6 @@ cd eclipse-os-complete
 14. **Power**: Gestión de energía
 15. **Privacy**: Privacidad y cumplimiento
 
-### Contribuir
-1. Fork del repositorio
-2. Crear una rama para tu feature
-3. Hacer commit de tus cambios
-4. Push a la rama
-5. Crear un Pull Request
-
 ## 📊 Estadísticas del Proyecto
 
 - **Líneas de Código**: 15,000+ líneas de Rust
@@ -154,19 +153,19 @@ cd eclipse-os-complete
 
 ## 🎯 Roadmap
 
-### Versión 1.1
+### Versión 0.5.0
 - [ ] Optimización de rendimiento
 - [ ] Mejoras en la interfaz gráfica
 - [ ] Aplicaciones de usuario básicas
 - [ ] Soporte para más hardware
 
-### Versión 1.2
+### Versión 0.6.0
 - [ ] Sistema de paquetes
 - [ ] Aplicaciones de productividad
 - [ ] Soporte para más arquitecturas
 - [ ] Mejoras en la seguridad
 
-### Versión 2.0
+### Versión 1.0.0
 - [ ] Interfaz gráfica completa
 - [ ] Aplicaciones de escritorio
 - [ ] Soporte para hardware moderno
@@ -192,4 +191,4 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver el archivo LICENSE para m�
 
 ---
 
-**Eclipse OS** - *El futuro de los sistemas operativos*
+**Eclipse OS v0.4.0** - *El futuro de los sistemas operativos*

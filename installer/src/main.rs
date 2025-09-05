@@ -70,7 +70,7 @@ fn install_eclipse_os() {
     println!();
     
     // 1. Mostrar discos disponibles
-    let disk_manager = DiskManager::new();
+    let mut disk_manager = DiskManager::new();
     let disks = disk_manager.list_disks();
     
     if disks.is_empty() {
@@ -86,7 +86,7 @@ fn install_eclipse_os() {
     
     // 2. Seleccionar disco
     let disk_choice = read_input("Selecciona el disco donde instalar (número): ");
-    let disk_index: usize = match disk_choice.trim().parse() {
+    let disk_index: usize = match disk_choice.trim().parse::<usize>() {
         Ok(n) => n - 1,
         Err(_) => {
             println!("❌ Número inválido");
@@ -119,7 +119,7 @@ fn install_eclipse_os() {
     println!();
     
     // Crear particiones
-    let partition_manager = PartitionManager::new();
+    let mut partition_manager = PartitionManager::new();
     match partition_manager.create_partitions(selected_disk) {
         Ok(partitions) => {
             println!("✅ Particiones creadas exitosamente");
@@ -180,7 +180,7 @@ fn show_disk_info() {
     println!("========================");
     println!();
     
-    let disk_manager = DiskManager::new();
+    let mut disk_manager = DiskManager::new();
     let disks = disk_manager.list_disks();
     
     if disks.is_empty() {

@@ -1,5 +1,0 @@
-# Bootloader UEFI simple para Eclipse OS
-# Este es un placeholder - en un sistema real necesitarías un bootloader UEFI real
-echo "Eclipse OS Bootloader"
-echo "Cargando kernel..."
-# Aquí iría el código real del bootloader UEFI

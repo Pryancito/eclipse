@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use crate::DiskInfo;
 
 pub struct DiskManager {
@@ -61,7 +62,7 @@ impl DiskManager {
     fn is_disk_accessible(&self, disk_path: &str) -> bool {
         // Verificar que el disco existe y es accesible
         if let Ok(metadata) = fs::metadata(disk_path) {
-            metadata.is_file() || metadata.is_block_device()
+            metadata.is_file() || metadata.file_type().is_block_device()
         } else {
             false
         }

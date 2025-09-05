@@ -34,6 +34,9 @@ mod sensor_driver;
 // Sistema de autodetección de hardware
 mod hardware_detection;
 
+// Sistema de gestión de energía
+mod power_management;
+
 // Implementación simple de Result para el kernel
 pub type KernelResult<T> = Result<T, KernelError>;
 
@@ -167,22 +170,22 @@ fn print_banner() {
     print_message("╔══════════════════════════════════════════════════════════════╗");
     print_message("║                Eclipse Rust OS - Next Gen                    ║");
     print_message("║                                                              ║");
-    print_message("║  🦀 100% Rust + Microkernel + IA + GUI Moderna             ║");
-    print_message("║  🚀 Compatible con aplicaciones Windows                     ║");
-    print_message("║  🔒 Seguridad avanzada + Encriptación end-to-end            ║");
-    print_message("║  🤖 IA integrada + Optimización automática                  ║");
-    print_message("║  🖥️ GUI GATE DIAGNOSTICS + Transparencias                ║");
-    print_message("║  🛡️ Privacidad por diseño + Cumplimiento GDPR             ║");
-    print_message("║  🔌 Sistema de plugins dinámico + Personalización total    ║");
-    print_message("║  🔧 Hardware moderno + Gestión de energía avanzada         ║");
-    print_message("║  🖥️ Shell moderna + Sistema de comandos completo           ║");
-    print_message("║  🚀 Sistema Ready + Comandos generativos (campa1-8)        ║");
-    print_message("║  📊 Monitor en tiempo real + Métricas dinámicas            ║");
-    print_message("║  🎨 Interfaz gráfica visual + Renderizado avanzado         ║");
-    print_message("║  🐳 Sistema de contenedores + Virtualización               ║");
-    print_message("║  🤖 Machine Learning + IA avanzada                         ║");
+    print_message("║  100% Rust + Microkernel + IA + GUI Moderna                ║");
+    print_message("║  Compatible con aplicaciones Windows                        ║");
+    print_message("║  Seguridad avanzada + Encriptacion end-to-end              ║");
+    print_message("║  IA integrada + Optimizacion automatica                    ║");
+    print_message("║  GUI GATE DIAGNOSTICS + Transparencias                     ║");
+    print_message("║  Privacidad por diseno + Cumplimiento GDPR                 ║");
+    print_message("║  Sistema de plugins dinamico + Personalizacion total       ║");
+    print_message("║  Hardware moderno + Gestion de energia avanzada            ║");
+    print_message("║  Shell moderna + Sistema de comandos completo              ║");
+    print_message("║  Sistema Ready + Comandos generativos (campa1-8)           ║");
+    print_message("║  Monitor en tiempo real + Metricas dinamicas               ║");
+    print_message("║  Interfaz grafica visual + Renderizado avanzado            ║");
+    print_message("║  Sistema de contenedores + Virtualizacion                  ║");
+    print_message("║  Machine Learning + IA avanzada                            ║");
     print_message("║                                                              ║");
-    print_message("║  Versión: 2.0.0 (Next Gen)                                  ║");
+    print_message("║  Versión: 0.4.0 (Next Gen)                                  ║");
     print_message("║  Arquitectura: x86_64 Microkernel                           ║");
     print_message("║  API: Windows 10/11 + IA nativa                             ║");
     print_message("╚══════════════════════════════════════════════════════════════╝");
@@ -300,66 +303,99 @@ fn initialize_kernel_components_with_messages() {
     
     // Inicializar sistema de sincronización
     synchronization::init();
-    print_message("  ✅ Sistema de sincronización inicializado");
+    print_message("  [OK] Sistema de sincronizacion inicializado");
     
     // Inicializar sistema de I/O
     io::init();
-    print_message("  ✅ Sistema de I/O inicializado");
+    print_message("  [OK] Sistema de I/O inicializado");
     
     // Inicializar sistema de archivos
     eclipse_kernel::filesystem::init();
-    print_message("  ✅ Sistema de archivos inicializado");
+    print_message("  [OK] Sistema de archivos inicializado");
     
     // Inicializar VFS
     eclipse_kernel::filesystem::vfs::init_vfs();
-    print_message("  ✅ VFS inicializado");
+    print_message("  [OK] VFS inicializado");
     
     // Inicializar driver FAT32
     // if let Err(e) = fat32::init_fat32(0) {
-    //     print_message("  ⚠️  Error inicializando FAT32:");
+    //     print_message("  [WARN] Error inicializando FAT32:");
     //     print_message(e);
     // } else {
-    //     print_message("  ✅ Driver FAT32 inicializado");
+    //     print_message("  [OK] Driver FAT32 inicializado");
     // }
-    print_message("  ✅ Driver FAT32 inicializado");
+    print_message("  [OK] Driver FAT32 inicializado");
     
     // Inicializar driver NTFS
     // if let Err(e) = ntfs::init_ntfs(1) {
-    //     print_message("  ⚠️  Error inicializando NTFS:");
+    //     print_message("  [WARN] Error inicializando NTFS:");
     //     print_message(e);
     // } else {
-    //     print_message("  ✅ Driver NTFS inicializado");
+    //     print_message("  [OK] Driver NTFS inicializado");
     // }
-    print_message("  ✅ Driver NTFS inicializado");
+    print_message("  [OK] Driver NTFS inicializado");
     
     // Inicializar sistema de red
     eclipse_kernel::network::init_network();
-    print_message("  ✅ Stack de red inicializado");
+    print_message("  [OK] Stack de red inicializado");
     
     // Inicializar driver de red
     // network_driver::init_network_driver(); // Comentado temporalmente
     
     // Inicializar sistema gráfico GUI
     // gui::init(); // Comentado temporalmente
-    print_message("  ✅ Sistema gráfico GUI inicializado");
+    print_message("  [OK] Sistema grafico GUI inicializado");
     
     // Inicializar sistema de optimización de rendimiento
     // performance::init();
-    print_message("  ✅ Sistema de optimización de rendimiento inicializado");
+    print_message("  [OK] Sistema de optimizacion de rendimiento inicializado");
     
-    print_message("  ✅ Driver de red inicializado");
+    print_message("  [OK] Driver de red inicializado");
     
     // Inicializar sistema de gráficos
     // graphics::init_graphics(); // Comentado temporalmente
-    print_message("  ✅ Sistema de gráficos inicializado");
+    print_message("  [OK] Sistema de graficos inicializado");
     
-    print_message("✅ Componentes del kernel inicializados correctamente");
+    print_message("[OK] Componentes del kernel inicializados correctamente");
 }
 
 /// Bucle principal del kernel
 fn kernel_main_loop() -> ! {
-    print_message("🔄 Iniciando bucle principal del kernel...");
+    print_message("Iniciando bucle principal del kernel...");
     
+    // Inicializar la shell interactiva
+    print_message("Iniciando shell interactiva de Eclipse OS...");
+    start_interactive_shell();
+}
+
+/// Iniciar shell interactiva
+fn start_interactive_shell() -> ! {
+    print_message("╔══════════════════════════════════════════════════════════════╗");
+    print_message("║                Eclipse OS - Shell Interactiva               ║");
+    print_message("║                                                              ║");
+    print_message("║  100% Rust + Microkernel + IA + GUI Moderna                ║");
+    print_message("║  Compatible con aplicaciones Windows                        ║");
+    print_message("║  Seguridad avanzada + Encriptacion end-to-end              ║");
+    print_message("║  IA integrada + Optimizacion automatica                    ║");
+    print_message("║  Shell moderna + Sistema de comandos completo              ║");
+    print_message("║  Sistema Ready + Comandos generativos (campa1-8)           ║");
+    print_message("║  Monitor en tiempo real + Metricas dinamicas               ║");
+    print_message("║  Interfaz grafica visual + Renderizado avanzado            ║");
+    print_message("║  Sistema de contenedores + Virtualizacion                  ║");
+    print_message("║  Machine Learning + IA avanzada                            ║");
+    print_message("║                                                              ║");
+    print_message("║  Versión: 0.4.0 (Next Gen)                                  ║");
+    print_message("║  Arquitectura: x86_64 Microkernel                           ║");
+    print_message("║  API: Windows 10/11 + IA nativa                             ║");
+    print_message("╚══════════════════════════════════════════════════════════════╝");
+    print_message("");
+    print_message("¡Bienvenido a Eclipse OS! Escribe 'help' para ver los comandos disponibles.");
+    print_message("");
+    
+    // Mostrar prompt de la shell
+    print_message("reactos-rust@nextgen:~$ ");
+    
+    // Bucle principal de la shell
     let mut cycle_count = 0;
     
     loop {
@@ -434,48 +470,53 @@ fn kernel_main_loop() -> ! {
         // Procesar optimizaciones de rendimiento
         // performance::process_performance_optimizations();
         
-        // Mostrar estadísticas del sistema cada 1000 ciclos
-        if cycle_count % 1000 == 0 {
+        // Mostrar estadísticas del sistema cada 10000 ciclos (menos frecuente)
+        if cycle_count % 10000 == 0 {
             show_system_stats();
         }
         
-        // Ejecutar aplicaciones de demostración cada 2000 ciclos
-        if cycle_count % 2000 == 0 {
+        // Ejecutar aplicaciones de demostración cada 20000 ciclos (menos frecuente)
+        if cycle_count % 20000 == 0 {
             run_demo_applications();
         }
         
-        // Ejecutar optimizaciones de rendimiento cada 3000 ciclos
-        if cycle_count % 3000 == 0 {
+        // Ejecutar optimizaciones de rendimiento cada 30000 ciclos (menos frecuente)
+        if cycle_count % 30000 == 0 {
             run_performance_optimizations();
         }
         
-        // Ejecutar profiling del kernel cada 5000 ciclos
-        if cycle_count % 5000 == 0 {
+        // Ejecutar profiling del kernel cada 50000 ciclos (menos frecuente)
+        if cycle_count % 50000 == 0 {
             run_kernel_profiling();
         }
         
-        // Demostrar caché inteligente cada 7000 ciclos
-        if cycle_count % 7000 == 0 {
+        // Demostrar caché inteligente cada 70000 ciclos (menos frecuente)
+        if cycle_count % 70000 == 0 {
             demonstrate_smart_cache();
         }
         
-        // Demostrar drivers adicionales cada 9000 ciclos
-        if cycle_count % 9000 == 0 {
+        // Demostrar drivers adicionales cada 90000 ciclos (menos frecuente)
+        if cycle_count % 90000 == 0 {
             demonstrate_additional_drivers();
         }
         
-        // Ejecutar autodetección de hardware cada 10000 ciclos
-        if cycle_count % 10000 == 0 {
+        // Ejecutar autodetección de hardware cada 100000 ciclos (menos frecuente)
+        if cycle_count % 100000 == 0 {
             run_hardware_detection();
         }
         
-        // Demostrar sistema de gráficos cada 5000 ciclos
-        if cycle_count % 5000 == 0 {
+        // Ejecutar gestión de energía cada 50000 ciclos (menos frecuente)
+        if cycle_count % 50000 == 0 {
+            run_power_management();
+        }
+        
+        // Demostrar sistema de gráficos cada 50000 ciclos (menos frecuente)
+        if cycle_count % 50000 == 0 {
             demonstrate_graphics();
         }
         
-        // Ejecutar tests del sistema cada 5000 ciclos
-        if cycle_count % 5000 == 0 {
+        // Ejecutar tests del sistema cada 50000 ciclos (menos frecuente)
+        if cycle_count % 50000 == 0 {
             run_system_tests();
         }
         
@@ -486,56 +527,56 @@ fn kernel_main_loop() -> ! {
 
 /// Mostrar estadísticas del sistema
 fn show_system_stats() {
-    print_message("📊 Estadísticas del sistema:");
+    print_message("Estadisticas del sistema:");
     
     // Estadísticas de memoria
     let (total_pages, free_pages, used_pages) = eclipse_kernel::memory::get_memory_stats();
-    print_message("  💾 Memoria: páginas libres de totales");
+    print_message("  Memoria: paginas libres de totales");
     
     // Estadísticas de procesos
             let (running_procs, ready_procs, blocked_procs) = eclipse_kernel::process::get_process_stats();
-    print_message("  🔄 Procesos: ejecutándose, listos, bloqueados");
+    print_message("  Procesos: ejecutandose, listos, bloqueados");
     
     // Estadísticas de hilos
     let (running_threads, ready_threads, blocked_threads) = eclipse_kernel::thread::get_thread_stats();
-    print_message("  🧵 Hilos: ejecutándose, listos, bloqueados");
+    print_message("  Hilos: ejecutandose, listos, bloqueados");
     
     // Estadísticas de I/O
     let (pending_io, in_progress_io, completed_io, failed_io) = io::get_io_stats();
-    print_message("  💿 I/O: pendientes, en progreso, completadas");
+    print_message("  I/O: pendientes, en progreso, completadas");
     
     // Estadísticas del sistema de archivos
     let (total_mounts, mounted_fs, open_files, total_files) = eclipse_kernel::filesystem::vfs::get_vfs_statistics();
-    print_message("  📁 Sistema de archivos: VFS activo, FAT32 y NTFS montados");
-    print_message("  📁 VFS: montajes totales, sistemas montados, archivos abiertos, archivos totales");
+    print_message("  Sistema de archivos: VFS activo, FAT32 y NTFS montados");
+    print_message("  VFS: montajes totales, sistemas montados, archivos abiertos, archivos totales");
     
     // Estadísticas de red
     if let Some(stats) = eclipse_kernel::network::get_network_stats() {
-        print_message("  🌐 Red: paquetes enviados, recibidos, conexiones TCP");
+        print_message("  Red: paquetes enviados, recibidos, conexiones TCP");
     } else {
-        print_message("  🌐 Red: stack no inicializado");
+        print_message("  Red: stack no inicializado");
     }
     
     // Estadísticas de gráficos
-    print_message("  🎨 Gráficos: VGA activo, sistema de ventanas listo");
+    print_message("  Graficos: VGA activo, sistema de ventanas listo");
     
     // Estadísticas de drivers
     let (total_drivers, running_drivers, loaded_drivers, error_drivers) = eclipse_kernel::drivers::system::get_driver_statistics();
-    print_message("  🔧 Drivers: totales, ejecutándose, cargados, errores");
+    print_message("  Drivers: totales, ejecutandose, cargados, errores");
     
     // Estadísticas de almacenamiento
     let (total_storage, ready_storage, error_storage) = eclipse_kernel::drivers::storage::get_storage_statistics();
-    print_message("  💾 Almacenamiento: dispositivos totales, listos, errores");
+    print_message("  Almacenamiento: dispositivos totales, listos, errores");
     
     // Estadísticas de red
     let (total_network, connected_network, error_network) = eclipse_kernel::drivers::network::get_network_statistics();
-    print_message("  🌐 Red: dispositivos totales, conectados, errores");
+    print_message("   Red: dispositivos totales, conectados, errores");
     
     // Estadísticas del microkernel
     if let Some(stats) = microkernel::get_microkernel_statistics() {
-        print_message("  🔧 Microkernel: servidores activos, clientes activos, mensajes totales");
+        print_message("   Microkernel: servidores activos, clientes activos, mensajes totales");
     } else {
-        print_message("  🔧 Microkernel: no inicializado");
+        print_message("   Microkernel: no inicializado");
     }
     
     // Estadísticas del sistema de IA
@@ -547,9 +588,9 @@ fn show_system_stats() {
     
     // Estadísticas de la GUI moderna
     if let Some(stats) = modern_gui::get_gui_statistics() {
-        print_message("  🖥️ GUI: paneles activos, elementos activos, animaciones activas");
+        print_message("   GUI: paneles activos, elementos activos, animaciones activas");
     } else {
-        print_message("  🖥️ GUI: sistema no inicializado");
+        print_message("   GUI: sistema no inicializado");
     }
     
     // Estadísticas del sistema de seguridad
@@ -561,62 +602,62 @@ fn show_system_stats() {
     
     // Estadísticas del sistema de privacidad
     // if let Some(stats) = privacy_system::get_privacy_statistics() {
-    //     print_message("  🛡️ Privacidad: datos almacenados, consentimientos activos, auditorías");
+    //     print_message("   Privacidad: datos almacenados, consentimientos activos, auditorías");
     // } else {
-    //     print_message("  🛡️ Privacidad: sistema no inicializado");
+    //     print_message("   Privacidad: sistema no inicializado");
     // }
-    print_message("  🛡️ Privacidad: sistema no inicializado");
+    print_message("   Privacidad: sistema no inicializado");
     
     // Estadísticas del sistema de plugins
     // if let Some(stats) = plugin_system::get_plugin_system_statistics() {
-    //     print_message("  🔌 Plugins: plugins totales, plugins cargados, plugins activos");
+    //     print_message("   Plugins: plugins totales, plugins cargados, plugins activos");
     // } else {
-    //     print_message("  🔌 Plugins: sistema no inicializado");
+    //     print_message("   Plugins: sistema no inicializado");
     // }
-    print_message("  🔌 Plugins: sistema no inicializado");
+    print_message("   Plugins: sistema no inicializado");
     
     // Estadísticas del sistema de personalización
     // if let Some(stats) = customization_system::get_customization_statistics() {
-    //     print_message("  🎨 Personalización: temas activos, perfiles activos, cambios aplicados");
+    //     print_message("   Personalización: temas activos, perfiles activos, cambios aplicados");
     // } else {
-    //     print_message("  🎨 Personalización: sistema no inicializado");
+    //     print_message("   Personalización: sistema no inicializado");
     // }
-    print_message("  🎨 Personalización: sistema no inicializado");
+    print_message("   Personalización: sistema no inicializado");
     
     // Estadísticas del gestor de hardware
     // if let Some(stats) = hardware_manager::get_hardware_manager_statistics() {
-    //     print_message("  🔧 Hardware: dispositivos totales, dispositivos activos, drivers cargados");
+    //     print_message("   Hardware: dispositivos totales, dispositivos activos, drivers cargados");
     // } else {
-    //     print_message("  🔧 Hardware: gestor no inicializado");
+    //     print_message("   Hardware: gestor no inicializado");
     // }
-    print_message("  🔧 Hardware: gestor no inicializado");
+    print_message("   Hardware: gestor no inicializado");
     
     // Estadísticas del gestor de energía y térmico
     if let Some(stats) = power_thermal_manager::get_power_thermal_statistics() {
-        print_message("  ⚡ Energía/Térmico: dispositivos térmicos, políticas activas, eventos");
+        print_message("   Energía/Térmico: dispositivos térmicos, políticas activas, eventos");
     } else {
-        print_message("  ⚡ Energía/Térmico: gestor no inicializado");
+        print_message("   Energía/Térmico: gestor no inicializado");
     }
     
     // Estadísticas del sistema de shell
     if let Some(stats) = shell::get_shell_statistics() {
-        print_message("  🖥️ Shell: comandos registrados, historial, aliases, variables de entorno");
+        print_message("   Shell: comandos registrados, historial, aliases, variables de entorno");
     } else {
-        print_message("  🖥️ Shell: sistema no inicializado");
+        print_message("   Shell: sistema no inicializado");
     }
     
     // Estadísticas del sistema Ready
     if let Some(stats) = ready_system::get_ready_statistics() {
-        print_message("  🚀 Ready: programas generados, comandos ejecutados, sistema activo");
+        print_message("   Ready: programas generados, comandos ejecutados, sistema activo");
     } else {
-        print_message("  🚀 Ready: sistema no inicializado");
+        print_message("   Ready: sistema no inicializado");
     }
     
     // Estadísticas del monitor en tiempo real
     if let Some(stats) = realtime_monitor::get_monitor_statistics() {
-        print_message("  📊 Monitor: métricas activas, actualizaciones, alertas críticas");
+        print_message("   Monitor: métricas activas, actualizaciones, alertas críticas");
     } else {
-        print_message("  📊 Monitor: sistema no inicializado");
+        print_message("   Monitor: sistema no inicializado");
     }
 }
 
@@ -666,11 +707,11 @@ fn run_system_tests() {
     
     // Mostrar resultados de tests
     // if results.failed > 0 {
-    //     print_message("⚠️  Tests fallidos detectados");
+    //     print_message("[WARN]  Tests fallidos detectados");
     // } else {
-    //     print_message("✅ Tests exitosos");
+    //     print_message("[OK] Tests exitosos");
     // }
-    print_message("✅ Tests del sistema completados");
+    print_message("[OK] Tests del sistema completados");
 }
 
 /// Procesar eventos del sistema
@@ -1244,7 +1285,7 @@ mod sensor_driver {
             let (prox, near) = self.get_proximity();
             
             format!(
-                "🌡️ Sensores: Accel=({:.1},{:.1},{:.1}) Temp={:.1}°C Luz={:.1}lux Presión={:.1}Pa Prox={:.1}cm Cerca={}",
+                " Sensores: Accel=({:.1},{:.1},{:.1}) Temp={:.1}°C Luz={:.1}lux Presión={:.1}Pa Prox={:.1}cm Cerca={}",
                 ax, ay, az, temp, light, pressure, prox, near
             )
         }
@@ -1286,6 +1327,11 @@ fn demonstrate_sensor_driver() {
 /// Ejecutar autodetección de hardware
 fn run_hardware_detection() {
     hardware_detection::run_hardware_detection();
+}
+
+/// Ejecutar gestión de energía
+fn run_power_management() {
+    power_management::run_power_management();
 }
 
 // ============================================================================
@@ -1615,8 +1661,8 @@ mod hardware_detection {
             report.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
             
             for device in &self.detected_devices {
-                let status = if device.is_working { "✅" } else { "❌" };
-                let driver = if device.driver_available { "🔧" } else { "⚠️" };
+                let status = if device.is_working { "[OK]" } else { "[ERROR]" };
+                let driver = if device.driver_available { "" } else { "[WARN]" };
                 
                 report.push_str(&format!(
                     "  {} {} {:?} - {} (VID: 0x{:04X}, DID: 0x{:04X})\n",
@@ -1629,7 +1675,7 @@ mod hardware_detection {
             }
             
             report.push_str(&format!(
-                "\n📊 Resumen: {} dispositivos detectados, {} funcionando correctamente",
+                "\n Resumen: {} dispositivos detectados, {} funcionando correctamente",
                 self.total_devices.load(Ordering::SeqCst),
                 self.working_devices.load(Ordering::SeqCst)
             ));
@@ -1661,5 +1707,398 @@ mod hardware_detection {
         let _ = detector.initialize();
         let _ = detector.scan_hardware();
         detector.get_detailed_report()
+    }
+}
+
+// ============================================================================
+// SISTEMA DE GESTIÓN DE ENERGÍA
+// ============================================================================
+
+/// Sistema de gestión de energía integrado
+mod power_management {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use alloc::format;
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+    
+    /// Perfil de energía
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum PowerProfile {
+        Performance,    // Máximo rendimiento
+        Balanced,       // Equilibrado
+        PowerSaver,     // Ahorro de energía
+        Custom,         // Personalizado
+    }
+    
+    /// Estado de energía del sistema
+    #[derive(Debug, Clone)]
+    pub struct PowerState {
+        pub cpu_frequency: u32,      // Frecuencia actual de CPU (MHz)
+        pub cpu_governor: String,    // Gobernador de CPU
+        pub memory_power: u8,        // Nivel de energía de memoria (0-100)
+        pub device_power: u8,        // Nivel de energía de dispositivos (0-100)
+        pub thermal_state: u8,       // Estado térmico (0-100)
+        pub power_consumption: u32,  // Consumo de energía (W)
+        pub battery_level: u8,       // Nivel de batería (0-100)
+        pub ac_connected: bool,      // Conectado a corriente alterna
+    }
+    
+    /// Configuración de gestión de energía
+    pub struct PowerConfig {
+        pub profile: PowerProfile,
+        pub cpu_min_freq: u32,
+        pub cpu_max_freq: u32,
+        pub cpu_governor: String,
+        pub memory_power_save: bool,
+        pub device_suspend: bool,
+        pub thermal_throttling: bool,
+        pub auto_scale: bool,
+    }
+    
+    /// Sistema de gestión de energía
+    pub struct PowerManager {
+        is_initialized: bool,
+        current_profile: PowerProfile,
+        power_state: PowerState,
+        config: PowerConfig,
+        cpu_frequency: AtomicU32,
+        memory_power: AtomicU8,
+        device_power: AtomicU8,
+        thermal_state: AtomicU8,
+        power_consumption: AtomicU32,
+        battery_level: AtomicU8,
+        ac_connected: AtomicBool,
+        auto_scale: AtomicBool,
+        thermal_throttling: AtomicBool,
+        device_suspend: AtomicBool,
+        memory_power_save: AtomicBool,
+    }
+    
+    impl PowerManager {
+        pub fn new() -> Self {
+            Self {
+                is_initialized: false,
+                current_profile: PowerProfile::Balanced,
+                power_state: PowerState {
+                    cpu_frequency: 3600,
+                    cpu_governor: "ondemand".to_string(),
+                    memory_power: 80,
+                    device_power: 85,
+                    thermal_state: 45,
+                    power_consumption: 65,
+                    battery_level: 85,
+                    ac_connected: true,
+                },
+                config: PowerConfig {
+                    profile: PowerProfile::Balanced,
+                    cpu_min_freq: 800,
+                    cpu_max_freq: 5000,
+                    cpu_governor: "ondemand".to_string(),
+                    memory_power_save: false,
+                    device_suspend: false,
+                    thermal_throttling: true,
+                    auto_scale: true,
+                },
+                cpu_frequency: AtomicU32::new(3600),
+                memory_power: AtomicU8::new(80),
+                device_power: AtomicU8::new(85),
+                thermal_state: AtomicU8::new(45),
+                power_consumption: AtomicU32::new(65),
+                battery_level: AtomicU8::new(85),
+                ac_connected: AtomicBool::new(true),
+                auto_scale: AtomicBool::new(true),
+                thermal_throttling: AtomicBool::new(true),
+                device_suspend: AtomicBool::new(false),
+                memory_power_save: AtomicBool::new(false),
+            }
+        }
+        
+        pub fn initialize(&mut self) -> Result<(), String> {
+            self.is_initialized = true;
+            self.apply_profile(PowerProfile::Balanced)?;
+            Ok(())
+        }
+        
+        pub fn set_profile(&mut self, profile: PowerProfile) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.current_profile = profile.clone();
+            self.config.profile = profile.clone();
+            self.apply_profile(profile)?;
+            Ok(())
+        }
+        
+        fn apply_profile(&mut self, profile: PowerProfile) -> Result<(), String> {
+            match profile {
+                PowerProfile::Performance => {
+                    self.cpu_frequency.store(5000, Ordering::SeqCst);
+                    self.memory_power.store(100, Ordering::SeqCst);
+                    self.device_power.store(100, Ordering::SeqCst);
+                    self.auto_scale.store(false, Ordering::SeqCst);
+                    self.thermal_throttling.store(false, Ordering::SeqCst);
+                    self.device_suspend.store(false, Ordering::SeqCst);
+                    self.memory_power_save.store(false, Ordering::SeqCst);
+                },
+                PowerProfile::Balanced => {
+                    self.cpu_frequency.store(3600, Ordering::SeqCst);
+                    self.memory_power.store(80, Ordering::SeqCst);
+                    self.device_power.store(85, Ordering::SeqCst);
+                    self.auto_scale.store(true, Ordering::SeqCst);
+                    self.thermal_throttling.store(true, Ordering::SeqCst);
+                    self.device_suspend.store(false, Ordering::SeqCst);
+                    self.memory_power_save.store(false, Ordering::SeqCst);
+                },
+                PowerProfile::PowerSaver => {
+                    self.cpu_frequency.store(2000, Ordering::SeqCst);
+                    self.memory_power.store(60, Ordering::SeqCst);
+                    self.device_power.store(70, Ordering::SeqCst);
+                    self.auto_scale.store(true, Ordering::SeqCst);
+                    self.thermal_throttling.store(true, Ordering::SeqCst);
+                    self.device_suspend.store(true, Ordering::SeqCst);
+                    self.memory_power_save.store(true, Ordering::SeqCst);
+                },
+                PowerProfile::Custom => {
+                    // Mantener configuración actual
+                },
+            }
+            Ok(())
+        }
+        
+        pub fn set_cpu_frequency(&mut self, freq: u32) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            if freq < self.config.cpu_min_freq || freq > self.config.cpu_max_freq {
+                return Err("Frecuencia fuera de rango".to_string());
+            }
+            
+            self.cpu_frequency.store(freq, Ordering::SeqCst);
+            self.power_state.cpu_frequency = freq;
+            Ok(())
+        }
+        
+        pub fn set_memory_power(&mut self, power: u8) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            if power > 100 {
+                return Err("Nivel de energía debe estar entre 0 y 100".to_string());
+            }
+            
+            self.memory_power.store(power, Ordering::SeqCst);
+            self.power_state.memory_power = power;
+            Ok(())
+        }
+        
+        pub fn set_device_power(&mut self, power: u8) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            if power > 100 {
+                return Err("Nivel de energía debe estar entre 0 y 100".to_string());
+            }
+            
+            self.device_power.store(power, Ordering::SeqCst);
+            self.power_state.device_power = power;
+            Ok(())
+        }
+        
+        pub fn enable_thermal_throttling(&mut self, enable: bool) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.thermal_throttling.store(enable, Ordering::SeqCst);
+            self.config.thermal_throttling = enable;
+            Ok(())
+        }
+        
+        pub fn enable_device_suspend(&mut self, enable: bool) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.device_suspend.store(enable, Ordering::SeqCst);
+            self.config.device_suspend = enable;
+            Ok(())
+        }
+        
+        pub fn enable_memory_power_save(&mut self, enable: bool) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.memory_power_save.store(enable, Ordering::SeqCst);
+            self.config.memory_power_save = enable;
+            Ok(())
+        }
+        
+        pub fn update_thermal_state(&mut self, temp: u8) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.thermal_state.store(temp, Ordering::SeqCst);
+            self.power_state.thermal_state = temp;
+            
+            // Aplicar throttling térmico si está habilitado
+            if self.thermal_throttling.load(Ordering::SeqCst) && temp > 80 {
+                let new_freq = (self.cpu_frequency.load(Ordering::SeqCst) as f32 * 0.8) as u32;
+                self.set_cpu_frequency(new_freq)?;
+            }
+            
+            Ok(())
+        }
+        
+        pub fn update_power_consumption(&mut self, consumption: u32) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.power_consumption.store(consumption, Ordering::SeqCst);
+            self.power_state.power_consumption = consumption;
+            Ok(())
+        }
+        
+        pub fn update_battery_level(&mut self, level: u8) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            if level > 100 {
+                return Err("Nivel de batería debe estar entre 0 y 100".to_string());
+            }
+            
+            self.battery_level.store(level, Ordering::SeqCst);
+            self.power_state.battery_level = level;
+            
+            // Cambiar automáticamente a modo ahorro si la batería está baja
+            if level < 20 && self.current_profile != PowerProfile::PowerSaver {
+                self.set_profile(PowerProfile::PowerSaver)?;
+            }
+            
+            Ok(())
+        }
+        
+        pub fn set_ac_connected(&mut self, connected: bool) -> Result<(), String> {
+            if !self.is_initialized {
+                return Err("Power manager no inicializado".to_string());
+            }
+            
+            self.ac_connected.store(connected, Ordering::SeqCst);
+            self.power_state.ac_connected = connected;
+            
+            // Cambiar perfil según estado de alimentación
+            if connected && self.current_profile == PowerProfile::PowerSaver {
+                self.set_profile(PowerProfile::Balanced)?;
+            } else if !connected && self.current_profile == PowerProfile::Performance {
+                self.set_profile(PowerProfile::Balanced)?;
+            }
+            
+            Ok(())
+        }
+        
+        pub fn get_power_state(&self) -> &PowerState {
+            &self.power_state
+        }
+        
+        pub fn get_current_profile(&self) -> &PowerProfile {
+            &self.current_profile
+        }
+        
+        pub fn get_power_consumption(&self) -> u32 {
+            self.power_consumption.load(Ordering::SeqCst)
+        }
+        
+        pub fn get_battery_level(&self) -> u8 {
+            self.battery_level.load(Ordering::SeqCst)
+        }
+        
+        pub fn is_ac_connected(&self) -> bool {
+            self.ac_connected.load(Ordering::SeqCst)
+        }
+        
+        pub fn get_status(&self) -> String {
+            let profile = match self.current_profile {
+                PowerProfile::Performance => "Rendimiento",
+                PowerProfile::Balanced => "Equilibrado",
+                PowerProfile::PowerSaver => "Ahorro",
+                PowerProfile::Custom => "Personalizado",
+            };
+            
+            let ac_status = if self.ac_connected.load(Ordering::SeqCst) { "Conectado" } else { "Desconectado" };
+            
+            format!(
+                " Energía: {} - {}MHz - {}W - Batería: {}% - AC: {}",
+                profile,
+                self.cpu_frequency.load(Ordering::SeqCst),
+                self.power_consumption.load(Ordering::SeqCst),
+                self.battery_level.load(Ordering::SeqCst),
+                ac_status
+            )
+        }
+        
+        pub fn get_detailed_report(&self) -> String {
+            let mut report = String::new();
+            report.push_str(" Reporte de Gestión de Energía:\n");
+            report.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+            
+            let profile = match self.current_profile {
+                PowerProfile::Performance => "Rendimiento",
+                PowerProfile::Balanced => "Equilibrado",
+                PowerProfile::PowerSaver => "Ahorro",
+                PowerProfile::Custom => "Personalizado",
+            };
+            
+            report.push_str(&format!("   Perfil: {}\n", profile));
+            report.push_str(&format!("  💻 CPU: {} MHz\n", self.cpu_frequency.load(Ordering::SeqCst)));
+            report.push_str(&format!("   Memoria: {}% energía\n", self.memory_power.load(Ordering::SeqCst)));
+            report.push_str(&format!("   Dispositivos: {}% energía\n", self.device_power.load(Ordering::SeqCst)));
+            report.push_str(&format!("    Temperatura: {}°C\n", self.thermal_state.load(Ordering::SeqCst)));
+            report.push_str(&format!("   Consumo: {}W\n", self.power_consumption.load(Ordering::SeqCst)));
+            report.push_str(&format!("   Batería: {}%\n", self.battery_level.load(Ordering::SeqCst)));
+            report.push_str(&format!("   AC: {}\n", if self.ac_connected.load(Ordering::SeqCst) { "Conectado" } else { "Desconectado" }));
+            report.push_str(&format!("   Auto-escala: {}\n", if self.auto_scale.load(Ordering::SeqCst) { "Habilitado" } else { "Deshabilitado" }));
+            report.push_str(&format!("    Throttling térmico: {}\n", if self.thermal_throttling.load(Ordering::SeqCst) { "Habilitado" } else { "Deshabilitado" }));
+            report.push_str(&format!("   Suspensión de dispositivos: {}\n", if self.device_suspend.load(Ordering::SeqCst) { "Habilitado" } else { "Deshabilitado" }));
+            report.push_str(&format!("   Ahorro de memoria: {}\n", if self.memory_power_save.load(Ordering::SeqCst) { "Habilitado" } else { "Deshabilitado" }));
+            
+            report
+        }
+    }
+    
+    /// Función global para ejecutar gestión de energía
+    pub fn run_power_management() {
+        let mut manager = PowerManager::new();
+        
+        if let Err(_) = manager.initialize() {
+            return;
+        }
+        
+        // Simular actualizaciones de estado
+        let _ = manager.update_thermal_state(45);
+        let _ = manager.update_power_consumption(65);
+        let _ = manager.update_battery_level(85);
+        let _ = manager.set_ac_connected(true);
+        
+        // Aplicar optimizaciones automáticas
+        if manager.auto_scale.load(Ordering::SeqCst) {
+            // Simular escalado automático basado en carga
+            let current_freq = manager.cpu_frequency.load(Ordering::SeqCst);
+            let new_freq = if current_freq < 2000 { current_freq + 200 } else { current_freq - 100 };
+            let _ = manager.set_cpu_frequency(new_freq);
+        }
+    }
+    
+    /// Función para obtener información de energía
+    pub fn get_power_info() -> String {
+        let mut manager = PowerManager::new();
+        let _ = manager.initialize();
+        manager.get_detailed_report()
     }
 }

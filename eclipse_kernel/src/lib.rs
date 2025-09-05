@@ -26,7 +26,7 @@ pub enum KernelError {
 
 pub type KernelResult<T> = Result<T, KernelError>;
 
-pub const KERNEL_VERSION: &str = "0.1.0";
+pub const KERNEL_VERSION: &str = "0.4.0";
 
 pub fn initialize() -> KernelResult<()> {
     // Kernel híbrido Eclipse-Redox inicializado

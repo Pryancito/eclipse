@@ -3,7 +3,7 @@
 # Script de instalación directa de Eclipse OS
 # Este script instala Eclipse OS directamente en un disco sin necesidad de ISO
 
-echo "🌙 Instalador de Eclipse OS v1.0"
+echo "🌙 Instalador de Eclipse OS v0.4.0"
 echo "================================="
 echo ""
 
@@ -68,24 +68,64 @@ create_partitions() {
     
     # Limpiar tabla de particiones
     echo "   🗑️  Limpiando tabla de particiones..."
-    wipefs -a "$disk" 2>/dev/null || true
+    if ! wipefs -a "$disk" 2>/dev/null; then
+        echo "   ⚠️  Advertencia: No se pudo limpiar completamente la tabla de particiones"
+    fi
     
     # Crear tabla GPT
     echo "   📋 Creando tabla de particiones GPT..."
-    parted "$disk" mklabel gpt
+    if ! parted "$disk" mklabel gpt; then
+        echo "❌ Error: No se pudo crear tabla GPT en $disk"
+        return 1
+    fi
     
     # Crear partición EFI (100MB)
     echo "   💾 Creando partición EFI (100MB)..."
-    parted "$disk" mkpart EFI fat32 1MiB 101MiB
-    parted "$disk" set 1 esp on
+    if ! parted "$disk" mkpart EFI fat32 1MiB 101MiB; then
+        echo "❌ Error: No se pudo crear partición EFI"
+        return 1
+    fi
+    
+    if ! parted "$disk" set 1 esp on; then
+        echo "❌ Error: No se pudo marcar partición EFI como ESP"
+        return 1
+    fi
     
     # Crear partición root (resto del disco)
     echo "   🗂️  Creando partición root (resto del disco)..."
-    parted "$disk" mkpart ROOT ext4 101MiB 100%
+    if ! parted "$disk" mkpart ROOT ext4 101MiB 100%; then
+        echo "❌ Error: No se pudo crear partición root"
+        return 1
+    fi
     
     # Sincronizar cambios
+    echo "   🔄 Sincronizando cambios..."
     sync
-    partprobe "$disk"
+    if ! partprobe "$disk"; then
+        echo "   ⚠️  Advertencia: partprobe falló, pero las particiones deberían estar disponibles"
+    fi
+    
+    # Verificar que las particiones existen
+    sleep 2
+    local part1="${disk}p1"
+    local part2="${disk}p2"
+    
+    # Si no existen con 'p', probar sin 'p' (para discos SATA)
+    if [ ! -b "$part1" ] && [ ! -b "${disk}1" ]; then
+        echo "❌ Error: Las particiones no se crearon correctamente"
+        return 1
+    fi
+    
+    # Ajustar nombres de particiones según el tipo de disco
+    if [ -b "$part1" ]; then
+        # Disco loop o NVMe
+        part1="${disk}p1"
+        part2="${disk}p2"
+    else
+        # Disco SATA
+        part1="${disk}1"
+        part2="${disk}2"
+    fi
     
     echo "✅ Particiones creadas exitosamente"
 }
@@ -93,18 +133,30 @@ create_partitions() {
 # Función para formatear particiones
 format_partitions() {
     local disk=$1
-    local efi_partition="${disk}1"
-    local root_partition="${disk}2"
+    local efi_partition="${disk}p1"
+    local root_partition="${disk}p2"
+    
+    # Ajustar nombres de particiones según el tipo de disco
+    if [ ! -b "$efi_partition" ]; then
+        efi_partition="${disk}1"
+        root_partition="${disk}2"
+    fi
     
     echo "🔧 Formateando particiones..."
     
     # Formatear partición EFI
     echo "   💾 Formateando partición EFI como FAT32..."
-    mkfs.fat -F32 -n "ECLIPSE_EFI" "$efi_partition"
+    if ! mkfs.fat -F32 -n "ECLIPSE_EFI" "$efi_partition"; then
+        echo "❌ Error: No se pudo formatear partición EFI"
+        return 1
+    fi
     
     # Formatear partición root
     echo "   🗂️  Formateando partición root como EXT4..."
-    mkfs.ext4 -F -L "ECLIPSE_ROOT" "$root_partition"
+    if ! mkfs.ext4 -F -L "ECLIPSE_ROOT" "$root_partition"; then
+        echo "❌ Error: No se pudo formatear partición root"
+        return 1
+    fi
     
     echo "✅ Particiones formateadas exitosamente"
 }
@@ -121,7 +173,10 @@ install_bootloader() {
     
     # Montar partición EFI
     echo "   📁 Montando partición EFI..."
-    mount "$efi_partition" /mnt/eclipse-efi
+    if ! mount "$efi_partition" /mnt/eclipse-efi; then
+        echo "❌ Error: No se pudo montar partición EFI"
+        return 1
+    fi
     
     # Crear estructura EFI
     echo "   📂 Creando estructura EFI..."
@@ -131,21 +186,30 @@ install_bootloader() {
     # Copiar bootloader
     echo "   📦 Instalando bootloader..."
     if [ -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi" ]; then
-        cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI
-        cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi
+        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI; then
+            echo "❌ Error: No se pudo copiar bootloader a EFI/BOOT/"
+            return 1
+        fi
+        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi; then
+            echo "❌ Error: No se pudo copiar bootloader a EFI/eclipse/"
+            return 1
+        fi
     else
         echo "❌ Error: Bootloader no encontrado"
-        echo "   Ejecuta: cd bootloader-uefi && ./build.sh"
+        echo "   Ejecuta: ./build.sh"
         return 1
     fi
     
     # Copiar kernel
     echo "   🧠 Instalando kernel..."
-    if [ -f "target_hardware/x86_64-unknown-none/release/eclipse_kernel" ]; then
-        cp target_hardware/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel
+    if [ -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
+        if ! cp eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel; then
+            echo "❌ Error: No se pudo copiar kernel"
+            return 1
+        fi
     else
         echo "❌ Error: Kernel no encontrado"
-        echo "   Ejecuta: cargo build --release"
+        echo "   Ejecuta: ./build.sh"
         return 1
     fi
     
@@ -163,7 +227,7 @@ SHOW_MENU=true
 
 [entry:eclipse]
 title=Eclipse OS
-description=Sistema Operativo Eclipse v1.0
+description=Sistema Operativo Eclipse v0.4.0
 kernel=/eclipse_kernel
 initrd=
 args=quiet splash
@@ -174,7 +238,7 @@ BOOT_CONF_EOF
 🌙 Eclipse OS - Sistema Operativo en Rust
 =========================================
 
-Versión: 1.0
+Versión: 0.4.0
 Arquitectura: x86_64
 Tipo: Instalación en disco
 
@@ -225,13 +289,22 @@ install_eclipse_os() {
     fi
     
     # Crear particiones
-    create_partitions "$disk"
+    if ! create_partitions "$disk"; then
+        echo "❌ Error: Falló la creación de particiones"
+        exit 1
+    fi
     
     # Formatear particiones
-    format_partitions "$disk"
+    if ! format_partitions "$disk"; then
+        echo "❌ Error: Falló el formateo de particiones"
+        exit 1
+    fi
     
     # Instalar bootloader
-    install_bootloader "$disk"
+    if ! install_bootloader "$disk"; then
+        echo "❌ Error: Falló la instalación del bootloader"
+        exit 1
+    fi
     
     echo ""
     echo "🎉 ¡Instalación completada exitosamente!"
@@ -242,7 +315,7 @@ install_eclipse_os() {
     echo "  - Partición EFI: ${disk}1 (FAT32)"
     echo "  - Partición root: ${disk}2 (EXT4)"
     echo "  - Bootloader: UEFI"
-    echo "  - Kernel: Eclipse OS v1.0"
+    echo "  - Kernel: Eclipse OS v0.4.0"
     echo ""
     echo "🔄 Reinicia el sistema para usar Eclipse OS"
     echo ""
@@ -290,18 +363,43 @@ if [ -z "$DISK" ]; then
     exit 1
 fi
 
-# Verificar que los archivos necesarios existen
-if [ ! -f "target_hardware/x86_64-unknown-none/release/eclipse_kernel" ]; then
-    echo "❌ Error: Kernel no encontrado"
-    echo "   Ejecuta: cargo build --release"
-    exit 1
-fi
+# Función para verificar y compilar archivos necesarios
+check_and_build_files() {
+    local missing_files=()
+    
+    # Verificar kernel
+    if [ ! -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
+        missing_files+=("kernel")
+    fi
+    
+    # Verificar bootloader
+    if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi" ]; then
+        missing_files+=("bootloader")
+    fi
+    
+    # Si faltan archivos, compilar
+    if [ ${#missing_files[@]} -gt 0 ]; then
+        echo "🔧 Archivos faltantes detectados: ${missing_files[*]}"
+        echo "   Compilando con build.sh..."
+        
+        if [ ! -f "build.sh" ]; then
+            echo "❌ Error: build.sh no encontrado"
+            echo "   Asegúrate de estar en el directorio raíz del proyecto"
+            exit 1
+        fi
+        
+        if ! ./build.sh; then
+            echo "❌ Error: Falló la compilación con build.sh"
+            exit 1
+        fi
+        
+        echo "✅ Compilación completada exitosamente"
+        echo ""
+    fi
+}
 
-if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi" ]; then
-    echo "❌ Error: Bootloader no encontrado"
-    echo "   Ejecuta: cd bootloader-uefi && ./build.sh"
-    exit 1
-fi
+# Verificar y compilar archivos necesarios
+check_and_build_files
 
 # Ejecutar instalación
 install_eclipse_os "$DISK" "$AUTO_INSTALL"
