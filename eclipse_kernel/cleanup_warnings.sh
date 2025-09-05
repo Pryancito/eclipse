@@ -1,106 +1,118 @@
 #!/bin/bash
 
 # Script para limpiar warnings del kernel Eclipse
-# Autor: Equipo de desarrollo Eclipse Kernel
-# Fecha: $(date)
+echo "🧹 Limpiando warnings del kernel Eclipse..."
 
-echo "🧹 Iniciando limpieza de warnings del kernel Eclipse..."
+# Agregar #[allow(dead_code)] a los módulos de aplicaciones
+echo "📱 Limpiando módulos de aplicaciones..."
 
-# Función para limpiar imports no utilizados
-cleanup_unused_imports() {
-    echo "📦 Limpiando imports no utilizados..."
-    
-    # Archivos con imports de core::arch::asm no utilizados
-    find src -name "*.rs" -exec grep -l "use core::arch::asm;" {} \; | while read file; do
-        if ! grep -q "asm!" "$file"; then
-            echo "  - Removiendo core::arch::asm de $file"
-            sed -i '/use core::arch::asm;/d' "$file"
-        fi
-    done
-    
-    # Archivos con imports de core::mem no utilizados
-    find src -name "*.rs" -exec grep -l "use core::mem;" {} \; | while read file; do
-        if ! grep -q "mem::" "$file"; then
-            echo "  - Removiendo core::mem de $file"
-            sed -i '/use core::mem;/d' "$file"
-        fi
-    done
-    
-    # Archivos con imports de core::ptr::NonNull no utilizados
-    find src -name "*.rs" -exec grep -l "use core::ptr::NonNull;" {} \; | while read file; do
-        if ! grep -q "NonNull" "$file"; then
-            echo "  - Removiendo core::ptr::NonNull de $file"
-            sed -i '/use core::ptr::NonNull;/d' "$file"
-        fi
-    done
-}
+# Shell
+sed -i '1i\#![allow(dead_code)]' src/apps/shell.rs
 
-# Función para limpiar variables no utilizadas
-cleanup_unused_variables() {
-    echo "🔧 Limpiando variables no utilizadas..."
-    
-    # Agregar prefijo _ a variables no utilizadas
-    find src -name "*.rs" -exec sed -i 's/let \([a-zA-Z_][a-zA-Z0-9_]*\) =/let _\1 =/g' {} \;
-}
+# File Manager
+sed -i '1i\#![allow(dead_code)]' src/apps/file_manager.rs
 
-# Función para limpiar funciones no utilizadas
-cleanup_unused_functions() {
-    echo "⚙️ Limpiando funciones no utilizadas..."
-    
-    # Agregar #[allow(dead_code)] a funciones no utilizadas
-    find src -name "*.rs" -exec sed -i 's/^pub fn /#[allow(dead_code)]\npub fn /g' {} \;
-}
+# System Info
+sed -i '1i\#![allow(dead_code)]' src/apps/system_info.rs
 
-# Función para limpiar enums no utilizados
-cleanup_unused_enums() {
-    echo "📋 Limpiando enums no utilizados..."
-    
-    # Agregar #[allow(dead_code)] a enums no utilizados
-    find src -name "*.rs" -exec sed -i 's/^pub enum /#[allow(dead_code)]\npub enum /g' {} \;
-}
+# Text Editor
+sed -i '1i\#![allow(dead_code)]' src/apps/text_editor.rs
 
-# Función para limpiar structs no utilizados
-cleanup_unused_structs() {
-    echo "🏗️ Limpiando structs no utilizados..."
-    
-    # Agregar #[allow(dead_code)] a structs no utilizados
-    find src -name "*.rs" -exec sed -i 's/^pub struct /#[allow(dead_code)]\npub struct /g' {} \;
-}
+# Calculator
+sed -i '1i\#![allow(dead_code)]' src/apps/calculator.rs
 
-# Función para limpiar atributos no utilizados
-cleanup_unused_attributes() {
-    echo "🏷️ Limpiando atributos no utilizados..."
-    
-    # Remover #![no_std] duplicados
-    find src -name "*.rs" -exec sed -i '/^#!\[no_std\]$/d' {} \;
-}
+# Task Manager
+sed -i '1i\#![allow(dead_code)]' src/apps/task_manager.rs
 
-# Función para limpiar imports específicos
-cleanup_specific_imports() {
-    echo "🎯 Limpiando imports específicos..."
-    
-    # Remover imports de AtomicU64 no utilizados
-    find src -name "*.rs" -exec sed -i 's/AtomicU64, //g' {} \;
-    find src -name "*.rs" -exec sed -i 's/, AtomicU64//g' {} \;
-    
-    # Remover imports de Ordering no utilizados
-    find src -name "*.rs" -exec sed -i 's/, Ordering//g' {} \;
-    
-    # Remover imports de alloc no utilizados
-    find src -name "*.rs" -exec sed -i 's/use alloc::alloc::{alloc, dealloc};//g' {} \;
-}
+# Debug Hardware
+sed -i '1i\#![allow(dead_code)]' src/debug_hardware.rs
 
-# Ejecutar limpieza
-echo "🚀 Iniciando proceso de limpieza..."
+# Hardware Safe
+sed -i '1i\#![allow(dead_code)]' src/hardware_safe.rs
 
-cleanup_unused_imports
-cleanup_specific_imports
-cleanup_unused_attributes
+echo "✅ Warnings de aplicaciones limpiados"
 
-echo "✅ Limpieza completada!"
+# Agregar #[allow(dead_code)] a módulos de UI
+echo "🖥️ Limpiando módulos de UI..."
 
-# Mostrar estadísticas
-echo "📊 Estadísticas de warnings:"
-cargo check 2>&1 | grep "warning:" | wc -l | xargs echo "  - Total de warnings:"
+# Window
+sed -i '1i\#![allow(dead_code)]' src/ui/window.rs
 
-echo "🎉 Proceso de limpieza finalizado!"
+# Event
+sed -i '1i\#![allow(dead_code)]' src/ui/event.rs
+
+# Graphics
+sed -i '1i\#![allow(dead_code)]' src/ui/graphics.rs
+
+# Terminal
+sed -i '1i\#![allow(dead_code)]' src/ui/terminal.rs
+
+# Compositor
+sed -i '1i\#![allow(dead_code)]' src/ui/compositor.rs
+
+# Widget
+sed -i '1i\#![allow(dead_code)]' src/ui/widget.rs
+
+echo "✅ Warnings de UI limpiados"
+
+# Agregar #[allow(dead_code)] a módulos de seguridad
+echo "🔒 Limpiando módulos de seguridad..."
+
+# Permissions
+sed -i '1i\#![allow(dead_code)]' src/security/permissions.rs
+
+# Authentication
+sed -i '1i\#![allow(dead_code)]' src/security/authentication.rs
+
+# Encryption
+sed -i '1i\#![allow(dead_code)]' src/security/encryption.rs
+
+# Access Control
+sed -i '1i\#![allow(dead_code)]' src/security/access_control.rs
+
+# Audit
+sed -i '1i\#![allow(dead_code)]' src/security/audit.rs
+
+# Memory Protection
+sed -i '1i\#![allow(dead_code)]' src/security/memory_protection.rs
+
+# Sandbox
+sed -i '1i\#![allow(dead_code)]' src/security/sandbox.rs
+
+echo "✅ Warnings de seguridad limpiados"
+
+# Agregar #[allow(dead_code)] a módulos de IA
+echo "🤖 Limpiando módulos de IA..."
+
+# AI Advanced
+sed -i '1i\#![allow(dead_code)]' src/ai_advanced.rs
+
+# AI Optimizer
+sed -i '1i\#![allow(dead_code)]' src/ai_optimizer.rs
+
+# AI Learning
+sed -i '1i\#![allow(dead_code)]' src/ai_learning.rs
+
+echo "✅ Warnings de IA limpiados"
+
+# Agregar #[allow(dead_code)] a otros módulos
+echo "🔧 Limpiando otros módulos..."
+
+# Monitoring
+sed -i '1i\#![allow(dead_code)]' src/monitoring.rs
+
+# Customization
+sed -i '1i\#![allow(dead_code)]' src/customization.rs
+
+# Interrupts Manager
+sed -i '1i\#![allow(dead_code)]' src/interrupts/manager.rs
+
+echo "✅ Otros warnings limpiados"
+
+echo "🎉 Limpieza de warnings completada!"
+echo "🔍 Verificando compilación..."
+
+# Verificar compilación
+cargo check
+
+echo "✅ Script de limpieza completado"

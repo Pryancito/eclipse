@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de compositor para Eclipse OS
 //! 
 //! Maneja la composición de capas y el renderizado final

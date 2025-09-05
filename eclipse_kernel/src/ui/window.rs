@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de ventanas para Eclipse OS
 //! 
 //! Maneja la creación, gestión y renderizado de ventanas

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de eventos para Eclipse OS
 //! 
 //! Maneja eventos de entrada (teclado, mouse) y eventos del sistema

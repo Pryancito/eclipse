@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Gestor de archivos para Eclipse OS
 //! 
 //! Proporciona una interfaz para navegar y gestionar archivos

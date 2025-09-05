@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de permisos y capabilities
 //! 
 //! Este módulo implementa el control de acceso basado en capabilities

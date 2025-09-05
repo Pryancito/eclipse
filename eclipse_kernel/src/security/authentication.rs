@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de autenticación y autorización
 //! 
 //! Este módulo implementa autenticación de usuarios, gestión de sesiones

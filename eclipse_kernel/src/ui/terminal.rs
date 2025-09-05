@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de terminal para Eclipse OS
 //! 
 //! Proporciona una interfaz de línea de comandos básica

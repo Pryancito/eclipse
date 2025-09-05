@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de auditoría y logging de seguridad
 //! 
 //! Este módulo implementa el registro de eventos de seguridad,

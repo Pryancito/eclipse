@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Advanced AI System for Eclipse OS
 //! 
 //! Sistema de inteligencia artificial robusto y avanzado para Eclipse OS

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de gráficos para Eclipse OS
 //! 
 //! Proporciona funciones de renderizado 2D y manejo de fuentes

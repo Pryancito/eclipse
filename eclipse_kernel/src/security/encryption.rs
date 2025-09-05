@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de cifrado y hash
 //! 
 //! Este módulo implementa funciones de cifrado, hash y manejo seguro

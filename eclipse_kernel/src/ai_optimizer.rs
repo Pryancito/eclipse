@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! AI-Powered Kernel Optimizer
 //! 
 //! Sistema de optimización automática del kernel Eclipse usando inteligencia artificial

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! AI Learning System for Eclipse Kernel
 //! 
 //! Sistema de aprendizaje automático específico para el kernel Eclipse

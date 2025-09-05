@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de control de acceso a recursos
 //! 
 //! Este módulo implementa el control de acceso basado en roles (RBAC)

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Información del sistema para Eclipse OS
 //! 
 //! Muestra información detallada sobre el hardware y software del sistema.

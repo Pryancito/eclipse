@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de sandboxing de procesos
 //! 
 //! Este módulo implementa el aislamiento de procesos mediante

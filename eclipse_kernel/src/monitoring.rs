@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![no_std]
 
 use core::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};

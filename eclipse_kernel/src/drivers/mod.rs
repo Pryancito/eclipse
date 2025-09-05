@@ -12,7 +12,6 @@ pub mod device;
 pub mod storage;
 pub mod network;
 pub mod video;
-pub mod audio;
 pub mod input;
 pub mod pci;
 pub mod usb;
@@ -85,7 +84,6 @@ pub fn init_driver_system() -> DriverResult<()> {
     storage::init_storage_drivers()?;
     network::init_network_drivers()?;
     video::init_video_drivers()?;
-    audio::init_audio_drivers()?;
     input::init_input_drivers()?;
     
     Ok(())

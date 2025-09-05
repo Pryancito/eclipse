@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de debug para hardware real
 //! 
 //! Este módulo proporciona logging detallado para diagnosticar problemas

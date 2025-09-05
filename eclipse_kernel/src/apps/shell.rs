@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shell avanzado para Eclipse OS
 //! 
 //! Proporciona una interfaz de línea de comandos moderna

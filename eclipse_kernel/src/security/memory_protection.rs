@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de protección de memoria
 //! 
 //! Este módulo implementa características de seguridad de memoria

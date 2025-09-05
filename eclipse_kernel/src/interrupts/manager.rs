@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Gestor principal de interrupciones para Eclipse OS
 //! 
 //! Coordina todos los sistemas de interrupciones y excepciones

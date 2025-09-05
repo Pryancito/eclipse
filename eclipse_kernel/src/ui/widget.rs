@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de widgets para Eclipse OS
 //! 
 //! Proporciona widgets básicos para la interfaz de usuario

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Gestor de tareas para Eclipse OS
 //! 
 //! Proporciona información y control sobre procesos del sistema.

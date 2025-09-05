@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Sistema de Personalización del Kernel Eclipse
 //! 
 //! Proporciona capacidades avanzadas de personalización del sistema,

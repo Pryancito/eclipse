@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Versión segura del kernel para hardware real
 //! 
 //! Este módulo implementa inicialización segura que no falla

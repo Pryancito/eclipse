@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Calculadora científica para Eclipse OS
 //! 
 //! Proporciona funciones matemáticas básicas y avanzadas
