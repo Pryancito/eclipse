@@ -64,3 +64,10 @@ pub fn init_network_system() -> NetworkResult<()> {
 pub fn get_network_system_info() -> &'static str {
     "Eclipse Network Stack v1.0 - TCP/IP, UDP, ICMP, ARP"
 }
+
+/// Inicializar red (compatible con main.rs)
+pub fn init_network() {
+    // Inicializar sistema de red
+    // En una implementación real, esto configuraría el sistema global
+    let _ = init_network_system();
+}

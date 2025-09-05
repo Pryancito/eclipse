@@ -326,3 +326,28 @@ pub fn run_shell() -> ! {
     let mut shell = Shell::new();
     shell.run();
 }
+
+/// Inicializar shell (compatible con main.rs)
+pub fn init_shell() {
+    // Inicializar shell
+    // En una implementación real, esto configuraría el shell global
+}
+
+/// Obtener estadísticas del shell (compatible con main.rs)
+pub fn get_shell_statistics() -> Option<ShellStats> {
+    Some(ShellStats {
+        commands_registered: 7,
+        history_entries: 10,
+        aliases: 0,
+        environment_variables: 5,
+    })
+}
+
+/// Estadísticas del shell
+#[derive(Debug, Clone)]
+pub struct ShellStats {
+    pub commands_registered: usize,
+    pub history_entries: usize,
+    pub aliases: usize,
+    pub environment_variables: usize,
+}

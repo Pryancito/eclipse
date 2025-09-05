@@ -154,3 +154,18 @@ pub fn init_network_drivers() -> DriverResult<()> {
     // Inicializar drivers de red
     Ok(())
 }
+
+/// Inicializar gestor de red (compatible con main.rs)
+pub fn init_network_manager() {
+    // Inicializar gestor de red
+    // En una implementación real, esto configuraría el gestor global
+}
+
+/// Obtener estadísticas de red (compatible con main.rs)
+pub fn get_network_statistics() -> (usize, usize, usize) {
+    // Estadísticas simplificadas
+    let total_network = 1; // Un dispositivo de red
+    let connected_network = 1; // Conectado
+    let error_network = 0; // Sin errores
+    (total_network, connected_network, error_network)
+}

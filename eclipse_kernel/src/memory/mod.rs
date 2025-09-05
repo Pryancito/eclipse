@@ -65,6 +65,15 @@ pub fn get_memory_info() -> MemoryInfo {
     }
 }
 
+/// Obtener estadísticas de memoria (compatible con main.rs)
+pub fn get_memory_stats() -> (usize, usize, usize) {
+    let info = get_memory_info();
+    let total_pages = (info.total_memory / PAGE_SIZE as u64) as usize;
+    let free_pages = (info.free_memory / PAGE_SIZE as u64) as usize;
+    let used_pages = total_pages - free_pages;
+    (total_pages, free_pages, used_pages)
+}
+
 /// Información del sistema de memoria
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryInfo {

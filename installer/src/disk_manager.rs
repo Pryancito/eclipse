@@ -30,13 +30,15 @@ impl DiskManager {
         match output {
             Ok(result) => {
                 let output_str = String::from_utf8_lossy(&result.stdout);
+                
                 for line in output_str.lines() {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 && parts[3] == "disk" {
+                    
+                    if parts.len() >= 4 && parts[parts.len() - 1] == "disk" {
                         let name = format!("/dev/{}", parts[0]);
                         let size = parts[1].to_string();
-                        let model = if parts.len() > 2 {
-                            parts[2..].join(" ")
+                        let model = if parts.len() > 3 {
+                            parts[2..parts.len() - 1].join(" ")
                         } else {
                             "Unknown".to_string()
                         };
@@ -62,7 +64,7 @@ impl DiskManager {
     fn is_disk_accessible(&self, disk_path: &str) -> bool {
         // Verificar que el disco existe y es accesible
         if let Ok(metadata) = fs::metadata(disk_path) {
-            metadata.is_file() || metadata.file_type().is_block_device()
+            metadata.file_type().is_block_device()
         } else {
             false
         }

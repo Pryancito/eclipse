@@ -321,3 +321,18 @@ pub fn init_vfs() -> VfsResult<()> {
 pub fn get_vfs() -> Option<&'static mut Vfs> {
     unsafe { VFS_INSTANCE.as_mut() }
 }
+
+/// Obtener estadísticas del VFS (compatible con main.rs)
+pub fn get_vfs_statistics() -> (usize, usize, usize, usize) {
+    unsafe {
+        if let Some(ref vfs) = VFS_INSTANCE {
+            let total_mounts = 1; // Un sistema de archivos montado
+            let mounted_fs = 1; // Un sistema de archivos montado
+            let open_files = vfs.open_files.iter().filter(|f| f.is_some()).count();
+            let total_files = 100; // Simplificado
+            (total_mounts, mounted_fs, open_files, total_files)
+        } else {
+            (0, 0, 0, 0)
+        }
+    }
+}

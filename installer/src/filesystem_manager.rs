@@ -41,8 +41,8 @@ impl FilesystemManager {
     fn format_partitions(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("   💾 Formateando particiones...");
         
-        let efi_partition = format!("{}p1", disk.name);
-        let root_partition = format!("{}p2", disk.name);
+        let efi_partition = format!("{}1", disk.name);
+        let root_partition = format!("{}2", disk.name);
         
         // Formatear partición EFI como FAT32
         self.format_efi_partition(&efi_partition)?;
@@ -94,8 +94,8 @@ impl FilesystemManager {
     fn mount_partitions(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("   📁 Montando particiones...");
         
-        let efi_partition = format!("{}p1", disk.name);
-        let root_partition = format!("{}p2", disk.name);
+        let efi_partition = format!("{}1", disk.name);
+        let root_partition = format!("{}2", disk.name);
         
         // Crear directorios de montaje
         if !Path::new(&self.efi_mount_point).exists() {
@@ -249,8 +249,8 @@ impl FilesystemManager {
     pub fn create_fstab(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("   📝 Creando archivo fstab...");
         
-        let efi_partition = format!("{}p1", disk.name);
-        let root_partition = format!("{}p2", disk.name);
+        let efi_partition = format!("{}1", disk.name);
+        let root_partition = format!("{}2", disk.name);
         
         let fstab_content = format!(r#"# Eclipse OS fstab
 # =================

@@ -48,7 +48,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0034;
+const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 
 #[inline(always)]
 fn pages_for_size(size: usize) -> usize { (size + 0xFFF) / 0x1000 }
@@ -64,10 +64,6 @@ fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
     let candidates = [
         uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
-        uefi::cstr16!("EFI\\BOOT\\eclipse_kernel"),
-        uefi::cstr16!("\\EFI\\BOOT\\eclipse_kernel"),
-        uefi::cstr16!("boot\\eclipse_kernel"),
-        uefi::cstr16!("\\boot\\eclipse_kernel"),
     ];
     for p in candidates.iter() {
         if let Ok(file) = root.open(p, FileMode::Read, FileAttribute::empty()) {
@@ -87,9 +83,17 @@ fn read_file_size(file: &mut RegularFile) -> Result<usize, Status> {
     }
 }
 
-unsafe fn jump_to_kernel(entry: u64, _framebuffer_info: FramebufferInfo) -> ! {
-    // Llamar directamente al punto de entrada del kernel
-    // El kernel manejará su propia inicialización
+/// Salta al kernel en la dirección de entrada especificada.
+/// Esta función nunca retorna.
+unsafe fn jump_to_kernel(entry: u64) -> ! {
+    // Asegura que la dirección de entrada no sea cero
+    if entry == 0 {
+        // Si la dirección es inválida, detiene el sistema
+        loop { core::arch::asm!("hlt"); }
+    }
+    // Transmuta la dirección a una función y salta
+    // Corrección: usar transmute directamente sobre u64, y asegurar que la convención de llamada sea correcta.
+    // El kernel usa extern "C" que en x86_64 es System V AMD64 ABI
     let entry_fn: extern "C" fn() -> ! = core::mem::transmute(entry as usize);
     entry_fn()
 }
@@ -348,7 +352,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     unsafe { serial_init(); serial_write_str("BL: inicio\r\n"); }
     // Mensaje inicial
     {
-        let mut out = system_table.stdout();
+        let out = system_table.stdout();
         let _ = out.write_str("Eclipse OS Bootloader UEFI\n");
         let _ = out.write_str("Cargando kernel ELF...\n");
     }
@@ -395,7 +399,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     {
         let bs = system_table.boot_services();
         // Buscar el protocolo GOP en todos los handles disponibles
-        let mut gop_handle = None;
         let mut gop_protocol = None;
         
         // Obtener todos los handles
@@ -411,7 +414,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                         uefi::table::boot::OpenProtocolAttributes::GetProtocol,
                     )
                 } {
-                    gop_handle = Some(*handle);
                     gop_protocol = Some(gop);
                     break;
                 }
@@ -435,42 +437,58 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 let mut n = 0usize;
                 
                 // Log base_address
-                unsafe { serial_write_str("BL: base=0x"); }
+                serial_write_str("BL: base=0x");
                 for i in (0..16).rev() {
                     let nyb = ((framebuffer_info.base_address >> (i*4)) & 0xF) as u8;
                     buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
                 }
                 buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
-                unsafe { for i in 0..n { serial_write_byte(buf[i]); } }
+                for i in 0..n { serial_write_byte(buf[i]); }
                 
                 // Log resolución
-                unsafe { 
-                    serial_write_str("BL: res="); 
-                    // Width
-                    n = 0;
-                    let w = framebuffer_info.width;
-                    if w == 0 { buf[n] = b'0'; n+=1; } else {
-                        let mut temp = w;
-                        while temp > 0 {
-                            buf[n] = b'0' + (temp % 10) as u8;
-                            temp /= 10;
-                            n += 1;
-                        }
+                serial_write_str("BL: res="); 
+                // Width
+                n = 0;
+                let w = framebuffer_info.width;
+                if w == 0 { 
+                    buf[n] = b'0'; n+=1; 
+                } else {
+                    let mut temp = w;
+                    let mut digits = [0u8; 8];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = b'0' + (temp % 10) as u8;
+                        temp /= 10;
+                        digit_count += 1;
                     }
-                    buf[n] = b'x'; n+=1;
-                    // Height
-                    let h = framebuffer_info.height;
-                    if h == 0 { buf[n] = b'0'; n+=1; } else {
-                        let mut temp = h;
-                        while temp > 0 {
-                            buf[n] = b'0' + (temp % 10) as u8;
-                            temp /= 10;
-                            n += 1;
-                        }
+                    // Escribir dígitos en orden correcto (invertir)
+                    for i in (0..digit_count).rev() {
+                        buf[n] = digits[i];
+                        n += 1;
                     }
-                    buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
-                    for i in 0..n { serial_write_byte(buf[i]); }
                 }
+                buf[n] = b'x'; n+=1;
+                // Height
+                let h = framebuffer_info.height;
+                if h == 0 { 
+                    buf[n] = b'0'; n+=1; 
+                } else {
+                    let mut temp = h;
+                    let mut digits = [0u8; 8];
+                    let mut digit_count = 0;
+                    while temp > 0 {
+                        digits[digit_count] = b'0' + (temp % 10) as u8;
+                        temp /= 10;
+                        digit_count += 1;
+                    }
+                    // Escribir dígitos en orden correcto (invertir)
+                    for i in (0..digit_count).rev() {
+                        buf[n] = digits[i];
+                        n += 1;
+                    }
+                }
+                buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
+                for i in 0..n { serial_write_byte(buf[i]); }
             }
         } else {
             unsafe { 
@@ -514,27 +532,27 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     // ExitBootServices (uefi 0.25.0)
-    let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
+    let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
-    
-    // Cambiar a nuestras tablas y stack antes de saltar al kernel
+
+    // Configurar paginación identidad y pila antes del salto
     unsafe {
-        // Cargar CR3 con la PML4 propia (identidad 0..1GiB)
+        // Cargar PML4 identidad en CR3
         core::arch::asm!(
             "mov cr3, {0}",
             in(reg) pml4_phys,
             options(nostack, preserves_flags)
         );
 
-        // Cambiar el puntero de pila a la parte alta del stack reservado
+        // Alinear y cargar RSP (16 bytes)
+        let rsp_alineado = stack_top & !0xFu64;
         core::arch::asm!(
             "mov rsp, {0}",
-            in(reg) stack_top,
+            in(reg) rsp_alineado,
             options(nostack, preserves_flags)
         );
 
-        serial_write_str("BL: CR3 y stack configurados\r\n");
-        serial_write_str("BL: saltando al kernel\r\n");
-        jump_to_kernel(entry_address, framebuffer_info)
+        serial_write_str("BL: CR3 y RSP configurados, saltando al kernel\r\n");
+        jump_to_kernel(entry_address)
     }
 }

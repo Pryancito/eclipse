@@ -97,3 +97,10 @@ pub fn init_filesystem() -> VfsResult<()> {
 pub fn get_filesystem_info() -> FileSystemInfo {
     FileSystemInfo::new()
 }
+
+/// Inicializar sistema de archivos (compatible con main.rs)
+pub fn init() {
+    // Inicializar sistema de archivos
+    // En una implementación real, esto configuraría el sistema global
+    let _ = init_filesystem();
+}

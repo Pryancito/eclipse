@@ -60,6 +60,15 @@ pub fn get_process_system_info() -> ProcessSystemInfo {
     }
 }
 
+/// Obtener estadísticas de procesos (compatible con main.rs)
+pub fn get_process_stats() -> (usize, usize, usize) {
+    let info = get_process_system_info();
+    let running_procs = if info.current_process.is_some() { 1 } else { 0 };
+    let ready_procs = info.total_processes as usize - running_procs;
+    let blocked_procs = 0; // Simplificado
+    (running_procs, ready_procs, blocked_procs)
+}
+
 /// Información del sistema de procesos
 #[derive(Debug, Clone)]
 pub struct ProcessSystemInfo {

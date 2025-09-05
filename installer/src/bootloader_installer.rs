@@ -39,7 +39,7 @@ impl BootloaderInstaller {
     fn mount_efi_partition(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("   📁 Montando partición EFI...");
         
-        let efi_partition = format!("{}p1", disk.name);
+        let efi_partition = format!("{}1", disk.name);
         
         // Crear directorio de montaje
         if !Path::new(&self.efi_mount_point).exists() {
@@ -83,7 +83,7 @@ impl BootloaderInstaller {
     fn install_bootloader_files(&self) -> Result<(), String> {
         println!("   📦 Instalando archivos del bootloader...");
         
-        let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi";
+        let bootloader_source = "../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
         let bootloader_dest = format!("{}/EFI/BOOT/BOOTX64.EFI", self.efi_mount_point);
         
         if !Path::new(bootloader_source).exists() {
@@ -161,7 +161,7 @@ args quiet splash
     fn install_kernel(&self) -> Result<(), String> {
         println!("   🧠 Instalando kernel Eclipse...");
         
-        let kernel_source = "target_hardware/x86_64-unknown-none/release/eclipse_kernel";
+        let kernel_source = "../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
         let kernel_dest = format!("{}/eclipse_kernel", self.efi_mount_point);
         
         if !Path::new(kernel_source).exists() {
@@ -198,7 +198,7 @@ args quiet splash
         
         // Montar partición root
         let root_mount = "/mnt/eclipse-root";
-        let root_partition = format!("{}p2", disk.name);
+        let root_partition = format!("{}2", disk.name);
         
         // Crear directorio de montaje
         if !Path::new(root_mount).exists() {

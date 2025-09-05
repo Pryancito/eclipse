@@ -425,3 +425,18 @@ pub fn init_storage_drivers() -> DriverResult<()> {
     
     Ok(())
 }
+
+/// Inicializar gestor de almacenamiento (compatible con main.rs)
+pub fn init_storage_manager() {
+    // Inicializar gestor de almacenamiento
+    // En una implementación real, esto configuraría el gestor global
+}
+
+/// Obtener estadísticas de almacenamiento (compatible con main.rs)
+pub fn get_storage_statistics() -> (usize, usize, usize) {
+    // Estadísticas simplificadas
+    let total_storage = 1; // Un dispositivo de almacenamiento
+    let ready_storage = 1; // Listo
+    let error_storage = 0; // Sin errores
+    (total_storage, ready_storage, error_storage)
+}

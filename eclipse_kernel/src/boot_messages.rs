@@ -211,21 +211,199 @@ pub fn boot_summary() {
 
 /// Función auxiliar para mostrar mensajes directamente
 fn display_message_direct(level: BootLevel, component: &'static str, message: &'static str) {
-    // En un entorno real, esto se implementaría con I/O del kernel
-    // Por ahora, es una implementación simplificada
+    // Implementación básica de impresión
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        static mut VGA_INDEX: usize = 0;
+        
+        let prefix = match level {
+            BootLevel::Info => "[INFO]",
+            BootLevel::Success => "[OK]",
+            BootLevel::Warning => "[WARN]",
+            BootLevel::Error => "[ERROR]",
+            BootLevel::Debug => "[DEBUG]",
+        };
+
+        // Imprimir prefijo
+        for byte in prefix.bytes() {
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                VGA_INDEX += 1;
+            }
+        }
+        
+        // Imprimir componente
+        for byte in component.bytes() {
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                VGA_INDEX += 1;
+            }
+        }
+        
+        // Imprimir ": "
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b':' as u16;
+            VGA_INDEX += 1;
+        }
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b' ' as u16;
+            VGA_INDEX += 1;
+        }
+        
+        // Imprimir mensaje
+        for byte in message.bytes() {
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                VGA_INDEX += 1;
+            }
+        }
+        
+        // Nueva línea
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+            VGA_INDEX += 1;
+        }
+    }
 }
 
 /// Función auxiliar para mostrar barra de progreso directamente
 fn display_progress_bar_direct(step: u32) {
-    // Implementación simplificada
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        static mut VGA_INDEX: usize = 0;
+        
+        let progress_text = "Progreso: ";
+        for byte in progress_text.bytes() {
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                VGA_INDEX += 1;
+            }
+        }
+        
+        // Imprimir número de paso
+        let mut n = step;
+        let mut digits = [0u8; 10];
+        let mut i = 0;
+        
+        if n == 0 {
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'0' as u16;
+                VGA_INDEX += 1;
+            }
+        } else {
+            while n > 0 {
+                digits[i] = (n % 10) as u8 + b'0';
+                n /= 10;
+                i += 1;
+            }
+            
+            for j in (0..i).rev() {
+                if VGA_INDEX < 2000 {
+                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | digits[j] as u16;
+                    VGA_INDEX += 1;
+                }
+            }
+        }
+        
+        // Imprimir "/15"
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'/' as u16;
+            VGA_INDEX += 1;
+        }
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'1' as u16;
+            VGA_INDEX += 1;
+        }
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'5' as u16;
+            VGA_INDEX += 1;
+        }
+        
+        // Nueva línea
+        if VGA_INDEX < 2000 {
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+            VGA_INDEX += 1;
+        }
+    }
 }
 
 /// Función auxiliar para mostrar banner directamente
 fn display_banner_direct() {
-    // Implementación simplificada
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        static mut VGA_INDEX: usize = 0;
+        
+        let banner_lines = [
+            "╔══════════════════════════════════════════════════════════════╗",
+            "║                                                              ║",
+            "║                Eclipse Rust OS - Next Gen                    ║",
+            "║                                                              ║",
+            "║  100% Rust + Microkernel + IA + GUI Moderna                ║",
+            "║  Compatible con aplicaciones Windows                        ║",
+            "║  Seguridad avanzada + Encriptacion end-to-end              ║",
+            "║  IA integrada + Optimizacion automatica                    ║",
+            "║  GUI GATE DIAGNOSTICS + Transparencias                     ║",
+            "║  Privacidad por diseno + Cumplimiento GDPR                 ║",
+            "║  Sistema de plugins dinamico + Personalizacion total       ║",
+            "║  Hardware moderno + Gestion de energia avanzada            ║",
+            "║  Shell moderna + Sistema de comandos completo              ║",
+            "║  Sistema Ready + Comandos generativos (campa1-8)           ║",
+            "║  Monitor en tiempo real + Metricas dinamicas               ║",
+            "║  Interfaz grafica visual + Renderizado avanzado            ║",
+            "║  Sistema de contenedores + Virtualizacion                  ║",
+            "║  Machine Learning + IA avanzada                            ║",
+            "║                                                              ║",
+            "║  Version: 0.4.0 (Next Gen)                                  ║",
+            "║  Arquitectura: x86_64 Microkernel                           ║",
+            "║  API: Windows 10/11 + IA nativa                             ║",
+            "╚══════════════════════════════════════════════════════════════╝",
+            "",
+        ];
+        
+        for line in &banner_lines {
+            for byte in line.bytes() {
+                if VGA_INDEX < 2000 {
+                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                    VGA_INDEX += 1;
+                }
+            }
+            // Nueva línea
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+                VGA_INDEX += 1;
+            }
+        }
+    }
 }
 
 /// Función auxiliar para mostrar resumen directamente
 fn display_summary_direct() {
-    // Implementación simplificada
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        static mut VGA_INDEX: usize = 0;
+        
+        let summary_lines = [
+            "========================================",
+            "    INICIALIZACION COMPLETA",
+            "========================================",
+            "Pasos completados: 15/15",
+            "Mensajes generados: 50+",
+            "Kernel Eclipse listo para operar!",
+            "",
+        ];
+        
+        for line in &summary_lines {
+            for byte in line.bytes() {
+                if VGA_INDEX < 2000 {
+                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                    VGA_INDEX += 1;
+                }
+            }
+            // Nueva línea
+            if VGA_INDEX < 2000 {
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+                VGA_INDEX += 1;
+            }
+        }
+    }
 }

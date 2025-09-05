@@ -105,19 +105,6 @@ pub fn init() -> KernelResult<()> {
     initialize()
 }
 
-/// Obtener estadísticas de hilos
-pub fn get_thread_stats() -> (u32, u32, u32) {
-    unsafe {
-        if let Some(ref manager) = THREAD_MANAGER {
-            let total = manager.threads.len() as u32;
-            let running = manager.threads.iter().filter(|t| t.state == ThreadState::Running).count() as u32;
-            let terminated = manager.threads.iter().filter(|t| t.state == ThreadState::Terminated).count() as u32;
-            (total, running, terminated)
-        } else {
-            (0, 0, 0)
-        }
-    }
-}
 
 /// Procesar cola de hilos (función requerida por main.rs)
 pub fn process_thread_queue() {
@@ -131,6 +118,20 @@ pub fn process_thread_queue() {
                     // En un kernel real, aquí se ejecutaría el código del hilo
                 }
             }
+        }
+    }
+}
+
+/// Obtener estadísticas de hilos (compatible con main.rs)
+pub fn get_thread_stats() -> (usize, usize, usize) {
+    unsafe {
+        if let Some(ref manager) = THREAD_MANAGER {
+            let running_threads = manager.threads.iter().filter(|t| t.state == ThreadState::Running).count();
+            let ready_threads = manager.threads.iter().filter(|t| t.state == ThreadState::Suspended).count();
+            let blocked_threads = 0; // Simplificado
+            (running_threads, ready_threads, blocked_threads)
+        } else {
+            (0, 0, 0)
         }
     }
 }

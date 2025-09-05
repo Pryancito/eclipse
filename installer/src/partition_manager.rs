@@ -113,7 +113,7 @@ impl PartitionManager {
                         .output();
                     
                     Ok(PartitionInfo {
-                        name: format!("{}p1", disk.name),
+                        name: format!("{}1", disk.name),
                         mount_point: "/boot/efi".to_string(),
                         filesystem: "fat32".to_string(),
                         size: "100MB".to_string(),
@@ -137,7 +137,7 @@ impl PartitionManager {
             Ok(result) => {
                 if result.status.success() {
                     Ok(PartitionInfo {
-                        name: format!("{}p2", disk.name),
+                        name: format!("{}2", disk.name),
                         mount_point: "/".to_string(),
                         filesystem: "ext4".to_string(),
                         size: "Resto del disco".to_string(),
@@ -181,11 +181,11 @@ impl PartitionManager {
         println!("🔧 Formateando particiones...");
         
         // Formatear partición EFI
-        let efi_partition = format!("{}p1", disk.name);
+        let efi_partition = format!("{}1", disk.name);
         self.format_efi_partition(&efi_partition)?;
         
         // Formatear partición root
-        let root_partition = format!("{}p2", disk.name);
+        let root_partition = format!("{}2", disk.name);
         self.format_root_partition(&root_partition)?;
         
         Ok(())

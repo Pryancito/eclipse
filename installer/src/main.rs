@@ -7,11 +7,13 @@ mod disk_manager;
 mod partition_manager;
 mod bootloader_installer;
 mod filesystem_manager;
+mod direct_installer;
 
 use disk_manager::DiskManager;
 use partition_manager::PartitionManager;
 use bootloader_installer::BootloaderInstaller;
 use filesystem_manager::FilesystemManager;
+use direct_installer::DirectInstaller;
 
 fn main() {
     println!("🌙 Eclipse OS Installer v1.0");
@@ -33,7 +35,7 @@ fn main() {
         
         match choice.trim() {
             "1" => {
-                install_eclipse_os();
+                install_eclipse_os_direct();
             }
             "2" => {
                 show_disk_info();
@@ -55,124 +57,68 @@ fn main() {
 }
 
 fn show_main_menu() {
-    println!("📋 Menú Principal");
-    println!("=================");
-    println!("1. Instalar Eclipse OS");
-    println!("2. Mostrar información de discos");
-    println!("3. Ayuda");
-    println!("4. Salir");
+            println!("📋 Menú Principal");
+        println!("=================");
+        println!("1. Instalar Eclipse OS (sin emojis)");
+        println!("2. Mostrar información de discos");
+        println!("3. Ayuda");
+        println!("4. Salir");
     println!();
 }
 
-fn install_eclipse_os() {
-    println!("🔧 Instalación de Eclipse OS");
-    println!("=============================");
+
+fn install_eclipse_os_direct() {
+    println!("Instalacion de Eclipse OS");
+    println!("=========================");
     println!();
     
-    // 1. Mostrar discos disponibles
+    // Mostrar discos disponibles
     let mut disk_manager = DiskManager::new();
     let disks = disk_manager.list_disks();
     
     if disks.is_empty() {
-        println!("❌ No se encontraron discos disponibles");
+        println!("No se encontraron discos disponibles");
         return;
     }
     
-    println!("💾 Discos disponibles:");
+    println!("Discos disponibles:");
     for (i, disk) in disks.iter().enumerate() {
         println!("  {}. {} ({})", i + 1, disk.name, disk.size);
     }
     println!();
     
-    // 2. Seleccionar disco
-    let disk_choice = read_input("Selecciona el disco donde instalar (número): ");
+    // Seleccionar disco
+    let disk_choice = read_input("Selecciona el disco donde instalar (numero): ");
     let disk_index: usize = match disk_choice.trim().parse::<usize>() {
         Ok(n) => n - 1,
         Err(_) => {
-            println!("❌ Número inválido");
+            println!("Numero invalido");
             return;
         }
     };
     
     if disk_index >= disks.len() {
-        println!("❌ Número de disco inválido");
+        println!("Numero de disco invalido");
         return;
     }
     
     let selected_disk = &disks[disk_index];
-    println!("✅ Disco seleccionado: {}", selected_disk.name);
-    println!();
     
-    // 3. Confirmar instalación
-    let confirm = read_input(&format!(
-        "⚠️  ADVERTENCIA: Esto borrará todos los datos en {}. ¿Continuar? (s/N): ",
-        selected_disk.name
-    ));
+    // Preguntar si es instalación automática
+    let auto_choice = read_input("Instalacion automatica? (s/N): ");
+    let auto_install = auto_choice.trim().to_lowercase() == "s";
     
-    if confirm.trim().to_lowercase() != "s" {
-        println!("❌ Instalación cancelada");
-        return;
-    }
-    
-    // 4. Iniciar instalación
-    println!("🚀 Iniciando instalación...");
-    println!();
-    
-    // Crear particiones
-    let mut partition_manager = PartitionManager::new();
-    match partition_manager.create_partitions(selected_disk) {
-        Ok(partitions) => {
-            println!("✅ Particiones creadas exitosamente");
-            for partition in &partitions {
-                println!("   - {}: {} ({})", partition.name, partition.mount_point, partition.filesystem);
-            }
+    // Ejecutar instalación directa
+    let direct_installer = DirectInstaller::new();
+    match direct_installer.install_eclipse_os(selected_disk, auto_install) {
+        Ok(_) => {
+            println!();
+            println!("Instalacion completada exitosamente!");
         }
         Err(e) => {
-            println!("❌ Error creando particiones: {}", e);
-            return;
+            println!("Error durante la instalacion: {}", e);
         }
     }
-    
-    // Instalar bootloader
-    let bootloader_installer = BootloaderInstaller::new();
-    match bootloader_installer.install_uefi(selected_disk) {
-        Ok(_) => println!("✅ Bootloader UEFI instalado"),
-        Err(e) => {
-            println!("❌ Error instalando bootloader: {}", e);
-            return;
-        }
-    }
-    
-    // Configurar sistema de archivos
-    let fs_manager = FilesystemManager::new();
-    match fs_manager.setup_filesystem(selected_disk) {
-        Ok(_) => println!("✅ Sistema de archivos configurado"),
-        Err(e) => {
-            println!("❌ Error configurando sistema de archivos: {}", e);
-            return;
-        }
-    }
-    
-    // Instalar kernel y archivos del sistema
-    match install_system_files(selected_disk) {
-        Ok(_) => println!("✅ Archivos del sistema instalados"),
-        Err(e) => {
-            println!("❌ Error instalando archivos del sistema: {}", e);
-            return;
-        }
-    }
-    
-    println!();
-    println!("🎉 ¡Instalación completada exitosamente!");
-    println!("========================================");
-    println!();
-    println!("📋 Resumen de la instalación:");
-    println!("  - Disco: {}", selected_disk.name);
-    println!("  - Bootloader: UEFI");
-    println!("  - Sistema de archivos: FAT32 (EFI) + EXT4 (root)");
-    println!("  - Kernel: Eclipse OS v1.0");
-    println!();
-    println!("🔄 Reinicia el sistema para usar Eclipse OS");
 }
 
 fn show_disk_info() {
@@ -231,6 +177,17 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
         fs::create_dir_all(efi_mount).map_err(|e| format!("Error creando directorio EFI: {}", e))?;
     }
     
+    // Montar la partición EFI
+    let efi_partition = format!("{}1", disk.name);
+    let mount_output = std::process::Command::new("mount")
+        .args(&[&efi_partition, efi_mount])
+        .output()
+        .map_err(|e| format!("Error ejecutando mount: {}", e))?;
+
+    if !mount_output.status.success() {
+        return Err(format!("Error montando partición EFI: {}", String::from_utf8_lossy(&mount_output.stderr)));
+    }
+    
     // Montar partición root
     let root_mount = "/mnt/eclipse-root";
     if !Path::new(root_mount).exists() {
@@ -238,7 +195,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     }
     
     // Copiar kernel
-    let kernel_source = "target_hardware/x86_64-unknown-none/release/eclipse_kernel";
+    let kernel_source = "../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
     let kernel_dest = format!("{}/eclipse_kernel", efi_mount);
     
     if Path::new(kernel_source).exists() {
@@ -250,7 +207,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     }
     
     // Copiar bootloader
-    let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader-main.efi";
+    let bootloader_source = "../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
     let bootloader_dest = format!("{}/EFI/BOOT/BOOTX64.EFI", efi_mount);
     
     if Path::new(bootloader_source).exists() {
@@ -266,6 +223,16 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     
     // Crear archivos de configuración
     create_config_files(efi_mount)?;
+    
+    // Desmontar partición EFI
+    let umount_output = std::process::Command::new("umount")
+        .arg(efi_mount)
+        .output()
+        .map_err(|e| format!("Error ejecutando umount: {}", e))?;
+
+    if !umount_output.status.success() {
+        eprintln!("Advertencia: Error desmontando partición EFI: {}", String::from_utf8_lossy(&umount_output.stderr));
+    }
     
     Ok(())
 }
