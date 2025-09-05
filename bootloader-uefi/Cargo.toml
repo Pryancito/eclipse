@@ -12,7 +12,7 @@ name = "eclipse-bootloader-main"
 path = "src/main.rs"
 
 [dependencies]
-uefi = { version = "0.25", features = ["alloc"] }
+uefi = { version = "0.35.0", features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"

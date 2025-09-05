@@ -6,6 +6,7 @@
 #![no_main]
 
 use uefi::prelude::*;
+use uefi::boot::LoadImageSource;
 use core::fmt::Write;
 
 // Global allocator simple
@@ -25,10 +26,25 @@ unsafe impl core::alloc::GlobalAlloc for SimpleAllocator {
 static ALLOCATOR: SimpleAllocator = SimpleAllocator;
 
 // Función para cargar el kernel de Eclipse OS
-fn load_kernel(_system_table: &SystemTable<Boot>) -> Result<(), uefi::Status> {
-    // En una implementación real, aquí se cargaría el kernel de Eclipse OS
-    // Por ahora, simulamos la carga exitosa
-    // TODO: Implementar carga real del kernel usando UEFI APIs
+fn load_kernel(system_table: &SystemTable) -> Result<(), uefi::Error> {
+    let boot_services = system_table.boot_services();
+    
+    // Obtener el handle de la imagen actual
+    let image_handle = system_table.image_handle();
+    
+    // Crear fuente de imagen desde archivo
+    let kernel_path = uefi::CString16::try_from("\\EFI\\BOOT\\eclipse_kernel.bin").unwrap();
+    let image_source = LoadImageSource::FromFile {
+        file_path: kernel_path,
+    };
+    
+    // Cargar la imagen del kernel
+    let kernel_handle = boot_services.load_image(image_handle, image_source)?;
+    
+    // Ejecutar el kernel - esto debería transferir el control
+    boot_services.start_image(kernel_handle)?;
+    
+    // Si llegamos aquí, el kernel no tomó control
     Ok(())
 }
 
@@ -43,7 +59,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 #[entry]
-fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+fn main() -> Status {
+    // Obtener el SystemTable
+    let system_table = uefi::system_table();
+    
     // Intentar cargar el kernel primero
     let kernel_result = load_kernel(&system_table);
     
@@ -63,7 +82,8 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let _ = output.write_str("Transfiriendo control al kernel...\n");
             // El kernel debería tomar control aquí
             // Si llegamos aquí, el kernel no tomó control
-            let _ = output.write_str("El kernel no tomo control del sistema\n");
+            let _ = output.write_str("ERROR: El kernel no tomo control del sistema\n");
+            let _ = output.write_str("Continuando con modo de emergencia...\n");
         }
         Err(e) => {
             let _ = output.write_str("Error al cargar el kernel: ");
