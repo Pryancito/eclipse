@@ -87,17 +87,11 @@ fn read_file_size(file: &mut RegularFile) -> Result<usize, Status> {
     }
 }
 
-unsafe fn jump_to_kernel(entry: u64, framebuffer_info: FramebufferInfo) -> ! {
-    // Pasar la información del framebuffer al kernel a través de registros
-    // RDI = base_address, RSI = width, RDX = height, RCX = pixels_per_scan_line, R8 = pixel_format
-    let entry_fn: extern "sysv64" fn(u64, u32, u32, u32, u32) -> ! = core::mem::transmute(entry as usize);
-    entry_fn(
-        framebuffer_info.base_address,
-        framebuffer_info.width,
-        framebuffer_info.height,
-        framebuffer_info.pixels_per_scan_line,
-        framebuffer_info.pixel_format,
-    )
+unsafe fn jump_to_kernel(entry: u64, _framebuffer_info: FramebufferInfo) -> ! {
+    // Llamar directamente al punto de entrada del kernel
+    // El kernel manejará su propia inicialización
+    let entry_fn: extern "C" fn() -> ! = core::mem::transmute(entry as usize);
+    entry_fn()
 }
 
 // Salida serie COM1 para diagnóstico temprano
@@ -523,7 +517,24 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
     
-    // Salto directo al kernel SIN configuración de paginación
-    unsafe { serial_write_str("BL: saltando al kernel\r\n"); }
-    unsafe { jump_to_kernel(entry_address, framebuffer_info) }
+    // Cambiar a nuestras tablas y stack antes de saltar al kernel
+    unsafe {
+        // Cargar CR3 con la PML4 propia (identidad 0..1GiB)
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) pml4_phys,
+            options(nostack, preserves_flags)
+        );
+
+        // Cambiar el puntero de pila a la parte alta del stack reservado
+        core::arch::asm!(
+            "mov rsp, {0}",
+            in(reg) stack_top,
+            options(nostack, preserves_flags)
+        );
+
+        serial_write_str("BL: CR3 y stack configurados\r\n");
+        serial_write_str("BL: saltando al kernel\r\n");
+        jump_to_kernel(entry_address, framebuffer_info)
+    }
 }
