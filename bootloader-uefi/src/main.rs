@@ -35,7 +35,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0010_0000;
+const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0034;
 
 #[inline(always)]
 fn pages_for_size(size: usize) -> usize { (size + 0xFFF) / 0x1000 }
@@ -77,6 +77,40 @@ fn read_file_size(file: &mut RegularFile) -> Result<usize, Status> {
 unsafe fn jump_to_kernel(entry: u64) -> ! {
     let entry_fn: extern "sysv64" fn() -> ! = core::mem::transmute(entry as usize);
     entry_fn()
+}
+
+// Salida serie COM1 para diagnóstico temprano
+#[inline(always)]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+}
+
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let mut val: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
+    val
+}
+
+unsafe fn serial_init() {
+    let base: u16 = 0x3F8;
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x80);
+    outb(base + 0, 0x01);
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x03);
+    outb(base + 2, 0xC7);
+    outb(base + 4, 0x0B);
+}
+
+unsafe fn serial_write_byte(b: u8) {
+    let base: u16 = 0x3F8;
+    while (inb(base + 5) & 0x20) == 0 {}
+    outb(base, b);
+}
+
+unsafe fn serial_write_str(s: &str) {
+    for &c in s.as_bytes() { serial_write_byte(c); }
 }
 
 // ELF64 estructuras mínimas
@@ -264,7 +298,7 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPd(e.status()))?;
 
-    unsafe {
+        unsafe {
         // Limpiar tablas
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
@@ -295,6 +329,8 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
 
 #[entry]
 fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+    // Serial init temprano
+    unsafe { serial_init(); serial_write_str("BL: inicio\r\n"); }
     // Mensaje inicial
     {
         let mut out = system_table.stdout();
@@ -338,6 +374,18 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let _ = out.write_str("Kernel ELF cargado\n");
         let _ = out.write_str("Entry ELF: 0x");
         let _ = core::fmt::write(out, format_args!("{:016x}\n", entry_address));
+        unsafe { serial_write_str("BL: entry="); }
+        {
+            // serial hex simple
+            let mut buf = [0u8; 18];
+            let mut n = 0usize;
+            for i in (0..16).rev() {
+                let nyb = ((entry_address >> (i*4)) & 0xF) as u8;
+                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
+            }
+            buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
+            unsafe { for i in 0..n { serial_write_byte(buf[i]); } }
+        }
         // Volcado de los primeros 16 bytes en entry
         let _ = out.write_str("Bytes@entry: ");
             unsafe {
@@ -350,22 +398,14 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
         let _ = out.write_str("\n");
         let _ = out.write_str("Saliendo de Boot Services...\n");
+        unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
     // ExitBootServices (uefi 0.25.0)
     let (_rt_st, _final_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
+    unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
 
-    // Preparar stack y saltar al kernel
-    // Alinear stack a 16 bytes
-    let aligned_stack_top = stack_top & !0xFu64;
-    unsafe {
-        // Cargar CR3 con nuestra PML4 identidad
-        core::arch::asm!(
-            "mov cr3, {0}",
-            in(reg) (pml4_phys as u64),
-            options(nostack, preserves_flags)
-        );
-        core::arch::asm!("mov rsp, {0}", in(reg) aligned_stack_top, options(nostack, preserves_flags));
-    }
+    // Salto directo al kernel SIN configuración de paginación
+    unsafe { serial_write_str("BL: saltando al kernel\r\n"); }
     unsafe { jump_to_kernel(entry_address) }
 }

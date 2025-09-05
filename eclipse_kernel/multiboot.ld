@@ -1,7 +1,7 @@
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x100000; /* The kernel will be loaded at 1MB */
+    . = 0x200000; /* Kernel base at 2 MiB to match UEFI loader */
 
     .multiboot_header : ALIGN(4) {
         *(.multiboot_header)
