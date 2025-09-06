@@ -1463,6 +1463,32 @@ pub fn kernel_main() -> ! {
         }
     }
 
+    // Ejecutar shell con IA integrada
+    unsafe {
+        VGA.set_color(Color::Cyan, Color::Black);
+        VGA.write_string("\n🤖 INICIANDO SHELL CON IA INTEGRADA...\n");
+        VGA.set_color(Color::White, Color::Black);
+    }
+
+    match crate::ai_shell::run_ai_shell() {
+        Ok(_) => {
+            unsafe {
+                VGA.set_color(Color::Green, Color::Black);
+                VGA.write_string("✅ Shell con IA ejecutado exitosamente\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+        Err(e) => {
+            unsafe {
+            VGA.set_color(Color::Red, Color::Black);
+            VGA.write_string("❌ Error ejecutando shell con IA: ");
+            VGA.write_string("Error de kernel");
+            VGA.write_string("\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+    }
+
     // Mostrar mensaje de que el kernel está listo
     unsafe {
         VGA.set_color(Color::Green, Color::Black);
