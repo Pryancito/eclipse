@@ -121,6 +121,38 @@ build_installer() {
     cd ..
 }
 
+# Función para compilar systemd
+build_systemd() {
+    print_step "Compilando sistema systemd..."
+    
+    if [ ! -d "eclipse-apps/systemd" ]; then
+        print_status "Directorio systemd no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-apps/systemd
+    
+    # Compilar systemd
+    print_status "Compilando systemd..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "Systemd compilado exitosamente"
+        
+        # Mostrar información del systemd compilado
+        local systemd_path="target/release/eclipse-systemd"
+        if [ -f "$systemd_path" ]; then
+            local systemd_size=$(du -h "$systemd_path" | cut -f1)
+            print_status "Systemd generado: $systemd_path ($systemd_size)"
+        fi
+    else
+        print_error "Error al compilar systemd"
+        return 1
+    fi
+    
+    cd ../..
+}
+
 # Función para compilar userland
 build_userland() {
     print_step "Compilando módulos userland..."
@@ -130,81 +162,25 @@ build_userland() {
         return 0
     fi
     
-    # Compilar IPC Common
-    print_status "Compilando IPC Common..."
-    cd userland/ipc_common
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "IPC Common compilado exitosamente"
-    else
-        print_error "Error al compilar IPC Common"
-        return 1
-    fi
-    cd ../..
-    
-    # Compilar Module Loader
-    print_status "Compilando Module Loader..."
-    cd userland/module_loader
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "Module Loader compilado exitosamente"
-    else
-        print_error "Error al compilar Module Loader"
-        return 1
-    fi
-    cd ../..
-    
-    # Compilar Graphics Module
-    print_status "Compilando Graphics Module..."
-    cd userland/graphics_module
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "Graphics Module compilado exitosamente"
-    else
-        print_error "Error al compilar Graphics Module"
-        return 1
-    fi
-    cd ../..
-    
-    # Compilar App Framework
-    print_status "Compilando App Framework..."
-    cd userland/app_framework
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "App Framework compilado exitosamente"
-    else
-        print_error "Error al compilar App Framework"
-        return 1
-    fi
-    cd ../..
-    
-    # Compilar el userland principal
-    print_status "Compilando Userland principal..."
+    # Usar el script build.sh del userland
+    print_status "Ejecutando script de compilación del userland..."
     cd userland
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "Userland principal compilado exitosamente"
-    else
-        print_error "Error al compilar Userland principal"
-        return 1
-    fi
-    cd ..
     
-    # Compilar sistema DRM
-    print_status "Compilando sistema DRM..."
-    if [ -d "userland/drm_display" ]; then
-        cd userland/drm_display
-        cargo build --release
+    if [ -f "build.sh" ]; then
+        chmod +x build.sh
+        ./build.sh
         if [ $? -eq 0 ]; then
-            print_success "Sistema DRM compilado exitosamente"
+            print_success "Userland compilado exitosamente usando build.sh"
         else
-            print_error "Error al compilar sistema DRM"
+            print_error "Error al compilar userland con build.sh"
             return 1
         fi
-        cd ../..
     else
-        print_status "Sistema DRM no encontrado, saltando..."
+        print_error "Script build.sh no encontrado en userland/"
+        return 1
     fi
+    
+    cd ..
     
     print_success "Todos los módulos userland compilados exitosamente"
 }
@@ -238,7 +214,16 @@ create_basic_distribution() {
     if [ -d "userland" ]; then
         print_status "Copiando módulos userland..."
         
-        # Copiar binarios userland
+        # Copiar binario principal del userland
+        if [ -f "userland/target/userland/eclipse_userland" ]; then
+            cp "userland/target/userland/eclipse_userland" "$BUILD_DIR/userland/bin/"
+            print_status "Userland principal copiado"
+        elif [ -f "userland/target/release/eclipse_userland" ]; then
+            cp "userland/target/release/eclipse_userland" "$BUILD_DIR/userland/bin/"
+            print_status "Userland principal copiado"
+        fi
+        
+        # Copiar binarios de módulos individuales si existen
         if [ -f "userland/module_loader/target/release/module_loader" ]; then
             cp "userland/module_loader/target/release/module_loader" "$BUILD_DIR/userland/bin/"
             print_status "Module Loader copiado"
@@ -254,11 +239,6 @@ create_basic_distribution() {
             print_status "App Framework copiado"
         fi
         
-        if [ -f "userland/target/release/eclipse-userland" ]; then
-            cp "userland/target/release/eclipse-userland" "$BUILD_DIR/userland/bin/"
-            print_status "Userland principal copiado"
-        fi
-        
         # Copiar sistema DRM si existe
         if [ -f "userland/drm_display/target/release/libdrm_display.rlib" ]; then
             cp "userland/drm_display/target/release/libdrm_display.rlib" "$BUILD_DIR/userland/lib/"
@@ -270,19 +250,27 @@ create_basic_distribution() {
             print_status "Ejemplo DRM copiado"
         fi
         
+        # Copiar systemd si existe
+        if [ -f "eclipse-apps/systemd/target/release/eclipse-systemd" ]; then
+            cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/userland/bin/"
+            print_status "Systemd copiado"
+        fi
+        
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
 name = "Eclipse OS"
 version = "0.5.0"
 kernel = "/boot/eclipse_kernel"
+init_system = "systemd"
 
 [modules]
 module_loader = "/userland/bin/module_loader"
 graphics_module = "/userland/bin/graphics_module"
 app_framework = "/userland/bin/app_framework"
-eclipse_userland = "/userland/bin/eclipse-userland"
+eclipse_userland = "/userland/bin/eclipse_userland"
 drm_display = "/userland/lib/libdrm_display.rlib"
+systemd = "/userland/bin/eclipse-systemd"
 
 [display]
 driver = "drm"
@@ -310,7 +298,7 @@ fi
 
 # Iniciar sistema DRM
 export RUST_LOG=info
-./eclipse-userland
+./eclipse_userland
 
 echo "Eclipse OS con DRM iniciado"
 EOF
@@ -327,7 +315,7 @@ EOF
 
 [system]
 kernel_path = "/boot/eclipse_kernel"
-userland_path = "/userland/bin/eclipse-userland"
+userland_path = "/userland/bin/eclipse_userland"
 
 [debug]
 enable_debug = false
@@ -349,6 +337,7 @@ show_build_summary() {
     echo "  Kernel Eclipse OS: eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
     echo "  Instalador: installer/target/release/eclipse-installer"
+    echo "  Systemd: eclipse-apps/systemd/target/release/eclipse-systemd"
     echo "  Userland: Módulos compilados e instalados"
     echo "  Sistema DRM: userland/drm_display/target/release/libdrm_display.rlib"
     echo ""
@@ -361,6 +350,7 @@ main() {
     build_kernel
     build_bootloader
     build_installer
+    build_systemd
     build_userland
     create_basic_distribution
     show_build_summary

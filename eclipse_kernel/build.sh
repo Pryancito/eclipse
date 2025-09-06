@@ -114,7 +114,7 @@ else
     cat > ../eclipse-apps/systemd/Cargo.toml << 'EOF'
 [package]
 name = "eclipse-systemd"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -203,7 +203,7 @@ else
     cat > ../userland/Cargo.toml << 'EOF'
 [package]
 name = "eclipse-userland"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 
 [[bin]]

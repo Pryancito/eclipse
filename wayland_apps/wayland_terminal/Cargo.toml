@@ -1,0 +1,15 @@
+[package]
+name = "wayland_terminal"
+version = "0.5.0"
+edition = "2021"
+
+[dependencies]
+libm = "0.2.2"
+linked_list_allocator = "0.10"
+
+[features]
+default = []
+alloc = []
+
+[profile.release]
+panic = "abort"

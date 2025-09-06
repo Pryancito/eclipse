@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# Script de demostración para mostrar los mensajes seriales de eclipse-systemd
+# Este script simula la conexión a la interfaz serial COM1
+
+echo "=========================================="
+echo "  DEMOSTRACIÓN DE MENSAJES SERIALES"
+echo "  Eclipse OS - eclipse-systemd"
+echo "=========================================="
+echo ""
+
+echo "Simulando conexión a COM1 (0x3F8)..."
+echo "Baud rate: 115200"
+echo "Data bits: 8"
+echo "Stop bits: 1"
+echo "Parity: None"
+echo ""
+
+echo "Esperando mensajes del kernel..."
+echo ""
+
+# Simular el mensaje que enviaría eclipse-systemd
+echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+echo "║                        ECLIPSE-SYSTEMD INICIADO                              ║"
+echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+echo ""
+echo "Proceso init iniciado:"
+echo "  - Nombre: eclipse-systemd"
+echo "  - PID: 1"
+echo "  - Ejecutable: /sbin/eclipse-systemd"
+echo ""
+echo "Variables de entorno configuradas:"
+echo "  - PATH=/sbin:/bin:/usr/sbin:/usr/bin"
+echo "  - HOME=/root"
+echo "  - USER=root"
+echo "  - SHELL=/bin/eclipse-shell"
+echo "  - TERM=xterm-256color"
+echo "  - DISPLAY=:0"
+echo "  - XDG_SESSION_TYPE=wayland"
+echo "  - XDG_SESSION_DESKTOP=eclipse"
+echo "  - XDG_CURRENT_DESKTOP=Eclipse:GNOME"
+echo ""
+echo "Estado del sistema:"
+echo "  - Init System: eclipse-systemd"
+echo "  - Display Server: Wayland"
+echo "  - Session Type: wayland"
+echo "  - Desktop Environment: Eclipse"
+echo ""
+echo "eclipse-systemd está listo y funcionando."
+echo "Sistema Eclipse OS completamente inicializado."
+echo ""
+
+echo "=========================================="
+echo "  DEMOSTRACIÓN COMPLETADA"
+echo "=========================================="
