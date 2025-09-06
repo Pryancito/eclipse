@@ -75,13 +75,16 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 
 ```bash
 # Clonar el repositorio
-git clone https://github.com/eclipse-os/eclipse-os.git
-cd eclipse-os
+git clone https://github.com/Pryancito/eclipse.git
+cd eclipse
 
 # Compilar todo el sistema
 ./build.sh
 
 # El sistema se compilará y creará una distribución en eclipse-os-build/
+
+cd install
+cargo run
 ```
 
 ### Compilación con DRM
@@ -302,9 +305,9 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ## Contacto
 
-- **GitHub**: https://github.com/eclipse-os/eclipse-os
-- **Issues**: https://github.com/eclipse-os/eclipse-os/issues
-- **Discussions**: https://github.com/eclipse-os/eclipse-os/discussions
+- **GitHub**: https://github.com/Pryancito/eclipse
+- **Issues**: https://github.com/Pryancito/eclipse/issues
+- **Discussions**: https://github.com/Pryancito/eclipse/discussions
 
 ---
 

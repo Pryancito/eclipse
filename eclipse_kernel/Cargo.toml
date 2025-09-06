@@ -15,12 +15,14 @@ path = "src/main.rs"
 
 [dependencies]
 heapless = "0.8"
+linked_list_allocator = "0.10"
 
 [features]
 default = []
 no_std = []
 hardware-debug = []
 safe-init = []
+alloc = []
 
 [profile.dev]
 panic = "abort"

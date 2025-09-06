@@ -5,6 +5,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+pub mod allocator;
+
 pub mod memory;
 pub mod process;
 pub mod thread;
@@ -21,7 +24,11 @@ pub mod init_system;  // Sistema de inicialización con systemd
 pub mod process_transfer;  // Transferencia de control del kernel al userland
 pub mod elf_loader;  // Cargador de ejecutables ELF64
 pub mod process_memory;  // Gestión de memoria para procesos
-pub mod real_integration;  // Integración real kernel-systemd
+pub mod paging;  // Sistema de paginación
+pub mod gdt;  // Global Descriptor Table
+pub mod idt;  // Interrupt Descriptor Table
+pub mod interrupts;  // Gestión de interrupciones y timers
+// pub mod real_integration;  // Integración real kernel-systemd (deshabilitado temporalmente)
 pub mod main_simple;
 pub mod main_with_init;  // Main con integración systemd
 pub mod vga_centered_display;

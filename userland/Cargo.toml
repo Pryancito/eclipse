@@ -1,25 +1,39 @@
 [package]
-name = "eclipse-userland"
+name = "eclipse_userland"
 version = "0.1.0"
 edition = "2021"
-authors = ["Eclipse OS Team"]
-description = "Userland de Eclipse OS en Rust"
-
-[lib]
-name = "eclipse_userland"
-crate-type = ["lib"]
 
 [dependencies]
-# Dependencias básicas
-libc = "0.2"
-anyhow = "1.0"
-log = "0.4"
-env_logger = "0.10"
-
-# Dependencias DRM
-drm = "0.9"
-nix = "0.27"
-thiserror = "1.0"
+libm = "0.2.2"
 
 [features]
 default = []
+alloc = []
+
+[lib]
+name = "eclipse_userland"
+path = "lib.rs"
+
+[[bin]]
+name = "wayland_terminal"
+path = "apps/wayland_terminal.rs"
+
+[[bin]]
+name = "wayland_calculator"
+path = "apps/wayland_calculator.rs"
+
+[[bin]]
+name = "wayland_text_editor"
+path = "apps/wayland_text_editor.rs"
+
+[[bin]]
+name = "wayland_app_manager"
+path = "apps/wayland_app_manager.rs"
+
+[[bin]]
+name = "simple_terminal"
+path = "apps/simple_terminal.rs"
+
+[[bin]]
+name = "wayland_terminal_simple"
+path = "apps/wayland_terminal_simple.rs"

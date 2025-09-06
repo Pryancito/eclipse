@@ -213,27 +213,16 @@ impl SerialWriter {
 pub static mut VGA: VgaWriter = VgaWriter::new();
 pub static mut SERIAL: SerialWriter = SerialWriter::new();
 
-// Allocator global simple
-use alloc::alloc::{GlobalAlloc, Layout};
-
-struct SimpleAllocator;
-
-unsafe impl GlobalAlloc for SimpleAllocator {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        // Implementación simple - en un kernel real esto sería más complejo
-        core::ptr::null_mut()
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Implementación simple
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: SimpleAllocator = SimpleAllocator;
+// El allocador global está definido en allocator.rs
 
 /// Función principal del kernel
 pub fn kernel_main() -> ! {
+    // Inicializar el allocador global
+    #[cfg(feature = "alloc")]
+    {
+        crate::allocator::init_allocator();
+    }
+    
     // Mostrar banner de inicio del kernel
     unsafe {
         VGA.set_color(Color::LightGreen, Color::Black);
