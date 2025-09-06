@@ -46,9 +46,9 @@ build_kernel() {
     
     cd eclipse_kernel
     
-    # Compilar el kernel directamente con cargo
+    # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
-    cargo build --release --target "$KERNEL_TARGET"
+    RUSTFLAGS="-Clink-arg=-T/home/moebius/eclipse/eclipse_kernel/linker.ld -C link-arg=--gc-sections" cargo build --release --target "$KERNEL_TARGET"
     
     if [ $? -eq 0 ]; then
         print_success "Kernel compilado exitosamente"

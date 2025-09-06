@@ -5,6 +5,9 @@ edition = "2021"
 authors = ["Eclipse Rust Team"]
 description = "Kernel nativo de Eclipse en Rust"
 
+[package.metadata.cargo-xbuild]
+sysroot_path = "sysroot"
+
 [lib]
 name = "eclipse_kernel"
 crate-type = ["lib", "staticlib"]
@@ -30,8 +33,8 @@ lto = false
 opt-level = "z"
 overflow-checks = false
 
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"
-overflow-checks = false
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-T/home/moebius/eclipse/eclipse_kernel/linker.ld",
+    "-C", "link-arg=--gc-sections"
+]

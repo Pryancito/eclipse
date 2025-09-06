@@ -18,6 +18,7 @@ impl DirectInstaller {
     }
 
     pub fn install_eclipse_os(&self, disk: &DiskInfo, auto_install: bool) -> Result<(), String> {
+        println!("DEBUG: Iniciando install_eclipse_os con disco: {}", disk.name);
         println!("Instalador de Eclipse OS v0.5.0");
         println!("================================");
         println!();
@@ -48,19 +49,47 @@ impl DirectInstaller {
         println!();
 
         // Crear particiones
+        println!("DEBUG: Creando particiones...");
         self.create_partitions(disk)?;
+        println!("DEBUG: Particiones creadas");
 
         // Formatear particiones
+        println!("DEBUG: Formateando particiones...");
         self.format_partitions(disk)?;
+        println!("DEBUG: Particiones formateadas");
 
         // Instalar bootloader
-        self.install_bootloader(disk)?;
+        println!("PASO: Instalando bootloader...");
+        match self.install_bootloader(disk) {
+            Ok(_) => {
+                println!("PASO: Bootloader instalado correctamente");
+            }
+            Err(e) => {
+                println!("ERROR: Falló la instalación del bootloader: {}", e);
+                return Err(e);
+            }
+        }
+
+        // Instalar sistema en partición root
+        println!("PASO: Instalando sistema en partición root...");
+        match self.install_system_to_root(disk) {
+            Ok(_) => {
+                println!("PASO: Sistema instalado en partición root completado");
+            }
+            Err(e) => {
+                println!("ERROR: Falló la instalación del sistema en partición root: {}", e);
+                return Err(e);
+            }
+        }
 
         // Instalar userland
         self.install_userland(disk)?;
 
         // Crear archivos de configuración
         self.create_config_files(disk)?;
+
+        // Desmontar particiones
+        self.unmount_partitions(disk)?;
 
         println!();
         println!("Instalacion completada exitosamente!");
@@ -72,6 +101,8 @@ impl DirectInstaller {
         println!("  - Particion root: {}2 (EXT4)", disk.name);
         println!("  - Bootloader: UEFI");
         println!("  - Kernel: Eclipse OS v0.5.0");
+        println!("  - Eclipse-systemd: Instalado en /sbin/init");
+        println!("  - Aplicaciones: Instaladas en /usr/bin");
         println!("  - Userland: Modulos compilados e instalados");
         println!();
         println!("Reinicia el sistema para usar Eclipse OS");
@@ -234,7 +265,7 @@ impl DirectInstaller {
 
         // Copiar bootloader
         println!("   Instalando bootloader...");
-        let bootloader_source = "../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
+        let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
         
         if !Path::new(bootloader_source).exists() {
             return Err("Bootloader no encontrado. Ejecuta 'cd bootloader-uefi && ./build.sh' primero".to_string());
@@ -248,8 +279,8 @@ impl DirectInstaller {
 
         // Copiar kernel
         println!("   Instalando kernel...");
-        let kernel_source = "../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
-        
+        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
+
         if !Path::new(kernel_source).exists() {
             return Err("Kernel no encontrado. Ejecuta 'cd eclipse_kernel && cargo build --release' primero".to_string());
         }
@@ -257,6 +288,252 @@ impl DirectInstaller {
         fs::copy(kernel_source, format!("{}/eclipse_kernel", self.efi_mount_point))
             .map_err(|e| format!("Error copiando kernel: {}", e))?;
 
+        Ok(())
+    }
+
+    fn install_system_to_root(&self, disk: &DiskInfo) -> Result<(), String> {
+        println!("DEBUG: Iniciando install_system_to_root para disco: {}", disk.name);
+        println!("Instalando sistema en partición root...");
+
+        // Montar partición root
+        let root_partition = format!("{}2", disk.name);
+        println!("   Montando particion root {} en {}...", root_partition, self.root_mount_point);
+        fs::create_dir_all(&self.root_mount_point)
+            .map_err(|e| format!("Error creando directorio root: {}", e))?;
+
+        let output = std::process::Command::new("mount")
+            .args(&[&root_partition, &self.root_mount_point])
+            .output()
+            .map_err(|e| format!("Error ejecutando mount: {}", e))?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            println!("   Error montando partición root: {}", error_msg);
+            return Err(format!("No se pudo montar particion root: {}", error_msg));
+        }
+
+        println!("   Particion root montada exitosamente en {}", self.root_mount_point);
+
+        // Instalar eclipse-systemd
+        self.install_eclipse_systemd(disk)?;
+
+        // Instalar aplicaciones del sistema
+        self.install_system_apps(disk)?;
+
+        println!("   Sistema instalado en partición root");
+        Ok(())
+    }
+
+    fn install_eclipse_systemd(&self, disk: &DiskInfo) -> Result<(), String> {
+        println!("   Instalando eclipse-systemd...");
+        let systemd_source = "../eclipse-apps/systemd/target/release/eclipse-systemd";
+
+        if Path::new(systemd_source).exists() {
+            // Crear directorios del sistema
+            fs::create_dir_all(format!("{}/sbin", self.root_mount_point))
+                .map_err(|e| format!("Error creando /sbin: {}", e))?;
+            fs::create_dir_all(format!("{}/etc/eclipse/systemd/system", self.root_mount_point))
+                .map_err(|e| format!("Error creando /etc/eclipse/systemd/system: {}", e))?;
+
+            // Copiar eclipse-systemd
+            fs::copy(systemd_source, format!("{}/sbin/eclipse-systemd", self.root_mount_point))
+                .map_err(|e| format!("Error copiando eclipse-systemd: {}", e))?;
+
+            // Crear enlace simbólico para /sbin/init
+            std::os::unix::fs::symlink("../sbin/eclipse-systemd", format!("{}/sbin/init", self.root_mount_point))
+                .map_err(|e| format!("Error creando enlace simbólico: {}", e))?;
+
+            // Copiar archivos de configuración
+            let config_source = "../etc/eclipse/systemd/system";
+            if Path::new(config_source).exists() {
+                let config_dest = format!("{}/etc/eclipse/systemd/system", self.root_mount_point);
+                fs::create_dir_all(&config_dest)
+                    .map_err(|e| format!("Error creando directorio de configuración: {}", e))?;
+
+                for entry in fs::read_dir(config_source)
+                    .map_err(|e| format!("Error leyendo directorio de configuración: {}", e))? {
+                    let entry = entry.map_err(|e| format!("Error leyendo entrada: {}", e))?;
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("service") ||
+                       path.extension().and_then(|s| s.to_str()) == Some("target") {
+                        let file_name = path.file_name().unwrap();
+                        fs::copy(&path, format!("{}/{}", config_dest, file_name.to_string_lossy()))
+                            .map_err(|e| format!("Error copiando archivo de configuración {}: {}", file_name.to_string_lossy(), e))?;
+                    }
+                }
+            }
+
+            println!("     Eclipse-systemd instalado");
+        } else {
+            println!("     Advertencia: Eclipse-systemd no encontrado");
+            println!("     Intentando compilar eclipse-systemd...");
+
+            // Intentar compilar eclipse-systemd
+            let compile_output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("cd ../eclipse-apps/systemd && cargo build --release")
+                .output()
+                .map_err(|e| format!("Error ejecutando compilación: {}", e))?;
+
+            if compile_output.status.success() {
+                println!("     Eclipse-systemd compilado exitosamente");
+                // Reintentar la instalación
+                if Path::new(systemd_source).exists() {
+                    fs::create_dir_all(format!("{}/sbin", self.root_mount_point))
+                        .map_err(|e| format!("Error creando /sbin: {}", e))?;
+                    fs::create_dir_all(format!("{}/etc/eclipse/systemd/system", self.root_mount_point))
+                        .map_err(|e| format!("Error creando /etc/eclipse/systemd/system: {}", e))?;
+
+                    fs::copy(systemd_source, format!("{}/sbin/eclipse-systemd", self.root_mount_point))
+                        .map_err(|e| format!("Error copiando eclipse-systemd: {}", e))?;
+
+                    std::os::unix::fs::symlink("../sbin/eclipse-systemd", format!("{}/sbin/init", self.root_mount_point))
+                        .map_err(|e| format!("Error creando enlace simbólico: {}", e))?;
+
+                    println!("     Eclipse-systemd instalado después de compilación");
+                }
+            } else {
+                println!("     Error compilando eclipse-systemd");
+                println!("     Instala manualmente con: cd ../eclipse-apps/systemd && cargo build --release");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn install_system_apps(&self, disk: &DiskInfo) -> Result<(), String> {
+        println!("   Instalando aplicaciones del sistema...");
+
+        // Crear directorios del sistema
+        let system_dirs = vec![
+            "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", 
+            "/etc", "/var", "/tmp", "/proc", "/sys", "/dev", "/mnt",
+            "/etc/eclipse", "/etc/eclipse/systemd", "/etc/eclipse/systemd/system",
+            "/var/log", "/var/lib", "/var/cache"
+        ];
+
+        for dir in system_dirs {
+            fs::create_dir_all(format!("{}{}", self.root_mount_point, dir))
+                .map_err(|e| format!("Error creando directorio {}: {}", dir, e))?;
+        }
+
+        // Instalar aplicaciones de eclipse-apps
+        let apps_to_install = vec![
+            ("../eclipse-apps/calculator/target/release/eclipse-calculator", "/usr/bin/eclipse-calculator"),
+            ("../eclipse-apps/text_editor/target/release/eclipse-text-editor", "/usr/bin/eclipse-text-editor"),
+            ("../eclipse-apps/file_manager/target/release/eclipse-file-manager", "/usr/bin/eclipse-file-manager"),
+            ("../eclipse-apps/terminal/target/release/eclipse-terminal", "/usr/bin/eclipse-terminal"),
+            ("../eclipse-apps/system_monitor/target/release/eclipse-system-monitor", "/usr/bin/eclipse-system-monitor"),
+        ];
+
+        for (source, dest) in apps_to_install {
+            if Path::new(source).exists() {
+                let full_dest = format!("{}{}", self.root_mount_point, dest);
+                fs::copy(source, &full_dest)
+                    .map_err(|e| format!("Error copiando {}: {}", dest, e))?;
+                
+                // Hacer ejecutable
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&full_dest)
+                    .map_err(|e| format!("Error obteniendo metadatos de {}: {}", dest, e))?
+                    .permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&full_dest, perms)
+                    .map_err(|e| format!("Error estableciendo permisos para {}: {}", dest, e))?;
+                
+                println!("     {} instalado", dest);
+            } else {
+                println!("     Advertencia: {} no encontrado", source);
+            }
+        }
+
+        // Crear archivos de configuración del sistema
+        self.create_system_config_files()?;
+
+        println!("   Aplicaciones del sistema instaladas");
+        Ok(())
+    }
+
+    fn create_system_config_files(&self) -> Result<(), String> {
+        // Crear /etc/hostname
+        fs::write(format!("{}/etc/hostname", self.root_mount_point), "eclipse-os")
+            .map_err(|e| format!("Error creando /etc/hostname: {}", e))?;
+
+        // Crear /etc/hosts
+        let hosts_content = r#"127.0.0.1	localhost
+::1		localhost
+127.0.1.1	eclipse-os
+"#;
+        fs::write(format!("{}/etc/hosts", self.root_mount_point), hosts_content)
+            .map_err(|e| format!("Error creando /etc/hosts: {}", e))?;
+
+        // Crear /etc/fstab
+        let fstab_content = r#"# /etc/fstab: static file system information
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+proc            /proc           proc    defaults        0       0
+sysfs           /sys            sysfs   defaults        0       0
+devtmpfs        /dev            devtmpfs defaults       0       0
+tmpfs           /tmp            tmpfs   defaults        0       0
+"#;
+        fs::write(format!("{}/etc/fstab", self.root_mount_point), fstab_content)
+            .map_err(|e| format!("Error creando /etc/fstab: {}", e))?;
+
+        // Crear configuración de eclipse-systemd
+        let systemd_config = r#"# Eclipse OS Systemd Configuration
+[Unit]
+Description=Eclipse OS Init System
+Documentation=https://github.com/eclipse-os/eclipse-os
+
+[Service]
+Type=notify
+ExecStart=/sbin/eclipse-systemd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#;
+        fs::write(format!("{}/etc/eclipse/systemd/system/eclipse-systemd.service", self.root_mount_point), systemd_config)
+            .map_err(|e| format!("Error creando configuración de systemd: {}", e))?;
+
+        println!("     Archivos de configuración del sistema creados");
+        Ok(())
+    }
+
+    fn unmount_partitions(&self, disk: &DiskInfo) -> Result<(), String> {
+        println!("Desmontando particiones...");
+
+        // Desmontar partición root
+        let root_partition = format!("{}2", disk.name);
+        let output = std::process::Command::new("umount")
+            .args(&[&self.root_mount_point])
+            .output()
+            .map_err(|e| format!("Error ejecutando umount: {}", e))?;
+
+        if !output.status.success() {
+            println!("     Advertencia: No se pudo desmontar partición root: {}", String::from_utf8_lossy(&output.stderr));
+        } else {
+            println!("     Partición root desmontada");
+        }
+
+        // Desmontar partición EFI
+        let efi_partition = format!("{}1", disk.name);
+        let output = std::process::Command::new("umount")
+            .args(&[&self.efi_mount_point])
+            .output()
+            .map_err(|e| format!("Error ejecutando umount: {}", e))?;
+
+        if !output.status.success() {
+            println!("     Advertencia: No se pudo desmontar partición EFI: {}", String::from_utf8_lossy(&output.stderr));
+        } else {
+            println!("     Partición EFI desmontada");
+        }
+
+        // Limpiar directorios de montaje
+        let _ = fs::remove_dir(&self.root_mount_point);
+        let _ = fs::remove_dir(&self.efi_mount_point);
+
+        println!("   Particiones desmontadas");
         Ok(())
     }
 

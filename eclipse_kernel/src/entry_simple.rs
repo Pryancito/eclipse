@@ -8,11 +8,7 @@
 
 use core::panic::PanicInfo;
 
-/// Función de pánico personalizada
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+// panic_handler definido en lib.rs
 
 /// Función principal del kernel
 #[no_mangle]

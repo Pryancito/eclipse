@@ -571,40 +571,7 @@ impl InitSystem {
             
             // Enviar mensaje de inicio
             SERIAL.write_str("\n");
-            SERIAL.write_str("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-            SERIAL.write_str("║                        ECLIPSE-SYSTEMD INICIADO                              ║\n");
-            SERIAL.write_str("╚══════════════════════════════════════════════════════════════════════════════╝\n");
-            SERIAL.write_str("\n");
-            
-            // Información del proceso
-            SERIAL.write_str("Proceso init iniciado:\n");
-            SERIAL.write_str("  - Nombre: ");
-            SERIAL.write_str(init_process.name);
-            SERIAL.write_str("\n");
-            SERIAL.write_str("  - PID: ");
-            SERIAL.write_str(&int_to_string(init_process.pid as u64));
-            SERIAL.write_str("\n");
-            SERIAL.write_str("  - Ejecutable: ");
-            SERIAL.write_str(init_process.executable_path);
-            SERIAL.write_str("\n");
-            
-            // Variables de entorno importantes
-            SERIAL.write_str("\nVariables de entorno configuradas:\n");
-            for env_var in init_process.environment {
-                SERIAL.write_str("  - ");
-                SERIAL.write_str(env_var);
-                SERIAL.write_str("\n");
-            }
-            
-            // Estado del sistema
-            SERIAL.write_str("\nEstado del sistema:\n");
-            SERIAL.write_str("  - Init System: eclipse-systemd\n");
-            SERIAL.write_str("  - Display Server: Wayland\n");
-            SERIAL.write_str("  - Session Type: wayland\n");
-            SERIAL.write_str("  - Desktop Environment: Eclipse\n");
-            
-            SERIAL.write_str("\neclipse-systemd está listo y funcionando.\n");
-            SERIAL.write_str("Sistema Eclipse OS completamente inicializado.\n");
+            SERIAL.write_str("Pasando control a systemd...\n");
             SERIAL.write_str("\n");
         }
     }

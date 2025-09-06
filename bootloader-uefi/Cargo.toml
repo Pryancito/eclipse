@@ -16,11 +16,5 @@ lto = true
 codegen-units = 1
 opt-level = "s"
 
-[profile.release]
-panic = "abort"
-lto = true
-codegen-units = 1
-opt-level = "z"
-
 [package.metadata.cargo-xbuild]
 sysroot_path = "sysroot"

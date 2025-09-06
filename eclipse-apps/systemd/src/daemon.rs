@@ -18,6 +18,7 @@ use crate::target_manager::TargetManager;
 use crate::service_manager::ServiceManager;
 use crate::dependency_resolver::DependencyResolver;
 use crate::journald::JournalManager;
+use crate::serial_logger::SerialLogger;
 
 /// Estado de un servicio
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +57,8 @@ pub struct SystemdDaemon {
     dependency_resolver: Arc<DependencyResolver>,
     /// Manager del journal
     journal_manager: Arc<JournalManager>,
+    /// Logger serial
+    pub serial_logger: Arc<SerialLogger>,
     /// Estado del daemon
     is_running: Arc<RwLock<bool>>,
     /// Directorio de servicios
@@ -66,6 +69,7 @@ impl SystemdDaemon {
     /// Crea una nueva instancia del daemon systemd
     pub fn new(service_dir: &str) -> Result<Self> {
         let journal_manager = Arc::new(JournalManager::new("/var/log/eclipse-systemd/journal.json")?);
+        let serial_logger = Arc::new(SerialLogger::new());
         
         Ok(Self {
             services: Arc::new(RwLock::new(HashMap::new())),
@@ -74,6 +78,7 @@ impl SystemdDaemon {
             service_manager: Arc::new(ServiceManager::new()),
             dependency_resolver: Arc::new(DependencyResolver::new()),
             journal_manager,
+            serial_logger,
             is_running: Arc::new(RwLock::new(false)),
             service_dir: service_dir.to_string(),
         })
@@ -86,6 +91,9 @@ impl SystemdDaemon {
         // Registrar inicio en el journal
         self.journal_manager.log_info("systemd", "Iniciando Eclipse SystemD Daemon v0.2.0")?;
         
+        // Escribir mensaje de inicio a serial
+        self.serial_logger.write_system_startup().await?;
+        
         // Cargar todos los archivos .service
         self.load_service_files().await?;
         
@@ -96,6 +104,7 @@ impl SystemdDaemon {
         *self.is_running.write().await = true;
         
         self.journal_manager.log_info("systemd", "Daemon systemd inicializado correctamente")?;
+        self.serial_logger.write_info("systemd", "Daemon systemd inicializado correctamente").await?;
         info!("✅ Daemon systemd inicializado correctamente");
         Ok(())
     }
@@ -162,6 +171,7 @@ impl SystemdDaemon {
         }
 
         self.journal_manager.log_info("systemd", &format!("Servicios cargados: {} exitosos, {} con errores", loaded_count, error_count))?;
+        self.serial_logger.write_info("systemd", &format!("Servicios cargados: {} exitosos, {} con errores", loaded_count, error_count)).await?;
         info!("📊 Servicios cargados: {} exitosos, {} con errores", loaded_count, error_count);
         Ok(())
     }
@@ -418,6 +428,7 @@ impl SystemdDaemon {
     pub async fn shutdown(&self) {
         info!("🛑 Iniciando apagado del daemon systemd");
         self.journal_manager.log_info("systemd", "Iniciando apagado del daemon systemd").ok();
+        self.serial_logger.write_system_shutdown().await.ok();
         
         *self.is_running.write().await = false;
         

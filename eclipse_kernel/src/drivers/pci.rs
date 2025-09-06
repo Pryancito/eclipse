@@ -1,365 +1,324 @@
 //! Driver PCI para Eclipse OS
 //! 
-//! Basado en el driver PCI de Redox OS
+//! Implementa detección y configuración de dispositivos PCI
+//! para identificar hardware gráfico y otros dispositivos.
 
-use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
-    MAX_DEVICES,
-};
+use core::ptr;
 
-// Importar tipos necesarios para no_std
-use alloc::vec::Vec;
-
-// Configuración PCI
+/// Configuración de espacio de configuración PCI
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
-const PCI_MAX_BUSES: u8 = 255;
-const PCI_MAX_DEVICES: u8 = 32;
-const PCI_MAX_FUNCTIONS: u8 = 8;
 
-// Estructura de configuración PCI
+/// IDs de fabricantes de GPU conocidos
+pub const VENDOR_ID_INTEL: u16 = 0x8086;
+pub const VENDOR_ID_NVIDIA: u16 = 0x10DE;
+pub const VENDOR_ID_AMD: u16 = 0x1002;
+pub const VENDOR_ID_VIA: u16 = 0x1106;
+pub const VENDOR_ID_SIS: u16 = 0x1039;
+
+/// Clases de dispositivos PCI
+pub const CLASS_DISPLAY: u8 = 0x03;
+pub const SUBCLASS_VGA: u8 = 0x00;
+pub const SUBCLASS_3D: u8 = 0x02;
+
+/// Información de un dispositivo PCI
 #[derive(Debug, Clone, Copy)]
-pub struct PciConfigSpace {
-    pub vendor_id: u16,
-    pub device_id: u16,
-    pub command: u16,
-    pub status: u16,
-    pub revision_id: u8,
-    pub class_code: u8,
-    pub subclass: u8,
-    pub prog_if: u8,
-    pub cache_line_size: u8,
-    pub latency_timer: u8,
-    pub header_type: u8,
-    pub bist: u8,
-    pub bars: [u32; 6],
-    pub cardbus_cis_pointer: u32,
-    pub subsystem_vendor_id: u16,
-    pub subsystem_id: u16,
-    pub expansion_rom_base: u32,
-    pub capabilities_pointer: u8,
-    pub reserved: [u8; 7],
-    pub interrupt_line: u8,
-    pub interrupt_pin: u8,
-    pub min_gnt: u8,
-    pub max_lat: u8,
-}
-
-impl PciConfigSpace {
-    pub fn new() -> Self {
-        Self {
-            vendor_id: 0,
-            device_id: 0,
-            command: 0,
-            status: 0,
-            revision_id: 0,
-            class_code: 0,
-            subclass: 0,
-            prog_if: 0,
-            cache_line_size: 0,
-            latency_timer: 0,
-            header_type: 0,
-            bist: 0,
-            bars: [0; 6],
-            cardbus_cis_pointer: 0,
-            subsystem_vendor_id: 0,
-            subsystem_id: 0,
-            expansion_rom_base: 0,
-            capabilities_pointer: 0,
-            reserved: [0; 7],
-            interrupt_line: 0,
-            interrupt_pin: 0,
-            min_gnt: 0,
-            max_lat: 0,
-        }
-    }
-}
-
-// Información de dispositivo PCI
-#[derive(Debug, Clone)]
-pub struct PciDeviceInfo {
+pub struct PciDevice {
     pub bus: u8,
     pub device: u8,
     pub function: u8,
-    pub config: PciConfigSpace,
-    pub is_present: bool,
-    pub is_multifunction: bool,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub class_code: u8,
+    pub subclass_code: u8,
+    pub prog_if: u8,
+    pub revision_id: u8,
+    pub header_type: u8,
+    pub status: u16,
+    pub command: u16,
 }
 
-impl PciDeviceInfo {
-    pub fn new(bus: u8, device: u8, function: u8) -> Self {
-        Self {
-            bus,
-            device,
-            function,
-            config: PciConfigSpace::new(),
-            is_present: false,
-            is_multifunction: false,
+impl PciDevice {
+    /// Leer registro de configuración PCI
+    pub fn read_config(&self, offset: u8) -> u32 {
+        let address = 0x80000000u32
+            | ((self.bus as u32) << 16)
+            | ((self.device as u32) << 11)
+            | ((self.function as u32) << 8)
+            | ((offset as u32) & 0xFC);
+        
+        unsafe {
+            // Escribir dirección
+            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
+            // Leer datos
+            ptr::read_volatile(PCI_CONFIG_DATA as *mut u32)
         }
     }
-
-    pub fn get_address(&self) -> u32 {
-        ((self.bus as u32) << 16) | ((self.device as u32) << 11) | ((self.function as u32) << 8)
+    
+    /// Escribir registro de configuración PCI
+    pub fn write_config(&self, offset: u8, value: u32) {
+        let address = 0x80000000u32
+            | ((self.bus as u32) << 16)
+            | ((self.device as u32) << 11)
+            | ((self.function as u32) << 8)
+            | ((offset as u32) & 0xFC);
+        
+        unsafe {
+            // Escribir dirección
+            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
+            // Escribir datos
+            ptr::write_volatile(PCI_CONFIG_DATA as *mut u32, value);
+        }
     }
 }
 
-// Driver PCI base
-pub struct PciDriver {
-    pub info: DriverInfo,
-    pub devices: [Option<PciDeviceInfo>; MAX_DEVICES],
-    pub device_count: u32,
-    pub is_initialized: bool,
+/// Información específica de GPU
+#[derive(Debug, Clone, Copy)]
+pub struct GpuInfo {
+    pub pci_device: PciDevice,
+    pub gpu_type: GpuType,
+    pub memory_size: u64,
+    pub is_primary: bool,
+    pub supports_2d: bool,
+    pub supports_3d: bool,
+    pub max_resolution: (u32, u32),
 }
 
-impl PciDriver {
+/// Tipos de GPU
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GpuType {
+    Intel,
+    Nvidia,
+    Amd,
+    Via,
+    Sis,
+    Unknown,
+}
+
+impl GpuType {
+    pub fn from_vendor_id(vendor_id: u16) -> Self {
+        match vendor_id {
+            VENDOR_ID_INTEL => GpuType::Intel,
+            VENDOR_ID_NVIDIA => GpuType::Nvidia,
+            VENDOR_ID_AMD => GpuType::Amd,
+            VENDOR_ID_VIA => GpuType::Via,
+            VENDOR_ID_SIS => GpuType::Sis,
+            _ => GpuType::Unknown,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GpuType::Intel => "Intel",
+            GpuType::Nvidia => "NVIDIA",
+            GpuType::Amd => "AMD",
+            GpuType::Via => "VIA",
+            GpuType::Sis => "SiS",
+            GpuType::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Gestor del bus PCI
+pub struct PciManager {
+    devices: [Option<PciDevice>; 256],
+    device_count: usize,
+    gpus: [Option<GpuInfo>; 16],
+    gpu_count: usize,
+}
+
+impl PciManager {
     pub fn new() -> Self {
-        let mut info = DriverInfo::new();
-        info.set_name("pci");
-        info.device_type = DeviceType::Pci;
-        info.version = 1;
-
         Self {
-            info,
-            devices: [(); MAX_DEVICES].map(|_| None),
+            devices: [(); 256].map(|_| None),
             device_count: 0,
-            is_initialized: false,
+            gpus: [(); 16].map(|_| None),
+            gpu_count: 0,
         }
     }
-
-    /// Leer configuración PCI (simplificado)
-    pub fn read_config(&self, _bus: u8, _device: u8, _function: u8, _offset: u8) -> u32 {
-        // En un sistema real, aquí se haría la lectura real del hardware PCI
-        // Por ahora, retornamos valores simulados
-        0x12345678
-    }
-
-    /// Escribir configuración PCI (simplificado)
-    pub fn write_config(&self, _bus: u8, _device: u8, _function: u8, _offset: u8, _value: u32) {
-        // En un sistema real, aquí se haría la escritura real del hardware PCI
-        // Por ahora, no hacemos nada
-    }
-
-    /// Detectar dispositivos PCI
-    pub fn detect_devices(&mut self) -> DriverResult<()> {
-        for bus in 0..PCI_MAX_BUSES {
-            for device in 0..PCI_MAX_DEVICES {
-                let mut device_info = PciDeviceInfo::new(bus, device, 0);
-                
-                // Leer vendor ID y device ID
-                let vendor_device = self.read_config(bus, device, 0, 0);
-                let vendor_id = (vendor_device & 0xFFFF) as u16;
-                let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
-                
-                if vendor_id == 0xFFFF {
-                    continue; // Dispositivo no presente
-                }
-                
-                device_info.config.vendor_id = vendor_id;
-                device_info.config.device_id = device_id;
-                device_info.is_present = true;
-                
-                // Leer header type
-                let header_type = self.read_config(bus, device, 0, 0x0C);
-                device_info.config.header_type = ((header_type >> 16) & 0xFF) as u8;
-                device_info.is_multifunction = (device_info.config.header_type & 0x80) != 0;
-                
-                // Leer class code
-                let class_revision = self.read_config(bus, device, 0, 0x08);
-                device_info.config.revision_id = (class_revision & 0xFF) as u8;
-                device_info.config.prog_if = ((class_revision >> 8) & 0xFF) as u8;
-                device_info.config.subclass = ((class_revision >> 16) & 0xFF) as u8;
-                device_info.config.class_code = ((class_revision >> 24) & 0xFF) as u8;
-                
-                // Leer BARs
-                for i in 0..6 {
-                    device_info.config.bars[i] = self.read_config(bus, device, 0, (0x10 + i * 4) as u8);
-                }
-                
-                // Leer interrupt line y pin
-                let interrupt_info = self.read_config(bus, device, 0, 0x3C);
-                device_info.config.interrupt_line = (interrupt_info & 0xFF) as u8;
-                device_info.config.interrupt_pin = ((interrupt_info >> 8) & 0xFF) as u8;
-                
-                // Verificar si es multifunción antes de mover
-                let is_multifunction = device_info.is_multifunction;
-                
-                // Agregar dispositivo
-                self.add_device(device_info)?;
-                
-                // Si es multifunción, detectar otras funciones
-                if is_multifunction {
-                    for function in 1..PCI_MAX_FUNCTIONS {
-                        let vendor_device = self.read_config(bus, device, function, 0);
-                        let vendor_id = (vendor_device & 0xFFFF) as u16;
-                        
-                        if vendor_id != 0xFFFF {
-                            let mut func_info = PciDeviceInfo::new(bus, device, function);
-                            func_info.config.vendor_id = vendor_id;
-                            func_info.config.device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
-                            func_info.is_present = true;
+    
+    /// Escanear todos los dispositivos PCI
+    pub fn scan_devices(&mut self) {
+        self.device_count = 0;
+        self.gpu_count = 0;
+        
+        // Escanear todos los buses (0-255)
+        for bus in 0..=255 {
+            // Escanear todos los dispositivos en el bus (0-31)
+            for device in 0..32 {
+                // Escanear todas las funciones (0-7)
+                for function in 0..8 {
+                    if let Some(pci_device) = self.read_pci_device(bus, device, function) {
+                        // Verificar si es un dispositivo válido
+                        if pci_device.vendor_id != 0xFFFF {
+                            self.add_device(pci_device);
                             
-                            // Leer configuración de la función
-                            let class_revision = self.read_config(bus, device, function, 0x08);
-                            func_info.config.revision_id = (class_revision & 0xFF) as u8;
-                            func_info.config.prog_if = ((class_revision >> 8) & 0xFF) as u8;
-                            func_info.config.subclass = ((class_revision >> 16) & 0xFF) as u8;
-                            func_info.config.class_code = ((class_revision >> 24) & 0xFF) as u8;
-                            
-                            self.add_device(func_info)?;
+                            // Si es una GPU, agregarla a la lista
+                            if self.is_gpu_device(&pci_device) {
+                                if let Some(gpu_info) = self.create_gpu_info(pci_device) {
+                                    self.add_gpu(gpu_info);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+    
+    /// Leer información de un dispositivo PCI específico
+    fn read_pci_device(&self, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
+        // Leer vendor ID y device ID
+        let vendor_device = self.read_config_dword(bus, device, function, 0x00);
+        let vendor_id = (vendor_device & 0xFFFF) as u16;
+        let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
         
-        Ok(())
-    }
-
-    /// Agregar dispositivo PCI
-    pub fn add_device(&mut self, device_info: PciDeviceInfo) -> DriverResult<()> {
-        if self.device_count >= MAX_DEVICES as u32 {
-            return Err(DriverError::OutOfMemory);
-        }
-
-        for i in 0..MAX_DEVICES {
-            if self.devices[i].is_none() {
-                self.devices[i] = Some(device_info);
-                self.device_count += 1;
-                return Ok(());
-            }
-        }
-
-        Err(DriverError::OutOfMemory)
-    }
-
-    /// Obtener dispositivo PCI por dirección
-    pub fn get_device(&self, bus: u8, device: u8, function: u8) -> Option<&PciDeviceInfo> {
-        for i in 0..MAX_DEVICES {
-            if let Some(ref pci_device) = self.devices[i] {
-                if pci_device.bus == bus && pci_device.device == device && pci_device.function == function {
-                    return Some(pci_device);
-                }
-            }
-        }
-        None
-    }
-
-    /// Listar dispositivos por clase
-    pub fn list_devices_by_class(&self, class_code: u8, subclass: u8) -> Vec<u32> {
-        let mut devices = Vec::new();
-        for i in 0..MAX_DEVICES {
-            if let Some(ref device) = self.devices[i] {
-                if device.config.class_code == class_code && device.config.subclass == subclass {
-                    devices.push(device.get_address());
-                }
-            }
-        }
-        devices
-    }
-
-    /// Obtener estadísticas PCI
-    pub fn get_pci_stats(&self) -> PciStats {
-        let mut stats = PciStats::new();
-        
-        for i in 0..MAX_DEVICES {
-            if let Some(ref device) = self.devices[i] {
-                stats.total_devices += 1;
-                
-                match device.config.class_code {
-                    0x01 => stats.storage_devices += 1,  // Mass storage
-                    0x02 => stats.network_devices += 1,  // Network
-                    0x03 => stats.video_devices += 1,    // Display
-                    0x04 => stats.audio_devices += 1,    // Multimedia
-                    0x06 => stats.bridge_devices += 1,   // Bridge
-                    _ => stats.other_devices += 1,
-                }
-                
-                if device.is_present {
-                    stats.active_devices += 1;
-                }
-            }
+        // Si vendor ID es 0xFFFF, el dispositivo no existe
+        if vendor_id == 0xFFFF {
+            return None;
         }
         
-        stats
+        // Leer command y status
+        let command_status = self.read_config_dword(bus, device, function, 0x04);
+        let command = (command_status & 0xFFFF) as u16;
+        let status = ((command_status >> 16) & 0xFFFF) as u16;
+        
+        // Leer class code, subclass, prog if, revision
+        let class_revision = self.read_config_dword(bus, device, function, 0x08);
+        let revision_id = (class_revision & 0xFF) as u8;
+        let prog_if = ((class_revision >> 8) & 0xFF) as u8;
+        let subclass_code = ((class_revision >> 16) & 0xFF) as u8;
+        let class_code = ((class_revision >> 24) & 0xFF) as u8;
+        
+        // Leer header type
+        let header_type = (self.read_config_dword(bus, device, function, 0x0C) >> 16) as u8;
+        
+        Some(PciDevice {
+            bus,
+            device,
+            function,
+            vendor_id,
+            device_id,
+            class_code,
+            subclass_code,
+            prog_if,
+            revision_id,
+            header_type,
+            status,
+            command,
+        })
+    }
+    
+    /// Leer un dword de configuración PCI
+    fn read_config_dword(&self, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        let address = 0x80000000u32
+            | ((bus as u32) << 16)
+            | ((device as u32) << 11)
+            | ((function as u32) << 8)
+            | ((offset as u32) & 0xFC);
+        
+        unsafe {
+            // Escribir dirección
+            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
+            // Leer datos
+            ptr::read_volatile(PCI_CONFIG_DATA as *mut u32)
+        }
+    }
+    
+    /// Agregar dispositivo a la lista
+    fn add_device(&mut self, device: PciDevice) {
+        if self.device_count < self.devices.len() {
+            self.devices[self.device_count] = Some(device);
+            self.device_count += 1;
+        }
+    }
+    
+    /// Verificar si un dispositivo es una GPU
+    fn is_gpu_device(&self, device: &PciDevice) -> bool {
+        device.class_code == CLASS_DISPLAY && 
+        (device.subclass_code == SUBCLASS_VGA || device.subclass_code == SUBCLASS_3D)
+    }
+    
+    /// Crear información de GPU a partir de dispositivo PCI
+    fn create_gpu_info(&self, device: PciDevice) -> Option<GpuInfo> {
+        let gpu_type = GpuType::from_vendor_id(device.vendor_id);
+        
+        // Obtener información específica de la GPU
+        let (memory_size, supports_2d, supports_3d, max_resolution) = 
+            self.get_gpu_capabilities(&device, gpu_type);
+        
+        Some(GpuInfo {
+            pci_device: device,
+            gpu_type,
+            memory_size,
+            is_primary: self.gpu_count == 0, // Primera GPU es la primaria
+            supports_2d,
+            supports_3d,
+            max_resolution,
+        })
+    }
+    
+    /// Obtener capacidades de la GPU
+    fn get_gpu_capabilities(&self, device: &PciDevice, gpu_type: GpuType) -> (u64, bool, bool, (u32, u32)) {
+        match gpu_type {
+            GpuType::Intel => {
+                // Intel Graphics - capacidades básicas
+                (256 * 1024 * 1024, true, false, (1920, 1080)) // 256MB, 2D, 1920x1080
+            },
+            GpuType::Nvidia => {
+                // NVIDIA - capacidades avanzadas
+                (1024 * 1024 * 1024, true, true, (3840, 2160)) // 1GB, 2D+3D, 4K
+            },
+            GpuType::Amd => {
+                // AMD - capacidades avanzadas
+                (512 * 1024 * 1024, true, true, (2560, 1440)) // 512MB, 2D+3D, 1440p
+            },
+            _ => {
+                // GPU desconocida - capacidades mínimas
+                (64 * 1024 * 1024, true, false, (1024, 768)) // 64MB, 2D, 1024x768
+            }
+        }
+    }
+    
+    /// Agregar GPU a la lista
+    fn add_gpu(&mut self, gpu: GpuInfo) {
+        if self.gpu_count < self.gpus.len() {
+            self.gpus[self.gpu_count] = Some(gpu);
+            self.gpu_count += 1;
+        }
+    }
+    
+    /// Obtener lista de GPUs detectadas
+    pub fn get_gpus(&self) -> &[Option<GpuInfo>] {
+        &self.gpus[..self.gpu_count]
+    }
+    
+    /// Obtener GPU primaria
+    pub fn get_primary_gpu(&self) -> Option<&GpuInfo> {
+        self.gpus.iter()
+            .find_map(|gpu| gpu.as_ref())
+            .filter(|gpu| gpu.is_primary)
+    }
+    
+    /// Obtener número total de dispositivos
+    pub fn device_count(&self) -> usize {
+        self.device_count
+    }
+    
+    /// Obtener número total de GPUs
+    pub fn gpu_count(&self) -> usize {
+        self.gpu_count
+    }
+    
+    /// Obtener información de un dispositivo específico
+    pub fn get_device(&self, index: usize) -> Option<&PciDevice> {
+        self.devices.get(index)?.as_ref()
     }
 }
 
-impl Driver for PciDriver {
-    fn get_info(&self) -> &DriverInfo {
-        &self.info
-    }
-
-    fn initialize(&mut self) -> DriverResult<()> {
-        if self.is_initialized {
-            return Ok(());
-        }
-
-        self.info.is_loaded = true;
-        self.detect_devices()?;
-        self.is_initialized = true;
-        
-        Ok(())
-    }
-
-    fn cleanup(&mut self) -> DriverResult<()> {
-        for i in 0..MAX_DEVICES {
-            self.devices[i] = None;
-        }
-        self.device_count = 0;
-        self.info.is_loaded = false;
-        self.is_initialized = false;
-        Ok(())
-    }
-
-    fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
-        device_info.device_type == DeviceType::Pci
-    }
-
-    fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {
-        device.driver_id = Some(self.info.id);
-        Ok(())
-    }
-
-    fn detach_device(&mut self, _device_id: u32) -> DriverResult<()> {
-        Ok(())
-    }
-
-    fn handle_interrupt(&mut self, _device_id: u32) -> DriverResult<()> {
-        Ok(())
-    }
-}
-
-// Estadísticas PCI
-#[derive(Debug, Clone, Copy)]
-pub struct PciStats {
-    pub total_devices: u32,
-    pub active_devices: u32,
-    pub storage_devices: u32,
-    pub network_devices: u32,
-    pub video_devices: u32,
-    pub audio_devices: u32,
-    pub bridge_devices: u32,
-    pub other_devices: u32,
-}
-
-impl PciStats {
-    pub fn new() -> Self {
-        Self {
-            total_devices: 0,
-            active_devices: 0,
-            storage_devices: 0,
-            network_devices: 0,
-            video_devices: 0,
-            audio_devices: 0,
-            bridge_devices: 0,
-            other_devices: 0,
-        }
-    }
-}
-
-// Funciones de inicialización
-pub fn init_pci_drivers() -> DriverResult<()> {
-    // Inicializar driver PCI
-    Ok(())
+/// Función de conveniencia para escanear PCI
+pub fn scan_pci_devices() -> PciManager {
+    let mut manager = PciManager::new();
+    manager.scan_devices();
+    manager
 }

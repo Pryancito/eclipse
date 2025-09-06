@@ -40,6 +40,10 @@ pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
+pub mod uefi_framebuffer;
+pub mod desktop_ai;
+pub mod hardware_detection; // Detección de hardware PCI
+pub mod apps; // Aplicaciones interactivas
 pub mod eclipse_core;  // Módulo core nativo de Eclipse
 pub mod testing;  // Sistema de pruebas y validación
 pub mod init_system;  // Sistema de inicialización con systemd
@@ -52,6 +56,7 @@ pub mod idt;  // Interrupt Descriptor Table
 pub mod interrupts;  // Gestión de interrupciones y timers
 // pub mod real_integration;  // Integración real kernel-systemd (deshabilitado temporalmente)
 pub mod main_simple;
+pub mod main_unified;  // Main unificado con funcionalidades de escritorio
 pub mod main_with_init;  // Main con integración systemd
 pub mod vga_centered_display;
 pub mod wayland;  // Módulo para mostrar texto centrado en VGA
@@ -364,4 +369,20 @@ fn process_ai_events() -> KernelResult<()> {
     }
     
     Ok(())
+}
+
+/// Panic handler para el kernel Eclipse OS
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // En un kernel real, esto mostraría información de debug
+    // Por ahora, simplemente entramos en un bucle infinito
+    loop {
+        // En una implementación real, aquí se podría:
+        // - Mostrar información del panic en pantalla
+        // - Escribir logs de debug
+        // - Reiniciar el sistema
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
 }

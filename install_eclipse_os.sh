@@ -165,21 +165,31 @@ format_partitions() {
 install_bootloader() {
     local disk=$1
     local efi_partition="${disk}p1"
-    
+    local root_partition="${disk}p2"
+
     # Ajustar nombres de particiones según el tipo de disco
     if [ ! -b "$efi_partition" ]; then
         efi_partition="${disk}1"
+        root_partition="${disk}2"
     fi
-    
+
     echo "🔧 Instalando bootloader UEFI..."
-    
+
     # Crear directorios de montaje
     mkdir -p /mnt/eclipse-efi
-    
+    mkdir -p /mnt/eclipse
+
     # Montar partición EFI
     echo "   📁 Montando partición EFI..."
     if ! mount "$efi_partition" /mnt/eclipse-efi; then
         echo "❌ Error: No se pudo montar partición EFI"
+        return 1
+    fi
+
+    # Montar partición root
+    echo "   📁 Montando partición root..."
+    if ! mount "$root_partition" /mnt/eclipse; then
+        echo "❌ Error: No se pudo montar partición root"
         return 1
     fi
     

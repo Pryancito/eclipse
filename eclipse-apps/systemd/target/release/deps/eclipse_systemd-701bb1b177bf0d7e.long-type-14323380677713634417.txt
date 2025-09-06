@@ -1,1 +1,0 @@
-Arc<tokio::sync::RwLock<HashMap<std::string::String, RunningService>>>

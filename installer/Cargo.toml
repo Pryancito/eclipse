@@ -12,3 +12,15 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use eclipse_kernel::{initialize, process_events, KERNEL_VERSION, gui, testing as kernel_testing};
+use crate::{initialize, process_events, KERNEL_VERSION, gui, testing as kernel_testing};
 use boot_messages::{boot_banner, boot_progress, boot_success, boot_info, boot_warning, boot_error, boot_summary};
 
 // Módulo Multiboot2
@@ -247,17 +247,17 @@ fn initialize_kernel_components_with_messages() {
     
     // Paso 4: Inicializar sistema de drivers
     boot_progress(4, "DRIVER_MGR", "Inicializando sistema de gestión de drivers...");
-    eclipse_kernel::drivers::system::init_driver_manager();
+    crate::drivers::system::init_driver_manager();
     boot_success("DRIVER_MGR", "Sistema de drivers inicializado correctamente");
     
     // Paso 5: Inicializar gestor de almacenamiento
     boot_progress(5, "STORAGE", "Inicializando gestor de almacenamiento...");
-    eclipse_kernel::drivers::storage::init_storage_manager();
+    crate::drivers::storage::init_storage_manager();
     boot_success("STORAGE", "Gestor de almacenamiento inicializado correctamente");
     
     // Paso 6: Inicializar gestor de red
     boot_progress(6, "NETWORK", "Inicializando gestor de red...");
-    eclipse_kernel::drivers::network::init_network_manager();
+    crate::drivers::network::init_network_manager();
     boot_success("NETWORK", "Gestor de red inicializado correctamente");
     
     // Paso 7: Inicializar microkernel moderno
@@ -347,11 +347,11 @@ fn initialize_kernel_components_with_messages() {
     print_message("  [OK] Sistema de I/O inicializado");
     
     // Inicializar sistema de archivos
-    eclipse_kernel::filesystem::init();
+    crate::filesystem::init();
     print_message("  [OK] Sistema de archivos inicializado");
     
     // Inicializar VFS
-    eclipse_kernel::filesystem::vfs::init_vfs();
+    crate::filesystem::vfs::init_vfs();
     print_message("  [OK] VFS inicializado");
     
     // Inicializar driver FAT32
@@ -373,7 +373,7 @@ fn initialize_kernel_components_with_messages() {
     print_message("  [OK] Driver NTFS inicializado");
     
     // Inicializar sistema de red
-    eclipse_kernel::network::init_network();
+    crate::network::init_network();
     print_message("  [OK] Stack de red inicializado");
     
     // Inicializar driver de red
@@ -490,7 +490,7 @@ fn start_interactive_shell() -> ! {
         process_system_events();
         
         // Procesar cola de hilos
-        eclipse_kernel::thread::process_thread_queue();
+        crate::thread::process_thread_queue();
         
         // Procesar I/O pendiente
         io::process_io_queue();
@@ -499,10 +499,10 @@ fn start_interactive_shell() -> ! {
         // network_driver::process_network_queues();
         
         // Procesar eventos del sistema gráfico GUI
-        eclipse_kernel::gui::process_events();
+        crate::gui::process_events();
         
         // Actualizar la pantalla GUI
-        eclipse_kernel::gui::update_display();
+        crate::gui::update_display();
         
         // Procesar optimizaciones de rendimiento
         // performance::process_performance_optimizations();
@@ -567,15 +567,15 @@ fn show_system_stats() {
     print_message("Estadisticas del sistema:");
     
     // Estadísticas de memoria
-    let (total_pages, free_pages, used_pages) = eclipse_kernel::memory::get_memory_stats();
+    let (total_pages, free_pages, used_pages) = crate::memory::get_memory_stats();
     print_message("  Memoria: paginas libres de totales");
     
     // Estadísticas de procesos
-            let (running_procs, ready_procs, blocked_procs) = eclipse_kernel::process::get_process_stats();
+            let (running_procs, ready_procs, blocked_procs) = crate::process::get_process_stats();
     print_message("  Procesos: ejecutandose, listos, bloqueados");
     
     // Estadísticas de hilos
-    let (running_threads, ready_threads, blocked_threads) = eclipse_kernel::thread::get_thread_stats();
+    let (running_threads, ready_threads, blocked_threads) = crate::thread::get_thread_stats();
     print_message("  Hilos: ejecutandose, listos, bloqueados");
     
     // Estadísticas de I/O
@@ -583,12 +583,12 @@ fn show_system_stats() {
     print_message("  I/O: pendientes, en progreso, completadas");
     
     // Estadísticas del sistema de archivos
-    let (total_mounts, mounted_fs, open_files, total_files) = eclipse_kernel::filesystem::vfs::get_vfs_statistics();
+    let (total_mounts, mounted_fs, open_files, total_files) = crate::filesystem::vfs::get_vfs_statistics();
     print_message("  Sistema de archivos: VFS activo, FAT32 y NTFS montados");
     print_message("  VFS: montajes totales, sistemas montados, archivos abiertos, archivos totales");
     
     // Estadísticas de red
-    if let Some(stats) = eclipse_kernel::network::get_network_stats() {
+    if let Some(stats) = crate::network::get_network_stats() {
         print_message("  Red: paquetes enviados, recibidos, conexiones TCP");
     } else {
         print_message("  Red: stack no inicializado");
@@ -598,15 +598,15 @@ fn show_system_stats() {
     print_message("  Graficos: VGA activo, sistema de ventanas listo");
     
     // Estadísticas de drivers
-    let (total_drivers, running_drivers, loaded_drivers, error_drivers) = eclipse_kernel::drivers::system::get_driver_statistics();
+    let (total_drivers, running_drivers, loaded_drivers, error_drivers) = crate::drivers::system::get_driver_statistics();
     print_message("  Drivers: totales, ejecutandose, cargados, errores");
     
     // Estadísticas de almacenamiento
-    let (total_storage, ready_storage, error_storage) = eclipse_kernel::drivers::storage::get_storage_statistics();
+    let (total_storage, ready_storage, error_storage) = crate::drivers::storage::get_storage_statistics();
     print_message("  Almacenamiento: dispositivos totales, listos, errores");
     
     // Estadísticas de red
-    let (total_network, connected_network, error_network) = eclipse_kernel::drivers::network::get_network_statistics();
+    let (total_network, connected_network, error_network) = crate::drivers::network::get_network_statistics();
     print_message("   Red: dispositivos totales, conectados, errores");
     
     // Estadísticas del microkernel
@@ -787,12 +787,7 @@ unsafe impl alloc::alloc::GlobalAlloc for SimpleAllocator {
     }
 }
 
-/// Panic handler para el kernel
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // En un kernel real, esto podría mostrar información de debug
-    loop {}
-}
+// panic_handler definido en lib.rs
 
 /// Implementaciones de funciones C estándar para el kernel
 #[no_mangle]

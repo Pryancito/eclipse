@@ -284,7 +284,7 @@ pub fn generate_kernel_report() -> KernelResult<String> {
                 }
             }
         },
-        Err(e) => {
+        Err(_e) => {
             report.push_str("Error obteniendo estado de salud del kernel\n");
             syslog_err!("KERNEL_UTILS", "Error generando reporte de estado");
         }

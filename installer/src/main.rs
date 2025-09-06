@@ -238,7 +238,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     }
     
     // Copiar kernel
-    let kernel_source = "../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
+    let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
     let kernel_dest = format!("{}/eclipse_kernel", efi_mount);
     
     if Path::new(kernel_source).exists() {
@@ -250,7 +250,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     }
     
     // Copiar bootloader
-    let bootloader_source = "../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
+    let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
     let bootloader_dest = format!("{}/EFI/BOOT/BOOTX64.EFI", efi_mount);
     
     if Path::new(bootloader_source).exists() {

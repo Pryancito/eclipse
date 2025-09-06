@@ -6,9 +6,18 @@ edition = "2021"
 [dependencies]
 heapless = "0.8"
 
-[profile.release]
-panic = "abort"
-
 [[bin]]
 name = "text_editor"
 path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"

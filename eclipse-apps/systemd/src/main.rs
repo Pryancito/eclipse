@@ -4,6 +4,7 @@ mod target_manager;
 mod service_manager;
 mod dependency_resolver;
 mod journald;
+mod serial_logger;
 mod control;
 
 use anyhow::Result;
@@ -63,6 +64,9 @@ async fn run_daemon() -> Result<()> {
     // Mostrar estado del sistema
     let status = daemon.get_system_status().await;
     info!("📊 Estado del sistema: {}", status.get_summary());
+    
+    // Escribir estado del sistema a serial
+    daemon.serial_logger.write_system_status(&status.get_summary()).await.ok();
     
     // Configurar manejo de señales
     let daemon_clone = Arc::clone(&daemon);

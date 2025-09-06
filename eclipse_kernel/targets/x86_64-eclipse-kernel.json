@@ -11,16 +11,16 @@
   "linker": "rust-lld",
   "panic-strategy": "abort",
   "disable-redzone": true,
-  "features": "-mmx,-sse,+soft-float",
+  "features": "-mmx,-sse",
   "pre-link-args": {
     "ld.lld": [
-      "-T", "multiboot.ld",
+      "-T", "/home/moebius/eclipse/eclipse_kernel/linker.ld",
       "--gc-sections"
     ]
   },
   "post-link-args": {
     "ld.lld": [
-      "-T", "multiboot.ld"
+      "-T", "/home/moebius/eclipse/eclipse_kernel/linker.ld"
     ]
   }
 }

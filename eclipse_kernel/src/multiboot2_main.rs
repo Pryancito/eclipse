@@ -318,13 +318,7 @@ fn print_message(_msg: &str) {
     // TODO: Implementar salida por puerto serie
 }
 
-/// Panic handler
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    print_message("🚨 PANIC: Kernel panic detectado!");
-    print_message("📍 Ubicación: archivo:linea:columna");
-    print_message("💬 Mensaje: panic detectado");
-    print_message("🔄 Sistema en bucle infinito...");
+// panic_handler definido en lib.rs
     
     loop {
         unsafe {
