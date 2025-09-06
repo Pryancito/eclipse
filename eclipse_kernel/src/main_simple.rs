@@ -42,6 +42,44 @@ fn int_to_string(mut num: u64) -> heapless::String<32> {
 
 use core::fmt::Write;
 
+/// Función auxiliar para dibujar texto en framebuffer
+fn draw_text_to_framebuffer(fb: &mut crate::drivers::framebuffer::FramebufferDriver, text: &str, x: u32, y: u32, color: crate::drivers::framebuffer::Color) {
+    let mut current_x = x;
+    let char_width = 8;
+    let char_height = 16;
+    
+    for ch in text.chars() {
+        if current_x + char_width < fb.info.width && y + char_height < fb.info.height {
+            draw_char_to_framebuffer(fb, ch, current_x, y, color);
+            current_x += char_width;
+        } else {
+            break; // No hay más espacio
+        }
+    }
+}
+
+/// Función auxiliar para dibujar un carácter en framebuffer
+fn draw_char_to_framebuffer(fb: &mut crate::drivers::framebuffer::FramebufferDriver, ch: char, x: u32, y: u32, color: crate::drivers::framebuffer::Color) {
+    // Implementación simplificada de dibujo de caracteres
+    // Por ahora, solo dibujamos un rectángulo sólido para cada carácter
+    let char_width = 8;
+    let char_height = 16;
+    
+    // Verificar límites
+    if x + char_width > fb.info.width || y + char_height > fb.info.height {
+        return;
+    }
+    
+    // Para caracteres no espaciales, dibujar un rectángulo sólido
+    if ch != ' ' {
+        for dy in 0..char_height {
+            for dx in 0..char_width {
+                fb.put_pixel(x + dx, y + dy, color);
+            }
+        }
+    }
+}
+
 // Modos de gráficos
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GraphicsMode {
@@ -288,7 +326,7 @@ pub fn kernel_main() -> ! {
         crate::allocator::init_allocator();
     }
     
-    // Inicializar VGA
+    // Inicializar sistema de display (usar VGA por ahora)
     unsafe {
         VGA.init_vga_mode();
         VGA.set_color(Color::LightGreen, Color::Black);
@@ -300,6 +338,16 @@ pub fn kernel_main() -> ! {
         VGA.write_string("\n🦀 KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("==========================================\n\n");
+        
+        // Mostrar información de debug sobre el framebuffer
+        VGA.set_color(Color::LightCyan, Color::Black);
+        VGA.write_string("Debug: Usando VGA para display\n");
+        VGA.write_string("Debug: Framebuffer disponible: ");
+        if crate::drivers::framebuffer::is_framebuffer_available() {
+            VGA.write_string("Sí (pero usando VGA)\n");
+        } else {
+            VGA.write_string("No\n");
+        }
     }
     
     // Inicializar drivers básicos
