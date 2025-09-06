@@ -44,12 +44,11 @@ echo ""
 build_kernel() {
     print_step "Compilando kernel Eclipse OS v0.5.0..."
     
-    cd eclipse_kernel
-    
     # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
-    RUSTFLAGS="-Clink-arg=-T/home/moebius/eclipse/eclipse_kernel/linker.ld -C link-arg=--gc-sections" cargo build --release --target "$KERNEL_TARGET"
-    
+    cd eclipse_kernel
+    cargo build --target x86_64-unknown-none --release
+
     if [ $? -eq 0 ]; then
         print_success "Kernel compilado exitosamente"
         
@@ -63,7 +62,6 @@ build_kernel() {
         print_error "Error al compilar el kernel"
         return 1
     fi
-    
     cd ..
 }
 
@@ -193,12 +191,13 @@ create_basic_distribution() {
     mkdir -p "$BUILD_DIR"/{boot,efi/boot,userland/{bin,lib,config}}
     
     # Copiar el kernel
-    if [ -f "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
-        cp "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" "$BUILD_DIR/boot/"
+    if [ -f "target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
+        cp "target/$KERNEL_TARGET/release/eclipse_kernel" "$BUILD_DIR/boot/"
         print_status "Kernel copiado a la distribución"
     else
         print_error "Kernel no encontrado - no se puede crear la distribución"
-        exit 1
+        print_status "Continuando sin kernel..."
+        # No salir, continuar con otros componentes
     fi
     
     # Copiar el bootloader UEFI si existe
@@ -308,6 +307,14 @@ EOF
         print_success "Módulos userland copiados a la distribución"
     fi
     
+    # Copiar el instalador si existe
+    if [ -f "target/release/eclipse-installer" ]; then
+        cp "target/release/eclipse-installer" "$BUILD_DIR/userland/bin/"
+        print_status "Instalador copiado a la distribución"
+    else
+        print_status "Instalador no encontrado - no se puede copiar"
+    fi
+    
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
 # Configuración UEFI para Eclipse OS v0.5.0
@@ -334,12 +341,19 @@ show_build_summary() {
     echo "  Distribución básica: $BUILD_DIR/"
     echo ""
     echo "Componentes compilados:"
-    echo "  Kernel Eclipse OS: eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel"
+    echo "  Kernel Eclipse OS: target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
     echo "  Instalador: installer/target/release/eclipse-installer"
     echo "  Systemd: eclipse-apps/systemd/target/release/eclipse-systemd"
     echo "  Userland: Módulos compilados e instalados"
     echo "  Sistema DRM: userland/drm_display/target/release/libdrm_display.rlib"
+    echo ""
+    echo "Distribución creada en: $BUILD_DIR/"
+    echo "  - Kernel: $BUILD_DIR/boot/eclipse_kernel"
+    echo "  - Bootloader: $BUILD_DIR/efi/boot/bootx64.efi"
+    echo "  - Instalador: $BUILD_DIR/userland/bin/eclipse-installer"
+    echo "  - Systemd: $BUILD_DIR/userland/bin/eclipse-systemd"
+    echo "  - Userland: $BUILD_DIR/userland/bin/eclipse_userland"
     echo ""
     echo "Eclipse OS v0.5.0 está listo para usar!"
 }

@@ -265,7 +265,7 @@ impl DirectInstaller {
 
         // Copiar bootloader
         println!("   Instalando bootloader...");
-        let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
+        let bootloader_source = "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
         
         if !Path::new(bootloader_source).exists() {
             return Err("Bootloader no encontrado. Ejecuta 'cd bootloader-uefi && ./build.sh' primero".to_string());
@@ -279,7 +279,7 @@ impl DirectInstaller {
 
         // Copiar kernel
         println!("   Instalando kernel...");
-        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
+        let kernel_source = "target/x86_64-unknown-none/release/eclipse_kernel";
 
         if !Path::new(kernel_source).exists() {
             return Err("Kernel no encontrado. Ejecuta 'cd eclipse_kernel && cargo build --release' primero".to_string());
@@ -324,7 +324,7 @@ impl DirectInstaller {
         Ok(())
     }
 
-    fn install_eclipse_systemd(&self, disk: &DiskInfo) -> Result<(), String> {
+    fn install_eclipse_systemd(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("   Instalando eclipse-systemd...");
         let systemd_source = "../eclipse-apps/systemd/target/release/eclipse-systemd";
 
@@ -401,7 +401,7 @@ impl DirectInstaller {
         Ok(())
     }
 
-    fn install_system_apps(&self, disk: &DiskInfo) -> Result<(), String> {
+    fn install_system_apps(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("   Instalando aplicaciones del sistema...");
 
         // Crear directorios del sistema
@@ -504,29 +504,53 @@ WantedBy=multi-user.target
         println!("Desmontando particiones...");
 
         // Desmontar partición root
-        let root_partition = format!("{}2", disk.name);
-        let output = std::process::Command::new("umount")
-            .args(&[&self.root_mount_point])
-            .output()
-            .map_err(|e| format!("Error ejecutando umount: {}", e))?;
+        let _root_partition = format!("{}2", disk.name);
+        
+        // Verificar si el punto de montaje existe antes de desmontar
+        if std::path::Path::new(&self.root_mount_point).exists() {
+            let output = std::process::Command::new("umount")
+                .args(&[&self.root_mount_point])
+                .output();
 
-        if !output.status.success() {
-            println!("     Advertencia: No se pudo desmontar partición root: {}", String::from_utf8_lossy(&output.stderr));
+            match output {
+                Ok(result) => {
+                    if !result.status.success() {
+                        println!("     Advertencia: No se pudo desmontar partición root: {}", String::from_utf8_lossy(&result.stderr));
+                    } else {
+                        println!("     Partición root desmontada");
+                    }
+                }
+                Err(e) => {
+                    println!("     Advertencia: Error ejecutando umount para root: {}", e);
+                }
+            }
         } else {
-            println!("     Partición root desmontada");
+            println!("     Partición root ya desmontada o no montada");
         }
 
         // Desmontar partición EFI
-        let efi_partition = format!("{}1", disk.name);
-        let output = std::process::Command::new("umount")
-            .args(&[&self.efi_mount_point])
-            .output()
-            .map_err(|e| format!("Error ejecutando umount: {}", e))?;
+        let _efi_partition = format!("{}1", disk.name);
+        
+        // Verificar si el punto de montaje existe antes de desmontar
+        if std::path::Path::new(&self.efi_mount_point).exists() {
+            let output = std::process::Command::new("umount")
+                .args(&[&self.efi_mount_point])
+                .output();
 
-        if !output.status.success() {
-            println!("     Advertencia: No se pudo desmontar partición EFI: {}", String::from_utf8_lossy(&output.stderr));
+            match output {
+                Ok(result) => {
+                    if !result.status.success() {
+                        println!("     Advertencia: No se pudo desmontar partición EFI: {}", String::from_utf8_lossy(&result.stderr));
+                    } else {
+                        println!("     Partición EFI desmontada");
+                    }
+                }
+                Err(e) => {
+                    println!("     Advertencia: Error ejecutando umount para EFI: {}", e);
+                }
+            }
         } else {
-            println!("     Partición EFI desmontada");
+            println!("     Partición EFI ya desmontada o no montada");
         }
 
         // Limpiar directorios de montaje
@@ -537,7 +561,7 @@ WantedBy=multi-user.target
         Ok(())
     }
 
-    fn install_userland(&self, disk: &DiskInfo) -> Result<(), String> {
+    fn install_userland(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("Instalando modulos userland...");
 
         // Crear directorio para userland
@@ -601,7 +625,7 @@ userland_memory = "256M"
         Ok(())
     }
 
-    fn create_config_files(&self, disk: &DiskInfo) -> Result<(), String> {
+    fn create_config_files(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("Creando archivos de configuracion...");
 
         // Crear configuración UEFI personalizada

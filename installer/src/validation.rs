@@ -20,8 +20,8 @@ impl SystemValidator {
                 "lsblk",
             ],
             required_files: vec![
-                "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel",
-                "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
+                "target/x86_64-unknown-none/release/eclipse_kernel",
+                "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
             ],
         }
     }
@@ -135,10 +135,10 @@ impl SystemValidator {
         println!("   Validando módulos userland...");
         
         let userland_modules = vec![
-            "../userland/module_loader/target/release/module_loader",
-            "../userland/graphics_module/target/release/graphics_module", 
-            "../userland/app_framework/target/release/app_framework",
-            "../userland/target/release/eclipse-userland",
+            "target/release/module_loader",
+            "target/release/graphics_module", 
+            "target/release/app_framework",
+            "target/release/eclipse_userland",
         ];
         
         let mut missing_modules = Vec::new();

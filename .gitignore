@@ -2,3 +2,5 @@ eclipse-os-complete/
 test_disk.img
 eclipse-os-build/
 eclipse-os.img
+*/target/
+target/

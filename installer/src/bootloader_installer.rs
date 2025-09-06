@@ -141,7 +141,7 @@ args=quiet splash
         Ok(())
     }
     
-    fn create_uefi_menu_entry(&self, disk: &DiskInfo) -> Result<(), String> {
+    fn create_uefi_menu_entry(&self, _disk: &DiskInfo) -> Result<(), String> {
         let menu_entry = format!(r#"# Eclipse OS UEFI Menu Entry
 # ==========================
 

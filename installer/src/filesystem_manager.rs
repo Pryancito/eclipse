@@ -177,7 +177,7 @@ impl FilesystemManager {
         
         for (link, target) in symlinks {
             let link_path = format!("{}/{}", self.root_mount_point, link);
-            let target_path = format!("{}/{}", self.root_mount_point, target);
+            let _target_path = format!("{}/{}", self.root_mount_point, target);
             
             if !Path::new(&link_path).exists() {
                 std::os::unix::fs::symlink(target, &link_path)
@@ -201,7 +201,7 @@ impl FilesystemManager {
             ("/sys", 0o555),
         ];
         
-        for (path, mode) in permissions {
+        for (path, _mode) in permissions {
             let full_path = format!("{}{}", self.root_mount_point, path);
             if Path::new(&full_path).exists() {
                 // En un sistema real, usaríamos chmod aquí

@@ -1,7 +1,4 @@
 use std::io::{self, Write};
-use std::process::Command;
-use std::fs;
-use std::path::Path;
 
 mod disk_manager;
 mod partition_manager;
@@ -12,9 +9,6 @@ mod uefi_config;
 mod validation;
 
 use disk_manager::DiskManager;
-use partition_manager::PartitionManager;
-use bootloader_installer::BootloaderInstaller;
-use filesystem_manager::FilesystemManager;
 use direct_installer::DirectInstaller;
 use validation::{SystemValidator, is_uefi_system, is_secure_boot_enabled};
 
@@ -211,118 +205,6 @@ fn show_help() {
     println!();
 }
 
-fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
-    println!("Instalando archivos del sistema...");
-    
-    // Montar partición EFI
-    let efi_mount = "/mnt/eclipse-efi";
-    if !Path::new(efi_mount).exists() {
-        fs::create_dir_all(efi_mount).map_err(|e| format!("Error creando directorio EFI: {}", e))?;
-    }
-    
-    // Montar la partición EFI
-    let efi_partition = format!("{}1", disk.name);
-    let mount_output = std::process::Command::new("mount")
-        .args(&[&efi_partition, efi_mount])
-        .output()
-        .map_err(|e| format!("Error ejecutando mount: {}", e))?;
-
-    if !mount_output.status.success() {
-        return Err(format!("Error montando partición EFI: {}", String::from_utf8_lossy(&mount_output.stderr)));
-    }
-    
-    // Montar partición root
-    let root_mount = "/mnt/eclipse-root";
-    if !Path::new(root_mount).exists() {
-        fs::create_dir_all(root_mount).map_err(|e| format!("Error creando directorio root: {}", e))?;
-    }
-    
-    // Copiar kernel
-    let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
-    let kernel_dest = format!("{}/eclipse_kernel", efi_mount);
-    
-    if Path::new(kernel_source).exists() {
-        fs::copy(kernel_source, &kernel_dest)
-            .map_err(|e| format!("Error copiando kernel: {}", e))?;
-        println!("   Kernel copiado");
-    } else {
-        return Err("Kernel no encontrado. Ejecuta 'cargo build --release' primero.".to_string());
-    }
-    
-    // Copiar bootloader
-    let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
-    let bootloader_dest = format!("{}/EFI/BOOT/BOOTX64.EFI", efi_mount);
-    
-    if Path::new(bootloader_source).exists() {
-        fs::create_dir_all(format!("{}/EFI/BOOT", efi_mount))
-            .map_err(|e| format!("Error creando directorio EFI/BOOT: {}", e))?;
-        
-        fs::copy(bootloader_source, &bootloader_dest)
-            .map_err(|e| format!("Error copiando bootloader: {}", e))?;
-        println!("   Bootloader copiado");
-    } else {
-        return Err("Bootloader no encontrado. Ejecuta 'cd bootloader-uefi && ./build.sh' primero.".to_string());
-    }
-    
-    // Crear archivos de configuración
-    create_config_files(efi_mount)?;
-    
-    // Desmontar partición EFI
-    let umount_output = std::process::Command::new("umount")
-        .arg(efi_mount)
-        .output()
-        .map_err(|e| format!("Error ejecutando umount: {}", e))?;
-
-    if !umount_output.status.success() {
-        eprintln!("Advertencia: Error desmontando partición EFI: {}", String::from_utf8_lossy(&umount_output.stderr));
-    }
-    
-    Ok(())
-}
-
-fn create_config_files(efi_mount: &str) -> Result<(), String> {
-    // Crear README
-    let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
-=====================================
-
-Versión: 0.5.0
-Arquitectura: x86_64
-Tipo: Instalación en disco
-
-Características:
-- Kernel microkernel en Rust
-- Bootloader UEFI personalizado
-- Sistema de archivos optimizado
-- Interfaz gráfica moderna
-
-Desarrollado con amor en Rust
-"#;
-    
-    fs::write(format!("{}/README.txt", efi_mount), readme_content)
-        .map_err(|e| format!("Error creando README: {}", e))?;
-    
-    // Crear archivo de configuración del bootloader
-    let boot_config = r#"# Eclipse OS Boot Configuration
-# =============================
-
-KERNEL_PATH=/eclipse_kernel
-INITRD_PATH=
-BOOT_ARGS=quiet splash
-TIMEOUT=5
-DEFAULT_ENTRY=eclipse
-
-[entry:eclipse]
-title=Eclipse OS
-kernel=/eclipse_kernel
-args=quiet splash
-"#;
-    
-    fs::write(format!("{}/boot.conf", efi_mount), boot_config)
-        .map_err(|e| format!("Error creando configuración de boot: {}", e))?;
-    
-        println!("   Archivos de configuración creados");
-    Ok(())
-}
 
 fn is_root() -> bool {
     unsafe {
