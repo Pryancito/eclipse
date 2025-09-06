@@ -270,6 +270,9 @@ macro_rules! syslog_warn {
     ($tag:expr, $msg:expr) => {
         crate::syslog::log_kernel(crate::syslog::SyslogSeverity::Warning, $tag, $msg);
     };
+    ($tag:expr, $msg:expr, $($arg:expr),*) => {
+        crate::syslog::log_kernel(crate::syslog::SyslogSeverity::Warning, $tag, &alloc::format!($msg, $($arg),*));
+    };
 }
 
 #[macro_export]
@@ -283,6 +286,9 @@ macro_rules! syslog_notice {
 macro_rules! syslog_info {
     ($tag:expr, $msg:expr) => {
         crate::syslog::log_kernel(crate::syslog::SyslogSeverity::Info, $tag, $msg);
+    };
+    ($tag:expr, $msg:expr, $($arg:expr),*) => {
+        crate::syslog::log_kernel(crate::syslog::SyslogSeverity::Info, $tag, &alloc::format!($msg, $($arg),*));
     };
 }
 

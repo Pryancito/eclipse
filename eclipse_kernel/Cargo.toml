@@ -19,6 +19,10 @@ path = "src/main.rs"
 [dependencies]
 heapless = "0.8"
 linked_list_allocator = "0.10"
+# Dependencias para modelos de IA pre-entrenados (simuladas)
+# candle-core = { version = "0.3", optional = true }
+# candle-nn = { version = "0.3", optional = true }
+# candle-transformers = { version = "0.3", optional = true }
 
 [features]
 default = ["no_std", "alloc"]
@@ -26,6 +30,8 @@ no_std = []
 hardware-debug = []
 safe-init = []
 alloc = []
+# Características para modelos de IA (implementación simulada)
+ai-models = []
 
 [profile.dev]
 panic = "abort"

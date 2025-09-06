@@ -8,6 +8,14 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
+/// Panic handler para el kernel
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // En un kernel real, aquí se manejaría el panic de manera segura
+    // Por ahora, simplemente entramos en un bucle infinito
+    loop {}
+}
+
 /// Allocator simple para el kernel
 // Allocator global definido en allocator.rs
 
@@ -48,6 +56,10 @@ pub mod ai_integration;  // Integración profunda de IA en el kernel
 pub mod ai_communication;  // Sistema de comunicación bidireccional con IA
 pub mod ai_control;  // Control del sistema operativo por IA
 pub mod ai_interface;  // Interfaz de usuario para interacción con IA
+pub mod ai_pretrained_models;  // Sistema de modelos de IA pre-entrenados
+pub mod ai_model_demo;  // Demostración de modelos de IA pre-entrenados
+pub mod ai_desktop_integration;  // Integración de IA con el escritorio
+pub mod ai_simple_demo;  // Demostración simple de IA
 pub mod syslog;  // Sistema de logging similar a syslog
 pub mod metrics;  // Sistema de métricas y monitoreo del kernel
 pub mod config;  // Sistema de configuración dinámica del kernel
@@ -292,6 +304,24 @@ pub fn initialize() -> KernelResult<()> {
             e
         })?;
     syslog_info!("AI_UI", "Interfaz de IA inicializada correctamente");
+    
+    // Inicializar sistema de modelos pre-entrenados
+    syslog_info!("AI_MODELS", "Inicializando sistema de modelos pre-entrenados");
+    ai_pretrained_models::init_pretrained_models()
+        .map_err(|e| {
+            syslog_err!("AI_MODELS", "Error inicializando modelos pre-entrenados");
+            e
+        })?;
+    syslog_info!("AI_MODELS", "Sistema de modelos pre-entrenados inicializado correctamente");
+
+    // Inicializar demostración simple de IA
+    syslog_info!("AI_DEMO", "Inicializando demostración simple de IA");
+    ai_simple_demo::init_simple_ai_demo()
+        .map_err(|e| {
+            syslog_err!("AI_DEMO", "Error inicializando demostración de IA");
+            e
+        })?;
+    syslog_info!("AI_DEMO", "Demostración simple de IA inicializada correctamente");
     
     // Kernel nativo de Eclipse con IA integrada inicializado correctamente
     syslog_info!("KERNEL", "Kernel nativo de Eclipse con IA integrada inicializado correctamente");

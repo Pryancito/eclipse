@@ -392,7 +392,7 @@ pub fn kernel_main() -> ! {
             VGA.write_string("  - ");
             VGA.write_string(gpu_info.gpu_type.as_str());
             VGA.write_string(" ");
-            VGA.write_string(&format!("{:04X}:{:04X}", gpu_info.pci_device.vendor_id, gpu_info.pci_device.device_id));
+            VGA.write_string(&alloc::format!("{:04X}:{:04X}", gpu_info.pci_device.vendor_id, gpu_info.pci_device.device_id));
             VGA.write_string(" (");
             VGA.write_string(&int_to_string(gpu_info.memory_size / (1024 * 1024)));
             VGA.write_string("MB)\n");
@@ -811,7 +811,7 @@ pub fn kernel_main() -> ! {
         }
         
         // Demostrar operaciones de aceleración 2D
-        let demo_operations = alloc::vec![
+        let demo_operations = [
             AccelerationOperation::ClearScreen(FbColor { r: 0, g: 0, b: 128, a: 255 }), // Fondo azul
             AccelerationOperation::FillRect(Rect { x: 100, y: 100, width: 200, height: 150 }, FbColor { r: 255, g: 0, b: 0, a: 255 }), // Rectángulo rojo
             AccelerationOperation::DrawRect(Rect { x: 120, y: 120, width: 160, height: 110 }, FbColor { r: 255, g: 255, b: 0, a: 255 }, 3), // Rectángulo amarillo
@@ -1437,10 +1437,36 @@ pub fn kernel_main() -> ! {
         VGA.set_color(Color::White, Color::Black);
     }
     
+    // Ejecutar demostración de IA
+    unsafe {
+        VGA.set_color(Color::Yellow, Color::Black);
+        VGA.write_string("\n🤖 EJECUTANDO DEMOSTRACIÓN DE IA...\n");
+        VGA.set_color(Color::White, Color::Black);
+    }
+    
+    match crate::ai_simple_demo::run_simple_ai_demo() {
+        Ok(_) => {
+            unsafe {
+                VGA.set_color(Color::Green, Color::Black);
+                VGA.write_string("✅ Demostración de IA completada exitosamente\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+        Err(e) => {
+            unsafe {
+                VGA.set_color(Color::Red, Color::Black);
+                VGA.write_string("❌ Error en demostración de IA: ");
+                VGA.write_string(e);
+                VGA.write_string("\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+    }
+
     // Mostrar mensaje de que el kernel está listo
     unsafe {
         VGA.set_color(Color::Green, Color::Black);
-        VGA.write_string("\n✅ KERNEL ECLIPSE OS INICIALIZADO COMPLETAMENTE\n");
+        VGA.write_string("\n✅ KERNEL ECLIPSE OS CON IA INICIALIZADO COMPLETAMENTE\n");
         VGA.set_color(Color::LightBlue, Color::Black);
         VGA.write_string("🔄 Esperando que el userland tome el control...\n");
         VGA.set_color(Color::White, Color::Black);
@@ -1455,18 +1481,4 @@ pub fn kernel_main() -> ! {
     }
 }
 
-/// Panic handler para el kernel Eclipse OS
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    // En un kernel real, esto mostraría información de debug
-    // Por ahora, simplemente entramos en un bucle infinito
-    loop {
-        // En una implementación real, aquí se podría:
-        // - Mostrar información del panic en pantalla
-        // - Escribir logs de debug
-        // - Reiniciar el sistema
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}
+// Panic handler removido para evitar conflicto con std
