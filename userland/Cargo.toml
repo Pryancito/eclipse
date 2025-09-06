@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 libm = "0.2.2"
+heapless = "0.8"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
 
 [features]
 default = []
@@ -15,25 +19,5 @@ name = "eclipse_userland"
 path = "lib.rs"
 
 [[bin]]
-name = "wayland_terminal"
-path = "apps/wayland_terminal.rs"
-
-[[bin]]
-name = "wayland_calculator"
-path = "apps/wayland_calculator.rs"
-
-[[bin]]
-name = "wayland_text_editor"
-path = "apps/wayland_text_editor.rs"
-
-[[bin]]
-name = "wayland_app_manager"
-path = "apps/wayland_app_manager.rs"
-
-[[bin]]
-name = "simple_terminal"
-path = "apps/simple_terminal.rs"
-
-[[bin]]
-name = "wayland_terminal_simple"
-path = "apps/wayland_terminal_simple.rs"
+name = "eclipse_userland"
+path = "src/main.rs"

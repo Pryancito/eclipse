@@ -3,7 +3,7 @@ name = "eclipse_kernel"
 version = "0.4.0"
 edition = "2021"
 authors = ["Eclipse Rust Team"]
-description = "Kernel híbrido Eclipse-Redox en Rust"
+description = "Kernel nativo de Eclipse en Rust"
 
 [lib]
 name = "eclipse_kernel"

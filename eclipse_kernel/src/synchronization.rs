@@ -4,19 +4,24 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Mutex simple
+/// Mutex simple genérico
 #[derive(Debug)]
-pub struct Mutex {
+pub struct Mutex<T> {
     locked: AtomicBool,
     owner: AtomicU32,
+    data: core::cell::UnsafeCell<T>,
 }
 
-impl Mutex {
+// Implementar Sync para permitir uso en statics
+unsafe impl<T> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
     /// Crear un nuevo mutex
-    pub fn new() -> Self {
+    pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
             owner: AtomicU32::new(0),
+            data: core::cell::UnsafeCell::new(data),
         }
     }
     
@@ -44,6 +49,45 @@ impl Mutex {
     /// Verificar si está bloqueado
     pub fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Acquire)
+    }
+    
+    /// Adquirir el mutex (bloqueante)
+    pub fn lock(&self) -> Result<MutexGuard<T>, &'static str> {
+        // En una implementación real, esto sería bloqueante
+        // Por ahora, solo verificamos si está disponible
+        if self.is_locked() {
+            Err("Mutex ya está bloqueado")
+        } else {
+            self.try_lock(0); // Usar thread_id 0 para simplicidad
+            Ok(MutexGuard { 
+                mutex: self,
+                _phantom: core::marker::PhantomData,
+            })
+        }
+    }
+}
+
+/// Guard del mutex
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    _phantom: core::marker::PhantomData<T>,
+}
+
+impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &Self::Target {
+        // En una implementación real, esto devolvería una referencia al valor protegido
+        // Por ahora, devolvemos un puntero nulo (esto es solo para compilación)
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // En una implementación real, esto devolvería una referencia mutable al valor protegido
+        // Por ahora, devolvemos un puntero nulo (esto es solo para compilación)
+        unsafe { &mut *self.mutex.data.get() }
     }
 }
 
@@ -91,7 +135,7 @@ impl Semaphore {
 
 /// Administrador de sincronización
 pub struct SynchronizationManager {
-    pub mutexes: [Option<Mutex>; 256],
+    pub mutexes: [Option<Mutex<()>>; 256],
     pub semaphores: [Option<Semaphore>; 256],
     pub next_mutex_id: u32,
     pub next_semaphore_id: u32,
@@ -111,7 +155,7 @@ impl SynchronizationManager {
     /// Inicializar el administrador de sincronización
     pub fn init(&mut self) {
         // Crear mutex del kernel
-        self.mutexes[0] = Some(Mutex::new());
+        self.mutexes[0] = Some(Mutex::new(()));
         
         // Crear semáforo del kernel
         self.semaphores[0] = Some(Semaphore::new(1, 1));
@@ -124,7 +168,7 @@ impl SynchronizationManager {
         
         for i in 1..256 {
             if self.mutexes[i].is_none() {
-                self.mutexes[i] = Some(Mutex::new());
+                self.mutexes[i] = Some(Mutex::new(()));
                 return Some(mutex_id);
             }
         }
@@ -148,7 +192,7 @@ impl SynchronizationManager {
     }
     
     /// Obtener un mutex por ID
-    pub fn get_mutex(&self, mutex_id: u32) -> Option<&Mutex> {
+    pub fn get_mutex(&self, mutex_id: u32) -> Option<&Mutex<()>> {
         for i in 0..256 {
             if let Some(ref mutex) = self.mutexes[i] {
                 if i as u32 == mutex_id {

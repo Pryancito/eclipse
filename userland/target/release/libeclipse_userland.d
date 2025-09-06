@@ -1,1 +1,1 @@
-/home/moebius/eclipse/userland/target/release/libeclipse_userland.rlib: /home/moebius/eclipse/userland/src/applications.rs /home/moebius/eclipse/userland/src/drm_display.rs /home/moebius/eclipse/userland/src/framebuffer_display.rs /home/moebius/eclipse/userland/src/lib.rs /home/moebius/eclipse/userland/src/services/mod.rs /home/moebius/eclipse/userland/src/services/system_services.rs /home/moebius/eclipse/userland/src/shell.rs
+/home/moebius/eclipse/userland/target/release/libeclipse_userland.rlib: /home/moebius/eclipse/userland/lib.rs

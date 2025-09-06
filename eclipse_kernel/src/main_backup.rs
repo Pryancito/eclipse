@@ -1,6 +1,6 @@
 //! Eclipse Rust Kernel - Main Entry Point
 //! 
-//! Kernel híbrido Eclipse-Redox completamente reescrito en Rust
+//! Kernel nativo de Eclipse completamente reescrito en Rust
 //! integrando funcionalidades avanzadas de ambos sistemas.
 
 #![no_std]

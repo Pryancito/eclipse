@@ -148,7 +148,7 @@ impl BootMessenger {
         self.print_text("║                                                              ║\n");
         self.print_text("║                    🌙 ECLIPSE KERNEL 🌙                    ║\n");
         self.print_text("║                                                              ║\n");
-        self.print_text("║              Kernel Híbrido Eclipse-Redox v0.1.0             ║\n");
+        self.print_text("║              Kernel Nativo de Eclipse v0.1.0             ║\n");
         self.print_text("║                                                              ║\n");
         self.print_text("╚══════════════════════════════════════════════════════════════╝\n");
         self.print_text("\n");
