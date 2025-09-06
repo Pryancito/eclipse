@@ -8,13 +8,24 @@ extern crate alloc;
 pub mod memory;
 pub mod process;
 pub mod thread;
+pub mod synchronization;  // Sistema de sincronización multihilo
+pub mod performance;  // Sistema de optimización de rendimiento multihilo
+pub mod math_utils;  // Utilidades matemáticas
 pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
 pub mod redox;  // Módulo de integración de Redox
 pub mod testing;  // Sistema de pruebas y validación
+pub mod init_system;  // Sistema de inicialización con systemd
+pub mod process_transfer;  // Transferencia de control del kernel al userland
+pub mod elf_loader;  // Cargador de ejecutables ELF64
+pub mod process_memory;  // Gestión de memoria para procesos
+pub mod real_integration;  // Integración real kernel-systemd
 pub mod main_simple;
+pub mod main_with_init;  // Main con integración systemd
+pub mod vga_centered_display;
+pub mod wayland;  // Módulo para mostrar texto centrado en VGA
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

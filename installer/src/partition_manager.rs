@@ -15,7 +15,7 @@ impl PartitionManager {
     pub fn create_partitions(&mut self, disk: &DiskInfo) -> Result<Vec<PartitionInfo>, String> {
         self.partitions.clear();
         
-        println!("🔧 Creando particiones en {}...", disk.name);
+        println!("Creando particiones en {}...", disk.name);
         
         // 1. Limpiar tabla de particiones existente
         self.clear_partition_table(disk)?;
@@ -34,12 +34,12 @@ impl PartitionManager {
         // 5. Aplicar cambios
         self.apply_changes(disk)?;
         
-        println!("✅ Particiones creadas exitosamente");
+        println!("Particiones creadas exitosamente");
         Ok(self.partitions.clone())
     }
     
     fn clear_partition_table(&self, disk: &DiskInfo) -> Result<(), String> {
-        println!("   🗑️  Limpiando tabla de particiones...");
+        println!("   Limpiando tabla de particiones...");
         
         let output = Command::new("wipefs")
             .args(&["-a", &disk.name])
@@ -79,7 +79,7 @@ impl PartitionManager {
     }
     
     fn create_gpt_table(&self, disk: &DiskInfo) -> Result<(), String> {
-        println!("   📋 Creando tabla de particiones GPT...");
+        println!("   Creando tabla de particiones GPT...");
         
         let output = Command::new("parted")
             .args(&[&disk.name, "mklabel", "gpt"])
@@ -98,7 +98,7 @@ impl PartitionManager {
     }
     
     fn create_efi_partition(&self, disk: &DiskInfo) -> Result<PartitionInfo, String> {
-        println!("   💾 Creando partición EFI (100MB)...");
+        println!("   Creando partición EFI (100MB)...");
         
         let output = Command::new("parted")
             .args(&[&disk.name, "mkpart", "EFI", "fat32", "1MiB", "101MiB"])
@@ -127,7 +127,7 @@ impl PartitionManager {
     }
     
     fn create_root_partition(&self, disk: &DiskInfo) -> Result<PartitionInfo, String> {
-        println!("   🗂️  Creando partición root (resto del disco)...");
+        println!("   Creando partición root (resto del disco)...");
         
         let output = Command::new("parted")
             .args(&[&disk.name, "mkpart", "ROOT", "ext4", "101MiB", "100%"])
@@ -151,7 +151,7 @@ impl PartitionManager {
     }
     
     fn apply_changes(&self, disk: &DiskInfo) -> Result<(), String> {
-        println!("   ⚡ Aplicando cambios...");
+        println!("   Aplicando cambios...");
         
         // Sincronizar cambios
         let _ = Command::new("sync").output();
@@ -178,7 +178,7 @@ impl PartitionManager {
     }
     
     pub fn format_partitions(&self, disk: &DiskInfo) -> Result<(), String> {
-        println!("🔧 Formateando particiones...");
+        println!("Formateando particiones...");
         
         // Formatear partición EFI
         let efi_partition = format!("{}1", disk.name);
@@ -192,7 +192,7 @@ impl PartitionManager {
     }
     
     fn format_efi_partition(&self, partition: &str) -> Result<(), String> {
-        println!("   💾 Formateando partición EFI como FAT32...");
+        println!("   Formateando partición EFI como FAT32...");
         
         let output = Command::new("mkfs.fat")
             .args(&["-F32", partition])
@@ -211,7 +211,7 @@ impl PartitionManager {
     }
     
     fn format_root_partition(&self, partition: &str) -> Result<(), String> {
-        println!("   🗂️  Formateando partición root como EXT4...");
+        println!("   Formateando partición root como EXT4...");
         
         let output = Command::new("mkfs.ext4")
             .args(&["-F", partition])

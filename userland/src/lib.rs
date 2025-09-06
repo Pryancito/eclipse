@@ -1,8 +1,10 @@
-//! # ReactOS Userland en Rust
+//! # Eclipse OS Userland en Rust
 
 pub mod shell;
 pub mod services;
 pub mod applications;
+pub mod drm_display;
+pub mod framebuffer_display;
 
 use anyhow::Result;
 

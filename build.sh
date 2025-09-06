@@ -35,14 +35,14 @@ UEFI_TARGET="x86_64-unknown-uefi"
 BUILD_DIR="eclipse-os-build"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN SIMPLIFICADO v0.4.0 ║"
+echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN SIMPLIFICADO v0.5.0 ║"
 echo "║ Kernel + Bootloader + Distribución + Instalador ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
 # Función para compilar el kernel
 build_kernel() {
-    print_step "Compilando kernel Eclipse OS v0.4.0..."
+    print_step "Compilando kernel Eclipse OS v0.5.0..."
     
     cd eclipse_kernel
     
@@ -178,29 +178,33 @@ build_userland() {
     fi
     cd ../..
     
-    # Compilar DRM Module
-    print_status "Compilando DRM Module..."
-    cd userland/drm_module
+    # Compilar el userland principal
+    print_status "Compilando Userland principal..."
+    cd userland
     cargo build --release
     if [ $? -eq 0 ]; then
-        print_success "DRM Module compilado exitosamente"
+        print_success "Userland principal compilado exitosamente"
     else
-        print_error "Error al compilar DRM Module"
+        print_error "Error al compilar Userland principal"
         return 1
     fi
-    cd ../..
+    cd ..
     
-    # Compilar NVIDIA Module
-    print_status "Compilando NVIDIA Module..."
-    cd userland/nvidia_module
-    cargo build --release
-    if [ $? -eq 0 ]; then
-        print_success "NVIDIA Module compilado exitosamente"
+    # Compilar sistema DRM
+    print_status "Compilando sistema DRM..."
+    if [ -d "userland/drm_display" ]; then
+        cd userland/drm_display
+        cargo build --release
+        if [ $? -eq 0 ]; then
+            print_success "Sistema DRM compilado exitosamente"
+        else
+            print_error "Error al compilar sistema DRM"
+            return 1
+        fi
+        cd ../..
     else
-        print_error "Error al compilar NVIDIA Module"
-        return 1
+        print_status "Sistema DRM no encontrado, saltando..."
     fi
-    cd ../..
     
     print_success "Todos los módulos userland compilados exitosamente"
 }
@@ -250,55 +254,105 @@ create_basic_distribution() {
             print_status "App Framework copiado"
         fi
         
-        if [ -f "userland/drm_module/target/release/drm_module" ]; then
-            cp "userland/drm_module/target/release/drm_module" "$BUILD_DIR/userland/bin/"
-            print_status "DRM Module copiado"
+        if [ -f "userland/target/release/eclipse-userland" ]; then
+            cp "userland/target/release/eclipse-userland" "$BUILD_DIR/userland/bin/"
+            print_status "Userland principal copiado"
         fi
         
-        if [ -f "userland/nvidia_module/target/release/nvidia_module" ]; then
-            cp "userland/nvidia_module/target/release/nvidia_module" "$BUILD_DIR/userland/bin/"
-            print_status "NVIDIA Module copiado"
+        # Copiar sistema DRM si existe
+        if [ -f "userland/drm_display/target/release/libdrm_display.rlib" ]; then
+            cp "userland/drm_display/target/release/libdrm_display.rlib" "$BUILD_DIR/userland/lib/"
+            print_status "Sistema DRM copiado"
+        fi
+        
+        if [ -f "userland/drm_display/target/release/eclipse_display" ]; then
+            cp "userland/drm_display/target/release/eclipse_display" "$BUILD_DIR/userland/bin/"
+            print_status "Ejemplo DRM copiado"
         fi
         
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
 name = "Eclipse OS"
-version = "0.4.0"
+version = "0.5.0"
 kernel = "/boot/eclipse_kernel"
 
 [modules]
 module_loader = "/userland/bin/module_loader"
 graphics_module = "/userland/bin/graphics_module"
 app_framework = "/userland/bin/app_framework"
-drm_module = "/userland/bin/drm_module"
-nvidia_module = "/userland/bin/nvidia_module"
+eclipse_userland = "/userland/bin/eclipse-userland"
+drm_display = "/userland/lib/libdrm_display.rlib"
+
+[display]
+driver = "drm"
+fallback = "vga"
+primary_device = "/dev/dri/card0"
 
 [ipc]
 socket_path = "/tmp/eclipse_ipc.sock"
 timeout = 5000
 EOF
         print_status "Configuración de userland creada"
+        
+        # Crear script de inicio DRM
+        cat > "$BUILD_DIR/userland/bin/start_drm.sh" << 'EOF'
+#!/bin/bash
+
+echo "Iniciando Eclipse OS con sistema DRM..."
+
+# Verificar permisos DRM
+if [ ! -w /dev/dri/card0 ]; then
+    echo "Error: Sin permisos para acceder a DRM"
+    echo "Ejecutar como root o agregar usuario al grupo video"
+    exit 1
+fi
+
+# Iniciar sistema DRM
+export RUST_LOG=info
+./eclipse-userland
+
+echo "Eclipse OS con DRM iniciado"
+EOF
+        chmod +x "$BUILD_DIR/userland/bin/start_drm.sh"
+        print_status "Script de inicio DRM creado"
+        
         print_success "Módulos userland copiados a la distribución"
     fi
     
-    # Crear configuración GRUB básica
-    cat > "$BUILD_DIR/boot/grub.cfg" << EOF
-set timeout=5
-set default=0
+    # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
+    cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
+# Configuración UEFI para Eclipse OS v0.5.0
+# Bootloader personalizado - no requiere GRUB
 
-menuentry "Eclipse OS v0.4.0" {
-    multiboot2 /boot/eclipse_kernel
-    boot
-}
+[system]
+kernel_path = "/boot/eclipse_kernel"
+userland_path = "/userland/bin/eclipse-userland"
 
-menuentry "Eclipse OS (modo debug)" {
-    multiboot2 /boot/eclipse_kernel debug
-    boot
-}
+[debug]
+enable_debug = false
+log_level = "info"
 EOF
     
     print_success "Distribución básica creada en $BUILD_DIR"
+}
+
+# Función para mostrar resumen de construcción
+show_build_summary() {
+    echo ""
+    print_success "Construcción completada exitosamente"
+    echo ""
+    echo "Archivos generados:"
+    echo "  Distribución básica: $BUILD_DIR/"
+    echo ""
+    echo "Componentes compilados:"
+    echo "  Kernel Eclipse OS: eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel"
+    echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
+    echo "  Instalador: installer/target/release/eclipse-installer"
+    echo "  Userland: Módulos compilados e instalados"
+    echo "  Sistema DRM: userland/drm_display/target/release/libdrm_display.rlib"
+    echo ""
+    echo "Eclipse OS v0.5.0 está listo para usar!"
 }
 
 # Función principal
@@ -309,19 +363,7 @@ main() {
     build_installer
     build_userland
     create_basic_distribution
-    
-    print_success "Construcción completada exitosamente"
-    echo ""
-    echo "📁 Archivos generados:"
-    echo "  🏗️  Distribución básica: $BUILD_DIR/"
-    echo ""
-    echo "🔧 Componentes compilados:"
-    echo "  ✅ Kernel Eclipse OS: eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel"
-    echo "  ✅ Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
-    echo "  ✅ Instalador: installer/target/release/eclipse-installer"
-    echo "  ✅ Userland: Módulos compilados e instalados"
-    echo ""
-    echo "🎉 ¡Eclipse OS v0.4.0 está listo para usar!"
+    show_build_summary
 }
 
 # Ejecutar función principal

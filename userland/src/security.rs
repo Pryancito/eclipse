@@ -1,7 +1,7 @@
 //! Security Module
 //! Gestión de seguridad y permisos
 
-use std::os::raw::{c_void, c_int};
+use std::os::raw::c_void;
 
 /// Handle de token de seguridad
 pub type SecurityToken = *mut c_void;

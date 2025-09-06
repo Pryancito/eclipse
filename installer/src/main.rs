@@ -8,23 +8,48 @@ mod partition_manager;
 mod bootloader_installer;
 mod filesystem_manager;
 mod direct_installer;
+mod uefi_config;
+mod validation;
 
 use disk_manager::DiskManager;
 use partition_manager::PartitionManager;
 use bootloader_installer::BootloaderInstaller;
 use filesystem_manager::FilesystemManager;
 use direct_installer::DirectInstaller;
+use validation::{SystemValidator, is_uefi_system, is_secure_boot_enabled};
 
 fn main() {
-    println!("🌙 Eclipse OS Installer v1.0");
+    println!("Eclipse OS Installer v0.5.0");
     println!("=============================");
     println!();
     
     // Verificar permisos de root
     if !is_root() {
-        println!("❌ Error: Este instalador debe ejecutarse como root");
+        println!("Error: Este instalador debe ejecutarse como root");
         println!("   Usa: sudo ./eclipse-installer");
         std::process::exit(1);
+    }
+    
+    // Validar sistema
+    let validator = SystemValidator::new();
+    if let Err(e) = validator.validate_system() {
+        println!("Error de validación: {}", e);
+        println!("   Asegúrate de que todos los comandos requeridos estén instalados");
+        println!("   y que los archivos del sistema estén compilados");
+        std::process::exit(1);
+    }
+    
+    // Verificar sistema UEFI
+    if !is_uefi_system() {
+        println!("Advertencia: No se detectó un sistema UEFI");
+        println!("   Eclipse OS está optimizado para sistemas UEFI");
+        println!("   La instalación puede no funcionar correctamente en sistemas BIOS");
+    }
+    
+    // Verificar Secure Boot
+    if is_secure_boot_enabled() {
+        println!("Advertencia: Secure Boot está habilitado");
+        println!("   Puede ser necesario deshabilitar Secure Boot para Eclipse OS");
     }
     
     // Mostrar menú principal
@@ -44,11 +69,11 @@ fn main() {
                 show_help();
             }
             "4" => {
-                println!("👋 ¡Hasta luego!");
+                println!("¡Hasta luego!");
                 break;
             }
             _ => {
-                println!("❌ Opción inválida. Intenta de nuevo.");
+                println!("Opción inválida. Intenta de nuevo.");
             }
         }
         
@@ -57,12 +82,12 @@ fn main() {
 }
 
 fn show_main_menu() {
-            println!("📋 Menú Principal");
-        println!("=================");
-        println!("1. Instalar Eclipse OS (sin emojis)");
-        println!("2. Mostrar información de discos");
-        println!("3. Ayuda");
-        println!("4. Salir");
+    println!("Menú Principal");
+    println!("===============");
+    println!("1. Instalar Eclipse OS");
+    println!("2. Mostrar información de discos");
+    println!("3. Ayuda");
+    println!("4. Salir");
     println!();
 }
 
@@ -104,6 +129,24 @@ fn install_eclipse_os_direct() {
     
     let selected_disk = &disks[disk_index];
     
+    // Validar disco seleccionado
+    let validator = SystemValidator::new();
+    if let Err(e) = validator.validate_disk(&selected_disk.name) {
+        println!("Error validando disco: {}", e);
+        return;
+    }
+    
+    // Verificar espacio en disco
+    if let Err(e) = validator.check_disk_space(&selected_disk.name) {
+        println!("Error de espacio en disco: {}", e);
+        return;
+    }
+    
+    // Validar módulos userland
+    if let Err(e) = validator.validate_userland_modules() {
+        println!("Advertencia: {}", e);
+    }
+    
     // Preguntar si es instalación automática
     let auto_choice = read_input("Instalacion automatica? (s/N): ");
     let auto_install = auto_choice.trim().to_lowercase() == "s";
@@ -122,20 +165,20 @@ fn install_eclipse_os_direct() {
 }
 
 fn show_disk_info() {
-    println!("💾 Información de Discos");
-    println!("========================");
+    println!("Información de Discos");
+    println!("======================");
     println!();
     
     let mut disk_manager = DiskManager::new();
     let disks = disk_manager.list_disks();
     
     if disks.is_empty() {
-        println!("❌ No se encontraron discos");
+        println!("No se encontraron discos");
         return;
     }
     
     for disk in disks {
-        println!("📀 Disco: {}", disk.name);
+        println!("Disco: {}", disk.name);
         println!("   Tamaño: {}", disk.size);
         println!("   Modelo: {}", disk.model);
         println!("   Tipo: {}", disk.disk_type);
@@ -144,22 +187,22 @@ fn show_disk_info() {
 }
 
 fn show_help() {
-    println!("❓ Ayuda del Instalador");
-    println!("=======================");
+    println!("Ayuda del Instalador");
+    println!("====================");
     println!();
     println!("Este instalador te permite instalar Eclipse OS en tu disco duro.");
     println!();
-    println!("📋 Requisitos:");
+    println!("Requisitos:");
     println!("  - Disco duro con al menos 1GB de espacio libre");
     println!("  - Sistema UEFI compatible");
     println!("  - Conexión a internet (para descargar dependencias)");
     println!();
-    println!("⚠️  Advertencias:");
+    println!("Advertencias:");
     println!("  - La instalación borrará todos los datos del disco seleccionado");
     println!("  - Haz una copia de seguridad de tus datos importantes");
     println!("  - Asegúrate de seleccionar el disco correcto");
     println!();
-    println!("🔧 Proceso de instalación:");
+    println!("Proceso de instalación:");
     println!("  1. Selección del disco de destino");
     println!("  2. Creación de particiones (EFI + Root)");
     println!("  3. Instalación del bootloader UEFI");
@@ -169,7 +212,7 @@ fn show_help() {
 }
 
 fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
-    println!("📦 Instalando archivos del sistema...");
+    println!("Instalando archivos del sistema...");
     
     // Montar partición EFI
     let efi_mount = "/mnt/eclipse-efi";
@@ -201,7 +244,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
     if Path::new(kernel_source).exists() {
         fs::copy(kernel_source, &kernel_dest)
             .map_err(|e| format!("Error copiando kernel: {}", e))?;
-        println!("   ✅ Kernel copiado");
+        println!("   Kernel copiado");
     } else {
         return Err("Kernel no encontrado. Ejecuta 'cargo build --release' primero.".to_string());
     }
@@ -216,7 +259,7 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
         
         fs::copy(bootloader_source, &bootloader_dest)
             .map_err(|e| format!("Error copiando bootloader: {}", e))?;
-        println!("   ✅ Bootloader copiado");
+        println!("   Bootloader copiado");
     } else {
         return Err("Bootloader no encontrado. Ejecuta 'cd bootloader-uefi && ./build.sh' primero.".to_string());
     }
@@ -239,10 +282,10 @@ fn install_system_files(disk: &DiskInfo) -> Result<(), String> {
 
 fn create_config_files(efi_mount: &str) -> Result<(), String> {
     // Crear README
-    let readme_content = r#"🌙 Eclipse OS - Sistema Operativo en Rust
-=========================================
+    let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
+=====================================
 
-Versión: 1.0
+Versión: 0.5.0
 Arquitectura: x86_64
 Tipo: Instalación en disco
 
@@ -252,7 +295,7 @@ Características:
 - Sistema de archivos optimizado
 - Interfaz gráfica moderna
 
-Desarrollado con ❤️ en Rust
+Desarrollado con amor en Rust
 "#;
     
     fs::write(format!("{}/README.txt", efi_mount), readme_content)
@@ -277,7 +320,7 @@ args=quiet splash
     fs::write(format!("{}/boot.conf", efi_mount), boot_config)
         .map_err(|e| format!("Error creando configuración de boot: {}", e))?;
     
-    println!("   ✅ Archivos de configuración creados");
+        println!("   Archivos de configuración creados");
     Ok(())
 }
 

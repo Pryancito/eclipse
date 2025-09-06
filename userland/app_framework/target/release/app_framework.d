@@ -1,1 +1,1 @@
-/home/moebius/eclipse/userland/app_framework/target/release/app_framework: /home/moebius/eclipse/userland/app_framework/src/main.rs /home/moebius/eclipse/userland/ipc_common/src/lib.rs
+/home/moebius/eclipse/userland/app_framework/target/release/app_framework: /home/moebius/eclipse/userland/app_framework/src/lib.rs /home/moebius/eclipse/userland/app_framework/src/main.rs /home/moebius/eclipse/userland/ipc_common/src/lib.rs

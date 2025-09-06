@@ -28,7 +28,7 @@ impl Shell {
         // Configurar variables de entorno básicas
         self.environment_variables.insert("PATH".to_string(), "C:\\Windows\\System32;C:\\Windows".to_string());
         self.environment_variables.insert("USERNAME".to_string(), "Administrator".to_string());
-        self.environment_variables.insert("COMPUTERNAME".to_string(), "REACTOS-RUST".to_string());
+        self.environment_variables.insert("COMPUTERNAME".to_string(), "ECLIPSE-OS".to_string());
         self.environment_variables.insert("OS".to_string(), "Windows_NT".to_string());
         
         Ok(())
@@ -88,7 +88,7 @@ impl Shell {
     }
     
     fn show_help(&self) -> Result<()> {
-        println!("ReactOS Rust Shell - Available commands:");
+        println!("Eclipse OS Shell - Available commands:");
         println!("  cd [directory]  - Change directory");
         println!("  dir             - List directory contents");
         println!("  echo [text]     - Display text");

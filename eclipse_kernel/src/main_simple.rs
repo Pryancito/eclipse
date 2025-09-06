@@ -1,6 +1,19 @@
 //! Módulo principal simplificado del kernel Eclipse OS
 
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use core::iter::Iterator;
+use core::option::Option::Some;
+use core::prelude::rust_2024::derive;
+
 use core::panic::PanicInfo;
+
+// Importar módulos del kernel
+use crate::init_system::{InitSystem, InitProcess};
+use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
 
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> heapless::String<32> {
@@ -200,7 +213,24 @@ impl SerialWriter {
 pub static mut VGA: VgaWriter = VgaWriter::new();
 pub static mut SERIAL: SerialWriter = SerialWriter::new();
 
-// El allocator global está definido en `lib.rs` (extern crate alloc)
+// Allocator global simple
+use alloc::alloc::{GlobalAlloc, Layout};
+
+struct SimpleAllocator;
+
+unsafe impl GlobalAlloc for SimpleAllocator {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        // Implementación simple - en un kernel real esto sería más complejo
+        core::ptr::null_mut()
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Implementación simple
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: SimpleAllocator = SimpleAllocator;
 
 /// Función principal del kernel
 pub fn kernel_main() -> ! {
@@ -222,75 +252,46 @@ pub fn kernel_main() -> ! {
         VGA.write_string("✓ Driver de serie COM1 activo\n");
         VGA.write_string("✓ Gestión de memoria básica lista\n");
         
-        // Inicializar sistema de drivers modulares
-        crate::drivers::modular::init_modular_drivers();
-        VGA.write_string("✓ Sistema de drivers modulares inicializado\n");
-        
-        // Inicializar gestor avanzado de drivers
-        let _ = crate::drivers::modular::manager::init_advanced_driver_manager();
-        VGA.write_string("✓ Gestor avanzado de drivers inicializado\n");
-        
-        // Inicializar sistema de módulos std
-        let _ = crate::drivers::modular::std_modules::init_std_modules();
-        VGA.write_string("✓ Sistema de módulos std inicializado\n");
-        
-        // Mostrar información de drivers registrados
-        let drivers = crate::drivers::modular::list_modular_drivers();
-        VGA.write_string("✓ Drivers modulares registrados: ");
-        VGA.write_string(&int_to_string(drivers.len() as u64));
-        VGA.write_string("\n");
-        
-        // Mostrar resumen del sistema de drivers
-        let summary = crate::drivers::modular::manager::get_system_summary();
-        VGA.write_string("✓ Drivers inicializados: ");
-        VGA.write_string(&int_to_string(summary.initialized_drivers as u64));
-        VGA.write_string("/");
-        VGA.write_string(&int_to_string(summary.total_drivers as u64));
-        VGA.write_string("\n");
-        
-        // Mostrar resumen de módulos std
-        let std_summary = crate::drivers::modular::std_modules::get_std_module_system_summary();
-        VGA.write_string("✓ Módulos std registrados: ");
-        VGA.write_string(&int_to_string(std_summary.total_modules as u64));
-        VGA.write_string("\n");
-        
-        VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("\nInformación del sistema:\n");
-        VGA.set_color(Color::White, Color::Black);
-        VGA.write_string("  - Arquitectura: x86_64\n");
-        VGA.write_string("  - Kernel: Rust (no_std)\n");
-        VGA.write_string("  - Gráficos: VGA + Drivers Modulares\n");
-        VGA.write_string("  - Drivers modulares: Cargados dinámicamente\n");
-        
-        // Mostrar información detallada de drivers modulares
-        VGA.set_color(Color::LightMagenta, Color::Black);
-        VGA.write_string("\nDrivers Modulares Registrados:\n");
-        VGA.set_color(Color::White, Color::Black);
-        
-        for driver_name in drivers.iter() {
-            VGA.write_string("  - ");
-            VGA.write_string(driver_name.as_str());
-            VGA.write_string("\n");
+        // Inicializar sistema de inicialización con systemd
+        VGA.write_string("✓ Inicializando sistema de inicialización...\n");
+    }
+    
+    // Inicializar systemd
+    let mut init_system = InitSystem::new();
+    match init_system.initialize() {
+        Ok(_) => {
+            unsafe {
+                VGA.set_color(Color::LightGreen, Color::Black);
+                VGA.write_string("✓ Sistema de inicialización (systemd) configurado\n");
+                
+                // Mostrar información del proceso init
+                if let Some(init_info) = init_system.get_init_info() {
+                    VGA.write_string("✓ Proceso init: ");
+                    VGA.write_string(init_info.name);
+                    VGA.write_string(" (PID: ");
+                    VGA.write_string(&int_to_string(init_info.pid as u64));
+                    VGA.write_string(")\n");
+                }
+                
+                VGA.set_color(Color::Yellow, Color::Black);
+                VGA.write_string("\nInformación del sistema:\n");
+                VGA.set_color(Color::White, Color::Black);
+                VGA.write_string("  - Arquitectura: x86_64\n");
+                VGA.write_string("  - Kernel: Rust (no_std)\n");
+                VGA.write_string("  - Gráficos: VGA\n");
+                VGA.write_string("  - Init System: systemd\n");
+                VGA.write_string("  - Init Process: eclipse-systemd\n");
+                VGA.write_string("  - Display Server: Wayland\n");
+            }
         }
-        
-        // Mostrar información de módulos std
-        VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("\nMódulos Std Registrados:\n");
-        VGA.set_color(Color::White, Color::Black);
-        
-        let stdmods_all = crate::drivers::modular::std_modules::get_std_module_manager().get_all_modules();
-        for module in stdmods_all.iter() {
-            VGA.write_string("  - ");
-            VGA.write_string(module.name.as_str());
-            VGA.write_string(" (");
-            VGA.write_string(match module.module_type {
-                crate::drivers::modular::std_modules::StdModuleType::Graphics => "Gráficos",
-                crate::drivers::modular::std_modules::StdModuleType::Audio => "Audio",
-                crate::drivers::modular::std_modules::StdModuleType::Network => "Red",
-                crate::drivers::modular::std_modules::StdModuleType::Storage => "Almacenamiento",
-                crate::drivers::modular::std_modules::StdModuleType::Custom => "Personalizado",
-            });
-            VGA.write_string(")\n");
+        Err(e) => {
+            unsafe {
+                VGA.set_color(Color::LightRed, Color::Black);
+                VGA.write_string("❌ Error al inicializar systemd: ");
+                VGA.write_string(e);
+                VGA.write_string("\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
         }
     }
     
@@ -323,16 +324,64 @@ pub fn kernel_main() -> ! {
         VGA.write_string("\n");
     }
     
-    // Mostrar mensaje final
+    // Inicializar Wayland
+    unsafe {
+        VGA.set_color(Color::Cyan, Color::Black);
+        VGA.write_string("\nInicializando Wayland...\n");
+        VGA.set_color(Color::White, Color::Black);
+    }
+    
+    match init_wayland() {
+        Ok(_) => {
+            unsafe {
+                VGA.set_color(Color::LightGreen, Color::Black);
+                VGA.write_string("✓ Wayland inicializado correctamente\n");
+                VGA.write_string("✓ Compositor Wayland activo\n");
+                VGA.write_string("✓ Protocolo de ventanas listo\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+        Err(e) => {
+            unsafe {
+                VGA.set_color(Color::LightRed, Color::Black);
+                VGA.write_string("❌ Error inicializando Wayland: ");
+                VGA.write_string(e);
+                VGA.write_string("\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+    }
+    
+    // Mostrar mensaje final y transferir control a systemd
     unsafe {
         VGA.set_color(Color::LightGreen, Color::Black);
         VGA.write_string("\n✓ Kernel Eclipse OS inicializado correctamente\n");
         VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("Sistema funcionando en modo VGA\n");
+        VGA.write_string("Transferiendo control a systemd...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
-    // Bucle principal del kernel
+    // Transferir control a systemd
+    match init_system.execute_init() {
+        Ok(_) => {
+            unsafe {
+                VGA.set_color(Color::LightGreen, Color::Black);
+                VGA.write_string("✓ Control transferido a systemd exitosamente\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+        Err(e) => {
+            unsafe {
+                VGA.set_color(Color::LightRed, Color::Black);
+                VGA.write_string("❌ Error al transferir control a systemd: ");
+                VGA.write_string(e);
+                VGA.write_string("\n");
+                VGA.set_color(Color::White, Color::Black);
+            }
+        }
+    }
+    
+    // Bucle principal del kernel (en caso de que systemd no tome control)
     loop {
         unsafe {
             core::arch::asm!("hlt");

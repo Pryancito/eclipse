@@ -134,6 +134,7 @@ impl BootMessenger {
             
             for byte in text.bytes() {
                 if VGA_INDEX < 2000 { // 80x25 = 2000 caracteres
+                    // Usar color blanco (0x0F) sobre negro (0x00) = 0x0F00
                     *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                     VGA_INDEX += 1;
                 }
@@ -227,7 +228,7 @@ fn display_message_direct(level: BootLevel, component: &'static str, message: &'
         // Imprimir prefijo
         for byte in prefix.bytes() {
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         }
@@ -235,32 +236,32 @@ fn display_message_direct(level: BootLevel, component: &'static str, message: &'
         // Imprimir componente
         for byte in component.bytes() {
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         }
         
         // Imprimir ": "
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b':' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b':' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b' ' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b' ' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
         
         // Imprimir mensaje
         for byte in message.bytes() {
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         }
         
         // Nueva línea
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
     }
@@ -275,7 +276,7 @@ fn display_progress_bar_direct(step: u32) {
         let progress_text = "Progreso: ";
         for byte in progress_text.bytes() {
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         }
@@ -287,7 +288,7 @@ fn display_progress_bar_direct(step: u32) {
         
         if n == 0 {
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'0' as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'0' as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         } else {
@@ -299,7 +300,7 @@ fn display_progress_bar_direct(step: u32) {
             
             for j in (0..i).rev() {
                 if VGA_INDEX < 2000 {
-                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | digits[j] as u16;
+                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | digits[j] as u16; // Blanco sobre negro
                     VGA_INDEX += 1;
                 }
             }
@@ -307,21 +308,21 @@ fn display_progress_bar_direct(step: u32) {
         
         // Imprimir "/15"
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'/' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'/' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'1' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'1' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'5' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'5' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
         
         // Nueva línea
         if VGA_INDEX < 2000 {
-            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+            *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16; // Blanco sobre negro
             VGA_INDEX += 1;
         }
     }
@@ -331,46 +332,25 @@ fn display_progress_bar_direct(step: u32) {
 fn display_banner_direct() {
     unsafe {
         let vga_buffer = 0xb8000 as *mut u16;
-        static mut VGA_INDEX: usize = 0;
         
-        let banner_lines = [
-            "╔══════════════════════════════════════════════════════════════╗",
-            "║                                                              ║",
-            "║                Eclipse Rust OS - Next Gen                    ║",
-            "║                                                              ║",
-            "║  100% Rust + Microkernel + IA + GUI Moderna                ║",
-            "║  Compatible con aplicaciones Windows                        ║",
-            "║  Seguridad avanzada + Encriptacion end-to-end              ║",
-            "║  IA integrada + Optimizacion automatica                    ║",
-            "║  GUI GATE DIAGNOSTICS + Transparencias                     ║",
-            "║  Privacidad por diseno + Cumplimiento GDPR                 ║",
-            "║  Sistema de plugins dinamico + Personalizacion total       ║",
-            "║  Hardware moderno + Gestion de energia avanzada            ║",
-            "║  Shell moderna + Sistema de comandos completo              ║",
-            "║  Sistema Ready + Comandos generativos (campa1-8)           ║",
-            "║  Monitor en tiempo real + Metricas dinamicas               ║",
-            "║  Interfaz grafica visual + Renderizado avanzado            ║",
-            "║  Sistema de contenedores + Virtualizacion                  ║",
-            "║  Machine Learning + IA avanzada                            ║",
-            "║                                                              ║",
-            "║  Version: 0.4.0 (Next Gen)                                  ║",
-            "║  Arquitectura: x86_64 Microkernel                           ║",
-            "║  API: Windows 10/11 + IA nativa                             ║",
-            "╚══════════════════════════════════════════════════════════════╝",
-            "",
-        ];
+        // Limpiar toda la pantalla con fondo negro
+        for i in 0..2000 {
+            *vga_buffer.add(i) = 0x0000; // Negro sobre negro (fondo negro)
+        }
         
-        for line in &banner_lines {
-            for byte in line.bytes() {
-                if VGA_INDEX < 2000 {
-                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
-                    VGA_INDEX += 1;
-                }
-            }
-            // Nueva línea
-            if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
-                VGA_INDEX += 1;
+        // Calcular posición central para "Eclipse OS"
+        // Pantalla: 80 columnas x 25 filas
+        // "Eclipse OS" tiene 10 caracteres
+        let text = "Eclipse OS";
+        let text_len = text.len();
+        let start_col = (80 - text_len) / 2; // Centrar horizontalmente
+        let start_row = 12; // Centrar verticalmente (fila 12 de 25)
+        let start_pos = start_row * 80 + start_col;
+        
+        // Escribir "Eclipse OS" en el centro
+        for (i, byte) in text.bytes().enumerate() {
+            if start_pos + i < 2000 {
+                *vga_buffer.add(start_pos + i) = 0x0F00 | byte as u16; // Blanco sobre negro
             }
         }
     }
@@ -395,13 +375,13 @@ fn display_summary_direct() {
         for line in &summary_lines {
             for byte in line.bytes() {
                 if VGA_INDEX < 2000 {
-                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16;
+                    *vga_buffer.add(VGA_INDEX) = 0x0F00 | byte as u16; // Blanco sobre negro
                     VGA_INDEX += 1;
                 }
             }
             // Nueva línea
             if VGA_INDEX < 2000 {
-                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16;
+                *vga_buffer.add(VGA_INDEX) = 0x0F00 | b'\n' as u16; // Blanco sobre negro
                 VGA_INDEX += 1;
             }
         }

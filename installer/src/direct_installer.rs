@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::io::{self, Write};
 use crate::DiskInfo;
+use crate::uefi_config::UefiConfigManager;
 
 pub struct DirectInstaller {
     efi_mount_point: String,
@@ -17,7 +18,7 @@ impl DirectInstaller {
     }
 
     pub fn install_eclipse_os(&self, disk: &DiskInfo, auto_install: bool) -> Result<(), String> {
-        println!("Instalador de Eclipse OS v0.4.0");
+        println!("Instalador de Eclipse OS v0.5.0");
         println!("================================");
         println!();
 
@@ -70,7 +71,7 @@ impl DirectInstaller {
         println!("  - Particion EFI: {}1 (FAT32)", disk.name);
         println!("  - Particion root: {}2 (EXT4)", disk.name);
         println!("  - Bootloader: UEFI");
-        println!("  - Kernel: Eclipse OS v0.4.0");
+        println!("  - Kernel: Eclipse OS v0.5.0");
         println!("  - Userland: Modulos compilados e instalados");
         println!();
         println!("Reinicia el sistema para usar Eclipse OS");
@@ -275,6 +276,7 @@ impl DirectInstaller {
             ("../userland/module_loader/target/release/module_loader", "module_loader"),
             ("../userland/graphics_module/target/release/graphics_module", "graphics_module"),
             ("../userland/app_framework/target/release/app_framework", "app_framework"),
+            ("../userland/target/release/eclipse-userland", "eclipse-userland"),
         ];
 
         for (source, name) in userland_modules {
@@ -286,22 +288,31 @@ impl DirectInstaller {
         }
 
         // Crear configuración de userland
-        let config_content = r#"# Eclipse OS Userland Configuration
-# =================================
+        let config_content = r#"# Eclipse OS Userland Configuration v0.5.0
+# =========================================
 
-# Module settings
-modules=graphics_module,audio_module,network_module,storage_module
+[system]
+name = "Eclipse OS"
+version = "0.5.0"
+kernel = "/eclipse_kernel"
 
-# Applications
-apps=terminal,filemanager,editor,monitor
+[modules]
+module_loader = "/userland/bin/module_loader"
+graphics_module = "/userland/bin/graphics_module"
+app_framework = "/userland/bin/app_framework"
+eclipse_userland = "/userland/bin/eclipse-userland"
 
-# Graphics settings
-graphics_mode=1920x1080x32
-vga_fallback=true
+[ipc]
+socket_path = "/tmp/eclipse_ipc.sock"
+timeout = 5000
 
-# Memory settings
-kernel_memory=64M
-userland_memory=256M
+[graphics]
+graphics_mode = "1920x1080x32"
+vga_fallback = true
+
+[memory]
+kernel_memory = "64M"
+userland_memory = "256M"
 "#;
 
         fs::write(format!("{}/userland/config/system.conf", self.efi_mount_point), config_content)
@@ -316,9 +327,16 @@ userland_memory=256M
     fn create_config_files(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("Creando archivos de configuracion...");
 
-        // Configuración del bootloader
-        let boot_conf = r#"# Eclipse OS Boot Configuration
-# =============================
+        // Crear configuración UEFI personalizada
+        let uefi_config = UefiConfigManager::new();
+        uefi_config.create_uefi_config(&self.efi_mount_point)?;
+        uefi_config.create_boot_entries(&self.efi_mount_point)?;
+        uefi_config.create_module_config(&self.efi_mount_point)?;
+        uefi_config.create_system_info(&self.efi_mount_point)?;
+
+        // Configuración del bootloader (compatibilidad)
+        let boot_conf = r#"# Eclipse OS Boot Configuration v0.5.0
+# ===================================
 
 TIMEOUT=5
 DEFAULT_ENTRY=eclipse
@@ -326,7 +344,7 @@ SHOW_MENU=true
 
 [entry:eclipse]
 title=Eclipse OS
-description=Sistema Operativo Eclipse v0.4.0
+description=Sistema Operativo Eclipse v0.5.0
 kernel=/eclipse_kernel
 initrd=
 args=quiet splash
@@ -337,9 +355,9 @@ args=quiet splash
 
         // README
         let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
-=========================================
+=====================================
 
-Version: 0.4.0
+Version: 0.5.0
 Arquitectura: x86_64
 Tipo: Instalacion en disco
 
@@ -368,7 +386,7 @@ Desarrollado con amor en Rust
         // Limpiar directorio de montaje
         let _ = fs::remove_dir(&self.efi_mount_point);
 
-        println!("Bootloader instalado exitosamente");
+        println!("Configuracion UEFI instalada exitosamente");
         Ok(())
     }
 

@@ -1,0 +1,1 @@
+cargo:rustc-env=DRM_SYS_BINDINGS_PATH=linux/x86_64

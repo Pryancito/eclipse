@@ -1,0 +1,16 @@
+[package]
+name = "drm_display"
+version = "0.1.0"
+edition = "2021"
+authors = ["Eclipse Rust Team"]
+description = "Sistema DRM para control de pantalla en Eclipse OS"
+
+[dependencies]
+drm = "0.9"
+libc = "0.2"
+nix = "0.27"
+anyhow = "1.0"
+thiserror = "1.0"
+
+[features]
+default = []

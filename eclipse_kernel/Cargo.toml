@@ -7,11 +7,11 @@ description = "Kernel híbrido Eclipse-Redox en Rust"
 
 [lib]
 name = "eclipse_kernel"
-crate-type = ["lib"]
+crate-type = ["lib", "staticlib"]
 
 [[bin]]
 name = "eclipse_kernel"
-path = "src/entry_simple.rs"
+path = "src/main.rs"
 
 [dependencies]
 heapless = "0.8"
