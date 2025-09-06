@@ -291,11 +291,15 @@ pub fn kernel_main() -> ! {
     // Inicializar VGA
     unsafe {
         VGA.init_vga_mode();
-        VGA.write_string("Eclipse OS Kernel v0.5.0\n");
-        VGA.write_string("Sistema de Drivers Modulares\n");
-        VGA.write_string("==============================\n");
+        VGA.set_color(Color::LightGreen, Color::Black);
+        VGA.write_string("╔══════════════════════════════════════════════════════════════╗\n");
+        VGA.write_string("║                    ECLIPSE OS KERNEL                         ║\n");
+        VGA.write_string("║                        v0.5.0                                ║\n");
+        VGA.write_string("╚══════════════════════════════════════════════════════════════╝\n");
+        VGA.set_color(Color::Yellow, Color::Black);
+        VGA.write_string("\n🦀 KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
         VGA.set_color(Color::White, Color::Black);
-        VGA.write_string("\nInicializando kernel Eclipse OS...\n\n");
+        VGA.write_string("==========================================\n\n");
     }
     
     // Inicializar drivers básicos
@@ -1385,6 +1389,16 @@ pub fn kernel_main() -> ! {
         VGA.set_color(Color::White, Color::Black);
     }
     
+    // Mostrar mensaje de que el kernel está listo
+    unsafe {
+        VGA.set_color(Color::Green, Color::Black);
+        VGA.write_string("\n✅ KERNEL ECLIPSE OS INICIALIZADO COMPLETAMENTE\n");
+        VGA.set_color(Color::LightBlue, Color::Black);
+        VGA.write_string("🔄 Esperando que el userland tome el control...\n");
+        VGA.set_color(Color::White, Color::Black);
+        VGA.write_string("===============================================\n\n");
+    }
+    
     // Bucle principal del kernel (en caso de que systemd no tome control)
     loop {
         unsafe {
@@ -1393,4 +1407,18 @@ pub fn kernel_main() -> ! {
     }
 }
 
-// panic_handler definido en lib.rs
+/// Panic handler para el kernel Eclipse OS
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // En un kernel real, esto mostraría información de debug
+    // Por ahora, simplemente entramos en un bucle infinito
+    loop {
+        // En una implementación real, aquí se podría:
+        // - Mostrar información del panic en pantalla
+        // - Escribir logs de debug
+        // - Reiniciar el sistema
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}

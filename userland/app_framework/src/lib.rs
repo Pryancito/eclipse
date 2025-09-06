@@ -478,6 +478,13 @@ impl AppFramework {
 
     /// Inicializar framework
     pub async fn initialize(&mut self) -> Result<()> {
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║                ECLIPSE OS APP FRAMEWORK                      ║");
+        println!("║                        v0.1.0                                ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!("\n🦀 APP FRAMEWORK TOMANDO CONTROL...");
+        println!("===================================");
+        
         println!("🚀 Inicializando Eclipse OS App Framework");
         
         // Registrar aplicaciones preinstaladas

@@ -233,6 +233,13 @@ async fn main() -> Result<()> {
     let config_json = &args[4];
     let config: ModuleConfig = serde_json::from_str(config_json)?;
 
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                ECLIPSE OS GRAPHICS MODULE                    ║");
+    println!("║                        v0.1.0                                ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("\n🦀 GRAPHICS MODULE TOMANDO CONTROL...");
+    println!("=====================================");
+    
     println!("🎨 Eclipse Graphics Module iniciado (ID: {})", module_id);
     println!("   Configuración: {:?}", config);
 

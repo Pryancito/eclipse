@@ -9,23 +9,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
 /// Allocator simple para el kernel
-struct KernelAllocator;
-
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        // En una implementación real, aquí se implementaría
-        // la asignación de memoria del kernel
-        null_mut()
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // En una implementación real, aquí se implementaría
-        // la liberación de memoria del kernel
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+// Allocator global definido en allocator.rs
 
 #[cfg(feature = "alloc")]
 pub mod allocator;
@@ -371,18 +355,4 @@ fn process_ai_events() -> KernelResult<()> {
     Ok(())
 }
 
-/// Panic handler para el kernel Eclipse OS
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    // En un kernel real, esto mostraría información de debug
-    // Por ahora, simplemente entramos en un bucle infinito
-    loop {
-        // En una implementación real, aquí se podría:
-        // - Mostrar información del panic en pantalla
-        // - Escribir logs de debug
-        // - Reiniciar el sistema
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}
+// Panic handler definido en main_simple.rs

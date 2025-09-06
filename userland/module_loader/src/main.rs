@@ -111,6 +111,13 @@ impl ModuleLoader {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                ECLIPSE OS MODULE LOADER                      ║");
+    println!("║                        v0.1.0                                ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("\n🦀 MODULE LOADER TOMANDO CONTROL...");
+    println!("===================================");
+    
     println!("🚀 Eclipse OS - Module Loader iniciado");
     
     let loader = ModuleLoader::new();
