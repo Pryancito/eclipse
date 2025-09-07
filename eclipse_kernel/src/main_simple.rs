@@ -42,44 +42,6 @@ fn int_to_string(mut num: u64) -> heapless::String<32> {
 
 use core::fmt::Write;
 
-/// Función auxiliar para dibujar texto en framebuffer
-fn draw_text_to_framebuffer(fb: &mut crate::drivers::framebuffer::FramebufferDriver, text: &str, x: u32, y: u32, color: crate::drivers::framebuffer::Color) {
-    let mut current_x = x;
-    let char_width = 8;
-    let char_height = 16;
-    
-    for ch in text.chars() {
-        if current_x + char_width < fb.info.width && y + char_height < fb.info.height {
-            draw_char_to_framebuffer(fb, ch, current_x, y, color);
-            current_x += char_width;
-        } else {
-            break; // No hay más espacio
-        }
-    }
-}
-
-/// Función auxiliar para dibujar un carácter en framebuffer
-fn draw_char_to_framebuffer(fb: &mut crate::drivers::framebuffer::FramebufferDriver, ch: char, x: u32, y: u32, color: crate::drivers::framebuffer::Color) {
-    // Implementación simplificada de dibujo de caracteres
-    // Por ahora, solo dibujamos un rectángulo sólido para cada carácter
-    let char_width = 8;
-    let char_height = 16;
-    
-    // Verificar límites
-    if x + char_width > fb.info.width || y + char_height > fb.info.height {
-        return;
-    }
-    
-    // Para caracteres no espaciales, dibujar un rectángulo sólido
-    if ch != ' ' {
-        for dy in 0..char_height {
-            for dx in 0..char_width {
-                fb.put_pixel(x + dx, y + dy, color);
-            }
-        }
-    }
-}
-
 // Modos de gráficos
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GraphicsMode {
@@ -320,13 +282,20 @@ pub static mut SERIAL: SerialWriter = SerialWriter::new();
 
 /// Función principal del kernel
 pub fn kernel_main() -> ! {
+    // DEBUG: Confirmar que llegamos a kernel_main
+    unsafe {
+        VGA.set_color(Color::Green, Color::Black);
+        VGA.write_string("DEBUG: kernel_main() iniciado!\n");
+        VGA.set_color(Color::White, Color::Black);
+    }
+    
     // Inicializar el allocador global
     #[cfg(feature = "alloc")]
     {
         crate::allocator::init_allocator();
     }
     
-    // Inicializar sistema de display (usar VGA por ahora)
+    // Inicializar sistema de display
     unsafe {
         VGA.init_vga_mode();
         VGA.set_color(Color::LightGreen, Color::Black);
@@ -344,7 +313,23 @@ pub fn kernel_main() -> ! {
         VGA.write_string("Debug: Usando VGA para display\n");
         VGA.write_string("Debug: Framebuffer disponible: ");
         if crate::drivers::framebuffer::is_framebuffer_available() {
-            VGA.write_string("Sí (pero usando VGA)\n");
+            VGA.write_string("Sí - Inicializando framebuffer...\n");
+            
+            // Usar framebuffer para mostrar mensajes
+            use crate::graphics::*;
+            framebuffer_clear(Color::Black);
+            framebuffer_write_string("╔══════════════════════════════════════════════════════════════╗\n");
+            framebuffer_write_string("║                    ECLIPSE OS KERNEL                         ║\n");
+            framebuffer_write_string("║                        v0.5.0                                ║\n");
+            framebuffer_write_string("╚══════════════════════════════════════════════════════════════╝\n");
+            framebuffer_write_string("\n🦀 KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
+            framebuffer_write_string("==========================================\n\n");
+            
+            // Mostrar información del framebuffer
+            framebuffer_write_string("Debug: Framebuffer activo - Resolución: ");
+            if let Some(info) = crate::drivers::framebuffer::get_framebuffer_info() {
+                framebuffer_write_string(&alloc::format!("{}x{}\n", info.width, info.height));
+            }
         } else {
             VGA.write_string("No\n");
         }
@@ -1507,4 +1492,9 @@ pub fn kernel_main() -> ! {
     }
 }
 
-// Panic handler removido para evitar conflicto con std
+/// Manejador de panic para el kernel
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Aquí podrías imprimir información de panic a VGA o serie si es necesario
+    loop {}
+}

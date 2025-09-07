@@ -636,5 +636,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             entry = in(reg) entry_reg,
             options(noreturn)
         );
+        if (framebuffer_info_ptr != 0) {
+            serial_write_str("Saltando al kernel con argumentos.\r\n");
+            jump_to_kernel_with_arg(entry_reg, framebuffer_info_ptr);
+        } else {
+            serial_write_str("Saltando al kernel sin argumentos.\r\n");
+            jump_to_kernel(entry_reg);
+        }
     }
 }

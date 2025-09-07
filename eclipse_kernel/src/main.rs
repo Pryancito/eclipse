@@ -22,11 +22,18 @@ pub struct FramebufferInfo {
     pub reserved_mask: u32,
 }
 
-// El panic_handler está definido en la librería principal
-
 /// Punto de entrada principal del kernel (con parámetros del framebuffer)
 #[no_mangle]
 pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
+    // DEBUG: Escribir inmediatamente a VGA para confirmar que llegamos aquí
+    unsafe {
+        use eclipse_kernel::main_simple::{VGA, Color};
+        VGA.init_vga_mode();
+        VGA.set_color(Color::Red, Color::Black);
+        VGA.write_string("DEBUG: _start() llamado!\n");
+        VGA.set_color(Color::White, Color::Black);
+    }
+    
     // Si tenemos información del framebuffer, usarla
     if !framebuffer_info.is_null() {
         unsafe {

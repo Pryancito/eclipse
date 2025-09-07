@@ -8,13 +8,13 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
-/// Panic handler para el kernel
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    // En un kernel real, aquí se manejaría el panic de manera segura
-    // Por ahora, simplemente entramos en un bucle infinito
-    loop {}
-}
+/// Panic handler para el kernel - comentado para evitar conflicto con std
+// #[panic_handler]
+// fn panic(info: &core::panic::PanicInfo) -> ! {
+//     // En un kernel real, aquí se manejaría el panic de manera segura
+//     // Por ahora, simplemente entramos en un bucle infinito
+//     loop {}
+// }
 
 /// Allocator simple para el kernel
 // Allocator global definido en allocator.rs
@@ -32,6 +32,7 @@ pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
+pub mod graphics;
 pub mod uefi_framebuffer;
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
@@ -63,6 +64,7 @@ pub mod ai_simple_demo;  // Demostración simple de IA
 pub mod ai_services;  // Servicios de IA integrados
 pub mod ai_commands;  // Comandos de IA para el shell
 pub mod ai_shell;  // Shell integrado con comandos de IA
+pub mod ai_inference_engine;  // Motor de inferencia real para modelos de IA
 pub mod syslog;  // Sistema de logging similar a syslog
 pub mod metrics;  // Sistema de métricas y monitoreo del kernel
 pub mod config;  // Sistema de configuración dinámica del kernel
@@ -316,6 +318,18 @@ pub fn initialize() -> KernelResult<()> {
             e
         })?;
     syslog_info!("AI_MODELS", "Sistema de modelos pre-entrenados inicializado correctamente");
+
+    // Inicializar motor de inferencia real
+    #[cfg(feature = "ai-models")]
+    {
+        syslog_info!("AI_ENGINE", "Inicializando motor de inferencia real");
+        ai_inference_engine::init_inference_engine()
+            .map_err(|e| {
+                syslog_err!("AI_ENGINE", "Error inicializando motor de inferencia");
+                KernelError::from("Error inicializando motor de inferencia")
+            })?;
+        syslog_info!("AI_ENGINE", "Motor de inferencia real inicializado correctamente");
+    }
 
     // Inicializar servicios de IA
     syslog_info!("AI_SERVICES", "Inicializando servicios de IA del sistema");
