@@ -368,7 +368,6 @@ impl PretrainedModelManager {
             let result = Self::generate_model_response_static(&model_info, input, processing_time);
             let error_condition = Self::simulate_error_condition_static();
             
-            // Simular verificación de errores
             if error_condition {
                 model.error_count += 1;
                 model.state = ModelState::Error;

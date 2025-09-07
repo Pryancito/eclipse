@@ -371,13 +371,13 @@ impl AIUserInterface {
             }
             PersonalityMode::Friendly => {
                 "¡Por supuesto! Puedo ayudarte con:\n\
-                📊 Estado del sistema\n\
-                ⚡ Optimización de rendimiento\n\
-                🔍 Diagnóstico de problemas\n\
-                🔧 Gestión de procesos\n\
-                💾 Gestión de memoria\n\
-                🔒 Monitoreo de seguridad\n\
-                🚀 Ajuste de rendimiento\n\
+                Estado del sistema\n\
+                Optimización de rendimiento\n\
+                Diagnóstico de problemas\n\
+                Gestión de procesos\n\
+                Gestión de memoria\n\
+                Monitoreo de seguridad\n\
+                Ajuste de rendimiento\n\
                 \n¿Qué te gustaría hacer?".to_string()
             }
             _ => {
@@ -439,11 +439,11 @@ impl AIUserInterface {
     fn generate_diagnose_response(&self) -> String {
         "Ejecutando diagnóstico completo del sistema...\n\
         \n\
-        ✅ Sistema de archivos: OK\n\
-        ✅ Memoria: OK\n\
-        ✅ CPU: OK\n\
-        ⚠️  Red: Latencia alta detectada\n\
-        ✅ Seguridad: OK\n\
+        Sistema de archivos: OK\n\
+        Memoria: OK\n\
+        CPU: OK\n\
+        [WARN] Red: Latencia alta detectada\n\
+        Seguridad: OK\n\
         \n\
         Recomendación: Verificar conexión de red".to_string()
     }

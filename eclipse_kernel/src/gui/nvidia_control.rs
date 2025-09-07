@@ -181,17 +181,17 @@ impl NvidiaControlPanel {
             y += 20;
             
             if driver.ray_tracing_supported {
-                render_text(framebuffer, "✓ Ray Tracing", Point::new(30, y), Color::GREEN);
+                render_text(framebuffer, "[OK] Ray Tracing", Point::new(30, y), Color::GREEN);
                 y += 15;
             }
             
             if driver.dlss_supported {
-                render_text(framebuffer, "✓ DLSS", Point::new(30, y), Color::GREEN);
+                render_text(framebuffer, "[OK] DLSS", Point::new(30, y), Color::GREEN);
                 y += 15;
             }
             
             if driver.hardware_acceleration {
-                render_text(framebuffer, "✓ Hardware Acceleration", Point::new(30, y), Color::GREEN);
+                render_text(framebuffer, "[OK] Hardware Acceleration", Point::new(30, y), Color::GREEN);
                 y += 15;
             }
         }

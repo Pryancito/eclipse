@@ -186,8 +186,8 @@ fn kernel_main() -> ! {
     initialize_kernel_components();
     
     // Mostrar mensaje de inicialización completada
-    print_message("✅ ReactOS Rust Kernel inicializado correctamente");
-    print_message("🚀 Sistema listo para ejecutar aplicaciones Windows");
+    print_message("[OK] ReactOS Rust Kernel inicializado correctamente");
+    print_message("Sistema listo para ejecutar aplicaciones Windows");
     
     // Bucle principal del kernel
     kernel_main_loop();
@@ -199,20 +199,20 @@ fn print_banner() {
     print_message("╔══════════════════════════════════════════════════════════════╗");
     print_message("║                ReactOS Rust OS - Next Gen                   ║");
     print_message("║                                                              ║");
-    print_message("║  🦀 100% Rust + Microkernel + IA + GUI Moderna             ║");
-    print_message("║  🚀 Compatible con aplicaciones Windows                     ║");
-    print_message("║  🔒 Seguridad avanzada + Encriptación end-to-end            ║");
-    print_message("║  🤖 IA integrada + Optimización automática                  ║");
-    print_message("║  🖥️ GUI GATE DIAGNOSTICS + Transparencias                ║");
-    print_message("║  🛡️ Privacidad por diseño + Cumplimiento GDPR             ║");
-    print_message("║  🔌 Sistema de plugins dinámico + Personalización total    ║");
-    print_message("║  🔧 Hardware moderno + Gestión de energía avanzada         ║");
-    print_message("║  🖥️ Shell moderna + Sistema de comandos completo           ║");
-    print_message("║  🚀 Sistema Ready + Comandos generativos (campa1-8)        ║");
-    print_message("║  📊 Monitor en tiempo real + Métricas dinámicas            ║");
-    print_message("║  🎨 Interfaz gráfica visual + Renderizado avanzado         ║");
-    print_message("║  🐳 Sistema de contenedores + Virtualización               ║");
-    print_message("║  🤖 Machine Learning + IA avanzada                         ║");
+    print_message("║  100% Rust + Microkernel + IA + GUI Moderna             ║");
+    print_message("║  Compatible con aplicaciones Windows                     ║");
+    print_message("║  Seguridad avanzada + Encriptación end-to-end            ║");
+    print_message("║  IA integrada + Optimización automática                  ║");
+    print_message("║  GUI GATE DIAGNOSTICS + Transparencias                ║");
+    print_message("║  Privacidad por diseño + Cumplimiento GDPR             ║");
+    print_message("║  Sistema de plugins dinámico + Personalización total    ║");
+    print_message("║  Hardware moderno + Gestión de energía avanzada         ║");
+    print_message("║  Shell moderna + Sistema de comandos completo           ║");
+    print_message("║  Sistema Ready + Comandos generativos (campa1-8)        ║");
+    print_message("║  Monitor en tiempo real + Métricas dinámicas            ║");
+    print_message("║  Interfaz gráfica visual + Renderizado avanzado         ║");
+    print_message("║  Sistema de contenedores + Virtualización               ║");
+    print_message("║  Machine Learning + IA avanzada                         ║");
     print_message("║                                                              ║");
     print_message("║  Versión: 0.4.0 (Next Gen)                                  ║");
     print_message("║  Arquitectura: x86_64 Microkernel                           ║");
@@ -224,50 +224,50 @@ fn print_banner() {
 
 /// Inicializar componentes del kernel
 fn initialize_kernel_components() {
-    print_message("🔧 Inicializando componentes del kernel...");
+    print_message("Inicializando componentes del kernel...");
     
     // Inicializar HAL
     // hal::init();
-    print_message("  ✅ HAL inicializado");
+    print_message("  [OK] HAL inicializado");
     
     // Inicializar drivers
     // drivers::init();
-    print_message("  ✅ Drivers inicializados");
+    print_message("  [OK] Drivers inicializados");
     
     // Inicializar administrador de memoria
     // memory::init();
-    print_message("  ✅ Administrador de memoria inicializado");
+    print_message("  [OK] Administrador de memoria inicializado");
     
     // Inicializar administrador de procesos
     // process::init();
-    print_message("  ✅ Administrador de procesos inicializado");
+    print_message("  [OK] Administrador de procesos inicializado");
     
     // Inicializar administrador de hilos
     // thread::init();
-    print_message("  ✅ Administrador de hilos inicializado");
+    print_message("  [OK] Administrador de hilos inicializado");
     
     // Inicializar sistema de I/O
     // io::init();
-    print_message("  ✅ Sistema de I/O inicializado");
+    print_message("  [OK] Sistema de I/O inicializado");
     
     // Inicializar sistema de archivos
     // filesystem::init();
-    print_message("  ✅ Sistema de archivos inicializado");
+    print_message("  [OK] Sistema de archivos inicializado");
     
     // Inicializar sistema de red
     // network::init_network();
-    print_message("  ✅ Stack de red inicializado");
+    print_message("  [OK] Stack de red inicializado");
     
     // Inicializar sistema de gráficos
     // graphics::init_graphics();
-    print_message("  ✅ Sistema de gráficos inicializado");
+    print_message("  [OK] Sistema de gráficos inicializado");
     
-    print_message("✅ Componentes del kernel inicializados correctamente");
+    print_message("[OK] Componentes del kernel inicializados correctamente");
 }
 
 /// Bucle principal del kernel
 fn kernel_main_loop() -> ! {
-    print_message("🔄 Iniciando bucle principal del kernel...");
+    print_message("Iniciando bucle principal del kernel...");
     
     let mut cycle_count = 0;
     
@@ -289,14 +289,14 @@ fn kernel_main_loop() -> ! {
 
 /// Mostrar estadísticas del sistema
 fn show_system_stats() {
-    print_message("📊 Estadísticas del sistema:");
-    print_message("  💾 Memoria: Sistema inicializado");
-    print_message("  🔄 Procesos: Sistema inicializado");
-    print_message("  🧵 Hilos: Sistema inicializado");
-    print_message("  💿 I/O: Sistema inicializado");
-    print_message("  📁 Sistema de archivos: Sistema inicializado");
-    print_message("  🌐 Red: Sistema inicializado");
-    print_message("  🎨 Gráficos: Sistema inicializado");
+    print_message("Estadísticas del sistema:");
+    print_message("  Memoria: Sistema inicializado");
+    print_message("  Procesos: Sistema inicializado");
+    print_message("  Hilos: Sistema inicializado");
+    print_message("  I/O: Sistema inicializado");
+    print_message("  Sistema de archivos: Sistema inicializado");
+    print_message("  Red: Sistema inicializado");
+    print_message("  Gráficos: Sistema inicializado");
 }
 
 /// Procesar eventos del sistema

@@ -83,7 +83,7 @@ impl BootloaderInstaller {
     fn install_bootloader_files(&self) -> Result<(), String> {
         println!("   📦 Instalando archivos del bootloader...");
         
-        let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
+        let bootloader_source = "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
         let bootloader_dest = format!("{}/EFI/BOOT/BOOTX64.EFI", self.efi_mount_point);
         
         if !Path::new(bootloader_source).exists() {
@@ -131,7 +131,7 @@ title=Eclipse OS
 description=Sistema Operativo Eclipse v1.0
 kernel=/eclipse_kernel
 initrd=
-args=quiet splash
+args=splash
 "#;
         
         let config_path = format!("{}/boot.conf", self.efi_mount_point);
@@ -161,7 +161,7 @@ args quiet splash
     fn install_kernel(&self) -> Result<(), String> {
         println!("   🧠 Instalando kernel Eclipse...");
         
-        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
+        let kernel_source = "target/x86_64-unknown-none/release/eclipse_kernel";
         let kernel_dest = format!("{}/eclipse_kernel", self.efi_mount_point);
         
         if !Path::new(kernel_source).exists() {

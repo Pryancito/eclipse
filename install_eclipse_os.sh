@@ -200,12 +200,12 @@ install_bootloader() {
     
     # Copiar bootloader
     echo "   📦 Instalando bootloader..."
-    if [ -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
-        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI; then
+    if [ -f "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
+        if ! cp target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/BOOT/BOOTX64.EFI; then
             echo "❌ Error: No se pudo copiar bootloader a EFI/BOOT/"
             return 1
         fi
-        if ! cp bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi; then
+        if ! cp target/x86_64-unknown-uefi/release/eclipse-bootloader.efi /mnt/eclipse-efi/EFI/eclipse/eclipse-bootloader.efi; then
             echo "❌ Error: No se pudo copiar bootloader a EFI/eclipse/"
             return 1
         fi
@@ -217,8 +217,8 @@ install_bootloader() {
     
     # Copiar kernel
     echo "   🧠 Instalando kernel..."
-    if [ -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
-        if ! cp eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel; then
+    if [ -f "target/x86_64-unknown-none/release/eclipse_kernel" ]; then
+        if ! cp target/x86_64-unknown-none/release/eclipse_kernel /mnt/eclipse-efi/eclipse_kernel; then
             echo "❌ Error: No se pudo copiar kernel"
             return 1
         fi
@@ -235,18 +235,18 @@ install_bootloader() {
         mkdir -p /mnt/eclipse-efi/userland/{bin,lib,config}
         
         # Copiar binarios userland
-        if [ -f "userland/module_loader/target/release/module_loader" ]; then
-            cp userland/module_loader/target/release/module_loader /mnt/eclipse-efi/userland/bin/
+        if [ -f "target/release/module_loader" ]; then
+            cp target/release/module_loader /mnt/eclipse-efi/userland/bin/
             echo "     ✓ Module Loader instalado"
         fi
         
-        if [ -f "userland/graphics_module/target/release/graphics_module" ]; then
-            cp userland/graphics_module/target/release/graphics_module /mnt/eclipse-efi/userland/bin/
+        if [ -f "target/release/graphics_module" ]; then
+            cp target/release/graphics_module /mnt/eclipse-efi/userland/bin/
             echo "     ✓ Graphics Module instalado"
         fi
         
-        if [ -f "userland/app_framework/target/release/app_framework" ]; then
-            cp userland/app_framework/target/release/app_framework /mnt/eclipse-efi/userland/bin/
+        if [ -f "target/release/app_framework" ]; then
+            cp target/release/app_framework /mnt/eclipse-efi/userland/bin/
             echo "     ✓ App Framework instalado"
         fi
         
@@ -293,7 +293,7 @@ title=Eclipse OS
 description=Sistema Operativo Eclipse v0.4.0
 kernel=/eclipse_kernel
 initrd=
-args=quiet splash
+args=splash
 BOOT_CONF_EOF
     
     # README
@@ -432,20 +432,20 @@ check_and_build_files() {
     local missing_files=()
     
     # Verificar kernel
-    if [ ! -f "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel" ]; then
+    if [ ! -f "target/x86_64-unknown-none/release/eclipse_kernel" ]; then
         missing_files+=("kernel")
     fi
     
     # Verificar bootloader
-    if [ ! -f "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
+    if [ ! -f "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi" ]; then
         missing_files+=("bootloader")
     fi
     
     # Verificar userland (opcional)
     if [ -d "userland" ]; then
-        if [ ! -f "userland/module_loader/target/release/module_loader" ] || 
-           [ ! -f "userland/graphics_module/target/release/graphics_module" ] || 
-           [ ! -f "userland/app_framework/target/release/app_framework" ]; then
+        if [ ! -f "target/release/module_loader" ] || 
+           [ ! -f "target/release/graphics_module" ] || 
+           [ ! -f "target/release/app_framework" ]; then
             missing_files+=("userland")
         fi
     fi

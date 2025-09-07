@@ -304,7 +304,7 @@ pub fn kernel_main() -> ! {
         VGA.write_string("║                        v0.5.0                                ║\n");
         VGA.write_string("╚══════════════════════════════════════════════════════════════╝\n");
         VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("\n🦀 KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
+        VGA.write_string("\nKERNEL TOMANDO CONTROL DEL SISTEMA...\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("==========================================\n\n");
         
@@ -322,7 +322,7 @@ pub fn kernel_main() -> ! {
             framebuffer_write_string("║                    ECLIPSE OS KERNEL                         ║\n");
             framebuffer_write_string("║                        v0.5.0                                ║\n");
             framebuffer_write_string("╚══════════════════════════════════════════════════════════════╝\n");
-            framebuffer_write_string("\n🦀 KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
+            framebuffer_write_string("\n KERNEL TOMANDO CONTROL DEL SISTEMA...\n");
             framebuffer_write_string("==========================================\n\n");
             
             // Mostrar información del framebuffer
@@ -338,18 +338,18 @@ pub fn kernel_main() -> ! {
     // Inicializar drivers básicos
     unsafe {
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("✓ Drivers VGA inicializados\n");
-        VGA.write_string("✓ Driver de serie COM1 activo\n");
-        VGA.write_string("✓ Gestión de memoria básica lista\n");
+        VGA.write_string("Drivers VGA inicializados\n");
+        VGA.write_string("Driver de serie COM1 activo\n");
+        VGA.write_string("Gestión de memoria básica lista\n");
         
         // Inicializar framebuffer
-        VGA.write_string("✓ Inicializando framebuffer...\n");
+        VGA.write_string("Inicializando framebuffer...\n");
     }
     
     // Detectar hardware gráfico usando PCI
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("🔍 Detectando hardware gráfico...\n");
+        VGA.write_string("Detectando hardware gráfico...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -370,7 +370,7 @@ pub fn kernel_main() -> ! {
     // Mostrar información de GPUs detectadas
     unsafe {
         VGA.set_color(Color::LightBlue, Color::Black);
-        VGA.write_string("📊 Hardware detectado:\n");
+        VGA.write_string("Hardware detectado:\n");
         VGA.set_color(Color::White, Color::Black);
         
         for gpu_info in &available_gpus {
@@ -391,7 +391,7 @@ pub fn kernel_main() -> ! {
     // Mostrar información de drivers cargados
     unsafe {
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("🔧 Drivers de GPU cargados:\n");
+        VGA.write_string("Drivers de GPU cargados:\n");
         VGA.set_color(Color::White, Color::Black);
         
         for driver_info in &driver_info {
@@ -417,7 +417,7 @@ pub fn kernel_main() -> ! {
                 Ok(_) => {
                     unsafe {
                         VGA.set_color(Color::LightGreen, Color::Black);
-                        VGA.write_string("✓ Framebuffer inicializado correctamente\n");
+                        VGA.write_string("Framebuffer inicializado correctamente\n");
                         VGA.set_color(Color::White, Color::Black);
                     }
                     GraphicsMode::Framebuffer
@@ -425,7 +425,7 @@ pub fn kernel_main() -> ! {
                 Err(e) => {
                     unsafe {
                         VGA.set_color(Color::LightRed, Color::Black);
-                        VGA.write_string("❌ Error inicializando framebuffer: ");
+                        VGA.write_string("Error inicializando framebuffer: ");
                         VGA.write_string(e);
                         VGA.write_string("\n");
                         VGA.set_color(Color::White, Color::Black);
@@ -437,7 +437,7 @@ pub fn kernel_main() -> ! {
         NewGraphicsMode::HardwareAccelerated => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Hardware acelerado disponible\n");
+                VGA.write_string("Hardware acelerado disponible\n");
                         VGA.write_string("  - Driver recomendado: ");
                         VGA.write_string(recommended_driver.as_str());
                 VGA.write_string("\n");
@@ -448,7 +448,7 @@ pub fn kernel_main() -> ! {
         NewGraphicsMode::VGA => {
             unsafe {
                 VGA.set_color(Color::Yellow, Color::Black);
-                VGA.write_string("⚠️  Usando modo VGA (texto)\n");
+                VGA.write_string("Usando modo VGA (texto)\n");
                 VGA.write_string("  - Resolución: 80x25 caracteres\n");
                 VGA.write_string("  - Colores: 16 colores\n");
                 VGA.write_string("  - Modo: Texto\n");
@@ -461,7 +461,7 @@ pub fn kernel_main() -> ! {
     // Inicializar integración DRM
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("🔗 Inicializando integración DRM...\n");
+        VGA.write_string("Inicializando integración DRM...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -495,7 +495,7 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Integración DRM inicializada correctamente\n");
+                VGA.write_string("Integración DRM inicializada correctamente\n");
                 
                 // Mostrar información de la integración DRM
                 let integration_info = drm_integration.get_integration_info();
@@ -520,14 +520,14 @@ pub fn kernel_main() -> ! {
                 Ok(_) => {
                     unsafe {
                         VGA.set_color(Color::LightGreen, Color::Black);
-                        VGA.write_string("✓ Comunicación DRM kernel-userland establecida\n");
+                        VGA.write_string("Comunicación DRM kernel-userland establecida\n");
                         VGA.set_color(Color::White, Color::Black);
                     }
                 }
                 Err(e) => {
                     unsafe {
                         VGA.set_color(Color::LightRed, Color::Black);
-                        VGA.write_string("❌ Error en comunicación DRM: ");
+                        VGA.write_string("Error en comunicación DRM: ");
                         VGA.write_string(e);
                         VGA.write_string("\n");
                         VGA.set_color(Color::White, Color::Black);
@@ -538,7 +538,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando integración DRM: ");
+                VGA.write_string("Error inicializando integración DRM: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -548,7 +548,7 @@ pub fn kernel_main() -> ! {
         
         // Inicializar sistema de inicialización con systemd
     unsafe {
-        VGA.write_string("✓ Inicializando sistema de inicialización...\n");
+        VGA.write_string("Inicializando sistema de inicialización...\n");
     }
     
     // Inicializar systemd
@@ -557,11 +557,11 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Sistema de inicialización (systemd) configurado\n");
+                VGA.write_string("Sistema de inicialización (systemd) configurado\n");
                 
                 // Mostrar información del proceso init
                 if let Some(init_info) = init_system.get_init_info() {
-                    VGA.write_string("✓ Proceso init: ");
+                    VGA.write_string("Proceso init: ");
                     VGA.write_string(init_info.name);
                     VGA.write_string(" (PID: ");
                     VGA.write_string(&int_to_string(init_info.pid as u64));
@@ -586,7 +586,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error al inicializar systemd: ");
+                VGA.write_string("Error al inicializar systemd: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -606,14 +606,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Ventana de terminal creada\n");
+                VGA.write_string("Ventana de terminal creada\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error creando ventana: ");
+                VGA.write_string("Error creando ventana: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -626,7 +626,7 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Escritorio renderizado correctamente\n");
+                VGA.write_string("[OK] Escritorio renderizado correctamente\n");
                 
                 // Mostrar estadísticas de rendimiento
                 let stats = crate::desktop_ai::ai_get_performance_stats();
@@ -648,41 +648,12 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error renderizando escritorio: ");
+                VGA.write_string("Error renderizando escritorio: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
-    }
-    
-    // Demostración de colores VGA
-    unsafe {
-        VGA.set_color(Color::LightRed, Color::Black);
-        VGA.write_string("\nDemostración de colores VGA:\n");
-        VGA.set_color(Color::White, Color::Black);
-        
-        let colors = [
-            (Color::Red, "Rojo"),
-            (Color::Green, "Verde"),
-            (Color::Blue, "Azul"),
-            (Color::Yellow, "Amarillo"),
-            (Color::Cyan, "Cian"),
-            (Color::Magenta, "Magenta"),
-        ];
-        
-        for (color, name) in colors.iter() {
-            VGA.set_color(*color, Color::Black);
-            VGA.write_string("■ ");
-            VGA.set_color(Color::White, Color::Black);
-            VGA.write_string(name);
-            if *color == Color::Cyan || *color == Color::Magenta {
-                VGA.write_string("\n");
-            } else {
-                VGA.write_string("  ");
-            }
-        }
-        VGA.write_string("\n");
     }
     
     // Inicializar Wayland
@@ -696,16 +667,16 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Wayland inicializado correctamente\n");
-                VGA.write_string("✓ Compositor Wayland activo\n");
-                VGA.write_string("✓ Protocolo de ventanas listo\n");
+                VGA.write_string("Wayland inicializado correctamente\n");
+                VGA.write_string("Compositor Wayland activo\n");
+                VGA.write_string("Protocolo de ventanas listo\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando Wayland: ");
+                VGA.write_string("Error inicializando Wayland: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -716,7 +687,7 @@ pub fn kernel_main() -> ! {
     // Mostrar mensaje final y transferir control a systemd
     unsafe {
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("\n✓ Kernel Eclipse OS inicializado correctamente\n");
+        VGA.write_string("\nKernel Eclipse OS inicializado correctamente\n");
         VGA.set_color(Color::Yellow, Color::Black);
         VGA.write_string("Transferiendo control a systemd...\n");
         VGA.set_color(Color::White, Color::Black);
@@ -727,14 +698,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Control transferido a systemd exitosamente\n");
+                VGA.write_string("Control transferido a systemd exitosamente\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error al transferir control a systemd: ");
+                VGA.write_string("Error al transferir control a systemd: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -755,7 +726,7 @@ pub fn kernel_main() -> ! {
     
         unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("🎨 Demostrando aceleración 2D...\n");
+        VGA.write_string("Demostrando aceleración 2D...\n");
         VGA.set_color(Color::White, Color::Black);
     }
         
@@ -765,7 +736,7 @@ pub fn kernel_main() -> ! {
                 crate::drivers::acceleration_2d::AccelerationResult::HardwareAccelerated => {
                     unsafe {
                         VGA.set_color(Color::LightGreen, Color::Black);
-                        VGA.write_string("✓ Aceleración 2D hardware habilitada\n");
+                        VGA.write_string("Aceleración 2D hardware habilitada\n");
                         VGA.write_string("  - GPU: ");
                         VGA.write_string(gpu_info.gpu_type.as_str());
                         VGA.write_string("\n");
@@ -778,14 +749,14 @@ pub fn kernel_main() -> ! {
                 crate::drivers::acceleration_2d::AccelerationResult::SoftwareFallback => {
                     unsafe {
                         VGA.set_color(Color::Yellow, Color::Black);
-                        VGA.write_string("⚠️  Usando aceleración 2D software\n");
+                        VGA.write_string("Usando aceleración 2D software\n");
                         VGA.set_color(Color::White, Color::Black);
                     }
                 }
                 crate::drivers::acceleration_2d::AccelerationResult::DriverError(e) => {
                     unsafe {
                         VGA.set_color(Color::LightRed, Color::Black);
-                        VGA.write_string("❌ Error en aceleración 2D: ");
+                        VGA.write_string("Error en aceleración 2D: ");
                         VGA.write_string(&e);
                         VGA.write_string("\n");
                         VGA.set_color(Color::White, Color::Black);
@@ -811,7 +782,7 @@ pub fn kernel_main() -> ! {
                 crate::drivers::acceleration_2d::AccelerationResult::HardwareAccelerated => {
                     unsafe {
                         VGA.set_color(Color::LightGreen, Color::Black);
-                        VGA.write_string("✓ Operación ");
+                        VGA.write_string("[OK] Operación ");
                         VGA.write_string(&int_to_string(i as u64 + 1));
                         VGA.write_string(" acelerada por hardware\n");
                         VGA.set_color(Color::White, Color::Black);
@@ -820,7 +791,7 @@ pub fn kernel_main() -> ! {
                 crate::drivers::acceleration_2d::AccelerationResult::SoftwareFallback => {
                     unsafe {
                         VGA.set_color(Color::Yellow, Color::Black);
-                        VGA.write_string("⚠️  Operación ");
+                        VGA.write_string("Operación ");
                         VGA.write_string(&int_to_string(i as u64 + 1));
                         VGA.write_string(" usando software\n");
                         VGA.set_color(Color::White, Color::Black);
@@ -829,7 +800,7 @@ pub fn kernel_main() -> ! {
                 crate::drivers::acceleration_2d::AccelerationResult::DriverError(e) => {
     unsafe {
         VGA.set_color(Color::LightRed, Color::Black);
-                        VGA.write_string("❌ Error en operación ");
+                        VGA.write_string("Error en operación ");
                         VGA.write_string(&int_to_string(i as u64 + 1));
                         VGA.write_string(": ");
                         VGA.write_string(&e);
@@ -844,7 +815,7 @@ pub fn kernel_main() -> ! {
         // Mostrar información de aceleración
         unsafe {
             VGA.set_color(Color::LightCyan, Color::Black);
-            VGA.write_string("📊 Información de aceleración 2D:\n");
+            VGA.write_string("Información de aceleración 2D:\n");
             VGA.write_string("  ");
             VGA.write_string(&acceleration_2d.get_acceleration_info());
             VGA.write_string("\n");
@@ -855,7 +826,7 @@ pub fn kernel_main() -> ! {
     // Demostración del sistema de entrada USB
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("⌨️  Inicializando sistema de entrada USB...\n");
+        VGA.write_string("Inicializando sistema de entrada USB...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -870,14 +841,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Sistema de entrada inicializado\n");
+                VGA.write_string("Sistema de entrada inicializado\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando sistema de entrada: ");
+                VGA.write_string("Error inicializando sistema de entrada: ");
                 VGA.write_string(e);
             VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -891,7 +862,7 @@ pub fn kernel_main() -> ! {
         Ok(device_id) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Teclado USB conectado (ID: ");
+                VGA.write_string("Teclado USB conectado (ID: ");
                 VGA.write_string(&int_to_string(device_id as u64));
                 VGA.write_string(")\n");
                 VGA.write_string("  - Vendor: Logitech (0x046D)\n");
@@ -902,7 +873,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error conectando teclado: ");
+                VGA.write_string("Error conectando teclado: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -916,7 +887,7 @@ pub fn kernel_main() -> ! {
         Ok(device_id) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Mouse USB conectado (ID: ");
+                VGA.write_string("Mouse USB conectado (ID: ");
                 VGA.write_string(&int_to_string(device_id as u64));
                 VGA.write_string(")\n");
                 VGA.write_string("  - Vendor: Logitech (0x046D)\n");
@@ -928,7 +899,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error conectando mouse: ");
+                VGA.write_string("Error conectando mouse: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -940,7 +911,7 @@ pub fn kernel_main() -> ! {
     let stats = input_system.get_stats();
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("📊 Estadísticas del sistema de entrada:\n");
+        VGA.write_string("Estadísticas del sistema de entrada:\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("  - Teclados activos: ");
         VGA.write_string(&int_to_string(stats.active_keyboards as u64));
@@ -959,7 +930,7 @@ pub fn kernel_main() -> ! {
     // Simular algunos eventos de entrada
     unsafe {
         VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("🎮 Simulando eventos de entrada...\n");
+        VGA.write_string("Simulando eventos de entrada...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -968,7 +939,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = input_system.process_keyboard_data(0, &keyboard_data) {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error procesando datos de teclado: ");
+            VGA.write_string("Error procesando datos de teclado: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -980,7 +951,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = input_system.process_mouse_data(0, &mouse_data) {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error procesando datos de mouse: ");
+            VGA.write_string("Error procesando datos de mouse: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -991,7 +962,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = input_system.process_events() {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error procesando eventos: ");
+            VGA.write_string("Error procesando eventos: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -1004,7 +975,7 @@ pub fn kernel_main() -> ! {
         event_count += 1;
         unsafe {
             VGA.set_color(Color::LightGreen, Color::Black);
-            VGA.write_string("✓ Evento ");
+            VGA.write_string("Evento ");
             VGA.write_string(&int_to_string(event_count));
             VGA.write_string(": ");
             VGA.set_color(Color::White, Color::Black);
@@ -1086,7 +1057,7 @@ pub fn kernel_main() -> ! {
     
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("🎯 Sistema de entrada USB completamente funcional\n");
+        VGA.write_string("Sistema de entrada USB completamente funcional\n");
         VGA.write_string("  - Soporte completo para teclado y mouse USB\n");
         VGA.write_string("  - Protocolo HID implementado\n");
         VGA.write_string("  - Sistema de eventos unificado\n");
@@ -1097,7 +1068,7 @@ pub fn kernel_main() -> ! {
     // Demostración del sistema completo integrado
     unsafe {
         VGA.set_color(Color::LightMagenta, Color::Black);
-        VGA.write_string("🚀 Inicializando ecosistema completo de entrada y GUI...\n");
+        VGA.write_string("Inicializando ecosistema completo de entrada y GUI...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -1129,14 +1100,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ USB Hub inicializado (4 puertos)\n");
+                VGA.write_string("USB Hub inicializado (4 puertos)\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando USB Hub: ");
+                VGA.write_string("Error inicializando USB Hub: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1166,7 +1137,7 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Driver HID inicializado\n");
+                VGA.write_string("Driver HID inicializado\n");
                 VGA.write_string("  - Descriptor HID: ");
                 VGA.write_string(&int_to_string(hid_driver.get_descriptor().to_bytes().len() as u64));
                 VGA.write_string(" bytes\n");
@@ -1179,7 +1150,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando HID: ");
+                VGA.write_string("Error inicializando HID: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1193,14 +1164,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Gestor de GUI inicializado\n");
+                VGA.write_string("Gestor de GUI inicializado\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando GUI: ");
+                VGA.write_string("Error inicializando GUI: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1213,14 +1184,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Ventana principal creada\n");
+                VGA.write_string("Ventana principal creada\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error creando ventana: ");
+                VGA.write_string("Error creando ventana: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1234,14 +1205,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Botón GUI creado\n");
+                VGA.write_string("Botón GUI creado\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error creando botón: ");
+                VGA.write_string("Error creando botón: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1254,14 +1225,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Campo de texto GUI creado\n");
+                VGA.write_string("Campo de texto GUI creado\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error creando campo de texto: ");
+                VGA.write_string("Error creando campo de texto: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1275,7 +1246,7 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Gestor de aplicaciones inicializado\n");
+                VGA.write_string("Gestor de aplicaciones inicializado\n");
                 VGA.write_string("  - Aplicaciones disponibles: ");
                 VGA.write_string(&int_to_string(app_manager.get_app_count() as u64));
                 VGA.write_string("\n");
@@ -1285,7 +1256,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando aplicaciones: ");
+                VGA.write_string("Error inicializando aplicaciones: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1298,7 +1269,7 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Aplicación activa: ");
+                VGA.write_string("Aplicación activa: ");
                 VGA.write_string(app_manager.get_current_app_name().unwrap_or("Desconocida"));
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1307,7 +1278,7 @@ pub fn kernel_main() -> ! {
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error cambiando aplicación: ");
+                VGA.write_string("Error cambiando aplicación: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1318,7 +1289,7 @@ pub fn kernel_main() -> ! {
     // Demostrar procesamiento de eventos integrado
     unsafe {
                 VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("🎮 Demostrando procesamiento de eventos integrado...\n");
+        VGA.write_string("Demostrando procesamiento de eventos integrado...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -1326,7 +1297,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = input_system.process_events() {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error procesando eventos de entrada: ");
+            VGA.write_string("Error procesando eventos de entrada: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -1339,7 +1310,7 @@ pub fn kernel_main() -> ! {
         if let Err(e) = gui_manager.process_input_event(&event) {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error procesando evento en GUI: ");
+                VGA.write_string("Error procesando evento en GUI: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1350,7 +1321,7 @@ pub fn kernel_main() -> ! {
         if let Err(e) = app_manager.process_input(&event) {
             unsafe {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error procesando evento en aplicación: ");
+                VGA.write_string("Error procesando evento en aplicación: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1362,7 +1333,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = gui_manager.render(&mut acceleration_2d) {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error renderizando GUI: ");
+            VGA.write_string("Error renderizando GUI: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -1373,7 +1344,7 @@ pub fn kernel_main() -> ! {
     if let Err(e) = app_manager.render(&mut acceleration_2d) {
         unsafe {
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("❌ Error renderizando aplicación: ");
+            VGA.write_string("Error renderizando aplicación: ");
             VGA.write_string(e);
             VGA.write_string("\n");
             VGA.set_color(Color::White, Color::Black);
@@ -1386,7 +1357,7 @@ pub fn kernel_main() -> ! {
     
     unsafe {
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("📊 Estadísticas del ecosistema completo:\n");
+        VGA.write_string("Estadísticas del ecosistema completo:\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("  - Teclados USB: ");
         VGA.write_string(&int_to_string(input_stats.active_keyboards as u64));
@@ -1412,7 +1383,7 @@ pub fn kernel_main() -> ! {
     
     unsafe {
         VGA.set_color(Color::LightMagenta, Color::Black);
-        VGA.write_string("🎯 Ecosistema completo de entrada y GUI funcional\n");
+        VGA.write_string("Ecosistema completo de entrada y GUI funcional\n");
         VGA.write_string("  - USB Hub con 4 puertos\n");
         VGA.write_string("  - Protocolo HID completo\n");
         VGA.write_string("  - Sistema de entrada unificado\n");
@@ -1425,7 +1396,7 @@ pub fn kernel_main() -> ! {
     // Ejecutar demostración de IA
     unsafe {
         VGA.set_color(Color::Yellow, Color::Black);
-        VGA.write_string("\n🤖 EJECUTANDO DEMOSTRACIÓN DE IA...\n");
+        VGA.write_string("\nEJECUTANDO DEMOSTRACIÓN DE IA...\n");
         VGA.set_color(Color::White, Color::Black);
     }
     
@@ -1433,14 +1404,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::Green, Color::Black);
-                VGA.write_string("✅ Demostración de IA completada exitosamente\n");
+                VGA.write_string("Demostración de IA completada exitosamente\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
                 VGA.set_color(Color::Red, Color::Black);
-                VGA.write_string("❌ Error en demostración de IA: ");
+                VGA.write_string("Error en demostración de IA: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1451,7 +1422,7 @@ pub fn kernel_main() -> ! {
     // Ejecutar shell con IA integrada
     unsafe {
         VGA.set_color(Color::Cyan, Color::Black);
-        VGA.write_string("\n🤖 INICIANDO SHELL CON IA INTEGRADA...\n");
+        VGA.write_string("\nINICIANDO SHELL CON IA INTEGRADA...\n");
         VGA.set_color(Color::White, Color::Black);
     }
 
@@ -1459,14 +1430,14 @@ pub fn kernel_main() -> ! {
         Ok(_) => {
             unsafe {
                 VGA.set_color(Color::Green, Color::Black);
-                VGA.write_string("✅ Shell con IA ejecutado exitosamente\n");
+                VGA.write_string("Shell con IA ejecutado exitosamente\n");
                 VGA.set_color(Color::White, Color::Black);
             }
         }
         Err(e) => {
             unsafe {
             VGA.set_color(Color::Red, Color::Black);
-            VGA.write_string("❌ Error ejecutando shell con IA: ");
+            VGA.write_string("Error ejecutando shell con IA: ");
             VGA.write_string("Error de kernel");
             VGA.write_string("\n");
                 VGA.set_color(Color::White, Color::Black);
@@ -1477,9 +1448,9 @@ pub fn kernel_main() -> ! {
     // Mostrar mensaje de que el kernel está listo
     unsafe {
         VGA.set_color(Color::Green, Color::Black);
-        VGA.write_string("\n✅ KERNEL ECLIPSE OS CON IA INICIALIZADO COMPLETAMENTE\n");
+        VGA.write_string("\nKERNEL ECLIPSE OS CON IA INICIALIZADO COMPLETAMENTE\n");
         VGA.set_color(Color::LightBlue, Color::Black);
-        VGA.write_string("🔄 Esperando que el userland tome el control...\n");
+        VGA.write_string("Esperando que el userland tome el control...\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("===============================================\n\n");
     }

@@ -222,9 +222,9 @@ pub extern "C" fn _start() -> ! {
         
         // Mostrar mensaje final
         VGA.set_color(VgaColor::LightGreen, VgaColor::Black);
-        VGA.write_string("\n✓ Sistema de escritorio inicializado correctamente\n");
-        VGA.write_string("✓ IA controlando la interfaz de usuario\n");
-        VGA.write_string("✓ Renderizado optimizado para máximo rendimiento\n");
+        VGA.write_string("\n[OK] Sistema de escritorio inicializado correctamente\n");
+        VGA.write_string("[OK] IA controlando la interfaz de usuario\n");
+        VGA.write_string("[OK] Renderizado optimizado para máximo rendimiento\n");
         VGA.set_color(VgaColor::White, VgaColor::Black);
     }
     

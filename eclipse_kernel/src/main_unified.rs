@@ -227,7 +227,7 @@ impl DesktopManager {
     pub fn render(&self) {
         unsafe {
             VGA.set_color(Color::White, self.background_color);
-            VGA.write_string("🖥️  Eclipse OS Desktop Manager\n");
+            VGA.write_string("Eclipse OS Desktop Manager\n");
             VGA.write_string("==============================\n\n");
             
             VGA.set_color(Color::LightCyan, self.background_color);
@@ -235,11 +235,11 @@ impl DesktopManager {
             
             for window in &self.windows {
                 if window.visible {
-                    let status = if window.focused { "★" } else { "○" };
+                    let status = if window.focused { "*" } else { "o" };
                     VGA.set_color(Color::Yellow, self.background_color);
                     VGA.write_string(&format!("{} Ventana {}: {}\n", status, window.id, window.title));
                     VGA.set_color(Color::LightGray, self.background_color);
-                    VGA.write_string(&format!("   Posición: ({}, {}) Tamaño: {}x{}\n", 
+                    VGA.write_string(&format!("   Posicion: ({}, {}) Tamano: {}x{}\n", 
                         window.x, window.y, window.width, window.height));
                 }
             }
@@ -255,7 +255,7 @@ pub fn kernel_main() -> ! {
     unsafe {
         // Inicializar VGA
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("🚀 Eclipse OS Kernel - Versión Unificada\n");
+        VGA.write_string("Eclipse OS Kernel - Version Unificada\n");
         VGA.write_string("========================================\n\n");
         
         VGA.set_color(Color::White, Color::Black);
@@ -263,17 +263,17 @@ pub fn kernel_main() -> ! {
         
         // Inicializar sistema de inicialización
         let mut init_system = InitSystem::new();
-        VGA.write_string("✓ Sistema de inicialización listo\n");
+        VGA.write_string("Sistema de inicializacion listo\n");
         
         // Inicializar Wayland
         match init_wayland() {
             Ok(_) => {
                 VGA.set_color(Color::LightGreen, Color::Black);
-                VGA.write_string("✓ Wayland inicializado correctamente\n");
+                VGA.write_string("Wayland inicializado correctamente\n");
             }
             Err(e) => {
                 VGA.set_color(Color::LightRed, Color::Black);
-                VGA.write_string("❌ Error inicializando Wayland: ");
+                VGA.write_string("Error inicializando Wayland: ");
                 VGA.write_string(e);
                 VGA.write_string("\n");
             }
@@ -296,7 +296,7 @@ pub fn kernel_main() -> ! {
         // Enfocar primera ventana
         desktop.focus_window(1);
         
-        VGA.write_string("\n🎯 Sistema de escritorio inicializado\n");
+        VGA.write_string("\nSistema de escritorio inicializado\n");
         VGA.write_string("=====================================\n\n");
         
         // Renderizar escritorio
@@ -304,31 +304,31 @@ pub fn kernel_main() -> ! {
         
         // Simular interacción del usuario
         VGA.set_color(Color::LightMagenta, Color::Black);
-        VGA.write_string("\n🔄 Simulando interacciones del usuario...\n");
+        VGA.write_string("\nSimulando interacciones del usuario...\n");
         
         // Cambiar foco entre ventanas
         desktop.focus_window(2);
-        VGA.write_string("✓ Cambiado foco a File Manager\n");
+        VGA.write_string("Cambiado foco a File Manager\n");
         
         desktop.focus_window(3);
-        VGA.write_string("✓ Cambiado foco a System Monitor\n");
+        VGA.write_string("Cambiado foco a System Monitor\n");
         
         desktop.focus_window(1);
-        VGA.write_string("✓ Cambiado foco a Terminal\n");
+        VGA.write_string("Cambiado foco a Terminal\n");
         
         // Mostrar estadísticas del sistema
         VGA.set_color(Color::LightCyan, Color::Black);
-        VGA.write_string("\n📊 Estadísticas del sistema:\n");
+        VGA.write_string("\nEstadisticas del sistema:\n");
         VGA.set_color(Color::White, Color::Black);
         VGA.write_string("  - Ventanas creadas: 3\n");
         VGA.write_string("  - Wayland activo: ");
-        VGA.write_string(if is_wayland_initialized() { "Sí" } else { "No" });
+        VGA.write_string(if is_wayland_initialized() { "Si" } else { "No" });
         VGA.write_string("\n");
         VGA.write_string("  - Modo de escritorio: Activo\n");
-        VGA.write_string("  - Gestión de ventanas: Funcional\n");
+        VGA.write_string("  - Gestion de ventanas: Funcional\n");
         
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("\n✅ Eclipse OS Desktop Kernel funcionando correctamente!\n");
+        VGA.write_string("\nEclipse OS Desktop Kernel funcionando correctamente!\n");
         VGA.write_string("   Sistema unificado con funcionalidades de escritorio\n");
         VGA.write_string("   y kernel simplificado integradas.\n");
         

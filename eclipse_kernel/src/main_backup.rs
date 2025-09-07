@@ -618,9 +618,9 @@ fn show_system_stats() {
     
     // Estadísticas del sistema de IA
     if let Some(stats) = ai_system::get_ai_system_statistics() {
-        print_message("  🤖 IA: modelos activos, inferencias totales, precisión promedio");
+        print_message("  IA: modelos activos, inferencias totales, precisión promedio");
     } else {
-        print_message("  🤖 IA: sistema no inicializado");
+        print_message("  IA: sistema no inicializado");
     }
     
     // Estadísticas de la GUI moderna
@@ -632,9 +632,9 @@ fn show_system_stats() {
     
     // Estadísticas del sistema de seguridad
     if let Some(stats) = advanced_security::get_security_statistics() {
-        print_message("  🔒 Seguridad: claves activas, sandboxes activos, encriptaciones totales");
+        print_message("  Seguridad: claves activas, sandboxes activos, encriptaciones totales");
     } else {
-        print_message("  🔒 Seguridad: sistema no inicializado");
+        print_message("  Seguridad: sistema no inicializado");
     }
     
     // Estadísticas del sistema de privacidad
@@ -984,7 +984,7 @@ mod audio_driver {
         
         pub fn get_status(&self) -> String {
             format!(
-                "🔊 Audio: ID={}, {}Hz, {}ch, {}bit, Playing={}",
+                "Audio: ID={}, {}Hz, {}ch, {}bit, Playing={}",
                 self.device_id,
                 self.sample_rate.load(Ordering::SeqCst),
                 self.channels.load(Ordering::SeqCst),
@@ -1051,7 +1051,7 @@ mod wifi_driver {
         
         pub fn get_status(&self) -> String {
             format!(
-                "📶 WiFi: {} - {} - {}% señal",
+                "WiFi: {} - {} - {}% señal",
                 self.interface,
                 if self.is_connected { 
                     self.current_network.as_ref().unwrap_or(&"Conectado".to_string())
@@ -1129,7 +1129,7 @@ mod bluetooth_driver {
         
         pub fn get_status(&self) -> String {
             format!(
-                "📱 Bluetooth: {} - Powered={} - Connected={} - Paired={} - {}% señal",
+                "Bluetooth: {} - Powered={} - Connected={} - Paired={} - {}% señal",
                 self.adapter,
                 self.is_powered,
                 self.is_connected,
@@ -1215,7 +1215,7 @@ mod camera_driver {
         
         pub fn get_status(&self) -> String {
             format!(
-                "📷 Cámara: ID={} - {}x{} - {}fps - Brillo={}% - Capturing={} - Recording={}",
+                "Cámara: ID={} - {}x{} - {}fps - Brillo={}% - Capturing={} - Recording={}",
                 self.device_id,
                 self.resolution_width.load(Ordering::SeqCst),
                 self.resolution_height.load(Ordering::SeqCst),
@@ -1682,14 +1682,14 @@ mod hardware_detection {
             let scanning = self.scan_in_progress.load(Ordering::SeqCst);
             
             format!(
-                "🔍 Autodetección: {} dispositivos totales, {} funcionando, Escaneando: {}",
+                "Autodetección: {} dispositivos totales, {} funcionando, Escaneando: {}",
                 total, working, scanning
             )
         }
         
         pub fn get_detailed_report(&self) -> String {
             let mut report = String::new();
-            report.push_str("🔍 Reporte de Autodetección de Hardware:\n");
+            report.push_str("Reporte de Autodetección de Hardware:\n");
             report.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
             
             for device in &self.detected_devices {
@@ -2088,7 +2088,7 @@ mod power_management {
             };
             
             report.push_str(&format!("   Perfil: {}\n", profile));
-            report.push_str(&format!("  💻 CPU: {} MHz\n", self.cpu_frequency.load(Ordering::SeqCst)));
+            report.push_str(&format!("   CPU: {} MHz\n", self.cpu_frequency.load(Ordering::SeqCst)));
             report.push_str(&format!("   Memoria: {}% energía\n", self.memory_power.load(Ordering::SeqCst)));
             report.push_str(&format!("   Dispositivos: {}% energía\n", self.device_power.load(Ordering::SeqCst)));
             report.push_str(&format!("    Temperatura: {}°C\n", self.thermal_state.load(Ordering::SeqCst)));

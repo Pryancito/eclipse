@@ -38,13 +38,13 @@ impl KernelProfiler {
     pub fn start_profiling(&mut self) {
         self.enabled = true;
         self.start_time = self.get_current_time();
-        println!("📊 Profiling del kernel iniciado");
+        println!("Profiling del kernel iniciado");
     }
     
     pub fn stop_profiling(&mut self) {
         self.enabled = false;
         let total_time = self.get_current_time() - self.start_time;
-        println!("📊 Profiling del kernel detenido ({}ms total)", total_time);
+        println!("Profiling del kernel detenido ({}ms total)", total_time);
     }
     
     pub fn measure_function<F, R>(&mut self, name: &str, func: F) -> R
@@ -78,7 +78,7 @@ impl KernelProfiler {
     
     pub fn get_report(&self) -> String {
         let mut report = String::new();
-        report.push_str("📊 Reporte de Profiling del Kernel:\n");
+        report.push_str("Reporte de Profiling del Kernel:\n");
         report.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
         
         for (name, measurement) in &self.measurements {
@@ -98,7 +98,7 @@ impl KernelProfiler {
     
     pub fn reset(&mut self) {
         self.measurements.clear();
-        println!("📊 Profiling resetado");
+        println!("Profiling resetado");
     }
 }
 

@@ -14,13 +14,13 @@ pub fn cmd_help(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
     if args.is_empty() {
         // Mostrar ayuda general
         let mut help = String::new();
-        writeln!(&mut help, "📚 Eclipse OS Shell - Comandos disponibles:").unwrap();
+        writeln!(&mut help, "Eclipse OS Shell - Comandos disponibles:").unwrap();
         writeln!(&mut help, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
         
         for category in shell.get_categories() {
             let commands = shell.list_commands_by_category(category.clone());
             if !commands.is_empty() {
-                writeln!(&mut help, "\n🔹 {}:", category_name(&category)).unwrap();
+                writeln!(&mut help, "\n{}:", category_name(&category)).unwrap();
                 for cmd in commands {
                     writeln!(&mut help, "  {:<15} - {}", cmd.name, cmd.description).unwrap();
                 }
@@ -35,7 +35,7 @@ pub fn cmd_help(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
         let cmd_name = &args[0];
         if let Some(cmd) = shell.get_command(cmd_name) {
             let mut help = String::new();
-            writeln!(&mut help, "📖 Ayuda para el comando '{}':", cmd.name).unwrap();
+            writeln!(&mut help, "Ayuda para el comando '{}':", cmd.name).unwrap();
             writeln!(&mut help, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
             writeln!(&mut help, "  Descripción: {}", cmd.description).unwrap();
             writeln!(&mut help, "  Uso: {}", cmd.usage).unwrap();
@@ -59,10 +59,10 @@ pub fn cmd_info(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     writeln!(&mut info, "   Drivers: PCI, USB, almacenamiento, red, gráficos").unwrap();
     writeln!(&mut info, "   Sistema de archivos: VFS, FAT32, NTFS").unwrap();
     writeln!(&mut info, "   Red: Stack completo TCP/IP con routing").unwrap();
-    writeln!(&mut info, "  🎨 GUI: Sistema de ventanas con compositor").unwrap();
+    writeln!(&mut info, "   GUI: Sistema de ventanas con compositor").unwrap();
     writeln!(&mut info, "   Seguridad: Sistema avanzado con encriptación").unwrap();
-    writeln!(&mut info, "  🤖 IA: Machine learning integrado").unwrap();
-    writeln!(&mut info, "  🐳 Contenedores: Sistema nativo de contenedores").unwrap();
+    writeln!(&mut info, "   IA: Machine learning integrado").unwrap();
+    writeln!(&mut info, "   Contenedores: Sistema nativo de contenedores").unwrap();
     writeln!(&mut info, "   Monitoreo: Tiempo real con métricas dinámicas").unwrap();
     Ok(info)
 }
@@ -305,7 +305,7 @@ pub fn cmd_security(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult
     writeln!(&mut result, "    Firewall: Activo").unwrap();
     writeln!(&mut result, "   Encriptación: AES-256").unwrap();
     writeln!(&mut result, "   Claves activas: 5").unwrap();
-    writeln!(&mut result, "  🏰 Sandboxes: 3 activos").unwrap();
+    writeln!(&mut result, "   Sandboxes: 3 activos").unwrap();
     writeln!(&mut result, "   Encriptaciones: 1024").unwrap();
     writeln!(&mut result, "   Alertas: 0").unwrap();
     writeln!(&mut result, "  [OK] Estado: Seguro").unwrap();
@@ -340,7 +340,7 @@ pub fn cmd_ai(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     match subcommand.as_str() {
         "status" => {
             let mut result = String::new();
-            writeln!(&mut result, "🤖 Estado del sistema de IA:").unwrap();
+            writeln!(&mut result, "Estado del sistema de IA:").unwrap();
             writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
             writeln!(&mut result, "   Modelos cargados: 3").unwrap();
             writeln!(&mut result, "   Inferencias totales: 1024").unwrap();
@@ -382,7 +382,7 @@ pub fn cmd_docker(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     match subcommand.as_str() {
         "ps" => {
             let mut result = String::new();
-            writeln!(&mut result, "🐳 Contenedores activos:").unwrap();
+            writeln!(&mut result, "Contenedores activos:").unwrap();
             writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
             writeln!(&mut result, "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS   PORTS   NAMES").unwrap();
             writeln!(&mut result, "abc123def456  eclipse   /bin/sh   2h ago    Up 2h    80/tcp  web-server").unwrap();
@@ -403,7 +403,7 @@ pub fn cmd_docker(args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_container(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "🐳 Información de contenedores:").unwrap();
+    writeln!(&mut result, "Información de contenedores:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut result, "   Contenedores totales: 2").unwrap();
     writeln!(&mut result, "  [OK] Contenedores ejecutándose: 1").unwrap();
@@ -451,7 +451,7 @@ pub fn cmd_clear(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_history(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
     let mut result = String::new();
-    writeln!(&mut result, "📜 Historial de comandos:").unwrap();
+    writeln!(&mut result, "Historial de comandos:").unwrap();
     writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     
     let limit = if args.is_empty() {
@@ -477,7 +477,7 @@ pub fn cmd_alias(args: &[String], shell: &mut AdvancedShell) -> ShellResult {
     if args.is_empty() {
         // Mostrar todos los alias
         let mut result = String::new();
-        writeln!(&mut result, "🔗 Alias disponibles:").unwrap();
+        writeln!(&mut result, "Alias disponibles:").unwrap();
         writeln!(&mut result, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
         for (alias, command) in &shell.aliases {
             writeln!(&mut result, "  {} = {}", alias, command).unwrap();
@@ -507,7 +507,7 @@ pub fn cmd_date(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 
 pub fn cmd_exit(_args: &[String], shell: &mut AdvancedShell) -> ShellResult {
     shell.running = false;
-    Ok("👋 Cerrando Eclipse OS Shell...".to_string())
+    Ok("Cerrando Eclipse OS Shell...".to_string())
 }
 
 // Función auxiliar para nombres de categorías
@@ -536,7 +536,7 @@ fn category_name(category: &CommandCategory) -> &'static str {
 pub fn cmd_lshw(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     // Simular información de hardware
     let mut output = String::new();
-    writeln!(&mut output, "🔍 Información de Hardware:").unwrap();
+    writeln!(&mut output, "Información de Hardware:").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     writeln!(&mut output, "   CPU: Intel Core i7-12700K (x86_64)").unwrap();
     writeln!(&mut output, "   Memoria: 32GB DDR4 RAM").unwrap();
@@ -607,7 +607,7 @@ pub fn cmd_lscpu(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
 /// Comando detect - Detectar hardware
 pub fn cmd_detect(_args: &[String], _shell: &mut AdvancedShell) -> ShellResult {
     let mut output = String::new();
-    writeln!(&mut output, "🔍 Detectando hardware...").unwrap();
+    writeln!(&mut output, "Detectando hardware...").unwrap();
     writeln!(&mut output, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
     
     // Simular proceso de detección

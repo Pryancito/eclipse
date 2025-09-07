@@ -74,7 +74,7 @@ impl AIDemo {
 
     /// Demuestra la integración de IA
     fn demo_ai_integration(&self) -> Result<(), &'static str> {
-        println!("🔧 DEMOSTRACIÓN: Integración de IA en el Kernel");
+        println!("DEMOSTRACIÓN: Integración de IA en el Kernel");
         println!("{}", "─".repeat(60));
         
         if let Some(ai) = crate::ai_integration::get_ai_integration() {
@@ -99,25 +99,25 @@ impl AIDemo {
             
             // Simular procesamiento de solicitud
             println!("");
-            println!("📝 Procesando solicitud: 'optimizar memoria del sistema'");
+            println!("Procesando solicitud: 'optimizar memoria del sistema'");
             match ai.process_intervention_request("optimizar memoria del sistema") {
                 Ok(command_id) => {
-                    println!("✅ Comando procesado exitosamente con ID: {}", command_id);
+                    println!("[OK] Comando procesado exitosamente con ID: {}", command_id);
                     
                     // Obtener resultado del comando
                     if let Some(result) = ai.get_command_result(command_id) {
-                        println!("📊 Resultado del comando:");
+                        println!("Resultado del comando:");
                         println!("  - Éxito: {}", result.success);
                         println!("  - Mensaje: {}", result.message);
                         println!("  - Datos: {:?}", result.data);
                     }
                 }
                 Err(e) => {
-                    println!("❌ Error procesando comando: {}", e);
+                    println!("[ERROR] Error procesando comando: {}", e);
                 }
             }
         } else {
-            println!("❌ IA no disponible");
+            println!("[ERROR] IA no disponible");
         }
         
         println!("");
@@ -126,7 +126,7 @@ impl AIDemo {
 
     /// Demuestra la comunicación con IA
     fn demo_ai_communication(&self) -> Result<(), &'static str> {
-        println!("💬 DEMOSTRACIÓN: Comunicación Bidireccional con IA");
+        println!("DEMOSTRACIÓN: Comunicación Bidireccional con IA");
         println!("{}", "─".repeat(60));
         
         if let Some(channel) = crate::ai_communication::get_ai_communication_channel() {
@@ -140,29 +140,29 @@ impl AIDemo {
             
             // Simular envío de mensaje
             println!("");
-            println!("📤 Enviando mensaje: 'status del sistema'");
+            println!("Enviando mensaje: 'status del sistema'");
             match channel.send_message("status del sistema", CommunicationType::Request) {
                 Ok(message_id) => {
-                    println!("✅ Mensaje enviado con ID: {}", message_id);
+                    println!("[OK] Mensaje enviado con ID: {}", message_id);
                 }
                 Err(e) => {
-                    println!("❌ Error enviando mensaje: {}", e);
+                    println!("[ERROR] Error enviando mensaje: {}", e);
                 }
             }
             
             // Simular envío de comando
             println!("");
-            println!("📤 Enviando comando: 'intervene memory'");
+            println!("Enviando comando: 'intervene memory'");
             match channel.send_message("intervene memory", CommunicationType::Command) {
                 Ok(message_id) => {
-                    println!("✅ Comando enviado con ID: {}", message_id);
+                    println!("[OK] Comando enviado con ID: {}", message_id);
                 }
                 Err(e) => {
-                    println!("❌ Error enviando comando: {}", e);
+                    println!("[ERROR] Error enviando comando: {}", e);
                 }
             }
         } else {
-            println!("❌ Canal de comunicación no disponible");
+            println!("[ERROR] Canal de comunicación no disponible");
         }
         
         println!("");
@@ -171,7 +171,7 @@ impl AIDemo {
 
     /// Demuestra el control del sistema por IA
     fn demo_ai_control(&self) -> Result<(), &'static str> {
-        println!("🎛️  DEMOSTRACIÓN: Control del Sistema Operativo por IA");
+        println!("DEMOSTRACIÓN: Control del Sistema Operativo por IA");
         println!("{}", "─".repeat(60));
         
         if let Some(controller) = crate::ai_control::get_ai_system_controller() {
@@ -210,17 +210,17 @@ impl AIDemo {
             
             // Simular evaluación de políticas
             println!("");
-            println!("🔍 Evaluando políticas de control...");
+            println!("Evaluando políticas de control...");
             match controller.evaluate_control_policies() {
                 Ok(_) => {
-                    println!("✅ Políticas evaluadas correctamente");
+                    println!("[OK] Políticas evaluadas correctamente");
                 }
                 Err(e) => {
-                    println!("❌ Error evaluando políticas: {}", e);
+                    println!("[ERROR] Error evaluando políticas: {}", e);
                 }
             }
         } else {
-            println!("❌ Controlador de IA no disponible");
+            println!("[ERROR] Controlador de IA no disponible");
         }
         
         println!("");
@@ -229,7 +229,7 @@ impl AIDemo {
 
     /// Demuestra la interfaz de usuario
     fn demo_ai_interface(&self) -> Result<(), &'static str> {
-        println!("🖥️  DEMOSTRACIÓN: Interfaz de Usuario para IA");
+        println!("DEMOSTRACIÓN: Interfaz de Usuario para IA");
         println!("{}", "─".repeat(60));
         
         if let Some(interface) = crate::ai_interface::get_ai_user_interface() {
@@ -253,16 +253,16 @@ impl AIDemo {
             ];
             
             println!("");
-            println!("💬 Simulando interacciones con el usuario:");
+            println!("Simulando interacciones con el usuario:");
             for input in test_inputs {
                 println!("");
-                println!("👤 Usuario: {}", input);
+                println!("Usuario: {}", input);
                 match interface.process_user_input(input) {
                     Ok(response) => {
-                        println!("🤖 IA: {}", response);
+                        println!("IA: {}", response);
                     }
                     Err(e) => {
-                        println!("❌ Error: {}", e);
+                        println!("[ERROR] Error: {}", e);
                     }
                 }
             }
@@ -270,7 +270,7 @@ impl AIDemo {
             // Mostrar historial de conversación
             let history = interface.get_conversation_history();
             println!("");
-            println!("📚 Historial de conversación (últimas {} entradas):", history.len().min(5));
+            println!("Historial de conversación (últimas {} entradas):", history.len().min(5));
             for entry in history.iter().rev().take(5) {
                 println!("  - [{}] Usuario: {}", entry.timestamp, entry.user_input);
                 println!("    IA: {}", entry.ai_response);
@@ -280,7 +280,7 @@ impl AIDemo {
                 println!("");
             }
         } else {
-            println!("❌ Interfaz de usuario no disponible");
+            println!("[ERROR] Interfaz de usuario no disponible");
         }
         
         println!("");
@@ -289,15 +289,15 @@ impl AIDemo {
 
     /// Muestra el resumen de la demostración
     fn show_summary(&self) -> Result<(), &'static str> {
-        println!("📊 RESUMEN DE LA DEMOSTRACIÓN");
+        println!("RESUMEN DE LA DEMOSTRACIÓN");
         println!("{}", "─".repeat(60));
         
-        println!("✅ Integración de IA en el kernel: Funcional");
-        println!("✅ Comunicación bidireccional: Funcional");
-        println!("✅ Control del sistema operativo: Funcional");
-        println!("✅ Interfaz de usuario: Funcional");
+        println!("[OK] Integración de IA en el kernel: Funcional");
+        println!("[OK] Comunicación bidireccional: Funcional");
+        println!("[OK] Control del sistema operativo: Funcional");
+        println!("[OK] Interfaz de usuario: Funcional");
         println!("");
-        println!("🎯 Características principales:");
+        println!("Características principales:");
         println!("  - Intervención automática en el sistema operativo");
         println!("  - Aprendizaje adaptativo de patrones de uso");
         println!("  - Comunicación natural con el usuario");
@@ -307,7 +307,7 @@ impl AIDemo {
         println!("  - Gestión inteligente de procesos");
         println!("  - Seguridad proactiva");
         println!("");
-        println!("🚀 Eclipse OS con IA integrada está listo para uso avanzado");
+        println!("Eclipse OS con IA integrada está listo para uso avanzado");
         println!("   Similar a Computer Use de Anthropic, pero a nivel de SO");
         println!("");
         

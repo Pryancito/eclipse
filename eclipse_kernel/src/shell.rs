@@ -238,7 +238,7 @@ impl Shell {
             
             for (i, (color, name)) in colors.iter().enumerate() {
                 VGA.set_color(*color, Color::Black);
-                VGA.write_string("■ ");
+                VGA.write_string("[*] ");
                 VGA.set_color(Color::White, Color::Black);
                 VGA.write_string(name);
                 if (i + 1) % 4 == 0 {
@@ -258,25 +258,25 @@ impl Shell {
             VGA.set_color(Color::White, Color::Black);
             
             // Test 1: VGA
-            VGA.write_string("  ✓ Test VGA: OK\n");
+            VGA.write_string("  [OK] Test VGA: OK\n");
             
             // Test 2: Serial
-            SERIAL.write_string("  ✓ Test Serial: OK\n");
+            SERIAL.write_string("  [OK] Test Serial: OK\n");
             
             // Test 3: Funciones de formateo
-            VGA.write_string("  ✓ Test formateo: ");
+            VGA.write_string("  [OK] Test formateo: ");
             print_hex(0xDEADBEEF);
             VGA.write_string("\n");
             
             // Test 4: Colores
             VGA.set_color(Color::LightRed, Color::Black);
-            VGA.write_string("  ✓ Test colores: ");
+            VGA.write_string("  [OK] Test colores: ");
             VGA.set_color(Color::LightGreen, Color::Black);
             VGA.write_string("OK");
             VGA.set_color(Color::White, Color::Black);
             VGA.write_string("\n");
             
-            VGA.write_string("  ✓ Todas las pruebas completadas exitosamente\n");
+            VGA.write_string("  [OK] Todas las pruebas completadas exitosamente\n");
             VGA.write_string("\n");
         }
     }
