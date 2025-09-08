@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 uefi = "0.25.0"
+goblin = { version = "0.7", default-features = false, features = ["elf32", "elf64", "alloc"] }
 
 [profile.dev]
 panic = "abort"

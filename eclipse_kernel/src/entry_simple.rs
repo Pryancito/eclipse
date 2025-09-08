@@ -10,20 +10,6 @@ use core::panic::PanicInfo;
 
 // panic_handler definido en lib.rs
 
-/// Función principal del kernel
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // Inicializar VGA y mostrar "Eclipse OS" centrado
-    init_vga_and_display();
-    
-    // Bucle infinito del kernel
-    loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}
-
 /// Inicializar VGA y mostrar "Eclipse OS" centrado
 fn init_vga_and_display() {
     unsafe {

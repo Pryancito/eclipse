@@ -1445,18 +1445,16 @@ pub fn kernel_main() -> ! {
     //     }
     // }
 
-    // Mostrar mensaje de que el kernel está listo
-    unsafe {
-        VGA.set_color(Color::Green, Color::Black);
-        VGA.write_string("\nKERNEL ECLIPSE OS CON IA INICIALIZADO COMPLETAMENTE\n");
-        VGA.set_color(Color::LightBlue, Color::Black);
-        VGA.write_string("Esperando que el userland tome el control...\n");
-        VGA.set_color(Color::White, Color::Black);
-        VGA.write_string("===============================================\n\n");
-    }
-    
-    // Bucle principal del kernel (en caso de que systemd no tome control)
     loop {
+        // Mostrar mensaje de que el kernel está listo
+        unsafe {
+            VGA.set_color(Color::Green, Color::Black);
+            VGA.write_string("\nKERNEL ECLIPSE OS CON IA INICIALIZADO COMPLETAMENTE\n");
+            VGA.set_color(Color::LightBlue, Color::Black);
+            VGA.write_string("Esperando que el userland tome el control...\n");
+            VGA.set_color(Color::White, Color::Black);
+            VGA.write_string("===============================================\n\n");
+        }
         unsafe {
             core::arch::asm!("hlt");
         }

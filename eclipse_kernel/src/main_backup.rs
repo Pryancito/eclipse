@@ -97,7 +97,7 @@ mod container_system_simple;
 mod machine_learning_simple;
 
 /// Punto de entrada principal del kernel (Multiboot2)
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Forzar pantalla negra ultra-agresivamente
     vga_centered_display::ultra_force_black_screen();
@@ -117,10 +117,10 @@ pub extern "C" fn _start() -> ! {
     
     // Bucle principal del kernel
     kernel_main_loop();
-}
+}*/
 
 /// Punto de entrada UEFI (sin Multiboot2)
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn uefi_entry() -> ! {
     // Forzar pantalla negra ultra-agresivamente
     vga_centered_display::ultra_force_black_screen();
@@ -140,10 +140,10 @@ pub extern "C" fn uefi_entry() -> ! {
     
     // Bucle principal del kernel
     kernel_main_loop();
-}
+}*/
 
 /// Punto de entrada UEFI con parámetros del framebuffer
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn uefi_entry_with_framebuffer(
     base_address: u64,
     width: u64,

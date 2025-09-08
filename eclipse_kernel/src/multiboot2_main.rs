@@ -45,7 +45,7 @@ mod container_system_simple;
 mod machine_learning_simple;
 
 /// Punto de entrada principal del kernel compatible con Multiboot2
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Verificar que estamos siendo cargados por un bootloader Multiboot2
     if !multiboot2::is_multiboot2() {
@@ -63,7 +63,7 @@ pub extern "C" fn _start() -> ! {
     
     // Llamar al kernel principal
     kernel_main();
-}
+}*/
 
 /// Procesar información del bootloader
 fn process_bootloader_info(info: &multiboot2::Multiboot2Info) {

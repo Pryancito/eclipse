@@ -41,6 +41,30 @@ unsafe fn serial_write_str(s: &str) {
     for &c in s.as_bytes() { serial_write_byte(c); }
 }
 
+unsafe fn serial_write_hex32(val: u32) {
+    for i in (0..8).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
+
+unsafe fn serial_write_hex64(val: u64) {
+    for i in (0..16).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
+
 // Estructura para recibir información del framebuffer del bootloader UEFI
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -57,7 +81,7 @@ pub struct FramebufferInfo {
 }
 
 /// Punto de entrada principal del kernel (con parámetros del framebuffer)
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
     // Serial temprano
     unsafe {
@@ -95,29 +119,39 @@ pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
     
     // Continuar con la inicialización del kernel
     kernel_main()
+
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}*/
+
+#[no_mangle]
+pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
+    unsafe {
+        serial_init();
+        if framebuffer_info.is_null() {
+            serial_write_str("KERNEL: framebuffer_info ES NULL\r\n");
+        } else {
+            let fb = &*framebuffer_info;
+            serial_write_str("KERNEL: framebuffer_info OK\r\n");
+            // Imprime base_address y resolución
+            // (puedes hacerlo con hex if necesario)
+            // Ejemplo simple:
+            serial_write_str("Base: ");
+            serial_write_hex64(fb.base_address);
+            serial_write_str("\r\nW: ");
+            serial_write_hex32(fb.width);
+            serial_write_str(", H: ");
+            serial_write_hex32(fb.height);
+            serial_write_str("\r\n");
+        }
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
 }
 
-/// Punto de entrada UEFI con parámetros del framebuffer
-#[no_mangle]
-pub extern "C" fn uefi_entry_with_framebuffer(
-    base_address: u64,
-    width: u64,
-    height: u64,
-    pixels_per_scan_line: u64
-) -> ! {
-    // Inicializar framebuffer con parámetros del bootloader UEFI
-    if let Err(_e) = init_framebuffer_from_bootloader(
-        base_address,
-        width as u32,
-        height as u32,
-        pixels_per_scan_line as u32,
-        0, // pixel_format (RGB888)
-        0  // pixel_bitmask
-    ) {
-        // Si falla la inicialización del framebuffer, usar VGA como fallback
-        kernel_main();
-    }
-    
-    // Continuar con la inicialización del kernel
-    kernel_main();
-}

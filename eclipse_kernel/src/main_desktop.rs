@@ -166,7 +166,7 @@ fn get_time_ms() -> u64 {
 }
 
 // Función principal del kernel
-#[no_mangle]
+/*#[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Inicializar VGA
     unsafe {
@@ -234,6 +234,6 @@ pub extern "C" fn _start() -> ! {
             core::arch::asm!("hlt");
         }
     }
-}
+}*/
 
 // El panic_handler se hereda de la librería principal
