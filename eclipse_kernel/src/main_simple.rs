@@ -1426,24 +1426,24 @@ pub fn kernel_main() -> ! {
         VGA.set_color(Color::White, Color::Black);
     }
 
-    match crate::ai_shell::run_ai_shell() {
-        Ok(_) => {
-            unsafe {
-                VGA.set_color(Color::Green, Color::Black);
-                VGA.write_string("Shell con IA ejecutado exitosamente\n");
-                VGA.set_color(Color::White, Color::Black);
-            }
-        }
-        Err(e) => {
-            unsafe {
-            VGA.set_color(Color::Red, Color::Black);
-            VGA.write_string("Error ejecutando shell con IA: ");
-            VGA.write_string("Error de kernel");
-            VGA.write_string("\n");
-                VGA.set_color(Color::White, Color::Black);
-            }
-        }
-    }
+    // match crate::ai_shell::run_ai_shell() {
+    //     Ok(_) => {
+    //         unsafe {
+    //             VGA.set_color(Color::Green, Color::Black);
+    //             VGA.write_string("Shell con IA ejecutado exitosamente\n");
+    //             VGA.set_color(Color::White, Color::Black);
+    //         }
+    //     }
+    //     Err(e) => {
+    //         unsafe {
+    //         VGA.set_color(Color::Red, Color::Black);
+    //         VGA.write_string("Error ejecutando shell con IA: ");
+    //         VGA.write_string("Error de kernel");
+    //         VGA.write_string("\n");
+    //             VGA.set_color(Color::White, Color::Black);
+    //         }
+    //     }
+    // }
 
     // Mostrar mensaje de que el kernel está listo
     unsafe {
@@ -1463,9 +1463,4 @@ pub fn kernel_main() -> ! {
     }
 }
 
-/// Manejador de panic para el kernel
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // Aquí podrías imprimir información de panic a VGA o serie si es necesario
-    loop {}
-}
+// El panic_handler está definido en lib.rs

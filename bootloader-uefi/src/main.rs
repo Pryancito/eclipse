@@ -7,7 +7,7 @@ use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, Directory, RegularFile, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::table::boot::{AllocateType, MemoryType, BootServices};
+use uefi::table::boot::{AllocateType, MemoryType, BootServices, OpenProtocolParams, OpenProtocolAttributes, SearchType};
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::Identify;
 
@@ -189,7 +189,16 @@ struct Elf64Phdr {
 
 const PT_LOAD: u32 = 1;
 
-fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<u64, BootError> {
+const MAX_PH: usize = 64;
+
+struct SegmentMap {
+    count: usize,
+    vstart: [u64; MAX_PH],
+    pstart: [u64; MAX_PH],
+    len: [u64; MAX_PH],
+}
+
+fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64, u64, u64, SegmentMap), BootError> {
     // Posicionar al inicio y leer cabecera ELF de forma exacta
     let _ = file.set_position(0);
     let mut ehdr_buf = [0u8; core::mem::size_of::<Elf64Ehdr>()];
@@ -220,9 +229,10 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<u64,
         return Err(BootError::LoadElf(Status::UNSUPPORTED));
     }
 
-    // PASO 1: calcular el rango total [min_start, max_end) de todos los PT_LOAD
+    // PASO 1: calcular el rango total [min_start, max_end) de todos los PT_LOAD y recolectar map de segmentos
     let mut min_start: u64 = u64::MAX;
     let mut max_end: u64 = 0;
+    let mut segmap = SegmentMap { count: 0, vstart: [0; MAX_PH], pstart: [0; MAX_PH], len: [0; MAX_PH] };
     for i in 0..phnum {
         let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
         if file.set_position(off).is_err() { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
@@ -243,6 +253,16 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<u64,
         let dest_phys = if phdr.p_paddr != 0 { phdr.p_paddr } else { phdr.p_vaddr };
         let dest_start = dest_phys & !0xFFFu64;
         let dest_end = (dest_phys + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+        // Guardar mapeo virtual->físico del segmento
+        if segmap.count < MAX_PH {
+            let vst = phdr.p_vaddr & !0xFFFu64;
+            let pst = dest_start;
+            let l = dest_end.saturating_sub(dest_start);
+            segmap.vstart[segmap.count] = vst;
+            segmap.pstart[segmap.count] = pst;
+            segmap.len[segmap.count] = l;
+            segmap.count += 1;
+        }
         if dest_start < min_start { min_start = dest_start; }
         if dest_end > max_end { max_end = dest_end; }
     }
@@ -296,7 +316,8 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<u64,
     }
 
     let entry = if ehdr.e_entry != 0 { ehdr.e_entry } else { 0x0020_0000 };
-    Ok(entry)
+    let total_len = max_end - min_start;
+    Ok((entry, min_start, total_len, segmap))
 }
 
 enum BootError {
@@ -310,15 +331,15 @@ enum BootError {
     AllocPd(Status),
 }
 
-fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::Result<(u64, u64, u64), BootError> {
+fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::Result<(u64, u64, u64, u64, u64, SegmentMap), BootError> {
     // Abrir raíz del FS
     let mut root = open_root_fs(bs, handle).map_err(|e| BootError::OpenRoot(e.status()))?;
 
     // Abrir kernel
     let mut kernel_file = open_kernel_file(&mut root).map_err(|e| BootError::OpenKernel(e.status()))?;
 
-    // Cargar ELF64 y obtener entry
-    let entry = load_elf64_segments(bs, &mut kernel_file)?;
+    // Cargar ELF64 y obtener entry y región física ocupada y mapas por segmento
+    let (entry, image_phys_base, image_phys_len, segmap) = load_elf64_segments(bs, &mut kernel_file)?;
 
     // Reservar stack (64 KiB) por debajo de 1 GiB para que esté mapeada (identidad 0..1GiB)
     let stack_pages: usize = 16;
@@ -329,17 +350,17 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
-    // Configurar paginación identidad simple (4 GiB, páginas de 2 MiB)
-    // Allocate: 1 página para PML4, 1 para PDPT, 4 para PD (1 por GiB)
+    // Configurar paginación identidad simple (8 GiB, páginas de 2 MiB) + alias para la imagen en 4GiB..
+    // Allocate: 1 página para PML4, 1 para PDPT, 8 para PD (1 por GiB)
     let pml4_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
     let pdpt_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
-    let mut pd_phys_arr: [u64; 4] = [0; 4];
-    for i in 0..4 {
-        pd_phys_arr[i] = bs
+    let mut pd_phys_arr: [u64; 8] = [0; 8];
+    for gi_b in 0..8 {
+        pd_phys_arr[gi_b] = bs
             .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
     }
@@ -348,7 +369,7 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
         // Limpiar tablas
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
-        for i in 0..4 { core::ptr::write_bytes(pd_phys_arr[i] as *mut u8, 0, 4096); }
+        for gi_b in 0..8 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
 
         // Flags
         let p_w = 0x003u64; // Present | Write
@@ -356,21 +377,26 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
 
         // PML4[0] -> PDPT
         let pml4 = pml4_phys as *mut u64;
-        *pml4 = (pdpt_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        *pml4.add(0) = (pdpt_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
 
-        // PDPT[0..3] -> PDs (cada entrada mapea 1 GiB)
+        // PDPT[0..7] -> PDs (cada entrada mapea 1 GiB)
         let pdpt = pdpt_phys as *mut u64;
-        for giB in 0..4u64 {
-            *pdpt.add(giB as usize) = (pd_phys_arr[giB as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
-            let pd = pd_phys_arr[giB as usize] as *mut u64;
+        for gi_b in 0..8u64 {
+            *pdpt.add(gi_b as usize) = (pd_phys_arr[gi_b as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+            let pd = pd_phys_arr[gi_b as usize] as *mut u64;
             for i in 0..512u64 {
-                let base = giB * 0x4000_0000u64 + i * 0x20_0000u64; // 1GiB * giB + 2MiB * i
-                *pd.add(i as usize) = (base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+                // Identidad por defecto
+                let mut phys_base = gi_b * 0x4000_0000u64 + i * 0x20_0000u64;
+                // Alias fijo: VA [4GiB,5GiB) -> PA [0,1GiB)
+                if gi_b == 4 { phys_base = i * 0x20_0000u64; }
+                *pd.add(i as usize) = (phys_base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
             }
         }
+
+        // Nota: mantenemos únicamente mapeo identidad 0–8 GiB y un alias [4–5)→[0–1) GiB.
     }
 
-    Ok((entry, stack_top, pml4_phys))
+    Ok((entry, stack_top, pml4_phys, image_phys_base, image_phys_len, segmap))
 }
 
 #[entry]
@@ -385,7 +411,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     // Preparación con reporte de error detallado
-    let (entry_address, stack_top, pml4_phys): (u64, u64, u64) = {
+    let (entry_address, stack_top, pml4_phys, image_phys_base, image_phys_len, _segmap): (u64, u64, u64, u64, u64, SegmentMap) = {
         let bs = system_table.boot_services();
         match prepare_boot_environment(bs, handle) {
             Ok(tuple) => tuple,
@@ -434,16 +460,16 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let mut gop_protocol = None;
         
         // Obtener todos los handles
-        if let Ok(handles) = bs.locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) {
-            for handle in handles.iter() {
+        if let Ok(handles) = bs.locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID)) {
+            for gop_handle in handles.iter() {
                 if let Ok(gop) = unsafe { 
                     bs.open_protocol::<GraphicsOutput>(
-                        uefi::table::boot::OpenProtocolParams {
-                            handle: *handle,
-                            agent: *handle,
+                        OpenProtocolParams {
+                            handle: *gop_handle,
+                            agent: handle,
                             controller: None,
                         },
-                        uefi::table::boot::OpenProtocolAttributes::GetProtocol,
+                        OpenProtocolAttributes::GetProtocol,
                     )
                 } {
                     gop_protocol = Some(gop);
@@ -621,15 +647,29 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         if arg_reg != 0 { serial_write_str("BL: pasando framebuffer al kernel\r\n"); }
         serial_write_str("BL: CR3 y RSP configurados, saltando al kernel\r\n");
 
-        let rsp_alineado = stack_top & !0xFu64;
-        // Cambiar CR3, RSP y saltar, todo en un único bloque sin retorno
+        // Alinear pila para llamada: antes de `call`, RSP % 16 == 0.
+        // Usaremos `call` para entrar al kernel, por lo que no restamos 8 aquí.
+        let rsp_alineado = (stack_top & !0xFu64);
+        // Configurar estado de CPU (SSE) y paginación, luego saltar al kernel
         core::arch::asm!(
+            // Desactivar interrupciones antes de cambiar CR3
+            "cli",
+            // Habilitar SSE/x87 para evitar #UD si el kernel usa instrucciones SSE
+            "mov rax, cr0",
+            "and rax, ~(1 << 2)",        // CR0.EM = 0
+            "or  rax,  (1 << 1)",        // CR0.MP = 1
+            "mov cr0, rax",
+            "mov rax, cr4",
+            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+            "mov cr4, rax",
+            // Cargar CR3
             "mov cr3, {cr3}",
             "mov rsp, {rsp}",
             // pasar argumento en RDI (aunque sea 0)
             "mov rdi, {arg}",
-            // saltar a la entrada del kernel
-            "jmp {entry}",
+            // llamar a la entrada del kernel (no retorna)
+            "call {entry}",
             cr3 = in(reg) pml4_phys,
             rsp = in(reg) rsp_alineado,
             arg = in(reg) arg_reg,

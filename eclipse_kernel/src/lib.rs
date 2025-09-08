@@ -8,13 +8,13 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
-/// Panic handler para el kernel - comentado para evitar conflicto con std
-// #[panic_handler]
-// fn panic(info: &core::panic::PanicInfo) -> ! {
-//     // En un kernel real, aquí se manejaría el panic de manera segura
-//     // Por ahora, simplemente entramos en un bucle infinito
-//     loop {}
-// }
+/// Panic handler para el kernel
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // En un kernel real, aquí se manejaría el panic de manera segura
+    // Por ahora, simplemente entramos en un bucle infinito
+    loop {}
+}
 
 /// Allocator simple para el kernel
 // Allocator global definido en allocator.rs
@@ -61,10 +61,10 @@ pub mod ai_pretrained_models;  // Sistema de modelos de IA pre-entrenados
 pub mod ai_model_demo;  // Demostración de modelos de IA pre-entrenados
 pub mod ai_desktop_integration;  // Integración de IA con el escritorio
 pub mod ai_simple_demo;  // Demostración simple de IA
-pub mod ai_services;  // Servicios de IA integrados
-pub mod ai_commands;  // Comandos de IA para el shell
-pub mod ai_shell;  // Shell integrado con comandos de IA
-pub mod ai_inference_engine;  // Motor de inferencia real para modelos de IA
+// pub mod ai_services;  // Servicios de IA integrados - Módulo no implementado
+// pub mod ai_commands;  // Comandos de IA para el shell - Módulo no implementado
+// pub mod ai_shell;  // Shell integrado con comandos de IA - Módulo no implementado
+// pub mod ai_inference_engine;  // Motor de inferencia real para modelos de IA - Módulo no implementado
 pub mod syslog;  // Sistema de logging similar a syslog
 pub mod metrics;  // Sistema de métricas y monitoreo del kernel
 pub mod config;  // Sistema de configuración dinámica del kernel
@@ -331,32 +331,32 @@ pub fn initialize() -> KernelResult<()> {
         syslog_info!("AI_ENGINE", "Motor de inferencia real inicializado correctamente");
     }
 
-    // Inicializar servicios de IA
-    syslog_info!("AI_SERVICES", "Inicializando servicios de IA del sistema");
-    ai_services::init_ai_services()
-        .map_err(|e| {
-            syslog_err!("AI_SERVICES", "Error inicializando servicios de IA");
-            e
-        })?;
-    syslog_info!("AI_SERVICES", "Servicios de IA inicializados correctamente");
+    // Inicializar servicios de IA - Módulos no implementados
+    // syslog_info!("AI_SERVICES", "Inicializando servicios de IA del sistema");
+    // ai_services::init_ai_services()
+    //     .map_err(|e| {
+    //         syslog_err!("AI_SERVICES", "Error inicializando servicios de IA");
+    //         e
+    //     })?;
+    // syslog_info!("AI_SERVICES", "Servicios de IA inicializados correctamente");
 
-    // Inicializar comandos de IA
-    syslog_info!("AI_COMMANDS", "Inicializando comandos de IA del shell");
-    ai_commands::init_ai_commands()
-        .map_err(|e| {
-            syslog_err!("AI_COMMANDS", "Error inicializando comandos de IA");
-            e
-        })?;
-    syslog_info!("AI_COMMANDS", "Comandos de IA inicializados correctamente");
+    // Inicializar comandos de IA - Módulos no implementados
+    // syslog_info!("AI_COMMANDS", "Inicializando comandos de IA del shell");
+    // ai_commands::init_ai_commands()
+    //     .map_err(|e| {
+    //         syslog_err!("AI_COMMANDS", "Error inicializando comandos de IA");
+    //         e
+    //     })?;
+    // syslog_info!("AI_COMMANDS", "Comandos de IA inicializados correctamente");
 
-    // Inicializar shell con IA
-    syslog_info!("AI_SHELL", "Inicializando shell con IA integrada");
-    ai_shell::init_ai_shell()
-        .map_err(|e| {
-            syslog_err!("AI_SHELL", "Error inicializando shell con IA");
-            e
-        })?;
-    syslog_info!("AI_SHELL", "Shell con IA inicializado correctamente");
+    // Inicializar shell con IA - Módulos no implementados
+    // syslog_info!("AI_SHELL", "Inicializando shell con IA integrada");
+    // ai_shell::init_ai_shell()
+    //     .map_err(|e| {
+    //         syslog_err!("AI_SHELL", "Error inicializando shell con IA");
+    //         e
+    //     })?;
+    // syslog_info!("AI_SHELL", "Shell con IA inicializado correctamente");
 
     // Inicializar demostración simple de IA
     syslog_info!("AI_DEMO", "Inicializando demostración simple de IA");

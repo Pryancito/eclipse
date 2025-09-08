@@ -135,10 +135,10 @@ impl SystemValidator {
         println!("   Validando módulos userland...");
         
         let userland_modules = vec![
-            "target/release/module_loader",
-            "target/release/graphics_module", 
-            "target/release/app_framework",
-            "target/release/eclipse_userland",
+            "userland/module_loader/target/release/module_loader",
+            "userland/graphics_module/target/release/graphics_module", 
+            "userland/app_framework/target/release/app_framework",
+            "userland/target/release/eclipse_userland",
         ];
         
         let mut missing_modules = Vec::new();

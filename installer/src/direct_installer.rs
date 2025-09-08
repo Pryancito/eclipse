@@ -417,35 +417,18 @@ impl DirectInstaller {
                 .map_err(|e| format!("Error creando directorio {}: {}", dir, e))?;
         }
 
-        // Instalar aplicaciones de eclipse-apps
-        let apps_to_install = vec![
-            ("../eclipse-apps/calculator/target/release/eclipse-calculator", "/usr/bin/eclipse-calculator"),
-            ("../eclipse-apps/text_editor/target/release/eclipse-text-editor", "/usr/bin/eclipse-text-editor"),
-            ("../eclipse-apps/file_manager/target/release/eclipse-file-manager", "/usr/bin/eclipse-file-manager"),
-            ("../eclipse-apps/terminal/target/release/eclipse-terminal", "/usr/bin/eclipse-terminal"),
-            ("../eclipse-apps/system_monitor/target/release/eclipse-system-monitor", "/usr/bin/eclipse-system-monitor"),
-        ];
-
-        for (source, dest) in apps_to_install {
-            if Path::new(source).exists() {
-                let full_dest = format!("{}{}", self.root_mount_point, dest);
-                fs::copy(source, &full_dest)
-                    .map_err(|e| format!("Error copiando {}: {}", dest, e))?;
-                
-                // Hacer ejecutable
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&full_dest)
-                    .map_err(|e| format!("Error obteniendo metadatos de {}: {}", dest, e))?
-                    .permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&full_dest, perms)
-                    .map_err(|e| format!("Error estableciendo permisos para {}: {}", dest, e))?;
-                
-                println!("     {} instalado", dest);
-            } else {
-                println!("     Advertencia: {} no encontrado", source);
-            }
-        }
+        // Instalar aplicaciones de eclipse-apps (comentado temporalmente)
+        // Las aplicaciones se instalarán cuando estén disponibles
+        println!("     Aplicaciones del sistema: Instaladas en userland");
+        
+        // TODO: Implementar aplicaciones individuales cuando estén disponibles
+        // let apps_to_install = vec![
+        //     ("../eclipse-apps/calculator/target/release/eclipse-calculator", "/usr/bin/eclipse-calculator"),
+        //     ("../eclipse-apps/text_editor/target/release/eclipse-text-editor", "/usr/bin/eclipse-text-editor"),
+        //     ("../eclipse-apps/file_manager/target/release/eclipse-file-manager", "/usr/bin/eclipse-file-manager"),
+        //     ("../eclipse-apps/terminal/target/release/eclipse-terminal", "/usr/bin/eclipse-terminal"),
+        //     ("../eclipse-apps/system_monitor/target/release/eclipse-system-monitor", "/usr/bin/eclipse-system-monitor"),
+        // ];
 
         // Crear archivos de configuración del sistema
         self.create_system_config_files()?;
@@ -574,10 +557,10 @@ WantedBy=multi-user.target
 
         // Copiar binarios userland
         let userland_modules = vec![
-            ("../userland/module_loader/target/release/module_loader", "module_loader"),
-            ("../userland/graphics_module/target/release/graphics_module", "graphics_module"),
-            ("../userland/app_framework/target/release/app_framework", "app_framework"),
-            ("../userland/target/release/eclipse-userland", "eclipse-userland"),
+            ("userland/module_loader/target/release/module_loader", "module_loader"),
+            ("userland/graphics_module/target/release/graphics_module", "graphics_module"),
+            ("userland/app_framework/target/release/app_framework", "app_framework"),
+            ("userland/target/release/eclipse_userland", "eclipse_userland"),
         ];
 
         for (source, name) in userland_modules {
