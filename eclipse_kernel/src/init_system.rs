@@ -8,7 +8,8 @@ use crate::main_simple::SerialWriter;
 use crate::elf_loader::{ElfLoader, load_eclipse_systemd};
 use crate::process_memory::{ProcessMemoryManager, setup_eclipse_systemd_memory};
 use crate::process_transfer::{ProcessTransfer, ProcessContext, transfer_to_eclipse_systemd};
-use heapless::{String, Vec};
+use alloc::vec::Vec;
+use alloc::string::String;
 
 // Instancia global del escritor serial
 static mut SERIAL: SerialWriter = SerialWriter::new();
@@ -253,12 +254,12 @@ impl InitSystem {
     }
     
     /// Leer archivo desde el disco
-    fn read_file_from_disk(&self, path: &str) -> Result<heapless::Vec<u8, 4096>, &'static str> {
+    fn read_file_from_disk(&self, path: &str) -> Result<Vec<u8>, &'static str> {
         // En un sistema real, esto usaría el sistema de archivos
         // Por ahora, simulamos la lectura del archivo
         
         // Simular datos del ejecutable eclipse-systemd
-        let mut file_data = heapless::Vec::<u8, 4096>::new();
+        let mut file_data = Vec::<u8>::new();
         
         // Simular header ELF
         file_data.extend_from_slice(&[0x7F, 0x45, 0x4C, 0x46]); // ELF magic
@@ -491,8 +492,8 @@ pub fn diagnose_init_system() -> InitSystemDiagnostic {
 /// Diagnóstico del sistema de inicialización
 #[derive(Debug, Clone)]
 pub struct InitSystemDiagnostic {
-    pub errors: heapless::Vec<(&'static str, &'static str), 16>,
-    pub warnings: heapless::Vec<(&'static str, &'static str), 16>,
+    pub errors: Vec<(&'static str, &'static str)>,
+    pub warnings: Vec<(&'static str, &'static str)>,
     pub is_healthy: bool,
 }
 
@@ -578,22 +579,21 @@ impl InitSystem {
 }
 
 /// Función auxiliar para convertir números a string
-fn int_to_string(mut num: u64) -> heapless::String<32> {
-    let mut result = heapless::String::<32>::new();
+fn int_to_string(mut num: u64) -> String {
     if num == 0 {
-        let _ = result.push_str("0");
-        return result;
+        return String::from("0");
     }
-    
-    let mut digits = heapless::Vec::<u8, 32>::new();
+
+    let mut digits = Vec::<u8>::new();
     while num > 0 {
-        let _ = digits.push((num % 10) as u8);
+        digits.push((num % 10) as u8);
         num /= 10;
     }
-    
+
+    let mut result = String::new();
     for &digit in digits.iter().rev() {
-        let _ = result.push((b'0' + digit) as char);
+        result.push((b'0' + digit) as char);
     }
-    
+
     result
 }

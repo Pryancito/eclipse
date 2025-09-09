@@ -51,6 +51,7 @@ pub mod interrupts;  // Gestión de interrupciones y timers
 pub mod main_simple;
 pub mod main_unified;  // Main unificado con funcionalidades de escritorio
 pub mod main_with_init;  // Main con integración systemd
+pub mod entry_simple;  // Punto de entrada UEFI
 pub mod vga_centered_display;
 pub mod wayland;  // Módulo para mostrar texto centrado en VGA
 pub mod ai_integration;  // Integración profunda de IA en el kernel
@@ -430,3 +431,4 @@ fn process_ai_events() -> KernelResult<()> {
 }
 
 // Panic handler definido en main_simple.rs
+

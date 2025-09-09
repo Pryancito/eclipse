@@ -5,10 +5,7 @@
 
 extern crate alloc;
 use alloc::boxed::Box;
-use core::error::Error;
-use core::iter::Iterator;
-use core::option::Option::Some;
-use core::prelude::rust_2024::derive;
+use core::fmt::Result as FmtResult;
 
 use core::panic::PanicInfo;
 use alloc::format;
@@ -17,6 +14,9 @@ use alloc::string::String;
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
+
+use crate::graphics::{set_colors, clear_screen, print_string, init_graphics};
+use crate::graphics::Color as GraphicsColor;
 
 // Serial COM1 para logs tempranos
 #[inline(always)]
@@ -77,26 +77,22 @@ unsafe fn serial_write_hex64(val: u64) {
 }
 
 /// Función para convertir números a string
-fn int_to_string(mut num: u64) -> heapless::String<32> {
-    let mut result = heapless::String::<32>::new();
-    if num == 0 {
-        let _ = result.push_str("0");
-        return result;
+fn int_to_string(mut num: u64) -> &'static str {
+    // Para simplificar, devolveremos strings fijos para números comunes
+    match num {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        10 => "10",
+        _ => "N/A", // Para números más grandes
     }
-    
-    while num > 0 {
-        let digit = (num % 10) as u8;
-        let _ = result.push((digit + b'0') as char);
-        num /= 10;
-    }
-    
-    // Invertir el string
-    let mut reversed = heapless::String::<32>::new();
-    for &byte in result.as_bytes().iter().rev() {
-        let _ = reversed.push(byte as char);
-    }
-    
-    reversed
 }
 
 use core::fmt::Write;
@@ -340,15 +336,19 @@ pub static mut SERIAL: SerialWriter = SerialWriter::new();
 // El allocador global está definido en allocator.rs
 
 /// Función principal del kernel
-pub fn kernel_main() -> Result<(), Box<dyn Error>> {
+pub fn kernel_main() -> Result<(), &'static str> {
     // DEBUG: Confirmar que llegamos a kernel_main
     unsafe {
         // Inicializar la interfaz serial si no está inicializada
         SERIAL.init();
         SERIAL.write_str("Kernel iniciado correctamente\r\n");
-        VGA.set_color(Color::Green, Color::Black);
-        VGA.write_string("DEBUG: kernel_main() iniciado!\n");
-        VGA.set_color(Color::White, Color::Black);
+        
+        // Inicializar sistema de gráficos
+        init_graphics();
+        
+        set_colors(GraphicsColor::Green, GraphicsColor::Black);
+        clear_screen();
+        print_string("Kernel Iniciado!");
     }
     
     // Inicializar el allocador global
@@ -359,12 +359,11 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     
     // Inicializar sistema de display
     unsafe {
-        VGA.init_vga_mode();
         VGA.set_color(Color::LightGreen, Color::Black);
-        VGA.write_string("╔══════════════════════════════════════════════════════════════╗\n");
-        VGA.write_string("║                    ECLIPSE OS KERNEL                         ║\n");
-        VGA.write_string("║                        v0.5.0                                ║\n");
-        VGA.write_string("╚══════════════════════════════════════════════════════════════╝\n");
+        print_string("╔══════════════════════════════════════════════════════════════╗\n");
+        print_string("║                    ECLIPSE OS KERNEL                         ║\n");
+        print_string("║                        v0.5.0                                ║\n");
+        print_string("╚══════════════════════════════════════════════════════════════╝\n");
         VGA.set_color(Color::Yellow, Color::Black);
         VGA.write_string("\nKERNEL TOMANDO CONTROL DEL SISTEMA...\n");
         VGA.set_color(Color::White, Color::Black);

@@ -1,9 +1,10 @@
-; Punto de entrada para Eclipse Kernel con Multiboot2
+; Punto de entrada para Eclipse Kernel compatible con UEFI
 ; Define el símbolo _start que será el punto de entrada
 
 section .text
 global _start
 
 _start:
-    ; Saltar a la función Rust
-    jmp multiboot2_entry
+    ; Para UEFI, saltar directamente a la función uefi_entry de Rust
+    ; El bootloader UEFI pasa información del framebuffer en RDI
+    jmp uefi_entry
