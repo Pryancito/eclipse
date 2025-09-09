@@ -32,8 +32,9 @@ fn init_allocator() {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe { serial_write_str("KERNEL: PANIC\r\n"); }
+    loop { unsafe { core::arch::asm!("hlt"); } }
 }
 
 

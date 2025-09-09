@@ -470,16 +470,23 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
-    // Configurar paginación identidad simple (8 GiB, páginas de 2 MiB) + alias para la imagen en 4GiB..
-    // Allocate: 1 página para PML4, 1 para PDPT, 8 para PD (1 por GiB)
+    // Configurar paginación identidad extendida (16 GiB, páginas de 2 MiB) para cubrir direcciones altas del kernel
+    // Allocate: 1 página para PML4, 2 para PDPT (para cubrir 512 GiB cada uno), 16 para PD (1 por GiB)
     let pml4_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
+
+    // Necesitamos 2 PDPT para cubrir direcciones hasta ~1 TiB
     let pdpt_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
-    let mut pd_phys_arr: [u64; 8] = [0; 8];
-    for gi_b in 0..8 {
+    let pdpt_phys_high = bs
+        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
+        .map_err(|e| BootError::AllocPdpt(e.status()))?;
+
+    // 16 PD para cubrir 16 GiB
+    let mut pd_phys_arr: [u64; 16] = [0; 16];
+    for gi_b in 0..16 {
         pd_phys_arr[gi_b] = bs
             .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
@@ -489,7 +496,8 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         // Limpiar tablas
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
-        for gi_b in 0..8 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
+        core::ptr::write_bytes(pdpt_phys_high as *mut u8, 0, 4096);
+        for gi_b in 0..16 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
 
         // Flags
         let p_w = 0x003u64; // Present | Write
@@ -512,6 +520,22 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
                 *pd.add(i as usize) = (phys_base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
             }
         }
+
+        // PDPT[8..15] -> PDs usando pdpt_phys_high (para direcciones altas)
+        let pdpt_high = pdpt_phys_high as *mut u64;
+        for gi_b in 8..16u64 {
+            let pd_idx = gi_b - 8; // 0..7 para el segundo PDPT
+            *pdpt_high.add(pd_idx as usize) = (pd_phys_arr[gi_b as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+            let pd = pd_phys_arr[gi_b as usize] as *mut u64;
+            for i in 0..512u64 {
+                // Identidad para direcciones altas
+                let phys_base = gi_b * 0x4000_0000u64 + i * 0x20_0000u64;
+                *pd.add(i as usize) = (phys_base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+            }
+        }
+
+        // Conectar el segundo PDPT al PML4 en la entrada 1 (para direcciones >= 512 GiB)
+        *pml4.add(1) = (pdpt_phys_high & 0x000F_FFFF_FFFF_F000u64) | p_w;
 
         // Mapear framebuffer si es necesario (dirección típica 0x80000000+)
         // Nota: framebuffer_info no está disponible aquí, se maneja después
@@ -800,8 +824,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     unsafe {
         // Preparar registros ANTES de tocar RSP para no volver a leer variables en stack
         let entry_reg = 0x200000u64; // Entry point virtual del kernel
-        let arg_reg = framebuffer_info_ptr; // puede ser 0
-        if arg_reg != 0 { serial_write_str("BL: pasando framebuffer al kernel\r\n"); }
 
         // Debug: mostrar valores antes de configurar CR3
         serial_write_str("BL: entry_reg=0x");
@@ -856,7 +878,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let cr3_value = pml4_phys;
         let rsp_alineado = stack_top & !0xFu64;
 
-        // SALTAR AL KERNEL DE FORMA MÁS SIMPLE Y DIRECTA
+        // SALTAR AL KERNEL PASANDO INFORMACIÓN DEL FRAMEBUFFER
         unsafe {
             // Primero configurar SSE (necesario para evitar #UD)
             core::arch::asm!(
@@ -876,7 +898,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 "mov cr3, {cr3}",           // Configurar paginación
                 "mov rsp, {rsp}",           // Configurar stack
                 "mov rax, {entry}",         // Copiar entry point a RAX
-                "jmp rax",                  // Saltar directamente al kernel (sin call)
+                "jmp rax",                  // Saltar directamente al kernel
                 cr3 = in(reg) cr3_value,
                 rsp = in(reg) rsp_alineado,
                 entry = in(reg) entry_reg,

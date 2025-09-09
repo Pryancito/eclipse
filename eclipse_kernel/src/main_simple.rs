@@ -4,7 +4,8 @@
 #![no_main]
 
 extern crate alloc;
-
+use alloc::boxed::Box;
+use core::error::Error;
 use core::iter::Iterator;
 use core::option::Option::Some;
 use core::prelude::rust_2024::derive;
@@ -16,6 +17,64 @@ use alloc::string::String;
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
+
+// Serial COM1 para logs tempranos
+#[inline(always)]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+}
+
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let mut val: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
+    val
+}
+
+unsafe fn serial_init() {
+    let base: u16 = 0x3F8;
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x80);
+    outb(base + 0, 0x01);
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x03);
+    outb(base + 2, 0xC7);
+    outb(base + 4, 0x0B);
+}
+
+unsafe fn serial_write_byte(b: u8) {
+    let base: u16 = 0x3F8;
+    while (inb(base + 5) & 0x20) == 0 {}
+    outb(base, b);
+}
+
+unsafe fn serial_write_str(s: &str) {
+    for &c in s.as_bytes() { serial_write_byte(c); }
+}
+
+unsafe fn serial_write_hex32(val: u32) {
+    for i in (0..8).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
+
+unsafe fn serial_write_hex64(val: u64) {
+    for i in (0..16).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
 
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> heapless::String<32> {
@@ -281,9 +340,12 @@ pub static mut SERIAL: SerialWriter = SerialWriter::new();
 // El allocador global está definido en allocator.rs
 
 /// Función principal del kernel
-pub fn kernel_main() -> ! {
+pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // DEBUG: Confirmar que llegamos a kernel_main
     unsafe {
+        // Inicializar la interfaz serial si no está inicializada
+        SERIAL.init();
+        SERIAL.write_str("Kernel iniciado correctamente\r\n");
         VGA.set_color(Color::Green, Color::Black);
         VGA.write_string("DEBUG: kernel_main() iniciado!\n");
         VGA.set_color(Color::White, Color::Black);

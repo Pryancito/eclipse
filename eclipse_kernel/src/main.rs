@@ -4,8 +4,10 @@
 #![no_main]
 
 // use core::panic::PanicInfo;
-use eclipse_kernel::main_simple::kernel_main;
-use eclipse_kernel::uefi_framebuffer::init_framebuffer_from_bootloader;
+use eclipse_kernel::main_simple;
+use core::error::Error;
+extern crate alloc;
+use alloc::boxed::Box;
 
 // Serial COM1 para logs tempranos
 #[inline(always)]
@@ -65,21 +67,6 @@ unsafe fn serial_write_hex64(val: u64) {
     }
 }
 
-// Estructura para recibir información del framebuffer del bootloader UEFI
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FramebufferInfo {
-    pub base_address: u64,
-    pub width: u32,
-    pub height: u32,
-    pub pixels_per_scan_line: u32,
-    pub pixel_format: u32,
-    pub red_mask: u32,
-    pub green_mask: u32,
-    pub blue_mask: u32,
-    pub reserved_mask: u32,
-}
-
 /// Punto de entrada principal del kernel (con parámetros del framebuffer)
 /*#[no_mangle]
 pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
@@ -127,11 +114,19 @@ pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
     }
 }*/
 
+// Punto de entrada principal del kernel (con parámetros del framebuffer)
 #[no_mangle]
-pub extern "C" fn _start(_framebuffer_info: *const FramebufferInfo) -> ! {
+pub extern "C" fn _start() -> ! {
     unsafe {
         serial_init();
         serial_write_str("KERNEL: _start\r\n");
+    }
+
+    unsafe {
+        core::arch::asm!(
+            "call {kernel_call}",
+            kernel_call = sym kernel_call,
+        );
     }
 
     // Loop infinito
@@ -142,3 +137,7 @@ pub extern "C" fn _start(_framebuffer_info: *const FramebufferInfo) -> ! {
     }
 }
 
+unsafe fn kernel_call() -> Result<(), Box<dyn Error>>{
+    main_simple::kernel_main();
+    Ok(())
+}
