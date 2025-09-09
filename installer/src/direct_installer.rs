@@ -265,7 +265,7 @@ impl DirectInstaller {
 
         // Copiar bootloader
         println!("   Instalando bootloader...");
-        let bootloader_source = "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
+        let bootloader_source = "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi";
         
         if !Path::new(bootloader_source).exists() {
             return Err("Bootloader no encontrado. Ejecuta 'cd bootloader-uefi && ./build.sh' primero".to_string());
@@ -279,7 +279,7 @@ impl DirectInstaller {
 
         // Copiar kernel
         println!("   Instalando kernel...");
-        let kernel_source = "target/x86_64-unknown-none/release/eclipse_kernel";
+        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
 
         if !Path::new(kernel_source).exists() {
             return Err("Kernel no encontrado. Ejecuta 'cd eclipse_kernel && cargo build --release' primero".to_string());
@@ -326,7 +326,7 @@ impl DirectInstaller {
 
     fn install_eclipse_systemd(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("   Instalando eclipse-systemd...");
-        let systemd_source = "../eclipse-apps/systemd/target/release/eclipse-systemd";
+        let systemd_source = "eclipse-apps/systemd/target/release/eclipse-systemd";
 
         if Path::new(systemd_source).exists() {
             // Crear directorios del sistema

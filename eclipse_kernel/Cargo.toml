@@ -35,8 +35,9 @@ ai-models = ["num-traits"]
 [profile.dev]
 panic = "abort"
 lto = false
-opt-level = "z"
+opt-level = 0
 overflow-checks = false
+debug = true
 
 [target.x86_64-unknown-none]
 rustflags = [

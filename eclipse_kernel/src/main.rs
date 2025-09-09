@@ -128,26 +128,13 @@ pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
 }*/
 
 #[no_mangle]
-pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
+pub extern "C" fn _start(_framebuffer_info: *const FramebufferInfo) -> ! {
     unsafe {
         serial_init();
-        if framebuffer_info.is_null() {
-            serial_write_str("KERNEL: framebuffer_info ES NULL\r\n");
-        } else {
-            let fb = &*framebuffer_info;
-            serial_write_str("KERNEL: framebuffer_info OK\r\n");
-            // Imprime base_address y resolución
-            // (puedes hacerlo con hex if necesario)
-            // Ejemplo simple:
-            serial_write_str("Base: ");
-            serial_write_hex64(fb.base_address);
-            serial_write_str("\r\nW: ");
-            serial_write_hex32(fb.width);
-            serial_write_str(", H: ");
-            serial_write_hex32(fb.height);
-            serial_write_str("\r\n");
-        }
+        serial_write_str("KERNEL: _start\r\n");
     }
+
+    // Loop infinito
     loop {
         unsafe {
             core::arch::asm!("hlt");

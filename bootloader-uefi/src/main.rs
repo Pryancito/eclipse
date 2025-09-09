@@ -70,17 +70,6 @@ fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
         // Nombres base
         uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
-        uefi::cstr16!("eclipse_kernel.bin"),
-        uefi::cstr16!("\\eclipse_kernel.bin"),
-        uefi::cstr16!("vmlinuz-eclipse"),
-        uefi::cstr16!("\\vmlinuz-eclipse"),
-        // Subdirectorios comunes
-        uefi::cstr16!("\\boot\\eclipse_kernel"),
-        uefi::cstr16!("\\boot\\eclipse_kernel.bin"),
-        uefi::cstr16!("\\boot\\vmlinuz-eclipse"),
-        uefi::cstr16!("\\EFI\\BOOT\\eclipse_kernel"),
-        uefi::cstr16!("\\EFI\\BOOT\\eclipse_kernel.bin"),
-        uefi::cstr16!("\\EFI\\BOOT\\vmlinuz-eclipse"),
     ];
     for p in candidates.iter() {
         if let Ok(file) = root.open(p, FileMode::Read, FileAttribute::empty()) {
@@ -156,6 +145,47 @@ unsafe fn serial_write_str(s: &str) {
     for &c in s.as_bytes() { serial_write_byte(c); }
 }
 
+unsafe fn serial_write_hex32(val: u32) {
+    for i in (0..8).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
+
+unsafe fn serial_write_hex64(val: u64) {
+    for i in (0..16).rev() {
+        let nibble = (val >> (i * 4)) & 0xF;
+        let c = if nibble < 10 {
+            b'0' + nibble as u8
+        } else {
+            b'A' + (nibble - 10) as u8
+        };
+        serial_write_byte(c);
+    }
+}
+
+unsafe fn serial_write_hex8(val: u8) {
+    let high = (val >> 4) & 0xF;
+    let low = val & 0xF;
+    let c1 = if high < 10 {
+        b'0' + high
+    } else {
+        b'A' + (high - 10)
+    };
+    let c2 = if low < 10 {
+        b'0' + low
+    } else {
+        b'A' + (low - 10)
+    };
+    serial_write_byte(c1);
+    serial_write_byte(c2);
+}
+
 // ELF64 estructuras mínimas
 #[repr(C)]
 struct Elf64Ehdr {
@@ -214,6 +244,20 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
     }
     let ehdr: Elf64Ehdr = unsafe { core::ptr::read_unaligned(ehdr_buf.as_ptr() as *const Elf64Ehdr) };
 
+    // Debug: verificar entry point
+    unsafe {
+        serial_write_str("DEBUG: raw e_entry bytes: ");
+        for i in 0..8 {
+            let byte = ehdr_buf[24 + i];
+            serial_write_hex32(byte as u32);
+            serial_write_str(" ");
+        }
+        serial_write_str("\r\n");
+        serial_write_str("DEBUG: ehdr.e_entry = 0x");
+        serial_write_hex64(ehdr.e_entry);
+        serial_write_str("\r\n");
+    }
+
     // Validaciones básicas
     if &ehdr.e_ident[0..4] != b"\x7FELF" { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
     if ehdr.e_ident[4] != 2 { return Err(BootError::LoadElf(Status::UNSUPPORTED)); } // 64-bit
@@ -229,10 +273,15 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         return Err(BootError::LoadElf(Status::UNSUPPORTED));
     }
 
-    // PASO 1: calcular el rango total [min_start, max_end) de todos los PT_LOAD y recolectar map de segmentos
-    let mut min_start: u64 = u64::MAX;
-    let mut max_end: u64 = 0;
+    // Reservar memoria física en dirección fija para el kernel
+    let kernel_phys_base = KERNEL_PHYS_LOAD_ADDR;
+
+    // PASO 1: calcular el rango virtual del kernel y recolectar información de segmentos
+    let mut min_vaddr: u64 = u64::MAX;
+    let mut max_vaddr: u64 = 0;
     let mut segmap = SegmentMap { count: 0, vstart: [0; MAX_PH], pstart: [0; MAX_PH], len: [0; MAX_PH] };
+
+    // Primer pase: calcular direcciones virtuales y tamaño total
     for i in 0..phnum {
         let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
         if file.set_position(off).is_err() { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
@@ -250,27 +299,58 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         }
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
-        let dest_phys = if phdr.p_paddr != 0 { phdr.p_paddr } else { phdr.p_vaddr };
-        let dest_start = dest_phys & !0xFFFu64;
-        let dest_end = (dest_phys + phdr.p_memsz + 0xFFF) & !0xFFFu64;
-        // Guardar mapeo virtual->físico del segmento
-        if segmap.count < MAX_PH {
-            let vst = phdr.p_vaddr & !0xFFFu64;
-            let pst = dest_start;
-            let l = dest_end.saturating_sub(dest_start);
-            segmap.vstart[segmap.count] = vst;
-            segmap.pstart[segmap.count] = pst;
-            segmap.len[segmap.count] = l;
-            segmap.count += 1;
+
+        // Calcular direcciones virtuales del segmento
+        let vaddr_start = phdr.p_vaddr & !0xFFFu64;
+        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+
+        if vaddr_start < min_vaddr { min_vaddr = vaddr_start; }
+        if vaddr_end > max_vaddr { max_vaddr = vaddr_end; }
+    }
+
+    if min_vaddr == u64::MAX || max_vaddr <= min_vaddr { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
+
+    // Calcular tamaño total del kernel
+    let total_size = max_vaddr - min_vaddr;
+    let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
+
+    // Reservar memoria física - usar BOOT_SERVICES_CODE para que UEFI no la reutilice después de exit
+    if let Err(st) = bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
+        return Err(BootError::LoadSegment { status: st.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
+    }
+
+    // Segundo pase: llenar el mapa de segmentos con direcciones físicas correctas
+    let mut seg_idx = 0;
+    for i in 0..phnum {
+        let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
+        if file.set_position(off).is_err() { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
+        if phentsize > ph_buf.len() { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
+        ph_buf.fill(0);
+        {
+            let mut got = 0usize;
+            while got < phentsize {
+                match file.read(&mut ph_buf[got..phentsize]) {
+                    Ok(n) if n > 0 => got += n,
+                    Ok(_) => return Err(BootError::LoadElf(Status::LOAD_ERROR)),
+                    Err(e) => return Err(BootError::LoadElf(e.status())),
+                }
+            }
         }
-        if dest_start < min_start { min_start = dest_start; }
-        if dest_end > max_end { max_end = dest_end; }
+        let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
+        if phdr.p_type != PT_LOAD { continue; }
+
+        // Calcular direcciones virtuales del segmento
+        let vaddr_start = phdr.p_vaddr & !0xFFFu64;
+        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+
+        if seg_idx < MAX_PH {
+            segmap.vstart[seg_idx] = vaddr_start;
+            segmap.pstart[seg_idx] = kernel_phys_base + (vaddr_start - min_vaddr); // Dirección física correspondiente
+            segmap.len[seg_idx] = vaddr_end.saturating_sub(vaddr_start);
+            seg_idx += 1;
+        }
     }
-    if min_start == u64::MAX || max_end <= min_start { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
-    let total_pages = ((max_end - min_start) / 0x1000) as usize;
-    if let Err(st) = bs.allocate_pages(AllocateType::Address(min_start), MemoryType::LOADER_CODE, total_pages) {
-        return Err(BootError::LoadSegment { status: st.status(), seg_index: 0, addr: min_start, pages: total_pages });
-    }
+    segmap.count = seg_idx;
 
     // PASO 2: copiar datos y zerofill por segmento (sin más reservas)
     for i in 0..phnum {
@@ -291,7 +371,23 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
 
-        let dest_phys = if phdr.p_paddr != 0 { phdr.p_paddr } else { phdr.p_vaddr };
+        // Calcular offset del segmento dentro del kernel cargado
+        let segment_offset = phdr.p_vaddr - min_vaddr;
+        let dest_phys = kernel_phys_base + segment_offset;
+
+        // Debug: mostrar información de carga del segmento
+        unsafe {
+            serial_write_str("DEBUG: segmento p_vaddr=0x");
+            serial_write_hex64(phdr.p_vaddr);
+            serial_write_str(" p_offset=0x");
+            serial_write_hex64(phdr.p_offset);
+            serial_write_str(" dest_phys=0x");
+            serial_write_hex64(dest_phys);
+            serial_write_str(" p_filesz=0x");
+            serial_write_hex64(phdr.p_filesz);
+            serial_write_str("\r\n");
+        }
+
         // Leer datos del segmento
         if file.set_position(phdr.p_offset).is_err() { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
         if phdr.p_filesz > 0 {
@@ -306,6 +402,19 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
                     Err(e) => return Err(BootError::LoadElf(e.status())),
                 }
             }
+
+            // Debug: verificar que se cargó correctamente
+            unsafe {
+                serial_write_str("DEBUG: verificando carga en 0x");
+                serial_write_hex64(dest_phys);
+                serial_write_str(": ");
+                for i in 0..16 {
+                    let b = core::ptr::read_volatile(dst_ptr.add(i));
+                    serial_write_hex32(b as u32);
+                    serial_write_str(" ");
+                }
+                serial_write_str("\r\n");
+            }
         }
         // Cero para .bss
         if phdr.p_memsz > phdr.p_filesz {
@@ -315,9 +424,26 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         }
     }
 
-    let entry = if ehdr.e_entry != 0 { ehdr.e_entry } else { 0x0020_0000 };
-    let total_len = max_end - min_start;
-    Ok((entry, min_start, total_len, segmap))
+    // Debug: mostrar valores calculados
+    unsafe {
+        serial_write_str("DEBUG: min_vaddr=0x");
+        serial_write_hex64(min_vaddr);
+        serial_write_str(" max_vaddr=0x");
+        serial_write_hex64(max_vaddr);
+        serial_write_str(" kernel_phys_base=0x");
+        serial_write_hex64(kernel_phys_base);
+        serial_write_str("\r\n");
+    }
+
+    // Ajustar el entry point al offset físico donde se cargó el kernel
+    let entry = if ehdr.e_entry != 0 {
+        ehdr.e_entry  // Mantener la dirección virtual del entry point
+    } else {
+        min_vaddr  // Si no hay entry point específico, usar el inicio del kernel
+    };
+
+    let total_len = max_vaddr - min_vaddr;
+    Ok((entry, kernel_phys_base, total_len, segmap))
 }
 
 enum BootError {
@@ -331,37 +457,31 @@ enum BootError {
     AllocPd(Status),
 }
 
-fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::Result<(u64, u64, u64, u64, u64, SegmentMap), BootError> {
-    // Abrir raíz del FS
-    let mut root = open_root_fs(bs, handle).map_err(|e| BootError::OpenRoot(e.status()))?;
-
-    // Abrir kernel
-    let mut kernel_file = open_kernel_file(&mut root).map_err(|e| BootError::OpenKernel(e.status()))?;
-
-    // Cargar ELF64 y obtener entry y región física ocupada y mapas por segmento
-    let (entry, image_phys_base, image_phys_len, segmap) = load_elf64_segments(bs, &mut kernel_file)?;
+fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::Result<(u64, u64), BootError> {
+    // Debug: confirmar que la función se está ejecutando
+    unsafe { serial_write_str("DEBUG: prepare_page_tables_only started\r\n"); }
 
     // Reservar stack (64 KiB) por debajo de 1 GiB para que esté mapeada (identidad 0..1GiB)
     let stack_pages: usize = 16;
     let one_gib: u64 = 1u64 << 30;
     let max_stack_addr: u64 = one_gib - 0x1000; // límite superior < 1GiB
     let stack_base = bs
-        .allocate_pages(AllocateType::MaxAddress(max_stack_addr), MemoryType::LOADER_DATA, stack_pages)
+        .allocate_pages(AllocateType::MaxAddress(max_stack_addr), MemoryType::BOOT_SERVICES_DATA, stack_pages)
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
     // Configurar paginación identidad simple (8 GiB, páginas de 2 MiB) + alias para la imagen en 4GiB..
     // Allocate: 1 página para PML4, 1 para PDPT, 8 para PD (1 por GiB)
     let pml4_phys = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
     let pdpt_phys = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
     let mut pd_phys_arr: [u64; 8] = [0; 8];
     for gi_b in 0..8 {
         pd_phys_arr[gi_b] = bs
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
     }
 
@@ -393,16 +513,50 @@ fn prepare_boot_environment(bs: &BootServices, handle: Handle) -> core::result::
             }
         }
 
-        // Nota: mantenemos únicamente mapeo identidad 0–8 GiB y un alias [4–5)→[0–1) GiB.
+        // Mapear framebuffer si es necesario (dirección típica 0x80000000+)
+        // Nota: framebuffer_info no está disponible aquí, se maneja después
+
+        // Mapear kernel específicamente: VA 0x200000 -> PA 0x0020_0000
+        {
+            let kernel_va = 0x200000u64;
+            let kernel_pa = 0x0020_0000u64;
+
+            // Calcular índices sin alinear
+            let pdpt_idx = (kernel_va >> 30) & 0x1FF; // 0
+            let pd_idx = (kernel_va >> 21) & 0x1FF;   // 1 (0x200000 / 0x200000 = 1)
+
+            // Alinear PA a 2MB
+            let kernel_pa_aligned = kernel_pa & !0x1F_FFFFu64;
+
+            if pdpt_idx < 8 {
+                let pd = pd_phys_arr[pdpt_idx as usize] as *mut u64;
+                // Mapear PD[1] que controla VA 0x0020_0000 - 0x003F_FFFF
+                *pd.add(pd_idx as usize) = (kernel_pa_aligned & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+            }
+        }
+
+        // Nota: mantenemos mapeo identidad 0–8 GiB
     }
 
-    Ok((entry, stack_top, pml4_phys, image_phys_base, image_phys_len, segmap))
+    unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }
+    Ok((pml4_phys, stack_top))
 }
 
 #[entry]
 fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Serial init temprano
-    unsafe { serial_init(); serial_write_str("BL: inicio\r\n"); }
+    unsafe {
+        serial_write_str("PRE-SERIAL-INIT\r\n");
+        serial_init();
+        serial_write_str("BL: inicio\r\n");
+        serial_write_str("DEBUG: serial initialized\r\n");
+    }
+
+    // Mensaje de debug en consola UEFI también
+    {
+        let out = system_table.stdout();
+        let _ = out.write_str("UEFI DEBUG: Bootloader started, serial init complete\r\n");
+    }
     // Mensaje inicial
     {
         let out = system_table.stdout();
@@ -411,30 +565,31 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     // Preparación con reporte de error detallado
-    let (entry_address, stack_top, pml4_phys, image_phys_base, image_phys_len, _segmap): (u64, u64, u64, u64, u64, SegmentMap) = {
+    unsafe { serial_write_str("DEBUG: about to call prepare_boot_environment\r\n"); }
+    let out = system_table.stdout();
+    let _ = out.write_str("DEBUG CONSOLE: about to call prepare_boot_environment\r\n");
+    // Preparar solo las tablas de páginas ANTES de exit_boot_services
+    let (pml4_phys, stack_top): (u64, u64) = {
         let bs = system_table.boot_services();
-        match prepare_boot_environment(bs, handle) {
-            Ok(tuple) => tuple,
+        unsafe { serial_write_str("DEBUG: got boot services\r\n"); }
+        match prepare_page_tables_only(bs, handle) {
+            Ok((pml4, stack)) => {
+                unsafe { serial_write_str("DEBUG: prepare_page_tables_only returned OK\r\n"); }
+                (pml4, stack)
+            },
             Err(err) => {
                 let mut out = system_table.stdout();
-                let _ = out.write_str("ERROR antes de cargar kernel: ");
+                let _ = out.write_str("ERROR preparando tablas de páginas: ");
                 match err {
-                    BootError::OpenRoot(st) => { let _ = out.write_str("open_root_fs "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
-                    BootError::OpenKernel(st) => { let _ = out.write_str("open_kernel_file "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
-                    BootError::LoadElf(st) => { let _ = out.write_str("load_elf64_segments "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
-                    BootError::LoadSegment { status, seg_index, addr, pages } => {
-                        let _ = out.write_str("load_elf64_segments seg ");
-                        let _ = core::fmt::write(&mut out, format_args!("{} ", seg_index));
-                        let _ = core::fmt::write(&mut out, format_args!("addr=0x{:016x} pages={} status=", addr, pages));
-                        let _ = core::fmt::write(&mut out, format_args!("{:?}", status));
-                    }
                     BootError::AllocStack(st) => { let _ = out.write_str("allocate_pages stack "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
                     BootError::AllocPml4(st) => { let _ = out.write_str("allocate_pages PML4 "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
                     BootError::AllocPdpt(st) => { let _ = out.write_str("allocate_pages PDPT "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
                     BootError::AllocPd(st) => { let _ = out.write_str("allocate_pages PD "); let _ = core::fmt::write(&mut out, format_args!("{:?}", st)); }
+                    _ => { let _ = out.write_str("otro error"); }
                 }
                 let _ = out.write_str("\n");
-                loop { unsafe { core::arch::asm!("hlt"); } }
+                // Valores por defecto en caso de error
+                (0, 0)
             }
         }
     };
@@ -494,7 +649,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 framebuffer_info.reserved_mask = mask.reserved;
             }
             // Reservar memoria persistente para pasar al kernel
-            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
                 framebuffer_info_ptr = phys;
                 unsafe {
                     let dst = phys as *mut FramebufferInfo;
@@ -583,98 +738,153 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     {
         use core::fmt::Write as _;
         let out = system_table.stdout();
-        let _ = out.write_str("Kernel ELF cargado\n");
-        let _ = out.write_str("Entry ELF: 0x");
-        let _ = core::fmt::write(out, format_args!("{:016x}\n", entry_address));
-        unsafe { serial_write_str("BL: entry="); }
-        {
-            // serial hex simple
-            let mut buf = [0u8; 18];
-            let mut n = 0usize;
-            for i in (0..16).rev() {
-                let nyb = ((entry_address >> (i*4)) & 0xF) as u8;
-                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
-            }
-            buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
-            unsafe { for i in 0..n { serial_write_byte(buf[i]); } }
-        }
-        // Volcado de los primeros 16 bytes en entry
-        let _ = out.write_str("Bytes@entry: ");
-            unsafe {
-            let ptr = entry_address as *const u8;
-            for i in 0..16 {
-                let b = core::ptr::read_volatile(ptr.add(i));
-                let _ = core::fmt::write(out, format_args!("{:02x}", b));
-                if i != 15 { let _ = out.write_str(" "); }
-            }
-        }
+        let _ = out.write_str("Preparando para cargar kernel después de ExitBootServices...\n");
         let _ = out.write_str("\n");
         let _ = out.write_str("Saliendo de Boot Services...\n");
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
     // ExitBootServices (uefi 0.25.0)
-    let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
+    // IMPORTANTE: Usar BOOT_SERVICES_CODE para mantener la memoria del kernel intacta
+    let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::BOOT_SERVICES_CODE);
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
+
+    // CARGAR EL KERNEL DESPUÉS DE EXIT_BOOT_SERVICES
+    unsafe {
+        serial_write_str("BL: cargando kernel despues de ExitBootServices...\r\n");
+
+        // Cargar kernel en memoria física 0x0020_0000
+        let kernel_phys_addr = 0x0020_0000u64;
+        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
+
+        // Leer desde el offset donde realmente está el código ejecutable
+        // Según hexdump, el código está en 0x1010, no en 0x1000
+        let code_offset = 0x1010; // Offset donde está el código real
+
+        // Copiar el kernel desde el offset correcto
+        let dst_ptr = kernel_phys_addr as *mut u8;
+        let src_ptr = kernel_data.as_ptr().add(code_offset);
+        let code_size = kernel_data.len() - code_offset;
+
+        for i in 0..code_size {
+            *dst_ptr.add(i) = *src_ptr.add(i);
+        }
+
+        serial_write_str("BL: kernel cargado en 0x00200000, ");
+        // Convertir el tamaño a string para mostrar
+        let size_kb = code_size / 1024;
+        if size_kb < 10 {
+            serial_write_byte(b'0' + size_kb as u8);
+        } else {
+            serial_write_byte(b'0' + (size_kb / 10) as u8);
+            serial_write_byte(b'0' + (size_kb % 10) as u8);
+        }
+        serial_write_str(" KB\r\n");
+
+        // Verificar que los bytes se cargaron correctamente
+        serial_write_str("BL: verificando bytes del kernel: ");
+        for i in 0..16 {
+            let b = *dst_ptr.add(i);
+            let high = (b >> 4) & 0xF;
+            let low = b & 0xF;
+            serial_write_byte(if high < 10 { b'0' + high } else { b'A' + high - 10 });
+            serial_write_byte(if low < 10 { b'0' + low } else { b'A' + low - 10 });
+            serial_write_str(" ");
+        }
+        serial_write_str("\r\n");
+    }
+
+    // Nota: Framebuffer mapping simplificado por ahora
 
     // Configurar paginación identidad y pila y saltar al kernel (sin usar la pila después de cambiarla)
     unsafe {
-        // Fallback: si no reservamos buffer para FramebufferInfo, ubicarlo en la pila (calculada respecto a stack_top)
-        if framebuffer_info_ptr == 0 && framebuffer_info.width != 0 && framebuffer_info.height != 0 {
-            let fb_slot = (stack_top - 256u64) & !0xFu64;
-            let dst = fb_slot as *mut FramebufferInfo;
-            core::ptr::write_volatile(dst, framebuffer_info);
-            framebuffer_info_ptr = fb_slot;
-            serial_write_str("BL: FB en pila\r\n");
-        }
-
-        // Log estado del puntero justo antes del salto
-        serial_write_str("BL: fbptr_post=0x");
-        {
-            let mut h = [0u8; 18];
-            let mut m = 0usize;
-            for i in (0..16).rev() {
-                let nyb = ((framebuffer_info_ptr >> (i*4)) & 0xF) as u8;
-                h[m] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; m+=1;
-            }
-            h[m] = b'\r'; m+=1; h[m] = b'\n'; m+=1;
-            for i in 0..m { serial_write_byte(h[i]); }
-        }
-
         // Preparar registros ANTES de tocar RSP para no volver a leer variables en stack
-        let entry_reg = entry_address;
+        let entry_reg = 0x200000u64; // Entry point virtual del kernel
         let arg_reg = framebuffer_info_ptr; // puede ser 0
         if arg_reg != 0 { serial_write_str("BL: pasando framebuffer al kernel\r\n"); }
-        serial_write_str("BL: CR3 y RSP configurados, saltando al kernel\r\n");
 
-        // Alinear pila para llamada: antes de `call`, RSP % 16 == 0.
-        // Usaremos `call` para entrar al kernel, por lo que no restamos 8 aquí.
-        let rsp_alineado = (stack_top & !0xFu64);
-        // Configurar estado de CPU (SSE) y paginación, luego saltar al kernel
-        core::arch::asm!(
-            // Desactivar interrupciones antes de cambiar CR3
-            "cli",
-            // Habilitar SSE/x87 para evitar #UD si el kernel usa instrucciones SSE
-            "mov rax, cr0",
-            "and rax, ~(1 << 2)",        // CR0.EM = 0
-            "or  rax,  (1 << 1)",        // CR0.MP = 1
-            "mov cr0, rax",
-            "mov rax, cr4",
-            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
-            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
-            "mov cr4, rax",
-            // Cargar CR3
-            "mov cr3, {cr3}",
-            "mov rsp, {rsp}",
-            // pasar argumento en RDI (aunque sea 0)
-            "mov rdi, {arg}",
-            // llamar a la entrada del kernel (no retorna)
-            "call {entry}",
-            cr3 = in(reg) pml4_phys,
-            rsp = in(reg) rsp_alineado,
-            arg = in(reg) arg_reg,
-            entry = in(reg) entry_reg,
-            options(noreturn)
-        );
+        // Debug: mostrar valores antes de configurar CR3
+        serial_write_str("BL: entry_reg=0x");
+        {
+            let mut buf = [0u8; 16];
+            let mut n = 0usize;
+            for i in (0..16).rev() {
+                let nyb = ((entry_reg >> (i*4)) & 0xF) as u8;
+                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
+            }
+            for i in 0..n { serial_write_byte(buf[i]); }
+        }
+        serial_write_str(" pml4_phys=0x");
+        {
+            let mut buf = [0u8; 16];
+            let mut n = 0usize;
+            for i in (0..16).rev() {
+                let nyb = ((pml4_phys >> (i*4)) & 0xF) as u8;
+                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
+            }
+            for i in 0..n { serial_write_byte(buf[i]); }
+        }
+        serial_write_str("\r\n");
+
+        // DEBUG: Verificar estado antes del salto
+        serial_write_str("BL: DEBUG antes del salto:\r\n");
+        serial_write_str("BL: entry_reg=");
+        serial_write_hex64(entry_reg);
+        serial_write_str(" pml4_phys=");
+        serial_write_hex64(pml4_phys);
+        serial_write_str(" stack_top=");
+        serial_write_hex64(stack_top);
+        serial_write_str("\r\n");
+
+        // Verificar que el código esté en la dirección física correcta
+        serial_write_str("BL: verificando kernel en PA 0x00200000: ");
+        let kernel_ptr = 0x00200000 as *const u8;
+        for i in 0..16 {
+            let byte = unsafe { *kernel_ptr.add(i) };
+            serial_write_hex8(byte);
+            serial_write_str(" ");
+        }
+        serial_write_str("\r\n");
+
+        // DEBUG: Mostrar qué va a pasar justo antes del assembly
+        serial_write_str("BL: saltando a kernel entry point...\r\n");
+
+        // CONFIGURAR PAGINACIÓN CON MAPEO DE IDENTIDAD SIMPLE
+        serial_write_str("BL: configurando paginacion con identidad...\r\n");
+
+        // Configurar CR3 con el PML4 que ya tenemos (que tiene mapeo de identidad)
+        let cr3_value = pml4_phys;
+        let rsp_alineado = stack_top & !0xFu64;
+
+        // SALTAR AL KERNEL DE FORMA MÁS SIMPLE Y DIRECTA
+        unsafe {
+            // Primero configurar SSE (necesario para evitar #UD)
+            core::arch::asm!(
+                "mov rax, cr0",
+                "and rax, ~(1 << 2)",        // CR0.EM = 0
+                "or  rax,  (1 << 1)",        // CR0.MP = 1
+                "mov cr0, rax",
+                "mov rax, cr4",
+                "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+                "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+                "mov cr4, rax"
+            );
+
+            // Configurar paginación y saltar al kernel
+            core::arch::asm!(
+                "cli",                      // Desactivar interrupciones
+                "mov cr3, {cr3}",           // Configurar paginación
+                "mov rsp, {rsp}",           // Configurar stack
+                "mov rax, {entry}",         // Copiar entry point a RAX
+                "jmp rax",                  // Saltar directamente al kernel (sin call)
+                cr3 = in(reg) cr3_value,
+                rsp = in(reg) rsp_alineado,
+                entry = in(reg) entry_reg,
+                options(noreturn)
+            );
+        }
+
+        // Si llegamos aquí, el kernel retornó (no debería pasar)
+        serial_write_str("BL: ERROR - kernel retorno!\r\n");
     }
 }

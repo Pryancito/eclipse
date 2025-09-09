@@ -20,8 +20,8 @@ impl SystemValidator {
                 "lsblk",
             ],
             required_files: vec![
-                "target/x86_64-unknown-none/release/eclipse_kernel",
-                "target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
+                "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel",
+                "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
             ],
         }
     }
