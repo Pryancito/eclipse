@@ -161,7 +161,7 @@ args quiet splash
     fn install_kernel(&self) -> Result<(), String> {
         println!("   🧠 Instalando kernel Eclipse...");
         
-        let kernel_source = "target/x86_64-unknown-none/release/eclipse_kernel";
+        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
         let kernel_dest = format!("{}/eclipse_kernel", self.efi_mount_point);
         
         if !Path::new(kernel_source).exists() {

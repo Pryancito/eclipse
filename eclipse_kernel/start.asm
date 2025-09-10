@@ -5,6 +5,6 @@ section .text
 global _start
 
 _start:
-    ; Para UEFI, saltar directamente a la función uefi_entry de Rust
-    ; El bootloader UEFI pasa información del framebuffer en RDI
-    jmp uefi_entry
+    ; Punto de entrada estándar - saltar directamente a la función _start de Rust
+    ; Esta función está definida en main.rs
+    jmp _start

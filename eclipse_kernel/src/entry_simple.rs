@@ -59,7 +59,6 @@ pub extern "C" fn uefi_entry(framebuffer_info: *const FramebufferInfo) -> ! {
         Err(e) => {
             unsafe {
                 serial_write_str("KERNEL: kernel_main() returned error: ");
-                serial_write_str(e);
                 serial_write_str("\r\n");
             }
             loop {

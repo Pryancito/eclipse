@@ -4,15 +4,12 @@
 //! ejecutando eclipse-systemd como PID 1
 
 use core::fmt::Write;
-use crate::main_simple::SerialWriter;
+use crate::main_simple::{serial_write_str, serial_init};
 use crate::elf_loader::{ElfLoader, load_eclipse_systemd};
 use crate::process_memory::{ProcessMemoryManager, setup_eclipse_systemd_memory};
 use crate::process_transfer::{ProcessTransfer, ProcessContext, transfer_to_eclipse_systemd};
 use alloc::vec::Vec;
 use alloc::string::String;
-
-// Instancia global del escritor serial
-static mut SERIAL: SerialWriter = SerialWriter::new();
 
 /// Información del proceso init
 #[derive(Debug, Clone)]
@@ -567,13 +564,10 @@ impl InitSystem {
     /// Enviar mensaje de inicio de eclipse-systemd a la interfaz serial
     fn send_systemd_startup_message(&self, init_process: &InitProcess) {
         unsafe {
-            // Inicializar la interfaz serial si no está inicializada
-            SERIAL.init();
-            
             // Enviar mensaje de inicio
-            SERIAL.write_str("\n");
-            SERIAL.write_str("Pasando control a systemd...\n");
-            SERIAL.write_str("\n");
+            serial_write_str("\r\n");
+            serial_write_str("Pasando control a systemd...\r\n");
+            serial_write_str("\r\n");
         }
     }
 }

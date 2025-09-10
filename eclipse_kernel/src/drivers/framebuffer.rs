@@ -225,12 +225,25 @@ impl FramebufferDriver {
         // Configurar offsets según el formato
         self.configure_pixel_offsets();
         
-        // Mapear memoria del framebuffer
+        // ✅ MAPEO SEGURO: Verificar que la dirección sea válida
+        if base_address < 0x1000 {
+            return Err("Invalid framebuffer base address");
+        }
+        
+        // Mapear memoria del framebuffer de forma segura
         self.buffer = base_address as *mut u8;
         
         // Validar que el mapeo sea válido
         if self.buffer.is_null() {
             return Err("Failed to map framebuffer memory");
+        }
+        
+        // ✅ VALIDACIÓN ADICIONAL: Verificar que podemos leer el primer byte
+        unsafe {
+            // Intentar leer el primer byte para verificar que la memoria es accesible
+            let test_byte = core::ptr::read_volatile(self.buffer);
+            // Si llegamos aquí, la memoria es accesible
+            core::ptr::write_volatile(self.buffer, test_byte); // Restaurar el valor original
         }
         
         self.is_initialized = true;
@@ -314,28 +327,39 @@ impl FramebufferDriver {
         unsafe { self.buffer.offset(offset) }
     }
     
-    /// Escribir un pixel
+    /// Escribir un pixel de forma segura
     pub fn put_pixel(&mut self, x: u32, y: u32, color: Color) {
+        // ✅ VALIDACIÓN: Verificar que el framebuffer esté inicializado
+        if !self.is_initialized {
+            return;
+        }
+        
+        // ✅ VALIDACIÓN: Verificar coordenadas
+        if x >= self.info.width || y >= self.info.height {
+            return;
+        }
+        
         let pixel_ptr = self.get_pixel_ptr(x, y);
         if !pixel_ptr.is_null() {
             let pixel_value = color.to_pixel(self.info.pixel_format);
             let bytes_per_pixel = self.info.pixel_format.bytes_per_pixel();
             
             unsafe {
+                // ✅ ACCESO SEGURO: Usar write_volatile para evitar optimizaciones
                 match bytes_per_pixel {
-                    1 => *pixel_ptr = pixel_value as u8,
+                    1 => core::ptr::write_volatile(pixel_ptr, pixel_value as u8),
                     2 => {
                         let pixel_ptr_16 = pixel_ptr as *mut u16;
-                        *pixel_ptr_16 = pixel_value as u16;
+                        core::ptr::write_volatile(pixel_ptr_16, pixel_value as u16);
                     },
                     3 => {
-                        *pixel_ptr = (pixel_value & 0xFF) as u8;
-                        *pixel_ptr.offset(1) = ((pixel_value >> 8) & 0xFF) as u8;
-                        *pixel_ptr.offset(2) = ((pixel_value >> 16) & 0xFF) as u8;
+                        core::ptr::write_volatile(pixel_ptr, (pixel_value & 0xFF) as u8);
+                        core::ptr::write_volatile(pixel_ptr.offset(1), ((pixel_value >> 8) & 0xFF) as u8);
+                        core::ptr::write_volatile(pixel_ptr.offset(2), ((pixel_value >> 16) & 0xFF) as u8);
                     },
                     4 => {
                         let pixel_ptr_32 = pixel_ptr as *mut u32;
-                        *pixel_ptr_32 = pixel_value;
+                        core::ptr::write_volatile(pixel_ptr_32, pixel_value);
                     },
                     _ => {},
                 }
@@ -610,18 +634,20 @@ pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
 /// Inicializar framebuffer con información UEFI
 /// Esta función es llamada desde el punto de entrada UEFI
 pub fn init_framebuffer_from_uefi(uefi_fb_info: &crate::entry_simple::FramebufferInfo) -> Result<(), &'static str> {
-    // Convertir formato de pixel UEFI a nuestro formato
+    // ✅ CORREGIR: Mapeo correcto de formatos UEFI
     let pixel_format = match uefi_fb_info.pixel_format {
-        0 => 0, // RGB
-        1 => 1, // BGR
+        0 => 0, // PixelRedGreenBlueReserved8BitPerColor
+        1 => 1, // PixelBlueGreenRedReserved8BitPerColor  
+        2 => 2, // PixelBitMask
+        3 => 3, // PixelBltOnly
         _ => 0, // Default to RGB
     };
 
-    // Crear bitmask basado en las máscaras de color
-    let pixel_bitmask = (uefi_fb_info.red_mask & 0xFF) |
-                       ((uefi_fb_info.green_mask & 0xFF) << 8) |
-                       ((uefi_fb_info.blue_mask & 0xFF) << 16) |
-                       ((uefi_fb_info.reserved_mask & 0xFF) << 24);
+    // ✅ CORREGIR: Crear bitmask correcto sin truncar
+    let pixel_bitmask = uefi_fb_info.red_mask |
+                       (uefi_fb_info.green_mask << 8) |
+                       (uefi_fb_info.blue_mask << 16) |
+                       (uefi_fb_info.reserved_mask << 24);
 
     init_framebuffer(
         uefi_fb_info.base_address,

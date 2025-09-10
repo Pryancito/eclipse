@@ -3,7 +3,7 @@
 
 use core::fmt::Write;
 use crate::drivers::framebuffer::{FramebufferDriver, Color as FbColor};
-use crate::main_simple::{VgaWriter, Color as VgaColor, VGA};
+use crate::main_simple::serial_write_str;
 
 // Tipos básicos para el escritorio
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,9 +212,8 @@ impl DesktopRenderer {
         } else {
             // Fallback VGA
             unsafe {
-                VGA.set_color(VgaColor::Blue, VgaColor::Black);
-                VGA.write_string("Eclipse OS Desktop\n");
-                VGA.write_string("==================\n");
+                serial_write_str("Eclipse OS Desktop\r\n");
+                serial_write_str("==================\r\n");
             }
         }
         Ok(())
@@ -234,14 +233,13 @@ impl DesktopRenderer {
         } else {
             // Fallback VGA - mostrar ventanas como texto
             unsafe {
-                VGA.set_color(VgaColor::White, VgaColor::Black);
-                VGA.write_string("Ventanas abiertas:\n");
+                serial_write_str("Ventanas abiertas:\r\n");
                 for window_opt in &self.state.windows {
                     if let Some(window) = window_opt {
                         if window.visible {
-                            VGA.write_string("  - ");
-                            VGA.write_string(window.title);
-                            VGA.write_string("\n");
+                            serial_write_str("  - ");
+                            serial_write_str(window.title);
+                            serial_write_str("\r\n");
                         }
                     }
                 }
@@ -332,8 +330,7 @@ impl DesktopRenderer {
         } else {
             // Fallback VGA
             unsafe {
-                VGA.set_color(VgaColor::DarkGray, VgaColor::Black);
-                VGA.write_string("Barra de tareas: [Inicio] [Aplicaciones] [Sistema]\n");
+                serial_write_str("Barra de tareas: [Inicio] [Aplicaciones] [Sistema]\r\n");
             }
         }
         Ok(())
