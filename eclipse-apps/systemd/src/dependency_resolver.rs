@@ -51,55 +51,89 @@ impl DependencyResolver {
     pub fn resolve_dependencies(&self, service_file: &ServiceFile) -> Result<Vec<String>> {
         let service_name = self.extract_service_name(service_file);
         let mut dependencies = Vec::new();
-        
-        debug!("🔍 Resolviendo dependencias para: {}", service_name);
-        
+        let mut required_deps = Vec::new();
+
+        debug!("Buscando Resolviendo dependencias para: {}", service_name);
+
         // Obtener dependencias de la sección [Unit]
         if let Some(unit_entries) = ServiceParser::get_section_entries(service_file, "Unit") {
-            // Requires
+            // Requires - dependencias obligatorias
             if let Some(requires) = unit_entries.get("Requires") {
                 for dep in requires.split_whitespace() {
-                    dependencies.push(dep.to_string());
-                    debug!("  📋 Requires: {}", dep);
+                    let dep_name = dep.to_string();
+                    dependencies.push(dep_name.clone());
+                    required_deps.push(dep_name);
+                    debug!("  Requerido Requires: {}", dep);
                 }
             }
-            
-            // Wants
+
+            // Wants - dependencias opcionales
             if let Some(wants) = unit_entries.get("Wants") {
                 for dep in wants.split_whitespace() {
                     dependencies.push(dep.to_string());
-                    debug!("  💭 Wants: {}", dep);
+                    debug!("  Opcional Wants: {}", dep);
                 }
             }
-            
-            // After
+
+            // After - orden de inicio
             if let Some(after) = unit_entries.get("After") {
                 for dep in after.split_whitespace() {
                     dependencies.push(dep.to_string());
-                    debug!("  ⏰ After: {}", dep);
+                    debug!("  Temporizador After: {}", dep);
                 }
             }
+
+            // Before - orden de inicio inverso
+            if let Some(before) = unit_entries.get("Before") {
+                debug!("  Temporizador Before: {} (no afecta orden de resolución)", before);
+            }
+
+            // Conflicts - servicios incompatibles
+            if let Some(conflicts) = unit_entries.get("Conflicts") {
+                debug!("  Conflicto  Conflicts: {} (no afecta resolución)", conflicts);
+            }
         }
-        
+
         // Resolver dependencias recursivamente
         let mut resolved_deps = Vec::new();
+        let mut visited = HashSet::new();
+
         for dep in dependencies {
-            if !resolved_deps.contains(&dep) {
-                resolved_deps.push(dep.clone());
-                
-                // Resolver dependencias de la dependencia
-                if let Ok(sub_deps) = self.resolve_service_dependencies(&dep) {
-                    for sub_dep in sub_deps {
-                        if !resolved_deps.contains(&sub_dep) {
-                            resolved_deps.push(sub_dep);
-                        }
-                    }
-                }
+            if !visited.contains(&dep) {
+                self.resolve_recursive(&dep, &mut resolved_deps, &mut visited, &required_deps)?;
             }
         }
-        
-        debug!("✅ Dependencias resueltas para {}: {:?}", service_name, resolved_deps);
+
+        debug!("Servicio Dependencias resueltas para {}: {:?}", service_name, resolved_deps);
         Ok(resolved_deps)
+    }
+
+    /// Resuelve dependencias recursivamente con detección de ciclos
+    fn resolve_recursive(&self, service_name: &str, resolved_deps: &mut Vec<String>,
+                        visited: &mut HashSet<String>, required_deps: &[String]) -> Result<()> {
+        // Evitar ciclos
+        if visited.contains(service_name) {
+            return Ok(());
+        }
+
+        visited.insert(service_name.to_string());
+
+        // Obtener dependencias del servicio
+        let deps = self.resolve_service_dependencies(service_name)?;
+
+        // Resolver dependencias de cada dependencia primero
+        for dep in deps {
+            if !visited.contains(&dep) {
+                self.resolve_recursive(&dep, resolved_deps, visited, required_deps)?;
+            }
+        }
+
+        // Agregar esta dependencia a la lista resuelta
+        if !resolved_deps.contains(&service_name.to_string()) {
+            resolved_deps.push(service_name.to_string());
+        }
+
+        Ok(())
     }
 
     /// Resuelve dependencias de un servicio específico
@@ -107,9 +141,9 @@ impl DependencyResolver {
         // En una implementación real, aquí se cargaría el archivo .service
         // y se resolverían sus dependencias
         // Por ahora, devolvemos dependencias básicas conocidas
-        
+
         let mut deps = Vec::new();
-        
+
         match service_name {
             "eclipse-gui.service" => {
                 deps.push("multi-user.target".to_string());
@@ -122,14 +156,23 @@ impl DependencyResolver {
             "network.service" => {
                 deps.push("basic.target".to_string());
             }
+            "multi-user.target" => {
+                deps.push("basic.target".to_string());
+            }
+            "graphical.target" => {
+                deps.push("multi-user.target".to_string());
+            }
             "syslog.service" => {
                 // No tiene dependencias
+            }
+            "basic.target" => {
+                deps.push("syslog.service".to_string());
             }
             _ => {
                 debug!("  ❓ Dependencias desconocidas para: {}", service_name);
             }
         }
-        
+
         Ok(deps)
     }
 
@@ -142,7 +185,7 @@ impl DependencyResolver {
 
     /// Resuelve el orden de inicio de una lista de servicios
     pub fn resolve_startup_order(&self, services: &[String]) -> Result<Vec<String>> {
-        debug!("🔄 Resolviendo orden de inicio para: {:?}", services);
+        debug!("Reiniciando Resolviendo orden de inicio para: {:?}", services);
         
         let mut graph = HashMap::new();
         let mut in_degree = HashMap::new();
@@ -194,11 +237,11 @@ impl DependencyResolver {
         
         // Verificar si hay ciclos
         if result.len() != services.len() {
-            warn!("⚠️  Ciclo detectado en dependencias de servicios");
+            warn!("Advertencia  Ciclo detectado en dependencias de servicios");
             return Err(anyhow::anyhow!("Ciclo detectado en dependencias"));
         }
         
-        debug!("✅ Orden de inicio resuelto: {:?}", result);
+        debug!("Servicio Orden de inicio resuelto: {:?}", result);
         Ok(result)
     }
 
@@ -215,7 +258,7 @@ impl DependencyResolver {
         }
         
         if !conflicts.is_empty() {
-            warn!("⚠️  Conflictos detectados: {:?}", conflicts);
+            warn!("Advertencia  Conflictos detectados: {:?}", conflicts);
         }
         
         Ok(conflicts)
@@ -226,12 +269,63 @@ impl DependencyResolver {
         // En una implementación real, aquí se verificarían las entradas
         // Conflicts en los archivos .service
         // Por ahora, simulamos algunos conflictos conocidos
-        
+
         match (service1, service2) {
             ("multi-user.target", "graphical.target") => true,
             ("graphical.target", "multi-user.target") => true,
+            ("shutdown.target", _) => true,
+            (_, "shutdown.target") => true,
             _ => false,
         }
+    }
+
+    /// Valida las dependencias de un servicio
+    pub fn validate_dependencies(&self, service_name: &str, available_services: &[String]) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        let deps = self.resolve_service_dependencies(service_name)?;
+
+        for dep in deps {
+            if !available_services.contains(&dep) {
+                warnings.push(format!("Dependencia '{}' no encontrada para '{}'", dep, service_name));
+            }
+        }
+
+        // Verificar conflictos
+        for other_service in available_services {
+            if self.services_conflict(service_name, other_service) {
+                warnings.push(format!("Conflicto detectado entre '{}' y '{}'", service_name, other_service));
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    /// Obtiene el grafo completo de dependencias
+    pub fn build_dependency_graph(&self, services: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        let mut graph = HashMap::new();
+
+        for service in services {
+            let deps = self.resolve_service_dependencies(service)?;
+            graph.insert(service.clone(), deps);
+        }
+
+        Ok(graph)
+    }
+
+    /// Encuentra servicios huérfanos (sin dependencias)
+    pub fn find_orphan_services(&self, services: &[String]) -> Vec<String> {
+        let mut orphans = Vec::new();
+
+        for service in services {
+            if let Ok(deps) = self.resolve_service_dependencies(service) {
+                if deps.is_empty() {
+                    orphans.push(service.clone());
+                }
+            }
+        }
+
+        orphans
     }
 
     /// Obtiene información de dependencias

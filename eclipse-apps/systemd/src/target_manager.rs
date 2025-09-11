@@ -38,7 +38,7 @@ impl TargetManager {
 
     /// Inicializa el manager de targets
     pub fn initialize(&mut self) -> Result<()> {
-        info!("🎯 Inicializando Target Manager");
+        info!("Target Inicializando Target Manager");
         
         // Cargar targets predefinidos
         self.load_predefined_targets()?;
@@ -46,7 +46,7 @@ impl TargetManager {
         // Cargar targets desde archivos
         self.load_target_files()?;
         
-        info!("✅ Target Manager inicializado con {} targets", self.targets.len());
+        info!("Servicio Target Manager inicializado con {} targets", self.targets.len());
         Ok(())
     }
 
@@ -107,7 +107,7 @@ impl TargetManager {
     fn load_target_files(&mut self) -> Result<()> {
         let target_dir_path = Path::new(&self.target_dir);
         if !target_dir_path.exists() {
-            warn!("⚠️  Directorio de targets no encontrado: {}", self.target_dir);
+            warn!("Advertencia  Directorio de targets no encontrado: {}", self.target_dir);
             return Ok(());
         }
 
@@ -122,16 +122,16 @@ impl TargetManager {
                             .unwrap_or("unknown")
                             .to_string();
                         
-                        debug!("🔍 Cargando target: {}", target_name);
+                        debug!("Buscando Cargando target: {}", target_name);
                         
                         match self.parse_target_file(&path) {
                             Ok(target) => {
                                 let target_name_clone = target_name.clone();
                                 self.targets.insert(target_name, target);
-                                debug!("  ✅ Target cargado: {}", target_name_clone);
+                                debug!("  Servicio Target cargado: {}", target_name_clone);
                             }
                             Err(e) => {
-                                warn!("  ❌ Error cargando target {}: {}", target_name, e);
+                                warn!("  Error Error cargando target {}: {}", target_name, e);
                             }
                         }
                     }
@@ -186,7 +186,7 @@ impl TargetManager {
                         after.extend(value.split_whitespace().map(|s| s.to_string()));
                     }
                     _ => {
-                        debug!("  📝 Entrada desconocida: {} = {}", key, value);
+                        debug!("  Registrando Entrada desconocida: {} = {}", key, value);
                     }
                 }
             }

@@ -306,8 +306,12 @@ fn process_system_events() {
 
 /// Hibernar CPU cuando no hay trabajo
 fn hibernate_cpu() {
+    // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
     unsafe {
-        asm!("hlt");
+        // Simular hibernación con spin loop
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -321,8 +325,12 @@ fn print_message(_msg: &str) {
 // panic_handler definido en lib.rs
     
     loop {
+        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
         unsafe {
-            asm!("hlt");
+            // Simular espera infinita con spin loop
+            for _ in 0..100000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }

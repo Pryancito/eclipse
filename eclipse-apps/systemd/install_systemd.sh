@@ -5,45 +5,45 @@
 
 set -e
 
-echo "🚀 Instalando Eclipse SystemD v0.1.0"
+echo "Iniciando Instalando Eclipse SystemD v0.1.0"
 echo "====================================="
 
 # Verificar que estamos en el directorio correcto
 if [ ! -f "Cargo.toml" ]; then
-    echo "❌ Error: Ejecutar desde el directorio systemd/"
+    echo "Error Error: Ejecutar desde el directorio systemd/"
     exit 1
 fi
 
 # Compilar en modo release
-echo "📦 Compilando Eclipse SystemD..."
+echo "Dependencias Compilando Eclipse SystemD..."
 cargo build --release
 
 if [ $? -ne 0 ]; then
-    echo "❌ Error al compilar Eclipse SystemD"
+    echo "Error Error al compilar Eclipse SystemD"
     exit 1
 fi
 
-echo "✅ Compilación exitosa"
+echo "Completado Compilación exitosa"
 
 # Crear directorios del sistema
-echo "📁 Creando directorios del sistema..."
+echo "Directorio Creando directorios del sistema..."
 sudo mkdir -p /sbin
 sudo mkdir -p /etc/eclipse/systemd/system
 sudo mkdir -p /var/log/eclipse
 sudo mkdir -p /var/lib/eclipse-systemd
 
 # Instalar ejecutable
-echo "🔧 Instalando ejecutable..."
+echo "Aplicando Instalando ejecutable..."
 sudo cp target/release/eclipse-systemd /sbin/eclipse-systemd
 sudo chmod +x /sbin/eclipse-systemd
 
 # Instalar archivos de configuración
-echo "📋 Instalando archivos de configuración..."
+echo "Configuracion Instalando archivos de configuración..."
 sudo cp ../etc/eclipse/systemd/system/*.service /etc/eclipse/systemd/system/
 sudo cp ../etc/eclipse/systemd/system/*.target /etc/eclipse/systemd/system/
 
 # Crear enlace simbólico para /sbin/init
-echo "🔗 Creando enlace simbólico para /sbin/init..."
+echo "Integrando Creando enlace simbólico para /sbin/init..."
 sudo ln -sf /sbin/eclipse-systemd /sbin/init
 
 # Crear usuario del sistema
@@ -60,7 +60,7 @@ sudo chmod 644 /etc/eclipse/systemd/system/*.service
 sudo chmod 644 /etc/eclipse/systemd/system/*.target
 
 # Crear script de inicio
-echo "📜 Creando script de inicio..."
+echo "Creando Creando script de inicio..."
 sudo tee /etc/init.d/eclipse-systemd > /dev/null << 'EOF'
 #!/bin/bash
 ### BEGIN INIT INFO
@@ -106,11 +106,11 @@ EOF
 sudo chmod +x /etc/init.d/eclipse-systemd
 
 # Habilitar servicio
-echo "⚙️  Habilitando servicio..."
+echo "Configurando  Habilitando servicio..."
 sudo update-rc.d eclipse-systemd defaults
 
 # Crear archivo de configuración del sistema
-echo "⚙️  Creando configuración del sistema..."
+echo "Configurando  Creando configuración del sistema..."
 sudo tee /etc/eclipse/systemd.conf > /dev/null << 'EOF'
 # Configuración de Eclipse SystemD
 [systemd]
@@ -137,27 +137,27 @@ monitor_services = true
 EOF
 
 # Probar instalación
-echo "🧪 Probando instalación..."
+echo "Probando Probando instalación..."
 if /sbin/eclipse-systemd --version > /dev/null 2>&1; then
-    echo "✅ Eclipse SystemD instalado correctamente"
+    echo "Completado Eclipse SystemD instalado correctamente"
 else
-    echo "⚠️  Eclipse SystemD instalado pero no responde a --version"
+    echo "Advertencia  Eclipse SystemD instalado pero no responde a --version"
 fi
 
 # Mostrar información de instalación
 echo ""
-echo "🎉 INSTALACIÓN COMPLETADA"
+echo "Completado INSTALACIÓN COMPLETADA"
 echo "========================="
-echo "📁 Ejecutable: /sbin/eclipse-systemd"
-echo "📁 Configuración: /etc/eclipse/systemd/"
-echo "📁 Logs: /var/log/eclipse/"
-echo "📁 Datos: /var/lib/eclipse-systemd/"
+echo "Directorio Ejecutable: /sbin/eclipse-systemd"
+echo "Directorio Configuración: /etc/eclipse/systemd/"
+echo "Directorio Logs: /var/log/eclipse/"
+echo "Directorio Datos: /var/lib/eclipse-systemd/"
 echo ""
-echo "🔧 COMANDOS ÚTILES:"
+echo "Aplicando COMANDOS ÚTILES:"
 echo "  Iniciar:     sudo service eclipse-systemd start"
 echo "  Detener:     sudo service eclipse-systemd stop"
 echo "  Reiniciar:   sudo service eclipse-systemd restart"
 echo "  Estado:      sudo service eclipse-systemd status"
 echo "  Ejecutar:    /sbin/eclipse-systemd"
 echo ""
-echo "🚀 Eclipse OS está listo para el arranque moderno con systemd!"
+echo "Iniciando Eclipse OS está listo para el arranque moderno con systemd!"

@@ -4,140 +4,71 @@
 #![no_main]
 
 // use core::panic::PanicInfo;
-use eclipse_kernel::main_simple;
 use core::error::Error;
 extern crate alloc;
 use alloc::boxed::Box;
 
-// Serial COM1 para logs tempranos
-#[inline(always)]
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
+// Importar funciones necesarias
+use eclipse_kernel::main_simple::{serial_write_str, serial_init, kernel_main};
 
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let mut val: u8;
-    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
-    val
-}
-
-unsafe fn serial_init() {
-    let base: u16 = 0x3F8;
-    outb(base + 1, 0x00);
-    outb(base + 3, 0x80);
-    outb(base + 0, 0x01);
-    outb(base + 1, 0x00);
-    outb(base + 3, 0x03);
-    outb(base + 2, 0xC7);
-    outb(base + 4, 0x0B);
-}
-
-unsafe fn serial_write_byte(b: u8) {
-    let base: u16 = 0x3F8;
-    while (inb(base + 5) & 0x20) == 0 {}
-    outb(base, b);
-}
-
-unsafe fn serial_write_str(s: &str) {
-    for &c in s.as_bytes() { serial_write_byte(c); }
-}
-
-unsafe fn serial_write_hex32(val: u32) {
-    for i in (0..8).rev() {
-        let nibble = (val >> (i * 4)) & 0xF;
-        let c = if nibble < 10 {
-            b'0' + nibble as u8
-        } else {
-            b'A' + (nibble - 10) as u8
-        };
-        serial_write_byte(c);
-    }
-}
-
-unsafe fn serial_write_hex64(val: u64) {
-    for i in (0..16).rev() {
-        let nibble = (val >> (i * 4)) & 0xF;
-        let c = if nibble < 10 {
-            b'0' + nibble as u8
-        } else {
-            b'A' + (nibble - 10) as u8
-        };
-        serial_write_byte(c);
-    }
-}
-
-/// Punto de entrada principal del kernel (con parámetros del framebuffer)
-/*#[no_mangle]
-pub extern "C" fn _start(framebuffer_info: *const FramebufferInfo) -> ! {
-    // Serial temprano
-    unsafe {
-        serial_init();
-        serial_write_str("KERNEL: _start\r\n");
-    }
-    // DEBUG: Escribir inmediatamente a VGA para confirmar que llegamos aquí
-    unsafe {
-        use eclipse_kernel::main_simple::{VGA, Color};
-        VGA.init_vga_mode();
-        VGA.set_color(Color::Red, Color::Black);
-        VGA.write_string("DEBUG: _start() llamado!\n");
-        VGA.set_color(Color::White, Color::Black);
-    }
-    
-    // Si tenemos información del framebuffer, usarla
-    if !framebuffer_info.is_null() {
-        unsafe {
-            let fb_info = &*framebuffer_info;
-            
-            // Inicializar framebuffer con parámetros del bootloader UEFI
-            if let Err(e) = init_framebuffer_from_bootloader(
-                fb_info.base_address,
-                fb_info.width,
-                fb_info.height,
-                fb_info.pixels_per_scan_line,
-                fb_info.pixel_format,
-                fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
-            ) {
-                // Si falla la inicialización del framebuffer, continuar sin framebuffer
-                // El kernel_main() manejará el fallback a VGA
-            }
-        }
-    }
-    
-    // Continuar con la inicialización del kernel
-    kernel_main()
-
-    loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}*/
-
+// Usamos el panic handler definido en lib.rs
 // Punto de entrada principal del kernel (con parámetros del framebuffer)
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // ⚠️  KERNEL ULTRA-SIMPLE PARA DIAGNOSTICAR PAGE FAULT ⚠️
+    // Solo las operaciones más básicas para identificar el problema
+
     unsafe {
+        // 1. Inicializar serial (operaciones I/O directas, no deberían causar PF)
         serial_init();
-        serial_write_str("KERNEL: _start\r\n");
-    }
 
-    unsafe {
-        core::arch::asm!(
-            "call {kernel_call}",
-            kernel_call = sym kernel_call,
-        );
-    }
+        // 2. Mensaje simple sin acceder a memoria compleja
+        serial_write_str("KERNEL: _start OK\r\n");
 
-    // Loop infinito
-    loop {
         unsafe {
-            core::arch::asm!("hlt");
+            core::arch::asm!(
+                "call {kernel_call}",
+                kernel_call = sym kernel_call,
+            );
+        }
+        
+        // 3. Loop simple sin llamadas complejas
+        loop {
+            // Simular espera sin hlt
+            for _ in 0..100000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }
 
-unsafe fn kernel_call() -> Result<(), Box<dyn Error>>{
-    main_simple::kernel_main();
-    Ok(())
+unsafe fn kernel_call() -> Result<(), &'static str>{
+    kernel_main()?;
+
+    // Después de la inicialización, el kernel debe continuar ejecutándose
+    // En Linux real, aquí entraría el scheduler principal
+    kernel_main_loop()
+}
+
+unsafe fn kernel_main_loop() -> Result<(), &'static str> {
+    serial_write_str("[KERNEL] Inicialización completada - Iniciando scheduler principal\r\n");
+    serial_write_str("[KERNEL] Eclipse OS v0.5.0 ejecutándose\r\n");
+    serial_write_str("[KERNEL] Presiona Ctrl+C para detener QEMU\r\n");
+
+    loop {
+        // En Linux real aquí iría:
+        // - schedule() - scheduling de procesos
+        // - Manejo de interrupciones
+        // - Timer ticks
+        // - etc.
+
+        // TEMPORALMENTE DESHABILITADO: Instrucción hlt causa opcode inválido
+        // Simular espera de interrupciones
+        unsafe {
+            serial_write_str("[KERNEL] Esperando interrupciones (hlt deshabilitado)\r\n");
+        }
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
+    }
 }

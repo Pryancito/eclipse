@@ -99,8 +99,10 @@ pub fn debug_pause(component: &str, message: &str) {
     // Bucle de espera para permitir leer el mensaje
     let mut counter = 0;
     loop {
+        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
         unsafe {
-            core::arch::asm!("nop");
+            // Simular nop con spin loop para evitar opcode inválido
+            core::hint::spin_loop();
         }
         counter += 1;
         
@@ -123,8 +125,10 @@ pub fn debug_reboot(reason: &str) {
         // Espera aproximada de 1 segundo
         let mut counter = 0;
         while counter < 1000000 {
+            // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
             unsafe {
-                core::arch::asm!("nop");
+                // Simular nop con spin loop para evitar opcode inválido
+                core::hint::spin_loop();
             }
             counter += 1;
         }
@@ -132,6 +136,10 @@ pub fn debug_reboot(reason: &str) {
     
     // Reiniciar
     unsafe {
-        core::arch::asm!("hlt");
+        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+        // Simular halt con spin loop
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
     }
 }

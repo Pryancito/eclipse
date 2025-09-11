@@ -1,25 +1,96 @@
-# Eclipse SystemD v0.1.0
+# Eclipse SystemD v0.6.0
 
-Sistema de inicialización moderno para Eclipse OS que implementa funcionalidades similares a systemd.
+Sistema de inicialización moderno y completo para Eclipse OS que implementa funcionalidades avanzadas similares a systemd.
 
-## Características
+## Características Principales
 
-- ✅ **Parser de archivos .service**: Parsea archivos de configuración .service estándar
-- ✅ **Validador de sintaxis**: Verifica la validez de los archivos .service
-- ✅ **Gestión de servicios**: Inicia, detiene y monitorea servicios
-- ✅ **Gestión de targets**: Maneja targets (equivalente a runlevels)
-- ✅ **Sistema de logging**: Journal integrado para logs del sistema
-- ✅ **Gestión de dependencias**: Resuelve dependencias entre servicios
-- ✅ **Configuración flexible**: Archivos .service estándar de systemd
+### Arquitectura del Sistema
+- Sistema modular: Arquitectura completamente modular con separación de responsabilidades
+- Integración completa: Integración nativa con el kernel Eclipse OS
+- Gestión de procesos: Monitoreo avanzado de procesos usando `/proc`
+- Gestión de recursos: Control de CPU, memoria e I/O por servicio
+- Sistema de notificaciones: Notificaciones en tiempo real entre servicios
+
+### Gestión de Servicios
+- Parser completo: Parser robusto de archivos `.service` estándar
+- Validador avanzado: Validación completa de sintaxis y dependencias
+- Estados del servicio: Estados completos (inactive, activating, active, deactivating, failed)
+- Control de ciclo de vida: Inicio, parada, reinicio y recarga de servicios
+- Manejo de señales: SIGTERM graceful shutdown con fallback a SIGKILL
+
+### Sistema de Dependencias
+- Resolución inteligente: Resolución automática de dependencias con detección de ciclos
+- Tipos de dependencia: `Requires`, `Wants`, `After`, `Before`, `Conflicts`
+- Orden de inicio: Ordenamiento topológico para inicio correcto
+- Validación: Verificación automática de dependencias faltantes
+
+### Monitoreo y Logging
+- Journal estructurado: Sistema de logging con JSON estructurado
+- Rotación automática: Rotación de archivos con compresión gzip
+- Niveles de prioridad: Emergencia, Alerta, Crítico, Error, Warning, Notice, Info, Debug
+- Búsqueda avanzada: Búsqueda y filtrado de logs por servicio y prioridad
+- Compresión: Compresión automática con niveles configurables
+
+### Sistema de Notificaciones
+- Canales broadcast: Comunicación en tiempo real entre servicios
+- Tipos de notificación: Ready, Reloading, Stopping, Error, Custom
+- Historial: Historial completo de notificaciones con límites configurables
+- Suscripción: Sistema de suscripción/desuscripción a canales
+
+### Gestión de Recursos
+- Monitoreo de CPU: Uso de CPU por proceso y sistema
+- Monitoreo de memoria: RAM, cache y buffers del sistema
+- Monitoreo de I/O: Operaciones de lectura/escritura por proceso
+- Límites configurables: Límites de CPU, memoria e I/O por servicio
+- Historial de uso: Historial temporal de uso de recursos
+
+### Gestión de Targets
+- Sistema de targets: Equivalente moderno a los runlevels tradicionales
+- Dependencias: Resolución de dependencias entre targets
+- Estados: Estados completos para targets (active, inactive, failed)
+- Transiciones: Transiciones suaves entre targets
+
+### Interfaz de Control
+- systemctl: Interfaz de línea de comandos completa
+- Comandos principales: start, stop, restart, reload, status, enable, disable
+- Gestión de targets: set-default, get-default, isolate
+- Monitoreo: list-units, list-services, show
+- Ayuda integrada: Sistema de ayuda completo
 
 ## Instalación
 
+### Compilación desde fuente
 ```bash
-# Compilar
+# Clonar el repositorio
+cd eclipse-apps/systemd
+
+# Compilar en modo release
 cargo build --release
 
+# Ejecutar pruebas
+cargo test
+
+# Verificar compilación
+ls -la target/release/eclipse-systemd
+```
+
+### Instalación del sistema
+```bash
 # Instalar (requiere sudo)
-./install_systemd.sh
+sudo ./install_systemd.sh
+
+# Verificar instalación
+sudo service eclipse-systemd status
+```
+
+### Integración con kernel
+```bash
+# Compilar kernel con integración systemd
+cd ../..
+./eclipse_kernel/build_with_systemd.sh
+
+# Ejecutar pruebas de integración
+./test_systemd_integration.sh
 ```
 
 ## Uso
@@ -154,11 +225,11 @@ Eclipse SystemD está diseñado para integrarse con el kernel Eclipse:
 
 ## Estado del proyecto
 
-- ✅ Parser de archivos .service
-- ✅ Validador de sintaxis
-- ✅ Gestión básica de servicios
-- ✅ Sistema de logging
-- ✅ Script de instalación
+- Completado Parser de archivos .service
+- Completado Validador de sintaxis
+- Completado Gestión básica de servicios
+- Completado Sistema de logging
+- Completado Script de instalación
 - 🚧 Integración con kernel (en progreso)
 - ⏳ Gestión avanzada de dependencias
 - ⏳ Sistema de notificaciones

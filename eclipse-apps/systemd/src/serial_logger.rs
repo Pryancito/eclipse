@@ -104,7 +104,7 @@ Estado: Iniciando servicios del sistema...
         }
 
         let status_message = format!(
-            "\n📊 Estado del sistema:\n{}\n",
+            "\nEstado Estado del sistema:\n{}\n",
             status
         );
 
@@ -125,7 +125,7 @@ Estado: Iniciando servicios del sistema...
         };
 
         let service_message = format!(
-            "🔧 Servicio {}: {} {}\n",
+            "Aplicando Servicio {}: {} {}\n",
             service_name,
             state,
             pid_info
@@ -157,7 +157,7 @@ Estado: Iniciando servicios del sistema...
         }
 
         let warning_message = format!(
-            "⚠️  ADVERTENCIA: {}\n",
+            "Advertencia  ADVERTENCIA: {}\n",
             warning
         );
 

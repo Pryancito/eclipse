@@ -37,6 +37,26 @@ pub struct ServiceInfo {
     pub exit_code: Option<i32>,
 }
 
+/// Información detallada de un proceso
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub state: String,
+    pub cpu_usage: f32,
+    pub memory_usage: u64,
+    pub start_time: u64,
+    pub command: String,
+}
+
+/// Estadísticas del manager de servicios
+#[derive(Debug, Clone)]
+pub struct ServiceManagerStats {
+    pub total_services: usize,
+    pub running_services: usize,
+    pub failed_services: usize,
+    pub active_services: usize,
+}
+
 /// Manager de servicios
 pub struct ServiceManager {
     /// Servicios en ejecución
@@ -57,12 +77,12 @@ impl ServiceManager {
     /// Registra un servicio
     pub fn register_service(&self, name: &str, service_file: ServiceFile) {
         self.service_configs.lock().unwrap().insert(name.to_string(), service_file);
-        debug!("📝 Servicio registrado: {}", name);
+        debug!("Registrando Servicio registrado: {}", name);
     }
 
     /// Inicia un servicio
     pub fn start_service(&self, name: &str) -> Result<()> {
-        info!("🚀 Iniciando servicio: {}", name);
+        info!("Iniciando Iniciando servicio: {}", name);
         
         // Verificar si ya está ejecutándose
         if self.is_service_running(name) {
@@ -83,13 +103,13 @@ impl ServiceManager {
         // Ejecutar el servicio
         self.execute_service(name, &service_file)?;
         
-        info!("✅ Servicio iniciado: {}", name);
+        info!("Servicio Servicio iniciado: {}", name);
         Ok(())
     }
 
     /// Detiene un servicio
     pub fn stop_service(&self, name: &str) -> Result<()> {
-        info!("🛑 Deteniendo servicio: {}", name);
+        info!("Deteniendo Deteniendo servicio: {}", name);
         
         let mut running = self.running_services.lock().unwrap();
         if let Some(service_info) = running.get_mut(name) {
@@ -102,7 +122,7 @@ impl ServiceManager {
             
             service_info.state = ServiceState::Inactive;
             running.remove(name);
-            info!("✅ Servicio detenido: {}", name);
+            info!("Servicio Servicio detenido: {}", name);
         } else {
             return Err(anyhow::anyhow!("Servicio no está ejecutándose: {}", name));
         }
@@ -112,7 +132,7 @@ impl ServiceManager {
 
     /// Reinicia un servicio
     pub fn restart_service(&self, name: &str) -> Result<()> {
-        info!("🔄 Reiniciando servicio: {}", name);
+        info!("Reiniciando Reiniciando servicio: {}", name);
         
         // Detener si está ejecutándose
         if self.is_service_running(name) {
@@ -125,13 +145,13 @@ impl ServiceManager {
         // Iniciar nuevamente
         self.start_service(name)?;
         
-        info!("✅ Servicio reiniciado: {}", name);
+        info!("Servicio Servicio reiniciado: {}", name);
         Ok(())
     }
 
     /// Recarga un servicio
     pub fn reload_service(&self, name: &str) -> Result<()> {
-        info!("🔄 Recargando servicio: {}", name);
+        info!("Reiniciando Recargando servicio: {}", name);
         
         let mut running = self.running_services.lock().unwrap();
         if let Some(service_info) = running.get_mut(name) {
@@ -143,12 +163,12 @@ impl ServiceManager {
                     .arg("-HUP")
                     .arg(pid.to_string())
                     .output() {
-                    warn!("⚠️  Error enviando SIGHUP a {}: {}", pid, e);
+                    warn!("Advertencia  Error enviando SIGHUP a {}: {}", pid, e);
                 }
             }
             
             service_info.state = ServiceState::Active;
-            info!("✅ Servicio recargado: {}", name);
+            info!("Servicio Servicio recargado: {}", name);
         } else {
             return Err(anyhow::anyhow!("Servicio no está ejecutándose: {}", name));
         }
@@ -217,9 +237,9 @@ impl ServiceManager {
             }
         }
 
-        debug!("👤 Ejecutando como usuario: {}, grupo: {}", user, group);
-        debug!("📁 Directorio de trabajo: {}", working_dir);
-        debug!("🚀 Comando: {}", exec_start);
+        debug!("Usuario Ejecutando como usuario: {}, grupo: {}", user, group);
+        debug!("Directorio Directorio de trabajo: {}", working_dir);
+        debug!("Iniciando Comando: {}", exec_start);
 
         // Ejecutar comando
         match cmd.spawn() {
@@ -240,7 +260,7 @@ impl ServiceManager {
                 
                 self.running_services.lock().unwrap().insert(name.to_string(), service_info);
                 
-                debug!("✅ Proceso iniciado con PID: {}", pid);
+                debug!("Servicio Proceso iniciado con PID: {}", pid);
                 
                 // Iniciar monitoreo del proceso en un hilo separado
                 self.start_process_monitoring(name, pid);
@@ -292,7 +312,7 @@ impl ServiceManager {
         let running_services = Arc::clone(&self.running_services);
         
         thread::spawn(move || {
-            debug!("🔍 Iniciando monitoreo del proceso {} (PID: {})", service_name, pid);
+            debug!("Buscando Iniciando monitoreo del proceso {} (PID: {})", service_name, pid);
             
             // En una implementación real, aquí se usaría waitpid o similar
             // para monitorear el proceso
@@ -301,7 +321,7 @@ impl ServiceManager {
                 
                 // Verificar si el proceso sigue ejecutándose
                 if !Self::is_process_running(pid) {
-                    warn!("⚠️  Proceso terminado: {} (PID: {})", service_name, pid);
+                    warn!("Advertencia  Proceso terminado: {} (PID: {})", service_name, pid);
                     
                     // Actualizar estado del servicio
                     if let Ok(mut running) = running_services.lock() {
@@ -319,43 +339,122 @@ impl ServiceManager {
 
     /// Verifica si un proceso está ejecutándose
     fn is_process_running(pid: u32) -> bool {
-        // En una implementación real, aquí se verificaría el estado del proceso
-        // usando syscalls del sistema operativo
-        // Por ahora, simulamos que siempre está ejecutándose
-        true
+        // En Linux, verificar si el proceso existe leyendo /proc/<pid>/stat
+        let proc_path = format!("/proc/{}/stat", pid);
+        match std::fs::read_to_string(&proc_path) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
     }
 
-    /// Termina un proceso
+    /// Termina un proceso con manejo mejorado de señales
     fn terminate_process(&self, pid: u32) -> Result<()> {
-        // Enviar señal SIGTERM
+        // Verificar que el proceso existe antes de intentar terminarlo
+        if !Self::is_process_running(pid) {
+            debug!("Proceso {} ya terminó", pid);
+            return Ok(());
+        }
+
+        // Enviar señal SIGTERM primero
+        debug!("Enviando SIGTERM a proceso {}", pid);
         if let Err(e) = Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
             .output() {
-            warn!("⚠️  Error enviando SIGTERM a {}: {}", pid, e);
+            warn!("Advertencia  Error enviando SIGTERM a {}: {}", pid, e);
         }
-        
-        // Esperar un poco para que el proceso termine
-        thread::sleep(Duration::from_millis(500));
-        
-        // Si aún está ejecutándose, enviar SIGKILL
-        if Self::is_process_running(pid) {
-            if let Err(e) = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .output() {
-                warn!("⚠️  Error enviando SIGKILL a {}: {}", pid, e);
+
+        // Esperar hasta 3 segundos para que el proceso termine gracefully
+        for i in 1..=6 {
+            thread::sleep(Duration::from_millis(500));
+            if !Self::is_process_running(pid) {
+                debug!("Proceso {} terminó correctamente después de {} intentos", pid, i);
+                return Ok(());
             }
         }
-        
+
+        // Si aún está ejecutándose, enviar SIGKILL
+        warn!("Advertencia  Proceso {} no respondió a SIGTERM, enviando SIGKILL", pid);
+        if let Err(e) = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .output() {
+            warn!("Advertencia  Error enviando SIGKILL a {}: {}", pid, e);
+        }
+
+        // Esperar un poco más para SIGKILL
+        thread::sleep(Duration::from_millis(200));
+        if Self::is_process_running(pid) {
+            warn!("Advertencia  Proceso {} no pudo ser terminado", pid);
+        } else {
+            debug!("Proceso {} terminado con SIGKILL", pid);
+        }
+
         Ok(())
+    }
+
+    /// Obtiene información detallada de un proceso
+    pub fn get_process_info(&self, pid: u32) -> Option<ProcessInfo> {
+        if !Self::is_process_running(pid) {
+            return None;
+        }
+
+        let stat_path = format!("/proc/{}/stat", pid);
+        let cmd_path = format!("/proc/{}/cmdline", pid);
+
+        // Leer información del proceso desde /proc/<pid>/stat
+        let stat_content = std::fs::read_to_string(&stat_path).ok()?;
+        let cmd_content = std::fs::read_to_string(&cmd_path).unwrap_or_default();
+
+        let stat_parts: Vec<&str> = stat_content.split_whitespace().collect();
+        if stat_parts.len() < 24 {
+            return None;
+        }
+
+        let state = stat_parts[2].to_string();
+        let start_time: u64 = stat_parts[21].parse().unwrap_or(0);
+        let command = if cmd_content.is_empty() {
+            stat_parts.get(1).unwrap_or(&"unknown").to_string()
+        } else {
+            cmd_content.replace('\0', " ").trim().to_string()
+        };
+
+        // Leer uso de memoria desde /proc/<pid>/statm
+        let memory_usage = self.get_memory_usage(pid);
+
+        // Calcular uso de CPU (simplificado)
+        let cpu_usage = 0.0; // En una implementación completa, se calcularía el uso real
+
+        Some(ProcessInfo {
+            pid,
+            state,
+            cpu_usage,
+            memory_usage,
+            start_time,
+            command,
+        })
+    }
+
+    /// Obtiene el uso de memoria de un proceso
+    fn get_memory_usage(&self, pid: u32) -> u64 {
+        let statm_path = format!("/proc/{}/statm", pid);
+        if let Ok(content) = std::fs::read_to_string(&statm_path) {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if let Some(total_pages) = parts.get(0) {
+                if let Ok(pages) = total_pages.parse::<u64>() {
+                    // Convertir páginas a bytes (asumiendo páginas de 4KB)
+                    return pages * 4096;
+                }
+            }
+        }
+        0
     }
 
     /// Obtiene estadísticas del manager
     pub fn get_stats(&self) -> ServiceManagerStats {
         let running = self.running_services.lock().unwrap();
         let configs = self.service_configs.lock().unwrap();
-        
+
         ServiceManagerStats {
             total_services: configs.len(),
             running_services: running.len(),
@@ -363,15 +462,6 @@ impl ServiceManager {
             active_services: running.values().filter(|s| s.state == ServiceState::Active).count(),
         }
     }
-}
-
-/// Estadísticas del manager de servicios
-#[derive(Debug, Clone)]
-pub struct ServiceManagerStats {
-    pub total_services: usize,
-    pub running_services: usize,
-    pub failed_services: usize,
-    pub active_services: usize,
 }
 
 impl ServiceManagerStats {

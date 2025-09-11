@@ -231,7 +231,11 @@ pub extern "C" fn _start() -> ! {
     // Loop infinito
     loop {
         unsafe {
-            core::arch::asm!("hlt");
+            // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+            // Simular halt con spin loop
+            for _ in 0..10000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }*/

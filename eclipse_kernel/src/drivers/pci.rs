@@ -125,15 +125,94 @@ pub struct PciManager {
     device_count: usize,
     gpus: [Option<GpuInfo>; 16],
     gpu_count: usize,
+    hardware_available: bool,
+}
+
+/// Versión minimal del PciManager para inicialización segura
+#[derive(Clone, Copy)]
+pub struct PciManagerMinimal {
+    device_count: usize,
+    gpu_count: usize,
+    hardware_available: bool,
+}
+
+impl PciManagerMinimal {
+    /// Crear versión minimal sin arrays grandes
+    pub fn new() -> Self {
+        Self {
+            device_count: 0,
+            gpu_count: 0,
+            hardware_available: false,
+        }
+    }
 }
 
 impl PciManager {
     pub fn new() -> Self {
-        Self {
+        let mut manager = Self {
             devices: [(); 256].map(|_| None),
             device_count: 0,
             gpus: [(); 16].map(|_| None),
             gpu_count: 0,
+            hardware_available: false,
+        };
+
+        // Verificar si el hardware PCI está disponible
+        manager.hardware_available = manager.check_pci_hardware();
+
+        manager
+    }
+
+    /// Crear PciManager sin verificar hardware (versión ultra-minimal)
+    pub fn new_without_hardware_check() -> Self {
+        // VERSIÓN ULTRA-MINIMAL: Crear arrays de forma manual para evitar problemas
+        let devices = [None; 256];
+        let gpus = [None; 16];
+
+        Self {
+            devices,
+            device_count: 0,
+            gpus,
+            gpu_count: 0,
+            hardware_available: false, // No verificado aún
+        }
+    }
+
+    /// Convertir de PciManagerMinimal a PciManager completo
+    pub fn from_minimal(minimal: PciManagerMinimal) -> Self {
+        Self {
+            devices: [None; 256],
+            device_count: minimal.device_count,
+            gpus: [None; 16],
+            gpu_count: minimal.gpu_count,
+            hardware_available: minimal.hardware_available,
+        }
+    }
+
+    /// Escanear dispositivos PCI de forma segura (sin operaciones de hardware)
+    pub fn scan_devices_safe(&mut self) {
+        // DEBUG: Función segura que no hace operaciones de hardware
+        unsafe { crate::main_simple::serial_write_str("DEBUG: scan_devices_safe() - sin operaciones hardware\r\n"); }
+
+        // Solo inicializar contadores, no hacer escaneo real
+        self.device_count = 0;
+        self.gpu_count = 0;
+
+        unsafe { crate::main_simple::serial_write_str("DEBUG: Contadores inicializados\r\n"); }
+    }
+
+    /// Verificar si el hardware PCI está disponible
+    fn check_pci_hardware(&self) -> bool {
+        // Intentar leer el registro de configuración PCI
+        // Si falla, el hardware PCI no está disponible
+        unsafe {
+            // Intentar leer vendor ID de un dispositivo conocido
+            let test_address = 0x80000000u32 | (0 << 16) | (0 << 11) | (0 << 8);
+            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, test_address);
+            let result = ptr::read_volatile(PCI_CONFIG_DATA as *mut u32);
+
+            // Si podemos leer algo que no sea todo 1s, el hardware está disponible
+            result != 0xFFFFFFFF
         }
     }
     
@@ -141,24 +220,54 @@ impl PciManager {
     pub fn scan_devices(&mut self) {
         self.device_count = 0;
         self.gpu_count = 0;
-        
-        // Escanear todos los buses (0-255)
-        for bus in 0..=255 {
+
+        // Solo escanear si el hardware PCI está disponible
+        if !self.hardware_available {
+            return;
+        }
+
+        // Escanear buses principales primero (0-31) para mayor eficiencia
+        // Limitar a buses razonables para evitar bloqueos
+        let max_bus = if cfg!(target_arch = "x86_64") { 31 } else { 255 };
+        let mut scan_count = 0;
+        const MAX_SCAN_ATTEMPTS: usize = 10000; // Límite de seguridad
+
+        for bus in 0..=max_bus {
             // Escanear todos los dispositivos en el bus (0-31)
             for device in 0..32 {
-                // Escanear todas las funciones (0-7)
+                // Solo escanear función 0 primero para dispositivos multi-función
                 for function in 0..8 {
+                    // Límite de seguridad para evitar bloqueos infinitos
+                    scan_count += 1;
+                    if scan_count > MAX_SCAN_ATTEMPTS {
+                        return;
+                    }
+
                     if let Some(pci_device) = self.read_pci_device(bus, device, function) {
                         // Verificar si es un dispositivo válido
                         if pci_device.vendor_id != 0xFFFF {
                             self.add_device(pci_device);
-                            
+
                             // Si es una GPU, agregarla a la lista
                             if self.is_gpu_device(&pci_device) {
                                 if let Some(gpu_info) = self.create_gpu_info(pci_device) {
                                     self.add_gpu(gpu_info);
                                 }
                             }
+
+                            // Si no es función 0, verificar si es multi-función
+                            if function == 0 && (pci_device.header_type & 0x80) != 0 {
+                                // Es multi-función, continuar escaneando
+                                continue;
+                            } else if function > 0 {
+                                // Es función adicional, continuar
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Si función 0 no existe, no buscar más funciones
+                        if function == 0 {
+                            break;
                         }
                     }
                 }
@@ -216,13 +325,26 @@ impl PciManager {
             | ((device as u32) << 11)
             | ((function as u32) << 8)
             | ((offset as u32) & 0xFC);
-        
+
         unsafe {
-            // Escribir dirección
+            // Escribir dirección con verificación de seguridad
             ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
+
+            // TEMPORALMENTE DESHABILITADO: nop en loop podría causar opcode inválido
+            // Pequeña pausa para estabilidad (simulada)
+            for _ in 0..10 {
+                // Simular nop con spin loop
+                core::hint::spin_loop();
+            }
+
             // Leer datos
             ptr::read_volatile(PCI_CONFIG_DATA as *mut u32)
         }
+    }
+
+    /// Verificar si el hardware PCI está disponible
+    pub fn is_hardware_available(&self) -> bool {
+        self.hardware_available
     }
     
     /// Agregar dispositivo a la lista

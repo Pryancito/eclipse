@@ -43,26 +43,38 @@ pub extern "C" fn uefi_entry(framebuffer_info: *const FramebufferInfo) -> ! {
     // Inicializar serial para debugging
     unsafe {
         serial_init();
-        serial_write_str("KERNEL: UEFI entry point reached\r\n");
+        crate::main_simple::serial_write_str("KERNEL: UEFI entry point reached\r\n");
     }
 
     // Llamar a la función principal del kernel
     match crate::main_simple::kernel_main() {
         Ok(_) => {
             unsafe {
-                serial_write_str("KERNEL: kernel_main() returned Ok, entering infinite loop\r\n");
+                crate::main_simple::serial_write_str("KERNEL: kernel_main() returned Ok, entering infinite loop\r\n");
             }
             loop {
-                unsafe { core::arch::asm!("hlt"); }
+                // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+                unsafe {
+                    crate::main_simple::serial_write_str("[ENTRY] Loop infinito (hlt deshabilitado)\r\n");
+                }
+                for _ in 0..100000 {
+                    core::hint::spin_loop();
+                }
             }
         }
         Err(e) => {
             unsafe {
-                serial_write_str("KERNEL: kernel_main() returned error: ");
-                serial_write_str("\r\n");
+                crate::main_simple::serial_write_str("KERNEL: kernel_main() returned error: ");
+                crate::main_simple::serial_write_str("\r\n");
             }
             loop {
-                unsafe { core::arch::asm!("hlt"); }
+                // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+                unsafe {
+                    crate::main_simple::serial_write_str("[ENTRY] Loop infinito (hlt deshabilitado)\r\n");
+                }
+                for _ in 0..100000 {
+                    core::hint::spin_loop();
+                }
             }
         }
     }
@@ -76,11 +88,13 @@ pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
 // Funciones de serial para debugging temprano
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
+    // CRÍTICO: Restaurar I/O para logging temprano - estas instrucciones son seguras
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
 }
 
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
+    // CRÍTICO: Restaurar I/O para logging temprano - estas instrucciones son seguras
     let mut val: u8;
     core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
     val
@@ -103,8 +117,5 @@ unsafe fn serial_write_byte(b: u8) {
     outb(base, b);
 }
 
-unsafe fn serial_write_str(s: &str) {
-    for &c in s.as_bytes() {
-        serial_write_byte(c);
-    }
-}
+// Función serial movida a main_simple.rs para evitar duplicados
+// Usar: crate::main_simple::serial_write_str()

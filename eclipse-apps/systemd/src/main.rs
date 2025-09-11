@@ -6,6 +6,8 @@ mod dependency_resolver;
 mod journald;
 mod serial_logger;
 mod control;
+mod notifications;
+mod resource_manager;
 
 use anyhow::Result;
 use log::{info, warn};
@@ -24,10 +26,10 @@ async fn main() -> Result<()> {
     println!("║                    ECLIPSE SYSTEMD                          ║");
     println!("║                        v0.2.0                                ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("\n🦀 USERLAND TOMANDO CONTROL DEL SISTEMA...");
+    println!("\nUSERLAND TOMANDO CONTROL DEL SISTEMA...");
     println!("===========================================");
     
-    info!("🚀 Eclipse SystemD v0.2.0 - Daemon completamente funcional");
+    info!("Eclipse SystemD v0.2.0 - Daemon completamente funcional");
     info!("Sistema de inicialización moderno para Eclipse OS");
     
     // Obtener argumentos de línea de comandos
@@ -45,7 +47,7 @@ async fn main() -> Result<()> {
 
 /// Ejecuta el daemon principal de systemd
 async fn run_daemon() -> Result<()> {
-    info!("🔄 Iniciando daemon systemd");
+    info!("Iniciando daemon systemd");
     
     // Directorio de servicios
     let service_dir = "/etc/eclipse/systemd/system";
@@ -58,36 +60,36 @@ async fn run_daemon() -> Result<()> {
     
     // Iniciar target por defecto
     let default_target = env::var("DEFAULT_TARGET").unwrap_or_else(|_| "graphical.target".to_string());
-    info!("🎯 Iniciando target por defecto: {}", default_target);
-    
+    info!("Iniciando target por defecto: {}", default_target);
+
     if let Err(e) = daemon.start_target(&default_target).await {
-        warn!("⚠️  Error iniciando target {}: {}", default_target, e);
+        warn!("Error iniciando target {}: {}", default_target, e);
         // Intentar con target básico
         if let Err(e) = daemon.start_target("multi-user.target").await {
-            warn!("⚠️  Error iniciando target básico: {}", e);
+            warn!("Error iniciando target básico: {}", e);
         }
     }
     
     // Mostrar estado del sistema
     let status = daemon.get_system_status().await;
-    info!("📊 Estado del sistema: {}", status.get_summary());
-    
+    info!("Estado del sistema: {}", status.get_summary());
+
     // Escribir estado del sistema a serial
     daemon.serial_logger.write_system_status(&status.get_summary()).await.ok();
-    
+
     // Configurar manejo de señales
     let daemon_clone = Arc::clone(&daemon);
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
             eprintln!("Error esperando señal: {}", e);
         }
-        info!("🛑 Señal de apagado recibida");
+        info!("Señal de apagado recibida");
         daemon_clone.shutdown().await;
     });
-    
+
     // Ejecutar loop principal
     daemon.run().await?;
-    
-    info!("✅ Daemon systemd finalizado");
+
+    info!("Daemon systemd finalizado");
     Ok(())
 }

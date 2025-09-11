@@ -136,7 +136,7 @@ impl SystemdControl {
 
     /// Inicia un servicio
     async fn start_service(&self, service_name: &str) -> Result<()> {
-        info!("🚀 Iniciando servicio: {}", service_name);
+        info!("Iniciando Iniciando servicio: {}", service_name);
         
         // En una implementación real, aquí se comunicaría con el daemon
         // Por ahora, ejecutamos el comando directamente
@@ -146,7 +146,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio iniciado: {}", service_name);
+            println!("Servicio Servicio iniciado: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error iniciando servicio {}: {}", service_name, error);
@@ -157,7 +157,7 @@ impl SystemdControl {
 
     /// Detiene un servicio
     async fn stop_service(&self, service_name: &str) -> Result<()> {
-        info!("🛑 Deteniendo servicio: {}", service_name);
+        info!("Deteniendo Deteniendo servicio: {}", service_name);
         
         let result = Command::new("systemctl")
             .arg("stop")
@@ -165,7 +165,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio detenido: {}", service_name);
+            println!("Servicio Servicio detenido: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error deteniendo servicio {}: {}", service_name, error);
@@ -176,7 +176,7 @@ impl SystemdControl {
 
     /// Reinicia un servicio
     async fn restart_service(&self, service_name: &str) -> Result<()> {
-        info!("🔄 Reiniciando servicio: {}", service_name);
+        info!("Reiniciando Reiniciando servicio: {}", service_name);
         
         let result = Command::new("systemctl")
             .arg("restart")
@@ -184,7 +184,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio reiniciado: {}", service_name);
+            println!("Servicio Servicio reiniciado: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error reiniciando servicio {}: {}", service_name, error);
@@ -195,7 +195,7 @@ impl SystemdControl {
 
     /// Recarga un servicio
     async fn reload_service(&self, service_name: &str) -> Result<()> {
-        info!("🔄 Recargando servicio: {}", service_name);
+        info!("Reiniciando Recargando servicio: {}", service_name);
         
         let result = Command::new("systemctl")
             .arg("reload")
@@ -203,7 +203,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio recargado: {}", service_name);
+            println!("Servicio Servicio recargado: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error recargando servicio {}: {}", service_name, error);
@@ -265,7 +265,7 @@ impl SystemdControl {
 
     /// Habilita un servicio
     async fn enable_service(&self, service_name: &str) -> Result<()> {
-        info!("✅ Habilitando servicio: {}", service_name);
+        info!("Servicio Habilitando servicio: {}", service_name);
         
         let result = Command::new("systemctl")
             .arg("enable")
@@ -273,7 +273,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio habilitado: {}", service_name);
+            println!("Servicio Servicio habilitado: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error habilitando servicio {}: {}", service_name, error);
@@ -292,7 +292,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Servicio deshabilitado: {}", service_name);
+            println!("Servicio Servicio deshabilitado: {}", service_name);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error deshabilitando servicio {}: {}", service_name, error);
@@ -329,14 +329,14 @@ impl SystemdControl {
 
     /// Recarga la configuración del daemon
     async fn daemon_reload(&self) -> Result<()> {
-        info!("🔄 Recargando configuración del daemon");
+        info!("Reiniciando Recargando configuración del daemon");
         
         let result = Command::new("systemctl")
             .arg("daemon-reload")
             .output()?;
 
         if result.status.success() {
-            println!("✅ Configuración del daemon recargada");
+            println!("Servicio Configuración del daemon recargada");
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error recargando configuración: {}", error);
@@ -359,7 +359,7 @@ impl SystemdControl {
 
     /// Establece el target por defecto
     async fn set_default_target(&self, target: &str) -> Result<()> {
-        info!("🎯 Estableciendo target por defecto: {}", target);
+        info!("Target Estableciendo target por defecto: {}", target);
         
         let result = Command::new("systemctl")
             .arg("set-default")
@@ -367,7 +367,7 @@ impl SystemdControl {
             .output()?;
 
         if result.status.success() {
-            println!("✅ Target por defecto establecido: {}", target);
+            println!("Servicio Target por defecto establecido: {}", target);
         } else {
             let error = String::from_utf8_lossy(&result.stderr);
             eprintln!("❌ Error estableciendo target {}: {}", target, error);

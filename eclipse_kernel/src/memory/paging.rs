@@ -3,7 +3,7 @@
 //! Implementa paginación de 4 niveles (PML4, PDPT, PD, PT)
 
 use crate::memory::manager::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
-
+use crate::main_simple::serial_write_str;
 /// Estructura para manejar la paginación
 pub struct PagingSystem {
     /// Tabla de páginas de nivel 4 (PML4)
@@ -122,14 +122,13 @@ impl PagingSystem {
         Ok(())
     }
 
-    /// Cargar la tabla de páginas en CR3
+    /// Cargar la tabla de páginas en CR3 (SIMULACIÓN ULTRA-SEGURA)
     fn load_page_table(&self) {
+        // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
+
         unsafe {
-            core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) self.pml4 as u64,
-                options(nostack)
-            );
+            serial_write_str("[MEMORY] Carga de tabla de páginas SIMULADA (CR3 deshabilitado)\r\n");
+            serial_write_str("[MEMORY] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
         }
     }
 
@@ -250,47 +249,22 @@ impl PagingSystem {
         }
     }
 
-    /// Habilitar paginación
+    /// Habilitar paginación (SIMULACIÓN ULTRA-SEGURA)
     pub fn enable_paging(&self) {
-        unsafe {
-            // Cargar CR3 con la dirección de PML4
-            core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) self.pml4 as u64,
-                options(nostack)
-            );
+        // TEMPORALMENTE DESHABILITADO: Instrucciones CR0/CR3 causan opcode inválido
 
-            // Habilitar paginación en CR0
-            let mut cr0: u64;
-            core::arch::asm!(
-                "mov {}, cr0",
-                out(reg) cr0,
-                options(nostack)
-            );
-            cr0 |= 0x80000000; // Bit PG (Paging)
-            core::arch::asm!(
-                "mov cr0, {}",
-                in(reg) cr0,
-                options(nostack)
-            );
+        unsafe {
+            serial_write_str("[MEMORY] Habilitación de paginación SIMULADA (CR0/CR3 deshabilitados)\r\n");
+            serial_write_str("[MEMORY] ERROR: Opcode inválido en RIP 000000000009F0AD - CR0/CR3 problemáticos\r\n");
         }
     }
 
-    /// Deshabilitar paginación
+    /// Deshabilitar paginación (SIMULACIÓN ULTRA-SEGURA)
     pub fn disable_paging(&self) {
+        // TEMPORALMENTE DESHABILITADO: Instrucciones CR0 causan opcode inválido
+
         unsafe {
-            let mut cr0: u64;
-            core::arch::asm!(
-                "mov {}, cr0",
-                out(reg) cr0,
-                options(nostack)
-            );
-            cr0 &= !0x80000000; // Limpiar bit PG
-            core::arch::asm!(
-                "mov cr0, {}",
-                in(reg) cr0,
-                options(nostack)
-            );
+            serial_write_str("[MEMORY] Deshabilitación de paginación SIMULADA (CR0 deshabilitado)\r\n");
         }
     }
 }

@@ -339,7 +339,11 @@ pub fn kernel_main() -> ! {
     loop {
         // Aquí iría el scheduler del kernel y manejo de interrupciones
         unsafe {
-            core::arch::asm!("hlt");
+            // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+            // Simular halt con spin loop
+            for _ in 0..10000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }

@@ -47,7 +47,11 @@ static ALLOCATOR: SimpleAllocator = SimpleAllocator;
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {
         unsafe {
-            core::arch::asm!("hlt");
+            // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+            // Simular halt con spin loop
+            for _ in 0..10000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }
@@ -95,7 +99,13 @@ unsafe fn jump_to_kernel(entry: u64) -> ! {
     // Asegura que la dirección de entrada no sea cero
     if entry == 0 {
         // Si la dirección es inválida, detiene el sistema
-        loop { core::arch::asm!("hlt"); }
+        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+        loop {
+            // Simular halt con spin loop
+            for _ in 0..10000 {
+                core::hint::spin_loop();
+            }
+        }
     }
     // Transmuta la dirección a una función y salta
     // Corrección: usar transmute directamente sobre u64, y asegurar que la convención de llamada sea correcta.
@@ -880,7 +890,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // SALTAR AL KERNEL PASANDO INFORMACIÓN DEL FRAMEBUFFER
         unsafe {
-            // Primero configurar SSE (necesario para evitar #UD)
+            // ⚠️  INSTRUCCIONES CRÍTICAS PARA BOOTLOADER - NO DESHABILITAR ⚠️
+            // Estas instrucciones SON necesarias para que el bootloader funcione
+
+            // Configurar SSE (necesario para evitar #UD)
             core::arch::asm!(
                 "mov rax, cr0",
                 "and rax, ~(1 << 2)",        // CR0.EM = 0
@@ -893,8 +906,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             );
 
             // Configurar paginación y saltar al kernel
+            // TEMPORALMENTE DESHABILITADO: cli causa opcode inválido
             core::arch::asm!(
-                "cli",                      // Desactivar interrupciones
+                // "cli",                      // Desactivar interrupciones (DESHABILITADO)
                 "mov cr3, {cr3}",           // Configurar paginación
                 "mov rsp, {rsp}",           // Configurar stack
                 "mov rax, {entry}",         // Copiar entry point a RAX

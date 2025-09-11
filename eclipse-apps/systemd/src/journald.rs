@@ -8,10 +8,12 @@ use log::{info, warn, error, debug};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{Write, BufWriter};
+use std::io::{Write, BufWriter, BufReader, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 /// Entrada del journal
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,8 @@ pub struct JournalConfig {
     pub max_files: u32,
     pub compress_old: bool,
     pub sync_interval: u64,
+    pub compression_level: i32,
+    pub retention_days: u32,
 }
 
 impl Default for JournalConfig {
@@ -91,6 +95,8 @@ impl Default for JournalConfig {
             max_files: 10,
             compress_old: true,
             sync_interval: 5, // 5 segundos
+            compression_level: 6, // Nivel de compresión por defecto
+            retention_days: 30, // Mantener logs por 30 días
         }
     }
 }
@@ -126,7 +132,7 @@ impl JournalManager {
 
     /// Registra una entrada en el journal
     pub fn log(&self, entry: JournalEntry) -> Result<()> {
-        debug!("📝 Registrando entrada en journal: {:?}", entry);
+        debug!("Registrando Registrando entrada en journal: {:?}", entry);
 
         // Serializar entrada como JSON
         let json = serde_json::to_string(&entry)?;
@@ -181,6 +187,63 @@ impl JournalManager {
         self.log_message(service, Priority::Debug, message)
     }
 
+    /// Registra un mensaje estructurado con campos adicionales
+    pub fn log_structured(&self, service: &str, priority: Priority, message: &str, fields: HashMap<String, String>) -> Result<()> {
+        let entry = JournalEntry {
+            timestamp: Utc::now(),
+            priority,
+            facility: Facility::Daemon,
+            service: service.to_string(),
+            message: message.to_string(),
+            pid: std::process::id().into(),
+            uid: Some(0), // root
+            gid: Some(0), // root
+            fields,
+        };
+
+        self.log(entry)
+    }
+
+    /// Registra evento de inicio de servicio
+    pub fn log_service_start(&self, service_name: &str, pid: u32) -> Result<()> {
+        let mut fields = HashMap::new();
+        fields.insert("EVENT".to_string(), "SERVICE_START".to_string());
+        fields.insert("PID".to_string(), pid.to_string());
+
+        self.log_structured(service_name, Priority::Info, &format!("Servicio {} iniciado", service_name), fields)
+    }
+
+    /// Registra evento de parada de servicio
+    pub fn log_service_stop(&self, service_name: &str, pid: Option<u32>, exit_code: Option<i32>) -> Result<()> {
+        let mut fields = HashMap::new();
+        fields.insert("EVENT".to_string(), "SERVICE_STOP".to_string());
+
+        if let Some(pid) = pid {
+            fields.insert("PID".to_string(), pid.to_string());
+        }
+
+        if let Some(code) = exit_code {
+            fields.insert("EXIT_CODE".to_string(), code.to_string());
+        }
+
+        let message = if let Some(code) = exit_code {
+            format!("Servicio {} detenido (código: {})", service_name, code)
+        } else {
+            format!("Servicio {} detenido", service_name)
+        };
+
+        self.log_structured(service_name, Priority::Info, &message, fields)
+    }
+
+    /// Registra evento de fallo de servicio
+    pub fn log_service_failure(&self, service_name: &str, error: &str) -> Result<()> {
+        let mut fields = HashMap::new();
+        fields.insert("EVENT".to_string(), "SERVICE_FAILURE".to_string());
+        fields.insert("ERROR".to_string(), error.to_string());
+
+        self.log_structured(service_name, Priority::Error, &format!("Servicio {} falló: {}", service_name, error), fields)
+    }
+
     /// Lee entradas del journal
     pub fn read_entries(&self, service: Option<&str>, limit: Option<usize>) -> Result<Vec<JournalEntry>> {
         let content = std::fs::read_to_string(&self.journal_file)?;
@@ -210,7 +273,7 @@ impl JournalManager {
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️  Error parseando entrada del journal: {}", e);
+                    warn!("Advertencia  Error parseando entrada del journal: {}", e);
                 }
             }
         }
@@ -261,7 +324,7 @@ impl JournalManager {
         let metadata = std::fs::metadata(&self.journal_file)?;
         
         if metadata.len() > self.config.max_file_size {
-            info!("🔄 Rotando archivo del journal (tamaño: {} bytes)", metadata.len());
+            info!("Reiniciando Rotando archivo del journal (tamaño: {} bytes)", metadata.len());
             self.rotate_journal()?;
         }
 
@@ -273,8 +336,11 @@ impl JournalManager {
         // Cerrar el writer actual
         drop(self.writer.lock().unwrap());
 
+        // Generar nombre del archivo rotado con timestamp
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let rotated_file = format!("{}.{}", self.journal_file, timestamp);
+
         // Renombrar archivo actual
-        let rotated_file = format!("{}.1", self.journal_file);
         std::fs::rename(&self.journal_file, &rotated_file)?;
 
         // Crear nuevo archivo
@@ -286,10 +352,38 @@ impl JournalManager {
         // Actualizar writer
         *self.writer.lock().unwrap() = BufWriter::new(file);
 
+        // Comprimir archivo rotado si está habilitado
+        if self.config.compress_old {
+            self.compress_rotated_file(&rotated_file)?;
+        }
+
         // Limpiar archivos antiguos
         self.cleanup_old_files()?;
 
-        info!("✅ Journal rotado correctamente");
+        info!("Servicio Journal rotado correctamente");
+        Ok(())
+    }
+
+    /// Comprime un archivo rotado del journal
+    fn compress_rotated_file(&self, file_path: &str) -> Result<()> {
+        let compressed_path = format!("{}.gz", file_path);
+
+        // Abrir archivo original
+        let input_file = std::fs::File::open(file_path)?;
+        let reader = BufReader::new(input_file);
+
+        // Crear archivo comprimido
+        let output_file = std::fs::File::create(&compressed_path)?;
+        let mut encoder = GzEncoder::new(output_file, Compression::new(self.config.compression_level as u32));
+
+        // Copiar contenido y comprimir
+        std::io::copy(&mut reader.take(u64::MAX), &mut encoder)?;
+        encoder.finish()?;
+
+        // Eliminar archivo original
+        std::fs::remove_file(file_path)?;
+
+        debug!("📦 Archivo comprimido: {} -> {}", file_path, compressed_path);
         Ok(())
     }
 
@@ -321,7 +415,7 @@ impl JournalManager {
             let to_remove = files.len() - self.config.max_files as usize;
             for (path, _) in files.iter().take(to_remove) {
                 if let Err(e) = std::fs::remove_file(path) {
-                    warn!("⚠️  Error eliminando archivo antiguo {:?}: {}", path, e);
+                    warn!("Advertencia  Error eliminando archivo antiguo {:?}: {}", path, e);
                 }
             }
         }

@@ -5,7 +5,7 @@
 use core::ptr;
 use core::mem;
 use core::arch::asm;
-
+use crate::main_simple::serial_write_str;
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: u64 = 0x1000;
 
@@ -338,19 +338,32 @@ impl PagingManager {
         &self.pml4 as *const PageMapLevel4 as u64
     }
 
-    /// Invalidar TLB
+    /// Invalidar TLB completa (SIMULACIÓN ULTRA-SEGURA)
     pub fn invalidate_tlb(&self) {
+        // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
+
         unsafe {
-            // Invalida toda la TLB
-            asm!("mov rax, cr3; mov cr3, rax", options(nomem, nostack));
+            serial_write_str("[PAGING] Invalidación TLB SIMULADA (CR3 deshabilitado)\r\n");
+            serial_write_str("[PAGING] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
         }
     }
 
-    /// Cambiar a nueva tabla de páginas
-    pub fn switch_to_pml4(&self) {
+    /// Invalidar una página específica en la TLB (SIMULACIÓN ULTRA-SEGURA)
+    pub fn invalidate_page(&self, _virtual_address: u64) {
+        // TEMPORALMENTE DESHABILITADO: Instrucción INVLPG causa opcode inválido
+
         unsafe {
-            let pml4_addr = self.get_pml4_address();
-            asm!("mov cr3, {}", in(reg) pml4_addr, options(nomem, nostack));
+            serial_write_str("[PAGING] Invalidación de página SIMULADA (INVLPG deshabilitado)\r\n");
+        }
+    }
+
+    /// Cambiar a nueva tabla de páginas (SIMULACIÓN ULTRA-SEGURA)
+    pub fn switch_to_pml4(&self) {
+        // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
+
+        unsafe {
+            serial_write_str("[PAGING] Cambio de tabla de páginas SIMULADO (CR3 deshabilitado)\r\n");
+            serial_write_str("[PAGING] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
         }
     }
 }

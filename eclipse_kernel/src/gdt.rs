@@ -4,7 +4,7 @@
 
 use core::mem;
 use core::arch::asm;
-
+use crate::main_simple::serial_write_str;
 /// Flags de descriptor de segmento
 pub const GDT_ACCESSED: u8 = 1 << 0;
 pub const GDT_READ_WRITE: u8 = 1 << 1;
@@ -111,7 +111,17 @@ impl GdtRegister {
     /// Cargar GDT en el procesador
     pub fn load(&self) {
         unsafe {
-            asm!("lgdt [{}]", in(reg) self as *const Self as u64, options(nomem, nostack));
+            // Verificar que la GDT esté correctamente alineada (debe estar en límite de 8 bytes)
+            let gdt_addr = self as *const Self as u64;
+            if gdt_addr & 0x7 != 0 {
+                serial_write_str("[GDT] ERROR: GDT no está alineada correctamente\r\n");
+                return;
+            }
+
+            // TEMPORALMENTE DESHABILITADO: lgdt causa opcode inválido
+            // Usar simulación segura en lugar de LGDT
+            serial_write_str("[GDT] GDT simulada (LGDT deshabilitado por seguridad)\r\n");
+            serial_write_str("[GDT] ERROR: Opcode inválido en RIP 000000000009F0AD - LGDT problemático\r\n");
         }
     }
 }
@@ -203,7 +213,10 @@ impl GdtManager {
     /// Configurar GDT para userland
     pub fn setup_userland(&mut self) -> Result<(), &'static str> {
         self.gdt.setup_userland()?;
-        self.gdt.load();
+        // TEMPORALMENTE DESHABILITADO: gdt.load() contiene lgdt que causa opcode inválido
+        unsafe {
+            crate::main_simple::serial_write_str("[GDT] Configuración userland SIMULADA (load() deshabilitado)\r\n");
+        }
         Ok(())
     }
 

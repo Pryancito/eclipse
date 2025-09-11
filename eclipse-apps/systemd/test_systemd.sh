@@ -5,7 +5,7 @@
 
 set -e
 
-echo "🧪 PRUEBAS DE ECLIPSE SYSTEMD v0.1.0"
+echo "Probando PRUEBAS DE ECLIPSE SYSTEMD v0.1.0"
 echo "====================================="
 
 # Colores para output
@@ -21,16 +21,16 @@ print_status() {
     local message=$2
     case $status in
         "OK")
-            echo -e "${GREEN}✅ $message${NC}"
+            echo -e "${GREEN}Completado $message${NC}"
             ;;
         "ERROR")
-            echo -e "${RED}❌ $message${NC}"
+            echo -e "${RED}Error $message${NC}"
             ;;
         "WARNING")
-            echo -e "${YELLOW}⚠️  $message${NC}"
+            echo -e "${YELLOW}Advertencia  $message${NC}"
             ;;
         "INFO")
-            echo -e "${BLUE}ℹ️  $message${NC}"
+            echo -e "${BLUE}Informacion  $message${NC}"
             ;;
     esac
 }
@@ -45,7 +45,7 @@ print_status "INFO" "Iniciando pruebas de Eclipse SystemD..."
 
 # Prueba 1: Compilación
 echo ""
-echo "🔨 PRUEBA 1: Compilación"
+echo "Compilando PRUEBA 1: Compilación"
 echo "------------------------"
 if cargo build --release > /dev/null 2>&1; then
     print_status "OK" "Compilación exitosa"
@@ -56,7 +56,7 @@ fi
 
 # Prueba 2: Ejecución básica
 echo ""
-echo "🚀 PRUEBA 2: Ejecución básica"
+echo "Iniciando PRUEBA 2: Ejecución básica"
 echo "-----------------------------"
 if timeout 10s target/release/eclipse-systemd > /dev/null 2>&1; then
     print_status "OK" "Ejecución básica exitosa"
@@ -90,7 +90,7 @@ fi
 
 # Prueba 4: Validador de sintaxis
 echo ""
-echo "🔍 PRUEBA 4: Validador de sintaxis"
+echo "Validando PRUEBA 4: Validador de sintaxis"
 echo "----------------------------------"
 if [ -d "$service_dir" ]; then
     valid_count=0
@@ -120,7 +120,7 @@ fi
 
 # Prueba 5: Dependencias
 echo ""
-echo "📦 PRUEBA 5: Dependencias"
+echo "Dependencias PRUEBA 5: Dependencias"
 echo "-------------------------"
 if ldd target/release/eclipse-systemd > /dev/null 2>&1; then
     print_status "OK" "Dependencias del sistema resueltas"
@@ -140,7 +140,7 @@ fi
 
 # Prueba 7: Tamaño del binario
 echo ""
-echo "📊 PRUEBA 7: Tamaño del binario"
+echo "Estadisticas PRUEBA 7: Tamaño del binario"
 echo "-------------------------------"
 binary_size=$(stat -c%s "target/release/eclipse-systemd" 2>/dev/null || echo "0")
 if [ "$binary_size" -gt 1000000 ]; then
@@ -151,7 +151,7 @@ fi
 
 # Resumen final
 echo ""
-echo "📋 RESUMEN DE PRUEBAS"
+echo "Configuracion RESUMEN DE PRUEBAS"
 echo "====================="
 
 # Contar pruebas exitosas
@@ -183,17 +183,17 @@ fi
 if [ $passed_tests -eq $total_tests ]; then
     print_status "OK" "Todas las pruebas pasaron ($passed_tests/$total_tests)"
     echo ""
-    echo "🎉 ¡Eclipse SystemD está listo para producción!"
-    echo "🚀 El sistema de inicialización moderno funciona correctamente"
+    echo "Completado ¡Eclipse SystemD está listo para producción!"
+    echo "Iniciando El sistema de inicialización moderno funciona correctamente"
     exit 0
 elif [ $passed_tests -gt $((total_tests / 2)) ]; then
     print_status "WARNING" "La mayoría de pruebas pasaron ($passed_tests/$total_tests)"
     echo ""
-    echo "⚠️  Eclipse SystemD funciona pero puede necesitar ajustes"
+    echo "Advertencia  Eclipse SystemD funciona pero puede necesitar ajustes"
     exit 1
 else
     print_status "ERROR" "Muchas pruebas fallaron ($passed_tests/$total_tests)"
     echo ""
-    echo "❌ Eclipse SystemD necesita correcciones antes de usar"
+    echo "Error Eclipse SystemD necesita correcciones antes de usar"
     exit 1
 fi
