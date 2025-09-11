@@ -9,7 +9,42 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 // Importar funciones necesarias
-use eclipse_kernel::main_simple::{serial_write_str, serial_init, kernel_main};
+use eclipse_kernel::main_simple::kernel_main;
+use eclipse_kernel::allocator;
+
+// Salida serie COM1 para diagnóstico temprano
+#[inline(always)]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+}
+
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let mut val: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
+    val
+}
+
+unsafe fn serial_init() {
+    let base: u16 = 0x3F8;
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x80);
+    outb(base + 0, 0x01);
+    outb(base + 1, 0x00);
+    outb(base + 3, 0x03);
+    outb(base + 2, 0xC7);
+    outb(base + 4, 0x0B);
+}
+
+unsafe fn serial_write_byte(b: u8) {
+    let base: u16 = 0x3F8;
+    while (inb(base + 5) & 0x20) == 0 {}
+    outb(base, b);
+}
+
+unsafe fn serial_write_str(s: &str) {
+    for &c in s.as_bytes() { serial_write_byte(c); }
+}
 
 // Usamos el panic handler definido en lib.rs
 // Punto de entrada principal del kernel (con parámetros del framebuffer)
@@ -19,56 +54,27 @@ pub extern "C" fn _start() -> ! {
     // Solo las operaciones más básicas para identificar el problema
 
     unsafe {
-        // 1. Inicializar serial (operaciones I/O directas, no deberían causar PF)
-        serial_init();
-
-        // 2. Mensaje simple sin acceder a memoria compleja
-        serial_write_str("KERNEL: _start OK\r\n");
-
+        // 1. Inicializar el allocador PRIMERO (necesario para logging)
+        #[cfg(feature = "alloc")]
+        {
+            allocator::init_allocator();
+        }
         unsafe {
             core::arch::asm!(
                 "call {kernel_call}",
                 kernel_call = sym kernel_call,
             );
         }
-        
-        // 3. Loop simple sin llamadas complejas
+
         loop {
-            // Simular espera sin hlt
-            for _ in 0..100000 {
+            for _ in 0..10000 {
                 core::hint::spin_loop();
             }
         }
     }
 }
 
-unsafe fn kernel_call() -> Result<(), &'static str>{
+unsafe fn kernel_call() -> Result<(), Box<dyn Error>> {
     kernel_main()?;
-
-    // Después de la inicialización, el kernel debe continuar ejecutándose
-    // En Linux real, aquí entraría el scheduler principal
-    kernel_main_loop()
-}
-
-unsafe fn kernel_main_loop() -> Result<(), &'static str> {
-    serial_write_str("[KERNEL] Inicialización completada - Iniciando scheduler principal\r\n");
-    serial_write_str("[KERNEL] Eclipse OS v0.5.0 ejecutándose\r\n");
-    serial_write_str("[KERNEL] Presiona Ctrl+C para detener QEMU\r\n");
-
-    loop {
-        // En Linux real aquí iría:
-        // - schedule() - scheduling de procesos
-        // - Manejo de interrupciones
-        // - Timer ticks
-        // - etc.
-
-        // TEMPORALMENTE DESHABILITADO: Instrucción hlt causa opcode inválido
-        // Simular espera de interrupciones
-        unsafe {
-            serial_write_str("[KERNEL] Esperando interrupciones (hlt deshabilitado)\r\n");
-        }
-        for _ in 0..10000 {
-            core::hint::spin_loop();
-        }
-    }
+    Ok(())
 }

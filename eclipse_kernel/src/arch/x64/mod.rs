@@ -2,7 +2,6 @@
 //! 
 //! Implementación específica para x64 con optimizaciones avanzadas
 
-pub mod trap_frame;
 pub mod optimizations;
 
 use optimizations::X64Optimizations;

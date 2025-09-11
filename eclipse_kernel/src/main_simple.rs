@@ -15,85 +15,8 @@ use alloc::string::String;
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
+use crate::serial;
 
-
-// Serial COM1 para logs tempranos
-// Serial COM1 para logs tempranos
-#[inline(always)]
-unsafe fn outb(port: u16, val: u8) {
-    // CRÍTICO: Restaurar I/O para logging - estas instrucciones son seguras
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
-
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    // CRÍTICO: Restaurar I/O para logging - estas instrucciones son seguras
-    let mut val: u8;
-    core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
-    val
-}
-
-pub unsafe fn serial_init() {
-    let base: u16 = 0x3F8;
-    outb(base + 1, 0x00);
-    outb(base + 3, 0x80);
-    outb(base + 0, 0x01);
-    outb(base + 1, 0x00);
-    outb(base + 3, 0x03);
-    outb(base + 2, 0xC7);
-    outb(base + 4, 0x0B);
-}
-
-unsafe fn serial_write_byte(b: u8) {
-    let base: u16 = 0x3F8;
-    while (inb(base + 5) & 0x20) == 0 {}
-    outb(base, b);
-}
-
-pub unsafe fn serial_write_str(s: &str) {
-    for &c in s.as_bytes() { serial_write_byte(c); }
-}
-
-unsafe fn serial_write_hex32(val: u32) {
-    for i in (0..8).rev() {
-        let nibble = (val >> (i * 4)) & 0xF;
-        let c = if nibble < 10 {
-            b'0' + nibble as u8
-        } else {
-            b'A' + (nibble - 10) as u8
-        };
-        serial_write_byte(c);
-    }
-}
-
-unsafe fn serial_write_hex64(val: u64) {
-    for i in (0..16).rev() {
-        let nibble = (val >> (i * 4)) & 0xF;
-        let c = if nibble < 10 {
-            b'0' + nibble as u8
-        } else {
-            b'A' + (nibble - 10) as u8
-        };
-        serial_write_byte(c);
-    }
-}
-
-unsafe fn serial_write_hex8(val: u8) {
-    let high = (val >> 4) & 0xF;
-    let low = val & 0xF;
-    let c1 = if high < 10 {
-        b'0' + high
-    } else {
-        b'A' + (high - 10)
-    };
-    let c2 = if low < 10 {
-        b'0' + low
-    } else {
-        b'A' + (low - 10)
-    };
-    serial_write_byte(c1);
-    serial_write_byte(c2);
-}
 
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> &'static str {
@@ -126,20 +49,10 @@ fn detect_graphics_hardware() -> crate::hardware_detection::GraphicsMode {
     result.graphics_mode
 }
 /// Función principal del kernel
-pub fn kernel_main() -> Result<(), &'static str> {
-    // Inicializar el allocador global
-    #[cfg(feature = "alloc")]
-    {
-        crate::allocator::init_allocator();
-        unsafe {
-            serial_write_str("Allocador inicializado.\r\n");
-        }
-    }
-
-    // Inicializar sistema de display
-    unsafe {
-        serial_write_str("Iniciando kernel.\r\n");
-    }
+pub fn kernel_main() -> Result<(), Box<dyn Error>> {
+    // El allocador ya fue inicializado en _start()
+    // Solo inicializar el sistema de logging (ya inicializado en _start())
+    // Logging removido temporalmente para evitar breakpoint
 
     // Usar nuevo sistema de detección con verificación de allocador
     use crate::hardware_detection::HardwareDetector;
@@ -147,20 +60,20 @@ pub fn kernel_main() -> Result<(), &'static str> {
     // Crear detector de hardware
     let mut detector = HardwareDetector::new_minimal();
     unsafe {
-        serial_write_str("[HARDWARE] Detector de hardware creado\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Verificar allocador
     detector.verify_allocator_safe();
     unsafe {
-        serial_write_str("[MEMORY] Allocador verificado correctamente\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Detectar hardware
     let detection_result = detector.detect_hardware();
     unsafe {
-        serial_write_str("[HARDWARE] Hardware detectado exitosamente\r\n");
-        serial_write_str("[PROGRESS] Inicializacion basica completada (1/11)\r\n");
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Clonar datos necesarios
@@ -169,59 +82,50 @@ pub fn kernel_main() -> Result<(), &'static str> {
     let recommended_driver = detection_result.recommended_driver.clone();
 
     // Mostrar información del hardware detectado
+    let gpu_count = available_gpus.len();
+    match gpu_count {
+        0 => {
+            // Logging removido temporalmente para evitar breakpoint
+        },
+        1 => {
+            // Logging removido temporalmente para evitar breakpoint
+        },
+        _ => {
+            // Logging removido temporalmente para evitar breakpoint
+        },
+    }
     unsafe {
-        let gpu_count = available_gpus.len();
-        match gpu_count {
-            0 => serial_write_str("[DISPLAY] Hardware detectado: Sin GPUs detectadas\r\n"),
-            1 => serial_write_str("[DISPLAY] Hardware detectado: 1 GPU detectada\r\n"),
-            _ => {
-                // Crear mensaje completo para evitar problemas de sincronización
-                let mut msg = String::new();
-                msg.push_str("[DISPLAY] Hardware detectado: ");
-                msg.push_str(int_to_string(gpu_count as u64));
-                msg.push_str(" GPUs detectadas\r\n");
-                serial_write_str(&msg);
-            }
-        }
-        serial_write_str("[PROGRESS] Informacion de hardware recopilada (2/11)\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Configurar modo gráfico
     let graphics_mode = match graphics_mode {
         crate::hardware_detection::GraphicsMode::Framebuffer => {
-            unsafe {
-                serial_write_str("[GRAPHICS] Modo grafico: Framebuffer\r\n");
-            }
+            // Logging removido temporalmente para evitar breakpoint
             crate::hardware_detection::GraphicsMode::Framebuffer
         }
         crate::hardware_detection::GraphicsMode::VGA => {
-            unsafe {
-                serial_write_str("[GRAPHICS] Modo grafico: VGA\r\n");
-            }
+            // Logging removido temporalmente para evitar breakpoint
             crate::hardware_detection::GraphicsMode::VGA
         }
         crate::hardware_detection::GraphicsMode::HardwareAccelerated => {
-            unsafe {
-                serial_write_str("[GRAPHICS] Modo grafico: Hardware Accelerated\r\n");
-            }
+            // Logging removido temporalmente para evitar breakpoint
             crate::hardware_detection::GraphicsMode::HardwareAccelerated
         }
     };
 
     // Inicializar sistema DRM
     unsafe {
-        serial_write_str("[DRM] Iniciando integracion DRM...\r\n");
-        serial_write_str("[PROGRESS] Sistema DRM preparado (4/11)\r\n");
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     }
     use crate::drivers::drm_integration::{DrmIntegration, DrmKernelCommand, create_drm_integration};
     let mut drm_integration = create_drm_integration();
 
     // Configurar framebuffer si está disponible
     let framebuffer_info = if graphics_mode == crate::hardware_detection::GraphicsMode::Framebuffer {
-        unsafe {
-            serial_write_str("[FRAMEBUFFER] Configurando framebuffer...\r\n");
-            serial_write_str("[RESOLUTION] Resolucion: 1920x1080, 32-bit RGBA\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
         Some(crate::drivers::framebuffer::FramebufferInfo {
             base_address: 0x1000000,
             size: 1920 * 1080 * 4,
@@ -240,152 +144,114 @@ pub fn kernel_main() -> Result<(), &'static str> {
             pixel_format: crate::drivers::framebuffer::PixelFormat::RGBA8888,
         })
     } else {
-        unsafe {
-            serial_write_str("[VGA] Usando modo VGA...\r\n");
-            serial_write_str("[RESOLUTION] Resolucion: 80x25 caracteres\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
         None
     };
 
     // Inicializar DRM solo si hay framebuffer disponible
-    unsafe {
-        serial_write_str("[DRM] Inicializando DRM...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 40% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     if framebuffer_info.is_some() {
         // Solo inicializar DRM si hay framebuffer disponible
         match drm_integration.initialize(framebuffer_info) {
             Ok(_) => {
                 drm_integration.execute_integrated_operation(DrmKernelCommand::Initialize);
-                unsafe {
-                    serial_write_str("[DRM] DRM inicializado correctamente\r\n");
-                    serial_write_str("[PROGRESS] Sistema grafico operativo (5/11)\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             Err(_) => {
-                unsafe {
-                    serial_write_str("[WARNING] Error inicializando DRM, continuando con VGA\r\n");
-                    serial_write_str("[PROGRESS] Modo grafico de respaldo activado (5/11)\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
         }
     } else {
         // No hay framebuffer, usar solo VGA
-        unsafe {
-            serial_write_str("[INFO] No hay framebuffer disponible, usando modo VGA\r\n");
-            serial_write_str("[PROGRESS] Modo grafico VGA activado (5/11)\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     }
+
+    // Inicializar sistema de archivos ANTES de los procesos
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    crate::filesystem::init();
+    // Logging removido temporalmente para evitar breakpoint
 
     // Inicializar sistema de procesos
-    unsafe {
-        serial_write_str("[PROCESSES] Inicializando sistema de procesos...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 50% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     let mut init_system = InitSystem::new();
     init_system.initialize();
-    unsafe {
-        serial_write_str("[PROGRESS] Sistema de procesos operativo (6/11)\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
     // Crear escritorio básico
-    unsafe {
-        serial_write_str("[DESKTOP] Configurando escritorio...\r\n");
-        serial_write_str("[WINDOWS] Creando ventanas del sistema...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     crate::desktop_ai::ai_create_window(1, 100, 100, 400, 300, "Terminal");
     crate::desktop_ai::ai_create_window(2, 520, 100, 400, 300, "File Manager");
     crate::desktop_ai::ai_create_window(3, 100, 420, 400, 300, "System Monitor");
 
     // Renderizar escritorio inicial
     crate::desktop_ai::ai_render_desktop();
-    unsafe {
-        serial_write_str("[PROGRESS] Escritorio configurado (7/11)\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
     // Inicializar Wayland si está disponible
-    unsafe {
-        serial_write_str("[WAYLAND] Verificando compositor Wayland...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
     init_wayland();
 
     if is_wayland_initialized() {
-        unsafe {
-            serial_write_str("[WAYLAND] Wayland inicializado correctamente\r\n");
-            serial_write_str("[GRAPHICS] Compositor grafico avanzado operativo\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     } else {
-        unsafe {
-            serial_write_str("[WARNING] Wayland no disponible, usando framebuffer\r\n");
-            serial_write_str("[GRAPHICS] Modo grafico framebuffer activado\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Transferir control al sistema de inicialización
-    unsafe {
-        serial_write_str("[INIT] Ejecutando inicializacion del sistema...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 60% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     init_system.execute_init();
-    unsafe {
-        serial_write_str("[PROGRESS] Sistema de inicializacion completado (8/11)\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
     // Inicializar aceleración 2D con primera GPU disponible
-    unsafe {
-        serial_write_str("[ACCELERATION] Configurando aceleracion grafica 2D...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 70% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     use crate::drivers::acceleration_2d::{Acceleration2D, AccelerationOperation, HardwareAccelerationType};
     use crate::drivers::framebuffer::{FramebufferDriver, Color as FbColor};
     use crate::desktop_ai::{Point, Rect};
 
-    let framebuffer = FramebufferDriver::new();
-    let mut acceleration_2d = Acceleration2D::new(framebuffer);
+    let mut framebuffer = FramebufferDriver::new();
+    let mut acceleration_2d = Acceleration2D::new(framebuffer.clone());
 
     if let Some(gpu_info) = available_gpus.first() {
         match acceleration_2d.initialize_with_gpu(gpu_info) {
             crate::drivers::acceleration_2d::AccelerationResult::HardwareAccelerated => {
-                unsafe {
-                    serial_write_str("[ACCELERATION] Aceleracion 2D: Hardware activada\r\n");
-                    serial_write_str("[GPU] GPU detectada y operativa\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             crate::drivers::acceleration_2d::AccelerationResult::SoftwareFallback => {
-                unsafe {
-                    serial_write_str("[WARNING] Aceleracion 2D: Modo software (fallback)\r\n");
-                    serial_write_str("[SOFTWARE] Procesamiento por software activado\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             crate::drivers::acceleration_2d::AccelerationResult::DriverError(_) => {
-                unsafe {
-                    serial_write_str("[ERROR] Aceleracion 2D: Error en driver\r\n");
-                    serial_write_str("[FALLBACK] Modo basico activado\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             _ => {
-                unsafe {
-                    serial_write_str("[INFO] Aceleracion 2D: Configuracion basica\r\n");
-                    serial_write_str("[GRAPHICS] Funcionalidad grafica basica operativa\r\n");
-                }
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
         }
     } else {
-        unsafe {
-            serial_write_str("[INFO] Sin GPUs disponibles, usando modo software\r\n");
-            serial_write_str("[SOFTWARE] Aceleracion por software activada\r\n");
-        }
+        // Logging removido temporalmente para evitar breakpoint
+        // Logging removido temporalmente para evitar breakpoint
     }
-    unsafe {
-        serial_write_str("[PROGRESS] Aceleracion grafica configurada (9/11)\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
     // Sistema de entrada USB
-    unsafe {
-        serial_write_str("[INPUT] Inicializando sistema de entrada...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 80% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     use crate::drivers::input_system::{InputSystem, InputSystemConfig, create_default_input_system};
     use crate::drivers::usb_keyboard::{UsbKeyboardDriver, create_usb_keyboard_driver};
     use crate::drivers::usb_mouse::{UsbMouseDriver, create_usb_mouse_driver};
@@ -394,20 +260,16 @@ pub fn kernel_main() -> Result<(), &'static str> {
     input_system.initialize();
 
     // Simular conexión de dispositivos USB
-    unsafe {
-        serial_write_str("[USB] Conectando dispositivos USB...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
     let keyboard = create_usb_keyboard_driver(0x046D, 0xC31C, 1, 0x81); // Logitech USB Keyboard
     input_system.add_keyboard(keyboard);
 
     let mouse = create_usb_mouse_driver(0x046D, 0xC077, 2, 0x82); // Logitech USB Mouse
     input_system.add_mouse(mouse);
 
-    unsafe {
-        serial_write_str("[USB] Teclado USB conectado (Logitech)\r\n");
-        serial_write_str("[USB] Mouse USB conectado (Logitech)\r\n");
-        serial_write_str("[PROGRESS] Sistema de entrada operativo (10/11)\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     // USB Hub
     use crate::drivers::usb_hub::{UsbHubDriver, UsbHubInfo, UsbHubType, UsbPowerSwitching, UsbOverCurrentProtection, create_standard_usb_hub};
@@ -453,10 +315,8 @@ pub fn kernel_main() -> Result<(), &'static str> {
     hid_driver.initialize();
 
     // Sistema GUI avanzado
-    unsafe {
-        serial_write_str("[GUI] Inicializando interfaz grafica...\r\n");
-        serial_write_str("[PROGRESS] Progreso: 90% completado\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
     use crate::drivers::gui_integration::{GuiManager, GuiWindow, GuiButton, GuiTextBox, create_gui_manager};
     use crate::apps::{InteractiveAppManager, create_app_manager};
 
@@ -464,17 +324,13 @@ pub fn kernel_main() -> Result<(), &'static str> {
     gui_manager.initialize();
 
     // Crear ventanas del sistema
-    unsafe {
-        serial_write_str("[WINDOWS] Creando ventanas del sistema...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
     gui_manager.create_window(1, String::from("Ventana Principal"), Rect { x: 100, y: 100, width: 400, height: 300 });
     gui_manager.create_window(2, String::from("Terminal"), Rect { x: 520, y: 100, width: 400, height: 300 });
     gui_manager.create_window(3, String::from("Monitor del Sistema"), Rect { x: 100, y: 420, width: 400, height: 300 });
 
     // Crear elementos GUI interactivos
-    unsafe {
-        serial_write_str("[CONTROLS] Creando elementos de interfaz...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
     let button = GuiButton::new(1, Rect { x: 20, y: 50, width: 100, height: 30 }, String::from("Boton"));
     gui_manager.add_element(Box::new(button));
 
@@ -482,38 +338,32 @@ pub fn kernel_main() -> Result<(), &'static str> {
     gui_manager.add_element(Box::new(textbox));
 
     // Sistema de aplicaciones avanzado
-    unsafe {
-        serial_write_str("[APPS] Inicializando gestor de aplicaciones...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
     let mut app_manager = create_app_manager();
     app_manager.initialize();
     app_manager.switch_app(0);
 
-    unsafe {
-        serial_write_str("[PROGRESS] Interfaz grafica completa (11/11)\r\n");
-        serial_write_str("[SUCCESS] SISTEMA ECLIPSE OS COMPLETAMENTE OPERATIVO\r\n");
-        serial_write_str("==================================================\r\n");
-        serial_write_str("[FEATURES] FUNCIONALIDADES DISPONIBLES:\r\n");
-        serial_write_str("=========================================\r\n");
-        serial_write_str("[OK] Hardware Detection\r\n");
-        serial_write_str("[OK] Graphics Subsystem (DRM/VGA)\r\n");
-        serial_write_str("[OK] Process Management\r\n");
-        serial_write_str("[OK] Desktop Environment\r\n");
-        serial_write_str("[OK] Wayland Compositor\r\n");
-        serial_write_str("[OK] 2D Acceleration\r\n");
-        serial_write_str("[OK] USB Input System\r\n");
-        serial_write_str("[OK] GUI Framework\r\n");
-        serial_write_str("[OK] Application Manager\r\n");
-        serial_write_str("[OK] Advanced Logging\r\n");
-        serial_write_str("=========================================\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     // Bucle principal del kernel
-    unsafe {
-        serial_write_str("[READY] Kernel Eclipse OS listo y funcionando!\r\n");
-        serial_write_str("[INFO] Sistema operativo moderno completamente operativo\r\n");
-        serial_write_str("[WAITING] Esperando operaciones del usuario...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     // Mantener el kernel ejecutándose
     loop {
@@ -530,14 +380,11 @@ pub fn kernel_main() -> Result<(), &'static str> {
         if let Err(_) = gui_manager.render(&mut acceleration_2d) {}
         if let Err(_) = app_manager.render(&mut acceleration_2d) {}
 
-        // Pequeña pausa para no consumir toda la CPU
-        for _ in 0..100000 {
-            // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-            unsafe {
-                // Simular nop con spin loop para evitar opcode inválido
-                core::hint::spin_loop();
-            }
+        // Pequeña pausa para no consumir toda la CPU - VERSION SIMPLIFICADA
+        for _ in 0..1000 {
+            // VERSION SIMPLIFICADA: Evitar spin_loop() que puede causar Invalid Opcode
+            // En lugar de usar core::hint::spin_loop(), usamos un loop vacío simple
+            // que es más compatible con diferentes entornos de emulación
         }
     }
-
 }

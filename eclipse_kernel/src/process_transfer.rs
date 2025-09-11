@@ -8,7 +8,7 @@ use crate::paging::{PagingManager, setup_userland_paging};
 use crate::gdt::{GdtManager, setup_userland_gdt};
 use crate::idt::{IdtManager, setup_userland_idt};
 use crate::interrupts::{InterruptManager, setup_userland_interrupts};
-use crate::main_simple::serial_write_str;
+use crate::serial;
 
 /// Contexto de ejecución de un proceso
 #[derive(Debug, Clone)]
@@ -126,7 +126,7 @@ impl ProcessTransfer {
     fn setup_gdt(&self) -> Result<(), &'static str> {
         // TEMPORALMENTE DESHABILITADO: setup_userland_gdt() contiene lgdt que causa opcode inválido
         unsafe {
-            serial_write_str("[PROCESS] GDT para userland SIMULADO (setup_userland_gdt() deshabilitado)\r\n");
+            // Logging removido temporalmente para evitar breakpoint
         }
         Ok(())
     }
@@ -135,7 +135,7 @@ impl ProcessTransfer {
     fn setup_idt(&self) -> Result<(), &'static str> {
         // TEMPORALMENTE DESHABILITADO: setup_userland_idt() contiene lidt que causa opcode inválido
         unsafe {
-            serial_write_str("[PROCESS] IDT para userland SIMULADO (setup_userland_idt() deshabilitado)\r\n");
+            // Logging removido temporalmente para evitar breakpoint
         }
         Ok(())
     }
@@ -144,8 +144,8 @@ impl ProcessTransfer {
     fn setup_paging(&self) -> Result<(), &'static str> {
         // TEMPORALMENTE DESHABILITADO: setup_userland_paging() contiene mov cr3 que causa opcode inválido
         unsafe {
-            serial_write_str("[PROCESS] Paginación para userland SIMULADA (setup_userland_paging() deshabilitado)\r\n");
-            serial_write_str("[PROCESS] Switch to PML4 SIMULADO (switch_to_pml4() deshabilitado)\r\n");
+            // Logging removido temporalmente para evitar breakpoint
+            // Logging removido temporalmente para evitar breakpoint
         }
         Ok(())
     }
@@ -154,7 +154,7 @@ impl ProcessTransfer {
     fn setup_interrupts(&self) -> Result<(), &'static str> {
         // TEMPORALMENTE DESHABILITADO: setup_userland_interrupts() puede contener instrucciones problemáticas
         unsafe {
-            serial_write_str("[PROCESS] Interrupciones para userland SIMULADAS (setup_userland_interrupts() deshabilitado)\r\n");
+            // Logging removido temporalmente para evitar breakpoint
         }
         Ok(())
     }
@@ -176,8 +176,8 @@ impl ProcessTransfer {
         // El problema está en la dirección RIP 000000000009F0AD
 
         unsafe {
-            serial_write_str("[SYSTEMD] Configuración de registros SIMULADA (instrucciones ASM deshabilitadas)\r\n");
-            serial_write_str("[SYSTEMD] ERROR: Opcode inválido detectado - investigando causa exacta\r\n");
+            // Logging removido temporalmente para evitar breakpoint
+            // Logging removido temporalmente para evitar breakpoint
         }
 
         Ok(())
@@ -187,24 +187,24 @@ impl ProcessTransfer {
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
         // SOLUCIÓN: Solo usar simulación segura, nunca iretq
         unsafe {
-            serial_write_str("[SYSTEMD] Iniciando simulación segura de eclipse-systemd...\r\n");
+            // Logging removido temporalmente para evitar breakpoint
         }
 
         // Simular ejecución de eclipse-systemd
         match simulate_eclipse_systemd_execution() {
             Ok(_) => {
                 unsafe {
-                    serial_write_str("[SUCCESS] Simulación de eclipse-systemd completada\r\n");
-                    serial_write_str("[KERNEL] Continuando con inicialización del sistema...\r\n");
+                    // Logging removido temporalmente para evitar breakpoint
+                    // Logging removido temporalmente para evitar breakpoint
                 }
                 return Ok(());
             }
             Err(e) => {
                 unsafe {
-                    serial_write_str("[WARNING] Simulación falló, pero continuando: ");
-                    serial_write_str(e);
-                    serial_write_str("\r\n");
-                    serial_write_str("[KERNEL] Continuando sin simulación completa...\r\n");
+                    // Logging removido temporalmente para evitar breakpoint
+                    // Logging removido temporalmente para evitar breakpoint
+                    // Logging removido temporalmente para evitar breakpoint
+                    // Logging removido temporalmente para evitar breakpoint
                 }
                 // No fallar completamente, continuar con el kernel
                 return Ok(());
@@ -256,17 +256,19 @@ pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
     // Por ahora, solo simulamos la ejecución exitosa
 
     unsafe {
-        serial_write_str("[SYSTEMD] Iniciando simulación de eclipse-systemd...\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     // Simular inicialización de systemd
     match simulate_systemd_initialization() {
-        Ok(_) => unsafe { serial_write_str("[SYSTEMD] Inicialización simulada exitosamente\r\n"); },
+        Ok(_) => {
+            // Logging removido temporalmente para evitar breakpoint
+        },
         Err(e) => {
             unsafe {
-                serial_write_str("[ERROR] Error en inicialización: ");
-                serial_write_str(e);
-                serial_write_str("\r\n");
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             return Err("Error en inicialización de systemd");
         }
@@ -274,19 +276,21 @@ pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
 
     // Simular bucle principal de systemd
     match simulate_systemd_main_loop() {
-        Ok(_) => unsafe { serial_write_str("[SYSTEMD] Bucle principal simulado exitosamente\r\n"); },
+        Ok(_) => {
+            // Logging removido temporalmente para evitar breakpoint
+        },
         Err(e) => {
             unsafe {
-                serial_write_str("[ERROR] Error en bucle principal: ");
-                serial_write_str(e);
-                serial_write_str("\r\n");
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
+                // Logging removido temporalmente para evitar breakpoint
             }
             return Err("Error en bucle principal de systemd");
         }
     }
 
     unsafe {
-        serial_write_str("[SYSTEMD] Simulación de eclipse-systemd completada\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     Ok(())
@@ -296,7 +300,7 @@ pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
 fn simulate_systemd_initialization() -> Result<(), &'static str> {
     // Simular configuración de servicios básicos
     unsafe {
-        serial_write_str("[SYSTEMD] Configurando servicios básicos...\r\n");
+        // Logging removido temporalmente para evitar breakpoint
         // Pequeña pausa para simular procesamiento
         for _ in 0..1000 {
             // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
@@ -307,7 +311,7 @@ fn simulate_systemd_initialization() -> Result<(), &'static str> {
 
     // Simular carga de unidades
     unsafe {
-        serial_write_str("[SYSTEMD] Cargando unidades de servicio...\r\n");
+        // Logging removido temporalmente para evitar breakpoint
         for _ in 0..1000 {
             // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
             // Simular nop con spin loop para evitar opcode inválido
@@ -317,7 +321,7 @@ fn simulate_systemd_initialization() -> Result<(), &'static str> {
 
     // Simular inicialización exitosa
     unsafe {
-        serial_write_str("[SYSTEMD] Inicialización completada\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     Ok(())
@@ -327,7 +331,7 @@ fn simulate_systemd_initialization() -> Result<(), &'static str> {
 fn simulate_systemd_main_loop() -> Result<(), &'static str> {
     // Simular procesamiento de eventos
     unsafe {
-        serial_write_str("[SYSTEMD] Iniciando procesamiento de eventos...\r\n");
+        // Logging removido temporalmente para evitar breakpoint
 
         // Simular algunos eventos de systemd
         for i in 0..5 {
@@ -338,12 +342,12 @@ fn simulate_systemd_main_loop() -> Result<(), &'static str> {
             core::hint::spin_loop();
             }
 
-            serial_write_str("[SYSTEMD] Evento ");
+            // Logging removido temporalmente para evitar breakpoint
             // Aquí podríamos convertir i a string, pero por simplicidad usamos un mensaje genérico
-            serial_write_str("procesado\r\n");
+            // Logging removido temporalmente para evitar breakpoint
         }
 
-        serial_write_str("[SYSTEMD] Todos los eventos procesados\r\n");
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     Ok(())

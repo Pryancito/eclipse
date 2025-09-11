@@ -5,7 +5,7 @@
 use core::ptr;
 use core::mem;
 use core::arch::asm;
-use crate::main_simple::serial_write_str;
+use crate::serial;
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: u64 = 0x1000;
 
@@ -343,8 +343,8 @@ impl PagingManager {
         // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
 
         unsafe {
-            serial_write_str("[PAGING] Invalidación TLB SIMULADA (CR3 deshabilitado)\r\n");
-            serial_write_str("[PAGING] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
+            
+            // Logging removido temporalmente para evitar breakpoint
         }
     }
 
@@ -353,7 +353,7 @@ impl PagingManager {
         // TEMPORALMENTE DESHABILITADO: Instrucción INVLPG causa opcode inválido
 
         unsafe {
-            serial_write_str("[PAGING] Invalidación de página SIMULADA (INVLPG deshabilitado)\r\n");
+            
         }
     }
 
@@ -362,8 +362,8 @@ impl PagingManager {
         // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
 
         unsafe {
-            serial_write_str("[PAGING] Cambio de tabla de páginas SIMULADO (CR3 deshabilitado)\r\n");
-            serial_write_str("[PAGING] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
+            
+            // Logging removido temporalmente para evitar breakpoint
         }
     }
 }

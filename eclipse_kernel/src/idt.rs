@@ -4,7 +4,7 @@
 
 use core::mem;
 use core::arch::asm;
-use crate::main_simple::serial_write_str;
+use crate::serial;
 
 /// Flags de descriptor de interrupción
 pub const IDT_PRESENT: u16 = 1 << 15;
@@ -90,14 +90,14 @@ impl IdtRegister {
             // Verificar que la IDT esté correctamente alineada (debe estar en límite de 8 bytes)
             let idt_addr = self as *const Self as u64;
             if idt_addr & 0x7 != 0 {
-                serial_write_str("[IDT] ERROR: IDT no está alineada correctamente\r\n");
+                // Logging removido temporalmente para evitar breakpoint
                 return;
             }
 
             // TEMPORALMENTE DESHABILITADO: lidt causa opcode inválido
             // Usar simulación segura en lugar de LIDT
-            serial_write_str("[IDT] IDT simulada (LIDT deshabilitado por seguridad)\r\n");
-            serial_write_str("[IDT] ERROR: Opcode inválido en RIP 000000000009F0AD - LIDT problemático\r\n");
+            
+            // Logging removido temporalmente para evitar breakpoint
         }
     }
 }
@@ -336,7 +336,7 @@ impl IdtManager {
         self.idt.setup_userland(kernel_code_selector)?;
         // TEMPORALMENTE DESHABILITADO: idt.load() contiene lidt que causa opcode inválido
         unsafe {
-            crate::main_simple::serial_write_str("[IDT] Configuración userland SIMULADA (load() deshabilitado)\r\n");
+            
         }
         Ok(())
     }

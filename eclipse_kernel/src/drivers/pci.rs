@@ -192,13 +192,13 @@ impl PciManager {
     /// Escanear dispositivos PCI de forma segura (sin operaciones de hardware)
     pub fn scan_devices_safe(&mut self) {
         // DEBUG: Función segura que no hace operaciones de hardware
-        unsafe { crate::main_simple::serial_write_str("DEBUG: scan_devices_safe() - sin operaciones hardware\r\n"); }
+        // Logging removido temporalmente para evitar breakpoint
 
         // Solo inicializar contadores, no hacer escaneo real
         self.device_count = 0;
         self.gpu_count = 0;
 
-        unsafe { crate::main_simple::serial_write_str("DEBUG: Contadores inicializados\r\n"); }
+        // Logging removido temporalmente para evitar breakpoint
     }
 
     /// Verificar si el hardware PCI está disponible

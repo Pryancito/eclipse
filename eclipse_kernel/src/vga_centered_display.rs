@@ -97,8 +97,7 @@ fn init_vga_mode() {
 unsafe fn outb(port: u16, value: u8) {
     // DESHABILITADO: Las instrucciones de puerto I/O causan opcode inválido
     // Usar simulación segura en lugar de acceso directo a puertos
-    use crate::main_simple::serial_write_str;
-    serial_write_str("[VGA] Escritura a puerto simulada\r\n");
+    // Logging removido temporalmente para evitar breakpoint
 }
 
 /// Mostrar texto centrado en la pantalla

@@ -35,7 +35,7 @@ fi
 # Copiar binarios al directorio de salida
 echo "Copiando binarios al directorio de salida..."
 mkdir -p target/userland/
-cp ../target/release/eclipse_userland target/userland/
+cp target/release/eclipse_userland target/userland/
 
 # Crear archivo de información
 echo "Creando archivo de información..."

@@ -321,7 +321,7 @@ pub extern "C" fn multiboot2_entry(magic: u32, info: *const Multiboot2Info) -> !
         // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
         // Invalid magic number - halt (simulado)
         unsafe {
-            crate::main_simple::serial_write_str("[MULTIBOOT2] ERROR: Invalid magic number (hlt deshabilitado)\r\n");
+            crate::
         }
         loop {
             // Simular halt con spin loop

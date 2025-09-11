@@ -191,8 +191,8 @@ create_basic_distribution() {
     mkdir -p "$BUILD_DIR"/{boot,efi/boot,userland/{bin,lib,config}}
     
     # Copiar el kernel
-    if [ -f "target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
-        cp "target/$KERNEL_TARGET/release/eclipse_kernel" "$BUILD_DIR/boot/"
+    if [ -f "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" ]; then
+        cp "eclipse_kernel/target/$KERNEL_TARGET/release/eclipse_kernel" "$BUILD_DIR/boot/"
         print_status "Kernel copiado a la distribución"
     else
         print_error "Kernel no encontrado - no se puede crear la distribución"

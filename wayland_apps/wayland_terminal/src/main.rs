@@ -33,7 +33,7 @@ fn init_allocator() {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { serial_write_str("KERNEL: PANIC\r\n"); }
+    unsafe { crate::serial::write_str("KERNEL: PANIC\r\n"); }
     // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
     loop {
         // Simular espera sin hlt para evitar opcode inválido

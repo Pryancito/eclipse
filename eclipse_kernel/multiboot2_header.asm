@@ -71,4 +71,19 @@ header_start:
     dw 0    ; flags
     dd 8    ; size
 
+; PVH ELF Note for QEMU compatibility
+section .note.pvh
+align 4
+
+pvh_note_start:
+    dd 4                              ; namesz
+    dd 8                              ; descsz
+    dd 0x4b564850                    ; type (PVH)
+    db 'X', 'e', 'n', 0               ; name
+    dd 0                              ; version
+    dd 0                              ; next_entry_offset
+    dd 0                              ; features
+
+pvh_note_end:
+
 header_end:

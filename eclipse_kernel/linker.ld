@@ -21,10 +21,18 @@ SECTIONS
         *(COMMON)
     }
     
+    .note : {
+        *(.note*)
+        *(.note.pvh)
+    }
+
+    .note.pvh : {
+        *(.note.pvh)
+    }
+
     /DISCARD/ : {
         *(.eh_frame)
         *(.debug_*)
         *(.comment)
-        *(.note*)
     }
 }

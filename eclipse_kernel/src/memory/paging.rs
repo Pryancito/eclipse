@@ -3,7 +3,7 @@
 //! Implementa paginación de 4 niveles (PML4, PDPT, PD, PT)
 
 use crate::memory::manager::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
-use crate::main_simple::serial_write_str;
+use crate::serial;
 /// Estructura para manejar la paginación
 pub struct PagingSystem {
     /// Tabla de páginas de nivel 4 (PML4)
@@ -127,8 +127,8 @@ impl PagingSystem {
         // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
 
         unsafe {
-            serial_write_str("[MEMORY] Carga de tabla de páginas SIMULADA (CR3 deshabilitado)\r\n");
-            serial_write_str("[MEMORY] ERROR: Opcode inválido en RIP 000000000009F0AD - CR3 problemático\r\n");
+            
+            // Logging removido temporalmente para evitar breakpoint
         }
     }
 
@@ -254,8 +254,8 @@ impl PagingSystem {
         // TEMPORALMENTE DESHABILITADO: Instrucciones CR0/CR3 causan opcode inválido
 
         unsafe {
-            serial_write_str("[MEMORY] Habilitación de paginación SIMULADA (CR0/CR3 deshabilitados)\r\n");
-            serial_write_str("[MEMORY] ERROR: Opcode inválido en RIP 000000000009F0AD - CR0/CR3 problemáticos\r\n");
+            
+            // Logging removido temporalmente para evitar breakpoint
         }
     }
 
@@ -264,7 +264,7 @@ impl PagingSystem {
         // TEMPORALMENTE DESHABILITADO: Instrucciones CR0 causan opcode inválido
 
         unsafe {
-            serial_write_str("[MEMORY] Deshabilitación de paginación SIMULADA (CR0 deshabilitado)\r\n");
+            
         }
     }
 }

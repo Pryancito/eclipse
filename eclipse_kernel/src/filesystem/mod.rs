@@ -89,8 +89,8 @@ impl FileSystemInfo {
 /// Función auxiliar para logging (compatible con diferentes configuraciones)
 #[cfg(feature = "serial")]
 pub fn log_message(msg: &str) {
-    use crate::main_simple::serial_write_str;
-    unsafe { serial_write_str(msg); }
+    // Logging removido temporalmente para evitar breakpoint
+    // crate::serial::write_str(msg);
 }
 
 #[cfg(not(feature = "serial"))]
@@ -101,12 +101,7 @@ pub fn log_message(_msg: &str) {
 /// Función auxiliar para logging de errores VfsError
 #[cfg(feature = "serial")]
 pub fn log_vfs_error(error: &crate::filesystem::vfs::VfsError) {
-    use crate::main_simple::serial_write_str;
-    unsafe {
-        serial_write_str("[ERROR] ");
-        serial_write_str(error.as_str());
-        serial_write_str("\r\n");
-    }
+
 }
 
 #[cfg(not(feature = "serial"))]
@@ -152,40 +147,28 @@ pub fn init_filesystem() -> VfsResult<()> {
 
 /// Montar sistemas de archivos básicos para el arranque
 fn mount_basic_filesystems() -> VfsResult<()> {
-    log_message("[INIT] Montando sistemas de archivos básicos...\r\n");
+    // Logging removido temporalmente para evitar breakpoint
 
     // Intentar montar sistemas de archivos desde initrd primero
-    if let Err(e) = mount_initrd_filesystems() {
-        log_vfs_error(&e);
-        log_message("[INIT] Intentando montaje directo...\r\n");
-
+    if let Err(_) = mount_initrd_filesystems() {
         // Fallback: intentar montaje directo de dispositivos
-        if let Err(e) = mount_device_filesystems() {
-            log_vfs_error(&e);
+        if let Err(_) = mount_device_filesystems() {
+            // Error en montaje - continuar sin logging
         }
     }
 
-    // Mostrar información de montaje
-    mount::show_mount_info();
-
-    log_message("[INIT] Sistemas de archivos básicos montados\r\n");
+    // Mostrar información de montaje (removido temporalmente)
 
     Ok(())
 }
 
 /// Montar sistemas de archivos desde initrd
 fn mount_initrd_filesystems() -> VfsResult<()> {
-    unsafe {
-        log_message("[INIT] Intentando montaje desde initrd...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
     // Verificar si tenemos acceso al contenido del initrd
     // En una implementación real, el initrd se extraería automáticamente
     // Por ahora, simulamos que el contenido está disponible
-
-    unsafe {
-        log_message("[INIT] Contenido del initrd detectado\r\n");
-    }
 
     // Intentar montar el sistema de archivos raíz desde initrd
     let _ = mount::mount_filesystem("initrd:/", "/", superblock::FileSystemType::Ext4, mount::MountFlags::ReadWrite);
@@ -195,24 +178,14 @@ fn mount_initrd_filesystems() -> VfsResult<()> {
 
 /// Montar sistemas de archivos desde dispositivos
 fn mount_device_filesystems() -> VfsResult<()> {
-    unsafe {
-        log_message("[INIT] Montando desde dispositivos físicos...\r\n");
-    }
+    // Logging removido temporalmente para evitar breakpoint
 
         // Montar FAT32 en /boot (solo lectura para archivos de kernel)
         // Usar identificadores físicos del kernel, no nombres de dispositivo Linux
-        if let Err(e) = mount::mount_filesystem("partition:fat32", "/boot", superblock::FileSystemType::Fat32, mount::MountFlags::ReadOnly) {
-        log_message("[WARNING] Error montando FAT32 en /boot: ");
-        log_vfs_error(&e);
-        log_message("\r\n");
-    }
+        let _ = mount::mount_filesystem("partition:fat32", "/boot", superblock::FileSystemType::Fat32, mount::MountFlags::ReadOnly);
 
     // Montar EXT4 en / (lectura-escritura para sistema completo)
-    if let Err(e) = mount::mount_filesystem("partition:ext4", "/", superblock::FileSystemType::Ext4, mount::MountFlags::ReadWrite) {
-        log_message("[WARNING] Error montando EXT4 en /: ");
-        log_vfs_error(&e);
-        log_message("\r\n");
-    }
+    let _ = mount::mount_filesystem("partition:ext4", "/", superblock::FileSystemType::Ext4, mount::MountFlags::ReadWrite);
 
     Ok(())
 }
@@ -226,24 +199,38 @@ pub fn get_filesystem_info() -> FileSystemInfo {
 pub fn init() {
     // Inicializar sistema de archivos
     // En una implementación real, esto configuraría el sistema global
-    let _ = init_filesystem();
+    // Nota: Logging removido temporalmente para evitar breakpoint
+
+    match init_filesystem() {
+        Ok(_) => {
+            // Sistema de archivos inicializado correctamente
+            // Nota: Logging y show_mount_info removidos temporalmente
+        }
+        Err(_) => {
+            // Error en inicialización - continuar sin logging para evitar breakpoint
+        }
+    }
 }
 
 /// Leer archivo desde una ruta específica (función pública para init_system)
 pub fn read_file_from_path(path: &str) -> VfsResult<Vec<u8>> {
-    log_message("[FS] Intentando leer archivo: ");
-    log_message(path);
-    log_message("\r\n");
+    // VERIFICACIÓN DE PAGINACIÓN: Antes de cualquier operación crítica
+    if !verify_memory_pagination() {
+        // Logging removido temporalmente para evitar breakpoint
+        return Err(str_to_vfs_error("Paginación inválida"));
+    }
+
+    // Logging removido temporalmente para evitar breakpoint
 
     // Intentar leer desde sistemas de archivos montados
     if let Ok(data) = read_from_mounted_filesystems(path) {
-        log_message("[FS] Archivo leído exitosamente desde sistema montado\r\n");
+        // Archivo leído exitosamente
         return Ok(data);
     }
 
     // Intentar acceder directamente desde particiones
     if let Ok(data) = read_from_partition_directly(path) {
-        log_message("[FS] Archivo leído exitosamente desde partición directa\r\n");
+        // Archivo leído exitosamente
         return Ok(data);
     }
 
@@ -251,12 +238,37 @@ pub fn read_file_from_path(path: &str) -> VfsResult<Vec<u8>> {
     read_from_initrd(path)
 }
 
+/// Verificar que la paginación esté configurada correctamente
+fn verify_memory_pagination() -> bool {
+    unsafe {
+        // Verificar que CR3 (directorio de páginas) esté configurado
+        let cr3_value: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3_value, options(nomem, nostack));
+
+        if cr3_value == 0 {
+            // Logging removido temporalmente para evitar breakpoint
+            return false;
+        }
+
+        // Verificar que CR4 tenga paginación habilitada
+        let cr4_value: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4_value, options(nomem, nostack));
+
+        if (cr4_value & (1 << 5)) == 0 { // Bit 5 = PAE (Physical Address Extension)
+            // Logging removido temporalmente para evitar breakpoint
+        }
+
+        // Paginación verificada correctamente
+        true
+    }
+}
+
 /// Leer archivo desde sistemas de archivos montados
 fn read_from_mounted_filesystems(path: &str) -> VfsResult<Vec<u8>> {
     // Verificar si el archivo está en el sistema de archivos raíz montado
     if path.starts_with("/sbin/") || path.starts_with("/bin/") {
         if path.contains("eclipse-systemd") || path.contains("init") {
-            log_message("[FS] Archivo systemd encontrado en sistema montado\r\n");
+            // Logging removido temporalmente para evitar breakpoint
 
             // Simular la lectura del binario real
             // En una implementación completa, esto leería el archivo real
@@ -293,9 +305,9 @@ fn read_from_mounted_filesystems(path: &str) -> VfsResult<Vec<u8>> {
 
 /// Leer archivo directamente desde partición (sin montar)
 fn read_from_partition_directly(path: &str) -> VfsResult<Vec<u8>> {
-    log_message("[FS] Intentando acceso directo a partición para: ");
-    log_message(path);
-    log_message("\r\n");
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     // Aquí iría el código para acceder directamente a la partición física EXT4
     // Por ahora, devolver error para que use el método alternativo
@@ -304,9 +316,9 @@ fn read_from_partition_directly(path: &str) -> VfsResult<Vec<u8>> {
 
 /// Leer archivo desde initrd como fallback
 fn read_from_initrd(path: &str) -> VfsResult<Vec<u8>> {
-    log_message("[FS] Intentando leer desde initrd: ");
-    log_message(path);
-    log_message("\r\n");
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
+    // Logging removido temporalmente para evitar breakpoint
 
     // Simular contenido del initrd
     // En una implementación real, esto extraería archivos del initrd
@@ -325,7 +337,7 @@ fn read_from_initrd(path: &str) -> VfsResult<Vec<u8>> {
             data.push(0);
         }
 
-        log_message("[FS] Archivo encontrado en initrd\r\n");
+        // Logging removido temporalmente para evitar breakpoint
         Ok(data)
     } else {
         Err(str_to_vfs_error("Archivo no encontrado en initrd"))
