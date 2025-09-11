@@ -186,13 +186,27 @@ impl HardwareDetector {
         
         let status = get_framebuffer_status();
         if let Some(info) = status.driver_info {
+            // Calcular información del framebuffer
+            let bpp = match info.pixel_format {
+                0 | 1 => 24, // RGB888, BGR888 = 24 bits
+                2 | 3 => 32, // RGBA8888, BGRA8888 = 32 bits
+                _ => 32,
+            };
+            let size = (info.width as u64) * (info.height as u64) * ((bpp / 8) as u64);
+
             Some(format!(
-                "Framebuffer: {}x{} @ {}bpp, {} bytes, Format: {:?}",
+                "Framebuffer: {}x{} @ {}bpp, {} bytes, Format: {}",
                 info.width,
                 info.height,
-                info.bpp,
-                info.size,
-                info.pixel_format
+                bpp,
+                size,
+                match info.pixel_format {
+                    0 => "RGB888",
+                    1 => "BGR888",
+                    2 => "RGBA8888",
+                    3 => "BGRA8888",
+                    _ => "Unknown",
+                }
             ))
         } else {
             Some("Framebuffer: Información no disponible".to_string())

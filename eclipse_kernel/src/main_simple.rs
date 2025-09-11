@@ -122,40 +122,13 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     use crate::drivers::drm_integration::{DrmIntegration, DrmKernelCommand, create_drm_integration};
     let mut drm_integration = create_drm_integration();
 
-    // Configurar framebuffer si está disponible
-    let framebuffer_info = if graphics_mode == crate::hardware_detection::GraphicsMode::Framebuffer {
-        // Logging removido temporalmente para evitar breakpoint
-        // Logging removido temporalmente para evitar breakpoint
-        Some(crate::drivers::framebuffer::FramebufferInfo {
-            base_address: 0x1000000,
-            size: 1920 * 1080 * 4,
-            width: 1920,
-            height: 1080,
-            pitch: 1920 * 4,
-            bpp: 32,
-            red_offset: 0,
-            green_offset: 8,
-            blue_offset: 16,
-            alpha_offset: 24,
-            red_length: 8,
-            green_length: 8,
-            blue_length: 8,
-            alpha_length: 8,
-            pixel_format: crate::drivers::framebuffer::PixelFormat::RGBA8888,
-        })
-    } else {
-        // Logging removido temporalmente para evitar breakpoint
-        // Logging removido temporalmente para evitar breakpoint
-        None
-    };
+    // Crear instancia del FramebufferDriver para verificar si está inicializado
+    let framebuffer_driver = crate::drivers::framebuffer::FramebufferDriver::new();
 
-    // Inicializar DRM solo si hay framebuffer disponible
-    // Logging removido temporalmente para evitar breakpoint
-    // Logging removido temporalmente para evitar breakpoint
-
-    if framebuffer_info.is_some() {
+    if framebuffer_driver.is_initialized() {
         // Solo inicializar DRM si hay framebuffer disponible
-        match drm_integration.initialize(framebuffer_info) {
+        let framebuffer_info = framebuffer_driver.get_info();
+        match drm_integration.initialize(Some(*framebuffer_info)) {
             Ok(_) => {
                 drm_integration.execute_integrated_operation(DrmKernelCommand::Initialize);
                 // Logging removido temporalmente para evitar breakpoint

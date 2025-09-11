@@ -57,6 +57,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
+const PT_LOAD: u32 = 1;
 
 #[inline(always)]
 fn pages_for_size(size: usize) -> usize { (size + 0xFFF) / 0x1000 }
@@ -91,34 +92,6 @@ fn read_file_size(file: &mut RegularFile) -> Result<usize, Status> {
         Ok(info) => Ok(info.file_size() as usize),
         Err(e) => Err(e.status()),
     }
-}
-
-/// Salta al kernel en la dirección de entrada especificada.
-/// Esta función nunca retorna.
-unsafe fn jump_to_kernel(entry: u64) -> ! {
-    // Asegura que la dirección de entrada no sea cero
-    if entry == 0 {
-        // Si la dirección es inválida, detiene el sistema
-        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-        loop {
-            // Simular halt con spin loop
-            for _ in 0..10000 {
-                core::hint::spin_loop();
-            }
-        }
-    }
-    // Transmuta la dirección a una función y salta
-    // Corrección: usar transmute directamente sobre u64, y asegurar que la convención de llamada sea correcta.
-    // El kernel usa extern "C" que en x86_64 es System V AMD64 ABI
-    let entry_fn: extern "C" fn() -> ! = core::mem::transmute(entry as usize);
-    entry_fn()
-}
-
-/// Salta al kernel pasando un argumento en RDI según SysV ABI
-unsafe fn jump_to_kernel_with_arg(entry: u64, arg_ptr: u64) -> ! {
-    let entry_fn: extern "C" fn(*const FramebufferInfo) -> ! = core::mem::transmute(entry as usize);
-    let arg = arg_ptr as *const FramebufferInfo;
-    entry_fn(arg)
 }
 
 // Salida serie COM1 para diagnóstico temprano
@@ -226,8 +199,6 @@ struct Elf64Phdr {
     p_memsz: u64,
     p_align: u64,
 }
-
-const PT_LOAD: u32 = 1;
 
 const MAX_PH: usize = 64;
 
@@ -454,6 +425,101 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
 
     let total_len = max_vaddr - min_vaddr;
     Ok((entry, kernel_phys_base, total_len, segmap))
+}
+
+fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, u64, u64), BootError> {
+    // Leer cabecera ELF
+    if kernel_data.len() < core::mem::size_of::<Elf64Ehdr>() {
+        return Err(BootError::LoadElf(Status::LOAD_ERROR));
+    }
+
+    let ehdr: Elf64Ehdr = unsafe { core::ptr::read_unaligned(kernel_data.as_ptr() as *const Elf64Ehdr) };
+
+    // Validaciones básicas
+    if &ehdr.e_ident[0..4] != b"\x7FELF" { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
+    if ehdr.e_ident[4] != 2 { return Err(BootError::LoadElf(Status::UNSUPPORTED)); } // 64-bit
+    if ehdr.e_machine != 62 { return Err(BootError::LoadElf(Status::UNSUPPORTED)); } // x86_64
+
+    // Iterar program headers
+    let phentsize = ehdr.e_phentsize as usize;
+    let phnum = ehdr.e_phnum as usize;
+
+    // Asegurar tamaño de entrada de programa esperado para ELF64
+    if phentsize != core::mem::size_of::<Elf64Phdr>() {
+        return Err(BootError::LoadElf(Status::UNSUPPORTED));
+    }
+
+    // Reservar memoria física en dirección fija para el kernel
+    let kernel_phys_base = KERNEL_PHYS_LOAD_ADDR;
+
+    // Calcular tamaño total necesario
+    let mut total_size = 0u64;
+    for i in 0..phnum {
+        let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
+        if off as usize + phentsize > kernel_data.len() {
+            return Err(BootError::LoadElf(Status::LOAD_ERROR));
+        }
+
+        let phdr: Elf64Phdr = unsafe {
+            core::ptr::read_unaligned(kernel_data[off as usize..].as_ptr() as *const Elf64Phdr)
+        };
+
+        if phdr.p_type != PT_LOAD { continue; }
+
+        let segment_end = phdr.p_vaddr + phdr.p_memsz;
+        if segment_end > total_size {
+            total_size = segment_end;
+        }
+    }
+
+    let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
+
+    // Reservar memoria física
+    if let Err(st) = bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
+        return Err(BootError::LoadSegment { status: st.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
+    }
+
+    // Cargar segmentos
+    for i in 0..phnum {
+        let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
+        let phdr: Elf64Phdr = unsafe {
+            core::ptr::read_unaligned(kernel_data[off as usize..].as_ptr() as *const Elf64Phdr)
+        };
+
+        if phdr.p_type != PT_LOAD { continue; }
+
+        // Calcular dirección física donde cargar el segmento
+        let dest_phys = kernel_phys_base + phdr.p_vaddr;
+
+        // Cargar datos del segmento
+        if phdr.p_filesz > 0 {
+            if phdr.p_offset as usize + phdr.p_filesz as usize > kernel_data.len() {
+                return Err(BootError::LoadElf(Status::LOAD_ERROR));
+            }
+
+            let src_data = &kernel_data[phdr.p_offset as usize..phdr.p_offset as usize + phdr.p_filesz as usize];
+            let dst_ptr = dest_phys as *mut u8;
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_data.as_ptr(), dst_ptr, phdr.p_filesz as usize);
+            }
+        }
+
+        // Inicializar memoria .bss (ceros)
+        if phdr.p_memsz > phdr.p_filesz {
+            let bss_ptr = (dest_phys + phdr.p_filesz) as *mut u8;
+            let bss_len = (phdr.p_memsz - phdr.p_filesz) as usize;
+            unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_len); }
+        }
+    }
+
+    let entry_point = if ehdr.e_entry != 0 {
+        ehdr.e_entry
+    } else {
+        kernel_phys_base // fallback
+    };
+
+    Ok((entry_point, kernel_phys_base, total_size))
 }
 
 enum BootError {
@@ -778,62 +844,65 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
+    // Preparar el entry point del kernel
+    let mut entry_reg = 0x200000u64; // Entry point virtual del kernel (valor por defecto)
+
+    // CARGAR EL KERNEL ANTES DE EXIT_BOOT_SERVICES
+    let (kernel_entry, kernel_base, kernel_size) = {
+        let bs = system_table.boot_services();
+        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
+
+        match load_kernel_from_data(bs, kernel_data) {
+            Ok((entry_point, kernel_phys_base, total_len)) => {
+                unsafe {
+                    serial_write_str("BL: kernel ELF cargado exitosamente\r\n");
+                    serial_write_str("BL: entry_point=0x");
+                    serial_write_hex64(entry_point);
+                    serial_write_str(" kernel_phys_base=0x");
+                    serial_write_hex64(kernel_phys_base);
+                    serial_write_str(" total_len=0x");
+                    serial_write_hex64(total_len);
+                    serial_write_str("\r\n");
+                }
+                entry_reg = entry_point;
+                (entry_point, kernel_phys_base, total_len)
+            },
+            Err(e) => {
+                unsafe {
+                    serial_write_str("BL: ERROR cargando kernel ELF: ");
+                    match e {
+                        BootError::LoadElf(st) => {
+                            serial_write_str("LoadElf status=");
+                            serial_write_hex64(st.0 as u64);
+                        },
+                        BootError::LoadSegment { status, seg_index, addr, pages } => {
+                            serial_write_str("LoadSegment seg=");
+                            serial_write_hex64(seg_index as u64);
+                            serial_write_str(" addr=0x");
+                            serial_write_hex64(addr);
+                            serial_write_str(" pages=");
+                            serial_write_hex64(pages as u64);
+                            serial_write_str(" status=");
+                            serial_write_hex64(status.0 as u64);
+                        },
+                        _ => serial_write_str("Otro error"),
+                    }
+                    serial_write_str("\r\n");
+                }
+                // Mantener valores por defecto si falla la carga
+                (0x200000u64, KERNEL_PHYS_LOAD_ADDR, 0)
+            }
+        }
+    };
+
     // ExitBootServices (uefi 0.25.0)
     // IMPORTANTE: Usar BOOT_SERVICES_CODE para mantener la memoria del kernel intacta
     let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::BOOT_SERVICES_CODE);
     unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
-
-    // CARGAR EL KERNEL DESPUÉS DE EXIT_BOOT_SERVICES
-    unsafe {
-        serial_write_str("BL: cargando kernel despues de ExitBootServices...\r\n");
-
-        // Cargar kernel en memoria física 0x0020_0000
-        let kernel_phys_addr = 0x0020_0000u64;
-        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
-
-        // Leer desde el offset donde realmente está el código ejecutable
-        // Según hexdump, el código está en 0x1010, no en 0x1000
-        let code_offset = 0x1010; // Offset donde está el código real
-
-        // Copiar el kernel desde el offset correcto
-        let dst_ptr = kernel_phys_addr as *mut u8;
-        let src_ptr = kernel_data.as_ptr().add(code_offset);
-        let code_size = kernel_data.len() - code_offset;
-
-        for i in 0..code_size {
-            *dst_ptr.add(i) = *src_ptr.add(i);
-        }
-
-        serial_write_str("BL: kernel cargado en 0x00200000, ");
-        // Convertir el tamaño a string para mostrar
-        let size_kb = code_size / 1024;
-        if size_kb < 10 {
-            serial_write_byte(b'0' + size_kb as u8);
-        } else {
-            serial_write_byte(b'0' + (size_kb / 10) as u8);
-            serial_write_byte(b'0' + (size_kb % 10) as u8);
-        }
-        serial_write_str(" KB\r\n");
-
-        // Verificar que los bytes se cargaron correctamente
-        serial_write_str("BL: verificando bytes del kernel: ");
-        for i in 0..16 {
-            let b = *dst_ptr.add(i);
-            let high = (b >> 4) & 0xF;
-            let low = b & 0xF;
-            serial_write_byte(if high < 10 { b'0' + high } else { b'A' + high - 10 });
-            serial_write_byte(if low < 10 { b'0' + low } else { b'A' + low - 10 });
-            serial_write_str(" ");
-        }
-        serial_write_str("\r\n");
-    }
-
     // Nota: Framebuffer mapping simplificado por ahora
 
     // Configurar paginación identidad y pila y saltar al kernel (sin usar la pila después de cambiarla)
     unsafe {
-        // Preparar registros ANTES de tocar RSP para no volver a leer variables en stack
-        let entry_reg = 0x200000u64; // Entry point virtual del kernel
 
         // Debug: mostrar valores antes de configurar CR3
         serial_write_str("BL: entry_reg=0x");
@@ -889,36 +958,35 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let rsp_alineado = stack_top & !0xFu64;
 
         // SALTAR AL KERNEL PASANDO INFORMACIÓN DEL FRAMEBUFFER
-        unsafe {
-            // ⚠️  INSTRUCCIONES CRÍTICAS PARA BOOTLOADER - NO DESHABILITAR ⚠️
-            // Estas instrucciones SON necesarias para que el bootloader funcione
+        // ⚠️  INSTRUCCIONES CRÍTICAS PARA BOOTLOADER - NO DESHABILITAR ⚠️
+        // Estas instrucciones SON necesarias para que el bootloader funcione
 
-            // Configurar SSE (necesario para evitar #UD)
-            core::arch::asm!(
-                "mov rax, cr0",
-                "and rax, ~(1 << 2)",        // CR0.EM = 0
-                "or  rax,  (1 << 1)",        // CR0.MP = 1
-                "mov cr0, rax",
-                "mov rax, cr4",
-                "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
-                "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
-                "mov cr4, rax"
-            );
+        // Configurar SSE (necesario para evitar #UD)
+        core::arch::asm!(
+            "mov rax, cr0",
+            "and rax, ~(1 << 2)",        // CR0.EM = 0
+            "or  rax,  (1 << 1)",        // CR0.MP = 1
+            "mov cr0, rax",
+            "mov rax, cr4",
+            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+            "mov cr4, rax"
+        );
 
-            // Configurar paginación y saltar al kernel
-            // TEMPORALMENTE DESHABILITADO: cli causa opcode inválido
-            core::arch::asm!(
-                // "cli",                      // Desactivar interrupciones (DESHABILITADO)
-                "mov cr3, {cr3}",           // Configurar paginación
-                "mov rsp, {rsp}",           // Configurar stack
-                "mov rax, {entry}",         // Copiar entry point a RAX
-                "jmp rax",                  // Saltar directamente al kernel
-                cr3 = in(reg) cr3_value,
-                rsp = in(reg) rsp_alineado,
-                entry = in(reg) entry_reg,
-                options(noreturn)
-            );
-        }
+        // Pasar el puntero a la estructura de framebuffer en rdi (primer argumento de la ABI x86_64)
+        // Asumimos que tienes una variable llamada framebuffer_info_ptr con la dirección física de la info del framebuffer
+        core::arch::asm!(
+            "mov cr3, {cr3}",           // Configurar paginación
+            "mov rsp, {rsp}",           // Configurar stack
+            "mov rdi, {fbinfo}",        // Pasar framebuffer_info_ptr en RDI
+            "mov rax, {entry}",         // Copiar entry point a RAX
+            "jmp rax",                  // Saltar directamente al kernel
+            cr3 = in(reg) cr3_value,
+            rsp = in(reg) rsp_alineado,
+            fbinfo = in(reg) framebuffer_info_ptr,
+            entry = in(reg) entry_reg,
+            options(noreturn)
+        );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)
         serial_write_str("BL: ERROR - kernel retorno!\r\n");

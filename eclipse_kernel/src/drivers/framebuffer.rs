@@ -10,20 +10,14 @@ use core::mem;
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferInfo {
     pub base_address: u64,
-    pub size: u64,
     pub width: u32,
     pub height: u32,
-    pub pitch: u32,        // bytes per scanline
-    pub bpp: u8,           // bits per pixel
-    pub red_offset: u8,
-    pub green_offset: u8,
-    pub blue_offset: u8,
-    pub alpha_offset: u8,
-    pub red_length: u8,
-    pub green_length: u8,
-    pub blue_length: u8,
-    pub alpha_length: u8,
-    pub pixel_format: PixelFormat,
+    pub pixels_per_scan_line: u32,
+    pub pixel_format: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub reserved_mask: u32,
 }
 
 /// Formatos de pixel soportados
@@ -152,20 +146,14 @@ impl FramebufferDriver {
         Self {
             info: FramebufferInfo {
                 base_address: 0,
-                size: 0,
                 width: 0,
                 height: 0,
-                pitch: 0,
-                bpp: 0,
-                red_offset: 0,
-                green_offset: 0,
-                blue_offset: 0,
-                alpha_offset: 0,
-                red_length: 0,
-                green_length: 0,
-                blue_length: 0,
-                alpha_length: 0,
-                pixel_format: PixelFormat::Unknown,
+                pixels_per_scan_line: 0,
+                pixel_format: 0,
+                red_mask: 0,
+                green_mask: 0,
+                blue_mask: 0,
+                reserved_mask: 0,
             },
             buffer: ptr::null_mut(),
             is_initialized: false,
@@ -181,9 +169,18 @@ impl FramebufferDriver {
                           pixel_format: u32,
                           pixel_bitmask: u32) -> Result<(), &'static str> {
         
-        // Validar parámetros básicos
-        if base_address == 0 || width == 0 || height == 0 {
-            return Err("Invalid framebuffer parameters");
+        // Validar parámetros básicos con más detalle
+        if base_address == 0 {
+            return Err("Invalid base address");
+        }
+        if width == 0 {
+            return Err("Invalid width (cannot be zero)");
+        }
+        if height == 0 {
+            return Err("Invalid height (cannot be zero)");
+        }
+        if pixels_per_scan_line == 0 && width == 0 {
+            return Err("Both pixels_per_scan_line and width cannot be zero");
         }
         
         // Determinar formato de pixel
@@ -192,34 +189,52 @@ impl FramebufferDriver {
             return Err("Unsupported pixel format");
         }
         
-        // Calcular pitch (bytes per scanline)
+        // Calcular bytes por pixel usando el método del enum
         let bytes_per_pixel = format.bytes_per_pixel();
+
+        // Log para debugging (comentado porque serial_write_hex32 no está disponible aquí)
+        // serial_write_str("FB: format=");
+        // serial_write_hex32(format);
+        // serial_write_str(" bytes_per_pixel=");
+        // serial_write_hex32(bytes_per_pixel as u32);
+        // serial_write_str("\r\n");
+
+        // Calcular pitch (bytes per scanline)
         let pitch = if pixels_per_scan_line > 0 {
             pixels_per_scan_line * bytes_per_pixel as u32
         } else {
             width * bytes_per_pixel as u32
         };
+
+        // ✅ CORRECCIÓN: El pitch ya está en bytes, no multiplicar por bytes_per_pixel nuevamente
+        // pixels_per_scan_line ya es el número de píxeles, multiplicarlo por bytes_per_pixel
+        // nos da los bytes por línea correctamente
         
         // Calcular tamaño total del buffer
         let size = (height * pitch) as u64;
         
         // Configurar información del framebuffer
+        // Evitar división por cero con validación adicional
+        let pixels_per_line = if bytes_per_pixel > 0 && pitch > 0 {
+            pitch / (bytes_per_pixel as u32)
+        } else if pixels_per_scan_line > 0 {
+            pixels_per_scan_line // Usar el valor original si hay problemas
+        } else if width > 0 {
+            width // Usar width como fallback
+        } else {
+            1920 // Valor por defecto seguro
+        };
+
         self.info = FramebufferInfo {
             base_address,
-            size,
             width,
             height,
-            pitch,
-            bpp: bytes_per_pixel * 8,
-            red_offset: 0,    // Se configurará según el formato
-            green_offset: 0,
-            blue_offset: 0,
-            alpha_offset: 0,
-            red_length: 8,
-            green_length: 8,
-            blue_length: 8,
-            alpha_length: 8,
-            pixel_format: format,
+            pixels_per_scan_line: pixels_per_line,
+            pixel_format,
+            red_mask: 0,      // Se configurarán según el formato
+            green_mask: 0,
+            blue_mask: 0,
+            reserved_mask: 0,
         };
         
         // Configurar offsets según el formato
@@ -238,70 +253,60 @@ impl FramebufferDriver {
             return Err("Failed to map framebuffer memory");
         }
         
-        // ✅ VALIDACIÓN ADICIONAL: Verificar que podemos leer el primer byte
+        // ✅ VALIDACIÓN ADICIONAL: Verificar que podemos leer el primer byte (de forma segura)
         unsafe {
-            // Intentar leer el primer byte para verificar que la memoria es accesible
-            let test_byte = core::ptr::read_volatile(self.buffer);
-            // Si llegamos aquí, la memoria es accesible
-            core::ptr::write_volatile(self.buffer, test_byte); // Restaurar el valor original
+            // Solo intentar leer si la dirección parece razonable
+            if base_address >= 0x1000 && base_address < 0x100000000 { // Hasta 4GB
+                // Intentar leer el primer byte para verificar que la memoria es accesible
+                let test_byte = core::ptr::read_volatile(self.buffer);
+                // Si llegamos aquí, la memoria es accesible
+                core::ptr::write_volatile(self.buffer, test_byte); // Restaurar el valor original
+            }
         }
-        
+
         self.is_initialized = true;
-        
-        // Limpiar pantalla
-        self.clear_screen(Color::BLACK);
+
+        // ❌ REMOVER: No llamar clear_screen aquí para evitar page faults
+        // La limpieza se hará después de la inicialización exitosa
         
         Ok(())
     }
     
     /// Configurar offsets de pixel según el formato
     fn configure_pixel_offsets(&mut self) {
+        // Configurar máscaras según el formato de pixel
         match self.info.pixel_format {
-            PixelFormat::RGBA8888 => {
-                self.info.red_offset = 0;
-                self.info.green_offset = 8;
-                self.info.blue_offset = 16;
-                self.info.alpha_offset = 24;
+            0 => { // RGB888
+                self.info.red_mask = 0x00FF0000;
+                self.info.green_mask = 0x0000FF00;
+                self.info.blue_mask = 0x000000FF;
+                self.info.reserved_mask = 0xFF000000;
             },
-            PixelFormat::BGRA8888 => {
-                self.info.blue_offset = 0;
-                self.info.green_offset = 8;
-                self.info.red_offset = 16;
-                self.info.alpha_offset = 24;
+            1 => { // BGR888
+                self.info.red_mask = 0x000000FF;
+                self.info.green_mask = 0x0000FF00;
+                self.info.blue_mask = 0x00FF0000;
+                self.info.reserved_mask = 0xFF000000;
             },
-            PixelFormat::RGB888 => {
-                self.info.red_offset = 0;
-                self.info.green_offset = 8;
-                self.info.blue_offset = 16;
-                self.info.alpha_offset = 0;
+            2 => { // RGBA8888
+                self.info.red_mask = 0x00FF0000;
+                self.info.green_mask = 0x0000FF00;
+                self.info.blue_mask = 0x000000FF;
+                self.info.reserved_mask = 0xFF000000;
             },
-            PixelFormat::BGR888 => {
-                self.info.blue_offset = 0;
-                self.info.green_offset = 8;
-                self.info.red_offset = 16;
-                self.info.alpha_offset = 0;
+            3 => { // BGRA8888
+                self.info.red_mask = 0x0000FF00;
+                self.info.green_mask = 0x00FF0000;
+                self.info.blue_mask = 0xFF000000;
+                self.info.reserved_mask = 0x000000FF;
             },
-            PixelFormat::RGB565 => {
-                self.info.red_offset = 11;
-                self.info.green_offset = 5;
-                self.info.blue_offset = 0;
-                self.info.alpha_offset = 0;
-                self.info.red_length = 5;
-                self.info.green_length = 6;
-                self.info.blue_length = 5;
-                self.info.alpha_length = 0;
-            },
-            PixelFormat::BGR565 => {
-                self.info.blue_offset = 11;
-                self.info.green_offset = 5;
-                self.info.red_offset = 0;
-                self.info.alpha_offset = 0;
-                self.info.red_length = 5;
-                self.info.green_length = 6;
-                self.info.blue_length = 5;
-                self.info.alpha_length = 0;
-            },
-            PixelFormat::Unknown => {},
+            _ => {
+                // Formato desconocido, usar valores por defecto (RGBA8888)
+                self.info.red_mask = 0x00FF0000;
+                self.info.green_mask = 0x0000FF00;
+                self.info.blue_mask = 0x000000FF;
+                self.info.reserved_mask = 0xFF000000;
+            }
         }
     }
     
@@ -320,10 +325,16 @@ impl FramebufferDriver {
         if !self.is_initialized || x >= self.info.width || y >= self.info.height {
             return ptr::null_mut();
         }
-        
-        let bytes_per_pixel = self.info.pixel_format.bytes_per_pixel();
-        let offset = (y * self.info.pitch + x * bytes_per_pixel as u32) as isize;
-        
+
+        // Determinar bytes por pixel basado en el formato
+        let bytes_per_pixel = match self.info.pixel_format {
+            0 | 1 => 3, // RGB888, BGR888
+            2 | 3 => 4, // RGBA8888, BGRA8888
+            _ => 4,     // Por defecto 4 bytes
+        };
+
+        let offset = (y * self.info.pixels_per_scan_line * bytes_per_pixel + x * bytes_per_pixel) as isize;
+
         unsafe { self.buffer.offset(offset) }
     }
     
@@ -341,8 +352,31 @@ impl FramebufferDriver {
         
         let pixel_ptr = self.get_pixel_ptr(x, y);
         if !pixel_ptr.is_null() {
-            let pixel_value = color.to_pixel(self.info.pixel_format);
-            let bytes_per_pixel = self.info.pixel_format.bytes_per_pixel();
+            // Determinar bytes por pixel y convertir color
+            let bytes_per_pixel = match self.info.pixel_format {
+                0 | 1 => 3, // RGB888, BGR888
+                2 | 3 => 4, // RGBA8888, BGRA8888
+                _ => 4,     // Por defecto 4 bytes
+            };
+
+            // Convertir color a valor de pixel según el formato
+            let pixel_value = match self.info.pixel_format {
+                0 => { // RGB888
+                    ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32)
+                },
+                1 => { // BGR888
+                    ((color.b as u32) << 16) | ((color.g as u32) << 8) | (color.r as u32)
+                },
+                2 => { // RGBA8888
+                    ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32) | ((color.a as u32) << 24)
+                },
+                3 => { // BGRA8888
+                    ((color.b as u32) << 16) | ((color.g as u32) << 8) | (color.r as u32) | ((color.a as u32) << 24)
+                },
+                _ => { // Por defecto RGBA8888
+                    ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32) | ((color.a as u32) << 24)
+                }
+            };
             
             unsafe {
                 // ✅ ACCESO SEGURO: Usar write_volatile para evitar optimizaciones
@@ -371,7 +405,12 @@ impl FramebufferDriver {
     pub fn get_pixel(&self, x: u32, y: u32) -> Color {
         let pixel_ptr = self.get_pixel_ptr(x, y);
         if !pixel_ptr.is_null() {
-            let bytes_per_pixel = self.info.pixel_format.bytes_per_pixel();
+            // Determinar bytes por pixel basado en el formato
+            let bytes_per_pixel = match self.info.pixel_format {
+                0 | 1 => 3, // RGB888, BGR888
+                2 | 3 => 4, // RGBA8888, BGRA8888
+                _ => 4,     // Por defecto 4 bytes
+            };
             
             unsafe {
                 let pixel_value = match bytes_per_pixel {
@@ -402,19 +441,33 @@ impl FramebufferDriver {
     /// Convertir valor de pixel a color
     fn pixel_to_color(&self, pixel_value: u32) -> Color {
         match self.info.pixel_format {
-            PixelFormat::RGBA8888 => Color::new(
-                ((pixel_value >> self.info.red_offset) & ((1 << self.info.red_length) - 1)) as u8,
-                ((pixel_value >> self.info.green_offset) & ((1 << self.info.green_length) - 1)) as u8,
-                ((pixel_value >> self.info.blue_offset) & ((1 << self.info.blue_length) - 1)) as u8,
-                ((pixel_value >> self.info.alpha_offset) & ((1 << self.info.alpha_length) - 1)) as u8,
-            ),
-            PixelFormat::BGRA8888 => Color::new(
-                ((pixel_value >> self.info.red_offset) & ((1 << self.info.red_length) - 1)) as u8,
-                ((pixel_value >> self.info.green_offset) & ((1 << self.info.green_length) - 1)) as u8,
-                ((pixel_value >> self.info.blue_offset) & ((1 << self.info.blue_length) - 1)) as u8,
-                ((pixel_value >> self.info.alpha_offset) & ((1 << self.info.alpha_length) - 1)) as u8,
-            ),
-            _ => Color::BLACK, // Implementar otros formatos si es necesario
+            2 => { // RGBA8888
+                let r = ((pixel_value & self.info.red_mask) >> 16) as u8;
+                let g = ((pixel_value & self.info.green_mask) >> 8) as u8;
+                let b = (pixel_value & self.info.blue_mask) as u8;
+                let a = ((pixel_value & self.info.reserved_mask) >> 24) as u8;
+                Color::new(r, g, b, a)
+            },
+            3 => { // BGRA8888
+                let r = ((pixel_value & self.info.red_mask) >> 8) as u8;
+                let g = ((pixel_value & self.info.green_mask) >> 16) as u8;
+                let b = ((pixel_value & self.info.blue_mask) >> 24) as u8;
+                let a = (pixel_value & self.info.reserved_mask) as u8;
+                Color::new(r, g, b, a)
+            },
+            0 => { // RGB888
+                let r = ((pixel_value & self.info.red_mask) >> 16) as u8;
+                let g = ((pixel_value & self.info.green_mask) >> 8) as u8;
+                let b = (pixel_value & self.info.blue_mask) as u8;
+                Color::new(r, g, b, 255)
+            },
+            1 => { // BGR888
+                let r = (pixel_value & self.info.red_mask) as u8;
+                let g = ((pixel_value & self.info.green_mask) >> 8) as u8;
+                let b = ((pixel_value & self.info.blue_mask) >> 16) as u8;
+                Color::new(r, g, b, 255)
+            },
+            _ => Color::BLACK, // Formato desconocido
         }
     }
     
@@ -431,6 +484,7 @@ impl FramebufferDriver {
     }
     
     /// Limpiar pantalla con color
+    /// Limpia toda la pantalla con el color especificado.
     pub fn clear_screen(&mut self, color: Color) {
         self.fill_rect(0, 0, self.info.width, self.info.height, color);
     }

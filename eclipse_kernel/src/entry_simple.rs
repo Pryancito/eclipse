@@ -28,7 +28,6 @@ pub struct FramebufferInfo {
 
 // Variable global para almacenar información del framebuffer
 static mut FRAMEBUFFER_INFO: Option<FramebufferInfo> = None;
-
 /// Punto de entrada principal del kernel compatible con UEFI
 /// Esta función es llamada por el bootloader UEFI con información del framebuffer
 #[no_mangle]

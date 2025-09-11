@@ -254,20 +254,14 @@ impl IntelGraphicsDriver {
         // Crear framebuffer
         let framebuffer_info = crate::drivers::framebuffer::FramebufferInfo {
             base_address: self.memory_base,
-            size: size as u64,
             width,
             height,
-            pitch,
-            bpp: bpp as u8,
-            red_offset: 16,
-            green_offset: 8,
-            blue_offset: 0,
-            alpha_offset: 24,
-            red_length: 8,
-            green_length: 8,
-            blue_length: 8,
-            alpha_length: 8,
-            pixel_format: PixelFormat::BGRA8888,
+            pixels_per_scan_line: width, // Usar width como valor por defecto
+            pixel_format: 1, // BGRA8888
+            red_mask: 0x0000FF00,      // BGRA: R en bits 8-15
+            green_mask: 0x00FF0000,    // BGRA: G en bits 16-23
+            blue_mask: 0xFF000000,     // BGRA: B en bits 24-31
+            reserved_mask: 0x000000FF, // BGRA: A en bits 0-7
         };
         
         let framebuffer = FramebufferDriver::new();
