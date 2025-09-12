@@ -22,3 +22,10 @@ debug = false
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-T/home/moebius/eclipse/wayland_apps/wayland_calculator/linker.ld",
+    "-C", "link-arg=--gc-sections",
+    "-C", "relocation-model=static"
+]

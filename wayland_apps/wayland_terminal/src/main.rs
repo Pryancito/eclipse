@@ -33,10 +33,9 @@ fn init_allocator() {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { crate::serial::write_str("KERNEL: PANIC\r\n"); }
-    // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
+    // En aplicaciones Wayland, no podemos acceder a serial del kernel
+    // Solo loop infinito en caso de panic
     loop {
-        // Simular espera sin hlt para evitar opcode inválido
         unsafe { core::arch::asm!("nop"); }
     }
 }

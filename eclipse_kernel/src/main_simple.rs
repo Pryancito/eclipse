@@ -65,12 +65,12 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
             bus: 0,
             device: 2,
             function: 0,
-            vendor_id: 0x8086,
-            device_id: 0x5916,
+            vendor_id: 0x10DE,
+            device_id: 0x13C0,
             class_code: 0x03,
             subclass_code: 0x00,
             prog_if: 0x00,
-            revision_id: 0x02,
+            revision_id: 0x00,
             header_type: 0x00,
             status: 0x0010,
             command: 0x0007,
@@ -85,9 +85,9 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // Inicializar aceleración de hardware
     init_hardware_acceleration(&gpu_info);
     if let Some(fb) = get_framebuffer() {
-        fb.clear_screen(Color::BLACK);
-        fb.draw_circle(100, 100, 50, Color::RED);
-        fb.draw_char(10, 10, 'A', Color::WHITE);
+        unsafe {
+            draw_direct_fallback(*fb.get_info());
+        }
     } else {
         panic!("Framebuffer not initialized");
     }
@@ -191,8 +191,7 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // Inicializar sistema de procesos
     // Logging removido temporalmente para evitar breakpoint
     // Logging removido temporalmente para evitar breakpoint
-    let mut init_system = InitSystem::new();
-    init_system.initialize();
+
     // Logging removido temporalmente para evitar breakpoint
 
     // Crear escritorio básico
@@ -221,7 +220,7 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // Transferir control al sistema de inicialización
     // Logging removido temporalmente para evitar breakpoint
     // Logging removido temporalmente para evitar breakpoint
-    init_system.execute_init();
+
     // Logging removido temporalmente para evitar breakpoint
 
     // Inicializar aceleración 2D con primera GPU disponible
@@ -321,6 +320,7 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     hid_driver.initialize();
 
     // Sistema GUI avanzado
+    let mut desktop_renderer = crate::desktop_ai::DesktopRenderer::new();
     // Logging removido temporalmente para evitar breakpoint
     // Logging removido temporalmente para evitar breakpoint
     use crate::drivers::gui_integration::{GuiManager, GuiWindow, GuiButton, GuiTextBox, create_gui_manager};
@@ -370,11 +370,14 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // Logging removido temporalmente para evitar breakpoint
     // Logging removido temporalmente para evitar breakpoint
     // Logging removido temporalmente para evitar breakpoint
-
+    let mut init_system = InitSystem::new();
+    init_system.initialize();
+    init_system.execute_init();
     // Mantener el kernel ejecutándose
     loop {
         // Procesar eventos del sistema de entrada
         if let Err(_) = input_system.process_events() {}
+        if let Err(_) = desktop_renderer.render_desktop() {}
 
         // Procesar eventos en la GUI
         while let Some(event) = input_system.get_next_event() {
