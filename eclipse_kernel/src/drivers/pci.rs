@@ -232,7 +232,7 @@ impl PciManager {
         let mut scan_count = 0;
         const MAX_SCAN_ATTEMPTS: usize = 10000; // Límite de seguridad
 
-        for bus in 0..=max_bus {
+        for bus in 0..(max_bus + 1) {
             // Escanear todos los dispositivos en el bus (0-31)
             for device in 0..32 {
                 // Solo escanear función 0 primero para dispositivos multi-función

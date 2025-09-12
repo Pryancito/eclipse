@@ -17,7 +17,14 @@ use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
 use crate::serial;
 
-
+use crate::drivers::framebuffer::{init_framebuffer, init_hardware_acceleration,
+        has_hardware_acceleration, get_acceleration_type,
+        get_hardware_acceleration_info, hardware_fill,
+        write_text, clear_screen, draw_rounded_rect,
+        is_framebuffer_available, Color, get_framebuffer,
+        FramebufferInfo
+};
+use crate::drivers::pci::{GpuType, GpuInfo};
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> &'static str {
     // Para simplificar, devolveremos strings fijos para números comunes
@@ -53,7 +60,37 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     // El allocador ya fue inicializado en _start()
     // Solo inicializar el sistema de logging (ya inicializado en _start())
     // Logging removido temporalmente para evitar breakpoint
-
+    let gpu_info = GpuInfo {
+        pci_device: crate::drivers::pci::PciDevice {
+            bus: 0,
+            device: 2,
+            function: 0,
+            vendor_id: 0x8086,
+            device_id: 0x5916,
+            class_code: 0x03,
+            subclass_code: 0x00,
+            prog_if: 0x00,
+            revision_id: 0x02,
+            header_type: 0x00,
+            status: 0x0010,
+            command: 0x0007,
+        },
+        gpu_type: GpuType::Nvidia, // Simular Intel Graphics
+        memory_size: 1024 * 1024 * 1024 * 8, // 8GB
+        is_primary: true,
+        supports_2d: true,
+        supports_3d: true,
+        max_resolution: (3840, 2160),
+    };
+    // Inicializar aceleración de hardware
+    init_hardware_acceleration(&gpu_info);
+    if let Some(fb) = get_framebuffer() {
+        fb.clear_screen(Color::BLACK);
+        fb.draw_circle(100, 100, 50, Color::RED);
+        fb.draw_char(10, 10, 'A', Color::WHITE);
+    } else {
+        panic!("Framebuffer not initialized");
+    }
     // Usar nuevo sistema de detección con verificación de allocador
     use crate::hardware_detection::HardwareDetector;
 
@@ -220,11 +257,7 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
         // Logging removido temporalmente para evitar breakpoint
         // Logging removido temporalmente para evitar breakpoint
     }
-    // Logging removido temporalmente para evitar breakpoint
 
-    // Sistema de entrada USB
-    // Logging removido temporalmente para evitar breakpoint
-    // Logging removido temporalmente para evitar breakpoint
     use crate::drivers::input_system::{InputSystem, InputSystemConfig, create_default_input_system};
     use crate::drivers::usb_keyboard::{UsbKeyboardDriver, create_usb_keyboard_driver};
     use crate::drivers::usb_mouse::{UsbMouseDriver, create_usb_mouse_driver};
@@ -358,6 +391,90 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
             // VERSION SIMPLIFICADA: Evitar spin_loop() que puede causar Invalid Opcode
             // En lugar de usar core::hint::spin_loop(), usamos un loop vacío simple
             // que es más compatible con diferentes entornos de emulación
+        }
+    }
+}
+
+/// Dibujar interfaz principal del kernel
+fn draw_interface() {
+    // Título principal con fondo redondeado
+    draw_rounded_rect(10, 10, 400, 60, 10, Color::new(30, 30, 60, 255)).unwrap_or_default();
+    write_text(20, 30, "Eclipse OS Kernel", Color::WHITE).unwrap_or_default();
+    write_text(20, 50, "Version 0.5.0 - Con Aceleración de Hardware", Color::CYAN).unwrap_or_default();
+
+    // Información del sistema
+    draw_rounded_rect(10, 80, 600, 120, 8, Color::new(40, 40, 40, 255)).unwrap_or_default();
+    write_text(20, 100, "Sistema Operativo en Desarrollo", Color::GREEN).unwrap_or_default();
+    
+    // Mostrar tipo de aceleración disponible
+    let accel_type = get_acceleration_type();
+    let accel_text = match accel_type {
+        crate::drivers::framebuffer::HardwareAcceleration::Intel2D => "Intel Graphics 2D",
+        crate::drivers::framebuffer::HardwareAcceleration::Nvidia2D => "NVIDIA 2D",
+        crate::drivers::framebuffer::HardwareAcceleration::Amd2D => "AMD 2D",
+        crate::drivers::framebuffer::HardwareAcceleration::Generic2D => "Genérico 2D",
+        crate::drivers::framebuffer::HardwareAcceleration::None => "Sin aceleración",
+    };
+    
+    write_text(20, 120, "Aceleración de Hardware:", Color::YELLOW).unwrap_or_default();
+    write_text(20, 140, accel_text, Color::ORANGE).unwrap_or_default();
+    
+    // Demostrar aceleración de hardware si está disponible
+    if has_hardware_acceleration() {
+        write_text(20, 160, "Probando aceleración de hardware...", Color::LIME).unwrap_or_default();
+        
+        // Usar hardware_fill para demostrar aceleración
+        hardware_fill(20, 180, 200, 50, Color::new(255, 100, 100, 255)).unwrap_or_default();
+        write_text(30, 200, "Rectángulo acelerado por hardware", Color::WHITE).unwrap_or_default();
+    }
+
+    // Barra de estado
+    draw_rounded_rect(10, 220, 600, 40, 5, Color::new(60, 60, 60, 255)).unwrap_or_default();
+    write_text(20, 240, "Sistema listo - Presiona cualquier tecla para continuar", Color::LIGHT_GRAY).unwrap_or_default();
+}
+
+/// Dibujo directo en memoria del framebuffer
+unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
+    
+    let fb_ptr = fb_info.base_address as *mut u32;
+    let width = fb_info.width.min(1280);
+    let height = fb_info.height.min(720);
+    
+    // Limpiar pantalla con color azul oscuro
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * width + x) as isize;
+            core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00101040); // Azul oscuro
+        }
+    }
+    
+    // Dibujar rectángulo rojo en la esquina superior izquierda
+    for y in 0..100 {
+        for x in 0..400 {
+            if y < height && x < width {
+                let offset = (y * width + x) as isize;
+                core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00FF0000); // Rojo
+            }
+        }
+    }
+    
+    // Dibujar rectángulo verde debajo del rojo
+    for y in 100..200 {
+        for x in 0..400 {
+            if y < height && x < width {
+                let offset = (y * width + x) as isize;
+                core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x0000FF00); // Verde
+            }
+        }
+    }
+    
+    // Dibujar rectángulo azul debajo del verde
+    for y in 200..300 {
+        for x in 0..400 {
+            if y < height && x < width {
+                let offset = (y * width + x) as isize;
+                core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x000000FF); // Azul
+            }
         }
     }
 }

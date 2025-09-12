@@ -275,8 +275,8 @@ impl Acceleration2D {
         let center_x = center.x as i32;
         let center_y = center.y as i32;
 
-        for y in -radius_i..=radius_i {
-            for x in -radius_i..=radius_i {
+        for y in -radius_i..(radius_i + 1) {
+            for x in -radius_i..(radius_i + 1) {
                 let distance_squared = x * x + y * y;
                 let radius_squared = radius_i * radius_i;
 
@@ -332,7 +332,7 @@ impl Acceleration2D {
         let start_y = if upper_half { top.y } else { middle.y };
         let end_y = if upper_half { middle.y } else { bottom.y };
 
-        for y in start_y..=end_y {
+        for y in start_y..(end_y + 1) {
             let mut x1 = 0u32;
             let mut x2 = 0u32;
 
@@ -358,7 +358,7 @@ impl Acceleration2D {
             if x1 > x2 {
                 core::mem::swap(&mut x1, &mut x2);
             }
-            for x in x1..=x2 {
+            for x in x1..(x2 + 1) {
                 if x < self.framebuffer.info.width && y < self.framebuffer.info.height {
                     self.framebuffer.put_pixel(x, y, color);
                 }

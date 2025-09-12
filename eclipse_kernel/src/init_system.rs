@@ -584,7 +584,7 @@ impl InitSystem {
         }
 
         // Simular un tiempo de carga
-        for i in 1..=3 {
+        for i in 1..4 {
             unsafe {
                 // Logging removido temporalmente para evitar breakpoint
                 // Aquí podríamos mostrar un porcentaje real

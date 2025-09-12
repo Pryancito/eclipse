@@ -373,7 +373,7 @@ impl CacheOptimizer {
 
     /// Prefetch secuencial
     fn prefetch_sequential(&mut self, last_address: u64) {
-        for i in 1..=self.config.prefetch_distance {
+        for i in 1..(self.config.prefetch_distance + 1) {
             let prefetch_address = last_address + (i * self.config.cache_line_size);
             self.prefetch_address(prefetch_address);
         }
@@ -381,7 +381,7 @@ impl CacheOptimizer {
 
     /// Prefetch con stride
     fn prefetch_stride(&mut self, last_address: u64, stride: u64) {
-        for i in 1..=self.config.prefetch_distance {
+        for i in 1..(self.config.prefetch_distance + 1) {
             let prefetch_address = last_address + (i * stride);
             self.prefetch_address(prefetch_address);
         }

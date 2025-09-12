@@ -119,7 +119,7 @@ pub fn debug_reboot(reason: &str) {
     debug_error("REBOOT", "Reiniciando sistema en 5 segundos...");
     
     // Esperar 5 segundos
-    for i in (1..=5).rev() {
+    for i in (1..6).rev() {
         debug_error("REBOOT", &format!("Reiniciando en {}...", i));
         
         // Espera aproximada de 1 segundo

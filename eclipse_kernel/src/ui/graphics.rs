@@ -266,8 +266,8 @@ impl GraphicsContext {
     
     /// Rellenar un círculo
     pub fn fill_circle(&mut self, center_x: i32, center_y: i32, radius: i32) {
-        for y in -radius..=radius {
-            for x in -radius..=radius {
+        for y in -radius..(radius + 1) {
+            for x in -radius..(radius + 1) {
                 if x * x + y * y <= radius * radius {
                     self.draw_pixel(center_x + x, center_y + y);
                 }

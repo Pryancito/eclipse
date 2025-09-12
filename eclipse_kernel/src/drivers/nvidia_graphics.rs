@@ -45,11 +45,11 @@ impl NvidiaGeneration {
     /// Determinar generación basada en device ID
     pub fn from_device_id(device_id: u16) -> Self {
         match device_id {
-            0x13C0..=0x13FF => NvidiaGeneration::GTX900,
-            0x1B80..=0x1BFF => NvidiaGeneration::GTX1000,
-            0x1F08..=0x1FFF => NvidiaGeneration::GTX2000,
-            0x2504..=0x25FF => NvidiaGeneration::GTX3000,
-            0x2684..=0x26FF => NvidiaGeneration::GTX4000,
+            0x13C0..0x1400 => NvidiaGeneration::GTX900,
+            0x1B80..0x1C00 => NvidiaGeneration::GTX1000,
+            0x1F08..0x2000 => NvidiaGeneration::GTX2000,
+            0x2504..0x2600 => NvidiaGeneration::GTX3000,
+            0x2684..0x2700 => NvidiaGeneration::GTX4000,
             _ => NvidiaGeneration::Unknown,
         }
     }
