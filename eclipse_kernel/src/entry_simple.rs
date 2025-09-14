@@ -45,21 +45,12 @@ pub extern "C" fn uefi_entry(framebuffer_info: *const FramebufferInfo) -> ! {
     }
 
     // Llamar a la función principal del kernel
-    match crate::main_simple::kernel_main() {
-        Ok(_) => {
-            loop {
-
-                for _ in 0..100000 {
-                    core::hint::spin_loop();
-                }
-            }
-        }
-        Err(e) => {
-            loop {
-                for _ in 0..100000 {
-                    core::hint::spin_loop();
-                }
-            }
+    crate::main_simple::kernel_main();
+    
+    // El kernel_main ya tiene su propio bucle, pero por si acaso:
+    loop {
+        for _ in 0..100000 {
+            core::hint::spin_loop();
         }
     }
 }

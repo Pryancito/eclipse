@@ -83,20 +83,20 @@ impl InterruptManager {
     fn setup_pic(&self) -> Result<(), &'static str> {
         unsafe {
             // Inicializar PIC Master
-            asm!("out dx, al", in("dx") PIC_MASTER_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x20u8);  // Vector base 0x20
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x04u8);  // Slave en IRQ2
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") PIC_ICW4_8086);
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x20u8);  // Vector base 0x20
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x04u8);  // Slave en IRQ2
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") PIC_ICW4_8086);
 
             // Inicializar PIC Slave
-            asm!("out dx, al", in("dx") PIC_SLAVE_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x28u8);  // Vector base 0x28
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x02u8);  // Slave ID
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") PIC_ICW4_8086);
+            core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
+            core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x28u8);  // Vector base 0x28
+            core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x02u8);  // Slave ID
+            core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") PIC_ICW4_8086);
 
             // Configurar máscaras de interrupciones
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0xFCu8);  // Habilitar timer y keyboard
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0xFFu8);   // Deshabilitar todas las interrupciones del slave
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0xFCu8);  // Habilitar timer y keyboard
+            core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0xFFu8);   // Deshabilitar todas las interrupciones del slave
         }
         
         Ok(())
@@ -112,11 +112,11 @@ impl InterruptManager {
 
         unsafe {
             // Configurar canal 0 del PIT
-            asm!("out dx, al", in("dx") PIT_COMMAND, in("al") PIT_BOTH | PIT_MODE3 | PIT_BCD);
+            core::arch::asm!("out dx, al", in("dx") PIT_COMMAND, in("al") PIT_BOTH | PIT_MODE3 | PIT_BCD);
             
             // Establecer divisor
-            asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") (divisor & 0xFF) as u8);
-            asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") ((divisor >> 8) & 0xFF) as u8);
+            core::arch::asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") (divisor & 0xFF) as u8);
+            core::arch::asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") ((divisor >> 8) & 0xFF) as u8);
         }
         
         Ok(())
@@ -125,14 +125,14 @@ impl InterruptManager {
     /// Habilitar interrupciones
     fn enable_interrupts(&self) {
         unsafe {
-            asm!("sti", options(nomem, nostack));
+            core::arch::asm!("sti", options(nomem, nostack));
         }
     }
 
     /// Deshabilitar interrupciones
     pub fn disable_interrupts(&self) {
         unsafe {
-            asm!("cli", options(nomem, nostack));
+            core::arch::asm!("cli", options(nomem, nostack));
         }
     }
 
@@ -141,10 +141,10 @@ impl InterruptManager {
         unsafe {
             if irq >= 8 {
                 // EOI para slave
-                asm!("out dx, al", in("dx") PIC_SLAVE_COMMAND, in("al") PIC_EOI);
+                core::arch::asm!("out dx, al", in("dx") PIC_SLAVE_COMMAND, in("al") PIC_EOI);
             }
             // EOI para master
-            asm!("out dx, al", in("dx") PIC_MASTER_COMMAND, in("al") PIC_EOI);
+            core::arch::asm!("out dx, al", in("dx") PIC_MASTER_COMMAND, in("al") PIC_EOI);
         }
     }
 

@@ -51,6 +51,7 @@ pub mod serial;  // Controlador del puerto serie
 pub mod logger;  // Sistema de logging con puerto serie
 // pub mod real_integration;  // Integración real kernel-systemd (deshabilitado temporalmente)
 pub mod main_simple;
+// Módulo ai_font_generator removido
 pub mod main_unified;  // Main unificado con funcionalidades de escritorio
 pub mod main_with_init;  // Main con integración systemd
 pub mod entry_simple;  // Punto de entrada UEFI

@@ -128,18 +128,11 @@ pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
             fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
         );
 
-        core::arch::asm!(
-            "call {kernel_call}",
-            kernel_call = sym kernel_call,
-        );
+        // Llamar directamente a la función principal del kernel
+        kernel_main();
 
         loop {
             core::hint::spin_loop();
         }
     }
-}
-
-unsafe fn kernel_call() -> Result<(), Box<dyn Error>> {
-    kernel_main()?;
-    Ok(())
 }

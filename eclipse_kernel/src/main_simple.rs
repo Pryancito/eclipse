@@ -17,14 +17,35 @@ use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
 use crate::serial;
 
+
 use crate::drivers::framebuffer::{init_framebuffer, init_hardware_acceleration,
         has_hardware_acceleration, get_acceleration_type,
         get_hardware_acceleration_info, hardware_fill,
         write_text, clear_screen, draw_rounded_rect,
         is_framebuffer_available, Color, get_framebuffer,
-        FramebufferInfo
+        FramebufferInfo, FramebufferDriver
 };
+// Módulo ai_font_generator removido
 use crate::drivers::pci::{GpuType, GpuInfo};
+
+/// Estructura para representar un carácter en una fuente
+#[derive(Debug, Clone, Copy)]
+pub struct CharBitmap {
+    pub width: u8,
+    pub height: u8,
+    pub data: [u8; 8], // Bitmap del carácter (8 bytes binarios)
+}
+
+/// Estructura para representar una fuente completa
+#[derive(Debug, Clone)]
+pub struct BitmapFont {
+    pub name: String,
+    pub size: u8,
+    pub char_width: u8,
+    pub char_height: u8,
+    pub chars: [CharBitmap; 256], // Tabla de caracteres ASCII
+}
+
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> &'static str {
     // Para simplificar, devolveremos strings fijos para números comunes
@@ -56,41 +77,26 @@ fn detect_graphics_hardware() -> crate::hardware_detection::GraphicsMode {
     result.graphics_mode
 }
 /// Función principal del kernel
-pub fn kernel_main() -> Result<(), Box<dyn Error>> {
-    // El allocador ya fue inicializado en _start()
-    // Solo inicializar el sistema de logging (ya inicializado en _start())
-    // Logging removido temporalmente para evitar breakpoint
-    let gpu_info = GpuInfo {
-        pci_device: crate::drivers::pci::PciDevice {
-            bus: 0,
-            device: 2,
-            function: 0,
-            vendor_id: 0x10DE,
-            device_id: 0x13C0,
-            class_code: 0x03,
-            subclass_code: 0x00,
-            prog_if: 0x00,
-            revision_id: 0x00,
-            header_type: 0x00,
-            status: 0x0010,
-            command: 0x0007,
-        },
-        gpu_type: GpuType::Nvidia, // Simular Intel Graphics
-        memory_size: 1024 * 1024 * 1024 * 8, // 8GB
-        is_primary: true,
-        supports_2d: true,
-        supports_3d: true,
-        max_resolution: (3840, 2160),
-    };
-    // Inicializar aceleración de hardware
-    init_hardware_acceleration(&gpu_info);
-    if let Some(fb) = get_framebuffer() {
-        unsafe {
-            draw_direct_fallback(*fb.get_info());
+pub fn kernel_main() {
+    unsafe {
+        if let Some(fb) = get_framebuffer() {            
+            // Limpiar pantalla con color negro UNA VEZ
+            fb.clear_screen(Color::WHITE);
+            fb.draw_char(50, 50, 'A', Color::SEMI_TRANSPARENT_BLACK);
+            //draw_character_direct(&fb, 50, 50, 'A', Color::WHITE);
+            //draw_text_direct(&fb, 50, 50, "A", Color::WHITE);
+            //draw_character_direct(&fb, 58, 50, 'Z', Color::WHITE);
         }
-    } else {
-        panic!("Framebuffer not initialized");
+
+        loop {
+            // Pausa muy larga para evitar consumo excesivo de CPU
+            for _ in 0..1000000 {
+                core::hint::spin_loop();
+            }
+        }
     }
+    /*
+    // El dibujo del framebuffer se movió al bucle principal para evitar parpadeo
     // Usar nuevo sistema de detección con verificación de allocador
     use crate::hardware_detection::HardwareDetector;
 
@@ -373,29 +379,54 @@ pub fn kernel_main() -> Result<(), Box<dyn Error>> {
     let mut init_system = InitSystem::new();
     init_system.initialize();
     init_system.execute_init();
-    // Mantener el kernel ejecutándose
-    loop {
-        // Procesar eventos del sistema de entrada
-        if let Err(_) = input_system.process_events() {}
-        if let Err(_) = desktop_renderer.render_desktop() {}
+    // Dibujar elementos UNA SOLA VEZ al inicio
+    if let Some(fb) = get_framebuffer() {
+        unsafe {
+            let fb_info = *fb.get_info();
+            
+            // Limpiar pantalla con color negro UNA VEZ
+            clear_screen_direct(&fb_info, Color::BLACK);
+            
+            draw_character_direct(&fb_info, 10, 10, 'A', Color::WHITE);
 
-        // Procesar eventos en la GUI
-        while let Some(event) = input_system.get_next_event() {
-            if let Err(_) = gui_manager.process_input_event(&event) {}
-            if let Err(_) = app_manager.process_input(&event) {}
-        }
-
-        // Renderizar GUI y aplicaciones
-        if let Err(_) = gui_manager.render(&mut acceleration_2d) {}
-        if let Err(_) = app_manager.render(&mut acceleration_2d) {}
-
-        // Pequeña pausa para no consumir toda la CPU - VERSION SIMPLIFICADA
-        for _ in 0..1000 {
-            // VERSION SIMPLIFICADA: Evitar spin_loop() que puede causar Invalid Opcode
-            // En lugar de usar core::hint::spin_loop(), usamos un loop vacío simple
-            // que es más compatible con diferentes entornos de emulación
+            // Dibujar texto "Hola Eclipse OS!" con efectos
+            draw_text_advanced_direct(&fb_info, 10, 10, "Hola Eclipse OS!", 
+                                    Color::WHITE, 
+                                    Some(Color::new(0, 0, 0, 128)), // Sombra negra
+                                    Some(Color::new(0, 0, 255, 255))); // Contorno azul
+            
+            // Dibujar algunos rectángulos de colores para demostrar las funciones
+            draw_rect_direct(&fb_info, 50, 50, 200, 100, Color::RED);
+            draw_rect_direct(&fb_info, 300, 50, 200, 100, Color::GREEN);
+            draw_rect_direct(&fb_info, 550, 50, 200, 100, Color::BLUE);
+            
+            // Dibujar más texto con diferentes efectos
+            draw_text_advanced_direct(&fb_info, 10, 200, "Sistema de Graficos Moderno", 
+                                    Color::CYAN, 
+                                    Some(Color::new(0, 0, 0, 64)), // Sombra sutil
+                                    None); // Sin contorno
+            
+            draw_text_advanced_direct(&fb_info, 10, 220, "Funciones Hibridas Funcionando!", 
+                                    Color::YELLOW, 
+                                    None, // Sin sombra
+                                    Some(Color::new(255, 0, 0, 255))); // Contorno rojo
+            
+            // Demostrar diferentes caracteres
+            draw_text_direct(&fb_info, 10, 250, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", Color::GREEN);
+            draw_text_direct(&fb_info, 10, 270, "abcdefghijklmnopqrstuvwxyz", Color::MAGENTA);
+            draw_text_direct(&fb_info, 10, 290, "0123456789!@#$%^&*()", Color::ORANGE);
+            
         }
     }
+
+    // Mantener el kernel ejecutándose SIN REDIBUJAR
+    // Solo bucle infinito sin tocar el framebuffer
+    loop {
+        // Pausa muy larga para evitar consumo excesivo de CPU
+        for _ in 0..1000000 {
+            core::hint::spin_loop();
+        }
+    }*/
 }
 
 /// Dibujar interfaz principal del kernel
@@ -436,7 +467,7 @@ fn draw_interface() {
     write_text(20, 240, "Sistema listo - Presiona cualquier tecla para continuar", Color::LIGHT_GRAY).unwrap_or_default();
 }
 
-/// Dibujo directo en memoria del framebuffer
+/*
 unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
     
     let fb_ptr = fb_info.base_address as *mut u32;
@@ -480,4 +511,4 @@ unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
             }
         }
     }
-}
+}*/
