@@ -7,8 +7,7 @@ use core::ptr;
 use crate::paging::{PagingManager, setup_userland_paging};
 use crate::gdt::{GdtManager, setup_userland_gdt};
 use crate::idt::{IdtManager, setup_userland_idt};
-use crate::interrupts::{InterruptManager, setup_userland_interrupts};
-use crate::serial;
+// use crate::interrupts::{InterruptManager, setup_userland_interrupts};  // TEMPORALMENTE DESHABILITADO
 
 /// Contexto de ejecución de un proceso
 #[derive(Debug, Clone)]

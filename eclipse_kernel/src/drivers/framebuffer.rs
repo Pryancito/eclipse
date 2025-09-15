@@ -1535,12 +1535,8 @@ impl FramebufferDriver {
             return ptr::null_mut();
         }
 
-        // Determinar bytes por pixel basado en el formato
-        let bytes_per_pixel = match self.info.pixel_format {
-            0 | 1 => 3, // RGB888, BGR888
-            2 | 3 => 4, // RGBA8888, BGRA8888
-            _ => 4,     // Por defecto 4 bytes
-        };
+        // Usar la función bytes_per_pixel() para consistencia
+        let bytes_per_pixel = self.bytes_per_pixel() as u32;
 
         // Verificar que no haya overflow en el cálculo del offset
         let scan_line_bytes = match self.info.pixels_per_scan_line.checked_mul(bytes_per_pixel) {
@@ -1571,45 +1567,88 @@ impl FramebufferDriver {
         unsafe { self.buffer.offset(total_offset as isize) }
     }
     
-    /// Escribir un pixel de forma segura
-    pub fn put_pixel(&mut self, x: u32, y: u32, color: Color) {
-        // Las validaciones de inicialización y coordenadas ya son correctas.
-        if !self.is_initialized || x >= self.info.width || y >= self.info.height {
-            return;
-        }
+    /// Llenar rectángulo con color
+    pub fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: Color) {
+        let end_x = core::cmp::min(x + width, self.info.width);
+        let end_y = core::cmp::min(y + height, self.info.height);
         
-        // Obtener el puntero al píxel y el formato de forma centralizada.
-        let pixel_ptr = self.get_pixel_ptr(x, y);
-        if pixel_ptr.is_null() {
+        for py in y..end_y {
+            for px in x..end_x {
+                self.put_pixel(px, py, color);
+            }
+        }
+    }
+    
+    /// Limpiar pantalla con color
+    /// Limpia toda la pantalla con el color especificado.
+    /// Limpiar la pantalla con un color específico (estilo wgpu moderno)
+    /// 
+    /// # Argumentos
+    /// * `color` - Color con el que limpiar la pantalla
+    /// 
+    /// # Ejemplo
+    /// ```rust
+    /// framebuffer.clear_screen(Color::BLACK);
+    /// framebuffer.clear_screen(Color::rgb(64, 128, 255));
+    /// ```
+    pub fn clear_screen(&mut self, color: Color) {
+        let width = self.info.width;
+        let height = self.info.height;
+        
+        // Limpiar pantalla línea por línea para mejor rendimiento
+        for x in 0..height {
+            for y in 0..width {
+                self.put_pixel(x, y, color);
+            }
+        }
+    }
+
+    pub fn draw_character(&mut self, x: u32, y: u32, ch: char, color: Color) {
+        let fb_width = self.info.width;
+        let fb_height = self.info.height;
+
+        // Buscar el bitmap correspondiente al carácter en FONT_DATA, que es un array de tuplas (char, [u8; 8])
+        let char_bitmap: [u8; 8] = *FONT_DATA
+            .iter()
+            .find(|(c, _)| *c == ch)
+            .map(|(_, bitmap)| bitmap)
+            .unwrap_or(&[0; 8]);
+
+        for i in 0..64 {
+            let px = i / 8;
+            let py = i % 8;
+            if (char_bitmap[px] & (1 << (7 - py))) != 0 {
+                let pixel_x = x + px as u32;
+                let pixel_y = y + py as u32;
+                if pixel_x < fb_width && pixel_y < fb_height {
+                    self.put_pixel(pixel_x, pixel_y, color);
+                }
+            }
+        }
+    }
+    
+    pub fn draw_text(&mut self, x: u32, y: u32, text: &str, color: Color) {
+        let mut current_x = x;
+        let char_width = 8;
+        
+        for ch in text.chars() {
+            if current_x + char_width > self.info.width {
+                break; 
+            }
+            self.draw_character(current_x, y, ch, color);
+            current_x += char_width;
+        }
+    }
+
+    pub fn put_pixel(&mut self, x: u32, y: u32, color: Color) {
+        // ✅ VALIDACIÓN: Verificar que el framebuffer esté inicializado
+        if !self.is_initialized {
             return;
         }
-    
-        // Convertir el color a un valor de 32 bits y determinar los bytes a escribir
-        let bytes_per_pixel = self.bytes_per_pixel();
-        let pixel_value = self.color_to_pixel(color);
         
         unsafe {
-            match bytes_per_pixel {
-                1 => {
-                    let p = pixel_ptr as *mut u8;
-                    core::ptr::write_volatile(p, pixel_value as u8);
-                },
-                2 => {
-                    let p = pixel_ptr as *mut u16;
-                    core::ptr::write_volatile(p, pixel_value as u16);
-                },
-                3 => {
-                    // Escribir 3 bytes eficientemente sin 3 llamadas separadas.
-                    let p = pixel_ptr as *mut u8;
-                    let color_bytes = pixel_value.to_le_bytes(); // Convertir a un array de bytes
-                    core::ptr::copy_nonoverlapping(color_bytes.as_ptr(), p, 3);
-                },
-                4 => {
-                    let p = pixel_ptr as *mut u32;
-                    core::ptr::write_volatile(p, pixel_value);
-                },
-                _ => { /* No hacer nada para formatos no soportados */ },
-            }
+            let fb_ptr = self.info.base_address as *mut u32;
+            core::ptr::write_volatile(fb_ptr.add((x * self.info.width + y) as usize), color.to_u32());
         }
     }
     
@@ -1701,47 +1740,6 @@ impl FramebufferDriver {
                 Color::new(r, g, b, 255)
             },
             _ => Color::BLACK, // Formato desconocido
-        }
-    }
-    
-    /// Llenar rectángulo con color
-    pub fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: Color) {
-        let end_x = core::cmp::min(x + width, self.info.width);
-        let end_y = core::cmp::min(y + height, self.info.height);
-        
-        for py in y..end_y {
-            for px in x..end_x {
-                self.put_pixel(px, py, color);
-            }
-        }
-    }
-    
-    /// Limpiar pantalla con color
-    /// Limpia toda la pantalla con el color especificado.
-    /// Limpiar la pantalla con un color específico (estilo wgpu moderno)
-    /// 
-    /// # Argumentos
-    /// * `color` - Color con el que limpiar la pantalla
-    /// 
-    /// # Ejemplo
-    /// ```rust
-    /// framebuffer.clear_screen(Color::BLACK);
-    /// framebuffer.clear_screen(Color::rgb(64, 128, 255));
-    /// ```
-    pub fn clear_screen(&mut self, color: Color) {
-        let fb_ptr = self.info.base_address as *mut u32;
-        let width = self.info.width.min(1280);
-        let height = self.info.height.min(720);
-        
-        // Limpiar pantalla línea por línea para mejor rendimiento
-        for y in 0..height {
-            for x in 0..width {
-                let offset = (y * width + x) as isize;
-                unsafe {
-                    core::ptr::write_volatile(fb_ptr.add(offset as usize), color.to_u32());
-                }
-                
-            }
         }
     }
 
@@ -2114,24 +2112,8 @@ impl FramebufferDriver {
         let bytes_per_pixel = self.bytes_per_pixel();
         let pitch = self.pitch();
         
-        // Convertir color a pixel una sola vez
-        let pixel_value = match self.info.pixel_format {
-            0 => { // RGB888
-                ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32)
-            },
-            1 => { // BGR888
-                ((color.b as u32) << 16) | ((color.g as u32) << 8) | (color.r as u32)
-            },
-            2 => { // RGBA8888
-                ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32) | ((color.a as u32) << 24)
-            },
-            3 => { // BGRA8888
-                ((color.b as u32) << 16) | ((color.g as u32) << 8) | (color.r as u32) | ((color.a as u32) << 24)
-            },
-            _ => { // Por defecto RGBA8888
-                ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32) | ((color.a as u32) << 24)
-            }
-        };
+        // Usar la función color_to_pixel para consistencia
+        let pixel_value = self.color_to_pixel(color);
         
         unsafe {
             for py in y..end_y {
@@ -2163,44 +2145,6 @@ impl FramebufferDriver {
                         }
                     },
                     _ => {},
-                }
-            }
-        }
-    }
-    
-    /// Dibuja un carácter usando un enfoque optimizado tipo wgpu (batch por scanline)
-    pub fn draw_char(&mut self, x: u32, y: u32, ch: char, color: Color) {
-        let fb_ptr = self.info.base_address as *mut u32;
-        let fb_width = self.info.width;
-        let fb_height = self.info.height;
-
-        // We get the character bitmap by searching the global font data.
-        /*let char_bitmap = FONT_DATA.iter()
-            .find(|(c, _)| c == &ch)
-            .map(|(_, bitmap)| bitmap)
-            .unwrap_or(&[1; 8]);*/
-
-        let char_bitmap: [u8; 8] = [0b00011000, 0b00100100, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b00000000];
-        
-        // The rest of the drawing logic remains the same.
-        // Versión corregida y optimizada del renderizado de caracteres 8x8
-        for py in 0..8 {
-            let pixel_y = y + py as u32;
-            if pixel_y >= fb_height {
-                self.draw_line(x as i32, y as i32, 100, 100, Color::RED);
-                continue;
-            }
-            for px in 0..8 {
-                if (char_bitmap[py] & (1u8 << (7 - px))) != 0 {
-                    let pixel_x = x + px as u32;
-                    if pixel_x < fb_width {
-                        let offset = (pixel_y * fb_width + pixel_x) as usize;
-                        unsafe {
-                            core::ptr::write_volatile(fb_ptr.add(offset), color.to_u32());
-                        }
-                    }
-                } else {
-                    self.draw_line(x as i32, y as i32, 150, 150, Color::GREEN);
                 }
             }
         }
@@ -2258,9 +2202,8 @@ impl FramebufferDriver {
     
     /// Dibujar línea usando algoritmo de Bresenham
     pub fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color) {
-        let fb_ptr = self.info.base_address as *mut u32;
-        let fb_width = self.info.width.min(1280);
-        let fb_height = self.info.height.min(720);
+        let fb_width = self.info.width;
+        let fb_height = self.info.height;
 
         // Algoritmo de Bresenham para dibujar una línea
         let mut x = x1 as i32;
@@ -2276,10 +2219,7 @@ impl FramebufferDriver {
 
         loop {
             if x >= 0 && (x as u32) < fb_width && y >= 0 && (y as u32) < fb_height {
-                let offset = (y as u32 * fb_width + x as u32) as isize;
-                unsafe {
-                    core::ptr::write_volatile(fb_ptr.add(offset as usize), color.to_u32());
-                }
+                self.put_pixel(x as u32, y as u32, color);
             }
             if x == x2 && y == y2 {
                 break;
@@ -2298,25 +2238,11 @@ impl FramebufferDriver {
     
     /// Dibujar rectángulo
     pub fn draw_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: Color) {
-        let fb_ptr = self.info.base_address as *mut u32;
-        let fb_width = self.info.width.min(1280);
-        let fb_height = self.info.height.min(720);
-        
-        // Convertir color a formato de pixel
-        let pixel_value = match self.info.pixel_format {
-            0 | 1 => (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16),
-            2 | 3 => (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16) | ((color.a as u32) << 24),
-            _ => (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16) | ((color.a as u32) << 24),
-        };
-        
         // Dibujar rectángulo
         for py in y..y + height {
             for px in x..x + width {
-                if px < fb_width && py < fb_height {
-                    let offset = (py * fb_width + px) as isize;
-                    unsafe {
-                        core::ptr::write_volatile(fb_ptr.add(offset as usize), pixel_value);
-                    }
+                if px < self.info.width && py < self.info.height {
+                    self.put_pixel(px, py, color);
                 }
             }
         }
@@ -2354,7 +2280,7 @@ impl FramebufferDriver {
                 break; // Salir si no cabe más texto
             }
 
-            self.draw_char(current_x, y, ch, color);
+            self.draw_character(current_x, y, ch, color);
             current_x += char_width;
         }
     }
@@ -3846,24 +3772,9 @@ impl FramebufferDriver {
         }
     }
     
-    pub fn draw_text(&mut self, x: u32, y: u32, text: &str, color: Color) {
-        let mut current_x = x;
-        let char_width = 8;
-        let char_height = 8;
-
-        for ch in text.chars() {
-            if current_x + char_width > self.info.width {
-                break; // Salir si no cabe más texto
-            }
-
-            self.draw_char(current_x, y, ch, color);
-            current_x += char_width;
-        }
-    }
-    
-    pub fn draw_character(&mut self, x: u32, y: u32, character: char, color: Color) {
+    /*pub fn draw_character(&mut self, x: u32, y: u32, character: char, color: Color) {
         self.draw_char(x, y, character, color);
-    }
+    }*/
     
     /// Dibujar texto simple (compatible con la API existente)
     pub fn draw_text_simple(&mut self, x: u32, y: u32, text: &str, color: Color) {

@@ -4,7 +4,6 @@
 
 use core::mem;
 use core::arch::asm;
-use crate::serial;
 
 /// Flags de descriptor de interrupción
 pub const IDT_PRESENT: u16 = 1 << 15;

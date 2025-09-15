@@ -5,7 +5,6 @@
 use core::ptr;
 use core::mem;
 use core::arch::asm;
-use crate::serial;
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: u64 = 0x1000;
 

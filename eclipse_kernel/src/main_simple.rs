@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt::Result as FmtResult;
 use core::error::Error;
+use core::fmt::Write;
 
 use core::panic::PanicInfo;
 use alloc::format;
@@ -15,36 +16,13 @@ use alloc::string::String;
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
-use crate::serial;
 
 
-use crate::drivers::framebuffer::{init_framebuffer, init_hardware_acceleration,
-        has_hardware_acceleration, get_acceleration_type,
-        get_hardware_acceleration_info, hardware_fill,
-        write_text, clear_screen, draw_rounded_rect,
-        is_framebuffer_available, Color, get_framebuffer,
-        FramebufferInfo, FramebufferDriver
+use crate::drivers::framebuffer::{Color, get_framebuffer,
+    FramebufferDriver, FramebufferInfo, clear_screen
 };
 // Módulo ai_font_generator removido
 use crate::drivers::pci::{GpuType, GpuInfo};
-
-/// Estructura para representar un carácter en una fuente
-#[derive(Debug, Clone, Copy)]
-pub struct CharBitmap {
-    pub width: u8,
-    pub height: u8,
-    pub data: [u8; 8], // Bitmap del carácter (8 bytes binarios)
-}
-
-/// Estructura para representar una fuente completa
-#[derive(Debug, Clone)]
-pub struct BitmapFont {
-    pub name: String,
-    pub size: u8,
-    pub char_width: u8,
-    pub char_height: u8,
-    pub chars: [CharBitmap; 256], // Tabla de caracteres ASCII
-}
 
 /// Función para convertir números a string
 fn int_to_string(mut num: u64) -> &'static str {
@@ -65,10 +43,6 @@ fn int_to_string(mut num: u64) -> &'static str {
     }
 }
 
-use core::fmt::Write;
-
-// Usar GraphicsMode del módulo hardware_detection para evitar duplicación
-
 // Función para detectar hardware gráfico (usando nuevo sistema PCI)
 fn detect_graphics_hardware() -> crate::hardware_detection::GraphicsMode {
     use crate::hardware_detection::detect_graphics_hardware;
@@ -78,23 +52,41 @@ fn detect_graphics_hardware() -> crate::hardware_detection::GraphicsMode {
 }
 /// Función principal del kernel
 pub fn kernel_main() {
-    unsafe {
-        if let Some(fb) = get_framebuffer() {            
-            // Limpiar pantalla con color negro UNA VEZ
-            fb.clear_screen(Color::WHITE);
-            fb.draw_char(50, 50, 'A', Color::SEMI_TRANSPARENT_BLACK);
-            //draw_character_direct(&fb, 50, 50, 'A', Color::WHITE);
-            //draw_text_direct(&fb, 50, 50, "A", Color::WHITE);
-            //draw_character_direct(&fb, 58, 50, 'Z', Color::WHITE);
+    // Verificar si hay framebuffer disponible
+    if let Some(fb) = get_framebuffer() {
+        // Verificar que el framebuffer esté inicializado
+        if fb.is_initialized() {
+            // Intentar acceso directo a la memoria del framebuffer
+            //let fb_info = &fb.info;
+            
+            // Limpiar pantalla usando acceso directo a memoria
+            //let fb_ptr = fb_info.base_address as *mut u32;
+            //let width = fb_info.width as usize;
+            //let height = fb_info.height as usize;
+            
+            // Dibujar algunos píxeles de prueba
+            //core::ptr::write_volatile(fb_ptr.add(10 * width + 10), 0x00FF0000); // Rojo
+            //core::ptr::write_volatile(fb_ptr.add(20 * width + 20), 0x0000FF00); // Verde
+            //core::ptr::write_volatile(fb_ptr.add(30 * width + 30), 0x000000FF); // Azul
+            fb.clear_screen(Color::BLACK);
+            // VERSIÓN SIMPLE: Solo dibujar un rectángulo para probar
+            //fb.draw_rect(50, 50, 100, 100, Color::WHITE);
+            // No usar draw_text ni draw_character por ahora para evitar Page Fault
+            //fb.draw_text(20, 20, "Hola Eclipse OS!", Color::WHITE);
+            fb.draw_character(20, 20, 'H', Color::WHITE);
+            fb.draw_character(20, 28, 'o', Color::WHITE);
+            fb.draw_character(20, 36, 'l', Color::WHITE);
+            fb.draw_character(20, 44, 'a', Color::WHITE);
         }
-
+    }
+    unsafe {
         loop {
-            // Pausa muy larga para evitar consumo excesivo de CPU
             for _ in 0..1000000 {
                 core::hint::spin_loop();
             }
         }
     }
+}
     /*
     // El dibujo del framebuffer se movió al bucle principal para evitar parpadeo
     // Usar nuevo sistema de detección con verificación de allocador
@@ -426,11 +418,10 @@ pub fn kernel_main() {
         for _ in 0..1000000 {
             core::hint::spin_loop();
         }
-    }*/
-}
+    }
+}*/
 
-/// Dibujar interfaz principal del kernel
-fn draw_interface() {
+/*fn draw_interface() {
     // Título principal con fondo redondeado
     draw_rounded_rect(10, 10, 400, 60, 10, Color::new(30, 30, 60, 255)).unwrap_or_default();
     write_text(20, 30, "Eclipse OS Kernel", Color::WHITE).unwrap_or_default();
@@ -467,7 +458,7 @@ fn draw_interface() {
     write_text(20, 240, "Sistema listo - Presiona cualquier tecla para continuar", Color::LIGHT_GRAY).unwrap_or_default();
 }
 
-/*
+*/
 unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
     
     let fb_ptr = fb_info.base_address as *mut u32;
@@ -511,4 +502,4 @@ unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
             }
         }
     }
-}*/
+}

@@ -4,7 +4,6 @@
 
 use core::mem;
 use core::arch::asm;
-use crate::serial;
 /// Flags de descriptor de segmento
 pub const GDT_ACCESSED: u8 = 1 << 0;
 pub const GDT_READ_WRITE: u8 = 1 << 1;

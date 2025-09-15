@@ -3,7 +3,6 @@
 //! Implementa paginación de 4 niveles (PML4, PDPT, PD, PT)
 
 use crate::memory::manager::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
-use crate::serial;
 /// Estructura para manejar la paginación
 pub struct PagingSystem {
     /// Tabla de páginas de nivel 4 (PML4)

@@ -4,7 +4,6 @@
 //! ejecutando eclipse-systemd como PID 1
 
 use core::fmt::Write;
-use crate::serial;
 use crate::elf_loader::{ElfLoader, load_eclipse_systemd};
 use crate::process_memory::{ProcessMemoryManager, setup_eclipse_systemd_memory};
 use crate::process_transfer::{ProcessTransfer, ProcessContext, transfer_to_eclipse_systemd};

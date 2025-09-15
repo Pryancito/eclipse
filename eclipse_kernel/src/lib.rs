@@ -46,9 +46,7 @@ pub mod process_memory;  // Gestión de memoria para procesos
 pub mod paging;  // Sistema de paginación
 pub mod gdt;  // Global Descriptor Table
 pub mod idt;  // Interrupt Descriptor Table
-pub mod interrupts;  // Gestión de interrupciones y timers
-pub mod serial;  // Controlador del puerto serie
-pub mod logger;  // Sistema de logging con puerto serie
+// pub mod interrupts;  // Gestión de interrupciones y timers - TEMPORALMENTE DESHABILITADO
 // pub mod real_integration;  // Integración real kernel-systemd (deshabilitado temporalmente)
 pub mod main_simple;
 // Módulo ai_font_generator removido

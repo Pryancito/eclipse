@@ -3,7 +3,6 @@
 
 use core::fmt::Write;
 use crate::drivers::framebuffer::{FramebufferDriver, Color as FbColor};
-use crate::serial;
 
 // Tipos básicos para el escritorio
 #[derive(Debug, Clone, Copy, PartialEq)]
