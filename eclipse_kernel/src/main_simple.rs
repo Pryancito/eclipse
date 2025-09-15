@@ -21,70 +21,90 @@ use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
 use crate::drivers::framebuffer::{Color, get_framebuffer,
     FramebufferDriver, FramebufferInfo, clear_screen
 };
+use crate::ai_typing_system::{AiTypingSystem, AiTypingConfig, TypingEffect,
+    create_ai_typing_system};
 // Módulo ai_font_generator removido
 use crate::drivers::pci::{GpuType, GpuInfo};
+use crate::hardware_detection::{GraphicsMode, detect_graphics_hardware};
 
-/// Función para convertir números a string
-fn int_to_string(mut num: u64) -> &'static str {
-    // Para simplificar, devolveremos strings fijos para números comunes
-    match num {
-        0 => "0",
-        1 => "1",
-        2 => "2",
-        3 => "3",
-        4 => "4",
-        5 => "5",
-        6 => "6",
-        7 => "7",
-        8 => "8",
-        9 => "9",
-        10 => "10",
-        _ => "N/A", // Para números más grandes
-    }
-}
-
-// Función para detectar hardware gráfico (usando nuevo sistema PCI)
-fn detect_graphics_hardware() -> crate::hardware_detection::GraphicsMode {
-    use crate::hardware_detection::detect_graphics_hardware;
-
-    let result = detect_graphics_hardware();
-    result.graphics_mode
-}
 /// Función principal del kernel
 pub fn kernel_main() {
     // Verificar si hay framebuffer disponible
     if let Some(fb) = get_framebuffer() {
-        // Verificar que el framebuffer esté inicializado
-        if fb.is_initialized() {
-            // Intentar acceso directo a la memoria del framebuffer
-            //let fb_info = &fb.info;
-            
-            // Limpiar pantalla usando acceso directo a memoria
-            //let fb_ptr = fb_info.base_address as *mut u32;
-            //let width = fb_info.width as usize;
-            //let height = fb_info.height as usize;
-            
-            // Dibujar algunos píxeles de prueba
-            //core::ptr::write_volatile(fb_ptr.add(10 * width + 10), 0x00FF0000); // Rojo
-            //core::ptr::write_volatile(fb_ptr.add(20 * width + 20), 0x0000FF00); // Verde
-            //core::ptr::write_volatile(fb_ptr.add(30 * width + 30), 0x000000FF); // Azul
-            fb.clear_screen(Color::BLACK);
-            // VERSIÓN SIMPLE: Solo dibujar un rectángulo para probar
-            //fb.draw_rect(50, 50, 100, 100, Color::WHITE);
-            // No usar draw_text ni draw_character por ahora para evitar Page Fault
-            //fb.draw_text(20, 20, "Hola Eclipse OS!", Color::WHITE);
-            fb.draw_character(20, 20, 'H', Color::WHITE);
-            fb.draw_character(20, 28, 'o', Color::WHITE);
-            fb.draw_character(20, 36, 'l', Color::WHITE);
-            fb.draw_character(20, 44, 'a', Color::WHITE);
-        }
-    }
-    unsafe {
-        loop {
-            for _ in 0..1000000 {
-                core::hint::spin_loop();
+        match detect_graphics_hardware().graphics_mode {
+            GraphicsMode::Framebuffer => {
+                fb.clear_screen(Color::BLACK);
+            }
+            GraphicsMode::VGA => {
+                fb.clear_screen(Color::BLACK);
+            }
+            GraphicsMode::HardwareAccelerated => {
+                use crate::drivers::pci::PciDevice;
+                use crate::drivers::pci::GpuInfo;
+                use crate::drivers::pci::GpuType;
+                use crate::drivers::pci::PciManager;
+                let mut pci_manager = PciManager::new();
+                pci_manager.scan_devices_safe();
+                let gpu_info = pci_manager.get_primary_gpu();
+                let Some(gpu_info) = gpu_info else {
+                    panic!("No se pudo crear la GPU info");
+                };
+                fb.clear_screen(Color::BLACK);
+                fb.init_hardware_acceleration(gpu_info);
             }
         }
+
+        // Crear sistema de AI para escritura
+        let mut ai_system = create_ai_typing_system();
+        
+        // Configurar efecto de escritura
+        let mut config = AiTypingConfig::default();
+        config.effect = TypingEffect::Typewriter;
+        config.color = Color::WHITE;
+        ai_system.set_config(config);
+        
+        // Escribir mensaje especial con efecto rainbow
+        let special_message = String::from("Eclipse OS Kernel con AI");
+        ai_system.write_message(fb, &special_message);
+        
+        // Demostrar función optimizada directa
+        ai_system.set_position(20, 200);
+        ai_system.write_message_direct(fb, "Funcion optimizada con punteros directos");
+        
+        // Escribir mensaje de bienvenida
+        ai_system.write_welcome_message(fb);
+        
+        // Escribir mensajes del sistema
+        ai_system.write_system_message(fb, 0); // "Cargando sistema de archivos..."
+        ai_system.write_system_message(fb, 1); // "Inicializando drivers de hardware..."
+        ai_system.write_system_message(fb, 2); // "Configurando red..."
+        
+        // Escribir mensaje de éxito
+        ai_system.write_success_message(fb, 0); // "Operacion completada exitosamente"
+        
+        // Cambiar a efecto rainbow para mensaje especial
+        let mut rainbow_config = AiTypingConfig::default();
+        rainbow_config.effect = TypingEffect::Rainbow;
+        ai_system.set_config(rainbow_config);
+         unsafe {
+             loop {
+                 // Sistema de aprendizaje continuo de la IA
+                 ai_system.feed_framebuffer(fb);
+                 
+                 // Aprendizaje adaptativo avanzado
+                 ai_system.adaptive_learning(fb);
+                 
+                 // Mostrar estadísticas de aprendizaje
+                 ai_system.display_learning_stats(fb);
+                 
+                 // Pausa optimizada para el loop
+                 for _ in 0..100000 {
+                     core::hint::spin_loop();
+                 }
+             }
+         }
+    } else {
+        panic!("No hay framebuffer disponible");
     }
 }
     /*

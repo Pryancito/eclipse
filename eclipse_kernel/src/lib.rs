@@ -63,6 +63,7 @@ pub mod ai_pretrained_models;  // Sistema de modelos de IA pre-entrenados
 pub mod ai_model_demo;  // Demostración de modelos de IA pre-entrenados
 pub mod ai_desktop_integration;  // Integración de IA con el escritorio
 pub mod ai_simple_demo;  // Demostración simple de IA
+pub mod ai_typing_system;  // Sistema de AI para escritura caracter por caracter
 // pub mod ai_services;  // Servicios de IA integrados - Módulo no implementado
 // pub mod ai_commands;  // Comandos de IA para el shell - Módulo no implementado
 // pub mod ai_shell;  // Shell integrado con comandos de IA - Módulo no implementado
