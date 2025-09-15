@@ -856,7 +856,7 @@ pub fn framebuffer_clear(color: Color) {
     use crate::drivers::framebuffer::{get_framebuffer, Color as FbColor};
     
     if let Some(ref mut fb) = get_framebuffer() {
-        let fb_color = convert_vga_to_framebuffer_color(color);
+        let fb_color: FbColor = convert_vga_to_framebuffer_color(color);
         fb.clear_screen(fb_color);
     }
 }

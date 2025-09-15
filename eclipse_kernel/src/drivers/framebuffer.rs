@@ -25,35 +25,35 @@ use crate::drivers::intel_graphics::{IntelGraphicsDriver, IntelDriverState};
 use crate::drivers::nvidia_graphics::{NvidiaGraphicsDriver, NvidiaDriverState};
 use crate::drivers::amd_graphics::{AmdGraphicsDriver, AmdDriverState};
 
-static FONT_DATA: [(u8, [u8; 8]); 26] = [
+static FONT_DATA: [(char, [u8; 8]); 88] = [
     // Your character-bitmap tuples
-    (65, [0b00011000, 0b00100100, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b00000000]),
-    (66, [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b00000000]),
-    (67, [0b00111100, 0b01000010, 0b01000000, 0b01000000, 0b01000000, 0b01000010, 0b00111100, 0b00000000]),
-    (68, [0b01111000, 0b01000100, 0b01000010, 0b01000010, 0b01000010, 0b01000100, 0b01111000, 0b00000000]),
-    (69, [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01111110, 0b00000000]),
-    (70, [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000]),
-    (71, [0b00111100, 0b01000010, 0b01000000, 0b01001110, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
-    (72, [0b01000010, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000]),
-    (73, [0b00111100, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00111100, 0b00000000]),
-    (74, [0b00011110, 0b00000100, 0b00000100, 0b00000100, 0b01000100, 0b01000100, 0b00111000, 0b00000000]),
-    (75, [0b01000010, 0b01000100, 0b01001000, 0b01110000, 0b01001000, 0b01000100, 0b01000010, 0b00000000]),
-    (76, [0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01111110, 0b00000000]),
-    (77, [0b01000010, 0b01100110, 0b01011010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00000000]),
-    (78, [0b01000010, 0b01100010, 0b01010010, 0b01001010, 0b01000110, 0b01000010, 0b01000010, 0b00000000]),
-    (79, [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
-    (80, [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000]),
-    (81, [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01001010, 0b01000100, 0b00111010, 0b00000000]),
-    (82, [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01001000, 0b01000100, 0b01000010, 0b00000000]),
-    (83, [0b00111100, 0b01000010, 0b01000000, 0b00111100, 0b00000010, 0b01000010, 0b00111100, 0b00000000]),
-    (84, [0b01111110, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00000000]),
-    (85, [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
-    (86, [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00100100, 0b00011000, 0b00000000]),
-    (87, [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01011010, 0b01100110, 0b01000010, 0b00000000]),
-    (88, [0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00100100, 0b01000010, 0b00000000]),
-    (89, [0b01000010, 0b00100100, 0b00011000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00000000]),
-    (90, [0b01111110, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01111110, 0b00000000]),
-    /*('a', [0b00000000, 0b00111000, 0b00000100, 0b00111100, 0b01000100, 0b01000100, 0b00111100, 0b00000000]),
+    ('A', [0b00011000, 0b00100100, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b00000000]),
+    ('B', [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b00000000]),
+    ('C', [0b00111100, 0b01000010, 0b01000000, 0b01000000, 0b01000000, 0b01000010, 0b00111100, 0b00000000]),
+    ('D', [0b01111000, 0b01000100, 0b01000010, 0b01000010, 0b01000010, 0b01000100, 0b01111000, 0b00000000]),
+    ('E', [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01111110, 0b00000000]),
+    ('F', [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000]),
+    ('G', [0b00111100, 0b01000010, 0b01000000, 0b01001110, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
+    ('H', [0b01000010, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000]),
+    ('I', [0b00111100, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00111100, 0b00000000]),
+    ('J', [0b00011110, 0b00000100, 0b00000100, 0b00000100, 0b01000100, 0b01000100, 0b00111000, 0b00000000]),
+    ('K', [0b01000010, 0b01000100, 0b01001000, 0b01110000, 0b01001000, 0b01000100, 0b01000010, 0b00000000]),
+    ('L', [0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01111110, 0b00000000]),
+    ('M', [0b01000010, 0b01100110, 0b01011010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00000000]),
+    ('N', [0b01000010, 0b01100010, 0b01010010, 0b01001010, 0b01000110, 0b01000010, 0b01000010, 0b00000000]),
+    ('O', [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
+    ('P', [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000]),
+    ('Q', [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01001010, 0b01000100, 0b00111010, 0b00000000]),
+    ('R', [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01001000, 0b01000100, 0b01000010, 0b00000000]),
+    ('S', [0b00111100, 0b01000010, 0b01000000, 0b00111100, 0b00000010, 0b01000010, 0b00111100, 0b00000000]),
+    ('T', [0b01111110, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00000000]),
+    ('U', [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000]),
+    ('V', [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00100100, 0b00011000, 0b00000000]),
+    ('W', [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01011010, 0b01100110, 0b01000010, 0b00000000]),
+    ('X', [0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00100100, 0b01000010, 0b00000000]),
+    ('Y', [0b01000010, 0b00100100, 0b00011000, 0b00010000, 0b00010000, 0b00010000, 0b00010000, 0b00000000]),
+    ('Z', [0b01111110, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01111110, 0b00000000]),
+    ('a', [0b00000000, 0b00111000, 0b00000100, 0b00111100, 0b01000100, 0b01000100, 0b00111100, 0b00000000]),
     ('b', [0b01000000, 0b01000000, 0b01111000, 0b01000100, 0b01000100, 0b01000100, 0b01111000, 0b00000000]),
     ('c', [0b00000000, 0b00111100, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b00111100, 0b00000000]),
     ('d', [0b00000100, 0b00000100, 0b00111100, 0b01000100, 0b01000100, 0b01000100, 0b00111100, 0b00000000]),
@@ -114,7 +114,7 @@ static FONT_DATA: [(u8, [u8; 8]); 26] = [
     ('\"', [0b00101000, 0b00101000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000]),
     ('`', [0b00010000, 0b00001000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000]),
     ('~', [0b00000000, 0b00000000, 0b00110010, 0b01001100, 0b00000000, 0b00000000, 0b00000000, 0b00000000]),
-    ('\'', [0b00010000, 0b00010000, 0b00010000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000]),*/
+    ('\'', [0b00010000, 0b00010000, 0b00010000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000]),
 ];
 
 /// Trait para operaciones básicas de dibujo
@@ -1605,76 +1605,77 @@ impl FramebufferDriver {
         }
     }
 
-    pub fn draw_character(&mut self, x: u32, y: u32, ch: u8, color: Color) {
+    pub fn draw_character(&mut self, x: u32, y: u32, ch: char, color: Color) {
         let fb_width = self.info.width;
         let fb_height = self.info.height;
 
         // Buscar el bitmap correspondiente al carácter en FONT_DATA, que es un array de tuplas (char, [u8; 8])
-        // Buscar el bitmap usando el valor ASCII numérico del carácter
         let char_bitmap: [u8; 8] = *FONT_DATA
             .iter()
-            .find(|(c, _)| *c as u8 == ch)
+            .find(|(c, _)| *c == ch)
             .map(|(_, bitmap)| bitmap)
             .unwrap_or(&[0; 8]);
 
-        for py in 0..8 {
-            for px in 0..8 {
-                if (char_bitmap[py] & (1 << (7 - px))) != 0 {
-                    let pixel_x = x + px as u32;
-                    let pixel_y = y + py as u32;
-                    if pixel_x < fb_width && pixel_y < fb_height {
-                        self.put_pixel(pixel_x, pixel_y, color);
-                    }
+
+        for i in 0..64 {
+            let px = i / 8;
+            let py = i % 8;
+            if (char_bitmap[px] & (1 << (7 - py))) != 0 {
+                let pixel_x = x + px as u32;
+                let pixel_y = y + py as u32;
+                if pixel_x < fb_width && pixel_y < fb_height {
+                    self.put_pixel(pixel_x, pixel_y, color);
                 }
             }
         }
     }
-    
+
     pub fn draw_text(&mut self, x: u32, y: u32, text: &String, color: Color) {
         let mut current_x = x;
         let char_width = 8;
         let char_height = 8;
     
         // Enfoque más seguro: iterar sobre los bytes de la cadena sin usar punteros directos
-        for &byte in text.as_bytes() {
+        for ch in text.chars() {
             if current_x + char_width > self.info.width {
                 break;
             }
-    
-            // Llamar a la función de dibujo con el byte del carácter
-            self.draw_character(current_x, y, byte, color);
+
+            // Llamar a la función de dibujo con el carácter Unicode
+            self.draw_character(current_x, y, ch, color);
             current_x += char_width;
         }
     }
     
     /// Función optimizada para kernel que usa punteros directos sin asignaciones de memoria
     /// Esta es la versión recomendada para kernels como Eclipse OS
-    pub fn write_text_kernel(&mut self, x: u32, y: u32, text: &str, color: Color) {
-        let mut current_x = x;
+    pub fn write_text_kernel(&mut self, text: &str, color: Color) {
+        let mut buffer_x: u8 = unsafe { *self.buffer };
+        let mut current_y = 5;
         let char_width = 8;
         let char_height = 8;
 
-        // Obtener un puntero crudo al inicio de la cadena de texto
-        // Esto es un puntero a la memoria que contiene los bytes de la cadena
         let mut current_ptr = text.as_ptr();
         let end_ptr = unsafe { current_ptr.add(text.len()) };
 
-        // Bucle para iterar sobre cada byte de la cadena
         while current_ptr < end_ptr {
             let char_code = unsafe { core::ptr::read_volatile(current_ptr) };
 
             // Verificar límites de pantalla
-            if current_x + char_width > self.info.width {
+            if current_y + char_height > self.info.height {
                 break;
             }
-
+            
             // Llamar a la función de dibujo con el byte del carácter
-            self.draw_character(current_x, y, char_code, color);
-
-            current_x += char_width;
+            self.draw_character(buffer_x.into(), current_y, char_code as char, color);
+            current_y += char_height;
 
             // Avanzar el puntero al siguiente byte
             current_ptr = unsafe { current_ptr.add(1) };
+        }
+        buffer_x += char_width;
+        unsafe {
+            *self.buffer = buffer_x;
         }
     }
     
@@ -1697,7 +1698,7 @@ impl FramebufferDriver {
             }
 
             // Dibujar caracter
-            self.draw_character(current_x, y, char_code, color);
+            self.draw_character(current_x, y, char_code as char, color);
             current_x += char_width;
 
             // Pausa para efecto de escritura (optimizada para kernel)
@@ -1713,13 +1714,13 @@ impl FramebufferDriver {
     pub fn ia_text(&mut self, x: u32, y: u32, text: &String, color: Color) {
         let char_width = 8;
 
-        self.write_text_kernel(x, y, text.as_str(), color);
+        self.write_text_kernel(text.as_str(), color);
     }
     
     pub fn ia_text_with_delay(&mut self, x: u32, y: u32, text: &String, color: Color, delay_ms: u32) {
         let char_width = 8;
 
-        self.write_text_kernel(x, y, text.as_str(), color);
+        self.write_text_kernel(text.as_str(), color);
             
         // Pausa personalizable para efecto de escritura
         let delay_cycles = delay_ms * 10000;
@@ -1746,7 +1747,7 @@ impl FramebufferDriver {
             }
             
             // Dibujar caracter
-            self.draw_character(current_x, y, byte, color);
+            self.draw_character(current_x, y, byte as char, color);
             current_x += char_width;
             cursor_x = current_x;
             

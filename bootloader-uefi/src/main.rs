@@ -489,7 +489,9 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         if phdr.p_type != PT_LOAD { continue; }
 
         // Calcular dirección física donde cargar el segmento
-        let dest_phys = kernel_phys_base + phdr.p_vaddr;
+        // El kernel se carga en la dirección física base, y los segmentos se cargan
+        // en sus offsets relativos desde el inicio del kernel
+        let dest_phys = kernel_phys_base + (phdr.p_vaddr - 0x200000); // 0x200000 es la dirección base virtual del kernel
 
         // Cargar datos del segmento
         if phdr.p_filesz > 0 {
@@ -949,6 +951,16 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // DEBUG: Mostrar qué va a pasar justo antes del assembly
         serial_write_str("BL: saltando a kernel entry point...\r\n");
+        
+        // Verificar que el kernel esté realmente cargado ANTES del salto
+        serial_write_str("BL: verificando kernel ANTES del salto: ");
+        let kernel_check_ptr = 0x00200000 as *const u8;
+        for i in 0..32 {
+            let byte = unsafe { *kernel_check_ptr.add(i) };
+            serial_write_hex8(byte);
+            if i % 8 == 7 { serial_write_str(" "); }
+        }
+        serial_write_str("\r\n");
 
         // CONFIGURAR PAGINACIÓN CON MAPEO DE IDENTIDAD SIMPLE
         serial_write_str("BL: configurando paginacion con identidad...\r\n");
@@ -972,6 +984,22 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
             "mov cr4, rax"
         );
+
+        // Intentar escribir directamente al framebuffer como test antes del salto
+        if framebuffer_info_ptr != 0 {
+            let fb_info = unsafe { core::ptr::read_volatile(framebuffer_info_ptr as *const FramebufferInfo) };
+            if fb_info.base_address != 0 {
+                let fb_ptr = fb_info.base_address as *mut u32;
+                // Escribir patrón de test antes del salto
+                for y in 0..fb_info.height.min(50) {
+                    for x in 0..fb_info.width.min(50) {
+                        let offset = (y * fb_info.width + x) as isize;
+                        unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00FF0000); } // Rojo
+                    }
+                }
+                serial_write_str("BL: patron de test escrito al framebuffer\r\n");
+            }
+        }
 
         // Pasar el puntero a la estructura de framebuffer en rdi (primer argumento de la ABI x86_64)
         // Asumimos que tienes una variable llamada framebuffer_info_ptr con la dirección física de la info del framebuffer

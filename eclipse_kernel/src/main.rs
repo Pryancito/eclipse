@@ -8,13 +8,28 @@ extern crate alloc;
 // Importar funciones necesarias
 use eclipse_kernel::main_simple::kernel_main;
 use eclipse_kernel::drivers::framebuffer::{
-    init_framebuffer, FramebufferInfo
+    init_framebuffer, FramebufferInfo, Color, get_framebuffer
 };
 
 // Usamos el panic handler definido en lib.rs
 // Punto de entrada principal del kernel (con parámetros del framebuffer)
 #[no_mangle]
 pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
+    // Configurar SSE/MMX inmediatamente al inicio
+    unsafe {
+        // Asegurar que SSE esté habilitado
+        core::arch::asm!(
+            "mov rax, cr0",
+            "and rax, ~(1 << 2)",        // CR0.EM = 0
+            "or  rax,  (1 << 1)",        // CR0.MP = 1
+            "mov cr0, rax",
+            "mov rax, cr4",
+            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+            "mov cr4, rax"
+        );
+    }
+    
     unsafe {
         // Leer la información del framebuffer de manera segura
         let fb_info = core::ptr::read_volatile(framebuffer_info_ptr);
@@ -28,9 +43,12 @@ pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
             fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
         );
 
-        // Llamar directamente a la función principal del kernel
-        kernel_main();
-        
+        // Obtener el framebuffer mutable
+        if let Some(fb) = get_framebuffer() {
+            // Llamar directamente a la función principal del kernel
+            kernel_main(fb);
+        }
+
         // El kernel nunca debería llegar aquí, pero por seguridad
         loop {
             core::hint::spin_loop();

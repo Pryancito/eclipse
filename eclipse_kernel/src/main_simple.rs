@@ -5,13 +5,12 @@
 
 extern crate alloc;
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 use core::fmt::Result as FmtResult;
 use core::error::Error;
 use core::fmt::Write;
-
 use core::panic::PanicInfo;
-use alloc::format;
-use alloc::string::String;
 
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
@@ -19,92 +18,227 @@ use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
 
 
 use crate::drivers::framebuffer::{Color, get_framebuffer,
-    FramebufferDriver, FramebufferInfo, clear_screen
+    FramebufferDriver, FramebufferInfo
 };
 use crate::ai_typing_system::{AiTypingSystem, AiTypingConfig, TypingEffect,
     create_ai_typing_system};
+use crate::ai_pretrained_models::{PretrainedModelManager, PretrainedModelType};
 // Módulo ai_font_generator removido
 use crate::drivers::pci::{GpuType, GpuInfo};
+use crate::drivers::usb::UsbDriver;
+use crate::drivers::usb_keyboard::{UsbKeyboardDriver, UsbKeyCode, KeyboardEvent};
+use crate::drivers::usb_mouse::{UsbMouseDriver, MouseButton, MouseEvent};
 use crate::hardware_detection::{GraphicsMode, detect_graphics_hardware};
 
 /// Función principal del kernel
-pub fn kernel_main() {
-    // Verificar si hay framebuffer disponible
-    if let Some(fb) = get_framebuffer() {
-        match detect_graphics_hardware().graphics_mode {
-            GraphicsMode::Framebuffer => {
-                fb.clear_screen(Color::BLACK);
-            }
-            GraphicsMode::VGA => {
-                fb.clear_screen(Color::BLACK);
-            }
-            GraphicsMode::HardwareAccelerated => {
-                use crate::drivers::pci::PciDevice;
-                use crate::drivers::pci::GpuInfo;
-                use crate::drivers::pci::GpuType;
-                use crate::drivers::pci::PciManager;
-                let mut pci_manager = PciManager::new();
-                pci_manager.scan_devices_safe();
-                let gpu_info = pci_manager.get_primary_gpu();
-                let Some(gpu_info) = gpu_info else {
-                    panic!("No se pudo crear la GPU info");
-                };
-                fb.clear_screen(Color::BLACK);
-                fb.init_hardware_acceleration(gpu_info);
-            }
-        }
+pub fn kernel_main(fb: &mut FramebufferDriver) {
+    // Configurar SSE/MMX antes de cualquier operación
+    unsafe {
+        // Asegurar que SSE esté habilitado
+        core::arch::asm!(
+            "mov rax, cr0",
+            "and rax, ~(1 << 2)",        // CR0.EM = 0
+            "or  rax,  (1 << 1)",        // CR0.MP = 1
+            "mov cr0, rax",
+            "mov rax, cr4",
+            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+            "mov cr4, rax"
+        );
+    }
+    
+    // Debug: Verificar estado del framebuffer
+    let fb_initialized = fb.is_initialized();
+    let fb_width = fb.info.width;
+    let fb_height = fb.info.height;
+    let fb_base = fb.info.base_address;
+    
+    if fb_initialized {
+        // Usar la API del framebuffer si está disponible
+        fb.clear_screen(Color::WHITE);
+        fb.write_text_kernel("Iniciando Eclipse OS Kernel", Color::YELLOW);
+        fb.write_text_kernel("Bienvenido profesor", Color::BLUE);
+    } else {
+        // Si el framebuffer no está inicializado, intentar inicialización de emergencia
+        panic!("Framebuffer no inicializado - base: 0x{:x}, width: {}, height: {}", 
+               fb_base, fb_width, fb_height);
+    }
 
-        // Crear sistema de AI para escritura
-        let mut ai_system = create_ai_typing_system();
-        
-        // Configurar efecto de escritura
-        let mut config = AiTypingConfig::default();
-        config.effect = TypingEffect::Typewriter;
-        config.color = Color::WHITE;
-        ai_system.set_config(config);
-        
-        // Escribir mensaje especial con efecto rainbow
-        let special_message = String::from("Eclipse OS Kernel con AI");
-        ai_system.write_message(fb, &special_message);
-        
-        // Demostrar función optimizada directa
-        ai_system.set_position(20, 200);
-        ai_system.write_message_direct(fb, "Funcion optimizada con punteros directos");
-        
-        // Escribir mensaje de bienvenida
-        ai_system.write_welcome_message(fb);
-        
-        // Escribir mensajes del sistema
-        ai_system.write_system_message(fb, 0); // "Cargando sistema de archivos..."
-        ai_system.write_system_message(fb, 1); // "Inicializando drivers de hardware..."
-        ai_system.write_system_message(fb, 2); // "Configurando red..."
-        
+    match detect_graphics_hardware().graphics_mode {
+        GraphicsMode::Framebuffer => {
+        }
+        GraphicsMode::VGA => {
+        }
+        GraphicsMode::HardwareAccelerated => {
+            use crate::drivers::pci::PciDevice;
+            use crate::drivers::pci::GpuInfo;
+            use crate::drivers::pci::GpuType;
+            use crate::drivers::pci::PciManager;
+            let mut pci_manager = PciManager::new();
+            pci_manager.scan_devices_safe();
+            let gpu_info = pci_manager.get_primary_gpu();
+            let Some(gpu_info) = gpu_info else {
+                panic!("No se pudo crear la GPU info");
+            };
+            let _ = fb.init_hardware_acceleration(gpu_info);
+            fb.write_text_kernel("Aceleración por hardware", Color::GREEN);
+        }
+    }
+    
+    // Crear sistema de AI para escritura
+    let mut ai_system = create_ai_typing_system();
+
+    // Configurar efecto de escritura
+    let mut config = AiTypingConfig::default();
+    config.effect = TypingEffect::Typewriter;
+    config.color = Color::WHITE;
+    ai_system.set_config(config);
+    
+    // Escribir mensaje especial con efecto rainbow
+    let special_message = String::from("Eclipse OS Kernel con AI");
+    ai_system.write_message(fb, &special_message);
+    
+    // Demostrar función optimizada directa
+    ai_system.set_position(20, 200);
+    ai_system.write_message_direct(fb, "Funcion optimizada con punteros directos");
+    
+    // Escribir mensaje de bienvenida
+    ai_system.write_welcome_message(fb);
+    
+    // Escribir mensajes del sistema
+    ai_system.write_system_message(fb, 0); // "Cargando sistema de archivos..."
+    ai_system.write_system_message(fb, 1); // "Inicializando drivers de hardware..."
+    ai_system.write_system_message(fb, 2); // "Configurando red..."
+    
         // Escribir mensaje de éxito
         ai_system.write_success_message(fb, 0); // "Operacion completada exitosamente"
+        
+        // Inicializar drivers USB
+        let mut usb_driver = UsbDriver::new();
+        let usb_init_result = usb_driver.initialize_controllers();
+        
+        // Inicializar driver de teclado USB (usando IDs de ejemplo)
+        let mut keyboard_driver = UsbKeyboardDriver::new(0x1234, 0x5678, 1, 0x81);
+        let keyboard_init_result = keyboard_driver.initialize();
+        
+        // Inicializar driver de mouse USB (usando IDs de ejemplo)
+        let mut mouse_driver = UsbMouseDriver::new(0x1234, 0x5679, 2, 0x82);
+        let mouse_init_result = mouse_driver.initialize();
+        
+        // Mostrar estado de los drivers
+        if usb_init_result.is_ok() {
+            fb.write_text_kernel("USB Driver: Inicializado", Color::GREEN);
+        } else {
+            fb.write_text_kernel("USB Driver: Error", Color::RED);
+        }
+        
+        if keyboard_init_result.is_ok() {
+            fb.write_text_kernel("Teclado USB: Inicializado", Color::GREEN);
+        } else {
+            fb.write_text_kernel("Teclado USB: Error", Color::RED);
+        }
+        
+        if mouse_init_result.is_ok() {
+            fb.write_text_kernel("Mouse USB: Inicializado", Color::GREEN);
+        } else {
+            fb.write_text_kernel("Mouse USB: Error", Color::RED);
+        }
         
         // Cambiar a efecto rainbow para mensaje especial
         let mut rainbow_config = AiTypingConfig::default();
         rainbow_config.effect = TypingEffect::Rainbow;
         ai_system.set_config(rainbow_config);
-         unsafe {
-             loop {
-                 // Sistema de aprendizaje continuo de la IA
-                 ai_system.feed_framebuffer(fb);
-                 
-                 // Aprendizaje adaptativo avanzado
-                 ai_system.adaptive_learning(fb);
-                 
-                 // Mostrar estadísticas de aprendizaje
-                 ai_system.display_learning_stats(fb);
-                 
-                 // Pausa optimizada para el loop
-                 for _ in 0..100000 {
-                     core::hint::spin_loop();
-                 }
-             }
-         }
-    } else {
-        panic!("No hay framebuffer disponible");
+    unsafe {
+        let mut inference_counter = 0;
+        loop {
+            // Sistema de aprendizaje continuo de la IA
+            ai_system.feed_framebuffer(fb);
+            
+            // Aprendizaje adaptativo avanzado
+            ai_system.adaptive_learning(fb);
+            
+            // Mostrar estadísticas de aprendizaje
+            ai_system.display_learning_stats(fb);
+            
+            // Procesar eventos de entrada cada 1000 iteraciones
+            if inference_counter % 1000 == 0 {
+                    // Procesar eventos de teclado
+                    if let Some(key_event) = keyboard_driver.get_next_event() {
+                        match key_event {
+                            KeyboardEvent::KeyPress { key, modifiers } => {
+                                let key_text = format!("Tecla: {:?}", key);
+                                fb.write_text_kernel(&key_text, Color::YELLOW);
+                                
+                                // Manejar teclas especiales
+                                match key {
+                                    UsbKeyCode::Escape => {
+                                        fb.write_text_kernel("ESC: Saliendo...", Color::RED);
+                                        break;
+                                    }
+                                    UsbKeyCode::Enter => {
+                                        fb.write_text_kernel("ENTER: Comando", Color::GREEN);
+                                    }
+                                    UsbKeyCode::Space => {
+                                        fb.write_text_kernel("SPACE: Pausa", Color::BLUE);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyboardEvent::KeyRelease { key, modifiers } => {
+                                let key_text = format!("Liberada: {:?}", key);
+                                fb.write_text_kernel(&key_text, Color::MAGENTA);
+                            }
+                            KeyboardEvent::KeyRepeat { key, modifiers } => {
+                                let key_text = format!("Repeticion: {:?}", key);
+                                fb.write_text_kernel(&key_text, Color::CYAN);
+                            }
+                        }
+                    }
+                
+                    // Procesar eventos de mouse
+                    if let Some(mouse_event) = mouse_driver.get_next_event() {
+                        match mouse_event {
+                            MouseEvent::Move { position, buttons } => {
+                                let mouse_text = format!("Mouse: ({}, {})", position.x, position.y);
+                                fb.write_text_kernel(&mouse_text, Color::CYAN);
+                            }
+                            MouseEvent::ButtonPress { button, position, buttons } => {
+                                let click_text = format!("Click: {:?} ({}, {})", button, position.x, position.y);
+                                fb.write_text_kernel(&click_text, Color::GREEN);
+                                
+                                // Manejar clics específicos
+                                match button {
+                                    MouseButton::Left => {
+                                        fb.write_text_kernel("Click izquierdo", Color::WHITE);
+                                    }
+                                    MouseButton::Right => {
+                                        fb.write_text_kernel("Click derecho", Color::WHITE);
+                                    }
+                                    MouseButton::Middle => {
+                                        fb.write_text_kernel("Click medio", Color::WHITE);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            MouseEvent::ButtonRelease { button, position, buttons } => {
+                                let release_text = format!("Liberado: {:?}", button);
+                                fb.write_text_kernel(&release_text, Color::MAGENTA);
+                            }
+                            MouseEvent::Wheel { wheel, position, buttons } => {
+                                let scroll_text = format!("Scroll: {:?}", wheel);
+                                fb.write_text_kernel(&scroll_text, Color::BLUE);
+                            }
+                        }
+                    }
+            }
+            
+            inference_counter += 1;
+            
+            // Pausa optimizada para el loop
+            for _ in 0..100000 {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
     /*

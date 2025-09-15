@@ -4,30 +4,36 @@ SECTIONS
 {
     . = 0x200000;
     
-    .text : {
+    .text : ALIGN(16) {
         *(.text .text.*)
+        . = ALIGN(16);
     }
     
-    .rodata : {
+    .rodata : ALIGN(16) {
         *(.rodata .rodata.*)
+        . = ALIGN(16);
     }
     
-    .data : {
+    .data : ALIGN(16) {
         *(.data .data.*)
+        . = ALIGN(16);
     }
     
-    .bss : {
+    .bss : ALIGN(16) {
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(16);
     }
     
-    .note : {
+    .note : ALIGN(16) {
         *(.note*)
         *(.note.pvh)
+        . = ALIGN(16);
     }
 
-    .note.pvh : {
+    .note.pvh : ALIGN(16) {
         *(.note.pvh)
+        . = ALIGN(16);
     }
 
     /DISCARD/ : {

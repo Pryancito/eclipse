@@ -135,7 +135,7 @@ impl AiTypingSystem {
         match self.config.effect {
             TypingEffect::Normal => {
                 // Usar función optimizada para kernel
-                fb.write_text_kernel(self.current_position.0, self.current_position.1, message.as_str(), self.config.color);
+                fb.write_text_kernel(message.as_str(), self.config.color);
             }
             TypingEffect::Fast => {
                 fb.ia_text_with_delay(self.current_position.0, self.current_position.1, message, self.config.color, 10);
@@ -165,7 +165,7 @@ impl AiTypingSystem {
         self.is_typing = true;
         
         // Usar función optimizada para kernel sin efectos
-        fb.write_text_kernel(self.current_position.0, self.current_position.1, message, self.config.color);
+        fb.write_text_kernel(message, self.config.color);
         
         // Mover posición para el siguiente mensaje
         self.current_position.1 += 20;
@@ -217,7 +217,7 @@ impl AiTypingSystem {
                 fb.draw_rect(current_x, self.current_position.1 + 10, 2, 8, Color::YELLOW);
             }
             
-            fb.draw_character(current_x, self.current_position.1, byte, self.config.color);
+            fb.draw_character(current_x, self.current_position.1, byte as char, self.config.color);
             current_x += char_width;
             
             // Pausa para efecto de sonido
@@ -251,7 +251,7 @@ impl AiTypingSystem {
             }
             
             // Dibujar caracter con color del arcoíris
-            fb.draw_character(current_x, self.current_position.1, char_code, color);
+            fb.draw_character(current_x, self.current_position.1, char_code as char, color);
             current_x += char_width;
             char_index += 1;
             
@@ -324,7 +324,7 @@ impl AiTypingSystem {
             fb.fill_rect_fast(x, y, 8, 8, Color::BLACK);
             
             // Dibujar caracter
-            fb.draw_character(x, y, char_code, Color::GREEN);
+            fb.draw_character(x, y, char_code as char, Color::GREEN);
             
             *char_index += 1;
         } else {
@@ -345,10 +345,10 @@ impl AiTypingSystem {
             let y = 200 + (RANDOM_SEED % 50) as u32;
             
             // Limpiar área pequeña
-            fb.fill_rect_fast(x, y, 8, 8, Color::BLACK);
+            fb.fill_rect_fast(x, y, 8, 8, Color::WHITE);
             
             // Dibujar caracter aleatorio
-            fb.draw_character(x, y, random_char, Color::BLUE);
+            fb.draw_character(x, y, random_char as char, Color::BLUE);
         }
     }
     
@@ -369,7 +369,7 @@ impl AiTypingSystem {
             }
             
             // Dibujar caracter de la palabra
-            fb.draw_character(x, y, char_code, Color::YELLOW);
+            fb.draw_character(x, y, char_code as char, Color::YELLOW);
         }
         
         *char_index += 1;
@@ -415,17 +415,17 @@ impl AiTypingSystem {
                 
                 // Mostrar contador de práctica
                 let counter_text = format!("Practicas: {}", STATS_COUNTER);
-                fb.write_text_kernel(stats_x, stats_y, &counter_text, Color::WHITE);
+                fb.write_text_kernel(&counter_text, Color::WHITE);
                 
                 // Mostrar patrón actual
                 let pattern_names = ["Alfabeto", "Aleatorio", "Palabras", "Bitmaps"];
                 let current_pattern = (STATS_COUNTER / 1000) % 4;
                 let pattern_text = format!("Patron: {}", pattern_names[current_pattern as usize]);
-                fb.write_text_kernel(stats_x, stats_y + 15, &pattern_text, Color::GREEN);
+                fb.write_text_kernel(&pattern_text, Color::GREEN);
                 
                 // Mostrar estado del sistema
                 let system_text = format!("IA: {}", if self.is_typing { "Escribiendo" } else { "Aprendiendo" });
-                fb.write_text_kernel(stats_x, stats_y + 30, &system_text, Color::YELLOW);
+                fb.write_text_kernel(&system_text, Color::YELLOW);
             }
         }
     }
@@ -475,7 +475,7 @@ impl AiTypingSystem {
             let y = 100;
             
             fb.fill_rect_fast(x, y, 8, 8, Color::BLACK);
-            fb.draw_character(x, y, char_code, Color::RED);
+            fb.draw_character(x, y, char_code as char, Color::RED);
             
             SIMPLE_CHAR_INDEX += 1;
         }
@@ -495,7 +495,7 @@ impl AiTypingSystem {
                 let x = 400 + (CHAR_INDEX as u32 * 10);
                 let y = 120;
                 
-                fb.draw_character(x, y, char_code, Color::GREEN);
+                fb.draw_character(x, y, char_code as char, Color::GREEN);
                 CHAR_INDEX += 1;
             } else {
                 CHAR_INDEX = 0;
