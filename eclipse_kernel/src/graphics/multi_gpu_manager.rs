@@ -145,13 +145,15 @@ impl MultiGpuManager {
     /// Detectar y unificar todas las GPUs
     fn detect_and_unify_gpus(&mut self) -> Result<(), String> {
         self.pci_manager.scan_devices();
-        let gpus = self.pci_manager.detect_gpus();
+        let gpus = self.pci_manager.get_gpus();
         
         self.unified_gpus.clear();
 
-        for gpu in gpus {
-            let unified_info = self.convert_to_unified_info(&gpu)?;
-            self.unified_gpus.push(unified_info);
+        for gpu_option in gpus {
+            if let Some(gpu) = gpu_option {
+                let unified_info = self.convert_to_unified_info(&gpu)?;
+                self.unified_gpus.push(unified_info);
+            }
         }
 
         // Establecer la primera GPU como activa por defecto
@@ -187,13 +189,13 @@ impl MultiGpuManager {
                             nvidia_info.rt_cores,
                             nvidia_info.tensor_cores,
                             nvidia_info.power_limit,
-                            nvidia_info.capabilities,
+                            Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("CUDA"))]),
                         )
                     } else {
                         // Información genérica
                         (
                             format!("NVIDIA GPU {:04X}:{:04X}", gpu.pci_device.vendor_id, gpu.pci_device.device_id),
-                            gpu.total_vram_mb as u64 * 1024 * 1024,
+                            gpu.memory_size,
                             8000, 1500, 2048, 16, 64, 200,
                             Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("CUDA"))]),
                         )
@@ -212,13 +214,13 @@ impl MultiGpuManager {
                             amd_info.ray_accelerators,
                             amd_info.ai_accelerators,
                             amd_info.power_limit,
-                            amd_info.capabilities,
+                            Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("OpenCL"))]),
                         )
                     } else {
                         // Información genérica
                         (
                             format!("AMD GPU {:04X}:{:04X}", gpu.pci_device.vendor_id, gpu.pci_device.device_id),
-                            gpu.total_vram_mb as u64 * 1024 * 1024,
+                            gpu.memory_size,
                             8000, 1000, 1024, 0, 0, 150,
                             Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("ROCm"))]),
                         )
@@ -237,13 +239,13 @@ impl MultiGpuManager {
                             intel_info.ray_tracing_units,
                             intel_info.ai_accelerators,
                             intel_info.power_limit,
-                            intel_info.capabilities,
+                            Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("OpenGL"))]),
                         )
                     } else {
                         // Información genérica
                         (
                             format!("Intel GPU {:04X}:{:04X}", gpu.pci_device.vendor_id, gpu.pci_device.device_id),
-                            gpu.total_vram_mb as u64 * 1024 * 1024,
+                            gpu.memory_size,
                             8000, 1000, 512, 0, 0, 15,
                             Vec::from([DriverCapability::Graphics, DriverCapability::Custom(String::from("oneAPI"))]),
                         )
@@ -252,7 +254,7 @@ impl MultiGpuManager {
                 SupportedGpuType::Unknown => {
                     (
                         format!("Unknown GPU {:04X}:{:04X}", gpu.pci_device.vendor_id, gpu.pci_device.device_id),
-                        gpu.total_vram_mb as u64 * 1024 * 1024,
+                        gpu.memory_size,
                         8000, 1000, 256, 0, 0, 100,
                         Vec::from([DriverCapability::Graphics]),
                     )
@@ -455,7 +457,12 @@ impl MultiGpuManager {
                 "  {}: {} ({}) - {} GB VRAM, {} Compute Units, {} Ray Tracing Units - {}\n",
                 i,
                 gpu.gpu_name,
-                gpu.gpu_type.as_str(),
+                match gpu.gpu_type {
+                    SupportedGpuType::Nvidia => "NVIDIA",
+                    SupportedGpuType::Amd => "AMD",
+                    SupportedGpuType::Intel => "Intel",
+                    SupportedGpuType::Unknown => "Unknown",
+                },
                 gpu.total_memory / (1024 * 1024 * 1024),
                 gpu.compute_units,
                 gpu.ray_tracing_units,

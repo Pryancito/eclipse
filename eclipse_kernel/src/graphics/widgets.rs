@@ -299,14 +299,14 @@ impl WidgetManager {
         };
 
         // Dibujar fondo
-        framebuffer.draw_rectangle(rect.x, rect.y, rect.width, rect.height, bg_color);
+        framebuffer.draw_rect(rect.x as u32, rect.y as u32, rect.width as u32, rect.height as u32, Color::from_hex(bg_color));
 
         // Dibujar borde
         if widget.style.border_width > 0 {
-            framebuffer.draw_rectangle(rect.x, rect.y, rect.width, widget.style.border_width, widget.style.border_color);
-            framebuffer.draw_rectangle(rect.x, rect.y, widget.style.border_width, rect.height, widget.style.border_color);
-            framebuffer.draw_rectangle(rect.x + rect.width as i32 - widget.style.border_width as i32, rect.y, widget.style.border_width, rect.height, widget.style.border_color);
-            framebuffer.draw_rectangle(rect.x, rect.y + rect.height as i32 - widget.style.border_width as i32, rect.width, widget.style.border_width, widget.style.border_color);
+            framebuffer.draw_rect(rect.x as u32, rect.y as u32, rect.width as u32, widget.style.border_width as u32, Color::from_hex(widget.style.border_color));
+            framebuffer.draw_rect(rect.x as u32, rect.y as u32, widget.style.border_width as u32, rect.height as u32, Color::from_hex(widget.style.border_color));
+            framebuffer.draw_rect((rect.x + rect.width as i32 - widget.style.border_width as i32) as u32, rect.y as u32, widget.style.border_width as u32, rect.height as u32, Color::from_hex(widget.style.border_color));
+            framebuffer.draw_rect(rect.x as u32, (rect.y + rect.height as i32 - widget.style.border_width as i32) as u32, rect.width as u32, widget.style.border_width as u32, Color::from_hex(widget.style.border_color));
         }
 
         // Dibujar contenido específico del widget
@@ -359,7 +359,7 @@ impl WidgetManager {
         if widget.state == WidgetState::Focused {
             let cursor_x = rect.x + (widget.text.len() as i32 * 6) + 2;
             let cursor_y = rect.y + 2;
-            framebuffer.draw_rectangle(cursor_x, cursor_y, 1, rect.height - 4, 0x000000);
+            framebuffer.draw_rect(cursor_x as u32, cursor_y as u32, 1 as u32, rect.height - 4 as u32, Color::from_hex(0x000000));
         }
     }
 
@@ -371,17 +371,17 @@ impl WidgetManager {
         let checkbox_y = rect.y + (rect.height - checkbox_size) as i32 / 2;
         
         // Dibujar cuadrado del checkbox
-        framebuffer.draw_rect(checkbox_x, checkbox_y, checkbox_size, checkbox_size, 0xFFFFFF);
-        framebuffer.draw_rect(checkbox_x, checkbox_y, checkbox_size, 1, 0x000000);
-        framebuffer.draw_rect(checkbox_x, checkbox_y, 1, checkbox_size, 0x000000);
-        framebuffer.draw_rect(checkbox_x + checkbox_size as i32 - 1, checkbox_y, 1, checkbox_size, 0x000000);
-        framebuffer.draw_rect(checkbox_x, checkbox_y + checkbox_size as i32 - 1, checkbox_size, 1, 0x000000);
+        framebuffer.draw_rect(checkbox_x as u32, checkbox_y as u32, checkbox_size as u32, checkbox_size as u32, Color::from_hex(0xFFFFFF));
+        framebuffer.draw_rect(checkbox_x as u32, checkbox_y as u32, checkbox_size as u32, 1 as u32, Color::from_hex(0x000000));
+        framebuffer.draw_rect(checkbox_x as u32, checkbox_y as u32, 1 as u32, checkbox_size as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect((checkbox_x + checkbox_size as i32 - 1) as u32, checkbox_y as u32, 1 as u32, checkbox_size as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect(checkbox_x as u32, (checkbox_y + checkbox_size as i32 - 1) as u32, checkbox_size as u32, 1 as u32, Color::from_hex(0x000000));
         
         // Dibujar marca si está marcado
         if widget.value != 0 {
-            framebuffer.draw_rect(checkbox_x + 3, checkbox_y + 3, 10, 2, 0x000000);
-            framebuffer.draw_rect(checkbox_x + 3, checkbox_y + 5, 2, 6, 0x000000);
-            framebuffer.draw_rect(checkbox_x + 5, checkbox_y + 7, 6, 2, 0x000000);
+            framebuffer.draw_rect((checkbox_x + 3) as u32, (checkbox_y + 3) as u32, 10 as u32, 2 as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect((checkbox_x + 3) as u32, (checkbox_y + 5) as u32, 2 as u32, 6 as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect((checkbox_x + 5) as u32, (checkbox_y + 7) as u32, 6 as u32, 2 as u32, Color::from_hex(0x000000));
         }
         
         // Dibujar texto
@@ -400,15 +400,15 @@ impl WidgetManager {
         let radio_y = rect.y + (rect.height - radio_size) as i32 / 2;
         
         // Dibujar círculo del radio button (simulado como cuadrado)
-        framebuffer.draw_rect(radio_x, radio_y, radio_size, radio_size, 0xFFFFFF);
-        framebuffer.draw_rect(radio_x, radio_y, radio_size, 1, 0x000000);
-        framebuffer.draw_rect(radio_x, radio_y, 1, radio_size, 0x000000);
-        framebuffer.draw_rect(radio_x + radio_size as i32 - 1, radio_y, 1, radio_size, 0x000000);
-        framebuffer.draw_rect(radio_x, radio_y + radio_size as i32 - 1, radio_size, 1, 0x000000);
+        framebuffer.draw_rect(radio_x as u32, radio_y as u32, radio_size as u32, radio_size as u32, Color::from_hex(0xFFFFFF));
+        framebuffer.draw_rect(radio_x as u32, radio_y as u32, radio_size as u32, 1 as u32, Color::from_hex(0x000000));
+        framebuffer.draw_rect(radio_x as u32, radio_y as u32, 1 as u32, radio_size as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect((radio_x + radio_size as i32 - 1) as u32, radio_y as u32, 1 as u32, radio_size as u32, Color::from_hex(0x000000));
+            framebuffer.draw_rect(radio_x as u32, (radio_y + radio_size as i32 - 1) as u32, radio_size as u32, 1 as u32, Color::from_hex(0x000000));
         
         // Dibujar punto si está seleccionado
         if widget.value != 0 {
-            framebuffer.draw_rect(radio_x + 4, radio_y + 4, 8, 8, 0x000000);
+            framebuffer.draw_rect((radio_x + 4) as u32, (radio_y + 4) as u32, 8 as u32, 8 as u32, Color::from_hex(0x000000));
         }
         
         // Dibujar texto
@@ -426,7 +426,7 @@ impl WidgetManager {
         let slider_y = rect.y + (rect.height - slider_height) as i32 / 2;
         
         // Dibujar pista del slider
-        framebuffer.draw_rect(rect.x, slider_y, rect.width, slider_height, 0xCCCCCC);
+        framebuffer.draw_rect(rect.x as u32, slider_y as u32, rect.width as u32, slider_height as u32, Color::from_hex(0xCCCCCC));
         
         // Calcular posición del thumb
         let thumb_width = 16;
@@ -434,7 +434,7 @@ impl WidgetManager {
         let thumb_y = rect.y + (rect.height - 16) as i32 / 2;
         
         // Dibujar thumb
-        framebuffer.draw_rect(thumb_x, thumb_y, thumb_width, 16, 0x666666);
+        framebuffer.draw_rect(thumb_x as u32, thumb_y as u32, thumb_width as u32, 16 as u32, Color::from_hex(0x666666));
     }
 
     /// Dibujar barra de progreso
@@ -442,14 +442,14 @@ impl WidgetManager {
         let rect = widget.get_rectangle();
         
         // Dibujar fondo de la barra
-        framebuffer.draw_rect(rect.x, rect.y, rect.width, rect.height, 0xCCCCCC);
+        framebuffer.draw_rect(rect.x as u32, rect.y as u32, rect.width as u32, rect.height as u32, Color::from_hex(0xCCCCCC));
         
         // Calcular ancho de la barra de progreso
         let progress_width = ((widget.value - widget.min_value) as u32 * rect.width / (widget.max_value - widget.min_value) as u32) as u32;
         
         // Dibujar barra de progreso
         if progress_width > 0 {
-            framebuffer.draw_rect(rect.x, rect.y, progress_width, rect.height, 0x00AA00);
+            framebuffer.draw_rect(rect.x as u32, rect.y as u32, progress_width as u32, rect.height as u32, Color::from_hex(0x00AA00));
         }
     }
 

@@ -10,7 +10,7 @@ use crate::drivers::framebuffer::FramebufferDriver;
 use crate::drivers::ipc::DriverManager;
 use crate::ipc::{DriverType, DriverConfig, DriverCapability};
 use crate::syslog;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;

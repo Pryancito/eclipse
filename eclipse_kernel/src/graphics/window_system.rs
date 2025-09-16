@@ -3,7 +3,7 @@
 //! Implementa un sistema moderno de ventanas con compositor
 //! y aceleración por hardware.
 
-use crate::drivers::framebuffer::FramebufferDriver;
+use crate::drivers::framebuffer::{FramebufferDriver, Color};
 use core::fmt;
 use crate::syslog;
 use alloc::string::String;
@@ -299,13 +299,14 @@ impl WindowCompositor {
 
     /// Establecer foco en ventana
     pub fn set_focus(&mut self, window_id: WindowId) -> Result<(), String> {
-        if let Some(window) = self.windows.get_mut(&window_id) {
-            // Quitar foco de la ventana anterior
-            if let Some(old_focus) = self.focused_window {
-                if let Some(old_window) = self.windows.get_mut(&old_focus) {
-                    old_window.set_focused(false);
-                }
+        // Quitar foco de la ventana anterior
+        if let Some(old_focus) = self.focused_window {
+            if let Some(old_window) = self.windows.get_mut(&old_focus) {
+                old_window.set_focused(false);
             }
+        }
+        
+        if let Some(window) = self.windows.get_mut(&window_id) {
 
             // Establecer nuevo foco
             window.set_focused(true);
@@ -393,7 +394,7 @@ impl WindowCompositor {
         window_list.sort_by_key(|w| w.z_order);
 
         // Limpiar framebuffer
-        framebuffer.clear_screen();
+        framebuffer.clear_screen(Color::BLACK);
 
         // Dibujar ventanas en orden
         for window in window_list {
@@ -409,14 +410,14 @@ impl WindowCompositor {
         
         // Dibujar borde de ventana
         let border_color = if window.focused { 0x00FF00 } else { 0x808080 }; // Verde si enfocada, gris si no
-        framebuffer.draw_rectangle(rect.x, rect.y, rect.width, 1, border_color); // Borde superior
-        framebuffer.draw_rectangle(rect.x, rect.y, 1, rect.height, border_color); // Borde izquierdo
-        framebuffer.draw_rectangle(rect.x + rect.width as i32 - 1, rect.y, 1, rect.height, border_color); // Borde derecho
-        framebuffer.draw_rectangle(rect.x, rect.y + rect.height as i32 - 1, rect.width, 1, border_color); // Borde inferior
+        framebuffer.draw_rect(rect.x as u32, rect.y as u32, rect.width as u32, 1, Color::from_hex(border_color)); // Borde superior
+        framebuffer.draw_rect(rect.x as u32, rect.y as u32, 1, rect.height as u32, Color::from_hex(border_color)); // Borde izquierdo
+        framebuffer.draw_rect((rect.x + rect.width as i32 - 1) as u32, rect.y as u32, 1, rect.height as u32, Color::from_hex(border_color)); // Borde derecho
+        framebuffer.draw_rect(rect.x as u32, (rect.y + rect.height as i32 - 1) as u32, rect.width as u32, 1, Color::from_hex(border_color)); // Borde inferior
 
         // Dibujar barra de título
         let title_bar_color = if window.focused { 0x4040FF } else { 0x404040 }; // Azul si enfocada, gris si no
-        framebuffer.draw_rectangle(rect.x + 1, rect.y + 1, rect.width - 2, 20, title_bar_color);
+        framebuffer.draw_rect((rect.x + 1) as u32, (rect.y + 1) as u32, (rect.width - 2) as u32, 20, Color::from_hex(title_bar_color));
 
         // Dibujar título
         let title_text = &window.title;
@@ -431,7 +432,7 @@ impl WindowCompositor {
                 if buffer_index < window.buffer.len() {
                     let pixel_color = window.buffer[buffer_index];
                     if pixel_color != 0 { // No dibujar píxeles transparentes
-                        framebuffer.draw_pixel(rect.x + x as i32 + 1, rect.y + y as i32 + 21, pixel_color);
+                        framebuffer.put_pixel((rect.x + x as i32 + 1) as u32, (rect.y + y as i32 + 21) as u32, Color::from_hex(pixel_color));
                     }
                 }
             }

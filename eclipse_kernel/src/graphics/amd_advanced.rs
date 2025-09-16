@@ -6,7 +6,7 @@
 use crate::drivers::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
 use crate::drivers::pci::{PciDevice, PciManager, GpuInfo, GpuType};
 use crate::syslog;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -91,14 +91,16 @@ impl AmdAdvancedDriver {
     /// Detectar GPUs AMD con información detallada
     fn detect_amd_gpus(&mut self) -> Result<(), String> {
         self.pci_manager.scan_devices();
-        let gpus = self.pci_manager.detect_gpus();
+        let gpus = self.pci_manager.get_gpus();
         
         self.amd_gpus.clear();
         
-        for gpu in gpus {
-            if matches!(gpu.gpu_type, GpuType::Amd) {
-                let amd_info = self.analyze_amd_gpu(&gpu)?;
-                self.amd_gpus.push(amd_info);
+        for gpu_option in gpus {
+            if let Some(gpu) = gpu_option {
+                if matches!(gpu.gpu_type, GpuType::Amd) {
+                    let amd_info = self.analyze_amd_gpu(&gpu)?;
+                    self.amd_gpus.push(amd_info);
+                }
             }
         }
 
@@ -207,10 +209,10 @@ impl AmdAdvancedDriver {
         let mut memory_bars = 0;
         
         for (i, bar) in bars.iter().enumerate() {
-            if let Some(bar_value) = bar {
+            if let Some(bar_value) = Some(*bar) {
                 // Verificar si es un BAR de memoria
                 if (bar_value & 0x1) == 0 { // Bit 0 = 0 indica memoria
-                    let bar_size = device.calculate_bar_size(i as u8)?;
+                    let bar_size = device.calculate_bar_size(i as u8);
                     if bar_size > 0 {
                         total_memory += bar_size;
                         memory_bars += 1;
@@ -565,7 +567,7 @@ impl Driver for AmdAdvancedDriver {
     }
 
     fn get_state(&self) -> DriverState {
-        self.info.state
+        self.info.state.clone()
     }
 
     fn can_handle_device(&self, vendor_id: u16, device_id: u16, class_code: u8) -> bool {

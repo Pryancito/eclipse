@@ -39,8 +39,8 @@ use crate::drivers::binary_driver_manager::{BinaryDriverManager, BinaryDriverMet
 use crate::ipc::{IpcManager, IpcMessage, DriverType, DriverConfig, DriverCommandType};
 // use crate::hotplug::{HotplugManager, HotplugEvent, HotplugNotification}; // REMOVIDO
 // use crate::hotplug::manager::HotplugConfig; // REMOVIDO
-// use crate::graphics::{GraphicsManager, Position, Size, WidgetType}; // TEMPORALMENTE DESHABILITADO
-// use crate::graphics::graphics_manager::GraphicsConfig; // TEMPORALMENTE DESHABILITADO
+use crate::graphics::{GraphicsManager, Position, Size, WidgetType};
+use crate::graphics::graphics_manager::GraphicsConfig;
 
 /// Función principal del kernel
 pub fn kernel_main(fb: &mut FramebufferDriver) {
@@ -266,8 +266,50 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
     
-    // Sistema de gráficos avanzado temporalmente deshabilitado
-    fb.write_text_kernel("Sistema de gráficos avanzado deshabilitado temporalmente", Color::YELLOW);
+    // Inicializar sistema de gráficos avanzado
+    fb.write_text_kernel("Inicializando sistema de gráficos avanzado...", Color::MAGENTA);
+    let graphics_config = GraphicsConfig {
+        enable_hardware_acceleration: true,
+        enable_cuda: true,
+        enable_ray_tracing: true,
+        enable_vulkan: true,
+        enable_opengl: true,
+        max_windows: 100,
+        max_widgets: 1000,
+        vsync_enabled: true,
+        antialiasing_enabled: true,
+    };
+    let mut graphics_manager = GraphicsManager::new(graphics_config);
+    match graphics_manager.initialize(fb.clone()) {
+        Ok(_) => {
+            fb.write_text_kernel("Sistema de gráficos inicializado", Color::GREEN);
+            
+            // Crear ventana de demostración
+            let demo_window_id = graphics_manager.create_demo_window();
+            fb.write_text_kernel(&format!("Ventana de demostración creada (ID: {})", demo_window_id), Color::CYAN);
+            
+            // Mostrar información de GPU
+            let gpu_info = graphics_manager.get_gpu_info();
+            fb.write_text_kernel(&format!("GPU: {}", gpu_info), Color::LIGHT_GRAY);
+            
+            // Mostrar estadísticas
+            let window_stats = graphics_manager.get_window_stats();
+            fb.write_text_kernel(&format!("Ventanas: {}", window_stats), Color::LIGHT_GRAY);
+            
+            let widget_stats = graphics_manager.get_widget_stats();
+            fb.write_text_kernel(&format!("Widgets: {}", widget_stats), Color::LIGHT_GRAY);
+            
+            // Renderizar frame de demostración
+            if let Err(e) = graphics_manager.render_frame() {
+                fb.write_text_kernel(&format!("Error renderizando frame: {}", e), Color::RED);
+            } else {
+                fb.write_text_kernel("Frame renderizado correctamente", Color::GREEN);
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&format!("Error inicializando gráficos: {}", e), Color::RED);
+        }
+    }
     
     // Demostrar sistema de hot-plug
     // Sistema de hot-plug removido - detección de hardware simplificada

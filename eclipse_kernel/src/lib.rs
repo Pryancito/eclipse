@@ -32,7 +32,7 @@ pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
-// pub mod graphics; // TEMPORALMENTE DESHABILITADO
+pub mod graphics; // Sistema de gráficos y GUI
 pub mod uefi_framebuffer;
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
