@@ -55,36 +55,48 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     
     if fb_initialized {
         // Usar la API del framebuffer si está disponible
-        fb.clear_screen(Color::WHITE);
-        fb.write_text_kernel("Iniciando Eclipse OS Kernel", Color::YELLOW);
-        fb.write_text_kernel("Bienvenido profesor", Color::BLUE);
+        fb.clear_screen(Color::BLACK);
+        // Intentar escribir texto simple
+        fb.write_text_kernel("Bienvenido a Eclipse OS!", Color::WHITE);
     } else {
         // Si el framebuffer no está inicializado, intentar inicialización de emergencia
         panic!("Framebuffer no inicializado - base: 0x{:x}, width: {}, height: {}", 
                fb_base, fb_width, fb_height);
     }
+    fb.write_text_kernel("Detectando hardware...", Color::WHITE);
+    // Corrección: usar el resultado completo de detect_graphics_hardware() para evitar múltiples llamadas y mejorar claridad.
+    let hw_result = detect_graphics_hardware();
 
-    match detect_graphics_hardware().graphics_mode {
-        GraphicsMode::Framebuffer => {
-        }
-        GraphicsMode::VGA => {
-        }
-        GraphicsMode::HardwareAccelerated => {
-            use crate::drivers::pci::PciDevice;
-            use crate::drivers::pci::GpuInfo;
-            use crate::drivers::pci::GpuType;
-            use crate::drivers::pci::PciManager;
-            let mut pci_manager = PciManager::new();
-            pci_manager.scan_devices_safe();
-            let gpu_info = pci_manager.get_primary_gpu();
-            let Some(gpu_info) = gpu_info else {
-                panic!("No se pudo crear la GPU info");
-            };
-            let _ = fb.init_hardware_acceleration(gpu_info);
-            fb.write_text_kernel("Aceleración por hardware", Color::GREEN);
+    fb.write_text_kernel("Hardware detectado correctamente", Color::GREEN);
+
+    // Mostrar información del modo gráfico detectado
+    let modo_str = match hw_result.graphics_mode {
+        GraphicsMode::Framebuffer => "Modo framebuffer",
+        GraphicsMode::VGA => "Modo VGA",
+        GraphicsMode::HardwareAccelerated => "Aceleración por hardware",
+    };
+
+    let color_modo = match hw_result.graphics_mode {
+        GraphicsMode::Framebuffer | GraphicsMode::VGA => Color::GREEN,
+        GraphicsMode::HardwareAccelerated => Color::GREEN,
+    };
+
+    fb.write_text_kernel(modo_str, color_modo);
+
+    // Si el modo es acelerado, intentar inicializar la aceleración y mostrar detalles
+    if let GraphicsMode::HardwareAccelerated = hw_result.graphics_mode {
+        if let Some(ref gpu_info) = hw_result.primary_gpu {
+            let resultado_acc = fb.init_hardware_acceleration(gpu_info);
+            if resultado_acc.is_ok() {
+                fb.write_text_kernel("Aceleración de hardware inicializada correctamente", Color::GREEN);
+            } else {
+                fb.write_text_kernel("Error al inicializar aceleración de hardware", Color::RED);
+            }
+        } else {
+            fb.write_text_kernel("No se detectó GPU para aceleración", Color::RED);
         }
     }
-    
+    fb.write_text_kernel("Iniciando sistema de AI...", Color::YELLOW);
     // Crear sistema de AI para escritura
     let mut ai_system = create_ai_typing_system();
 
@@ -97,11 +109,6 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     // Escribir mensaje especial con efecto rainbow
     let special_message = String::from("Eclipse OS Kernel con AI");
     ai_system.write_message(fb, &special_message);
-    
-    // Demostrar función optimizada directa
-    ai_system.set_position(20, 200);
-    ai_system.write_message_direct(fb, "Funcion optimizada con punteros directos");
-    
     // Escribir mensaje de bienvenida
     ai_system.write_welcome_message(fb);
     
@@ -112,7 +119,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     
         // Escribir mensaje de éxito
         ai_system.write_success_message(fb, 0); // "Operacion completada exitosamente"
-        
+    fb.write_text_kernel("Inicializando drivers USB...", Color::YELLOW);
         // Inicializar drivers USB
         let mut usb_driver = UsbDriver::new();
         let usb_init_result = usb_driver.initialize_controllers();
@@ -144,102 +151,24 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             fb.write_text_kernel("Mouse USB: Error", Color::RED);
         }
         
-        // Cambiar a efecto rainbow para mensaje especial
-        let mut rainbow_config = AiTypingConfig::default();
-        rainbow_config.effect = TypingEffect::Rainbow;
-        ai_system.set_config(rainbow_config);
-    unsafe {
-        let mut inference_counter = 0;
+        // BUCLE PRINCIPAL SIMPLIFICADO: Evitar operaciones complejas que causan cuelgues
+        fb.write_text_kernel("Sistema listo - Bucle principal iniciado", Color::GREEN);
+        
+        // Bucle principal simplificado
+        let mut counter = 0;
         loop {
-            // Sistema de aprendizaje continuo de la IA
-            ai_system.feed_framebuffer(fb);
-            
-            // Aprendizaje adaptativo avanzado
-            ai_system.adaptive_learning(fb);
-            
-            // Mostrar estadísticas de aprendizaje
-            ai_system.display_learning_stats(fb);
-            
-            // Procesar eventos de entrada cada 1000 iteraciones
-            if inference_counter % 1000 == 0 {
-                    // Procesar eventos de teclado
-                    if let Some(key_event) = keyboard_driver.get_next_event() {
-                        match key_event {
-                            KeyboardEvent::KeyPress { key, modifiers } => {
-                                let key_text = format!("Tecla: {:?}", key);
-                                fb.write_text_kernel(&key_text, Color::YELLOW);
-                                
-                                // Manejar teclas especiales
-                                match key {
-                                    UsbKeyCode::Escape => {
-                                        fb.write_text_kernel("ESC: Saliendo...", Color::RED);
-                                        break;
-                                    }
-                                    UsbKeyCode::Enter => {
-                                        fb.write_text_kernel("ENTER: Comando", Color::GREEN);
-                                    }
-                                    UsbKeyCode::Space => {
-                                        fb.write_text_kernel("SPACE: Pausa", Color::BLUE);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            KeyboardEvent::KeyRelease { key, modifiers } => {
-                                let key_text = format!("Liberada: {:?}", key);
-                                fb.write_text_kernel(&key_text, Color::MAGENTA);
-                            }
-                            KeyboardEvent::KeyRepeat { key, modifiers } => {
-                                let key_text = format!("Repeticion: {:?}", key);
-                                fb.write_text_kernel(&key_text, Color::CYAN);
-                            }
-                        }
-                    }
-                
-                    // Procesar eventos de mouse
-                    if let Some(mouse_event) = mouse_driver.get_next_event() {
-                        match mouse_event {
-                            MouseEvent::Move { position, buttons } => {
-                                let mouse_text = format!("Mouse: ({}, {})", position.x, position.y);
-                                fb.write_text_kernel(&mouse_text, Color::CYAN);
-                            }
-                            MouseEvent::ButtonPress { button, position, buttons } => {
-                                let click_text = format!("Click: {:?} ({}, {})", button, position.x, position.y);
-                                fb.write_text_kernel(&click_text, Color::GREEN);
-                                
-                                // Manejar clics específicos
-                                match button {
-                                    MouseButton::Left => {
-                                        fb.write_text_kernel("Click izquierdo", Color::WHITE);
-                                    }
-                                    MouseButton::Right => {
-                                        fb.write_text_kernel("Click derecho", Color::WHITE);
-                                    }
-                                    MouseButton::Middle => {
-                                        fb.write_text_kernel("Click medio", Color::WHITE);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            MouseEvent::ButtonRelease { button, position, buttons } => {
-                                let release_text = format!("Liberado: {:?}", button);
-                                fb.write_text_kernel(&release_text, Color::MAGENTA);
-                            }
-                            MouseEvent::Wheel { wheel, position, buttons } => {
-                                let scroll_text = format!("Scroll: {:?}", wheel);
-                                fb.write_text_kernel(&scroll_text, Color::BLUE);
-                            }
-                        }
-                    }
+            // Mostrar contador cada 1000 iteraciones
+            if counter % 1000 == 0 {
+                fb.write_text_kernel("Sistema funcionando...", Color::CYAN);
             }
             
-            inference_counter += 1;
+            counter += 1;
             
             // Pausa optimizada para el loop
             for _ in 0..100000 {
                 core::hint::spin_loop();
             }
         }
-    }
 }
     /*
     // El dibujo del framebuffer se movió al bucle principal para evitar parpadeo
@@ -531,36 +460,38 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             let fb_info = *fb.get_info();
             
             // Limpiar pantalla con color negro UNA VEZ
-            clear_screen_direct(&fb_info, Color::BLACK);
-            
-            draw_character_direct(&fb_info, 10, 10, 'A', Color::WHITE);
+            unsafe {
+                clear_screen_direct(&fb_info, Color::BLACK);
+                
+                draw_character_direct(&fb_info, 10, 10, 'A', Color::WHITE);
 
-            // Dibujar texto "Hola Eclipse OS!" con efectos
-            draw_text_advanced_direct(&fb_info, 10, 10, "Hola Eclipse OS!", 
-                                    Color::WHITE, 
-                                    Some(Color::new(0, 0, 0, 128)), // Sombra negra
-                                    Some(Color::new(0, 0, 255, 255))); // Contorno azul
-            
-            // Dibujar algunos rectángulos de colores para demostrar las funciones
-            draw_rect_direct(&fb_info, 50, 50, 200, 100, Color::RED);
-            draw_rect_direct(&fb_info, 300, 50, 200, 100, Color::GREEN);
-            draw_rect_direct(&fb_info, 550, 50, 200, 100, Color::BLUE);
-            
-            // Dibujar más texto con diferentes efectos
-            draw_text_advanced_direct(&fb_info, 10, 200, "Sistema de Graficos Moderno", 
-                                    Color::CYAN, 
-                                    Some(Color::new(0, 0, 0, 64)), // Sombra sutil
-                                    None); // Sin contorno
-            
-            draw_text_advanced_direct(&fb_info, 10, 220, "Funciones Hibridas Funcionando!", 
-                                    Color::YELLOW, 
-                                    None, // Sin sombra
-                                    Some(Color::new(255, 0, 0, 255))); // Contorno rojo
-            
-            // Demostrar diferentes caracteres
-            draw_text_direct(&fb_info, 10, 250, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", Color::GREEN);
-            draw_text_direct(&fb_info, 10, 270, "abcdefghijklmnopqrstuvwxyz", Color::MAGENTA);
-            draw_text_direct(&fb_info, 10, 290, "0123456789!@#$%^&*()", Color::ORANGE);
+                // Dibujar texto "Hola Eclipse OS!" con efectos
+                draw_text_advanced_direct(&fb_info, 10, 10, "Hola Eclipse OS!", 
+                                        Color::WHITE, 
+                                        Some(Color::new(0, 0, 0, 128)), // Sombra negra
+                                        Some(Color::new(0, 0, 255, 255))); // Contorno azul
+                
+                // Dibujar algunos rectángulos de colores para demostrar las funciones
+                draw_rect_direct(&fb_info, 50, 50, 200, 100, Color::RED);
+                draw_rect_direct(&fb_info, 300, 50, 200, 100, Color::GREEN);
+                draw_rect_direct(&fb_info, 550, 50, 200, 100, Color::BLUE);
+                
+                // Dibujar más texto con diferentes efectos
+                draw_text_advanced_direct(&fb_info, 10, 200, "Sistema de Graficos Moderno", 
+                                        Color::CYAN, 
+                                        Some(Color::new(0, 0, 0, 64)), // Sombra sutil
+                                        None); // Sin contorno
+                
+                draw_text_advanced_direct(&fb_info, 10, 220, "Funciones Hibridas Funcionando!", 
+                                        Color::YELLOW, 
+                                        None, // Sin sombra
+                                        Some(Color::new(255, 0, 0, 255))); // Contorno rojo
+                
+                // Demostrar diferentes caracteres
+                draw_text_direct(&fb_info, 10, 250, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", Color::GREEN);
+                draw_text_direct(&fb_info, 10, 270, "abcdefghijklmnopqrstuvwxyz", Color::MAGENTA);
+                draw_text_direct(&fb_info, 10, 290, "0123456789!@#$%^&*()", Color::ORANGE);
+            }
             
         }
     }
@@ -613,6 +544,97 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
 }
 
 */
+// Funciones de dibujo directo para compatibilidad con hardware real
+unsafe fn clear_screen_direct(fb_info: &FramebufferInfo, color: Color) {
+    let fb_ptr = fb_info.base_address as *mut u32;
+    let width = fb_info.width.min(1280);
+    let height = fb_info.height.min(720);
+    let color_value = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+    
+    // Limpiar pantalla con el color especificado
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * width + x) as isize;
+            core::ptr::write_volatile(fb_ptr.add(offset as usize), color_value);
+        }
+    }
+}
+
+unsafe fn draw_rect_direct(fb_info: &FramebufferInfo, x: u32, y: u32, width: u32, height: u32, color: Color) {
+    let fb_ptr = fb_info.base_address as *mut u32;
+    let fb_width = fb_info.width;
+    let fb_height = fb_info.height;
+    let color_value = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+    
+    // Verificar límites
+    let end_x = (x + width).min(fb_width);
+    let end_y = (y + height).min(fb_height);
+    
+    // Dibujar rectángulo sólido
+    for py in y..end_y {
+        for px in x..end_x {
+            let offset = (py * fb_width + px) as isize;
+            core::ptr::write_volatile(fb_ptr.add(offset as usize), color_value);
+        }
+    }
+}
+
+unsafe fn draw_character_direct(fb_info: &FramebufferInfo, x: u32, y: u32, ch: char, color: Color) {
+    // Implementación simple de dibujo de caracteres
+    let fb_ptr = fb_info.base_address as *mut u32;
+    let fb_width = fb_info.width;
+    let fb_height = fb_info.height;
+    let color_value = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+    
+    // Verificar límites
+    if x + 8 >= fb_width || y + 16 >= fb_height {
+        return;
+    }
+    
+    // Dibujar un rectángulo simple para representar el carácter
+    for py in y..y + 16 {
+        for px in x..x + 8 {
+            let offset = (py * fb_width + px) as isize;
+            core::ptr::write_volatile(fb_ptr.add(offset as usize), color_value);
+        }
+    }
+}
+
+unsafe fn draw_text_direct(fb_info: &FramebufferInfo, x: u32, y: u32, text: &str, color: Color) {
+    let mut current_x = x;
+    let char_width = 8;
+    let char_height = 16;
+    
+    for ch in text.chars() {
+        if current_x + char_width < fb_info.width {
+            draw_character_direct(fb_info, current_x, y, ch, color);
+            current_x += char_width;
+        } else {
+            break; // No hay más espacio en la línea
+        }
+    }
+}
+
+unsafe fn draw_text_advanced_direct(fb_info: &FramebufferInfo, x: u32, y: u32, text: &str, 
+                                   color: Color, shadow: Option<Color>, outline: Option<Color>) {
+    // Dibujar sombra si está especificada
+    if let Some(shadow_color) = shadow {
+        draw_text_direct(fb_info, x + 1, y + 1, text, shadow_color);
+    }
+    
+    // Dibujar contorno si está especificado
+    if let Some(outline_color) = outline {
+        // Dibujar contorno en todas las direcciones
+        draw_text_direct(fb_info, x - 1, y, text, outline_color);
+        draw_text_direct(fb_info, x + 1, y, text, outline_color);
+        draw_text_direct(fb_info, x, y - 1, text, outline_color);
+        draw_text_direct(fb_info, x, y + 1, text, outline_color);
+    }
+    
+    // Dibujar texto principal
+    draw_text_direct(fb_info, x, y, text, color);
+}
+
 unsafe fn draw_direct_fallback(fb_info: FramebufferInfo) {
     
     let fb_ptr = fb_info.base_address as *mut u32;

@@ -3,15 +3,12 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
-// Importar funciones necesarias
 use eclipse_kernel::main_simple::kernel_main;
 use eclipse_kernel::drivers::framebuffer::{
-    init_framebuffer, FramebufferInfo, Color, get_framebuffer
+    FramebufferInfo, FramebufferDriver, Color,
+    get_framebuffer, init_framebuffer
 };
 
-// Usamos el panic handler definido en lib.rs
 // Punto de entrada principal del kernel (con parámetros del framebuffer)
 #[no_mangle]
 pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {

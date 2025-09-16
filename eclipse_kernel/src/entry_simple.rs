@@ -11,21 +11,7 @@ use core::panic::PanicInfo;
 // Importar módulos necesarios
 use crate::drivers::framebuffer::get_framebuffer;
 use crate::main_simple::kernel_main;
-
-// Estructura para información del framebuffer (debe coincidir con el bootloader)
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FramebufferInfo {
-    pub base_address: u64,
-    pub width: u32,
-    pub height: u32,
-    pub pixels_per_scan_line: u32,
-    pub pixel_format: u32,
-    pub red_mask: u32,
-    pub green_mask: u32,
-    pub blue_mask: u32,
-    pub reserved_mask: u32,
-}
+use crate::drivers::framebuffer::FramebufferInfo; // Importar desde drivers/framebuffer.rs
 
 // Variable global para almacenar información del framebuffer
 static mut FRAMEBUFFER_INFO: Option<FramebufferInfo> = None;
@@ -50,52 +36,72 @@ pub extern "C" fn uefi_entry(framebuffer_info: *const FramebufferInfo) -> ! {
     
     // Llamar a la función principal del kernel
     // Inicializar el framebuffer usando la información recibida
-    // El puntero framebuffer_info nunca es Option, es un puntero crudo.
-    // Hay que leerlo de forma segura antes de usarlo.
     unsafe {
         let info = core::ptr::read_volatile(framebuffer_info);
         
-        // Debug: Verificar información del framebuffer recibida
-        // Intentar escribir directamente al framebuffer para test
-        if info.base_address != 0 {
-            let fb_ptr = info.base_address as *mut u32;
-            
-            // Escribir patrón de test directamente
-            for y in 0..info.height.min(50) {
-                for x in 0..info.width.min(50) {
-                    let offset = (y * info.width + x) as isize;
-                    core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00FF0000); // Rojo
-                }
-            }
-            
-            // Dibujar rectángulo verde
-            for y in 0..20 {
-                for x in 0..40 {
-                    let offset = (y * info.width + x) as isize;
-                    core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x0000FF00); // Verde
-                }
-            }
-        }
+        // Almacenar la información del framebuffer globalmente
+        FRAMEBUFFER_INFO = Some(info);
         
-        if let Some(fb) = crate::drivers::framebuffer::init_framebuffer(
+        // Inicializar el framebuffer correctamente
+        if let Ok(_) = crate::drivers::framebuffer::init_framebuffer(
             info.base_address,
             info.width,
             info.height,
             info.pixels_per_scan_line,
             info.pixel_format,
             info.red_mask | info.green_mask | info.blue_mask
-        ).ok().and_then(|_| get_framebuffer()) {
-            crate::main_simple::kernel_main(fb);
+        ) {
+            // Si la inicialización fue exitosa, usar la API del framebuffer
+            if let Some(mut fb) = get_framebuffer() {
+                // Limpiar pantalla con negro
+                fb.clear_screen(crate::drivers::framebuffer::Color::BLACK);
+                
+                // Llamar a la función principal del kernel
+                crate::main_simple::kernel_main(&mut fb);
+            } else {
+                // Fallback: escribir directamente al framebuffer
+                if info.base_address != 0 {
+                    let fb_ptr = info.base_address as *mut u32;
+                    
+                    // Limpiar pantalla con negro
+                    for y in 0..info.height {
+                        for x in 0..info.width {
+                            let offset = (y * info.pixels_per_scan_line + x) as isize;
+                            core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00000000); // Negro
+                        }
+                    }
+                    
+                    // Dibujar un mensaje simple
+                    for y in 100..120 {
+                        for x in 100..300 {
+                            if y < info.height && x < info.width {
+                                let offset = (y * info.pixels_per_scan_line + x) as isize;
+                                core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00FFFFFF); // Blanco
+                            }
+                        }
+                    }
+                }
+            }
         } else {
-            // Si falla la inicialización, intentar escribir directamente
+            // Si falla la inicialización, escribir directamente al framebuffer
             if info.base_address != 0 {
                 let fb_ptr = info.base_address as *mut u32;
                 
-                // Escribir patrón de emergencia
-                for y in 0..info.height.min(100) {
-                    for x in 0..info.width.min(100) {
-                        let offset = (y * info.width + x) as isize;
-                        core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x000000FF); // Azul
+                // Limpiar pantalla con azul oscuro
+                for y in 0..info.height {
+                    for x in 0..info.width {
+                        let offset = (y * info.pixels_per_scan_line + x) as isize;
+                        core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00000080); // Azul oscuro
+                    }
+                }
+                
+                // Dibujar mensaje de error
+                for y in 200..220 {
+                    for x in 200..400 {
+                        if y < info.height && x < info.width {
+                            let offset = (y * info.pixels_per_scan_line + x) as isize;
+                            core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x00FF0000); // Rojo
+                        }
                     }
                 }
             }

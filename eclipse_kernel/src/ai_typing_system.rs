@@ -70,33 +70,58 @@ pub struct AiMessages {
 
 impl AiMessages {
     pub fn new() -> Self {
+        // VERSIÓN SEGURA: Usar mensajes estáticos para evitar problemas con el allocator
         Self {
-            welcome_messages: vec![
-                String::from("Bienvenido a Eclipse OS"),
-                String::from("Sistema inicializado correctamente"),
-                String::from("AI Kernel activado"),
-                String::from("Framebuffer detectado"),
-                String::from("Sistema listo para usar"),
-            ],
-            system_messages: vec![
-                String::from("Cargando sistema de archivos..."),
-                String::from("Inicializando drivers de hardware..."),
-                String::from("Configurando red..."),
-                String::from("Preparando interfaz grafica..."),
-                String::from("Sistema optimizado y listo"),
-            ],
-            error_messages: vec![
-                String::from("Error: No se pudo inicializar el framebuffer"),
-                String::from("Advertencia: Hardware no detectado"),
-                String::from("Error: Memoria insuficiente"),
-                String::from("Sistema en modo de recuperacion"),
-            ],
-            success_messages: vec![
-                String::from("Operacion completada exitosamente"),
-                String::from("Sistema funcionando correctamente"),
-                String::from("Todos los drivers cargados"),
-                String::from("Sistema estable y optimizado"),
-            ],
+            welcome_messages: vec![],
+            system_messages: vec![],
+            error_messages: vec![],
+            success_messages: vec![],
+        }
+    }
+    
+    /// Obtener mensaje de bienvenida por índice (versión segura)
+    pub fn get_welcome_message(&self, index: usize) -> &'static str {
+        match index {
+            0 => "Bienvenido a Eclipse OS",
+            1 => "Sistema inicializado correctamente", 
+            2 => "AI Kernel activado",
+            3 => "Framebuffer detectado",
+            4 => "Sistema listo para usar",
+            _ => "Bienvenido al sistema",
+        }
+    }
+    
+    /// Obtener mensaje del sistema por índice (versión segura)
+    pub fn get_system_message(&self, index: usize) -> &'static str {
+        match index {
+            0 => "Cargando sistema de archivos...",
+            1 => "Inicializando drivers de hardware...",
+            2 => "Configurando red...",
+            3 => "Preparando interfaz grafica...",
+            4 => "Sistema optimizado y listo",
+            _ => "Procesando...",
+        }
+    }
+    
+    /// Obtener mensaje de error por índice (versión segura)
+    pub fn get_error_message(&self, index: usize) -> &'static str {
+        match index {
+            0 => "Error: No se pudo inicializar el framebuffer",
+            1 => "Advertencia: Hardware no detectado",
+            2 => "Error: Memoria insuficiente",
+            3 => "Sistema en modo de recuperacion",
+            _ => "Error del sistema",
+        }
+    }
+    
+    /// Obtener mensaje de éxito por índice (versión segura)
+    pub fn get_success_message(&self, index: usize) -> &'static str {
+        match index {
+            0 => "Operacion completada exitosamente",
+            1 => "Sistema funcionando correctamente",
+            2 => "Todos los drivers cargados",
+            3 => "Sistema estable y optimizado",
+            _ => "Operacion exitosa",
         }
     }
 }
@@ -132,31 +157,9 @@ impl AiTypingSystem {
     pub fn write_message(&mut self, fb: &mut FramebufferDriver, message: &String) {
         self.is_typing = true;
         
-        match self.config.effect {
-            TypingEffect::Normal => {
-                // Usar función optimizada para kernel
-                fb.write_text_kernel(message.as_str(), self.config.color);
-            }
-            TypingEffect::Fast => {
-                fb.ia_text_with_delay(self.current_position.0, self.current_position.1, message, self.config.color, 10);
-            }
-            TypingEffect::Slow => {
-                fb.ia_text_with_delay(self.current_position.0, self.current_position.1, message, self.config.color, 200);
-            }
-            TypingEffect::Typewriter => {
-                // Usar función optimizada con efecto de escritura
-                fb.write_text_kernel_typing(self.current_position.0, self.current_position.1, message.as_str(), self.config.color);
-            }
-            TypingEffect::WithSound => {
-                self.write_with_sound_effect(fb, message);
-            }
-            TypingEffect::Rainbow => {
-                self.write_rainbow_effect(fb, message);
-            }
-        }
-        
-        // Mover posición para el siguiente mensaje
-        self.current_position.1 += 20;
+        // VERSIÓN SEGURA: Usar write_message_direct para evitar problemas con el allocator
+        self.write_message_direct(fb, message.as_str());
+
         self.is_typing = false;
     }
     
@@ -167,43 +170,35 @@ impl AiTypingSystem {
         // Usar función optimizada para kernel sin efectos
         fb.write_text_kernel(message, self.config.color);
         
-        // Mover posición para el siguiente mensaje
-        self.current_position.1 += 20;
         self.is_typing = false;
     }
     
-    /// Escribir mensaje de bienvenida aleatorio
+    /// Escribir mensaje de bienvenida aleatorio (versión segura)
     pub fn write_welcome_message(&mut self, fb: &mut FramebufferDriver) {
-        let message = self.messages.welcome_messages[0].clone(); // Clonar el mensaje
-        self.write_message(fb, &message);
+        let message = self.messages.get_welcome_message(0);
+        self.write_message_direct(fb, message);
     }
     
-    /// Escribir mensaje del sistema
+    /// Escribir mensaje del sistema (versión segura)
     pub fn write_system_message(&mut self, fb: &mut FramebufferDriver, message_index: usize) {
-        if message_index < self.messages.system_messages.len() {
-            let message = self.messages.system_messages[message_index].clone(); // Clonar el mensaje
-            self.write_message(fb, &message);
-        }
+        let message = self.messages.get_system_message(message_index);
+        self.write_message_direct(fb, message);
     }
     
-    /// Escribir mensaje de error
+    /// Escribir mensaje de error (versión segura)
     pub fn write_error_message(&mut self, fb: &mut FramebufferDriver, message_index: usize) {
-        if message_index < self.messages.error_messages.len() {
-            let message = self.messages.error_messages[message_index].clone(); // Clonar el mensaje
-            self.config.color = Color::RED; // Cambiar color a rojo para errores
-            self.write_message(fb, &message);
-            self.config.color = Color::WHITE; // Restaurar color original
-        }
+        let message = self.messages.get_error_message(message_index);
+        self.config.color = Color::RED; // Cambiar color a rojo para errores
+        self.write_message_direct(fb, message);
+        self.config.color = Color::WHITE; // Restaurar color original
     }
     
-    /// Escribir mensaje de éxito
+    /// Escribir mensaje de éxito (versión segura)
     pub fn write_success_message(&mut self, fb: &mut FramebufferDriver, message_index: usize) {
-        if message_index < self.messages.success_messages.len() {
-            let message = self.messages.success_messages[message_index].clone(); // Clonar el mensaje
-            self.config.color = Color::GREEN; // Cambiar color a verde para éxito
-            self.write_message(fb, &message);
-            self.config.color = Color::WHITE; // Restaurar color original
-        }
+        let message = self.messages.get_success_message(message_index);
+        self.config.color = Color::GREEN; // Cambiar color a verde para éxito
+        self.write_message_direct(fb, message);
+        self.config.color = Color::WHITE; // Restaurar color original
     }
     
     /// Efecto de escritura con sonido simulado

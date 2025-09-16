@@ -1323,6 +1323,7 @@ pub struct FramebufferDriver {
     buffer: *mut u8,
     is_initialized: bool,
     hardware_acceleration: HardwareAccelerationManager,
+    current_x: u32,
 }
 
 impl FramebufferDriver {
@@ -1343,6 +1344,7 @@ impl FramebufferDriver {
             buffer: ptr::null_mut(),
             is_initialized: false,
             hardware_acceleration: HardwareAccelerationManager::new(),
+            current_x: 10,
         }
     }
     
@@ -1598,9 +1600,12 @@ impl FramebufferDriver {
         let height = self.info.height;
         
         // Limpiar pantalla línea por línea para mejor rendimiento
-        for x in 0..height {
-            for y in 0..width {
-                self.put_pixel(x, y, color);
+        for y in 0..height {
+            for x in 0..width {
+                let stride = self.info.pixels_per_scan_line;
+                let fb_ptr = self.info.base_address as *mut u32;
+                let offset = (y * stride + x) as isize;
+                unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color.to_u32()); } // VERDE
             }
         }
     }
@@ -1650,7 +1655,7 @@ impl FramebufferDriver {
     /// Función optimizada para kernel que usa punteros directos sin asignaciones de memoria
     /// Esta es la versión recomendada para kernels como Eclipse OS
     pub fn write_text_kernel(&mut self, text: &str, color: Color) {
-        let mut buffer_x: u8 = unsafe { *self.buffer };
+        let mut buffer_x: u32 = self.current_x;
         let mut current_y = 5;
         let char_width = 8;
         let char_height = 8;
@@ -1667,16 +1672,13 @@ impl FramebufferDriver {
             }
             
             // Llamar a la función de dibujo con el byte del carácter
-            self.draw_character(buffer_x.into(), current_y, char_code as char, color);
-            current_y += char_height;
+            self.draw_character(buffer_x, current_y + 2, char_code as char, color);
+            current_y += char_width;
 
             // Avanzar el puntero al siguiente byte
             current_ptr = unsafe { current_ptr.add(1) };
         }
-        buffer_x += char_width;
-        unsafe {
-            *self.buffer = buffer_x;
-        }
+        self.current_x += 16;
     }
     
     /// Versión optimizada con efecto de escritura para kernel
@@ -1767,8 +1769,9 @@ impl FramebufferDriver {
         }
         
         unsafe {
+            let stride = self.info.pixels_per_scan_line;
             let fb_ptr = self.info.base_address as *mut u32;
-            core::ptr::write_volatile(fb_ptr.add((x * self.info.width + y) as usize), color.to_u32());
+            core::ptr::write_volatile(fb_ptr.add((x * stride + y) as usize), color.to_u32());
         }
     }
     
@@ -3039,7 +3042,7 @@ pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
 
 /// Inicializar framebuffer con información UEFI
 /// Esta función es llamada desde el punto de entrada UEFI
-pub fn init_framebuffer_from_uefi(uefi_fb_info: &crate::entry_simple::FramebufferInfo) -> Result<(), &'static str> {
+pub fn init_framebuffer_from_uefi(uefi_fb_info: &FramebufferInfo) -> Result<(), &'static str> {
     // ✅ CORREGIR: Mapeo correcto de formatos UEFI
     let pixel_format = match uefi_fb_info.pixel_format {
         0 => 0, // PixelRedGreenBlueReserved8BitPerColor
@@ -3365,7 +3368,8 @@ impl LayerManager {
                                    buffer: layer.buffer,
                                    is_initialized: true,
                                    hardware_acceleration: HardwareAccelerationManager::new(),
-                               });
+                                   current_x: 0,
+                                });
         } else {
             // Alpha blending pixel por pixel
             for y in 0..actual_height {
