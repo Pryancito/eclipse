@@ -3,9 +3,9 @@
 //! Este módulo conecta el sistema de archivos NTFS con las APIs de Windows
 //! para proporcionar compatibilidad completa.
 
-use super::ntfs::*;
+use crate::ntfs::*;
 use core::ffi::c_void;
-use core::ptr;
+// use core::ptr;
 
 /// Handle de archivo NTFS
 pub type NtfsFileHandle = *mut c_void;
@@ -333,8 +333,9 @@ pub fn ntfs_flush_file_buffers(file_handle: NtfsFileHandle) -> Result<(), &'stat
 
 /// Obtener estadísticas de rendimiento NTFS
 pub fn ntfs_get_performance_stats() -> Result<(u32, u32, u64, u64), &'static str> {
-    if let Some(ref mut driver) = get_ntfs_driver() {
-        Ok(driver.get_stats())
+    if let Some(driver) = get_ntfs_driver() {
+        let stats = driver.get_stats();
+        Ok(stats)
     } else {
         Err("Driver NTFS no inicializado")
     }

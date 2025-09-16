@@ -4,6 +4,7 @@
 //! para identificar hardware gráfico y otros dispositivos.
 
 use core::ptr;
+use core::arch::asm;
 
 /// Configuración de espacio de configuración PCI
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
@@ -20,6 +21,7 @@ pub const VENDOR_ID_SIS: u16 = 0x1039;
 pub const CLASS_DISPLAY: u8 = 0x03;
 pub const SUBCLASS_VGA: u8 = 0x00;
 pub const SUBCLASS_3D: u8 = 0x02;
+pub const SUBCLASS_DISPLAY_OTHER: u8 = 0x80;
 
 /// Información de un dispositivo PCI
 #[derive(Debug, Clone, Copy)]
@@ -41,34 +43,128 @@ pub struct PciDevice {
 impl PciDevice {
     /// Leer registro de configuración PCI
     pub fn read_config(&self, offset: u8) -> u32 {
-        let address = 0x80000000u32
+        let address = 0x8000_0000u32
             | ((self.bus as u32) << 16)
             | ((self.device as u32) << 11)
             | ((self.function as u32) << 8)
             | ((offset as u32) & 0xFC);
         
         unsafe {
-            // Escribir dirección
-            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
-            // Leer datos
-            ptr::read_volatile(PCI_CONFIG_DATA as *mut u32)
+            io_outl(PCI_CONFIG_ADDRESS, address);
+            // Pequeña pausa
+            core::hint::spin_loop();
+            io_inl(PCI_CONFIG_DATA)
         }
     }
     
     /// Escribir registro de configuración PCI
     pub fn write_config(&self, offset: u8, value: u32) {
-        let address = 0x80000000u32
+        let address = 0x8000_0000u32
             | ((self.bus as u32) << 16)
             | ((self.device as u32) << 11)
             | ((self.function as u32) << 8)
             | ((offset as u32) & 0xFC);
         
         unsafe {
-            // Escribir dirección
-            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
-            // Escribir datos
-            ptr::write_volatile(PCI_CONFIG_DATA as *mut u32, value);
+            io_outl(PCI_CONFIG_ADDRESS, address);
+            io_outl(PCI_CONFIG_DATA, value);
         }
+    }
+
+    /// Leer command y status del dispositivo
+    pub fn read_command_status(&self) -> (u16, u16) {
+        let v = self.read_config(0x04);
+        let command = (v & 0xFFFF) as u16;
+        let status = ((v >> 16) & 0xFFFF) as u16;
+        (command, status)
+    }
+
+    /// Habilitar MMIO y Bus Master en el dispositivo
+    pub fn enable_mmio_and_bus_master(&self) {
+        let (command, status) = self.read_command_status();
+        let mut new_command = command;
+        // Bit 1: Memory Space Enable, Bit 2: Bus Master Enable
+        new_command |= 1 << 1;
+        new_command |= 1 << 2;
+        let value = (status as u32) << 16 | (new_command as u32);
+        self.write_config(0x04, value);
+    }
+
+    /// Leer un BAR de 32 bits (BAR0..BAR5)
+    pub fn read_bar(&self, bar_index: u8) -> u32 {
+        let index = core::cmp::min(bar_index, 5);
+        let offset = 0x10 + index * 4;
+        self.read_config(offset)
+    }
+
+    /// Leer todos los BARs (BAR0..BAR5)
+    pub fn read_all_bars(&self) -> [u32; 6] {
+        let mut bars = [0u32; 6];
+        for i in 0..6 {
+            bars[i] = self.read_bar(i as u8);
+        }
+        bars
+    }
+
+    /// Calcular tamaño real de un BAR usando máscara
+    pub fn calculate_bar_size(&self, bar_index: u8) -> u64 {
+        let bar = self.read_bar(bar_index);
+        if bar == 0 || bar == 0xFFFFFFFF { return 0; }
+        
+        // Guardar valor original
+        let original = bar;
+        // Escribir todo 1s para leer el tamaño
+        self.write_config(0x10 + (bar_index as u8) * 4, 0xFFFFFFFF);
+        let masked = self.read_bar(bar_index);
+        // Restaurar valor original
+        self.write_config(0x10 + (bar_index as u8) * 4, original);
+        
+        // Calcular tamaño basado en bits bajos
+        if (masked & 0x1) == 0 { // Memoria
+            if (masked & 0x6) == 0x4 { // 64-bit memory BAR
+                // Para BARs 64-bit, necesitamos leer el siguiente BAR también
+                if bar_index < 5 {
+                    let next_bar = self.read_bar(bar_index + 1);
+                    let next_original = next_bar;
+                    self.write_config(0x10 + (bar_index + 1) * 4, 0xFFFFFFFF);
+                    let masked_next = self.read_bar(bar_index + 1);
+                    self.write_config(0x10 + (bar_index + 1) * 4, next_original);
+                    
+                    let full_masked = ((masked_next as u64) << 32) | (masked as u64 & 0xFFFFFFF0);
+                    let size = !full_masked + 1;
+                    size
+                } else {
+                    // BAR 64-bit en la última posición, usar solo 32 bits
+                    let size = !(masked & 0xFFFFFFF0) + 1;
+                    size as u64
+                }
+            } else { // 32-bit memory BAR
+                let size = !(masked & 0xFFFFFFF0) + 1;
+                size as u64
+            }
+        } else { // I/O
+            let size = !(masked & 0xFFFFFFFC) + 1;
+            size as u64
+        }
+    }
+
+    /// Leer capability list pointer
+    pub fn read_capability_pointer(&self) -> u8 {
+        let status = (self.read_config(0x04) >> 16) as u16;
+        if (status & 0x10) != 0 { // Capabilities bit set
+            (self.read_config(0x34) & 0xFF) as u8
+        } else {
+            0
+        }
+    }
+
+    /// Leer capability específica
+    pub fn read_capability(&self, offset: u8) -> Option<(u8, u8)> {
+        if offset == 0 { return None; }
+        let cap = self.read_config(offset);
+        let id = (cap & 0xFF) as u8;
+        let next = ((cap >> 8) & 0xFF) as u8;
+        Some((id, next))
     }
 }
 
@@ -90,6 +186,10 @@ pub enum GpuType {
     Intel,
     Nvidia,
     Amd,
+    Qemu,
+    Virtio,
+    Qxl,
+    Vmware,
     Via,
     Sis,
     Unknown,
@@ -101,6 +201,10 @@ impl GpuType {
             VENDOR_ID_INTEL => GpuType::Intel,
             VENDOR_ID_NVIDIA => GpuType::Nvidia,
             VENDOR_ID_AMD => GpuType::Amd,
+            0x1234 => GpuType::Qemu,   // QEMU/Bochs std VGA
+            0x1AF4 => GpuType::Virtio, // Virtio GPU
+            0x1B36 => GpuType::Qxl,    // QXL (Red Hat)
+            0x15AD => GpuType::Vmware, // VMware SVGA
             VENDOR_ID_VIA => GpuType::Via,
             VENDOR_ID_SIS => GpuType::Sis,
             _ => GpuType::Unknown,
@@ -112,6 +216,10 @@ impl GpuType {
             GpuType::Intel => "Intel",
             GpuType::Nvidia => "NVIDIA",
             GpuType::Amd => "AMD",
+            GpuType::Qemu => "QEMU StdVGA",
+            GpuType::Virtio => "Virtio GPU",
+            GpuType::Qxl => "QXL",
+            GpuType::Vmware => "VMware SVGA",
             GpuType::Via => "VIA",
             GpuType::Sis => "SiS",
             GpuType::Unknown => "Unknown",
@@ -232,25 +340,18 @@ impl PciManager {
         
         // Intentar leer de forma segura
         unsafe {
-            let address = 0x80000000u32
+            let address = 0x8000_0000u32
                 | ((bus as u32) << 16)
                 | ((device as u32) << 11)
                 | ((function as u32) << 8)
                 | ((offset as u32) & 0xFC);
-            
-            // Escribir dirección
-            ptr::write_volatile(PCI_CONFIG_ADDRESS as *mut u32, address);
-            
-            // Pequeña pausa para estabilidad
-            for _ in 0..10 {
-                core::hint::spin_loop();
-            }
-            
-            // Leer datos
-            let result = ptr::read_volatile(PCI_CONFIG_DATA as *mut u32);
-            
-            // Verificar que la lectura fue válida
-            if result == 0xFFFFFFFF && Self::vendor_id_from_result(result) == 0xFFFF {
+
+            io_outl(PCI_CONFIG_ADDRESS, address);
+            // Pequeña pausa
+            for _ in 0..10 { core::hint::spin_loop(); }
+            let result = io_inl(PCI_CONFIG_DATA);
+
+            if result == 0xFFFF_FFFF {
                 Err("Dispositivo PCI no encontrado")
             } else {
                 Ok(result)
@@ -268,9 +369,12 @@ impl PciManager {
         self.device_count = 0;
         self.gpu_count = 0;
 
-        // Verificar si PCI está disponible
+        // Si la disponibilidad aún no fue comprobada, comprobar ahora
         if !self.hardware_available {
-            self.create_fallback_gpu();
+            self.hardware_available = self.check_pci_hardware();
+        }
+        if !self.hardware_available {
+            // No forzar GPU de fallback aquí, reportar 0 dispositivos/GPUs
             return;
         }
 
@@ -289,13 +393,17 @@ impl PciManager {
                     }
                     
                     // Verificar funciones adicionales (para dispositivos multifunción)
-                    for function in 1..=7 {
-                        if let Ok(func_info) = self.read_pci_device_safe(bus, device, function) {
-                            self.add_device(func_info);
-                            
-                            if self.is_gpu_device(&func_info) {
-                                if let Some(gpu_info) = self.create_gpu_info(func_info) {
-                                    self.add_gpu(gpu_info);
+                    let header = (self.read_config_dword(bus, device, 0, 0x0C) >> 16) as u8;
+                    let is_multifunction = (header & 0x80) != 0;
+                    if is_multifunction {
+                        for function in 1..=7 {
+                            if let Ok(func_info) = self.read_pci_device_safe(bus, device, function) {
+                                self.add_device(func_info);
+                                
+                                if self.is_gpu_device(&func_info) {
+                                    if let Some(gpu_info) = self.create_gpu_info(func_info) {
+                                        self.add_gpu(gpu_info);
+                                    }
                                 }
                             }
                         }
@@ -304,10 +412,7 @@ impl PciManager {
             }
         }
         
-        // Si no se encontraron GPUs reales, crear una de fallback
-        if self.gpu_count == 0 {
-            self.create_fallback_gpu();
-        }
+        // No crear GPUs ficticias: si no hay, reportar 0
     }
     
     /// Crear GPU de fallback cuando no se detecta hardware real
@@ -407,8 +512,9 @@ impl PciManager {
     
     /// Verificar si un dispositivo es una GPU
     fn is_gpu_device(&self, device: &PciDevice) -> bool {
-        device.class_code == CLASS_DISPLAY && 
-        (device.subclass_code == SUBCLASS_VGA || device.subclass_code == SUBCLASS_3D)
+        // Solo contar GPUs reales: clase Display (0x03) y subclases comunes
+        if device.class_code != CLASS_DISPLAY { return false; }
+        matches!(device.subclass_code, SUBCLASS_VGA | SUBCLASS_3D | SUBCLASS_DISPLAY_OTHER)
     }
     
     /// Crear información de GPU a partir de dispositivo PCI
@@ -478,7 +584,22 @@ impl PciManager {
             GpuType::Nvidia => {
                 supports_3d = true; // NVIDIA siempre soporta 3D
                 max_resolution = (3840, 2160); // 4K
-                if memory_size == 0 { memory_size = 1024 * 1024 * 1024; }
+                // Para NVIDIA, priorizar detección real desde BARs
+                let mut total_detected = 0u64;
+                for bar_idx in 0..6 {
+                    let bar = self.try_read_pci_safe(device.bus, device.device, device.function, 0x10 + bar_idx * 4).unwrap_or(0);
+                    if bar != 0 && bar != 0xFFFFFFFF && (bar & 0x1) == 0 { // Memoria válida
+                        let bar_size = self.estimate_bar_size(bar);
+                        total_detected += bar_size;
+                    }
+                }
+                
+                if total_detected > 0 {
+                    memory_size = total_detected;
+                } else {
+                    // Fallback: estimación basada en device ID solo si no se detectó nada
+                    memory_size = self.estimate_nvidia_memory(device.device_id);
+                }
             },
             GpuType::Amd => {
                 supports_3d = true; // AMD siempre soporta 3D
@@ -495,20 +616,66 @@ impl PciManager {
         (memory_size, supports_2d, supports_3d, max_resolution)
     }
     
-    /// Estimar el tamaño de un BAR
+    /// Estimar el tamaño de un BAR usando el método de máscara
     fn estimate_bar_size(&self, bar: u32) -> u64 {
-        // Implementación simplificada para estimar el tamaño del BAR
-        // En una implementación real, esto sería más complejo
         if bar == 0 || bar == 0xFFFFFFFF {
             return 0;
         }
         
-        // Estimación básica basada en el valor del BAR
-        let size = (bar & 0xFFFFFFF0) as u64;
-        if size > 0 {
-            size.max(1024 * 1024) // Mínimo 1MB
+        // Verificar si es un BAR de memoria (bit 0 = 0)
+        if (bar & 0x1) == 0 {
+            // BAR de memoria
+            let size_mask = bar & 0xFFFFFFF0; // Máscara de 4KB alineada
+            if size_mask > 0 {
+                // Calcular tamaño real basado en los bits de dirección
+                let size = (1u64 << (32 - size_mask.leading_zeros())) as u64;
+                size.max(1024 * 1024) // Mínimo 1MB
+            } else {
+                0
+            }
         } else {
-            0
+            // BAR de I/O (bit 0 = 1)
+            let size_mask = bar & 0xFFFFFFFC; // Máscara de 4 bytes alineada
+            if size_mask > 0 {
+                let size = (1u64 << (32 - size_mask.leading_zeros())) as u64;
+                size.max(4) // Mínimo 4 bytes para I/O
+            } else {
+                0
+            }
+        }
+    }
+    
+    /// Estimar memoria de GPU NVIDIA basada en device ID
+    fn estimate_nvidia_memory(&self, device_id: u16) -> u64 {
+        // Estimaciones basadas en device IDs comunes de NVIDIA
+        match device_id {
+            // RTX 40 series (8GB+)
+            0x2782..=0x27FF => 8 * 1024 * 1024 * 1024, // RTX 4080/4090
+            // RTX 30 series (6-24GB)
+            0x2204..=0x22FF => 6 * 1024 * 1024 * 1024, // RTX 3060
+            0x2484..=0x24FF => 8 * 1024 * 1024 * 1024, // RTX 3070
+            0x2504..=0x25FF => 10 * 1024 * 1024 * 1024, // RTX 3080
+            0x2206..=0x2207 => 12 * 1024 * 1024 * 1024, // RTX 3080 Ti
+            0x2208..=0x2209 => 24 * 1024 * 1024 * 1024, // RTX 3090
+            // RTX 20 series (6-11GB)
+            0x1F02..=0x1F03 => 6 * 1024 * 1024 * 1024, // RTX 2060
+            0x1F04..=0x1F05 => 8 * 1024 * 1024 * 1024, // RTX 2070
+            0x1F06..=0x1F07 => 8 * 1024 * 1024 * 1024, // RTX 2060 SUPER
+            0x1E04..=0x1E05 => 8 * 1024 * 1024 * 1024, // RTX 2080
+            0x1E07..=0x1E08 => 11 * 1024 * 1024 * 1024, // RTX 2080 Ti
+            // GTX 16 series (4-8GB)
+            0x2182..=0x21FF => 4 * 1024 * 1024 * 1024, // GTX 1650
+            0x1F80..=0x1F81 => 6 * 1024 * 1024 * 1024, // GTX 1660
+            0x1F82..=0x1F83 => 6 * 1024 * 1024 * 1024, // GTX 1660 Ti
+            // GTX 10 series (2-11GB)
+            0x1B80..=0x1B81 => 2 * 1024 * 1024 * 1024, // GTX 1050
+            0x1B82..=0x1B83 => 4 * 1024 * 1024 * 1024, // GTX 1050 Ti
+            0x1C02..=0x1C03 => 3 * 1024 * 1024 * 1024, // GTX 1060
+            0x1B00..=0x1B01 => 4 * 1024 * 1024 * 1024, // GTX 1070
+            0x1B02..=0x1B03 => 8 * 1024 * 1024 * 1024, // GTX 1080
+            0x1B06..=0x1B07 => 11 * 1024 * 1024 * 1024, // GTX 1080 Ti
+            // Fallback para GPUs NVIDIA desconocidas
+            _ => 8 * 1024 * 1024 * 1024, // 8GB por defecto para NVIDIA moderna
         }
     }
     
@@ -532,6 +699,15 @@ impl PciManager {
     
     /// Agregar GPU a la lista
     fn add_gpu(&mut self, gpu: GpuInfo) {
+        // Evitar duplicados por funciones múltiples del mismo dispositivo (mismo bus:device)
+        let bus = gpu.pci_device.bus;
+        let dev = gpu.pci_device.device;
+        let already_present = self.gpus[..self.gpu_count]
+            .iter()
+            .filter_map(|g| g.as_ref())
+            .any(|g| g.pci_device.bus == bus && g.pci_device.device == dev);
+        if already_present { return; }
+
         if self.gpu_count < self.gpus.len() {
             self.gpus[self.gpu_count] = Some(gpu);
             self.gpu_count += 1;
@@ -564,6 +740,29 @@ impl PciManager {
     pub fn get_device(&self, index: usize) -> Option<&PciDevice> {
         self.devices.get(index)?.as_ref()
     }
+}
+
+// IO de puertos 32-bit
+#[inline(always)]
+unsafe fn io_outl(port: u16, value: u32) {
+    asm!(
+        "out dx, eax",
+        in("dx") port,
+        in("eax") value,
+        options(nomem, nostack, preserves_flags)
+    );
+}
+
+#[inline(always)]
+unsafe fn io_inl(port: u16) -> u32 {
+    let value: u32;
+    asm!(
+        "in eax, dx",
+        in("dx") port,
+        out("eax") value,
+        options(nomem, nostack, preserves_flags)
+    );
+    value
 }
 
 /// Función de conveniencia para escanear PCI

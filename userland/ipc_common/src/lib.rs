@@ -50,6 +50,42 @@ pub enum IpcMessage {
     Pong,
     /// Notificación de cierre
     Shutdown,
+    /// Cargar driver dinámicamente
+    LoadDriver {
+        driver_type: DriverType,
+        driver_name: String,
+        driver_data: Vec<u8>,
+        config: DriverConfig,
+    },
+    /// Respuesta de carga de driver
+    LoadDriverResponse {
+        success: bool,
+        driver_id: Option<u32>,
+        error: Option<String>,
+    },
+    /// Comando específico para driver
+    DriverCommand {
+        driver_id: u32,
+        command: DriverCommandType,
+        args: Vec<u8>,
+    },
+    /// Respuesta de comando de driver
+    DriverCommandResponse {
+        driver_id: u32,
+        success: bool,
+        result: Option<Vec<u8>>,
+        error: Option<String>,
+    },
+    /// Desregistrar driver
+    UnloadDriver {
+        driver_id: u32,
+    },
+    /// Listar drivers disponibles
+    ListDrivers,
+    /// Respuesta de lista de drivers
+    ListDriversResponse {
+        drivers: Vec<DriverInfo>,
+    },
 }
 
 /// Tipos de módulos disponibles
@@ -59,6 +95,22 @@ pub enum ModuleType {
     Audio,
     Network,
     Storage,
+    Driver(DriverType),
+    Custom(String),
+}
+
+/// Tipos de drivers específicos
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DriverType {
+    PCI,
+    NVIDIA,
+    AMD,
+    Intel,
+    USB,
+    Network,
+    Storage,
+    Audio,
+    Input,
     Custom(String),
 }
 
@@ -127,6 +179,73 @@ pub enum NetworkOperation {
     Receive,
     Listen { port: u16 },
     Accept,
+}
+
+/// Configuración de driver
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverConfig {
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub priority: u8,
+    pub auto_load: bool,
+    pub memory_limit: u64,
+    pub dependencies: Vec<String>,
+    pub capabilities: Vec<DriverCapability>,
+}
+
+/// Información de driver
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverInfo {
+    pub id: u32,
+    pub config: DriverConfig,
+    pub status: DriverStatus,
+    pub pid: Option<u32>,
+    pub memory_usage: u64,
+    pub uptime: u64,
+}
+
+/// Estado del driver
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DriverStatus {
+    Unloaded,
+    Loading,
+    Loaded,
+    Initializing,
+    Ready,
+    Error(String),
+    Unloading,
+}
+
+/// Capacidades del driver
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DriverCapability {
+    Graphics,
+    Network,
+    Storage,
+    Audio,
+    Input,
+    Power,
+    Security,
+    Custom(String),
+}
+
+/// Tipos de comandos de driver
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DriverCommandType {
+    Initialize,
+    Shutdown,
+    Suspend,
+    Resume,
+    GetStatus,
+    GetCapabilities,
+    ExecuteCommand { command: String },
+    GetDeviceInfo { device_id: u32 },
+    ScanDevices,
+    EnableDevice { device_id: u32 },
+    DisableDevice { device_id: u32 },
+    Custom { command: String },
 }
 
 /// Trait para serialización de mensajes IPC

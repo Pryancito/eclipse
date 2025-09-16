@@ -3,6 +3,7 @@ use ipc_common::*;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use driver_loader::{DriverLoader, create_driver_loader};
 
 /// Driver gráfico avanzado
 pub struct GraphicsDriver {
@@ -12,6 +13,7 @@ pub struct GraphicsDriver {
     bpp: u8,
     framebuffer: Vec<u32>,
     mode: GraphicsMode,
+    driver_loader: DriverLoader,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,7 @@ impl GraphicsDriver {
             bpp: 32,
             framebuffer: Vec::new(),
             mode: GraphicsMode::VGA,
+            driver_loader: create_driver_loader(),
         }
     }
 
@@ -169,6 +172,33 @@ impl GraphicsDriver {
         Ok(())
     }
 
+    /// Cargar driver dinámicamente
+    pub fn load_driver(&mut self, driver_type: DriverType, driver_name: String, config: DriverConfig) -> Result<u32> {
+        let driver_id = self.driver_loader.load_driver(
+            driver_type,
+            driver_name,
+            vec![], // Datos binarios del driver
+            config,
+        )?;
+        println!("✓ Driver cargado con ID: {}", driver_id);
+        Ok(driver_id)
+    }
+
+    /// Ejecutar comando en driver
+    pub fn execute_driver_command(&mut self, driver_id: u32, command: DriverCommandType, args: Vec<u8>) -> Result<Vec<u8>> {
+        self.driver_loader.execute_command(driver_id, command, args)
+    }
+
+    /// Listar drivers disponibles
+    pub fn list_drivers(&self) -> Vec<DriverInfo> {
+        self.driver_loader.list_drivers()
+    }
+
+    /// Obtener información de driver
+    pub fn get_driver_info(&self, driver_id: u32) -> Option<&DriverInfo> {
+        self.driver_loader.get_driver_info(driver_id)
+    }
+
     /// Procesar comando gráfico
     pub async fn process_command(&mut self, command: &str, args: Vec<String>) -> Result<String> {
         match command {
@@ -215,6 +245,64 @@ impl GraphicsDriver {
                 self.swap_buffers()?;
                 Ok("Buffer intercambiado".to_string())
             },
+            "list_drivers" => {
+                let drivers = self.list_drivers();
+                let driver_list: Vec<String> = drivers.iter()
+                    .map(|d| format!("ID: {} - {} ({:?})", d.id, d.config.name, d.status))
+                    .collect();
+                Ok(format!("Drivers disponibles:\n{}", driver_list.join("\n")))
+            },
+            "load_driver" => {
+                if args.len() >= 2 {
+                    let driver_name = args[0].clone();
+                    let driver_type = match args[1].as_str() {
+                        "nvidia" => DriverType::NVIDIA,
+                        "amd" => DriverType::AMD,
+                        "intel" => DriverType::Intel,
+                        "pci" => DriverType::PCI,
+                        _ => DriverType::Custom(args[1].clone()),
+                    };
+                    
+                    let config = DriverConfig {
+                        name: driver_name.clone(),
+                        version: "1.0.0".to_string(),
+                        author: "Eclipse OS".to_string(),
+                        description: format!("Driver {} cargado dinámicamente", driver_name),
+                        priority: 1,
+                        auto_load: false,
+                        memory_limit: 1024 * 1024,
+                        dependencies: vec![],
+                        capabilities: vec![DriverCapability::Graphics],
+                    };
+                    
+                    let driver_id = self.load_driver(driver_type, driver_name, config)?;
+                    Ok(format!("Driver cargado con ID: {}", driver_id))
+                } else {
+                    Err(anyhow::anyhow!("Uso: load_driver <nombre> <tipo>"))
+                }
+            },
+            "driver_command" => {
+                if args.len() >= 2 {
+                    let driver_id = args[0].parse::<u32>()?;
+                    let cmd = args[1].clone();
+                    
+                    let command_type = match cmd.as_str() {
+                        "init" => DriverCommandType::Initialize,
+                        "shutdown" => DriverCommandType::Shutdown,
+                        "status" => DriverCommandType::GetStatus,
+                        "capabilities" => DriverCommandType::GetCapabilities,
+                        "get_gpu_count" => DriverCommandType::ExecuteCommand { command: "get_gpu_count".to_string() },
+                        "get_memory_info" => DriverCommandType::ExecuteCommand { command: "get_memory_info".to_string() },
+                        _ => DriverCommandType::Custom { command: cmd },
+                    };
+                    
+                    let result = self.execute_driver_command(driver_id, command_type, vec![])?;
+                    let result_str = String::from_utf8_lossy(&result);
+                    Ok(format!("Resultado: {}", result_str))
+                } else {
+                    Err(anyhow::anyhow!("Uso: driver_command <driver_id> <comando>"))
+                }
+            },
             _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         }
     }
@@ -253,6 +341,53 @@ async fn main() -> Result<()> {
     driver.swap_buffers()?;
 
     println!("✓ Driver gráfico listo y funcionando");
+    
+    // Demostrar sistema de drivers dinámicos
+    println!("\n🔧 SISTEMA DE DRIVERS DINÁMICOS");
+    println!("=================================");
+    
+    // Listar drivers predefinidos
+    let drivers = driver.list_drivers();
+    println!("Drivers predefinidos:");
+    for driver_info in &drivers {
+        println!("  - {} (ID: {}) - {:?}", driver_info.config.name, driver_info.id, driver_info.status);
+    }
+    
+    // Cargar un driver personalizado
+    let custom_config = DriverConfig {
+        name: "Custom Graphics Driver".to_string(),
+        version: "1.0.0".to_string(),
+        author: "Usuario".to_string(),
+        description: "Driver personalizado para gráficos".to_string(),
+        priority: 3,
+        auto_load: false,
+        memory_limit: 2 * 1024 * 1024,
+        dependencies: vec!["PCI Driver".to_string()],
+        capabilities: vec![DriverCapability::Graphics, DriverCapability::Custom("Custom".to_string())],
+    };
+    
+    let custom_driver_id = driver.load_driver(DriverType::Custom("Custom".to_string()), "Custom Graphics Driver".to_string(), custom_config)?;
+    println!("✓ Driver personalizado cargado con ID: {}", custom_driver_id);
+    
+    // Ejecutar comandos en drivers
+    for driver_info in &drivers {
+        if driver_info.config.name.contains("NVIDIA") {
+            println!("\n🎮 Probando driver NVIDIA:");
+            
+            // Inicializar driver
+            let init_result = driver.execute_driver_command(driver_info.id, DriverCommandType::Initialize, vec![])?;
+            println!("  Inicialización: {}", String::from_utf8_lossy(&init_result));
+            
+            // Obtener conteo de GPUs
+            let gpu_count_result = driver.execute_driver_command(driver_info.id, DriverCommandType::ExecuteCommand { command: "get_gpu_count".to_string() }, vec![])?;
+            let gpu_count = u32::from_le_bytes([gpu_count_result[0], gpu_count_result[1], gpu_count_result[2], gpu_count_result[3]]);
+            println!("  GPUs detectadas: {}", gpu_count);
+            
+            // Obtener información de memoria
+            let memory_result = driver.execute_driver_command(driver_info.id, DriverCommandType::ExecuteCommand { command: "get_memory_info".to_string() }, vec![])?;
+            println!("  Memoria: {}", String::from_utf8_lossy(&memory_result));
+        }
+    }
     
     // Simular trabajo del módulo por un tiempo
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;

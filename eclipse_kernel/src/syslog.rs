@@ -8,6 +8,11 @@ use core::fmt::Write;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
+use core::cmp::min;
+
+// Opcionalmente intentar NTFS/FAT32 si están inicializados
+use crate::ntfs_integration as ntfs;
+use crate::fat32::{get_fat32_driver, FAT32_CLUSTER_EOF};
 
 /// Facilidades syslog estándar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +114,8 @@ pub struct SyslogLogger {
     current_entry: AtomicUsize,
     enabled: AtomicBool,
     min_severity: AtomicU8,
+    // Buffer circular simple para volcado a disco (texto plano formateado)
+    ring_buf: RingBuffer,
 }
 
 static SYSLOG_LOGGER: SyslogLogger = SyslogLogger {
@@ -118,6 +125,7 @@ static SYSLOG_LOGGER: SyslogLogger = SyslogLogger {
     current_entry: AtomicUsize::new(0),
     enabled: AtomicBool::new(true),
     min_severity: AtomicU8::new(SyslogSeverity::Info as u8),
+    ring_buf: RingBuffer::new(),
 };
 
 impl SyslogLogger {
@@ -148,9 +156,14 @@ impl SyslogLogger {
             return;
         }
 
-        // Formatear y enviar a puerto serial
+        // Formatear
         let formatted = entry.format_syslog();
+
+        // Enviar a puerto serial
         self.write_to_serial(&formatted);
+
+        // Almacenar en buffer circular para posible volcado a disco
+        self.ring_buf.append_line(&formatted);
 
         // Almacenar en buffer circular (si hay espacio)
         // En un kernel real, esto sería más complejo
@@ -203,6 +216,63 @@ impl SyslogLogger {
             min_severity: self.min_severity.load(Ordering::SeqCst),
             serial_port: self.serial_port,
         }
+    }
+}
+
+// Buffer circular de texto para dmesg (512 KiB)
+struct RingBuffer {
+    buf: spin::Mutex<RingBufferInner>,
+}
+
+struct RingBufferInner {
+    data: [u8; 512 * 1024],
+    len: usize,
+    wrote_wrap: bool,
+}
+
+impl RingBuffer {
+    const fn new() -> Self {
+        Self { buf: spin::Mutex::new(RingBufferInner { data: [0; 512 * 1024], len: 0, wrote_wrap: false }) }
+    }
+
+    fn append_line(&self, s: &str) {
+        let mut g = self.buf.lock();
+        let bytes = s.as_bytes();
+        let mut remaining = bytes.len() + 1; // incluir '\n'
+        let mut src_idx = 0usize;
+        while remaining > 0 {
+            let cap = g.data.len();
+            if g.len >= cap { g.len = 0; g.wrote_wrap = true; }
+            let write_here = min(cap - g.len, remaining);
+            if write_here == 0 { break; }
+            // copiar bytes
+            let take_data = min(bytes.len() - src_idx, write_here);
+            let start = g.len;
+            let end = start + take_data;
+            if take_data > 0 {
+                g.data[start .. end].copy_from_slice(&bytes[src_idx .. src_idx + take_data]);
+            }
+            // si aún queda 1 byte para el '\n'
+            if write_here > take_data {
+                let nl_pos = start + take_data;
+                g.data[nl_pos] = b'\n';
+            }
+            g.len = start + write_here;
+            src_idx += take_data;
+            remaining -= write_here;
+        }
+    }
+
+    fn snapshot(&self) -> alloc::vec::Vec<u8> {
+        let g = self.buf.lock();
+        if !g.wrote_wrap {
+            return g.data[..g.len].to_vec();
+        }
+        // Si hubo wrap, devolver data[g.len..] + data[..g.len]
+        let mut out = Vec::with_capacity(g.data.len());
+        out.extend_from_slice(&g.data[g.len..]);
+        out.extend_from_slice(&g.data[..g.len]);
+        out
     }
 }
 
@@ -367,4 +437,38 @@ pub fn set_syslog_level(severity: SyslogSeverity) {
 
 pub fn enable_syslog(enabled: bool) {
     SYSLOG_LOGGER.set_enabled(enabled);
+}
+
+/// Volcar el buffer de syslog a un archivo en disco. Intenta NTFS (\\dmesg) y luego FAT32 (DMESG.TXT en raíz)
+pub fn flush_syslog_to_file() -> Result<(), &'static str> {
+    let snapshot = SYSLOG_LOGGER.ring_buf.snapshot();
+    if snapshot.is_empty() { return Ok(()); }
+
+    // 1) Intentar NTFS
+    if let Ok(mut _fh) = {
+        let mut h: ntfs::NtfsFileHandle = core::ptr::null_mut();
+        match ntfs::ntfs_create_file(&mut h as *mut _, /*desired_access*/0, /*attrs*/0, /*disp*/0, "\\dmesg") {
+            Ok(_) => Ok(h),
+            Err(e) => Err(e),
+        }
+    } {
+        let mut written: u32 = 0;
+        let _ = ntfs::ntfs_write_file(_fh, snapshot.as_ptr(), snapshot.len() as u32, &mut written as *mut _);
+        let _ = ntfs::ntfs_flush_file_buffers(_fh);
+        let _ = ntfs::ntfs_close_file(_fh);
+        return Ok(());
+    }
+
+    // 2) Intentar FAT32 (archivo DMESG.TXT en el directorio raíz)
+    if let Some(driver) = get_fat32_driver() {
+        // Crear/abrir archivo sencillo (best-effort)
+        let _ = driver.create_file(driver.root_cluster, "DMESG.TXT");
+        // Escribir primer cluster
+        // NOTA: write_cluster actualmente simula escritura; suficiente para integración inicial
+        let first_cluster = 3u32; // en create_file se asigna 3 en allocate_cluster()
+        let _ = driver.write_cluster(first_cluster, &snapshot);
+        return Ok(());
+    }
+
+    Err("No hay backend de FS disponible")
 }

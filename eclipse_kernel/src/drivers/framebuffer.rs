@@ -1670,7 +1670,18 @@ impl FramebufferDriver {
             if current_y + char_height > self.info.height {
                 break;
             }
-            
+            if buffer_x + char_width > self.info.width {
+                buffer_x = 10;
+                self.current_x = 10;
+                current_y = 5; // Reiniciar al principio de la pantalla
+                self.clear_screen(Color::BLACK);
+            }
+            if current_y + char_height > self.info.height {
+                buffer_x = 10;
+                self.current_x = 10;
+                current_y = 5; // Reiniciar al principio de la pantalla
+                self.clear_screen(Color::BLACK);
+            }
             // Llamar a la función de dibujo con el byte del carácter
             self.draw_character(buffer_x, current_y + 2, char_code as char, color);
             current_y += char_width;

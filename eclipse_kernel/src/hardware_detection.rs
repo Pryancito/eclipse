@@ -76,14 +76,12 @@ impl HardwareDetector {
 
     /// Crear detector con verificación de allocador (versión ultra-segura)
     pub fn new_safe() -> Option<Self> {
-        // VERSIÓN ULTRA SENCILLA: Solo crear la estructura básica
-        // Sin ninguna operación que pueda fallar
-
+        // Crear estructura segura pero con PciManager real disponible para debug
         Some(Self {
-            pci_manager: None, // Inicialmente None para evitar problemas
+            pci_manager: Some(PciManager::new()),
             pci_manager_minimal: PciManagerMinimal::new(),
             detection_result: None,
-            allocator_ready: false, // Marcar como no listo inicialmente
+            allocator_ready: false,
         })
     }
 
@@ -280,13 +278,11 @@ impl HardwareDetector {
         // Usar la versión segura que no puede colgarse
         let mut gpus = Vec::new();
         
-        // Crear manager PCI minimal para evitar problemas
-        let mut pci_manager = PciManager::new_without_hardware_check();
+        // Usar el manager PCI completo con verificación real de hardware
+        let mut pci_manager = PciManager::new();
         
-        // Solo escanear si el hardware está disponible
-        if pci_manager.is_hardware_available() {
-            pci_manager.scan_devices();
-        }
+        // Escanear dispositivos PCI (maneja internamente disponibilidad)
+        pci_manager.scan_devices();
         
         // Obtener GPUs detectadas del manager
         for gpu_option in pci_manager.get_gpus() {
@@ -295,10 +291,7 @@ impl HardwareDetector {
             }
         }
         
-        // Si no se encontraron GPUs, crear una de fallback
-        if gpus.is_empty() {
-            gpus.push(self.create_fallback_gpu());
-        }
+        // No agregar fallback aquí: reportar lista vacía si no hay GPUs
         
         gpus
     }
@@ -391,6 +384,10 @@ impl HardwareDetector {
             GpuType::Amd => true,     // Driver AMD disponible
             GpuType::Via => false,    // Driver VIA no disponible
             GpuType::Sis => false,    // Driver SiS no disponible
+            GpuType::Qemu => true,    // Driver QEMU disponible (framebuffer genérico)
+            GpuType::Virtio => true,  // Driver Virtio disponible (framebuffer genérico)
+            GpuType::Qxl => true,     // Driver QXL (framebuffer genérico)
+            GpuType::Vmware => true,  // Driver VMware SVGA (framebuffer genérico)
             GpuType::Unknown => false,
         }
     }
@@ -415,16 +412,21 @@ impl HardwareDetector {
     
     /// Determinar GPU primaria
     fn determine_primary_gpu(&self, gpus: &[GpuInfo]) -> Option<GpuInfo> {
-        if gpus.is_empty() {
-            return None;
-        }
-        
-        // Priorizar GPUs con capacidades 3D
-        if let Some(gpu) = gpus.iter().find(|gpu| gpu.supports_3d) {
+        if gpus.is_empty() { return None; }
+
+        // Preferir NVIDIA discreta
+        if let Some(gpu) = gpus.iter().find(|g| g.gpu_type == GpuType::Nvidia) {
             return Some(gpu.clone());
         }
-        
-        // Si no hay 3D, tomar la primera disponible
+        // Luego AMD
+        if let Some(gpu) = gpus.iter().find(|g| g.gpu_type == GpuType::Amd) {
+            return Some(gpu.clone());
+        }
+        // Luego Intel
+        if let Some(gpu) = gpus.iter().find(|g| g.gpu_type == GpuType::Intel) {
+            return Some(gpu.clone());
+        }
+        // Si no, la primera
         gpus.first().cloned()
     }
     

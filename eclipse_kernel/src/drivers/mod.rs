@@ -32,10 +32,15 @@ pub mod input_system;
 pub mod gui_integration;
 pub mod manager;
 pub mod modular;
+pub mod ipc;
+pub mod pci_driver;
+pub mod nvidia_pci_driver;
+pub mod binary_driver_manager;
 
 // Re-exportar componentes principales
 pub use device::{DeviceType, DeviceState, DeviceError};
 pub use manager::DriverResult;
+pub use ipc::{Driver, DriverManager, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
 
 // Constantes del sistema de drivers
 pub const MAX_DEVICES: usize = 256;

@@ -32,7 +32,7 @@ pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
-pub mod graphics;
+// pub mod graphics; // TEMPORALMENTE DESHABILITADO
 pub mod uefi_framebuffer;
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
@@ -73,6 +73,11 @@ pub mod metrics;  // Sistema de métricas y monitoreo del kernel
 pub mod config;  // Sistema de configuración dinámica del kernel
 pub mod plugins;  // Sistema de plugins del kernel
 pub mod kernel_utils;  // Utilidades del kernel Eclipse
+pub mod fat32;  // Sistema de archivos FAT32 (experimental)
+pub mod ntfs;   // Sistema de archivos NTFS (experimental)
+pub mod ntfs_integration;  // Integración NTFS (stub)
+pub mod ipc;    // Sistema IPC para comunicación kernel-userland
+// pub mod hotplug; // Sistema de hot-plug para detección automática de hardware - REMOVIDO
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

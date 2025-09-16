@@ -34,6 +34,12 @@ pub extern "C" fn uefi_entry(framebuffer_info: *const FramebufferInfo) -> ! {
         );
     }
     
+    // Inicializar allocador global antes de cualquier uso de alloc
+    #[cfg(feature = "alloc")]
+    {
+        crate::allocator::init_allocator();
+    }
+    
     // Llamar a la función principal del kernel
     // Inicializar el framebuffer usando la información recibida
     unsafe {

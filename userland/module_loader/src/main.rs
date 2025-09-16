@@ -95,6 +95,7 @@ impl ModuleLoader {
             ModuleType::Audio => "audio_module".to_string(),
             ModuleType::Network => "network_module".to_string(),
             ModuleType::Storage => "storage_module".to_string(),
+            ModuleType::Driver(_) => "driver_module".to_string(),
             ModuleType::Custom(name) => name.clone(),
         }
     }
