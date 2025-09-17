@@ -104,29 +104,40 @@ impl GraphicsManager {
 
     /// Inicializar sistema de gráficos
     pub fn initialize(&mut self, framebuffer: FramebufferDriver) -> Result<(), String> {
-
         self.framebuffer = Some(framebuffer);
+        if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] initialize IN", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
 
         // Inicializar sistema de múltiples GPUs
         if self.config.enable_hardware_acceleration {
+            if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] init multi-GPU...", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
             if let Err(e) = self.multi_gpu_manager.initialize_all_drivers() {
                 // Si falla la inicialización de GPUs, continuar sin aceleración
                 // Log de advertencia - continuar sin aceleración
+                if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] multi-GPU fallo (continuo)", crate::drivers::framebuffer::Color::YELLOW); }
             }
         }
 
         // Inicializar driver NVIDIA si está disponible (para compatibilidad)
         if self.config.enable_hardware_acceleration {
+            if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] init NVIDIA...", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
             if let Err(e) = self.initialize_nvidia_driver() {
                 // No es crítico si falla
                 // Log de advertencia - continuar sin aceleración
+                if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] NVIDIA fallo (continuo)", crate::drivers::framebuffer::Color::YELLOW); }
             }
         }
 
-        // Crear ventana de escritorio
-        self.create_desktop_window();
+        // Crear ventana de escritorio (omitir en entornos sin aceleración, p.ej. QEMU)
+        if self.config.enable_hardware_acceleration {
+            if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] create desktop...", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
+            self.create_desktop_window();
+            if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] desktop OK", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
+        } else {
+            if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] desktop omitido (sin aceleración)", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
+        }
 
         self.initialized = true;
+        if let Some(ref mut fb) = self.framebuffer { fb.write_text_kernel("[GFX] initialize OUT", crate::drivers::framebuffer::Color::LIGHT_GRAY); }
         Ok(())
     }
 

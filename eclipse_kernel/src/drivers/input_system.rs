@@ -7,50 +7,11 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::boxed::Box;
 
-use crate::drivers::usb_keyboard::{UsbKeyboardDriver, UsbKeyCode};
-use crate::drivers::usb_mouse::{UsbMouseDriver, MouseButton};
+use crate::drivers::usb_keyboard::{UsbKeyboardDriver, KeyboardEvent, UsbKeyCode, ModifierState};
+use crate::drivers::usb_mouse::{UsbMouseDriver, MouseEvent, MouseButton, MousePosition, MouseButtonState};
 
 /// Sistema de entrada unificado para Eclipse OS
 /// Gestiona eventos de teclado y mouse de forma centralizada
-
-/// Evento de teclado
-#[derive(Debug, Clone, PartialEq)]
-pub struct KeyboardEvent {
-    pub key_code: UsbKeyCode,
-    pub pressed: bool,
-    pub timestamp: u64,
-}
-
-/// Evento de mouse
-#[derive(Debug, Clone, PartialEq)]
-pub struct MouseEvent {
-    pub button: Option<MouseButton>,
-    pub position: (i32, i32),
-    pub pressed: bool,
-    pub timestamp: u64,
-}
-
-/// Evento del sistema
-#[derive(Debug, Clone, PartialEq)]
-pub enum SystemEvent {
-    DeviceConnected,
-    DeviceDisconnected,
-}
-
-/// Estado de modificadores del teclado
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModifierState {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub shift: bool,
-    pub meta: bool,
-}
-
-/// Posición del mouse
-pub type MousePosition = (i32, i32);
-
-/// Estado de botones del mouse
-pub type MouseButtonState = crate::drivers::usb_mouse::MouseButtonState;
 
 /// Tipo de evento de entrada
 #[derive(Debug, Clone, PartialEq)]
@@ -60,7 +21,14 @@ pub enum InputEventType {
     System(SystemEvent),
 }
 
-// SystemEvent ya está definido arriba
+/// Eventos del sistema
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemEvent {
+    DeviceConnected { device_type: String, device_id: u32 },
+    DeviceDisconnected { device_type: String, device_id: u32 },
+    InputError { error: String },
+    BufferOverflow,
+}
 
 /// Evento de entrada unificado
 #[derive(Debug, Clone, PartialEq)]
@@ -202,7 +170,7 @@ impl InputSystem {
     
     /// Agregar teclado USB
     pub fn add_keyboard(&mut self, mut keyboard: UsbKeyboardDriver) -> Result<u32, &'static str> {
-        keyboard.initialize().map_err(|_| "Failed to initialize keyboard")?;
+        keyboard.initialize().map_err(|e| "Error initializing keyboard")?;
         
         let device_id = self.keyboards.len() as u32;
         self.keyboards.push(keyboard);
@@ -210,7 +178,10 @@ impl InputSystem {
         
         // Crear evento de dispositivo conectado
         let event = InputEvent::new(
-            InputEventType::System(SystemEvent::DeviceConnected),
+            InputEventType::System(SystemEvent::DeviceConnected {
+                device_type: "Keyboard".to_string(),
+                device_id,
+            }),
             device_id,
             self.current_timestamp,
         );
@@ -221,7 +192,7 @@ impl InputSystem {
     
     /// Agregar mouse USB
     pub fn add_mouse(&mut self, mut mouse: UsbMouseDriver) -> Result<u32, &'static str> {
-        mouse.initialize().map_err(|_| "Failed to initialize mouse")?;
+        mouse.initialize().map_err(|e| "Error initializing mouse")?;
         
         let device_id = self.mice.len() as u32;
         self.mice.push(mouse);
@@ -229,7 +200,10 @@ impl InputSystem {
         
         // Crear evento de dispositivo conectado
         let event = InputEvent::new(
-            InputEventType::System(SystemEvent::DeviceConnected),
+            InputEventType::System(SystemEvent::DeviceConnected {
+                device_type: "Mouse".to_string(),
+                device_id,
+            }),
             device_id,
             self.current_timestamp,
         );
@@ -257,7 +231,7 @@ impl InputSystem {
         // Agregar eventos de teclado
         for (device_id, keyboard_event) in keyboard_events {
             let input_event = InputEvent::new(
-                InputEventType::Keyboard(keyboard_event.to_input_system_keyboard_event()),
+                InputEventType::Keyboard(keyboard_event),
                 device_id,
                 self.current_timestamp,
             );
@@ -277,7 +251,7 @@ impl InputSystem {
         // Agregar eventos de mouse
         for (device_id, mouse_event) in mouse_events {
             let input_event = InputEvent::new(
-                InputEventType::Mouse(mouse_event.to_input_system_mouse_event()),
+                InputEventType::Mouse(mouse_event),
                 device_id,
                 self.current_timestamp,
             );
@@ -382,7 +356,7 @@ impl InputSystem {
     /// Procesar datos de teclado
     pub fn process_keyboard_data(&mut self, device_id: u32, data: &[u8]) -> Result<(), &'static str> {
         if let Some(keyboard) = self.get_keyboard(device_id) {
-            keyboard.process_keyboard_data(data).map_err(|_| "Failed to process keyboard data")?;
+            keyboard.process_keyboard_data(data).map_err(|e| "Error processing keyboard data")?;
         } else {
             return Err("Teclado no encontrado");
         }
@@ -392,7 +366,7 @@ impl InputSystem {
     /// Procesar datos de mouse
     pub fn process_mouse_data(&mut self, device_id: u32, data: &[u8]) -> Result<(), &'static str> {
         if let Some(mouse) = self.get_mouse(device_id) {
-            mouse.process_mouse_data(data).map_err(|_| "Failed to process mouse data")?;
+            mouse.process_mouse_data(data).map_err(|e| "Error processing mouse data")?;
         } else {
             return Err("Mouse no encontrado");
         }
@@ -402,7 +376,7 @@ impl InputSystem {
     /// Obtener estado actual de todos los dispositivos
     pub fn get_device_states(&self) -> DeviceStates {
         DeviceStates {
-            keyboards: self.keyboards.iter().map(|k| k.get_modifier_state().to_input_system_modifier_state()).collect(),
+            keyboards: self.keyboards.iter().map(|k| k.get_modifier_state()).collect(),
             mice: self.mice.iter().map(|m| (m.get_position(), m.get_button_state())).collect(),
         }
     }

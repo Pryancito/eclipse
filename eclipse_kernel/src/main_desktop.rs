@@ -166,7 +166,7 @@ fn get_time_ms() -> u64 {
 }
 
 // Función principal del kernel
-/*#[no_mangle]
+#[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Inicializar VGA
     unsafe {
@@ -231,13 +231,9 @@ pub extern "C" fn _start() -> ! {
     // Loop infinito
     loop {
         unsafe {
-            // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-            // Simular halt con spin loop
-            for _ in 0..10000 {
-                core::hint::spin_loop();
-            }
+            core::arch::asm!("hlt");
         }
     }
-}*/
+}
 
 // El panic_handler se hereda de la librería principal

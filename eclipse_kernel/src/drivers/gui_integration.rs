@@ -7,10 +7,8 @@ use alloc::sync::Arc;
 use alloc::boxed::Box;
 
 use crate::drivers::input_system::{InputSystem, InputEvent, InputEventType};
-use crate::drivers::usb_keyboard::{UsbKeyCode, ModifierState};
-use crate::drivers::input_system::KeyboardEvent;
-use crate::drivers::usb_mouse::{MouseButton, MousePosition, MouseButtonState};
-use crate::drivers::input_system::MouseEvent;
+use crate::drivers::usb_keyboard::{KeyboardEvent, UsbKeyCode, ModifierState};
+use crate::drivers::usb_mouse::{MouseEvent, MouseButton, MousePosition, MouseButtonState};
 use crate::drivers::acceleration_2d::{Acceleration2D, AccelerationOperation};
 use crate::drivers::framebuffer::{FramebufferDriver, Color};
 use crate::desktop_ai::{Point, Rect};
@@ -204,15 +202,15 @@ impl GuiElement for GuiButton {
     
     fn process_mouse_event(&mut self, event: &MouseEvent, _window: &GuiWindow) -> bool {
         match event {
-            MouseEvent { button: Some(button), pressed: true, .. } => {
-                if *button == MouseButton::Left && self.contains_point(Point { x: event.position.0 as u32, y: event.position.1 as u32 }) && self.enabled {
+            MouseEvent::ButtonPress { button, position, .. } => {
+                if *button == MouseButton::Left && self.contains_point(Point { x: position.x as u32, y: position.y as u32 }) && self.enabled {
                     self.pressed = true;
                     return true;
                 }
             }
-            MouseEvent { button: Some(button), pressed: false, .. } => {
+            MouseEvent::ButtonRelease { button, position, .. } => {
                 if *button == MouseButton::Left {
-                    if self.pressed && self.contains_point(Point { x: event.position.0 as u32, y: event.position.1 as u32 }) {
+                    if self.pressed && self.contains_point(Point { x: position.x as u32, y: position.y as u32 }) {
                         // Botón clickeado
                         self.pressed = false;
                         return true;
@@ -220,8 +218,8 @@ impl GuiElement for GuiButton {
                     self.pressed = false;
                 }
             }
-            MouseEvent { button: None, .. } => {
-                self.hovered = self.contains_point(Point { x: event.position.0 as u32, y: event.position.1 as u32 });
+            MouseEvent::Move { position, .. } => {
+                self.hovered = self.contains_point(Point { x: position.x as u32, y: position.y as u32 });
             }
             _ => {}
         }
@@ -362,9 +360,9 @@ impl GuiElement for GuiTextBox {
     
     fn process_mouse_event(&mut self, event: &MouseEvent, _window: &GuiWindow) -> bool {
         match event {
-            MouseEvent { button: Some(button), pressed: true, .. } => {
+            MouseEvent::ButtonPress { button, position, .. } => {
                 if *button == MouseButton::Left {
-                    self.focused = self.contains_point(Point { x: event.position.0 as u32, y: event.position.1 as u32 });
+                    self.focused = self.contains_point(Point { x: position.x as u32, y: position.y as u32 });
                     return self.focused;
                 }
             }
@@ -378,9 +376,8 @@ impl GuiElement for GuiTextBox {
             return false;
         }
         
-        match event {
-            KeyboardEvent { key_code: key, pressed: true, .. } => {
-                match key {
+        if event.pressed {
+            match event.key_code {
                     UsbKeyCode::Backspace => {
                         self.delete_char();
                         return true;
@@ -398,16 +395,12 @@ impl GuiElement for GuiTextBox {
                         return true;
                     }
                     _ => {
-                        // Por ahora, no usamos shift (se puede mejorar más tarde)
-                        let shift_pressed = false;
-                        if let Some(ch) = key.to_ascii(shift_pressed, false) {
+                        if let Some(ch) = event.key_code.to_ascii(event.modifiers.shift_pressed(), false) {
                             self.insert_char(ch);
                             return true;
                         }
                     }
                 }
-            }
-            _ => {}
         }
         false
     }
@@ -475,9 +468,9 @@ impl GuiManager {
             windows: Vec::new(),
             elements: Vec::new(),
             focused_window: None,
-            mouse_position: (0, 0),
-            mouse_buttons: MouseButtonState::default(),
-            keyboard_modifiers: ModifierState::default(),
+            mouse_position: MousePosition::new(),
+            mouse_buttons: MouseButtonState::new(),
+            keyboard_modifiers: ModifierState::new(),
             initialized: false,
         }
     }
@@ -512,58 +505,36 @@ impl GuiManager {
     }
     
     fn process_mouse_event(&mut self, event: &MouseEvent) -> Result<(), &'static str> {
-        // Actualizar posición del mouse
-        self.mouse_position = event.position;
-        
-        // Actualizar estado de botones si hay uno presionado
-        if let Some(button) = event.button {
-            match button {
-                MouseButton::Left => self.mouse_buttons.left = event.pressed,
-                MouseButton::Right => self.mouse_buttons.right = event.pressed,
-                MouseButton::Middle => self.mouse_buttons.middle = event.pressed,
-                MouseButton::Side1 => self.mouse_buttons.side1 = event.pressed,
-                MouseButton::Side2 => self.mouse_buttons.side2 = event.pressed,
-                MouseButton::WheelUp => {}, // No se almacena el estado de la rueda
-                MouseButton::WheelDown => {}, // No se almacena el estado de la rueda
-            }
-        }
-        
-        // Verificar si el mouse está sobre alguna ventana
-        for window in &mut self.windows {
-            if window.contains_point(Point { x: event.position.0 as u32, y: event.position.1 as u32 }) {
-                window.focused = true;
-                self.focused_window = Some(window.id);
-            } else {
-                window.focused = false;
-            }
-        }
-        
-        // Procesar click en elementos si hay un botón presionado
-        if event.pressed {
-            if let Some(focused_window) = self.focused_window {
-                if let Some(window) = self.windows.iter().find(|w| w.id == focused_window) {
-                    for element in &mut self.elements {
-                        if element.process_mouse_event(event, window) {
-                            break;
-                        }
+        match event {
+            MouseEvent::Move { position, buttons } => {
+                self.mouse_position = *position;
+                self.mouse_buttons = *buttons;
+                
+                // Verificar si el mouse está sobre alguna ventana
+                for window in &mut self.windows {
+                    if window.contains_point(Point { x: position.x as u32, y: position.y as u32 }) {
+                        window.focused = true;
+                        self.focused_window = Some(window.id);
+                    } else {
+                        window.focused = false;
                     }
                 }
             }
-        }
-        Ok(())
-    }
-    
-    fn process_keyboard_event(&mut self, event: &KeyboardEvent) -> Result<(), &'static str> {
-        match event {
-            KeyboardEvent { key_code: key, pressed: true, .. } => {
-                // Los modificadores no están disponibles en el KeyboardEvent del input_system
-                // Mantenemos el estado actual de los modificadores
+            MouseEvent::ButtonPress { button, position, .. } => {
+                // Procesar click en ventanas
+                for window in &mut self.windows {
+                    if window.contains_point(Point { x: position.x as u32, y: position.y as u32 }) {
+                        window.focused = true;
+                        self.focused_window = Some(window.id);
+                        break;
+                    }
+                }
                 
-                // Procesar teclado en ventana enfocada
+                // Procesar click en elementos
                 if let Some(focused_window) = self.focused_window {
                     if let Some(window) = self.windows.iter().find(|w| w.id == focused_window) {
                         for element in &mut self.elements {
-                            if element.process_keyboard_event(event, window) {
+                            if element.process_mouse_event(event, window) {
                                 break;
                             }
                         }
@@ -571,6 +542,24 @@ impl GuiManager {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+    
+    fn process_keyboard_event(&mut self, event: &KeyboardEvent) -> Result<(), &'static str> {
+        if event.pressed {
+            self.keyboard_modifiers = event.modifiers;
+                
+            // Procesar teclado en ventana enfocada
+            if let Some(focused_window) = self.focused_window {
+                if let Some(window) = self.windows.iter().find(|w| w.id == focused_window) {
+                    for element in &mut self.elements {
+                        if element.process_keyboard_event(event, window) {
+                            break;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

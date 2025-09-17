@@ -97,18 +97,14 @@ mod container_system_simple;
 mod machine_learning_simple;
 
 /// Punto de entrada principal del kernel (Multiboot2)
-/*#[no_mangle]
+#[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Forzar pantalla negra ultra-agresivamente
     vga_centered_display::ultra_force_black_screen();
     
     // Esperar un momento para mostrar la pantalla
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Forzar pantalla negra de nuevo
@@ -116,30 +112,22 @@ pub extern "C" fn _start() -> ! {
     
     // Esperar un momento más
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Bucle principal del kernel
     kernel_main_loop();
-}*/
+}
 
 /// Punto de entrada UEFI (sin Multiboot2)
-/*#[no_mangle]
+#[no_mangle]
 pub extern "C" fn uefi_entry() -> ! {
     // Forzar pantalla negra ultra-agresivamente
     vga_centered_display::ultra_force_black_screen();
     
     // Esperar un momento para mostrar la pantalla
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Forzar pantalla negra de nuevo
@@ -147,19 +135,15 @@ pub extern "C" fn uefi_entry() -> ! {
     
     // Esperar un momento más
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Bucle principal del kernel
     kernel_main_loop();
-}*/
+}
 
 /// Punto de entrada UEFI con parámetros del framebuffer
-/*#[no_mangle]
+#[no_mangle]
 pub extern "C" fn uefi_entry_with_framebuffer(
     base_address: u64,
     width: u64,
@@ -171,11 +155,7 @@ pub extern "C" fn uefi_entry_with_framebuffer(
     
     // Esperar un momento para mostrar la pantalla
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Forzar pantalla negra de nuevo
@@ -183,11 +163,7 @@ pub extern "C" fn uefi_entry_with_framebuffer(
     
     // Esperar un momento más
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Bucle principal del kernel
@@ -199,15 +175,9 @@ pub extern "C" fn uefi_entry_with_framebuffer(
 pub extern "C" fn multiboot2_entry(magic: u32, info: *const multiboot2::Multiboot2Info) -> ! {
     // Verificar magic number
     if magic != multiboot2::MULTIBOOT2_MAGIC {
-        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-        // Invalid magic number - halt (simulado)
-        unsafe {
-            // Simular halt con spin loop infinito
-            loop {
-                for _ in 0..100000 {
-                    core::hint::spin_loop();
-                }
-            }
+        // Invalid magic number - halt
+        loop {
+            unsafe { core::arch::asm!("hlt"); }
         }
     }
     
@@ -216,11 +186,7 @@ pub extern "C" fn multiboot2_entry(magic: u32, info: *const multiboot2::Multiboo
     
     // Esperar un momento para mostrar la pantalla
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Forzar pantalla negra de nuevo
@@ -228,11 +194,7 @@ pub extern "C" fn multiboot2_entry(magic: u32, info: *const multiboot2::Multiboo
     
     // Esperar un momento más
     for _ in 0..1000000 {
-        // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-        unsafe {
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
+        unsafe { core::arch::asm!("nop"); }
     }
     
     // Bucle principal del kernel

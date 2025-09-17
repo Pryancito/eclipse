@@ -5,66 +5,66 @@
 
 set -e
 
-echo "INTEGRACION COMPILANDO KERNEL ECLIPSE OS CON INTEGRACIÓN SYSTEMD"
+echo "🔗 COMPILANDO KERNEL ECLIPSE OS CON INTEGRACIÓN SYSTEMD"
 echo "======================================================"
 echo ""
 
 # Verificar que estamos en el directorio correcto
 if [ ! -f "Cargo.toml" ]; then
-    echo "ERROR Error: Ejecutar desde el directorio eclipse_kernel/"
+    echo "❌ Error: Ejecutar desde el directorio eclipse_kernel/"
     exit 1
 fi
 
 # Verificar que eclipse-systemd existe
 if [ ! -f "../eclipse-apps/systemd/target/release/eclipse-systemd" ]; then
-    echo "ERROR Error: eclipse-systemd no encontrado"
+    echo "❌ Error: eclipse-systemd no encontrado"
     echo "   Compila primero: cd ../eclipse-apps/systemd && cargo build --release"
     exit 1
 fi
 
-echo "COMPLETADO eclipse-systemd encontrado"
+echo "✅ eclipse-systemd encontrado"
 
 # Crear directorio de salida
 mkdir -p target/systemd-integration
 
-echo "APLICANDO Compilando kernel con integración systemd..."
+echo "🔧 Compilando kernel con integración systemd..."
 
 # Compilar el kernel
 cargo build --release --target x86_64-unknown-none
 
 if [ $? -ne 0 ]; then
-    echo "ERROR Error al compilar el kernel"
+    echo "❌ Error al compilar el kernel"
     exit 1
 fi
 
-echo "COMPLETADO Kernel compilado correctamente"
+echo "✅ Kernel compilado correctamente"
 
 # Copiar eclipse-systemd al directorio de salida
-echo "PREPARANDO Preparando integración con systemd..."
+echo "📋 Preparando integración con systemd..."
 cp ../eclipse-apps/systemd/target/release/eclipse-systemd target/systemd-integration/
 
 # Crear enlace simbólico para /sbin/init
-echo "INTEGRACION Creando enlace simbólico /sbin/init..."
+echo "🔗 Creando enlace simbólico /sbin/init..."
 ln -sf eclipse-systemd target/systemd-integration/init
 
 # Crear directorio de configuración
 mkdir -p target/systemd-integration/etc/eclipse/systemd/system
 
 # Copiar archivos de configuración
-echo "PREPARANDO Copiando archivos de configuración..."
+echo "📋 Copiando archivos de configuración..."
 cp -r ../etc/eclipse/systemd/system/* target/systemd-integration/etc/eclipse/systemd/system/ 2>/dev/null || true
 
 # Crear script de arranque
-echo "CREANDO Creando script de arranque..."
+echo "📜 Creando script de arranque..."
 cat > target/systemd-integration/start_eclipse_os.sh << 'EOF'
 #!/bin/bash
 
 # Script de arranque de Eclipse OS con systemd
-echo "INICIANDO Iniciando Eclipse OS con systemd..."
+echo "🚀 Iniciando Eclipse OS con systemd..."
 
 # Verificar que eclipse-systemd existe
 if [ ! -f "./eclipse-systemd" ]; then
-    echo "ERROR Error: eclipse-systemd no encontrado"
+    echo "❌ Error: eclipse-systemd no encontrado"
     exit 1
 fi
 
@@ -87,14 +87,14 @@ export XDG_SESSION_DESKTOP="eclipse"
 export XDG_CURRENT_DESKTOP="Eclipse:GNOME"
 
 # Ejecutar eclipse-systemd como PID 1
-echo "INTEGRACION Ejecutando eclipse-systemd como PID 1..."
+echo "🔗 Ejecutando eclipse-systemd como PID 1..."
 exec ./eclipse-systemd
 EOF
 
 chmod +x target/systemd-integration/start_eclipse_os.sh
 
 # Crear README de integración
-echo "DOCUMENTACION Creando documentación de integración..."
+echo "📚 Creando documentación de integración..."
 cat > target/systemd-integration/README.md << 'EOF'
 # Eclipse OS con Integración SystemD
 
@@ -141,18 +141,18 @@ Puedes modificar los servicios editando estos archivos .service.
 EOF
 
 echo ""
-echo "EXITO INTEGRACIÓN COMPLETADA"
+echo "🎉 INTEGRACIÓN COMPLETADA"
 echo "========================"
 echo ""
-echo "ARCHIVOS Archivos generados en: target/systemd-integration/"
+echo "📁 Archivos generados en: target/systemd-integration/"
 echo "   - eclipse-systemd: Ejecutable principal"
 echo "   - init: Enlace simbólico para /sbin/init"
 echo "   - start_eclipse_os.sh: Script de arranque"
 echo "   - etc/: Archivos de configuración"
 echo "   - README.md: Documentación"
 echo ""
-echo "INICIANDO Para probar la integración:"
+echo "🚀 Para probar la integración:"
 echo "   cd target/systemd-integration"
 echo "   ./start_eclipse_os.sh"
 echo ""
-echo "COMPLETADO Eclipse OS con systemd está listo para usar!"
+echo "✅ Eclipse OS con systemd está listo para usar!"

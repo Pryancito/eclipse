@@ -256,12 +256,12 @@ impl IntelGraphicsDriver {
             base_address: self.memory_base,
             width,
             height,
-            pixels_per_scan_line: width, // Usar width como valor por defecto
-            pixel_format: 1, // BGRA8888
-            red_mask: 0x0000FF00,      // BGRA: R en bits 8-15
-            green_mask: 0x00FF0000,    // BGRA: G en bits 16-23
-            blue_mask: 0xFF000000,     // BGRA: B en bits 24-31
-            reserved_mask: 0x000000FF, // BGRA: A en bits 0-7
+            pixels_per_scan_line: width,
+            pixel_format: crate::drivers::framebuffer::PixelFormat::BGRA8888 as u32,
+            red_mask: 0x00FF0000,
+            green_mask: 0x0000FF00,
+            blue_mask: 0x000000FF,
+            reserved_mask: 0xFF000000,
         };
         
         let framebuffer = FramebufferDriver::new();

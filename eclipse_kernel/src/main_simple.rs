@@ -82,7 +82,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
                fb_base, fb_width, fb_height);
     }
     fb.write_text_kernel("[1/6] Detectando hardware...", Color::WHITE);
-    // Corrección: usar el resultado completo de detect_graphics_hardware() para evitar múltiples llamadas y mejorar claridad.
+    // Detección de hardware
     let hw_result = detect_graphics_hardware();
 
     fb.write_text_kernel("[2/6] Hardware detectado correctamente", Color::GREEN);
@@ -97,6 +97,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     fb.write_text_kernel("Sistema de hot-plug removido", Color::YELLOW);
     
     // Registrar driver PCI base
+    fb.write_text_kernel("[3/6] Registrando PCI driver...", Color::LIGHT_GRAY);
     let pci_driver = Box::new(PciDriver::new());
     match driver_manager.register_driver(pci_driver) {
         Ok(pci_id) => {
@@ -127,9 +128,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
                             fb.write_text_kernel(&format!("GPUs NVIDIA detectadas: {}", count), Color::CYAN);
                         }
                     }
-                    Ok(_) => {
-                        fb.write_text_kernel("Comando get_gpu_count ejecutado", Color::CYAN);
-                    }
+                    Ok(_) => { /* silencioso */ }
                     Err(e) => {
                         fb.write_text_kernel(&format!("Error ejecutando comando: {}", e), Color::RED);
                     }
@@ -142,7 +141,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     }
     
     // Demostrar sistema IPC del kernel
-    fb.write_text_kernel("Probando sistema IPC del kernel...", Color::CYAN);
+    // Probando sistema IPC del kernel (mensaje reducido)
+    fb.write_text_kernel("Probando IPC del kernel...", Color::CYAN);
     
     // Simular carga de driver desde userland
     let nvidia_config = DriverConfig {
@@ -247,7 +247,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             match binary_driver_manager.execute_command(binary_driver_id, "driver_command", b"get_info".to_vec()) {
                 Ok(result) => {
                     let result_str = String::from_utf8_lossy(&result);
-                    fb.write_text_kernel(&format!("Comando binario: {}", result_str), Color::CYAN);
+                // Resultado de comando binario (mensaje reducido)
+                fb.write_text_kernel(&format!("Cmd binario: {}", result_str), Color::CYAN);
                 }
                 Err(e) => {
                     fb.write_text_kernel(&format!("Error en comando binario: {}", e), Color::RED);
@@ -256,9 +257,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             
             // Obtener información del driver binario
             if let Some(driver_info) = binary_driver_manager.get_driver_info(binary_driver_id) {
-                fb.write_text_kernel(&format!("Driver: {} v{}", driver_info.name, driver_info.version), Color::LIGHT_GRAY);
-                fb.write_text_kernel(&format!("Autor: {}", driver_info.author), Color::LIGHT_GRAY);
-                fb.write_text_kernel(&format!("Estado: {:?}", driver_info.state), Color::LIGHT_GRAY);
+            // Info resumida del driver binario
+            fb.write_text_kernel(&format!("Driver: {} v{} ({:?})", driver_info.name, driver_info.version, driver_info.state), Color::LIGHT_GRAY);
             }
         }
         Err(e) => {
@@ -267,56 +267,11 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     }
     
     // Inicializar sistema de gráficos avanzado
-    fb.write_text_kernel("Inicializando sistema de gráficos avanzado...", Color::MAGENTA);
-    let graphics_config = GraphicsConfig {
-        enable_hardware_acceleration: true,
-        enable_cuda: true,
-        enable_ray_tracing: true,
-        enable_vulkan: true,
-        enable_opengl: true,
-        max_windows: 100,
-        max_widgets: 1000,
-        vsync_enabled: true,
-        antialiasing_enabled: true,
-    };
-    let mut graphics_manager = GraphicsManager::new(graphics_config);
-    match graphics_manager.initialize(fb.clone()) {
-        Ok(_) => {
-            fb.write_text_kernel("Sistema de gráficos inicializado", Color::GREEN);
-            
-            // Crear ventana de demostración
-            let demo_window_id = graphics_manager.create_demo_window();
-            fb.write_text_kernel(&format!("Ventana de demostración creada (ID: {})", demo_window_id), Color::CYAN);
-            
-            // Mostrar información de GPU
-            let gpu_info = graphics_manager.get_gpu_info();
-            if !gpu_info.is_empty() {
-                fb.write_text_kernel(&format!("GPUs detectadas: {}", gpu_info.len()), Color::LIGHT_GRAY);
-            } else {
-                fb.write_text_kernel("No hay GPUs detectadas", Color::LIGHT_GRAY);
-            }
-            
-            // Mostrar estadísticas
-            let window_stats = graphics_manager.get_window_stats();
-            fb.write_text_kernel(&format!("Ventanas: {}", window_stats), Color::LIGHT_GRAY);
-            
-            let widget_stats = graphics_manager.get_widget_stats();
-            fb.write_text_kernel(&format!("Widgets: {}", widget_stats), Color::LIGHT_GRAY);
-            
-            // Renderizar frame de demostración
-            if let Err(e) = graphics_manager.render_frame() {
-                fb.write_text_kernel(&format!("Error renderizando frame: {}", e), Color::RED);
-            } else {
-                fb.write_text_kernel("Frame renderizado correctamente", Color::GREEN);
-            }
-        }
-        Err(e) => {
-            fb.write_text_kernel(&format!("Error inicializando gráficos: {}", e), Color::RED);
-        }
-    }
+    // Modo texto temporal (Wayland más adelante): omitimos creación de ventanas/render
+    fb.write_text_kernel("Modo texto: sistema gráfico omitido (Wayland pendiente)", Color::LIGHT_GRAY);
     
-    // Inicializar sistema de hot-plug USB
-    fb.write_text_kernel("Inicializando sistema de hot-plug USB...", Color::MAGENTA);
+    // Inicializar sistema de hot-plug USB (mismo flujo en QEMU y hardware real)
+    fb.write_text_kernel("Inicializando hot-plug USB...", Color::MAGENTA);
     let hotplug_config = HotplugConfig {
         enable_usb_hotplug: true,
         enable_mouse_support: true,
@@ -329,8 +284,6 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     match hotplug_manager.initialize() {
         Ok(_) => {
             fb.write_text_kernel("Sistema de hot-plug USB inicializado", Color::GREEN);
-            
-            // Iniciar polling
             if let Err(e) = hotplug_manager.start() {
                 fb.write_text_kernel(&format!("Error iniciando hot-plug: {}", e), Color::RED);
             } else {
@@ -342,12 +295,11 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
     
-    // Detección básica de dispositivos PCI
+    // Detección básica de dispositivos PCI (mismo flujo en QEMU y hardware real)
     let mut pci_manager = PciManager::new();
     pci_manager.scan_devices();
     let pci_devices = pci_manager.get_gpus();
-    fb.write_text_kernel(&format!("Dispositivos PCI detectados: {}", pci_devices.len()), Color::CYAN);
-    
+    fb.write_text_kernel(&format!("PCI GPUs: {}", pci_devices.len()), Color::CYAN);
     for device_option in pci_devices {
         if let Some(device) = device_option {
             fb.write_text_kernel(&format!("  - PCI {:04X}:{:04X} Clase: {:02X}", 
@@ -355,58 +307,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
     
-    // Demostrar sistema de hot-plug USB
-    fb.write_text_kernel("Demostrando sistema de hot-plug USB...", Color::MAGENTA);
-    
-    // Simular conexión de ratón USB
-    if let Ok(mouse_id) = hotplug_manager.simulate_usb_device_connection(UsbDeviceType::Mouse, 1) {
-        fb.write_text_kernel(&format!("Ratón USB conectado (ID: {})", mouse_id), Color::GREEN);
-        
-        // Inicializar driver del ratón
-        let mut mouse_driver = UsbMouseDriver::new(mouse_id);
-        if let Ok(_) = mouse_driver.initialize() {
-            fb.write_text_kernel("Driver del ratón USB inicializado", Color::GREEN);
-            
-            // Simular movimiento del ratón
-            if let Ok(_) = mouse_driver.simulate_movement(10, 5) {
-                let pos = mouse_driver.get_position();
-                fb.write_text_kernel(&format!("Posición del ratón: ({}, {})", pos.0, pos.1), Color::LIGHT_GRAY);
-            }
-            
-            // Simular clic del ratón
-            if let Ok(_) = mouse_driver.simulate_click(MouseButton::Left) {
-                fb.write_text_kernel("Clic izquierdo del ratón simulado", Color::LIGHT_GRAY);
-            }
-        }
-    }
-    
-    // Simular conexión de teclado USB
-    if let Ok(keyboard_id) = hotplug_manager.simulate_usb_device_connection(UsbDeviceType::Keyboard, 2) {
-        fb.write_text_kernel(&format!("Teclado USB conectado (ID: {})", keyboard_id), Color::GREEN);
-        
-        // Inicializar driver del teclado
-        let mut keyboard_driver = UsbKeyboardDriver::new(keyboard_id);
-        if let Ok(_) = keyboard_driver.initialize() {
-            fb.write_text_kernel("Driver del teclado USB inicializado", Color::GREEN);
-            
-            // Simular secuencia de teclas
-            let test_keys = [UsbKeyCode::H, UsbKeyCode::E, UsbKeyCode::L, UsbKeyCode::L, UsbKeyCode::O];
-            if let Ok(_) = keyboard_driver.simulate_key_sequence(&test_keys) {
-                fb.write_text_kernel("Secuencia 'HELLO' simulada en el teclado", Color::LIGHT_GRAY);
-            }
-        }
-    }
-    
-    // Procesar eventos de hot-plug
-    hotplug_manager.process_events();
-    
-    // Mostrar estadísticas del sistema de hot-plug
-    let stats = hotplug_manager.get_stats();
-    fb.write_text_kernel(&stats.to_string(), Color::LIGHT_GRAY);
-    
-    // Mostrar estado del sistema
-    let status = hotplug_manager.get_system_status();
-    fb.write_text_kernel(&status, Color::LIGHT_GRAY);
+    // Demostración USB
 
     // Mostrar información del modo gráfico detectado
     let modo_str = match hw_result.graphics_mode {
@@ -467,7 +368,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     let driver_msg = format!("Driver recomendado: {}", hw_result.recommended_driver.as_str());
     fb.write_text_kernel(&driver_msg, Color::LIGHT_GRAY);
 
-    // Depuracion: listar algunos dispositivos PCI detectados
+    // Depuracion: listar algunos dispositivos PCI detectados (siempre)
     fb.write_text_kernel("PCI dump (parcial):", Color::WHITE);
     let mut pci_dbg = PciManager::new();
     pci_dbg.scan_devices();
@@ -487,6 +388,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
 
+    // QEMU: sin demo gráfica; mantenemos solo texto para depuración
+
     // Inicializar GPU primaria: habilitar MMIO y Bus Master, leer BARs
     if let Some(primary) = &hw_result.primary_gpu {
         let dev: &PciDevice = &primary.pci_device;
@@ -505,7 +408,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         for i in 0..6 {
             let size = dev.calculate_bar_size(i);
             if size > 0 {
-                total_memory += size;
+                total_memory += size as u64;
                 memory_bars += 1;
                 let size_mb = size / (1024 * 1024);
                 let size_gb = size / (1024 * 1024 * 1024);
@@ -627,7 +530,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         // Escribir mensaje de éxito
         ai_system.write_success_message(fb, 0); // "Operacion completada exitosamente"
     fb.write_text_kernel("[5/6] Inicializando drivers USB...", Color::YELLOW);
-        // Inicializar drivers USB
+        // Inicializar drivers USB (mismo flujo en QEMU y hardware real)
         let mut usb_driver = UsbDriver::new();
         let usb_init_result = usb_driver.initialize_controllers();
         

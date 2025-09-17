@@ -61,11 +61,7 @@ impl EclipseKernelWithInit {
         loop {
             // Bucle principal del kernel
             unsafe {
-                // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-                // Simular halt con spin loop
-                for _ in 0..10000 {
-                    core::hint::spin_loop();
-                }
+                core::arch::asm!("hlt");
             }
         }
     }
@@ -97,11 +93,7 @@ pub fn main_with_systemd() -> ! {
         // Manejar error de inicialización
         loop {
             unsafe {
-                // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-                // Simular halt con spin loop
-                for _ in 0..10000 {
-                    core::hint::spin_loop();
-                }
+                core::arch::asm!("hlt");
             }
         }
     }

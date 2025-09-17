@@ -193,9 +193,9 @@ impl NvidiaAdvancedDriver {
             if let Some(bar_value) = Some(*bar) {
                 // Verificar si es un BAR de memoria
                 if (bar_value & 0x1) == 0 { // Bit 0 = 0 indica memoria
-                    let bar_size = device.calculate_bar_size(i as u8);
+                    let bar_size = device.calculate_bar_size(i as usize);
                     if bar_size > 0 {
-                        total_memory += bar_size;
+                        total_memory += bar_size as u64;
                         memory_bars += 1;
                         
                     }

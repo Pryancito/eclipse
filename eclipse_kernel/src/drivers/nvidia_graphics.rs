@@ -9,6 +9,8 @@ use crate::drivers::pci::{PciDevice, GpuInfo, GpuType};
 use crate::drivers::framebuffer::{FramebufferDriver, PixelFormat, Color, FramebufferInfo};
 use crate::desktop_ai::{Point, Rect};
 use alloc::format;
+use alloc::vec;
+use alloc::string::ToString;
 
 // IDs de dispositivos NVIDIA conocidos
 const NVIDIA_VENDOR_ID: u16 = 0x10DE;
@@ -45,11 +47,11 @@ impl NvidiaGeneration {
     /// Determinar generación basada en device ID
     pub fn from_device_id(device_id: u16) -> Self {
         match device_id {
-            0x13C0..0x1400 => NvidiaGeneration::GTX900,
-            0x1B80..0x1C00 => NvidiaGeneration::GTX1000,
-            0x1F08..0x2000 => NvidiaGeneration::GTX2000,
-            0x2504..0x2600 => NvidiaGeneration::GTX3000,
-            0x2684..0x2700 => NvidiaGeneration::GTX4000,
+            0x13C0..=0x13FF => NvidiaGeneration::GTX900,
+            0x1B80..=0x1BFF => NvidiaGeneration::GTX1000,
+            0x1F08..=0x1FFF => NvidiaGeneration::GTX2000,
+            0x2504..=0x25FF => NvidiaGeneration::GTX3000,
+            0x2684..=0x26FF => NvidiaGeneration::GTX4000,
             _ => NvidiaGeneration::Unknown,
         }
     }
@@ -437,4 +439,38 @@ pub enum Nvidia2DOperation {
 /// Función de conveniencia para crear un driver NVIDIA
 pub fn create_nvidia_driver(pci_device: PciDevice, gpu_info: GpuInfo) -> NvidiaGraphicsDriver {
     NvidiaGraphicsDriver::new(pci_device, gpu_info)
+}
+
+/// Detectar GPU NVIDIA en el sistema
+pub fn detect_nvidia_gpu() -> Option<NvidiaGraphicsDriver> {
+    // Simular detección de GPU NVIDIA
+    // En un kernel real, esto escanearía el bus PCI
+    
+    // Crear un dispositivo PCI simulado para NVIDIA
+    let pci_device = PciDevice {
+        bus: 0,
+        device: 1,
+        function: 0,
+        vendor_id: NVIDIA_VENDOR_ID,
+        device_id: NVIDIA_GTX_3000_SERIES, // RTX 3060 como ejemplo
+        class_code: 0x03, // VGA controller
+        subclass_code: 0x00,
+        prog_if: 0x00,
+        revision_id: 0xA1,
+        header_type: 0x00,
+        status: 0x0010,
+        command: 0x0007,
+    };
+    
+    let gpu_info = GpuInfo {
+        pci_device,
+        gpu_type: GpuType::Nvidia,
+        memory_size: 8 * 1024 * 1024 * 1024, // 8GB
+        is_primary: true,
+        supports_2d: true,
+        supports_3d: true,
+        max_resolution: (3840, 2160), // 4K
+    };
+    
+    Some(NvidiaGraphicsDriver::new(pci_device, gpu_info))
 }

@@ -21,7 +21,21 @@ pub enum MouseButton {
 }
 
 /// Posición del mouse
-pub type MousePosition = (i32, i32);
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MousePosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl MousePosition {
+    pub fn new() -> Self {
+        Self { x: 0, y: 0 }
+    }
+    
+    pub fn new_with_coords(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
 
 /// Evento de mouse
 #[derive(Debug, Clone, PartialEq)]
@@ -53,8 +67,8 @@ pub struct MouseButtonState {
     pub side2: bool,
 }
 
-impl Default for MouseButtonState {
-    fn default() -> Self {
+impl MouseButtonState {
+    pub fn new() -> Self {
         Self {
             left: false,
             right: false,
@@ -62,6 +76,12 @@ impl Default for MouseButtonState {
             side1: false,
             side2: false,
         }
+    }
+}
+
+impl Default for MouseButtonState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,7 +116,7 @@ impl Default for MouseConfig {
 pub struct UsbMouseDriver {
     device_id: u32,
     config: MouseConfig,
-    current_position: (i32, i32),
+    current_position: MousePosition,
     last_position: (i32, i32),
     button_state: MouseButtonState,
     last_click_time: u64,
@@ -111,7 +131,7 @@ impl UsbMouseDriver {
         Self {
             device_id,
             config: MouseConfig::default(),
-            current_position: (0, 0),
+            current_position: MousePosition::new(),
             last_position: (0, 0),
             button_state: MouseButtonState::default(),
             last_click_time: 0,
@@ -134,8 +154,8 @@ impl UsbMouseDriver {
         ));
 
         // Simular inicialización del dispositivo USB
-        self.current_position = (400, 300); // Posición inicial en el centro
-        self.last_position = self.current_position;
+        self.current_position = MousePosition::new_with_coords(400, 300); // Posición inicial en el centro
+        self.last_position = (self.current_position.x, self.current_position.y);
         self.is_initialized = true;
 
         syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", "Driver USB para ratón inicializado correctamente");
@@ -164,12 +184,12 @@ impl UsbMouseDriver {
 
         // Calcular nueva posición con sensibilidad
         let sensitivity = self.config.sensitivity * self.config.acceleration;
-        let new_x = self.current_position.0 + (x_movement as f32 * sensitivity) as i32;
-        let new_y = self.current_position.1 + (y_movement as f32 * sensitivity) as i32;
+        let new_x = self.current_position.x + (x_movement as f32 * sensitivity) as i32;
+        let new_y = self.current_position.y + (y_movement as f32 * sensitivity) as i32;
 
         // Actualizar posición
-        self.last_position = self.current_position;
-        self.current_position = (new_x, new_y);
+        self.last_position = (self.current_position.x, self.current_position.y);
+        self.current_position = MousePosition::new_with_coords(new_x, new_y);
 
         // Crear evento del ratón
         let event = MouseEvent::Move { 
@@ -184,7 +204,7 @@ impl UsbMouseDriver {
     }
 
     /// Obtener posición actual del ratón
-    pub fn get_position(&self) -> (i32, i32) {
+    pub fn get_position(&self) -> MousePosition {
         self.current_position
     }
 
@@ -250,8 +270,8 @@ impl UsbMouseDriver {
         alloc::format!(
             "Ratón USB (ID: {}) - Posición: ({}, {}), Eventos: {}, Botones: L:{} R:{} M:{}",
             self.device_id,
-            self.current_position.0,
-            self.current_position.1,
+            self.current_position.x,
+            self.current_position.y,
             self.event_count(),
             self.button_state.left,
             self.button_state.right,
@@ -266,11 +286,11 @@ impl UsbMouseDriver {
         }
 
         let sensitivity = self.config.sensitivity * self.config.acceleration;
-        let new_x = self.current_position.0 + (delta_x as f32 * sensitivity) as i32;
-        let new_y = self.current_position.1 + (delta_y as f32 * sensitivity) as i32;
+        let new_x = self.current_position.x + (delta_x as f32 * sensitivity) as i32;
+        let new_y = self.current_position.y + (delta_y as f32 * sensitivity) as i32;
 
-        self.last_position = self.current_position;
-        self.current_position = (new_x, new_y);
+        self.last_position = (self.current_position.x, self.current_position.y);
+        self.current_position = MousePosition::new_with_coords(new_x, new_y);
 
         let event = MouseEvent::Move { 
             position: self.current_position, 
@@ -348,37 +368,5 @@ impl UsbMouseDriver {
     /// Establecer sensibilidad del ratón
     pub fn set_sensitivity(&mut self, sensitivity: f32) {
         self.config.sensitivity = sensitivity;
-    }
-}
-
-impl MouseEvent {
-    /// Convertir a MouseEvent del input_system
-    pub fn to_input_system_mouse_event(&self) -> crate::drivers::input_system::MouseEvent {
-        match self {
-            MouseEvent::ButtonPress { button, position } => crate::drivers::input_system::MouseEvent {
-                button: Some(*button),
-                position: *position,
-                pressed: true,
-                timestamp: 0, // Se establecerá en el input_system
-            },
-            MouseEvent::ButtonRelease { button, position } => crate::drivers::input_system::MouseEvent {
-                button: Some(*button),
-                position: *position,
-                pressed: false,
-                timestamp: 0, // Se establecerá en el input_system
-            },
-            MouseEvent::Move { position, .. } => crate::drivers::input_system::MouseEvent {
-                button: None,
-                position: *position,
-                pressed: false,
-                timestamp: 0, // Se establecerá en el input_system
-            },
-            MouseEvent::Scroll { .. } => crate::drivers::input_system::MouseEvent {
-                button: None,
-                position: (0, 0),
-                pressed: false,
-                timestamp: 0, // Se establecerá en el input_system
-            },
-        }
     }
 }

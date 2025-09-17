@@ -1,10 +1,9 @@
-; Punto de entrada para Eclipse Kernel compatible con UEFI
+; Punto de entrada para Eclipse Kernel con Multiboot2
 ; Define el símbolo _start que será el punto de entrada
 
 section .text
 global _start
 
 _start:
-    ; Punto de entrada estándar - saltar directamente a la función _start de Rust
-    ; Esta función está definida en main.rs
-    jmp _start
+    ; Saltar a la función Rust
+    jmp multiboot2_entry

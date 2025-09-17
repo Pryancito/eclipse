@@ -172,7 +172,7 @@ impl UsbKeyCode {
 }
 
 /// Estado de las teclas modificadoras
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModifierState {
     pub left_shift: bool,
     pub right_shift: bool,
@@ -187,8 +187,8 @@ pub struct ModifierState {
     pub scroll_lock: bool,
 }
 
-impl Default for ModifierState {
-    fn default() -> Self {
+impl ModifierState {
+    pub fn new() -> Self {
         Self {
             left_shift: false,
             right_shift: false,
@@ -203,33 +203,43 @@ impl Default for ModifierState {
             scroll_lock: false,
         }
     }
-}
 
-impl ModifierState {
-    /// Convertir a ModifierState del input_system
-    pub fn to_input_system_modifier_state(&self) -> crate::drivers::input_system::ModifierState {
-        crate::drivers::input_system::ModifierState {
-            ctrl: self.left_ctrl || self.right_ctrl,
-            alt: self.left_alt || self.right_alt,
-            shift: self.left_shift || self.right_shift,
-            meta: self.left_meta || self.right_meta,
-        }
+    pub fn shift_pressed(&self) -> bool {
+        self.left_shift || self.right_shift
     }
 }
 
-impl KeyboardEvent {
+impl Default for ModifierState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// impl ModifierState {
+//     /// Convertir a ModifierState del input_system
+//     pub fn to_input_system_modifier_state(&self) -> crate::drivers::input_system::ModifierState {
+//         crate::drivers::input_system::ModifierState {
+//             ctrl: self.left_ctrl || self.right_ctrl,
+//             alt: self.left_alt || self.right_alt,
+//             shift: self.left_shift || self.right_shift,
+//             meta: self.left_meta || self.right_meta,
+//         }
+//     }
+// }
+// 
+// impl KeyboardEvent {
     /// Convertir a KeyboardEvent del input_system
-    pub fn to_input_system_keyboard_event(&self) -> crate::drivers::input_system::KeyboardEvent {
-        crate::drivers::input_system::KeyboardEvent {
-            key_code: self.key_code,
-            pressed: self.pressed,
-            timestamp: self.timestamp,
-        }
-    }
-}
+//     pub fn to_input_system_keyboard_event(&self) -> crate::drivers::input_system::KeyboardEvent {
+//         crate::drivers::input_system::KeyboardEvent {
+//             key_code: self.key_code,
+//             pressed: self.pressed,
+//             timestamp: self.timestamp,
+//         }
+//     }
+// }
 
 /// Evento del teclado
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KeyboardEvent {
     pub key_code: UsbKeyCode,
     pub pressed: bool,

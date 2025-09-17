@@ -6,6 +6,7 @@
 use crate::drivers::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
 use crate::drivers::pci::{PciDevice, PciManager, GpuInfo, GpuType};
 use crate::syslog;
+use crate::syslog_info;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
@@ -141,21 +142,33 @@ impl MultiGpuManager {
 
     /// Inicializar todos los drivers de GPU
     pub fn initialize_all_drivers(&mut self) -> Result<(), String> {
+        // Debug: Iniciando inicialización de drivers
+        // logging silenciado en QEMU
 
         // Inicializar driver NVIDIA
+        
         self.initialize_nvidia_driver()?;
+        
 
         // Inicializar driver AMD
+        
         self.initialize_amd_driver()?;
+        
 
         // Inicializar driver Intel
+        
         self.initialize_intel_driver()?;
+        
 
         // Detectar y unificar todas las GPUs
+        
         self.detect_and_unify_gpus()?;
+        
 
         // Calcular estadísticas totales
+        
         self.calculate_total_statistics();
+        
 
         Ok(())
     }
@@ -204,15 +217,21 @@ impl MultiGpuManager {
 
     /// Detectar y unificar todas las GPUs
     fn detect_and_unify_gpus(&mut self) -> Result<(), String> {
+        
         self.pci_manager.scan_devices();
+        
+        
         let gpus = self.pci_manager.get_gpus();
+        
         
         self.unified_gpus.clear();
 
-        for gpu_option in gpus {
+        for (i, gpu_option) in gpus.iter().enumerate() {
             if let Some(gpu) = gpu_option {
+                
                 let unified_info = self.convert_to_unified_info(&gpu)?;
                 self.unified_gpus.push(unified_info);
+                
             }
         }
 
@@ -220,6 +239,7 @@ impl MultiGpuManager {
         if !self.unified_gpus.is_empty() {
             self.active_gpu_index = Some(0);
             self.unified_gpus[0].is_active = true;
+            
         }
 
         Ok(())

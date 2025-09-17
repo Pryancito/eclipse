@@ -4,13 +4,14 @@
 //! ejecutando eclipse-systemd como PID 1
 
 use core::fmt::Write;
+// use crate::main_simple::SerialWriter;
 use crate::elf_loader::{ElfLoader, load_eclipse_systemd};
 use crate::process_memory::{ProcessMemoryManager, setup_eclipse_systemd_memory};
 use crate::process_transfer::{ProcessTransfer, ProcessContext, transfer_to_eclipse_systemd};
-use crate::process::{init_process_system, get_process_manager, ProcessPriority};
-use crate::performance::thread_pool::{ThreadPool, Task, ThreadPoolConfig};
-use alloc::vec::Vec;
-use alloc::string::String;
+use heapless::{String, Vec};
+
+// Instancia global del escritor serial
+// static mut SERIAL: SerialWriter = SerialWriter::new();
 
 /// Información del proceso init
 #[derive(Debug, Clone)]
@@ -20,14 +21,6 @@ pub struct InitProcess {
     pub executable_path: &'static str,
     pub arguments: &'static [&'static str],
     pub environment: &'static [&'static str],
-}
-
-/// Información del binario ELF
-#[derive(Debug, Clone)]
-struct ElfInfo {
-    class: u8,      // 1 = 32-bit, 2 = 64-bit
-    data: u8,       // 1 = little-endian, 2 = big-endian
-    elf_type: u16,  // 1 = relocatable, 2 = executable, 3 = shared, 4 = core
 }
 
 /// Gestor del sistema de inicialización
@@ -77,182 +70,27 @@ impl InitSystem {
 
     /// Verificar que eclipse-systemd existe
     fn check_systemd_exists(&self) -> bool {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // PASO 1: Intentar leer el binario desde el sistema de archivos
-        let systemd_path = "/sbin/eclipse-systemd";
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // PASO 2: Intentar leer el archivo de forma segura
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        match self.safe_read_systemd_binary(systemd_path) {
-            Ok(binary_data) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Mostrar tamaño aproximado
-                    if binary_data.len() > 1024 {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else if binary_data.len() > 0 {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else {
-                        // Logging removido temporalmente para evitar breakpoint
-                    }
-                    // Logging removido temporalmente para evitar breakpoint
-
-                    // Verificar formato ELF básico
-                    if binary_data.len() >= 4 {
-                        if binary_data[0] == 0x7F && binary_data[1] == b'E' && binary_data[2] == b'L' && binary_data[3] == b'F' {
-                            // Logging removido temporalmente para evitar breakpoint
-                            // Logging removido temporalmente para evitar breakpoint
-                        } else {
-                            // Logging removido temporalmente para evitar breakpoint
-                            // Logging removido temporalmente para evitar breakpoint
-                        }
-                    } else {
-                        // Logging removido temporalmente para evitar breakpoint
-                    }
-                }
-                true
-            }
-            Err(err_msg) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                false
+        // En un sistema real, esto verificaría la existencia del archivo
+        // Por ahora, simulamos la verificación con diferentes rutas posibles
+        
+        let possible_paths = [
+            "/sbin/eclipse-systemd",
+            "/bin/eclipse-systemd", 
+            "/usr/sbin/eclipse-systemd",
+            "/usr/bin/eclipse-systemd",
+            "/system/bin/eclipse-systemd",
+        ];
+        
+        // Simular verificación de existencia
+        for path in &possible_paths {
+            if self.verify_executable_exists(path) {
+                return true;
             }
         }
+        
+        false
     }
-
-    /// PASO 2: Lectura segura del binario systemd con manejo de errores
-    fn safe_read_systemd_binary(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Método 1: Intentar usar el sistema de archivos del kernel
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        match crate::filesystem::read_file_from_path(path) {
-            Ok(data) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Convertir tamaño a string de forma segura
-                    let size = data.len();
-                    if size > 0 {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else {
-                        // Logging removido temporalmente para evitar breakpoint
-                    }
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                return Ok(data);
-            }
-            Err(err) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-            }
-        }
-
-        // Método 2: Simulación controlada (fallback seguro)
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Crear un binario ELF simulado básico para pruebas
-        let mock_binary = self.create_safe_mock_systemd_binary();
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        Ok(mock_binary)
-    }
-
-    /// Crear un binario ELF simulado para pruebas cuando el real no está disponible
-    fn create_safe_mock_systemd_binary(&self) -> Vec<u8> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Crear un ELF header básico (simplificado)
-        let mut binary = Vec::new();
-
-        // ELF Magic Number
-        binary.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
-
-        // Clase (64-bit), Data (Little-endian), Version (1)
-        binary.extend_from_slice(&[2, 1, 1, 0]);
-
-        // OS/ABI (System V), ABI Version, Padding
-        binary.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-
-        // Type (Executable), Machine (x86-64)
-        binary.extend_from_slice(&[2, 0, 0x3E, 0]);
-
-        // Version (1)
-        binary.extend_from_slice(&[1, 0, 0, 0]);
-
-        // Entry point (simulado)
-        binary.extend_from_slice(&[0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-
-        // Program header offset, Section header offset (simulados)
-        binary.extend_from_slice(&[0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // phoff
-        binary.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // shoff
-
-        // Flags, Header size, Program header size, Program header count
-        binary.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags
-        binary.extend_from_slice(&[0x40, 0x00]); // ehsize
-        binary.extend_from_slice(&[0x38, 0x00]); // phentsize
-        binary.extend_from_slice(&[0x01, 0x00]); // phnum
-
-        // Section header size, Section header count, Section name string table index
-        binary.extend_from_slice(&[0x40, 0x00]); // shentsize
-        binary.extend_from_slice(&[0x00, 0x00]); // shnum
-        binary.extend_from_slice(&[0x00, 0x00]); // shstrndx
-
-        // Agregar algo de contenido simulado para que parezca un binario real
-        for i in 0..100 {
-            binary.push((i % 256) as u8);
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Mostrar tamaño
-            if binary.len() > 100 {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        binary
-    }
-
+    
     /// Verificar que un ejecutable existe y es válido
     fn verify_executable_exists(&self, path: &str) -> bool {
         // En un sistema real, esto verificaría:
@@ -336,550 +174,31 @@ impl InitSystem {
 
         let init_process = self.init_process.as_ref().unwrap();
         
+        // Verificar que eclipse-systemd existe y es válido
+        if !self.check_systemd_exists() {
+            return Err("eclipse-systemd no encontrado o no es válido");
+        }
+        
         // Enviar mensaje de inicio a la interfaz serial
         self.send_systemd_startup_message(init_process);
         
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Intentar ejecutar systemd realmente primero
-        if self.try_execute_real_systemd(init_process).is_ok() {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return Ok(());
-        }
-
-        // Si falla la ejecución real, usar simulación como fallback
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        match crate::process_transfer::simulate_eclipse_systemd_execution() {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                Ok(())
-            }
-            Err(e) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                Err("Fallo tanto la ejecución real como la simulación de systemd")
-            }
-        }
-    }
-
-    /// Intentar ejecutar eclipse-systemd realmente
-    fn try_execute_real_systemd(&self, init_process: &InitProcess) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Realizar diagnóstico del sistema antes de intentar ejecutar
-        self.diagnose_system_state()?;
-
-        // Primero intentar ejecutar el binario real de systemd
-        match self.execute_real_systemd_binary() {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                Ok(())
-            },
-            Err(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                // Fallback a simulación
-                crate::process_transfer::simulate_eclipse_systemd_execution()
-            }
-        }
-    }
-
-    /// Diagnosticar el estado del sistema antes de ejecutar el binario
-    fn diagnose_system_state(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Verificar estado de la paginación
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Verificar que el binario existe y es válido
-        if !self.check_systemd_exists() {
-                // Logging removido temporalmente para evitar breakpoint
-                return Err("Binario no encontrado");
-            }
-
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Intentar cargar el binario para verificar integridad
-            match self.load_systemd_binary("/sbin/eclipse-systemd") {
-                Ok(data) => {
-                    if data.is_empty() {
-                        // Logging removido temporalmente para evitar breakpoint
-                        return Err("Binario vacío");
-                    }
-
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Mostrar tamaño aproximado
-                    if data.len() > 1024 * 1024 {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else if data.len() > 1024 {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else {
-                        // Logging removido temporalmente para evitar breakpoint
-                    }
-                    // Logging removido temporalmente para evitar breakpoint
-
-                    // Validar formato ELF
-                    if self.validate_systemd_binary(&data) {
-                        // Logging removido temporalmente para evitar breakpoint
-                    } else {
-                        // Logging removido temporalmente para evitar breakpoint
-                        return Err("Formato ELF inválido");
-                    }
-                }
-                Err(_) => {
-                    // Logging removido temporalmente para evitar breakpoint
-                    return Err("Error cargando binario");
-                }
-            }
-
-            // Verificar estado de la memoria
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Verificar configuración de procesos
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        Ok(())
-    }
-
-    /// Intentar ejecutar el binario real de eclipse-systemd
-    fn execute_real_systemd_binary(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Verificar que el binario existe
-        if !self.check_systemd_exists() {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return Err("eclipse-systemd no encontrado");
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Crear un thread separado para cargar y ejecutar el binario
-        // Esto evita bloquear la ejecución principal del kernel
-        let result = self.spawn_systemd_loader_thread();
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        result
-    }
-
-    /// Crear un thread separado para cargar el binario de systemd
-    fn spawn_systemd_loader_thread(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Crear thread pool (usa configuración por defecto)
-        let mut thread_pool = ThreadPool::new();
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Inicializar el thread pool
-        match thread_pool.initialize() {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-            }
-            Err(err) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                return self.simulate_realistic_systemd_execution();
-            }
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Crear tarea para cargar el binario
-        let systemd_path = "/sbin/eclipse-systemd";
-        let task_data = systemd_path.as_bytes().to_vec();
-
-        let systemd_task = Task {
-            task_id: 0, // Se asignará automáticamente por el pool
-            priority: 10, // Alta prioridad
-            estimated_duration: 500, // 500ms estimados
-            data: task_data,
-            callback: None, // No necesitamos callback para esta tarea
-        };
-
-        // Enviar la tarea al thread pool
-        match thread_pool.submit_task(systemd_task) {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-
-                // El kernel continúa ejecutándose mientras se carga el binario
-                // Aquí podríamos hacer otras tareas del kernel
-                self.monitor_systemd_loading(&mut thread_pool)
-            }
-            Err(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                self.simulate_realistic_systemd_execution()
-            }
-        }
-    }
-
-    /// Monitorear el progreso de carga del binario systemd
-    fn monitor_systemd_loading(&self, thread_pool: &mut ThreadPool) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Simular monitoreo del progreso
-        // En un sistema real, aquí verificaríamos el estado de la tarea
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Simular un tiempo de carga
-        for i in 1..4 {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Aquí podríamos mostrar un porcentaje real
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-            }
-
-            // En un sistema real, aquí esperaríamos un poco
-            // pero por simplicidad continuamos inmediatamente
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Simular inicialización de servicios
-        self.initialize_systemd_services()
-    }
-
-    /// Inicializar servicios del sistema después de cargar systemd
-    fn initialize_systemd_services(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        Ok(())
-    }
-
-    /// Cargar y ejecutar el binario real de systemd
-    fn load_and_execute_systemd_binary(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Intentar cargar el binario desde el sistema de archivos
-        match self.load_systemd_binary("/sbin/eclipse-systemd") {
-            Ok(binary_data) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Aquí podríamos mostrar el tamaño, pero por simplicidad continuamos
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-
-                // Verificar que sea un ELF válido
-                if self.validate_systemd_binary(&binary_data) {
-                    unsafe {
-                        // Logging removido temporalmente para evitar breakpoint
-                    }
-
-                    // Ejecutar el binario (en un entorno controlado)
-                    self.execute_systemd_binary(&binary_data)
-                } else {
-                    Err("Binario no es un ELF válido")
-                }
-            }
-            Err(e) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Cargar el binario de systemd desde el sistema de archivos
-    fn load_systemd_binary(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Asegurar que las particiones estén montadas
-        self.ensure_partitions_mounted()?;
-
-        // Intentar leer usando el sistema de archivos real
-        match crate::filesystem::read_file_from_path(path) {
-            Ok(data) => {
-                if data.is_empty() {
-                    Err("Archivo vacío")
-                } else {
-                    Ok(data)
-                }
-            }
-            Err(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                // Si falla, intentar método alternativo
-                self.read_file_from_partitioned_disk(path)
-            }
-        }
-    }
-
-    /// Validar que el binario sea un ELF válido
-    fn validate_systemd_binary(&self, binary_data: &[u8]) -> bool {
-        if binary_data.len() < 4 {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return false;
-        }
-
-        // Verificar firma ELF (0x7F, 'E', 'L', 'F')
-        if binary_data[0] != 0x7F || binary_data[1] != b'E' || binary_data[2] != b'L' || binary_data[3] != b'F' {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return false;
-        }
-
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-        true
-    }
-
-    /// Ejecutar el binario de systemd en un entorno controlado
-    fn execute_systemd_binary(&self, binary_data: &[u8]) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Verificar tamaño mínimo del binario
-        if binary_data.len() < 64 {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return Err("Binario demasiado pequeño");
-        }
-
-        // Verificar que no intentemos ejecutar datos aleatorios
-        // La dirección 0x0009F0AD podría contener datos del kernel o datos no inicializados
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Verificar paginación antes de intentar acceder a la memoria
-            if !self.verify_pagination_setup() {
-                // Logging removido temporalmente para evitar breakpoint
-                return Err("Paginación inválida");
-            }
-
-            // Verificar que el área de memoria donde se ejecutaría el código esté limpia
-            // Esto es crítico para evitar ejecutar datos aleatorios
-            if !self.check_memory_safety(0x0009F0AD) {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                return Err("Memoria no segura");
-            }
-        }
-
-        // En lugar de intentar ejecutar el binario directamente (que causaría el error),
-        // vamos a analizarlo y simular su ejecución de manera segura
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Analizar el header ELF para obtener información
-        if let Some(elf_info) = self.analyze_elf_header(binary_data) {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Aquí podríamos mostrar el entry point si lo tuviéramos
-                // Logging removido temporalmente para evitar breakpoint
-            }
-
-            // Simular la ejecución en lugar de ejecutarla realmente
-            // Esto evita el error de Invalid Opcode
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-            }
-
-            Ok(())
-        } else {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            Err("Header ELF inválido")
-        }
-    }
-
-    /// Verificar que la paginación esté configurada correctamente
-    fn verify_pagination_setup(&self) -> bool {
-        // Verificación simplificada de paginación
-        // En lugar de leer registros del procesador directamente,
-        // asumimos que la paginación está configurada correctamente
-        // si el kernel está ejecutándose sin errores de memoria
+        // 1. Cargar el ejecutable eclipse-systemd
+        let loaded_process = self.load_eclipse_systemd_executable()?;
         
-        // Verificar que estamos en modo de 64 bits
-        // Esto se puede hacer de forma más segura verificando el estado del sistema
-        true
-    }
-
-    /// Verificar que una dirección de memoria sea segura para acceso
-    fn check_memory_safety(&self, address: u64) -> bool {
-        unsafe {
-            // Intentar acceder a la dirección de manera segura
-            // Si la dirección no está mapeada, esto causará un page fault
-            let ptr = address as *const u8;
-
-            // Usar un bloque de prueba para verificar si podemos acceder
-            let result = core::ptr::read_volatile(ptr);
-
-            // Si llegamos aquí sin page fault, la dirección es accesible
-            // Pero verificar que no contenga datos aleatorios obvios
-            if result == 0xCC || result == 0xCD { // Common debug values
-                // Logging removido temporalmente para evitar breakpoint
-                return false;
-            }
-
-            // Logging removido temporalmente para evitar breakpoint
-            true
-        }
-    }
-
-    /// Analizar el header ELF del binario
-    fn analyze_elf_header(&self, binary_data: &[u8]) -> Option<ElfInfo> {
-        if binary_data.len() < 64 {
-            return None;
-        }
-
-        // Verificar firma ELF
-        if binary_data[0] != 0x7F || binary_data[1] != b'E' || binary_data[2] != b'L' || binary_data[3] != b'F' {
-            return None;
-        }
-
-        // Extraer información básica del ELF
-        let elf_class = binary_data[4];
-        let elf_data = binary_data[5];
-        let elf_type = ((binary_data[17] as u16) << 8) | (binary_data[16] as u16);
-
-        // Solo soportamos ELF 64-bit little-endian ejecutables
-        if elf_class != 2 || elf_data != 1 || elf_type != 2 {
-            return None;
-        }
-
-        Some(ElfInfo {
-            class: elf_class,
-            data: elf_data,
-            elf_type: elf_type,
-        })
-    }
-
-    /// Simular ejecución más realista de systemd
-    fn simulate_realistic_systemd_execution(&self) -> Result<(), &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular carga de servicios básicos
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular resolución de dependencias
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular inicio de servicios
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular target multi-user
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular target gráfico
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-
-            // Simular finalización exitosa
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
+        // 2. Configurar el espacio de direcciones del proceso
+        let process_memory = self.setup_process_memory(&loaded_process)?;
+        
+        // 3. Configurar argumentos y variables de entorno
+        let (argc, argv, envp) = self.setup_process_arguments(init_process, &process_memory)?;
+        
+        // 4. Transferir control al userland
+        self.transfer_control_to_userland(
+            loaded_process.entry_point,
+            process_memory.stack_pointer,
+            argc,
+            argv,
+            envp,
+        )?;
         
         Ok(())
     }
@@ -933,80 +252,15 @@ impl InitSystem {
         elf_loader.load_elf(&file_data[..])
     }
     
-    /// Leer archivo desde el disco usando el sistema de archivos real
-    fn read_file_from_disk(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        // Intentar montar las particiones necesarias si no están montadas
-        self.ensure_partitions_mounted()?;
-
-        // Usar el sistema de archivos real para leer el archivo
-        match crate::filesystem::read_file_from_path(path) {
-            Ok(data) => Ok(data),
-            Err(_) => {
-                // Si falla el acceso real, intentar método alternativo
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                self.read_file_from_partitioned_disk(path)
-            }
-        }
-    }
-
-    /// Asegurar que las particiones necesarias estén montadas
-    fn ensure_partitions_mounted(&self) -> Result<(), &'static str> {
-        use crate::filesystem::{mount_filesystem, FileSystemType, MountFlags};
-
-        // Intentar montar la partición EXT4 (/) si no está montada
-        // En el kernel usamos identificadores físicos, no nombres de dispositivo Linux
-        match mount_filesystem("partition:ext4", "/", FileSystemType::Ext4, MountFlags::ReadOnly) {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                Ok(())
-            }
-            Err(e) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                // No fallar completamente, continuar
-                Ok(())
-            }
-        }
-    }
-
-    /// Leer archivo desde disco particionado (método alternativo)
-    fn read_file_from_partitioned_disk(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        // Este método intenta acceder directamente a las particiones
-        // sin usar el sistema de archivos completo
-
-        if path.contains("/sbin/") || path.contains("/bin/") {
-            if path.contains("eclipse-systemd") || path.contains("init") {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-
-                // Intentar acceder al binario desde la partición EXT4
-                // Por ahora, devolver datos simulados hasta implementar acceso real
-                self.create_mock_systemd_binary()
-            } else {
-                Err("Archivo no encontrado en partición EXT4")
-            }
-        } else {
-            Err("Ruta no soportada para acceso a particiones múltiples")
-        }
-    }
-
-    /// Crear un binario mock de systemd para testing
-    fn create_mock_systemd_binary(&self) -> Result<Vec<u8>, &'static str> {
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        let mut file_data = Vec::<u8>::new();
+    /// Leer archivo desde el disco
+    fn read_file_from_disk(&self, path: &str) -> Result<heapless::Vec<u8, 4096>, &'static str> {
+        // En un sistema real, esto usaría el sistema de archivos
+        // Por ahora, simulamos la lectura del archivo
         
-        // Header ELF válido
+        // Simular datos del ejecutable eclipse-systemd
+        let mut file_data = heapless::Vec::<u8, 4096>::new();
+        
+        // Simular header ELF
         file_data.extend_from_slice(&[0x7F, 0x45, 0x4C, 0x46]); // ELF magic
         file_data.push(2); // ELFCLASS64
         file_data.push(1); // ELFDATA2LSB
@@ -1014,18 +268,8 @@ impl InitSystem {
         file_data.push(0); // ELFOSABI_SYSV
         file_data.extend_from_slice(&[0; 7]); // Padding
         
-        // Program header básico
-        file_data.extend_from_slice(&[0; 56]); // Program header table
-
-        // Código mínimo que no cause Invalid Opcode
-        // Simular una función main simple que retorne exitosamente
-        file_data.extend_from_slice(&[
-            0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (exit code 0)
-            0xC3,                                     // ret
-        ]);
-
-        // Padding para hacer el archivo más grande
-        for _ in 0..(4096 - file_data.len()) {
+        // Simular más datos del ELF
+        for _ in 0..1024 {
             file_data.push(0);
         }
         
@@ -1247,8 +491,8 @@ pub fn diagnose_init_system() -> InitSystemDiagnostic {
 /// Diagnóstico del sistema de inicialización
 #[derive(Debug, Clone)]
 pub struct InitSystemDiagnostic {
-    pub errors: Vec<(&'static str, &'static str)>,
-    pub warnings: Vec<(&'static str, &'static str)>,
+    pub errors: heapless::Vec<(&'static str, &'static str), 16>,
+    pub warnings: heapless::Vec<(&'static str, &'static str), 16>,
     pub is_healthy: bool,
 }
 
@@ -1322,30 +566,34 @@ impl InitSystem {
     /// Enviar mensaje de inicio de eclipse-systemd a la interfaz serial
     fn send_systemd_startup_message(&self, init_process: &InitProcess) {
         unsafe {
+            // Inicializar la interfaz serial si no está inicializada
+            // SERIAL.init();
+            
             // Enviar mensaje de inicio
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
+            // SERIAL.write_str("\n");
+            // SERIAL.write_str("Pasando control a systemd...\n");
+            // SERIAL.write_str("\n");
         }
     }
 }
 
 /// Función auxiliar para convertir números a string
-fn int_to_string(mut num: u64) -> String {
+fn int_to_string(mut num: u64) -> heapless::String<32> {
+    let mut result = heapless::String::<32>::new();
     if num == 0 {
-        return String::from("0");
+        let _ = result.push_str("0");
+        return result;
     }
-
-    let mut digits = Vec::<u8>::new();
+    
+    let mut digits = heapless::Vec::<u8, 32>::new();
     while num > 0 {
-        digits.push((num % 10) as u8);
+        let _ = digits.push((num % 10) as u8);
         num /= 10;
     }
-
-    let mut result = String::new();
+    
     for &digit in digits.iter().rev() {
-        result.push((b'0' + digit) as char);
+        let _ = result.push((b'0' + digit) as char);
     }
-
+    
     result
 }

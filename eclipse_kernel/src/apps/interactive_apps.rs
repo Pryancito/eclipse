@@ -7,10 +7,8 @@ use alloc::sync::Arc;
 use alloc::boxed::Box;
 
 use crate::drivers::input_system::{InputSystem, InputEvent, InputEventType};
-use crate::drivers::usb_keyboard::{UsbKeyCode, ModifierState};
-use crate::drivers::input_system::KeyboardEvent;
-use crate::drivers::usb_mouse::{MouseButton, MousePosition, MouseButtonState};
-use crate::drivers::input_system::MouseEvent;
+use crate::drivers::usb_keyboard::{KeyboardEvent, UsbKeyCode, ModifierState};
+use crate::drivers::usb_mouse::{MouseEvent, MouseButton, MousePosition, MouseButtonState};
 use crate::drivers::acceleration_2d::{Acceleration2D, AccelerationOperation};
 use crate::drivers::framebuffer::{FramebufferDriver, Color};
 use crate::desktop_ai::{Point, Rect};
@@ -93,9 +91,8 @@ impl InteractiveApp for TextEditor {
     
     fn process_input(&mut self, event: &InputEvent) -> Result<(), &'static str> {
         if let InputEventType::Keyboard(keyboard_event) = &event.event_type {
-            match keyboard_event {
-                KeyboardEvent { key_code: key, pressed: true, .. } => {
-                    match key {
+            if keyboard_event.pressed {
+                    match keyboard_event.key_code {
                         UsbKeyCode::Backspace => {
                             self.delete_char();
                         }
@@ -112,14 +109,11 @@ impl InteractiveApp for TextEditor {
                             self.insert_char('\t');
                         }
                         _ => {
-                            // Por ahora, no usamos shift (se puede mejorar más tarde)
-                            if let Some(ch) = key.to_ascii(false, false) {
+                            if let Some(ch) = keyboard_event.key_code.to_ascii(keyboard_event.modifiers.shift_pressed(), false) {
                                 self.insert_char(ch);
                             }
                         }
                     }
-                }
-                _ => {}
             }
         }
         Ok(())
@@ -206,7 +200,7 @@ impl DrawingApp {
             current_color: Color { r: 255, g: 255, b: 255, a: 255 }, // Blanco
             brush_size: 3,
             mouse_pressed: false,
-            last_mouse_pos: (0, 0),
+            last_mouse_pos: MousePosition::new(),
             window_rect: Rect { x: 200, y: 150, width: canvas_width + 40, height: canvas_height + 40 },
             initialized: false,
         }
@@ -219,19 +213,19 @@ impl DrawingApp {
     }
     
     fn draw_line(&mut self, start: MousePosition, end: MousePosition, color: Color) {
-        let dx = (end.0 - start.0).abs();
-        let dy = (end.1 - start.1).abs();
-        let sx = if start.0 < end.0 { 1 } else { -1 };
-        let sy = if start.1 < end.1 { 1 } else { -1 };
+        let dx = (end.x - start.x).abs();
+        let dy = (end.y - start.y).abs();
+        let sx = if start.x < end.x { 1 } else { -1 };
+        let sy = if start.y < end.y { 1 } else { -1 };
         let mut err = dx - dy;
         
-        let mut x = start.0;
-        let mut y = start.1;
+        let mut x = start.x;
+        let mut y = start.y;
         
         loop {
             self.draw_pixel(x, y, color);
             
-            if x == end.0 && y == end.1 {
+            if x == end.x && y == end.y {
                 break;
             }
             
@@ -270,49 +264,46 @@ impl InteractiveApp for DrawingApp {
         match &event.event_type {
             InputEventType::Mouse(mouse_event) => {
                 match mouse_event {
-                    MouseEvent { button: Some(button), pressed: true, .. } => {
+                    MouseEvent::ButtonPress { button, position, .. } => {
                         if *button == MouseButton::Left {
                             self.mouse_pressed = true;
-                            self.last_mouse_pos = mouse_event.position;
+                            self.last_mouse_pos = *position;
                         }
                     }
-                    MouseEvent { button: Some(button), pressed: false, .. } => {
+                    MouseEvent::ButtonRelease { button, .. } => {
                         if *button == MouseButton::Left {
                             self.mouse_pressed = false;
                         }
                     }
-                    MouseEvent { button: None, .. } => {
+                    MouseEvent::Move { position, .. } => {
                         if self.mouse_pressed {
-                            self.draw_line(self.last_mouse_pos, mouse_event.position, self.current_color);
-                            self.last_mouse_pos = mouse_event.position;
+                            self.draw_line(self.last_mouse_pos, *position, self.current_color);
+                            self.last_mouse_pos = *position;
                         }
                     }
                     _ => {}
                 }
             }
             InputEventType::Keyboard(keyboard_event) => {
-                match keyboard_event {
-                    KeyboardEvent { key_code: key, pressed: true, .. } => {
-                        match key {
-                            UsbKeyCode::C => {
-                                self.clear_canvas();
-                            }
-                            UsbKeyCode::Num1 => {
-                                self.current_color = Color { r: 255, g: 0, b: 0, a: 255 }; // Rojo
-                            }
-                            UsbKeyCode::Num2 => {
-                                self.current_color = Color { r: 0, g: 255, b: 0, a: 255 }; // Verde
-                            }
-                            UsbKeyCode::Num3 => {
-                                self.current_color = Color { r: 0, g: 0, b: 255, a: 255 }; // Azul
-                            }
-                            UsbKeyCode::Num4 => {
-                                self.current_color = Color { r: 255, g: 255, b: 255, a: 255 }; // Blanco
-                            }
-                            _ => {}
+                if keyboard_event.pressed {
+                    match keyboard_event.key_code {
+                        UsbKeyCode::C => {
+                            self.clear_canvas();
                         }
+                        UsbKeyCode::Num1 => {
+                            self.current_color = Color { r: 255, g: 0, b: 0, a: 255 }; // Rojo
+                        }
+                        UsbKeyCode::Num2 => {
+                            self.current_color = Color { r: 0, g: 255, b: 0, a: 255 }; // Verde
+                        }
+                        UsbKeyCode::Num3 => {
+                            self.current_color = Color { r: 0, g: 0, b: 255, a: 255 }; // Azul
+                        }
+                        UsbKeyCode::Num4 => {
+                            self.current_color = Color { r: 255, g: 255, b: 255, a: 255 }; // Blanco
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             _ => {}
@@ -456,29 +447,26 @@ impl InteractiveApp for CalculatorApp {
     
     fn process_input(&mut self, event: &InputEvent) -> Result<(), &'static str> {
         if let InputEventType::Keyboard(keyboard_event) = &event.event_type {
-            match keyboard_event {
-                KeyboardEvent { key_code: key, pressed: true, .. } => {
-                    match key {
-                        UsbKeyCode::Num0 => self.input_number('0'),
-                        UsbKeyCode::Num1 => self.input_number('1'),
-                        UsbKeyCode::Num2 => self.input_number('2'),
-                        UsbKeyCode::Num3 => self.input_number('3'),
-                        UsbKeyCode::Num4 => self.input_number('4'),
-                        UsbKeyCode::Num5 => self.input_number('5'),
-                        UsbKeyCode::Num6 => self.input_number('6'),
-                        UsbKeyCode::Num7 => self.input_number('7'),
-                        UsbKeyCode::Num8 => self.input_number('8'),
-                        UsbKeyCode::Num9 => self.input_number('9'),
-                        UsbKeyCode::Equal => self.calculate(),
-                        UsbKeyCode::Minus => self.input_operation('-'),
-                        UsbKeyCode::NumPadPlus => self.input_operation('+'),
-                        UsbKeyCode::NumPadStar => self.input_operation('*'),
-                        UsbKeyCode::Slash => self.input_operation('/'),
-                        UsbKeyCode::Escape => self.clear(),
-                        _ => {}
-                    }
+            if keyboard_event.pressed {
+                match keyboard_event.key_code {
+                    UsbKeyCode::Num0 => self.input_number('0'),
+                    UsbKeyCode::Num1 => self.input_number('1'),
+                    UsbKeyCode::Num2 => self.input_number('2'),
+                    UsbKeyCode::Num3 => self.input_number('3'),
+                    UsbKeyCode::Num4 => self.input_number('4'),
+                    UsbKeyCode::Num5 => self.input_number('5'),
+                    UsbKeyCode::Num6 => self.input_number('6'),
+                    UsbKeyCode::Num7 => self.input_number('7'),
+                    UsbKeyCode::Num8 => self.input_number('8'),
+                    UsbKeyCode::Num9 => self.input_number('9'),
+                    UsbKeyCode::Equal => self.calculate(),
+                    UsbKeyCode::Minus => self.input_operation('-'),
+                    UsbKeyCode::NumPadPlus => self.input_operation('+'),
+                    UsbKeyCode::NumPadStar => self.input_operation('*'),
+                    UsbKeyCode::Slash => self.input_operation('/'),
+                    UsbKeyCode::Escape => self.clear(),
+                    _ => {}
                 }
-                _ => {}
             }
         }
         Ok(())

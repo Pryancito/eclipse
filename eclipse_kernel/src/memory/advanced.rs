@@ -6,7 +6,6 @@
 use core::mem;
 use core::ptr::{self, NonNull};
 use core::alloc::{GlobalAlloc, Layout};
-use alloc::boxed::Box;
 
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: usize = 4096;

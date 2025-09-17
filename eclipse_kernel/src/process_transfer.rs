@@ -7,7 +7,7 @@ use core::ptr;
 use crate::paging::{PagingManager, setup_userland_paging};
 use crate::gdt::{GdtManager, setup_userland_gdt};
 use crate::idt::{IdtManager, setup_userland_idt};
-// use crate::interrupts::{InterruptManager, setup_userland_interrupts};  // TEMPORALMENTE DESHABILITADO
+use crate::interrupts::{InterruptManager, setup_userland_interrupts};
 
 /// Contexto de ejecución de un proceso
 #[derive(Debug, Clone)]
@@ -123,39 +123,34 @@ impl ProcessTransfer {
 
     /// Configurar Global Descriptor Table (GDT)
     fn setup_gdt(&self) -> Result<(), &'static str> {
-        // TEMPORALMENTE DESHABILITADO: setup_userland_gdt() contiene lgdt que causa opcode inválido
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-        Ok(())
+        // Configurar GDT real para userland
+        setup_userland_gdt()
     }
 
     /// Configurar Interrupt Descriptor Table (IDT)
     fn setup_idt(&self) -> Result<(), &'static str> {
-        // TEMPORALMENTE DESHABILITADO: setup_userland_idt() contiene lidt que causa opcode inválido
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-        Ok(())
+        // Configurar IDT real para userland
+        let kernel_code_selector = 0x08;  // Selector de código de kernel
+        setup_userland_idt(kernel_code_selector)
     }
 
     /// Configurar paginación
     fn setup_paging(&self) -> Result<(), &'static str> {
-        // TEMPORALMENTE DESHABILITADO: setup_userland_paging() contiene mov cr3 que causa opcode inválido
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
-        }
+        // Configurar paginación real para userland
+        let _pml4_addr = setup_userland_paging()?;
+        
+        // Cambiar a la nueva tabla de páginas
+        let mut paging_manager = PagingManager::new();
+        paging_manager.setup_userland_paging()?;
+        paging_manager.switch_to_pml4();
+        
         Ok(())
     }
 
     /// Configurar interrupciones
     fn setup_interrupts(&self) -> Result<(), &'static str> {
-        // TEMPORALMENTE DESHABILITADO: setup_userland_interrupts() puede contener instrucciones problemáticas
-        unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-        Ok(())
+        // Configurar interrupciones reales para userland
+        setup_userland_interrupts()
     }
 
     /// Ejecutar proceso del userland
@@ -169,46 +164,62 @@ impl ProcessTransfer {
         Ok(())
     }
 
-    /// Configurar registros para userland (SIMULACIÓN ULTRA-SEGURA)
-    fn setup_userland_registers(&self, _context: &ProcessContext) -> Result<(), &'static str> {
-        // TEMPORALMENTE DESHABILITADO: TODAS las instrucciones assembly causan opcode inválido
-        // El problema está en la dirección RIP 000000000009F0AD
-
+    /// Configurar registros para userland
+    fn setup_userland_registers(&self, context: &ProcessContext) -> Result<(), &'static str> {
+        // Configurar registros de segmento
         unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-            // Logging removido temporalmente para evitar breakpoint
+            asm!("mov ds, ax", in("ax") context.ds, options(nomem, nostack));
+            asm!("mov es, ax", in("ax") context.es, options(nomem, nostack));
+            asm!("mov fs, ax", in("ax") context.fs, options(nomem, nostack));
+            asm!("mov gs, ax", in("ax") context.gs, options(nomem, nostack));
         }
-
+        
         Ok(())
     }
 
-    /// Transferir control al userland usando simulación segura
+    /// Transferir control al userland usando iretq
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
-        // SOLUCIÓN: Solo usar simulación segura, nunca iretq
+        // Preparar stack para iretq
+        let stack_ptr = context.rsp;
+        
+        // Colocar datos en la pila para iretq
         unsafe {
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Simular ejecución de eclipse-systemd
-        match simulate_eclipse_systemd_execution() {
-            Ok(_) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                return Ok(());
+            let stack_data = [
+                context.ss,      // SS
+                context.rsp,     // RSP
+                context.rflags,  // RFLAGS
+                context.cs,      // CS
+                context.rip,     // RIP
+            ];
+            
+            // Colocar datos en la pila
+            let stack_addr = stack_ptr as *mut u64;
+            for (i, &value) in stack_data.iter().enumerate() {
+                *stack_addr.add(i) = value;
             }
-            Err(e) => {
-                unsafe {
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                    // Logging removido temporalmente para evitar breakpoint
-                }
-                // No fallar completamente, continuar con el kernel
-                return Ok(());
-            }
+            
+            // Configurar registros
+            asm!("mov rax, {}", in(reg) context.rax, options(nomem, nostack));
+            asm!("mov rbx, {}", in(reg) context.rbx, options(nomem, nostack));
+            asm!("mov rcx, {}", in(reg) context.rcx, options(nomem, nostack));
+            asm!("mov rdx, {}", in(reg) context.rdx, options(nomem, nostack));
+            asm!("mov rsi, {}", in(reg) context.rsi, options(nomem, nostack));
+            asm!("mov rdi, {}", in(reg) context.rdi, options(nomem, nostack));
+            asm!("mov rbp, {}", in(reg) context.rbp, options(nomem, nostack));
+            asm!("mov r8, {}", in(reg) context.r8, options(nomem, nostack));
+            asm!("mov r9, {}", in(reg) context.r9, options(nomem, nostack));
+            asm!("mov r10, {}", in(reg) context.r10, options(nomem, nostack));
+            asm!("mov r11, {}", in(reg) context.r11, options(nomem, nostack));
+            asm!("mov r12, {}", in(reg) context.r12, options(nomem, nostack));
+            asm!("mov r13, {}", in(reg) context.r13, options(nomem, nostack));
+            asm!("mov r14, {}", in(reg) context.r14, options(nomem, nostack));
+            asm!("mov r15, {}", in(reg) context.r15, options(nomem, nostack));
+            
+            // Transferir control usando iretq
+            asm!("iretq", options(nomem, nostack));
         }
+        
+        Ok(())
     }
 
     /// Registrar inicio del proceso
@@ -253,101 +264,24 @@ pub fn transfer_to_eclipse_systemd(
 pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
     // En un sistema real, aquí eclipse-systemd se ejecutaría realmente
     // Por ahora, solo simulamos la ejecución exitosa
-
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-    }
-
+    
     // Simular inicialización de systemd
-    match simulate_systemd_initialization() {
-        Ok(_) => {
-            // Logging removido temporalmente para evitar breakpoint
-        },
-        Err(e) => {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return Err("Error en inicialización de systemd");
-        }
-    }
-
+    simulate_systemd_initialization()?;
+    
     // Simular bucle principal de systemd
-    match simulate_systemd_main_loop() {
-        Ok(_) => {
-            // Logging removido temporalmente para evitar breakpoint
-        },
-        Err(e) => {
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-            }
-            return Err("Error en bucle principal de systemd");
-        }
-    }
-
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-    }
-
+    simulate_systemd_main_loop()?;
+    
     Ok(())
 }
 
 /// Simular inicialización de systemd
 fn simulate_systemd_initialization() -> Result<(), &'static str> {
-    // Simular configuración de servicios básicos
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-        // Pequeña pausa para simular procesamiento
-        for _ in 0..1000 {
-            // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
-    }
-
-    // Simular carga de unidades
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-        for _ in 0..1000 {
-            // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-        }
-    }
-
     // Simular inicialización exitosa
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-    }
-
     Ok(())
 }
 
 /// Simular bucle principal de systemd
 fn simulate_systemd_main_loop() -> Result<(), &'static str> {
-    // Simular procesamiento de eventos
-    unsafe {
-        // Logging removido temporalmente para evitar breakpoint
-
-        // Simular algunos eventos de systemd
-        for i in 0..5 {
-            // Simular procesamiento de un evento
-            for _ in 0..500 {
-                // TEMPORALMENTE DESHABILITADO: nop causa opcode inválido
-            // Simular nop con spin loop para evitar opcode inválido
-            core::hint::spin_loop();
-            }
-
-            // Logging removido temporalmente para evitar breakpoint
-            // Aquí podríamos convertir i a string, pero por simplicidad usamos un mensaje genérico
-            // Logging removido temporalmente para evitar breakpoint
-        }
-
-        // Logging removido temporalmente para evitar breakpoint
-    }
-
+    // Simular bucle principal exitoso
     Ok(())
 }

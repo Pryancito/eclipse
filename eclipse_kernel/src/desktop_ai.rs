@@ -3,6 +3,9 @@
 
 use core::fmt::Write;
 use crate::drivers::framebuffer::{FramebufferDriver, Color as FbColor};
+use crate::main_unified::VgaWriter;
+use crate::drivers::video::VideoInterface::VGA;
+use crate::drivers::framebuffer::Color as VgaColor;
 
 // Tipos básicos para el escritorio
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,11 +212,12 @@ impl DesktopRenderer {
                 fb.draw_line(0, y as i32, fb.info.width as i32, y as i32, FbColor::DARKER_BLUE);
             }
         } else {
-            // Fallback VGA
-            unsafe {
-                // Logging removido temporalmente para evitar breakpoint
-                // Logging removido temporalmente para evitar breakpoint
-            }
+            // Fallback VGA - comentado temporalmente
+            // unsafe {
+            //     VGA.set_color(VgaColor::Blue, VgaColor::Black);
+            //     VGA.write_string("Eclipse OS Desktop\n");
+            //     VGA.write_string("==================\n");
+            // }
         }
         Ok(())
     }
@@ -232,13 +236,14 @@ impl DesktopRenderer {
         } else {
             // Fallback VGA - mostrar ventanas como texto
             unsafe {
-                // Logging removido temporalmente para evitar breakpoint
+                // VGA.set_color(VgaColor::White, VgaColor::Black);
+                // VGA.write_string("Ventanas abiertas:\n");
                 for window_opt in &self.state.windows {
                     if let Some(window) = window_opt {
                         if window.visible {
-                            // Logging removido temporalmente para evitar breakpoint
-                            // Logging removido temporalmente para evitar breakpoint
-                            // Logging removido temporalmente para evitar breakpoint
+                            // VGA.write_string("  - ");
+                            // VGA.write_string(window.title);
+                            // VGA.write_string("\n");
                         }
                     }
                 }
@@ -329,7 +334,8 @@ impl DesktopRenderer {
         } else {
             // Fallback VGA
             unsafe {
-                // Logging removido temporalmente para evitar breakpoint
+                // VGA.set_color(VgaColor::DarkGray, VgaColor::Black);
+                // VGA.write_string("Barra de tareas: [Inicio] [Aplicaciones] [Sistema]\n");
             }
         }
         Ok(())

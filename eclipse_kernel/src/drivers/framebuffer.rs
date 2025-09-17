@@ -1324,6 +1324,7 @@ pub struct FramebufferDriver {
     is_initialized: bool,
     hardware_acceleration: HardwareAccelerationManager,
     current_x: u32,
+    current_y: u32,
 }
 
 impl FramebufferDriver {
@@ -1345,6 +1346,7 @@ impl FramebufferDriver {
             is_initialized: false,
             hardware_acceleration: HardwareAccelerationManager::new(),
             current_x: 10,
+            current_y: 5,
         }
     }
     
@@ -1614,22 +1616,22 @@ impl FramebufferDriver {
         let fb_width = self.info.width;
         let fb_height = self.info.height;
 
-        // Buscar el bitmap correspondiente al carácter en FONT_DATA, que es un array de tuplas (char, [u8; 8])
+        // Bitmap 8x8: cada byte es una fila, bit 7..0 son columnas
         let char_bitmap: [u8; 8] = *FONT_DATA
             .iter()
             .find(|(c, _)| *c == ch)
             .map(|(_, bitmap)| bitmap)
             .unwrap_or(&[0; 8]);
 
-
-        for i in 0..64 {
-            let px = i / 8;
-            let py = i % 8;
-            if (char_bitmap[px] & (1 << (7 - py))) != 0 {
-                let pixel_x = x + px as u32;
-                let pixel_y = y + py as u32;
-                if pixel_x < fb_width && pixel_y < fb_height {
-                    self.put_pixel(pixel_x, pixel_y, color);
+        for row in 0..8 {
+            let row_bits = char_bitmap[row];
+            for col in 0..8 {
+                if (row_bits & (1 << (7 - col))) != 0 {
+                    let pixel_x = x + col as u32;
+                    let pixel_y = y + row as u32;
+                    if pixel_x < fb_width && pixel_y < fb_height {
+                        self.put_pixel(pixel_x, pixel_y, color);
+                    }
                 }
             }
         }
@@ -1655,30 +1657,87 @@ impl FramebufferDriver {
     /// Función optimizada para kernel que usa punteros directos sin asignaciones de memoria
     /// Esta es la versión recomendada para kernels como Eclipse OS
     pub fn write_text_kernel(&mut self, text: &str, color: Color) {
-        let mut buffer_x: u32 = self.current_x;
-        let mut current_y = 5;
-        let char_width = 8;
-        let char_height = 8;
+        let line_height: u32 = 16;
+        let char_width: u32 = 8;
+        let char_height: u32 = 8;
 
-        let mut current_ptr = text.as_ptr();
-        let end_ptr = unsafe { current_ptr.add(text.len()) };
+        let mut x: u32 = 10; // margen izquierdo fijo
+        let mut y: u32 = self.current_y;
 
-        while current_ptr < end_ptr {
-            let char_code = unsafe { core::ptr::read_volatile(current_ptr) };
+        // 1) Calcular cuántas líneas nuevas se imprimirán (conteo de '\n')
+        let mut lines_needed: u32 = 1; // al menos una línea
+        for &b in text.as_bytes() { if b == b'\n' { lines_needed += 1; } }
 
-            // Verificar límites de pantalla
-            if current_y + char_height > self.info.height {
-                break;
-            }
-            
-            // Llamar a la función de dibujo con el byte del carácter
-            self.draw_character(buffer_x, current_y + 2, char_code as char, color);
-            current_y += char_width;
+        // 2) Calcular espacio disponible en pantalla desde la posición actual
+        let height = self.info.height;
+        let mut visible_lines_left = if y + char_height > height {
+            0
+        } else {
+            ((height - (y + char_height)) / line_height) + 1
+        };
 
-            // Avanzar el puntero al siguiente byte
-            current_ptr = unsafe { current_ptr.add(1) };
+        // 3) Desplazar de una vez si no caben todas las líneas
+        if lines_needed > visible_lines_left {
+            let missing = lines_needed - visible_lines_left;
+            self.scroll_up(missing * line_height);
+            // reposicionar al final visible
+            y = height.saturating_sub(char_height + 2 + (line_height * (lines_needed - 1)));
+            visible_lines_left = ((height - (y + char_height)) / line_height) + 1;
         }
-        self.current_x += 16;
+
+        // 4) Pintado sin scroll dentro del bucle (solo wraps y saltos de línea)
+        for &byte in text.as_bytes() {
+            if byte == b'\n' {
+                x = 10;
+                y = y.saturating_add(line_height);
+                continue;
+            }
+
+            if x + char_width > self.info.width { // wrap
+                x = 10;
+                y = y.saturating_add(line_height);
+            }
+
+            self.draw_character(x, y + 2, byte as char, color);
+            x += char_width;
+        }
+
+        // 5) Avanzar cursor a la siguiente línea, con un único scroll si fuera necesario
+        y = y.saturating_add(line_height);
+        if y + char_height > height {
+            self.scroll_up(line_height);
+            y = height.saturating_sub(char_height + 2);
+        }
+        self.current_y = y;
+    }
+
+    /// Desplaza el framebuffer hacia arriba una cantidad de píxeles y limpia la zona inferior
+    fn scroll_up(&mut self, pixels: u32) {
+        if pixels == 0 { return; }
+        if !self.is_initialized { return; }
+
+        let stride = self.info.pixels_per_scan_line;
+        let width = stride; // usamos stride como ancho real en memoria
+        let height = self.info.height;
+        if pixels >= height { 
+            // Limpiar todo si se solicita desplazar más de la altura
+            self.clear_screen(Color::BLACK);
+            return;
+        }
+
+        unsafe {
+            let fb = self.info.base_address as *mut u32;
+            let rows_to_move = height - pixels;
+            // Copiar filas superiores hacia arriba (maneja solapamiento tipo memmove)
+            let src = fb.add((pixels * width) as usize);
+            let dst = fb;
+            core::ptr::copy(src, dst, (rows_to_move * width) as usize);
+
+            // Limpiar la zona inferior recién liberada con memset acelerado
+            let start_clear = (rows_to_move * width) as usize;
+            let count_elements = (height * width) as usize - start_clear;
+            core::ptr::write_bytes(fb.add(start_clear), 0u8, count_elements);
+        }
     }
     
     /// Versión optimizada con efecto de escritura para kernel
@@ -1771,7 +1830,8 @@ impl FramebufferDriver {
         unsafe {
             let stride = self.info.pixels_per_scan_line;
             let fb_ptr = self.info.base_address as *mut u32;
-            core::ptr::write_volatile(fb_ptr.add((x * stride + y) as usize), color.to_u32());
+            // Offset correcto: y * stride + x
+            core::ptr::write_volatile(fb_ptr.add((y * stride + x) as usize), color.to_u32());
         }
     }
     
@@ -3369,6 +3429,7 @@ impl LayerManager {
                                    is_initialized: true,
                                    hardware_acceleration: HardwareAccelerationManager::new(),
                                    current_x: 0,
+                                   current_y: 0,
                                 });
         } else {
             // Alpha blending pixel por pixel

@@ -2,7 +2,8 @@
 //! 
 //! Implementa paginación de 4 niveles (PML4, PDPT, PD, PT)
 
-use crate::paging::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
+use crate::memory::manager::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
+
 /// Estructura para manejar la paginación
 pub struct PagingSystem {
     /// Tabla de páginas de nivel 4 (PML4)
@@ -121,13 +122,14 @@ impl PagingSystem {
         Ok(())
     }
 
-    /// Cargar la tabla de páginas en CR3 (SIMULACIÓN ULTRA-SEGURA)
+    /// Cargar la tabla de páginas en CR3
     fn load_page_table(&self) {
-        // TEMPORALMENTE DESHABILITADO: Instrucciones CR3 causan opcode inválido
-
         unsafe {
-            
-            // Logging removido temporalmente para evitar breakpoint
+            core::arch::asm!(
+                "mov cr3, {}",
+                in(reg) self.pml4 as u64,
+                options(nostack)
+            );
         }
     }
 
@@ -248,22 +250,47 @@ impl PagingSystem {
         }
     }
 
-    /// Habilitar paginación (SIMULACIÓN ULTRA-SEGURA)
+    /// Habilitar paginación
     pub fn enable_paging(&self) {
-        // TEMPORALMENTE DESHABILITADO: Instrucciones CR0/CR3 causan opcode inválido
-
         unsafe {
-            
-            // Logging removido temporalmente para evitar breakpoint
+            // Cargar CR3 con la dirección de PML4
+            core::arch::asm!(
+                "mov cr3, {}",
+                in(reg) self.pml4 as u64,
+                options(nostack)
+            );
+
+            // Habilitar paginación en CR0
+            let mut cr0: u64;
+            core::arch::asm!(
+                "mov {}, cr0",
+                out(reg) cr0,
+                options(nostack)
+            );
+            cr0 |= 0x80000000; // Bit PG (Paging)
+            core::arch::asm!(
+                "mov cr0, {}",
+                in(reg) cr0,
+                options(nostack)
+            );
         }
     }
 
-    /// Deshabilitar paginación (SIMULACIÓN ULTRA-SEGURA)
+    /// Deshabilitar paginación
     pub fn disable_paging(&self) {
-        // TEMPORALMENTE DESHABILITADO: Instrucciones CR0 causan opcode inválido
-
         unsafe {
-            
+            let mut cr0: u64;
+            core::arch::asm!(
+                "mov {}, cr0",
+                out(reg) cr0,
+                options(nostack)
+            );
+            cr0 &= !0x80000000; // Limpiar bit PG
+            core::arch::asm!(
+                "mov cr0, {}",
+                in(reg) cr0,
+                options(nostack)
+            );
         }
     }
 }

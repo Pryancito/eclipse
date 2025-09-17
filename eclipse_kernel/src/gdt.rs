@@ -4,6 +4,7 @@
 
 use core::mem;
 use core::arch::asm;
+
 /// Flags de descriptor de segmento
 pub const GDT_ACCESSED: u8 = 1 << 0;
 pub const GDT_READ_WRITE: u8 = 1 << 1;
@@ -110,17 +111,7 @@ impl GdtRegister {
     /// Cargar GDT en el procesador
     pub fn load(&self) {
         unsafe {
-            // Verificar que la GDT esté correctamente alineada (debe estar en límite de 8 bytes)
-            let gdt_addr = self as *const Self as u64;
-            if gdt_addr & 0x7 != 0 {
-                // Logging removido temporalmente para evitar breakpoint
-                return;
-            }
-
-            // TEMPORALMENTE DESHABILITADO: lgdt causa opcode inválido
-            // Usar simulación segura en lugar de LGDT
-            
-            // Logging removido temporalmente para evitar breakpoint
+            asm!("lgdt [{}]", in(reg) self as *const Self as u64, options(nomem, nostack));
         }
     }
 }
@@ -212,10 +203,7 @@ impl GdtManager {
     /// Configurar GDT para userland
     pub fn setup_userland(&mut self) -> Result<(), &'static str> {
         self.gdt.setup_userland()?;
-        // TEMPORALMENTE DESHABILITADO: gdt.load() contiene lgdt que causa opcode inválido
-        unsafe {
-            
-        }
+        self.gdt.load();
         Ok(())
     }
 

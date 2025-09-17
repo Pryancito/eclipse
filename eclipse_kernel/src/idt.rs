@@ -86,17 +86,7 @@ impl IdtRegister {
     /// Cargar IDT en el procesador
     pub fn load(&self) {
         unsafe {
-            // Verificar que la IDT esté correctamente alineada (debe estar en límite de 8 bytes)
-            let idt_addr = self as *const Self as u64;
-            if idt_addr & 0x7 != 0 {
-                // Logging removido temporalmente para evitar breakpoint
-                return;
-            }
-
-            // TEMPORALMENTE DESHABILITADO: lidt causa opcode inválido
-            // Usar simulación segura en lugar de LIDT
-            
-            // Logging removido temporalmente para evitar breakpoint
+            asm!("lidt [{}]", in(reg) self as *const Self as u64, options(nomem, nostack));
         }
     }
 }
@@ -333,10 +323,7 @@ impl IdtManager {
     /// Configurar IDT para userland
     pub fn setup_userland(&mut self, kernel_code_selector: u16) -> Result<(), &'static str> {
         self.idt.setup_userland(kernel_code_selector)?;
-        // TEMPORALMENTE DESHABILITADO: idt.load() contiene lidt que causa opcode inválido
-        unsafe {
-            
-        }
+        self.idt.load();
         Ok(())
     }
 

@@ -1,185 +1,114 @@
-//! Sistema de gestión de memoria para Eclipse OS
+//! Módulo de Gestión de Memoria para Eclipse OS
 //! 
-//! Implementa allocator, heap, paginación y memoria virtual
+//! Este módulo proporciona todas las funcionalidades de gestión de memoria:
+//! - Paginación de 4 niveles
+//! - Asignación dinámica de memoria
+//! - Gestión de memoria física
+//! - Protección de memoria
 
-pub mod allocator;
-pub mod heap;
+pub mod manager;
 pub mod paging;
-pub mod virtual_memory;
-pub mod memory_manager;
+pub mod allocator;
 
-use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
+// Re-exportar las estructuras principales
+pub use manager::{init_memory_manager, get_memory_manager};
+pub use paging::{init_paging, enable_paging};
 
-/// Información de memoria del sistema
-#[derive(Debug, Clone)]
+/// Constantes de memoria
+pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_TABLE_ENTRIES: usize = 512;
+pub const PAGE_LEVELS: usize = 4;
+
+/// Flags de página
+pub const PAGE_PRESENT: u64 = 1 << 0;
+pub const PAGE_WRITABLE: u64 = 1 << 1;
+pub const PAGE_USER: u64 = 1 << 2;
+pub const PAGE_WRITE_THROUGH: u64 = 1 << 3;
+pub const PAGE_CACHE_DISABLE: u64 = 1 << 4;
+pub const PAGE_SIZE_2MB: u64 = 1 << 7;
+
+/// Direcciones importantes
+pub const KERNEL_VIRTUAL_BASE: u64 = 0xffff800000000000;
+pub const KERNEL_HEAP_START: u64 = 0x2000000;
+pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16MB
+
+/// Inicializar el sistema de memoria completo
+pub fn init_memory_system(physical_base: u64, memory_size: u64) -> Result<(), &'static str> {
+    // Inicializar el gestor de memoria
+    init_memory_manager(physical_base, memory_size)?;
+    
+    // Inicializar el sistema de paginación
+    let _paging = init_paging()?;
+    
+    // Habilitar paginación
+    enable_paging();
+    
+    Ok(())
+}
+
+/// Obtener información del sistema de memoria
+pub fn get_memory_info() -> MemoryInfo {
+    if let Some(manager) = get_memory_manager() {
+        MemoryInfo {
+            total_memory: manager.physical_memory_size,
+            free_memory: manager.physical_memory_size, // Simplificado
+            used_memory: 0,
+            page_size: PAGE_SIZE,
+        }
+    } else {
+        MemoryInfo {
+            total_memory: 0,
+            free_memory: 0,
+            used_memory: 0,
+            page_size: PAGE_SIZE,
+        }
+    }
+}
+
+/// Obtener estadísticas de memoria (compatible con main.rs)
+pub fn get_memory_stats() -> (usize, usize, usize) {
+    let info = get_memory_info();
+    let total_pages = (info.total_memory / PAGE_SIZE as u64) as usize;
+    let free_pages = (info.free_memory / PAGE_SIZE as u64) as usize;
+    let used_pages = total_pages - free_pages;
+    (total_pages, free_pages, used_pages)
+}
+
+/// Información del sistema de memoria
+#[derive(Debug, Clone, Copy)]
 pub struct MemoryInfo {
     pub total_memory: u64,
-    pub available_memory: u64,
+    pub free_memory: u64,
     pub used_memory: u64,
-    pub kernel_memory: u64,
-    pub heap_memory: u64,
-    pub page_count: u64,
-    pub free_pages: u64,
-}
-
-/// Estadísticas de memoria
-#[derive(Debug, Clone)]
-pub struct MemoryStats {
-    pub allocations: u64,
-    pub deallocations: u64,
-    pub total_allocated: u64,
-    pub peak_usage: u64,
-    pub fragmentation: f32,
-}
-
-/// Configuración de memoria
-#[derive(Debug, Clone)]
-pub struct MemoryConfig {
-    pub heap_size: usize,
     pub page_size: usize,
-    pub enable_virtual_memory: bool,
-    pub enable_memory_protection: bool,
-    pub max_allocations: usize,
 }
 
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            heap_size: 64 * 1024 * 1024, // 64MB
-            page_size: 4096, // 4KB
-            enable_virtual_memory: true,
-            enable_memory_protection: true,
-            max_allocations: 10000,
-        }
+/// Funciones de utilidad para memoria
+pub mod utils {
+    use super::*;
+
+    /// Alinear una dirección a un múltiplo de página
+    pub fn align_to_page(addr: u64) -> u64 {
+        (addr + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
+    }
+
+    /// Verificar si una dirección está alineada a página
+    pub fn is_page_aligned(addr: u64) -> bool {
+        (addr & (PAGE_SIZE as u64 - 1)) == 0
+    }
+
+    /// Calcular el número de páginas necesarias para un tamaño
+    pub fn pages_needed(size: usize) -> usize {
+        (size + PAGE_SIZE - 1) / PAGE_SIZE
+    }
+
+    /// Convertir bytes a páginas
+    pub fn bytes_to_pages(bytes: usize) -> usize {
+        pages_needed(bytes)
+    }
+
+    /// Convertir páginas a bytes
+    pub fn pages_to_bytes(pages: usize) -> usize {
+        pages * PAGE_SIZE
     }
 }
-
-/// Gestor principal de memoria
-pub struct MemoryManager {
-    config: MemoryConfig,
-    info: MemoryInfo,
-    stats: MemoryStats,
-    initialized: bool,
-}
-
-impl MemoryManager {
-    pub fn new(config: MemoryConfig) -> Self {
-        Self {
-            config,
-            info: MemoryInfo {
-                total_memory: 0,
-                available_memory: 0,
-                used_memory: 0,
-                kernel_memory: 0,
-                heap_memory: 0,
-                page_count: 0,
-                free_pages: 0,
-            },
-            stats: MemoryStats {
-                allocations: 0,
-                deallocations: 0,
-                total_allocated: 0,
-                peak_usage: 0,
-                fragmentation: 0.0,
-            },
-            initialized: false,
-        }
-    }
-
-    pub fn initialize(&mut self) -> Result<(), &'static str> {
-        if self.initialized {
-            return Err("Memory manager already initialized");
-        }
-
-        // Simular detección de memoria
-        self.info.total_memory = 8 * 1024 * 1024 * 1024; // 8GB
-        self.info.available_memory = self.info.total_memory - (512 * 1024 * 1024); // 512MB para kernel
-        self.info.kernel_memory = 512 * 1024 * 1024;
-        self.info.heap_memory = self.config.heap_size as u64;
-        self.info.page_count = self.info.total_memory / self.config.page_size as u64;
-        self.info.free_pages = self.info.page_count - (self.info.kernel_memory / self.config.page_size as u64);
-
-        self.initialized = true;
-        Ok(())
-    }
-
-    pub fn get_info(&self) -> &MemoryInfo {
-        &self.info
-    }
-
-    pub fn get_stats(&self) -> &MemoryStats {
-        &self.stats
-    }
-
-    pub fn allocate(&mut self, size: usize) -> Result<*mut u8, &'static str> {
-        if !self.initialized {
-            return Err("Memory manager not initialized");
-        }
-
-        if size == 0 {
-            return Err("Cannot allocate zero bytes");
-        }
-
-        if size > self.config.heap_size {
-            return Err("Allocation too large");
-        }
-
-        // Simular asignación de memoria
-        self.stats.allocations += 1;
-        self.stats.total_allocated += size as u64;
-        self.info.used_memory += size as u64;
-        
-        if self.info.used_memory > self.stats.peak_usage {
-            self.stats.peak_usage = self.info.used_memory;
-        }
-
-        // En un sistema real, aquí se asignaría memoria real
-        Ok(core::ptr::null_mut())
-    }
-
-    pub fn deallocate(&mut self, ptr: *mut u8, size: usize) -> Result<(), &'static str> {
-        if !self.initialized {
-            return Err("Memory manager not initialized");
-        }
-
-        if ptr.is_null() {
-            return Err("Cannot deallocate null pointer");
-        }
-
-        // Simular liberación de memoria
-        self.stats.deallocations += 1;
-        self.stats.total_allocated -= size as u64;
-        self.info.used_memory -= size as u64;
-
-        Ok(())
-    }
-
-    pub fn get_memory_usage_percentage(&self) -> f32 {
-        if self.info.total_memory == 0 {
-            return 0.0;
-        }
-        (self.info.used_memory as f32 / self.info.total_memory as f32) * 100.0
-    }
-}
-
-/// Allocator global para el kernel
-pub struct KernelAllocator {
-    memory_manager: MemoryManager,
-}
-
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Implementación básica del allocator
-        core::ptr::null_mut()
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        // Implementación básica del deallocator
-    }
-}
-
-// #[global_allocator]
-// static ALLOCATOR: KernelAllocator = KernelAllocator {
-//     memory_manager: MemoryManager::new(MemoryConfig::default()),
-// };

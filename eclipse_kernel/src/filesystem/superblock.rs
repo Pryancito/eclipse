@@ -16,7 +16,6 @@ pub const SUPERBLOCK_SIZE: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileSystemType {
     EclipseFS,
-    Fat32,
     Ext2,
     Ext3,
     Ext4,
@@ -29,7 +28,6 @@ impl FileSystemType {
     pub fn to_u32(&self) -> u32 {
         match self {
             FileSystemType::EclipseFS => 0x45434C50, // "ECLP"
-            FileSystemType::Fat32 => 0x46415432, // "FAT2"
             FileSystemType::Ext2 => 0xEF53,
             FileSystemType::Ext3 => 0xEF53,
             FileSystemType::Ext4 => 0xEF53,
@@ -42,7 +40,6 @@ impl FileSystemType {
     pub fn from_u32(value: u32) -> Self {
         match value {
             0x45434C50 => FileSystemType::EclipseFS,
-            0x46415432 => FileSystemType::Fat32,
             0xEF53 => FileSystemType::Ext2,
             0x58465342 => FileSystemType::XFS,
             0x9123683E => FileSystemType::Btrfs,
@@ -53,7 +50,6 @@ impl FileSystemType {
     pub fn as_str(&self) -> &'static str {
         match self {
             FileSystemType::EclipseFS => "EclipseFS",
-            FileSystemType::Fat32 => "fat32",
             FileSystemType::Ext2 => "ext2",
             FileSystemType::Ext3 => "ext3",
             FileSystemType::Ext4 => "ext4",

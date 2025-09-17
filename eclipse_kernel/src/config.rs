@@ -9,7 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
-use crate::{KernelError, KernelResult, syslog_info, syslog_warn, syslog_err};
+use crate::{KernelError, KernelResult};
 
 /// Tipo de valor de configuración
 #[derive(Debug, Clone, PartialEq)]
@@ -541,7 +541,7 @@ impl ConfigManager {
                 if let Some(ConfigValue::UnsignedInteger(level)) = self.get_config(key) {
                     self.config.set_log_level(*level as u32)?;
                     let msg = format!("Nivel de logging cambiado a {}", level);
-        syslog_info!("CONFIG", &msg);
+        // logging silenciado
                 }
             },
             "logging.serial_enabled" => {
@@ -549,21 +549,21 @@ impl ConfigManager {
                     self.config.set_log_to_serial(*enabled);
                     let status = if *enabled { "habilitado" } else { "deshabilitado" };
                     let msg = format!("Logging a serial {}", status);
-                    syslog_info!("CONFIG", &msg);
+                    
                 }
             },
             "memory.pool_size" => {
                 if let Some(ConfigValue::UnsignedInteger(size)) = self.get_config(key) {
                     self.config.set_memory_pool_size(*size)?;
                     let msg = format!("Tamaño del pool de memoria cambiado a {} bytes", size);
-                    syslog_info!("CONFIG", &msg);
+                    
                 }
             },
             "process.max_count" => {
                 if let Some(ConfigValue::UnsignedInteger(max)) = self.get_config(key) {
                     self.config.set_max_processes(*max as u32)?;
                     let msg = format!("Número máximo de procesos cambiado a {}", max);
-                    syslog_info!("CONFIG", &msg);
+                    
                 }
             },
             "ai.enabled" => {
@@ -571,7 +571,7 @@ impl ConfigManager {
                     self.config.set_ai_enabled(*enabled);
                     let status = if *enabled { "habilitado" } else { "deshabilitado" };
                     let msg = format!("Sistema de IA {}", status);
-                    syslog_info!("CONFIG", &msg);
+                    
                 }
             },
             "metrics.enabled" => {
@@ -579,19 +579,18 @@ impl ConfigManager {
                     self.config.set_metrics_enabled(*enabled);
                     let status = if *enabled { "habilitada" } else { "deshabilitada" };
                     let msg = format!("Recolección de métricas {}", status);
-                    syslog_info!("CONFIG", &msg);
+                    
                 }
             },
             "metrics.collection_interval" => {
                 if let Some(ConfigValue::UnsignedInteger(interval)) = self.get_config(key) {
                     self.config.set_metrics_collection_interval(*interval)?;
-                    let msg = format!("Intervalo de recolección de métricas cambiado a {} ms", interval);
-                    syslog_info!("CONFIG", &msg);
+                    let _msg = format!("Intervalo de recolección de métricas cambiado a {} ms", interval);
                 }
             },
             _ => {
-                let msg = format!("Configuración '{}' no tiene aplicación automática", key);
-                syslog_warn!("CONFIG", &msg);
+                let _msg = format!("Configuración '{}' no tiene aplicación automática", key);
+                
             }
         }
         Ok(())
@@ -653,7 +652,6 @@ static CONFIG_MANAGER: Mutex<Option<ConfigManager>> = Mutex::new(None);
 
 /// Inicializar el sistema de configuración
 pub fn init_config() -> KernelResult<()> {
-    syslog_info!("CONFIG", "Inicializando sistema de configuración");
     let mut manager = CONFIG_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
     *manager = Some(ConfigManager::new());
     Ok(())

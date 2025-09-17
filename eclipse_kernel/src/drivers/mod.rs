@@ -14,11 +14,19 @@ pub mod network;
 pub mod video;
 pub mod framebuffer;
 pub mod input;
-pub mod usb_mouse;
-pub mod usb_keyboard;
 pub mod pci;
+pub mod pci_driver;
+pub mod nvidia_pci_driver;
+pub mod binary_driver_manager;
+pub mod ipc;
 pub mod intel_graphics;
 pub mod nvidia_graphics;
+pub mod nvidia_smi;
+pub mod nvidia_cuda;
+pub mod nvidia_vulkan;
+pub mod nvidia_rtx;
+pub mod nvidia_integration;
+pub mod nvidia_example;
 pub mod amd_graphics;
 pub mod gpu_manager;
 pub mod drm;
@@ -26,21 +34,19 @@ pub mod drm_manager;
 pub mod drm_integration;
 pub mod acceleration_2d;
 pub mod usb;
+pub mod usb_keyboard;
+pub mod usb_mouse;
 pub mod usb_hub;
 pub mod usb_hid;
 pub mod input_system;
 pub mod gui_integration;
 pub mod manager;
 pub mod modular;
-pub mod ipc;
-pub mod pci_driver;
-pub mod nvidia_pci_driver;
-pub mod binary_driver_manager;
+pub mod virtio_gpu;
 
 // Re-exportar componentes principales
 pub use device::{DeviceType, DeviceState, DeviceError};
 pub use manager::DriverResult;
-pub use ipc::{Driver, DriverManager, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
 
 // Constantes del sistema de drivers
 pub const MAX_DEVICES: usize = 256;

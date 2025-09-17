@@ -47,8 +47,8 @@ impl PciDriver {
         self.devices.clear();
         self.gpus.clear();
 
-        // Escanear dispositivos PCI
-        self.pci_manager.scan_devices();
+        // Escanear dispositivos PCI (temporalmente deshabilitado para evitar cuelgues en entornos sin HW)
+        // self.pci_manager.scan_devices();
         // Los dispositivos se obtienen después del escaneo
         // for device in devices {
         //     let key = (device.bus as u32) << 16 | (device.device as u32) << 8 | (device.function as u32);

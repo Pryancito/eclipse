@@ -318,16 +318,9 @@ impl Multiboot2Context {
 pub extern "C" fn multiboot2_entry(magic: u32, info: *const Multiboot2Info) -> ! {
     // Verificar magic number
     if magic != MULTIBOOT2_MAGIC {
-        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-        // Invalid magic number - halt (simulado)
-        unsafe {
-            crate::
-        }
+        // Invalid magic number - halt
         loop {
-            // Simular halt con spin loop
-            for _ in 0..100000 {
-                core::hint::spin_loop();
-            }
+            unsafe { core::arch::asm!("hlt"); }
         }
     }
     
@@ -399,13 +392,7 @@ fn kernel_main_loop() -> ! {
         }
         
         // Hibernar CPU
-        // TEMPORALMENTE DESHABILITADO: hlt causa opcode inválido
-        unsafe {
-            // Simular halt con spin loop
-            for _ in 0..100000 {
-                core::hint::spin_loop();
-            }
-        }
+        unsafe { core::arch::asm!("hlt"); }
     }
 }
 

@@ -10,7 +10,7 @@ use core::ptr::null_mut;
 
 /// Panic handler para el kernel
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
     // En un kernel real, aquí se manejaría el panic de manera segura
     // Por ahora, simplemente entramos en un bucle infinito
     loop {}
@@ -32,7 +32,7 @@ pub mod drivers;
 pub mod filesystem;
 pub mod network;
 pub mod gui;
-pub mod graphics; // Sistema de gráficos y GUI
+pub mod graphics;
 pub mod uefi_framebuffer;
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
@@ -46,13 +46,11 @@ pub mod process_memory;  // Gestión de memoria para procesos
 pub mod paging;  // Sistema de paginación
 pub mod gdt;  // Global Descriptor Table
 pub mod idt;  // Interrupt Descriptor Table
-// pub mod interrupts;  // Gestión de interrupciones y timers - TEMPORALMENTE DESHABILITADO
+pub mod interrupts;  // Gestión de interrupciones y timers
 // pub mod real_integration;  // Integración real kernel-systemd (deshabilitado temporalmente)
 pub mod main_simple;
-// Módulo ai_font_generator removido
 pub mod main_unified;  // Main unificado con funcionalidades de escritorio
 pub mod main_with_init;  // Main con integración systemd
-pub mod entry_simple;  // Punto de entrada UEFI
 pub mod vga_centered_display;
 pub mod wayland;  // Módulo para mostrar texto centrado en VGA
 pub mod ai_integration;  // Integración profunda de IA en el kernel
@@ -63,21 +61,18 @@ pub mod ai_pretrained_models;  // Sistema de modelos de IA pre-entrenados
 pub mod ai_model_demo;  // Demostración de modelos de IA pre-entrenados
 pub mod ai_desktop_integration;  // Integración de IA con el escritorio
 pub mod ai_simple_demo;  // Demostración simple de IA
-pub mod ai_typing_system;  // Sistema de AI para escritura caracter por caracter
-// pub mod ai_services;  // Servicios de IA integrados - Módulo no implementado
-// pub mod ai_commands;  // Comandos de IA para el shell - Módulo no implementado
-// pub mod ai_shell;  // Shell integrado con comandos de IA - Módulo no implementado
-// pub mod ai_inference_engine;  // Motor de inferencia real para modelos de IA - Módulo no implementado
+pub mod ai_services;  // Servicios de IA integrados
+pub mod ai_commands;  // Comandos de IA para el shell
+pub mod ai_shell;  // Shell integrado con comandos de IA
+pub mod ai_inference_engine;  // Motor de inferencia real para modelos de IA
+pub mod ai_typing_system;  // Sistema de escritura inteligente con IA
+pub mod ipc;  // Sistema de comunicación inter-proceso
+pub mod hotplug;  // Sistema de hotplug para dispositivos USB
 pub mod syslog;  // Sistema de logging similar a syslog
 pub mod metrics;  // Sistema de métricas y monitoreo del kernel
 pub mod config;  // Sistema de configuración dinámica del kernel
 pub mod plugins;  // Sistema de plugins del kernel
 pub mod kernel_utils;  // Utilidades del kernel Eclipse
-pub mod fat32;  // Sistema de archivos FAT32 (experimental)
-pub mod ntfs;   // Sistema de archivos NTFS (experimental)
-pub mod ntfs_integration;  // Integración NTFS (stub)
-pub mod ipc;    // Sistema IPC para comunicación kernel-userland
-pub mod hotplug; // Sistema de hot-plug USB para detección automática de hardware
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,129 +249,129 @@ pub const KERNEL_VERSION: &str = "0.4.0";
 
 pub fn initialize() -> KernelResult<()> {
     // Kernel nativo de Eclipse inicializado
-
+    
     // Inicializar el sistema de logging syslog primero
-    syslog::init_syslog()?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    // syslog deshabilitado en QEMU/arranque: no inicializar ni loguear
+    // syslog::init_syslog()?;
+    
     // Inicializar el sistema de métricas
-    // Logging removido temporalmente para evitar breakpoint
+    
     metrics::init_metrics()?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar el sistema de configuración
-    // Logging removido temporalmente para evitar breakpoint
+    
     config::init_config()?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar el sistema de plugins
-    // Logging removido temporalmente para evitar breakpoint
+    
     plugins::init_plugins()?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar el kernel base de Eclipse
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar el sistema core de Eclipse
-    // Logging removido temporalmente para evitar breakpoint
+    
     eclipse_core::init_eclipse_core()?;
-    // Logging removido temporalmente para evitar breakpoint
+    
     
     // Inicializar sistema de IA integrado
-    // Logging removido temporalmente para evitar breakpoint
+    
     ai_integration::init_ai_integration()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI", "Error inicializando sistema de IA");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar comunicación con IA
-    // Logging removido temporalmente para evitar breakpoint
+    
     ai_communication::init_ai_communication()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI_COMM", "Error inicializando comunicación con IA");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar controlador de sistema por IA
-    // Logging removido temporalmente para evitar breakpoint
+    
     ai_control::init_ai_system_controller()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI_CTRL", "Error inicializando controlador de IA");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar interfaz de usuario para IA
-    // Logging removido temporalmente para evitar breakpoint
+    
     ai_interface::init_ai_user_interface()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI_UI", "Error inicializando interfaz de IA");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
-
+    
+    
     // Inicializar sistema de modelos pre-entrenados
-    // Logging removido temporalmente para evitar breakpoint
+    
     ai_pretrained_models::init_pretrained_models()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI_MODELS", "Error inicializando modelos pre-entrenados");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
+    
 
     // Inicializar motor de inferencia real
     #[cfg(feature = "ai-models")]
     {
-        // Logging removido temporalmente para evitar breakpoint
+        
         ai_inference_engine::init_inference_engine()
             .map_err(|e| {
-                // Logging removido temporalmente para evitar breakpoint
+                syslog_err!("AI_ENGINE", "Error inicializando motor de inferencia");
                 KernelError::from("Error inicializando motor de inferencia")
             })?;
-        // Logging removido temporalmente para evitar breakpoint
+        
     }
 
-    // Inicializar servicios de IA - Módulos no implementados
-    // syslog_info!("AI_SERVICES", "Inicializando servicios de IA del sistema");
-    // ai_services::init_ai_services()
-    //     .map_err(|e| {
-    //         syslog_err!("AI_SERVICES", "Error inicializando servicios de IA");
-    //         e
-    //     })?;
-    // syslog_info!("AI_SERVICES", "Servicios de IA inicializados correctamente");
-
-    // Inicializar comandos de IA - Módulos no implementados
-    // syslog_info!("AI_COMMANDS", "Inicializando comandos de IA del shell");
-    // ai_commands::init_ai_commands()
-    //     .map_err(|e| {
-    //         syslog_err!("AI_COMMANDS", "Error inicializando comandos de IA");
-    //         e
-    //     })?;
-    // syslog_info!("AI_COMMANDS", "Comandos de IA inicializados correctamente");
-
-    // Inicializar shell con IA - Módulos no implementados
-    // syslog_info!("AI_SHELL", "Inicializando shell con IA integrada");
-    // ai_shell::init_ai_shell()
-    //     .map_err(|e| {
-    //         syslog_err!("AI_SHELL", "Error inicializando shell con IA");
-    //         e
-    //     })?;
-    // syslog_info!("AI_SHELL", "Shell con IA inicializado correctamente");
-
-    // Inicializar demostración simple de IA
-    // Logging removido temporalmente para evitar breakpoint
-    ai_simple_demo::init_simple_ai_demo()
+    // Inicializar servicios de IA
+    
+    ai_services::init_ai_services()
         .map_err(|e| {
-            // Logging removido temporalmente para evitar breakpoint
+            syslog_err!("AI_SERVICES", "Error inicializando servicios de IA");
             e
         })?;
-    // Logging removido temporalmente para evitar breakpoint
+    
 
+    // Inicializar comandos de IA
+    
+    ai_commands::init_ai_commands()
+        .map_err(|e| {
+            syslog_err!("AI_COMMANDS", "Error inicializando comandos de IA");
+            e
+        })?;
+    
+
+    // Inicializar shell con IA
+    
+    ai_shell::init_ai_shell()
+        .map_err(|e| {
+            syslog_err!("AI_SHELL", "Error inicializando shell con IA");
+            e
+        })?;
+    
+
+    // Inicializar demostración simple de IA
+    
+    ai_simple_demo::init_simple_ai_demo()
+        .map_err(|e| {
+            syslog_err!("AI_DEMO", "Error inicializando demostración de IA");
+            e
+        })?;
+    
+    
     // Kernel nativo de Eclipse con IA integrada inicializado correctamente
-    // Logging removido temporalmente para evitar breakpoint
+    
     Ok(())
 }
 
@@ -438,4 +433,3 @@ fn process_ai_events() -> KernelResult<()> {
 }
 
 // Panic handler definido en main_simple.rs
-

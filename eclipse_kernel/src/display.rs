@@ -126,11 +126,9 @@ impl DisplayDriver {
             return;
         }
 
-        // Verificar límites con protección contra división por cero
-        if self.font_height > 0 && self.framebuffer_info.height > 0 {
-            if self.current_y >= self.framebuffer_info.height / self.font_height {
-                self.scroll_framebuffer();
-            }
+        // Verificar límites
+        if self.current_y >= self.framebuffer_info.height / self.font_height {
+            self.scroll_framebuffer();
         }
 
         // Dibujar carácter en framebuffer (implementación básica)
@@ -142,11 +140,8 @@ impl DisplayDriver {
         self.draw_rect(x, y, self.font_width, self.font_height, 0xFFFFFF); // Blanco
 
         self.current_x += 1;
-        // Verificar que el framebuffer esté inicializado y evitar división por cero
-        if self.framebuffer_enabled && self.font_width > 0 && self.framebuffer_info.width > 0 {
-            if self.current_x >= self.framebuffer_info.width / self.font_width {
-                self.new_line();
-            }
+        if self.current_x >= self.framebuffer_info.width / self.font_width {
+            self.new_line();
         }
     }
 
@@ -171,11 +166,8 @@ impl DisplayDriver {
         self.current_y += 1;
         
         if self.framebuffer_enabled {
-            // Verificar que no haya división por cero
-            if self.font_height > 0 && self.framebuffer_info.height > 0 {
-                if self.current_y >= self.framebuffer_info.height / self.font_height {
-                    self.scroll_framebuffer();
-                }
+            if self.current_y >= self.framebuffer_info.height / self.font_height {
+                self.scroll_framebuffer();
             }
         } else if self.vga_enabled {
             if self.current_y >= 25 {
@@ -217,12 +209,7 @@ impl DisplayDriver {
             }
         }
         
-        // Calcular la nueva posición Y con protección contra división por cero
-        if self.font_height > 0 && self.framebuffer_info.height > 0 {
-            self.current_y = (self.framebuffer_info.height / self.font_height) - 1;
-        } else {
-            self.current_y = 0; // Valor por defecto si hay problemas
-        }
+        self.current_y = (self.framebuffer_info.height / self.font_height) - 1;
     }
 
     fn scroll_vga(&mut self) {

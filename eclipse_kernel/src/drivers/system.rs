@@ -1,7 +1,7 @@
 //! Sistema de Drivers para ReactOS Rust Kernel
 //! 
 //! Implementa un sistema modular de drivers con soporte para
-//! gestión de recursos y comunicación con hardware.
+//! hotplug, gestión de recursos y comunicación con hardware.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::ptr::NonNull;
