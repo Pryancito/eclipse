@@ -4,7 +4,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use crate::memory::manager::PAGE_SIZE;
+use crate::paging::PAGE_SIZE;
 
 /// Estrategias de asignación de memoria
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +15,12 @@ pub enum AllocationStrategy {
     BlockBased,
     /// Asignación híbrida (páginas + bloques)
     Hybrid,
+    /// Primer ajuste (First Fit)
+    FirstFit,
+    /// Mejor ajuste (Best Fit)
+    BestFit,
+    /// Peor ajuste (Worst Fit)
+    WorstFit,
 }
 
 /// Información de un bloque de memoria asignado
@@ -43,7 +49,7 @@ impl BlockAllocator {
         Self {
             strategy,
             min_block_size: 16, // 16 bytes mínimo
-            max_block_size: PAGE_SIZE * 4, // 16KB máximo
+            max_block_size: (PAGE_SIZE * 4) as usize, // 16KB máximo
         }
     }
 

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 
 /// Códigos de teclas USB (HID Usage Tables)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UsbKeyCode {
     // Teclas de función
     F1 = 0x3A, F2 = 0x3B, F3 = 0x3C, F4 = 0x3D,
@@ -76,6 +76,8 @@ pub enum UsbKeyCode {
     NumAdd = 0x57,
     NumEnter = 0x58,
     NumDecimal = 0x63,
+    NumPadPlus = 0x157,  // Alias para NumAdd (valor diferente)
+    NumPadStar = 0x155,  // Alias para NumMultiply (valor diferente)
 
     // Teclas de sistema
     PrintScreen = 0x46,
@@ -93,6 +95,80 @@ pub enum UsbKeyCode {
     Next = 0xB5,
 
     Unknown = 0x00,
+}
+
+impl UsbKeyCode {
+    /// Convertir código de tecla a carácter ASCII
+    pub fn to_ascii(&self, shift_pressed: bool, caps_lock: bool) -> Option<char> {
+        let ch = match self {
+            // Letras
+            UsbKeyCode::A => if shift_pressed || caps_lock { 'A' } else { 'a' },
+            UsbKeyCode::B => if shift_pressed || caps_lock { 'B' } else { 'b' },
+            UsbKeyCode::C => if shift_pressed || caps_lock { 'C' } else { 'c' },
+            UsbKeyCode::D => if shift_pressed || caps_lock { 'D' } else { 'd' },
+            UsbKeyCode::E => if shift_pressed || caps_lock { 'E' } else { 'e' },
+            UsbKeyCode::F => if shift_pressed || caps_lock { 'F' } else { 'f' },
+            UsbKeyCode::G => if shift_pressed || caps_lock { 'G' } else { 'g' },
+            UsbKeyCode::H => if shift_pressed || caps_lock { 'H' } else { 'h' },
+            UsbKeyCode::I => if shift_pressed || caps_lock { 'I' } else { 'i' },
+            UsbKeyCode::J => if shift_pressed || caps_lock { 'J' } else { 'j' },
+            UsbKeyCode::K => if shift_pressed || caps_lock { 'K' } else { 'k' },
+            UsbKeyCode::L => if shift_pressed || caps_lock { 'L' } else { 'l' },
+            UsbKeyCode::M => if shift_pressed || caps_lock { 'M' } else { 'm' },
+            UsbKeyCode::N => if shift_pressed || caps_lock { 'N' } else { 'n' },
+            UsbKeyCode::O => if shift_pressed || caps_lock { 'O' } else { 'o' },
+            UsbKeyCode::P => if shift_pressed || caps_lock { 'P' } else { 'p' },
+            UsbKeyCode::Q => if shift_pressed || caps_lock { 'Q' } else { 'q' },
+            UsbKeyCode::R => if shift_pressed || caps_lock { 'R' } else { 'r' },
+            UsbKeyCode::S => if shift_pressed || caps_lock { 'S' } else { 's' },
+            UsbKeyCode::T => if shift_pressed || caps_lock { 'T' } else { 't' },
+            UsbKeyCode::U => if shift_pressed || caps_lock { 'U' } else { 'u' },
+            UsbKeyCode::V => if shift_pressed || caps_lock { 'V' } else { 'v' },
+            UsbKeyCode::W => if shift_pressed || caps_lock { 'W' } else { 'w' },
+            UsbKeyCode::X => if shift_pressed || caps_lock { 'X' } else { 'x' },
+            UsbKeyCode::Y => if shift_pressed || caps_lock { 'Y' } else { 'y' },
+            UsbKeyCode::Z => if shift_pressed || caps_lock { 'Z' } else { 'z' },
+            
+            // Números
+            UsbKeyCode::Num0 => if shift_pressed { ')' } else { '0' },
+            UsbKeyCode::Num1 => if shift_pressed { '!' } else { '1' },
+            UsbKeyCode::Num2 => if shift_pressed { '@' } else { '2' },
+            UsbKeyCode::Num3 => if shift_pressed { '#' } else { '3' },
+            UsbKeyCode::Num4 => if shift_pressed { '$' } else { '4' },
+            UsbKeyCode::Num5 => if shift_pressed { '%' } else { '5' },
+            UsbKeyCode::Num6 => if shift_pressed { '^' } else { '6' },
+            UsbKeyCode::Num7 => if shift_pressed { '&' } else { '7' },
+            UsbKeyCode::Num8 => if shift_pressed { '*' } else { '8' },
+            UsbKeyCode::Num9 => if shift_pressed { '(' } else { '9' },
+            
+            // Símbolos
+            UsbKeyCode::Space => ' ',
+            UsbKeyCode::Minus => if shift_pressed { '_' } else { '-' },
+            UsbKeyCode::Equal => if shift_pressed { '+' } else { '=' },
+            UsbKeyCode::LeftBracket => if shift_pressed { '{' } else { '[' },
+            UsbKeyCode::RightBracket => if shift_pressed { '}' } else { ']' },
+            UsbKeyCode::Backslash => if shift_pressed { '|' } else { '\\' },
+            UsbKeyCode::Semicolon => if shift_pressed { ':' } else { ';' },
+            UsbKeyCode::Quote => if shift_pressed { '"' } else { '\'' },
+            UsbKeyCode::Grave => if shift_pressed { '~' } else { '`' },
+            UsbKeyCode::Comma => if shift_pressed { '<' } else { ',' },
+            UsbKeyCode::Period => if shift_pressed { '>' } else { '.' },
+            UsbKeyCode::Slash => if shift_pressed { '?' } else { '/' },
+            
+            // Teclado numérico
+            UsbKeyCode::NumPadPlus => '+',
+            UsbKeyCode::NumPadStar => '*',
+            UsbKeyCode::NumAdd => '+',
+            UsbKeyCode::NumMultiply => '*',
+            UsbKeyCode::NumSubtract => '-',
+            UsbKeyCode::NumDivide => '/',
+            UsbKeyCode::NumDecimal => '.',
+            
+            // Teclas especiales que no producen caracteres
+            _ => return None,
+        };
+        Some(ch)
+    }
 }
 
 /// Estado de las teclas modificadoras
@@ -125,6 +201,29 @@ impl Default for ModifierState {
             caps_lock: false,
             num_lock: false,
             scroll_lock: false,
+        }
+    }
+}
+
+impl ModifierState {
+    /// Convertir a ModifierState del input_system
+    pub fn to_input_system_modifier_state(&self) -> crate::drivers::input_system::ModifierState {
+        crate::drivers::input_system::ModifierState {
+            ctrl: self.left_ctrl || self.right_ctrl,
+            alt: self.left_alt || self.right_alt,
+            shift: self.left_shift || self.right_shift,
+            meta: self.left_meta || self.right_meta,
+        }
+    }
+}
+
+impl KeyboardEvent {
+    /// Convertir a KeyboardEvent del input_system
+    pub fn to_input_system_keyboard_event(&self) -> crate::drivers::input_system::KeyboardEvent {
+        crate::drivers::input_system::KeyboardEvent {
+            key_code: self.key_code,
+            pressed: self.pressed,
+            timestamp: self.timestamp,
         }
     }
 }
@@ -172,6 +271,7 @@ impl Default for KeyboardConfig {
 }
 
 /// Driver USB para teclado
+#[derive(Debug)]
 pub struct UsbKeyboardDriver {
     device_id: u32,
     config: KeyboardConfig,

@@ -13,8 +13,8 @@ use crate::syslog;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::boxed::Box;
+use alloc::format;
 
 /// Configuración del sistema de gráficos
 #[derive(Debug, Clone)]

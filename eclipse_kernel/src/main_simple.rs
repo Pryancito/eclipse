@@ -38,7 +38,7 @@ use crate::drivers::nvidia_pci_driver::NvidiaPciDriver;
 use crate::drivers::binary_driver_manager::{BinaryDriverManager, BinaryDriverMetadata};
 use crate::ipc::{IpcManager, IpcMessage, DriverType, DriverConfig, DriverCommandType};
 use crate::hotplug::{HotplugManager, UsbDeviceType, UsbHotplugEvent};
-use crate::hotplug::manager::HotplugConfig;
+use crate::hotplug::HotplugConfig;
 use crate::graphics::{GraphicsManager, Position, Size, WidgetType};
 use crate::graphics::graphics_manager::GraphicsConfig;
 
@@ -628,11 +628,11 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         let usb_init_result = usb_driver.initialize_controllers();
         
         // Inicializar driver de teclado USB (usando IDs de ejemplo)
-        let mut keyboard_driver = UsbKeyboardDriver::new(0x1234, 0x5678, 1, 0x81);
+        let mut keyboard_driver = UsbKeyboardDriver::new(0x1234);
         let keyboard_init_result = keyboard_driver.initialize();
         
         // Inicializar driver de mouse USB (usando IDs de ejemplo)
-        let mut mouse_driver = UsbMouseDriver::new(0x1234, 0x5679, 2, 0x82);
+        let mut mouse_driver = UsbMouseDriver::new(0x1234);
         let mouse_init_result = mouse_driver.initialize();
         
         // Mostrar estado de los drivers

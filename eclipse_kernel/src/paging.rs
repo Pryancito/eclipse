@@ -5,8 +5,32 @@
 use core::ptr;
 use core::mem;
 use core::arch::asm;
+use alloc::vec::Vec;
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: u64 = 0x1000;
+
+/// Número de entradas en una tabla de páginas (512 para x86_64)
+pub const PAGE_TABLE_ENTRIES: usize = 512;
+
+/// Permisos de página
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PagePermission {
+    ReadOnly,
+    ReadWrite,
+    Execute,
+    ReadExecute,
+    ReadWriteExecute,
+}
+
+/// Estadísticas de paginación
+#[derive(Debug, Clone)]
+pub struct PagingStats {
+    pub total_pages: usize,
+    pub allocated_pages: usize,
+    pub free_pages: usize,
+    pub page_faults: u64,
+    pub tlb_misses: u64,
+}
 
 /// Flags de página
 pub const PAGE_PRESENT: u64 = 1 << 0;
@@ -248,6 +272,13 @@ impl PagingManager {
         }
     }
 
+    /// Inicializar el gestor de paginación
+    pub fn initialize(&mut self) -> Result<(), &'static str> {
+        // Configurar paginación básica
+        self.setup_userland_paging()?;
+        Ok(())
+    }
+
     /// Configurar paginación para userland
     pub fn setup_userland_paging(&mut self) -> Result<u64, &'static str> {
         // Configurar mapeo de PML4 -> PDPT
@@ -363,6 +394,57 @@ impl PagingManager {
         unsafe {
             
             // Logging removido temporalmente para evitar breakpoint
+        }
+    }
+
+    /// Asignar páginas físicas
+    pub fn allocate_pages(&mut self, count: usize) -> Result<Vec<usize>, &'static str> {
+        let mut pages = Vec::new();
+        for _ in 0..count {
+            let page_addr = self.next_physical_addr as usize;
+            self.next_physical_addr += PAGE_SIZE;
+            pages.push(page_addr);
+        }
+        Ok(pages)
+    }
+
+    /// Mapear memoria virtual a física
+    pub fn map_memory(&mut self, virtual_addr: usize, physical_addr: usize, size: usize, _permission: PagePermission) -> Result<(), &'static str> {
+        // Implementación simplificada - solo mapear la primera página
+        if size > 0 {
+            // En una implementación real, aquí se configurarían las tablas de páginas
+            // Por ahora, solo simulamos el mapeo
+        }
+        Ok(())
+    }
+
+    /// Desmapear memoria virtual
+    pub fn unmap_memory(&mut self, _virtual_addr: usize) -> Result<(), &'static str> {
+        // Implementación simplificada
+        Ok(())
+    }
+
+    /// Desasignar páginas físicas
+    pub fn deallocate_pages(&mut self, _pages: &[usize]) -> Result<(), &'static str> {
+        // Implementación simplificada
+        Ok(())
+    }
+
+    /// Traducir dirección virtual a física
+    pub fn translate_address(&self, _virtual_addr: usize) -> Result<usize, &'static str> {
+        // Implementación simplificada - devolver la misma dirección
+        // En una implementación real, aquí se consultarían las tablas de páginas
+        Ok(_virtual_addr)
+    }
+
+    /// Obtener estadísticas de memoria
+    pub fn get_memory_stats(&self) -> PagingStats {
+        PagingStats {
+            total_pages: 0,
+            allocated_pages: 0,
+            free_pages: 0,
+            page_faults: 0,
+            tlb_misses: 0,
         }
     }
 }

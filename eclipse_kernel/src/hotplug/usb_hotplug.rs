@@ -9,6 +9,7 @@ use super::notifications::{UsbNotificationSystem, UsbSystemNotification};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use crate::syslog;
 
 /// Controlador de hot-plug USB
@@ -41,7 +42,7 @@ impl UsbHotplugManager {
 
     /// Inicializar el sistema de hot-plug USB
     pub fn initialize(&mut self) -> Result<(), String> {
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",("Inicializando sistema de hot-plug USB...");
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", "Inicializando sistema de hot-plug USB...");
         
         self.system_notifications.add_notification(
             UsbSystemNotification::SystemInitialized
@@ -50,7 +51,7 @@ impl UsbHotplugManager {
         // Registrar callbacks por defecto
         self.register_default_callbacks();
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",("Sistema de hot-plug USB inicializado correctamente");
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", "Sistema de hot-plug USB inicializado correctamente");
         Ok(())
     }
 
@@ -58,7 +59,7 @@ impl UsbHotplugManager {
     fn register_default_callbacks(&mut self) {
         // Callback para dispositivos conectados
         let connected_callback = Box::new(|device: &UsbDeviceInfo| {
-            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",(&alloc::format!(
+            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", &alloc::format!(
                 "Dispositivo USB conectado: {} (ID: {}, Tipo: {:?})",
                 device.device_name,
                 device.device_id,
@@ -69,7 +70,7 @@ impl UsbHotplugManager {
 
         // Callback para dispositivos desconectados
         let disconnected_callback = Box::new(|device_id: u32| {
-            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",(&alloc::format!(
+            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", &alloc::format!(
                 "Dispositivo USB desconectado: ID {}",
                 device_id
             ));
@@ -78,7 +79,7 @@ impl UsbHotplugManager {
 
         // Callback para ratones USB
         let mouse_callback = Box::new(|device: &UsbDeviceInfo| {
-            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",(&alloc::format!(
+            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", &alloc::format!(
                 "Ratón USB detectado: {} en puerto {}",
                 device.device_name,
                 device.port_number
@@ -88,11 +89,7 @@ impl UsbHotplugManager {
 
         // Callback para teclados USB
         let keyboard_callback = Box::new(|device: &UsbDeviceInfo| {
-            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",(&alloc::format!(
-                "Teclado USB detectado: {} en puerto {}",
-                device.device_name,
-                device.port_number
-            ));
+            syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", "Teclado USB detectado");
         });
         self.notification_system.register_keyboard_callback(keyboard_callback);
     }
@@ -108,7 +105,7 @@ impl UsbHotplugManager {
             UsbSystemNotification::PollingStarted
         );
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",("Iniciando polling de dispositivos USB...");
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", "Iniciando polling de dispositivos USB...");
         Ok(())
     }
 
@@ -118,7 +115,7 @@ impl UsbHotplugManager {
         self.system_notifications.add_notification(
             UsbSystemNotification::PollingStopped
         );
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG",("Polling de dispositivos USB detenido");
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_HOTPLUG", "Polling de dispositivos USB detenido");
     }
 
     /// Procesar eventos USB pendientes

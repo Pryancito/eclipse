@@ -179,7 +179,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator {
-    memory_manager: MemoryManager::new(MemoryConfig::default()),
-};
+// #[global_allocator]
+// static ALLOCATOR: KernelAllocator = KernelAllocator {
+//     memory_manager: MemoryManager::new(MemoryConfig::default()),
+// };

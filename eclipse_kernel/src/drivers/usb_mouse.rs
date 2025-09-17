@@ -25,15 +25,26 @@ pub type MousePosition = (i32, i32);
 
 /// Evento de mouse
 #[derive(Debug, Clone, PartialEq)]
-pub struct MouseEvent {
+pub enum MouseEvent {
+    ButtonPress { button: MouseButton, position: MousePosition },
+    ButtonRelease { button: MouseButton, position: MousePosition },
+    Move { position: MousePosition, buttons: MouseButtonState },
+    Scroll { delta: i32, position: MousePosition },
+}
+
+/// Datos de mouse
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouseData {
     pub button: Option<MouseButton>,
     pub position: MousePosition,
+    pub x: i32,
+    pub y: i32,
     pub pressed: bool,
     pub timestamp: u64,
 }
 
 /// Estado de los botones del ratón
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MouseButtonState {
     pub left: bool,
     pub right: bool,
@@ -81,6 +92,7 @@ impl Default for MouseConfig {
 }
 
 /// Driver USB para ratón
+#[derive(Debug)]
 pub struct UsbMouseDriver {
     device_id: u32,
     config: MouseConfig,
@@ -160,13 +172,9 @@ impl UsbMouseDriver {
         self.current_position = (new_x, new_y);
 
         // Crear evento del ratón
-        let event = MouseEvent {
-            x: self.current_position.0,
-            y: self.current_position.1,
-            wheel_x: 0,
-            wheel_y: 0,
-            buttons: self.button_state,
-            timestamp: self.get_timestamp(),
+        let event = MouseEvent::Move { 
+            position: self.current_position, 
+            buttons: self.button_state 
         };
 
         // Agregar evento a la cola
@@ -264,13 +272,9 @@ impl UsbMouseDriver {
         self.last_position = self.current_position;
         self.current_position = (new_x, new_y);
 
-        let event = MouseEvent {
-            x: self.current_position.0,
-            y: self.current_position.1,
-            wheel_x: 0,
-            wheel_y: 0,
-            buttons: self.button_state,
-            timestamp: self.get_timestamp(),
+        let event = MouseEvent::Move { 
+            position: self.current_position, 
+            buttons: self.button_state 
         };
 
         self.add_event(event);
@@ -293,13 +297,9 @@ impl UsbMouseDriver {
             _ => {}
         }
 
-        let event = MouseEvent {
-            x: self.current_position.0,
-            y: self.current_position.1,
-            wheel_x: 0,
-            wheel_y: 0,
-            buttons: self.button_state,
-            timestamp: self.get_timestamp(),
+        let event = MouseEvent::Move { 
+            position: self.current_position, 
+            buttons: self.button_state 
         };
 
         self.add_event(event);
@@ -322,13 +322,9 @@ impl UsbMouseDriver {
             _ => {}
         }
 
-        let event = MouseEvent {
-            x: self.current_position.0,
-            y: self.current_position.1,
-            wheel_x: 0,
-            wheel_y: 0,
-            buttons: self.button_state,
-            timestamp: self.get_timestamp(),
+        let event = MouseEvent::Move { 
+            position: self.current_position, 
+            buttons: self.button_state 
         };
 
         self.add_event(event);
@@ -347,5 +343,42 @@ impl UsbMouseDriver {
     fn get_timestamp(&self) -> u64 {
         // Simular timestamp (en un sistema real usaría un reloj del sistema)
         self.last_click_time + 1
+    }
+
+    /// Establecer sensibilidad del ratón
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.config.sensitivity = sensitivity;
+    }
+}
+
+impl MouseEvent {
+    /// Convertir a MouseEvent del input_system
+    pub fn to_input_system_mouse_event(&self) -> crate::drivers::input_system::MouseEvent {
+        match self {
+            MouseEvent::ButtonPress { button, position } => crate::drivers::input_system::MouseEvent {
+                button: Some(*button),
+                position: *position,
+                pressed: true,
+                timestamp: 0, // Se establecerá en el input_system
+            },
+            MouseEvent::ButtonRelease { button, position } => crate::drivers::input_system::MouseEvent {
+                button: Some(*button),
+                position: *position,
+                pressed: false,
+                timestamp: 0, // Se establecerá en el input_system
+            },
+            MouseEvent::Move { position, .. } => crate::drivers::input_system::MouseEvent {
+                button: None,
+                position: *position,
+                pressed: false,
+                timestamp: 0, // Se establecerá en el input_system
+            },
+            MouseEvent::Scroll { .. } => crate::drivers::input_system::MouseEvent {
+                button: None,
+                position: (0, 0),
+                pressed: false,
+                timestamp: 0, // Se establecerá en el input_system
+            },
+        }
     }
 }
