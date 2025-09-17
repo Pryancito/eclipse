@@ -451,39 +451,6 @@ impl MultiGpuManager {
         }
     }
 
-    /// Obtener lista de GPUs unificadas
-    pub fn get_unified_gpus(&self) -> &Vec<UnifiedGpuInfo> {
-        &self.unified_gpus
-    }
-
-    /// Obtener GPU activa
-    pub fn get_active_gpu(&self) -> Option<&UnifiedGpuInfo> {
-        if let Some(index) = self.active_gpu_index {
-            self.unified_gpus.get(index)
-        } else {
-            None
-        }
-    }
-
-    /// Establecer GPU activa
-    pub fn set_active_gpu(&mut self, index: usize) -> Result<(), String> {
-        if index < self.unified_gpus.len() {
-            // Desactivar GPU anterior
-            if let Some(old_index) = self.active_gpu_index {
-                if old_index < self.unified_gpus.len() {
-                    self.unified_gpus[old_index].is_active = false;
-                }
-            }
-
-            // Activar nueva GPU
-            self.unified_gpus[index].is_active = true;
-            self.active_gpu_index = Some(index);
-
-            Ok(())
-        } else {
-            Err(format!("Índice de GPU inválido: {}", index))
-        }
-    }
 
 
     /// Obtener información detallada de una GPU específica
@@ -527,22 +494,6 @@ impl MultiGpuManager {
             SupportedGpuType::Unknown => "Unknown",
         }
     }
-}
-
-/// Estadísticas del sistema multi-GPU
-#[derive(Debug, Clone)]
-pub struct MultiGpuStats {
-    pub total_gpus: usize,
-    pub active_gpu: Option<usize>,
-    pub total_memory: u64,
-    pub total_compute_units: u32,
-    pub total_ray_tracing_units: u32,
-    pub total_ai_accelerators: u32,
-    pub nvidia_gpus: usize,
-    pub amd_gpus: usize,
-    pub intel_gpus: usize,
-    pub unknown_gpus: usize,
-}
 
     /// Obtener todas las GPUs unificadas
     pub fn get_unified_gpus(&self) -> &Vec<UnifiedGpuInfo> {
@@ -593,6 +544,22 @@ pub struct MultiGpuStats {
             total_ray_tracing_units: self.total_ray_tracing_units,
         }
     }
+}
+
+/// Estadísticas del sistema multi-GPU
+#[derive(Debug, Clone)]
+pub struct MultiGpuStats {
+    pub total_gpus: usize,
+    pub active_gpu: Option<usize>,
+    pub total_memory: u64,
+    pub total_compute_units: u32,
+    pub total_ray_tracing_units: u32,
+    pub total_ai_accelerators: u32,
+    pub nvidia_gpus: usize,
+    pub amd_gpus: usize,
+    pub intel_gpus: usize,
+    pub unknown_gpus: usize,
+}
 
 impl core::fmt::Display for MultiGpuStats {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
