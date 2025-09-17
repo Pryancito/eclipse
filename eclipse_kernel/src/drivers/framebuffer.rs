@@ -1666,34 +1666,19 @@ impl FramebufferDriver {
         while current_ptr < end_ptr {
             let char_code = unsafe { core::ptr::read_volatile(current_ptr) };
 
-            // Si llegamos al final de la pantalla, limpiar y reiniciar desde el principio
+            // Verificar límites de pantalla
             if current_y + char_height > self.info.height {
-                self.clear_screen(Color::BLACK);
-                buffer_x = 10;
-                self.current_x = 10;
-                current_y = 5;
+                break;
             }
-            if buffer_x + char_width > self.info.width {
-                buffer_x = 10;
-                self.current_x = 10;
-                current_y += char_height;
-                // Si después de saltar de línea llegamos al final de la pantalla, limpiar y reiniciar
-                if current_y + char_height > self.info.height {
-                    self.clear_screen(Color::BLACK);
-                    buffer_x = 10;
-                    self.current_x = 10;
-                    current_y = 5;
-                }
-            }
-
-            // Dibujar el carácter
+            
+            // Llamar a la función de dibujo con el byte del carácter
             self.draw_character(buffer_x, current_y + 2, char_code as char, color);
-            buffer_x += char_width;
+            current_y += char_width;
 
             // Avanzar el puntero al siguiente byte
             current_ptr = unsafe { current_ptr.add(1) };
         }
-        self.current_x = buffer_x;
+        self.current_x += 16;
     }
     
     /// Versión optimizada con efecto de escritura para kernel

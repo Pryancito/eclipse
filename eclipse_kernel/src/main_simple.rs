@@ -290,7 +290,11 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             
             // Mostrar información de GPU
             let gpu_info = graphics_manager.get_gpu_info();
-            fb.write_text_kernel(&format!("GPU: {}", gpu_info), Color::LIGHT_GRAY);
+            if !gpu_info.is_empty() {
+                fb.write_text_kernel(&format!("GPUs detectadas: {}", gpu_info.len()), Color::LIGHT_GRAY);
+            } else {
+                fb.write_text_kernel("No hay GPUs detectadas", Color::LIGHT_GRAY);
+            }
             
             // Mostrar estadísticas
             let window_stats = graphics_manager.get_window_stats();

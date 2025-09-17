@@ -15,6 +15,66 @@ use super::nvidia_advanced::NvidiaAdvancedDriver;
 use super::amd_advanced::AmdAdvancedDriver;
 use super::intel_advanced::IntelAdvancedDriver;
 
+/// Información de GPU NVIDIA
+#[derive(Debug, Clone)]
+pub struct NvidiaGpuInfo {
+    pub pci_device: PciDevice,
+    pub gpu_name: String,
+    pub total_memory: u64,
+    pub memory_clock: u32,
+    pub core_clock: u32,
+    pub cuda_cores: u32,
+    pub rt_cores: u32,
+    pub tensor_cores: u32,
+    pub memory_bandwidth: u64,
+    pub power_limit: u32,
+    pub temperature: u32,
+    pub fan_speed: u32,
+    pub driver_version: String,
+    pub capabilities: Vec<DriverCapability>,
+    pub is_active: bool,
+}
+
+/// Información de GPU AMD
+#[derive(Debug, Clone)]
+pub struct AmdGpuInfo {
+    pub pci_device: PciDevice,
+    pub gpu_name: String,
+    pub total_memory: u64,
+    pub memory_clock: u32,
+    pub core_clock: u32,
+    pub compute_units: u32,
+    pub ray_accelerators: u32,
+    pub ai_accelerators: u32,
+    pub memory_bandwidth: u64,
+    pub power_limit: u32,
+    pub temperature: u32,
+    pub fan_speed: u32,
+    pub driver_version: String,
+    pub capabilities: Vec<DriverCapability>,
+    pub is_active: bool,
+}
+
+/// Información de GPU Intel
+#[derive(Debug, Clone)]
+pub struct IntelGpuInfo {
+    pub pci_device: PciDevice,
+    pub gpu_name: String,
+    pub total_memory: u64,
+    pub memory_clock: u32,
+    pub core_clock: u32,
+    pub execution_units: u32,
+    pub ray_tracing_units: u32,
+    pub ai_accelerators: u32,
+    pub memory_bandwidth: u64,
+    pub power_limit: u32,
+    pub temperature: u32,
+    pub fan_speed: u32,
+    pub driver_version: String,
+    pub capabilities: Vec<DriverCapability>,
+    pub is_active: bool,
+}
+
 /// Tipo de GPU soportada
 #[derive(Debug, Clone, PartialEq)]
 pub enum SupportedGpuType {
@@ -425,21 +485,6 @@ impl MultiGpuManager {
         }
     }
 
-    /// Obtener estadísticas totales del sistema
-    pub fn get_total_statistics(&self) -> MultiGpuStats {
-        MultiGpuStats {
-            total_gpus: self.unified_gpus.len(),
-            active_gpu: self.active_gpu_index,
-            total_memory: self.total_memory,
-            total_compute_units: self.total_compute_units,
-            total_ray_tracing_units: self.total_ray_tracing_units,
-            total_ai_accelerators: self.total_ai_accelerators,
-            nvidia_gpus: self.unified_gpus.iter().filter(|g| g.gpu_type == SupportedGpuType::Nvidia).count(),
-            amd_gpus: self.unified_gpus.iter().filter(|g| g.gpu_type == SupportedGpuType::Amd).count(),
-            intel_gpus: self.unified_gpus.iter().filter(|g| g.gpu_type == SupportedGpuType::Intel).count(),
-            unknown_gpus: self.unified_gpus.iter().filter(|g| g.gpu_type == SupportedGpuType::Unknown).count(),
-        }
-    }
 
     /// Obtener información detallada de una GPU específica
     pub fn get_gpu_details(&self, index: usize) -> Option<&UnifiedGpuInfo> {
@@ -498,6 +543,56 @@ pub struct MultiGpuStats {
     pub intel_gpus: usize,
     pub unknown_gpus: usize,
 }
+
+    /// Obtener todas las GPUs unificadas
+    pub fn get_unified_gpus(&self) -> &Vec<UnifiedGpuInfo> {
+        &self.unified_gpus
+    }
+
+    /// Obtener GPU activa
+    pub fn get_active_gpu(&self) -> Option<&UnifiedGpuInfo> {
+        if let Some(index) = self.active_gpu_index {
+            self.unified_gpus.get(index)
+        } else {
+            None
+        }
+    }
+
+    /// Cambiar GPU activa
+    pub fn set_active_gpu(&mut self, gpu_index: usize) -> Result<(), String> {
+        if gpu_index >= self.unified_gpus.len() {
+            return Err(format!("Índice de GPU inválido: {}", gpu_index));
+        }
+
+        // Desactivar GPU actual
+        if let Some(current_index) = self.active_gpu_index {
+            if current_index < self.unified_gpus.len() {
+                self.unified_gpus[current_index].is_active = false;
+            }
+        }
+
+        // Activar nueva GPU
+        self.unified_gpus[gpu_index].is_active = true;
+        self.active_gpu_index = Some(gpu_index);
+
+        Ok(())
+    }
+
+    /// Obtener estadísticas totales
+    pub fn get_total_statistics(&self) -> MultiGpuStats {
+        MultiGpuStats {
+            total_gpus: self.unified_gpus.len(),
+            nvidia_gpus: self.unified_gpus.iter().filter(|gpu| gpu.gpu_type == SupportedGpuType::Nvidia).count(),
+            amd_gpus: self.unified_gpus.iter().filter(|gpu| gpu.gpu_type == SupportedGpuType::Amd).count(),
+            intel_gpus: self.unified_gpus.iter().filter(|gpu| gpu.gpu_type == SupportedGpuType::Intel).count(),
+            unknown_gpus: self.unified_gpus.iter().filter(|gpu| gpu.gpu_type == SupportedGpuType::Unknown).count(),
+            total_memory: self.total_memory,
+            total_compute_units: self.total_compute_units,
+            active_gpu: self.active_gpu_index,
+            total_ai_accelerators: self.total_ai_accelerators,
+            total_ray_tracing_units: self.total_ray_tracing_units,
+        }
+    }
 
 impl core::fmt::Display for MultiGpuStats {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

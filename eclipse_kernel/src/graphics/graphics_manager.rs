@@ -5,6 +5,7 @@
 
 use super::window_system::{WindowCompositor, WindowId, Position, Size};
 use super::widgets::{WidgetManager, WidgetId, WidgetType};
+use super::multi_gpu_manager::{MultiGpuManager, UnifiedGpuInfo, SupportedGpuType};
 use super::nvidia_advanced::NvidiaAdvancedDriver;
 use crate::drivers::framebuffer::FramebufferDriver;
 use crate::drivers::ipc::DriverManager;
@@ -50,6 +51,7 @@ impl Default for GraphicsConfig {
 pub struct GraphicsManager {
     config: GraphicsConfig,
     driver_manager: DriverManager,
+    multi_gpu_manager: MultiGpuManager,
     window_compositor: WindowCompositor,
     widget_manager: WidgetManager,
     nvidia_driver: Option<NvidiaAdvancedDriver>,
@@ -90,6 +92,7 @@ impl GraphicsManager {
         Self {
             config,
             driver_manager: DriverManager::new(),
+            multi_gpu_manager: MultiGpuManager::new(),
             window_compositor: WindowCompositor::new(),
             widget_manager: WidgetManager::new(),
             nvidia_driver: None,
@@ -104,9 +107,20 @@ impl GraphicsManager {
 
         self.framebuffer = Some(framebuffer);
 
-        // Inicializar driver NVIDIA si está disponible
+        // Inicializar sistema de múltiples GPUs
         if self.config.enable_hardware_acceleration {
-            self.initialize_nvidia_driver()?;
+            if let Err(e) = self.multi_gpu_manager.initialize_all_drivers() {
+                // Si falla la inicialización de GPUs, continuar sin aceleración
+                // Log de advertencia - continuar sin aceleración
+            }
+        }
+
+        // Inicializar driver NVIDIA si está disponible (para compatibilidad)
+        if self.config.enable_hardware_acceleration {
+            if let Err(e) = self.initialize_nvidia_driver() {
+                // No es crítico si falla
+                // Log de advertencia - continuar sin aceleración
+            }
         }
 
         // Crear ventana de escritorio
@@ -144,6 +158,32 @@ impl GraphicsManager {
             Size { width: 800, height: 600 }
         );
         
+    }
+
+    /// Obtener información de todas las GPUs detectadas
+    pub fn get_gpu_info(&self) -> &Vec<UnifiedGpuInfo> {
+        self.multi_gpu_manager.get_unified_gpus()
+    }
+
+    /// Obtener GPU activa
+    pub fn get_active_gpu(&self) -> Option<&UnifiedGpuInfo> {
+        self.multi_gpu_manager.get_active_gpu()
+    }
+
+    /// Cambiar GPU activa
+    pub fn set_active_gpu(&mut self, gpu_index: usize) -> Result<(), String> {
+        self.multi_gpu_manager.set_active_gpu(gpu_index)
+    }
+
+    /// Obtener estadísticas de GPUs
+    pub fn get_gpu_statistics(&self) -> (u64, u32, u32, u32) {
+        let stats = self.multi_gpu_manager.get_total_statistics();
+        (stats.total_memory, stats.total_compute_units, stats.total_ray_tracing_units, stats.total_ai_accelerators)
+    }
+
+    /// Verificar si hay aceleración por hardware disponible
+    pub fn has_hardware_acceleration(&self) -> bool {
+        !self.multi_gpu_manager.get_unified_gpus().is_empty()
     }
 
     /// Crear ventana
@@ -219,14 +259,6 @@ impl GraphicsManager {
         }
     }
 
-    /// Obtener información de GPU
-    pub fn get_gpu_info(&self) -> String {
-        if let Some(driver_info) = self.driver_manager.list_drivers().iter().find(|d| d.name.contains("NVIDIA")) {
-            format!("GPU: {} v{} - {:?}", driver_info.name, driver_info.version, driver_info.state)
-        } else {
-            "No hay driver NVIDIA disponible".to_string()
-        }
-    }
 
     /// Obtener estadísticas de rendimiento
     pub fn get_performance_stats(&self) -> &GraphicsPerformanceStats {
