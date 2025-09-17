@@ -129,7 +129,7 @@ impl WaylandServer {
     }
     
     /// Registrar un global
-    fn register_global(&mut self, name: String, interface: String, version: u32) -> Result<(), &'static str> {
+    pub fn register_global(&mut self, name: String, interface: String, version: u32) -> Result<(), &'static str> {
         let object_id = self.get_next_object_id();
         
         let global_info = GlobalInfo {
@@ -186,7 +186,7 @@ impl WaylandServer {
     }
     
     /// Procesar eventos de clientes
-    fn process_client_events(&mut self) -> Result<(), &'static str> {
+    pub fn process_client_events(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se procesarían los eventos de todos los clientes
         // Por ahora, simulamos el procesamiento
         Ok(())

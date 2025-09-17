@@ -48,7 +48,7 @@ build_kernel() {
     # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
     cd eclipse_kernel
-    cargo build --target x86_64-unknown-none --release
+    cargo build --target x86_64-unknown-none --release --features cosmic-desktop
 
     if [ $? -eq 0 ]; then
         print_success "Kernel compilado exitosamente"

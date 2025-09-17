@@ -53,7 +53,8 @@ pub mod main_unified;  // Main unificado con funcionalidades de escritorio
 pub mod main_with_init;  // Main con integración systemd
 pub mod vga_centered_display;
 pub mod wayland;  // Módulo para mostrar texto centrado en VGA
-pub mod ai;  // Sistema de IA principal
+pub mod ai;
+pub mod cosmic;  // Sistema de IA principal
 pub mod ai_integration;  // Integración profunda de IA en el kernel
 pub mod ai_communication;  // Sistema de comunicación bidireccional con IA
 pub mod ai_control;  // Control del sistema operativo por IA
