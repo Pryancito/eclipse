@@ -29,16 +29,16 @@ use crate::drivers::pci::{GpuType, GpuInfo};
 use crate::drivers::pci::PciManager;
 use crate::drivers::pci::PciDevice;
 use crate::drivers::usb::UsbDriver;
-use crate::drivers::usb_keyboard::{UsbKeyboardDriver, UsbKeyCode, KeyboardEvent};
-use crate::drivers::usb_mouse::{UsbMouseDriver, MouseButton, MouseEvent};
+use crate::drivers::usb_keyboard::{UsbKeyboardDriver, UsbKeyCode, KeyboardEvent, KeyboardConfig};
+use crate::drivers::usb_mouse::{UsbMouseDriver, MouseButton, MouseEvent, MouseConfig};
 use crate::hardware_detection::{GraphicsMode, detect_graphics_hardware};
 use crate::drivers::ipc::{DriverManager, DriverMessage, DriverResponse};
 use crate::drivers::pci_driver::PciDriver;
 use crate::drivers::nvidia_pci_driver::NvidiaPciDriver;
 use crate::drivers::binary_driver_manager::{BinaryDriverManager, BinaryDriverMetadata};
 use crate::ipc::{IpcManager, IpcMessage, DriverType, DriverConfig, DriverCommandType};
-// use crate::hotplug::{HotplugManager, HotplugEvent, HotplugNotification}; // REMOVIDO
-// use crate::hotplug::manager::HotplugConfig; // REMOVIDO
+use crate::hotplug::{HotplugManager, UsbDeviceType, UsbHotplugEvent};
+use crate::hotplug::manager::HotplugConfig;
 use crate::graphics::{GraphicsManager, Position, Size, WidgetType};
 use crate::graphics::graphics_manager::GraphicsConfig;
 
@@ -311,9 +311,32 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
     
-    // Demostrar sistema de hot-plug
-    // Sistema de hot-plug removido - detección de hardware simplificada
-    fb.write_text_kernel("Detección de hardware simplificada...", Color::MAGENTA);
+    // Inicializar sistema de hot-plug USB
+    fb.write_text_kernel("Inicializando sistema de hot-plug USB...", Color::MAGENTA);
+    let hotplug_config = HotplugConfig {
+        enable_usb_hotplug: true,
+        enable_mouse_support: true,
+        enable_keyboard_support: true,
+        enable_storage_support: true,
+        poll_interval_ms: 100,
+        max_devices: 32,
+    };
+    let mut hotplug_manager = HotplugManager::new(hotplug_config);
+    match hotplug_manager.initialize() {
+        Ok(_) => {
+            fb.write_text_kernel("Sistema de hot-plug USB inicializado", Color::GREEN);
+            
+            // Iniciar polling
+            if let Err(e) = hotplug_manager.start() {
+                fb.write_text_kernel(&format!("Error iniciando hot-plug: {}", e), Color::RED);
+            } else {
+                fb.write_text_kernel("Polling de hot-plug iniciado", Color::GREEN);
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&format!("Error inicializando hot-plug: {}", e), Color::RED);
+        }
+    }
     
     // Detección básica de dispositivos PCI
     let mut pci_manager = PciManager::new();
@@ -327,6 +350,59 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
                 device.pci_device.vendor_id, device.pci_device.device_id, device.pci_device.class_code), Color::LIGHT_GRAY);
         }
     }
+    
+    // Demostrar sistema de hot-plug USB
+    fb.write_text_kernel("Demostrando sistema de hot-plug USB...", Color::MAGENTA);
+    
+    // Simular conexión de ratón USB
+    if let Ok(mouse_id) = hotplug_manager.simulate_usb_device_connection(UsbDeviceType::Mouse, 1) {
+        fb.write_text_kernel(&format!("Ratón USB conectado (ID: {})", mouse_id), Color::GREEN);
+        
+        // Inicializar driver del ratón
+        let mut mouse_driver = UsbMouseDriver::new(mouse_id);
+        if let Ok(_) = mouse_driver.initialize() {
+            fb.write_text_kernel("Driver del ratón USB inicializado", Color::GREEN);
+            
+            // Simular movimiento del ratón
+            if let Ok(_) = mouse_driver.simulate_movement(10, 5) {
+                let pos = mouse_driver.get_position();
+                fb.write_text_kernel(&format!("Posición del ratón: ({}, {})", pos.0, pos.1), Color::LIGHT_GRAY);
+            }
+            
+            // Simular clic del ratón
+            if let Ok(_) = mouse_driver.simulate_click(MouseButton::Left) {
+                fb.write_text_kernel("Clic izquierdo del ratón simulado", Color::LIGHT_GRAY);
+            }
+        }
+    }
+    
+    // Simular conexión de teclado USB
+    if let Ok(keyboard_id) = hotplug_manager.simulate_usb_device_connection(UsbDeviceType::Keyboard, 2) {
+        fb.write_text_kernel(&format!("Teclado USB conectado (ID: {})", keyboard_id), Color::GREEN);
+        
+        // Inicializar driver del teclado
+        let mut keyboard_driver = UsbKeyboardDriver::new(keyboard_id);
+        if let Ok(_) = keyboard_driver.initialize() {
+            fb.write_text_kernel("Driver del teclado USB inicializado", Color::GREEN);
+            
+            // Simular secuencia de teclas
+            let test_keys = [UsbKeyCode::H, UsbKeyCode::E, UsbKeyCode::L, UsbKeyCode::L, UsbKeyCode::O];
+            if let Ok(_) = keyboard_driver.simulate_key_sequence(&test_keys) {
+                fb.write_text_kernel("Secuencia 'HELLO' simulada en el teclado", Color::LIGHT_GRAY);
+            }
+        }
+    }
+    
+    // Procesar eventos de hot-plug
+    hotplug_manager.process_events();
+    
+    // Mostrar estadísticas del sistema de hot-plug
+    let stats = hotplug_manager.get_stats();
+    fb.write_text_kernel(&stats.to_string(), Color::LIGHT_GRAY);
+    
+    // Mostrar estado del sistema
+    let status = hotplug_manager.get_system_status();
+    fb.write_text_kernel(&status, Color::LIGHT_GRAY);
 
     // Mostrar información del modo gráfico detectado
     let modo_str = match hw_result.graphics_mode {

@@ -77,7 +77,7 @@ pub mod fat32;  // Sistema de archivos FAT32 (experimental)
 pub mod ntfs;   // Sistema de archivos NTFS (experimental)
 pub mod ntfs_integration;  // Integración NTFS (stub)
 pub mod ipc;    // Sistema IPC para comunicación kernel-userland
-// pub mod hotplug; // Sistema de hot-plug para detección automática de hardware - REMOVIDO
+pub mod hotplug; // Sistema de hot-plug USB para detección automática de hardware
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

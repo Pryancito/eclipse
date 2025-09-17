@@ -7,11 +7,50 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::boxed::Box;
 
-use crate::drivers::usb_keyboard::{UsbKeyboardDriver, KeyboardEvent, UsbKeyCode, ModifierState};
-use crate::drivers::usb_mouse::{UsbMouseDriver, MouseEvent, MouseButton, MousePosition, MouseButtonState};
+use crate::drivers::usb_keyboard::{UsbKeyboardDriver, UsbKeyCode};
+use crate::drivers::usb_mouse::{UsbMouseDriver, MouseButton};
 
 /// Sistema de entrada unificado para Eclipse OS
 /// Gestiona eventos de teclado y mouse de forma centralizada
+
+/// Evento de teclado
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyboardEvent {
+    pub key_code: UsbKeyCode,
+    pub pressed: bool,
+    pub timestamp: u64,
+}
+
+/// Evento de mouse
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouseEvent {
+    pub button: Option<MouseButton>,
+    pub position: (i32, i32),
+    pub pressed: bool,
+    pub timestamp: u64,
+}
+
+/// Evento del sistema
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemEvent {
+    DeviceConnected,
+    DeviceDisconnected,
+}
+
+/// Estado de modificadores del teclado
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModifierState {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+/// Posición del mouse
+pub type MousePosition = (i32, i32);
+
+/// Estado de botones del mouse
+pub type MouseButtonState = Vec<MouseButton>;
 
 /// Tipo de evento de entrada
 #[derive(Debug, Clone, PartialEq)]
@@ -21,14 +60,7 @@ pub enum InputEventType {
     System(SystemEvent),
 }
 
-/// Eventos del sistema
-#[derive(Debug, Clone, PartialEq)]
-pub enum SystemEvent {
-    DeviceConnected { device_type: String, device_id: u32 },
-    DeviceDisconnected { device_type: String, device_id: u32 },
-    InputError { error: String },
-    BufferOverflow,
-}
+// SystemEvent ya está definido arriba
 
 /// Evento de entrada unificado
 #[derive(Debug, Clone, PartialEq)]
