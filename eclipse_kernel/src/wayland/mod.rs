@@ -11,12 +11,16 @@ pub mod input;
 pub mod output;
 pub mod shell;
 pub mod client;
+pub mod client_api;
 pub mod server;
 pub mod buffer;
 pub mod shm;
 pub mod drm;
 pub mod egl;
 pub mod display_driver;
+pub mod rendering;
+pub mod apps;
+pub mod example;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;

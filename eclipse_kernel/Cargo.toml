@@ -22,6 +22,11 @@ linked_list_allocator = "0.10"
 # Dependencias para modelos de IA reales (compatibles con no_std)
 # Dependencias para matemáticas
 num-traits = { version = "0.2", optional = true, default-features = false }
+# Dependencias para Wayland
+wayland-client = { version = "0.29", optional = true, default-features = false }
+wayland-server = { version = "0.29", optional = true, default-features = false }
+# Dependencias para renderización
+khronos-egl = { version = "4.1", optional = true, default-features = false }
 
 [features]
 default = ["no_std", "alloc"]
@@ -30,7 +35,12 @@ hardware-debug = []
 safe-init = []
 alloc = []
 # Características para modelos de IA reales
-ai-models = ["num-traits"]
+ai-models = ["dep:num-traits"]
+# Características para Wayland
+wayland-server = ["dep:wayland-server"]
+wayland-client = ["dep:wayland-client"]
+wayland-egl = ["dep:wayland-client", "dep:khronos-egl"]
+wayland-full = ["dep:wayland-server", "dep:wayland-client", "dep:khronos-egl"]
 
 [profile.dev]
 panic = "abort"

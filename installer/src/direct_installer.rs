@@ -320,6 +320,9 @@ impl DirectInstaller {
         // Instalar aplicaciones del sistema
         self.install_system_apps(disk)?;
 
+        // Instalar modelos de IA
+        self.install_ai_models(disk)?;
+
         println!("   Sistema instalado en partición root");
         Ok(())
     }
@@ -698,6 +701,68 @@ Desarrollado con amor en Rust
         }
         
         println!();
+        Ok(())
+    }
+
+    fn install_ai_models(&self, _disk: &DiskInfo) -> Result<(), String> {
+        println!("   Instalando modelos de IA...");
+        
+        let models_source = "eclipse_kernel/models";
+        let models_dest = format!("{}/models", self.root_mount_point);
+        
+        // Crear directorio de modelos
+        fs::create_dir_all(&models_dest)
+            .map_err(|e| format!("Error creando directorio de modelos: {}", e))?;
+        
+        // Verificar si existe el directorio de modelos
+        if !Path::new(models_source).exists() {
+            println!("     Advertencia: Directorio de modelos no encontrado en {}", models_source);
+            println!("     Los modelos de IA no se instalarán");
+            return Ok(());
+        }
+        
+        // Copiar todos los modelos
+        let models = [
+            "anomaly-detector",
+            "distilbert-base", 
+            "efficientnet-lite",
+            "mobilenetv2",
+            "performance-predictor",
+            "tinyllama-1.1b"
+        ];
+        
+        for model in &models {
+            let model_source = format!("{}/{}", models_source, model);
+            let model_dest = format!("{}/{}", models_dest, model);
+            
+            if Path::new(&model_source).exists() {
+                // Crear directorio del modelo
+                fs::create_dir_all(&model_dest)
+                    .map_err(|e| format!("Error creando directorio para modelo {}: {}", model, e))?;
+                
+                // Copiar todos los archivos del modelo
+                if let Ok(entries) = fs::read_dir(&model_source) {
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            let src_path = entry.path();
+                            if src_path.is_file() {
+                                let file_name = src_path.file_name().unwrap();
+                                let dest_path = format!("{}/{}", model_dest, file_name.to_string_lossy());
+                                
+                                fs::copy(&src_path, &dest_path)
+                                    .map_err(|e| format!("Error copiando archivo {} del modelo {}: {}", 
+                                                       file_name.to_string_lossy(), model, e))?;
+                            }
+                        }
+                    }
+                    println!("     Modelo {} instalado", model);
+                }
+            } else {
+                println!("     Advertencia: Modelo {} no encontrado", model);
+            }
+        }
+        
+        println!("     Modelos de IA instalados en /models");
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use alloc::vec;
 
 /// Buffer de memoria compartida
+#[derive(Debug, Clone)]
 pub struct SharedMemoryBuffer {
     pub data: Vec<u8>,
     pub width: u32,

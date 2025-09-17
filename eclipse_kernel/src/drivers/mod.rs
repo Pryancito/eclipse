@@ -43,6 +43,9 @@ pub mod gui_integration;
 pub mod manager;
 pub mod modular;
 pub mod virtio_gpu;
+pub mod bochs_vbe;
+pub mod vmware_svga;
+pub mod usb_xhci;
 
 // Re-exportar componentes principales
 pub use device::{DeviceType, DeviceState, DeviceError};

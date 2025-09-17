@@ -24,8 +24,13 @@ use crate::drivers::framebuffer::{Color, get_framebuffer,
 use crate::ai_typing_system::{AiTypingSystem, AiTypingConfig, TypingEffect,
     create_ai_typing_system};
 use crate::ai_pretrained_models::{PretrainedModelManager, PretrainedModelType};
+use crate::ai::{ModelLoader, ModelType};
 // Módulo ai_font_generator removido
 use crate::drivers::pci::{GpuType, GpuInfo};
+use crate::drivers::virtio_gpu::VirtioGpuDriver;
+use crate::drivers::bochs_vbe::BochsVbeDriver;
+use crate::drivers::vmware_svga::VmwareSvgaDriver;
+use crate::drivers::usb_xhci::XhciController;
 use crate::drivers::pci::PciManager;
 use crate::drivers::pci::PciDevice;
 use crate::drivers::usb::UsbDriver;
@@ -324,6 +329,38 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     fb.write_text_kernel("[3/6] Modo grafico: ", Color::WHITE);
     fb.write_text_kernel(modo_str, color_modo);
 
+    // Selector de backend de vídeo: Virtio-GPU si es la GPU primaria, GOP como fallback
+    if let Some(primary) = &hw_result.primary_gpu {
+        match primary.gpu_type {
+            GpuType::Virtio => {
+                let mut virt = VirtioGpuDriver::new();
+                match virt.initialize() {
+                    Ok(_) => fb.write_text_kernel("Backend de vídeo: Virtio-GPU", Color::GREEN),
+                    Err(e) => fb.write_text_kernel(&format!("Backend de vídeo: Virtio-GPU (falló init: {:?})", e), Color::YELLOW),
+                }
+            }
+            GpuType::QemuBochs => {
+                let mut bochs = BochsVbeDriver::new();
+                match bochs.initialize() {
+                    Ok(_) => fb.write_text_kernel("Backend de vídeo: Bochs VBE", Color::GREEN),
+                    Err(_) => fb.write_text_kernel("Backend de vídeo: Bochs VBE (falló init)", Color::YELLOW),
+                }
+            }
+            GpuType::Vmware => {
+                let mut vmw = VmwareSvgaDriver::new();
+                match vmw.initialize() {
+                    Ok(_) => fb.write_text_kernel("Backend de vídeo: VMware SVGA II", Color::GREEN),
+                    Err(_) => fb.write_text_kernel("Backend de vídeo: VMware SVGA II (falló init)", Color::YELLOW),
+                }
+            }
+            _ => {
+                fb.write_text_kernel("Backend de vídeo: GOP/UEFI (fallback)", Color::LIGHT_GRAY);
+            }
+        }
+    } else {
+        fb.write_text_kernel("Backend de vídeo: GOP/UEFI (sin GPU primaria)", Color::LIGHT_GRAY);
+    }
+
     // Mostrar breve info de framebuffer si está disponible
     if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
         let dims = format!("FB {}x{} @{}", info.width, info.height, info.pixels_per_scan_line);
@@ -385,6 +422,54 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
                 dev.subclass_code
             );
             fb.write_text_kernel(&msg, Color::LIGHT_GRAY);
+        }
+    }
+
+    // Detectar controladores USB por PCI (class 0x0C, subclass 0x03)
+    let mut usb_ctrls: heapless::Vec<(u8,u8,u8,u8), 16> = heapless::Vec::new();
+    for i in 0..pci_dbg.device_count() {
+        if let Some(mut dev) = pci_dbg.get_device(i) {
+            if dev.class_code == 0x0C && dev.subclass_code == 0x03 {
+                let prog_if = dev.prog_if; // UHCI=0x00, OHCI=0x10, EHCI=0x20, XHCI=0x30
+                // Habilitar MMIO/BusMaster para el controlador USB
+                dev.enable_mmio_and_bus_master();
+                let _ = usb_ctrls.push((dev.bus, dev.device, dev.function, prog_if));
+            }
+        }
+    }
+    let usb_msg = format!("Controladores USB (PCI): {}", usb_ctrls.len());
+    fb.write_text_kernel(&usb_msg, Color::WHITE);
+    for (bus, dev, func, prog_if) in usb_ctrls.iter().copied().take(8) {
+        let kind = match prog_if {
+            0x00 => "UHCI",
+            0x10 => "OHCI",
+            0x20 => "EHCI",
+            0x30 => "XHCI",
+            _ => "USB?",
+        };
+        let line = format!("  {:02X}:{:02X}.{} {}", bus, dev, func, kind);
+        fb.write_text_kernel(&line, Color::LIGHT_GRAY);
+
+        // Intentar inicializar xHCI genérico
+        if prog_if == 0x30 {
+            // Buscar el dispositivo por BDF manualmente
+            let mut found = None;
+            for idx in 0..pci_dbg.device_count() {
+                if let Some(devinfo) = pci_dbg.get_device(idx) {
+                    if devinfo.bus == bus && devinfo.device == dev && devinfo.function == func {
+                        found = Some(devinfo.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(pci_dev) = found {
+                let mut xhci = XhciController::new(pci_dev);
+                if xhci.initialize().is_ok() {
+                    fb.write_text_kernel("xHCI inicializado", Color::GREEN);
+                } else {
+                    fb.write_text_kernel("xHCI fallo init", Color::YELLOW);
+                }
+            }
         }
     }
 
@@ -493,6 +578,28 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         fb.write_text_kernel("Sin GPU primaria para inicializar", Color::YELLOW);
     }
 
+    // Soporte básico multi-GPU: habilitar MMIO/BusMaster en las adicionales
+    if hw_result.available_gpus.len() > 1 {
+        fb.write_text_kernel("Multi-GPU: habilitando GPUs adicionales", Color::WHITE);
+        for gpu in hw_result.available_gpus.iter() {
+            if let Some(ref primary) = hw_result.primary_gpu {
+                if gpu.pci_device.bus == primary.pci_device.bus
+                    && gpu.pci_device.device == primary.pci_device.device
+                    && gpu.pci_device.function == primary.pci_device.function {
+                    continue; // ya tratada
+                }
+            }
+            let dev = &gpu.pci_device;
+            dev.enable_mmio_and_bus_master();
+            let msg = format!(
+                "  GPU secundaria habilitada {:04X}:{:04X}",
+                dev.vendor_id, dev.device_id
+            );
+            fb.write_text_kernel(&msg, Color::LIGHT_GRAY);
+        }
+        fb.write_text_kernel("Multi-GPU (experimental) activo", Color::CYAN);
+    }
+
     // Si el modo es acelerado, intentar inicializar la aceleración y mostrar detalles
     if let GraphicsMode::HardwareAccelerated = hw_result.graphics_mode {
         if let Some(ref gpu_info) = hw_result.primary_gpu {
@@ -509,6 +616,25 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     fb.write_text_kernel("[4/6] Iniciando sistema de AI...", Color::YELLOW);
     // Crear sistema de AI para escritura
     let mut ai_system = create_ai_typing_system();
+    
+    // Inicializar cargador de modelos de IA
+    let mut model_loader = ModelLoader::new();
+    fb.write_text_kernel("Cargando modelos de IA...", Color::CYAN);
+    
+    // Cargar modelos disponibles
+    match model_loader.load_all_models() {
+        Ok(_) => {
+            let loaded_count = model_loader.list_models().iter().filter(|m| m.loaded).count();
+            fb.write_text_kernel(&format!("Modelos cargados: {}/{}", loaded_count, model_loader.list_models().len()), Color::GREEN);
+            
+            // Mostrar memoria total requerida
+            let total_mem = model_loader.total_memory_required() / (1024 * 1024); // MB
+            fb.write_text_kernel(&format!("Memoria total requerida: {} MB", total_mem), Color::CYAN);
+        },
+        Err(_) => {
+            fb.write_text_kernel("Error al cargar algunos modelos de IA", Color::RED);
+        }
+    }
 
     // Configurar efecto de escritura
     let mut config = AiTypingConfig::default();

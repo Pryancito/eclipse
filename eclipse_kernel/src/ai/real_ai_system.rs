@@ -4,7 +4,7 @@
 //! no solo muestra mensajes de demostración.
 
 use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::format;
 use core::time::Duration;
 
@@ -141,16 +141,15 @@ impl RealAISystem {
     /// Cargar patrones base
     fn load_base_patterns(&mut self) -> Result<(), String> {
         // Cargar patrones fundamentales
-        let base_patterns = vec![
-            "sistema".to_string(),
-            "hardware".to_string(),
-            "gráficos".to_string(),
-            "kernel".to_string(),
-            "driver".to_string(),
-            "memoria".to_string(),
-            "proceso".to_string(),
-            "archivo".to_string(),
-        ];
+        let mut base_patterns = Vec::new();
+        base_patterns.push("sistema".to_string());
+        base_patterns.push("hardware".to_string());
+        base_patterns.push("gráficos".to_string());
+        base_patterns.push("kernel".to_string());
+        base_patterns.push("driver".to_string());
+        base_patterns.push("memoria".to_string());
+        base_patterns.push("proceso".to_string());
+        base_patterns.push("archivo".to_string());
         
         for pattern in base_patterns {
             self.learned_patterns.push(pattern);
