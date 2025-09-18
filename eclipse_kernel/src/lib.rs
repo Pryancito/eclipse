@@ -34,6 +34,7 @@ pub mod network;
 pub mod gui;
 pub mod graphics;
 pub mod uefi_framebuffer;
+pub mod gpu_fallback; // Sistema de fallback de UEFI/GOP a GPU hardware real
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
 pub mod apps; // Aplicaciones interactivas
@@ -55,6 +56,7 @@ pub mod vga_centered_display;
 pub mod wayland;  // Módulo para mostrar texto centrado en VGA
 pub mod ai;
 pub mod cosmic;  // Sistema de IA principal
+pub mod window_system;  // Sistema de ventanas X11/Wayland-like
 pub mod ai_integration;  // Integración profunda de IA en el kernel
 pub mod ai_communication;  // Sistema de comunicación bidireccional con IA
 pub mod ai_control;  // Control del sistema operativo por IA

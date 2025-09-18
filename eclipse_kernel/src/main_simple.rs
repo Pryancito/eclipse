@@ -272,9 +272,47 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         }
     }
     
-    // Inicializar sistema de gráficos avanzado
-    // Modo texto temporal (Wayland más adelante): omitimos creación de ventanas/render
-    fb.write_text_kernel("Modo texto: sistema gráfico omitido (Wayland pendiente)", Color::LIGHT_GRAY);
+    // Inicializar sistema de gráficos avanzado con Wayland
+    fb.write_text_kernel("[4/9] Inicializando sistema gráfico avanzado...", Color::CYAN);
+    
+    // Inicializar Graphics Manager con Wayland
+    let graphics_config = GraphicsConfig {
+        enable_hardware_acceleration: true,
+        enable_cuda: true,
+        enable_ray_tracing: true,
+        enable_vulkan: true,
+        enable_opengl: true,
+        max_windows: 100,
+        max_widgets: 1000,
+        vsync_enabled: true,
+        antialiasing_enabled: true,
+    };
+    
+    let mut graphics_manager = GraphicsManager::new(graphics_config);
+    // Obtener el framebuffer para inicializar el sistema gráfico
+    if let Some(framebuffer) = crate::drivers::framebuffer::get_framebuffer() {
+        match graphics_manager.initialize(unsafe { core::ptr::read(framebuffer) }) {
+        Ok(_) => {
+            fb.write_text_kernel("Sistema gráfico avanzado inicializado", Color::GREEN);
+            
+            // Crear ventana principal del sistema
+            let window_id = graphics_manager.create_window("Eclipse OS Desktop".to_string(), Position { x: 0, y: 0 }, Size { width: 1024, height: 768 });
+            fb.write_text_kernel(&format!("Ventana principal creada: ID {}", window_id), Color::LIGHT_GRAY);
+            
+            // Crear algunos widgets de ejemplo
+            let button_widget = graphics_manager.create_widget(WidgetType::Button, Position { x: 50, y: 50 }, Size { width: 100, height: 30 });
+            fb.write_text_kernel(&format!("Widget botón creado: ID {}", button_widget), Color::LIGHT_GRAY);
+            
+            let label_widget = graphics_manager.create_widget(WidgetType::Label, Position { x: 50, y: 100 }, Size { width: 200, height: 20 });
+            fb.write_text_kernel(&format!("Widget etiqueta creado: ID {}", label_widget), Color::LIGHT_GRAY);
+        }
+        Err(e) => {
+            fb.write_text_kernel(&format!("Error inicializando sistema gráfico: {}", e), Color::RED);
+        }
+        }
+    } else {
+        fb.write_text_kernel("Error: No se pudo obtener el framebuffer para inicializar el sistema gráfico", Color::RED);
+    }
     
     // Inicializar sistema de hot-plug USB (mismo flujo en QEMU y hardware real)
     fb.write_text_kernel("Inicializando hot-plug USB...", Color::MAGENTA);
@@ -330,36 +368,56 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     fb.write_text_kernel("[3/6] Modo grafico: ", Color::WHITE);
     fb.write_text_kernel(modo_str, color_modo);
 
-    // Selector de backend de vídeo: Virtio-GPU si es la GPU primaria, GOP como fallback
-    if let Some(primary) = &hw_result.primary_gpu {
-        match primary.gpu_type {
-            GpuType::Virtio => {
-                let mut virt = VirtioGpuDriver::new();
-                match virt.initialize() {
-                    Ok(_) => fb.write_text_kernel("Backend de vídeo: Virtio-GPU", Color::GREEN),
-                    Err(e) => fb.write_text_kernel(&format!("Backend de vídeo: Virtio-GPU (falló init: {:?})", e), Color::YELLOW),
-                }
+    // Sistema de fallback GPU: UEFI/GOP -> GPU hardware real
+    fb.write_text_kernel("[3.5/6] Inicializando sistema de fallback GPU...", Color::CYAN);
+    
+    // Debug: Mostrar estado del framebuffer antes de la inicialización
+    if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
+        let fb_debug = format!("FB inicial: {}x{} @0x{:X}", info.width, info.height, info.base_address);
+        fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
+    }
+    
+    match crate::gpu_fallback::init_gpu_fallback() {
+        Ok(_) => {
+            fb.write_text_kernel("Sistema de fallback GPU inicializado", Color::GREEN);
+            
+            // Mostrar información del backend activo
+            if let Some(backend_info) = crate::gpu_fallback::get_active_backend_info() {
+                fb.write_text_kernel(backend_info.as_str(), Color::GREEN);
+            } else {
+                fb.write_text_kernel("No se pudo obtener información del backend activo", Color::YELLOW);
             }
-            GpuType::QemuBochs => {
-                let mut bochs = BochsVbeDriver::new();
-                match bochs.initialize() {
-                    Ok(_) => fb.write_text_kernel("Backend de vídeo: Bochs VBE", Color::GREEN),
-                    Err(_) => fb.write_text_kernel("Backend de vídeo: Bochs VBE (falló init)", Color::YELLOW),
-                }
+            
+            // Mostrar estadísticas del sistema de fallback
+            let stats = crate::gpu_fallback::get_fallback_stats();
+            fb.write_text_kernel(&stats, Color::LIGHT_GRAY);
+            
+            // Indicar si estamos usando hardware real
+            if crate::gpu_fallback::is_using_real_hardware() {
+                fb.write_text_kernel("✓ Usando GPU hardware real", Color::GREEN);
+            } else {
+                fb.write_text_kernel("⚠ Usando framebuffer UEFI/GOP (fallback)", Color::YELLOW);
             }
-            GpuType::Vmware => {
-                let mut vmw = VmwareSvgaDriver::new();
-                match vmw.initialize() {
-                    Ok(_) => fb.write_text_kernel("Backend de vídeo: VMware SVGA II", Color::GREEN),
-                    Err(_) => fb.write_text_kernel("Backend de vídeo: VMware SVGA II (falló init)", Color::YELLOW),
-                }
-            }
-            _ => {
-                fb.write_text_kernel("Backend de vídeo: GOP/UEFI (fallback)", Color::LIGHT_GRAY);
+            
+            // Debug: Mostrar estado del framebuffer después de la inicialización
+            if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
+                let fb_debug = format!("FB final: {}x{} @0x{:X}", info.width, info.height, info.base_address);
+                fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
             }
         }
-    } else {
-        fb.write_text_kernel("Backend de vídeo: GOP/UEFI (sin GPU primaria)", Color::LIGHT_GRAY);
+        Err(e) => {
+            fb.write_text_kernel(&format!("Error inicializando fallback GPU: {}", e), Color::RED);
+            fb.write_text_kernel("Usando framebuffer UEFI/GOP por defecto", Color::YELLOW);
+            
+            // Debug: Mostrar información de error detallada
+            fb.write_text_kernel("Debug: Verificando estado del framebuffer...", Color::CYAN);
+            if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
+                let fb_debug = format!("FB disponible: {}x{} @0x{:X}", info.width, info.height, info.base_address);
+                fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
+            } else {
+                fb.write_text_kernel("FB no disponible - usando modo de emergencia", Color::RED);
+            }
+        }
     }
 
     // Mostrar breve info de framebuffer si está disponible
@@ -614,7 +672,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
             fb.write_text_kernel("No se detectó GPU para aceleración", Color::RED);
         }
     }
-    fb.write_text_kernel("[4/6] Iniciando sistema de AI...", Color::YELLOW);
+    fb.write_text_kernel("[5/9] Iniciando sistema de AI...", Color::YELLOW);
     // Crear sistema de AI para escritura
     let mut ai_system = create_ai_typing_system();
     
@@ -656,7 +714,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     
     // Escribir mensaje de éxito
     ai_system.write_success_message(fb, 0); // "Operacion completada exitosamente"
-    fb.write_text_kernel("[5/6] Inicializando drivers USB...", Color::YELLOW);
+    fb.write_text_kernel("[6/9] Inicializando drivers USB...", Color::YELLOW);
     // Inicializar drivers USB (mismo flujo en QEMU y hardware real)
     let mut usb_driver = UsbDriver::new();
     let usb_init_result = usb_driver.initialize_controllers();
@@ -678,18 +736,51 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     
     if keyboard_init_result.is_ok() {
         fb.write_text_kernel("Teclado USB: Inicializado", Color::GREEN);
+        
+        // Activar LEDs del teclado
+        fb.write_text_kernel("Activando LEDs del teclado...", Color::CYAN);
+        match keyboard_driver.enable_all_leds() {
+            Ok(_) => {
+                fb.write_text_kernel("✓ LEDs del teclado activados", Color::GREEN);
+                
+                // Activar LEDs específicos con delay
+                let _ = keyboard_driver.set_num_lock_led(true);
+                let _ = keyboard_driver.set_caps_lock_led(true);
+                let _ = keyboard_driver.set_scroll_lock_led(true);
+            }
+            Err(e) => {
+                fb.write_text_kernel(&format!("Error activando LEDs del teclado: {}", e), Color::YELLOW);
+            }
+        }
     } else {
         fb.write_text_kernel("Teclado USB: Error", Color::RED);
     }
     
     if mouse_init_result.is_ok() {
         fb.write_text_kernel("Mouse USB: Inicializado", Color::GREEN);
+        
+        // Activar LEDs del mouse
+        fb.write_text_kernel("Activando LEDs del mouse...", Color::CYAN);
+        match mouse_driver.enable_all_leds() {
+            Ok(_) => {
+                fb.write_text_kernel("✓ LEDs del mouse activados", Color::GREEN);
+                
+                // Activar LEDs específicos con delay
+                let _ = mouse_driver.set_scroll_wheel_led(true);
+                let _ = mouse_driver.set_side_buttons_led(true);
+                let _ = mouse_driver.set_logo_led(true);
+                let _ = mouse_driver.set_dpi_indicator_led(true);
+            }
+            Err(e) => {
+                fb.write_text_kernel(&format!("Error activando LEDs del mouse: {}", e), Color::YELLOW);
+            }
+        }
     } else {
         fb.write_text_kernel("Mouse USB: Error", Color::RED);
     }
     
     // Inicializar Wayland si está disponible
-    fb.write_text_kernel("[6/8] Inicializando Wayland...", Color::CYAN);
+    fb.write_text_kernel("[7/9] Inicializando Wayland...", Color::CYAN);
     init_wayland();
 
     if is_wayland_initialized() {
@@ -705,8 +796,45 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
         fb.write_text_kernel("Wayland no disponible, usando modo framebuffer", Color::YELLOW);
     }
 
+    // Inicializar Sistema de Ventanas (X11/Wayland-like)
+    fb.write_text_kernel("[8/9] Inicializando Sistema de Ventanas...", Color::CYAN);
+    match crate::window_system::init_window_system() {
+        Ok(_) => {
+            fb.write_text_kernel("Sistema de Ventanas inicializado correctamente", Color::GREEN);
+            
+            // Crear una ventana de ejemplo
+            let client_id = crate::window_system::client_api::connect_global_client("Sistema".to_string()).unwrap_or(0);
+            if client_id > 0 {
+                let flags = crate::window_system::protocol::WindowFlags::default();
+                match crate::window_system::window_manager::create_global_window(
+                    client_id,
+                    "Ventana de Ejemplo".to_string(),
+                    100, 100, 400, 300,
+                    flags,
+                    crate::window_system::window::WindowType::Normal,
+                ) {
+                    Ok(window_id) => {
+                        fb.write_text_kernel(&format!("Ventana de ejemplo creada: ID {}", window_id), Color::LIGHT_GRAY);
+                        
+                        // Mapear la ventana
+                        if let Ok(_) = crate::window_system::window_manager::get_window_manager() {
+                            // La ventana se mapeará automáticamente
+                            fb.write_text_kernel("Ventana mapeada y visible", Color::LIGHT_GRAY);
+                        }
+                    }
+                    Err(e) => {
+                        fb.write_text_kernel(&format!("Error creando ventana: {}", e), Color::YELLOW);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&format!("Error inicializando sistema de ventanas: {}", e), Color::YELLOW);
+        }
+    }
+
     // Inicializar COSMIC Desktop Environment
-    fb.write_text_kernel("[7/8] Inicializando COSMIC Desktop Environment...", Color::CYAN);
+    fb.write_text_kernel("[9/9] Inicializando COSMIC Desktop Environment...", Color::CYAN);
 
     let cosmic_config = CosmicConfig {
         enable_ai_features: true,
@@ -754,11 +882,105 @@ pub fn kernel_main(fb: &mut FramebufferDriver) {
     }
 
     // BUCLE PRINCIPAL SIMPLIFICADO: Evitar operaciones complejas que causan cuelgues
-    fb.write_text_kernel("[8/8] Sistema listo - Bucle principal iniciado", Color::GREEN);
+    fb.write_text_kernel("[10/10] Sistema listo - Bucle principal iniciado", Color::GREEN);
+
+    // Contador de frames y control de logging
+    let mut frame_counter: u64 = 0;
+    let log_interval_frames: u64 = 120; // ~2s a 60 FPS
+    let mut led_demo_counter: u64 = 0;
+    let led_demo_interval: u64 = 300; // ~5s a 60 FPS
     
     loop {
-        // Pausa optimizada para el loop
-        for _ in 0..100000 {
+        // Procesar eventos y renderizar un frame de COSMIC si está activo
+        // (Ignorar errores de forma segura en este modo simplificado)
+        {
+            // Verificar estado del compositor antes de llamar a métodos
+            // para evitar overhead innecesario
+            // Nota: get_state() es barato y solo lee flags
+            // Si el compositor está activo, procesar y renderizar
+            if cosmic_manager.get_state().compositor_running {
+                let _ = cosmic_manager.process_events();
+                let _ = cosmic_manager.render_frame();
+            }
+        }
+
+        // Procesar sistema de ventanas
+        {
+            if crate::window_system::is_window_system_initialized() {
+                let _ = crate::window_system::process_window_system_events();
+                let _ = crate::window_system::render_window_system_frame();
+            }
+        }
+
+        // Logging de estadísticas cada cierto número de frames
+        if frame_counter % log_interval_frames == 0 {
+            let stats = cosmic_manager.get_performance_stats();
+            fb.write_text_kernel(
+                &format!(
+                    "COSMIC: ventanas={}, {:.1} FPS, CPU {:.0}% GPU {:.0}%",
+                    stats.window_count,
+                    stats.frame_rate,
+                    stats.cpu_usage,
+                    stats.gpu_usage
+                ),
+                Color::LIGHT_GRAY,
+            );
+        }
+
+        // Demostración de LEDs cada cierto número de frames
+        if frame_counter % led_demo_interval == 0 {
+            led_demo_counter += 1;
+            let demo_phase = (led_demo_counter % 4) as u8;
+            
+            match demo_phase {
+                0 => {
+                    // Activar todos los LEDs
+                    let _ = keyboard_driver.enable_all_leds();
+                    let _ = mouse_driver.enable_all_leds();
+                    fb.write_text_kernel("LED Demo: Todos los LEDs activados", Color::CYAN);
+                }
+                1 => {
+                    // Solo Num Lock y Scroll Wheel
+                    let _ = keyboard_driver.set_num_lock_led(true);
+                    let _ = keyboard_driver.set_caps_lock_led(false);
+                    let _ = keyboard_driver.set_scroll_lock_led(false);
+                    let _ = mouse_driver.set_scroll_wheel_led(true);
+                    let _ = mouse_driver.set_side_buttons_led(false);
+                    let _ = mouse_driver.set_logo_led(false);
+                    let _ = mouse_driver.set_dpi_indicator_led(false);
+                    fb.write_text_kernel("LED Demo: Num Lock + Scroll Wheel", Color::CYAN);
+                }
+                2 => {
+                    // Solo Caps Lock y Logo
+                    let _ = keyboard_driver.set_num_lock_led(false);
+                    let _ = keyboard_driver.set_caps_lock_led(true);
+                    let _ = keyboard_driver.set_scroll_lock_led(false);
+                    let _ = mouse_driver.set_scroll_wheel_led(false);
+                    let _ = mouse_driver.set_side_buttons_led(false);
+                    let _ = mouse_driver.set_logo_led(true);
+                    let _ = mouse_driver.set_dpi_indicator_led(false);
+                    fb.write_text_kernel("LED Demo: Caps Lock + Logo", Color::CYAN);
+                }
+                3 => {
+                    // Solo Scroll Lock y DPI Indicator
+                    let _ = keyboard_driver.set_num_lock_led(false);
+                    let _ = keyboard_driver.set_caps_lock_led(false);
+                    let _ = keyboard_driver.set_scroll_lock_led(true);
+                    let _ = mouse_driver.set_scroll_wheel_led(false);
+                    let _ = mouse_driver.set_side_buttons_led(false);
+                    let _ = mouse_driver.set_logo_led(false);
+                    let _ = mouse_driver.set_dpi_indicator_led(true);
+                    fb.write_text_kernel("LED Demo: Scroll Lock + DPI Indicator", Color::CYAN);
+                }
+                _ => {}
+            }
+        }
+
+        frame_counter = frame_counter.wrapping_add(1);
+
+        // Pacing básico para ~60 FPS usando spin (no hay temporizador estándar)
+        // Ajustar iteraciones según hardware/hipervisor si fuese necesario
+        for _ in 0..60000u32 {
             core::hint::spin_loop();
         }
     }

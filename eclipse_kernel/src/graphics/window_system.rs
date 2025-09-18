@@ -96,7 +96,10 @@ pub struct Window {
 impl Window {
     /// Crear nueva ventana
     pub fn new(id: WindowId, title: String, position: Position, size: Size) -> Self {
-        let buffer_size = (size.width * size.height) as usize;
+        // Para evitar colgadas, crear un buffer más pequeño inicialmente
+        // El buffer se redimensionará dinámicamente cuando sea necesario
+        let initial_buffer_size = 1024; // Solo 1KB inicialmente
+        
         Self {
             id,
             title,
@@ -110,10 +113,10 @@ impl Window {
             parent: None,
             children: Vec::new(),
             buffer: {
-                let mut buf = Vec::with_capacity(buffer_size);
-                buf.resize(buffer_size, 0);
+                let mut buf = Vec::new();
+                buf.resize(initial_buffer_size, 0u32);
                 buf
-            }, // Inicializar con píxeles transparentes
+            }, // Buffer pequeño inicial
             dirty: true,
             created_time: 0, // Se establecerá por el sistema
             last_modified: 0,

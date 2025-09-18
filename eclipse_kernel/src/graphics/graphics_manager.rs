@@ -163,12 +163,27 @@ impl GraphicsManager {
 
     /// Crear ventana de escritorio
     fn create_desktop_window(&mut self) {
+        if let Some(ref mut fb) = self.framebuffer { 
+            fb.write_text_kernel("[GFX] create_desktop_window IN", crate::drivers::framebuffer::Color::LIGHT_GRAY); 
+        }
+        
+        if let Some(ref mut fb) = self.framebuffer { 
+            fb.write_text_kernel("[GFX] creando ventana desktop...", crate::drivers::framebuffer::Color::LIGHT_GRAY); 
+        }
+        
         let desktop_id = self.window_compositor.create_window(
             "Eclipse OS Desktop".to_string(),
             Position { x: 0, y: 0 },
             Size { width: 800, height: 600 }
         );
         
+        if let Some(ref mut fb) = self.framebuffer { 
+            fb.write_text_kernel(&format!("[GFX] ventana desktop creada: ID {}", desktop_id), crate::drivers::framebuffer::Color::LIGHT_GRAY); 
+        }
+        
+        if let Some(ref mut fb) = self.framebuffer { 
+            fb.write_text_kernel("[GFX] create_desktop_window OUT", crate::drivers::framebuffer::Color::LIGHT_GRAY); 
+        }
     }
 
     /// Obtener información de todas las GPUs detectadas

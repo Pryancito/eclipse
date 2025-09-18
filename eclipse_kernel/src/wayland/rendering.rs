@@ -119,7 +119,15 @@ impl WaylandRenderer {
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         match self.backend {
             RenderBackend::Software => {
-                self.init_software_rendering()?;
+                // Intentar OpenGL primero; si falla, caer a Software
+                match self.init_opengl_rendering() {
+                    Ok(()) => {
+                        self.backend = RenderBackend::OpenGL;
+                    }
+                    Err(_) => {
+                        self.init_software_rendering()?;
+                    }
+                }
             }
             RenderBackend::OpenGL => {
                 self.init_opengl_rendering()?;

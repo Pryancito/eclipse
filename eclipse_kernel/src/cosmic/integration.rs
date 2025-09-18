@@ -4,6 +4,7 @@
 //! y el kernel de Eclipse OS, incluyendo la gestión de recursos y eventos.
 
 use super::{WindowManagerMode, CosmicPerformanceStats};
+use super::compositor::{CosmicCompositor, CompositorConfig};
 use crate::wayland::{server::WaylandServer, init_wayland};
 use crate::drivers::framebuffer::{FramebufferDriver, get_framebuffer};
 use alloc::string::{String, ToString};
@@ -17,6 +18,7 @@ pub struct CosmicIntegration {
     compositor_initialized: bool,
     window_manager_initialized: bool,
     performance_stats: CosmicPerformanceStats,
+    compositor: Option<CosmicCompositor>,
 }
 
 impl CosmicIntegration {
@@ -36,6 +38,7 @@ impl CosmicIntegration {
             compositor_initialized: false,
             window_manager_initialized: false,
             performance_stats: CosmicPerformanceStats::default(),
+            compositor: None,
         })
     }
 
@@ -53,6 +56,14 @@ impl CosmicIntegration {
         self.register_cosmic_globals(&mut wayland_server)?;
 
         self.wayland_server = Some(wayland_server);
+        
+        // Iniciar compositor gráfico real y crear una ventana de demostración
+        let mut compositor = CosmicCompositor::new();
+        let comp_cfg = CompositorConfig::default();
+        compositor.initialize(comp_cfg)?;
+        let _ = compositor.create_window(1, 100, 100, 640, 360);
+        self.compositor = Some(compositor);
+
         self.compositor_initialized = true;
 
         Ok(())
@@ -135,6 +146,11 @@ impl CosmicIntegration {
         if let Some(ref mut server) = self.wayland_server {
             // Ejecutar bucle principal de Wayland
             server.run()?;
+        }
+
+        // Renderizar frame del compositor si está presente
+        if let Some(ref mut compositor) = self.compositor {
+            let _ = compositor.render_frame();
         }
 
         // Actualizar estadísticas de rendimiento
@@ -245,6 +261,7 @@ impl Default for CosmicIntegration {
             compositor_initialized: false,
             window_manager_initialized: false,
             performance_stats: CosmicPerformanceStats::default(),
+            compositor: None,
         })
     }
 }

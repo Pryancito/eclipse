@@ -5,7 +5,7 @@
 
 use super::{CosmicPerformanceStats, WindowManagerMode};
 use crate::wayland::rendering::{WaylandRenderer, RenderBackend};
-use crate::drivers::framebuffer::FramebufferDriver;
+use crate::drivers::framebuffer::{FramebufferDriver, Color};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::vec;
@@ -90,10 +90,45 @@ impl CosmicCompositor {
         // Obtener framebuffer
         self.framebuffer = crate::drivers::framebuffer::get_framebuffer().map(|fb| unsafe { core::ptr::read(fb) });
 
-        // Inicializar renderer
-        let mut renderer = WaylandRenderer::new(config.render_backend);
-        renderer.initialize()?;
-        self.renderer = Some(renderer);
+        // Inicializar renderer: preferir OpenGL y caer a backend solicitado si falla
+        // Esto explota además el fallback interno cuando el backend pedido es Software
+        let mut renderer = WaylandRenderer::new(RenderBackend::OpenGL);
+        match renderer.initialize() {
+            Ok(_) => {
+                // OpenGL activo
+                self.renderer = Some(renderer);
+            }
+            Err(_) => {
+                // Fallback al backend solicitado en config (p.ej., Software)
+                let mut fallback = WaylandRenderer::new(config.render_backend);
+                fallback
+                    .initialize()
+                    .map_err(|_| "No se pudo inicializar el renderer (OpenGL ni fallback)".to_string())?;
+                self.renderer = Some(fallback);
+            }
+        }
+
+        // Configurar framebuffer real en el renderer si está disponible
+        if let (Some(ref fb), Some(ref mut renderer)) = (&self.framebuffer, &mut self.renderer) {
+            renderer.framebuffer.width = fb.info.width;
+            renderer.framebuffer.height = fb.info.height;
+            renderer.framebuffer.pitch = fb.info.pixels_per_scan_line * 4;
+            renderer.framebuffer.format = crate::wayland::surface::BufferFormat::XRGB8888;
+            renderer.framebuffer.address = fb.info.base_address as *mut u8;
+        }
+
+        // Log en framebuffer del backend efectivo
+        if let (Some(ref mut fb), Some(ref renderer)) = (&mut self.framebuffer, &self.renderer) {
+            let stats = renderer.get_stats();
+            let backend_str = match stats.backend {
+                RenderBackend::OpenGL => "OpenGL",
+                RenderBackend::Vulkan => "Vulkan",
+                RenderBackend::DirectFB => "DirectFB",
+                RenderBackend::Software => "Software",
+            };
+            let msg = alloc::format!("Compositor backend: {}", backend_str);
+            fb.write_text_kernel(&msg, Color::LIGHT_GRAY);
+        }
 
         self.initialized = true;
         Ok(())
@@ -259,19 +294,42 @@ impl CosmicCompositor {
         if let Some(ref mut renderer) = self.renderer {
             // Registrar superficie si no está registrada
             // Crear buffer para la superficie
-            let buffer = crate::wayland::buffer::SharedMemoryBuffer::new(
+            let mut buffer = crate::wayland::buffer::SharedMemoryBuffer::new(
                 window.width,
                 window.height,
                 crate::wayland::surface::BufferFormat::XRGB8888
             );
+            // Copiar contenido de la ventana al buffer (u32 -> u8)
+            let expected_len = (window.width * window.height) as usize;
+            if window.buffer.len() == expected_len {
+                let dst = buffer.get_data_mut();
+                // Interpretar dst como [u32] para copia directa
+                if dst.len() >= expected_len * 4 {
+                    unsafe {
+                        let dst_u32 = core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u32, expected_len);
+                        dst_u32.copy_from_slice(&window.buffer);
+                    }
+                }
+            }
             renderer.register_surface(window.id, buffer, (window.x, window.y))?;
 
             // Actualizar buffer de la superficie
-            let buffer = crate::wayland::buffer::SharedMemoryBuffer::new(
+            let mut buffer = crate::wayland::buffer::SharedMemoryBuffer::new(
                 window.width,
                 window.height,
                 crate::wayland::surface::BufferFormat::XRGB8888
             );
+            // Copiar nuevamente el contenido actualizado
+            let expected_len2 = (window.width * window.height) as usize;
+            if window.buffer.len() == expected_len2 {
+                let dst2 = buffer.get_data_mut();
+                if dst2.len() >= expected_len2 * 4 {
+                    unsafe {
+                        let dst_u32_2 = core::slice::from_raw_parts_mut(dst2.as_mut_ptr() as *mut u32, expected_len2);
+                        dst_u32_2.copy_from_slice(&window.buffer);
+                    }
+                }
+            }
             renderer.update_surface_buffer(window.id, buffer)?;
         }
         Ok(())

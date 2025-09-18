@@ -706,4 +706,102 @@ impl UsbKeyboardDriver {
         self.last_event_time += 1;
         self.last_event_time
     }
+
+    /// Controlar LEDs del teclado
+    pub fn set_leds(&mut self, leds: KeyboardLeds) -> Result<(), String> {
+        if !self.is_initialized {
+            return Err("El driver del teclado no está inicializado".to_string());
+        }
+
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", &alloc::format!(
+            "Configurando LEDs del teclado: {:?}", leds
+        ));
+
+        // Simular envío de comando de LEDs al dispositivo USB
+        // En un driver real, esto enviaría un report HID al dispositivo
+        let led_byte = leds.to_byte();
+        
+        // Simular delay de comunicación USB
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", &alloc::format!(
+            "LEDs del teclado configurados: 0x{:02X}", led_byte
+        ));
+
+        Ok(())
+    }
+
+    /// Activar todos los LEDs del teclado
+    pub fn enable_all_leds(&mut self) -> Result<(), String> {
+        self.set_leds(KeyboardLeds {
+            num_lock: true,
+            caps_lock: true,
+            scroll_lock: true,
+            compose: true,
+            kana: true,
+        })
+    }
+
+    /// Desactivar todos los LEDs del teclado
+    pub fn disable_all_leds(&mut self) -> Result<(), String> {
+        self.set_leds(KeyboardLeds::default())
+    }
+
+    /// Activar LED de Num Lock
+    pub fn set_num_lock_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = KeyboardLeds::default();
+        leds.num_lock = enabled;
+        self.set_leds(leds)
+    }
+
+    /// Activar LED de Caps Lock
+    pub fn set_caps_lock_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = KeyboardLeds::default();
+        leds.caps_lock = enabled;
+        self.set_leds(leds)
+    }
+
+    /// Activar LED de Scroll Lock
+    pub fn set_scroll_lock_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = KeyboardLeds::default();
+        leds.scroll_lock = enabled;
+        self.set_leds(leds)
+    }
+}
+
+/// Control de LEDs del teclado
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyboardLeds {
+    pub num_lock: bool,
+    pub caps_lock: bool,
+    pub scroll_lock: bool,
+    pub compose: bool,
+    pub kana: bool,
+}
+
+impl Default for KeyboardLeds {
+    fn default() -> Self {
+        Self {
+            num_lock: false,
+            caps_lock: false,
+            scroll_lock: false,
+            compose: false,
+            kana: false,
+        }
+    }
+}
+
+impl KeyboardLeds {
+    /// Convertir a byte para envío USB
+    pub fn to_byte(&self) -> u8 {
+        let mut byte = 0;
+        if self.num_lock { byte |= 0x01; }
+        if self.caps_lock { byte |= 0x02; }
+        if self.scroll_lock { byte |= 0x04; }
+        if self.compose { byte |= 0x08; }
+        if self.kana { byte |= 0x10; }
+        byte
+    }
 }

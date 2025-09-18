@@ -369,4 +369,105 @@ impl UsbMouseDriver {
     pub fn set_sensitivity(&mut self, sensitivity: f32) {
         self.config.sensitivity = sensitivity;
     }
+
+    /// Controlar LEDs del mouse
+    pub fn set_leds(&mut self, leds: MouseLeds) -> Result<(), String> {
+        if !self.is_initialized {
+            return Err("El driver del mouse no está inicializado".to_string());
+        }
+
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", &alloc::format!(
+            "Configurando LEDs del mouse: {:?}", leds
+        ));
+
+        // Simular envío de comando de LEDs al dispositivo USB
+        // En un driver real, esto enviaría un report HID al dispositivo
+        let led_byte = leds.to_byte();
+        
+        // Simular delay de comunicación USB
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+
+        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", &alloc::format!(
+            "LEDs del mouse configurados: 0x{:02X}", led_byte
+        ));
+
+        Ok(())
+    }
+
+    /// Activar todos los LEDs del mouse
+    pub fn enable_all_leds(&mut self) -> Result<(), String> {
+        self.set_leds(MouseLeds {
+            scroll_wheel: true,
+            side_buttons: true,
+            logo: true,
+            dpi_indicator: true,
+        })
+    }
+
+    /// Desactivar todos los LEDs del mouse
+    pub fn disable_all_leds(&mut self) -> Result<(), String> {
+        self.set_leds(MouseLeds::default())
+    }
+
+    /// Activar LED de la rueda de scroll
+    pub fn set_scroll_wheel_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = MouseLeds::default();
+        leds.scroll_wheel = enabled;
+        self.set_leds(leds)
+    }
+
+    /// Activar LEDs de botones laterales
+    pub fn set_side_buttons_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = MouseLeds::default();
+        leds.side_buttons = enabled;
+        self.set_leds(leds)
+    }
+
+    /// Activar LED del logo
+    pub fn set_logo_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = MouseLeds::default();
+        leds.logo = enabled;
+        self.set_leds(leds)
+    }
+
+    /// Activar indicador de DPI
+    pub fn set_dpi_indicator_led(&mut self, enabled: bool) -> Result<(), String> {
+        let mut leds = MouseLeds::default();
+        leds.dpi_indicator = enabled;
+        self.set_leds(leds)
+    }
+}
+
+/// Control de LEDs del mouse
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MouseLeds {
+    pub scroll_wheel: bool,
+    pub side_buttons: bool,
+    pub logo: bool,
+    pub dpi_indicator: bool,
+}
+
+impl Default for MouseLeds {
+    fn default() -> Self {
+        Self {
+            scroll_wheel: false,
+            side_buttons: false,
+            logo: false,
+            dpi_indicator: false,
+        }
+    }
+}
+
+impl MouseLeds {
+    /// Convertir a byte para envío USB
+    pub fn to_byte(&self) -> u8 {
+        let mut byte = 0;
+        if self.scroll_wheel { byte |= 0x01; }
+        if self.side_buttons { byte |= 0x02; }
+        if self.logo { byte |= 0x04; }
+        if self.dpi_indicator { byte |= 0x08; }
+        byte
+    }
 }
