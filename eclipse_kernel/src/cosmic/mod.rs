@@ -9,6 +9,7 @@ pub mod theme;
 pub mod ai_features;
 pub mod compositor;
 pub mod window_manager;
+pub mod demo;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -199,6 +200,189 @@ impl CosmicManager {
             self.state.performance_stats = integration.get_performance_stats();
         }
         &self.state.performance_stats
+    }
+
+    /// Obtener estado de COSMIC
+    pub fn get_state(&self) -> &CosmicState {
+        &self.state
+    }
+
+    /// Procesar eventos de COSMIC
+    pub fn process_events(&mut self) -> Result<(), String> {
+        if !self.state.initialized {
+            return Err("COSMIC no inicializado".to_string());
+        }
+
+        if let Some(ref mut integration) = self.integration {
+            integration.process_events()?;
+        }
+
+        Ok(())
+    }
+
+    /// Renderizar frame de COSMIC
+    pub fn render_frame(&mut self) -> Result<(), String> {
+        if !self.state.initialized {
+            return Err("COSMIC no inicializado".to_string());
+        }
+
+        if let Some(ref mut integration) = self.integration {
+            integration.render_frame()?;
+        }
+
+        Ok(())
+    }
+
+    /// Crear nueva ventana
+    pub fn create_window(&mut self, title: String, width: u32, height: u32) -> Result<u32, String> {
+        if !self.state.window_manager_active {
+            return Err("Gestor de ventanas no activo".to_string());
+        }
+
+        if let Some(ref mut integration) = self.integration {
+            let window_id = integration.create_window(title, width, height)?;
+            self.state.active_windows.push(window_id);
+            Ok(window_id)
+        } else {
+            Err("Integración no disponible".to_string())
+        }
+    }
+
+    /// Destruir ventana
+    pub fn destroy_window(&mut self, window_id: u32) -> Result<(), String> {
+        if !self.state.window_manager_active {
+            return Err("Gestor de ventanas no activo".to_string());
+        }
+
+        if let Some(ref mut integration) = self.integration {
+            integration.destroy_window(window_id)?;
+            self.state.active_windows.retain(|&id| id != window_id);
+        }
+
+        Ok(())
+    }
+
+    /// Obtener información del framebuffer
+    pub fn get_framebuffer_info(&self) -> Option<String> {
+        self.integration.as_ref()?.get_framebuffer_info()
+    }
+
+    /// Aplicar tema personalizado
+    pub fn apply_custom_theme(&mut self, theme_name: &str) -> Result<(), String> {
+        if !self.state.initialized {
+            return Err("COSMIC no inicializado".to_string());
+        }
+
+        // En implementación real, cargar tema desde archivo
+        match theme_name {
+            "space" => {
+                if let Some(ref mut theme) = self.theme {
+                    theme.apply()?;
+                }
+            }
+            "dark" => {
+                // Aplicar tema oscuro
+                Ok(())
+            }
+            "light" => {
+                // Aplicar tema claro
+                Ok(())
+            }
+            _ => Err("Tema no encontrado".to_string())
+        }
+    }
+
+    /// Obtener sugerencias de IA
+    pub fn get_ai_suggestions(&mut self) -> Vec<String> {
+        if let Some(ref mut ai_features) = self.ai_features {
+            // Obtener sugerencias de optimización
+            let mut suggestions = Vec::new();
+            
+            // Analizar rendimiento actual
+            let stats = self.get_performance_stats();
+            let perf_suggestions = ai_features.analyze_performance(stats);
+            
+            for suggestion in perf_suggestions {
+                suggestions.push(suggestion.description);
+            }
+            
+            suggestions
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Aplicar optimización sugerida por IA
+    pub fn apply_ai_optimization(&mut self, optimization: &str) -> Result<(), String> {
+        if let Some(ref mut ai_features) = self.ai_features {
+            // En implementación real, aplicar optimización específica
+            match optimization {
+                "reduce_effects" => {
+                    // Reducir efectos visuales
+                    Ok(())
+                }
+                "optimize_memory" => {
+                    // Optimizar uso de memoria
+                    Ok(())
+                }
+                "adjust_window_layout" => {
+                    // Ajustar layout de ventanas
+                    Ok(())
+                }
+                _ => Err("Optimización no reconocida".to_string())
+            }
+        } else {
+            Err("Características de IA no disponibles".to_string())
+        }
+    }
+
+    /// Obtener información del sistema COSMIC
+    pub fn get_system_info(&self) -> String {
+        let mut info = String::new();
+        
+        info.push_str("=== COSMIC Desktop Environment ===\n");
+        info.push_str(&format!("Estado: {}\n", 
+            if self.state.initialized { "Inicializado" } else { "No inicializado" }));
+        info.push_str(&format!("Compositor: {}\n", 
+            if self.state.compositor_running { "Activo" } else { "Inactivo" }));
+        info.push_str(&format!("Gestor de ventanas: {}\n", 
+            if self.state.window_manager_active { "Activo" } else { "Inactivo" }));
+        info.push_str(&format!("Tema aplicado: {}\n", 
+            if self.state.theme_applied { "Sí" } else { "No" }));
+        info.push_str(&format!("IA habilitada: {}\n", 
+            if self.state.ai_features_enabled { "Sí" } else { "No" }));
+        info.push_str(&format!("Ventanas activas: {}\n", self.state.active_windows.len()));
+        
+        if let Some(ref integration) = self.integration {
+            if let Some(fb_info) = integration.get_framebuffer_info() {
+                info.push_str(&format!("{}\n", fb_info));
+            }
+        }
+        
+        info.push_str(&format!("Modo de ventanas: {:?}\n", self.config.window_manager_mode));
+        info.push_str(&format!("Modo de rendimiento: {:?}\n", self.config.performance_mode));
+        
+        info
+    }
+
+    /// Detener COSMIC
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        if !self.state.initialized {
+            return Ok(());
+        }
+
+        // Detener integración
+        if let Some(ref mut integration) = self.integration {
+            integration.shutdown()?;
+        }
+
+        // Limpiar estado
+        self.state.initialized = false;
+        self.state.compositor_running = false;
+        self.state.window_manager_active = false;
+        self.state.active_windows.clear();
+
+        Ok(())
     }
 
     /// Obtener estado actual

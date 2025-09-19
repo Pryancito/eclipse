@@ -51,7 +51,6 @@ use crate::drivers::binary_driver_manager::{BinaryDriverManager, BinaryDriverMet
 use crate::ipc::{IpcManager, IpcMessage, DriverType, DriverConfig, DriverCommandType};
 use crate::hotplug::{HotplugManager, UsbDeviceType, UsbHotplugEvent};
 use crate::hotplug::HotplugConfig;
-// Módulos de gráficos removidos temporalmente
 use crate::filesystem::vfs::{init_vfs, get_vfs, get_vfs_statistics, create_demo_filesystem, write_demo_content};
 use crate::filesystem::cache::init_file_cache;
 use crate::filesystem::block::init_block_device;
@@ -72,29 +71,32 @@ fn get_uefi_framebuffer_info(current_fb: &FramebufferDriver) -> (u32, u32, u32, 
     (width, height, pixels_per_scan_line, base_address)
 }
 
-// Esta función ya no se usa - eliminada para seguir el enfoque de Linux
+/// Verificar si una dirección de framebuffer es válida
+fn is_valid_framebuffer_address(address: u64) -> bool {
+    // Direcciones físicas bajas o direcciones mapeadas de video
+    address < 0x100000000 || (address >= 0x10000000 && address < 0x60000000)
+}
 
 /// Probar escritura en framebuffer
 fn test_framebuffer_write(fb: &mut FramebufferDriver) -> bool {
     if fb.info.base_address == 0 || fb.info.width == 0 || fb.info.height == 0 {
-        // Parámetros inválidos
         return false;
     }
     
-    // Si el driver no está inicializado, asumir que funciona (para nuevas direcciones mapeadas)
+    // Si el driver no está inicializado, verificar que la dirección esté mapeada
     if !fb.is_initialized() {
-        // Driver no inicializado, asumiendo válido
-        return true;
+        return fb.info.base_address >= 0x10000000 && fb.info.base_address < 0x60000000;
     }
     
+    // Para drivers inicializados, verificar acceso a VRAM
     let bytes_per_pixel = core::cmp::max(1u32, fb.bytes_per_pixel() as u32);
     let ppsl = fb.info.pixels_per_scan_line.max(fb.info.width);
     let x = (fb.info.width / 2).min(ppsl.saturating_sub(1)).min(100);
     let y = (fb.info.height / 2).min(fb.info.height.saturating_sub(1)).min(100);
     let offset_bytes = ((y * ppsl) + x) * bytes_per_pixel;
     
-    // Intentar acceso directo a VRAM solo si la dirección parece válida
-    if fb.info.base_address < 0x100000000 || (fb.info.base_address >= 0x10000000 && fb.info.base_address < 0x60000000) {  // Direcciones físicas bajas o mapeadas
+    // Verificar acceso a VRAM para direcciones válidas
+    if is_valid_framebuffer_address(fb.info.base_address) {
         unsafe {
             let ptr = (fb.info.base_address as *mut u8).add(offset_bytes as usize) as *mut u32;
             let original = core::ptr::read_volatile(ptr);
@@ -102,30 +104,25 @@ fn test_framebuffer_write(fb: &mut FramebufferDriver) -> bool {
             core::ptr::write_volatile(ptr, test_val);
             let read_back = core::ptr::read_volatile(ptr);
             core::ptr::write_volatile(ptr, original);
-            let result = read_back == test_val;
-            // VRAM test completado
-            return result;
+            return read_back == test_val;
         }
     }
     
-    // Para direcciones altas (mapeadas), asumir que funcionan
-    // Dirección alta mapeada, asumiendo válido
     true
 }
 
 /// Verificar que la memoria del framebuffer es válida
 fn verify_framebuffer_memory(fb: &mut FramebufferDriver) -> bool {
     if fb.info.base_address == 0 || fb.info.width == 0 || fb.info.height == 0 {
-        // Parámetros inválidos
         return false;
     }
     
-    // Si el driver no está inicializado, asumir que funciona (para nuevas direcciones mapeadas)
+    // Si el driver no está inicializado, verificar que la dirección esté mapeada
     if !fb.is_initialized() {
-        // Driver no inicializado, asumiendo válido
-        return true;
+        return fb.info.base_address >= 0x10000000 && fb.info.base_address < 0x60000000;
     }
     
+    // Para drivers inicializados, verificar acceso a VRAM en posiciones clave
     let bytes_per_pixel = core::cmp::max(1u32, fb.bytes_per_pixel() as u32);
     let ppsl = fb.info.pixels_per_scan_line.max(fb.info.width);
     let positions = [
@@ -136,8 +133,7 @@ fn verify_framebuffer_memory(fb: &mut FramebufferDriver) -> bool {
         (fb.info.width / 2, fb.info.height / 2),
     ];
     
-    // Verificar VRAM para direcciones físicas bajas o mapeadas
-    if fb.info.base_address < 0x100000000 || (fb.info.base_address >= 0x10000000 && fb.info.base_address < 0x60000000) {
+    if is_valid_framebuffer_address(fb.info.base_address) {
         unsafe {
             for (x, y) in positions {
                 let offset_bytes = ((y * ppsl) + x) * bytes_per_pixel;
@@ -147,7 +143,6 @@ fn verify_framebuffer_memory(fb: &mut FramebufferDriver) -> bool {
         }
     }
     
-    // Verificación completada
     true
 }
 
@@ -330,47 +325,26 @@ fn read_hardware_framebuffer_info(base_address: u64, pci_device: &crate::drivers
 
 /// Función para cambiar la resolución de pantalla de forma segura
 fn change_screen_resolution(fb: &mut FramebufferDriver, updater: &mut FramebufferUpdater, width: u32, height: u32, bits_per_pixel: u32) -> Result<FramebufferDriver, String> {
-    // Validar que la resolución solicitada sea segura
+    // Validar resolución
     if !is_safe_resolution(width, height) {
-        let error_msg = format!("Resolución {}x{} no es segura para el monitor", width, height);
+        let error_msg = format!("Resolución {}x{} no es segura", width, height);
         fb.write_text_kernel(&error_msg, Color::YELLOW);
         return Err(error_msg);
     }
 
-    // Mostrar información de UEFI GOP
-    if updater.is_uefi_gop_available() {
-        fb.write_text_kernel("UEFI GOP: Disponible", Color::GREEN);
-        let gop_info = updater.get_uefi_gop_info();
-        fb.write_text_kernel(&gop_info, Color::LIGHT_GRAY);
-    } else {
-        fb.write_text_kernel("UEFI GOP: No disponible - usando modo simulado", Color::YELLOW);
-    }
-
-    // Mostrar modos disponibles
-    let modes_info = updater.list_available_modes();
-    fb.write_text_kernel("Modos de video disponibles:", Color::CYAN);
-    for line in modes_info.lines().take(5) { // Mostrar solo los primeros 5
-        fb.write_text_kernel(line, Color::LIGHT_GRAY);
-    }
-
-    // Verificar si la resolución es compatible antes de intentar cambiarla
+    // Verificar compatibilidad
     if !updater.is_resolution_supported(width, height, bits_per_pixel) {
         let error_msg = format!("Resolución {}x{} @{}bpp no es compatible", width, height, bits_per_pixel);
         fb.write_text_kernel(&error_msg, Color::YELLOW);
         return Err(error_msg.into());
     }
 
-    // Mostrar advertencia antes del cambio
-    fb.write_text_kernel("ADVERTENCIA: Cambiando resolución...", Color::YELLOW);
-    fb.write_text_kernel("Si el monitor pierde señal, reinicia el sistema", Color::YELLOW);
-
-    // Intentar cambiar la resolución con validación adicional
+    // Cambiar resolución
     match updater.change_resolution(width, height, bits_per_pixel) {
         Ok(mut new_fb) => {
-            fb.write_text_kernel(&format!("Resolución cambiada exitosamente a {}x{} @{}bpp", width, height, bits_per_pixel), Color::GREEN);
-            fb.write_text_kernel("Cambio de resolución completado", Color::GREEN);
+            fb.write_text_kernel(&format!("Resolución cambiada a {}x{} @{}bpp", width, height, bits_per_pixel), Color::GREEN);
             
-            // CONFIGURAR EL NUEVO FRAMEBUFFER: respetar base del nuevo modo y medir stride
+            // Configurar el nuevo framebuffer
             new_fb.info.width = width;
             new_fb.info.height = height;
             new_fb.info.pixels_per_scan_line = probe_pixels_per_scan_line(
@@ -379,11 +353,13 @@ fn change_screen_resolution(fb: &mut FramebufferDriver, updater: &mut Framebuffe
                 height,
                 bits_per_pixel,
             );
-            // Si el modo no aporta base válida, reutilizar la base anterior del GOP
+            
+            // Usar base anterior si no hay base válida
             if new_fb.info.base_address == 0 {
                 new_fb.info.base_address = fb.info.base_address;
             }
-            // Conservar formato/máscaras existentes si vienen válidos; si no, mantener los actuales
+            
+            // Conservar formato si no está definido
             if new_fb.info.pixel_format == 0 {
                 new_fb.info.pixel_format = fb.info.pixel_format;
                 new_fb.info.red_mask = fb.info.red_mask;
@@ -397,40 +373,45 @@ fn change_screen_resolution(fb: &mut FramebufferDriver, updater: &mut Framebuffe
         Err(error) => {
             let error_msg = format!("Error cambiando resolución: {}", error);
             fb.write_text_kernel(&error_msg, Color::RED);
-            fb.write_text_kernel("Manteniendo resolución actual", Color::YELLOW);
             Err(error_msg.into())
         }
     }
 }
 
-/// Intentar deducir pixels_per_scan_line a partir de la dirección del framebuffer
+/// Calcular pixels_per_scan_line para el framebuffer
 fn probe_pixels_per_scan_line(base_address: u64, width: u32, height: u32, bits_per_pixel: u32) -> u32 {
     if base_address == 0 || width == 0 || height == 0 {
         return width.max(1);
     }
+    
     let bytes_per_pixel = core::cmp::max(1, (bits_per_pixel / 8)) as u32;
-    // Heurística segura para QEMU/Bochs y GOP simple: stride = width
-    // Si en el futuro diferenciamos GPU, podremos ampliar esta sonda.
     let candidate_ppsl = width;
-    // Validación mínima: escribir/leer dos posiciones separadas una línea usando candidate_ppsl
-    unsafe {
-        let fb_ptr = base_address as *mut u32;
-        // Posiciones: (0,0) y (0,1)
-        let off0 = 0;
-        let off1 = (candidate_ppsl) * bytes_per_pixel;
-        let p0 = fb_ptr.add(off0 as usize / 4);
-        let p1 = fb_ptr.add(off1 as usize / 4);
-        let orig0 = core::ptr::read_volatile(p0);
-        let orig1 = core::ptr::read_volatile(p1);
-        core::ptr::write_volatile(p0, 0x11223344);
-        core::ptr::write_volatile(p1, 0x55667788);
-        let ok = core::ptr::read_volatile(p0) == 0x11223344 && core::ptr::read_volatile(p1) == 0x55667788;
-        // Restaurar
-        core::ptr::write_volatile(p0, orig0);
-        core::ptr::write_volatile(p1, orig1);
-        if ok { return candidate_ppsl; }
+    
+    // Verificar que el stride funciona escribiendo en dos líneas diferentes
+    if is_valid_framebuffer_address(base_address) {
+        unsafe {
+            let fb_ptr = base_address as *mut u32;
+            let off0 = 0;
+            let off1 = candidate_ppsl * bytes_per_pixel;
+            let p0 = fb_ptr.add(off0 as usize / 4);
+            let p1 = fb_ptr.add(off1 as usize / 4);
+            
+            let orig0 = core::ptr::read_volatile(p0);
+            let orig1 = core::ptr::read_volatile(p1);
+            core::ptr::write_volatile(p0, 0x11223344);
+            core::ptr::write_volatile(p1, 0x55667788);
+            
+            let ok = core::ptr::read_volatile(p0) == 0x11223344 && 
+                     core::ptr::read_volatile(p1) == 0x55667788;
+            
+            // Restaurar valores originales
+            core::ptr::write_volatile(p0, orig0);
+            core::ptr::write_volatile(p1, orig1);
+            
+            if ok { return candidate_ppsl; }
+        }
     }
-    // Fallback: width
+    
     width
 }
 
@@ -605,36 +586,8 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
         fb.write_text_kernel("Error inicializando gestor de resolución", Color::RED);
         fb.write_text_kernel("Manteniendo resolución UEFI original", Color::LIGHT_GRAY);
     }
-    loop {}
-    // ========================================
-    // FASE 1: BOOTLOADER UEFI/GOP
-    // ========================================
-    // El framebuffer 'fb' viene del bootloader con UEFI/GOP
-    // Mostrar información del framebuffer GOP inicial
-    let fb_initialized = fb.is_initialized();
-    let fb_width = fb.info.width;
-    let fb_height = fb.info.height;
-    let fb_base = fb.info.base_address;
-    
-    if fb_initialized {
-        fb.clear_screen(Color::BLACK);
-        fb.write_text_kernel("=== FASE 1: BOOTLOADER UEFI/GOP ===", Color::CYAN);
-        fb.write_text_kernel("Framebuffer GOP inicializado", Color::GREEN);
-        let gop_info = format!("GOP: {}x{} @0x{:X}", fb_width, fb_height, fb_base);
-        fb.write_text_kernel(&gop_info, Color::LIGHT_GRAY);
-    } else {
-        panic!("Framebuffer GOP no inicializado - base: 0x{:x}, width: {}, height: {}", 
-               fb_base, fb_width, fb_height);
-    }
-    
-    // ========================================
-    // FASE 2: DETECCIÓN DE HARDWARE
-    // ========================================
-    fb.write_text_kernel("=== FASE 2: DETECCIÓN DE HARDWARE ===", Color::YELLOW);
+
     fb.write_text_kernel("Detectando hardware gráfico...", Color::WHITE);
-    
-    // Detección de hardware
-    let hw_result = detect_graphics_hardware();
 
     // Mostrar resultado de detección
     match hw_result.graphics_mode {
@@ -652,7 +605,6 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
     // ========================================
     // FASE 3: TRANSICIÓN A HARDWARE DETECTADO
     // ========================================
-    fb.write_text_kernel("=== FASE 3: TRANSICIÓN A HARDWARE ===", Color::MAGENTA);
     fb.write_text_kernel("Inicializando framebuffer del hardware...", Color::WHITE);
     
     // Inicializar sistema de gráficos para el hardware detectado
@@ -1214,7 +1166,6 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
         }
     }
     
-    // Sistema de gráficos avanzado temporalmente deshabilitado
     fb.write_text_kernel("[6/7] Sistema de gráficos avanzado deshabilitado temporalmente", Color::YELLOW);
     
     // Inicializar sistema de hot-plug USB (mismo flujo en QEMU y hardware real)
@@ -1271,67 +1222,7 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
     fb.write_text_kernel("[3/5] Modo grafico: ", Color::WHITE);
     fb.write_text_kernel(modo_str, color_modo);
 
-    // Sistema de fallback GPU: UEFI/GOP -> GPU hardware real
-    fb.write_text_kernel("[3/5] Inicializando sistema de fallback GPU...", Color::CYAN);
     
-    // Debug: Mostrar estado del framebuffer antes de la inicialización
-    if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
-        let fb_debug = format!("FB inicial: {}x{} @0x{:X}", info.width, info.height, info.base_address);
-        fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
-    }
-    
-    match crate::gpu_fallback::init_gpu_fallback() {
-        Ok(_) => {
-            fb.write_text_kernel("Sistema de fallback GPU inicializado", Color::GREEN);
-            
-            // Mostrar información del backend activo
-            if let Some(backend_info) = crate::gpu_fallback::get_active_backend_info() {
-                fb.write_text_kernel(backend_info.as_str(), Color::GREEN);
-            } else {
-                fb.write_text_kernel("No se pudo obtener información del backend activo", Color::YELLOW);
-            }
-            
-            // Mostrar estadísticas del sistema de fallback
-            let stats = crate::gpu_fallback::get_fallback_stats();
-            fb.write_text_kernel(&stats, Color::LIGHT_GRAY);
-            
-            // Indicar si estamos usando hardware real
-            if crate::gpu_fallback::is_using_real_hardware() {
-                fb.write_text_kernel("✓ Usando GPU hardware real", Color::GREEN);
-                
-                // IMPORTANTE: Actualizar la variable fb con el framebuffer actualizado
-                // después del fallback a hardware real
-                if let Some(updated_fb) = crate::drivers::framebuffer::get_framebuffer() {
-                    // Actualizar la referencia del framebuffer
-                    *fb = unsafe { core::ptr::read(updated_fb) };
-                    fb.write_text_kernel("Framebuffer actualizado para hardware real", Color::GREEN);
-                }
-            } else {
-                fb.write_text_kernel("⚠ Usando framebuffer UEFI/GOP (fallback)", Color::YELLOW);
-            }
-            
-            // Debug: Mostrar estado del framebuffer después de la inicialización
-            if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
-                let fb_debug = format!("FB final: {}x{} @0x{:X}", info.width, info.height, info.base_address);
-                fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
-            }
-            
-        }
-        Err(e) => {
-            fb.write_text_kernel(&format!("Error inicializando fallback GPU: {}", e), Color::RED);
-            fb.write_text_kernel("Usando framebuffer UEFI/GOP por defecto", Color::YELLOW);
-            
-            // Debug: Mostrar información de error detallada
-            fb.write_text_kernel("Debug: Verificando estado del framebuffer...", Color::CYAN);
-            if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
-                let fb_debug = format!("FB disponible: {}x{} @0x{:X}", info.width, info.height, info.base_address);
-                fb.write_text_kernel(&fb_debug, Color::LIGHT_GRAY);
-            } else {
-                fb.write_text_kernel("FB no disponible - usando modo de emergencia", Color::RED);
-            }
-        }
-    }
-
     // Mostrar breve info de framebuffer si está disponible
     if let Some(info) = crate::uefi_framebuffer::get_framebuffer_status().driver_info {
         let dims = format!("FB {}x{} @{}", info.width, info.height, info.pixels_per_scan_line);

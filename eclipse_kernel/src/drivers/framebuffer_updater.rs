@@ -27,24 +27,18 @@ impl FramebufferUpdater {
 
     /// Mapear memoria para el framebuffer
     fn map_framebuffer_memory(&self, size: usize) -> Result<u64, String> {
-        // Usar una región de memoria conocida que funcione en QEMU
-        // Estas direcciones están en el rango de memoria de video mapeada
-        
-        let base_addresses = [
-            0x10000000,  // Región de memoria de video 1 (256MB)
-            0x20000000,  // Región de memoria de video 2 (512MB)
-            0x30000000,  // Región de memoria de video 3 (768MB)
-            0x40000000,  // Región de memoria de video 4 (1GB)
-            0x50000000,  // Región de memoria de video 5 (1.25GB)
+        // Regiones de memoria de video disponibles en QEMU
+        const VIDEO_MEMORY_REGIONS: [u64; 5] = [
+            0x10000000,  // 256MB
+            0x20000000,  // 512MB
+            0x30000000,  // 768MB
+            0x40000000,  // 1GB
+            0x50000000,  // 1.25GB
         ];
         
-        for &base in &base_addresses {
-            // Verificar que la región sea lo suficientemente grande
-            if self.is_memory_region_suitable(base, size) {
-                // Mapear la región de memoria
-                if self.map_memory_region(base, size) {
-                    return Ok(base);
-                }
+        for &base in &VIDEO_MEMORY_REGIONS {
+            if self.is_memory_region_suitable(base, size) && self.map_memory_region(base, size) {
+                return Ok(base);
             }
         }
         
@@ -53,26 +47,18 @@ impl FramebufferUpdater {
 
     /// Verificar si una región de memoria es adecuada para el framebuffer
     fn is_memory_region_suitable(&self, base: u64, size: usize) -> bool {
-        // Verificar que la región esté en el rango de memoria de video
-        // y que sea lo suficientemente grande
+        // Verificar que esté en el rango de memoria de video y sea lo suficientemente grande
         base >= 0x10000000 && base < 0x60000000 && size <= 0x10000000
     }
     
-    /// Mapear una región de memoria específica
-    fn map_memory_region(&self, base: u64, size: usize) -> bool {
-        // En un kernel real, aquí mapearíamos la memoria física a virtual
-        // Para QEMU, asumimos que estas regiones están disponibles
-        // y son accesibles para el framebuffer
-        
-        // Verificar que podemos acceder a la región
+    /// Verificar que una región de memoria es accesible
+    fn map_memory_region(&self, base: u64, _size: usize) -> bool {
+        // Verificar acceso a la región escribiendo y leyendo un byte
         unsafe {
             let ptr = base as *mut u8;
-            // Intentar escribir y leer un byte para verificar que la región es accesible
             let test_value = 0xAA;
             core::ptr::write_volatile(ptr, test_value);
             let read_value = core::ptr::read_volatile(ptr);
-            
-            // Si podemos leer y escribir, la región está mapeada
             read_value == test_value
         }
     }

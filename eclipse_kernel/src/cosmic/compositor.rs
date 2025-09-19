@@ -241,23 +241,26 @@ impl CosmicCompositor {
         Ok(())
     }
 
-    /// Renderizar frame completo
+    /// Renderizar frame completo con efectos avanzados
     pub fn render_frame(&mut self) -> Result<(), String> {
         if !self.initialized {
             return Err("Compositor no inicializado".to_string());
         }
 
-        // Limpiar pantalla (simulado para WaylandRenderer)
-        // En una implementación real, esto limpiaría el framebuffer
+        // Limpiar pantalla con fondo espacial
+        self.clear_screen_with_space_background()?;
 
         // Ordenar ventanas por Z-order
         self.active_windows.sort_by_key(|w| w.z_order);
 
-        // Renderizar ventanas visibles
+        // Renderizar ventanas visibles con efectos
         let window_count = self.active_windows.len();
         for i in 0..window_count {
             let window = &self.active_windows[i];
             if window.visible && window.needs_redraw {
+                // Aplicar efectos de ventana (sombra, transparencia, etc.)
+                self.apply_window_effects(window)?;
+                
                 // Crear una copia de la ventana para evitar problemas de préstamo
                 let window_copy = CompositorWindow {
                     id: window.id,
@@ -274,6 +277,9 @@ impl CosmicCompositor {
             }
         }
 
+        // Renderizar efectos de compositor (partículas, animaciones)
+        self.render_compositor_effects()?;
+
         // Presentar frame
         self.present_frame()?;
 
@@ -286,6 +292,108 @@ impl CosmicCompositor {
     /// Limpiar pantalla
     fn clear_screen(&mut self) -> Result<(), String> {
         // Simulado - en una implementación real limpiaríamos el framebuffer
+        Ok(())
+    }
+
+    /// Limpiar pantalla con fondo espacial
+    fn clear_screen_with_space_background(&mut self) -> Result<(), String> {
+        if let Some(ref mut fb) = self.framebuffer {
+            // Crear gradiente espacial
+            let width = fb.info.width;
+            let height = fb.info.height;
+            
+            for y in 0..height {
+                for x in 0..width {
+                    // Gradiente de azul oscuro a negro
+                    let intensity = (y as f32 / height as f32) * 0.3 + 0.1;
+                    let r = (intensity * 0.1 * 255.0) as u8;
+                    let g = (intensity * 0.2 * 255.0) as u8;
+                    let b = (intensity * 0.4 * 255.0) as u8;
+                    
+                    let color = (b as u32) | ((g as u32) << 8) | ((r as u32) << 16) | (0xFF << 24);
+                    fb.set_pixel(x, y, color);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aplicar efectos de ventana
+    fn apply_window_effects(&mut self, window: &CompositorWindow) -> Result<(), String> {
+        // Aplicar sombra a la ventana
+        self.render_window_shadow(window)?;
+        
+        // Aplicar transparencia si está habilitada
+        if self.window_manager_mode == WindowManagerMode::Hybrid {
+            self.apply_window_transparency(window)?;
+        }
+        
+        Ok(())
+    }
+
+    /// Renderizar sombra de ventana
+    fn render_window_shadow(&mut self, window: &CompositorWindow) -> Result<(), String> {
+        if let Some(ref mut fb) = self.framebuffer {
+            let shadow_offset = 3;
+            let shadow_size = 8;
+            
+            // Renderizar sombra gradual
+            for dy in 0..shadow_size {
+                for dx in 0..shadow_size {
+                    let shadow_x = window.x + shadow_offset + dx as i32;
+                    let shadow_y = window.y + shadow_offset + dy as i32;
+                    
+                    if shadow_x >= 0 && shadow_y >= 0 && 
+                       shadow_x < fb.info.width as i32 && shadow_y < fb.info.height as i32 {
+                        let alpha = (255 - (dy + dx) * 32).min(255) as u8;
+                        let shadow_color = (0x00 << 24) | (0x00 << 16) | (0x00 << 8) | alpha as u32;
+                        fb.set_pixel(shadow_x as u32, shadow_y as u32, shadow_color);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aplicar transparencia a ventana
+    fn apply_window_transparency(&mut self, window: &CompositorWindow) -> Result<(), String> {
+        // Simular transparencia mezclando con fondo
+        // En una implementación real, esto se haría en el shader
+        Ok(())
+    }
+
+    /// Renderizar efectos de compositor
+    fn render_compositor_effects(&mut self) -> Result<(), String> {
+        // Renderizar partículas espaciales
+        self.render_space_particles()?;
+        
+        // Renderizar efectos de transición
+        self.render_transition_effects()?;
+        
+        Ok(())
+    }
+
+    /// Renderizar partículas espaciales
+    fn render_space_particles(&mut self) -> Result<(), String> {
+        if let Some(ref mut fb) = self.framebuffer {
+            // Simular partículas estelares
+            let particle_count = 50;
+            for i in 0..particle_count {
+                let x = (i * 17 + (self.performance_stats.frame_rate as u32 * 2)) % fb.info.width;
+                let y = (i * 23 + (self.performance_stats.frame_rate as u32 * 3)) % fb.info.height;
+                
+                let brightness = ((i * 5) % 255) as u8;
+                let particle_color = (brightness << 24) | (brightness << 16) | (brightness << 8) | 0xFF;
+                fb.set_pixel(x, y, particle_color);
+            }
+        }
+        Ok(())
+    }
+
+    /// Renderizar efectos de transición
+    fn render_transition_effects(&mut self) -> Result<(), String> {
+        // Efectos de transición entre ventanas
+        // En una implementación real, esto manejaría animaciones
         Ok(())
     }
 
