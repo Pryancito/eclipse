@@ -269,28 +269,94 @@ impl WindowCompositor {
     /// Renderizar una ventana individual
     fn render_window(&mut self, window_id: WindowId) -> Result<(), &'static str> {
         if let Some(render_info) = self.window_buffers.get_mut(&window_id) {
-            // Limpiar buffer de la ventana
-            render_info.buffer.clear(Color::WHITE);
+            // Limpiar buffer de la ventana con color de fondo
+            render_info.buffer.clear(Color::LIGHT_GRAY);
+            
+            // Dibujar barra de título
+            let title_bar_height = 30;
+            let title_bar_rect = Rectangle::new(0, 0, render_info.geometry.width, title_bar_height);
+            render_info.buffer.draw_rect(title_bar_rect, Color::DARK_GRAY);
             
             // Dibujar bordes de la ventana
-            let border_color = Color::GRAY;
-            let border_rect = Rectangle::new(0, 0, render_info.geometry.width, 1);
+            let border_color = Color::BLACK;
+            let border_width = 2;
+            
+            // Borde superior
+            let border_rect = Rectangle::new(0, 0, render_info.geometry.width, border_width);
             render_info.buffer.draw_rect(border_rect, border_color);
             
-            let border_rect = Rectangle::new(0, 0, 1, render_info.geometry.height);
+            // Borde izquierdo
+            let border_rect = Rectangle::new(0, 0, border_width, render_info.geometry.height);
             render_info.buffer.draw_rect(border_rect, border_color);
             
-            let border_rect = Rectangle::new((render_info.geometry.width - 1) as i32, 0, 1, render_info.geometry.height);
+            // Borde derecho
+            let border_rect = Rectangle::new((render_info.geometry.width - border_width) as i32, 0, border_width, render_info.geometry.height);
             render_info.buffer.draw_rect(border_rect, border_color);
             
-            let border_rect = Rectangle::new(0, (render_info.geometry.height - 1) as i32, render_info.geometry.width, 1);
+            // Borde inferior
+            let border_rect = Rectangle::new(0, (render_info.geometry.height - border_width) as i32, render_info.geometry.width, border_width);
             render_info.buffer.draw_rect(border_rect, border_color);
+            
+            // Dibujar botones de la barra de título (simplificados)
+            let button_size = 20;
+            let button_y = 5;
+            let button_spacing = 25;
+            
+            // Botón cerrar (rojo)
+            let close_rect = Rectangle::new((render_info.geometry.width - button_spacing) as i32, button_y, button_size, button_size);
+            render_info.buffer.draw_rect(close_rect, Color::RED);
+            
+            // Botón minimizar (amarillo)
+            let minimize_rect = Rectangle::new((render_info.geometry.width - button_spacing * 2) as i32, button_y, button_size, button_size);
+            render_info.buffer.draw_rect(minimize_rect, Color::YELLOW);
+            
+            // Botón maximizar (verde)
+            let maximize_rect = Rectangle::new((render_info.geometry.width - button_spacing * 3) as i32, button_y, button_size, button_size);
+            render_info.buffer.draw_rect(maximize_rect, Color::GREEN);
+            
+            // Dibujar contenido de la ventana (área de trabajo)
+            let content_rect = Rectangle::new(
+                border_width as i32, 
+                (title_bar_height + border_width) as i32, 
+                render_info.geometry.width - (border_width * 2), 
+                render_info.geometry.height - (title_bar_height + border_width * 2)
+            );
+            render_info.buffer.draw_rect(content_rect, Color::WHITE);
+            
+            // Dibujar patrón de cuadros en el área de contenido
+            Self::draw_window_content_pattern_static(&mut render_info.buffer, content_rect);
             
             // Marcar como no necesita redibujado
             render_info.needs_redraw = false;
         }
         
         Ok(())
+    }
+    
+    /// Dibujar patrón de contenido en la ventana
+    fn draw_window_content_pattern(&self, buffer: &mut CompositionBuffer, rect: Rectangle) {
+        Self::draw_window_content_pattern_static(buffer, rect);
+    }
+    
+    fn draw_window_content_pattern_static(buffer: &mut CompositionBuffer, rect: Rectangle) {
+        let pattern_size = 20;
+        let mut color_toggle = false;
+        
+        for y in 0..(rect.height / pattern_size) {
+            for x in 0..(rect.width / pattern_size) {
+                let pattern_rect = Rectangle::new(
+                    rect.x + (x * pattern_size) as i32,
+                    rect.y + (y * pattern_size) as i32,
+                    pattern_size,
+                    pattern_size
+                );
+                
+                let color = if color_toggle { Color::LIGHT_GRAY } else { Color::WHITE };
+                buffer.draw_rect(pattern_rect, color);
+                color_toggle = !color_toggle;
+            }
+            color_toggle = !color_toggle; // Alternar filas
+        }
     }
 
     /// Actualizar estadísticas de frame
@@ -316,11 +382,41 @@ impl WindowCompositor {
         // Componer frame si es necesario
         self.compose_frame()?;
         
-        // Copiar buffer principal al framebuffer del sistema
-        for y in 0..self.main_buffer.height {
-            for x in 0..self.main_buffer.width {
+        // Obtener dimensiones del framebuffer del sistema
+        let fb_width = framebuffer.info.width;
+        let fb_height = framebuffer.info.height;
+        
+        // Ajustar resolución del compositor si es necesario
+        if self.main_buffer.width != fb_width || self.main_buffer.height != fb_height {
+            self.set_resolution(fb_width, fb_height)?;
+            self.compose_frame()?; // Re-componer con nueva resolución
+        }
+        
+        // Copiar buffer principal al framebuffer del sistema de manera eficiente
+        let min_width = core::cmp::min(self.main_buffer.width, fb_width);
+        let min_height = core::cmp::min(self.main_buffer.height, fb_height);
+        
+        for y in 0..min_height {
+            for x in 0..min_width {
                 if let Some(color) = self.main_buffer.get_pixel(x as i32, y as i32) {
                     framebuffer.put_pixel(x, y, color);
+                }
+            }
+        }
+        
+        // Rellenar el resto del framebuffer con negro si es necesario
+        if fb_width > self.main_buffer.width {
+            for y in 0..min_height {
+                for x in self.main_buffer.width..fb_width {
+                    framebuffer.put_pixel(x, y, Color::BLACK);
+                }
+            }
+        }
+        
+        if fb_height > self.main_buffer.height {
+            for y in self.main_buffer.height..fb_height {
+                for x in 0..fb_width {
+                    framebuffer.put_pixel(x, y, Color::BLACK);
                 }
             }
         }
@@ -351,6 +447,11 @@ impl WindowCompositor {
     /// Obtener número de ventanas registradas
     pub fn get_window_count(&self) -> usize {
         self.window_buffers.len()
+    }
+
+    /// Obtener orden de las ventanas
+    pub fn get_window_order(&self) -> &Vec<WindowId> {
+        &self.z_order
     }
 
     /// Obtener estadísticas del compositor

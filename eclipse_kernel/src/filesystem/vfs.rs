@@ -62,6 +62,12 @@ impl VfsError {
     }
 }
 
+impl core::fmt::Display for VfsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl From<&str> for VfsError {
     fn from(_s: &str) -> Self {
         VfsError::SystemError
@@ -164,8 +170,32 @@ impl Vfs {
     pub fn read(&mut self, handle: u32, buffer: &mut [u8]) -> VfsResult<usize> {
         let file_handle = self.get_file_handle(handle)?;
         
-        // Implementación simplificada - no lee datos reales
-        Ok(0)
+        // Verificar permisos de lectura
+        if file_handle.mode & 0x3 == 1 { // Solo escritura
+            return Err(VfsError::PermissionDenied);
+        }
+        
+        // Obtener inodo
+        let inode = self.get_inode(file_handle.inode)?;
+        
+        // Verificar que no exceda el tamaño del archivo
+        if file_handle.position >= inode.size {
+            return Ok(0); // EOF
+        }
+        
+        // Calcular cuántos bytes leer
+        let remaining = inode.size - file_handle.position;
+        let to_read = buffer.len().min(remaining as usize);
+        
+        // Leer datos del cache o disco
+        let bytes_read = self.read_inode_data(file_handle.inode, file_handle.position, &mut buffer[..to_read])?;
+        
+        // Actualizar posición
+        if let Some(ref mut handle) = self.open_files[handle as usize] {
+            handle.position += bytes_read as u64;
+        }
+        
+        Ok(bytes_read)
     }
 
     /// Escribir a un archivo
@@ -173,12 +203,36 @@ impl Vfs {
         let file_handle = self.get_file_handle(handle)?;
         
         // Verificar modo de escritura
-        if file_handle.mode & 0x3 == 0 {
+        if file_handle.mode & 0x3 == 0 { // Solo lectura
             return Err(VfsError::PermissionDenied);
         }
-
-        // Implementación simplificada - no escribe datos reales
-        Ok(buffer.len())
+        
+        // Guardar valores necesarios antes del borrow mutable
+        let inode_num = file_handle.inode;
+        let position = file_handle.position;
+        
+        // Escribir datos al cache o disco
+        let bytes_written = self.write_inode_data(inode_num, position, buffer)?;
+        
+        // Actualizar tamaño del archivo si es necesario
+        let new_position = position + bytes_written as u64;
+        
+        // Obtener inodo y actualizar tamaño si es necesario
+        let mut inode = self.get_inode(inode_num)?;
+        if new_position > inode.size {
+            inode.set_size(new_position);
+            self.update_inode(inode_num, &inode)?;
+        }
+        
+        // Actualizar posición
+        if let Some(ref mut handle) = self.open_files[handle as usize] {
+            handle.position = new_position;
+        }
+        
+        // Marcar sistema de archivos como sucio
+        self.superblock.mark_dirty();
+        
+        Ok(bytes_written)
     }
 
     /// Crear un archivo
@@ -301,6 +355,137 @@ impl Vfs {
     pub fn get_filesystem_info(&self) -> FileSystemInfo {
         FileSystemInfo::new()
     }
+    
+    /// Obtener inodo por número
+    fn get_inode(&self, inode_num: u32) -> VfsResult<crate::filesystem::inode::Inode> {
+        // Implementación simplificada - crear inodo básico
+        if inode_num == 1 {
+            Ok(crate::filesystem::inode::Inode::new_directory())
+        } else {
+            Ok(crate::filesystem::inode::Inode::new_file())
+        }
+    }
+    
+    /// Actualizar inodo
+    fn update_inode(&mut self, _inode_num: u32, _inode: &crate::filesystem::inode::Inode) -> VfsResult<()> {
+        // Implementación simplificada
+        Ok(())
+    }
+    
+    /// Leer datos de un inodo
+    fn read_inode_data(&mut self, inode_num: u32, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
+        // Intentar leer del cache de archivos primero
+        if let Some(cache) = crate::filesystem::cache::get_file_cache() {
+            if let Some(cache_entry) = cache.get(inode_num) {
+                let start = offset as usize;
+                let end = (start + buffer.len()).min(cache_entry.data.len());
+                if start < cache_entry.data.len() {
+                    let len = end - start;
+                    buffer[..len].copy_from_slice(&cache_entry.data[start..end]);
+                    return Ok(len);
+                }
+            }
+        }
+        
+        // Si no está en cache de archivos, leer del sistema de bloques
+        if let Some(block_cache) = crate::filesystem::block::get_block_cache() {
+            // Calcular bloque inicial
+            let block_size = crate::filesystem::BLOCK_SIZE as u64;
+            let start_block = offset / block_size;
+            let block_offset = (offset % block_size) as usize;
+            
+            // Leer bloques necesarios
+            let mut bytes_read = 0;
+            let mut remaining = buffer.len();
+            let mut current_offset = block_offset;
+            let mut current_block = start_block;
+            
+            while remaining > 0 && bytes_read < buffer.len() {
+                match block_cache.get_or_load_block(current_block) {
+                    Ok(block_data) => {
+                        let available = block_data.len() - current_offset;
+                        let to_copy = remaining.min(available);
+                        
+                        buffer[bytes_read..bytes_read + to_copy]
+                            .copy_from_slice(&block_data[current_offset..current_offset + to_copy]);
+                        
+                        bytes_read += to_copy;
+                        remaining -= to_copy;
+                        current_offset = 0;
+                        current_block += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            
+            Ok(bytes_read)
+        } else {
+            // Fallback: datos de ejemplo
+            let data = b"Eclipse OS File System - Archivo de ejemplo\n";
+            let start = offset as usize;
+            let end = (start + buffer.len()).min(data.len());
+            if start < data.len() {
+                let len = end - start;
+                buffer[..len].copy_from_slice(&data[start..end]);
+                Ok(len)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+    
+    /// Escribir datos a un inodo
+    fn write_inode_data(&mut self, inode_num: u32, offset: u64, data: &[u8]) -> VfsResult<usize> {
+        // Escribir al cache de archivos
+        if let Some(cache) = crate::filesystem::cache::get_file_cache() {
+            let cache_entry = cache.put(inode_num);
+            let start = offset as usize;
+            let end = (start + data.len()).min(cache_entry.data.len());
+            if start < cache_entry.data.len() {
+                let len = end - start;
+                cache_entry.data[start..end].copy_from_slice(&data[..len]);
+                cache_entry.dirty = true;
+            }
+        }
+        
+        // También escribir al sistema de bloques
+        if let Some(block_cache) = crate::filesystem::block::get_block_cache() {
+            let block_size = crate::filesystem::BLOCK_SIZE as u64;
+            let start_block = offset / block_size;
+            let block_offset = (offset % block_size) as usize;
+            
+            let mut bytes_written = 0;
+            let mut remaining = data.len();
+            let mut current_offset = block_offset;
+            let mut current_block = start_block;
+            
+            while remaining > 0 && bytes_written < data.len() {
+                match block_cache.get_or_load_block(current_block) {
+                    Ok(block_data) => {
+                        let available = block_data.len() - current_offset;
+                        let to_write = remaining.min(available);
+                        
+                        block_data[current_offset..current_offset + to_write]
+                            .copy_from_slice(&data[bytes_written..bytes_written + to_write]);
+                        
+                        // Marcar bloque como sucio
+                        block_cache.mark_dirty(current_block);
+                        
+                        bytes_written += to_write;
+                        remaining -= to_write;
+                        current_offset = 0;
+                        current_block += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            
+            Ok(bytes_written)
+        } else {
+            // Fallback: solo retornar el tamaño
+            Ok(data.len())
+        }
+    }
 }
 
 // Instancia global del VFS
@@ -333,6 +518,70 @@ pub fn get_vfs_statistics() -> (usize, usize, usize, usize) {
             (total_mounts, mounted_fs, open_files, total_files)
         } else {
             (0, 0, 0, 0)
+        }
+    }
+}
+
+/// Crear sistema de archivos de demostración
+pub fn create_demo_filesystem() -> VfsResult<()> {
+    unsafe {
+        if let Some(ref mut vfs) = VFS_INSTANCE {
+            // Crear directorio raíz con algunos archivos de ejemplo
+            let mut root_dir = crate::filesystem::directory::Directory::new();
+            
+            // Crear archivo de bienvenida
+            let mut welcome_entry = crate::filesystem::directory::DirectoryEntry::new();
+            welcome_entry.inode = 2;
+            welcome_entry.set_name("welcome.txt");
+            welcome_entry.entry_type = crate::filesystem::INODE_TYPE_FILE as u8;
+            root_dir.add_entry(welcome_entry);
+            
+            // Crear directorio de sistema
+            let mut system_entry = crate::filesystem::directory::DirectoryEntry::new();
+            system_entry.inode = 3;
+            system_entry.set_name("system");
+            system_entry.entry_type = crate::filesystem::INODE_TYPE_DIR as u8;
+            root_dir.add_entry(system_entry);
+            
+            // Crear archivo de configuración
+            let mut config_entry = crate::filesystem::directory::DirectoryEntry::new();
+            config_entry.inode = 4;
+            config_entry.set_name("config.ini");
+            config_entry.entry_type = crate::filesystem::INODE_TYPE_FILE as u8;
+            root_dir.add_entry(config_entry);
+            
+            // Crear directorio de usuarios
+            let mut users_entry = crate::filesystem::directory::DirectoryEntry::new();
+            users_entry.inode = 5;
+            users_entry.set_name("users");
+            users_entry.entry_type = crate::filesystem::INODE_TYPE_DIR as u8;
+            root_dir.add_entry(users_entry);
+            
+            // Crear archivo de log
+            let mut log_entry = crate::filesystem::directory::DirectoryEntry::new();
+            log_entry.inode = 6;
+            log_entry.set_name("system.log");
+            log_entry.entry_type = crate::filesystem::INODE_TYPE_FILE as u8;
+            root_dir.add_entry(log_entry);
+            
+            Ok(())
+        } else {
+            Err(VfsError::SystemError)
+        }
+    }
+}
+
+/// Escribir contenido de demostración a un archivo
+pub fn write_demo_content(inode: u32, content: &[u8]) -> VfsResult<()> {
+    unsafe {
+        if let Some(cache) = crate::filesystem::cache::get_file_cache() {
+            let cache_entry = cache.put(inode);
+            let len = content.len().min(cache_entry.data.len());
+            cache_entry.data[..len].copy_from_slice(&content[..len]);
+            cache_entry.dirty = true;
+            Ok(())
+        } else {
+            Err(VfsError::SystemError)
         }
     }
 }

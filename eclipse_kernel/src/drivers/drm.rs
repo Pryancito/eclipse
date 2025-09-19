@@ -9,6 +9,143 @@ use crate::drivers::framebuffer::{FramebufferDriver, PixelFormat, Color, Framebu
 use crate::desktop_ai::{Point, Rect};
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::collections::BTreeMap;
+
+/// Tipos de shader soportados
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShaderType {
+    ColorAdjust,
+    Blur,
+    Sharpen,
+    EdgeDetection,
+    Grayscale,
+    Sepia,
+    Invert,
+    Brightness,
+    Contrast,
+    Saturation,
+}
+
+/// Parámetros de shader
+#[derive(Debug, Clone)]
+pub struct ShaderParams {
+    pub intensity: f32,
+    pub color: Color,
+    pub matrix: [f32; 9], // Matriz 3x3 para transformaciones
+}
+
+impl Default for ShaderParams {
+    fn default() -> Self {
+        Self {
+            intensity: 1.0,
+            color: Color::WHITE,
+            matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
+/// Modos de blending para compositing
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    SoftLight,
+    HardLight,
+    ColorDodge,
+    ColorBurn,
+    Darken,
+    Lighten,
+    Difference,
+    Exclusion,
+}
+
+/// Matriz de transformación 3x3
+#[derive(Debug, Clone, Copy)]
+pub struct TransformMatrix {
+    pub m: [f32; 9],
+}
+
+impl Default for TransformMatrix {
+    fn default() -> Self {
+        Self {
+            m: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
+impl TransformMatrix {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn translate(x: f32, y: f32) -> Self {
+        Self {
+            m: [1.0, 0.0, x, 0.0, 1.0, y, 0.0, 0.0, 1.0],
+        }
+    }
+    
+    pub fn scale(sx: f32, sy: f32) -> Self {
+        Self {
+            m: [sx, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+    
+    pub fn rotate(angle: f32) -> Self {
+        // Implementación simple de cos y sin para no_std
+        let cos_a = Self::simple_cos(angle);
+        let sin_a = Self::simple_sin(angle);
+        Self {
+            m: [cos_a, -sin_a, 0.0, sin_a, cos_a, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+    
+    /// Implementación simple de cos para no_std
+    fn simple_cos(angle: f32) -> f32 {
+        // Aproximación simple usando serie de Taylor
+        let x = angle % (2.0 * 3.14159265359);
+        let x2 = x * x;
+        let x4 = x2 * x2;
+        let x6 = x4 * x2;
+        1.0 - x2/2.0 + x4/24.0 - x6/720.0
+    }
+    
+    /// Implementación simple de sin para no_std
+    fn simple_sin(angle: f32) -> f32 {
+        // Aproximación simple usando serie de Taylor
+        let x = angle % (2.0 * 3.14159265359);
+        let x2 = x * x;
+        let x3 = x2 * x;
+        let x5 = x3 * x2;
+        let x7 = x5 * x2;
+        x - x3/6.0 + x5/120.0 - x7/5040.0
+    }
+}
+
+/// Textura GPU
+#[derive(Debug, Clone)]
+pub struct GpuTexture {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub data: Vec<u8>,
+    pub gpu_handle: Option<u32>, // Handle del GPU
+}
+
+/// Capa de compositing
+#[derive(Debug, Clone)]
+pub struct CompositingLayer {
+    pub id: u32,
+    pub texture_id: Option<u32>,
+    pub rect: Rect,
+    pub blend_mode: BlendMode,
+    pub alpha: f32,
+    pub transform: TransformMatrix,
+    pub visible: bool,
+    pub z_order: i32,
+}
 
 /// Estados del driver DRM
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,6 +181,18 @@ pub enum DrmOperation {
     FlipBuffer,
     EnableVsync,
     DisableVsync,
+    // Nuevas operaciones aceleradas
+    ScrollUp { pixels: u32 },
+    ScrollDown { pixels: u32 },
+    ScrollLeft { pixels: u32 },
+    ScrollRight { pixels: u32 },
+    LoadTexture { id: u32, data: Vec<u8>, width: u32, height: u32 },
+    DrawTexture { texture_id: u32, src_rect: Rect, dst_rect: Rect },
+    ApplyShader { shader_type: ShaderType, params: ShaderParams },
+    CompositeLayer { layer_id: u32, blend_mode: BlendMode, alpha: f32 },
+    Transform { matrix: TransformMatrix },
+    EnableHardwareAcceleration,
+    DisableHardwareAcceleration,
 }
 
 /// Driver DRM del kernel
@@ -55,6 +204,13 @@ pub struct DrmDriver {
     pub current_mode: (u32, u32),
     pub is_double_buffering: bool,
     pub is_vsync_enabled: bool,
+    // Nuevas capacidades avanzadas
+    pub textures: BTreeMap<u32, GpuTexture>,
+    pub layers: BTreeMap<u32, CompositingLayer>,
+    pub hardware_acceleration_enabled: bool,
+    pub next_texture_id: u32,
+    pub next_layer_id: u32,
+    pub performance_stats: DrmPerformanceStats,
 }
 
 impl DrmDriver {
@@ -76,6 +232,22 @@ impl DrmDriver {
             current_mode: (1920, 1080),
             is_double_buffering: false,
             is_vsync_enabled: false,
+            // Inicializar nuevas capacidades
+            textures: BTreeMap::new(),
+            layers: BTreeMap::new(),
+            hardware_acceleration_enabled: false,
+            next_texture_id: 1,
+            next_layer_id: 1,
+            performance_stats: DrmPerformanceStats {
+                frames_rendered: 0,
+                scroll_operations: 0,
+                texture_operations: 0,
+                composite_operations: 0,
+                average_frame_time: 0.0,
+                average_scroll_time: 0.0,
+                gpu_memory_used: 0,
+                cpu_usage_percent: 0.0,
+            },
         }
     }
 
@@ -185,6 +357,40 @@ impl DrmDriver {
             },
             DrmOperation::DisableVsync => {
                 self.disable_vsync()
+            },
+            // Nuevas operaciones aceleradas
+            DrmOperation::ScrollUp { pixels } => {
+                self.scroll_up_drm(pixels)
+            },
+            DrmOperation::ScrollDown { pixels } => {
+                self.scroll_down_drm(pixels)
+            },
+            DrmOperation::ScrollLeft { pixels } => {
+                self.scroll_left_drm(pixels)
+            },
+            DrmOperation::ScrollRight { pixels } => {
+                self.scroll_right_drm(pixels)
+            },
+            DrmOperation::LoadTexture { id, data, width, height } => {
+                self.load_texture(id, data, width, height)
+            },
+            DrmOperation::DrawTexture { texture_id, src_rect, dst_rect } => {
+                self.draw_texture(texture_id, src_rect, dst_rect)
+            },
+            DrmOperation::ApplyShader { shader_type, params } => {
+                self.apply_shader(shader_type, params)
+            },
+            DrmOperation::CompositeLayer { layer_id, blend_mode, alpha } => {
+                self.composite_layer(layer_id, blend_mode, alpha)
+            },
+            DrmOperation::Transform { matrix } => {
+                self.apply_transform(matrix)
+            },
+            DrmOperation::EnableHardwareAcceleration => {
+                self.enable_hardware_acceleration()
+            },
+            DrmOperation::DisableHardwareAcceleration => {
+                self.disable_hardware_acceleration()
             },
         }
     }
@@ -300,6 +506,372 @@ impl DrmDriver {
             device_fd: self.info.device_fd,
         }
     }
+
+    // ===== NUEVAS FUNCIONES DRM ACELERADAS =====
+
+    /// Scroll hacia arriba usando DRM (ultra-rápido)
+    pub fn scroll_up_drm(&mut self, pixels: u32) -> Result<(), &'static str> {
+        if pixels == 0 { return Ok(()); }
+        
+        let start_time = self.get_timestamp();
+        
+        // Usar operación Blit de DRM para scroll ultra-rápido
+        let src_rect = Rect {
+            x: 0,
+            y: pixels,
+            width: self.current_mode.0,
+            height: self.current_mode.1 - pixels,
+        };
+        
+        let dst_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.current_mode.0,
+            height: self.current_mode.1 - pixels,
+        };
+        
+        // Ejecutar blit acelerado por hardware
+        self.blit(src_rect, dst_rect)?;
+        
+        // Limpiar zona inferior
+        let clear_rect = Rect {
+            x: 0,
+            y: self.current_mode.1 - pixels,
+            width: self.current_mode.0,
+            height: pixels,
+        };
+        
+        self.draw_rect(clear_rect, Color::BLACK)?;
+        
+        // Actualizar estadísticas
+        self.performance_stats.scroll_operations += 1;
+        let end_time = self.get_timestamp();
+        let scroll_time = (end_time - start_time) as f32 / 1000.0; // Convertir a ms
+        self.performance_stats.average_scroll_time = 
+            (self.performance_stats.average_scroll_time + scroll_time) / 2.0;
+        
+        Ok(())
+    }
+
+    /// Scroll hacia abajo usando DRM
+    pub fn scroll_down_drm(&mut self, pixels: u32) -> Result<(), &'static str> {
+        if pixels == 0 { return Ok(()); }
+        
+        let src_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.current_mode.0,
+            height: self.current_mode.1 - pixels,
+        };
+        
+        let dst_rect = Rect {
+            x: 0,
+            y: pixels,
+            width: self.current_mode.0,
+            height: self.current_mode.1 - pixels,
+        };
+        
+        self.blit(src_rect, dst_rect)?;
+        
+        // Limpiar zona superior
+        let clear_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.current_mode.0,
+            height: pixels,
+        };
+        
+        self.draw_rect(clear_rect, Color::BLACK)?;
+        Ok(())
+    }
+
+    /// Scroll hacia la izquierda usando DRM
+    pub fn scroll_left_drm(&mut self, pixels: u32) -> Result<(), &'static str> {
+        if pixels == 0 { return Ok(()); }
+        
+        let src_rect = Rect {
+            x: pixels,
+            y: 0,
+            width: self.current_mode.0 - pixels,
+            height: self.current_mode.1,
+        };
+        
+        let dst_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.current_mode.0 - pixels,
+            height: self.current_mode.1,
+        };
+        
+        self.blit(src_rect, dst_rect)?;
+        
+        // Limpiar zona derecha
+        let clear_rect = Rect {
+            x: self.current_mode.0 - pixels,
+            y: 0,
+            width: pixels,
+            height: self.current_mode.1,
+        };
+        
+        self.draw_rect(clear_rect, Color::BLACK)?;
+        Ok(())
+    }
+
+    /// Scroll hacia la derecha usando DRM
+    pub fn scroll_right_drm(&mut self, pixels: u32) -> Result<(), &'static str> {
+        if pixels == 0 { return Ok(()); }
+        
+        let src_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.current_mode.0 - pixels,
+            height: self.current_mode.1,
+        };
+        
+        let dst_rect = Rect {
+            x: pixels,
+            y: 0,
+            width: self.current_mode.0 - pixels,
+            height: self.current_mode.1,
+        };
+        
+        self.blit(src_rect, dst_rect)?;
+        
+        // Limpiar zona izquierda
+        let clear_rect = Rect {
+            x: 0,
+            y: 0,
+            width: pixels,
+            height: self.current_mode.1,
+        };
+        
+        self.draw_rect(clear_rect, Color::BLACK)?;
+        Ok(())
+    }
+
+    /// Cargar textura en GPU
+    pub fn load_texture(&mut self, id: u32, data: Vec<u8>, width: u32, height: u32) -> Result<(), &'static str> {
+        let texture = GpuTexture {
+            id,
+            width,
+            height,
+            format: PixelFormat::RGBA8888,
+            data: data.clone(),
+            gpu_handle: Some(self.next_texture_id),
+        };
+        
+        self.textures.insert(id, texture);
+        self.next_texture_id += 1;
+        
+        // Actualizar memoria GPU usada
+        self.performance_stats.gpu_memory_used += (width * height * 4) as u64;
+        self.performance_stats.texture_operations += 1;
+        
+        Ok(())
+    }
+
+    /// Dibujar textura usando GPU
+    pub fn draw_texture(&mut self, texture_id: u32, src_rect: Rect, dst_rect: Rect) -> Result<(), &'static str> {
+        if let Some(texture) = self.textures.get(&texture_id) {
+            // En una implementación real, esto usaría el GPU para dibujar la textura
+            // Por ahora, simulamos con operaciones de framebuffer
+            if let Some(ref mut fb) = self.framebuffer {
+                // Simular dibujo de textura
+                for y in 0..dst_rect.height {
+                    for x in 0..dst_rect.width {
+                        let src_x = src_rect.x + x;
+                        let src_y = src_rect.y + y;
+                        let dst_x = dst_rect.x + x;
+                        let dst_y = dst_rect.y + y;
+                        
+                        if src_x >= 0 && src_y >= 0 && 
+                           src_x < texture.width as u32 && src_y < texture.height as u32 &&
+                           dst_x >= 0 && dst_y >= 0 &&
+                           dst_x < self.current_mode.0 as u32 && dst_y < self.current_mode.1 as u32 {
+                            
+                            let pixel_index = ((src_y as u32 * texture.width + src_x as u32) * 4) as usize;
+                            if pixel_index + 3 < texture.data.len() {
+                                let r = texture.data[pixel_index];
+                                let g = texture.data[pixel_index + 1];
+                                let b = texture.data[pixel_index + 2];
+                                let a = texture.data[pixel_index + 3];
+                                
+                                let color = Color::rgb(r, g, b);
+                                fb.put_pixel(dst_x as u32, dst_y as u32, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aplicar shader a la pantalla
+    pub fn apply_shader(&mut self, shader_type: ShaderType, params: ShaderParams) -> Result<(), &'static str> {
+        if let Some(ref mut fb) = self.framebuffer {
+            // Aplicar shader a cada pixel
+            for y in 0..self.current_mode.1 {
+                for x in 0..self.current_mode.0 {
+                    let current_color = fb.get_pixel(x, y);
+                    let new_color = Self::apply_shader_to_pixel_static(current_color, shader_type, &params);
+                    fb.put_pixel(x, y, new_color);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aplicar shader a un pixel individual (función estática)
+    fn apply_shader_to_pixel_static(color: Color, shader_type: ShaderType, params: &ShaderParams) -> Color {
+        let r = color.r;
+        let g = color.g;
+        let b = color.b;
+        let mut new_r = r as f32;
+        let mut new_g = g as f32;
+        let mut new_b = b as f32;
+        let mut new_a = 255.0; // Alpha fijo
+        
+        match shader_type {
+            ShaderType::Grayscale => {
+                let gray = (new_r * 0.299 + new_g * 0.587 + new_b * 0.114) * params.intensity;
+                new_r = gray;
+                new_g = gray;
+                new_b = gray;
+            },
+            ShaderType::Invert => {
+                new_r = (255.0 - new_r) * params.intensity;
+                new_g = (255.0 - new_g) * params.intensity;
+                new_b = (255.0 - new_b) * params.intensity;
+            },
+            ShaderType::Brightness => {
+                new_r = (new_r + params.intensity * 100.0).min(255.0).max(0.0);
+                new_g = (new_g + params.intensity * 100.0).min(255.0).max(0.0);
+                new_b = (new_b + params.intensity * 100.0).min(255.0).max(0.0);
+            },
+            ShaderType::Contrast => {
+                let factor = (259.0 * (params.intensity * 255.0 + 255.0)) / (255.0 * (259.0 - params.intensity * 255.0));
+                new_r = ((new_r - 128.0) * factor + 128.0).min(255.0).max(0.0);
+                new_g = ((new_g - 128.0) * factor + 128.0).min(255.0).max(0.0);
+                new_b = ((new_b - 128.0) * factor + 128.0).min(255.0).max(0.0);
+            },
+            _ => {
+                // Shader no implementado, devolver color original
+            }
+        }
+        
+        Color::rgb(
+            new_r as u8,
+            new_g as u8,
+            new_b as u8,
+        )
+    }
+
+    /// Componer capa con blending
+    pub fn composite_layer(&mut self, layer_id: u32, blend_mode: BlendMode, alpha: f32) -> Result<(), &'static str> {
+        if let Some(layer) = self.layers.get(&layer_id) {
+            if !layer.visible { return Ok(()); }
+            
+            // Aplicar transformación
+            let transformed_rect = self.apply_transform_to_rect(layer.rect, layer.transform);
+            
+            // Aplicar blending
+            self.apply_blend_mode(transformed_rect, blend_mode, alpha);
+            
+            self.performance_stats.composite_operations += 1;
+        }
+        Ok(())
+    }
+
+    /// Aplicar transformación
+    pub fn apply_transform(&mut self, matrix: TransformMatrix) -> Result<(), &'static str> {
+        // En una implementación real, esto aplicaría la transformación a todas las capas
+        // Por ahora, solo actualizamos la matriz de transformación global
+        Ok(())
+    }
+
+    /// Deshabilitar aceleración hardware
+    pub fn disable_hardware_acceleration(&mut self) -> Result<(), &'static str> {
+        self.hardware_acceleration_enabled = false;
+        Ok(())
+    }
+
+    // ===== FUNCIONES AUXILIARES =====
+
+    /// Obtener timestamp actual (simulado)
+    fn get_timestamp(&self) -> u64 {
+        // En una implementación real, esto usaría un timer del sistema
+        0
+    }
+
+    /// Aplicar transformación a un rectángulo
+    fn apply_transform_to_rect(&self, rect: Rect, transform: TransformMatrix) -> Rect {
+        // Aplicar transformación 2D básica
+        let new_x = (rect.x as f32 * transform.m[0] + rect.y as f32 * transform.m[1] + transform.m[2]) as u32;
+        let new_y = (rect.x as f32 * transform.m[3] + rect.y as f32 * transform.m[4] + transform.m[5]) as u32;
+        let new_width = (rect.width as f32 * transform.m[0]) as u32;
+        let new_height = (rect.height as f32 * transform.m[4]) as u32;
+        
+        Rect {
+            x: new_x,
+            y: new_y,
+            width: new_width,
+            height: new_height,
+        }
+    }
+
+    /// Aplicar modo de blending
+    fn apply_blend_mode(&mut self, rect: Rect, blend_mode: BlendMode, alpha: f32) {
+        // En una implementación real, esto aplicaría el blending usando GPU
+        // Por ahora, solo simulamos
+        match blend_mode {
+            BlendMode::Normal => {
+                // Blending normal (ya implementado)
+            },
+            BlendMode::Multiply => {
+                // Multiplicar colores
+            },
+            BlendMode::Screen => {
+                // Modo pantalla
+            },
+            _ => {
+                // Otros modos de blending
+            }
+        }
+    }
+
+    /// Obtener estadísticas de rendimiento
+    pub fn get_performance_stats(&self) -> &DrmPerformanceStats {
+        &self.performance_stats
+    }
+
+    /// Crear nueva capa de compositing
+    pub fn create_layer(&mut self, rect: Rect) -> u32 {
+        let layer_id = self.next_layer_id;
+        let layer = CompositingLayer {
+            id: layer_id,
+            texture_id: None,
+            rect,
+            blend_mode: BlendMode::Normal,
+            alpha: 1.0,
+            transform: TransformMatrix::new(),
+            visible: true,
+            z_order: 0,
+        };
+        
+        self.layers.insert(layer_id, layer);
+        self.next_layer_id += 1;
+        layer_id
+    }
+
+    /// Eliminar capa de compositing
+    pub fn remove_layer(&mut self, layer_id: u32) -> Result<(), &'static str> {
+        if self.layers.remove(&layer_id).is_some() {
+            Ok(())
+        } else {
+            Err("Capa no encontrada")
+        }
+    }
 }
 
 /// Estadísticas del driver DRM
@@ -311,6 +883,19 @@ pub struct DrmDriverStats {
     pub is_vsync_enabled: bool,
     pub supports_hardware_acceleration: bool,
     pub device_fd: i32,
+}
+
+/// Estadísticas de rendimiento DRM
+#[derive(Debug, Clone)]
+pub struct DrmPerformanceStats {
+    pub frames_rendered: u64,
+    pub scroll_operations: u64,
+    pub texture_operations: u64,
+    pub composite_operations: u64,
+    pub average_frame_time: f32,
+    pub average_scroll_time: f32,
+    pub gpu_memory_used: u64,
+    pub cpu_usage_percent: f32,
 }
 
 /// Función de conveniencia para crear un driver DRM

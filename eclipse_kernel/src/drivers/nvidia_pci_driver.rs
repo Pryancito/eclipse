@@ -1,5 +1,6 @@
 use super::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
 use super::pci::{PciDevice, PciManager, GpuInfo, GpuType};
+use crate::hardware_detection::HardwareDetectionResult;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
@@ -48,18 +49,13 @@ impl NvidiaPciDriver {
     }
 
     /// Detectar y configurar GPUs NVIDIA
-    fn detect_nvidia_gpus(&mut self) -> Result<(), String> {
+    fn detect_nvidia_gpus(&mut self, hw_result: &HardwareDetectionResult) -> Result<(), String> {
         self.nvidia_gpus.clear();
         
-        // Obtener todas las GPUs detectadas
-        let all_gpus = self.pci_manager.get_gpus();
-        
-        // Filtrar solo las GPUs NVIDIA
-        for gpu_option in all_gpus {
-            if let Some(gpu) = gpu_option {
-                if matches!(gpu.gpu_type, GpuType::Nvidia) {
-                    self.nvidia_gpus.push(gpu.clone());
-                }
+        // Usar la información de hardware ya detectada
+        for gpu in &hw_result.available_gpus {
+            if matches!(gpu.gpu_type, GpuType::Nvidia) {
+                self.nvidia_gpus.push(gpu.clone());
             }
         }
 
@@ -69,13 +65,6 @@ impl NvidiaPciDriver {
 
         // Configurar la primera GPU como activa por defecto
         self.active_gpu = Some(0);
-
-        // NVIDIA Driver: {} GPUs NVIDIA detectadas
-        
-        // Mostrar información detallada de cada GPU
-        for (i, gpu) in self.nvidia_gpus.iter().enumerate() {
-            // GPU {}: {} {} ({} MB VRAM)
-        }
 
         Ok(())
     }
@@ -228,21 +217,29 @@ impl NvidiaPciDriver {
     }
 }
 
-impl Driver for NvidiaPciDriver {
-    fn initialize(&mut self) -> Result<(), String> {
+impl NvidiaPciDriver {
+    /// Inicializar con información de hardware detectada
+    pub fn initialize_with_hardware(&mut self, hw_result: &HardwareDetectionResult) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
         
-        // Inicializar el manager PCI
-        // self.pci_manager.initialize()?; // TEMPORALMENTE DESHABILITADO
-        
-        // Detectar GPUs NVIDIA
-        self.detect_nvidia_gpus()?;
+        // Detectar GPUs NVIDIA usando la información ya detectada
+        self.detect_nvidia_gpus(hw_result)?;
         
         // Habilitar MMIO para la GPU activa
         self.enable_mmio()?;
         
         self.info.state = DriverState::Ready;
-        // NVIDIA PCI Driver inicializado correctamente
+        Ok(())
+    }
+}
+
+impl Driver for NvidiaPciDriver {
+    fn initialize(&mut self) -> Result<(), String> {
+        self.info.state = DriverState::Initializing;
+        
+        // El driver necesita información de hardware externa
+        // Por ahora, solo configuramos el estado
+        self.info.state = DriverState::Ready;
         Ok(())
     }
 
@@ -269,14 +266,9 @@ impl Driver for NvidiaPciDriver {
     fn resume(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
         
-        // Re-detectar GPUs al reanudar
-        self.detect_nvidia_gpus()?;
-        
-        // Re-habilitar MMIO
-        self.enable_mmio()?;
-        
+        // El resume necesita información de hardware externa
+        // Por ahora, solo configuramos el estado
         self.info.state = DriverState::Ready;
-        // NVIDIA PCI Driver reanudado
         Ok(())
     }
 

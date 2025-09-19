@@ -171,6 +171,9 @@ impl NvidiaGraphicsDriver {
             return Err("No se pudo obtener la base de memoria o MMIO de la GPU NVIDIA");
         }
 
+        // Configurar registros MMIO para modo de video
+        self.configure_video_mode()?;
+        
         // Simular configuración de registros MMIO
         self.write_mmio(0x0000, 0xDEADBEEF); // Ejemplo de escritura en registro
         let value = self.read_mmio(0x0000); // Ejemplo de lectura
@@ -474,3 +477,110 @@ pub fn detect_nvidia_gpu() -> Option<NvidiaGraphicsDriver> {
     
     Some(NvidiaGraphicsDriver::new(pci_device, gpu_info))
 }
+
+impl NvidiaGraphicsDriver {
+    /// Configurar modo de video NVIDIA
+    fn configure_video_mode(&mut self) -> Result<(), &'static str> {
+        // Configurar registros de control de video
+        self.write_mmio(NVIDIA_VIDEO_CONTROL, 0x00000001); // Habilitar video
+        self.write_mmio(NVIDIA_VIDEO_MODE, 0x00000020); // Modo 32-bit
+        
+        // Configurar sincronización
+        self.write_mmio(NVIDIA_H_SYNC_START, 0x00000000);
+        self.write_mmio(NVIDIA_H_SYNC_END, 0x00000000);
+        self.write_mmio(NVIDIA_V_SYNC_START, 0x00000000);
+        self.write_mmio(NVIDIA_V_SYNC_END, 0x00000000);
+        
+        Ok(())
+    }
+
+    /// Reconfigurar tarjeta gráfica para nuevo framebuffer
+    pub fn reconfigure_graphics_card(&mut self, new_fb_info: &FramebufferInfo) -> Result<(), &'static str> {
+        // 1. Deshabilitar video temporalmente
+        self.write_mmio(NVIDIA_VIDEO_CONTROL, 0x00000000);
+        
+        // 2. Configurar nueva resolución
+        self.write_mmio(NVIDIA_WIDTH, new_fb_info.width);
+        self.write_mmio(NVIDIA_HEIGHT, new_fb_info.height);
+        self.write_mmio(NVIDIA_STRIDE, new_fb_info.pixels_per_scan_line);
+        
+        // 3. Configurar nueva dirección de framebuffer
+        self.write_mmio(NVIDIA_FB_BASE_LOW, new_fb_info.base_address as u32);
+        self.write_mmio(NVIDIA_FB_BASE_HIGH, (new_fb_info.base_address >> 32) as u32);
+        
+        // 4. Configurar formato de pixel
+        let pixel_format = match new_fb_info.pixel_format {
+            32 => 0x00000020, // 32-bit RGBA
+            24 => 0x00000018, // 24-bit RGB
+            16 => 0x00000010, // 16-bit RGB
+            _ => 0x00000020,  // Default 32-bit
+        };
+        self.write_mmio(NVIDIA_PIXEL_FORMAT, pixel_format);
+        
+        // 5. Reconfigurar sincronización para nueva resolución
+        self.reconfigure_timing(new_fb_info)?;
+        
+        // 6. Habilitar video con nueva configuración
+        self.write_mmio(NVIDIA_VIDEO_CONTROL, 0x00000001);
+        
+        Ok(())
+    }
+
+    /// Reconfigurar timing de sincronización
+    fn reconfigure_timing(&self, fb_info: &FramebufferInfo) -> Result<(), &'static str> {
+        // Calcular timing basado en resolución
+        let h_total = fb_info.width + 100; // H total
+        let v_total = fb_info.height + 50; // V total
+        
+        self.write_mmio(NVIDIA_H_TOTAL, h_total);
+        self.write_mmio(NVIDIA_V_TOTAL, v_total);
+        self.write_mmio(NVIDIA_H_SYNC_START, fb_info.width);
+        self.write_mmio(NVIDIA_H_SYNC_END, fb_info.width + 20);
+        self.write_mmio(NVIDIA_V_SYNC_START, fb_info.height);
+        self.write_mmio(NVIDIA_V_SYNC_END, fb_info.height + 5);
+        
+        Ok(())
+    }
+
+    /// Cambiar modo de video VESA/UEFI
+    pub fn set_vesa_mode(&mut self, mode: u16) -> Result<(), &'static str> {
+        // Implementar cambio de modo VESA
+        // Esto requeriría llamadas a servicios de firmware
+        self.write_mmio(NVIDIA_VESA_MODE, mode as u32);
+        Ok(())
+    }
+
+    /// Llamar a servicios de firmware UEFI
+    pub fn call_uefi_graphics_service(&self, service: u32, params: &[u32]) -> Result<u32, &'static str> {
+        // Implementar llamadas a servicios UEFI
+        // Esto requeriría integración con el sistema UEFI
+        self.write_mmio(NVIDIA_UEFI_SERVICE, service);
+        for (i, param) in params.iter().enumerate() {
+            self.write_mmio(NVIDIA_UEFI_PARAM_BASE + i as u32, *param);
+        }
+        
+        // Leer resultado
+        let result = self.read_mmio(NVIDIA_UEFI_RESULT);
+        Ok(result)
+    }
+}
+
+// Constantes de registros NVIDIA
+const NVIDIA_VIDEO_CONTROL: u32 = 0x0000;
+const NVIDIA_VIDEO_MODE: u32 = 0x0004;
+const NVIDIA_WIDTH: u32 = 0x0008;
+const NVIDIA_HEIGHT: u32 = 0x000C;
+const NVIDIA_STRIDE: u32 = 0x0010;
+const NVIDIA_FB_BASE_LOW: u32 = 0x0014;
+const NVIDIA_FB_BASE_HIGH: u32 = 0x0018;
+const NVIDIA_PIXEL_FORMAT: u32 = 0x001C;
+const NVIDIA_H_TOTAL: u32 = 0x0020;
+const NVIDIA_V_TOTAL: u32 = 0x0024;
+const NVIDIA_H_SYNC_START: u32 = 0x0028;
+const NVIDIA_H_SYNC_END: u32 = 0x002C;
+const NVIDIA_V_SYNC_START: u32 = 0x0030;
+const NVIDIA_V_SYNC_END: u32 = 0x0034;
+const NVIDIA_VESA_MODE: u32 = 0x0038;
+const NVIDIA_UEFI_SERVICE: u32 = 0x003C;
+const NVIDIA_UEFI_PARAM_BASE: u32 = 0x0040;
+const NVIDIA_UEFI_RESULT: u32 = 0x0080;

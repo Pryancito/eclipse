@@ -26,7 +26,6 @@ pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
             "mov cr4, rax"
         );
     }
-    
     unsafe {
         // Leer la información del framebuffer de manera segura
         let fb_info = core::ptr::read_volatile(framebuffer_info_ptr);
@@ -42,7 +41,6 @@ pub extern "C" fn _start(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
 
         // Obtener el framebuffer mutable
         if let Some(fb) = get_framebuffer() {
-            // Llamar directamente a la función principal del kernel
             kernel_main(fb);
         }
 

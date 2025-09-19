@@ -35,6 +35,7 @@ pub mod gui;
 pub mod graphics;
 pub mod uefi_framebuffer;
 pub mod gpu_fallback; // Sistema de fallback de UEFI/GOP a GPU hardware real
+pub mod graphics_optimization; // Optimizaciones de gráficos para hardware real
 pub mod desktop_ai;
 pub mod hardware_detection; // Detección de hardware PCI
 pub mod apps; // Aplicaciones interactivas

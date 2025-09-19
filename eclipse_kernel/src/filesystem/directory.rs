@@ -1,6 +1,7 @@
 //! Gestión de directorios para Eclipse OS
 
 use crate::filesystem::{MAX_FILENAME_LEN, MAX_DIRECTORY_ENTRIES};
+use alloc::string::ToString;
 
 // Entrada de directorio
 #[derive(Debug, Clone, Copy)]
@@ -59,5 +60,72 @@ impl Directory {
         } else {
             false
         }
+    }
+    
+    /// Buscar entrada por nombre
+    pub fn find_entry(&self, name: &str) -> Option<&DirectoryEntry> {
+        for entry in &self.entries {
+            if let Some(ref dir_entry) = entry {
+                let entry_name = core::str::from_utf8(&dir_entry.name[..dir_entry.name_len as usize]).ok()?;
+                if entry_name == name {
+                    return Some(dir_entry);
+                }
+            }
+        }
+        None
+    }
+    
+    /// Buscar entrada por inodo
+    pub fn find_entry_by_inode(&self, inode: u32) -> Option<&DirectoryEntry> {
+        for entry in &self.entries {
+            if let Some(ref dir_entry) = entry {
+                if dir_entry.inode == inode {
+                    return Some(dir_entry);
+                }
+            }
+        }
+        None
+    }
+    
+    /// Eliminar entrada por nombre
+    pub fn remove_entry(&mut self, name: &str) -> bool {
+        for i in 0..self.entry_count {
+            if let Some(ref dir_entry) = self.entries[i] {
+                let entry_name = core::str::from_utf8(&dir_entry.name[..dir_entry.name_len as usize]).ok();
+                if entry_name == Some(name) {
+                    // Mover entradas hacia atrás
+                    for j in i..self.entry_count - 1 {
+                        self.entries[j] = self.entries[j + 1];
+                    }
+                    self.entries[self.entry_count - 1] = None;
+                    self.entry_count -= 1;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    /// Obtener lista de nombres de archivos
+    pub fn list_files(&self) -> alloc::vec::Vec<alloc::string::String> {
+        let mut files = alloc::vec::Vec::new();
+        for entry in &self.entries {
+            if let Some(ref dir_entry) = entry {
+                if let Ok(name) = core::str::from_utf8(&dir_entry.name[..dir_entry.name_len as usize]) {
+                    files.push(name.to_string());
+                }
+            }
+        }
+        files
+    }
+    
+    /// Verificar si el directorio está vacío
+    pub fn is_empty(&self) -> bool {
+        self.entry_count == 0
+    }
+    
+    /// Obtener número de entradas
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
     }
 }

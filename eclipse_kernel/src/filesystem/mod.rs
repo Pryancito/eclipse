@@ -15,6 +15,7 @@ pub mod file;
 pub mod cache;
 pub mod block;
 pub mod utils;
+pub mod fat32;
 
 // Re-exportar componentes principales
 pub use vfs::VfsResult;

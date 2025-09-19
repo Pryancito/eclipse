@@ -260,6 +260,9 @@ impl Compositor {
     
     /// Renderizar información de debug
     fn render_debug_info(&self, framebuffer: &mut crate::gui::framebuffer::Framebuffer) {
+        // DESHABILITADO: No mostrar información de debug en pantalla
+        return;
+        
         // Mostrar FPS en la esquina superior derecha
         let fps_text = "FPS: 60"; // En un sistema real, esto sería dinámico
         let fps_pos = Point::new(framebuffer.info.width as i32 - 80, 10);
