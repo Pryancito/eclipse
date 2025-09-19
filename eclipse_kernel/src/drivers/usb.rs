@@ -12,6 +12,7 @@ use crate::drivers::{
 // Importar tipos necesarios para no_std
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::format;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 // Constantes USB
@@ -595,6 +596,7 @@ impl UsbSetupPacket {
 }
 
 /// Controlador USB real con comunicación hardware
+#[derive(Clone)]
 pub struct RealUsbController {
     pub controller_type: UsbControllerType,
     pub base_address: u64,

@@ -16,6 +16,8 @@ pub enum MouseButton {
     Middle,
     Side1,
     Side2,
+    Button4,
+    Button5,
     WheelUp,
     WheelDown,
 }

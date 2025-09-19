@@ -9,6 +9,20 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 
+/// Estadísticas de rendimiento para COSMIC
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerformanceStats {
+    pub render_time: u32,
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+    pub cache_hit_rate: f32,
+    pub windows_count: u32,
+    pub cpu_usage: f32,
+    pub memory_usage: f32,
+    pub gpu_usage: f32,
+    pub compositor_latency: f32,
+}
+
 /// Características de IA para COSMIC
 pub struct CosmicAIFeatures {
     model_loader: Option<ModelLoader>,
@@ -189,7 +203,7 @@ impl CosmicAIFeatures {
     }
 
     /// Analizar rendimiento y sugerir optimizaciones
-    pub fn analyze_performance(&mut self, stats: &CosmicPerformanceStats) -> Vec<PerformanceSuggestion> {
+    pub fn analyze_performance(&mut self, stats: &PerformanceStats) -> Vec<PerformanceSuggestion> {
         let mut suggestions = Vec::new();
 
         if !self.performance_optimization {
@@ -207,7 +221,7 @@ impl CosmicAIFeatures {
         }
 
         // Analizar uso de memoria
-        if stats.memory_usage > 1024 * 1024 * 1024 { // 1GB
+        if stats.memory_usage > 1024.0 * 1024.0 * 1024.0 { // 1GB
             suggestions.push(PerformanceSuggestion {
                 suggestion_type: PerformanceSuggestionType::MemoryManagement,
                 description: "Limpiar caché de aplicaciones".to_string(),
@@ -227,7 +241,7 @@ impl CosmicAIFeatures {
         }
 
         // Analizar latencia del compositor
-        if stats.compositor_latency > 20 {
+        if stats.compositor_latency > 20.0 {
             suggestions.push(PerformanceSuggestion {
                 suggestion_type: PerformanceSuggestionType::WindowOptimization,
                 description: "Optimizar renderizado de ventanas".to_string(),

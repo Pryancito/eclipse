@@ -13,6 +13,8 @@ pub mod demo;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::format;
+use crate::desktop_ai::PerformanceStats;
 
 /// Configuración de COSMIC para Eclipse OS
 #[derive(Debug, Clone)]
@@ -279,6 +281,7 @@ impl CosmicManager {
                 if let Some(ref mut theme) = self.theme {
                     theme.apply()?;
                 }
+                Ok(())
             }
             "dark" => {
                 // Aplicar tema oscuro
@@ -294,22 +297,31 @@ impl CosmicManager {
 
     /// Obtener sugerencias de IA
     pub fn get_ai_suggestions(&mut self) -> Vec<String> {
+        let mut suggestions = Vec::new();
+        
         if let Some(ref mut ai_features) = self.ai_features {
-            // Obtener sugerencias de optimización
-            let mut suggestions = Vec::new();
+            // Crear estadísticas básicas sin mutar self
+            let stats = ai_features::PerformanceStats {
+                render_time: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_hit_rate: 0.0,
+                windows_count: 0,
+                cpu_usage: 0.0,
+                memory_usage: 0.0,
+                gpu_usage: 0.0,
+                compositor_latency: 0.0,
+            };
             
-            // Analizar rendimiento actual
-            let stats = self.get_performance_stats();
-            let perf_suggestions = ai_features.analyze_performance(stats);
+            // Obtener sugerencias de optimización
+            let perf_suggestions = ai_features.analyze_performance(&stats);
             
             for suggestion in perf_suggestions {
                 suggestions.push(suggestion.description);
             }
-            
-            suggestions
-        } else {
-            Vec::new()
         }
+        
+        suggestions
     }
 
     /// Aplicar optimización sugerida por IA
@@ -385,78 +397,6 @@ impl CosmicManager {
         Ok(())
     }
 
-    /// Obtener estado actual
-    pub fn get_state(&self) -> &CosmicState {
-        &self.state
-    }
-
-    /// Obtener configuración
-    pub fn get_config(&self) -> &CosmicConfig {
-        &self.config
-    }
-
-    /// Actualizar configuración
-    pub fn update_config(&mut self, new_config: CosmicConfig) -> Result<(), String> {
-        self.config = new_config;
-        
-        // Reaplicar tema si cambió
-        if self.config.enable_space_theme && !self.state.theme_applied {
-            let mut theme = theme::EclipseSpaceTheme::new();
-            theme.apply()?;
-            self.theme = Some(theme);
-            self.state.theme_applied = true;
-        }
-
-        // Reinicializar características de IA si cambiaron
-        if self.config.enable_ai_features && !self.state.ai_features_enabled {
-            self.ai_features = Some(ai_features::CosmicAIFeatures::new()?);
-            self.state.ai_features_enabled = true;
-        }
-
-        Ok(())
-    }
-
-    /// Renderizar frame
-    pub fn render_frame(&mut self) -> Result<(), String> {
-        if !self.state.compositor_running {
-            return Ok(());
-        }
-
-        if let Some(ref mut integration) = self.integration {
-            integration.render_frame()?;
-        }
-
-        // Actualizar estadísticas de rendimiento
-        self.get_performance_stats();
-
-        Ok(())
-    }
-
-    /// Procesar eventos
-    pub fn process_events(&mut self) -> Result<(), String> {
-        if !self.state.compositor_running {
-            return Ok(());
-        }
-
-        if let Some(ref mut integration) = self.integration {
-            integration.process_events()?;
-        }
-
-        Ok(())
-    }
-
-    /// Detener COSMIC
-    pub fn shutdown(&mut self) -> Result<(), String> {
-        if let Some(ref mut integration) = self.integration {
-            integration.shutdown()?;
-        }
-
-        self.state.compositor_running = false;
-        self.state.window_manager_active = false;
-        self.state.initialized = false;
-
-        Ok(())
-    }
 }
 
 impl Default for CosmicManager {

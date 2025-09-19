@@ -258,9 +258,6 @@ impl CosmicCompositor {
         for i in 0..window_count {
             let window = &self.active_windows[i];
             if window.visible && window.needs_redraw {
-                // Aplicar efectos de ventana (sombra, transparencia, etc.)
-                self.apply_window_effects(window)?;
-                
                 // Crear una copia de la ventana para evitar problemas de préstamo
                 let window_copy = CompositorWindow {
                     id: window.id,
@@ -273,6 +270,9 @@ impl CosmicCompositor {
                     needs_redraw: window.needs_redraw,
                     buffer: window.buffer.clone(),
                 };
+                
+                // Aplicar efectos de ventana usando la copia
+                self.apply_window_effects(&window_copy)?;
                 self.render_window(&window_copy)?;
             }
         }
@@ -311,7 +311,7 @@ impl CosmicCompositor {
                     let b = (intensity * 0.4 * 255.0) as u8;
                     
                     let color = (b as u32) | ((g as u32) << 8) | ((r as u32) << 16) | (0xFF << 24);
-                    fb.set_pixel(x, y, color);
+                    fb.put_pixel(x, y, Color::from_u32(color));
                 }
             }
         }
@@ -347,7 +347,7 @@ impl CosmicCompositor {
                        shadow_x < fb.info.width as i32 && shadow_y < fb.info.height as i32 {
                         let alpha = (255 - (dy + dx) * 32).min(255) as u8;
                         let shadow_color = (0x00 << 24) | (0x00 << 16) | (0x00 << 8) | alpha as u32;
-                        fb.set_pixel(shadow_x as u32, shadow_y as u32, shadow_color);
+                        fb.put_pixel(shadow_x as u32, shadow_y as u32, Color::from_u32(shadow_color));
                     }
                 }
             }
@@ -383,8 +383,8 @@ impl CosmicCompositor {
                 let y = (i * 23 + (self.performance_stats.frame_rate as u32 * 3)) % fb.info.height;
                 
                 let brightness = ((i * 5) % 255) as u8;
-                let particle_color = (brightness << 24) | (brightness << 16) | (brightness << 8) | 0xFF;
-                fb.set_pixel(x, y, particle_color);
+                let particle_color = ((brightness as u32) << 24) | ((brightness as u32) << 16) | ((brightness as u32) << 8) | 0xFF;
+                fb.put_pixel(x, y, Color::from_u32(particle_color));
             }
         }
         Ok(())

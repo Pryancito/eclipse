@@ -14,7 +14,9 @@ use crate::drivers::{
 };
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::format;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::fmt;
 
 /// Gestor principal de drivers USB reales
 pub struct UsbManager {
@@ -386,29 +388,32 @@ impl UsbManager {
     }
 }
 
+impl fmt::Debug for UsbManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UsbManager")
+            .field("info", &self.info)
+            .field("controllers_count", &self.controllers.len())
+            .field("keyboard_driver", &self.keyboard_driver.is_some())
+            .field("mouse_driver", &self.mouse_driver.is_some())
+            .field("device_count", &self.device_count)
+            .field("is_initialized", &self.is_initialized)
+            .finish()
+    }
+}
+
 impl Driver for UsbManager {
     fn get_info(&self) -> &DriverInfo {
         &self.info
     }
 
     fn initialize(&mut self) -> DriverResult<()> {
-        if self.is_initialized {
-            return Ok(());
-        }
-
-        // Detectar controladores USB
-        self.detect_controllers()?;
-
-        // Inicializar controladores
         self.initialize_controllers()?;
-
-        // Inicializar drivers de dispositivos
         self.initialize_device_drivers()?;
-
-        self.info.is_loaded = true;
         self.is_initialized = true;
+        self.info.is_loaded = true;
         Ok(())
     }
+
 
     fn cleanup(&mut self) -> DriverResult<()> {
         self.controllers.clear();

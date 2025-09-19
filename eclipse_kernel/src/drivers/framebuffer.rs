@@ -995,6 +995,11 @@ impl Color {
         )
     }
 
+    /// Crear color desde valor u32 (alias para from_hex_alpha)
+    pub fn from_u32(value: u32) -> Self {
+        Self::from_hex_alpha(value)
+    }
+
     /// Convertir a valor u32 RGBA
     pub fn to_u32(&self) -> u32 {
         ((self.a as u32) << 24) | 

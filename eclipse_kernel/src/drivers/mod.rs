@@ -49,6 +49,8 @@ pub mod usb_hid;
 pub mod usb_keyboard_real;
 pub mod usb_mouse_real;
 pub mod usb_manager;
+pub mod keyboard;
+pub mod mouse;
 pub mod input_system;
 pub mod gui_integration;
 pub mod manager;

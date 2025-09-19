@@ -11,7 +11,9 @@ use crate::drivers::{
 };
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::format;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::fmt;
 
 /// Driver USB real para teclado
 pub struct UsbKeyboardReal {
@@ -30,7 +32,7 @@ impl UsbKeyboardReal {
     pub fn new() -> Self {
         let mut info = DriverInfo::new();
         info.set_name("usb_keyboard_real");
-        info.device_type = DeviceType::Keyboard;
+        info.device_type = DeviceType::Input;
         info.version = 2;
 
         Self {
@@ -107,7 +109,8 @@ impl UsbKeyboardReal {
         }
 
         // Detectar teclas liberadas comparando con el reporte anterior
-        self.detect_key_releases(&self.last_report, report);
+        let last_report = self.last_report;
+        self.detect_key_releases(&last_report, report);
     }
 
     /// Procesar modificadores (Ctrl, Alt, Shift, etc.)
@@ -343,6 +346,18 @@ impl UsbKeyboardReal {
     }
 }
 
+impl fmt::Debug for UsbKeyboardReal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UsbKeyboardReal")
+            .field("info", &self.info)
+            .field("usb_controller", &self.usb_controller.is_some())
+            .field("keyboard_device", &self.keyboard_device.is_some())
+            .field("is_initialized", &self.is_initialized)
+            .field("key_buffer_len", &self.key_buffer.len())
+            .finish()
+    }
+}
+
 impl Driver for UsbKeyboardReal {
     fn get_info(&self) -> &DriverInfo {
         &self.info
@@ -371,7 +386,7 @@ impl Driver for UsbKeyboardReal {
     }
 
     fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
-        device_info.device_type == DeviceType::Keyboard
+        device_info.device_type == DeviceType::Input
     }
 
     fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {

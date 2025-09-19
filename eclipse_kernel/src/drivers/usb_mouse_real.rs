@@ -11,7 +11,9 @@ use crate::drivers::{
 };
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use alloc::format;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::fmt;
 
 /// Driver USB real para ratón
 pub struct UsbMouseReal {
@@ -33,7 +35,7 @@ impl UsbMouseReal {
     pub fn new() -> Self {
         let mut info = DriverInfo::new();
         info.set_name("usb_mouse_real");
-        info.device_type = DeviceType::Mouse;
+        info.device_type = DeviceType::Input;
         info.version = 2;
 
         Self {
@@ -274,6 +276,18 @@ impl UsbMouseReal {
     }
 }
 
+impl fmt::Debug for UsbMouseReal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UsbMouseReal")
+            .field("info", &self.info)
+            .field("usb_controller", &self.usb_controller.is_some())
+            .field("mouse_device", &self.mouse_device.is_some())
+            .field("is_initialized", &self.is_initialized)
+            .field("event_buffer_len", &self.event_buffer.len())
+            .finish()
+    }
+}
+
 impl Driver for UsbMouseReal {
     fn get_info(&self) -> &DriverInfo {
         &self.info
@@ -305,7 +319,7 @@ impl Driver for UsbMouseReal {
     }
 
     fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
-        device_info.device_type == DeviceType::Mouse
+        device_info.device_type == DeviceType::Input
     }
 
     fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {
