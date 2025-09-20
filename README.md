@@ -35,7 +35,7 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Eclipse OS v0.5.0                        │
+│                    Eclipse OS v0.6.0                        │
 ├─────────────────────────────────────────────────────────────┤
 │  Userland Applications                                      │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
@@ -279,7 +279,7 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ## Estado del Proyecto
 
-- **Versión**: 0.5.0
+- **Versión**: 0.6.0
 - **Estado**: En desarrollo activo
 - **Kernel**: Funcional con VGA y UEFI
 - **Userland**: Sistema DRM implementado

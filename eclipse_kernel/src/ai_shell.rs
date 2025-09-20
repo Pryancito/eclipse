@@ -338,7 +338,7 @@ impl AIShell {
 
     /// Comando uname
     fn uname_command(&self) -> KernelResult<String> {
-        Ok("Eclipse OS 0.5.0 x86_64 GNU/Linux".to_string())
+        Ok("Eclipse OS 0.6.0 x86_64 GNU/Linux".to_string())
     }
 
     /// Comando date
@@ -372,7 +372,7 @@ impl AIShell {
 ║                    ECLIPSE OS AI SHELL                      ║
 ║                                                              ║
 ║  Sistema Operativo Eclipse con Inteligencia Artificial     ║
-║  Versión 0.5.0 - Kernel Nativo en Rust                     ║
+║  Versión 0.6.0 - Kernel Nativo en Rust                     ║
 ║                                                              ║
 ║  Comandos disponibles:                                       ║
 ║    - Comandos del sistema: help, ls, ps, top, etc.          ║

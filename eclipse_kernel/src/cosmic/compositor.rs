@@ -242,7 +242,7 @@ impl CosmicCompositor {
     }
 
     /// Renderizar frame completo con efectos avanzados
-    pub fn render_frame(&mut self) -> Result<(), String> {
+    pub fn render_frame(&mut self, mut cosmic_manager: Option<&mut crate::cosmic::CosmicManager>) -> Result<(), String> {
         if !self.initialized {
             return Err("Compositor no inicializado".to_string());
         }
@@ -279,6 +279,13 @@ impl CosmicCompositor {
 
         // Renderizar efectos de compositor (partículas, animaciones)
         self.render_compositor_effects()?;
+
+        // Renderizar barra de tareas si está disponible
+        if let Some(ref mut cosmic) = cosmic_manager {
+            if let Some(ref mut fb) = self.framebuffer {
+                cosmic.render_taskbar(fb)?;
+            }
+        }
 
         // Presentar frame
         self.present_frame()?;

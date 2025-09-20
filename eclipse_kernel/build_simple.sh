@@ -66,7 +66,7 @@ else
     cat > ../eclipse-apps/systemd/Cargo.toml << 'EOF'
 [package]
 name = "eclipse-systemd"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]

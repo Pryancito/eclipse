@@ -995,9 +995,19 @@ impl Color {
         )
     }
 
+    /// Crear color desde valores RGBA (alias para rgba)
+    pub fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self::rgba(r, g, b, a)
+    }
+
     /// Crear color desde valor u32 (alias para from_hex_alpha)
     pub fn from_u32(value: u32) -> Self {
         Self::from_hex_alpha(value)
+    }
+
+    /// Convertir a tupla RGBA
+    pub fn to_rgba(&self) -> (u8, u8, u8, u8) {
+        (self.r, self.g, self.b, self.a)
     }
 
     /// Convertir a valor u32 RGBA

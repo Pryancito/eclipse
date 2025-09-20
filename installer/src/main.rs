@@ -13,7 +13,7 @@ use direct_installer::DirectInstaller;
 use validation::{SystemValidator, is_uefi_system, is_secure_boot_enabled};
 
 fn main() {
-    println!("Eclipse OS Installer v0.5.0");
+    println!("Eclipse OS Installer v0.6.0");
     println!("=============================");
     println!();
     

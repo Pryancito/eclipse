@@ -150,7 +150,7 @@ impl CosmicIntegration {
 
         // Renderizar frame del compositor si está presente
         if let Some(ref mut compositor) = self.compositor {
-            let _ = compositor.render_frame();
+            let _ = compositor.render_frame(None);
         }
 
         // Actualizar estadísticas de rendimiento

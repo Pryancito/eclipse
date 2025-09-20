@@ -1740,14 +1740,7 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
 
     // COSMIC Desktop Environment ya inicializado con Wayland
 
-    let cosmic_config = CosmicConfig {
-        enable_ai_features: true,
-        enable_space_theme: true,
-        enable_hardware_acceleration: true,
-        window_manager_mode: WindowManagerMode::Hybrid,
-        ai_assistant_enabled: true,
-        performance_mode: PerformanceMode::Balanced,
-    };
+    let cosmic_config = CosmicConfig::default();
 
     let mut cosmic_manager = CosmicManager::with_config(cosmic_config);
 

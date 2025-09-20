@@ -19,14 +19,7 @@ pub struct CosmicDemo {
 impl CosmicDemo {
     /// Crear nueva demostración
     pub fn new() -> Self {
-        let config = CosmicConfig {
-            enable_ai_features: true,
-            enable_space_theme: true,
-            enable_hardware_acceleration: true,
-            window_manager_mode: WindowManagerMode::Hybrid,
-            ai_assistant_enabled: true,
-            performance_mode: PerformanceMode::Balanced,
-        };
+        let config = CosmicConfig::default();
 
         Self {
             manager: CosmicManager::with_config(config),
@@ -93,17 +86,17 @@ impl CosmicDemo {
         fb.write_text_kernel("=== DEMOSTRACIÓN DE VENTANAS ===", Color::YELLOW);
         
         // Crear ventana principal
-        let window1 = self.manager.create_window("Eclipse Terminal".to_string(), 800, 600)?;
+        let window1 = self.manager.create_window("Eclipse Terminal".to_string(), "terminal".to_string(), 100, 100, 800, 600);
         self.demo_windows.push(window1);
         fb.write_text_kernel(&format!("✓ Ventana creada: ID {}", window1), Color::GREEN);
         
         // Crear ventana secundaria
-        let window2 = self.manager.create_window("Eclipse Editor".to_string(), 600, 400)?;
+        let window2 = self.manager.create_window("Eclipse Editor".to_string(), "editor".to_string(), 200, 150, 600, 400);
         self.demo_windows.push(window2);
         fb.write_text_kernel(&format!("✓ Ventana creada: ID {}", window2), Color::GREEN);
         
         // Crear ventana de diálogo
-        let window3 = self.manager.create_window("Sistema de Archivos".to_string(), 500, 350)?;
+        let window3 = self.manager.create_window("Sistema de Archivos".to_string(), "files".to_string(), 300, 200, 500, 350);
         self.demo_windows.push(window3);
         fb.write_text_kernel(&format!("✓ Ventana creada: ID {}", window3), Color::GREEN);
         

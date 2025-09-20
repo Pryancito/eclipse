@@ -36,14 +36,14 @@ UEFI_TARGET="x86_64-unknown-uefi"
 BUILD_DIR="eclipse-os-build"
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.5.0 ║"
+echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.6.0 ║"
 echo "║ Kernel + Bootloader + Userland + Aplicaciones Wayland + Instalador ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
 
 # Función para compilar el kernel
 build_kernel() {
-    print_step "Compilando kernel Eclipse OS v0.5.0..."
+    print_step "Compilando kernel Eclipse OS v0.6.0..."
     
     # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
@@ -445,7 +445,7 @@ create_basic_distribution() {
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
 name = "Eclipse OS"
-version = "0.5.0"
+version = "0.6.0"
 kernel = "/boot/eclipse_kernel"
 init_system = "systemd"
 
@@ -509,7 +509,7 @@ EOF
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
-# Configuración UEFI para Eclipse OS v0.5.0
+# Configuración UEFI para Eclipse OS v0.6.0
 # Bootloader personalizado - no requiere GRUB
 
 [system]
@@ -562,7 +562,7 @@ show_build_summary() {
     echo "  - Instalador: $BUILD_DIR/userland/bin/eclipse-installer"
     echo "  - Systemd: $BUILD_DIR/userland/bin/eclipse-systemd"
     echo ""
-    echo "Eclipse OS v0.5.0 está listo para usar!"
+    echo "Eclipse OS v0.6.0 está listo para usar!"
 }
 
 # Función principal
