@@ -1837,7 +1837,7 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
         }
 
         // Procesar sistema de ventanas
-        {
+        /*{
             if crate::window_system::is_window_system_initialized() {
                 let _ = crate::window_system::process_window_system_events();
                 let _ = crate::window_system::render_window_system_frame();
@@ -1847,7 +1847,7 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
                     let _ = compositor.render_to_framebuffer(fb);
                 }
             }
-        }
+        }*/
 
         // Logging de estadísticas cada cierto número de frames
         if frame_counter % log_interval_frames == 0 {

@@ -136,6 +136,7 @@ pub struct CosmicState {
     pub window_manager_active: bool,
     pub ai_features_enabled: bool,
     pub theme_applied: bool,
+    pub cuda_enabled: bool,
     pub active_windows: Vec<u32>,
     pub performance_stats: CosmicPerformanceStats,
 }
@@ -235,6 +236,7 @@ impl CosmicManager {
                 window_manager_active: false,
                 ai_features_enabled: false,
                 theme_applied: false,
+                cuda_enabled: false,
                 active_windows: Vec::new(),
                 performance_stats: CosmicPerformanceStats::default(),
             },
@@ -270,6 +272,7 @@ impl CosmicManager {
                 window_manager_active: false,
                 ai_features_enabled: false,
                 theme_applied: false,
+                cuda_enabled: false,
                 active_windows: Vec::new(),
                 performance_stats: CosmicPerformanceStats::default(),
             },
@@ -318,6 +321,19 @@ impl CosmicManager {
             self.state.ai_features_enabled = true;
         }
 
+        // Inicializar aceleración CUDA si está habilitada
+        if self.config.enable_cuda_acceleration {
+            match self.cuda_acceleration.initialize() {
+                Ok(_) => {
+                    self.state.cuda_enabled = true;
+                }
+                Err(e) => {
+                    // Log del error pero continuar sin CUDA
+                    // En un sistema real, aquí se registraría el error
+                }
+            }
+        }
+
         self.state.initialized = true;
         Ok(())
     }
@@ -361,6 +377,20 @@ impl CosmicManager {
     /// Obtener estado de COSMIC
     pub fn get_state(&self) -> &CosmicState {
         &self.state
+    }
+
+    /// Obtener información CUDA
+    pub fn get_cuda_info(&self) -> String {
+        if self.state.cuda_enabled {
+            self.cuda_acceleration.get_cuda_info()
+        } else {
+            "CUDA: Deshabilitado".to_string()
+        }
+    }
+
+    /// Verificar si CUDA está habilitado
+    pub fn is_cuda_enabled(&self) -> bool {
+        self.state.cuda_enabled
     }
 
     /// Procesar eventos de COSMIC
