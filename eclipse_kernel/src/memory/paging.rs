@@ -1,8 +1,8 @@
 //! Sistema de Paginación para Eclipse OS
-//! 
+//!
 //! Implementa paginación de 4 niveles (PML4, PDPT, PD, PT)
 
-use crate::memory::manager::{PAGE_TABLE_ENTRIES, PAGE_PRESENT, PAGE_WRITABLE};
+use crate::memory::manager::{PAGE_PRESENT, PAGE_TABLE_ENTRIES, PAGE_WRITABLE};
 
 /// Estructura para manejar la paginación
 pub struct PagingSystem {
@@ -66,23 +66,31 @@ impl PagingSystem {
     pub fn init(&mut self) -> Result<(), &'static str> {
         // Crear las tablas de páginas
         self.create_page_tables()?;
-        
+
         // Configurar mapeo de identidad
         self.setup_identity_mapping()?;
-        
+
         // Cargar la tabla de páginas en CR3
         self.load_page_table();
-        
+
         Ok(())
     }
 
     /// Crear las tablas de páginas
     fn create_page_tables(&mut self) -> Result<(), &'static str> {
         // Usar memoria estática para las tablas de páginas (más seguro)
-        static mut PML4_TABLE: PageTable = PageTable { entries: [0; PAGE_TABLE_ENTRIES] };
-        static mut PDPT_TABLE: PageTable = PageTable { entries: [0; PAGE_TABLE_ENTRIES] };
-        static mut PD_TABLE: PageTable = PageTable { entries: [0; PAGE_TABLE_ENTRIES] };
-        static mut PT_TABLE: PageTable = PageTable { entries: [0; PAGE_TABLE_ENTRIES] };
+        static mut PML4_TABLE: PageTable = PageTable {
+            entries: [0; PAGE_TABLE_ENTRIES],
+        };
+        static mut PDPT_TABLE: PageTable = PageTable {
+            entries: [0; PAGE_TABLE_ENTRIES],
+        };
+        static mut PD_TABLE: PageTable = PageTable {
+            entries: [0; PAGE_TABLE_ENTRIES],
+        };
+        static mut PT_TABLE: PageTable = PageTable {
+            entries: [0; PAGE_TABLE_ENTRIES],
+        };
 
         unsafe {
             // Inicializar las tablas
@@ -90,7 +98,7 @@ impl PagingSystem {
             PDPT_TABLE = PageTable::new();
             PD_TABLE = PageTable::new();
             PT_TABLE = PageTable::new();
-            
+
             // Asignar punteros
             self.pml4 = &mut PML4_TABLE as *mut PageTable;
             self.pdpt = &mut PDPT_TABLE as *mut PageTable;
@@ -106,16 +114,19 @@ impl PagingSystem {
         unsafe {
             // Configurar PML4 para apuntar a PDPT
             (*self.pml4).set_entry(0, self.pdpt as u64 | PAGE_PRESENT | PAGE_WRITABLE);
-            
+
             // Configurar PDPT para apuntar a PD
             (*self.pdpt).set_entry(0, self.pd as u64 | PAGE_PRESENT | PAGE_WRITABLE);
-            
+
             // Configurar PD con páginas de 2MB
             (*self.pd).set_entry(0, 0 | PAGE_PRESENT | PAGE_WRITABLE | (1 << 7)); // Página de 2MB
-            
+
             // Configurar entradas adicionales para cubrir más memoria
             for i in 1..8 {
-                (*self.pd).set_entry(i, (i as u64 * 0x200000) | PAGE_PRESENT | PAGE_WRITABLE | (1 << 7));
+                (*self.pd).set_entry(
+                    i,
+                    (i as u64 * 0x200000) | PAGE_PRESENT | PAGE_WRITABLE | (1 << 7),
+                );
             }
         }
 
@@ -134,7 +145,12 @@ impl PagingSystem {
     }
 
     /// Mapear una página virtual a una página física
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
+    pub fn map_page(
+        &mut self,
+        virtual_addr: u64,
+        physical_addr: u64,
+        flags: u64,
+    ) -> Result<(), &'static str> {
         let pml4_index = (virtual_addr >> 39) & 0x1ff;
         let pdpt_index = (virtual_addr >> 30) & 0x1ff;
         let pd_index = (virtual_addr >> 21) & 0x1ff;
@@ -145,7 +161,10 @@ impl PagingSystem {
             if !(*self.pml4).is_present(pml4_index as usize) {
                 // Crear nueva tabla PDPT (simplificado)
                 let new_pdpt = PageTable::new();
-                (*self.pml4).set_entry(pml4_index as usize, &new_pdpt as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE);
+                (*self.pml4).set_entry(
+                    pml4_index as usize,
+                    &new_pdpt as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE,
+                );
             }
 
             // Obtener la dirección de la tabla PDPT
@@ -156,7 +175,10 @@ impl PagingSystem {
             if !(*pdpt_ptr).is_present(pdpt_index as usize) {
                 // Crear nueva tabla PD (simplificado)
                 let new_pd = PageTable::new();
-                (*pdpt_ptr).set_entry(pdpt_index as usize, &new_pd as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE);
+                (*pdpt_ptr).set_entry(
+                    pdpt_index as usize,
+                    &new_pd as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE,
+                );
             }
 
             // Obtener la dirección de la tabla PD
@@ -167,7 +189,10 @@ impl PagingSystem {
             if !(*pd_ptr).is_present(pd_index as usize) {
                 // Crear nueva tabla PT (simplificado)
                 let new_pt = PageTable::new();
-                (*pd_ptr).set_entry(pd_index as usize, &new_pt as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE);
+                (*pd_ptr).set_entry(
+                    pd_index as usize,
+                    &new_pt as *const _ as u64 | PAGE_PRESENT | PAGE_WRITABLE,
+                );
             }
 
             // Obtener la dirección de la tabla PT

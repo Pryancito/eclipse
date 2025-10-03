@@ -1,17 +1,17 @@
 #![no_std]
 
-use core::ptr;
-use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::format;
+use alloc::vec::Vec;
+use core::ptr;
 
-use crate::drivers::framebuffer::{FramebufferDriver, PixelFormat, Color};
 use crate::desktop_ai::{Point, Rect};
-use crate::drivers::pci::{PciDevice, GpuInfo, GpuType};
+use crate::drivers::amd_graphics::AmdGraphicsDriver;
+use crate::drivers::framebuffer::{Color, FramebufferDriver, PixelFormat};
 use crate::drivers::intel_graphics::IntelGraphicsDriver;
 use crate::drivers::nvidia_graphics::NvidiaGraphicsDriver;
-use crate::drivers::amd_graphics::AmdGraphicsDriver;
+use crate::drivers::pci::{GpuInfo, GpuType, PciDevice};
 
 /// Módulo de aceleración 2D para Eclipse OS
 /// Proporciona funciones optimizadas de renderizado 2D que aprovechan el hardware gráfico
@@ -41,9 +41,9 @@ pub enum HardwareAccelerationType {
 #[derive(Debug, Clone)]
 pub enum AccelerationOperation {
     FillRect(Rect, Color),
-    DrawRect(Rect, Color, u32), // rect, color, thickness
+    DrawRect(Rect, Color, u32),         // rect, color, thickness
     DrawLine(Point, Point, Color, u32), // start, end, color, thickness
-    Blit(Rect, Rect), // source, destination
+    Blit(Rect, Rect),                   // source, destination
     ClearScreen(Color),
     DrawCircle(Point, u32, Color, bool), // center, radius, color, filled
     DrawTriangle(Point, Point, Point, Color, bool), // p1, p2, p3, color, filled
@@ -91,7 +91,8 @@ impl Acceleration2D {
                 }
             }
             GpuType::Nvidia => {
-                let mut nvidia_driver = NvidiaGraphicsDriver::new(gpu_info.pci_device.clone(), gpu_info.clone());
+                let mut nvidia_driver =
+                    NvidiaGraphicsDriver::new(gpu_info.pci_device.clone(), gpu_info.clone());
                 match nvidia_driver.init(None) {
                     Ok(_) => {
                         self.nvidia_driver = Some(nvidia_driver);
@@ -106,7 +107,8 @@ impl Acceleration2D {
                 }
             }
             GpuType::Amd => {
-                let mut amd_driver = AmdGraphicsDriver::new(gpu_info.pci_device.clone(), gpu_info.clone());
+                let mut amd_driver =
+                    AmdGraphicsDriver::new(gpu_info.pci_device.clone(), gpu_info.clone());
                 match amd_driver.init(None) {
                     Ok(_) => {
                         self.amd_driver = Some(amd_driver);
@@ -140,9 +142,8 @@ impl Acceleration2D {
                             AccelerationOperation::DrawRect(rect, color, thickness) => {
                                 driver.draw_rect(rect, color, thickness, &mut self.framebuffer)
                             }
-                            AccelerationOperation::DrawLine(start, end, color, thickness) => {
-                                driver.draw_line(start, end, color, thickness, &mut self.framebuffer)
-                            }
+                            AccelerationOperation::DrawLine(start, end, color, thickness) => driver
+                                .draw_line(start, end, color, thickness, &mut self.framebuffer),
                             AccelerationOperation::Blit(src, dst) => {
                                 driver.blit(src, dst, &mut self.framebuffer)
                             }
@@ -150,10 +151,23 @@ impl Acceleration2D {
                                 driver.clear_screen(color, &mut self.framebuffer)
                             }
                             AccelerationOperation::DrawCircle(center, radius, color, filled) => {
-                                driver.draw_circle(center, radius, color, filled, &mut self.framebuffer)
+                                driver.draw_circle(
+                                    center,
+                                    radius,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                             AccelerationOperation::DrawTriangle(p1, p2, p3, color, filled) => {
-                                driver.draw_triangle(p1, p2, p3, color, filled, &mut self.framebuffer)
+                                driver.draw_triangle(
+                                    p1,
+                                    p2,
+                                    p3,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                         }
                     } else {
@@ -169,9 +183,8 @@ impl Acceleration2D {
                             AccelerationOperation::DrawRect(rect, color, thickness) => {
                                 driver.draw_rect(rect, color, thickness, &mut self.framebuffer)
                             }
-                            AccelerationOperation::DrawLine(start, end, color, thickness) => {
-                                driver.draw_line(start, end, color, thickness, &mut self.framebuffer)
-                            }
+                            AccelerationOperation::DrawLine(start, end, color, thickness) => driver
+                                .draw_line(start, end, color, thickness, &mut self.framebuffer),
                             AccelerationOperation::Blit(src, dst) => {
                                 driver.blit(src, dst, &mut self.framebuffer)
                             }
@@ -179,10 +192,23 @@ impl Acceleration2D {
                                 driver.clear_screen(color, &mut self.framebuffer)
                             }
                             AccelerationOperation::DrawCircle(center, radius, color, filled) => {
-                                driver.draw_circle(center, radius, color, filled, &mut self.framebuffer)
+                                driver.draw_circle(
+                                    center,
+                                    radius,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                             AccelerationOperation::DrawTriangle(p1, p2, p3, color, filled) => {
-                                driver.draw_triangle(p1, p2, p3, color, filled, &mut self.framebuffer)
+                                driver.draw_triangle(
+                                    p1,
+                                    p2,
+                                    p3,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                         }
                     } else {
@@ -198,9 +224,8 @@ impl Acceleration2D {
                             AccelerationOperation::DrawRect(rect, color, thickness) => {
                                 driver.draw_rect(rect, color, thickness, &mut self.framebuffer)
                             }
-                            AccelerationOperation::DrawLine(start, end, color, thickness) => {
-                                driver.draw_line(start, end, color, thickness, &mut self.framebuffer)
-                            }
+                            AccelerationOperation::DrawLine(start, end, color, thickness) => driver
+                                .draw_line(start, end, color, thickness, &mut self.framebuffer),
                             AccelerationOperation::Blit(src, dst) => {
                                 driver.blit(src, dst, &mut self.framebuffer)
                             }
@@ -208,19 +233,30 @@ impl Acceleration2D {
                                 driver.clear_screen(color, &mut self.framebuffer)
                             }
                             AccelerationOperation::DrawCircle(center, radius, color, filled) => {
-                                driver.draw_circle(center, radius, color, filled, &mut self.framebuffer)
+                                driver.draw_circle(
+                                    center,
+                                    radius,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                             AccelerationOperation::DrawTriangle(p1, p2, p3, color, filled) => {
-                                driver.draw_triangle(p1, p2, p3, color, filled, &mut self.framebuffer)
+                                driver.draw_triangle(
+                                    p1,
+                                    p2,
+                                    p3,
+                                    color,
+                                    filled,
+                                    &mut self.framebuffer,
+                                )
                             }
                         }
                     } else {
                         self.execute_software_operation(operation)
                     }
                 }
-                _ => {
-                    self.execute_software_operation(operation)
-                }
+                _ => self.execute_software_operation(operation),
             }
         } else {
             // Fallback a software
@@ -228,20 +264,30 @@ impl Acceleration2D {
         }
     }
 
-
     /// Ejecutar operación usando software (fallback)
-    fn execute_software_operation(&mut self, operation: AccelerationOperation) -> AccelerationResult {
+    fn execute_software_operation(
+        &mut self,
+        operation: AccelerationOperation,
+    ) -> AccelerationResult {
         match operation {
             AccelerationOperation::FillRect(rect, color) => {
-                self.framebuffer.fill_rect(rect.x, rect.y, rect.width, rect.height, color);
+                self.framebuffer
+                    .fill_rect(rect.x, rect.y, rect.width, rect.height, color);
                 AccelerationResult::SoftwareFallback
             }
             AccelerationOperation::DrawRect(rect, color, thickness) => {
-                self.framebuffer.draw_rect(rect.x, rect.y, rect.width, rect.height, color);
+                self.framebuffer
+                    .draw_rect(rect.x, rect.y, rect.width, rect.height, color);
                 AccelerationResult::SoftwareFallback
             }
             AccelerationOperation::DrawLine(start, end, color, thickness) => {
-                self.framebuffer.draw_line(start.x as i32, start.y as i32, end.x as i32, end.y as i32, color);
+                self.framebuffer.draw_line(
+                    start.x as i32,
+                    start.y as i32,
+                    end.x as i32,
+                    end.y as i32,
+                    color,
+                );
                 AccelerationResult::SoftwareFallback
             }
             AccelerationOperation::Blit(src, dst) => {
@@ -255,7 +301,13 @@ impl Acceleration2D {
                 AccelerationResult::SoftwareFallback
             }
             AccelerationOperation::ClearScreen(color) => {
-                self.framebuffer.fill_rect(0, 0, self.framebuffer.info.width, self.framebuffer.info.height, color);
+                self.framebuffer.fill_rect(
+                    0,
+                    0,
+                    self.framebuffer.info.width,
+                    self.framebuffer.info.height,
+                    color,
+                );
                 AccelerationResult::SoftwareFallback
             }
             AccelerationOperation::DrawCircle(center, radius, color, filled) => {
@@ -291,8 +343,10 @@ impl Acceleration2D {
                 if should_draw {
                     let pixel_x = (center_x + x) as u32;
                     let pixel_y = (center_y + y) as u32;
-                    
-                    if pixel_x < self.framebuffer.info.width && pixel_y < self.framebuffer.info.height {
+
+                    if pixel_x < self.framebuffer.info.width
+                        && pixel_y < self.framebuffer.info.height
+                    {
                         self.framebuffer.put_pixel(pixel_x, pixel_y, color);
                     }
                 }
@@ -301,14 +355,24 @@ impl Acceleration2D {
     }
 
     /// Dibujar triángulo usando software
-    fn draw_triangle_software(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool) {
+    fn draw_triangle_software(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+    ) {
         if filled {
             self.fill_triangle_software(p1, p2, p3, color);
         } else {
             // Dibujar líneas del triángulo
-            self.framebuffer.draw_line(p1.x as i32, p1.y as i32, p2.x as i32, p2.y as i32, color);
-            self.framebuffer.draw_line(p2.x as i32, p2.y as i32, p3.x as i32, p3.y as i32, color);
-            self.framebuffer.draw_line(p3.x as i32, p3.y as i32, p1.x as i32, p1.y as i32, color);
+            self.framebuffer
+                .draw_line(p1.x as i32, p1.y as i32, p2.x as i32, p2.y as i32, color);
+            self.framebuffer
+                .draw_line(p2.x as i32, p2.y as i32, p3.x as i32, p3.y as i32, color);
+            self.framebuffer
+                .draw_line(p3.x as i32, p3.y as i32, p1.x as i32, p1.y as i32, color);
         }
     }
 
@@ -322,13 +386,20 @@ impl Acceleration2D {
 
         // Rellenar desde top hasta middle
         self.fill_triangle_half(top, middle, bottom, color, true);
-        
+
         // Rellenar desde middle hasta bottom
         self.fill_triangle_half(top, middle, bottom, color, false);
     }
 
     /// Rellenar la mitad superior o inferior del triángulo
-    fn fill_triangle_half(&mut self, top: Point, middle: Point, bottom: Point, color: Color, upper_half: bool) {
+    fn fill_triangle_half(
+        &mut self,
+        top: Point,
+        middle: Point,
+        bottom: Point,
+        color: Color,
+        upper_half: bool,
+    ) {
         let start_y = if upper_half { top.y } else { middle.y };
         let end_y = if upper_half { middle.y } else { bottom.y };
 
@@ -339,18 +410,26 @@ impl Acceleration2D {
             if upper_half {
                 // Calcular intersecciones con las líneas top-middle y top-bottom
                 if middle.y != top.y {
-                    x1 = top.x + ((middle.x as i32 - top.x as i32) * (y as i32 - top.y as i32) / (middle.y as i32 - top.y as i32)) as u32;
+                    x1 = top.x
+                        + ((middle.x as i32 - top.x as i32) * (y as i32 - top.y as i32)
+                            / (middle.y as i32 - top.y as i32)) as u32;
                 }
                 if bottom.y != top.y {
-                    x2 = top.x + ((bottom.x as i32 - top.x as i32) * (y as i32 - top.y as i32) / (bottom.y as i32 - top.y as i32)) as u32;
+                    x2 = top.x
+                        + ((bottom.x as i32 - top.x as i32) * (y as i32 - top.y as i32)
+                            / (bottom.y as i32 - top.y as i32)) as u32;
                 }
             } else {
                 // Calcular intersecciones con las líneas middle-bottom y top-bottom
                 if bottom.y != middle.y {
-                    x1 = middle.x + ((bottom.x as i32 - middle.x as i32) * (y as i32 - middle.y as i32) / (bottom.y as i32 - middle.y as i32)) as u32;
+                    x1 = middle.x
+                        + ((bottom.x as i32 - middle.x as i32) * (y as i32 - middle.y as i32)
+                            / (bottom.y as i32 - middle.y as i32)) as u32;
                 }
                 if bottom.y != top.y {
-                    x2 = top.x + ((bottom.x as i32 - top.x as i32) * (y as i32 - top.y as i32) / (bottom.y as i32 - top.y as i32)) as u32;
+                    x2 = top.x
+                        + ((bottom.x as i32 - top.x as i32) * (y as i32 - top.y as i32)
+                            / (bottom.y as i32 - top.y as i32)) as u32;
                 }
             }
 
@@ -370,7 +449,11 @@ impl Acceleration2D {
     pub fn get_acceleration_info(&self) -> String {
         format!(
             "Aceleración 2D: {} | Hardware: {:?} | Habilitada: {}",
-            if self.acceleration_enabled { "Activa" } else { "Inactiva" },
+            if self.acceleration_enabled {
+                "Activa"
+            } else {
+                "Inactiva"
+            },
             self.hardware_type,
             self.acceleration_enabled
         )
@@ -378,54 +461,120 @@ impl Acceleration2D {
 
     /// Verificar si una operación está soportada por hardware
     pub fn is_operation_supported(&self, operation: &AccelerationOperation) -> bool {
-        self.acceleration_enabled && match operation {
-            AccelerationOperation::FillRect(_, _) => true,
-            AccelerationOperation::DrawRect(_, _, _) => true,
-            AccelerationOperation::DrawLine(_, _, _, _) => true,
-            AccelerationOperation::Blit(_, _) => true,
-            AccelerationOperation::ClearScreen(_) => true,
-            AccelerationOperation::DrawCircle(_, _, _, _) => true,
-            AccelerationOperation::DrawTriangle(_, _, _, _, _) => true,
-        }
+        self.acceleration_enabled
+            && match operation {
+                AccelerationOperation::FillRect(_, _) => true,
+                AccelerationOperation::DrawRect(_, _, _) => true,
+                AccelerationOperation::DrawLine(_, _, _, _) => true,
+                AccelerationOperation::Blit(_, _) => true,
+                AccelerationOperation::ClearScreen(_) => true,
+                AccelerationOperation::DrawCircle(_, _, _, _) => true,
+                AccelerationOperation::DrawTriangle(_, _, _, _, _) => true,
+            }
     }
 }
 
 /// Trait para drivers de gráficos que soportan aceleración 2D
 pub trait GraphicsDriver {
-    fn fill_rect(&mut self, rect: Rect, color: Color, fb: &mut FramebufferDriver) -> AccelerationResult;
-    fn draw_rect(&mut self, rect: Rect, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult;
-    fn draw_line(&mut self, start: Point, end: Point, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult;
+    fn fill_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult;
+    fn draw_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult;
+    fn draw_line(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult;
     fn blit(&mut self, src: Rect, dst: Rect, fb: &mut FramebufferDriver) -> AccelerationResult;
     fn clear_screen(&mut self, color: Color, fb: &mut FramebufferDriver) -> AccelerationResult;
-    fn draw_circle(&mut self, center: Point, radius: u32, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult;
-    fn draw_triangle(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult;
+    fn draw_circle(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult;
+    fn draw_triangle(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult;
 }
 
 /// Implementación del trait para Intel Graphics
 impl GraphicsDriver for IntelGraphicsDriver {
-    fn fill_rect(&mut self, rect: Rect, color: Color, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::FillRect(rect, color), fb) {
+    fn fill_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::FillRect(rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel fill_rect failed".to_string()),
         }
     }
 
-    fn draw_rect(&mut self, rect: Rect, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::DrawRect(rect, color, thickness), fb) {
+    fn draw_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::DrawRect(rect, color, thickness),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel draw_rect failed".to_string()),
         }
     }
 
-    fn draw_line(&mut self, start: Point, end: Point, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::DrawLine(start, end, color, thickness), fb) {
+    fn draw_line(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::DrawLine(
+                start, end, color, thickness,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel draw_line failed".to_string()),
         }
     }
 
     fn blit(&mut self, src: Rect, dst: Rect, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::Blit(src, dst), fb) {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::Blit(src, dst),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel blit failed".to_string()),
         }
@@ -438,21 +587,49 @@ impl GraphicsDriver for IntelGraphicsDriver {
             width: fb.info.width,
             height: fb.info.height,
         };
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::FillRect(screen_rect, color), fb) {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::FillRect(screen_rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel clear_screen failed".to_string()),
         }
     }
 
-    fn draw_circle(&mut self, center: Point, radius: u32, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::DrawCircle(center, radius, color, filled), fb) {
+    fn draw_circle(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::DrawCircle(
+                center, radius, color, filled,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel draw_circle failed".to_string()),
         }
     }
 
-    fn draw_triangle(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::intel_graphics::Intel2DOperation::DrawTriangle(p1, p2, p3, color, filled), fb) {
+    fn draw_triangle(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::intel_graphics::Intel2DOperation::DrawTriangle(
+                p1, p2, p3, color, filled,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("Intel draw_triangle failed".to_string()),
         }
@@ -461,29 +638,61 @@ impl GraphicsDriver for IntelGraphicsDriver {
 
 /// Implementación del trait para NVIDIA Graphics
 impl GraphicsDriver for NvidiaGraphicsDriver {
-    fn fill_rect(&mut self, rect: Rect, color: Color, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::FillRect(rect, color), fb) {
+    fn fill_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::FillRect(rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA fill_rect failed".to_string()),
         }
     }
 
-    fn draw_rect(&mut self, rect: Rect, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawRect(rect, color, thickness), fb) {
+    fn draw_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawRect(rect, color, thickness),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA draw_rect failed".to_string()),
         }
     }
 
-    fn draw_line(&mut self, start: Point, end: Point, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawLine(start, end, color, thickness), fb) {
+    fn draw_line(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawLine(
+                start, end, color, thickness,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA draw_line failed".to_string()),
         }
     }
 
     fn blit(&mut self, src: Rect, dst: Rect, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::Blit(src, dst), fb) {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::Blit(src, dst),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA blit failed".to_string()),
         }
@@ -496,21 +705,49 @@ impl GraphicsDriver for NvidiaGraphicsDriver {
             width: fb.info.width,
             height: fb.info.height,
         };
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::FillRect(screen_rect, color), fb) {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::FillRect(screen_rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA clear_screen failed".to_string()),
         }
     }
 
-    fn draw_circle(&mut self, center: Point, radius: u32, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawCircle(center, radius, color, filled), fb) {
+    fn draw_circle(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawCircle(
+                center, radius, color, filled,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA draw_circle failed".to_string()),
         }
     }
 
-    fn draw_triangle(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawTriangle(p1, p2, p3, color, filled), fb) {
+    fn draw_triangle(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::nvidia_graphics::Nvidia2DOperation::DrawTriangle(
+                p1, p2, p3, color, filled,
+            ),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("NVIDIA draw_triangle failed".to_string()),
         }
@@ -519,29 +756,59 @@ impl GraphicsDriver for NvidiaGraphicsDriver {
 
 /// Implementación del trait para AMD Graphics
 impl GraphicsDriver for AmdGraphicsDriver {
-    fn fill_rect(&mut self, rect: Rect, color: Color, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::FillRect(rect, color), fb) {
+    fn fill_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::FillRect(rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD fill_rect failed".to_string()),
         }
     }
 
-    fn draw_rect(&mut self, rect: Rect, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::DrawRect(rect, color, thickness), fb) {
+    fn draw_rect(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::DrawRect(rect, color, thickness),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD draw_rect failed".to_string()),
         }
     }
 
-    fn draw_line(&mut self, start: Point, end: Point, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::DrawLine(start, end, color, thickness), fb) {
+    fn draw_line(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::DrawLine(start, end, color, thickness),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD draw_line failed".to_string()),
         }
     }
 
     fn blit(&mut self, src: Rect, dst: Rect, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::Blit(src, dst), fb) {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::Blit(src, dst),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD blit failed".to_string()),
         }
@@ -554,21 +821,45 @@ impl GraphicsDriver for AmdGraphicsDriver {
             width: fb.info.width,
             height: fb.info.height,
         };
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::FillRect(screen_rect, color), fb) {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::FillRect(screen_rect, color),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD clear_screen failed".to_string()),
         }
     }
 
-    fn draw_circle(&mut self, center: Point, radius: u32, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::DrawCircle(center, radius, color, filled), fb) {
+    fn draw_circle(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::DrawCircle(center, radius, color, filled),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD draw_circle failed".to_string()),
         }
     }
 
-    fn draw_triangle(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool, fb: &mut FramebufferDriver) -> AccelerationResult {
-        match self.render_2d(crate::drivers::amd_graphics::Amd2DOperation::DrawTriangle(p1, p2, p3, color, filled), fb) {
+    fn draw_triangle(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> AccelerationResult {
+        match self.render_2d(
+            crate::drivers::amd_graphics::Amd2DOperation::DrawTriangle(p1, p2, p3, color, filled),
+            fb,
+        ) {
             Ok(_) => AccelerationResult::HardwareAccelerated,
             Err(_) => AccelerationResult::DriverError("AMD draw_triangle failed".to_string()),
         }

@@ -1,10 +1,10 @@
-use core::fmt;
+use crate::drivers::framebuffer::{Color, FramebufferDriver, FramebufferInfo};
+use crate::drivers::pci::{GpuInfo, GpuType};
+use crate::hardware_detection::HardwareDetectionResult;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
-use crate::drivers::framebuffer::{FramebufferDriver, FramebufferInfo, Color};
-use crate::drivers::pci::{GpuType, GpuInfo};
-use crate::hardware_detection::HardwareDetectionResult;
+use core::fmt;
 
 /// Driver de framebuffer hardware directo para scroll optimizado
 pub struct HardwareFramebufferDriver {
@@ -44,23 +44,27 @@ impl HardwareFramebufferDriver {
     }
 
     /// Inicializar framebuffer hardware desde UEFI
-    pub fn initialize_from_uefi(&mut self, uefi_fb: &FramebufferDriver, hw_result: &HardwareDetectionResult) -> Result<(), String> {
+    pub fn initialize_from_uefi(
+        &mut self,
+        uefi_fb: &FramebufferDriver,
+        hw_result: &HardwareDetectionResult,
+    ) -> Result<(), String> {
         // Copiar información básica del UEFI
         self.info = *uefi_fb.get_info();
-        
+
         // Detectar GPU primaria para optimizaciones
         if let Some(primary_gpu) = &hw_result.primary_gpu {
             self.gpu_type = primary_gpu.gpu_type;
             self.vendor_id = primary_gpu.pci_device.vendor_id;
             self.device_id = primary_gpu.pci_device.device_id;
-            
+
             // Configurar optimizaciones específicas por GPU
             self.configure_gpu_optimizations(primary_gpu)?;
         }
-        
+
         // Configurar framebuffer optimizado
         self.setup_optimized_framebuffer()?;
-        
+
         Ok(())
     }
 
@@ -71,28 +75,28 @@ impl HardwareFramebufferDriver {
                 self.hardware_optimized = true;
                 self.dma_enabled = true;
                 self.setup_nvidia_optimizations()?;
-            },
+            }
             GpuType::Amd => {
                 self.hardware_optimized = true;
                 self.dma_enabled = true;
                 self.setup_amd_optimizations()?;
-            },
+            }
             GpuType::Intel => {
                 self.hardware_optimized = true;
                 self.dma_enabled = false; // Intel usa SIMD
                 self.setup_intel_optimizations()?;
-            },
+            }
             GpuType::QemuBochs => {
                 self.hardware_optimized = false;
                 self.dma_enabled = false;
                 self.setup_qemu_optimizations()?;
-            },
+            }
             _ => {
                 self.hardware_optimized = false;
                 self.dma_enabled = false;
             }
         }
-        
+
         Ok(())
     }
 
@@ -103,15 +107,15 @@ impl HardwareFramebufferDriver {
             // Configurar double buffer para scroll suave
             let buffer_size = (self.info.width * self.info.height * 4) as usize;
             self.double_buffer = Some(alloc::alloc::alloc(
-                alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap()
+                alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap(),
             ) as *mut u32);
-            
+
             // Configurar cache de scroll
             self.scroll_cache = Some(alloc::alloc::alloc(
-                alloc::alloc::Layout::from_size_align(buffer_size / 4, 4096).unwrap()
+                alloc::alloc::Layout::from_size_align(buffer_size / 4, 4096).unwrap(),
             ) as *mut u32);
         }
-        
+
         Ok(())
     }
 
@@ -121,10 +125,10 @@ impl HardwareFramebufferDriver {
         unsafe {
             let buffer_size = (self.info.width * self.info.height * 4) as usize;
             self.double_buffer = Some(alloc::alloc::alloc(
-                alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap()
+                alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap(),
             ) as *mut u32);
         }
-        
+
         Ok(())
     }
 
@@ -149,7 +153,7 @@ impl HardwareFramebufferDriver {
         self.info.green_mask = 0x00FF00;
         self.info.blue_mask = 0x0000FF;
         self.info.reserved_mask = 0x000000;
-        
+
         Ok(())
     }
 
@@ -185,34 +189,41 @@ impl HardwareFramebufferDriver {
     }
 
     /// Scroll optimizado para NVIDIA usando DMA
-    fn nvidia_scroll(&self, fb_ptr: *mut u32, width: usize, height: usize, stride: usize, lines: i32) -> Result<(), String> {
+    fn nvidia_scroll(
+        &self,
+        fb_ptr: *mut u32,
+        width: usize,
+        height: usize,
+        stride: usize,
+        lines: i32,
+    ) -> Result<(), String> {
         if lines > 0 {
             // Scroll hacia arriba
             let src_offset = (lines as usize * stride) * 4;
             let dst_offset = 0;
             let copy_size = ((height - lines as usize) * stride) * 4;
-            
+
             if let Some(double_buf) = self.double_buffer {
                 // Usar double buffer para scroll suave
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         fb_ptr.add(src_offset / 4),
                         double_buf.add(dst_offset / 4),
-                        copy_size / 4
+                        copy_size / 4,
                     );
-                    
+
                     // Limpiar área inferior
                     core::ptr::write_bytes(
                         fb_ptr.add((height - lines as usize) * stride),
                         0,
-                        (lines as usize * stride) * 4
+                        (lines as usize * stride) * 4,
                     );
-                    
+
                     // Copiar de vuelta
                     core::ptr::copy_nonoverlapping(
                         double_buf.add(dst_offset / 4),
                         fb_ptr.add(dst_offset / 4),
-                        copy_size / 4
+                        copy_size / 4,
                     );
                 }
             } else {
@@ -221,14 +232,14 @@ impl HardwareFramebufferDriver {
                     core::ptr::copy(
                         fb_ptr.add(src_offset / 4),
                         fb_ptr.add(dst_offset / 4),
-                        copy_size / 4
+                        copy_size / 4,
                     );
-                    
+
                     // Limpiar área inferior
                     core::ptr::write_bytes(
                         fb_ptr.add((height - lines as usize) * stride),
                         0,
-                        (lines as usize * stride) * 4
+                        (lines as usize * stride) * 4,
                     );
                 }
             }
@@ -238,53 +249,63 @@ impl HardwareFramebufferDriver {
             let src_offset = 0;
             let dst_offset = (lines_abs * stride) * 4;
             let copy_size = ((height - lines_abs) * stride) * 4;
-            
+
             unsafe {
                 core::ptr::copy(
                     fb_ptr.add(src_offset / 4),
                     fb_ptr.add(dst_offset / 4),
-                    copy_size / 4
+                    copy_size / 4,
                 );
-                
+
                 // Limpiar área superior
-                core::ptr::write_bytes(
-                    fb_ptr.add(src_offset / 4),
-                    0,
-                    (lines_abs * stride) * 4
-                );
+                core::ptr::write_bytes(fb_ptr.add(src_offset / 4), 0, (lines_abs * stride) * 4);
             }
         }
-        
+
         Ok(())
     }
 
     /// Scroll optimizado para AMD
-    fn amd_scroll(&self, fb_ptr: *mut u32, width: usize, height: usize, stride: usize, lines: i32) -> Result<(), String> {
+    fn amd_scroll(
+        &self,
+        fb_ptr: *mut u32,
+        width: usize,
+        height: usize,
+        stride: usize,
+        lines: i32,
+    ) -> Result<(), String> {
         // Similar a NVIDIA pero con optimizaciones específicas de AMD
         self.nvidia_scroll(fb_ptr, width, height, stride, lines)
     }
 
     /// Scroll optimizado para Intel usando SIMD
-    fn intel_scroll(&self, fb_ptr: *mut u32, width: usize, height: usize, stride: usize, lines: i32) -> Result<(), String> {
+    fn intel_scroll(
+        &self,
+        fb_ptr: *mut u32,
+        width: usize,
+        height: usize,
+        stride: usize,
+        lines: i32,
+    ) -> Result<(), String> {
         if lines > 0 {
             // Scroll hacia arriba usando SIMD
             let src_offset = (lines as usize * stride) * 4;
             let dst_offset = 0;
             let copy_size = ((height - lines as usize) * stride) * 4;
-            
+
             unsafe {
                 // Usar memmove optimizado para Intel
                 core::ptr::copy(
                     fb_ptr.add(src_offset / 4),
                     fb_ptr.add(dst_offset / 4),
-                    copy_size / 4
+                    copy_size / 4,
                 );
-                
+
                 // Limpiar área inferior
                 core::ptr::write_bytes(
                     fb_ptr.add((height - lines as usize) * stride),
                     0,
-                    (lines as usize * stride) * 4
+                    (lines as usize * stride) * 4,
                 );
             }
         } else {
@@ -293,46 +314,49 @@ impl HardwareFramebufferDriver {
             let src_offset = 0;
             let dst_offset = (lines_abs * stride) * 4;
             let copy_size = ((height - lines_abs) * stride) * 4;
-            
+
             unsafe {
                 core::ptr::copy(
                     fb_ptr.add(src_offset / 4),
                     fb_ptr.add(dst_offset / 4),
-                    copy_size / 4
+                    copy_size / 4,
                 );
-                
+
                 // Limpiar área superior
-                core::ptr::write_bytes(
-                    fb_ptr.add(src_offset / 4),
-                    0,
-                    (lines_abs * stride) * 4
-                );
+                core::ptr::write_bytes(fb_ptr.add(src_offset / 4), 0, (lines_abs * stride) * 4);
             }
         }
-        
+
         Ok(())
     }
 
     /// Scroll genérico para hardware no optimizado
-    fn generic_scroll(&self, fb_ptr: *mut u32, width: usize, height: usize, stride: usize, lines: i32) -> Result<(), String> {
+    fn generic_scroll(
+        &self,
+        fb_ptr: *mut u32,
+        width: usize,
+        height: usize,
+        stride: usize,
+        lines: i32,
+    ) -> Result<(), String> {
         if lines > 0 {
             // Scroll hacia arriba
             let src_offset = (lines as usize * stride) * 4;
             let dst_offset = 0;
             let copy_size = ((height - lines as usize) * stride) * 4;
-            
+
             unsafe {
                 core::ptr::copy(
                     fb_ptr.add(src_offset / 4),
                     fb_ptr.add(dst_offset / 4),
-                    copy_size / 4
+                    copy_size / 4,
                 );
-                
+
                 // Limpiar área inferior
                 core::ptr::write_bytes(
                     fb_ptr.add((height - lines as usize) * stride),
                     0,
-                    (lines as usize * stride) * 4
+                    (lines as usize * stride) * 4,
                 );
             }
         } else {
@@ -341,23 +365,19 @@ impl HardwareFramebufferDriver {
             let src_offset = 0;
             let dst_offset = (lines_abs * stride) * 4;
             let copy_size = ((height - lines_abs) * stride) * 4;
-            
+
             unsafe {
                 core::ptr::copy(
                     fb_ptr.add(src_offset / 4),
                     fb_ptr.add(dst_offset / 4),
-                    copy_size / 4
+                    copy_size / 4,
                 );
-                
+
                 // Limpiar área superior
-                core::ptr::write_bytes(
-                    fb_ptr.add(src_offset / 4),
-                    0,
-                    (lines_abs * stride) * 4
-                );
+                core::ptr::write_bytes(fb_ptr.add(src_offset / 4), 0, (lines_abs * stride) * 4);
             }
         }
-        
+
         Ok(())
     }
 
@@ -381,7 +401,7 @@ impl HardwareFramebufferDriver {
                 Color::BLUE => 0x000000FF,
                 _ => 0x00000000,
             };
-            
+
             unsafe {
                 core::ptr::write_bytes(fb_ptr, color_value as u8, pixel_count * 4);
             }
@@ -419,17 +439,17 @@ impl Drop for HardwareFramebufferDriver {
                 let buffer_size = (self.info.width * self.info.height * 4) as usize;
                 alloc::alloc::dealloc(
                     ptr as *mut u8,
-                    alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap()
+                    alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap(),
                 );
             }
         }
-        
+
         if let Some(ptr) = self.scroll_cache {
             unsafe {
                 let buffer_size = (self.info.width * self.info.height) as usize;
                 alloc::alloc::dealloc(
                     ptr as *mut u8,
-                    alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap()
+                    alloc::alloc::Layout::from_size_align(buffer_size, 4096).unwrap(),
                 );
             }
         }

@@ -1,13 +1,13 @@
 //! Características de IA integradas para COSMIC en Eclipse OS
-//! 
+//!
 //! Este módulo proporciona funcionalidades de IA que mejoran la experiencia
 //! del usuario en el entorno de escritorio COSMIC.
 
-use super::{CosmicPerformanceStats};
+use super::CosmicPerformanceStats;
 use crate::ai::{ModelLoader, ModelType};
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
 
 /// Estadísticas de rendimiento para COSMIC
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,7 +122,10 @@ impl CosmicAIFeatures {
     }
 
     /// Analizar patrón de uso de ventanas y sugerir optimizaciones
-    pub fn analyze_window_usage(&mut self, window_history: &[WindowEvent]) -> Vec<WindowSuggestion> {
+    pub fn analyze_window_usage(
+        &mut self,
+        window_history: &[WindowEvent],
+    ) -> Vec<WindowSuggestion> {
         let mut suggestions = Vec::new();
 
         if !self.smart_window_management {
@@ -221,7 +224,8 @@ impl CosmicAIFeatures {
         }
 
         // Analizar uso de memoria
-        if stats.memory_usage > 1024.0 * 1024.0 * 1024.0 { // 1GB
+        if stats.memory_usage > 1024.0 * 1024.0 * 1024.0 {
+            // 1GB
             suggestions.push(PerformanceSuggestion {
                 suggestion_type: PerformanceSuggestionType::MemoryManagement,
                 description: "Limpiar caché de aplicaciones".to_string(),
@@ -314,22 +318,64 @@ impl CosmicAIFeatures {
     /// Obtener estado de las características de IA
     pub fn get_status(&self) -> String {
         let mut status = String::new();
-        
+
         status.push_str("Características de IA:\n");
-        status.push_str(&format!("  Gestión inteligente de ventanas: {}\n", 
-            if self.smart_window_management { "Activada" } else { "Desactivada" }));
-        status.push_str(&format!("  UI predictiva: {}\n", 
-            if self.predictive_ui { "Activada" } else { "Desactivada" }));
-        status.push_str(&format!("  Optimización de rendimiento: {}\n", 
-            if self.performance_optimization { "Activada" } else { "Desactivada" }));
-        status.push_str(&format!("  Asistente de voz: {}\n", 
-            if self.voice_assistant { "Activado" } else { "Desactivado" }));
-        status.push_str(&format!("  Reconocimiento de gestos: {}\n", 
-            if self.gesture_recognition { "Activado" } else { "Desactivado" }));
-        status.push_str(&format!("  Conciencia contextual: {}\n", 
-            if self.context_awareness { "Activada" } else { "Desactivada" }));
-        status.push_str(&format!("  Modelos de IA cargados: {}\n", 
-            if self.model_loader.is_some() { "Sí" } else { "No" }));
+        status.push_str(&format!(
+            "  Gestión inteligente de ventanas: {}\n",
+            if self.smart_window_management {
+                "Activada"
+            } else {
+                "Desactivada"
+            }
+        ));
+        status.push_str(&format!(
+            "  UI predictiva: {}\n",
+            if self.predictive_ui {
+                "Activada"
+            } else {
+                "Desactivada"
+            }
+        ));
+        status.push_str(&format!(
+            "  Optimización de rendimiento: {}\n",
+            if self.performance_optimization {
+                "Activada"
+            } else {
+                "Desactivada"
+            }
+        ));
+        status.push_str(&format!(
+            "  Asistente de voz: {}\n",
+            if self.voice_assistant {
+                "Activado"
+            } else {
+                "Desactivado"
+            }
+        ));
+        status.push_str(&format!(
+            "  Reconocimiento de gestos: {}\n",
+            if self.gesture_recognition {
+                "Activado"
+            } else {
+                "Desactivado"
+            }
+        ));
+        status.push_str(&format!(
+            "  Conciencia contextual: {}\n",
+            if self.context_awareness {
+                "Activada"
+            } else {
+                "Desactivada"
+            }
+        ));
+        status.push_str(&format!(
+            "  Modelos de IA cargados: {}\n",
+            if self.model_loader.is_some() {
+                "Sí"
+            } else {
+                "No"
+            }
+        ));
 
         status
     }
@@ -338,11 +384,30 @@ impl CosmicAIFeatures {
 /// Eventos de ventana para análisis de IA
 #[derive(Debug, Clone)]
 pub enum WindowEvent {
-    Created { window_id: u32, timestamp: u64 },
-    Moved { window_id: u32, old_pos: (i32, i32), new_pos: (i32, i32) },
-    Resized { window_id: u32, old_size: (u32, u32), new_size: (u32, u32) },
-    Focused { window_id: u32 },
-    Minimized { window_id: u32 },
-    Maximized { window_id: u32 },
-    Closed { window_id: u32 },
+    Created {
+        window_id: u32,
+        timestamp: u64,
+    },
+    Moved {
+        window_id: u32,
+        old_pos: (i32, i32),
+        new_pos: (i32, i32),
+    },
+    Resized {
+        window_id: u32,
+        old_size: (u32, u32),
+        new_size: (u32, u32),
+    },
+    Focused {
+        window_id: u32,
+    },
+    Minimized {
+        window_id: u32,
+    },
+    Maximized {
+        window_id: u32,
+    },
+    Closed {
+        window_id: u32,
+    },
 }

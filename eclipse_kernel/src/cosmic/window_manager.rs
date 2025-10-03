@@ -1,15 +1,15 @@
 //! Gestor de ventanas COSMIC para Eclipse OS
-//! 
+//!
 //! Implementa la gestión inteligente de ventanas con características
 //! únicas de Eclipse OS como IA integrada y temas espaciales.
 
-use super::{WindowManagerMode};
+use super::ai_features::{CosmicAIFeatures, WindowEvent, WindowSuggestion};
 use super::compositor::CompositorWindow;
-use super::ai_features::{CosmicAIFeatures, WindowSuggestion, WindowEvent};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use alloc::vec;
+use super::WindowManagerMode;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Gestor de ventanas COSMIC
 pub struct CosmicWindowManager {
@@ -81,20 +81,29 @@ impl CosmicWindowManager {
     }
 
     /// Crear nueva ventana
-    pub fn create_window(&mut self, title: String, x: i32, y: i32, width: u32, height: u32) -> Result<u32, String> {
+    pub fn create_window(
+        &mut self,
+        title: String,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<u32, String> {
         let id = self.next_window_id;
         self.next_window_id += 1;
 
         // Aplicar sugerencias de IA si están disponibles
-        let (final_x, final_y, final_width, final_height) = if let Some(ref mut ai) = self.ai_features {
-            if self.windows.len() >= 3 { // Aplicar tiling automático después de 3 ventanas
-                self.get_tiling_layout(id, width, height)
+        let (final_x, final_y, final_width, final_height) =
+            if let Some(ref mut ai) = self.ai_features {
+                if self.windows.len() >= 3 {
+                    // Aplicar tiling automático después de 3 ventanas
+                    self.get_tiling_layout(id, width, height)
+                } else {
+                    (x, y, width, height)
+                }
             } else {
                 (x, y, width, height)
-            }
-        } else {
-            (x, y, width, height)
-        };
+            };
 
         let window = CompositorWindow {
             id,
@@ -112,9 +121,9 @@ impl CosmicWindowManager {
         self.focused_window = Some(id);
 
         // Registrar evento para análisis de IA
-        self.window_history.push(WindowEvent::Created { 
-            window_id: id, 
-            timestamp: self.get_current_timestamp() 
+        self.window_history.push(WindowEvent::Created {
+            window_id: id,
+            timestamp: self.get_current_timestamp(),
         });
 
         Ok(id)
@@ -131,7 +140,8 @@ impl CosmicWindowManager {
             }
 
             // Registrar evento para análisis de IA
-            self.window_history.push(WindowEvent::Closed { window_id: id });
+            self.window_history
+                .push(WindowEvent::Closed { window_id: id });
 
             // Reorganizar ventanas si es necesario
             self.reorganize_windows()?;
@@ -149,10 +159,10 @@ impl CosmicWindowManager {
             window.needs_redraw = true;
 
             // Registrar evento para análisis de IA
-            self.window_history.push(WindowEvent::Moved { 
-                window_id: id, 
-                old_pos, 
-                new_pos: (x, y) 
+            self.window_history.push(WindowEvent::Moved {
+                window_id: id,
+                old_pos,
+                new_pos: (x, y),
             });
         }
 
@@ -169,10 +179,10 @@ impl CosmicWindowManager {
             window.needs_redraw = true;
 
             // Registrar evento para análisis de IA
-            self.window_history.push(WindowEvent::Resized { 
-                window_id: id, 
-                old_size, 
-                new_size: (width, height) 
+            self.window_history.push(WindowEvent::Resized {
+                window_id: id,
+                old_size,
+                new_size: (width, height),
             });
         }
 
@@ -188,7 +198,7 @@ impl CosmicWindowManager {
                 max_z_order = w.z_order;
             }
         }
-        
+
         // Luego actualizar la ventana específica
         if let Some(window) = self.windows.iter_mut().find(|w| w.id == id) {
             window.z_order = max_z_order + 1;
@@ -198,7 +208,8 @@ impl CosmicWindowManager {
         self.focused_window = Some(id);
 
         // Registrar evento para análisis de IA
-        self.window_history.push(WindowEvent::Focused { window_id: id });
+        self.window_history
+            .push(WindowEvent::Focused { window_id: id });
 
         Ok(())
     }
@@ -212,14 +223,17 @@ impl CosmicWindowManager {
 
         // Cambiar foco a otra ventana
         if self.focused_window == Some(id) {
-            self.focused_window = self.windows.iter()
+            self.focused_window = self
+                .windows
+                .iter()
                 .filter(|w| w.id != id && w.visible)
                 .last()
                 .map(|w| w.id);
         }
 
         // Registrar evento para análisis de IA
-        self.window_history.push(WindowEvent::Minimized { window_id: id });
+        self.window_history
+            .push(WindowEvent::Minimized { window_id: id });
 
         Ok(())
     }
@@ -238,7 +252,9 @@ impl CosmicWindowManager {
                     window.y = 0;
                     window.width = 1920; // Resolución por defecto
                     window.height = 1080;
-                    window.buffer.resize((window.width * window.height) as usize, 0);
+                    window
+                        .buffer
+                        .resize((window.width * window.height) as usize, 0);
                     window.needs_redraw = true;
                 }
                 WindowManagerMode::Hybrid => {
@@ -249,7 +265,8 @@ impl CosmicWindowManager {
         }
 
         // Registrar evento para análisis de IA
-        self.window_history.push(WindowEvent::Maximized { window_id: id });
+        self.window_history
+            .push(WindowEvent::Maximized { window_id: id });
 
         Ok(())
     }
@@ -257,7 +274,7 @@ impl CosmicWindowManager {
     /// Obtener layout de tiling para nueva ventana
     fn get_tiling_layout(&self, id: u32, width: u32, height: u32) -> (i32, i32, u32, u32) {
         let window_count = self.windows.len();
-        
+
         match window_count {
             1 => {
                 // Primera ventana: ocupar mitad izquierda
@@ -270,19 +287,29 @@ impl CosmicWindowManager {
             _ => {
                 // Ventanas adicionales: layout en cuadrícula
                 // Simplificado para no_std - usar lógica básica en lugar de sqrt y ceil
-                let cols = if window_count <= 1 { 1 } 
-                          else if window_count <= 4 { 2 }
-                          else if window_count <= 9 { 3 }
-                          else { 4 };
+                let cols = if window_count <= 1 {
+                    1
+                } else if window_count <= 4 {
+                    2
+                } else if window_count <= 9 {
+                    3
+                } else {
+                    4
+                };
                 let rows = ((window_count + cols - 1) / cols).max(1);
-                
+
                 let cell_width = 1920 / cols;
                 let cell_height = 1080 / rows;
-                
+
                 let col = (window_count - 1) % cols;
                 let row = (window_count - 1) / cols;
-                
-                ((col * cell_width) as i32, (row * cell_height) as i32, cell_width.try_into().unwrap(), cell_height.try_into().unwrap())
+
+                (
+                    (col * cell_width) as i32,
+                    (row * cell_height) as i32,
+                    cell_width.try_into().unwrap(),
+                    cell_height.try_into().unwrap(),
+                )
             }
         }
     }
@@ -309,7 +336,7 @@ impl CosmicWindowManager {
     /// Reorganizar layout de tiling
     fn reorganize_tiling_layout(&mut self) -> Result<(), String> {
         let window_count = self.windows.len();
-        
+
         if window_count == 0 {
             return Ok(());
         }
@@ -317,14 +344,14 @@ impl CosmicWindowManager {
         // Simular sqrt y ceil para no_std
         let cols = if window_count <= 1 { 1 } else { 2 };
         let rows = if window_count <= 2 { 1 } else { 2 };
-        
+
         let cell_width = 1920 / cols;
         let cell_height = 1080 / rows;
 
         for (i, window) in self.windows.iter_mut().enumerate() {
             let col = i as u32 % cols;
             let row = i as u32 / cols;
-            
+
             window.x = (col * cell_width) as i32;
             window.y = (row * cell_height) as i32;
             window.width = cell_width;
@@ -359,7 +386,7 @@ impl CosmicWindowManager {
     /// Cambiar modo de gestión de ventanas
     pub fn set_mode(&mut self, mode: WindowManagerMode) -> Result<(), String> {
         self.mode = mode;
-        
+
         // Reorganizar ventanas según el nuevo modo
         match mode {
             WindowManagerMode::Tiling => {
@@ -389,7 +416,11 @@ impl CosmicWindowManager {
 
     /// Aplicar sugerencia de IA
     pub fn apply_ai_suggestion(&mut self, suggestion: &WindowSuggestion) -> Result<(), String> {
-        if let Some(window) = self.windows.iter_mut().find(|w| w.id == suggestion.window_id) {
+        if let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == suggestion.window_id)
+        {
             window.x = suggestion.suggested_position.0;
             window.y = suggestion.suggested_position.1;
             window.width = suggestion.suggested_size.0;
@@ -422,14 +453,24 @@ impl CosmicWindowManager {
     /// Obtener estadísticas
     pub fn get_stats(&self) -> String {
         let mut stats = String::new();
-        
+
         stats.push_str("Gestor de Ventanas COSMIC:\n");
         stats.push_str(&format!("  Modo: {:?}\n", self.mode));
         stats.push_str(&format!("  Ventanas activas: {}\n", self.windows.len()));
-        stats.push_str(&format!("  Workspace actual: {}/{}\n", self.current_workspace + 1, self.workspace_count));
+        stats.push_str(&format!(
+            "  Workspace actual: {}/{}\n",
+            self.current_workspace + 1,
+            self.workspace_count
+        ));
         stats.push_str(&format!("  Ventana enfocada: {:?}\n", self.focused_window));
-        stats.push_str(&format!("  Eventos registrados: {}\n", self.window_history.len()));
-        stats.push_str(&format!("  IA habilitada: {}\n", self.ai_features.is_some()));
+        stats.push_str(&format!(
+            "  Eventos registrados: {}\n",
+            self.window_history.len()
+        ));
+        stats.push_str(&format!(
+            "  IA habilitada: {}\n",
+            self.ai_features.is_some()
+        ));
 
         stats
     }

@@ -3,12 +3,12 @@
 //! Este módulo implementa un scheduler que se adapta automáticamente
 //! a las condiciones del sistema para optimizar el rendimiento
 
-use crate::process::{ProcessId, ThreadId, ProcessPriority};
-use crate::math_utils::{sqrt, max_f64};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use alloc::vec::Vec;
+use crate::math_utils::{max_f64, sqrt};
+use crate::process::{ProcessId, ProcessPriority, ThreadId};
 use alloc::collections::BTreeMap;
 use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Algoritmo de scheduling actual
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,22 +24,22 @@ pub enum CurrentAlgorithm {
 /// Métricas de rendimiento del scheduler
 #[derive(Debug, Clone)]
 pub struct SchedulerMetrics {
-    pub throughput: f64,           // tareas completadas por segundo
-    pub latency: f64,              // latencia promedio
-    pub fairness: f64,             // score de equidad (0-100)
-    pub cpu_utilization: f64,      // utilización de CPU
+    pub throughput: f64,              // tareas completadas por segundo
+    pub latency: f64,                 // latencia promedio
+    pub fairness: f64,                // score de equidad (0-100)
+    pub cpu_utilization: f64,         // utilización de CPU
     pub context_switch_overhead: f64, // overhead de context switching
-    pub algorithm_effectiveness: f64,  // efectividad del algoritmo actual
+    pub algorithm_effectiveness: f64, // efectividad del algoritmo actual
 }
 
 /// Configuración del scheduler adaptativo
 #[derive(Debug, Clone)]
 pub struct AdaptiveSchedulerConfig {
-    pub adaptation_interval: u64,      // intervalo de adaptación en nanosegundos
-    pub performance_window: u64,       // ventana de medición de rendimiento
-    pub threshold_improvement: f64,    // umbral de mejora para cambiar algoritmo
-    pub enable_learning: bool,         // habilitar aprendizaje automático
-    pub enable_prediction: bool,       // habilitar predicción de carga
+    pub adaptation_interval: u64, // intervalo de adaptación en nanosegundos
+    pub performance_window: u64,  // ventana de medición de rendimiento
+    pub threshold_improvement: f64, // umbral de mejora para cambiar algoritmo
+    pub enable_learning: bool,    // habilitar aprendizaje automático
+    pub enable_prediction: bool,  // habilitar predicción de carga
     pub enable_workload_analysis: bool, // habilitar análisis de carga de trabajo
 }
 
@@ -152,7 +152,7 @@ impl AdaptiveScheduler {
         self.process_info.clear();
         self.algorithm_performance.clear();
         self.learning_data.clear();
-        
+
         // Inicializar métricas
         self.metrics = SchedulerMetrics {
             throughput: 0.0,
@@ -162,10 +162,10 @@ impl AdaptiveScheduler {
             context_switch_overhead: 0.0,
             algorithm_effectiveness: 0.0,
         };
-        
+
         // Inicializar algoritmo por defecto
         self.current_algorithm = CurrentAlgorithm::RoundRobin;
-        
+
         Ok(())
     }
 
@@ -173,43 +173,44 @@ impl AdaptiveScheduler {
     pub fn adapt_scheduling(&mut self) -> Result<(), &'static str> {
         let current_time = self.get_current_time();
         let last_adaptation = self.last_adaptation_time.load(Ordering::Acquire);
-        
+
         // Verificar si es tiempo de adaptar
         if current_time - last_adaptation < self.config.adaptation_interval {
             return Ok(());
         }
-        
+
         // Actualizar timestamp
-        self.last_adaptation_time.store(current_time, Ordering::Release);
-        
+        self.last_adaptation_time
+            .store(current_time, Ordering::Release);
+
         // Analizar carga de trabajo actual
         let workload_characteristics = self.analyze_workload();
-        
+
         // Predecir mejor algoritmo si está habilitado
         let predicted_algorithm = if self.config.enable_prediction {
             self.predict_best_algorithm(&workload_characteristics)
         } else {
             self.current_algorithm
         };
-        
+
         // Evaluar rendimiento del algoritmo actual
         let current_performance = self.evaluate_current_performance();
-        
+
         // Decidir si cambiar algoritmo
         if self.should_change_algorithm(predicted_algorithm, current_performance) {
             self.change_algorithm(predicted_algorithm);
         }
-        
+
         // Actualizar métricas
         self.update_metrics();
-        
+
         // Aprender del resultado si está habilitado
         if self.config.enable_learning {
             self.learn_from_performance(current_performance);
         }
-        
+
         self.adaptation_count.fetch_add(1, Ordering::Relaxed);
-        
+
         Ok(())
     }
 
@@ -225,47 +226,53 @@ impl AdaptiveScheduler {
                 variance_priority: 0.0,
             };
         }
-        
+
         let process_count = self.process_info.len();
         let total_cpu_time: u64 = self.process_info.values().map(|p| p.cpu_time).sum();
         let total_io_time: u64 = self.process_info.values().map(|p| p.io_wait_time).sum();
         let total_memory: u64 = self.process_info.values().map(|p| p.memory_usage).sum();
-        
+
         let cpu_intensity = if total_cpu_time > 0 {
             total_cpu_time as f64 / (total_cpu_time + total_io_time) as f64
         } else {
             0.0
         };
-        
+
         let io_intensity = if total_io_time > 0 {
             total_io_time as f64 / (total_cpu_time + total_io_time) as f64
         } else {
             0.0
         };
-        
+
         let memory_intensity = if total_memory > 0 {
             (total_memory as f64 / (1024.0 * 1024.0)) / process_count as f64 // MB por proceso
         } else {
             0.0
         };
-        
-        let priorities: Vec<u8> = self.process_info.values().map(|p| p.priority as u8).collect();
+
+        let priorities: Vec<u8> = self
+            .process_info
+            .values()
+            .map(|p| p.priority as u8)
+            .collect();
         let average_priority = if !priorities.is_empty() {
             priorities.iter().sum::<u8>() as f64 / priorities.len() as f64
         } else {
             5.0
         };
-        
+
         let variance_priority = if priorities.len() > 1 {
             let mean = average_priority;
-            let variance = priorities.iter()
+            let variance = priorities
+                .iter()
                 .map(|&p| (p as f64 - mean) * (p as f64 - mean))
-                .sum::<f64>() / priorities.len() as f64;
+                .sum::<f64>()
+                / priorities.len() as f64;
             sqrt(variance)
         } else {
             0.0
         };
-        
+
         WorkloadCharacteristics {
             cpu_intensity,
             io_intensity,
@@ -289,9 +296,13 @@ impl AdaptiveScheduler {
     }
 
     /// Predecir con modelo
-    fn predict_with_model(&self, model: &PredictionModel, workload: &WorkloadCharacteristics) -> BTreeMap<CurrentAlgorithm, f64> {
+    fn predict_with_model(
+        &self,
+        model: &PredictionModel,
+        workload: &WorkloadCharacteristics,
+    ) -> BTreeMap<CurrentAlgorithm, f64> {
         let mut scores = BTreeMap::new();
-        
+
         // Simulación de predicción con modelo
         // En un sistema real, esto usaría un modelo de ML entrenado
         for algorithm in &[
@@ -304,12 +315,16 @@ impl AdaptiveScheduler {
             let score = self.calculate_algorithm_score(*algorithm, workload);
             scores.insert(*algorithm, score);
         }
-        
+
         scores
     }
 
     /// Calcular score de algoritmo
-    fn calculate_algorithm_score(&self, algorithm: CurrentAlgorithm, workload: &WorkloadCharacteristics) -> f64 {
+    fn calculate_algorithm_score(
+        &self,
+        algorithm: CurrentAlgorithm,
+        workload: &WorkloadCharacteristics,
+    ) -> f64 {
         match algorithm {
             CurrentAlgorithm::RoundRobin => {
                 // Round Robin es bueno para cargas equilibradas
@@ -318,7 +333,7 @@ impl AdaptiveScheduler {
                 } else {
                     0.6
                 }
-            },
+            }
             CurrentAlgorithm::Priority => {
                 // Priority es bueno cuando hay mucha variación en prioridades
                 if workload.variance_priority > 2.0 {
@@ -326,7 +341,7 @@ impl AdaptiveScheduler {
                 } else {
                     0.5
                 }
-            },
+            }
             CurrentAlgorithm::FCFS => {
                 // FCFS es bueno para cargas ligeras
                 if workload.process_count < 10 {
@@ -334,7 +349,7 @@ impl AdaptiveScheduler {
                 } else {
                     0.4
                 }
-            },
+            }
             CurrentAlgorithm::SJF => {
                 // SJF es bueno para cargas con tiempos de ejecución conocidos
                 if workload.cpu_intensity > 0.8 {
@@ -342,7 +357,7 @@ impl AdaptiveScheduler {
                 } else {
                     0.5
                 }
-            },
+            }
             CurrentAlgorithm::MLFQ => {
                 // MLFQ es bueno para cargas mixtas
                 if workload.cpu_intensity > 0.3 && workload.io_intensity > 0.3 {
@@ -350,13 +365,16 @@ impl AdaptiveScheduler {
                 } else {
                     0.6
                 }
-            },
+            }
             CurrentAlgorithm::Adaptive => 0.5, // Placeholder
         }
     }
 
     /// Selección heurística de algoritmo
-    fn heuristic_algorithm_selection(&self, workload: &WorkloadCharacteristics) -> CurrentAlgorithm {
+    fn heuristic_algorithm_selection(
+        &self,
+        workload: &WorkloadCharacteristics,
+    ) -> CurrentAlgorithm {
         if workload.process_count < 5 {
             CurrentAlgorithm::FCFS
         } else if workload.variance_priority > 2.0 {
@@ -371,8 +389,12 @@ impl AdaptiveScheduler {
     }
 
     /// Algoritmo con mayor score
-    fn algorithm_with_highest_score(&self, scores: BTreeMap<CurrentAlgorithm, f64>) -> CurrentAlgorithm {
-        scores.iter()
+    fn algorithm_with_highest_score(
+        &self,
+        scores: BTreeMap<CurrentAlgorithm, f64>,
+    ) -> CurrentAlgorithm {
+        scores
+            .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(algorithm, _)| *algorithm)
             .unwrap_or(CurrentAlgorithm::RoundRobin)
@@ -385,22 +407,27 @@ impl AdaptiveScheduler {
         let latency_score = (1.0 - self.metrics.latency / 1000.0).max(0.0);
         let fairness_score = self.metrics.fairness / 100.0;
         let utilization_score = self.metrics.cpu_utilization / 100.0;
-        
+
         (throughput_score + latency_score + fairness_score + utilization_score) / 4.0
     }
 
     /// Decidir si cambiar algoritmo
-    fn should_change_algorithm(&self, predicted_algorithm: CurrentAlgorithm, current_performance: f64) -> bool {
+    fn should_change_algorithm(
+        &self,
+        predicted_algorithm: CurrentAlgorithm,
+        current_performance: f64,
+    ) -> bool {
         if predicted_algorithm == self.current_algorithm {
             return false;
         }
-        
+
         // Obtener rendimiento histórico del algoritmo predicho
-        let predicted_performance = self.algorithm_performance
+        let predicted_performance = self
+            .algorithm_performance
             .get(&predicted_algorithm)
             .copied()
             .unwrap_or(0.5);
-        
+
         // Cambiar si el algoritmo predicho es significativamente mejor
         predicted_performance > current_performance + self.config.threshold_improvement
     }
@@ -408,7 +435,7 @@ impl AdaptiveScheduler {
     /// Cambiar algoritmo
     fn change_algorithm(&mut self, new_algorithm: CurrentAlgorithm) {
         self.current_algorithm = new_algorithm;
-        
+
         // Registrar el cambio
         self.record_algorithm_change(new_algorithm);
     }
@@ -423,7 +450,7 @@ impl AdaptiveScheduler {
     fn update_metrics(&mut self) {
         // Simular actualización de métricas
         // En un sistema real, esto calcularía métricas reales
-        
+
         self.metrics.throughput = self.calculate_throughput();
         self.metrics.latency = self.calculate_latency();
         self.metrics.fairness = self.calculate_fairness();
@@ -452,7 +479,7 @@ impl AdaptiveScheduler {
         } else {
             0
         };
-        
+
         average_cpu_time as f64 / 1000.0 // Convertir a ms
     }
 
@@ -462,17 +489,19 @@ impl AdaptiveScheduler {
         if self.process_info.is_empty() {
             return 100.0;
         }
-        
+
         let cpu_times: Vec<u64> = self.process_info.values().map(|p| p.cpu_time).collect();
         let mean = cpu_times.iter().sum::<u64>() as f64 / cpu_times.len() as f64;
-        
-        let variance = cpu_times.iter()
-                .map(|&time| (time as f64 - mean) * (time as f64 - mean))
-            .sum::<f64>() / cpu_times.len() as f64;
-        
+
+        let variance = cpu_times
+            .iter()
+            .map(|&time| (time as f64 - mean) * (time as f64 - mean))
+            .sum::<f64>()
+            / cpu_times.len() as f64;
+
         let std_dev = sqrt(variance);
         let coefficient_of_variation = if mean > 0.0 { std_dev / mean } else { 0.0 };
-        
+
         // Convertir a score de equidad (menor variación = mayor equidad)
         max_f64((1.0 - coefficient_of_variation) * 100.0, 0.0)
     }
@@ -482,7 +511,7 @@ impl AdaptiveScheduler {
         // Simulación de utilización de CPU
         let total_cpu_time: u64 = self.process_info.values().map(|p| p.cpu_time).sum();
         let time_window = 1000000000; // 1 segundo en nanosegundos
-        
+
         (total_cpu_time as f64 / time_window as f64 * 100.0).min(100.0)
     }
 
@@ -491,7 +520,7 @@ impl AdaptiveScheduler {
         // Simulación de overhead de context switching
         let total_switches: u64 = self.process_info.values().map(|p| p.context_switches).sum();
         let switch_overhead = 1000; // 1 microsegundo por switch
-        
+
         total_switches as f64 * switch_overhead as f64 / 1000.0 // Convertir a ms
     }
 
@@ -499,24 +528,25 @@ impl AdaptiveScheduler {
     fn learn_from_performance(&mut self, performance: f64) {
         let current_time = self.get_current_time();
         let workload = self.analyze_workload();
-        
+
         let sample = LearningSample {
             workload_characteristics: workload,
             algorithm_used: self.current_algorithm,
             performance_achieved: performance,
             timestamp: current_time,
         };
-        
+
         self.learning_data.push(sample);
-        
+
         // Mantener solo los últimos 1000 samples
         if self.learning_data.len() > 1000 {
             self.learning_data.remove(0);
         }
-        
+
         // Actualizar rendimiento del algoritmo
-        self.algorithm_performance.insert(self.current_algorithm, performance);
-        
+        self.algorithm_performance
+            .insert(self.current_algorithm, performance);
+
         // Entrenar modelo si hay suficientes datos
         if self.learning_data.len() >= 100 {
             self.train_prediction_model();
@@ -527,13 +557,13 @@ impl AdaptiveScheduler {
     fn train_prediction_model(&mut self) {
         // Simulación de entrenamiento de modelo
         // En un sistema real, esto usaría algoritmos de ML como regresión lineal o redes neuronales
-        
+
         let model = PredictionModel {
             weights: vec![0.3, 0.2, 0.2, 0.1, 0.1, 0.1], // Pesos para diferentes características
             bias: 0.1,
             accuracy: 0.85, // 85% de precisión simulada
         };
-        
+
         self.prediction_model = Some(model);
     }
 
@@ -554,7 +584,8 @@ impl AdaptiveScheduler {
 
     /// Actualizar información de proceso
     pub fn update_process_info(&mut self, process_info: ProcessInfo) {
-        self.process_info.insert(process_info.process_id, process_info);
+        self.process_info
+            .insert(process_info.process_id, process_info);
     }
 
     /// Obtener tiempo actual (simulado)

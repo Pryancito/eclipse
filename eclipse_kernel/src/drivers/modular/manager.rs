@@ -1,9 +1,11 @@
 //! Gestor avanzado de drivers modulares
-//! 
+//!
 //! Proporciona herramientas avanzadas para gestionar drivers modulares,
 //! incluyendo configuración, monitoreo y control.
 
-use super::{ModularDriver, DriverError, DriverInfo, Capability, list_modular_drivers, get_modular_driver};
+use super::{
+    get_modular_driver, list_modular_drivers, Capability, DriverError, DriverInfo, ModularDriver,
+};
 
 /// Estado de un driver
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,11 +60,11 @@ impl AdvancedDriverManager {
             driver_stats: heapless::Vec::new(),
         }
     }
-    
+
     /// Inicializar gestor
     pub fn init(&mut self) -> Result<(), DriverError> {
         let drivers = list_modular_drivers();
-        
+
         // Inicializar estados y configuraciones por defecto
         for _ in 0..drivers.len() {
             let _ = self.driver_states.push(DriverState::Uninitialized);
@@ -79,19 +81,23 @@ impl AdvancedDriverManager {
                 uptime_ms: 0,
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Obtener información completa de todos los drivers
     pub fn get_all_driver_info(&self) -> heapless::Vec<DriverInfoComplete, 8> {
         let mut info_list = heapless::Vec::new();
         let drivers = list_modular_drivers();
-        
+
         for (i, driver_name) in drivers.iter().enumerate() {
             if let Some(driver) = get_modular_driver(driver_name.as_str()) {
                 let basic_info = driver.get_info();
-                let state = self.driver_states.get(i).copied().unwrap_or(DriverState::Uninitialized);
+                let state = self
+                    .driver_states
+                    .get(i)
+                    .copied()
+                    .unwrap_or(DriverState::Uninitialized);
                 let config = self.driver_configs.get(i).cloned().unwrap_or(DriverConfig {
                     auto_start: true,
                     priority: 5,
@@ -104,26 +110,26 @@ impl AdvancedDriverManager {
                     error_count: 0,
                     uptime_ms: 0,
                 });
-                
+
                 let complete_info = DriverInfoComplete {
                     basic_info,
                     state,
                     config,
                     stats,
                 };
-                
+
                 let _ = info_list.push(complete_info);
             }
         }
-        
+
         info_list
     }
-    
+
     /// Inicializar driver específico
     pub fn init_driver(&mut self, driver_name: &str) -> Result<(), DriverError> {
         if let Some(driver) = get_modular_driver(driver_name) {
             let start_time = 0; // En una implementación real, esto sería el tiempo actual
-            
+
             match driver.init() {
                 Ok(_) => {
                     self.update_driver_state(driver_name, DriverState::Initialized);
@@ -146,7 +152,7 @@ impl AdvancedDriverManager {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Detener driver específico
     pub fn stop_driver(&mut self, driver_name: &str) -> Result<(), DriverError> {
         if let Some(driver) = get_modular_driver(driver_name) {
@@ -157,9 +163,13 @@ impl AdvancedDriverManager {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Configurar driver específico
-    pub fn configure_driver(&mut self, driver_name: &str, config: DriverConfig) -> Result<(), DriverError> {
+    pub fn configure_driver(
+        &mut self,
+        driver_name: &str,
+        config: DriverConfig,
+    ) -> Result<(), DriverError> {
         let drivers = list_modular_drivers();
         if let Some(index) = drivers.iter().position(|name| name.as_str() == driver_name) {
             if let Some(driver_config) = self.driver_configs.get_mut(index) {
@@ -172,7 +182,7 @@ impl AdvancedDriverManager {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Obtener estado de driver
     pub fn get_driver_state(&self, driver_name: &str) -> Option<DriverState> {
         let drivers = list_modular_drivers();
@@ -182,7 +192,7 @@ impl AdvancedDriverManager {
             None
         }
     }
-    
+
     /// Actualizar estado de driver
     fn update_driver_state(&mut self, driver_name: &str, state: DriverState) {
         let drivers = list_modular_drivers();
@@ -192,7 +202,7 @@ impl AdvancedDriverManager {
             }
         }
     }
-    
+
     /// Actualizar estadísticas de driver
     fn update_driver_stats<F>(&mut self, driver_name: &str, updater: F)
     where
@@ -205,14 +215,14 @@ impl AdvancedDriverManager {
             }
         }
     }
-    
+
     /// Obtener resumen del sistema
     pub fn get_system_summary(&self) -> SystemSummary {
         let mut total_drivers = 0;
         let mut initialized_drivers = 0;
         let mut error_drivers = 0;
         let mut total_errors = 0;
-        
+
         for state in self.driver_states.iter() {
             total_drivers += 1;
             match state {
@@ -221,11 +231,11 @@ impl AdvancedDriverManager {
                 _ => {}
             }
         }
-        
+
         for stats in self.driver_stats.iter() {
             total_errors += stats.error_count;
         }
-        
+
         SystemSummary {
             total_drivers,
             initialized_drivers,
@@ -249,24 +259,15 @@ static mut ADVANCED_DRIVER_MANAGER: AdvancedDriverManager = AdvancedDriverManage
 
 /// Obtener instancia del gestor avanzado
 pub fn get_advanced_driver_manager() -> &'static mut AdvancedDriverManager {
-    unsafe {
-        &mut ADVANCED_DRIVER_MANAGER
-    }
+    unsafe { &mut ADVANCED_DRIVER_MANAGER }
 }
 
 /// Inicializar gestor avanzado
 pub fn init_advanced_driver_manager() -> Result<(), DriverError> {
-    unsafe {
-        ADVANCED_DRIVER_MANAGER.init()
-    }
+    unsafe { ADVANCED_DRIVER_MANAGER.init() }
 }
 
 /// Obtener resumen del sistema
 pub fn get_system_summary() -> SystemSummary {
-    unsafe {
-        ADVANCED_DRIVER_MANAGER.get_system_summary()
-    }
+    unsafe { ADVANCED_DRIVER_MANAGER.get_system_summary() }
 }
-
-
-

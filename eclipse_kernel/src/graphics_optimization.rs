@@ -1,10 +1,10 @@
 //! Optimizaciones de gráficos para hardware real
-//! 
+//!
 //! Este módulo implementa optimizaciones específicas para mejorar el rendimiento
 //! gráfico en hardware real, especialmente para operaciones de scroll.
 
-use crate::drivers::framebuffer::{FramebufferDriver, Color};
-use crate::window_system::geometry::{Point, Size, Rectangle};
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
+use crate::window_system::geometry::{Point, Rectangle, Size};
 use alloc::vec::Vec;
 use core::arch::asm;
 
@@ -26,7 +26,7 @@ impl Default for GraphicsOptimizationConfig {
             enable_double_buffering: true,
             enable_region_scroll: true,
             enable_memory_optimization: true,
-            scroll_region_size: 64, // Scroll en bloques de 64 píxeles
+            scroll_region_size: 64,          // Scroll en bloques de 64 píxeles
             double_buffer_size: 1024 * 1024, // 1MB de buffer doble
         }
     }
@@ -90,16 +90,16 @@ impl GraphicsOptimizer {
     /// Inicializar regiones de scroll
     fn initialize_scroll_regions(&mut self) -> Result<(), &'static str> {
         self.scroll_regions.clear();
-        
+
         // Crear regiones de scroll más grandes para evitar problemas de rendimiento
         let region_size = core::cmp::max(self.config.scroll_region_size, 128);
-        
+
         // Dividir la pantalla en regiones de scroll más grandes
         for y in (0..768).step_by(region_size as usize) {
             for x in (0..1024).step_by(region_size as usize) {
                 let width = core::cmp::min(region_size, 1024 - x);
                 let height = core::cmp::min(region_size, 768 - y);
-                
+
                 // Solo crear regiones si tienen un tamaño mínimo
                 if width >= 64 && height >= 64 {
                     self.scroll_regions.push(ScrollRegion {
@@ -110,7 +110,7 @@ impl GraphicsOptimizer {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -157,7 +157,7 @@ impl GraphicsOptimizer {
         if scroll_delta.y != 0 {
             self.optimized_scroll_vertical(framebuffer, scroll_delta.y, scroll_rect)?;
         }
-        
+
         if scroll_delta.x != 0 {
             self.optimized_scroll_horizontal(framebuffer, scroll_delta.x, scroll_rect)?;
         }
@@ -180,9 +180,11 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(fb_height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y =
+            core::cmp::min(fb_height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(fb_width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x =
+            core::cmp::min(fb_width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
 
         if delta_y > 0 {
             // Scroll hacia abajo - mover líneas hacia arriba
@@ -190,14 +192,17 @@ impl GraphicsOptimizer {
                 let src_y = y + delta_y as u32;
                 if src_y < end_y {
                     self.hardware_copy_line(
-                        fb_ptr, stride,
-                        start_x, src_y,
-                        start_x, y,
-                        end_x - start_x
+                        fb_ptr,
+                        stride,
+                        start_x,
+                        src_y,
+                        start_x,
+                        y,
+                        end_x - start_x,
                     )?;
                 }
             }
-            
+
             // Limpiar líneas inferiores
             for y in (end_y - delta_y as u32)..end_y {
                 self.hardware_clear_line(fb_ptr, stride, start_x, y, end_x - start_x)?;
@@ -208,13 +213,16 @@ impl GraphicsOptimizer {
             for y in (start_y + abs_delta)..end_y {
                 let src_y = y - abs_delta;
                 self.hardware_copy_line(
-                    fb_ptr, stride,
-                    start_x, src_y,
-                    start_x, y,
-                    end_x - start_x
+                    fb_ptr,
+                    stride,
+                    start_x,
+                    src_y,
+                    start_x,
+                    y,
+                    end_x - start_x,
                 )?;
             }
-            
+
             // Limpiar líneas superiores
             for y in start_y..(start_y + abs_delta) {
                 self.hardware_clear_line(fb_ptr, stride, start_x, y, end_x - start_x)?;
@@ -239,9 +247,11 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(fb_height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y =
+            core::cmp::min(fb_height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(fb_width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x =
+            core::cmp::min(fb_width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
 
         if delta_x > 0 {
             // Scroll hacia la derecha - usar copia de líneas optimizada
@@ -249,18 +259,17 @@ impl GraphicsOptimizer {
             for y in start_y..end_y {
                 // Copiar línea completa con offset
                 self.hardware_copy_line(
-                    fb_ptr, stride,
-                    start_x + delta, y,
-                    start_x, y,
-                    end_x - start_x - delta
+                    fb_ptr,
+                    stride,
+                    start_x + delta,
+                    y,
+                    start_x,
+                    y,
+                    end_x - start_x - delta,
                 )?;
-                
+
                 // Limpiar píxeles de la derecha
-                self.hardware_clear_line(
-                    fb_ptr, stride,
-                    end_x - delta, y,
-                    delta
-                )?;
+                self.hardware_clear_line(fb_ptr, stride, end_x - delta, y, delta)?;
             }
         } else {
             // Scroll hacia la izquierda - usar copia de líneas optimizada
@@ -268,18 +277,17 @@ impl GraphicsOptimizer {
             for y in start_y..end_y {
                 // Copiar línea completa con offset
                 self.hardware_copy_line(
-                    fb_ptr, stride,
-                    start_x, y,
-                    start_x + abs_delta, y,
-                    end_x - start_x - abs_delta
+                    fb_ptr,
+                    stride,
+                    start_x,
+                    y,
+                    start_x + abs_delta,
+                    y,
+                    end_x - start_x - abs_delta,
                 )?;
-                
+
                 // Limpiar píxeles de la izquierda
-                self.hardware_clear_line(
-                    fb_ptr, stride,
-                    start_x, y,
-                    abs_delta
-                )?;
+                self.hardware_clear_line(fb_ptr, stride, start_x, y, abs_delta)?;
             }
         }
 
@@ -304,12 +312,12 @@ impl GraphicsOptimizer {
         unsafe {
             let src_offset = (src_y * stride + src_x) as usize;
             let dst_offset = (dst_y * stride + dst_x) as usize;
-            
+
             // Usar instrucciones SIMD para copia rápida
             let mut remaining = width as usize;
             let mut src_idx = 0;
             let mut dst_idx = 0;
-            
+
             // Copiar en bloques de 8 píxeles (256 bits) usando AVX2
             while remaining >= 8 {
                 asm!(
@@ -320,12 +328,12 @@ impl GraphicsOptimizer {
                     out("ymm0") _,
                     options(nostack, preserves_flags)
                 );
-                
+
                 src_idx += 8;
                 dst_idx += 8;
                 remaining -= 8;
             }
-            
+
             // Copiar píxeles restantes
             while remaining > 0 {
                 *fb_ptr.add(dst_idx) = *fb_ptr.add(src_idx);
@@ -353,11 +361,11 @@ impl GraphicsOptimizer {
 
         unsafe {
             let offset = (y * stride + x) as usize;
-            
+
             // Limpiar en bloques de 8 píxeles usando AVX2
             let mut remaining = width as usize;
             let mut idx = 0;
-            
+
             while remaining >= 8 {
                 asm!(
                     "vpxor ymm0, ymm0, ymm0",
@@ -366,11 +374,11 @@ impl GraphicsOptimizer {
                     out("ymm0") _,
                     options(nostack, preserves_flags)
                 );
-                
+
                 idx += 8;
                 remaining -= 8;
             }
-            
+
             // Limpiar píxeles restantes
             while remaining > 0 {
                 *fb_ptr.add(idx) = 0;
@@ -427,9 +435,15 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(framebuffer.info.height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y = core::cmp::min(
+            framebuffer.info.height as i32,
+            scroll_rect.y + scroll_rect.height as i32,
+        ) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(framebuffer.info.width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x = core::cmp::min(
+            framebuffer.info.width as i32,
+            scroll_rect.x + scroll_rect.width as i32,
+        ) as u32;
 
         let stride = framebuffer.info.pixels_per_scan_line;
         let fb_ptr = framebuffer.info.base_address as *mut u32;
@@ -461,62 +475,54 @@ impl GraphicsOptimizer {
                 // Scroll hacia abajo - estilo Linux optimizado
                 let delta = delta_y as u32;
                 let lines_to_move = end_y - start_y - delta;
-                
+
                 if lines_to_move > 0 {
                     // Calcular tamaños para operaciones de memoria
                     let bytes_per_line = width * 4; // 4 bytes por píxel
                     let total_bytes = lines_to_move * bytes_per_line;
-                    
+
                     // Usar memmove para mover todo el bloque de una vez
                     let src_start = (start_y * stride + start_x) as usize;
                     let dst_start = ((start_y + delta) * stride + start_x) as usize;
-                    
+
                     // Mover líneas de abajo hacia arriba - una sola operación
                     core::ptr::copy(
                         fb_ptr.add(src_start),
                         fb_ptr.add(dst_start),
-                        total_bytes as usize
+                        total_bytes as usize,
                     );
                 }
-                
+
                 // Limpiar líneas superiores - usar memset para mejor rendimiento
                 let clear_bytes = delta * width * 4;
                 let clear_start = (start_y * stride + start_x) as usize;
-                core::ptr::write_bytes(
-                    fb_ptr.add(clear_start),
-                    0,
-                    clear_bytes as usize
-                );
+                core::ptr::write_bytes(fb_ptr.add(clear_start), 0, clear_bytes as usize);
             } else {
                 // Scroll hacia arriba - estilo Linux optimizado
                 let abs_delta = (-delta_y) as u32;
                 let lines_to_move = end_y - start_y - abs_delta;
-                
+
                 if lines_to_move > 0 {
                     // Calcular tamaños para operaciones de memoria
                     let bytes_per_line = width * 4; // 4 bytes por píxel
                     let total_bytes = lines_to_move * bytes_per_line;
-                    
+
                     // Usar memmove para mover todo el bloque de una vez
                     let src_start = ((start_y + abs_delta) * stride + start_x) as usize;
                     let dst_start = (start_y * stride + start_x) as usize;
-                    
+
                     // Mover líneas de arriba hacia abajo - una sola operación
                     core::ptr::copy(
                         fb_ptr.add(src_start),
                         fb_ptr.add(dst_start),
-                        total_bytes as usize
+                        total_bytes as usize,
                     );
                 }
-                
+
                 // Limpiar líneas inferiores - usar memset para mejor rendimiento
                 let clear_bytes = abs_delta * width * 4;
                 let clear_start = ((end_y - abs_delta) * stride + start_x) as usize;
-                core::ptr::write_bytes(
-                    fb_ptr.add(clear_start),
-                    0,
-                    clear_bytes as usize
-                );
+                core::ptr::write_bytes(fb_ptr.add(clear_start), 0, clear_bytes as usize);
             }
         }
 
@@ -545,20 +551,20 @@ impl GraphicsOptimizer {
                 for y in (start_y..(end_y - delta)).rev() {
                     let src_offset = (y * stride + start_x) as usize;
                     let dst_offset = ((y + delta) * stride + start_x) as usize;
-                    
+
                     // Usar SSE para copiar 4 píxeles a la vez
                     let mut x = 0;
                     while x + 4 <= width {
                         let src = fb_ptr.add(src_offset + x as usize);
                         let dst = fb_ptr.add(dst_offset + x as usize);
-                        
+
                         // Cargar 4 píxeles (16 bytes) usando SSE
                         let pixels = core::ptr::read_unaligned(src as *const [u32; 4]);
                         core::ptr::write_unaligned(dst as *mut [u32; 4], pixels);
-                        
+
                         x += 4;
                     }
-                    
+
                     // Copiar píxeles restantes
                     while x < width {
                         let src_offset_px = src_offset + x as usize;
@@ -567,7 +573,7 @@ impl GraphicsOptimizer {
                         x += 1;
                     }
                 }
-                
+
                 // Limpiar líneas superiores
                 for y in start_y..(start_y + delta) {
                     let offset = (y * stride + start_x) as usize;
@@ -577,7 +583,7 @@ impl GraphicsOptimizer {
                         core::ptr::write_unaligned(dst as *mut [u32; 4], [0; 4]);
                         x += 4;
                     }
-                    
+
                     // Limpiar píxeles restantes
                     while x < width {
                         *fb_ptr.add(offset + x as usize) = 0;
@@ -590,20 +596,20 @@ impl GraphicsOptimizer {
                 for y in start_y..(end_y - abs_delta) {
                     let src_offset = ((y + abs_delta) * stride + start_x) as usize;
                     let dst_offset = (y * stride + start_x) as usize;
-                    
+
                     // Usar SSE para copiar 4 píxeles a la vez
                     let mut x = 0;
                     while x + 4 <= width {
                         let src = fb_ptr.add(src_offset + x as usize);
                         let dst = fb_ptr.add(dst_offset + x as usize);
-                        
+
                         // Cargar 4 píxeles (16 bytes) usando SSE
                         let pixels = core::ptr::read_unaligned(src as *const [u32; 4]);
                         core::ptr::write_unaligned(dst as *mut [u32; 4], pixels);
-                        
+
                         x += 4;
                     }
-                    
+
                     // Copiar píxeles restantes
                     while x < width {
                         let src_offset_px = src_offset + x as usize;
@@ -612,7 +618,7 @@ impl GraphicsOptimizer {
                         x += 1;
                     }
                 }
-                
+
                 // Limpiar líneas inferiores
                 for y in (end_y - abs_delta)..end_y {
                     let offset = (y * stride + start_x) as usize;
@@ -622,7 +628,7 @@ impl GraphicsOptimizer {
                         core::ptr::write_unaligned(dst as *mut [u32; 4], [0; 4]);
                         x += 4;
                     }
-                    
+
                     // Limpiar píxeles restantes
                     while x < width {
                         *fb_ptr.add(offset + x as usize) = 0;
@@ -647,9 +653,15 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(framebuffer.info.height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y = core::cmp::min(
+            framebuffer.info.height as i32,
+            scroll_rect.y + scroll_rect.height as i32,
+        ) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(framebuffer.info.width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x = core::cmp::min(
+            framebuffer.info.width as i32,
+            scroll_rect.x + scroll_rect.width as i32,
+        ) as u32;
 
         // Usar acceso directo al framebuffer para mejor rendimiento
         let stride = framebuffer.info.pixels_per_scan_line;
@@ -666,7 +678,7 @@ impl GraphicsOptimizer {
                         *fb_ptr.add(dst_offset) = *fb_ptr.add(src_offset);
                     }
                 }
-                
+
                 // Limpiar líneas superiores
                 for y in start_y..(start_y + delta) {
                     for x in start_x..end_x {
@@ -684,7 +696,7 @@ impl GraphicsOptimizer {
                         *fb_ptr.add(dst_offset) = *fb_ptr.add(src_offset);
                     }
                 }
-                
+
                 // Limpiar líneas inferiores
                 for y in (end_y - abs_delta)..end_y {
                     for x in start_x..end_x {
@@ -710,16 +722,24 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(framebuffer.info.height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y = core::cmp::min(
+            framebuffer.info.height as i32,
+            scroll_rect.y + scroll_rect.height as i32,
+        ) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(framebuffer.info.width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x = core::cmp::min(
+            framebuffer.info.width as i32,
+            scroll_rect.x + scroll_rect.width as i32,
+        ) as u32;
 
         let stride = framebuffer.info.pixels_per_scan_line;
         let fb_ptr = framebuffer.info.base_address as *mut u32;
         let width = end_x - start_x;
 
         // Usar scroll estilo Linux - mucho más eficiente
-        self.linux_style_scroll_horizontal(fb_ptr, stride, start_y, end_y, start_x, width, delta_x)?;
+        self.linux_style_scroll_horizontal(
+            fb_ptr, stride, start_y, end_y, start_x, width, delta_x,
+        )?;
 
         Ok(())
     }
@@ -744,78 +764,66 @@ impl GraphicsOptimizer {
                 // Scroll hacia la derecha - estilo Linux
                 let delta = delta_x as u32;
                 let pixels_to_move = width - delta;
-                
+
                 if pixels_to_move > 0 {
                     // Calcular bytes para mover
                     let bytes_to_move = pixels_to_move * 4; // 4 bytes por píxel
-                    
+
                     for y in start_y..end_y {
                         let src_start = (y * stride + start_x + delta) as usize;
                         let dst_start = (y * stride + start_x) as usize;
-                        
+
                         // Mover píxeles de derecha a izquierda
                         core::ptr::copy(
                             fb_ptr.add(src_start),
                             fb_ptr.add(dst_start),
-                            bytes_to_move as usize
+                            bytes_to_move as usize,
                         );
-                        
+
                         // Limpiar píxeles de la derecha
                         let clear_start = (y * stride + start_x + width - delta) as usize;
-                        core::ptr::write_bytes(
-                            fb_ptr.add(clear_start),
-                            0,
-                            (delta * 4) as usize
-                        );
+                        core::ptr::write_bytes(fb_ptr.add(clear_start), 0, (delta * 4) as usize);
                     }
                 } else {
                     // Si no hay píxeles que mover, solo limpiar
                     for y in start_y..end_y {
                         let clear_start = (y * stride + start_x) as usize;
-                        core::ptr::write_bytes(
-                            fb_ptr.add(clear_start),
-                            0,
-                            (width * 4) as usize
-                        );
+                        core::ptr::write_bytes(fb_ptr.add(clear_start), 0, (width * 4) as usize);
                     }
                 }
             } else {
                 // Scroll hacia la izquierda - estilo Linux
                 let abs_delta = (-delta_x) as u32;
                 let pixels_to_move = width - abs_delta;
-                
+
                 if pixels_to_move > 0 {
                     // Calcular bytes para mover
                     let bytes_to_move = pixels_to_move * 4; // 4 bytes por píxel
-                    
+
                     for y in start_y..end_y {
                         let src_start = (y * stride + start_x + abs_delta) as usize;
                         let dst_start = (y * stride + start_x) as usize;
-                        
+
                         // Mover píxeles de izquierda a derecha
                         core::ptr::copy(
                             fb_ptr.add(src_start),
                             fb_ptr.add(dst_start),
-                            bytes_to_move as usize
+                            bytes_to_move as usize,
                         );
-                        
+
                         // Limpiar píxeles de la izquierda
                         let clear_start = (y * stride + start_x) as usize;
                         core::ptr::write_bytes(
                             fb_ptr.add(clear_start),
                             0,
-                            (abs_delta * 4) as usize
+                            (abs_delta * 4) as usize,
                         );
                     }
                 } else {
                     // Si no hay píxeles que mover, solo limpiar
                     for y in start_y..end_y {
                         let clear_start = (y * stride + start_x) as usize;
-                        core::ptr::write_bytes(
-                            fb_ptr.add(clear_start),
-                            0,
-                            (width * 4) as usize
-                        );
+                        core::ptr::write_bytes(fb_ptr.add(clear_start), 0, (width * 4) as usize);
                     }
                 }
             }
@@ -836,9 +844,15 @@ impl GraphicsOptimizer {
         }
 
         let start_y = core::cmp::max(0, scroll_rect.y) as u32;
-        let end_y = core::cmp::min(framebuffer.info.height as i32, scroll_rect.y + scroll_rect.height as i32) as u32;
+        let end_y = core::cmp::min(
+            framebuffer.info.height as i32,
+            scroll_rect.y + scroll_rect.height as i32,
+        ) as u32;
         let start_x = core::cmp::max(0, scroll_rect.x) as u32;
-        let end_x = core::cmp::min(framebuffer.info.width as i32, scroll_rect.x + scroll_rect.width as i32) as u32;
+        let end_x = core::cmp::min(
+            framebuffer.info.width as i32,
+            scroll_rect.x + scroll_rect.width as i32,
+        ) as u32;
 
         // Usar acceso directo al framebuffer para mejor rendimiento
         let stride = framebuffer.info.pixels_per_scan_line;
@@ -854,7 +868,7 @@ impl GraphicsOptimizer {
                         let dst_offset = (y * stride + x) as usize;
                         *fb_ptr.add(dst_offset) = *fb_ptr.add(src_offset);
                     }
-                    
+
                     // Limpiar píxeles de la derecha
                     for x in (end_x - delta)..end_x {
                         let offset = (y * stride + x) as usize;
@@ -870,7 +884,7 @@ impl GraphicsOptimizer {
                         let dst_offset = (y * stride + x) as usize;
                         *fb_ptr.add(dst_offset) = *fb_ptr.add(src_offset);
                     }
-                    
+
                     // Limpiar píxeles de la izquierda
                     for x in start_x..(start_x + abs_delta) {
                         let offset = (y * stride + x) as usize;
@@ -891,12 +905,11 @@ impl GraphicsOptimizer {
         scroll_rect: Rectangle,
     ) -> Result<(), &'static str> {
         // Identificar regiones afectadas por el scroll
-        let affected_regions: Vec<usize> = self.scroll_regions
+        let affected_regions: Vec<usize> = self
+            .scroll_regions
             .iter()
             .enumerate()
-            .filter(|(_, region)| {
-                region.rect.intersects(&scroll_rect)
-            })
+            .filter(|(_, region)| region.rect.intersects(&scroll_rect))
             .map(|(i, _)| i)
             .collect();
 
@@ -921,7 +934,7 @@ impl GraphicsOptimizer {
         scroll_delta: Point,
     ) -> Result<(), &'static str> {
         let rect = region.rect;
-        
+
         // Calcular nueva posición de la región
         let new_rect = Rectangle::new(
             rect.x + scroll_delta.x,
@@ -931,9 +944,11 @@ impl GraphicsOptimizer {
         );
 
         // Verificar que la nueva posición esté dentro de los límites
-        if new_rect.x < 0 || new_rect.y < 0 || 
-           new_rect.x + new_rect.width as i32 > 1024 || 
-           new_rect.y + new_rect.height as i32 > 768 {
+        if new_rect.x < 0
+            || new_rect.y < 0
+            || new_rect.x + new_rect.width as i32 > 1024
+            || new_rect.y + new_rect.height as i32 > 768
+        {
             return Ok(());
         }
 
@@ -954,7 +969,7 @@ impl GraphicsOptimizer {
         scroll_delta: Point,
     ) -> Result<(), &'static str> {
         let rect = region.rect;
-        
+
         // Calcular nueva posición de la región
         let new_rect = Rectangle::new(
             rect.x + scroll_delta.x,
@@ -964,9 +979,11 @@ impl GraphicsOptimizer {
         );
 
         // Verificar que la nueva posición esté dentro de los límites
-        if new_rect.x < 0 || new_rect.y < 0 || 
-           new_rect.x + new_rect.width as i32 > 1024 || 
-           new_rect.y + new_rect.height as i32 > 768 {
+        if new_rect.x < 0
+            || new_rect.y < 0
+            || new_rect.x + new_rect.width as i32 > 1024
+            || new_rect.y + new_rect.height as i32 > 768
+        {
             return Ok(());
         }
 
@@ -989,10 +1006,12 @@ impl GraphicsOptimizer {
     ) -> Result<(), &'static str> {
         // Implementación de scroll de pantalla completa
         // Esto es menos eficiente pero más simple
-        
+
         if scroll_delta.y > 0 {
             // Scroll hacia abajo
-            for y in (scroll_rect.y..scroll_rect.y + scroll_rect.height as i32 - scroll_delta.y).rev() {
+            for y in
+                (scroll_rect.y..scroll_rect.y + scroll_rect.height as i32 - scroll_delta.y).rev()
+            {
                 for x in scroll_rect.x..scroll_rect.x + scroll_rect.width as i32 {
                     let color = framebuffer.get_pixel(x as u32, y as u32);
                     framebuffer.put_pixel(x as u32, (y + scroll_delta.y) as u32, color);
@@ -1053,17 +1072,20 @@ impl GraphicsOptimizer {
     ) -> Result<(), &'static str> {
         // En una implementación real, esto usaría DMA para copiar memoria
         // Por ahora simulamos con copia de memoria optimizada
-        
+
         let width = core::cmp::min(src_rect.width, dst_rect.width);
         let height = core::cmp::min(src_rect.height, dst_rect.height);
-        
+
         // Usar operaciones de memoria optimizadas
         unsafe {
             self.optimized_memory_copy(
                 framebuffer,
-                src_rect.x, src_rect.y,
-                dst_rect.x, dst_rect.y,
-                width, height,
+                src_rect.x,
+                src_rect.y,
+                dst_rect.x,
+                dst_rect.y,
+                width,
+                height,
             )?;
         }
 
@@ -1079,7 +1101,7 @@ impl GraphicsOptimizer {
     ) -> Result<(), &'static str> {
         let width = core::cmp::min(src_rect.width, dst_rect.width);
         let height = core::cmp::min(src_rect.height, dst_rect.height);
-        
+
         for y in 0..height {
             for x in 0..width {
                 let color = framebuffer.get_pixel(
@@ -1110,9 +1132,12 @@ impl GraphicsOptimizer {
     unsafe fn optimized_memory_copy(
         &self,
         framebuffer: &mut FramebufferDriver,
-        src_x: i32, src_y: i32,
-        dst_x: i32, dst_y: i32,
-        mut width: u32, height: u32,
+        src_x: i32,
+        src_y: i32,
+        dst_x: i32,
+        dst_y: i32,
+        mut width: u32,
+        height: u32,
     ) -> Result<(), &'static str> {
         // Obtener punteros a los datos del framebuffer
         let fb_ptr = framebuffer.info.base_address;
@@ -1122,18 +1147,18 @@ impl GraphicsOptimizer {
 
         let bytes_per_pixel = 4; // ARGB
         let stride = framebuffer.info.pixels_per_scan_line * bytes_per_pixel;
-        
+
         let src_offset = (src_y * stride as i32 + src_x * bytes_per_pixel as i32) as isize;
         let dst_offset = (dst_y * stride as i32 + dst_x * bytes_per_pixel as i32) as isize;
-        
+
         let src_ptr = (fb_ptr as *mut u8).offset(src_offset);
         let dst_ptr = (fb_ptr as *mut u8).offset(dst_offset);
-        
+
         // Copiar línea por línea usando instrucciones optimizadas
         for y in 0..height {
             let mut line_src = src_ptr.offset((y * stride) as isize);
             let mut line_dst = dst_ptr.offset((y * stride) as isize);
-            
+
             // Usar rep movsd para copia rápida de 32 bits
             asm!(
                 "rep movsd",
@@ -1148,7 +1173,10 @@ impl GraphicsOptimizer {
     }
 
     /// Limpiar regiones sucias
-    pub fn clear_dirty_regions(&mut self, framebuffer: &mut FramebufferDriver) -> Result<(), &'static str> {
+    pub fn clear_dirty_regions(
+        &mut self,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         for region in &mut self.scroll_regions {
             if region.dirty {
                 // Limpiar la región con color de fondo
@@ -1157,7 +1185,7 @@ impl GraphicsOptimizer {
                     region.rect.y as u32,
                     region.rect.width,
                     region.rect.height,
-                    Color::BLACK
+                    Color::BLACK,
                 );
                 region.dirty = false;
             }
@@ -1175,7 +1203,7 @@ impl GraphicsOptimizer {
     pub fn get_stats(&self) -> OptimizationStats {
         let dirty_regions = self.scroll_regions.iter().filter(|r| r.dirty).count();
         let total_regions = self.scroll_regions.len();
-        
+
         OptimizationStats {
             dma_enabled: self.dma_enabled,
             double_buffering_enabled: self.double_buffer.is_some(),
@@ -1187,7 +1215,10 @@ impl GraphicsOptimizer {
     }
 
     /// Aplicar doble buffering
-    pub fn apply_double_buffering(&mut self, framebuffer: &mut FramebufferDriver) -> Result<(), &'static str> {
+    pub fn apply_double_buffering(
+        &mut self,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         if !self.config.enable_double_buffering {
             return Ok(());
         }
@@ -1199,15 +1230,18 @@ impl GraphicsOptimizer {
     }
 
     /// Sincronizar con el hardware
-    pub fn sync_with_hardware(&mut self, framebuffer: &mut FramebufferDriver) -> Result<(), &'static str> {
+    pub fn sync_with_hardware(
+        &mut self,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Forzar sincronización con el hardware de gráficos
         // En una implementación real, esto sincronizaría con el hardware
-        
+
         // Si estamos usando DMA, sincronizar las transferencias
         if self.config.enable_dma {
             // En una implementación real, esto esperaría a que las transferencias DMA terminen
         }
-        
+
         Ok(())
     }
 }
@@ -1235,16 +1269,16 @@ pub fn init_graphics_optimizer() -> Result<(), &'static str> {
 
         // Detectar si estamos usando hardware real
         let using_real_hardware = crate::gpu_fallback::is_using_real_hardware();
-        
+
         let mut config = GraphicsOptimizationConfig::default();
-        
+
         // Configuración optimizada para ambos tipos de hardware
         // Tanto hardware real como QEMU pueden beneficiarse del scroll optimizado
         config.enable_dma = false; // Deshabilitar DMA temporalmente para evitar problemas
         config.enable_double_buffering = false; // Deshabilitar doble buffer temporalmente
         config.enable_region_scroll = true;
         config.enable_memory_optimization = true; // HABILITAR scroll por hardware para todos
-        
+
         if using_real_hardware {
             // Configuración para hardware real
             config.scroll_region_size = 256; // Regiones más grandes para hardware real
@@ -1254,7 +1288,7 @@ pub fn init_graphics_optimizer() -> Result<(), &'static str> {
             config.scroll_region_size = 128; // Regiones más pequeñas para QEMU
             config.double_buffer_size = 128 * 1024; // 128KB de doble buffer
         }
-        
+
         let mut optimizer = GraphicsOptimizer::new(config);
         optimizer.initialize()?;
         GRAPHICS_OPTIMIZER = Some(optimizer);
@@ -1265,7 +1299,9 @@ pub fn init_graphics_optimizer() -> Result<(), &'static str> {
 /// Obtener referencia al optimizador
 pub fn get_graphics_optimizer() -> Result<&'static mut GraphicsOptimizer, &'static str> {
     unsafe {
-        GRAPHICS_OPTIMIZER.as_mut().ok_or("Optimizador no inicializado")
+        GRAPHICS_OPTIMIZER
+            .as_mut()
+            .ok_or("Optimizador no inicializado")
     }
 }
 
@@ -1287,9 +1323,7 @@ pub fn clear_dirty_regions(framebuffer: &mut FramebufferDriver) -> Result<(), &'
 
 /// Obtener estadísticas globales
 pub fn get_optimization_stats() -> Option<OptimizationStats> {
-    unsafe {
-        GRAPHICS_OPTIMIZER.as_ref().map(|o| o.get_stats())
-    }
+    unsafe { GRAPHICS_OPTIMIZER.as_ref().map(|o| o.get_stats()) }
 }
 
 /// Forzar actualización del framebuffer para hardware real
@@ -1300,7 +1334,7 @@ pub fn force_framebuffer_update() -> Result<(), &'static str> {
             if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
                 // Solo hacer clear de las regiones sucias (operación simple)
                 optimizer.clear_dirty_regions(&mut *fb)?;
-                
+
                 // Aplicar optimizaciones básicas sin operaciones complejas
                 if optimizer.config.enable_double_buffering {
                     // Aplicar doble buffer de forma simplificada

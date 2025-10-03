@@ -10,6 +10,7 @@ use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType, BootServices, OpenProtocolParams, OpenProtocolAttributes, SearchType};
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::Identify;
+use core::mem;
 
 // Estructura para pasar información del framebuffer al kernel
 #[repr(C)]
@@ -58,6 +59,8 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
+const KERNEL_VIRT_BASE: u64 = 0x200000;
+const MAX_KERNEL_ALLOCATION: u64 = 64 * 1024 * 1024; // 64 MiB como límite razonable para el kernel
 
 #[inline(always)]
 fn pages_for_size(size: usize) -> usize { (size + 0xFFF) / 0x1000 }
@@ -548,8 +551,9 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
     // Reservar memoria física en dirección fija para el kernel
     let kernel_phys_base = KERNEL_PHYS_LOAD_ADDR;
 
-    // Calcular tamaño total necesario
-    let mut total_size = 0u64;
+    // Calcular tamaño total necesario basándose en el rango real de offsets
+    let mut max_offset: u64 = 0;
+
     for i in 0..phnum {
         let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
         if off as usize + phentsize > kernel_data.len() {
@@ -561,65 +565,226 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         };
 
         if phdr.p_type != PT_LOAD { continue; }
+        if phdr.p_memsz == 0 { continue; }
 
-        let segment_end = phdr.p_vaddr + phdr.p_memsz;
-        if segment_end > total_size {
-            total_size = segment_end;
+        if phdr.p_vaddr < KERNEL_VIRT_BASE {
+            unsafe {
+                serial_write_str("DEBUG: Segmento con vaddr por debajo de KERNEL_VIRT_BASE, ignorado\r\n");
+            }
+            continue;
+        }
+
+        let seg_end = phdr.p_vaddr.checked_add(phdr.p_memsz).ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+        if seg_end <= KERNEL_VIRT_BASE { continue; }
+
+        let offset_end = seg_end - KERNEL_VIRT_BASE;
+        if offset_end > max_offset {
+            max_offset = offset_end;
         }
     }
 
-    let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
+    if max_offset == 0 {
+        return Err(BootError::LoadElf(Status::LOAD_ERROR));
+    }
 
-    // Reservar memoria física
-    if let Err(st) = bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
-        return Err(BootError::LoadSegment { status: st.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
+    let mut total_size = (max_offset + 0xFFF) & !0xFFF; // alinear hacia arriba a página
+    if total_size > MAX_KERNEL_ALLOCATION {
+        unsafe {
+            serial_write_str("DEBUG: total_size excede MAX_KERNEL_ALLOCATION, truncando\r\n");
+        }
+        total_size = MAX_KERNEL_ALLOCATION;
+    }
+
+    let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
+    
+    // Debug: mostrar el tamaño calculado
+    unsafe {
+        serial_write_str("DEBUG: total_size calculado: 0x");
+        serial_write_hex64(total_size);
+        serial_write_str(" (");
+        serial_write_hex64(total_size);
+        serial_write_str(" bytes)\r\n");
+        serial_write_str("DEBUG: total_pages calculado: ");
+        serial_write_hex64(total_pages as u64);
+        serial_write_str("\r\n");
+    }
+
+    // Reservar memoria física (usar AnyPages para evitar conflictos de dirección)
+    let mut allocated_addr = kernel_phys_base;
+
+    match bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
+        Ok(addr) => {
+            allocated_addr = addr;
+            unsafe {
+                serial_write_str("DEBUG: memoria asignada en 0x");
+                serial_write_hex64(addr);
+                serial_write_str(" (Address request)\r\n");
+            }
+        }
+        Err(st_addr) => {
+            unsafe {
+                serial_write_str("DEBUG: allocate_address fallo con status=0x");
+                serial_write_hex64(st_addr.status().0 as u64);
+                serial_write_str(", intentando AnyPages\r\n");
+            }
+            match bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_CODE, total_pages) {
+                Ok(addr) => {
+                    allocated_addr = addr;
+                    unsafe {
+                        serial_write_str("DEBUG: memoria asignada en 0x");
+                        serial_write_hex64(addr);
+                        serial_write_str(" (AnyPages)\r\n");
+                    }
+                }
+                Err(st_any) => {
+                    return Err(BootError::LoadSegment { status: st_any.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
+                }
+            }
+        }
     }
 
     // Cargar segmentos
+    unsafe {
+        serial_write_str("DEBUG: Iniciando carga de segmentos...\r\n");
+    }
+    
     for i in 0..phnum {
         let off = ehdr.e_phoff + (i as u64) * (ehdr.e_phentsize as u64);
         let phdr: Elf64Phdr = unsafe {
             core::ptr::read_unaligned(kernel_data[off as usize..].as_ptr() as *const Elf64Phdr)
         };
 
-        if phdr.p_type != PT_LOAD { continue; }
+        if phdr.p_type != PT_LOAD { 
+            unsafe {
+                serial_write_str("DEBUG: Segmento ");
+                serial_write_hex64(i as u64);
+                serial_write_str(" no es PT_LOAD, saltando\r\n");
+            }
+            continue; 
+        }
+        
+        unsafe {
+            serial_write_str("DEBUG: Cargando segmento ");
+            serial_write_hex64(i as u64);
+            serial_write_str("...\r\n");
+        }
 
         // Calcular dirección física donde cargar el segmento
-        // El kernel se carga en la dirección física base, y los segmentos se cargan
+        // El kernel se carga en la dirección física asignada, y los segmentos se cargan
         // en sus offsets relativos desde el inicio del kernel
-        let dest_phys = kernel_phys_base + (phdr.p_vaddr - 0x200000); // 0x200000 es la dirección base virtual del kernel
+        let offset = phdr.p_vaddr.checked_sub(KERNEL_VIRT_BASE).unwrap_or(0);
+        let dest_phys = allocated_addr + offset;
+        
+        unsafe {
+            serial_write_str("DEBUG: Segmento ");
+            serial_write_hex64(i as u64);
+            serial_write_str(" - p_vaddr=0x");
+            serial_write_hex64(phdr.p_vaddr);
+            serial_write_str(" dest_phys=0x");
+            serial_write_hex64(dest_phys);
+            serial_write_str(" offset=0x");
+            serial_write_hex64(offset);
+            serial_write_str(" p_memsz=0x");
+            serial_write_hex64(phdr.p_memsz);
+            serial_write_str("\r\n");
+        }
 
-        // Cargar datos del segmento
-        if phdr.p_filesz > 0 {
-            if phdr.p_offset as usize + phdr.p_filesz as usize > kernel_data.len() {
+        // Cargar datos del segmento (limitar el tamaño para evitar segmentos excesivos)
+        let available = total_size.saturating_sub(offset);
+        let mut actual_filesz = phdr.p_filesz;
+        if actual_filesz > available { actual_filesz = available; }
+        
+        if actual_filesz > 0 {
+            if phdr.p_offset as usize + actual_filesz as usize > kernel_data.len() {
                 return Err(BootError::LoadElf(Status::LOAD_ERROR));
             }
 
-            let src_data = &kernel_data[phdr.p_offset as usize..phdr.p_offset as usize + phdr.p_filesz as usize];
+            let src_data = &kernel_data[phdr.p_offset as usize..phdr.p_offset as usize + actual_filesz as usize];
             let dst_ptr = dest_phys as *mut u8;
-
+            
             unsafe {
-                core::ptr::copy_nonoverlapping(src_data.as_ptr(), dst_ptr, phdr.p_filesz as usize);
+                serial_write_str("DEBUG: Copiando ");
+                serial_write_hex64(actual_filesz);
+                serial_write_str(" bytes de 0x");
+                serial_write_hex64(src_data.as_ptr() as u64);
+                serial_write_str(" a 0x");
+                serial_write_hex64(dst_ptr as u64);
+                serial_write_str("\r\n");
+                
+                core::ptr::copy_nonoverlapping(src_data.as_ptr(), dst_ptr, actual_filesz as usize);
+                
+                serial_write_str("DEBUG: Copia completada\r\n");
             }
         }
 
-        // Inicializar memoria .bss (ceros)
-        if phdr.p_memsz > phdr.p_filesz {
-            let bss_ptr = (dest_phys + phdr.p_filesz) as *mut u8;
-            let bss_len = (phdr.p_memsz - phdr.p_filesz) as usize;
+        // Inicializar memoria .bss (ceros) - limitar al espacio reservado
+        let mut actual_memsz = phdr.p_memsz;
+        if actual_memsz > available { actual_memsz = available; }
+        
+        if actual_memsz > actual_filesz {
+            let bss_ptr = (dest_phys + actual_filesz) as *mut u8;
+            let bss_len = (actual_memsz - actual_filesz) as usize;
             unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_len); }
         }
     }
 
     // Calcular la dirección física del entry point
-    // El entry point virtual del kernel es 0x200000, pero necesitamos la dirección física
+    // El kernel se carga en allocated_addr, y el entry point virtual usa KERNEL_VIRT_BASE
+    // Necesitamos convertir la dirección virtual a física
     let entry_point_phys = if ehdr.e_entry != 0 {
-        kernel_phys_base + (ehdr.e_entry - 0x200000) // Convertir VA a PA
+        let entry_offset = ehdr.e_entry.checked_sub(KERNEL_VIRT_BASE).unwrap_or(0);
+        let calculated = allocated_addr + entry_offset;
+        unsafe {
+            serial_write_str("DEBUG: Entry point virtual: 0x");
+            serial_write_hex64(ehdr.e_entry);
+            serial_write_str("\r\n");
+            serial_write_str("DEBUG: Memoria asignada en: 0x");
+            serial_write_hex64(allocated_addr);
+            serial_write_str("\r\n");
+            serial_write_str("DEBUG: Offset entry calculado: 0x");
+            serial_write_hex64(entry_offset);
+            serial_write_str("\r\n");
+            serial_write_str("DEBUG: Entry point físico calculado: 0x");
+            serial_write_hex64(calculated);
+            serial_write_str("\r\n");
+        }
+        calculated
     } else {
-        kernel_phys_base // fallback
+        unsafe {
+            serial_write_str("DEBUG: ehdr.e_entry es 0, usando fallback\r\n");
+        }
+        allocated_addr // fallback
+    };
+    
+    // Debug: mostrar el entry point calculado
+    unsafe {
+        serial_write_str("DEBUG: entry point calculado: 0x");
+        serial_write_hex64(entry_point_phys);
+        serial_write_str(" (VA: 0x");
+        serial_write_hex64(ehdr.e_entry);
+        serial_write_str(", PA base: 0x");
+        serial_write_hex64(allocated_addr);
+        serial_write_str(")\r\n");
+        
+        // Debug crítico: verificar que el entry point no sea 0xB0000
+        if entry_point_phys == 0xB0000 {
+            serial_write_str("DEBUG: ERROR CRITICO - entry_point_phys es 0xB0000!\r\n");
+            serial_write_str("DEBUG: ehdr.e_entry = 0x");
+            serial_write_hex64(ehdr.e_entry);
+            serial_write_str("\r\n");
+            serial_write_str("DEBUG: allocated_addr = 0x");
+            serial_write_hex64(allocated_addr);
+            serial_write_str("\r\n");
+            serial_write_str("DEBUG: Calculo: allocated_addr + (ehdr.e_entry - 0x200060)\r\n");
+            serial_write_str("DEBUG: Calculo: 0x");
+            serial_write_hex64(allocated_addr);
+            serial_write_str(" + (0x");
+            serial_write_hex64(ehdr.e_entry);
+            serial_write_str(" - 0x200060)\r\n");
+        }
     };
 
-    Ok((entry_point_phys, kernel_phys_base, total_size))
+    Ok((entry_point_phys, allocated_addr, total_size))
 }
 
 enum BootError {
@@ -717,29 +882,38 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         // Nota: framebuffer_info no está disponible aquí, se maneja después
 
         // Mapear kernel específicamente: VA 0x200000 -> PA 0x0020_0000
-        {
-            let kernel_va = 0x200000u64;
-            let kernel_pa = 0x0020_0000u64;
-
-            // Calcular índices sin alinear
-            let pdpt_idx = (kernel_va >> 30) & 0x1FF; // 0
-            let pd_idx = (kernel_va >> 21) & 0x1FF;   // 1 (0x200000 / 0x200000 = 1)
-
-            // Alinear PA a 2MB
-            let kernel_pa_aligned = kernel_pa & !0x1F_FFFFu64;
-
-            if pdpt_idx < 8 {
-                let pd = pd_phys_arr[pdpt_idx as usize] as *mut u64;
-                // Mapear PD[1] que controla VA 0x0020_0000 - 0x003F_FFFF
-                *pd.add(pd_idx as usize) = (kernel_pa_aligned & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
-            }
-        }
+        // No se realiza alias específico para el kernel; el mapeo identidad cubre VA=PA
 
         // Nota: mantenemos mapeo identidad 0–8 GiB
     }
 
     unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }
     Ok((pml4_phys, stack_top))
+}
+
+fn load_eclipsefs_data(image: uefi::Handle, st: &mut SystemTable<Boot>) -> Result<(u64, u64), &'static str> {
+    let mut fs = st.boot_services().get_image_file_system(image).expect("Failed to get file system");
+    let mut root = fs.open_volume().expect("Failed to open volume");
+
+    let mut file = match root.open(cstr16!("eclipsefs.img"), FileMode::Read, FileAttribute::empty()) {
+        Ok(f) => f.into_regular_file().unwrap(), // Convertir a RegularFile
+        Err(_) => return Err("Could not open eclipsefs.img"),
+    };
+
+    // Buffer para FileInfo. 128 bytes es suficiente.
+    let mut info_buffer = [0u8; 128]; 
+    let file_info = file.get_info::<FileInfo>(&mut info_buffer).expect("Failed to get file info");
+    let file_size = file_info.file_size() as usize;
+
+    let pages = (file_size + 0xFFF) / 0x1000;
+    let mem_start = st.boot_services()
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+        .expect("Failed to allocate pages for eclipsefs.img");
+    
+    let buf = unsafe { slice::from_raw_parts_mut(mem_start as *mut u8, file_size) };
+    file.read(buf).expect("Failed to read eclipsefs.img");
+
+    Ok((mem_start as u64, file_size as u64))
 }
 
 #[entry]
@@ -960,11 +1134,8 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
-    // Preparar el entry point del kernel
-    let mut entry_reg = 0x200000u64; // Entry point virtual del kernel (valor por defecto)
-
     // CARGAR EL KERNEL ANTES DE EXIT_BOOT_SERVICES
-    let (kernel_entry, kernel_base, kernel_size) = {
+    let (kernel_entry, kernel_base, kernel_size, entry_reg) = {
         let bs = system_table.boot_services();
         let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
 
@@ -981,8 +1152,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_hex64(total_len);
                     serial_write_str("\r\n");
                 }
-                entry_reg = entry_point;
-                (entry_point, kernel_phys_base, total_len)
+                (entry_point, kernel_phys_base, total_len, entry_point)
             },
             Err(e) => {
                 unsafe {
@@ -1008,7 +1178,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str("\r\n");
                 }
                 // Mantener valores por defecto si falla la carga
-                (0x200000u64, KERNEL_PHYS_LOAD_ADDR, 0)
+                (0x200000u64, KERNEL_PHYS_LOAD_ADDR, 0, 0x200000u64)
             }
         }
     };
@@ -1069,8 +1239,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         serial_write_str("\r\n");
 
         // Verificar que el código esté en la dirección física correcta
-        serial_write_str("BL: verificando kernel en PA 0x200000: ");
-        let kernel_ptr = 0x200000 as *const u8;
+        serial_write_str("BL: verificando kernel en PA ");
+        serial_write_hex64(entry_reg);
+        serial_write_str(": ");
+        let kernel_ptr = entry_reg as *const u8;
         for i in 0..16 {
             let byte = unsafe { *kernel_ptr.add(i) };
             serial_write_hex8(byte);
@@ -1083,7 +1255,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         // Verificar que el kernel esté realmente cargado ANTES del salto
         serial_write_str("BL: verificando kernel ANTES del salto: ");
-        let kernel_check_ptr = 0x200000 as *const u8;
+        let kernel_check_ptr = entry_reg as *const u8;
         for i in 0..32 {
             let byte = unsafe { *kernel_check_ptr.add(i) };
             serial_write_hex8(byte);
@@ -1378,6 +1550,21 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         serial_write_str("BL: CR3 actual: ");
         serial_write_hex64(cr3_current);
         serial_write_str("\r\n");
+        
+        // Debug adicional del entry point
+        serial_write_str("BL: Entry point calculado: 0x");
+        serial_write_hex64(entry_reg);
+        serial_write_str("\r\n");
+        serial_write_str("BL: Framebuffer info ptr: 0x");
+        serial_write_hex64(framebuffer_info_ptr);
+        serial_write_str("\r\n");
+        
+        // Debug crítico: verificar que entry_reg no sea 0xB0000
+        if entry_reg == 0xB0000 {
+            serial_write_str("BL: ERROR CRITICO - entry_reg es 0xB0000! Esto es incorrecto!\r\n");
+            serial_write_str("BL: Abortando salto al kernel para evitar crash\r\n");
+            return Status::SUCCESS;
+        }
 
         // Pasar el puntero a la estructura de framebuffer en rdi (primer argumento de la ABI x86_64)
         // Usar la dirección física calculada del entry point del kernel
@@ -1390,12 +1577,14 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             cr3 = in(reg) cr3_value,
             rsp = in(reg) rsp_alineado,
             fbinfo = in(reg) framebuffer_info_ptr,
-            entry = in(reg) entry_reg,
-            options(noreturn)
+            entry = in(reg) entry_reg
         );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)
         serial_write_str("BL: ERROR - kernel retorno! Esto NO deberia pasar!\r\n");
         serial_write_str("BL: El kernel deberia haber tomado control completo\r\n");
     }
+    
+    // Si llegamos aquí, el kernel retornó (no debería pasar)
+    Status::SUCCESS
 }

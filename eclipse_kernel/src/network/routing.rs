@@ -1,5 +1,5 @@
 //! Sistema de routing de red
-//! 
+//!
 //! Tabla de routing y algoritmos de enrutamiento
 
 #![allow(dead_code)] // Permitir código no utilizado - API completa del kernel
@@ -13,10 +13,10 @@ use super::NetworkError;
 /// Tipos de ruta
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RouteType {
-    Direct,     // Ruta directa a la red local
-    Gateway,    // Ruta a través de un gateway
-    Host,       // Ruta a un host específico
-    Default,    // Ruta por defecto
+    Direct,  // Ruta directa a la red local
+    Gateway, // Ruta a través de un gateway
+    Host,    // Ruta a un host específico
+    Default, // Ruta por defecto
 }
 
 impl From<u8> for RouteType {
@@ -65,12 +65,19 @@ impl Route {
             timestamp: 0,
         }
     }
-    
+
     /// Crear ruta directa
     pub fn direct(destination: IpAddress, netmask: IpAddress, interface_index: u32) -> Self {
-        Self::new(destination, netmask, None, interface_index, RouteType::Direct, 0)
+        Self::new(
+            destination,
+            netmask,
+            None,
+            interface_index,
+            RouteType::Direct,
+            0,
+        )
     }
-    
+
     /// Crear ruta a través de gateway
     pub fn gateway(
         destination: IpAddress,
@@ -79,9 +86,16 @@ impl Route {
         interface_index: u32,
         metric: u32,
     ) -> Self {
-        Self::new(destination, netmask, Some(gateway), interface_index, RouteType::Gateway, metric)
+        Self::new(
+            destination,
+            netmask,
+            Some(gateway),
+            interface_index,
+            RouteType::Gateway,
+            metric,
+        )
     }
-    
+
     /// Crear ruta por defecto
     pub fn default(gateway: IpAddress, interface_index: u32, metric: u32) -> Self {
         Self::new(
@@ -93,28 +107,28 @@ impl Route {
             metric,
         )
     }
-    
+
     /// Establecer timestamp
     pub fn set_timestamp(&mut self, timestamp: u64) {
         self.timestamp = timestamp;
     }
-    
+
     /// Activar ruta
     pub fn activate(&mut self) {
         self.is_active = true;
     }
-    
+
     /// Desactivar ruta
     pub fn deactivate(&mut self) {
         self.is_active = false;
     }
-    
+
     /// Verificar si la ruta coincide con una IP
     pub fn matches(&self, ip: IpAddress) -> bool {
         if !self.is_active {
             return false;
         }
-        
+
         match self.route_type {
             RouteType::Default => true,
             RouteType::Direct | RouteType::Gateway | RouteType::Host => {
@@ -124,7 +138,7 @@ impl Route {
             }
         }
     }
-    
+
     /// Obtener dirección de red
     pub fn get_network_address(&self) -> IpAddress {
         let network_bytes = [
@@ -135,7 +149,7 @@ impl Route {
         ];
         IpAddress::from_bytes(network_bytes)
     }
-    
+
     /// Obtener red objetivo para una IP
     fn get_target_network(&self, ip: IpAddress) -> IpAddress {
         let network_bytes = [
@@ -146,22 +160,22 @@ impl Route {
         ];
         IpAddress::from_bytes(network_bytes)
     }
-    
+
     /// Obtener gateway
     pub fn get_gateway(&self) -> Option<IpAddress> {
         self.gateway
     }
-    
+
     /// Obtener interfaz
     pub fn get_interface(&self) -> u32 {
         self.interface_index
     }
-    
+
     /// Obtener métrica
     pub fn get_metric(&self) -> u32 {
         self.metric
     }
-    
+
     /// Comparar rutas por métrica
     pub fn compare_by_metric(&self, other: &Route) -> Ordering {
         self.metric.cmp(&other.metric)
@@ -182,31 +196,33 @@ impl RoutingTable {
             max_routes: super::MAX_ROUTES,
         }
     }
-    
+
     /// Agregar ruta
     pub fn add_route(&mut self, route: Route) -> Result<(), NetworkError> {
         if self.routes.len() >= self.max_routes {
             return Err(NetworkError::OutOfMemory);
         }
-        
+
         // Verificar si ya existe una ruta similar
         if let Some(existing_route) = self.find_specific_route(route.destination, route.netmask) {
             // Actualizar ruta existente
-            if let Some(pos) = self.routes.iter().position(|r| r.destination == existing_route.destination && r.netmask == existing_route.netmask) {
+            if let Some(pos) = self.routes.iter().position(|r| {
+                r.destination == existing_route.destination && r.netmask == existing_route.netmask
+            }) {
                 self.routes[pos] = route;
             }
         } else {
             self.routes.push(route);
         }
-        
+
         Ok(())
     }
-    
+
     /// Buscar ruta para una IP
     pub fn find_route(&self, ip: IpAddress) -> Option<&Route> {
         let mut best_route: Option<&Route> = None;
         let mut best_metric = u32::MAX;
-        
+
         for route in &self.routes {
             if route.matches(ip) {
                 // Preferir rutas más específicas (métricas más bajas)
@@ -216,46 +232,53 @@ impl RoutingTable {
                 }
             }
         }
-        
+
         best_route
     }
-    
+
     /// Buscar ruta específica
-    pub fn find_specific_route(&self, destination: IpAddress, netmask: IpAddress) -> Option<&Route> {
-        self.routes.iter().find(|route| {
-            route.destination == destination && route.netmask == netmask
-        })
+    pub fn find_specific_route(
+        &self,
+        destination: IpAddress,
+        netmask: IpAddress,
+    ) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|route| route.destination == destination && route.netmask == netmask)
     }
-    
+
     /// Remover ruta
     pub fn remove_route(&mut self, destination: IpAddress, netmask: IpAddress) -> bool {
-        if let Some(pos) = self.routes.iter().position(|route| {
-            route.destination == destination && route.netmask == netmask
-        }) {
+        if let Some(pos) = self
+            .routes
+            .iter()
+            .position(|route| route.destination == destination && route.netmask == netmask)
+        {
             self.routes.remove(pos);
             true
         } else {
             false
         }
     }
-    
+
     /// Obtener todas las rutas
     pub fn get_routes(&self) -> &[Route] {
         &self.routes
     }
-    
+
     /// Obtener rutas activas
     pub fn get_active_routes(&self) -> Vec<&Route> {
         self.routes.iter().filter(|route| route.is_active).collect()
     }
-    
+
     /// Obtener rutas por interfaz
     pub fn get_routes_by_interface(&self, interface_index: u32) -> Vec<&Route> {
-        self.routes.iter()
+        self.routes
+            .iter()
             .filter(|route| route.interface_index == interface_index)
             .collect()
     }
-    
+
     /// Limpiar rutas expiradas
     pub fn cleanup_expired(&mut self, current_time: u64, ttl: u64) {
         self.routes.retain(|route| {
@@ -266,29 +289,41 @@ impl RoutingTable {
             }
         });
     }
-    
+
     /// Obtener número de rutas
     pub fn size(&self) -> usize {
         self.routes.len()
     }
-    
+
     /// Verificar si la tabla está llena
     pub fn is_full(&self) -> bool {
         self.routes.len() >= self.max_routes
     }
-    
+
     /// Limpiar tabla
     pub fn clear(&mut self) {
         self.routes.clear();
     }
-    
+
     /// Obtener estadísticas
     pub fn get_stats(&self) -> RoutingTableStats {
         let active_routes = self.routes.iter().filter(|r| r.is_active).count();
-        let direct_routes = self.routes.iter().filter(|r| r.route_type == RouteType::Direct).count();
-        let gateway_routes = self.routes.iter().filter(|r| r.route_type == RouteType::Gateway).count();
-        let default_routes = self.routes.iter().filter(|r| r.route_type == RouteType::Default).count();
-        
+        let direct_routes = self
+            .routes
+            .iter()
+            .filter(|r| r.route_type == RouteType::Direct)
+            .count();
+        let gateway_routes = self
+            .routes
+            .iter()
+            .filter(|r| r.route_type == RouteType::Gateway)
+            .count();
+        let default_routes = self
+            .routes
+            .iter()
+            .filter(|r| r.route_type == RouteType::Default)
+            .count();
+
         RoutingTableStats {
             total_routes: self.routes.len(),
             active_routes,
@@ -327,17 +362,17 @@ impl RoutingAlgorithm {
             route_ttl: 300, // 5 minutos
         }
     }
-    
+
     /// Agregar ruta
     pub fn add_route(&mut self, route: Route) -> Result<(), NetworkError> {
         self.table.add_route(route)
     }
-    
+
     /// Buscar mejor ruta
     pub fn find_best_route(&self, ip: IpAddress) -> Option<&Route> {
         self.table.find_route(ip)
     }
-    
+
     /// Obtener siguiente salto
     pub fn get_next_hop(&self, ip: IpAddress) -> Option<IpAddress> {
         if let Some(route) = self.find_best_route(ip) {
@@ -350,12 +385,12 @@ impl RoutingAlgorithm {
             None
         }
     }
-    
+
     /// Obtener interfaz de salida
     pub fn get_output_interface(&self, ip: IpAddress) -> Option<u32> {
         self.find_best_route(ip).map(|route| route.get_interface())
     }
-    
+
     /// Verificar si una IP es local
     pub fn is_local(&self, ip: IpAddress) -> bool {
         if let Some(route) = self.find_best_route(ip) {
@@ -364,7 +399,7 @@ impl RoutingAlgorithm {
             false
         }
     }
-    
+
     /// Actualizar métricas
     pub fn update_metrics(&mut self, current_time: u64) {
         for route in &mut self.table.routes {
@@ -376,17 +411,17 @@ impl RoutingAlgorithm {
             }
         }
     }
-    
+
     /// Limpiar rutas expiradas
     pub fn cleanup(&mut self, current_time: u64) {
         self.table.cleanup_expired(current_time, self.route_ttl);
     }
-    
+
     /// Obtener tabla de routing
     pub fn get_table(&self) -> &RoutingTable {
         &self.table
     }
-    
+
     /// Obtener estadísticas
     pub fn get_stats(&self) -> RoutingTableStats {
         self.table.get_stats()
@@ -402,7 +437,7 @@ pub fn init_routing_table() -> Result<(), NetworkError> {
         if ROUTING_ALGORITHM.is_some() {
             return Err(NetworkError::ProtocolError);
         }
-        
+
         ROUTING_ALGORITHM = Some(RoutingAlgorithm::new());
         Ok(())
     }

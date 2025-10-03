@@ -1,12 +1,12 @@
 //! Driver USB para ratón
-//! 
+//!
 //! Implementa soporte completo para ratones USB con funcionalidades avanzadas.
 
-use crate::drivers::framebuffer::{FramebufferDriver, Color};
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
 use crate::syslog;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 
 /// Botones del ratón
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -33,7 +33,7 @@ impl MousePosition {
     pub fn new() -> Self {
         Self { x: 0, y: 0 }
     }
-    
+
     pub fn new_with_coords(x: i32, y: i32) -> Self {
         Self { x, y }
     }
@@ -42,10 +42,22 @@ impl MousePosition {
 /// Evento de mouse
 #[derive(Debug, Clone, PartialEq)]
 pub enum MouseEvent {
-    ButtonPress { button: MouseButton, position: MousePosition },
-    ButtonRelease { button: MouseButton, position: MousePosition },
-    Move { position: MousePosition, buttons: MouseButtonState },
-    Scroll { delta: i32, position: MousePosition },
+    ButtonPress {
+        button: MouseButton,
+        position: MousePosition,
+    },
+    ButtonRelease {
+        button: MouseButton,
+        position: MousePosition,
+    },
+    Move {
+        position: MousePosition,
+        buttons: MouseButtonState,
+    },
+    Scroll {
+        delta: i32,
+        position: MousePosition,
+    },
 }
 
 /// Datos de mouse
@@ -150,17 +162,25 @@ impl UsbMouseDriver {
             return Err("El driver del ratón ya está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", &alloc::format!(
-            "Inicializando driver USB para ratón (ID: {})",
-            self.device_id
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_MOUSE",
+            &alloc::format!(
+                "Inicializando driver USB para ratón (ID: {})",
+                self.device_id
+            ),
+        );
 
         // Simular inicialización del dispositivo USB
         self.current_position = MousePosition::new_with_coords(400, 300); // Posición inicial en el centro
         self.last_position = (self.current_position.x, self.current_position.y);
         self.is_initialized = true;
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", "Driver USB para ratón inicializado correctamente");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_MOUSE",
+            "Driver USB para ratón inicializado correctamente",
+        );
         Ok(())
     }
 
@@ -194,9 +214,9 @@ impl UsbMouseDriver {
         self.current_position = MousePosition::new_with_coords(new_x, new_y);
 
         // Crear evento del ratón
-        let event = MouseEvent::Move { 
-            position: self.current_position, 
-            buttons: self.button_state 
+        let event = MouseEvent::Move {
+            position: self.current_position,
+            buttons: self.button_state,
         };
 
         // Agregar evento a la cola
@@ -294,9 +314,9 @@ impl UsbMouseDriver {
         self.last_position = (self.current_position.x, self.current_position.y);
         self.current_position = MousePosition::new_with_coords(new_x, new_y);
 
-        let event = MouseEvent::Move { 
-            position: self.current_position, 
-            buttons: self.button_state 
+        let event = MouseEvent::Move {
+            position: self.current_position,
+            buttons: self.button_state,
         };
 
         self.add_event(event);
@@ -319,9 +339,9 @@ impl UsbMouseDriver {
             _ => {}
         }
 
-        let event = MouseEvent::Move { 
-            position: self.current_position, 
-            buttons: self.button_state 
+        let event = MouseEvent::Move {
+            position: self.current_position,
+            buttons: self.button_state,
         };
 
         self.add_event(event);
@@ -344,9 +364,9 @@ impl UsbMouseDriver {
             _ => {}
         }
 
-        let event = MouseEvent::Move { 
-            position: self.current_position, 
-            buttons: self.button_state 
+        let event = MouseEvent::Move {
+            position: self.current_position,
+            buttons: self.button_state,
         };
 
         self.add_event(event);
@@ -378,22 +398,26 @@ impl UsbMouseDriver {
             return Err("El driver del mouse no está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", &alloc::format!(
-            "Configurando LEDs del mouse: {:?}", leds
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_MOUSE",
+            &alloc::format!("Configurando LEDs del mouse: {:?}", leds),
+        );
 
         // Simular envío de comando de LEDs al dispositivo USB
         // En un driver real, esto enviaría un report HID al dispositivo
         let led_byte = leds.to_byte();
-        
+
         // Simular delay de comunicación USB
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_MOUSE", &alloc::format!(
-            "LEDs del mouse configurados: 0x{:02X}", led_byte
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_MOUSE",
+            &alloc::format!("LEDs del mouse configurados: 0x{:02X}", led_byte),
+        );
 
         Ok(())
     }
@@ -466,10 +490,18 @@ impl MouseLeds {
     /// Convertir a byte para envío USB
     pub fn to_byte(&self) -> u8 {
         let mut byte = 0;
-        if self.scroll_wheel { byte |= 0x01; }
-        if self.side_buttons { byte |= 0x02; }
-        if self.logo { byte |= 0x04; }
-        if self.dpi_indicator { byte |= 0x08; }
+        if self.scroll_wheel {
+            byte |= 0x01;
+        }
+        if self.side_buttons {
+            byte |= 0x02;
+        }
+        if self.logo {
+            byte |= 0x04;
+        }
+        if self.dpi_indicator {
+            byte |= 0x08;
+        }
         byte
     }
 }

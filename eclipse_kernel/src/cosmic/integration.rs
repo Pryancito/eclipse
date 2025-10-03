@@ -1,15 +1,15 @@
 //! Integración entre COSMIC y Eclipse OS
-//! 
+//!
 //! Este módulo maneja la comunicación entre el entorno de escritorio COSMIC
 //! y el kernel de Eclipse OS, incluyendo la gestión de recursos y eventos.
 
-use super::{WindowManagerMode, CosmicPerformanceStats};
-use super::compositor::{CosmicCompositor, CompositorConfig};
-use crate::wayland::{server::WaylandServer, init_wayland};
-use crate::drivers::framebuffer::{FramebufferDriver, get_framebuffer};
+use super::compositor::{CompositorConfig, CosmicCompositor};
+use super::{CosmicPerformanceStats, WindowManagerMode};
+use crate::drivers::framebuffer::{get_framebuffer, FramebufferDriver};
+use crate::wayland::{init_wayland, server::WaylandServer};
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
 
 /// Integración principal entre COSMIC y Eclipse OS
 pub struct CosmicIntegration {
@@ -48,15 +48,15 @@ impl CosmicIntegration {
             return Ok(());
         }
 
-        // Crear servidor Wayland
-        let mut wayland_server = WaylandServer::new(8080);
+        // Crear servidor Wayland con socket Unix (más rápido y confiable)
+        let mut wayland_server = WaylandServer::new(0);
         wayland_server.initialize()?;
-        
+
         // Registrar globals de COSMIC
         self.register_cosmic_globals(&mut wayland_server)?;
 
         self.wayland_server = Some(wayland_server);
-        
+
         // Iniciar compositor gráfico real y crear una ventana de demostración
         let mut compositor = CosmicCompositor::new();
         let comp_cfg = CompositorConfig::default();
@@ -80,11 +80,27 @@ impl CosmicIntegration {
         server.register_global("wl_shell".to_string(), "wl_shell".to_string(), 1)?;
 
         // Registrar globals específicos de COSMIC
-        server.register_global("cosmic_session".to_string(), "cosmic_session".to_string(), 1)?;
-        server.register_global("cosmic_background".to_string(), "cosmic_background".to_string(), 1)?;
+        server.register_global(
+            "cosmic_session".to_string(),
+            "cosmic_session".to_string(),
+            1,
+        )?;
+        server.register_global(
+            "cosmic_background".to_string(),
+            "cosmic_background".to_string(),
+            1,
+        )?;
         server.register_global("cosmic_panel".to_string(), "cosmic_panel".to_string(), 1)?;
-        server.register_global("cosmic_workspace".to_string(), "cosmic_workspace".to_string(), 1)?;
-        server.register_global("cosmic_notification".to_string(), "cosmic_notification".to_string(), 1)?;
+        server.register_global(
+            "cosmic_workspace".to_string(),
+            "cosmic_workspace".to_string(),
+            1,
+        )?;
+        server.register_global(
+            "cosmic_notification".to_string(),
+            "cosmic_notification".to_string(),
+            1,
+        )?;
 
         Ok(())
     }
@@ -230,12 +246,9 @@ impl CosmicIntegration {
 
     /// Obtener información del framebuffer
     pub fn get_framebuffer_info(&self) -> Option<String> {
-        self.framebuffer.as_ref().map(|fb| {
-            format!("Framebuffer: {}x{}", 
-                fb.info.width, 
-                fb.info.height
-            )
-        })
+        self.framebuffer
+            .as_ref()
+            .map(|fb| format!("Framebuffer: {}x{}", fb.info.width, fb.info.height))
     }
 
     /// Detener integración

@@ -1,13 +1,15 @@
 //! Gestor de drivers binarios para Eclipse OS
-//! 
+//!
 //! Este módulo maneja la carga y ejecución de drivers binarios
 //! desde archivos .edriver en el kernel.
 
-use super::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
-use alloc::string::String;
-use alloc::vec::Vec;
+use super::ipc::{
+    Driver, DriverCapability, DriverInfo, DriverMessage, DriverResponse, DriverState,
+};
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Metadatos de un driver binario
 #[derive(Debug, Clone)]
@@ -48,12 +50,12 @@ impl BinaryDriver {
     pub fn load_into_memory(&mut self) -> Result<(), String> {
         // En un sistema real, aquí se cargaría el binario en memoria
         // y se configuraría la protección de memoria apropiada
-        
+
         self.state = DriverState::Loading;
-        
+
         // Simular carga en memoria
         self.loaded_address = Some(0x1000000); // Dirección simulada
-        
+
         self.state = DriverState::Loaded;
         Ok(())
     }
@@ -65,22 +67,21 @@ impl BinaryDriver {
                 // Simular ejecución de función principal
                 Ok(b"Driver binario ejecutado".to_vec())
             }
-            "driver_shutdown" => {
-                Ok(b"Driver binario cerrado".to_vec())
-            }
+            "driver_shutdown" => Ok(b"Driver binario cerrado".to_vec()),
             "driver_command" => {
                 // Simular ejecución de comando
                 let cmd = String::from_utf8_lossy(args);
                 if cmd.contains("get_info") {
-                    Ok(format!("Driver {} v{} - {}", 
-                             self.metadata.name, 
-                             self.metadata.version, 
-                             self.metadata.description).into_bytes())
+                    Ok(format!(
+                        "Driver {} v{} - {}",
+                        self.metadata.name, self.metadata.version, self.metadata.description
+                    )
+                    .into_bytes())
                 } else {
                     Ok(b"Comando ejecutado".to_vec())
                 }
             }
-            _ => Err(format!("Función no encontrada: {}", function_name))
+            _ => Err(format!("Función no encontrada: {}", function_name)),
         }
     }
 }
@@ -88,26 +89,26 @@ impl BinaryDriver {
 impl Driver for BinaryDriver {
     fn initialize(&mut self) -> Result<(), String> {
         self.state = DriverState::Initializing;
-        
+
         // Cargar en memoria
         self.load_into_memory()?;
-        
+
         // Ejecutar función de inicialización
         self.execute_function("driver_main", &[])?;
-        
+
         self.state = DriverState::Ready;
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
         self.state = DriverState::Unloading;
-        
+
         // Ejecutar función de cierre
         self.execute_function("driver_shutdown", &[])?;
-        
+
         // Liberar memoria
         self.loaded_address = None;
-        
+
         self.state = DriverState::Unloaded;
         Ok(())
     }
@@ -119,10 +120,10 @@ impl Driver for BinaryDriver {
 
     fn resume(&mut self) -> Result<(), String> {
         self.state = DriverState::Initializing;
-        
+
         // Re-cargar en memoria
         self.load_into_memory()?;
-        
+
         self.state = DriverState::Ready;
         Ok(())
     }
@@ -142,35 +143,30 @@ impl Driver for BinaryDriver {
 
     fn handle_message(&mut self, message: DriverMessage) -> DriverResponse {
         match message {
-            DriverMessage::Initialize => {
-                match self.initialize() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Shutdown => {
-                match self.shutdown() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Suspend => {
-                match self.suspend() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Resume => {
-                match self.resume() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
+            DriverMessage::Initialize => match self.initialize() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Shutdown => match self.shutdown() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Suspend => match self.suspend() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Resume => match self.resume() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
             DriverMessage::GetStatus => {
                 DriverResponse::SuccessWithData(format!("{:?}", self.state).into_bytes())
             }
             DriverMessage::GetCapabilities => {
-                let caps: Vec<String> = self.metadata.capabilities.iter()
+                let caps: Vec<String> = self
+                    .metadata
+                    .capabilities
+                    .iter()
                     .map(|c| format!("{:?}", c))
                     .collect();
                 let caps_str = caps.join(",");
@@ -217,12 +213,16 @@ impl BinaryDriverManager {
     }
 
     /// Cargar driver binario desde datos
-    pub fn load_binary_driver(&mut self, metadata: BinaryDriverMetadata, binary_data: Vec<u8>) -> Result<u32, String> {
+    pub fn load_binary_driver(
+        &mut self,
+        metadata: BinaryDriverMetadata,
+        binary_data: Vec<u8>,
+    ) -> Result<u32, String> {
         let driver_id = self.next_id;
         self.next_id += 1;
 
         let mut driver = BinaryDriver::new(metadata, binary_data);
-        
+
         // Inicializar el driver
         driver.initialize()?;
 
@@ -236,7 +236,12 @@ impl BinaryDriverManager {
     }
 
     /// Ejecutar comando en driver binario
-    pub fn execute_command(&mut self, driver_id: u32, command: &str, args: Vec<u8>) -> Result<Vec<u8>, String> {
+    pub fn execute_command(
+        &mut self,
+        driver_id: u32,
+        command: &str,
+        args: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
         if let Some(driver) = self.drivers.get_mut(&driver_id) {
             driver.execute_function(command, &args)
         } else {
@@ -263,12 +268,18 @@ impl BinaryDriverManager {
     pub fn verify_compatibility(metadata: &BinaryDriverMetadata) -> Result<(), String> {
         // Verificar arquitectura
         if metadata.target_arch != "x86_64" {
-            return Err(format!("Arquitectura no soportada: {}", metadata.target_arch));
+            return Err(format!(
+                "Arquitectura no soportada: {}",
+                metadata.target_arch
+            ));
         }
 
         // Verificar sistema operativo
         if metadata.target_os != "eclipse" {
-            return Err(format!("Sistema operativo no soportado: {}", metadata.target_os));
+            return Err(format!(
+                "Sistema operativo no soportado: {}",
+                metadata.target_os
+            ));
         }
 
         Ok(())

@@ -1,12 +1,12 @@
 //! Sistema de fases de inicialización de gráficos
-//! 
+//!
 //! Arquitectura de 3 fases:
 //! 1. UEFI/GOP para bootloader
 //! 2. UEFI/GOP para kernel en detección de gráficos  
 //! 3. DRM/FB/GOP para kernel posterior
 
-use core::fmt;
 use crate::drivers::framebuffer::FramebufferInfo;
+use core::fmt;
 
 /// Fases de inicialización de gráficos
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,12 +133,16 @@ impl GraphicsPhaseManager {
 
     /// Inicializar fase de detección UEFI
     pub fn init_uefi_detection(&mut self) -> Result<(), &'static str> {
-        self.state.transition_to(GraphicsPhase::UefiKernelDetection)?;
+        self.state
+            .transition_to(GraphicsPhase::UefiKernelDetection)?;
         Ok(())
     }
 
     /// Inicializar fase de runtime DRM
-    pub fn init_drm_runtime(&mut self, framebuffer_info: FramebufferInfo) -> Result<(), &'static str> {
+    pub fn init_drm_runtime(
+        &mut self,
+        framebuffer_info: FramebufferInfo,
+    ) -> Result<(), &'static str> {
         self.state.transition_to(GraphicsPhase::DrmKernelRuntime)?;
         self.state.mark_initialized(framebuffer_info);
         Ok(())
@@ -151,7 +155,10 @@ impl GraphicsPhaseManager {
 
     /// Verificar si debemos usar UEFI
     pub fn should_use_uefi(&self) -> bool {
-        matches!(self.state.current_phase, GraphicsPhase::UefiBootloader | GraphicsPhase::UefiKernelDetection)
+        matches!(
+            self.state.current_phase,
+            GraphicsPhase::UefiBootloader | GraphicsPhase::UefiKernelDetection
+        )
     }
 }
 
@@ -167,7 +174,5 @@ pub fn init_graphics_phase_manager() {
 
 /// Obtener el manager de fases
 pub fn get_graphics_phase_manager() -> Option<&'static mut GraphicsPhaseManager> {
-    unsafe {
-        GRAPHICS_PHASE_MANAGER.as_mut()
-    }
+    unsafe { GRAPHICS_PHASE_MANAGER.as_mut() }
 }

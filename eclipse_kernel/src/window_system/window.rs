@@ -1,13 +1,13 @@
 //! Definición de ventana individual
-//! 
+//!
 //! Representa una ventana individual en el sistema de ventanas.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::geometry::{Point, Size, Rectangle};
+use super::geometry::{Point, Rectangle, Size};
 use super::protocol::WindowFlags;
-use super::{WindowId, ClientId};
+use super::{ClientId, WindowId};
 
 /// Estado de una ventana
 #[derive(Debug, Clone, PartialEq)]

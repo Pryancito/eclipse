@@ -6,10 +6,10 @@ use crate::KernelResult;
 /// Inicializar el sistema de seguridad de Eclipse
 pub fn init_eclipse_security() -> KernelResult<()> {
     // Inicializando sistema de seguridad Eclipse
-    
+
     // Aquí se implementan las funcionalidades específicas de seguridad de Eclipse
     // como el sistema de permisos avanzado, sandboxing, etc.
-    
+
     // Sistema de seguridad Eclipse inicializado
     Ok(())
 }
@@ -18,6 +18,6 @@ pub fn init_eclipse_security() -> KernelResult<()> {
 pub fn process_security_events() -> KernelResult<()> {
     // Procesar eventos específicos de seguridad de Eclipse
     // como access violations, security audits, etc.
-    
+
     Ok(())
 }

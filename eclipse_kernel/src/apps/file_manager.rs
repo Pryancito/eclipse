@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! Gestor de archivos para Eclipse OS
-//! 
+//!
 //! Proporciona una interfaz para navegar y gestionar archivos
 //! y directorios del sistema.
 
-use alloc::{vec, vec::Vec};
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::{vec, vec::Vec};
 
 /// Tipo de entrada del sistema de archivos
 #[derive(Debug, Clone, PartialEq)]
@@ -80,11 +80,11 @@ impl FileManager {
     /// Ejecutar el gestor de archivos
     pub fn run(&mut self) -> Result<(), &'static str> {
         self.show_welcome();
-        
+
         loop {
             self.show_prompt();
             let input = self.read_input();
-            
+
             if input.trim().is_empty() {
                 continue;
             }
@@ -199,7 +199,7 @@ impl FileManager {
         let dir = args.get(0).map(|s| *s).unwrap_or(&self.current_path);
         self.print_info(&format!("Contenido de: {}", dir));
         self.print_info("");
-        
+
         // Simular listado de archivos
         let files = vec![
             FileInfo {
@@ -269,11 +269,11 @@ impl FileManager {
                 FileType::Socket => "S",
                 FileType::Pipe => "P",
             };
-            
+
             if i % 3 == 0 && i > 0 {
                 self.print_info("");
             }
-            
+
             self.print_info(&format!("{}{:<20}", file.name, file_type_char));
             i += 1;
         }
@@ -299,8 +299,10 @@ impl FileManager {
 
     fn show_details_view(&self, files: &[FileInfo]) {
         self.print_info("Permisos    Propietario  Grupo      Tamaño  Modificado        Nombre");
-        self.print_info("──────────  ───────────  ─────────  ──────  ─────────────────  ──────────────");
-        
+        self.print_info(
+            "──────────  ───────────  ─────────  ──────  ─────────────────  ──────────────",
+        );
+
         for file in files {
             let file_type_char = match file.file_type {
                 FileType::File => "-",
@@ -310,7 +312,7 @@ impl FileManager {
                 FileType::Socket => "S",
                 FileType::Pipe => "P",
             };
-            
+
             self.print_info(&format!(
                 "{}{} {:10} {:10} {:6} {}  {}",
                 file_type_char,
@@ -326,7 +328,7 @@ impl FileManager {
 
     fn cmd_cd(&mut self, args: &[&str]) -> Result<(), &'static str> {
         let dir = args.get(0).unwrap_or(&"/");
-        
+
         if *dir == ".." {
             if let Some(pos) = self.current_path.rfind('/') {
                 if pos > 0 {
@@ -341,7 +343,7 @@ impl FileManager {
             self.history.push(self.current_path.clone());
             self.current_path = dir.to_string();
         }
-        
+
         self.print_info(&format!("Directorio cambiado a: {}", self.current_path));
         Ok(())
     }
@@ -442,7 +444,10 @@ impl FileManager {
         if args.len() < 2 {
             return Err("Uso: chown <propietario> <archivo>");
         }
-        self.print_info(&format!("Cambiando propietario de {} a {}", args[1], args[0]));
+        self.print_info(&format!(
+            "Cambiando propietario de {} a {}",
+            args[1], args[0]
+        ));
         Ok(())
     }
 
@@ -485,8 +490,12 @@ impl FileManager {
         if args.is_empty() {
             return Err("Uso: bookmark <nombre>");
         }
-        self.bookmarks.push((args[0].to_string(), self.current_path.clone()));
-        self.print_info(&format!("Marcador '{}' creado para {}", args[0], self.current_path));
+        self.bookmarks
+            .push((args[0].to_string(), self.current_path.clone()));
+        self.print_info(&format!(
+            "Marcador '{}' creado para {}",
+            args[0], self.current_path
+        ));
         Ok(())
     }
 
@@ -494,7 +503,7 @@ impl FileManager {
         if args.is_empty() {
             return Err("Uso: goto <nombre>");
         }
-        
+
         if let Some((_, path)) = self.bookmarks.iter().find(|(name, _)| name == args[0]) {
             self.history.push(self.current_path.clone());
             self.current_path = path.clone();
@@ -517,7 +526,7 @@ impl FileManager {
         if args.is_empty() {
             return Err("Uso: view <modo> (list|grid|tree|details)");
         }
-        
+
         match args[0] {
             "list" => self.view_mode = ViewMode::List,
             "grid" => self.view_mode = ViewMode::Grid,
@@ -525,7 +534,7 @@ impl FileManager {
             "details" => self.view_mode = ViewMode::Details,
             _ => return Err("Modo de vista no válido"),
         }
-        
+
         self.print_info(&format!("Modo de vista cambiado a: {:?}", self.view_mode));
         Ok(())
     }
@@ -534,7 +543,7 @@ impl FileManager {
         if args.is_empty() {
             return Err("Uso: sort <por> (name|size|modified|type|permissions)");
         }
-        
+
         match args[0] {
             "name" => self.sort_by = SortBy::Name,
             "size" => self.sort_by = SortBy::Size,
@@ -543,7 +552,7 @@ impl FileManager {
             "permissions" => self.sort_by = SortBy::Permissions,
             _ => return Err("Criterio de ordenamiento no válido"),
         }
-        
+
         self.print_info(&format!("Ordenamiento cambiado a: {:?}", self.sort_by));
         Ok(())
     }

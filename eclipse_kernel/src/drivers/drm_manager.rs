@@ -3,12 +3,14 @@
 //! Este módulo gestiona la integración del sistema DRM con el kernel,
 //! proporcionando una interfaz unificada para control de pantalla.
 
-use crate::drivers::drm::{DrmDriver, DrmDriverState, DrmOperation, DrmDriverStats, create_drm_driver};
-use crate::drivers::framebuffer::{FramebufferDriver, FramebufferInfo, Color};
 use crate::desktop_ai::{Point, Rect};
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
+use crate::drivers::drm::{
+    create_drm_driver, DrmDriver, DrmDriverState, DrmDriverStats, DrmOperation,
+};
+use crate::drivers::framebuffer::{Color, FramebufferDriver, FramebufferInfo};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Gestor de drivers DRM
 #[derive(Debug, Clone)]
@@ -31,7 +33,10 @@ impl DrmManager {
     }
 
     /// Inicializar el gestor DRM
-    pub fn initialize(&mut self, framebuffer_info: Option<FramebufferInfo>) -> Result<(), &'static str> {
+    pub fn initialize(
+        &mut self,
+        framebuffer_info: Option<FramebufferInfo>,
+    ) -> Result<(), &'static str> {
         if self.is_initialized {
             return Ok(());
         }
@@ -77,7 +82,8 @@ impl DrmManager {
 
     /// Verificar si hay drivers DRM listos
     pub fn has_ready_drivers(&self) -> bool {
-        self.drm_drivers.iter()
+        self.drm_drivers
+            .iter()
             .filter_map(|d| d.as_ref())
             .any(|d| d.is_ready())
     }
@@ -120,8 +126,17 @@ impl DrmManager {
     }
 
     /// Cambiar modo de pantalla
-    pub fn set_mode(&mut self, width: u32, height: u32, refresh_rate: u32) -> Result<(), &'static str> {
-        self.execute_operation(DrmOperation::SetMode { width, height, refresh_rate })
+    pub fn set_mode(
+        &mut self,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+    ) -> Result<(), &'static str> {
+        self.execute_operation(DrmOperation::SetMode {
+            width,
+            height,
+            refresh_rate,
+        })
     }
 
     /// Habilitar VSync
@@ -155,14 +170,18 @@ impl DrmManager {
 
                 let drm_info = driver.get_info();
                 let stats = driver.get_stats();
-                
+
                 info.push(format!(
                     "DRM {}: {} - {}x{} - {} - Estado: {}",
                     i + 1,
                     drm_info.device_path,
                     drm_info.width,
                     drm_info.height,
-                    if stats.supports_hardware_acceleration { "HW Accel" } else { "SW" },
+                    if stats.supports_hardware_acceleration {
+                        "HW Accel"
+                    } else {
+                        "SW"
+                    },
                     state_str
                 ));
             }
@@ -177,7 +196,9 @@ impl DrmManager {
     /// Obtener estadísticas del gestor DRM
     pub fn get_drm_stats(&self) -> DrmManagerStats {
         let total_drivers = self.drm_count;
-        let ready_drivers = self.drm_drivers.iter()
+        let ready_drivers = self
+            .drm_drivers
+            .iter()
             .filter_map(|d| d.as_ref())
             .filter(|d| d.is_ready())
             .count();
@@ -213,7 +234,9 @@ pub fn create_drm_manager() -> DrmManager {
 }
 
 /// Función de conveniencia para inicializar DRM con framebuffer
-pub fn initialize_drm_manager(framebuffer_info: Option<FramebufferInfo>) -> Result<DrmManager, &'static str> {
+pub fn initialize_drm_manager(
+    framebuffer_info: Option<FramebufferInfo>,
+) -> Result<DrmManager, &'static str> {
     let mut manager = DrmManager::new();
     manager.initialize(framebuffer_info)?;
     Ok(manager)

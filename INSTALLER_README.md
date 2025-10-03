@@ -92,7 +92,7 @@ eclipse/
 ### 3. Particionado
 - Limpiar tabla de particiones existente
 - Crear tabla GPT
-- Crear partición EFI (100MB, FAT32)
+- Crear partición EFI (10GB, FAT32) - Espacio para modelos de IA
 - Crear partición root (resto del disco, EXT4)
 
 ### 4. Instalación de Bootloader
@@ -177,7 +177,7 @@ Después de la instalación, el disco tendrá la siguiente estructura:
 
 ```
 /dev/sda
-├── /dev/sda1    # Partición EFI (FAT32, 100MB)
+├── /dev/sda1    # Partición EFI (FAT32, 10GB) - Modelos de IA
 │   ├── /EFI/BOOT/BOOTX64.EFI
 │   ├── /EFI/eclipse/eclipse-bootloader.efi
 │   ├── /eclipse_kernel

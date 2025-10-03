@@ -1,10 +1,10 @@
 //! Gestor de drivers para Eclipse OS
-//! 
+//!
 //! Basado en la arquitectura de drivers de Redox OS
 
 use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType, DeviceState},
-    MAX_DEVICES, MAX_DRIVERS, DRIVER_NAME_LEN,
+    device::{Device, DeviceInfo, DeviceState, DeviceType},
+    DRIVER_NAME_LEN, MAX_DEVICES, MAX_DRIVERS,
 };
 
 // Importar tipos necesarios para no_std
@@ -72,7 +72,7 @@ impl DriverInfo {
     pub fn set_name(&mut self, name: &str) {
         let name_bytes = name.as_bytes();
         let len = name_bytes.len().min(DRIVER_NAME_LEN - 1);
-        
+
         for i in 0..DRIVER_NAME_LEN {
             if i < len {
                 self.name[i] = name_bytes[i];
@@ -297,10 +297,10 @@ impl DriverManager {
     /// Obtener estadísticas
     pub fn get_stats(&self) -> DriverStats {
         let mut stats = DriverStats::new();
-        
+
         stats.total_devices = self.device_count;
         stats.total_drivers = self.driver_count;
-        
+
         for i in 0..MAX_DEVICES {
             if let Some(ref device) = self.devices[i] {
                 match device.info.device_type {
@@ -311,7 +311,7 @@ impl DriverManager {
                     DeviceType::Input => stats.input_devices += 1,
                     _ => stats.other_devices += 1,
                 }
-                
+
                 if device.is_ready() {
                     stats.ready_devices += 1;
                 } else if device.info.state == DeviceState::Error {
@@ -319,7 +319,7 @@ impl DriverManager {
                 }
             }
         }
-        
+
         stats
     }
 }

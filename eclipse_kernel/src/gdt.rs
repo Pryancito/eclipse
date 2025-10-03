@@ -1,9 +1,9 @@
 //! Configuración de la Global Descriptor Table (GDT) para Eclipse OS
-//! 
+//!
 //! Este módulo maneja la configuración de descriptores de segmento para kernel y userland
 
-use core::mem;
 use core::arch::asm;
+use core::mem;
 
 /// Flags de descriptor de segmento
 pub const GDT_ACCESSED: u8 = 1 << 0;
@@ -48,45 +48,45 @@ impl SegmentDescriptor {
     /// Crear descriptor de código
     pub fn new_code_segment(base: u32, limit: u32, dpl: u8) -> Self {
         let mut desc = Self::new();
-        
+
         desc.limit_low = (limit & 0xFFFF) as u16;
         desc.base_low = (base & 0xFFFF) as u16;
         desc.base_middle = ((base >> 16) & 0xFF) as u8;
         desc.base_high = ((base >> 24) & 0xFF) as u8;
-        
+
         desc.access = GDT_PRESENT | GDT_CODE_DATA | GDT_EXECUTABLE | GDT_READ_WRITE | dpl;
         desc.granularity = GDT_GRANULARITY | GDT_64BIT | (((limit >> 16) & 0xF) as u8);
-        
+
         desc
     }
 
     /// Crear descriptor de datos
     pub fn new_data_segment(base: u32, limit: u32, dpl: u8) -> Self {
         let mut desc = Self::new();
-        
+
         desc.limit_low = (limit & 0xFFFF) as u16;
         desc.base_low = (base & 0xFFFF) as u16;
         desc.base_middle = ((base >> 16) & 0xFF) as u8;
         desc.base_high = ((base >> 24) & 0xFF) as u8;
-        
+
         desc.access = GDT_PRESENT | GDT_CODE_DATA | GDT_READ_WRITE | dpl;
         desc.granularity = GDT_GRANULARITY | GDT_64BIT | (((limit >> 16) & 0xF) as u8);
-        
+
         desc
     }
 
     /// Crear descriptor de TSS (Task State Segment)
     pub fn new_tss_segment(base: u64, limit: u32) -> Self {
         let mut desc = Self::new();
-        
+
         desc.limit_low = (limit & 0xFFFF) as u16;
         desc.base_low = (base & 0xFFFF) as u16;
         desc.base_middle = ((base >> 16) & 0xFF) as u8;
         desc.base_high = ((base >> 24) & 0xFF) as u8;
-        
+
         desc.access = GDT_PRESENT | GDT_CODE_DATA | GDT_ACCESSED | GDT_DPL_RING0;
         desc.granularity = GDT_GRANULARITY | GDT_64BIT | (((limit >> 16) & 0xF) as u8);
-        
+
         desc
     }
 }
@@ -145,7 +145,7 @@ impl Gdt {
         // Configurar descriptores de userland
         self.user_code = SegmentDescriptor::new_code_segment(0, 0xFFFFF, GDT_DPL_RING3);
         self.user_data = SegmentDescriptor::new_data_segment(0, 0xFFFFF, GDT_DPL_RING3);
-        
+
         Ok(())
     }
 
@@ -157,27 +157,27 @@ impl Gdt {
 
     /// Obtener selector de código de kernel
     pub fn get_kernel_code_selector(&self) -> u16 {
-        0x08  // Índice 1, RPL 0, TI 0
+        0x08 // Índice 1, RPL 0, TI 0
     }
 
     /// Obtener selector de datos de kernel
     pub fn get_kernel_data_selector(&self) -> u16 {
-        0x10  // Índice 2, RPL 0, TI 0
+        0x10 // Índice 2, RPL 0, TI 0
     }
 
     /// Obtener selector de código de usuario
     pub fn get_user_code_selector(&self) -> u16 {
-        0x2B  // Índice 5, RPL 3, TI 0
+        0x2B // Índice 5, RPL 3, TI 0
     }
 
     /// Obtener selector de datos de usuario
     pub fn get_user_data_selector(&self) -> u16 {
-        0x23  // Índice 4, RPL 3, TI 0
+        0x23 // Índice 4, RPL 3, TI 0
     }
 
     /// Obtener selector de TSS
     pub fn get_tss_selector(&self) -> u16 {
-        0x30  // Índice 6, RPL 0, TI 0
+        0x30 // Índice 6, RPL 0, TI 0
     }
 }
 
@@ -195,9 +195,7 @@ pub struct GdtManager {
 impl GdtManager {
     /// Crear nuevo gestor de GDT
     pub fn new() -> Self {
-        Self {
-            gdt: Gdt::new(),
-        }
+        Self { gdt: Gdt::new() }
     }
 
     /// Configurar GDT para userland

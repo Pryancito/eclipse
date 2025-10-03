@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 //! Editor de texto para Eclipse OS
-//! 
+//!
 //! Proporciona funcionalidades básicas de edición de texto.
 
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Editor de texto
 pub struct TextEditor {

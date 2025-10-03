@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 //! Shell avanzado para Eclipse OS
-//! 
+//!
 //! Proporciona una interfaz de línea de comandos moderna
 //! con características avanzadas como autocompletado, historial,
 //! y scripting.
 
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Comando del shell
 #[derive(Debug, Clone)]
@@ -76,7 +76,7 @@ impl EclipseShell {
             prompt: "eclipse@system".to_string(),
             aliases: Vec::new(),
         };
-        
+
         // Configurar aliases por defecto
         shell.setup_default_aliases();
         shell
@@ -94,17 +94,17 @@ impl EclipseShell {
     /// Ejecutar el shell
     pub fn run(&mut self) -> Result<(), &'static str> {
         self.show_welcome();
-        
+
         loop {
             self.show_prompt();
             let input = self.read_input();
-            
+
             if input.trim().is_empty() {
                 continue;
             }
 
             self.history.add_command(input.clone());
-            
+
             if let Err(e) = self.execute_command(&input) {
                 self.print_error(&format!("Error: {}", e));
             }
@@ -136,7 +136,7 @@ impl EclipseShell {
 
     fn execute_command(&mut self, input: &str) -> Result<(), &'static str> {
         let command = self.parse_command(input);
-        
+
         match command.name.as_str() {
             "help" => self.cmd_help(),
             "exit" => self.cmd_exit(),
@@ -173,7 +173,7 @@ impl EclipseShell {
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let name = parts.get(0).unwrap_or(&"").to_string();
         let args = parts[1..].iter().map(|s| s.to_string()).collect();
-        
+
         Command {
             name,
             args,
@@ -354,7 +354,8 @@ impl EclipseShell {
     }
 
     fn get_alias(&self, name: &str) -> Option<&String> {
-        self.aliases.iter()
+        self.aliases
+            .iter()
             .find(|(alias, _)| alias == name)
             .map(|(_, command)| command)
     }

@@ -7,55 +7,52 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-
+use eclipse_kernel::main_simple::kernel_main;
+use eclipse_kernel::drivers::framebuffer::{
+    FramebufferInfo, FramebufferDriver, Color,
+    get_framebuffer, init_framebuffer
+};
 // panic_handler definido en lib.rs
 
-/// Función principal del kernel
+/// Función principal del kernel (llamada desde start.asm)
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // Inicializar VGA y mostrar "Eclipse OS" centrado
-    init_vga_and_display();
-    
-    // Bucle infinito del kernel
-    loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
-}
-
-/// Inicializar VGA y mostrar "Eclipse OS" centrado
-fn init_vga_and_display() {
+pub extern "C" fn multiboot2_entry(framebuffer_info_ptr: *const FramebufferInfo) -> ! {
     unsafe {
-        let vga_buffer = 0xb8000 as *mut u16;
-        
-        // Limpiar toda la pantalla con fondo negro
-        for i in 0..2000 {
-            *vga_buffer.add(i) = 0x0000; // Negro sobre negro (fondo negro)
-        }
-        
-        // Mostrar "Eclipse OS" centrado
-        display_centered_text("Eclipse OS");
+        // Asegurar que SSE esté habilitado
+        core::arch::asm!(
+            "mov rax, cr0",
+            "and rax, ~(1 << 2)",        // CR0.EM = 0
+            "or  rax,  (1 << 1)",        // CR0.MP = 1
+            "mov cr0, rax",
+            "mov rax, cr4",
+            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
+            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
+            "mov cr4, rax"
+        );
     }
-}
-
-/// Mostrar texto centrado en la pantalla
-fn display_centered_text(text: &str) {
     unsafe {
-        let vga_buffer = 0xb8000 as *mut u16;
-        
-        // Calcular posición central
-        // Pantalla: 80 columnas x 25 filas
-        let text_len = text.len();
-        let start_col = (80 - text_len) / 2; // Centrar horizontalmente
-        let start_row = 12; // Centrar verticalmente (fila 12 de 25)
-        let start_pos = start_row * 80 + start_col;
-        
-        // Escribir texto centrado
-        for (i, byte) in text.bytes().enumerate() {
-            if start_pos + i < 2000 {
-                *vga_buffer.add(start_pos + i) = 0x0F00 | byte as u16; // Blanco sobre negro
-            }
+        // Leer la información del framebuffer de manera segura
+        let fb_info = core::ptr::read_volatile(framebuffer_info_ptr);
+        // Inicializar el framebuffer usando la nueva API
+        let _ = init_framebuffer(
+            fb_info.base_address,
+            fb_info.width,
+            fb_info.height,
+            fb_info.pixels_per_scan_line,
+            fb_info.pixel_format,
+            fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
+        );
+
+        // Obtener el framebuffer mutable
+        if let Some(fb) = get_framebuffer() {
+            kernel_main(fb);
+        } else {
+            panic!("No se pudo obtener el framebuffer");
+        }
+
+        // El kernel nunca debería llegar aquí, pero por seguridad
+        loop {
+            core::hint::spin_loop();
         }
     }
 }

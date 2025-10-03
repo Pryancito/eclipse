@@ -1,14 +1,14 @@
 //! Gráficos DRM para fase de runtime del kernel
-//! 
+//!
 //! Esta fase se encarga de:
 //! - Inicializar DRM (Direct Rendering Manager)
 //! - Configurar framebuffer avanzado
 //! - Proporcionar aceleración hardware
 
-use crate::drivers::framebuffer::FramebufferInfo;
-use crate::alloc::string::ToString;
-use alloc::{vec, vec::Vec, string::String};
 use super::phases::{get_graphics_phase_manager, GraphicsPhase};
+use crate::alloc::string::ToString;
+use crate::drivers::framebuffer::FramebufferInfo;
+use alloc::{string::String, vec, vec::Vec};
 
 /// Estado del sistema DRM
 #[derive(Debug)]
@@ -159,9 +159,10 @@ fn detect_drm_devices() -> Result<Vec<DrmDevice>, &'static str> {
 fn select_primary_device(devices: &[DrmDevice]) -> Result<u32, &'static str> {
     // Priorizar dispositivos con mejor soporte
     for device in devices {
-        if device.capabilities.supports_atomic && 
-           device.capabilities.supports_kms && 
-           device.capabilities.supports_dri {
+        if device.capabilities.supports_atomic
+            && device.capabilities.supports_kms
+            && device.capabilities.supports_dri
+        {
             return Ok(device.id);
         }
     }
@@ -178,12 +179,12 @@ fn select_primary_device(devices: &[DrmDevice]) -> Result<u32, &'static str> {
 fn init_primary_device(device_id: u32, devices: &[DrmDevice]) -> Result<(), &'static str> {
     if let Some(device) = devices.iter().find(|d| d.id == device_id) {
         // Inicializando dispositivo
-        
+
         // Simular inicialización del dispositivo
         // En una implementación real, esto abriría el dispositivo y configuraría KMS
-        
+
         // Dispositivo inicializado exitosamente
-        
+
         Ok(())
     } else {
         Err("Dispositivo DRM no encontrado")
@@ -194,7 +195,7 @@ fn init_primary_device(device_id: u32, devices: &[DrmDevice]) -> Result<(), &'st
 fn configure_drm_framebuffer(device_id: u32) -> Result<FramebufferInfo, &'static str> {
     // Simular configuración del framebuffer DRM
     // En una implementación real, esto configuraría el framebuffer usando DRM KMS
-    
+
     let framebuffer_info = FramebufferInfo {
         base_address: 0x80000000, // Dirección simulada
         width: 1920,
@@ -234,49 +235,53 @@ pub fn execute_drm_operation(operation: DrmOperation) -> Result<(), &'static str
     }
 
     match operation {
-        DrmOperation::ScrollUp { pixels } => {
-            execute_drm_scroll_up(pixels)
-        }
-        DrmOperation::ScrollDown { pixels } => {
-            execute_drm_scroll_down(pixels)
-        }
-        DrmOperation::Blit { src_rect, dst_rect } => {
-            execute_drm_blit(src_rect, dst_rect)
-        }
-        _ => Err("Operación DRM no implementada")
+        DrmOperation::ScrollUp { pixels } => execute_drm_scroll_up(pixels),
+        DrmOperation::ScrollDown { pixels } => execute_drm_scroll_down(pixels),
+        DrmOperation::Blit { src_rect, dst_rect } => execute_drm_blit(src_rect, dst_rect),
+        _ => Err("Operación DRM no implementada"),
     }
 }
 
 /// Operaciones DRM disponibles
 #[derive(Debug)]
 pub enum DrmOperation {
-    ScrollUp { pixels: u32 },
-    ScrollDown { pixels: u32 },
-    Blit { src_rect: (u32, u32, u32, u32), dst_rect: (u32, u32, u32, u32) },
+    ScrollUp {
+        pixels: u32,
+    },
+    ScrollDown {
+        pixels: u32,
+    },
+    Blit {
+        src_rect: (u32, u32, u32, u32),
+        dst_rect: (u32, u32, u32, u32),
+    },
 }
 
 /// Ejecutar scroll hacia arriba con DRM
 fn execute_drm_scroll_up(pixels: u32) -> Result<(), &'static str> {
     // Ejecutando scroll hacia arriba
-    
+
     // Simular operación DRM
     // En una implementación real, esto usaría DRM blit operations
-    
+
     Ok(())
 }
 
 /// Ejecutar scroll hacia abajo con DRM
 fn execute_drm_scroll_down(pixels: u32) -> Result<(), &'static str> {
     // Ejecutando scroll hacia abajo
-    
+
     // Simular operación DRM
     Ok(())
 }
 
 /// Ejecutar blit con DRM
-fn execute_drm_blit(src_rect: (u32, u32, u32, u32), dst_rect: (u32, u32, u32, u32)) -> Result<(), &'static str> {
+fn execute_drm_blit(
+    src_rect: (u32, u32, u32, u32),
+    dst_rect: (u32, u32, u32, u32),
+) -> Result<(), &'static str> {
     // Ejecutando blit
-    
+
     // Simular operación DRM blit
     Ok(())
 }

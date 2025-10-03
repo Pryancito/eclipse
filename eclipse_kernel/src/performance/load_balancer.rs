@@ -76,17 +76,21 @@ impl LoadBalancer {
         // Limpiar métricas existentes
         self.thread_metrics.clear();
         self.process_metrics.clear();
-        
+
         // Configurar algoritmo adaptativo por defecto
         self.algorithm = LoadBalancingAlgorithm::Adaptive;
-        
+
         Ok(())
     }
 
     /// Actualizar métricas de un thread
     pub fn update_thread_metrics(&mut self, metrics: ThreadLoadMetrics) {
         // Buscar si el thread ya existe
-        if let Some(existing) = self.thread_metrics.iter_mut().find(|m| m.thread_id == metrics.thread_id) {
+        if let Some(existing) = self
+            .thread_metrics
+            .iter_mut()
+            .find(|m| m.thread_id == metrics.thread_id)
+        {
             *existing = metrics;
         } else {
             self.thread_metrics.push(metrics);
@@ -96,7 +100,11 @@ impl LoadBalancer {
     /// Actualizar métricas de un proceso
     pub fn update_process_metrics(&mut self, metrics: ProcessLoadMetrics) {
         // Buscar si el proceso ya existe
-        if let Some(existing) = self.process_metrics.iter_mut().find(|m| m.process_id == metrics.process_id) {
+        if let Some(existing) = self
+            .process_metrics
+            .iter_mut()
+            .find(|m| m.process_id == metrics.process_id)
+        {
             *existing = metrics;
         } else {
             self.process_metrics.push(metrics);
@@ -107,14 +115,15 @@ impl LoadBalancer {
     pub fn balance_load(&mut self) -> Result<(), &'static str> {
         let current_time = self.get_current_time();
         let last_balance = self.last_balance_time.load(Ordering::Acquire);
-        
+
         // Verificar si es tiempo de balancear
         if current_time - last_balance < self.balance_interval {
             return Ok(());
         }
 
         // Actualizar timestamp
-        self.last_balance_time.store(current_time, Ordering::Release);
+        self.last_balance_time
+            .store(current_time, Ordering::Release);
 
         // Realizar balance según el algoritmo
         match self.algorithm {
@@ -127,7 +136,8 @@ impl LoadBalancer {
         }
 
         // Incrementar contador de operaciones
-        self.total_balance_operations.fetch_add(1, Ordering::Relaxed);
+        self.total_balance_operations
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -150,11 +160,15 @@ impl LoadBalancer {
         let avg_cpu = total_cpu / self.thread_metrics.len() as f64;
 
         // Identificar threads sobrecargados y subcargados
-        let overloaded: Vec<_> = self.thread_metrics.iter()
+        let overloaded: Vec<_> = self
+            .thread_metrics
+            .iter()
             .filter(|m| m.cpu_usage > avg_cpu * 1.2)
             .collect();
 
-        let underloaded: Vec<_> = self.thread_metrics.iter()
+        let underloaded: Vec<_> = self
+            .thread_metrics
+            .iter()
             .filter(|m| m.cpu_usage < avg_cpu * 0.8)
             .collect();
 
@@ -179,9 +193,12 @@ impl LoadBalancer {
         let avg_memory = total_memory / self.thread_metrics.len() as f64;
 
         // Identificar threads con uso de memoria desbalanceado
-        let memory_variance = self.thread_metrics.iter()
+        let memory_variance = self
+            .thread_metrics
+            .iter()
             .map(|m| (m.memory_usage - avg_memory) * (m.memory_usage - avg_memory))
-            .sum::<f64>() / self.thread_metrics.len() as f64;
+            .sum::<f64>()
+            / self.thread_metrics.len() as f64;
 
         let balance_quality = if memory_variance < 0.1 {
             95 // Excelente balance de memoria
@@ -205,9 +222,7 @@ impl LoadBalancer {
         sorted_processes.sort_by_key(|p| p.priority);
 
         // Asignar recursos según prioridad
-        let high_priority_count = sorted_processes.iter()
-            .filter(|p| p.priority <= 2)
-            .count();
+        let high_priority_count = sorted_processes.iter().filter(|p| p.priority <= 2).count();
 
         let balance_quality = if high_priority_count > 0 {
             85 // Buen balance de prioridades
@@ -231,7 +246,7 @@ impl LoadBalancer {
 
         // Score híbrido ponderado
         let hybrid_score = (cpu_score * 0.4 + memory_score * 0.3 + priority_score * 0.3) as u64;
-        
+
         self.update_balance_score(hybrid_score);
     }
 
@@ -239,7 +254,7 @@ impl LoadBalancer {
     fn balance_adaptive(&mut self) {
         // El algoritmo adaptativo cambia su estrategia basándose en el rendimiento
         let current_score = self.balance_score.load(Ordering::Acquire);
-        
+
         if current_score < 60 {
             // Si el balance es pobre, usar estrategia más agresiva
             self.balance_hybrid();
@@ -260,10 +275,13 @@ impl LoadBalancer {
 
         let total_cpu: f64 = self.thread_metrics.iter().map(|m| m.cpu_usage).sum();
         let avg_cpu = total_cpu / self.thread_metrics.len() as f64;
-        
-        let variance = self.thread_metrics.iter()
+
+        let variance = self
+            .thread_metrics
+            .iter()
             .map(|m| (m.cpu_usage - avg_cpu) * (m.cpu_usage - avg_cpu))
-            .sum::<f64>() / self.thread_metrics.len() as f64;
+            .sum::<f64>()
+            / self.thread_metrics.len() as f64;
 
         // Convertir varianza a score (menor varianza = mejor score)
         (100.0 - (variance * 100.0).min(100.0)).max(0.0)
@@ -277,10 +295,13 @@ impl LoadBalancer {
 
         let total_memory: f64 = self.thread_metrics.iter().map(|m| m.memory_usage).sum();
         let avg_memory = total_memory / self.thread_metrics.len() as f64;
-        
-        let variance = self.thread_metrics.iter()
+
+        let variance = self
+            .thread_metrics
+            .iter()
             .map(|m| (m.memory_usage - avg_memory) * (m.memory_usage - avg_memory))
-            .sum::<f64>() / self.thread_metrics.len() as f64;
+            .sum::<f64>()
+            / self.thread_metrics.len() as f64;
 
         (100.0 - (variance * 100.0).min(100.0)).max(0.0)
     }
@@ -291,7 +312,9 @@ impl LoadBalancer {
             return 50.0;
         }
 
-        let high_priority_count = self.process_metrics.iter()
+        let high_priority_count = self
+            .process_metrics
+            .iter()
             .filter(|p| p.priority <= 2)
             .count();
 

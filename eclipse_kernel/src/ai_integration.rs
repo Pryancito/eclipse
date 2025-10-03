@@ -1,15 +1,15 @@
 //! Integración profunda de IA en Eclipse OS
-//! 
+//!
 //! Este módulo implementa un sistema de IA integrado que puede intervenir
 //! en las funcionalidades del sistema operativo, similar a Computer Use de Anthropic.
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Estado de la IA
 #[derive(Debug, Clone, PartialEq)]
@@ -136,13 +136,13 @@ impl AIIntegration {
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Inicializar estado
         self.state.store(true, Ordering::Release);
-        
+
         // Configurar contexto inicial
         self.update_system_context()?;
-        
+
         // Iniciar monitoreo del sistema
         self.start_system_monitoring()?;
-        
+
         Ok(())
     }
 
@@ -150,7 +150,7 @@ impl AIIntegration {
     fn update_system_context(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se obtendrían métricas reales del sistema
         // Por ahora, simulamos datos
-        
+
         self.system_context.cpu_usage = 0.25; // 25%
         self.system_context.memory_usage = 0.60; // 60%
         self.system_context.disk_usage = 0.40; // 40%
@@ -158,7 +158,7 @@ impl AIIntegration {
         self.system_context.active_processes = 45;
         self.system_context.system_load = 1.2;
         self.system_context.uptime = 3600; // 1 hora
-        
+
         Ok(())
     }
 
@@ -173,7 +173,7 @@ impl AIIntegration {
     pub fn process_intervention_request(&mut self, request: &str) -> Result<u64, &'static str> {
         // Analizar la solicitud y determinar el tipo de intervención
         let intervention_type = self.analyze_request(request)?;
-        
+
         // Crear comando
         let command = AICommand {
             id: self.command_counter,
@@ -184,22 +184,22 @@ impl AIIntegration {
             priority: self.calculate_priority(request)?,
             timestamp: self.get_current_timestamp(),
         };
-        
+
         self.command_counter += 1;
         self.pending_commands.push(command.clone());
-        
+
         // Ejecutar comando si está en modo autónomo
         if self.config.enable_autonomous_mode {
             self.execute_command(&command)?;
         }
-        
+
         Ok(command.id)
     }
 
     /// Analiza una solicitud para determinar el tipo de intervención
     fn analyze_request(&self, request: &str) -> Result<AIIntervention, &'static str> {
         let request_lower = request.to_lowercase();
-        
+
         if request_lower.contains("proceso") || request_lower.contains("process") {
             Ok(AIIntervention::ProcessManagement)
         } else if request_lower.contains("memoria") || request_lower.contains("memory") {
@@ -239,14 +239,17 @@ impl AIIntegration {
     fn extract_parameters(&self, request: &str) -> Result<BTreeMap<String, String>, &'static str> {
         let mut parameters = BTreeMap::new();
         parameters.insert("request".to_string(), request.to_string());
-        parameters.insert("timestamp".to_string(), self.get_current_timestamp().to_string());
+        parameters.insert(
+            "timestamp".to_string(),
+            self.get_current_timestamp().to_string(),
+        );
         Ok(parameters)
     }
 
     /// Calcula la prioridad del comando
     fn calculate_priority(&self, request: &str) -> Result<u8, &'static str> {
         let request_lower = request.to_lowercase();
-        
+
         if request_lower.contains("urgente") || request_lower.contains("urgent") {
             Ok(9)
         } else if request_lower.contains("importante") || request_lower.contains("important") {
@@ -268,48 +271,37 @@ impl AIIntegration {
     /// Ejecuta un comando de IA
     fn execute_command(&mut self, command: &AICommand) -> Result<(), &'static str> {
         let result = match command.intervention_type {
-            AIIntervention::ProcessManagement => {
-                self.execute_process_management(command)?
-            }
-            AIIntervention::MemoryOptimization => {
-                self.execute_memory_optimization(command)?
-            }
-            AIIntervention::SecurityMonitoring => {
-                self.execute_security_monitoring(command)?
-            }
-            AIIntervention::PerformanceTuning => {
-                self.execute_performance_tuning(command)?
-            }
-            AIIntervention::UserAssistance => {
-                self.execute_user_assistance(command)?
-            }
-            AIIntervention::SystemDiagnostics => {
-                self.execute_system_diagnostics(command)?
-            }
+            AIIntervention::ProcessManagement => self.execute_process_management(command)?,
+            AIIntervention::MemoryOptimization => self.execute_memory_optimization(command)?,
+            AIIntervention::SecurityMonitoring => self.execute_security_monitoring(command)?,
+            AIIntervention::PerformanceTuning => self.execute_performance_tuning(command)?,
+            AIIntervention::UserAssistance => self.execute_user_assistance(command)?,
+            AIIntervention::SystemDiagnostics => self.execute_system_diagnostics(command)?,
             AIIntervention::PredictiveMaintenance => {
                 self.execute_predictive_maintenance(command)?
             }
-            AIIntervention::ResourceAllocation => {
-                self.execute_resource_allocation(command)?
-            }
+            AIIntervention::ResourceAllocation => self.execute_resource_allocation(command)?,
         };
 
         // Guardar resultado
         self.command_results.insert(command.id, result);
-        
+
         Ok(())
     }
 
     /// Ejecuta gestión de procesos
-    fn execute_process_management(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_process_management(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         // En una implementación real, aquí se gestionarían procesos
         // Por ahora, simulamos la ejecución
-        
+
         let mut data = BTreeMap::new();
         data.insert("processes_analyzed".to_string(), "15".to_string());
         data.insert("processes_optimized".to_string(), "3".to_string());
         data.insert("memory_freed".to_string(), "256MB".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -320,12 +312,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta optimización de memoria
-    fn execute_memory_optimization(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_memory_optimization(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("memory_before".to_string(), "1.2GB".to_string());
         data.insert("memory_after".to_string(), "0.8GB".to_string());
         data.insert("optimization_percentage".to_string(), "33%".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -336,12 +331,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta monitoreo de seguridad
-    fn execute_security_monitoring(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_security_monitoring(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("threats_detected".to_string(), "0".to_string());
         data.insert("vulnerabilities_found".to_string(), "2".to_string());
         data.insert("security_score".to_string(), "85".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -352,12 +350,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta ajuste de rendimiento
-    fn execute_performance_tuning(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_performance_tuning(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("cpu_usage_before".to_string(), "75%".to_string());
         data.insert("cpu_usage_after".to_string(), "45%".to_string());
         data.insert("performance_improvement".to_string(), "40%".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -368,12 +369,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta asistencia al usuario
-    fn execute_user_assistance(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_user_assistance(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("suggestions_provided".to_string(), "5".to_string());
         data.insert("help_topics".to_string(), "3".to_string());
         data.insert("user_satisfaction".to_string(), "high".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -384,12 +388,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta diagnóstico del sistema
-    fn execute_system_diagnostics(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_system_diagnostics(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("system_health".to_string(), "good".to_string());
         data.insert("issues_found".to_string(), "1".to_string());
         data.insert("recommendations".to_string(), "3".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -400,12 +407,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta mantenimiento predictivo
-    fn execute_predictive_maintenance(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_predictive_maintenance(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("maintenance_needed".to_string(), "false".to_string());
         data.insert("predicted_failures".to_string(), "0".to_string());
         data.insert("maintenance_schedule".to_string(), "next_week".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -416,12 +426,15 @@ impl AIIntegration {
     }
 
     /// Ejecuta asignación de recursos
-    fn execute_resource_allocation(&self, command: &AICommand) -> Result<AICommandResult, &'static str> {
+    fn execute_resource_allocation(
+        &self,
+        command: &AICommand,
+    ) -> Result<AICommandResult, &'static str> {
         let mut data = BTreeMap::new();
         data.insert("resources_allocated".to_string(), "8".to_string());
         data.insert("efficiency_improvement".to_string(), "25%".to_string());
         data.insert("waste_reduction".to_string(), "15%".to_string());
-        
+
         Ok(AICommandResult {
             command_id: command.id,
             success: true,
@@ -495,7 +508,5 @@ pub fn init_ai_integration() -> Result<(), &'static str> {
 
 /// Obtiene la instancia global de integración de IA
 pub fn get_ai_integration() -> Option<&'static mut AIIntegration> {
-    unsafe {
-        AI_INTEGRATION.as_mut()
-    }
+    unsafe { AI_INTEGRATION.as_mut() }
 }

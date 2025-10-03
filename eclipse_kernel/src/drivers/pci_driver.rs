@@ -1,9 +1,11 @@
-use super::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
-use super::pci::{PciDevice, PciManager, GpuInfo, GpuType};
-use alloc::string::String;
-use alloc::vec::Vec;
+use super::ipc::{
+    Driver, DriverCapability, DriverInfo, DriverMessage, DriverResponse, DriverState,
+};
+use super::pci::{GpuInfo, GpuType, PciDevice, PciManager};
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Driver PCI base que implementa el sistema IPC
 pub struct PciDriver {
@@ -56,8 +58,13 @@ impl PciDriver {
         // }
 
         // Detectar GPUs
-        self.gpus = self.pci_manager.get_gpus().iter().filter_map(|gpu| gpu.clone()).collect();
-        
+        self.gpus = self
+            .pci_manager
+            .get_gpus()
+            .iter()
+            .filter_map(|gpu| gpu.clone())
+            .collect();
+
         // PCI Driver: {} dispositivos detectados, {} GPUs encontradas
 
         Ok(())
@@ -94,7 +101,7 @@ impl PciDriver {
                     let bus = args[0];
                     let device = args[1];
                     let function = args[2];
-                    
+
                     if let Some(pci_device) = self.get_device_info(bus, device, function) {
                         // Serializar información del dispositivo
                         let mut data = Vec::new();
@@ -104,7 +111,7 @@ impl PciDriver {
                         data.extend_from_slice(&pci_device.subclass_code.to_le_bytes());
                         data.extend_from_slice(&pci_device.prog_if.to_le_bytes());
                         data.extend_from_slice(&pci_device.revision_id.to_le_bytes());
-                        
+
                         DriverResponse::SuccessWithData(data)
                     } else {
                         DriverResponse::Error(String::from("Dispositivo no encontrado"))
@@ -119,7 +126,7 @@ impl PciDriver {
                     if gpu_index < self.gpus.len() {
                         let gpu = &self.gpus[gpu_index];
                         let mut data = Vec::new();
-                        
+
                         // Serializar información de la GPU
                         data.extend_from_slice(&gpu.pci_device.vendor_id.to_le_bytes());
                         data.extend_from_slice(&gpu.pci_device.device_id.to_le_bytes());
@@ -127,13 +134,13 @@ impl PciDriver {
                         data.extend_from_slice(&gpu.pci_device.bus.to_le_bytes());
                         data.extend_from_slice(&gpu.pci_device.device.to_le_bytes());
                         data.extend_from_slice(&gpu.pci_device.function.to_le_bytes());
-                        
+
                         // Agregar tipo de GPU como string
                         let gpu_type_str = gpu.gpu_type.as_str();
                         let gpu_type_bytes = gpu_type_str.as_bytes();
                         data.extend_from_slice(&(gpu_type_bytes.len() as u32).to_le_bytes());
                         data.extend_from_slice(gpu_type_bytes);
-                        
+
                         DriverResponse::SuccessWithData(data)
                     } else {
                         DriverResponse::Error(String::from("Índice de GPU inválido"))
@@ -147,7 +154,7 @@ impl PciDriver {
                     let bus = args[0];
                     let device = args[1];
                     let function = args[2];
-                    
+
                     if let Some(pci_device) = self.get_device_info(bus, device, function) {
                         // Habilitar MMIO y Bus Master
                         // MMIO habilitado temporalmente - método no implementado
@@ -167,13 +174,13 @@ impl PciDriver {
 impl Driver for PciDriver {
     fn initialize(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
-        
+
         // Inicializar el manager PCI
         // self.pci_manager.initialize()?; // TEMPORALMENTE DESHABILITADO
-        
+
         // Escanear dispositivos
         self.scan_devices()?;
-        
+
         self.info.state = DriverState::Ready;
         // PCI Driver inicializado correctamente
         Ok(())
@@ -181,11 +188,11 @@ impl Driver for PciDriver {
 
     fn shutdown(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Unloading;
-        
+
         // Limpiar recursos
         self.devices.clear();
         self.gpus.clear();
-        
+
         self.info.state = DriverState::Unloaded;
         // PCI Driver cerrado correctamente
         Ok(())
@@ -199,10 +206,10 @@ impl Driver for PciDriver {
 
     fn resume(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
-        
+
         // Re-escanear dispositivos al reanudar
         self.scan_devices()?;
-        
+
         self.info.state = DriverState::Ready;
         // PCI Driver reanudado
         Ok(())
@@ -214,35 +221,30 @@ impl Driver for PciDriver {
 
     fn handle_message(&mut self, message: DriverMessage) -> DriverResponse {
         match message {
-            DriverMessage::Initialize => {
-                match self.initialize() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Shutdown => {
-                match self.shutdown() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Suspend => {
-                match self.suspend() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Resume => {
-                match self.resume() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::GetStatus => {
-                DriverResponse::SuccessWithData(format!("{:?}", self.info.state).as_bytes().to_vec())
-            }
+            DriverMessage::Initialize => match self.initialize() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Shutdown => match self.shutdown() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Suspend => match self.suspend() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Resume => match self.resume() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::GetStatus => DriverResponse::SuccessWithData(
+                format!("{:?}", self.info.state).as_bytes().to_vec(),
+            ),
             DriverMessage::GetCapabilities => {
-                let caps: Vec<String> = self.info.capabilities.iter()
+                let caps: Vec<String> = self
+                    .info
+                    .capabilities
+                    .iter()
                     .map(|c| format!("{:?}", c))
                     .collect();
                 let caps_str = caps.join(",");

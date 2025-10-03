@@ -1,11 +1,11 @@
 #![no_std]
 
-use core::ptr;
-use alloc::vec::Vec;
-use alloc::string::String;
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::ptr;
 
 /// Protocolo HID (Human Interface Device) completo para Eclipse OS
 /// Implementa descriptores HID, reportes, y gestión de dispositivos
@@ -210,7 +210,7 @@ impl HidDescriptor {
             report_descriptor_length: 0,
         }
     }
-    
+
     /// Convertir a bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = alloc::vec::Vec::new();
@@ -238,31 +238,34 @@ impl HidDescriptorItem {
     pub fn new(tag: u8, data: Vec<u8>) -> Self {
         Self { tag, data }
     }
-    
+
     /// Crear item de página de uso
     pub fn usage_page(usage_page: HidUsagePage) -> Self {
         Self::new(0x05, alloc::vec::Vec::from([usage_page as u8]))
     }
-    
+
     /// Crear item de uso
     pub fn usage(usage: u16) -> Self {
         if usage <= 0xFF {
             Self::new(0x09, alloc::vec::Vec::from([usage as u8]))
         } else {
-            Self::new(0x09, alloc::vec::Vec::from([(usage & 0xFF) as u8, ((usage >> 8) & 0xFF) as u8]))
+            Self::new(
+                0x09,
+                alloc::vec::Vec::from([(usage & 0xFF) as u8, ((usage >> 8) & 0xFF) as u8]),
+            )
         }
     }
-    
+
     /// Crear item de colección
     pub fn collection(collection_type: u8) -> Self {
         Self::new(0xA1, alloc::vec::Vec::from([collection_type]))
     }
-    
+
     /// Crear item de fin de colección
     pub fn end_collection() -> Self {
         Self::new(0xC0, alloc::vec::Vec::from([]))
     }
-    
+
     /// Crear item de entrada
     pub fn input(input_bits: u32) -> Self {
         let mut data = Vec::new();
@@ -279,7 +282,7 @@ impl HidDescriptorItem {
         }
         Self::new(0x81, data)
     }
-    
+
     /// Crear item de salida
     pub fn output(output_bits: u32) -> Self {
         let mut data = Vec::new();
@@ -296,7 +299,7 @@ impl HidDescriptorItem {
         }
         Self::new(0x91, data)
     }
-    
+
     /// Crear item de característica
     pub fn feature(feature_bits: u32) -> Self {
         let mut data = Vec::new();
@@ -313,7 +316,7 @@ impl HidDescriptorItem {
         }
         Self::new(0xB1, data)
     }
-    
+
     /// Convertir a bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = alloc::vec::Vec::new();
@@ -333,198 +336,260 @@ impl HidReportDescriptor {
     pub fn new() -> Self {
         Self { items: Vec::new() }
     }
-    
+
     /// Crear descriptor para teclado
     pub fn create_keyboard_descriptor() -> Self {
         let mut descriptor = Self::new();
-        
+
         // Usage Page (Generic Desktop)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
+
         // Usage (Keyboard)
         descriptor.items.push(HidDescriptorItem::usage(0x06));
-        
+
         // Collection (Application)
         descriptor.items.push(HidDescriptorItem::collection(0x01));
-        
+
         // Usage Page (Keyboard)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::Keyboard));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::Keyboard));
+
         // Usage Minimum (0x00)
         descriptor.items.push(HidDescriptorItem::usage(0x00));
-        
+
         // Usage Maximum (0xE7)
         descriptor.items.push(HidDescriptorItem::usage(0xE7));
-        
+
         // Logical Minimum (0)
-        descriptor.items.push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
+
         // Logical Maximum (1)
-        descriptor.items.push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x01])));
+
         // Report Count (8)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x08])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x08])));
+
         // Report Size (1)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
+
         // Input (Data, Variable, Absolute) -- Modifier byte
         descriptor.items.push(HidDescriptorItem::input(0x02));
-        
+
         // Report Count (1)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
+
         // Report Size (8)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
+
         // Input (Constant) -- Reserved byte
         descriptor.items.push(HidDescriptorItem::input(0x01));
-        
+
         // Report Count (5)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x05])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x05])));
+
         // Report Size (1)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
+
         // Usage Page (LEDs)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::Led));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::Led));
+
         // Usage Minimum (1)
         descriptor.items.push(HidDescriptorItem::usage(0x01));
-        
+
         // Usage Maximum (5)
         descriptor.items.push(HidDescriptorItem::usage(0x05));
-        
+
         // Output (Data, Variable, Absolute) -- LED report
         descriptor.items.push(HidDescriptorItem::output(0x02));
-        
+
         // Report Count (1)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
+
         // Report Size (3)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x03])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x03])));
+
         // Output (Constant) -- LED report padding
         descriptor.items.push(HidDescriptorItem::output(0x01));
-        
+
         // Report Count (6)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x06])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x06])));
+
         // Report Size (8)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
+
         // Logical Minimum (0)
-        descriptor.items.push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
+
         // Logical Maximum (101)
-        descriptor.items.push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x65])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x65])));
+
         // Usage Page (Keyboard)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::Keyboard));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::Keyboard));
+
         // Usage Minimum (0)
         descriptor.items.push(HidDescriptorItem::usage(0x00));
-        
+
         // Usage Maximum (101)
         descriptor.items.push(HidDescriptorItem::usage(0x65));
-        
+
         // Input (Data, Array) -- Key array
         descriptor.items.push(HidDescriptorItem::input(0x00));
-        
+
         // End Collection
         descriptor.items.push(HidDescriptorItem::end_collection());
-        
+
         descriptor
     }
-    
+
     /// Crear descriptor para mouse
     pub fn create_mouse_descriptor() -> Self {
         let mut descriptor = Self::new();
-        
+
         // Usage Page (Generic Desktop)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
+
         // Usage (Mouse)
         descriptor.items.push(HidDescriptorItem::usage(0x02));
-        
+
         // Collection (Application)
         descriptor.items.push(HidDescriptorItem::collection(0x01));
-        
+
         // Usage (Pointer)
         descriptor.items.push(HidDescriptorItem::usage(0x01));
-        
+
         // Collection (Physical)
         descriptor.items.push(HidDescriptorItem::collection(0x00));
-        
+
         // Usage Page (Button)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::Button));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::Button));
+
         // Usage Minimum (1)
         descriptor.items.push(HidDescriptorItem::usage(0x01));
-        
+
         // Usage Maximum (3)
         descriptor.items.push(HidDescriptorItem::usage(0x03));
-        
+
         // Logical Minimum (0)
-        descriptor.items.push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x00])));
+
         // Logical Maximum (1)
-        descriptor.items.push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x01])));
+
         // Report Count (3)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x03])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x03])));
+
         // Report Size (1)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x01])));
+
         // Input (Data, Variable, Absolute) -- Buttons
         descriptor.items.push(HidDescriptorItem::input(0x02));
-        
+
         // Report Count (1)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x01])));
+
         // Report Size (5)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x05])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x05])));
+
         // Input (Constant) -- Padding
         descriptor.items.push(HidDescriptorItem::input(0x01));
-        
+
         // Usage Page (Generic Desktop)
-        descriptor.items.push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::usage_page(HidUsagePage::GenericDesktop));
+
         // Usage (X)
         descriptor.items.push(HidDescriptorItem::usage(0x30));
-        
+
         // Usage (Y)
         descriptor.items.push(HidDescriptorItem::usage(0x31));
-        
+
         // Usage (Wheel)
         descriptor.items.push(HidDescriptorItem::usage(0x38));
-        
+
         // Logical Minimum (-127)
-        descriptor.items.push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x81])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x15, alloc::vec::Vec::from([0x81])));
+
         // Logical Maximum (127)
-        descriptor.items.push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x7F])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x25, alloc::vec::Vec::from([0x7F])));
+
         // Report Size (8)
-        descriptor.items.push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x75, alloc::vec::Vec::from([0x08])));
+
         // Report Count (3)
-        descriptor.items.push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x03])));
-        
+        descriptor
+            .items
+            .push(HidDescriptorItem::new(0x95, alloc::vec::Vec::from([0x03])));
+
         // Input (Data, Variable, Relative) -- X, Y, Wheel
         descriptor.items.push(HidDescriptorItem::input(0x06));
-        
+
         // End Collection
         descriptor.items.push(HidDescriptorItem::end_collection());
-        
+
         // End Collection
         descriptor.items.push(HidDescriptorItem::end_collection());
-        
+
         descriptor
     }
-    
+
     /// Convertir a bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = alloc::vec::Vec::new();
@@ -578,34 +643,40 @@ impl HidDriver {
             error_count: 0,
         }
     }
-    
+
     /// Inicializar el driver HID
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Configurar descriptor HID
         self.descriptor.report_descriptor_length = self.info.report_descriptor_length;
-        
+
         // Crear descriptor de reporte basado en el tipo de dispositivo
         self.create_report_descriptor()?;
-        
+
         // Configurar endpoint
         self.configure_endpoint()?;
-        
+
         self.initialized = true;
         Ok(())
     }
-    
+
     /// Crear descriptor de reporte basado en el tipo de dispositivo
     fn create_report_descriptor(&mut self) -> Result<(), &'static str> {
         match self.info.device_class {
-            0x03 => { // HID Class
+            0x03 => {
+                // HID Class
                 match self.info.device_subclass {
-                    0x01 => { // Boot Interface Subclass
+                    0x01 => {
+                        // Boot Interface Subclass
                         match self.info.device_protocol {
-                            0x01 => { // Keyboard
-                                self.report_descriptor = HidReportDescriptor::create_keyboard_descriptor();
+                            0x01 => {
+                                // Keyboard
+                                self.report_descriptor =
+                                    HidReportDescriptor::create_keyboard_descriptor();
                             }
-                            0x02 => { // Mouse
-                                self.report_descriptor = HidReportDescriptor::create_mouse_descriptor();
+                            0x02 => {
+                                // Mouse
+                                self.report_descriptor =
+                                    HidReportDescriptor::create_mouse_descriptor();
                             }
                             _ => {
                                 return Err("Protocolo HID no soportado");
@@ -623,34 +694,34 @@ impl HidDriver {
         }
         Ok(())
     }
-    
+
     /// Configurar endpoint
     fn configure_endpoint(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se configuraría el endpoint USB
         // Por ahora simulamos la configuración
         Ok(())
     }
-    
+
     /// Obtener descriptor HID
     pub fn get_descriptor(&self) -> &HidDescriptor {
         &self.descriptor
     }
-    
+
     /// Obtener descriptor de reporte
     pub fn get_report_descriptor(&self) -> &HidReportDescriptor {
         &self.report_descriptor
     }
-    
+
     /// Obtener información del dispositivo
     pub fn get_info(&self) -> &HidDeviceInfo {
         &self.info
     }
-    
+
     /// Verificar si está inicializado
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
-    
+
     /// Obtener longitud del descriptor de reporte
     pub fn get_report_descriptor_length(&self) -> u16 {
         self.report_descriptor.to_bytes().len() as u16
@@ -658,6 +729,10 @@ impl HidDriver {
 }
 
 /// Función de conveniencia para crear un driver HID
-pub fn create_hid_driver(info: HidDeviceInfo, device_address: u8, endpoint_address: u8) -> HidDriver {
+pub fn create_hid_driver(
+    info: HidDeviceInfo,
+    device_address: u8,
+    endpoint_address: u8,
+) -> HidDriver {
     HidDriver::new(info, device_address, endpoint_address)
 }

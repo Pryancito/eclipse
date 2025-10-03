@@ -1,13 +1,13 @@
 //! Transferencia de control del kernel al userland
-//! 
+//!
 //! Este módulo maneja la transición del kernel al userland ejecutando eclipse-systemd
 
+use crate::gdt::{setup_userland_gdt, GdtManager};
+use crate::idt::{setup_userland_idt, IdtManager};
+use crate::interrupts::{setup_userland_interrupts, InterruptManager};
+use crate::paging::{setup_userland_paging, PagingManager};
 use core::arch::asm;
 use core::ptr;
-use crate::paging::{PagingManager, setup_userland_paging};
-use crate::gdt::{GdtManager, setup_userland_gdt};
-use crate::idt::{IdtManager, setup_userland_idt};
-use crate::interrupts::{InterruptManager, setup_userland_interrupts};
 
 /// Contexto de ejecución de un proceso
 #[derive(Debug, Clone)]
@@ -59,21 +59,21 @@ impl ProcessContext {
             r14: 0,
             r15: 0,
             rip: entry_point,
-            rflags: 0x202,  // Interrupciones habilitadas, bit 1 reservado
-            cs: 0x2B,       // Selector de código userland (GDT entry 5)
-            ss: 0x23,       // Selector de pila userland (GDT entry 4)
-            ds: 0x23,       // Selector de datos userland (GDT entry 4)
-            es: 0x23,       // Selector extra userland (GDT entry 4)
-            fs: 0x23,       // Selector FS userland (GDT entry 4)
-            gs: 0x23,       // Selector GS userland (GDT entry 4)
+            rflags: 0x202, // Interrupciones habilitadas, bit 1 reservado
+            cs: 0x2B,      // Selector de código userland (GDT entry 5)
+            ss: 0x23,      // Selector de pila userland (GDT entry 4)
+            ds: 0x23,      // Selector de datos userland (GDT entry 4)
+            es: 0x23,      // Selector extra userland (GDT entry 4)
+            fs: 0x23,      // Selector FS userland (GDT entry 4)
+            gs: 0x23,      // Selector GS userland (GDT entry 4)
         }
     }
 
     /// Configurar argumentos del proceso
     pub fn set_args(&mut self, argc: u64, argv: u64, envp: u64) {
-        self.rdi = argc;    // Primer argumento (argc)
-        self.rsi = argv;    // Segundo argumento (argv)
-        self.rdx = envp;    // Tercer argumento (envp)
+        self.rdi = argc; // Primer argumento (argc)
+        self.rsi = argv; // Segundo argumento (argv)
+        self.rdx = envp; // Tercer argumento (envp)
     }
 }
 
@@ -85,15 +85,13 @@ pub struct ProcessTransfer {
 impl ProcessTransfer {
     /// Crear nuevo gestor de transferencia
     pub fn new() -> Self {
-        Self {
-            current_pid: 0,
-        }
+        Self { current_pid: 0 }
     }
 
     /// Transferir control a un proceso del userland
     pub fn transfer_to_userland(&mut self, context: ProcessContext) -> Result<(), &'static str> {
         // Configurar el proceso como activo
-        self.current_pid = 1;  // eclipse-systemd será PID 1
+        self.current_pid = 1; // eclipse-systemd será PID 1
 
         // Configurar el entorno de ejecución
         self.setup_userland_environment()?;
@@ -108,13 +106,13 @@ impl ProcessTransfer {
     fn setup_userland_environment(&self) -> Result<(), &'static str> {
         // Configurar paginación real
         self.setup_paging()?;
-        
+
         // Configurar GDT real
         self.setup_gdt()?;
-        
+
         // Configurar IDT real
         self.setup_idt()?;
-        
+
         // Configurar interrupciones reales
         self.setup_interrupts()?;
 
@@ -130,7 +128,7 @@ impl ProcessTransfer {
     /// Configurar Interrupt Descriptor Table (IDT)
     fn setup_idt(&self) -> Result<(), &'static str> {
         // Configurar IDT real para userland
-        let kernel_code_selector = 0x08;  // Selector de código de kernel
+        let kernel_code_selector = 0x08; // Selector de código de kernel
         setup_userland_idt(kernel_code_selector)
     }
 
@@ -138,12 +136,12 @@ impl ProcessTransfer {
     fn setup_paging(&self) -> Result<(), &'static str> {
         // Configurar paginación real para userland
         let _pml4_addr = setup_userland_paging()?;
-        
+
         // Cambiar a la nueva tabla de páginas
         let mut paging_manager = PagingManager::new();
         paging_manager.setup_userland_paging()?;
         paging_manager.switch_to_pml4();
-        
+
         Ok(())
     }
 
@@ -157,10 +155,10 @@ impl ProcessTransfer {
     fn execute_userland_process(&self, context: ProcessContext) -> Result<(), &'static str> {
         // Configurar registros para transferencia al userland
         self.setup_userland_registers(&context)?;
-        
+
         // Transferir control usando iretq
         self.transfer_to_userland_with_iretq(context)?;
-        
+
         Ok(())
     }
 
@@ -173,7 +171,7 @@ impl ProcessTransfer {
             asm!("mov fs, ax", in("ax") context.fs, options(nomem, nostack));
             asm!("mov gs, ax", in("ax") context.gs, options(nomem, nostack));
         }
-        
+
         Ok(())
     }
 
@@ -181,23 +179,23 @@ impl ProcessTransfer {
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
         // Preparar stack para iretq
         let stack_ptr = context.rsp;
-        
+
         // Colocar datos en la pila para iretq
         unsafe {
             let stack_data = [
-                context.ss,      // SS
-                context.rsp,     // RSP
-                context.rflags,  // RFLAGS
-                context.cs,      // CS
-                context.rip,     // RIP
+                context.ss,     // SS
+                context.rsp,    // RSP
+                context.rflags, // RFLAGS
+                context.cs,     // CS
+                context.rip,    // RIP
             ];
-            
+
             // Colocar datos en la pila
             let stack_addr = stack_ptr as *mut u64;
             for (i, &value) in stack_data.iter().enumerate() {
                 *stack_addr.add(i) = value;
             }
-            
+
             // Configurar registros
             asm!("mov rax, {}", in(reg) context.rax, options(nomem, nostack));
             asm!("mov rbx, {}", in(reg) context.rbx, options(nomem, nostack));
@@ -214,11 +212,11 @@ impl ProcessTransfer {
             asm!("mov r13, {}", in(reg) context.r13, options(nomem, nostack));
             asm!("mov r14, {}", in(reg) context.r14, options(nomem, nostack));
             asm!("mov r15, {}", in(reg) context.r15, options(nomem, nostack));
-            
+
             // Transferir control usando iretq
             asm!("iretq", options(nomem, nostack));
         }
-        
+
         Ok(())
     }
 
@@ -249,14 +247,14 @@ pub fn transfer_to_eclipse_systemd(
     envp: u64,
 ) -> Result<(), &'static str> {
     let mut transfer = ProcessTransfer::new();
-    
+
     // Crear contexto del proceso
     let mut context = ProcessContext::new(entry_point, stack_pointer);
     context.set_args(argc, argv, envp);
-    
+
     // Transferir control
     transfer.transfer_to_userland(context)?;
-    
+
     Ok(())
 }
 
@@ -264,13 +262,13 @@ pub fn transfer_to_eclipse_systemd(
 pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
     // En un sistema real, aquí eclipse-systemd se ejecutaría realmente
     // Por ahora, solo simulamos la ejecución exitosa
-    
+
     // Simular inicialización de systemd
     simulate_systemd_initialization()?;
-    
+
     // Simular bucle principal de systemd
     simulate_systemd_main_loop()?;
-    
+
     Ok(())
 }
 

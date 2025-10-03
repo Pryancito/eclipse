@@ -1,5 +1,5 @@
 //! Geometría de ventanas y superficies
-//! 
+//!
 //! Define estructuras para manejar posiciones, tamaños y transformaciones
 //! de ventanas en el sistema de ventanas.
 
@@ -13,7 +13,7 @@ fn sqrt(x: f32) -> f32 {
     if x == 0.0 {
         return 0.0;
     }
-    
+
     let mut guess = x / 2.0;
     for _ in 0..10 {
         guess = (guess + x / guess) / 2.0;
@@ -101,7 +101,12 @@ pub struct Rectangle {
 
 impl Rectangle {
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Crear rectángulo desde punto y tamaño
@@ -116,7 +121,10 @@ impl Rectangle {
 
     /// Esquina superior izquierda
     pub fn top_left(&self) -> Point {
-        Point { x: self.x, y: self.y }
+        Point {
+            x: self.x,
+            y: self.y,
+        }
     }
 
     /// Esquina inferior derecha
@@ -293,7 +301,9 @@ impl Region {
 
     /// Verificar si un punto está en la región
     pub fn contains_point(&self, point: &Point) -> bool {
-        self.rectangles.iter().any(|rect| rect.contains_point(point))
+        self.rectangles
+            .iter()
+            .any(|rect| rect.contains_point(point))
     }
 
     /// Verificar si un rectángulo está completamente en la región
@@ -310,22 +320,22 @@ impl Region {
     fn simplify(&mut self) {
         // Implementación básica: mantener solo rectángulos no solapados
         let mut simplified: alloc::vec::Vec<Rectangle> = alloc::vec::Vec::new();
-        
+
         for rect in &self.rectangles {
             let mut should_add = true;
-            
+
             for existing in &simplified {
                 if existing.contains_rectangle(rect) {
                     should_add = false;
                     break;
                 }
             }
-            
+
             if should_add {
                 simplified.push(*rect);
             }
         }
-        
+
         self.rectangles = simplified;
     }
 
@@ -364,7 +374,7 @@ mod tests {
     fn test_point_operations() {
         let p1 = Point::new(0, 0);
         let p2 = Point::new(3, 4);
-        
+
         assert_eq!(p1.magnitude(), 0.0);
         assert_eq!(p2.magnitude(), 5.0);
         assert_eq!(p1.distance_to(&p2), 5.0);
@@ -375,10 +385,10 @@ mod tests {
         let rect1 = Rectangle::new(0, 0, 100, 100);
         let rect2 = Rectangle::new(50, 50, 100, 100);
         let point = Point::new(25, 25);
-        
+
         assert!(rect1.contains_point(&point));
         assert!(rect1.intersects(&rect2));
-        
+
         let intersection = rect1.intersection(&rect2);
         assert!(intersection.is_some());
         assert_eq!(intersection.unwrap(), Rectangle::new(50, 50, 50, 50));

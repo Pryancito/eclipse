@@ -1,5 +1,5 @@
 //! Módulo de red TCP/IP para Eclipse OS
-//! 
+//!
 //! Este módulo implementa un stack de red completo con soporte para:
 //! - Protocolos de capa de red (IP, ICMP, ARP)
 //! - Protocolos de capa de transporte (TCP, UDP)
@@ -7,16 +7,16 @@
 //! - Sistema de routing
 //! - API de sockets
 
-pub mod ip;
-pub mod tcp;
-pub mod udp;
-pub mod icmp;
 pub mod arp;
-pub mod interface;
 pub mod buffer;
+pub mod icmp;
+pub mod interface;
+pub mod ip;
+pub mod manager;
 pub mod routing;
 pub mod socket;
-pub mod manager;
+pub mod tcp;
+pub mod udp;
 
 // Re-exportar tipos principales
 

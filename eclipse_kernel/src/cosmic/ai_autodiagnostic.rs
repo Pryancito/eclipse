@@ -1,5 +1,5 @@
 //! Sistema de Autodiagnóstico de IA para Lunar GUI
-//! 
+//!
 //! Este módulo implementa un sistema de IA que puede diagnosticar problemas
 //! de renderizado y aplicar correcciones automáticamente.
 
@@ -66,7 +66,13 @@ impl AIAutoDiagnostic {
     }
 
     /// Actualizar métricas del sistema
-    pub fn update_metrics(&mut self, fps: f32, memory_usage: f32, render_errors: u32, cuda_errors: u32) {
+    pub fn update_metrics(
+        &mut self,
+        fps: f32,
+        memory_usage: f32,
+        render_errors: u32,
+        cuda_errors: u32,
+    ) {
         self.frame_count += 1;
         self.last_fps = fps;
         self.memory_usage = memory_usage;
@@ -85,7 +91,7 @@ impl AIAutoDiagnostic {
 
         // Análisis de IA para determinar el estado del sistema
         let (state, confidence, description) = self.analyze_system_state();
-        
+
         // Generar acciones de autocorrección
         let suggested_actions = self.generate_correction_actions(&state);
 
@@ -99,7 +105,7 @@ impl AIAutoDiagnostic {
 
         // Guardar en historial
         self.diagnostic_history.push(result.clone());
-        
+
         // Limitar historial a 100 entradas
         if self.diagnostic_history.len() > 100 {
             self.diagnostic_history.remove(0);
@@ -115,7 +121,7 @@ impl AIAutoDiagnostic {
             return (
                 DiagnosticState::RenderingIssue,
                 0.95,
-                "Sistema detectado: Pantalla gris - FPS=0 y errores de renderizado".to_string()
+                "Sistema detectado: Pantalla gris - FPS=0 y errores de renderizado".to_string(),
             );
         }
 
@@ -124,7 +130,7 @@ impl AIAutoDiagnostic {
             return (
                 DiagnosticState::CudaIssue,
                 0.90,
-                "Sistema detectado: Múltiples errores de CUDA".to_string()
+                "Sistema detectado: Múltiples errores de CUDA".to_string(),
             );
         }
 
@@ -133,7 +139,7 @@ impl AIAutoDiagnostic {
             return (
                 DiagnosticState::MemoryIssue,
                 0.85,
-                "Sistema detectado: Uso alto de memoria".to_string()
+                "Sistema detectado: Uso alto de memoria".to_string(),
             );
         }
 
@@ -142,7 +148,7 @@ impl AIAutoDiagnostic {
             return (
                 DiagnosticState::PerformanceIssue,
                 0.80,
-                "Sistema detectado: Rendimiento bajo - FPS < 30".to_string()
+                "Sistema detectado: Rendimiento bajo - FPS < 30".to_string(),
             );
         }
 
@@ -151,7 +157,7 @@ impl AIAutoDiagnostic {
             return (
                 DiagnosticState::Healthy,
                 0.95,
-                "Sistema saludable - Rendimiento óptimo".to_string()
+                "Sistema saludable - Rendimiento óptimo".to_string(),
             );
         }
 
@@ -159,7 +165,7 @@ impl AIAutoDiagnostic {
         (
             DiagnosticState::UnknownIssue,
             0.50,
-            "Estado del sistema no determinado".to_string()
+            "Estado del sistema no determinado".to_string(),
         )
     }
 
@@ -172,69 +178,63 @@ impl AIAutoDiagnostic {
                     AutoCorrectAction::FallbackToSimpleMode,
                     AutoCorrectAction::DisableAdvancedEffects,
                 ]
-            },
+            }
             DiagnosticState::CudaIssue => {
                 alloc::vec![
                     AutoCorrectAction::RestartCuda,
                     AutoCorrectAction::FallbackToSimpleMode,
                     AutoCorrectAction::ClearMemory,
                 ]
-            },
+            }
             DiagnosticState::MemoryIssue => {
                 alloc::vec![
                     AutoCorrectAction::ClearMemory,
                     AutoCorrectAction::ReduceObjectCount,
                     AutoCorrectAction::DecreaseQuality,
                 ]
-            },
+            }
             DiagnosticState::PerformanceIssue => {
                 alloc::vec![
                     AutoCorrectAction::IncreaseFrameDelay,
                     AutoCorrectAction::DecreaseQuality,
                     AutoCorrectAction::ReduceObjectCount,
                 ]
-            },
+            }
             DiagnosticState::Healthy => {
                 Vec::new() // No se necesitan correcciones
-            },
+            }
             DiagnosticState::UnknownIssue => {
                 alloc::vec![
                     AutoCorrectAction::FallbackToSimpleMode,
                     AutoCorrectAction::EnableBasicRendering,
                 ]
-            },
+            }
         }
     }
 
     /// Aplicar autocorrección automáticamente
     pub fn apply_auto_correction(&mut self, action: &AutoCorrectAction) -> String {
         self.auto_corrections_applied.push(action.clone());
-        
+
         match action {
             AutoCorrectAction::EnableBasicRendering => {
                 "IA: Activando renderizado básico forzado".to_string()
-            },
+            }
             AutoCorrectAction::DisableAdvancedEffects => {
                 "IA: Deshabilitando efectos avanzados".to_string()
-            },
+            }
             AutoCorrectAction::ReduceObjectCount => {
                 "IA: Reduciendo número de objetos renderizados".to_string()
-            },
-            AutoCorrectAction::ClearMemory => {
-                "IA: Limpiando memoria del sistema".to_string()
-            },
-            AutoCorrectAction::RestartCuda => {
-                "IA: Reiniciando sistema CUDA".to_string()
-            },
-            AutoCorrectAction::FallbackToSimpleMode => {
-                "IA: Cambiando a modo simple".to_string()
-            },
+            }
+            AutoCorrectAction::ClearMemory => "IA: Limpiando memoria del sistema".to_string(),
+            AutoCorrectAction::RestartCuda => "IA: Reiniciando sistema CUDA".to_string(),
+            AutoCorrectAction::FallbackToSimpleMode => "IA: Cambiando a modo simple".to_string(),
             AutoCorrectAction::IncreaseFrameDelay => {
                 "IA: Aumentando delay entre frames".to_string()
-            },
+            }
             AutoCorrectAction::DecreaseQuality => {
                 "IA: Reduciendo calidad de renderizado".to_string()
-            },
+            }
         }
     }
 
@@ -242,7 +242,7 @@ impl AIAutoDiagnostic {
     pub fn get_diagnostic_stats(&self) -> String {
         let total_diagnostics = self.diagnostic_history.len();
         let total_corrections = self.auto_corrections_applied.len();
-        
+
         alloc::format!(
             "Diagnósticos: {} | Correcciones: {} | FPS: {:.1} | Errores: {}",
             total_diagnostics,
@@ -293,23 +293,23 @@ impl AutoCorrectConfig {
         match action {
             AutoCorrectAction::EnableBasicRendering => {
                 self.enable_basic_rendering = true;
-            },
+            }
             AutoCorrectAction::FallbackToSimpleMode => {
                 self.fallback_mode = true;
                 self.simple_mode = true;
-            },
+            }
             AutoCorrectAction::DisableAdvancedEffects => {
                 self.reduced_quality = true;
-            },
+            }
             AutoCorrectAction::ReduceObjectCount => {
                 self.max_objects = 50;
-            },
+            }
             AutoCorrectAction::IncreaseFrameDelay => {
                 self.frame_delay = 2;
-            },
+            }
             AutoCorrectAction::DecreaseQuality => {
                 self.reduced_quality = true;
-            },
+            }
             _ => {
                 // Otras acciones no modifican la configuración directamente
             }

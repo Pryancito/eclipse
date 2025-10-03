@@ -7,22 +7,22 @@
 //! - Memory locality optimization
 //! - Performance profiling
 
-pub mod load_balancer;
-pub mod context_switch_optimizer;
+pub mod adaptive_scheduler;
 pub mod cache_optimizer;
+pub mod context_switch_optimizer;
+pub mod load_balancer;
 pub mod memory_locality;
 pub mod performance_profiler;
 pub mod thread_pool;
-pub mod adaptive_scheduler;
 
 // Re-exportar las estructuras principales
-pub use load_balancer::LoadBalancer;
-pub use context_switch_optimizer::ContextSwitchOptimizer;
+pub use adaptive_scheduler::AdaptiveScheduler;
 pub use cache_optimizer::CacheOptimizer;
+pub use context_switch_optimizer::ContextSwitchOptimizer;
+pub use load_balancer::LoadBalancer;
 pub use memory_locality::MemoryLocalityOptimizer;
 pub use performance_profiler::PerformanceProfiler;
 pub use thread_pool::ThreadPool;
-pub use adaptive_scheduler::AdaptiveScheduler;
 
 /// Configuración de optimización de rendimiento
 #[derive(Debug, Clone)]
@@ -129,7 +129,7 @@ impl PerformanceManager {
     pub fn update_config(&mut self, config: PerformanceConfig) {
         let cache_line_size = config.cache_line_size;
         let numa_aware = config.numa_aware;
-        
+
         self.config = config;
         self.cache_optimizer.update_cache_line_size(cache_line_size);
         self.memory_optimizer.update_numa_awareness(numa_aware);

@@ -1,9 +1,11 @@
-use crate::drivers::pci::{PciDevice, GpuType, GpuInfo};
-use crate::drivers::framebuffer::{FramebufferDriver, FramebufferInfo, Color, PixelFormat};
-use crate::drivers::framebuffer_manager::{FramebufferManager, get_global_framebuffer, set_global_framebuffer};
+use crate::drivers::framebuffer::{Color, FramebufferDriver, FramebufferInfo, PixelFormat};
+use crate::drivers::framebuffer_manager::{
+    get_global_framebuffer, set_global_framebuffer, FramebufferManager,
+};
+use crate::drivers::pci::{GpuInfo, GpuType, PciDevice};
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
 use core::fmt::Write;
 
 /// Información del framebuffer directo detectado
@@ -54,7 +56,9 @@ impl DirectFramebufferDriver {
             GpuType::QemuBochs => self.configure_qemu_framebuffer(gpu, uefi_resolution),
             GpuType::Vmware => self.configure_vmware_framebuffer(gpu, uefi_resolution),
             GpuType::Virtio => self.configure_virtio_framebuffer(gpu, uefi_resolution),
-            _ => Err(String::from("Tipo de GPU no soportado para framebuffer directo")),
+            _ => Err(String::from(
+                "Tipo de GPU no soportado para framebuffer directo",
+            )),
         }
     }
 
@@ -70,9 +74,14 @@ impl DirectFramebufferDriver {
     }
 
     /// Crear DirectFramebufferInfo usando resolución UEFI
-    fn create_framebuffer_info(&self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32), fb_base: u64) -> DirectFramebufferInfo {
+    fn create_framebuffer_info(
+        &self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+        fb_base: u64,
+    ) -> DirectFramebufferInfo {
         let (width, height, stride) = uefi_resolution;
-        
+
         DirectFramebufferInfo {
             base_address: fb_base,
             width,
@@ -87,17 +96,23 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para NVIDIA
-    fn configure_nvidia_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_nvidia_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         // Leer BARs de NVIDIA
         let bars = gpu.pci_device.read_all_bars();
-        
+
         // NVIDIA típicamente usa BAR0 para framebuffer
         let fb_base = if bars[0] != 0 {
             bars[0] as u64
         } else if bars[1] != 0 {
             bars[1] as u64
         } else {
-            return Err(String::from("No se encontró BAR válido para framebuffer NVIDIA"));
+            return Err(String::from(
+                "No se encontró BAR válido para framebuffer NVIDIA",
+            ));
         };
 
         // NO cambiar resolución - mantener UEFI como cualquier entorno gráfico
@@ -115,14 +130,20 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para AMD
-    fn configure_amd_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_amd_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         let bars = gpu.pci_device.read_all_bars();
-        
+
         // AMD típicamente usa BAR0 para framebuffer
         let fb_base = if bars[0] != 0 {
             bars[0] as u64
         } else {
-            return Err(String::from("No se encontró BAR válido para framebuffer AMD"));
+            return Err(String::from(
+                "No se encontró BAR válido para framebuffer AMD",
+            ));
         };
 
         // NO cambiar resolución - mantener UEFI como cualquier entorno gráfico
@@ -140,14 +161,20 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para Intel
-    fn configure_intel_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_intel_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         let bars = gpu.pci_device.read_all_bars();
-        
+
         // Intel típicamente usa BAR0 para framebuffer
         let fb_base = if bars[0] != 0 {
             bars[0] as u64
         } else {
-            return Err(String::from("No se encontró BAR válido para framebuffer Intel"));
+            return Err(String::from(
+                "No se encontró BAR válido para framebuffer Intel",
+            ));
         };
 
         // NO cambiar resolución - mantener UEFI como cualquier entorno gráfico
@@ -165,11 +192,15 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para QEMU
-    fn configure_qemu_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_qemu_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         // QEMU puede usar tanto VGA text mode como framebuffer gráfico
         // Usar resolución UEFI para mantener consistencia
         let (width, height, stride) = uefi_resolution;
-        
+
         // Si la resolución es muy pequeña, usar VGA text mode
         if width < 640 || height < 480 {
             let fb_info = DirectFramebufferInfo {
@@ -204,13 +235,19 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para VMware
-    fn configure_vmware_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_vmware_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         let bars = gpu.pci_device.read_all_bars();
-        
+
         let fb_base = if bars[0] != 0 {
             bars[0] as u64
         } else {
-            return Err(String::from("No se encontró BAR válido para framebuffer VMware"));
+            return Err(String::from(
+                "No se encontró BAR válido para framebuffer VMware",
+            ));
         };
 
         // NO cambiar resolución - mantener UEFI como cualquier entorno gráfico
@@ -225,13 +262,19 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar framebuffer directo para VirtIO
-    fn configure_virtio_framebuffer(&mut self, gpu: &GpuInfo, uefi_resolution: (u32, u32, u32)) -> Result<DirectFramebufferInfo, String> {
+    fn configure_virtio_framebuffer(
+        &mut self,
+        gpu: &GpuInfo,
+        uefi_resolution: (u32, u32, u32),
+    ) -> Result<DirectFramebufferInfo, String> {
         let bars = gpu.pci_device.read_all_bars();
-        
+
         let fb_base = if bars[0] != 0 {
             bars[0] as u64
         } else {
-            return Err(String::from("No se encontró BAR válido para framebuffer VirtIO"));
+            return Err(String::from(
+                "No se encontró BAR válido para framebuffer VirtIO",
+            ));
         };
 
         // NO cambiar resolución - mantener UEFI como cualquier entorno gráfico
@@ -246,10 +289,15 @@ impl DirectFramebufferDriver {
     }
 
     /// Configurar modo de video específico para NVIDIA
-    fn set_nvidia_video_mode(&self, pci_device: &PciDevice, width: u32, height: u32) -> Result<(), String> {
+    fn set_nvidia_video_mode(
+        &self,
+        pci_device: &PciDevice,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         // Habilitar MMIO y Bus Master
         pci_device.enable_mmio_and_bus_master();
-        
+
         // Configurar modo de video NVIDIA
         // Esto es específico del hardware NVIDIA
         unsafe {
@@ -265,14 +313,19 @@ impl DirectFramebufferDriver {
                 core::ptr::write_volatile(fb_ptr.add(2), 0x20); // BGR888
             }
         }
-        
+
         Ok(())
     }
 
     /// Configurar modo de video específico para AMD
-    fn set_amd_video_mode(&self, pci_device: &PciDevice, width: u32, height: u32) -> Result<(), String> {
+    fn set_amd_video_mode(
+        &self,
+        pci_device: &PciDevice,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         pci_device.enable_mmio_and_bus_master();
-        
+
         unsafe {
             let bars = pci_device.read_all_bars();
             let fb_ptr = bars[0] as *mut u32;
@@ -282,14 +335,19 @@ impl DirectFramebufferDriver {
                 core::ptr::write_volatile(fb_ptr.add(2), 0x20);
             }
         }
-        
+
         Ok(())
     }
 
     /// Configurar modo de video específico para Intel
-    fn set_intel_video_mode(&self, pci_device: &PciDevice, width: u32, height: u32) -> Result<(), String> {
+    fn set_intel_video_mode(
+        &self,
+        pci_device: &PciDevice,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         pci_device.enable_mmio_and_bus_master();
-        
+
         unsafe {
             let bars = pci_device.read_all_bars();
             let fb_ptr = bars[0] as *mut u32;
@@ -299,7 +357,7 @@ impl DirectFramebufferDriver {
                 core::ptr::write_volatile(fb_ptr.add(2), 0x20);
             }
         }
-        
+
         Ok(())
     }
 
@@ -314,7 +372,7 @@ impl DirectFramebufferDriver {
         if let Some(fb_info) = &self.current_fb {
             // PASO 1: Configurar hardware a nivel de ensamblador
             self.initialize_hardware_framebuffer(fb_info)?;
-            
+
             // PASO 2: Crear nuevo FramebufferDriver optimizado con el hardware específico
             let framebuffer_info = FramebufferInfo {
                 base_address: fb_info.base_address,
@@ -330,12 +388,12 @@ impl DirectFramebufferDriver {
 
             // PASO 3: Crear nuevo FramebufferDriver con configuración optimizada
             let mut new_fb = FramebufferDriver::new();
-            
+
             // PASO 4: Inicializar con la información del hardware específico
-            let pixel_bitmask = (framebuffer_info.red_mask << 16) | 
-                               (framebuffer_info.green_mask << 8) | 
-                               framebuffer_info.blue_mask;
-            
+            let pixel_bitmask = (framebuffer_info.red_mask << 16)
+                | (framebuffer_info.green_mask << 8)
+                | framebuffer_info.blue_mask;
+
             match new_fb.init_from_uefi(
                 framebuffer_info.base_address,
                 framebuffer_info.width,
@@ -349,35 +407,30 @@ impl DirectFramebufferDriver {
                     set_global_framebuffer(new_fb.clone());
                     Ok(new_fb)
                 }
-                Err(e) => Err(format!("Error inicializando framebuffer optimizado: {}", e))
+                Err(e) => Err(format!("Error inicializando framebuffer optimizado: {}", e)),
             }
         } else {
-            Err(String::from("No hay información de framebuffer directo disponible"))
+            Err(String::from(
+                "No hay información de framebuffer directo disponible",
+            ))
         }
     }
 
     /// Inicializar hardware del framebuffer a nivel de ensamblador
-    pub fn initialize_hardware_framebuffer(&self, fb_info: &DirectFramebufferInfo) -> Result<(), String> {
+    pub fn initialize_hardware_framebuffer(
+        &self,
+        fb_info: &DirectFramebufferInfo,
+    ) -> Result<(), String> {
         match fb_info.gpu_type {
-            crate::drivers::pci::GpuType::Nvidia => {
-                self.initialize_nvidia_hardware(fb_info)
-            }
-            crate::drivers::pci::GpuType::Amd => {
-                self.initialize_amd_hardware(fb_info)
-            }
-            crate::drivers::pci::GpuType::Intel => {
-                self.initialize_intel_hardware(fb_info)
-            }
+            crate::drivers::pci::GpuType::Nvidia => self.initialize_nvidia_hardware(fb_info),
+            crate::drivers::pci::GpuType::Amd => self.initialize_amd_hardware(fb_info),
+            crate::drivers::pci::GpuType::Intel => self.initialize_intel_hardware(fb_info),
             crate::drivers::pci::GpuType::QemuBochs => {
                 // QEMU no necesita reconfiguración compleja
                 self.initialize_qemu_simple(fb_info)
             }
-            crate::drivers::pci::GpuType::Vmware => {
-                self.initialize_vmware_hardware(fb_info)
-            }
-            crate::drivers::pci::GpuType::Virtio => {
-                self.initialize_virtio_hardware(fb_info)
-            }
+            crate::drivers::pci::GpuType::Vmware => self.initialize_vmware_hardware(fb_info),
+            crate::drivers::pci::GpuType::Virtio => self.initialize_virtio_hardware(fb_info),
             _ => {
                 // Para GPUs desconocidas, usar configuración genérica
                 self.initialize_generic_hardware(fb_info)
@@ -386,35 +439,30 @@ impl DirectFramebufferDriver {
     }
 
     /// Reconfigurar tarjeta gráfica para nuevo framebuffer
-    pub fn reconfigure_graphics_card(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    pub fn reconfigure_graphics_card(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         if let Some(direct_fb_info) = &self.current_fb {
             match direct_fb_info.gpu_type {
-                crate::drivers::pci::GpuType::Nvidia => {
-                    self.reconfigure_nvidia_graphics(fb_info)
-                }
-                crate::drivers::pci::GpuType::Amd => {
-                    self.reconfigure_amd_graphics(fb_info)
-                }
-                crate::drivers::pci::GpuType::Intel => {
-                    self.reconfigure_intel_graphics(fb_info)
-                }
+                crate::drivers::pci::GpuType::Nvidia => self.reconfigure_nvidia_graphics(fb_info),
+                crate::drivers::pci::GpuType::Amd => self.reconfigure_amd_graphics(fb_info),
+                crate::drivers::pci::GpuType::Intel => self.reconfigure_intel_graphics(fb_info),
                 crate::drivers::pci::GpuType::QemuBochs => {
                     // QEMU no necesita reconfiguración
                     Ok(())
                 }
-                crate::drivers::pci::GpuType::Vmware => {
-                    self.reconfigure_vmware_graphics(fb_info)
-                }
-                crate::drivers::pci::GpuType::Virtio => {
-                    self.reconfigure_virtio_graphics(fb_info)
-                }
+                crate::drivers::pci::GpuType::Vmware => self.reconfigure_vmware_graphics(fb_info),
+                crate::drivers::pci::GpuType::Virtio => self.reconfigure_virtio_graphics(fb_info),
                 _ => {
                     // Para GPUs desconocidas, usar configuración genérica
                     self.reconfigure_generic_graphics(fb_info)
                 }
             }
         } else {
-            Err(String::from("No hay información de framebuffer directo disponible"))
+            Err(String::from(
+                "No hay información de framebuffer directo disponible",
+            ))
         }
     }
 
@@ -430,7 +478,7 @@ impl DirectFramebufferDriver {
             self.write_nvidia_register(fb_info, 0x4, 0x00000020); // Pixel format (32-bit)
             self.write_nvidia_register(fb_info, 0x5, fb_info.base_address as u32); // Base address low
             self.write_nvidia_register(fb_info, 0x6, (fb_info.base_address >> 32) as u32); // Base address high
-            
+
             // Habilitar aceleración 2D
             self.write_nvidia_register(fb_info, 0x10, 0x00000001); // Enable 2D acceleration
             self.write_nvidia_register(fb_info, 0x11, 0x00000001); // Enable hardware cursor
@@ -449,7 +497,7 @@ impl DirectFramebufferDriver {
             self.write_amd_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_amd_register(fb_info, 0x4, 0x00000020); // Pixel format
             self.write_amd_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
-            
+
             // Habilitar aceleración AMD
             self.write_amd_register(fb_info, 0x10, 0x00000001); // Enable 2D
             self.write_amd_register(fb_info, 0x11, 0x00000001); // Enable scrolling
@@ -467,7 +515,7 @@ impl DirectFramebufferDriver {
             self.write_intel_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_intel_register(fb_info, 0x4, 0x00000020); // Pixel format
             self.write_intel_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
-            
+
             // Habilitar aceleración Intel
             self.write_intel_register(fb_info, 0x10, 0x00000001); // Enable 2D
             self.write_intel_register(fb_info, 0x11, 0x00000001); // Enable scrolling
@@ -484,7 +532,8 @@ impl DirectFramebufferDriver {
             self.write_qemu_register(fb_info, 0x2, fb_info.height); // Height
             self.write_qemu_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_qemu_register(fb_info, 0x4, 0x00000020); // Pixel format
-            self.write_qemu_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
+            self.write_qemu_register(fb_info, 0x5, fb_info.base_address as u32);
+            // Base address
         }
         Ok(())
     }
@@ -499,7 +548,7 @@ impl DirectFramebufferDriver {
             if base.is_null() {
                 return Err(String::from("Framebuffer QEMU no disponible"));
             }
-            
+
             // Configuración mínima para QEMU
             self.write_qemu_register(fb_info, 0x0, 0x00000001); // Enable
             self.write_qemu_register(fb_info, 0x1, fb_info.width); // Width
@@ -517,7 +566,8 @@ impl DirectFramebufferDriver {
             self.write_vmware_register(fb_info, 0x2, fb_info.height); // Height
             self.write_vmware_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_vmware_register(fb_info, 0x4, 0x00000020); // Pixel format
-            self.write_vmware_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
+            self.write_vmware_register(fb_info, 0x5, fb_info.base_address as u32);
+            // Base address
         }
         Ok(())
     }
@@ -531,7 +581,8 @@ impl DirectFramebufferDriver {
             self.write_virtio_register(fb_info, 0x2, fb_info.height); // Height
             self.write_virtio_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_virtio_register(fb_info, 0x4, 0x00000020); // Pixel format
-            self.write_virtio_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
+            self.write_virtio_register(fb_info, 0x5, fb_info.base_address as u32);
+            // Base address
         }
         Ok(())
     }
@@ -545,7 +596,8 @@ impl DirectFramebufferDriver {
             self.write_generic_register(fb_info, 0x2, fb_info.height); // Height
             self.write_generic_register(fb_info, 0x3, fb_info.stride); // Stride
             self.write_generic_register(fb_info, 0x4, 0x00000020); // Pixel format
-            self.write_generic_register(fb_info, 0x5, fb_info.base_address as u32); // Base address
+            self.write_generic_register(fb_info, 0x5, fb_info.base_address as u32);
+            // Base address
         }
         Ok(())
     }
@@ -598,8 +650,12 @@ impl DirectFramebufferDriver {
         if let Some(fb) = &self.current_fb {
             format!(
                 "Direct FB: {}x{} @0x{:X} ({}: {:04X}:{:04X})",
-                fb.width, fb.height, fb.base_address,
-                fb.gpu_type.as_str(), fb.vendor_id, fb.device_id
+                fb.width,
+                fb.height,
+                fb.base_address,
+                fb.gpu_type.as_str(),
+                fb.vendor_id,
+                fb.device_id
             )
         } else {
             String::from("No framebuffer directo activo")
@@ -607,34 +663,52 @@ impl DirectFramebufferDriver {
     }
 
     // Funciones de reconfiguración específicas por GPU
-    fn reconfigure_nvidia_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_nvidia_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfigurar NVIDIA usando los drivers específicos
         // Esto se integraría con el driver NVIDIA real
         Ok(())
     }
 
-    fn reconfigure_amd_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_amd_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfigurar AMD usando los drivers específicos
         // Esto se integraría con el driver AMD real
         Ok(())
     }
 
-    fn reconfigure_intel_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_intel_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfigurar Intel usando los drivers específicos
         Ok(())
     }
 
-    fn reconfigure_vmware_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_vmware_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfigurar VMware usando los drivers específicos
         Ok(())
     }
 
-    fn reconfigure_virtio_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_virtio_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfigurar VirtIO usando los drivers específicos
         Ok(())
     }
 
-    fn reconfigure_generic_graphics(&self, fb_info: &crate::drivers::framebuffer::FramebufferInfo) -> Result<(), String> {
+    fn reconfigure_generic_graphics(
+        &self,
+        fb_info: &crate::drivers::framebuffer::FramebufferInfo,
+    ) -> Result<(), String> {
         // Reconfiguración genérica para GPUs desconocidas
         Ok(())
     }

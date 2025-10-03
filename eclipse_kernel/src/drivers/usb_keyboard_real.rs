@@ -1,19 +1,19 @@
 //! Driver USB real para teclado
-//! 
+//!
 //! Implementa soporte completo para teclados USB reales con comunicación
 //! hardware directa, no simulación.
 
 use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType, DeviceOperations},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
-    usb::{RealUsbController, UsbDeviceInfo, UsbDeviceClass, UsbControllerType},
-    keyboard::{KeyboardDriver, KeyEvent, KeyState, KeyCode},
+    device::{Device, DeviceInfo, DeviceOperations, DeviceType},
+    keyboard::{KeyCode, KeyEvent, KeyState, KeyboardDriver},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
+    usb::{RealUsbController, UsbControllerType, UsbDeviceClass, UsbDeviceInfo},
 };
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Driver USB real para teclado
 pub struct UsbKeyboardReal {
@@ -23,7 +23,7 @@ pub struct UsbKeyboardReal {
     pub is_initialized: bool,
     pub key_buffer: Vec<KeyEvent>,
     pub current_keys: [bool; 256], // Estado actual de todas las teclas
-    pub last_report: [u8; 8], // Último reporte HID recibido
+    pub last_report: [u8; 8],      // Último reporte HID recibido
     pub endpoint: u8,
     pub address: u8,
 }
@@ -58,7 +58,7 @@ impl UsbKeyboardReal {
         if let Some(ref mut controller) = self.usb_controller {
             // Buscar dispositivos HID
             let hid_devices = controller.get_hid_devices();
-            
+
             for device in hid_devices {
                 // Verificar si es un teclado (clase HID, subclase 0x01, protocolo 0x01)
                 if device.device_descriptor.device_class == UsbDeviceClass::HID {
@@ -79,7 +79,7 @@ impl UsbKeyboardReal {
             if let Some(ref device) = self.keyboard_device {
                 let mut report = [0u8; 8];
                 controller.read_hid_data(device.address, self.endpoint, &mut report)?;
-                
+
                 // Procesar reporte HID
                 self.process_hid_report(&report);
                 self.last_report = report;
@@ -129,16 +129,20 @@ impl UsbKeyboardReal {
         for (bit, key_code) in modifier_keys.iter() {
             let is_pressed = (modifiers & bit) != 0;
             let key_index = *key_code as usize;
-            
+
             if is_pressed != self.current_keys[key_index] {
                 self.current_keys[key_index] = is_pressed;
-                
+
                 let event = KeyEvent {
                     key: *key_code,
-                    state: if is_pressed { KeyState::Pressed } else { KeyState::Released },
+                    state: if is_pressed {
+                        KeyState::Pressed
+                    } else {
+                        KeyState::Released
+                    },
                     modifiers: self.get_current_modifiers(),
                 };
-                
+
                 self.key_buffer.push(event);
             }
         }
@@ -148,16 +152,16 @@ impl UsbKeyboardReal {
     fn process_key_press(&mut self, key_code: u8) {
         if let Some(key) = self.usb_key_to_keycode(key_code) {
             let key_index = key as usize;
-            
+
             if !self.current_keys[key_index] {
                 self.current_keys[key_index] = true;
-                
+
                 let event = KeyEvent {
                     key,
                     state: KeyState::Pressed,
                     modifiers: self.get_current_modifiers(),
                 };
-                
+
                 self.key_buffer.push(event);
             }
         }
@@ -173,13 +177,13 @@ impl UsbKeyboardReal {
                 if let Some(key) = self.usb_key_to_keycode(old_key) {
                     let key_index = key as usize;
                     self.current_keys[key_index] = false;
-                    
+
                     let event = KeyEvent {
                         key,
                         state: KeyState::Released,
                         modifiers: self.get_current_modifiers(),
                     };
-                    
+
                     self.key_buffer.push(event);
                 }
             }
@@ -291,16 +295,24 @@ impl UsbKeyboardReal {
     /// Obtener modificadores actuales
     fn get_current_modifiers(&self) -> u8 {
         let mut modifiers = 0;
-        if self.current_keys[KeyCode::LeftCtrl as usize] || self.current_keys[KeyCode::RightCtrl as usize] {
+        if self.current_keys[KeyCode::LeftCtrl as usize]
+            || self.current_keys[KeyCode::RightCtrl as usize]
+        {
             modifiers |= 0x01;
         }
-        if self.current_keys[KeyCode::LeftShift as usize] || self.current_keys[KeyCode::RightShift as usize] {
+        if self.current_keys[KeyCode::LeftShift as usize]
+            || self.current_keys[KeyCode::RightShift as usize]
+        {
             modifiers |= 0x02;
         }
-        if self.current_keys[KeyCode::LeftAlt as usize] || self.current_keys[KeyCode::RightAlt as usize] {
+        if self.current_keys[KeyCode::LeftAlt as usize]
+            || self.current_keys[KeyCode::RightAlt as usize]
+        {
             modifiers |= 0x04;
         }
-        if self.current_keys[KeyCode::LeftMeta as usize] || self.current_keys[KeyCode::RightMeta as usize] {
+        if self.current_keys[KeyCode::LeftMeta as usize]
+            || self.current_keys[KeyCode::RightMeta as usize]
+        {
             modifiers |= 0x08;
         }
         modifiers
@@ -325,23 +337,24 @@ impl UsbKeyboardReal {
     pub fn get_keyboard_stats(&self) -> String {
         let mut stats = String::new();
         stats.push_str("=== TECLADO USB REAL ===\n");
-        
+
         if let Some(ref device) = self.keyboard_device {
-            stats.push_str(&format!("Dispositivo: VID={:04X} PID={:04X}\n", 
-                device.device_descriptor.vendor_id,
-                device.device_descriptor.product_id
+            stats.push_str(&format!(
+                "Dispositivo: VID={:04X} PID={:04X}\n",
+                device.device_descriptor.vendor_id, device.device_descriptor.product_id
             ));
             stats.push_str(&format!("Dirección USB: {}\n", device.address));
             stats.push_str(&format!("Endpoint: 0x{:02X}\n", self.endpoint));
         } else {
             stats.push_str("Dispositivo: No detectado\n");
         }
-        
+
         stats.push_str(&format!("Eventos en buffer: {}\n", self.key_buffer.len()));
-        stats.push_str(&format!("Teclas presionadas: {}\n", 
+        stats.push_str(&format!(
+            "Teclas presionadas: {}\n",
             self.current_keys.iter().filter(|&&pressed| pressed).count()
         ));
-        
+
         stats
     }
 }
@@ -370,7 +383,7 @@ impl Driver for UsbKeyboardReal {
 
         // Detectar teclado USB
         self.detect_keyboard()?;
-        
+
         self.info.is_loaded = true;
         self.is_initialized = true;
         Ok(())

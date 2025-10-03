@@ -1,20 +1,24 @@
 #![no_std]
 
-use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::boxed::Box;
+use alloc::vec::Vec;
 
-use crate::drivers::usb_keyboard::{UsbKeyboardDriver, KeyboardEvent, UsbKeyCode, ModifierState};
-use crate::drivers::usb_mouse::{UsbMouseDriver, MouseEvent, MouseButton as UsbMouseButton, MousePosition, MouseButtonState};
-use crate::drivers::usb_manager::UsbManager;
+use crate::drivers::keyboard::{KeyCode, KeyEvent, KeyState};
 use crate::drivers::manager::Driver;
+use crate::drivers::mouse::{
+    self as mouse, MouseButton as RealMouseButton, MouseEvent as RealMouseEvent, MouseState,
+};
+use crate::drivers::usb_keyboard::{KeyboardEvent, ModifierState, UsbKeyCode, UsbKeyboardDriver};
 use crate::drivers::usb_keyboard_real::UsbKeyboardReal;
+use crate::drivers::usb_manager::UsbManager;
+use crate::drivers::usb_mouse::{
+    MouseButton as UsbMouseButton, MouseButtonState, MouseEvent, MousePosition, UsbMouseDriver,
+};
 use crate::drivers::usb_mouse_real::UsbMouseReal;
-use crate::drivers::keyboard::{KeyEvent, KeyCode, KeyState};
-use crate::drivers::mouse::{MouseEvent as RealMouseEvent, MouseButton as RealMouseButton, MouseState, self as mouse};
 
 /// Sistema de entrada unificado para Eclipse OS
 /// Gestiona eventos de teclado y mouse de forma centralizada
@@ -54,22 +58,22 @@ impl InputEvent {
             processed: false,
         }
     }
-    
+
     /// Marcar evento como procesado
     pub fn mark_processed(&mut self) {
         self.processed = true;
     }
-    
+
     /// Verificar si es evento de teclado
     pub fn is_keyboard(&self) -> bool {
         matches!(self.event_type, InputEventType::Keyboard(_))
     }
-    
+
     /// Verificar si es evento de mouse
     pub fn is_mouse(&self) -> bool {
         matches!(self.event_type, InputEventType::Mouse(_))
     }
-    
+
     /// Verificar si es evento del sistema
     pub fn is_system(&self) -> bool {
         matches!(self.event_type, InputEventType::System(_))
@@ -81,7 +85,7 @@ impl InputEvent {
 pub struct InputSystemConfig {
     pub max_events: usize,
     pub keyboard_repeat_delay: u32, // ms
-    pub keyboard_repeat_rate: u32, // eventos por segundo
+    pub keyboard_repeat_rate: u32,  // eventos por segundo
     pub mouse_sensitivity: f32,
     pub enable_keyboard_repeat: bool,
     pub enable_mouse_acceleration: bool,
@@ -155,7 +159,7 @@ impl InputSystem {
             current_timestamp: 0,
         }
     }
-    
+
     /// Inicializar el sistema de entrada
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Limpiar buffers
@@ -164,21 +168,25 @@ impl InputSystem {
         self.mice.clear();
         self.real_keyboards.clear();
         self.real_mice.clear();
-        
+
         // Inicializar gestor USB real
         let mut usb_manager = UsbManager::new();
         if usb_manager.initialize().is_ok() {
             self.usb_manager = Some(usb_manager);
-            
+
             // Obtener drivers USB reales del gestor
             if let Some(ref mut manager) = self.usb_manager {
                 // Los drivers reales se manejan internamente en el UsbManager
                 // Solo actualizamos las estadísticas
-                self.stats.active_keyboards = if manager.is_keyboard_connected() { 1 } else { 0 };
+                self.stats.active_keyboards = if manager.is_keyboard_connected() {
+                    1
+                } else {
+                    0
+                };
                 self.stats.active_mice = if manager.is_mouse_connected() { 1 } else { 0 };
             }
         }
-        
+
         // Resetear estadísticas
         self.stats = InputSystemStats {
             total_events: 0,
@@ -191,19 +199,21 @@ impl InputSystem {
             active_keyboards: self.stats.active_keyboards,
             active_mice: self.stats.active_mice,
         };
-        
+
         self.initialized = true;
         Ok(())
     }
-    
+
     /// Agregar teclado USB
     pub fn add_keyboard(&mut self, mut keyboard: UsbKeyboardDriver) -> Result<u32, &'static str> {
-        keyboard.initialize().map_err(|e| "Error initializing keyboard")?;
-        
+        keyboard
+            .initialize()
+            .map_err(|e| "Error initializing keyboard")?;
+
         let device_id = self.keyboards.len() as u32;
         self.keyboards.push(keyboard);
         self.stats.active_keyboards += 1;
-        
+
         // Crear evento de dispositivo conectado
         let event = InputEvent::new(
             InputEventType::System(SystemEvent::DeviceConnected {
@@ -214,18 +224,18 @@ impl InputSystem {
             self.current_timestamp,
         );
         self.add_event(event);
-        
+
         Ok(device_id)
     }
-    
+
     /// Agregar mouse USB
     pub fn add_mouse(&mut self, mut mouse: UsbMouseDriver) -> Result<u32, &'static str> {
         mouse.initialize().map_err(|e| "Error initializing mouse")?;
-        
+
         let device_id = self.mice.len() as u32;
         self.mice.push(mouse);
         self.stats.active_mice += 1;
-        
+
         // Crear evento de dispositivo conectado
         let event = InputEvent::new(
             InputEventType::System(SystemEvent::DeviceConnected {
@@ -236,16 +246,16 @@ impl InputSystem {
             self.current_timestamp,
         );
         self.add_event(event);
-        
+
         Ok(device_id)
     }
-    
+
     /// Procesar eventos de todos los dispositivos
     pub fn process_events(&mut self) -> Result<(), &'static str> {
         if !self.initialized {
             return Err("Sistema de entrada no inicializado");
         }
-        
+
         // Procesar teclados
         let mut keyboard_events = Vec::new();
         for (i, keyboard) in self.keyboards.iter_mut().enumerate() {
@@ -255,7 +265,7 @@ impl InputSystem {
                 }
             }
         }
-        
+
         // Agregar eventos de teclado
         for (device_id, keyboard_event) in keyboard_events {
             let input_event = InputEvent::new(
@@ -265,7 +275,7 @@ impl InputSystem {
             );
             self.add_event(input_event);
         }
-        
+
         // Procesar mouse
         let mut mouse_events = Vec::new();
         for (i, mouse) in self.mice.iter_mut().enumerate() {
@@ -275,7 +285,7 @@ impl InputSystem {
                 }
             }
         }
-        
+
         // Agregar eventos de mouse
         for (device_id, mouse_event) in mouse_events {
             let input_event = InputEvent::new(
@@ -285,33 +295,35 @@ impl InputSystem {
             );
             self.add_event(input_event);
         }
-        
+
         // Procesar drivers USB reales
         self.process_real_usb_events()?;
-        
+
         // Actualizar timestamp
         self.current_timestamp += 1;
-        
+
         Ok(())
     }
-    
+
     /// Procesar eventos de drivers USB reales
     fn process_real_usb_events(&mut self) -> Result<(), &'static str> {
         // Recopilar eventos para evitar problemas de borrowing
         let mut keyboard_events = Vec::new();
         let mut mouse_events = Vec::new();
-        
+
         if let Some(ref mut usb_manager) = self.usb_manager {
             // Procesar interrupciones USB
-            usb_manager.handle_usb_interrupts().map_err(|_| "USB interrupt error")?;
-            
+            usb_manager
+                .handle_usb_interrupts()
+                .map_err(|_| "USB interrupt error")?;
+
             // Recopilar eventos de teclado
             while usb_manager.has_keyboard_events() {
                 if let Some(key_event) = usb_manager.get_next_key_event() {
                     keyboard_events.push(key_event);
                 }
             }
-            
+
             // Recopilar eventos de ratón
             while usb_manager.has_mouse_events() {
                 if let Some(mouse_event) = usb_manager.get_next_mouse_event() {
@@ -319,7 +331,7 @@ impl InputSystem {
                 }
             }
         }
-        
+
         // Procesar eventos recopilados
         for key_event in keyboard_events {
             let keyboard_event = InputSystem::convert_real_key_event_static(key_event);
@@ -330,7 +342,7 @@ impl InputSystem {
             );
             self.add_event(input_event);
         }
-        
+
         for mouse_event in mouse_events {
             let system_mouse_event = InputSystem::convert_real_mouse_event_static(mouse_event);
             let input_event = InputEvent::new(
@@ -340,10 +352,10 @@ impl InputSystem {
             );
             self.add_event(input_event);
         }
-        
+
         Ok(())
     }
-    
+
     /// Convertir KeyEvent real a KeyboardEvent del sistema (método estático)
     fn convert_real_key_event_static(key_event: KeyEvent) -> KeyboardEvent {
         // Convertir KeyCode a UsbKeyCode
@@ -387,7 +399,7 @@ impl InputSystem {
             KeyCode::RightAlt => UsbKeyCode::RightAlt,
             _ => UsbKeyCode::Unknown,
         };
-        
+
         // Convertir KeyState a ModifierState
         let modifier_state = ModifierState {
             left_ctrl: key_event.modifiers & 0x01 != 0,
@@ -402,16 +414,16 @@ impl InputSystem {
             caps_lock: false,
             scroll_lock: false,
         };
-        
+
         KeyboardEvent {
             key_code: usb_key_code,
             modifiers: modifier_state,
             pressed: matches!(key_event.state, KeyState::Pressed),
             character: None, // Por defecto, se puede calcular después
-            timestamp: 0, // Por defecto, se puede establecer después
+            timestamp: 0,    // Por defecto, se puede establecer después
         }
     }
-    
+
     /// Convertir MouseEvent real a MouseEvent del sistema (método estático)
     fn convert_real_mouse_event_static(mouse_event: RealMouseEvent) -> MouseEvent {
         // Convertir MouseButton real a MouseButton del sistema
@@ -424,9 +436,9 @@ impl InputSystem {
             RealMouseButton::Wheel => UsbMouseButton::WheelUp,
             _ => UsbMouseButton::Left, // Default
         };
-        
+
         let position = MousePosition::new_with_coords(mouse_event.x, mouse_event.y);
-        
+
         // Convertir a enum MouseEvent del sistema
         match mouse_event.state {
             MouseState::Pressed => MouseEvent::ButtonPress {
@@ -441,17 +453,14 @@ impl InputSystem {
                 position,
                 buttons: MouseButtonState::new(),
             },
-            MouseState::WheelUp => MouseEvent::Scroll {
-                delta: 1,
-                position,
-            },
+            MouseState::WheelUp => MouseEvent::Scroll { delta: 1, position },
             MouseState::WheelDown => MouseEvent::Scroll {
                 delta: -1,
                 position,
             },
         }
     }
-    
+
     /// Agregar evento al buffer
     fn add_event(&mut self, event: InputEvent) {
         // Verificar si hay espacio en el buffer
@@ -460,115 +469,132 @@ impl InputSystem {
             self.event_buffer.pop_front();
             self.stats.events_dropped += 1;
         }
-        
+
         // Agregar evento
         self.event_buffer.push_back(event);
         self.stats.total_events += 1;
-        
+
         // Actualizar estadísticas por tipo
         match self.event_buffer.back().unwrap().event_type {
             InputEventType::Keyboard(_) => self.stats.keyboard_events += 1,
             InputEventType::Mouse(_) => self.stats.mouse_events += 1,
             InputEventType::System(_) => self.stats.system_events += 1,
         }
-        
+
         // Actualizar uso del buffer
-        self.stats.buffer_usage = (self.event_buffer.len() as f32 / self.config.max_events as f32) * 100.0;
+        self.stats.buffer_usage =
+            (self.event_buffer.len() as f32 / self.config.max_events as f32) * 100.0;
     }
-    
+
     /// Obtener siguiente evento
     pub fn get_next_event(&mut self) -> Option<InputEvent> {
         self.event_buffer.pop_front()
     }
-    
+
     /// Verificar si hay eventos pendientes
     pub fn has_events(&self) -> bool {
         !self.event_buffer.is_empty()
     }
-    
+
     /// Obtener número de eventos pendientes
     pub fn event_count(&self) -> usize {
         self.event_buffer.len()
     }
-    
+
     /// Limpiar buffer de eventos
     pub fn clear_events(&mut self) {
         self.event_buffer.clear();
     }
-    
+
     /// Obtener estadísticas del sistema
     pub fn get_stats(&self) -> &InputSystemStats {
         &self.stats
     }
-    
+
     /// Obtener teclado por ID
     pub fn get_keyboard(&mut self, device_id: u32) -> Option<&mut UsbKeyboardDriver> {
         self.keyboards.get_mut(device_id as usize)
     }
-    
+
     /// Obtener mouse por ID
     pub fn get_mouse(&mut self, device_id: u32) -> Option<&mut UsbMouseDriver> {
         self.mice.get_mut(device_id as usize)
     }
-    
+
     /// Obtener número de teclados activos
     pub fn keyboard_count(&self) -> usize {
         self.keyboards.len()
     }
-    
+
     /// Obtener número de mouse activos
     pub fn mouse_count(&self) -> usize {
         self.mice.len()
     }
-    
+
     /// Verificar si el sistema está inicializado
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
-    
+
     /// Actualizar configuración
     pub fn update_config(&mut self, config: InputSystemConfig) {
         self.config = config;
-        
+
         // Aplicar nueva sensibilidad a todos los mouse
         for mouse in &mut self.mice {
             mouse.set_sensitivity(self.config.mouse_sensitivity);
         }
     }
-    
+
     /// Obtener configuración actual
     pub fn get_config(&self) -> &InputSystemConfig {
         &self.config
     }
-    
+
     /// Procesar datos de teclado
-    pub fn process_keyboard_data(&mut self, device_id: u32, data: &[u8]) -> Result<(), &'static str> {
+    pub fn process_keyboard_data(
+        &mut self,
+        device_id: u32,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
         if let Some(keyboard) = self.get_keyboard(device_id) {
-            keyboard.process_keyboard_data(data).map_err(|e| "Error processing keyboard data")?;
+            keyboard
+                .process_keyboard_data(data)
+                .map_err(|e| "Error processing keyboard data")?;
         } else {
             return Err("Teclado no encontrado");
         }
         Ok(())
     }
-    
+
     /// Procesar datos de mouse
     pub fn process_mouse_data(&mut self, device_id: u32, data: &[u8]) -> Result<(), &'static str> {
         if let Some(mouse) = self.get_mouse(device_id) {
-            mouse.process_mouse_data(data).map_err(|e| "Error processing mouse data")?;
+            mouse
+                .process_mouse_data(data)
+                .map_err(|e| "Error processing mouse data")?;
         } else {
             return Err("Mouse no encontrado");
         }
         Ok(())
     }
-    
+
     /// Obtener estado actual de todos los dispositivos
     pub fn get_device_states(&self) -> DeviceStates {
         DeviceStates {
-            keyboards: self.keyboards.iter().map(|k| k.get_modifier_state()).collect(),
-            mice: self.mice.iter().map(|m| (m.get_position(), m.get_button_state())).collect(),
+            keyboards: self
+                .keyboards
+                .iter()
+                .map(|k| k.get_modifier_state())
+                .collect(),
+            mice: self
+                .mice
+                .iter()
+                .map(|m| (m.get_position(), m.get_button_state()))
+                .collect(),
         }
     }
-    
+
     /// Obtener información de drivers USB reales
     pub fn get_real_usb_info(&self) -> String {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -577,7 +603,7 @@ impl InputSystem {
             "Gestor USB real no inicializado".to_string()
         }
     }
-    
+
     /// Verificar si hay teclado USB real conectado
     pub fn has_real_keyboard(&self) -> bool {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -586,7 +612,7 @@ impl InputSystem {
             false
         }
     }
-    
+
     /// Verificar si hay ratón USB real conectado
     pub fn has_real_mouse(&self) -> bool {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -595,7 +621,7 @@ impl InputSystem {
             false
         }
     }
-    
+
     /// Obtener número de dispositivos USB reales conectados
     pub fn get_real_usb_device_count(&self) -> u32 {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -604,19 +630,29 @@ impl InputSystem {
             0
         }
     }
-    
+
     /// Reinicializar drivers USB reales
     pub fn reinitialize_real_usb(&mut self) -> Result<(), &'static str> {
         if let Some(ref mut usb_manager) = self.usb_manager {
-            usb_manager.reinitialize_devices().map_err(|_| "Error reinicializando USB")?;
-            
+            usb_manager
+                .reinitialize_devices()
+                .map_err(|_| "Error reinicializando USB")?;
+
             // Actualizar estadísticas
-            self.stats.active_keyboards = if usb_manager.is_keyboard_connected() { 1 } else { 0 };
-            self.stats.active_mice = if usb_manager.is_mouse_connected() { 1 } else { 0 };
+            self.stats.active_keyboards = if usb_manager.is_keyboard_connected() {
+                1
+            } else {
+                0
+            };
+            self.stats.active_mice = if usb_manager.is_mouse_connected() {
+                1
+            } else {
+                0
+            };
         }
         Ok(())
     }
-    
+
     /// Obtener posición del ratón USB real
     pub fn get_real_mouse_position(&self) -> Option<(i32, i32)> {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -629,7 +665,7 @@ impl InputSystem {
             None
         }
     }
-    
+
     /// Establecer posición del ratón USB real
     pub fn set_real_mouse_position(&mut self, x: i32, y: i32) -> Result<(), &'static str> {
         if let Some(ref mut usb_manager) = self.usb_manager {
@@ -643,7 +679,7 @@ impl InputSystem {
             Err("Gestor USB real no inicializado")
         }
     }
-    
+
     /// Verificar si una tecla está presionada en el teclado USB real
     pub fn is_real_key_pressed(&self, key: KeyCode) -> bool {
         if let Some(ref usb_manager) = self.usb_manager {
@@ -656,7 +692,7 @@ impl InputSystem {
             false
         }
     }
-    
+
     /// Verificar si un botón del ratón USB real está presionado
     pub fn is_real_mouse_button_pressed(&self, button: RealMouseButton) -> bool {
         if let Some(ref usb_manager) = self.usb_manager {

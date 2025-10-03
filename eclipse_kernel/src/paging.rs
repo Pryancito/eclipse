@@ -1,10 +1,10 @@
 //! Sistema de paginación para Eclipse OS
-//! 
+//!
 //! Este módulo maneja la configuración de tablas de páginas y mapeo de memoria
 
-use core::ptr;
-use core::mem;
 use core::arch::asm;
+use core::mem;
+use core::ptr;
 
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -13,11 +13,11 @@ pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_PRESENT: u64 = 1 << 0;
 pub const PAGE_WRITABLE: u64 = 1 << 1;
 pub const PAGE_USER: u64 = 1 << 2;
-pub const PAGE_PWT: u64 = 1 << 3;  // Page Write Through
-pub const PAGE_PCD: u64 = 1 << 4;  // Page Cache Disable
+pub const PAGE_PWT: u64 = 1 << 3; // Page Write Through
+pub const PAGE_PCD: u64 = 1 << 4; // Page Cache Disable
 pub const PAGE_ACCESSED: u64 = 1 << 5;
 pub const PAGE_DIRTY: u64 = 1 << 6;
-pub const PAGE_SIZE_FLAG: u64 = 1 << 7;  // Page Size (2MB pages)
+pub const PAGE_SIZE_FLAG: u64 = 1 << 7; // Page Size (2MB pages)
 pub const PAGE_GLOBAL: u64 = 1 << 8;
 
 /// Entrada de tabla de páginas
@@ -111,29 +111,34 @@ impl PageTable {
     }
 
     /// Mapear página virtual a física
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
+    pub fn map_page(
+        &mut self,
+        virtual_addr: u64,
+        physical_addr: u64,
+        flags: u64,
+    ) -> Result<(), &'static str> {
         let index = ((virtual_addr >> 12) & 0x1FF) as usize;
-        
+
         if index >= 512 {
             return Err("Índice de tabla de páginas inválido");
         }
 
         let entry = PageTableEntry::new_with_flags(physical_addr, flags | PAGE_PRESENT);
         self.set_entry(index, entry);
-        
+
         Ok(())
     }
 
     /// Desmapear página
     pub fn unmap_page(&mut self, virtual_addr: u64) -> Result<(), &'static str> {
         let index = ((virtual_addr >> 12) & 0x1FF) as usize;
-        
+
         if index >= 512 {
             return Err("Índice de tabla de páginas inválido");
         }
 
         self.set_entry(index, PageTableEntry::new());
-        
+
         Ok(())
     }
 }
@@ -153,17 +158,24 @@ impl PageDirectoryPointerTable {
     }
 
     /// Mapear tabla de páginas
-    pub fn map_page_table(&mut self, virtual_addr: u64, page_table: &PageTable) -> Result<(), &'static str> {
+    pub fn map_page_table(
+        &mut self,
+        virtual_addr: u64,
+        page_table: &PageTable,
+    ) -> Result<(), &'static str> {
         let index = ((virtual_addr >> 21) & 0x1FF) as usize;
-        
+
         if index >= 512 {
             return Err("Índice de PDPT inválido");
         }
 
         let page_table_addr = page_table as *const PageTable as u64;
-        let entry = PageTableEntry::new_with_flags(page_table_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        let entry = PageTableEntry::new_with_flags(
+            page_table_addr,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+        );
         self.entries[index] = entry;
-        
+
         Ok(())
     }
 }
@@ -183,17 +195,24 @@ impl PageDirectory {
     }
 
     /// Mapear tabla de páginas
-    pub fn map_page_table(&mut self, virtual_addr: u64, page_table: &PageTable) -> Result<(), &'static str> {
+    pub fn map_page_table(
+        &mut self,
+        virtual_addr: u64,
+        page_table: &PageTable,
+    ) -> Result<(), &'static str> {
         let index = ((virtual_addr >> 21) & 0x1FF) as usize;
-        
+
         if index >= 512 {
             return Err("Índice de directorio de páginas inválido");
         }
 
         let page_table_addr = page_table as *const PageTable as u64;
-        let entry = PageTableEntry::new_with_flags(page_table_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        let entry = PageTableEntry::new_with_flags(
+            page_table_addr,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+        );
         self.entries[index] = entry;
-        
+
         Ok(())
     }
 }
@@ -213,17 +232,22 @@ impl PageMapLevel4 {
     }
 
     /// Mapear PDPT
-    pub fn map_pdpt(&mut self, virtual_addr: u64, pdpt: &PageDirectoryPointerTable) -> Result<(), &'static str> {
+    pub fn map_pdpt(
+        &mut self,
+        virtual_addr: u64,
+        pdpt: &PageDirectoryPointerTable,
+    ) -> Result<(), &'static str> {
         let index = ((virtual_addr >> 39) & 0x1FF) as usize;
-        
+
         if index >= 512 {
             return Err("Índice de PML4 inválido");
         }
 
         let pdpt_addr = pdpt as *const PageDirectoryPointerTable as u64;
-        let entry = PageTableEntry::new_with_flags(pdpt_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        let entry =
+            PageTableEntry::new_with_flags(pdpt_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         self.entries[index] = entry;
-        
+
         Ok(())
     }
 }
@@ -245,7 +269,7 @@ impl PagingManager {
             pdpt: PageDirectoryPointerTable::new(),
             pd: PageDirectory::new(),
             pt: PageTable::new(),
-            next_physical_addr: 0x100000,  // Empezar después de los primeros 1MB
+            next_physical_addr: 0x100000, // Empezar después de los primeros 1MB
         }
     }
 
@@ -253,19 +277,19 @@ impl PagingManager {
     pub fn setup_userland_paging(&mut self) -> Result<u64, &'static str> {
         // Configurar mapeo de PML4 -> PDPT
         self.pml4.map_pdpt(0, &self.pdpt)?;
-        
+
         // Configurar mapeo de PDPT -> PD (usar PageTable en lugar de PageDirectory)
         // self.pdpt.map_page_table(0, &self.pd)?;
-        
+
         // Configurar mapeo de PD -> PT
         self.pd.map_page_table(0, &self.pt)?;
-        
+
         // Mapear memoria del kernel (primeros 1MB)
         self.map_kernel_memory()?;
-        
+
         // Mapear memoria del userland
         self.map_userland_memory()?;
-        
+
         // Retornar dirección física de PML4
         Ok(&self.pml4 as *const PageMapLevel4 as u64)
     }
@@ -273,33 +297,35 @@ impl PagingManager {
     /// Mapear memoria del kernel
     fn map_kernel_memory(&mut self) -> Result<(), &'static str> {
         // Mapear los primeros 1MB con permisos de kernel
-        for i in 0..256 {  // 256 páginas = 1MB
+        for i in 0..256 {
+            // 256 páginas = 1MB
             let virtual_addr = i * PAGE_SIZE;
-            let physical_addr = virtual_addr;  // Mapeo 1:1 para el kernel
-            let flags = PAGE_PRESENT | PAGE_WRITABLE;  // Solo kernel puede escribir
-            
+            let physical_addr = virtual_addr; // Mapeo 1:1 para el kernel
+            let flags = PAGE_PRESENT | PAGE_WRITABLE; // Solo kernel puede escribir
+
             self.pt.map_page(virtual_addr, physical_addr, flags)?;
         }
-        
+
         Ok(())
     }
 
     /// Mapear memoria del userland
     fn map_userland_memory(&mut self) -> Result<(), &'static str> {
-        // Mapear espacio de userland (0x400000 - 0x7FFFFFFFFFFF)
+        // Mapear solo un rango pequeño de memoria del userland para eclipse-systemd
+        // Esto evita problemas de alineación y asignación excesiva de memoria
         let userland_start = 0x400000;
-        let userland_end = 0x800000000000;  // 48 bits de espacio virtual
-        
+        let userland_end = 0x500000; // Solo 1MB de memoria del userland
+
         let mut current_addr = userland_start;
         while current_addr < userland_end {
             let physical_addr = self.allocate_physical_page()?;
             let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            
+
             self.pt.map_page(current_addr, physical_addr, flags)?;
-            
+
             current_addr += PAGE_SIZE;
         }
-        
+
         Ok(())
     }
 
@@ -307,24 +333,25 @@ impl PagingManager {
     fn allocate_physical_page(&mut self) -> Result<u64, &'static str> {
         let addr = self.next_physical_addr;
         self.next_physical_addr += PAGE_SIZE;
-        
-        if self.next_physical_addr > 0x100000000 {  // Límite de 4GB
+
+        if self.next_physical_addr > 0x100000000 {
+            // Límite de 4GB
             return Err("Memoria física agotada");
         }
-        
+
         Ok(addr)
     }
 
     /// Mapear página específica
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
-        // Verificar que la dirección virtual esté en el rango mapeado
-        if virtual_addr < 0x400000 || virtual_addr >= 0x800000000000 {
-            return Err("Dirección virtual fuera del rango de userland");
-        }
-
+    pub fn map_page(
+        &mut self,
+        virtual_addr: u64,
+        physical_addr: u64,
+        flags: u64,
+    ) -> Result<(), &'static str> {
         // Mapear en la tabla de páginas
         self.pt.map_page(virtual_addr, physical_addr, flags)?;
-        
+
         Ok(())
     }
 

@@ -1,13 +1,13 @@
 //! Gestor de Framebuffer con Referencias Compartidas
-//! 
+//!
 //! Implementa un sistema de referencias compartidas para el framebuffer
 //! que permite actualizar todas las referencias cuando el framebuffer cambia.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
-use alloc::sync::Arc;
+use crate::drivers::framebuffer::{FramebufferDriver, FramebufferInfo};
 use alloc::boxed::Box;
 use alloc::string::String;
-use crate::drivers::framebuffer::{FramebufferDriver, FramebufferInfo};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Puntero atómico al framebuffer actual
 static CURRENT_FRAMEBUFFER: AtomicPtr<FramebufferDriver> = AtomicPtr::new(core::ptr::null_mut());
@@ -20,9 +20,7 @@ pub struct FramebufferManager {
 impl FramebufferManager {
     /// Crear nuevo gestor de framebuffer
     pub fn new() -> Self {
-        Self {
-            current_fb: None,
-        }
+        Self { current_fb: None }
     }
 
     /// Establecer el framebuffer actual
@@ -30,10 +28,10 @@ impl FramebufferManager {
         // Crear una copia en el heap
         let fb_box = Box::new(fb);
         let fb_ptr = Box::into_raw(fb_box);
-        
+
         // Actualizar el puntero atómico
         CURRENT_FRAMEBUFFER.store(fb_ptr, Ordering::SeqCst);
-        
+
         // Crear Arc para referencias compartidas
         let fb_arc = unsafe { Arc::from_raw(fb_ptr) };
         self.current_fb = Some(fb_arc);
@@ -61,7 +59,7 @@ impl FramebufferManager {
             // Crear nuevo framebuffer con la información actualizada
             let mut new_fb = (**fb_arc).clone();
             new_fb.info = new_info;
-            
+
             // Reemplazar el framebuffer actual (desempaquetar del Arc)
             self.set_framebuffer(new_fb);
             Ok(())

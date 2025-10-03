@@ -1,7 +1,7 @@
-use core::fmt;
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
 
 /// Estructura que representa un modo de video
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,8 +38,11 @@ impl fmt::Display for ResolutionChangeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ResolutionChangeResult::Success(info) => {
-                write!(f, "Resolución cambiada exitosamente: {}x{} @0x{:X}", 
-                       info.width, info.height, info.base_address)
+                write!(
+                    f,
+                    "Resolución cambiada exitosamente: {}x{} @0x{:X}",
+                    info.width, info.height, info.base_address
+                )
             }
             ResolutionChangeResult::ModeNotFound => {
                 write!(f, "Modo de video no encontrado")
@@ -79,7 +82,7 @@ impl ResolutionManager {
         // En un sistema real, aquí se consultaría UEFI GOP
         // Por ahora, simulamos algunos modos comunes con validación
         self.available_modes.clear();
-        
+
         // Modos de video comunes ordenados por seguridad (más seguros primero)
         let common_modes = [
             (640, 480, 32, 60),   // VGA - Muy seguro
@@ -155,7 +158,12 @@ impl ResolutionManager {
     }
 
     /// Cambiar a un modo de video específico con validación mejorada
-    pub fn set_mode(&mut self, width: u32, height: u32, bits_per_pixel: u32) -> ResolutionChangeResult {
+    pub fn set_mode(
+        &mut self,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> ResolutionChangeResult {
         // Validar parámetros básicos
         if width == 0 || height == 0 || bits_per_pixel == 0 {
             return ResolutionChangeResult::InvalidMode;
@@ -210,7 +218,9 @@ impl ResolutionManager {
             (3840, 2160), // 4K
         ];
 
-        standard_resolutions.iter().any(|(w, h)| *w == width && *h == height)
+        standard_resolutions
+            .iter()
+            .any(|(w, h)| *w == width && *h == height)
     }
 
     /// Validar compatibilidad del modo con el hardware actual
@@ -241,7 +251,7 @@ impl ResolutionManager {
         // 2. Llamaría a UEFI GOP SetMode con validación
         // 3. Verificaría que el cambio fue exitoso
         // 4. Si falla, restauraría el modo anterior
-        
+
         // Simulamos la información del framebuffer con validación adicional
         let framebuffer_info = FramebufferInfo {
             base_address: 0xE0000000, // Dirección simulada
@@ -254,7 +264,7 @@ impl ResolutionManager {
 
         // Simular una pequeña pausa para evitar cambios demasiado rápidos
         // En un sistema real, esto sería una espera de sincronización
-        
+
         Ok(framebuffer_info)
     }
 
@@ -264,7 +274,7 @@ impl ResolutionManager {
         // 1. Llamaría a UEFI GOP SetMode
         // 2. Obtendría la nueva información del framebuffer
         // 3. Actualizaría las tablas de páginas
-        
+
         // Simulamos la información del framebuffer
         let framebuffer_info = FramebufferInfo {
             base_address: 0xE0000000, // Dirección simulada
@@ -295,11 +305,17 @@ impl ResolutionManager {
         }
 
         // Encontrar el modo con la resolución más alta
-        let highest_mode = self.available_modes.iter()
+        let highest_mode = self
+            .available_modes
+            .iter()
             .max_by_key(|mode| mode.width * mode.height)
             .unwrap();
 
-        self.set_mode(highest_mode.width, highest_mode.height, highest_mode.bits_per_pixel)
+        self.set_mode(
+            highest_mode.width,
+            highest_mode.height,
+            highest_mode.bits_per_pixel,
+        )
     }
 
     /// Cambiar a la mejor resolución segura disponible
@@ -327,7 +343,11 @@ impl ResolutionManager {
 
         // Si no se encuentra ninguna resolución segura, usar la primera disponible
         let first_mode = &self.available_modes[0];
-        self.set_mode(first_mode.width, first_mode.height, first_mode.bits_per_pixel)
+        self.set_mode(
+            first_mode.width,
+            first_mode.height,
+            first_mode.bits_per_pixel,
+        )
     }
 
     /// Obtener la mejor resolución recomendada para el monitor
@@ -353,7 +373,11 @@ impl ResolutionManager {
 
         // Si no se encuentra ninguna recomendada, usar la primera disponible
         let first_mode = &self.available_modes[0];
-        Some((first_mode.width, first_mode.height, first_mode.bits_per_pixel))
+        Some((
+            first_mode.width,
+            first_mode.height,
+            first_mode.bits_per_pixel,
+        ))
     }
 
     /// Cambiar a una resolución específica por nombre
@@ -380,8 +404,10 @@ impl ResolutionManager {
     /// Obtener información de resolución en formato legible
     pub fn get_resolution_info(&self) -> String {
         if let Some(mode) = &self.current_mode {
-            format!("{}x{} @{}bpp ({}Hz)", 
-                   mode.width, mode.height, mode.bits_per_pixel, mode.refresh_rate)
+            format!(
+                "{}x{} @{}bpp ({}Hz)",
+                mode.width, mode.height, mode.bits_per_pixel, mode.refresh_rate
+            )
         } else {
             "No hay modo establecido".to_string()
         }
@@ -395,8 +421,10 @@ impl ResolutionManager {
 
         let mut result = String::new();
         for (i, mode) in self.available_modes.iter().enumerate() {
-            result.push_str(&format!("{}: {}x{} @{}bpp ({}Hz)\n", 
-                                   i, mode.width, mode.height, mode.bits_per_pixel, mode.refresh_rate));
+            result.push_str(&format!(
+                "{}: {}x{} @{}bpp ({}Hz)\n",
+                i, mode.width, mode.height, mode.bits_per_pixel, mode.refresh_rate
+            ));
         }
         result
     }
@@ -418,7 +446,7 @@ pub mod uefi_integration {
         // 1. Obtendría el protocolo GOP de UEFI System Table
         // 2. Llamaría a QueryMode para cada modo disponible
         // 3. Construiría la lista de VideoMode
-        
+
         // Por ahora, devolvemos una lista vacía
         Ok(Vec::new())
     }
@@ -429,7 +457,7 @@ pub mod uefi_integration {
         // 1. Llamaría a UEFI GOP SetMode
         // 2. Obtendría la nueva información del framebuffer
         // 3. Actualizaría las estructuras del kernel
-        
+
         Err("UEFI GOP no implementado")
     }
 }
@@ -457,7 +485,7 @@ mod tests {
     fn test_find_mode() {
         let mut manager = ResolutionManager::new();
         manager.detect_available_modes().unwrap();
-        
+
         let mode = manager.find_mode(1920, 1080, 32);
         assert!(mode.is_some());
         assert_eq!(mode.unwrap().width, 1920);
@@ -468,7 +496,7 @@ mod tests {
     fn test_set_mode() {
         let mut manager = ResolutionManager::new();
         manager.detect_available_modes().unwrap();
-        
+
         let result = manager.set_mode(1920, 1080, 32);
         match result {
             ResolutionChangeResult::Success(_) => {

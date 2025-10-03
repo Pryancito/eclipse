@@ -1,15 +1,15 @@
 //! Sistema CUDA para Aceleración GPU de COSMIC Desktop
-//! 
+//!
 //! Este módulo implementa la integración CUDA avanzada para acelerar el renderizado
 //! del entorno de escritorio COSMIC usando la GPU para operaciones paralelas de gráficos.
 
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
+use super::ai_renderer::{ObjectContent, ObjectType, ObjectUUID};
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec;
-use crate::drivers::framebuffer::{FramebufferDriver, Color};
-use super::ai_renderer::{ObjectUUID, ObjectType, ObjectContent};
+use alloc::vec::Vec;
 
 /// Gestor CUDA de COSMIC
 #[derive(Debug, Clone)]
@@ -219,7 +219,7 @@ impl CosmicCuda {
     fn allocate_gpu_memory(&mut self) -> Result<bool, String> {
         // Simulación de asignación de memoria
         let memory_size = (self.config.gpu_memory_mb * 1024 * 1024) as u64;
-        
+
         self.gpu_memory.total_size = memory_size;
         self.gpu_memory.free_size = memory_size;
         self.gpu_memory.used_size = 0;
@@ -247,17 +247,21 @@ impl CosmicCuda {
     }
 
     /// Renderizar con aceleración CUDA (usando IPC)
-    pub fn render_with_cuda(&mut self, objects: &Vec<CudaRenderObject>, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    pub fn render_with_cuda(
+        &mut self,
+        objects: &Vec<CudaRenderObject>,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         if !self.state.gpu_rendering_active {
             return Err("Renderizado GPU no está activo".to_string());
         }
 
         // Optimización: Agrupar objetos por tipo para renderizado en lote
         let optimized_objects = self.optimize_objects_for_batch_rendering(objects);
-        
+
         // Convertir objetos optimizados a formato IPC
         let ipc_objects = self.convert_to_ipc_objects(&optimized_objects);
-        
+
         // Simular envío IPC optimizado al servicio CUDA
         match self.send_render_request_ipc_optimized(objects, 1024, 768) {
             Ok(framebuffer_data) => {
@@ -279,9 +283,12 @@ impl CosmicCuda {
     }
 
     /// Optimizar objetos para renderizado en lote
-    fn optimize_objects_for_batch_rendering(&self, objects: &Vec<CudaRenderObject>) -> Vec<CudaRenderObject> {
+    fn optimize_objects_for_batch_rendering(
+        &self,
+        objects: &Vec<CudaRenderObject>,
+    ) -> Vec<CudaRenderObject> {
         let mut optimized = Vec::new();
-        
+
         // Agrupar objetos por tipo para renderizado eficiente
         let mut rect_objects = Vec::new();
         let mut text_objects = Vec::new();
@@ -291,13 +298,13 @@ impl CosmicCuda {
             match obj.object_type {
                 ObjectType::Window | ObjectType::Button | ObjectType::Panel => {
                     rect_objects.push(obj.clone());
-                },
+                }
                 ObjectType::Text => {
                     text_objects.push(obj.clone());
-                },
+                }
                 ObjectType::Image => {
                     effect_objects.push(obj.clone());
-                },
+                }
                 _ => {
                     optimized.push(obj.clone());
                 }
@@ -318,39 +325,52 @@ impl CosmicCuda {
     }
 
     /// Envío IPC optimizado al servicio CUDA
-    fn send_render_request_ipc_optimized(&self, objects: &Vec<CudaRenderObject>, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    fn send_render_request_ipc_optimized(
+        &self,
+        objects: &Vec<CudaRenderObject>,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
         // Simular envío optimizado al servicio CUDA
         // En un sistema real, aquí usaríamos IPC optimizado con batching
-        
+
         // Simular procesamiento optimizado
         let framebuffer_size = (width * height * 4) as usize; // 4 bytes por pixel
         let framebuffer_data = vec![0u8; framebuffer_size];
-        
+
         Ok(framebuffer_data)
     }
 
     /// Aplicar datos de framebuffer optimizado
-    fn apply_framebuffer_data_optimized(&self, framebuffer: &mut FramebufferDriver, data: &Vec<u8>) -> Result<(), String> {
+    fn apply_framebuffer_data_optimized(
+        &self,
+        framebuffer: &mut FramebufferDriver,
+        data: &Vec<u8>,
+    ) -> Result<(), String> {
         // Simular aplicación optimizada de datos
         // En un sistema real, aquí copiaríamos los datos optimizados
-        
+
         Ok(())
     }
 
     /// Renderizado CUDA local optimizado (fallback)
-    fn render_with_cuda_local_optimized(&mut self, objects: &Vec<CudaRenderObject>, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_with_cuda_local_optimized(
+        &mut self,
+        objects: &Vec<CudaRenderObject>,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Renderizado local optimizado como fallback
         for obj in objects {
             match obj.object_type {
                 ObjectType::Window | ObjectType::Button | ObjectType::Panel => {
                     self.render_rect_cuda_optimized(obj, framebuffer)?;
-                },
+                }
                 ObjectType::Text => {
                     self.render_text_cuda_optimized(obj, framebuffer)?;
-                },
+                }
                 ObjectType::Image => {
                     self.render_effect_cuda_optimized(obj, framebuffer)?;
-                },
+                }
                 _ => {}
             }
         }
@@ -358,41 +378,57 @@ impl CosmicCuda {
     }
 
     /// Renderizar rectángulo CUDA optimizado
-    fn render_rect_cuda_optimized(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_rect_cuda_optimized(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA optimizado para rectángulos
         self.stats.gpu_render_time += 0.001; // 1ms optimizado
         Ok(())
     }
 
     /// Renderizar texto CUDA optimizado
-    fn render_text_cuda_optimized(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_text_cuda_optimized(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA optimizado para texto
         self.stats.gpu_render_time += 0.002; // 2ms optimizado
         Ok(())
     }
 
     /// Renderizar efecto CUDA optimizado
-    fn render_effect_cuda_optimized(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_effect_cuda_optimized(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA optimizado para efectos
         self.stats.gpu_render_time += 0.003; // 3ms optimizado
         Ok(())
     }
 
     /// Renderizar rectángulo con CUDA
-    fn render_rect_cuda(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_rect_cuda(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA para renderizado de rectángulos
         // En un sistema real, aquí se ejecutaría el kernel en la GPU
-        
+
         // Simular procesamiento paralelo
         let start_time = self.get_current_time();
-        
+
         // Renderizar en CPU (simulando que viene de GPU)
         framebuffer.draw_rect(
             obj.x as u32,
             obj.y as u32,
             obj.width,
             obj.height,
-            Color::from_hex(obj.color)
+            Color::from_hex(obj.color),
         );
 
         let end_time = self.get_current_time();
@@ -403,16 +439,20 @@ impl CosmicCuda {
     }
 
     /// Renderizar texto con CUDA
-    fn render_text_cuda(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_text_cuda(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA para renderizado de texto
         let start_time = self.get_current_time();
-        
+
         // Renderizar texto (simulando que viene de GPU)
         framebuffer.draw_text_simple(
             obj.x as u32,
             obj.y as u32,
             &obj.text.clone().unwrap_or("CUDA Text".to_string()),
-            Color::from_hex(obj.color)
+            Color::from_hex(obj.color),
         );
 
         let end_time = self.get_current_time();
@@ -423,7 +463,11 @@ impl CosmicCuda {
     }
 
     /// Componer objetos con CUDA
-    pub fn compose_with_cuda(&mut self, compositions: &Vec<CudaComposition>, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    pub fn compose_with_cuda(
+        &mut self,
+        compositions: &Vec<CudaComposition>,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         if !self.config.enable_gpu_composition {
             return Err("Composición GPU deshabilitada".to_string());
         }
@@ -438,7 +482,11 @@ impl CosmicCuda {
     }
 
     /// Renderizar composición con CUDA
-    fn render_composition_cuda(&mut self, composition: &CudaComposition, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_composition_cuda(
+        &mut self,
+        composition: &CudaComposition,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Simular kernel CUDA para composición
         for obj in &composition.objects {
             self.render_rect_cuda(obj, framebuffer)?;
@@ -452,9 +500,9 @@ impl CosmicCuda {
         if self.stats.cpu_render_time > 0.0 {
             self.stats.speedup = self.stats.cpu_render_time / self.stats.gpu_render_time.max(0.001);
         }
-        
+
         self.stats.gpu_memory_used = (self.gpu_memory.used_size as f32) / (1024.0 * 1024.0);
-        
+
         // Simular FPS
         if self.stats.gpu_render_time > 0.0 {
             self.stats.gpu_fps = 1000.0 / self.stats.gpu_render_time;
@@ -470,13 +518,19 @@ impl CosmicCuda {
 
     /// Obtener información CUDA
     pub fn get_cuda_info(&self) -> String {
-        format!("CUDA: GPU={} | Kernels={} | Memoria={:.1}MB/{:.1}MB | FPS={:.1} | Speedup={:.2}x",
-                if self.state.gpu_available { "Disponible" } else { "No disponible" },
-                self.stats.kernels_executed,
-                self.stats.gpu_memory_used,
-                self.stats.gpu_memory_total,
-                self.stats.gpu_fps,
-                self.stats.speedup)
+        format!(
+            "CUDA: GPU={} | Kernels={} | Memoria={:.1}MB/{:.1}MB | FPS={:.1} | Speedup={:.2}x",
+            if self.state.gpu_available {
+                "Disponible"
+            } else {
+                "No disponible"
+            },
+            self.stats.kernels_executed,
+            self.stats.gpu_memory_used,
+            self.stats.gpu_memory_total,
+            self.stats.gpu_fps,
+            self.stats.speedup
+        )
     }
 
     /// Obtener estadísticas CUDA
@@ -492,7 +546,7 @@ impl CosmicCuda {
     /// Convertir objetos a formato IPC
     fn convert_to_ipc_objects(&self, objects: &Vec<CudaRenderObject>) -> Vec<IpcRenderObject> {
         let mut ipc_objects = Vec::new();
-        
+
         for obj in objects {
             let ipc_obj = IpcRenderObject {
                 uuid: obj.uuid.uuid.to_short_string(),
@@ -508,35 +562,40 @@ impl CosmicCuda {
             };
             ipc_objects.push(ipc_obj);
         }
-        
+
         ipc_objects
     }
 
     /// Enviar solicitud de renderizado via IPC
-    fn send_render_request_ipc(&self, objects: &Vec<IpcRenderObject>, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    fn send_render_request_ipc(
+        &self,
+        objects: &Vec<IpcRenderObject>,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
         // En un sistema real, aquí usaríamos el cliente IPC para comunicarse con el servicio CUDA
         // Por ahora, simulamos una respuesta exitosa
-        
+
         // Simular datos de framebuffer (RGBA)
         let mut framebuffer_data = alloc::vec![0u8; (width * height * 4) as usize];
-        
+
         // Simular renderizado de objetos
         for obj in objects {
             if !obj.visible {
                 continue;
             }
-            
+
             // Simular renderizado de rectángulo
             let r = ((obj.color >> 16) & 0xFF) as u8;
             let g = ((obj.color >> 8) & 0xFF) as u8;
             let b = (obj.color & 0xFF) as u8;
             let a = 255u8;
-            
+
             let start_x = obj.x.max(0) as u32;
             let start_y = obj.y.max(0) as u32;
             let end_x = (obj.x + obj.width as i32).min(width as i32) as u32;
             let end_y = (obj.y + obj.height as i32).min(height as i32) as u32;
-            
+
             for y in start_y..end_y {
                 for x in start_x..end_x {
                     let pixel_index = ((y * width + x) * 4) as usize;
@@ -549,38 +608,46 @@ impl CosmicCuda {
                 }
             }
         }
-        
+
         Ok(framebuffer_data)
     }
 
     /// Aplicar datos del framebuffer al driver
-    fn apply_framebuffer_data(&self, framebuffer: &mut FramebufferDriver, data: &[u8]) -> Result<(), String> {
+    fn apply_framebuffer_data(
+        &self,
+        framebuffer: &mut FramebufferDriver,
+        data: &[u8],
+    ) -> Result<(), String> {
         // En un sistema real, aquí copiaríamos los datos del framebuffer
         // Por ahora, simulamos aplicando algunos objetos directamente
-        
+
         // Simular aplicación de datos
         // (En un sistema real, esto sería más eficiente)
-        
+
         Ok(())
     }
 
     /// Renderizado CUDA local (fallback)
-    fn render_with_cuda_local(&mut self, objects: &Vec<CudaRenderObject>, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_with_cuda_local(
+        &mut self,
+        objects: &Vec<CudaRenderObject>,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         // Renderizado local como fallback
         for obj in objects {
             match obj.object_type {
                 ObjectType::Window => {
                     self.render_rect_cuda_local(obj, framebuffer)?;
-                },
+                }
                 ObjectType::Button => {
                     self.render_rect_cuda_local(obj, framebuffer)?;
-                },
+                }
                 ObjectType::Panel => {
                     self.render_rect_cuda_local(obj, framebuffer)?;
-                },
+                }
                 ObjectType::Text => {
                     self.render_text_cuda_local(obj, framebuffer)?;
-                },
+                }
                 _ => {
                     self.render_rect_cuda_local(obj, framebuffer)?;
                 }
@@ -590,25 +657,33 @@ impl CosmicCuda {
     }
 
     /// Renderizar rectángulo CUDA local
-    fn render_rect_cuda_local(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_rect_cuda_local(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         framebuffer.draw_rect(
             obj.x as u32,
             obj.y as u32,
             obj.width,
             obj.height,
-            Color::from_hex(obj.color)
+            Color::from_hex(obj.color),
         );
         Ok(())
     }
 
     /// Renderizar texto CUDA local
-    fn render_text_cuda_local(&mut self, obj: &CudaRenderObject, framebuffer: &mut FramebufferDriver) -> Result<(), String> {
+    fn render_text_cuda_local(
+        &mut self,
+        obj: &CudaRenderObject,
+        framebuffer: &mut FramebufferDriver,
+    ) -> Result<(), String> {
         if let Some(ref text) = obj.text {
             framebuffer.draw_text_simple(
                 obj.x as u32,
                 obj.y as u32,
                 text,
-                Color::from_hex(obj.color)
+                Color::from_hex(obj.color),
             );
         }
         Ok(())

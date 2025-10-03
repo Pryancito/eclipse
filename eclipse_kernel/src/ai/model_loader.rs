@@ -1,9 +1,9 @@
 //! Cargador de modelos de IA para Eclipse OS Kernel
 
-use crate::drivers::manager::{DriverResult, DriverError};
+use crate::drivers::manager::{DriverError, DriverResult};
 use core::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelType {
     IsolationForest,
     Llama,
@@ -112,17 +112,18 @@ impl ModelLoader {
         }
 
         let model = &mut self.models[index];
-        
+
         // Simular carga del modelo (en implementación real, cargaría desde filesystem)
         // Por ahora solo marcamos como cargado
         model.loaded = true;
-        
+
         Ok(())
     }
 
     /// Verifica si un modelo está cargado
     pub fn is_model_loaded(&self, model_type: &ModelType) -> bool {
-        self.models.iter()
+        self.models
+            .iter()
             .find(|m| core::mem::discriminant(&m.model_type) == core::mem::discriminant(model_type))
             .map(|m| m.loaded)
             .unwrap_or(false)
@@ -130,7 +131,8 @@ impl ModelLoader {
 
     /// Obtiene información de un modelo
     pub fn get_model_info(&self, model_type: &ModelType) -> Option<&ModelConfig> {
-        self.models.iter()
+        self.models
+            .iter()
             .find(|m| core::mem::discriminant(&m.model_type) == core::mem::discriminant(model_type))
     }
 
@@ -146,7 +148,8 @@ impl ModelLoader {
 
     /// Calcula memoria de modelos cargados
     pub fn loaded_memory_usage(&self) -> usize {
-        self.models.iter()
+        self.models
+            .iter()
             .filter(|m| m.loaded)
             .map(|m| m.size)
             .sum()

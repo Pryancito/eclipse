@@ -1,11 +1,11 @@
 //! Tema espacial personalizado para COSMIC en Eclipse OS
-//! 
+//!
 //! Implementa un tema visual inspirado en el espacio y la exploración,
 //! característico de Eclipse OS.
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
 
 /// Colores del tema espacial Eclipse
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,15 +75,15 @@ impl EclipseSpaceTheme {
                 primary: ColorRGB::new(0, 102, 204),
                 secondary: ColorRGB::new(51, 153, 255),
                 accent: ColorRGB::new(255, 102, 204), // Magenta brillante
-                
+
                 // Fondos oscuros
                 background: ColorRGB::new(10, 15, 25),
                 surface: ColorRGB::new(20, 25, 35),
-                
+
                 // Texto
                 text: ColorRGB::new(255, 255, 255),
                 text_secondary: ColorRGB::new(180, 180, 180),
-                
+
                 // Bordes y sombras
                 border: ColorRGB::new(51, 153, 255),
                 shadow: ColorRGB::new(0, 0, 0),
@@ -113,10 +113,10 @@ impl EclipseSpaceTheme {
 
         // Aplicar colores del tema
         self.apply_colors()?;
-        
+
         // Aplicar fuentes
         self.apply_fonts()?;
-        
+
         // Aplicar efectos
         self.apply_effects()?;
 
@@ -163,51 +163,96 @@ impl EclipseSpaceTheme {
     /// Generar CSS del tema para COSMIC
     pub fn generate_css(&self) -> String {
         let mut css = String::new();
-        
+
         // Variables CSS
         css.push_str(":root {\n");
-        css.push_str(&format!("  --eclipse-primary: {};\n", self.colors.primary.to_hex()));
-        css.push_str(&format!("  --eclipse-secondary: {};\n", self.colors.secondary.to_hex()));
-        css.push_str(&format!("  --eclipse-accent: {};\n", self.colors.accent.to_hex()));
-        css.push_str(&format!("  --eclipse-background: {};\n", self.colors.background.to_hex()));
-        css.push_str(&format!("  --eclipse-surface: {};\n", self.colors.surface.to_hex()));
-        css.push_str(&format!("  --eclipse-text: {};\n", self.colors.text.to_hex()));
-        css.push_str(&format!("  --eclipse-text-secondary: {};\n", self.colors.text_secondary.to_hex()));
-        css.push_str(&format!("  --eclipse-border: {};\n", self.colors.border.to_hex()));
-        css.push_str(&format!("  --eclipse-shadow: {};\n", self.colors.shadow.to_hex()));
+        css.push_str(&format!(
+            "  --eclipse-primary: {};\n",
+            self.colors.primary.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-secondary: {};\n",
+            self.colors.secondary.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-accent: {};\n",
+            self.colors.accent.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-background: {};\n",
+            self.colors.background.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-surface: {};\n",
+            self.colors.surface.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-text: {};\n",
+            self.colors.text.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-text-secondary: {};\n",
+            self.colors.text_secondary.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-border: {};\n",
+            self.colors.border.to_hex()
+        ));
+        css.push_str(&format!(
+            "  --eclipse-shadow: {};\n",
+            self.colors.shadow.to_hex()
+        ));
         css.push_str("}\n\n");
 
         // Estilos de ventanas
         css.push_str(".cosmic-window {\n");
         css.push_str("  background: var(--eclipse-surface);\n");
         css.push_str("  border: 1px solid var(--eclipse-border);\n");
-        css.push_str(&format!("  border-radius: {}px;\n", self.effects.border_radius));
-        css.push_str(&format!("  box-shadow: 0 0 {}px var(--eclipse-shadow);\n", self.effects.shadow_blur));
+        css.push_str(&format!(
+            "  border-radius: {}px;\n",
+            self.effects.border_radius
+        ));
+        css.push_str(&format!(
+            "  box-shadow: 0 0 {}px var(--eclipse-shadow);\n",
+            self.effects.shadow_blur
+        ));
         css.push_str("}\n\n");
 
         // Estilos de botones
         css.push_str(".cosmic-button {\n");
         css.push_str("  background: var(--eclipse-primary);\n");
         css.push_str("  color: var(--eclipse-text);\n");
-        css.push_str(&format!("  border-radius: {}px;\n", self.effects.border_radius / 2));
+        css.push_str(&format!(
+            "  border-radius: {}px;\n",
+            self.effects.border_radius / 2
+        ));
         css.push_str("  border: none;\n");
         css.push_str("  padding: 8px 16px;\n");
         css.push_str("}\n\n");
 
         css.push_str(".cosmic-button:hover {\n");
         css.push_str("  background: var(--eclipse-secondary);\n");
-        css.push_str(&format!("  box-shadow: 0 0 {}px var(--eclipse-primary);\n", self.effects.shadow_blur / 2));
+        css.push_str(&format!(
+            "  box-shadow: 0 0 {}px var(--eclipse-primary);\n",
+            self.effects.shadow_blur / 2
+        ));
         css.push_str("}\n\n");
 
         // Estilos de texto
         css.push_str(".cosmic-text {\n");
         css.push_str("  color: var(--eclipse-text);\n");
-        css.push_str(&format!("  font-family: '{}', sans-serif;\n", self.fonts.primary_font));
+        css.push_str(&format!(
+            "  font-family: '{}', sans-serif;\n",
+            self.fonts.primary_font
+        ));
         css.push_str("}\n\n");
 
         css.push_str(".cosmic-title {\n");
         css.push_str("  color: var(--eclipse-accent);\n");
-        css.push_str(&format!("  font-family: '{}', monospace;\n", self.fonts.title_font));
+        css.push_str(&format!(
+            "  font-family: '{}', monospace;\n",
+            self.fonts.title_font
+        ));
         css.push_str("  font-weight: bold;\n");
         css.push_str("}\n\n");
 
@@ -222,7 +267,7 @@ impl EclipseSpaceTheme {
     /// Generar configuración de tema para COSMIC
     pub fn generate_theme_config(&self) -> String {
         let mut config = String::new();
-        
+
         config.push_str("[theme]\n");
         config.push_str("name = \"Eclipse Space\"\n");
         config.push_str("version = \"1.0.0\"\n");
@@ -230,12 +275,21 @@ impl EclipseSpaceTheme {
 
         config.push_str("[colors]\n");
         config.push_str(&format!("primary = \"{}\"\n", self.colors.primary.to_hex()));
-        config.push_str(&format!("secondary = \"{}\"\n", self.colors.secondary.to_hex()));
+        config.push_str(&format!(
+            "secondary = \"{}\"\n",
+            self.colors.secondary.to_hex()
+        ));
         config.push_str(&format!("accent = \"{}\"\n", self.colors.accent.to_hex()));
-        config.push_str(&format!("background = \"{}\"\n", self.colors.background.to_hex()));
+        config.push_str(&format!(
+            "background = \"{}\"\n",
+            self.colors.background.to_hex()
+        ));
         config.push_str(&format!("surface = \"{}\"\n", self.colors.surface.to_hex()));
         config.push_str(&format!("text = \"{}\"\n", self.colors.text.to_hex()));
-        config.push_str(&format!("text-secondary = \"{}\"\n", self.colors.text_secondary.to_hex()));
+        config.push_str(&format!(
+            "text-secondary = \"{}\"\n",
+            self.colors.text_secondary.to_hex()
+        ));
         config.push_str(&format!("border = \"{}\"\n", self.colors.border.to_hex()));
         config.push_str(&format!("shadow = \"{}\"\n", self.colors.shadow.to_hex()));
         config.push_str("\n");

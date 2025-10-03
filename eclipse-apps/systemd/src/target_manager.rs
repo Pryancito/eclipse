@@ -86,18 +86,51 @@ impl TargetManager {
             description: "Graphical System Target".to_string(),
             services: vec![
                 "multi-user.target".to_string(),
-                "eclipse-gui.service".to_string(),
+                // Encadenar por targets y servicios
+                "wayland.target".to_string(),
+                "eclipse-wayland.service".to_string(),
+                "eclipse-cosmic.service".to_string(),
             ],
-            dependencies: vec!["multi-user.target".to_string()],
+            dependencies: vec!["multi-user.target".to_string(), "wayland.target".to_string()],
             conflicts: vec!["multi-user.target".to_string()],
             before: vec![],
-            after: vec!["multi-user.target".to_string()],
+            after: vec!["multi-user.target".to_string(), "wayland.target".to_string(), "eclipse-wayland.service".to_string()],
+        };
+
+        // Target de Wayland
+        let wayland_target = Target {
+            name: "wayland.target".to_string(),
+            description: "Wayland Compositor Target".to_string(),
+            services: vec![
+                "hardware.target".to_string(),
+                "eclipse-wayland.service".to_string(),
+            ],
+            dependencies: vec!["hardware.target".to_string()],
+            conflicts: vec![],
+            before: vec!["graphical.target".to_string()],
+            after: vec!["hardware.target".to_string()],
+        };
+
+        // Target de Hardware
+        let hardware_target = Target {
+            name: "hardware.target".to_string(),
+            description: "Hardware Initialization Target".to_string(),
+            services: vec![
+                "drm-init.service".to_string(),
+                "input-init.service".to_string(),
+            ],
+            dependencies: vec![],
+            conflicts: vec![],
+            before: vec!["wayland.target".to_string()],
+            after: vec![],
         };
 
         // Agregar targets predefinidos
         self.targets.insert("basic.target".to_string(), basic_target);
         self.targets.insert("multi-user.target".to_string(), multi_user_target);
         self.targets.insert("graphical.target".to_string(), graphical_target);
+        self.targets.insert("wayland.target".to_string(), wayland_target);
+        self.targets.insert("hardware.target".to_string(), hardware_target);
         
         debug!("📦 Targets predefinidos cargados: basic, multi-user, graphical");
         Ok(())

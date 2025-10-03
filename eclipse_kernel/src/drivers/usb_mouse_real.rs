@@ -1,19 +1,19 @@
 //! Driver USB real para ratón
-//! 
+//!
 //! Implementa soporte completo para ratones USB reales con comunicación
 //! hardware directa, no simulación.
 
 use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType, DeviceOperations},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
-    usb::{RealUsbController, UsbDeviceInfo, UsbDeviceClass, UsbControllerType},
-    mouse::{MouseDriver, MouseEvent, MouseButton, MouseState},
+    device::{Device, DeviceInfo, DeviceOperations, DeviceType},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
+    mouse::{MouseButton, MouseDriver, MouseEvent, MouseState},
+    usb::{RealUsbController, UsbControllerType, UsbDeviceClass, UsbDeviceInfo},
 };
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Driver USB real para ratón
 pub struct UsbMouseReal {
@@ -23,7 +23,7 @@ pub struct UsbMouseReal {
     pub is_initialized: bool,
     pub event_buffer: Vec<MouseEvent>,
     pub current_buttons: [bool; 8], // Estado actual de los botones
-    pub last_report: [u8; 4], // Último reporte HID recibido
+    pub last_report: [u8; 4],       // Último reporte HID recibido
     pub endpoint: u8,
     pub address: u8,
     pub x: i32,
@@ -64,7 +64,7 @@ impl UsbMouseReal {
         if let Some(ref mut controller) = self.usb_controller {
             // Buscar dispositivos HID
             let hid_devices = controller.get_hid_devices();
-            
+
             for device in hid_devices {
                 // Verificar si es un ratón (clase HID, subclase 0x01, protocolo 0x02)
                 if device.device_descriptor.device_class == UsbDeviceClass::HID {
@@ -85,7 +85,7 @@ impl UsbMouseReal {
             if let Some(ref device) = self.mouse_device {
                 let mut report = [0u8; 4];
                 controller.read_hid_data(device.address, self.endpoint, &mut report)?;
-                
+
                 // Procesar reporte HID
                 self.process_hid_report(&report);
                 self.last_report = report;
@@ -134,18 +134,22 @@ impl UsbMouseReal {
         for (bit, button) in button_mapping.iter() {
             let is_pressed = (buttons & bit) != 0;
             let button_index = *button as usize;
-            
+
             if is_pressed != self.current_buttons[button_index] {
                 self.current_buttons[button_index] = is_pressed;
-                
+
                 let event = MouseEvent {
                     button: *button,
-                    state: if is_pressed { MouseState::Pressed } else { MouseState::Released },
+                    state: if is_pressed {
+                        MouseState::Pressed
+                    } else {
+                        MouseState::Released
+                    },
                     x: self.x,
                     y: self.y,
                     wheel: self.wheel,
                 };
-                
+
                 self.event_buffer.push(event);
             }
         }
@@ -175,7 +179,11 @@ impl UsbMouseReal {
         // Crear evento de rueda
         let event = MouseEvent {
             button: MouseButton::Wheel,
-            state: if wheel_delta > 0 { MouseState::WheelUp } else { MouseState::WheelDown },
+            state: if wheel_delta > 0 {
+                MouseState::WheelUp
+            } else {
+                MouseState::WheelDown
+            },
             x: self.x,
             y: self.y,
             wheel: self.wheel,
@@ -219,41 +227,46 @@ impl UsbMouseReal {
     pub fn get_mouse_stats(&self) -> String {
         let mut stats = String::new();
         stats.push_str("=== RATÓN USB REAL ===\n");
-        
+
         if let Some(ref device) = self.mouse_device {
-            stats.push_str(&format!("Dispositivo: VID={:04X} PID={:04X}\n", 
-                device.device_descriptor.vendor_id,
-                device.device_descriptor.product_id
+            stats.push_str(&format!(
+                "Dispositivo: VID={:04X} PID={:04X}\n",
+                device.device_descriptor.vendor_id, device.device_descriptor.product_id
             ));
             stats.push_str(&format!("Dirección USB: {}\n", device.address));
             stats.push_str(&format!("Endpoint: 0x{:02X}\n", self.endpoint));
         } else {
             stats.push_str("Dispositivo: No detectado\n");
         }
-        
+
         stats.push_str(&format!("Posición: ({}, {})\n", self.x, self.y));
         stats.push_str(&format!("Rueda: {}\n", self.wheel));
         stats.push_str(&format!("Eventos en buffer: {}\n", self.event_buffer.len()));
-        
-        let pressed_buttons: Vec<&str> = self.current_buttons.iter()
+
+        let pressed_buttons: Vec<&str> = self
+            .current_buttons
+            .iter()
             .enumerate()
             .filter(|(_, &pressed)| pressed)
             .map(|(i, _)| match i {
                 0 => "Izquierdo",
-                1 => "Derecho", 
+                1 => "Derecho",
                 2 => "Medio",
                 3 => "Botón4",
                 4 => "Botón5",
                 _ => "Desconocido",
             })
             .collect();
-        
+
         if !pressed_buttons.is_empty() {
-            stats.push_str(&format!("Botones presionados: {}\n", pressed_buttons.join(", ")));
+            stats.push_str(&format!(
+                "Botones presionados: {}\n",
+                pressed_buttons.join(", ")
+            ));
         } else {
             stats.push_str("Botones presionados: Ninguno\n");
         }
-        
+
         stats
     }
 
@@ -300,7 +313,7 @@ impl Driver for UsbMouseReal {
 
         // Detectar ratón USB
         self.detect_mouse()?;
-        
+
         self.info.is_loaded = true;
         self.is_initialized = true;
         Ok(())

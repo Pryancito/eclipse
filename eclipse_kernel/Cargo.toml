@@ -17,14 +17,18 @@ name = "eclipse_kernel"
 path = "src/main.rs"
 
 [dependencies]
+x86_64 = "0.14.9"
+bootloader = { version = "0.9.8", features = ["map_physical_memory"] }
+volatile = "0.2.6"
 heapless = "0.8"
 linked_list_allocator = "0.10"
+eclipsefs-lib = { path = "../eclipsefs-lib", default-features = false }
 # Dependencias para acceso a hardware PCI/MMIO
-volatile = "0.4"
 bitflags = "2.4"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # Dependencias para modelos de IA reales (compatibles con no_std)
 # Dependencias para matemáticas
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 num-traits = { version = "0.2", optional = true, default-features = false }
 # Dependencias para Wayland (simplificadas para no_std)
 # wayland-client = { version = "0.29", optional = true, default-features = false }
@@ -34,6 +38,16 @@ num-traits = { version = "0.2", optional = true, default-features = false }
 # Dependencias para COSMIC Desktop Environment (simuladas)
 # Nota: Las dependencias reales de COSMIC no son compatibles con no_std
 # Usamos implementaciones propias que simulan la funcionalidad
+# Dependencias para GUI moderna (Kazari - compatible con no_std)
+# kazari = { version = "0.0.1", optional = true, default-features = false }
+vte = { version = "0.11.0", default-features = false, optional = true }
+# NUEVO: para operaciones I/O en drivers
+x86 = "0.52.0"
+hashbrown = "0.14"
+spin = "0.9"
+virtio-drivers-and-devices = "0.2.3"
+virtio-spec = "0.3.2"
+polished_pci = { version = "0.2.2", default-features = false }
 
 [features]
 default = ["no_std", "alloc"]
@@ -43,6 +57,8 @@ safe-init = []
 alloc = []
 # Características para modelos de IA reales
 ai-models = ["dep:num-traits"]
+# Características para GUI moderna con Kazari
+# kazari-gui = ["dep:kazari"]
 # Características para Wayland (simplificadas)
 # wayland-server = ["dep:wayland-server"]
 # wayland-client = ["dep:wayland-client"]
@@ -65,3 +81,4 @@ rustflags = [
     "-C", "link-arg=-T/home/moebius/eclipse/eclipse_kernel/linker.ld",
     "-C", "link-arg=--gc-sections"
 ]
+

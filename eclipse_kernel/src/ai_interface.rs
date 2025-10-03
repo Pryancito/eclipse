@@ -1,19 +1,19 @@
 //! Interfaz de usuario para interacción con IA
-//! 
+//!
 //! Este módulo implementa la interfaz de usuario que permite
 //! interactuar con la IA del sistema operativo de forma natural.
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ai_integration::{AIIntegration, AIIntervention, AICommand, AICommandResult};
-use crate::ai_communication::{AICommunicationChannel, CommunicationType, AIMessage};
+use crate::ai_communication::{AICommunicationChannel, AIMessage, CommunicationType};
 use crate::ai_control::{AISystemController, ControllerStats, SystemMetrics};
+use crate::ai_integration::{AICommand, AICommandResult, AIIntegration, AIIntervention};
 
 /// Interfaz de usuario para IA
 pub struct AIUserInterface {
@@ -106,13 +106,13 @@ impl AIUserInterface {
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Activar interfaz
         self.is_active.store(true, Ordering::Release);
-        
+
         // Inicializar sesión
         self.initialize_session()?;
-        
+
         // Cargar preferencias del usuario
         self.load_user_preferences()?;
-        
+
         Ok(())
     }
 
@@ -120,7 +120,7 @@ impl AIUserInterface {
     fn initialize_session(&mut self) -> Result<(), &'static str> {
         self.session_state.session_id = self.generate_session_id();
         self.session_state.start_time = self.get_current_timestamp();
-        
+
         // Agregar entrada de bienvenida
         let welcome_entry = ConversationEntry {
             id: 0,
@@ -131,9 +131,9 @@ impl AIUserInterface {
             command_id: None,
             success: true,
         };
-        
+
         self.conversation_history.push(welcome_entry);
-        
+
         Ok(())
     }
 
@@ -176,11 +176,17 @@ impl AIUserInterface {
     fn load_user_preferences(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se cargarían las preferencias
         // desde un archivo de configuración o base de datos
-        
-        self.session_state.user_preferences.insert("language".to_string(), "es".to_string());
-        self.session_state.user_preferences.insert("timezone".to_string(), "UTC".to_string());
-        self.session_state.user_preferences.insert("notifications".to_string(), "enabled".to_string());
-        
+
+        self.session_state
+            .user_preferences
+            .insert("language".to_string(), "es".to_string());
+        self.session_state
+            .user_preferences
+            .insert("timezone".to_string(), "UTC".to_string());
+        self.session_state
+            .user_preferences
+            .insert("notifications".to_string(), "enabled".to_string());
+
         Ok(())
     }
 
@@ -192,13 +198,13 @@ impl AIUserInterface {
 
         // Analizar entrada del usuario
         let analysis = self.analyze_user_input(input)?;
-        
+
         // Generar respuesta
         let response = self.generate_response(&analysis)?;
-        
+
         // Ejecutar intervención si es necesaria
         let intervention_result = self.execute_intervention_if_needed(&analysis)?;
-        
+
         // Crear entrada de conversación
         let conversation_entry = ConversationEntry {
             id: self.conversation_history.len() as u64,
@@ -209,33 +215,33 @@ impl AIUserInterface {
             command_id: intervention_result,
             success: intervention_result.is_some(),
         };
-        
+
         self.conversation_history.push(conversation_entry);
-        
+
         // Limitar tamaño del historial
         if self.conversation_history.len() > self.interface_config.max_conversation_history {
             self.conversation_history.remove(0);
         }
-        
+
         Ok(response)
     }
 
     /// Analiza la entrada del usuario
     fn analyze_user_input(&self, input: &str) -> Result<UserInputAnalysis, &'static str> {
         let input_lower = input.to_lowercase();
-        
+
         // Determinar intención
         let intention = self.determine_intention(&input_lower)?;
-        
+
         // Determinar tipo de intervención
         let intervention_type = self.determine_intervention_type(&input_lower)?;
-        
+
         // Extraer parámetros
         let parameters = self.extract_parameters(input)?;
-        
+
         // Determinar prioridad
         let priority = self.determine_priority(&input_lower)?;
-        
+
         Ok(UserInputAnalysis {
             intention,
             intervention_type,
@@ -269,7 +275,10 @@ impl AIUserInterface {
     }
 
     /// Determina el tipo de intervención
-    fn determine_intervention_type(&self, input: &str) -> Result<Option<AIIntervention>, &'static str> {
+    fn determine_intervention_type(
+        &self,
+        input: &str,
+    ) -> Result<Option<AIIntervention>, &'static str> {
         if input.contains("proceso") || input.contains("process") {
             Ok(Some(AIIntervention::ProcessManagement))
         } else if input.contains("memoria") || input.contains("memory") {
@@ -292,10 +301,10 @@ impl AIUserInterface {
     /// Extrae parámetros de la entrada
     fn extract_parameters(&self, input: &str) -> Result<BTreeMap<String, String>, &'static str> {
         let mut parameters = BTreeMap::new();
-        
+
         // En una implementación real, aquí se usaría NLP para extraer parámetros
         // Por ahora, extraemos información básica
-        
+
         if input.contains("urgente") || input.contains("urgent") {
             parameters.insert("priority".to_string(), "high".to_string());
         } else if input.contains("importante") || input.contains("important") {
@@ -303,10 +312,13 @@ impl AIUserInterface {
         } else {
             parameters.insert("priority".to_string(), "low".to_string());
         }
-        
+
         parameters.insert("input".to_string(), input.to_string());
-        parameters.insert("timestamp".to_string(), self.get_current_timestamp().to_string());
-        
+        parameters.insert(
+            "timestamp".to_string(),
+            self.get_current_timestamp().to_string(),
+        );
+
         Ok(parameters)
     }
 
@@ -326,51 +338,31 @@ impl AIUserInterface {
     /// Genera respuesta
     fn generate_response(&self, analysis: &UserInputAnalysis) -> Result<String, &'static str> {
         match analysis.intention {
-            UserIntention::Help => {
-                Ok(self.generate_help_response())
-            }
-            UserIntention::Status => {
-                Ok(self.generate_status_response())
-            }
-            UserIntention::Optimize => {
-                Ok(self.generate_optimize_response())
-            }
-            UserIntention::Diagnose => {
-                Ok(self.generate_diagnose_response())
-            }
-            UserIntention::ProcessManagement => {
-                Ok(self.generate_process_management_response())
-            }
-            UserIntention::MemoryManagement => {
-                Ok(self.generate_memory_management_response())
-            }
-            UserIntention::Security => {
-                Ok(self.generate_security_response())
-            }
-            UserIntention::Performance => {
-                Ok(self.generate_performance_response())
-            }
-            UserIntention::General => {
-                Ok(self.generate_general_response())
-            }
+            UserIntention::Help => Ok(self.generate_help_response()),
+            UserIntention::Status => Ok(self.generate_status_response()),
+            UserIntention::Optimize => Ok(self.generate_optimize_response()),
+            UserIntention::Diagnose => Ok(self.generate_diagnose_response()),
+            UserIntention::ProcessManagement => Ok(self.generate_process_management_response()),
+            UserIntention::MemoryManagement => Ok(self.generate_memory_management_response()),
+            UserIntention::Security => Ok(self.generate_security_response()),
+            UserIntention::Performance => Ok(self.generate_performance_response()),
+            UserIntention::General => Ok(self.generate_general_response()),
         }
     }
 
     /// Genera respuesta de ayuda
     fn generate_help_response(&self) -> String {
         match self.interface_config.personality_mode {
-            PersonalityMode::Professional => {
-                "Comandos disponibles:\n\
+            PersonalityMode::Professional => "Comandos disponibles:\n\
                 - status: Estado del sistema\n\
                 - optimize: Optimizar rendimiento\n\
                 - diagnose: Diagnosticar problemas\n\
                 - processes: Gestionar procesos\n\
                 - memory: Gestionar memoria\n\
                 - security: Monitorear seguridad\n\
-                - performance: Ajustar rendimiento".to_string()
-            }
-            PersonalityMode::Friendly => {
-                "¡Por supuesto! Puedo ayudarte con:\n\
+                - performance: Ajustar rendimiento"
+                .to_string(),
+            PersonalityMode::Friendly => "¡Por supuesto! Puedo ayudarte con:\n\
                 Estado del sistema\n\
                 Optimización de rendimiento\n\
                 Diagnóstico de problemas\n\
@@ -378,11 +370,10 @@ impl AIUserInterface {
                 Gestión de memoria\n\
                 Monitoreo de seguridad\n\
                 Ajuste de rendimiento\n\
-                \n¿Qué te gustaría hacer?".to_string()
-            }
-            _ => {
-                "Comandos: status, optimize, diagnose, processes, memory, security, performance".to_string()
-            }
+                \n¿Qué te gustaría hacer?"
+                .to_string(),
+            _ => "Comandos: status, optimize, diagnose, processes, memory, security, performance"
+                .to_string(),
         }
     }
 
@@ -391,7 +382,7 @@ impl AIUserInterface {
         if let Some(controller) = crate::ai_control::get_ai_system_controller() {
             let stats = controller.get_controller_stats();
             let metrics = controller.get_system_status();
-            
+
             format!(
                 "=== Estado del Sistema ===\n\
                 Controlador IA: {}\n\
@@ -407,7 +398,11 @@ impl AIUserInterface {
                 === Procesos ===\n\
                 Activos: {}\n\
                 Carga: {:.1}",
-                if stats.is_active { "Activo" } else { "Inactivo" },
+                if stats.is_active {
+                    "Activo"
+                } else {
+                    "Inactivo"
+                },
                 stats.successful_interventions,
                 stats.total_interventions,
                 stats.success_rate * 100.0,
@@ -432,7 +427,8 @@ impl AIUserInterface {
         - Aplicando optimizaciones\n\
         - Monitoreando mejoras\n\
         \n\
-        Optimización completada. Rendimiento mejorado en un 15%.".to_string()
+        Optimización completada. Rendimiento mejorado en un 15%."
+            .to_string()
     }
 
     /// Genera respuesta de diagnóstico
@@ -445,7 +441,8 @@ impl AIUserInterface {
         [WARN] Red: Latencia alta detectada\n\
         Seguridad: OK\n\
         \n\
-        Recomendación: Verificar conexión de red".to_string()
+        Recomendación: Verificar conexión de red"
+            .to_string()
     }
 
     /// Genera respuesta de gestión de procesos
@@ -457,7 +454,8 @@ impl AIUserInterface {
         - Optimizando asignación de recursos\n\
         - Terminando procesos innecesarios\n\
         \n\
-        Gestión completada. 3 procesos optimizados.".to_string()
+        Gestión completada. 3 procesos optimizados."
+            .to_string()
     }
 
     /// Genera respuesta de gestión de memoria
@@ -469,7 +467,8 @@ impl AIUserInterface {
         - Optimizando caché\n\
         - Ajustando asignación de memoria\n\
         \n\
-        Memoria optimizada. 256MB liberados.".to_string()
+        Memoria optimizada. 256MB liberados."
+            .to_string()
     }
 
     /// Genera respuesta de seguridad
@@ -481,7 +480,8 @@ impl AIUserInterface {
         - Analizando logs de seguridad\n\
         - Actualizando políticas de seguridad\n\
         \n\
-        Monitoreo completado. Sistema seguro.".to_string()
+        Monitoreo completado. Sistema seguro."
+            .to_string()
     }
 
     /// Genera respuesta de rendimiento
@@ -493,7 +493,8 @@ impl AIUserInterface {
         - Optimizando I/O\n\
         - Mejorando latencia de red\n\
         \n\
-        Rendimiento mejorado en un 25%.".to_string()
+        Rendimiento mejorado en un 25%."
+            .to_string()
     }
 
     /// Genera respuesta general
@@ -512,7 +513,10 @@ impl AIUserInterface {
     }
 
     /// Ejecuta intervención si es necesaria
-    fn execute_intervention_if_needed(&self, analysis: &UserInputAnalysis) -> Result<Option<u64>, &'static str> {
+    fn execute_intervention_if_needed(
+        &self,
+        analysis: &UserInputAnalysis,
+    ) -> Result<Option<u64>, &'static str> {
         if let Some(intervention_type) = &analysis.intervention_type {
             // Crear comando de intervención
             let command = AICommand {
@@ -550,8 +554,16 @@ impl AIUserInterface {
     pub fn get_interface_stats(&self) -> InterfaceStats {
         InterfaceStats {
             total_conversations: self.conversation_history.len(),
-            successful_interventions: self.conversation_history.iter().filter(|e| e.success).count(),
-            failed_interventions: self.conversation_history.iter().filter(|e| !e.success).count(),
+            successful_interventions: self
+                .conversation_history
+                .iter()
+                .filter(|e| e.success)
+                .count(),
+            failed_interventions: self
+                .conversation_history
+                .iter()
+                .filter(|e| !e.success)
+                .count(),
             session_duration: self.get_current_timestamp() - self.session_state.start_time,
             is_active: self.is_active.load(Ordering::Acquire),
         }
@@ -615,7 +627,5 @@ pub fn init_ai_user_interface() -> Result<(), &'static str> {
 
 /// Obtiene la instancia global de la interfaz
 pub fn get_ai_user_interface() -> Option<&'static mut AIUserInterface> {
-    unsafe {
-        AI_USER_INTERFACE.as_mut()
-    }
+    unsafe { AI_USER_INTERFACE.as_mut() }
 }

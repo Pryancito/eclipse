@@ -1,5 +1,5 @@
 //! Módulo de Gestión de Procesos para Eclipse OS
-//! 
+//!
 //! Este módulo proporciona todas las funcionalidades de gestión de procesos:
 //! - Estructura de procesos (PCB)
 //! - Scheduler con múltiples algoritmos
@@ -7,18 +7,14 @@
 //! - Context switching
 //! - Estadísticas del sistema
 
+pub mod manager;
 pub mod process;
 pub mod scheduler;
-pub mod manager;
 
 // Re-exportar las estructuras principales
-pub use process::{
-    ProcessId, ProcessState, ProcessPriority, ThreadId
-};
+pub use manager::{get_process_manager, init_process_manager};
+pub use process::{ProcessId, ProcessPriority, ProcessState, ThreadId};
 pub use scheduler::SchedulingAlgorithm;
-pub use manager::{
-    init_process_manager, get_process_manager
-};
 
 /// Constantes del sistema de procesos
 pub const MAX_PROCESSES: usize = 1024;
@@ -30,7 +26,7 @@ pub const THREAD_QUANTUM: u64 = 50; // 50ms
 pub fn init_process_system() -> Result<(), &'static str> {
     // Inicializar el gestor de procesos
     init_process_manager()?;
-    
+
     Ok(())
 }
 

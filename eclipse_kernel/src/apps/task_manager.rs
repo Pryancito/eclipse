@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 //! Gestor de tareas para Eclipse OS
-//! 
+//!
 //! Proporciona información y control sobre procesos del sistema.
 
-use alloc::{vec, vec::Vec};
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::{vec, vec::Vec};
 
 /// Información de un proceso
 #[derive(Debug, Clone)]
@@ -96,7 +96,7 @@ impl TaskManager {
         self.print_info("═══════════════════════════════════════════════════════════════");
         self.print_info("PID    Nombre           Estado    CPU%   Memoria  Prioridad  Usuario");
         self.print_info("─────  ───────────────  ────────  ─────  ───────  ─────────  ───────");
-        
+
         for process in &self.processes {
             let state_str = match process.state {
                 ProcessState::Running => "Running",
@@ -105,7 +105,7 @@ impl TaskManager {
                 ProcessState::Zombie => "Zombie",
                 ProcessState::Dead => "Dead",
             };
-            
+
             self.print_info(&format!(
                 "{:<5}  {:<15}  {:<8}  {:<5.1}  {:<6}  {:<9}  {}",
                 process.pid,

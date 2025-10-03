@@ -1,9 +1,9 @@
 //! Demostración del sistema de drivers modulares
-//! 
+//!
 //! Muestra información sobre los drivers modulares registrados
 //! y permite probar sus funcionalidades.
 
-use super::{ModularDriver, DriverError, list_modular_drivers, get_modular_driver};
+use super::{get_modular_driver, list_modular_drivers, DriverError, ModularDriver};
 
 /// Información de demostración de drivers
 pub struct DriverDemo {
@@ -19,41 +19,41 @@ impl DriverDemo {
             current_driver: None,
         }
     }
-    
+
     /// Iniciar demostración
     pub fn start_demo(&mut self) -> Result<(), DriverError> {
         self.demo_active = true;
         Ok(())
     }
-    
+
     /// Detener demostración
     pub fn stop_demo(&mut self) {
         self.demo_active = false;
         self.current_driver = None;
     }
-    
+
     /// Mostrar información de todos los drivers
     pub fn show_all_drivers_info(&self) -> heapless::Vec<DriverInfo, 8> {
         let mut info_list = heapless::Vec::new();
         let drivers = list_modular_drivers();
-        
+
         for driver_name in drivers.iter() {
             if let Some(driver) = get_modular_driver(driver_name.as_str()) {
                 let info = driver.get_info();
                 let _ = info_list.push(info);
             }
         }
-        
+
         info_list
     }
-    
+
     /// Probar driver específico
     pub fn test_driver(&mut self, driver_name: &str) -> Result<DriverTestResult, DriverError> {
         if let Some(driver) = get_modular_driver(driver_name) {
             let mut name = heapless::String::<32>::new();
             let _ = name.push_str(driver_name);
             self.current_driver = Some(name);
-            
+
             // Probar funcionalidades básicas del driver
             let mut result = DriverTestResult {
                 driver_name: {
@@ -67,46 +67,46 @@ impl DriverDemo {
                 test_passed: 0,
                 test_total: 0,
             };
-            
+
             // Obtener información del driver
             let info = driver.get_info();
             result.capabilities = info.capabilities;
-            
+
             // Probar inicialización
             if let Ok(_) = driver.init() {
                 result.init_success = true;
                 result.test_passed += 1;
             }
             result.test_total += 1;
-            
+
             // Probar disponibilidad
             if driver.is_available() {
                 result.test_passed += 1;
             }
             result.test_total += 1;
-            
+
             Ok(result)
         } else {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Ejecutar demostración completa
     pub fn run_full_demo(&mut self) -> Result<DemoResults, DriverError> {
         if !self.demo_active {
             return Err(DriverError::NotAvailable);
         }
-        
+
         let mut results = DemoResults {
             total_drivers: 0,
             successful_drivers: 0,
             failed_drivers: 0,
             driver_tests: heapless::Vec::new(),
         };
-        
+
         let drivers = list_modular_drivers();
         results.total_drivers = drivers.len();
-        
+
         for driver_name in drivers.iter() {
             match self.test_driver(driver_name.as_str()) {
                 Ok(test_result) => {
@@ -122,10 +122,10 @@ impl DriverDemo {
                 }
             }
         }
-        
+
         Ok(results)
     }
-    
+
     /// Verificar si la demostración está activa
     pub fn is_demo_active(&self) -> bool {
         self.demo_active
@@ -160,16 +160,12 @@ static mut DRIVER_DEMO: DriverDemo = DriverDemo::new();
 
 /// Obtener instancia de la demostración
 pub fn get_driver_demo() -> &'static mut DriverDemo {
-    unsafe {
-        &mut DRIVER_DEMO
-    }
+    unsafe { &mut DRIVER_DEMO }
 }
 
 /// Iniciar demostración de drivers
 pub fn start_driver_demo() -> Result<(), DriverError> {
-    unsafe {
-        DRIVER_DEMO.start_demo()
-    }
+    unsafe { DRIVER_DEMO.start_demo() }
 }
 
 /// Detener demostración de drivers
@@ -181,7 +177,5 @@ pub fn stop_driver_demo() {
 
 /// Ejecutar demostración completa
 pub fn run_driver_demo() -> Result<DemoResults, DriverError> {
-    unsafe {
-        DRIVER_DEMO.run_full_demo()
-    }
+    unsafe { DRIVER_DEMO.run_full_demo() }
 }

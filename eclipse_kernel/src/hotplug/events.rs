@@ -1,5 +1,5 @@
 //! Sistema de eventos para hot-plug USB
-//! 
+//!
 //! Maneja la cola de eventos y notificaciones del sistema USB.
 
 use alloc::collections::VecDeque;
@@ -44,10 +44,10 @@ pub struct UsbDeviceInfo {
 /// Velocidad USB
 #[derive(Debug, Clone, PartialEq)]
 pub enum UsbSpeed {
-    LowSpeed,    // 1.5 Mbps
-    FullSpeed,   // 12 Mbps
-    HighSpeed,   // 480 Mbps
-    SuperSpeed,  // 5 Gbps
+    LowSpeed,       // 1.5 Mbps
+    FullSpeed,      // 12 Mbps
+    HighSpeed,      // 480 Mbps
+    SuperSpeed,     // 5 Gbps
     SuperSpeedPlus, // 10 Gbps
 }
 

@@ -1,7 +1,10 @@
 //! # Gestión de Hilos del Kernel
 
-use crate::{KernelResult, KernelError};
-use alloc::{vec::Vec, string::{String, ToString}};
+use crate::{KernelError, KernelResult};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
@@ -30,7 +33,7 @@ impl ThreadManager {
             next_thread_id: 1,
         }
     }
-    
+
     pub fn initialize(&mut self) -> KernelResult<()> {
         // Crear hilo principal del sistema
         let system_thread = ThreadInfo {
@@ -42,22 +45,22 @@ impl ThreadManager {
         self.threads.push(system_thread);
         Ok(())
     }
-    
+
     pub fn create_thread(&mut self, process_id: u32, name: &str) -> KernelResult<u32> {
         let thread_id = self.next_thread_id;
         self.next_thread_id += 1;
-        
+
         let thread_info = ThreadInfo {
             thread_id,
             process_id,
             name: name.to_string(),
             state: ThreadState::Running,
         };
-        
+
         self.threads.push(thread_info);
         Ok(thread_id)
     }
-    
+
     pub fn terminate_thread(&mut self, thread_id: u32) -> KernelResult<()> {
         if let Some(thread) = self.threads.iter_mut().find(|t| t.thread_id == thread_id) {
             thread.state = ThreadState::Terminated;
@@ -105,7 +108,6 @@ pub fn init() -> KernelResult<()> {
     initialize()
 }
 
-
 /// Procesar cola de hilos (función requerida por main.rs)
 pub fn process_thread_queue() {
     // Implementación básica para procesar cola de hilos
@@ -126,8 +128,16 @@ pub fn process_thread_queue() {
 pub fn get_thread_stats() -> (usize, usize, usize) {
     unsafe {
         if let Some(ref manager) = THREAD_MANAGER {
-            let running_threads = manager.threads.iter().filter(|t| t.state == ThreadState::Running).count();
-            let ready_threads = manager.threads.iter().filter(|t| t.state == ThreadState::Suspended).count();
+            let running_threads = manager
+                .threads
+                .iter()
+                .filter(|t| t.state == ThreadState::Running)
+                .count();
+            let ready_threads = manager
+                .threads
+                .iter()
+                .filter(|t| t.state == ThreadState::Suspended)
+                .count();
             let blocked_threads = 0; // Simplificado
             (running_threads, ready_threads, blocked_threads)
         } else {

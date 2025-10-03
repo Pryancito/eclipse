@@ -1,18 +1,18 @@
 //! Sistema de fallback de UEFI/GOP framebuffer a GPU hardware real
-//! 
+//!
 //! Este módulo implementa la transición automática del framebuffer UEFI/GOP
 //! a drivers de GPU hardware real cuando están disponibles.
 
-use crate::drivers::framebuffer::{FramebufferDriver, Color};
+use crate::drivers::bochs_vbe::BochsVbeDriver;
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
 use crate::drivers::pci::{GpuInfo, GpuType};
 use crate::drivers::virtio_gpu::VirtioGpuDriver;
-use crate::drivers::bochs_vbe::BochsVbeDriver;
 use crate::drivers::vmware_svga::VmwareSvgaDriver;
-use crate::hardware_detection::{HardwareDetectionResult, detect_graphics_hardware};
-use crate::uefi_framebuffer::{BootloaderFramebufferInfo, get_framebuffer_status};
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
+use crate::hardware_detection::{detect_graphics_hardware, HardwareDetectionResult};
+use crate::uefi_framebuffer::{get_framebuffer_status, BootloaderFramebufferInfo};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Estado del sistema de fallback GPU
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +37,8 @@ pub struct ActiveGraphicsBackend {
     pub initialized: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Tipos de backend de gráficos disponibles
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphicsBackendType {
     UefiFramebuffer,
     VirtioGpu,
@@ -66,10 +67,11 @@ impl GraphicsBackendType {
 
     /// Verificar si es un backend de hardware real
     pub fn is_real_hardware(&self) -> bool {
-        matches!(self, 
-            GraphicsBackendType::NvidiaGpu | 
-            GraphicsBackendType::AmdGpu | 
-            GraphicsBackendType::IntelGpu
+        matches!(
+            self,
+            GraphicsBackendType::NvidiaGpu
+                | GraphicsBackendType::AmdGpu
+                | GraphicsBackendType::IntelGpu
         )
     }
 }
@@ -100,7 +102,7 @@ impl GpuFallbackManager {
     /// Inicializar el sistema de fallback
     pub fn initialize(&mut self) -> Result<(), String> {
         // 1. Detectar hardware disponible
-        self.hardware_detection_result = Some(detect_graphics_hardware());
+        self.hardware_detection_result = Some((*detect_graphics_hardware()).clone());
         let hw_result = self.hardware_detection_result.as_ref().unwrap();
 
         // 2. Obtener framebuffer UEFI inicial
@@ -136,13 +138,15 @@ impl GpuFallbackManager {
             self.available_backends.push(ActiveGraphicsBackend {
                 backend_type: GraphicsBackendType::UefiFramebuffer,
                 gpu_info: None,
-                framebuffer_info: get_framebuffer_status().driver_info.map(|info| BootloaderFramebufferInfo {
-                    base_address: info.base_address,
-                    width: info.width,
-                    height: info.height,
-                    pixels_per_scan_line: info.pixels_per_scan_line,
-                    pixel_format: info.pixel_format,
-                    pixel_bitmask: 0, // Valor por defecto
+                framebuffer_info: get_framebuffer_status().driver_info.map(|info| {
+                    BootloaderFramebufferInfo {
+                        base_address: info.base_address,
+                        width: info.width,
+                        height: info.height,
+                        pixels_per_scan_line: info.pixels_per_scan_line,
+                        pixel_format: info.pixel_format,
+                        pixel_bitmask: 0, // Valor por defecto
+                    }
                 }),
                 performance_score: GraphicsBackendType::UefiFramebuffer.priority(),
                 initialized: true,
@@ -152,116 +156,53 @@ impl GpuFallbackManager {
         // 2. Detectar GPUs hardware real
         for gpu in &hw_result.available_gpus {
             let backend_type = match gpu.gpu_type {
-                GpuType::Virtio => GraphicsBackendType::VirtioGpu,
-                GpuType::QemuBochs => GraphicsBackendType::BochsVbe,
-                GpuType::Vmware => GraphicsBackendType::VmwareSvga,
-                GpuType::Intel => GraphicsBackendType::IntelGpu,
-                GpuType::Nvidia => GraphicsBackendType::NvidiaGpu,
-                GpuType::Amd => GraphicsBackendType::AmdGpu,
-                _ => GraphicsBackendType::UnknownGpu,
+                GpuType::Virtio => Some(GraphicsBackendType::VirtioGpu),
+                GpuType::QemuBochs => Some(GraphicsBackendType::BochsVbe),
+                GpuType::Vmware => Some(GraphicsBackendType::VmwareSvga),
+                GpuType::Intel => Some(GraphicsBackendType::IntelGpu),
+                GpuType::Nvidia => Some(GraphicsBackendType::NvidiaGpu),
+                GpuType::Amd => Some(GraphicsBackendType::AmdGpu),
+                _ => None,
             };
 
-            let backend_type_clone = backend_type.clone();
-            self.available_backends.push(ActiveGraphicsBackend {
-                backend_type: backend_type_clone.clone(),
-                gpu_info: Some(gpu.clone()),
-                framebuffer_info: None,
-                performance_score: backend_type_clone.priority(),
-                initialized: false,
-            });
+            if let Some(bt) = backend_type {
+                self.available_backends.push(ActiveGraphicsBackend {
+                    backend_type: bt,
+                    gpu_info: Some(gpu.clone()),
+                    framebuffer_info: None,
+                    performance_score: bt.priority(),
+                    initialized: false,
+                });
+            }
         }
-
-        // Ordenar por prioridad (mayor primero)
-        self.available_backends.sort_by(|a, b| b.performance_score.cmp(&a.performance_score));
-
         Ok(())
     }
 
     /// Seleccionar el mejor backend disponible
     fn select_best_backend(&mut self) -> Result<(), String> {
-        if self.available_backends.is_empty() {
-            return Err("No hay backends gráficos disponibles".to_string());
+        self.available_backends
+            .sort_by_key(|b| b.performance_score);
+
+        if let Some(best) = self.available_backends.last_mut() {
+            if let Some(gpu) = &best.gpu_info {
+                match best.backend_type {
+                    GraphicsBackendType::BochsVbe => {
+                        let mut driver = BochsVbeDriver::new(gpu.pci_device);
+                        if driver.init().is_ok() {
+                            best.initialized = true;
+                            self.active_backend = Some(best.clone());
+                        }
+                    }
+                    _ => { /* Otros drivers se inicializarán aquí */ }
+                }
+            }
+            if best.initialized {
+                self.state = GpuFallbackState::HardwareGpu;
+                return Ok(());
+            }
         }
 
-        // Intentar inicializar backends en orden de prioridad usando transición suave
-        for i in 0..self.available_backends.len() {
-            let backend_type = self.available_backends[i].backend_type.clone();
-            match self.transition_to_backend(backend_type.clone()) {
-                Ok(_) => {
-                    // Backend inicializado correctamente
-                    return Ok(());
-                }
-                Err(e) => {
-                    // Continuar con el siguiente backend
-                    continue;
-                }
-            }
-        }
-
-        // Si todos fallan, usar UEFI framebuffer como fallback
-        self.state = GpuFallbackState::FallbackToUefi;
-        self.active_backend = self.available_backends.iter()
-            .find(|b| b.backend_type == GraphicsBackendType::UefiFramebuffer)
-            .cloned();
-        
-        if self.active_backend.is_none() {
-            return Err("No se pudo seleccionar ningún backend gráfico, incluyendo UEFI framebuffer".to_string());
-        }
-        
-        Ok(())
-    }
-
-    /// Intentar inicializar un backend específico
-    fn try_initialize_backend(backend: &mut ActiveGraphicsBackend) -> bool {
-        match backend.backend_type {
-            GraphicsBackendType::VirtioGpu => {
-                let mut driver = VirtioGpuDriver::new();
-                match driver.initialize() {
-                    Ok(_) => {
-                        backend.initialized = true;
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
-            GraphicsBackendType::BochsVbe => {
-                let mut driver = BochsVbeDriver::new();
-                match driver.initialize() {
-                    Ok(_) => {
-                        backend.initialized = true;
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
-            GraphicsBackendType::VmwareSvga => {
-                let mut driver = VmwareSvgaDriver::new();
-                match driver.initialize() {
-                    Ok(_) => {
-                        backend.initialized = true;
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
-            GraphicsBackendType::IntelGpu | 
-            GraphicsBackendType::NvidiaGpu | 
-            GraphicsBackendType::AmdGpu => {
-                // Usar framebuffer UEFI con optimizaciones para hardware real
-                // Esto permite aprovechar las optimizaciones de gráficos sin drivers completos
-                backend.initialized = true;
-                true
-            }
-            GraphicsBackendType::UefiFramebuffer => {
-                // UEFI framebuffer ya está inicializado
-                backend.initialized = true;
-                true
-            }
-            GraphicsBackendType::UnknownGpu => {
-                backend.initialized = false;
-                false
-            }
-        }
+        Err("No se encontró ningún backend gráfico funcional".to_string())
     }
 
     /// Actualizar estado basado en el backend seleccionado
@@ -279,11 +220,14 @@ impl GpuFallbackManager {
     pub fn get_active_backend_info(&self) -> Option<String> {
         if let Some(backend) = &self.active_backend {
             let gpu_info = if let Some(gpu) = &backend.gpu_info {
-                format!(" ({}:{:04X})", gpu.pci_device.vendor_id, gpu.pci_device.device_id)
+                format!(
+                    " ({}:{:04X})",
+                    gpu.pci_device.vendor_id, gpu.pci_device.device_id
+                )
             } else {
                 String::new()
             };
-            
+
             let backend_name = match backend.backend_type {
                 GraphicsBackendType::UefiFramebuffer => "UEFI/GOP Framebuffer",
                 GraphicsBackendType::VirtioGpu => "Virtio-GPU",
@@ -308,10 +252,12 @@ impl GpuFallbackManager {
 
     /// Verificar si estamos usando GPU hardware real
     pub fn is_using_real_hardware(&self) -> bool {
-        matches!(self.state, GpuFallbackState::HardwareGpu) &&
-        self.active_backend.as_ref()
-            .map(|b| b.backend_type.is_real_hardware())
-            .unwrap_or(false)
+        matches!(self.state, GpuFallbackState::HardwareGpu)
+            && self
+                .active_backend
+                .as_ref()
+                .map(|b| b.backend_type.is_real_hardware())
+                .unwrap_or(false)
     }
 
     /// Obtener lista de backends disponibles
@@ -320,7 +266,13 @@ impl GpuFallbackManager {
     }
 
     /// Actualizar la dirección del framebuffer y hacer clear_screen
-    fn update_framebuffer_and_clear(&mut self, new_base_address: u64, width: u32, height: u32, pixels_per_scan_line: u32) -> Result<(), String> {
+    fn update_framebuffer_and_clear(
+        &mut self,
+        new_base_address: u64,
+        width: u32,
+        height: u32,
+        pixels_per_scan_line: u32,
+    ) -> Result<(), String> {
         // 1. Hacer clear_screen en el framebuffer actual antes de cambiar
         if let Some(ref mut uefi_fb) = self.uefi_framebuffer {
             uefi_fb.clear_screen(Color::BLACK);
@@ -329,7 +281,14 @@ impl GpuFallbackManager {
         // 2. Reinicializar el framebuffer global con la nueva información
         if let Some(global_fb) = crate::drivers::framebuffer::get_framebuffer() {
             // Reinicializar con la nueva información usando el método público
-            match global_fb.init_from_uefi(new_base_address, width, height, pixels_per_scan_line, 0, 0) {
+            match global_fb.init_from_uefi(
+                new_base_address,
+                width,
+                height,
+                pixels_per_scan_line,
+                0,
+                0,
+            ) {
                 Ok(_) => {
                     // Hacer clear_screen en la nueva dirección
                     global_fb.clear_screen(Color::BLACK);
@@ -342,12 +301,24 @@ impl GpuFallbackManager {
 
         // 3. Actualizar el framebuffer UEFI local si existe
         if let Some(ref mut uefi_fb) = self.uefi_framebuffer {
-            match uefi_fb.init_from_uefi(new_base_address, width, height, pixels_per_scan_line, 0, 0) {
+            match uefi_fb.init_from_uefi(
+                new_base_address,
+                width,
+                height,
+                pixels_per_scan_line,
+                0,
+                0,
+            ) {
                 Ok(_) => {
                     // Hacer clear_screen en la nueva dirección
                     uefi_fb.clear_screen(Color::BLACK);
                 }
-                Err(e) => return Err(format!("Error reinicializando framebuffer UEFI local: {}", e)),
+                Err(e) => {
+                    return Err(format!(
+                        "Error reinicializando framebuffer UEFI local: {}",
+                        e
+                    ))
+                }
             }
         }
 
@@ -355,38 +326,21 @@ impl GpuFallbackManager {
     }
 
     /// Transición suave entre backends con actualización de framebuffer
-    pub fn transition_to_backend(&mut self, backend_type: GraphicsBackendType) -> Result<(), String> {
+    pub fn transition_to_backend(
+        &mut self,
+        backend_type: GraphicsBackendType,
+    ) -> Result<(), String> {
         // Buscar el índice del backend
-        let backend_index = self.available_backends.iter()
+        let backend_index = self
+            .available_backends
+            .iter()
             .position(|b| b.backend_type == backend_type);
-        
+
         if let Some(index) = backend_index {
-            // Intentar inicializar el nuevo backend
-            if Self::try_initialize_backend(&mut self.available_backends[index]) {
-                // Si es un backend de GPU hardware, mantener framebuffer UEFI pero con optimizaciones
-                if backend_type.is_real_hardware() {
-                    // Para hardware real, mantenemos el framebuffer UEFI pero habilitamos optimizaciones
-                    // El optimizador de gráficos se encargará de aplicar las mejoras específicas
-                    if let Some(gpu_info) = &self.available_backends[index].gpu_info {
-                        // Log de la GPU detectada para debug
-                        if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
-                            let gpu_debug = format!("GPU detectada: {} {:04X}:{:04X}", 
-                                gpu_info.gpu_type.as_str(),
-                                gpu_info.pci_device.vendor_id,
-                                gpu_info.pci_device.device_id
-                            );
-                            fb.write_text_kernel(&gpu_debug, crate::drivers::framebuffer::Color::LIGHT_GRAY);
-                        }
-                    }
-                }
-                
-                // Cambiar al nuevo backend
-                self.active_backend = Some(self.available_backends[index].clone());
-                self.update_state_for_backend(&backend_type);
-                Ok(())
-            } else {
-                Err(format!("No se pudo inicializar el backend {:?}", backend_type))
-            }
+            // Cambiar al nuevo backend
+            self.active_backend = Some(self.available_backends[index].clone());
+            self.update_state_for_backend(&backend_type);
+            Ok(())
         } else {
             Err(format!("Backend {:?} no está disponible", backend_type))
         }
@@ -411,10 +365,12 @@ impl GpuFallbackManager {
     /// Obtener estadísticas del sistema de fallback
     pub fn get_stats(&self) -> String {
         let backend_count = self.available_backends.len();
-        let hardware_backends = self.available_backends.iter()
+        let hardware_backends = self
+            .available_backends
+            .iter()
             .filter(|b| b.backend_type.is_real_hardware())
             .count();
-        
+
         format!(
             "Fallback GPU: {} backends disponibles, {} hardware real, estado: {:?}",
             backend_count, hardware_backends, self.state
@@ -442,7 +398,8 @@ pub fn init_gpu_fallback() -> Result<(), String> {
 /// Obtener información del backend activo
 pub fn get_active_backend_info() -> Option<String> {
     unsafe {
-        GPU_FALLBACK_MANAGER.as_ref()
+        GPU_FALLBACK_MANAGER
+            .as_ref()
             .and_then(|m| m.get_active_backend_info())
     }
 }
@@ -450,7 +407,8 @@ pub fn get_active_backend_info() -> Option<String> {
 /// Verificar si estamos usando GPU hardware real
 pub fn is_using_real_hardware() -> bool {
     unsafe {
-        GPU_FALLBACK_MANAGER.as_ref()
+        GPU_FALLBACK_MANAGER
+            .as_ref()
             .map(|m| m.is_using_real_hardware())
             .unwrap_or(false)
     }
@@ -459,7 +417,8 @@ pub fn is_using_real_hardware() -> bool {
 /// Obtener estadísticas del sistema de fallback
 pub fn get_fallback_stats() -> String {
     unsafe {
-        GPU_FALLBACK_MANAGER.as_ref()
+        GPU_FALLBACK_MANAGER
+            .as_ref()
             .map(|m| m.get_stats())
             .unwrap_or_else(|| "Sistema de fallback GPU no inicializado".to_string())
     }
@@ -488,13 +447,13 @@ pub fn transition_to_backend(backend_type: GraphicsBackendType) -> Result<(), St
 }
 
 // ## Ejemplo de uso de la nueva funcionalidad de fallback GPU
-// 
+//
 // ```rust
 // use crate::gpu_fallback::{init_gpu_fallback, transition_to_backend, GraphicsBackendType};
-// 
+//
 // // Inicializar el sistema de fallback
 // init_gpu_fallback()?;
-// 
+//
 // // Transición suave a GPU hardware real con actualización de framebuffer
 // // Esto automáticamente:
 // // 1. Hace clear_screen en el framebuffer actual
@@ -502,22 +461,22 @@ pub fn transition_to_backend(backend_type: GraphicsBackendType) -> Result<(), St
 // // 3. Hace clear_screen en la nueva dirección
 // // 4. Cambia al nuevo backend
 // transition_to_backend(GraphicsBackendType::NvidiaGpu)?;
-// 
+//
 // // O forzar transición a Intel GPU
 // transition_to_backend(GraphicsBackendType::IntelGpu)?;
 // ```
-// 
+//
 // ## Mejoras implementadas:
-// 
+//
 // 1. **Actualización automática del framebuffer**: Cuando se hace fallback a GPU hardware real,
 //    el sistema automáticamente actualiza la dirección base del framebuffer a una dirección
 //    específica para cada tipo de GPU.
-// 
+//
 // 2. **Clear screen antes del cambio**: Se limpia la pantalla en el framebuffer actual antes
 //    de cambiar a la nueva dirección para evitar artefactos visuales.
-// 
+//
 // 3. **Clear screen después del cambio**: Se limpia la pantalla en la nueva dirección del
 //    framebuffer para asegurar una transición limpia.
-// 
+//
 // 4. **Transición suave**: La función `transition_to_backend()` maneja todo el proceso de
 //    manera segura y eficiente.

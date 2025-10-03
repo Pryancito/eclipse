@@ -1,22 +1,22 @@
 //! Gestor de drivers USB reales
-//! 
+//!
 //! Integra todos los drivers USB reales (teclado, ratón, etc.) y proporciona
 //! una interfaz unificada para el sistema.
 
 use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType, DeviceOperations},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    device::{Device, DeviceInfo, DeviceOperations, DeviceType},
+    keyboard::{KeyCode, KeyEvent},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
+    mouse::{MouseButton, MouseEvent},
     usb::{RealUsbController, UsbControllerType, UsbDeviceClass},
     usb_keyboard_real::UsbKeyboardReal,
     usb_mouse_real::UsbMouseReal,
-    keyboard::{KeyEvent, KeyCode},
-    mouse::{MouseEvent, MouseButton},
 };
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Gestor principal de drivers USB reales
 pub struct UsbManager {
@@ -58,7 +58,7 @@ impl UsbManager {
             let controller = RealUsbController::new(
                 UsbControllerType::XHCI,
                 xhci_base,
-                11 // IRQ típico para XHCI
+                11, // IRQ típico para XHCI
             );
             self.add_controller(controller)?;
         }
@@ -68,7 +68,7 @@ impl UsbManager {
             let controller = RealUsbController::new(
                 UsbControllerType::EHCI,
                 ehci_base,
-                12 // IRQ típico para EHCI
+                12, // IRQ típico para EHCI
             );
             self.add_controller(controller)?;
         }
@@ -78,7 +78,7 @@ impl UsbManager {
             let controller = RealUsbController::new(
                 UsbControllerType::OHCI,
                 ohci_base,
-                9 // IRQ típico para OHCI
+                9, // IRQ típico para OHCI
             );
             self.add_controller(controller)?;
         }
@@ -88,7 +88,7 @@ impl UsbManager {
             let controller = RealUsbController::new(
                 UsbControllerType::UHCI,
                 uhci_base,
-                9 // IRQ típico para UHCI
+                9, // IRQ típico para UHCI
             );
             self.add_controller(controller)?;
         }
@@ -310,28 +310,29 @@ impl UsbManager {
         stats.push_str("=== GESTOR USB REAL ===\n");
         stats.push_str(&format!("Controladores USB: {}\n", self.controllers.len()));
         stats.push_str(&format!("Dispositivos detectados: {}\n", self.device_count));
-        
+
         if let Some(ref keyboard) = self.keyboard_driver {
             stats.push_str("\n");
             stats.push_str(&keyboard.get_keyboard_stats());
         }
-        
+
         if let Some(ref mouse) = self.mouse_driver {
             stats.push_str("\n");
             stats.push_str(&mouse.get_mouse_stats());
         }
-        
+
         // Estadísticas de controladores
         for (i, controller) in self.controllers.iter().enumerate() {
-            stats.push_str(&format!("\nControlador {}: {:?} en 0x{:08X}\n", 
-                i + 1, 
+            stats.push_str(&format!(
+                "\nControlador {}: {:?} en 0x{:08X}\n",
+                i + 1,
                 controller.controller_type,
                 controller.base_address
             ));
             stats.push_str(&format!("  Habilitado: {}\n", controller.is_enabled));
             stats.push_str(&format!("  Dispositivos: {}\n", controller.devices.len()));
         }
-        
+
         stats
     }
 
@@ -413,7 +414,6 @@ impl Driver for UsbManager {
         self.info.is_loaded = true;
         Ok(())
     }
-
 
     fn cleanup(&mut self) -> DriverResult<()> {
         self.controllers.clear();

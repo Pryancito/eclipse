@@ -1,5 +1,5 @@
 //! Cliente Wayland para Eclipse OS
-//! 
+//!
 //! Implementa la gestión de clientes Wayland.
 
 use super::protocol::*;
@@ -22,17 +22,17 @@ impl WaylandClient {
             surfaces: Vec::new(),
         }
     }
-    
+
     /// Desconectar cliente
     pub fn disconnect(&mut self) {
         self.is_connected = false;
     }
-    
+
     /// Agregar superficie
     pub fn add_surface(&mut self, surface_id: ObjectId) {
         self.surfaces.push(surface_id);
     }
-    
+
     /// Remover superficie
     pub fn remove_surface(&mut self, surface_id: ObjectId) {
         self.surfaces.retain(|&id| id != surface_id);

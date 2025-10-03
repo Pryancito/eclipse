@@ -1,16 +1,16 @@
 //! Sistema de plugins del kernel Eclipse
-//! 
+//!
 //! Permite cargar, ejecutar y gestionar plugins dinámicamente
 //! para extender la funcionalidad del kernel sin recompilar.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
 use crate::synchronization::Mutex;
+use crate::{syslog_debug, syslog_err, syslog_info, syslog_warn, KernelError, KernelResult};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::boxed::Box;
-use alloc::format;
-use crate::{KernelError, KernelResult, syslog_info, syslog_warn, syslog_err, syslog_debug};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Estado de un plugin
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,13 +28,13 @@ pub enum PluginState {
 /// Tipo de plugin
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginType {
-    Driver,      // Driver de hardware
-    Filesystem,  // Sistema de archivos
-    Network,     // Protocolo de red
-    Security,    // Módulo de seguridad
-    AI,          // Módulo de IA
-    Utility,     // Utilidad del sistema
-    Custom,      // Plugin personalizado
+    Driver,     // Driver de hardware
+    Filesystem, // Sistema de archivos
+    Network,    // Protocolo de red
+    Security,   // Módulo de seguridad
+    AI,         // Módulo de IA
+    Utility,    // Utilidad del sistema
+    Custom,     // Plugin personalizado
 }
 
 /// Prioridad de un plugin
@@ -91,22 +91,22 @@ pub struct PluginHandle {
 pub trait PluginInterface {
     /// Inicializar el plugin
     fn initialize(&mut self) -> KernelResult<()>;
-    
+
     /// Ejecutar el plugin
     fn execute(&mut self) -> KernelResult<()>;
-    
+
     /// Pausar el plugin
     fn pause(&mut self) -> KernelResult<()>;
-    
+
     /// Reanudar el plugin
     fn resume(&mut self) -> KernelResult<()>;
-    
+
     /// Finalizar el plugin
     fn shutdown(&mut self) -> KernelResult<()>;
-    
+
     /// Obtener información del plugin
     fn get_info(&self) -> &PluginInfo;
-    
+
     /// Manejar evento del sistema
     fn handle_event(&mut self, event: PluginEvent) -> KernelResult<()>;
 }
@@ -173,7 +173,7 @@ impl PluginManager {
         }
 
         let plugin_name = info.name.clone();
-        
+
         if self.plugins.contains_key(&plugin_name) {
             return Err(KernelError::ValidationError);
         }
@@ -193,7 +193,7 @@ impl PluginManager {
 
         self.plugins.insert(plugin_name.clone(), plugin);
         self.total_plugins.fetch_add(1, Ordering::SeqCst);
-        
+
         let msg = format!("Plugin '{}' registrado", plugin_name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -207,8 +207,10 @@ impl PluginManager {
 
         // Obtener tiempo actual antes del borrow mutable
         let current_time = self.get_current_time();
-        
-        let plugin = self.plugins.get_mut(name)
+
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -217,13 +219,15 @@ impl PluginManager {
         }
 
         // Cambiar estado a cargando
-        plugin.state.store(PluginState::Loading as u32, Ordering::SeqCst);
-        
+        plugin
+            .state
+            .store(PluginState::Loading as u32, Ordering::SeqCst);
+
         // Simular carga del plugin
         plugin.load_time = current_time;
         plugin.memory_address = Some(0x1000000); // Simular dirección de memoria
         plugin.memory_size = plugin.info.memory_usage;
-        
+
         // Crear handle del plugin
         let handle = PluginHandle {
             id: self.next_plugin_id.fetch_add(1, Ordering::SeqCst),
@@ -231,13 +235,16 @@ impl PluginManager {
             data_section: 0x1001000,
             code_section: 0x1002000,
         };
-        
+
         plugin.handle = Some(handle);
-        plugin.state.store(PluginState::Loaded as u32, Ordering::SeqCst);
-        
+        plugin
+            .state
+            .store(PluginState::Loaded as u32, Ordering::SeqCst);
+
         self.loaded_plugins.fetch_add(1, Ordering::SeqCst);
-        self.plugin_memory_usage.fetch_add(plugin.memory_size, Ordering::SeqCst);
-        
+        self.plugin_memory_usage
+            .fetch_add(plugin.memory_size, Ordering::SeqCst);
+
         let msg = format!("Plugin '{}' cargado exitosamente", name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -247,8 +254,10 @@ impl PluginManager {
     pub fn initialize_plugin(&mut self, name: &str) -> KernelResult<()> {
         // Obtener tiempo actual antes del borrow mutable
         let current_time = self.get_current_time();
-        
-        let plugin = self.plugins.get_mut(name)
+
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -257,9 +266,11 @@ impl PluginManager {
         }
 
         // Simular inicialización
-        plugin.state.store(PluginState::Initialized as u32, Ordering::SeqCst);
+        plugin
+            .state
+            .store(PluginState::Initialized as u32, Ordering::SeqCst);
         plugin.last_activity = current_time;
-        
+
         let msg = format!("Plugin '{}' inicializado", name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -269,8 +280,10 @@ impl PluginManager {
     pub fn execute_plugin(&mut self, name: &str) -> KernelResult<()> {
         // Obtener tiempo actual antes del borrow mutable
         let current_time = self.get_current_time();
-        
-        let plugin = self.plugins.get_mut(name)
+
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -279,14 +292,16 @@ impl PluginManager {
         }
 
         // Simular ejecución
-        plugin.state.store(PluginState::Running as u32, Ordering::SeqCst);
+        plugin
+            .state
+            .store(PluginState::Running as u32, Ordering::SeqCst);
         plugin.execution_count.fetch_add(1, Ordering::SeqCst);
         plugin.last_activity = current_time;
-        
+
         if current_state == PluginState::Initialized {
             self.running_plugins.fetch_add(1, Ordering::SeqCst);
         }
-        
+
         let msg = format!("Plugin '{}' ejecutándose", name);
         syslog_debug!("PLUGINS", &msg);
         Ok(())
@@ -294,7 +309,9 @@ impl PluginManager {
 
     /// Pausar un plugin
     pub fn pause_plugin(&mut self, name: &str) -> KernelResult<()> {
-        let plugin = self.plugins.get_mut(name)
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -302,9 +319,11 @@ impl PluginManager {
             return Err(KernelError::ValidationError);
         }
 
-        plugin.state.store(PluginState::Paused as u32, Ordering::SeqCst);
+        plugin
+            .state
+            .store(PluginState::Paused as u32, Ordering::SeqCst);
         self.running_plugins.fetch_sub(1, Ordering::SeqCst);
-        
+
         let msg = format!("Plugin '{}' pausado", name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -314,8 +333,10 @@ impl PluginManager {
     pub fn resume_plugin(&mut self, name: &str) -> KernelResult<()> {
         // Obtener tiempo actual antes del borrow mutable
         let current_time = self.get_current_time();
-        
-        let plugin = self.plugins.get_mut(name)
+
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -323,10 +344,12 @@ impl PluginManager {
             return Err(KernelError::ValidationError);
         }
 
-        plugin.state.store(PluginState::Running as u32, Ordering::SeqCst);
+        plugin
+            .state
+            .store(PluginState::Running as u32, Ordering::SeqCst);
         self.running_plugins.fetch_add(1, Ordering::SeqCst);
         plugin.last_activity = current_time;
-        
+
         let msg = format!("Plugin '{}' reanudado", name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -334,7 +357,9 @@ impl PluginManager {
 
     /// Descargar un plugin
     pub fn unload_plugin(&mut self, name: &str) -> KernelResult<()> {
-        let plugin = self.plugins.get_mut(name)
+        let plugin = self
+            .plugins
+            .get_mut(name)
             .ok_or(KernelError::ValidationError)?;
 
         let current_state = PluginState::from(plugin.state.load(Ordering::SeqCst));
@@ -343,22 +368,27 @@ impl PluginManager {
         }
 
         // Cambiar estado a descargando
-        plugin.state.store(PluginState::Unloading as u32, Ordering::SeqCst);
-        
+        plugin
+            .state
+            .store(PluginState::Unloading as u32, Ordering::SeqCst);
+
         // Liberar recursos
         if current_state == PluginState::Running {
             self.running_plugins.fetch_sub(1, Ordering::SeqCst);
         }
-        
+
         self.loaded_plugins.fetch_sub(1, Ordering::SeqCst);
-        self.plugin_memory_usage.fetch_sub(plugin.memory_size, Ordering::SeqCst);
-        
+        self.plugin_memory_usage
+            .fetch_sub(plugin.memory_size, Ordering::SeqCst);
+
         // Limpiar handle y memoria
         plugin.handle = None;
         plugin.memory_address = None;
         plugin.memory_size = 0;
-        plugin.state.store(PluginState::Unloaded as u32, Ordering::SeqCst);
-        
+        plugin
+            .state
+            .store(PluginState::Unloaded as u32, Ordering::SeqCst);
+
         let msg = format!("Plugin '{}' descargado", name);
         syslog_info!("PLUGINS", &msg);
         Ok(())
@@ -371,7 +401,9 @@ impl PluginManager {
 
     /// Obtener estado de un plugin
     pub fn get_plugin_state(&self, name: &str) -> Option<PluginState> {
-        self.plugins.get(name).map(|p| PluginState::from(p.state.load(Ordering::SeqCst)))
+        self.plugins
+            .get(name)
+            .map(|p| PluginState::from(p.state.load(Ordering::SeqCst)))
     }
 
     /// Listar todos los plugins
@@ -397,23 +429,24 @@ impl PluginManager {
         }
 
         let current_time = self.get_current_time();
-        
+
         // Procesar plugins en ejecución
         for (name, plugin) in &mut self.plugins {
             let state = PluginState::from(plugin.state.load(Ordering::SeqCst));
-            
+
             if state == PluginState::Running {
                 // Simular procesamiento del plugin
                 plugin.last_activity = current_time;
-                
+
                 // Verificar si el plugin necesita atención
-                if current_time - plugin.last_activity > 10000 { // 10 segundos
+                if current_time - plugin.last_activity > 10000 {
+                    // 10 segundos
                     let msg = format!("Plugin '{}' inactivo por mucho tiempo", name);
-        syslog_warn!("PLUGINS", &msg);
+                    syslog_warn!("PLUGINS", &msg);
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -489,7 +522,9 @@ static PLUGIN_MANAGER: Mutex<Option<PluginManager>> = Mutex::new(None);
 
 /// Inicializar el sistema de plugins
 pub fn init_plugins() -> KernelResult<()> {
-    let mut manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let mut manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     *manager = Some(PluginManager::new());
     if let Some(ref mut plugin_manager) = *manager {
         plugin_manager.initialize()
@@ -505,7 +540,9 @@ pub fn get_plugin_manager() -> &'static Mutex<Option<PluginManager>> {
 
 /// Registrar un plugin
 pub fn register_plugin(info: PluginInfo) -> KernelResult<()> {
-    let mut manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let mut manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref mut plugin_manager) = *manager {
         plugin_manager.register_plugin(info)
     } else {
@@ -515,7 +552,9 @@ pub fn register_plugin(info: PluginInfo) -> KernelResult<()> {
 
 /// Cargar un plugin
 pub fn load_plugin(name: &str) -> KernelResult<()> {
-    let mut manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let mut manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref mut plugin_manager) = *manager {
         plugin_manager.load_plugin(name)
     } else {
@@ -525,7 +564,9 @@ pub fn load_plugin(name: &str) -> KernelResult<()> {
 
 /// Ejecutar un plugin
 pub fn execute_plugin(name: &str) -> KernelResult<()> {
-    let mut manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let mut manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref mut plugin_manager) = *manager {
         plugin_manager.execute_plugin(name)
     } else {
@@ -535,7 +576,9 @@ pub fn execute_plugin(name: &str) -> KernelResult<()> {
 
 /// Procesar eventos de plugins
 pub fn process_plugin_events() -> KernelResult<()> {
-    let mut manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let mut manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref mut plugin_manager) = *manager {
         plugin_manager.process_plugin_events()
     } else {
@@ -545,7 +588,9 @@ pub fn process_plugin_events() -> KernelResult<()> {
 
 /// Obtener estadísticas de plugins
 pub fn get_plugin_statistics() -> KernelResult<PluginStatistics> {
-    let manager = PLUGIN_MANAGER.lock().map_err(|_| KernelError::InternalError)?;
+    let manager = PLUGIN_MANAGER
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref plugin_manager) = *manager {
         Ok(plugin_manager.get_statistics())
     } else {

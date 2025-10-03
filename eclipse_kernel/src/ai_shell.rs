@@ -1,15 +1,15 @@
 //! Shell integrado con comandos de IA para Eclipse OS
-//! 
+//!
 //! Este módulo proporciona un shell interactivo que incluye
 //! comandos de IA integrados en el sistema operativo.
 
 #![no_std]
 
+use crate::ai_commands::{execute_ai_command, get_ai_command_manager};
+use crate::{syslog_err, syslog_info, syslog_warn, KernelError, KernelResult};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
-use crate::ai_commands::{execute_ai_command, get_ai_command_manager};
-use crate::{KernelResult, KernelError, syslog_info, syslog_warn, syslog_err};
 
 /// Shell integrado con IA
 pub struct AIShell {
@@ -32,13 +32,19 @@ impl AIShell {
     /// Inicializar el shell
     pub fn initialize(&mut self) -> KernelResult<()> {
         syslog_info!("AI_SHELL", "Inicializando shell con IA integrada");
-        
+
         // Configurar variables de entorno por defecto
-        self.variables.insert("PS1".to_string(), "eclipse-ai> ".to_string());
-        self.variables.insert("PATH".to_string(), "/bin:/usr/bin:/usr/local/bin".to_string());
-        self.variables.insert("HOME".to_string(), "/home/user".to_string());
-        self.variables.insert("USER".to_string(), "eclipse".to_string());
-        
+        self.variables
+            .insert("PS1".to_string(), "eclipse-ai> ".to_string());
+        self.variables.insert(
+            "PATH".to_string(),
+            "/bin:/usr/bin:/usr/local/bin".to_string(),
+        );
+        self.variables
+            .insert("HOME".to_string(), "/home/user".to_string());
+        self.variables
+            .insert("USER".to_string(), "eclipse".to_string());
+
         self.is_running = true;
         syslog_info!("AI_SHELL", "Shell con IA inicializado correctamente");
         Ok(())
@@ -75,60 +81,34 @@ impl AIShell {
                 self.is_running = false;
                 Ok("Saliendo del shell Eclipse AI...".to_string())
             }
-            "help" => {
-                self.help_command()
-            }
+            "help" => self.help_command(),
             "clear" => {
                 Ok("\x1B[2J\x1B[H".to_string()) // ANSI clear screen
             }
-            "history" => {
-                self.history_command()
-            }
-            "echo" => {
-                Ok(args.join(" "))
-            }
-            "set" => {
-                self.set_command(args)
-            }
-            "get" => {
-                self.get_command(args)
-            }
-            "env" => {
-                self.env_command()
-            }
-            "pwd" => {
-                Ok(self.variables.get("PWD").unwrap_or(&"/".to_string()).clone())
-            }
-            "cd" => {
-                self.cd_command(args)
-            }
-            "ls" => {
-                self.ls_command(args)
-            }
-            "ps" => {
-                self.ps_command()
-            }
-            "top" => {
-                self.top_command()
-            }
-            "free" => {
-                self.free_command()
-            }
-            "df" => {
-                self.df_command()
-            }
-            "uptime" => {
-                self.uptime_command()
-            }
-            "uname" => {
-                self.uname_command()
-            }
-            "whoami" => {
-                Ok(self.variables.get("USER").unwrap_or(&"eclipse".to_string()).clone())
-            }
-            "date" => {
-                self.date_command()
-            }
+            "history" => self.history_command(),
+            "echo" => Ok(args.join(" ")),
+            "set" => self.set_command(args),
+            "get" => self.get_command(args),
+            "env" => self.env_command(),
+            "pwd" => Ok(self
+                .variables
+                .get("PWD")
+                .unwrap_or(&"/".to_string())
+                .clone()),
+            "cd" => self.cd_command(args),
+            "ls" => self.ls_command(args),
+            "ps" => self.ps_command(),
+            "top" => self.top_command(),
+            "free" => self.free_command(),
+            "df" => self.df_command(),
+            "uptime" => self.uptime_command(),
+            "uname" => self.uname_command(),
+            "whoami" => Ok(self
+                .variables
+                .get("USER")
+                .unwrap_or(&"eclipse".to_string())
+                .clone()),
+            "date" => self.date_command(),
             // Comandos de IA
             _ => {
                 // Intentar ejecutar como comando de IA
@@ -147,7 +127,7 @@ impl AIShell {
     fn help_command(&self) -> KernelResult<String> {
         let mut output = String::new();
         output.push_str("=== ECLIPSE OS AI SHELL ===\n\n");
-        
+
         output.push_str("Comandos del Sistema:\n");
         output.push_str("  help          - Mostrar esta ayuda\n");
         output.push_str("  clear         - Limpiar pantalla\n");
@@ -168,18 +148,22 @@ impl AIShell {
         output.push_str("  uname         - Información del sistema\n");
         output.push_str("  whoami        - Usuario actual\n");
         output.push_str("  date          - Fecha y hora\n\n");
-        
+
         output.push_str("Comandos de IA:\n");
         if let Some(manager) = get_ai_command_manager() {
             for command_name in manager.list_commands() {
                 if let Some(command) = manager.get_command_info(&command_name) {
-                    output.push_str(&alloc::format!("  {} - {}\n", command.name, command.description));
+                    output.push_str(&alloc::format!(
+                        "  {} - {}\n",
+                        command.name,
+                        command.description
+                    ));
                 }
             }
         }
-        
+
         output.push_str("\nEscriba 'ai-help' para más información sobre comandos de IA.\n");
-        
+
         Ok(output)
     }
 
@@ -187,11 +171,11 @@ impl AIShell {
     fn history_command(&self) -> KernelResult<String> {
         let mut output = String::new();
         output.push_str("=== HISTORIAL DE COMANDOS ===\n\n");
-        
+
         for (i, cmd) in self.command_history.iter().enumerate() {
             output.push_str(&alloc::format!("{:3}: {}\n", i + 1, cmd));
         }
-        
+
         Ok(output)
     }
 
@@ -230,18 +214,21 @@ impl AIShell {
     fn env_command(&self) -> KernelResult<String> {
         let mut output = String::new();
         output.push_str("=== VARIABLES DE ENTORNO ===\n\n");
-        
+
         for (var, val) in &self.variables {
             output.push_str(&alloc::format!("{}={}\n", var, val));
         }
-        
+
         Ok(output)
     }
 
     /// Comando cd
     fn cd_command(&mut self, args: &[String]) -> KernelResult<String> {
         let dir = if args.is_empty() {
-            self.variables.get("HOME").unwrap_or(&"/".to_string()).clone()
+            self.variables
+                .get("HOME")
+                .unwrap_or(&"/".to_string())
+                .clone()
         } else {
             args[0].clone()
         };
@@ -254,7 +241,10 @@ impl AIShell {
     /// Comando ls
     fn ls_command(&self, args: &[String]) -> KernelResult<String> {
         let dir = if args.is_empty() {
-            self.variables.get("PWD").unwrap_or(&"/".to_string()).clone()
+            self.variables
+                .get("PWD")
+                .unwrap_or(&"/".to_string())
+                .clone()
         } else {
             args[0].clone()
         };
@@ -333,7 +323,10 @@ impl AIShell {
 
     /// Comando uptime
     fn uptime_command(&self) -> KernelResult<String> {
-        Ok("Sistema activo desde: 00:00:01, tiempo de actividad: 1 día, 2 horas, 30 minutos".to_string())
+        Ok(
+            "Sistema activo desde: 00:00:01, tiempo de actividad: 1 día, 2 horas, 30 minutos"
+                .to_string(),
+        )
     }
 
     /// Comando uname
@@ -349,10 +342,10 @@ impl AIShell {
     /// Ejecutar shell interactivo
     pub fn run_interactive(&mut self) -> KernelResult<()> {
         syslog_info!("AI_SHELL", "Iniciando shell interactivo con IA");
-        
+
         // Mostrar banner de bienvenida
         self.show_welcome_banner()?;
-        
+
         // Bucle principal del shell
         while self.is_running {
             // En una implementación real, aquí se leería input del usuario
@@ -360,7 +353,7 @@ impl AIShell {
             self.run_demo_commands()?;
             break; // Salir después de la demostración
         }
-        
+
         syslog_info!("AI_SHELL", "Shell interactivo finalizado");
         Ok(())
     }
@@ -383,7 +376,7 @@ impl AIShell {
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 "#;
-        
+
         syslog_info!("AI_SHELL", banner);
         Ok(())
     }
@@ -399,7 +392,8 @@ impl AIShell {
             "free",
             "uname",
             "ai-help",
-        ].to_vec();
+        ]
+        .to_vec();
 
         for cmd in demo_commands {
             syslog_info!("AI_SHELL", &alloc::format!("Ejecutando: {}", cmd));
@@ -410,7 +404,10 @@ impl AIShell {
                     }
                 }
                 Err(e) => {
-                    syslog_warn!("AI_SHELL", &alloc::format!("Error ejecutando '{}': {}", cmd, e));
+                    syslog_warn!(
+                        "AI_SHELL",
+                        &alloc::format!("Error ejecutando '{}': {}", cmd, e)
+                    );
                 }
             }
         }
@@ -425,14 +422,14 @@ static mut AI_SHELL: Option<AIShell> = None;
 /// Inicializar shell con IA
 pub fn init_ai_shell() -> KernelResult<()> {
     syslog_info!("AI_SHELL", "Inicializando shell con IA integrada");
-    
+
     unsafe {
         AI_SHELL = Some(AIShell::new());
         if let Some(ref mut shell) = AI_SHELL {
             shell.initialize()?;
         }
     }
-    
+
     syslog_info!("AI_SHELL", "Shell con IA inicializado correctamente");
     Ok(())
 }

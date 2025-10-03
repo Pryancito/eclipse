@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 //! Información del sistema para Eclipse OS
-//! 
+//!
 //! Muestra información detallada sobre el hardware y software del sistema.
 
-use alloc::{vec, vec::Vec};
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::{vec, vec::Vec};
 
 /// Información del sistema
 pub struct SystemInfo {
@@ -79,11 +79,11 @@ impl SystemInfo {
                 usage: 15.5,
             },
             memory_info: MemoryInfo {
-                total: 8589934592, // 8GB
-                used: 4294967296,  // 4GB
-                free: 4294967296,  // 4GB
-                cached: 1073741824, // 1GB
-                buffers: 536870912, // 512MB
+                total: 8589934592,      // 8GB
+                used: 4294967296,       // 4GB
+                free: 4294967296,       // 4GB
+                cached: 1073741824,     // 1GB
+                buffers: 536870912,     // 512MB
                 swap_total: 8589934592, // 8GB
                 swap_used: 0,
                 swap_free: 8589934592, // 8GB
@@ -157,7 +157,10 @@ impl SystemInfo {
         self.print_info("═══════════════════════════════════════════════════════════════");
         self.print_info("                        INFORMACIÓN GENERAL");
         self.print_info("═══════════════════════════════════════════════════════════════");
-        self.print_info(&format!("Sistema Operativo: {} {}", self.os_name, self.os_version));
+        self.print_info(&format!(
+            "Sistema Operativo: {} {}",
+            self.os_name, self.os_version
+        ));
         self.print_info(&format!("Kernel: {}", self.kernel_version));
         self.print_info(&format!("Arquitectura: {}", self.architecture));
         self.print_info(&format!("Tiempo de actividad: {} segundos", self.uptime));
@@ -181,16 +184,40 @@ impl SystemInfo {
         self.print_info("═══════════════════════════════════════════════════════════════");
         self.print_info("                            MEMORIA");
         self.print_info("═══════════════════════════════════════════════════════════════");
-        self.print_info(&format!("Total: {} MB", self.memory_info.total / 1024 / 1024));
-        self.print_info(&format!("Usada: {} MB", self.memory_info.used / 1024 / 1024));
-        self.print_info(&format!("Libre: {} MB", self.memory_info.free / 1024 / 1024));
-        self.print_info(&format!("Cache: {} MB", self.memory_info.cached / 1024 / 1024));
-        self.print_info(&format!("Buffers: {} MB", self.memory_info.buffers / 1024 / 1024));
+        self.print_info(&format!(
+            "Total: {} MB",
+            self.memory_info.total / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "Usada: {} MB",
+            self.memory_info.used / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "Libre: {} MB",
+            self.memory_info.free / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "Cache: {} MB",
+            self.memory_info.cached / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "Buffers: {} MB",
+            self.memory_info.buffers / 1024 / 1024
+        ));
         self.print_info("");
         self.print_info("Swap:");
-        self.print_info(&format!("  Total: {} MB", self.memory_info.swap_total / 1024 / 1024));
-        self.print_info(&format!("  Usada: {} MB", self.memory_info.swap_used / 1024 / 1024));
-        self.print_info(&format!("  Libre: {} MB", self.memory_info.swap_free / 1024 / 1024));
+        self.print_info(&format!(
+            "  Total: {} MB",
+            self.memory_info.swap_total / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "  Usada: {} MB",
+            self.memory_info.swap_used / 1024 / 1024
+        ));
+        self.print_info(&format!(
+            "  Libre: {} MB",
+            self.memory_info.swap_free / 1024 / 1024
+        ));
         self.print_info("");
     }
 
@@ -198,9 +225,13 @@ impl SystemInfo {
         self.print_info("═══════════════════════════════════════════════════════════════");
         self.print_info("                            DISCOS");
         self.print_info("═══════════════════════════════════════════════════════════════");
-        self.print_info("Dispositivo    Punto de montaje  Sistema  Tamaño    Usado    Libre    Uso%");
-        self.print_info("─────────────  ────────────────  ───────  ────────  ───────  ───────  ─────");
-        
+        self.print_info(
+            "Dispositivo    Punto de montaje  Sistema  Tamaño    Usado    Libre    Uso%",
+        );
+        self.print_info(
+            "─────────────  ────────────────  ───────  ────────  ───────  ───────  ─────",
+        );
+
         for disk in &self.disk_info {
             self.print_info(&format!(
                 "{:<13} {:<17} {:<7} {:<8} {:<7} {:<7} {:.1}%",
@@ -222,7 +253,7 @@ impl SystemInfo {
         self.print_info("═══════════════════════════════════════════════════════════════");
         self.print_info("Interfaz    Dirección IP      MAC              Estado  RX      TX");
         self.print_info("──────────  ────────────────  ───────────────  ──────  ───────  ───────");
-        
+
         for net in &self.network_info {
             self.print_info(&format!(
                 "{:<10} {:<17} {:<16} {:<7} {:<7} {:<7}",
@@ -275,12 +306,12 @@ fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit_index = 0;
-    
+
     while size >= 1024.0 && unit_index < UNITS.len() - 1 {
         size /= 1024.0;
         unit_index += 1;
     }
-    
+
     format!("{:.1}{}", size, UNITS[unit_index])
 }
 

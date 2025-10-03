@@ -1,11 +1,11 @@
 #![no_std]
 
-use core::ptr;
-use alloc::vec::Vec;
-use alloc::string::String;
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::ptr;
 
 /// Driver de USB Hub para Eclipse OS
 /// Implementa soporte para concentradores USB (USB Hubs)
@@ -105,38 +105,57 @@ pub enum UsbHubType {
 /// Modo de conmutación de energía
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsbPowerSwitching {
-    Global,  // Todos los puertos se encienden/apagan juntos
+    Global,     // Todos los puertos se encienden/apagan juntos
     Individual, // Cada puerto se controla individualmente
 }
 
 /// Protección contra sobrecorriente
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsbOverCurrentProtection {
-    Global,  // Protección global
+    Global,     // Protección global
     Individual, // Protección por puerto
 }
 
 /// Evento del hub USB
 #[derive(Debug, Clone, PartialEq)]
 pub enum UsbHubEvent {
-    PortConnected { port: u8, device_speed: UsbDeviceSpeed },
-    PortDisconnected { port: u8 },
-    PortEnabled { port: u8 },
-    PortDisabled { port: u8 },
-    PortSuspended { port: u8 },
-    PortResumed { port: u8 },
-    PortReset { port: u8 },
-    OverCurrent { port: u8 },
-    HubError { error: String },
+    PortConnected {
+        port: u8,
+        device_speed: UsbDeviceSpeed,
+    },
+    PortDisconnected {
+        port: u8,
+    },
+    PortEnabled {
+        port: u8,
+    },
+    PortDisabled {
+        port: u8,
+    },
+    PortSuspended {
+        port: u8,
+    },
+    PortResumed {
+        port: u8,
+    },
+    PortReset {
+        port: u8,
+    },
+    OverCurrent {
+        port: u8,
+    },
+    HubError {
+        error: String,
+    },
 }
 
 /// Velocidad del dispositivo USB
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsbDeviceSpeed {
-    LowSpeed,    // 1.5 Mbps
-    FullSpeed,   // 12 Mbps
-    HighSpeed,   // 480 Mbps
-    SuperSpeed,  // 5 Gbps
+    LowSpeed,       // 1.5 Mbps
+    FullSpeed,      // 12 Mbps
+    HighSpeed,      // 480 Mbps
+    SuperSpeed,     // 5 Gbps
     SuperSpeedPlus, // 10 Gbps
 }
 
@@ -169,11 +188,11 @@ impl UsbHubDriver {
     pub fn new(info: UsbHubInfo) -> Self {
         let num_ports = info.num_ports as usize;
         let mut ports = Vec::with_capacity(num_ports);
-        
+
         for i in 0..num_ports {
             ports.push(UsbPortFeatures::new(i as u8 + 1));
         }
-        
+
         Self {
             info,
             ports,
@@ -184,29 +203,29 @@ impl UsbHubDriver {
             remote_wakeup: false,
         }
     }
-    
+
     /// Inicializar el hub USB
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Configurar el hub
         self.configure_hub()?;
-        
+
         // Inicializar todos los puertos
         self.initialize_ports()?;
-        
+
         // Habilitar detección de cambios
         self.enable_port_change_detection()?;
-        
+
         self.initialized = true;
         Ok(())
     }
-    
+
     /// Configurar el hub
     fn configure_hub(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se configuraría el hub USB
         // Por ahora simulamos la configuración
         Ok(())
     }
-    
+
     /// Inicializar todos los puertos
     fn initialize_ports(&mut self) -> Result<(), &'static str> {
         for port in &mut self.ports {
@@ -217,27 +236,27 @@ impl UsbHubDriver {
         }
         Ok(())
     }
-    
+
     /// Habilitar detección de cambios en puertos
     fn enable_port_change_detection(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se habilitaría la detección de cambios
         // Por ahora simulamos la habilitación
         Ok(())
     }
-    
+
     /// Procesar cambios en los puertos
     pub fn process_port_changes(&mut self) -> Result<(), &'static str> {
         if !self.initialized {
             return Err("Hub no inicializado");
         }
-        
+
         // En una implementación real, aquí se leerían los registros de estado del hub
         // Por ahora simulamos algunos cambios
         self.simulate_port_changes();
-        
+
         Ok(())
     }
-    
+
     /// Simular cambios en los puertos (para demostración)
     fn simulate_port_changes(&mut self) {
         // Simular conexión de dispositivo en puerto 1
@@ -246,7 +265,7 @@ impl UsbHubDriver {
                 port.state = UsbPortState::Enabled;
                 port.port_connection = true;
                 port.high_speed_device = true;
-                
+
                 let event = UsbHubEvent::PortConnected {
                     port: 1,
                     device_speed: UsbDeviceSpeed::HighSpeed,
@@ -254,14 +273,14 @@ impl UsbHubDriver {
                 self.event_buffer.push_back(event);
             }
         }
-        
+
         // Simular conexión de dispositivo en puerto 2
         if let Some(port) = self.ports.get_mut(1) {
             if port.state == UsbPortState::PowerOff {
                 port.state = UsbPortState::Enabled;
                 port.port_connection = true;
                 // port.full_speed_device = true; // Campo no existe
-                
+
                 let event = UsbHubEvent::PortConnected {
                     port: 2,
                     device_speed: UsbDeviceSpeed::FullSpeed,
@@ -270,14 +289,14 @@ impl UsbHubDriver {
             }
         }
     }
-    
+
     /// Habilitar puerto
     pub fn enable_port(&mut self, port_number: u8) -> Result<(), &'static str> {
         if let Some(port) = self.ports.get_mut((port_number - 1) as usize) {
             port.state = UsbPortState::Enabled;
             port.port_enable = true;
             port.port_power = true;
-            
+
             let event = UsbHubEvent::PortEnabled { port: port_number };
             self.event_buffer.push_back(event);
             Ok(())
@@ -285,14 +304,14 @@ impl UsbHubDriver {
             Err("Puerto no encontrado")
         }
     }
-    
+
     /// Deshabilitar puerto
     pub fn disable_port(&mut self, port_number: u8) -> Result<(), &'static str> {
         if let Some(port) = self.ports.get_mut((port_number - 1) as usize) {
             port.state = UsbPortState::Disabled;
             port.port_enable = false;
             port.port_power = false;
-            
+
             let event = UsbHubEvent::PortDisabled { port: port_number };
             self.event_buffer.push_back(event);
             Ok(())
@@ -300,13 +319,13 @@ impl UsbHubDriver {
             Err("Puerto no encontrado")
         }
     }
-    
+
     /// Resetear puerto
     pub fn reset_port(&mut self, port_number: u8) -> Result<(), &'static str> {
         if let Some(port) = self.ports.get_mut((port_number - 1) as usize) {
             port.state = UsbPortState::Reset;
             port.port_reset = true;
-            
+
             let event = UsbHubEvent::PortReset { port: port_number };
             self.event_buffer.push_back(event);
             Ok(())
@@ -314,13 +333,13 @@ impl UsbHubDriver {
             Err("Puerto no encontrado")
         }
     }
-    
+
     /// Suspender puerto
     pub fn suspend_port(&mut self, port_number: u8) -> Result<(), &'static str> {
         if let Some(port) = self.ports.get_mut((port_number - 1) as usize) {
             port.state = UsbPortState::Suspended;
             port.port_suspend = true;
-            
+
             let event = UsbHubEvent::PortSuspended { port: port_number };
             self.event_buffer.push_back(event);
             Ok(())
@@ -328,13 +347,13 @@ impl UsbHubDriver {
             Err("Puerto no encontrado")
         }
     }
-    
+
     /// Reanudar puerto
     pub fn resume_port(&mut self, port_number: u8) -> Result<(), &'static str> {
         if let Some(port) = self.ports.get_mut((port_number - 1) as usize) {
             port.state = UsbPortState::Enabled;
             port.port_suspend = false;
-            
+
             let event = UsbHubEvent::PortResumed { port: port_number };
             self.event_buffer.push_back(event);
             Ok(())
@@ -342,32 +361,32 @@ impl UsbHubDriver {
             Err("Puerto no encontrado")
         }
     }
-    
+
     /// Obtener siguiente evento
     pub fn get_next_event(&mut self) -> Option<UsbHubEvent> {
         self.event_buffer.pop_front()
     }
-    
+
     /// Verificar si hay eventos pendientes
     pub fn has_events(&self) -> bool {
         !self.event_buffer.is_empty()
     }
-    
+
     /// Obtener información de un puerto
     pub fn get_port_info(&self, port_number: u8) -> Option<&UsbPortFeatures> {
         self.ports.get((port_number - 1) as usize)
     }
-    
+
     /// Obtener información de todos los puertos
     pub fn get_all_ports(&self) -> &[UsbPortFeatures] {
         &self.ports
     }
-    
+
     /// Obtener número de puertos
     pub fn get_port_count(&self) -> u8 {
         self.info.num_ports
     }
-    
+
     /// Obtener puertos activos
     pub fn get_active_ports(&self) -> Vec<u8> {
         let mut active_ports = Vec::new();
@@ -378,7 +397,7 @@ impl UsbHubDriver {
         }
         active_ports
     }
-    
+
     /// Obtener estadísticas del hub
     pub fn get_stats(&self) -> UsbHubStats {
         UsbHubStats {
@@ -389,17 +408,17 @@ impl UsbHubDriver {
             remote_wakeup: self.remote_wakeup,
         }
     }
-    
+
     /// Verificar si el hub está inicializado
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
-    
+
     /// Limpiar buffer de eventos
     pub fn clear_events(&mut self) {
         self.event_buffer.clear();
     }
-    
+
     /// Obtener información del hub
     pub fn get_info(&self) -> &UsbHubInfo {
         &self.info
@@ -422,7 +441,12 @@ pub fn create_usb_hub(info: UsbHubInfo) -> UsbHubDriver {
 }
 
 /// Función de conveniencia para crear un hub USB estándar
-pub fn create_standard_usb_hub(vendor_id: u16, product_id: u16, device_address: u8, num_ports: u8) -> UsbHubDriver {
+pub fn create_standard_usb_hub(
+    vendor_id: u16,
+    product_id: u16,
+    device_address: u8,
+    num_ports: u8,
+) -> UsbHubDriver {
     let info = UsbHubInfo {
         vendor_id,
         product_id,
@@ -438,6 +462,6 @@ pub fn create_standard_usb_hub(vendor_id: u16, product_id: u16, device_address: 
         port_indicators: true,
         compound_device: false,
     };
-    
+
     UsbHubDriver::new(info)
 }

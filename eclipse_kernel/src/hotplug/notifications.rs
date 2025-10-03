@@ -1,11 +1,11 @@
 //! Sistema de notificaciones para hot-plug USB
-//! 
+//!
 //! Maneja notificaciones y callbacks para eventos USB.
 
-use super::{UsbHotplugEvent, UsbDeviceInfo, UsbDeviceType};
+use super::{UsbDeviceInfo, UsbDeviceType, UsbHotplugEvent};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 /// Tipo de callback para eventos USB
 pub type UsbEventCallback = Box<dyn Fn(&UsbHotplugEvent) + Send + Sync>;
@@ -53,7 +53,10 @@ impl UsbNotificationSystem {
     }
 
     /// Registrar callback para dispositivos desconectados
-    pub fn register_device_disconnected_callback(&mut self, callback: UsbDeviceDisconnectedCallback) {
+    pub fn register_device_disconnected_callback(
+        &mut self,
+        callback: UsbDeviceDisconnectedCallback,
+    ) {
         self.device_disconnected_callbacks.push(callback);
     }
 
@@ -80,7 +83,7 @@ impl UsbNotificationSystem {
                 for callback in &self.device_connected_callbacks {
                     callback(info);
                 }
-                
+
                 // Notificar callbacks específicos por tipo de dispositivo
                 match info.device_type {
                     UsbDeviceType::Mouse => {
@@ -134,11 +137,11 @@ impl UsbNotificationSystem {
 
     /// Obtener número de callbacks registrados
     pub fn callback_count(&self) -> usize {
-        self.general_callbacks.len() +
-        self.device_connected_callbacks.len() +
-        self.device_disconnected_callbacks.len() +
-        self.mouse_callbacks.len() +
-        self.keyboard_callbacks.len()
+        self.general_callbacks.len()
+            + self.device_connected_callbacks.len()
+            + self.device_disconnected_callbacks.len()
+            + self.mouse_callbacks.len()
+            + self.keyboard_callbacks.len()
     }
 }
 

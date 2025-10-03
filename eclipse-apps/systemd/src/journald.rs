@@ -73,6 +73,8 @@ pub struct JournalManager {
     journal_file: String,
     /// Buffer de escritura
     writer: Arc<Mutex<BufWriter<std::fs::File>>>,
+    /// Ruta de log plano adicional
+    plain_log_file: String,
     /// Configuración
     config: JournalConfig,
 }
@@ -115,17 +117,53 @@ impl JournalManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Abrir archivo del journal
-        let file = OpenOptions::new()
+        // Abrir archivo del journal con fallback a /run si /var está ro
+        let writer = {
+            match OpenOptions::new().create(true).append(true).open(journal_file) {
+                Ok(file) => Arc::new(Mutex::new(BufWriter::new(file))),
+                Err(e) => {
+                    let fallback_json = "/run/systemd-journal.json";
+                    if let Some(parent) = Path::new(fallback_json).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(fallback_json)?;
+                    eprintln!(
+                        "[systemd] aviso: no se pudo abrir {} ({}), usando {}",
+                        journal_file, e, fallback_json
+                    );
+                    Arc::new(Mutex::new(BufWriter::new(file)))
+                }
+            }
+        };
+
+        // Preparar log plano adicional en /var/log/systemd.log
+        let plain_log_file = "/var/log/systemd.log".to_string();
+        if let Some(parent) = Path::new(&plain_log_file).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Crear si no existe y ajustar permisos básicos (0644)
+        let _ = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(journal_file)?;
-
-        let writer = Arc::new(Mutex::new(BufWriter::new(file)));
+            .open(&plain_log_file)?;
+        // Establecer permisos 0644 si es posible
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&plain_log_file) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o644);
+                let _ = std::fs::set_permissions(&plain_log_file, perms);
+            }
+        }
 
         Ok(Self {
             journal_file: journal_file.to_string(),
             writer,
+            plain_log_file,
             config,
         })
     }
@@ -144,10 +182,69 @@ impl JournalManager {
             writer.flush()?;
         }
 
+        // Escribir también al log plano /var/log/systemd.log
+        self.append_plain_log(&entry)?;
+
         // Verificar tamaño del archivo
         self.check_file_size()?;
 
         Ok(())
+    }
+
+    /// Añade una línea legible a /var/log/systemd.log
+    fn append_plain_log(&self, entry: &JournalEntry) -> Result<()> {
+        let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S%.3f");
+        let prio = match entry.priority {
+            Priority::Emergency => "EMERG",
+            Priority::Alert => "ALERT",
+            Priority::Critical => "CRIT",
+            Priority::Error => "ERROR",
+            Priority::Warning => "WARN",
+            Priority::Notice => "NOTICE",
+            Priority::Info => "INFO",
+            Priority::Debug => "DEBUG",
+        };
+        let line = format!(
+            "[{}] {} {}{}: {}\n",
+            ts,
+            prio,
+            entry.service,
+            entry.pid.map(|p| format!("[{}]", p)).unwrap_or_default(),
+            entry.message
+        );
+
+        // Intentar escribir en /var/log/systemd.log
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.plain_log_file)
+        {
+            Ok(mut file) => {
+                file.write_all(line.as_bytes())?;
+                file.flush()?;
+                Ok(())
+            }
+            Err(e) => {
+                // Fallback: intentar /run/systemd.log (suele ser escribible en live/ISO)
+                let fallback = "/run/systemd.log";
+                if let Some(parent) = Path::new(fallback).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match OpenOptions::new().create(true).append(true).open(fallback) {
+                    Ok(mut file) => {
+                        let _ = file.write_all(line.as_bytes());
+                        let _ = file.flush();
+                        eprintln!("[systemd] aviso: no se pudo escribir en {} ({}), usando {}", self.plain_log_file, e, fallback);
+                        Ok(())
+                    }
+                    Err(e2) => {
+                        // Último recurso: stderr
+                        eprintln!("[systemd] error: no se pudo escribir logs en {} ({}) ni en {} ({}). Mensaje: {}", self.plain_log_file, e, fallback, e2, line.trim());
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 
     /// Registra un mensaje simple

@@ -4,8 +4,8 @@
 //! reduciendo la latencia y mejorando la eficiencia
 
 use crate::process::{ProcessId, ThreadId};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Configuración de optimización de context switching
 #[derive(Debug, Clone)]
@@ -35,11 +35,11 @@ impl Default for ContextSwitchConfig {
 #[derive(Debug, Clone)]
 pub struct ContextSwitchMetrics {
     pub total_switches: u64,
-    pub average_switch_time: u64,    // en nanosegundos
+    pub average_switch_time: u64, // en nanosegundos
     pub min_switch_time: u64,
     pub max_switch_time: u64,
-    pub switch_frequency: f64,       // switches por segundo
-    pub efficiency_score: f64,       // 0-100
+    pub switch_frequency: f64, // switches por segundo
+    pub efficiency_score: f64, // 0-100
 }
 
 /// Optimizador de context switching
@@ -82,21 +82,26 @@ impl ContextSwitchOptimizer {
         self.switch_times.clear();
         self.prefetch_cache.clear();
         self.register_cache.clear();
-        
+
         // Activar optimizaciones por defecto
         self.optimization_active.store(1, Ordering::Release);
-        
+
         Ok(())
     }
 
     /// Registrar un context switch
-    pub fn record_context_switch(&mut self, from_thread: ThreadId, to_thread: ThreadId, switch_time: u64) {
+    pub fn record_context_switch(
+        &mut self,
+        from_thread: ThreadId,
+        to_thread: ThreadId,
+        switch_time: u64,
+    ) {
         let current_time = self.get_current_time();
-        
+
         // Actualizar métricas
         self.metrics.total_switches += 1;
         self.switch_count.fetch_add(1, Ordering::Relaxed);
-        
+
         // Actualizar tiempos
         if switch_time < self.metrics.min_switch_time {
             self.metrics.min_switch_time = switch_time;
@@ -104,29 +109,30 @@ impl ContextSwitchOptimizer {
         if switch_time > self.metrics.max_switch_time {
             self.metrics.max_switch_time = switch_time;
         }
-        
+
         // Calcular tiempo promedio
         self.switch_times.push(switch_time);
         if self.switch_times.len() > 1000 {
             self.switch_times.remove(0); // Mantener solo los últimos 1000
         }
-        
+
         let total_time: u64 = self.switch_times.iter().sum();
         self.metrics.average_switch_time = total_time / self.switch_times.len() as u64;
-        
+
         // Calcular frecuencia
         let time_delta = current_time - self.last_switch_time.load(Ordering::Acquire);
         if time_delta > 0 {
-            self.metrics.switch_frequency = 1_000_000_000.0 / time_delta as f64; // nanosegundos a segundos
+            self.metrics.switch_frequency = 1_000_000_000.0 / time_delta as f64;
+            // nanosegundos a segundos
         }
-        
+
         self.last_switch_time.store(current_time, Ordering::Release);
-        
+
         // Aplicar optimizaciones si están activas
         if self.optimization_active.load(Ordering::Acquire) == 1 {
             self.apply_optimizations(from_thread, to_thread);
         }
-        
+
         // Actualizar score de eficiencia
         self.update_efficiency_score();
     }
@@ -136,15 +142,15 @@ impl ContextSwitchOptimizer {
         if self.config.enable_lazy_save {
             self.optimize_lazy_save(from_thread, to_thread);
         }
-        
+
         if self.config.enable_register_optimization {
             self.optimize_register_usage(from_thread, to_thread);
         }
-        
+
         if self.config.enable_cache_prefetch {
             self.optimize_cache_prefetch(to_thread);
         }
-        
+
         if self.config.enable_tlb_optimization {
             self.optimize_tlb_usage(to_thread);
         }
@@ -169,7 +175,7 @@ impl ContextSwitchOptimizer {
         // Pre-cargar datos del thread de destino en cache
         if !self.prefetch_cache.contains(&to_thread) {
             self.prefetch_cache.push(to_thread);
-            
+
             // Limitar el tamaño del cache de prefetch
             if self.prefetch_cache.len() > 10 {
                 self.prefetch_cache.remove(0);
@@ -190,7 +196,7 @@ impl ContextSwitchOptimizer {
             self.metrics.efficiency_score = 0.0;
             return;
         }
-        
+
         // Score basado en el tiempo promedio de switch
         // Menor tiempo = mayor eficiencia
         let target_time = 1000; // 1 microsegundo objetivo
@@ -199,19 +205,20 @@ impl ContextSwitchOptimizer {
         } else {
             (target_time as f64 / self.metrics.average_switch_time as f64) * 100.0
         };
-        
+
         self.metrics.efficiency_score = efficiency.min(100.0).max(0.0);
     }
 
     /// Verificar si se necesita optimización
     pub fn needs_optimization(&self) -> bool {
-        self.metrics.switch_frequency > self.config.max_context_switch_frequency as f64 ||
-        self.metrics.average_switch_time > self.config.optimization_threshold
+        self.metrics.switch_frequency > self.config.max_context_switch_frequency as f64
+            || self.metrics.average_switch_time > self.config.optimization_threshold
     }
 
     /// Activar/desactivar optimizaciones
     pub fn set_optimization_active(&self, active: bool) {
-        self.optimization_active.store(if active { 1 } else { 0 }, Ordering::Release);
+        self.optimization_active
+            .store(if active { 1 } else { 0 }, Ordering::Release);
     }
 
     /// Actualizar configuración
@@ -281,4 +288,3 @@ pub struct ContextSwitchStats {
     pub prefetch_cache_size: usize,
     pub recent_switch_times: usize,
 }
-

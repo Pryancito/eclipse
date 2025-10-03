@@ -1,44 +1,142 @@
 //! Driver de teclado para Eclipse OS
-//! 
+//!
 //! Define las interfaces y tipos básicos para drivers de teclado.
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
 };
 
 /// Códigos de tecla
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyCode {
     // Letras
-    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-    
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+
     // Números
-    Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
-    
+    Key0,
+    Key1,
+    Key2,
+    Key3,
+    Key4,
+    Key5,
+    Key6,
+    Key7,
+    Key8,
+    Key9,
+
     // Teclas especiales
-    Space, Enter, Escape, Backspace, Tab, CapsLock, Shift, Ctrl, Alt,
-    Left, Right, Up, Down, Home, End, PageUp, PageDown, Insert, Delete,
-    
+    Space,
+    Enter,
+    Escape,
+    Backspace,
+    Tab,
+    CapsLock,
+    Shift,
+    Ctrl,
+    Alt,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+
     // Teclas de función
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
-    
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+
     // Símbolos
-    Semicolon, Quote, Backslash, Comma, Period, Slash,
-    LeftBracket, RightBracket, Minus, Equals, Grave,
-    Equal, Apostrophe, PrintScreen, ScrollLock, Pause,
-    
+    Semicolon,
+    Quote,
+    Backslash,
+    Comma,
+    Period,
+    Slash,
+    LeftBracket,
+    RightBracket,
+    Minus,
+    Equals,
+    Grave,
+    Equal,
+    Apostrophe,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+
     // Teclas del teclado numérico
-    Numpad0, Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
-    NumLock, NumpadDivide, NumpadMultiply, NumpadSubtract, NumpadAdd, NumpadEnter, NumpadDecimal,
-    
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumLock,
+    NumpadDivide,
+    NumpadMultiply,
+    NumpadSubtract,
+    NumpadAdd,
+    NumpadEnter,
+    NumpadDecimal,
+
     // Teclas del sistema
-    LeftShift, RightShift, LeftCtrl, RightCtrl, LeftAlt, RightAlt,
-    LeftMeta, RightMeta, Menu,
-    
+    LeftShift,
+    RightShift,
+    LeftCtrl,
+    RightCtrl,
+    LeftAlt,
+    RightAlt,
+    LeftMeta,
+    RightMeta,
+    Menu,
+
     // Teclas adicionales
-    None, Wheel,
-    
+    None,
+    Wheel,
+
     // Desconocida
     Unknown,
 }
@@ -72,16 +170,16 @@ impl KeyEvent {
 pub trait KeyboardDriver {
     /// Leer siguiente evento de teclado
     fn read_key(&mut self) -> Option<KeyEvent>;
-    
+
     /// Verificar si una tecla está presionada
     fn is_key_pressed(&self, key: KeyCode) -> bool;
-    
+
     /// Obtener modificadores actuales
     fn get_modifiers(&self) -> u8;
-    
+
     /// Limpiar buffer de eventos
     fn clear_buffer(&mut self);
-    
+
     /// Verificar si hay eventos pendientes
     fn has_key_events(&self) -> bool;
 }

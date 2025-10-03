@@ -1,6 +1,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::{vec, format};
+use alloc::{format, vec};
 
 /// Integración con Vulkan para gráficos modernos
 pub struct VulkanIntegration {
@@ -138,7 +138,7 @@ impl VulkanIntegration {
         // - vkCreateInstance() para crear instancia
         // - vkEnumeratePhysicalDevices() para enumerar dispositivos
         // - vkGetPhysicalDeviceProperties() para obtener propiedades
-        
+
         let instance = Some(VulkanInstance {
             api_version: (1, 3, 0),
             extensions: vec![
@@ -155,66 +155,60 @@ impl VulkanIntegration {
                 "VK_LAYER_LUNARG_monitor".to_string(),
             ],
         });
-        
-        let physical_devices = vec![
-            VulkanPhysicalDevice {
-                device_id: 0,
-                name: "GeForce RTX 3060".to_string(),
-                device_type: VulkanDeviceType::DiscreteGpu,
-                api_version: (1, 3, 0),
-                driver_version: (535, 154, 5),
-                vendor_id: 0x10DE, // NVIDIA
-                memory_heaps: vec![
-                    VulkanMemoryHeap {
-                        size: 8 * 1024 * 1024 * 1024, // 8GB
-                        flags: 0x00000001, // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-                    },
-                ],
-                queue_families: vec![
-                    VulkanQueueFamily {
-                        index: 0,
-                        queue_count: 1,
-                        flags: 0x00000001, // VK_QUEUE_GRAPHICS_BIT
-                        supports_graphics: true,
-                        supports_compute: true,
-                        supports_transfer: true,
-                        supports_sparse_binding: true,
-                    },
-                ],
-                extensions: vec![
-                    "VK_KHR_swapchain".to_string(),
-                    "VK_KHR_ray_tracing_pipeline".to_string(),
-                    "VK_KHR_acceleration_structure".to_string(),
-                    "VK_KHR_ray_query".to_string(),
-                    "VK_NV_ray_tracing".to_string(),
-                ],
-                features: VulkanFeatures {
-                    geometry_shader: true,
-                    tessellation_shader: true,
-                    multi_viewport: true,
-                    sampler_anisotropy: true,
-                    texture_compression_bc: true,
-                    texture_compression_etc2: false,
-                    texture_compression_astc: false,
-                    shader_float64: true,
-                    shader_int64: true,
-                    shader_int16: true,
-                    shader_clip_distance: true,
-                    shader_cull_distance: true,
-                    shader_draw_parameters: true,
-                    shader_image_gather_extended: true,
-                    shader_storage_image_extended_formats: true,
-                    shader_storage_image_multisample: true,
-                    shader_storage_image_read_without_format: true,
-                    shader_storage_image_write_without_format: true,
-                    shader_uniform_buffer_array_dynamic_indexing: true,
-                    shader_sampled_image_array_dynamic_indexing: true,
-                    shader_storage_buffer_array_dynamic_indexing: true,
-                    shader_storage_image_array_dynamic_indexing: true,
-                },
+
+        let physical_devices = vec![VulkanPhysicalDevice {
+            device_id: 0,
+            name: "GeForce RTX 3060".to_string(),
+            device_type: VulkanDeviceType::DiscreteGpu,
+            api_version: (1, 3, 0),
+            driver_version: (535, 154, 5),
+            vendor_id: 0x10DE, // NVIDIA
+            memory_heaps: vec![VulkanMemoryHeap {
+                size: 8 * 1024 * 1024 * 1024, // 8GB
+                flags: 0x00000001,            // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+            }],
+            queue_families: vec![VulkanQueueFamily {
+                index: 0,
+                queue_count: 1,
+                flags: 0x00000001, // VK_QUEUE_GRAPHICS_BIT
+                supports_graphics: true,
+                supports_compute: true,
+                supports_transfer: true,
+                supports_sparse_binding: true,
+            }],
+            extensions: vec![
+                "VK_KHR_swapchain".to_string(),
+                "VK_KHR_ray_tracing_pipeline".to_string(),
+                "VK_KHR_acceleration_structure".to_string(),
+                "VK_KHR_ray_query".to_string(),
+                "VK_NV_ray_tracing".to_string(),
+            ],
+            features: VulkanFeatures {
+                geometry_shader: true,
+                tessellation_shader: true,
+                multi_viewport: true,
+                sampler_anisotropy: true,
+                texture_compression_bc: true,
+                texture_compression_etc2: false,
+                texture_compression_astc: false,
+                shader_float64: true,
+                shader_int64: true,
+                shader_int16: true,
+                shader_clip_distance: true,
+                shader_cull_distance: true,
+                shader_draw_parameters: true,
+                shader_image_gather_extended: true,
+                shader_storage_image_extended_formats: true,
+                shader_storage_image_multisample: true,
+                shader_storage_image_read_without_format: true,
+                shader_storage_image_write_without_format: true,
+                shader_uniform_buffer_array_dynamic_indexing: true,
+                shader_sampled_image_array_dynamic_indexing: true,
+                shader_storage_buffer_array_dynamic_indexing: true,
+                shader_storage_image_array_dynamic_indexing: true,
             },
-        ];
-        
+        }];
+
         Ok(VulkanIntegration {
             instance,
             physical_devices,
@@ -222,82 +216,78 @@ impl VulkanIntegration {
             swapchain: None,
         })
     }
-    
+
     /// Crear dispositivo lógico Vulkan
     pub fn create_device(&mut self, physical_device_id: u32) -> Result<(), &'static str> {
         // En un kernel real, esto usaría:
         // - vkCreateDevice() para crear dispositivo
         // - vkGetDeviceQueue() para obtener colas
-        
+
         if physical_device_id >= self.physical_devices.len() as u32 {
             return Err("Physical device ID inválido");
         }
-        
-        let queues = vec![
-            VulkanQueue {
-                family_index: 0,
-                queue_index: 0,
-                flags: 0x00000001, // VK_QUEUE_GRAPHICS_BIT
-            },
-        ];
-        
-        let command_pools = vec![
-            VulkanCommandPool {
-                queue_family_index: 0,
-                flags: 0x00000001, // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
-            },
-        ];
-        
+
+        let queues = vec![VulkanQueue {
+            family_index: 0,
+            queue_index: 0,
+            flags: 0x00000001, // VK_QUEUE_GRAPHICS_BIT
+        }];
+
+        let command_pools = vec![VulkanCommandPool {
+            queue_family_index: 0,
+            flags: 0x00000001, // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+        }];
+
         self.device = Some(VulkanDevice {
             physical_device_id,
             queues,
             command_pools,
         });
-        
+
         Ok(())
     }
-    
+
     /// Crear swapchain
     pub fn create_swapchain(&mut self, width: u32, height: u32) -> Result<(), &'static str> {
         // En un kernel real, esto usaría:
         // - vkCreateSwapchainKHR() para crear swapchain
         // - vkGetSwapchainImagesKHR() para obtener imágenes
-        
-        let images = vec![
-            VulkanImage {
-                width,
-                height,
-                format: 0x00000008, // VK_FORMAT_B8G8R8A8_UNORM
-                usage: 0x00000001, // VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-            },
-        ];
-        
-        self.swapchain = Some(VulkanSwapchain {
+
+        let images = vec![VulkanImage {
             width,
             height,
             format: 0x00000008, // VK_FORMAT_B8G8R8A8_UNORM
+            usage: 0x00000001,  // VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+        }];
+
+        self.swapchain = Some(VulkanSwapchain {
+            width,
+            height,
+            format: 0x00000008,       // VK_FORMAT_B8G8R8A8_UNORM
             present_mode: 0x00000001, // VK_PRESENT_MODE_FIFO_KHR
             images,
         });
-        
+
         Ok(())
     }
-    
+
     /// Obtener información de dispositivo físico
     pub fn get_physical_device(&self, device_id: u32) -> Option<&VulkanPhysicalDevice> {
         self.physical_devices.get(device_id as usize)
     }
-    
+
     /// Verificar soporte para ray tracing
     pub fn supports_ray_tracing(&self, device_id: u32) -> bool {
         if let Some(device) = self.get_physical_device(device_id) {
-            device.extensions.contains(&"VK_KHR_ray_tracing_pipeline".to_string()) ||
-            device.extensions.contains(&"VK_NV_ray_tracing".to_string())
+            device
+                .extensions
+                .contains(&"VK_KHR_ray_tracing_pipeline".to_string())
+                || device.extensions.contains(&"VK_NV_ray_tracing".to_string())
         } else {
             false
         }
     }
-    
+
     /// Verificar soporte para extensiones específicas
     pub fn supports_extension(&self, device_id: u32, extension: &str) -> bool {
         if let Some(device) = self.get_physical_device(device_id) {
@@ -306,12 +296,12 @@ impl VulkanIntegration {
             false
         }
     }
-    
+
     /// Verificar si Vulkan está disponible
     pub fn is_vulkan_available(&self) -> bool {
         !self.physical_devices.is_empty()
     }
-    
+
     /// Obtener versión de Vulkan
     pub fn get_vulkan_version(&self) -> Option<(u32, u32, u32)> {
         self.instance.as_ref().map(|i| i.api_version)

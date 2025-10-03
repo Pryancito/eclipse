@@ -1,10 +1,12 @@
 //! Inicialización del framebuffer desde UEFI
-//! 
+//!
 //! Este módulo implementa la obtención de información del framebuffer
 //! desde el bootloader UEFI, siguiendo las prácticas estándar de Linux.
 
+use crate::drivers::framebuffer::{
+    get_framebuffer_info, init_framebuffer, is_framebuffer_available,
+};
 use core::ptr;
-use crate::drivers::framebuffer::{init_framebuffer, is_framebuffer_available, get_framebuffer_info};
 
 /// Información del framebuffer de UEFI
 #[repr(C)]
@@ -60,11 +62,11 @@ pub fn init_framebuffer_from_bootloader(
     if base_address == 0 {
         return Err("Invalid framebuffer base address");
     }
-    
+
     if width == 0 || height == 0 {
         return Err("Invalid framebuffer dimensions");
     }
-    
+
     // Almacenar información del framebuffer
     let fb_info = BootloaderFramebufferInfo {
         base_address,
@@ -74,11 +76,11 @@ pub fn init_framebuffer_from_bootloader(
         pixel_format,
         pixel_bitmask,
     };
-    
+
     unsafe {
         FRAMEBUFFER_INFO = Some(fb_info);
     }
-    
+
     // Inicializar el driver de framebuffer
     init_framebuffer(
         base_address,
@@ -88,11 +90,11 @@ pub fn init_framebuffer_from_bootloader(
         pixel_format,
         pixel_bitmask,
     )?;
-    
+
     unsafe {
         FRAMEBUFFER_INITIALIZED = true;
     }
-    
+
     Ok(())
 }
 
@@ -106,7 +108,7 @@ pub fn init_framebuffer_from_multiboot2(
 ) -> Result<(), &'static str> {
     // Multiboot2 no proporciona pixel_bitmask, usar valor por defecto
     let pixel_bitmask = 0;
-    
+
     init_framebuffer_from_bootloader(
         base_address,
         width,
@@ -127,7 +129,7 @@ pub fn init_framebuffer_default() -> Result<(), &'static str> {
     let pixels_per_scan_line = width; // Asumir que no hay padding
     let pixel_format = 0; // RGB888
     let pixel_bitmask = 0;
-    
+
     init_framebuffer_from_bootloader(
         base_address,
         width,
@@ -141,17 +143,17 @@ pub fn init_framebuffer_default() -> Result<(), &'static str> {
 /// Detectar framebuffer automáticamente
 pub fn auto_detect_framebuffer() -> Result<(), &'static str> {
     // Intentar detectar framebuffer usando diferentes métodos
-    
+
     // Método 1: Buscar en memoria conocida
     if let Ok(_) = detect_framebuffer_in_memory() {
         return Ok(());
     }
-    
+
     // Método 2: Usar valores por defecto
     if let Ok(_) = init_framebuffer_default() {
         return Ok(());
     }
-    
+
     // Método 3: Fallback a VGA
     Err("No framebuffer detected, falling back to VGA")
 }
@@ -164,19 +166,16 @@ fn detect_framebuffer_in_memory() -> Result<(), &'static str> {
         0xE0000000, // Otra dirección común
         0x80000000, // Dirección alternativa
     ];
-    
+
     for &addr in &possible_addresses {
         if is_valid_framebuffer_address(addr) {
             // Intentar inicializar con resolución común
-            if let Ok(_) = init_framebuffer_from_bootloader(
-                addr,
-                1920, 1080, 1920, 0, 0
-            ) {
+            if let Ok(_) = init_framebuffer_from_bootloader(addr, 1920, 1080, 1920, 0, 0) {
                 return Ok(());
             }
         }
     }
-    
+
     Err("No valid framebuffer found in memory")
 }
 
@@ -218,19 +217,21 @@ pub struct FramebufferStatus {
 }
 
 /// Inicializar framebuffer con información de UEFI Graphics Output Protocol
-pub fn init_framebuffer_from_uefi_gop(gop: *const UefiGraphicsOutputProtocol) -> Result<(), &'static str> {
+pub fn init_framebuffer_from_uefi_gop(
+    gop: *const UefiGraphicsOutputProtocol,
+) -> Result<(), &'static str> {
     if gop.is_null() {
         return Err("Invalid UEFI GOP pointer");
     }
-    
+
     unsafe {
         let gop = &*gop;
         let mode_info = &*gop.mode_info;
-        
+
         // Calcular dirección base del framebuffer
         // En UEFI, esto se obtiene del modo actual
         let base_address = mode_info as *const _ as u64; // Simplificado
-        
+
         init_framebuffer_from_bootloader(
             base_address,
             mode_info.horizontal_resolution,
@@ -246,12 +247,12 @@ pub fn init_framebuffer_from_uefi_gop(gop: *const UefiGraphicsOutputProtocol) ->
 pub fn configure_framebuffer_for_hardware() -> Result<(), &'static str> {
     // Detectar tipo de hardware y configurar accordingly
     // Esto es una implementación simplificada
-    
+
     // Intentar auto-detección primero
     if let Ok(_) = auto_detect_framebuffer() {
         return Ok(());
     }
-    
+
     // Si falla, usar configuración por defecto
     init_framebuffer_default()
 }

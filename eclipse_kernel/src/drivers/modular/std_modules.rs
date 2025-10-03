@@ -1,9 +1,9 @@
 //! Sistema de módulos std para Eclipse OS
-//! 
+//!
 //! Permite cargar módulos que usen std como procesos separados
 //! y comunicarse con ellos a través de IPC.
 
-use super::{DriverError, DriverInfo, Capability};
+use super::{Capability, DriverError, DriverInfo};
 
 /// Tipo de módulo std
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,16 +72,20 @@ impl StdModuleManager {
             next_pid: 1000, // PIDs empiezan en 1000 para módulos
         }
     }
-    
+
     /// Registrar un módulo std
-    pub fn register_module(&mut self, name: &str, module_type: StdModuleType) -> Result<(), DriverError> {
+    pub fn register_module(
+        &mut self,
+        name: &str,
+        module_type: StdModuleType,
+    ) -> Result<(), DriverError> {
         if self.modules.len() >= 8 {
             return Err(DriverError::NotAvailable);
         }
-        
+
         let mut module_name = heapless::String::<32>::new();
         let _ = module_name.push_str(name);
-        
+
         let module_info = StdModuleInfo {
             name: module_name,
             module_type,
@@ -91,48 +95,49 @@ impl StdModuleManager {
             memory_usage: 0,
             cpu_usage: 0.0,
         };
-        
-        self.modules.push(module_info)
+
+        self.modules
+            .push(module_info)
             .map_err(|_| DriverError::NotAvailable)?;
-        
+
         Ok(())
     }
-    
+
     /// Cargar un módulo std
     pub fn load_module(&mut self, name: &str) -> Result<u32, DriverError> {
         if let Some(module) = self.modules.iter_mut().find(|m| m.name.as_str() == name) {
             if module.state != StdModuleState::NotLoaded {
                 return Err(DriverError::NotAvailable);
             }
-            
+
             module.state = StdModuleState::Loading;
             module.pid = Some(self.next_pid);
             self.next_pid += 1;
-            
+
             // Simular carga del módulo
             module.state = StdModuleState::Loaded;
             module.memory_usage = 1024 * 1024; // 1MB simulado
-            
+
             Ok(module.pid.unwrap())
         } else {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Iniciar un módulo std
     pub fn start_module(&mut self, name: &str) -> Result<(), DriverError> {
         if let Some(module) = self.modules.iter_mut().find(|m| m.name.as_str() == name) {
             if module.state != StdModuleState::Loaded {
                 return Err(DriverError::NotAvailable);
             }
-            
+
             module.state = StdModuleState::Running;
             Ok(())
         } else {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Detener un módulo std
     pub fn stop_module(&mut self, name: &str) -> Result<(), DriverError> {
         if let Some(module) = self.modules.iter_mut().find(|m| m.name.as_str() == name) {
@@ -142,14 +147,18 @@ impl StdModuleManager {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Enviar comando a un módulo std
-    pub fn send_command(&mut self, name: &str, command: StdModuleCommand) -> Result<StdModuleResponse, DriverError> {
+    pub fn send_command(
+        &mut self,
+        name: &str,
+        command: StdModuleCommand,
+    ) -> Result<StdModuleResponse, DriverError> {
         if let Some(module) = self.modules.iter_mut().find(|m| m.name.as_str() == name) {
             if module.state != StdModuleState::Running {
                 return Err(DriverError::NotAvailable);
             }
-            
+
             // Simular procesamiento del comando
             match command {
                 StdModuleCommand::Init => {
@@ -164,33 +173,31 @@ impl StdModuleManager {
                     module.state = StdModuleState::Stopped;
                     Ok(StdModuleResponse::Success)
                 }
-                StdModuleCommand::GetInfo => {
-                    Ok(StdModuleResponse::Info(module.clone()))
-                }
-                _ => Ok(StdModuleResponse::Success)
+                StdModuleCommand::GetInfo => Ok(StdModuleResponse::Info(module.clone())),
+                _ => Ok(StdModuleResponse::Success),
             }
         } else {
             Err(DriverError::NotAvailable)
         }
     }
-    
+
     /// Obtener información de todos los módulos
     pub fn get_all_modules(&self) -> &[StdModuleInfo] {
         &self.modules
     }
-    
+
     /// Obtener módulo por nombre
     pub fn get_module(&self, name: &str) -> Option<&StdModuleInfo> {
         self.modules.iter().find(|m| m.name.as_str() == name)
     }
-    
+
     /// Obtener resumen del sistema
     pub fn get_system_summary(&self) -> StdModuleSystemSummary {
         let mut total_modules = 0;
         let mut loaded_modules = 0;
         let mut running_modules = 0;
         let mut total_memory = 0;
-        
+
         for module in self.modules.iter() {
             total_modules += 1;
             if module.state == StdModuleState::Loaded || module.state == StdModuleState::Running {
@@ -201,7 +208,7 @@ impl StdModuleManager {
             }
             total_memory += module.memory_usage;
         }
-        
+
         StdModuleSystemSummary {
             total_modules,
             loaded_modules,
@@ -225,9 +232,7 @@ static mut STD_MODULE_MANAGER: StdModuleManager = StdModuleManager::new();
 
 /// Obtener instancia del gestor de módulos std
 pub fn get_std_module_manager() -> &'static mut StdModuleManager {
-    unsafe {
-        &mut STD_MODULE_MANAGER
-    }
+    unsafe { &mut STD_MODULE_MANAGER }
 }
 
 /// Inicializar sistema de módulos std
@@ -238,45 +243,35 @@ pub fn init_std_modules() -> Result<(), DriverError> {
         STD_MODULE_MANAGER.register_module("audio_std", StdModuleType::Audio)?;
         STD_MODULE_MANAGER.register_module("network_std", StdModuleType::Network)?;
         STD_MODULE_MANAGER.register_module("storage_std", StdModuleType::Storage)?;
-        
+
         Ok(())
     }
 }
 
 /// Cargar módulo std
 pub fn load_std_module(name: &str) -> Result<u32, DriverError> {
-    unsafe {
-        STD_MODULE_MANAGER.load_module(name)
-    }
+    unsafe { STD_MODULE_MANAGER.load_module(name) }
 }
 
 /// Iniciar módulo std
 pub fn start_std_module(name: &str) -> Result<(), DriverError> {
-    unsafe {
-        STD_MODULE_MANAGER.start_module(name)
-    }
+    unsafe { STD_MODULE_MANAGER.start_module(name) }
 }
 
 /// Detener módulo std
 pub fn stop_std_module(name: &str) -> Result<(), DriverError> {
-    unsafe {
-        STD_MODULE_MANAGER.stop_module(name)
-    }
+    unsafe { STD_MODULE_MANAGER.stop_module(name) }
 }
 
 /// Enviar comando a módulo std
-pub fn send_std_module_command(name: &str, command: StdModuleCommand) -> Result<StdModuleResponse, DriverError> {
-    unsafe {
-        STD_MODULE_MANAGER.send_command(name, command)
-    }
+pub fn send_std_module_command(
+    name: &str,
+    command: StdModuleCommand,
+) -> Result<StdModuleResponse, DriverError> {
+    unsafe { STD_MODULE_MANAGER.send_command(name, command) }
 }
 
 /// Obtener resumen del sistema de módulos std
 pub fn get_std_module_system_summary() -> StdModuleSystemSummary {
-    unsafe {
-        STD_MODULE_MANAGER.get_system_summary()
-    }
+    unsafe { STD_MODULE_MANAGER.get_system_summary() }
 }
-
-
-

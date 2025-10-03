@@ -1,13 +1,13 @@
 //! Gestor de archivos gráfico para Eclipse OS
-//! 
+//!
 //! Proporciona una interfaz gráfica moderna para la gestión de archivos
 //! con soporte para operaciones de arrastrar y soltar, vista previa y más.
 
-use alloc::vec::Vec;
-use alloc::vec;
-use alloc::string::{String, ToString};
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Tipo de archivo
 #[derive(Debug, Clone, PartialEq)]
@@ -74,7 +74,7 @@ impl FileManagerGui {
             status_bar_height: 30,
         }
     }
-    
+
     /// Ejecutar el gestor de archivos
     pub fn run(&mut self) -> Result<(), &'static str> {
         self.show_welcome();
@@ -82,7 +82,7 @@ impl FileManagerGui {
         self.render_interface();
         Ok(())
     }
-    
+
     fn show_welcome(&self) {
         self.print_info("╔══════════════════════════════════════════════════════════════╗");
         self.print_info("║                                                              ║");
@@ -94,20 +94,20 @@ impl FileManagerGui {
         self.print_info("╚══════════════════════════════════════════════════════════════╝");
         self.print_info("");
     }
-    
+
     fn load_directory(&mut self, path: &str) -> Result<(), &'static str> {
         self.current_path = path.to_string();
         self.files.clear();
-        
+
         // Simular carga de archivos del directorio
         self.files = self.get_directory_contents(path);
-        
+
         // Ordenar archivos
         self.sort_files();
-        
+
         Ok(())
     }
-    
+
     fn get_directory_contents(&self, path: &str) -> Vec<FileInfo> {
         // Simular contenido de directorio
         match path {
@@ -174,7 +174,7 @@ impl FileManagerGui {
                         is_readonly: false,
                     },
                 ]
-            },
+            }
             "/system" => {
                 vec![
                     FileInfo {
@@ -198,25 +198,23 @@ impl FileManagerGui {
                         is_readonly: false,
                     },
                 ]
-            },
+            }
             "/users" => {
-                vec![
-                    FileInfo {
-                        name: "eclipse".to_string(),
-                        path: "/users/eclipse".to_string(),
-                        file_type: FileType::Directory,
-                        size: 4096,
-                        modified: "2024-01-01 00:00:00".to_string(),
-                        permissions: "drwxr-xr-x".to_string(),
-                        is_hidden: false,
-                        is_readonly: false,
-                    },
-                ]
-            },
+                vec![FileInfo {
+                    name: "eclipse".to_string(),
+                    path: "/users/eclipse".to_string(),
+                    file_type: FileType::Directory,
+                    size: 4096,
+                    modified: "2024-01-01 00:00:00".to_string(),
+                    permissions: "drwxr-xr-x".to_string(),
+                    is_hidden: false,
+                    is_readonly: false,
+                }]
+            }
             _ => Vec::new(),
         }
     }
-    
+
     fn render_interface(&self) {
         self.render_title_bar();
         self.render_menu_bar();
@@ -225,21 +223,21 @@ impl FileManagerGui {
         self.render_main_area();
         self.render_status_bar();
     }
-    
+
     fn render_title_bar(&self) {
         self.print_info("┌─ Eclipse File Manager ──────────────────────────────────────────────┐");
     }
-    
+
     fn render_menu_bar(&self) {
         self.print_info("│ Archivo  Editar  Ver  Herramientas  Ayuda                          │");
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
     }
-    
+
     fn render_toolbar(&self) {
         self.print_info("│ [←] [→] [↑] [🔄] [📁] [📄] [✂️] [📋] [🗑️] [🔍] [⚙️]                │");
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
     }
-    
+
     fn render_sidebar(&self) {
         self.print_info("│ LUGARES                    │ ARCHIVOS Y CARPETAS                    │");
         self.print_info("│                            │                                        │");
@@ -262,11 +260,13 @@ impl FileManagerGui {
         self.print_info("│                            │                                        │");
         self.print_info("├────────────────────────────┼────────────────────────────────────────┤");
     }
-    
+
     fn render_main_area(&self) {
-        self.print_info("│ RUTA: /                                                                 │");
+        self.print_info(
+            "│ RUTA: /                                                                 │",
+        );
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
-        
+
         // Mostrar archivos según el modo de vista
         match self.view_mode {
             ViewMode::List => self.render_list_view(),
@@ -275,16 +275,16 @@ impl FileManagerGui {
             ViewMode::Tree => self.render_tree_view(),
         }
     }
-    
+
     fn render_list_view(&self) {
         self.print_info("│ Nombre                Tamaño    Modificado        Permisos          │");
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
-        
+
         for file in &self.files {
             if !self.show_hidden && file.is_hidden {
                 continue;
             }
-            
+
             let icon = self.get_file_icon(&file.file_type);
             let size_str = self.format_size(file.size);
             let name = if file.name.len() > 20 {
@@ -292,56 +292,60 @@ impl FileManagerGui {
             } else {
                 format!("{:<20}", file.name)
             };
-            
-            self.print_info(&format!("│ {} {:<20} {:<8} {:<16} {:<10} │",
-                icon, name, size_str, file.modified, file.permissions));
+
+            self.print_info(&format!(
+                "│ {} {:<20} {:<8} {:<16} {:<10} │",
+                icon, name, size_str, file.modified, file.permissions
+            ));
         }
     }
-    
+
     fn render_grid_view(&self) {
         self.print_info("│                                                                     │");
-        
+
         let items_per_row = 6;
         let mut i = 0;
-        
+
         for file in &self.files {
             if !self.show_hidden && file.is_hidden {
                 continue;
             }
-            
+
             if i % items_per_row == 0 {
                 if i > 0 {
-                    self.print_info("│                                                                     │");
+                    self.print_info(
+                        "│                                                                     │",
+                    );
                 }
                 self.print_info("│ ");
             }
-            
+
             let icon = self.get_file_icon(&file.file_type);
             let name = if file.name.len() > 8 {
                 format!("{}...", &file.name[..5])
             } else {
                 file.name.clone()
             };
-            
+
             self.print_info(&format!("{} {:<8} ", icon, name));
-            
+
             i += 1;
         }
-        
+
         if i % items_per_row != 0 {
             self.print_info("│");
         }
     }
-    
+
     fn render_details_view(&self) {
         self.print_info("│ Nombre                Tamaño    Tipo      Modificado        Permisos │");
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
-        
+
         for file in &self.files {
             if !self.show_hidden && file.is_hidden {
                 continue;
             }
-            
+
             let icon = self.get_file_icon(&file.file_type);
             let size_str = self.format_size(file.size);
             let type_str = self.get_file_type_string(&file.file_type);
@@ -350,39 +354,49 @@ impl FileManagerGui {
             } else {
                 format!("{:<20}", file.name)
             };
-            
-            self.print_info(&format!("│ {} {:<20} {:<8} {:<8} {:<16} {:<10} │",
-                icon, name, size_str, type_str, file.modified, file.permissions));
+
+            self.print_info(&format!(
+                "│ {} {:<20} {:<8} {:<8} {:<16} {:<10} │",
+                icon, name, size_str, type_str, file.modified, file.permissions
+            ));
         }
     }
-    
+
     fn render_tree_view(&self) {
-        self.print_info("│ 📁 /                                                                  │");
-        
+        self.print_info(
+            "│ 📁 /                                                                  │",
+        );
+
         for file in &self.files {
             if !self.show_hidden && file.is_hidden {
                 continue;
             }
-            
+
             let icon = self.get_file_icon(&file.file_type);
             let indent = "  ";
-            
-            self.print_info(&format!("│ {}├─ {} {}                                                      │",
-                indent, icon, file.name));
+
+            self.print_info(&format!(
+                "│ {}├─ {} {}                                                      │",
+                indent, icon, file.name
+            ));
         }
     }
-    
+
     fn render_status_bar(&self) {
         let total_files = self.files.len();
         let selected_count = self.selected_files.len();
         let total_size = self.files.iter().map(|f| f.size).sum::<u64>();
-        
+
         self.print_info("├─────────────────────────────────────────────────────────────────────┤");
-        self.print_info(&format!("│ {} archivos, {} seleccionados, {} total                    │",
-            total_files, selected_count, self.format_size(total_size)));
+        self.print_info(&format!(
+            "│ {} archivos, {} seleccionados, {} total                    │",
+            total_files,
+            selected_count,
+            self.format_size(total_size)
+        ));
         self.print_info("└─────────────────────────────────────────────────────────────────────┘");
     }
-    
+
     fn get_file_icon(&self, file_type: &FileType) -> &'static str {
         match file_type {
             FileType::Directory => "📁",
@@ -394,7 +408,7 @@ impl FileManagerGui {
             FileType::Unknown => "❓",
         }
     }
-    
+
     fn get_file_type_string(&self, file_type: &FileType) -> &'static str {
         match file_type {
             FileType::Directory => "Carpeta",
@@ -406,7 +420,7 @@ impl FileManagerGui {
             FileType::Unknown => "Desconocido",
         }
     }
-    
+
     fn format_size(&self, size: u64) -> String {
         if size < 1024 {
             format!("{} B", size)
@@ -418,7 +432,7 @@ impl FileManagerGui {
             format!("{} GB", size / (1024 * 1024 * 1024))
         }
     }
-    
+
     fn sort_files(&mut self) {
         let sort_by = self.sort_by.clone();
         let sort_ascending = self.sort_ascending;
@@ -428,13 +442,15 @@ impl FileManagerGui {
                 "size" => a.size.cmp(&b.size),
                 "modified" => a.modified.cmp(&b.modified),
                 "type" => {
-                    let a_type = Self::get_file_type_string_static(&Self::file_type_to_string(&a.file_type));
-                    let b_type = Self::get_file_type_string_static(&Self::file_type_to_string(&b.file_type));
+                    let a_type =
+                        Self::get_file_type_string_static(&Self::file_type_to_string(&a.file_type));
+                    let b_type =
+                        Self::get_file_type_string_static(&Self::file_type_to_string(&b.file_type));
                     a_type.cmp(&b_type)
-                },
+                }
                 _ => a.name.cmp(&b.name),
             };
-            
+
             if sort_ascending {
                 result
             } else {
@@ -442,7 +458,7 @@ impl FileManagerGui {
             }
         });
     }
-    
+
     fn file_type_to_string(file_type: &FileType) -> String {
         match file_type {
             FileType::Directory => "Directorio".to_string(),
@@ -454,7 +470,7 @@ impl FileManagerGui {
             FileType::Unknown => "Desconocido".to_string(),
         }
     }
-    
+
     fn get_file_type_string_static(file_type: &str) -> String {
         match file_type {
             "txt" | "md" | "log" => "Documento".to_string(),
@@ -466,41 +482,41 @@ impl FileManagerGui {
             _ => "Desconocido".to_string(),
         }
     }
-    
+
     /// Cambiar directorio
     pub fn change_directory(&mut self, path: &str) -> Result<(), &'static str> {
         self.load_directory(path)
     }
-    
+
     /// Seleccionar archivo
     pub fn select_file(&mut self, filename: &str) {
         if !self.selected_files.contains(&filename.to_string()) {
             self.selected_files.push(filename.to_string());
         }
     }
-    
+
     /// Deseleccionar archivo
     pub fn deselect_file(&mut self, filename: &str) {
         self.selected_files.retain(|f| f != filename);
     }
-    
+
     /// Cambiar modo de vista
     pub fn set_view_mode(&mut self, mode: ViewMode) {
         self.view_mode = mode;
     }
-    
+
     /// Ordenar archivos
     pub fn sort_by(&mut self, field: &str, ascending: bool) {
         self.sort_by = field.to_string();
         self.sort_ascending = ascending;
         self.sort_files();
     }
-    
+
     /// Alternar archivos ocultos
     pub fn toggle_hidden_files(&mut self) {
         self.show_hidden = !self.show_hidden;
     }
-    
+
     fn print_info(&self, text: &str) {
         // En una implementación real, esto renderizaría en la interfaz gráfica
         // Por ahora solo simulamos

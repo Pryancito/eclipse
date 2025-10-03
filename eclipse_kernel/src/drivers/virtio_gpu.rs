@@ -64,5 +64,3 @@ impl VirtioGpuDriver {
         Ok(())
     }
 }
-
-

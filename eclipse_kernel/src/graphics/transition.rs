@@ -1,11 +1,11 @@
 //! Sistema de transición entre fases de gráficos
-//! 
+//!
 //! Maneja la transición suave entre:
 //! - UEFI Bootloader -> UEFI Kernel Detection
 //! - UEFI Kernel Detection -> DRM Kernel Runtime
 
+use super::phases::{get_graphics_phase_manager, GraphicsPhase};
 use crate::drivers::framebuffer::FramebufferInfo;
-use super::phases::{GraphicsPhase, get_graphics_phase_manager};
 
 /// Estado de transición
 #[derive(Debug)]
@@ -36,7 +36,11 @@ impl TransitionManager {
     }
 
     /// Iniciar transición entre fases
-    pub fn start_transition(&mut self, from: GraphicsPhase, to: GraphicsPhase) -> Result<(), &'static str> {
+    pub fn start_transition(
+        &mut self,
+        from: GraphicsPhase,
+        to: GraphicsPhase,
+    ) -> Result<(), &'static str> {
         if self.current_transition.is_some() {
             return Err("Ya hay una transición en progreso");
         }
@@ -58,7 +62,7 @@ impl TransitionManager {
     pub fn update_transition(&mut self, progress: u8) {
         if let Some(transition) = &mut self.current_transition {
             transition.progress = progress.min(100);
-            
+
             if progress >= 100 {
                 self.complete_transition();
             }
@@ -86,17 +90,17 @@ impl TransitionManager {
 /// Transicionar de UEFI Bootloader a UEFI Kernel Detection
 pub fn transition_bootloader_to_detection() -> Result<(), &'static str> {
     // Log de transición
-    
+
     // Esta transición es automática y no requiere pasos especiales
     // El bootloader ya ha configurado el framebuffer UEFI
-    
+
     Ok(())
 }
 
 /// Transicionar de UEFI Kernel Detection a DRM Kernel Runtime
 pub fn transition_detection_to_drm(framebuffer_info: FramebufferInfo) -> Result<(), &'static str> {
     // Log de transición
-    
+
     // Paso 1: Verificar compatibilidad DRM
     if !crate::graphics::uefi_graphics::has_drm_compatible_adapters() {
         return Err("No hay adaptadores compatibles con DRM");
@@ -115,7 +119,7 @@ pub fn transition_detection_to_drm(framebuffer_info: FramebufferInfo) -> Result<
 /// Preparar transición a DRM
 fn prepare_drm_transition(framebuffer_info: &FramebufferInfo) -> Result<(), &'static str> {
     // Preparando transición
-    
+
     // Validar información del framebuffer
     if framebuffer_info.width == 0 || framebuffer_info.height == 0 {
         return Err("Información de framebuffer inválida");

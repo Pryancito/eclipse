@@ -1,5 +1,5 @@
 //! Scheduler de Procesos para Eclipse OS
-//! 
+//!
 //! Implementa diferentes algoritmos de scheduling
 
 use crate::process::process::{ProcessControlBlock, ProcessId, ProcessPriority, ThreadId};
@@ -207,7 +207,10 @@ impl ProcessScheduler {
     }
 
     /// Seleccionar el siguiente proceso a ejecutar
-    pub fn select_next_process(&mut self, processes: &[Option<ProcessControlBlock>]) -> Option<ProcessId> {
+    pub fn select_next_process(
+        &mut self,
+        processes: &[Option<ProcessControlBlock>],
+    ) -> Option<ProcessId> {
         match self.algorithm {
             SchedulingAlgorithm::RoundRobin => self.select_round_robin(),
             SchedulingAlgorithm::Priority => self.select_priority(processes),
@@ -289,7 +292,7 @@ impl ProcessScheduler {
     /// Realizar context switch
     pub fn context_switch(&mut self, new_pid: ProcessId) -> Option<ProcessId> {
         let old_pid = self.current_process;
-        
+
         self.previous_process = old_pid;
         self.current_process = Some(new_pid);
         self.context_switches += 1;
@@ -310,7 +313,7 @@ impl ProcessScheduler {
                 if self.algorithm == SchedulingAlgorithm::RoundRobin {
                     return (self.current_time - pcb.last_run_time) >= self.quantum;
                 }
-                
+
                 // Verificar si hay un proceso de mayor prioridad
                 if self.algorithm == SchedulingAlgorithm::Priority {
                     for i in 0..self.ready_queue.count {
@@ -326,7 +329,7 @@ impl ProcessScheduler {
                 }
             }
         }
-        
+
         false
     }
 

@@ -1,10 +1,10 @@
 //! Drivers de red para Eclipse OS
-//! 
+//!
 //! Basado en los drivers de red de Redox OS
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
 
@@ -125,7 +125,7 @@ impl Driver for NetworkDriver {
 
         // Configurar nombre
         network_info.name[..device.info.name.len()].copy_from_slice(&device.info.name);
-        
+
         // Generar MAC address basada en vendor/device ID
         network_info.mac_address[0] = 0x02; // Local bit
         network_info.mac_address[1] = (device.info.vendor_id >> 8) as u8;
@@ -136,7 +136,7 @@ impl Driver for NetworkDriver {
 
         self.add_device(network_info)?;
         device.driver_id = Some(self.info.id);
-        
+
         Ok(())
     }
 

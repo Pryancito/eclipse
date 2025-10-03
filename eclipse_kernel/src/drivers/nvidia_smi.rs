@@ -1,6 +1,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::{vec, format};
+use alloc::{format, vec};
 
 /// Integración con nvidia-smi para métricas en tiempo real
 pub struct NvidiaSmiIntegration {
@@ -40,7 +40,7 @@ impl NvidiaSmiIntegration {
         // En un kernel real, esto ejecutaría:
         // nvidia-smi --query-gpu=count --format=csv,noheader,nounits
         let gpu_count = 1; // Simulado
-        
+
         let mut gpus = Vec::new();
         for i in 0..gpu_count {
             gpus.push(NvidiaGpuMetrics {
@@ -48,7 +48,7 @@ impl NvidiaSmiIntegration {
                 name: "GeForce RTX 3060".to_string(),
                 temperature: 45,
                 power_draw: 170,
-                memory_used: 1024 * 1024 * 1024, // 1GB usado
+                memory_used: 1024 * 1024 * 1024,      // 1GB usado
                 memory_total: 8 * 1024 * 1024 * 1024, // 8GB total
                 utilization_gpu: 25,
                 utilization_memory: 15,
@@ -58,15 +58,15 @@ impl NvidiaSmiIntegration {
                 processes: vec![],
             });
         }
-        
+
         Ok(NvidiaSmiIntegration { gpu_count, gpus })
     }
-    
+
     /// Actualizar métricas en tiempo real
     pub fn update_metrics(&mut self) -> Result<(), &'static str> {
         // En un kernel real, esto ejecutaría:
         // nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu,utilization.memory,clocks.gr,clocks.mem,fan.speed --format=csv,noheader,nounits
-        
+
         for gpu in &mut self.gpus {
             // Simular actualización de métricas
             gpu.temperature = 45 + (gpu.gpu_id * 2) as u32;
@@ -75,20 +75,20 @@ impl NvidiaSmiIntegration {
             gpu.utilization_memory = 15 + (gpu.gpu_id * 3) as u32;
             gpu.fan_speed = 45 + (gpu.gpu_id * 5) as u32;
         }
-        
+
         Ok(())
     }
-    
+
     /// Obtener métricas de una GPU específica
     pub fn get_gpu_metrics(&self, gpu_id: u32) -> Option<&NvidiaGpuMetrics> {
         self.gpus.get(gpu_id as usize)
     }
-    
+
     /// Obtener todos los procesos usando GPU
     pub fn get_gpu_processes(&mut self) -> Result<(), &'static str> {
         // En un kernel real, esto ejecutaría:
         // nvidia-smi --query-compute-apps=pid,process_name,used_memory,utilization.gpu --format=csv,noheader,nounits
-        
+
         for gpu in &mut self.gpus {
             gpu.processes = vec![
                 NvidiaProcess {
@@ -105,10 +105,10 @@ impl NvidiaSmiIntegration {
                 },
             ];
         }
-        
+
         Ok(())
     }
-    
+
     /// Obtener información de temperatura crítica
     pub fn get_critical_temperature(&self, gpu_id: u32) -> Option<u32> {
         if let Some(gpu) = self.get_gpu_metrics(gpu_id) {
@@ -117,7 +117,7 @@ impl NvidiaSmiIntegration {
             None
         }
     }
-    
+
     /// Verificar si la GPU está en estado crítico
     pub fn is_gpu_critical(&self, gpu_id: u32) -> bool {
         if let Some(temperature) = self.get_critical_temperature(gpu_id) {

@@ -1,13 +1,13 @@
 //! Sistema de logging similar a syslog para Eclipse OS
-//! 
+//!
 //! Implementa un sistema de logging robusto y eficiente
 //! compatible con el estándar syslog.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, AtomicBool, Ordering};
-use core::fmt::Write;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Facilidades syslog estándar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,14 +37,14 @@ pub enum SyslogFacility {
 /// Niveles de severidad syslog
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SyslogSeverity {
-    Emergency = 0,  // system is unusable
-    Alert = 1,      // action must be taken immediately
-    Critical = 2,   // critical conditions
-    Error = 3,      // error conditions
-    Warning = 4,    // warning conditions
-    Notice = 5,     // normal but significant condition
-    Info = 6,       // informational messages
-    Debug = 7,      // debug-level messages
+    Emergency = 0, // system is unusable
+    Alert = 1,     // action must be taken immediately
+    Critical = 2,  // critical conditions
+    Error = 3,     // error conditions
+    Warning = 4,   // warning conditions
+    Notice = 5,    // normal but significant condition
+    Info = 6,      // informational messages
+    Debug = 7,     // debug-level messages
 }
 
 /// Entrada de log syslog
@@ -60,7 +60,12 @@ pub struct SyslogEntry {
 }
 
 impl SyslogEntry {
-    pub fn new(facility: SyslogFacility, severity: SyslogSeverity, tag: &str, message: &str) -> Self {
+    pub fn new(
+        facility: SyslogFacility,
+        severity: SyslogSeverity,
+        tag: &str,
+        message: &str,
+    ) -> Self {
         Self {
             timestamp: get_current_timestamp(),
             facility,
@@ -76,13 +81,17 @@ impl SyslogEntry {
     pub fn format_syslog(&self) -> String {
         let priority = (self.facility as u8) * 8 + (self.severity as u8);
         let timestamp_str = format_timestamp(self.timestamp);
-        
+
         if let Some(pid) = self.pid {
-            format!("<{}>{} {} {}[{}]: {}", 
-                priority, timestamp_str, self.hostname, self.tag, pid, self.message)
+            format!(
+                "<{}>{} {} {}[{}]: {}",
+                priority, timestamp_str, self.hostname, self.tag, pid, self.message
+            )
         } else {
-            format!("<{}>{} {} {}: {}", 
-                priority, timestamp_str, self.hostname, self.tag, self.message)
+            format!(
+                "<{}>{} {} {}: {}",
+                priority, timestamp_str, self.hostname, self.tag, self.message
+            )
         }
     }
 
@@ -90,13 +99,17 @@ impl SyslogEntry {
     pub fn format_rfc3164(&self) -> String {
         let priority = (self.facility as u8) * 8 + (self.severity as u8);
         let timestamp_str = format_timestamp_rfc3164(self.timestamp);
-        
+
         if let Some(pid) = self.pid {
-            format!("<{}>{} {} {}[{}]: {}", 
-                priority, timestamp_str, self.hostname, self.tag, pid, self.message)
+            format!(
+                "<{}>{} {} {}[{}]: {}",
+                priority, timestamp_str, self.hostname, self.tag, pid, self.message
+            )
         } else {
-            format!("<{}>{} {} {}: {}", 
-                priority, timestamp_str, self.hostname, self.tag, self.message)
+            format!(
+                "<{}>{} {} {}: {}",
+                priority, timestamp_str, self.hostname, self.tag, self.message
+            )
         }
     }
 }
@@ -129,15 +142,15 @@ impl SyslogLogger {
         }
         // Inicializar puerto serial
         init_serial_port(SYSLOG_LOGGER.serial_port)?;
-        
+
         // Log de inicio
         let entry = SyslogEntry::new(
             SyslogFacility::Kernel,
             SyslogSeverity::Info,
             "syslog",
-            "Sistema de logging syslog inicializado"
+            "Sistema de logging syslog inicializado",
         );
-        
+
         SYSLOG_LOGGER.log_entry(&entry);
         Ok(())
     }
@@ -163,8 +176,12 @@ impl SyslogLogger {
     /// Escribir a puerto serial
     fn write_to_serial(&self, data: &str) {
         // Si está deshabilitado, no escribir
-        if !self.enabled.load(Ordering::SeqCst) { return; }
-        for byte in data.bytes() { self.write_serial_byte(byte); }
+        if !self.enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        for byte in data.bytes() {
+            self.write_serial_byte(byte);
+        }
     }
 
     /// Escribir un byte al puerto serial
@@ -173,7 +190,7 @@ impl SyslogLogger {
         while !self.is_serial_ready() {
             core::hint::spin_loop();
         }
-        
+
         // Escribir byte
         unsafe {
             core::ptr::write_volatile(self.serial_port as *mut u8, byte);
@@ -333,26 +350,26 @@ fn format_timestamp_rfc3164(timestamp: u64) -> String {
 fn init_serial_port(port: u16) -> Result<(), &'static str> {
     // Inicializar puerto serial COM1
     // Configurar baud rate, bits de datos, paridad, etc.
-    
+
     // Configurar divisor de baud rate (115200 bps)
     unsafe {
         // Habilitar DLAB
         core::ptr::write_volatile((port + 3) as *mut u8, 0x80);
-        
+
         // Configurar divisor (115200 bps = 1)
         core::ptr::write_volatile(port as *mut u8, 0x01);
         core::ptr::write_volatile((port + 1) as *mut u8, 0x00);
-        
+
         // Configurar línea de control (8 bits, sin paridad, 1 stop bit)
         core::ptr::write_volatile((port + 3) as *mut u8, 0x03);
-        
+
         // Habilitar FIFO
         core::ptr::write_volatile((port + 2) as *mut u8, 0xC7);
-        
+
         // Habilitar interrupciones
         core::ptr::write_volatile((port + 1) as *mut u8, 0x01);
     }
-    
+
     Ok(())
 }
 

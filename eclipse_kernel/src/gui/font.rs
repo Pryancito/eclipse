@@ -1,8 +1,8 @@
 //! Sistema de renderizado de fuentes
-//! 
+//!
 //! Maneja el renderizado de texto en el framebuffer
 
-use crate::gui::framebuffer::{Framebuffer, Color, Point};
+use crate::gui::framebuffer::{Color, Framebuffer, Point};
 
 /// Información de una fuente
 #[derive(Debug, Clone, Copy)]
@@ -22,7 +22,7 @@ impl FontInfo {
             line_spacing: 16,
         }
     }
-    
+
     pub fn small_6x12() -> Self {
         Self {
             width: 6,
@@ -48,11 +48,11 @@ impl BitmapFont {
             glyphs: &DEFAULT_FONT_8X16,
         }
     }
-    
+
     /// Obtener bitmap de un carácter
     pub fn get_glyph(&self, character: char) -> &[u8] {
         let char_code = character as usize;
-        
+
         // Solo soportamos caracteres ASCII básicos
         if char_code >= 32 && char_code < 127 {
             let start_index = (char_code - 32) * self.info.height as usize;
@@ -65,12 +65,12 @@ impl BitmapFont {
             &self.glyphs[start_index..end_index]
         }
     }
-    
+
     /// Calcular el ancho de un texto
     pub fn calculate_text_width(&self, text: &str) -> u32 {
         text.len() as u32 * self.info.width as u32
     }
-    
+
     /// Calcular la altura de un texto (con saltos de línea)
     pub fn calculate_text_height(&self, text: &str) -> u32 {
         let line_count = text.lines().count().max(1);
@@ -95,38 +95,56 @@ impl FontRenderer {
             tab_width: 4,
         }
     }
-    
+
     /// Renderizar un carácter en una posición específica
-    pub fn render_char(&self, framebuffer: &mut Framebuffer, character: char, position: Point, color: Color) {
+    pub fn render_char(
+        &self,
+        framebuffer: &mut Framebuffer,
+        character: char,
+        position: Point,
+        color: Color,
+    ) {
         let glyph = self.current_font.get_glyph(character);
-        
+
         for (row, &byte) in glyph.iter().enumerate() {
             for col in 0..8 {
                 if (byte >> (7 - col)) & 1 != 0 {
                     let x = position.x + col as i32;
                     let y = position.y + row as i32;
-                    
-                    if x >= 0 && x < framebuffer.info.width as i32 &&
-                       y >= 0 && y < framebuffer.info.height as i32 {
+
+                    if x >= 0
+                        && x < framebuffer.info.width as i32
+                        && y >= 0
+                        && y < framebuffer.info.height as i32
+                    {
                         framebuffer.put_pixel(x as u32, y as u32, color);
                     }
                 } else if let Some(bg_color) = self.background_color {
                     let x = position.x + col as i32;
                     let y = position.y + row as i32;
-                    
-                    if x >= 0 && x < framebuffer.info.width as i32 &&
-                       y >= 0 && y < framebuffer.info.height as i32 {
+
+                    if x >= 0
+                        && x < framebuffer.info.width as i32
+                        && y >= 0
+                        && y < framebuffer.info.height as i32
+                    {
                         framebuffer.put_pixel(x as u32, y as u32, bg_color);
                     }
                 }
             }
         }
     }
-    
+
     /// Renderizar texto en una posición específica
-    pub fn render_text(&self, framebuffer: &mut Framebuffer, text: &str, position: Point, color: Color) {
+    pub fn render_text(
+        &self,
+        framebuffer: &mut Framebuffer,
+        text: &str,
+        position: Point,
+        color: Color,
+    ) {
         let mut current_pos = position;
-        
+
         for character in text.chars() {
             match character {
                 '\n' => {
@@ -141,7 +159,9 @@ impl FontRenderer {
                 '\t' => {
                     // Tabulación
                     let tab_pixels = self.tab_width as i32 * self.current_font.info.width as i32;
-                    current_pos.x = ((current_pos.x - position.x + tab_pixels) / tab_pixels) * tab_pixels + position.x;
+                    current_pos.x = ((current_pos.x - position.x + tab_pixels) / tab_pixels)
+                        * tab_pixels
+                        + position.x;
                 }
                 _ => {
                     // Carácter normal
@@ -149,7 +169,7 @@ impl FontRenderer {
                     current_pos.x += self.current_font.info.width as i32;
                 }
             }
-            
+
             // Verificar si necesitamos hacer wrap
             if current_pos.x >= framebuffer.info.width as i32 {
                 current_pos.x = position.x;
@@ -157,29 +177,35 @@ impl FontRenderer {
             }
         }
     }
-    
+
     /// Renderizar texto centrado en un rectángulo
-    pub fn render_text_centered(&self, framebuffer: &mut Framebuffer, text: &str, rect: crate::gui::framebuffer::Rect, color: Color) {
+    pub fn render_text_centered(
+        &self,
+        framebuffer: &mut Framebuffer,
+        text: &str,
+        rect: crate::gui::framebuffer::Rect,
+        color: Color,
+    ) {
         let text_width = self.current_font.calculate_text_width(text);
         let text_height = self.current_font.calculate_text_height(text);
-        
+
         let center_x = rect.x + (rect.width as i32 - text_width as i32) / 2;
         let center_y = rect.y + (rect.height as i32 - text_height as i32) / 2;
-        
+
         let center_pos = Point::new(center_x, center_y);
         self.render_text(framebuffer, text, center_pos, color);
     }
-    
+
     /// Cambiar fuente actual
     pub fn set_font(&mut self, font: BitmapFont) {
         self.current_font = font;
     }
-    
+
     /// Establecer color de fondo para texto
     pub fn set_background_color(&mut self, color: Option<Color>) {
         self.background_color = color;
     }
-    
+
     /// Establecer ancho de tabulación
     pub fn set_tab_width(&mut self, width: u8) {
         self.tab_width = width;
@@ -191,33 +217,22 @@ impl FontRenderer {
 /// En un sistema real, esto vendría de un archivo de fuente o ROM
 static DEFAULT_FONT_8X16: [u8; 96] = [
     // Carácter ' ' (espacio)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    
-    // Carácter '!' 
-    0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
-    0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
-    
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Carácter '!'
+    0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
     // Carácter '"'
-    0x00, 0x00, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    
+    0x00, 0x00, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     // Carácter '#'
-    0x00, 0x00, 0x36, 0x36, 0x7F, 0x36, 0x36, 0x36,
-    0x7F, 0x36, 0x36, 0x36, 0x00, 0x00, 0x00, 0x00,
-    
+    0x00, 0x00, 0x36, 0x36, 0x7F, 0x36, 0x36, 0x36, 0x7F, 0x36, 0x36, 0x36, 0x00, 0x00, 0x00, 0x00,
     // Carácter '$'
-    0x00, 0x18, 0x18, 0x3E, 0x63, 0x60, 0x30, 0x18,
-    0x0C, 0x06, 0x63, 0x3E, 0x18, 0x18, 0x00, 0x00,
-    
+    0x00, 0x18, 0x18, 0x3E, 0x63, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x63, 0x3E, 0x18, 0x18, 0x00, 0x00,
     // Los siguientes caracteres son simplificados para el ejemplo
     // En un sistema real, cada carácter tendría su bitmap completo
-    
+
     // Para simplificar, repetir el patrón del '!' para los demás caracteres
     // (esto es solo para demostración)
-    0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
-    0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
-    
+    0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00,
+    0x00,
     // ... (repetir para los 90 caracteres restantes)
     // En una implementación real, aquí estarían todos los bitmaps de caracteres ASCII
 ];
@@ -227,10 +242,10 @@ static DEFAULT_FONT_8X16: [u8; 96] = [
 const fn generate_default_font() -> [u8; 95 * 16] {
     let mut font = [0u8; 95 * 16];
     let pattern = [
-        0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
-        0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00,
+        0x00,
     ];
-    
+
     let mut i = 0;
     while i < 95 {
         let mut j = 0;
@@ -240,7 +255,7 @@ const fn generate_default_font() -> [u8; 95 * 16] {
         }
         i += 1;
     }
-    
+
     font
 }
 
@@ -257,9 +272,7 @@ pub fn init_font_renderer() {
 
 /// Obtener referencia al renderizador de fuentes
 pub fn get_font_renderer() -> Option<&'static mut FontRenderer> {
-    unsafe {
-        FONT_RENDERER.as_mut()
-    }
+    unsafe { FONT_RENDERER.as_mut() }
 }
 
 /// Renderizar texto (función de conveniencia)
@@ -284,11 +297,11 @@ pub fn render_char(framebuffer: &mut Framebuffer, character: char, position: Poi
 fn render_text_vga_fallback(text: &str, position: Point, _color: Color) {
     // Mapear a buffer de texto VGA (0xB8000)
     let vga_buffer = 0xB8000 as *mut u8;
-    
+
     // Calcular posición en el buffer de texto VGA (80x25 caracteres)
     let x = (position.x / 8) as usize; // 8 pixels por carácter
     let y = (position.y / 16) as usize; // 16 pixels por línea
-    
+
     if x < 80 && y < 25 {
         for (i, byte) in text.bytes().enumerate() {
             if x + i < 80 {

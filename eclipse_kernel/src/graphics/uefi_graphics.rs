@@ -1,14 +1,14 @@
 //! Gráficos UEFI para fase de detección de hardware
-//! 
+//!
 //! Esta fase se encarga de:
 //! - Detectar hardware gráfico disponible
 //! - Inicializar GOP (Graphics Output Protocol)
 //! - Preparar transición a DRM
 
-use crate::drivers::framebuffer::FramebufferInfo;
-use crate::alloc::string::ToString;
-use alloc::{vec, vec::Vec, string::String};
 use super::phases::{get_graphics_phase_manager, GraphicsPhase};
+use crate::alloc::string::ToString;
+use crate::drivers::framebuffer::FramebufferInfo;
+use alloc::{string::String, vec, vec::Vec};
 
 /// Información de hardware gráfico detectado
 #[derive(Debug, Clone)]
@@ -75,10 +75,10 @@ pub fn init_uefi_graphics() -> Result<(), &'static str> {
 
     // Detectar hardware gráfico
     let hardware_info = detect_graphics_hardware()?;
-    
+
     // Log de hardware detectado
     log_graphics_hardware(&hardware_info);
-    
+
     // Preparar para transición a DRM si es posible
     if hardware_info.primary_adapter.is_some() {
         prepare_drm_transition(&hardware_info)?;
@@ -90,10 +90,10 @@ pub fn init_uefi_graphics() -> Result<(), &'static str> {
 /// Detectar hardware gráfico disponible
 fn detect_graphics_hardware() -> Result<GraphicsHardwareInfo, &'static str> {
     let mut adapters = Vec::new();
-    
+
     // Simular detección de adaptadores gráficos
     // En una implementación real, esto usaría UEFI GOP para detectar hardware
-    
+
     // Adaptador simulado 1: Intel HD Graphics (integrado)
     adapters.push(GraphicsAdapter {
         id: 0,
@@ -105,11 +105,7 @@ fn detect_graphics_hardware() -> Result<GraphicsHardwareInfo, &'static str> {
             supports_textures: true,
             supports_compositing: true,
             video_memory_mb: 1024,
-            supported_resolutions: vec![
-                (1920, 1080),
-                (1366, 768),
-                (1024, 768),
-            ],
+            supported_resolutions: vec![(1920, 1080), (1366, 768), (1024, 768)],
         },
         drm_compatible: true,
     });
@@ -125,11 +121,7 @@ fn detect_graphics_hardware() -> Result<GraphicsHardwareInfo, &'static str> {
             supports_textures: true,
             supports_compositing: true,
             video_memory_mb: 6144,
-            supported_resolutions: vec![
-                (3840, 2160),
-                (2560, 1440),
-                (1920, 1080),
-            ],
+            supported_resolutions: vec![(3840, 2160), (2560, 1440), (1920, 1080)],
         },
         drm_compatible: true,
     });
@@ -145,16 +137,14 @@ fn detect_graphics_hardware() -> Result<GraphicsHardwareInfo, &'static str> {
             supports_textures: false,
             supports_compositing: false,
             video_memory_mb: 64,
-            supported_resolutions: vec![
-                (1024, 768),
-                (800, 600),
-            ],
+            supported_resolutions: vec![(1024, 768), (800, 600)],
         },
         drm_compatible: false,
     });
 
     // Seleccionar adaptador principal (primero compatible con DRM)
-    let primary_adapter = adapters.iter()
+    let primary_adapter = adapters
+        .iter()
         .find(|adapter| adapter.drm_compatible)
         .map(|adapter| adapter.id);
 
@@ -169,14 +159,14 @@ fn detect_graphics_hardware() -> Result<GraphicsHardwareInfo, &'static str> {
 fn log_graphics_hardware(hardware_info: &GraphicsHardwareInfo) {
     // Log("[UEFI Graphics] Hardware detectado:");
     // Log("  Adaptadores encontrados: {}", hardware_info.adapter_count);
-    
+
     for adapter in &hardware_info.adapters {
         // Log("  - {} (ID: {})", adapter.name, adapter.id);
         // Log("    Tipo: {:?}", adapter.adapter_type);
         // Log("    DRM compatible: {}", adapter.drm_compatible);
         // Log("    Memoria: {} MB", adapter.capabilities.video_memory_mb);
     }
-    
+
     if let Some(primary_id) = hardware_info.primary_adapter {
         // Log("  Adaptador principal: ID {}", primary_id);
     } else {
@@ -190,16 +180,16 @@ fn prepare_drm_transition(hardware_info: &GraphicsHardwareInfo) -> Result<(), &'
         if let Some(adapter) = hardware_info.adapters.iter().find(|a| a.id == primary_id) {
             if adapter.drm_compatible {
                 // Log("[UEFI Graphics] Preparando transición a DRM para {}", adapter.name);
-                
+
                 // Aquí se prepararía la información del framebuffer para DRM
                 // Por ahora, simulamos la preparación
                 prepare_framebuffer_info(adapter)?;
-                
+
                 return Ok(());
             }
         }
     }
-    
+
     Err("No hay adaptador compatible con DRM disponible")
 }
 
@@ -208,12 +198,12 @@ fn prepare_framebuffer_info(adapter: &GraphicsAdapter) -> Result<(), &'static st
     // Simular preparación del framebuffer
     // En una implementación real, esto configuraría el framebuffer UEFI
     // para la transición a DRM
-    
+
     // Log("[UEFI Graphics] Configurando framebuffer para DRM:");
     // Log("  Adaptador: {}", adapter.name);
     // Log("  Memoria: {} MB", adapter.capabilities.video_memory_mb);
     // Log("  Resoluciones: {:?}", adapter.capabilities.supported_resolutions);
-    
+
     Ok(())
 }
 

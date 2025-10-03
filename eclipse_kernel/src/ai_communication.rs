@@ -1,17 +1,17 @@
 //! Sistema de comunicación bidireccional con IA
-//! 
+//!
 //! Este módulo implementa la comunicación entre la IA y el sistema operativo,
 //! permitiendo intervenciones en tiempo real y aprendizaje continuo.
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ai_integration::{AIIntegration, AICommand, AICommandResult, AIIntervention};
+use crate::ai_integration::{AICommand, AICommandResult, AIIntegration, AIIntervention};
 
 /// Tipo de mensaje de comunicación
 #[derive(Debug, Clone, PartialEq)]
@@ -87,10 +87,10 @@ impl AICommunicationChannel {
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Establecer conexión con la IA
         self.establish_connection()?;
-        
+
         // Iniciar procesamiento de mensajes
         self.start_message_processing()?;
-        
+
         Ok(())
     }
 
@@ -98,7 +98,7 @@ impl AICommunicationChannel {
     fn establish_connection(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se establecería la conexión
         // con el servicio de IA (local o remoto)
-        
+
         self.is_connected.store(true, Ordering::Release);
         Ok(())
     }
@@ -111,7 +111,11 @@ impl AICommunicationChannel {
     }
 
     /// Envía un mensaje a la IA
-    pub fn send_message(&mut self, content: &str, message_type: CommunicationType) -> Result<u64, &'static str> {
+    pub fn send_message(
+        &mut self,
+        content: &str,
+        message_type: CommunicationType,
+    ) -> Result<u64, &'static str> {
         if !self.is_connected.load(Ordering::Acquire) {
             return Err("Canal de comunicación no conectado");
         }
@@ -171,7 +175,7 @@ impl AICommunicationChannel {
                         timestamp: self.get_current_timestamp(),
                         priority: 7,
                     };
-                    
+
                     // En una implementación real, aquí se enviaría la respuesta
                 }
                 Err(e) => {
@@ -184,7 +188,7 @@ impl AICommunicationChannel {
                         timestamp: self.get_current_timestamp(),
                         priority: 9,
                     };
-                    
+
                     // En una implementación real, aquí se enviaría el error
                 }
             }
@@ -196,7 +200,7 @@ impl AICommunicationChannel {
     fn handle_command(&self, message: &AIMessage) -> Result<(), &'static str> {
         // Parsear comando
         let command_parts: Vec<&str> = message.content.split_whitespace().collect();
-        
+
         if command_parts.is_empty() {
             return Err("Comando vacío");
         }
@@ -230,7 +234,7 @@ impl AICommunicationChannel {
         if let Some(ai) = crate::ai_integration::get_ai_integration() {
             let stats = ai.get_ai_stats();
             let context = ai.get_system_context();
-            
+
             let status_message = format!(
                 "Estado de IA: Activo\n\
                 Comandos totales: {}\n\
@@ -246,7 +250,7 @@ impl AICommunicationChannel {
                 context.memory_usage * 100.0,
                 context.active_processes
             );
-            
+
             // En una implementación real, aquí se enviaría el estado
         }
         Ok(())
@@ -265,7 +269,10 @@ impl AICommunicationChannel {
             match ai.process_intervention_request(&request) {
                 Ok(command_id) => {
                     // Crear respuesta de éxito
-                    let response = format!("Intervención {} iniciada con ID: {}", intervention_type, command_id);
+                    let response = format!(
+                        "Intervención {} iniciada con ID: {}",
+                        intervention_type, command_id
+                    );
                     // En una implementación real, aquí se enviaría la respuesta
                 }
                 Err(e) => {
@@ -284,10 +291,10 @@ impl AICommunicationChannel {
         }
 
         let learning_data = args.join(" ");
-        
+
         // En una implementación real, aquí se procesarían los datos de aprendizaje
         // y se actualizaría el modelo de IA
-        
+
         Ok(())
     }
 
@@ -298,15 +305,18 @@ impl AICommunicationChannel {
         }
 
         let optimization_type = args[0];
-        
+
         // Crear solicitud de optimización
         let request = format!("optimizar {}", optimization_type);
-        
+
         if let Some(ai) = crate::ai_integration::get_ai_integration() {
             match ai.process_intervention_request(&request) {
                 Ok(command_id) => {
                     // Crear respuesta de éxito
-                    let response = format!("Optimización {} iniciada con ID: {}", optimization_type, command_id);
+                    let response = format!(
+                        "Optimización {} iniciada con ID: {}",
+                        optimization_type, command_id
+                    );
                     // En una implementación real, aquí se enviaría la respuesta
                 }
                 Err(e) => {
@@ -322,7 +332,7 @@ impl AICommunicationChannel {
     fn handle_status_request(&self, message: &AIMessage) -> Result<(), &'static str> {
         // Procesar solicitud de estado específica
         let status_info = self.get_detailed_status()?;
-        
+
         // Crear respuesta
         let response = AIMessage {
             id: self.message_counter + 1,
@@ -332,7 +342,7 @@ impl AICommunicationChannel {
             timestamp: self.get_current_timestamp(),
             priority: 6,
         };
-        
+
         // En una implementación real, aquí se enviaría la respuesta
         Ok(())
     }
@@ -342,7 +352,7 @@ impl AICommunicationChannel {
         if let Some(ai) = crate::ai_integration::get_ai_integration() {
             let stats = ai.get_ai_stats();
             let context = ai.get_system_context();
-            
+
             Ok(format!(
                 "=== Estado Detallado del Sistema ===\n\
                 IA: {}\n\
@@ -363,7 +373,11 @@ impl AICommunicationChannel {
                 Tiempo activo: {} segundos\n\
                 Errores: {}\n\
                 Advertencias: {}",
-                if ai.get_state() == crate::ai_integration::AIState::Active { "Activo" } else { "Inactivo" },
+                if ai.get_state() == crate::ai_integration::AIState::Active {
+                    "Activo"
+                } else {
+                    "Inactivo"
+                },
                 stats.successful_commands,
                 stats.total_commands,
                 stats.get_success_rate() * 100.0,
@@ -483,7 +497,5 @@ pub fn init_ai_communication() -> Result<(), &'static str> {
 
 /// Obtiene la instancia global del canal de comunicación
 pub fn get_ai_communication_channel() -> Option<&'static mut AICommunicationChannel> {
-    unsafe {
-        AI_COMMUNICATION_CHANNEL.as_mut()
-    }
+    unsafe { AI_COMMUNICATION_CHANNEL.as_mut() }
 }

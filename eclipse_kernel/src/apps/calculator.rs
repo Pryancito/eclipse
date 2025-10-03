@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! Calculadora científica para Eclipse OS
-//! 
+//!
 //! Proporciona funciones matemáticas básicas y avanzadas
 //! con soporte para expresiones complejas.
 
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Operador matemático
 #[derive(Debug, Clone, PartialEq)]
@@ -55,11 +55,11 @@ impl Calculator {
     /// Ejecutar la calculadora
     pub fn run(&mut self) -> Result<(), &'static str> {
         self.show_welcome();
-        
+
         loop {
             self.show_prompt();
             let input = self.read_input();
-            
+
             if input.trim().is_empty() {
                 continue;
             }
@@ -129,7 +129,7 @@ impl Calculator {
 
         // Parsear la expresión
         let tokens = self.parse_expression(expr)?;
-        
+
         // Evaluar la expresión
         self.evaluate_tokens(&tokens)
     }
@@ -146,70 +146,90 @@ impl Calculator {
                 }
                 '+' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Add));
                 }
                 '-' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Subtract));
                 }
                 '*' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Multiply));
                 }
                 '/' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Divide));
                 }
                 '^' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Power));
                 }
                 '%' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Modulo));
                 }
                 '!' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::Operator(Operator::Factorial));
                 }
                 '(' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::LeftParen);
                 }
                 ')' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                     tokens.push(Token::RightParen);
                 }
                 ' ' => {
                     if !current_number.is_empty() {
-                        tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+                        tokens.push(Token::Number(
+                            current_number.parse().map_err(|_| "Número inválido")?,
+                        ));
                         current_number.clear();
                     }
                 }
@@ -218,7 +238,7 @@ impl Calculator {
                     if ch.is_alphabetic() {
                         let mut func_name = String::new();
                         func_name.push(ch);
-                        
+
                         while let Some(&next_ch) = chars.peek() {
                             if next_ch.is_alphabetic() {
                                 func_name.push(chars.next().unwrap());
@@ -226,7 +246,7 @@ impl Calculator {
                                 break;
                             }
                         }
-                        
+
                         match func_name.as_str() {
                             "sin" => tokens.push(Token::Operator(Operator::Sine)),
                             "cos" => tokens.push(Token::Operator(Operator::Cosine)),
@@ -242,7 +262,9 @@ impl Calculator {
         }
 
         if !current_number.is_empty() {
-            tokens.push(Token::Number(current_number.parse().map_err(|_| "Número inválido")?));
+            tokens.push(Token::Number(
+                current_number.parse().map_err(|_| "Número inválido")?,
+            ));
         }
 
         Ok(tokens)
@@ -251,7 +273,7 @@ impl Calculator {
     fn evaluate_tokens(&mut self, tokens: &[Token]) -> Result<f64, &'static str> {
         // Implementación simplificada de evaluación de expresiones
         // En una implementación real, esto usaría el algoritmo shunting yard
-        
+
         if tokens.is_empty() {
             return Err("Expresión vacía");
         }
@@ -268,10 +290,10 @@ impl Calculator {
                     if stack.len() < 2 {
                         return Err("Operador sin suficientes operandos");
                     }
-                    
+
                     let b = stack.pop().unwrap();
                     let a = stack.pop().unwrap();
-                    
+
                     let result = match op {
                         Operator::Add => a + b,
                         Operator::Subtract => a - b,
@@ -292,7 +314,7 @@ impl Calculator {
                         Operator::Logarithm => self.log10(a),
                         Operator::NaturalLog => self.ln(a),
                     };
-                    
+
                     stack.push(result);
                 }
                 _ => return Err("Token no soportado en esta posición"),

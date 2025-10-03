@@ -1,10 +1,10 @@
 //! Drivers de almacenamiento para Eclipse OS
-//! 
+//!
 //! Basado en los drivers de almacenamiento de Redox OS
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
 
@@ -166,10 +166,10 @@ impl Driver for StorageDriver {
 
         // Configurar nombre
         storage_info.name[..device.info.name.len()].copy_from_slice(&device.info.name);
-        
+
         // Configurar capacidad simulada (1GB)
         storage_info.capacity = 1024 * 1024 * 1024;
-        
+
         // Configurar interfaz basada en vendor/device ID
         if device.info.vendor_id == 0x8086 {
             storage_info.interface_type = StorageInterface::SATA;
@@ -181,10 +181,10 @@ impl Driver for StorageDriver {
 
         // Agregar dispositivo
         self.add_device(storage_info)?;
-        
+
         // Configurar driver ID en el dispositivo
         device.driver_id = Some(self.info.id);
-        
+
         Ok(())
     }
 
@@ -247,7 +247,7 @@ impl AtaDriver {
     pub fn detect_devices(&mut self) -> DriverResult<()> {
         for i in 0..2 {
             self.channels[i].enable();
-            
+
             // Detectar dispositivos en el canal
             for device in 0..2 {
                 if let Ok(device_info) = self.identify_device(i, device) {
@@ -264,12 +264,12 @@ impl AtaDriver {
                         serial: device_info.serial,
                         firmware: device_info.firmware,
                     };
-                    
+
                     // Configurar nombre (simplificado)
                     let name = b"ata0.0";
                     let len = name.len().min(31);
                     storage_info.name[..len].copy_from_slice(&name[..len]);
-                    
+
                     self.base.add_device(storage_info)?;
                 }
             }
@@ -280,7 +280,7 @@ impl AtaDriver {
     fn identify_device(&self, channel: usize, device: usize) -> DriverResult<AtaDeviceInfo> {
         // Implementación simplificada de identificación ATA
         // En una implementación real, esto leería los registros ATA
-        
+
         Ok(AtaDeviceInfo {
             capacity: 1024 * 1024 * 1024, // 1GB
             model: [0; 64],
@@ -318,8 +318,8 @@ impl Driver for AtaDriver {
 
     fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
         // Probar si es un dispositivo ATA
-        device_info.device_type == DeviceType::Storage &&
-        (device_info.class_code == 0x01 && device_info.subclass == 0x01) // Mass storage, ATA
+        device_info.device_type == DeviceType::Storage
+            && (device_info.class_code == 0x01 && device_info.subclass == 0x01) // Mass storage, ATA
     }
 
     fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {
@@ -401,8 +401,9 @@ impl Driver for NvmeDriver {
 
     fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
         // Probar si es un dispositivo NVMe
-        device_info.device_type == DeviceType::Storage &&
-        device_info.class_code == 0x01 && device_info.subclass == 0x08 // Mass storage, NVMe
+        device_info.device_type == DeviceType::Storage
+            && device_info.class_code == 0x01
+            && device_info.subclass == 0x08 // Mass storage, NVMe
     }
 
     fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {
@@ -422,7 +423,7 @@ impl Driver for NvmeDriver {
 pub fn init_storage_drivers() -> DriverResult<()> {
     // Inicializar drivers de almacenamiento
     // En una implementación real, esto registraría los drivers con el gestor
-    
+
     Ok(())
 }
 

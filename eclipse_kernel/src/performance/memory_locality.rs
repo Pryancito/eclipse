@@ -3,9 +3,9 @@
 //! Este módulo optimiza la localidad de memoria para mejorar
 //! el rendimiento del sistema multihilo
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Configuración de optimización de localidad de memoria
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ impl Default for MemoryLocalityConfig {
             enable_page_migration: true,
             enable_memory_interleaving: false,
             numa_nodes: 1,
-            page_size: 4096, // 4KB
+            page_size: 4096,          // 4KB
             migration_threshold: 0.8, // 80% threshold
         }
     }
@@ -65,7 +65,7 @@ pub struct MemoryLocalityOptimizer {
     metrics: MemoryLocalityMetrics,
     pages: Vec<MemoryPage>,
     access_patterns: Vec<(u64, u64)>, // (address, timestamp)
-    numa_usage: Vec<u64>, // Uso por nodo NUMA
+    numa_usage: Vec<u64>,             // Uso por nodo NUMA
     migration_count: AtomicUsize,
     optimization_cycles: AtomicU64,
 }
@@ -78,7 +78,7 @@ impl MemoryLocalityOptimizer {
             numa_nodes: if numa_aware { 4 } else { 1 },
             ..Default::default()
         };
-        
+
         Self {
             config,
             metrics: MemoryLocalityMetrics {
@@ -105,7 +105,7 @@ impl MemoryLocalityOptimizer {
         self.pages.clear();
         self.access_patterns.clear();
         self.numa_usage.fill(0);
-        
+
         // Inicializar métricas
         self.metrics = MemoryLocalityMetrics {
             total_pages: 0,
@@ -117,22 +117,22 @@ impl MemoryLocalityOptimizer {
             memory_fragmentation: 0.0,
             average_access_distance: 0.0,
         };
-        
+
         Ok(())
     }
 
     /// Registrar acceso a memoria
     pub fn record_memory_access(&mut self, address: u64, thread_id: u32) {
         let current_time = self.get_current_time();
-        
+
         // Registrar patrón de acceso
         self.access_patterns.push((address, current_time));
-        
+
         // Mantener solo los últimos 1000 accesos
         if self.access_patterns.len() > 1000 {
             self.access_patterns.remove(0);
         }
-        
+
         // Buscar o crear página
         let page_address = self.get_page_address(address);
         if let Some(page) = self.pages.iter_mut().find(|p| p.address == page_address) {
@@ -154,7 +154,7 @@ impl MemoryLocalityOptimizer {
             self.pages.push(new_page);
             self.metrics.total_pages += 1;
         }
-        
+
         // Actualizar uso de NUMA
         if self.config.enable_numa_awareness {
             let numa_node = self.get_numa_node(address);
@@ -167,25 +167,25 @@ impl MemoryLocalityOptimizer {
     /// Optimizar localidad de memoria
     pub fn optimize_memory_locality(&mut self) -> Result<(), &'static str> {
         self.optimization_cycles.fetch_add(1, Ordering::Relaxed);
-        
+
         // Clasificar páginas como hot/cold
         self.classify_pages();
-        
+
         if self.config.enable_page_migration {
             self.migrate_pages();
         }
-        
+
         if self.config.enable_memory_compaction {
             self.compact_memory();
         }
-        
+
         if self.config.enable_memory_interleaving {
             self.interleave_memory();
         }
-        
+
         // Actualizar métricas
         self.update_metrics();
-        
+
         Ok(())
     }
 
@@ -194,14 +194,14 @@ impl MemoryLocalityOptimizer {
         let current_time = self.get_current_time();
         let hot_threshold = 10; // Accesos mínimos para ser hot
         let time_threshold = 1000000; // 1 segundo en nanosegundos
-        
+
         for page in &mut self.pages {
             let is_recent = current_time - page.last_access < time_threshold;
             let is_frequently_accessed = page.access_count >= hot_threshold;
-            
+
             page.is_hot = is_recent && is_frequently_accessed;
         }
-        
+
         // Actualizar contadores
         self.metrics.hot_pages = self.pages.iter().filter(|p| p.is_hot).count() as u64;
         self.metrics.cold_pages = self.pages.iter().filter(|p| !p.is_hot).count() as u64;
@@ -212,25 +212,25 @@ impl MemoryLocalityOptimizer {
         if !self.config.enable_numa_awareness {
             return;
         }
-        
+
         let current_time = self.get_current_time();
         let migration_threshold = self.config.migration_threshold;
-        
+
         let mut pages_to_migrate = Vec::new();
-        
+
         for (index, page) in self.pages.iter().enumerate() {
             if page.is_migrated || !page.is_hot {
                 continue;
             }
-            
+
             // Calcular score de migración
             let migration_score = self.calculate_migration_score(page);
-            
+
             if migration_score > migration_threshold {
                 pages_to_migrate.push(index);
             }
         }
-        
+
         for index in pages_to_migrate {
             if let Some(page) = self.pages.get_mut(index) {
                 // Simular migración de página
@@ -248,11 +248,11 @@ impl MemoryLocalityOptimizer {
         if !self.config.enable_numa_awareness {
             return 0.0;
         }
-        
+
         // Score basado en frecuencia de acceso y localidad
         let access_score = (page.access_count as f64 / 100.0).min(1.0);
         let locality_score = self.calculate_page_locality(page);
-        
+
         (access_score + locality_score) / 2.0
     }
 
@@ -261,11 +261,13 @@ impl MemoryLocalityOptimizer {
         // Buscar accesos cercanos en el patrón de acceso
         let page_start = page.address;
         let page_end = page.address + page.size;
-        
-        let nearby_accesses = self.access_patterns.iter()
+
+        let nearby_accesses = self
+            .access_patterns
+            .iter()
             .filter(|(addr, _)| *addr >= page_start && *addr < page_end)
             .count();
-        
+
         // Normalizar score
         (nearby_accesses as f64 / 10.0).min(1.0)
     }
@@ -290,7 +292,7 @@ impl MemoryLocalityOptimizer {
         if !self.config.enable_numa_awareness {
             return;
         }
-        
+
         // Simulación de intercalado de memoria
         // En un sistema real, esto distribuiría páginas entre nodos NUMA
         self.balance_numa_usage();
@@ -301,14 +303,12 @@ impl MemoryLocalityOptimizer {
         if self.pages.is_empty() {
             return 0.0;
         }
-        
+
         // Simulación de cálculo de fragmentación
         // En un sistema real, esto calcularía la fragmentación real
         let total_pages = self.pages.len() as f64;
-        let fragmented_pages = self.pages.iter()
-            .filter(|p| p.is_migrated)
-            .count() as f64;
-        
+        let fragmented_pages = self.pages.iter().filter(|p| p.is_migrated).count() as f64;
+
         (fragmented_pages / total_pages) * 100.0
     }
 
@@ -317,15 +317,20 @@ impl MemoryLocalityOptimizer {
         if !self.config.enable_numa_awareness || self.numa_usage.len() <= 1 {
             return;
         }
-        
+
         let total_usage: u64 = self.numa_usage.iter().sum();
         let average_usage = total_usage / self.numa_usage.len() as u64;
-        
+
         // Calcular score de balance
-        let variance = self.numa_usage.iter()
-            .map(|&usage| (usage as f64 - average_usage as f64) * (usage as f64 - average_usage as f64))
-            .sum::<f64>() / self.numa_usage.len() as f64;
-        
+        let variance = self
+            .numa_usage
+            .iter()
+            .map(|&usage| {
+                (usage as f64 - average_usage as f64) * (usage as f64 - average_usage as f64)
+            })
+            .sum::<f64>()
+            / self.numa_usage.len() as f64;
+
         self.metrics.numa_balance_score = (100.0 - (variance / 100.0).min(100.0)).max(0.0);
     }
 
@@ -333,7 +338,7 @@ impl MemoryLocalityOptimizer {
     fn update_metrics(&mut self) {
         // Actualizar score de localidad
         self.metrics.locality_score = self.calculate_locality_score();
-        
+
         // Actualizar distancia promedio de acceso
         self.metrics.average_access_distance = self.calculate_average_access_distance();
     }
@@ -343,10 +348,10 @@ impl MemoryLocalityOptimizer {
         if self.pages.is_empty() {
             return 0.0;
         }
-        
+
         let hot_ratio = self.metrics.hot_pages as f64 / self.metrics.total_pages as f64;
         let migration_ratio = self.metrics.migrated_pages as f64 / self.metrics.total_pages as f64;
-        
+
         // Score combinado de localidad
         (hot_ratio * 0.7 + migration_ratio * 0.3) * 100.0
     }
@@ -356,16 +361,17 @@ impl MemoryLocalityOptimizer {
         if self.access_patterns.len() < 2 {
             return 0.0;
         }
-        
+
         let mut total_distance = 0.0;
         let mut count = 0;
-        
+
         for i in 1..self.access_patterns.len() {
-            let distance = (self.access_patterns[i].0 as f64 - self.access_patterns[i-1].0 as f64).abs();
+            let distance =
+                (self.access_patterns[i].0 as f64 - self.access_patterns[i - 1].0 as f64).abs();
             total_distance += distance;
             count += 1;
         }
-        
+
         if count > 0 {
             total_distance / count as f64
         } else {
@@ -383,7 +389,7 @@ impl MemoryLocalityOptimizer {
         if !self.config.enable_numa_awareness {
             return 0;
         }
-        
+
         // Simulación de distribución NUMA
         (address as usize / (1024 * 1024)) % self.config.numa_nodes
     }

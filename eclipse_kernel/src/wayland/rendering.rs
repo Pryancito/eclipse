@@ -1,16 +1,16 @@
 //! Sistema de Renderización Wayland para Eclipse OS
-//! 
+//!
 //! Implementa el sistema de renderización que maneja OpenGL/Vulkan
 //! y la composición de superficies Wayland.
 
-use super::protocol::*;
-use super::surface::*;
 use super::buffer::*;
 use super::egl::*;
-use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::vec::Vec;
+use super::protocol::*;
+use super::surface::*;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Sistema de renderización Wayland
 pub struct WaylandRenderer {
@@ -114,23 +114,29 @@ impl WaylandRenderer {
             },
         }
     }
-    
+
     /// Inicializar sistema de renderización
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         match self.backend {
             RenderBackend::Software => {
-                // Intentar OpenGL primero; si falla, caer a Software
+                // En esta fase forzamos ruta Software para asegurar dibujo estable
+                self.init_software_rendering()?;
+            }
+            RenderBackend::OpenGL => {
+                // Intentar OpenGL; si no hay contexto válido, caer a Software
                 match self.init_opengl_rendering() {
                     Ok(()) => {
-                        self.backend = RenderBackend::OpenGL;
+                        if self.egl_context.is_none() {
+                            // No hay contexto real, usar software
+                            self.backend = RenderBackend::Software;
+                            self.init_software_rendering()?;
+                        }
                     }
                     Err(_) => {
+                        self.backend = RenderBackend::Software;
                         self.init_software_rendering()?;
                     }
                 }
-            }
-            RenderBackend::OpenGL => {
-                self.init_opengl_rendering()?;
             }
             RenderBackend::Vulkan => {
                 self.init_vulkan_rendering()?;
@@ -139,48 +145,48 @@ impl WaylandRenderer {
                 self.init_directfb_rendering()?;
             }
         }
-        
+
         self.is_initialized.store(true, Ordering::Release);
         Ok(())
     }
-    
+
     /// Inicializar renderización por software
     fn init_software_rendering(&mut self) -> Result<(), &'static str> {
         // Configurar renderización por software
         // Por ahora, simulamos la inicialización
         Ok(())
     }
-    
+
     /// Inicializar renderización OpenGL
     fn init_opengl_rendering(&mut self) -> Result<(), &'static str> {
         // Crear contexto EGL
         let mut egl_context = EglContext::new();
         egl_context.initialize()?;
         self.egl_context = Some(egl_context);
-        
+
         // Compilar shaders básicos
         self.compile_basic_shaders()?;
-        
+
         // Configurar estado OpenGL
         self.setup_opengl_state()?;
-        
+
         Ok(())
     }
-    
+
     /// Inicializar renderización Vulkan
     fn init_vulkan_rendering(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se inicializaría Vulkan
         // Por ahora, simulamos la inicialización
         Ok(())
     }
-    
+
     /// Inicializar renderización DirectFB
     fn init_directfb_rendering(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se inicializaría DirectFB
         // Por ahora, simulamos la inicialización
         Ok(())
     }
-    
+
     /// Compilar shaders básicos
     fn compile_basic_shaders(&mut self) -> Result<(), &'static str> {
         // Vertex shader básico para composición
@@ -199,7 +205,7 @@ impl WaylandRenderer {
                 TexCoord = aTexCoord;
             }
         "#;
-        
+
         // Fragment shader básico para composición
         let fragment_shader_source = r#"
             #version 330 core
@@ -213,32 +219,43 @@ impl WaylandRenderer {
                 FragColor = texture(texture1, TexCoord) * alpha;
             }
         "#;
-        
+
         // Compilar shaders (simulado)
-        self.shader_cache.vertex_shaders.insert("basic_vertex".to_string(), 1);
-        self.shader_cache.fragment_shaders.insert("basic_fragment".to_string(), 2);
-        self.shader_cache.programs.insert("basic_composition".to_string(), 3);
-        
+        self.shader_cache
+            .vertex_shaders
+            .insert("basic_vertex".to_string(), 1);
+        self.shader_cache
+            .fragment_shaders
+            .insert("basic_fragment".to_string(), 2);
+        self.shader_cache
+            .programs
+            .insert("basic_composition".to_string(), 3);
+
         Ok(())
     }
-    
+
     /// Configurar estado OpenGL
     fn setup_opengl_state(&mut self) -> Result<(), &'static str> {
         // Configurar blending para transparencia
         // glEnable(GL_BLEND);
         // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        
+
         // Configurar viewport
         // glViewport(0, 0, self.framebuffer.width as i32, self.framebuffer.height as i32);
-        
+
         Ok(())
     }
-    
+
     /// Registrar superficie para renderizado
-    pub fn register_surface(&mut self, surface_id: ObjectId, buffer: SharedMemoryBuffer, position: (i32, i32)) -> Result<(), &'static str> {
+    pub fn register_surface(
+        &mut self,
+        surface_id: ObjectId,
+        buffer: SharedMemoryBuffer,
+        position: (i32, i32),
+    ) -> Result<(), &'static str> {
         let buffer_width = buffer.width;
         let buffer_height = buffer.height;
-        
+
         let render_surface = RenderSurface {
             surface_id,
             buffer: Some(buffer),
@@ -249,15 +266,15 @@ impl WaylandRenderer {
             alpha: 1.0,
             transform: Transform::Normal,
         };
-        
+
         self.surfaces.insert(surface_id, render_surface);
-        
+
         // Crear textura para la superficie
         self.create_surface_texture(surface_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Crear textura para superficie
     fn create_surface_texture(&mut self, surface_id: ObjectId) -> Result<(), &'static str> {
         let buffer_info = if let Some(surface) = self.surfaces.get(&surface_id) {
@@ -269,7 +286,7 @@ impl WaylandRenderer {
         } else {
             None
         };
-        
+
         if let Some((width, height, format)) = buffer_info {
             let texture_info = TextureInfo {
                 id: surface_id as u32, // En un sistema real, esto sería un ID de textura OpenGL
@@ -277,15 +294,15 @@ impl WaylandRenderer {
                 height,
                 format: self.buffer_format_to_texture_format(format),
             };
-            
+
             if let Some(surface) = self.surfaces.get_mut(&surface_id) {
                 surface.texture = Some(texture_info);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Convertir formato de buffer a formato de textura
     fn buffer_format_to_texture_format(&self, buffer_format: BufferFormat) -> TextureFormat {
         match buffer_format {
@@ -295,49 +312,62 @@ impl WaylandRenderer {
             BufferFormat::RGB565 => TextureFormat::RGB888, // Conversión necesaria
         }
     }
-    
+
     /// Actualizar buffer de superficie
-    pub fn update_surface_buffer(&mut self, surface_id: ObjectId, buffer: SharedMemoryBuffer) -> Result<(), &'static str> {
+    pub fn update_surface_buffer(
+        &mut self,
+        surface_id: ObjectId,
+        buffer: SharedMemoryBuffer,
+    ) -> Result<(), &'static str> {
         let buffer_width = buffer.width;
         let buffer_height = buffer.height;
-        
+
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             surface.buffer = Some(buffer.clone());
             surface.size = (buffer_width, buffer_height);
         }
-        
+
         // Actualizar textura
         self.update_surface_texture(surface_id, &buffer)?;
-        
+
         Ok(())
     }
-    
+
     /// Actualizar textura de superficie
-    fn update_surface_texture(&mut self, surface_id: ObjectId, buffer: &SharedMemoryBuffer) -> Result<(), &'static str> {
+    fn update_surface_texture(
+        &mut self,
+        surface_id: ObjectId,
+        buffer: &SharedMemoryBuffer,
+    ) -> Result<(), &'static str> {
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             if let Some(ref mut texture) = surface.texture {
                 // En un sistema real, aquí se actualizaría la textura OpenGL
                 // glBindTexture(GL_TEXTURE_2D, texture.id);
-                // glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer.width as i32, buffer.height as i32, 
+                // glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer.width as i32, buffer.height as i32,
                 //                 GL_RGBA, GL_UNSIGNED_BYTE, buffer.data.as_ptr());
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Renderizar frame completo
     pub fn render_frame(&mut self) -> Result<(), &'static str> {
         if !self.is_initialized.load(Ordering::Acquire) {
             return Err("Renderer not initialized");
         }
-        
+
         match self.backend {
             RenderBackend::Software => {
                 self.render_frame_software()?;
             }
             RenderBackend::OpenGL => {
-                self.render_frame_opengl()?;
+                // Si no hay contexto EGL válido, usar software
+                if self.egl_context.is_none() {
+                    self.render_frame_software()?;
+                } else {
+                    self.render_frame_opengl()?;
+                }
             }
             RenderBackend::Vulkan => {
                 self.render_frame_vulkan()?;
@@ -346,100 +376,103 @@ impl WaylandRenderer {
                 self.render_frame_directfb()?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Renderizar frame con OpenGL
     fn render_frame_opengl(&mut self) -> Result<(), &'static str> {
         // Limpiar framebuffer
         // glClearColor(0.0, 0.0, 0.0, 1.0);
         // glClear(GL_COLOR_BUFFER_BIT);
-        
+
         // Renderizar todas las superficies visibles
         for (_, surface) in &self.surfaces {
             if surface.visible {
                 self.render_surface_opengl(surface)?;
             }
         }
-        
+
         // Intercambiar buffers
         if let Some(_egl_context) = &self.egl_context {
             // En un sistema real, aquí se intercambiarían los buffers EGL
             // Por ahora, simulamos la operación
         }
-        
+
         Ok(())
     }
-    
+
     /// Renderizar superficie individual con OpenGL
     fn render_surface_opengl(&self, surface: &RenderSurface) -> Result<(), &'static str> {
         if let Some(ref texture) = surface.texture {
             // Usar programa de shader
             // glUseProgram(self.shader_cache.programs["basic_composition"]);
-            
+
             // Configurar transformación
             let model_matrix = self.calculate_model_matrix(surface);
             // glUniformMatrix4fv(model_location, 1, GL_FALSE, model_matrix.as_ptr());
-            
+
             // Configurar alpha
             // glUniform1f(alpha_location, surface.alpha);
-            
+
             // Bind textura
             // glBindTexture(GL_TEXTURE_2D, texture.id);
-            
+
             // Renderizar quad
             // glDrawArrays(GL_TRIANGLES, 0, 6);
         }
-        
+
         Ok(())
     }
-    
+
     /// Calcular matriz de modelo para superficie
     fn calculate_model_matrix(&self, surface: &RenderSurface) -> [f32; 16] {
         let mut matrix = [0.0; 16];
-        
+
         // Matriz de identidad
-        matrix[0] = 1.0; matrix[5] = 1.0; matrix[10] = 1.0; matrix[15] = 1.0;
-        
+        matrix[0] = 1.0;
+        matrix[5] = 1.0;
+        matrix[10] = 1.0;
+        matrix[15] = 1.0;
+
         // Aplicar posición
         matrix[12] = surface.position.0 as f32;
         matrix[13] = surface.position.1 as f32;
-        
+
         // Aplicar escala
         matrix[0] *= surface.size.0 as f32;
         matrix[5] *= surface.size.1 as f32;
-        
+
         // Aplicar transformación (rotación, etc.)
         match surface.transform {
-            Transform::Normal => {},
+            Transform::Normal => {}
             Transform::Rotate90 => {
                 // Rotación 90 grados
             }
             _ => {}
         }
-        
+
         matrix
     }
-    
+
     /// Renderizar frame con software
     fn render_frame_software(&mut self) -> Result<(), &'static str> {
         // Limpiar framebuffer
         self.clear_framebuffer()?;
-        
+
         // Renderizar superficies en orden Z
         let mut sorted_surfaces: Vec<_> = self.surfaces.iter().collect();
         sorted_surfaces.sort_by_key(|(id, _)| *id); // Orden simple por ID
-        
+
         for (_, surface) in sorted_surfaces {
             if surface.visible {
                 self.blit_surface_software(surface)?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Limpiar framebuffer
     fn clear_framebuffer(&self) -> Result<(), &'static str> {
         if !self.framebuffer.address.is_null() {
@@ -450,100 +483,128 @@ impl WaylandRenderer {
         }
         Ok(())
     }
-    
+
     /// Blit superficie con software
     fn blit_surface_software(&self, surface: &RenderSurface) -> Result<(), &'static str> {
         if let Some(ref buffer) = surface.buffer {
             // Calcular coordenadas de destino
             let dst_x = surface.position.0.max(0) as u32;
             let dst_y = surface.position.1.max(0) as u32;
-            let src_x = if surface.position.0 < 0 { (-surface.position.0) as u32 } else { 0 };
-            let src_y = if surface.position.1 < 0 { (-surface.position.1) as u32 } else { 0 };
-            
+            let src_x = if surface.position.0 < 0 {
+                (-surface.position.0) as u32
+            } else {
+                0
+            };
+            let src_y = if surface.position.1 < 0 {
+                (-surface.position.1) as u32
+            } else {
+                0
+            };
+
             let width = (surface.size.0 - src_x).min(self.framebuffer.width - dst_x);
             let height = (surface.size.1 - src_y).min(self.framebuffer.height - dst_y);
-            
+
             if width > 0 && height > 0 {
                 self.blit_buffer(
                     &buffer.data,
-                    src_x, src_y, surface.size.0,
-                    dst_x, dst_y,
-                    width, height,
+                    src_x,
+                    src_y,
+                    surface.size.0,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
                 )?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Blit buffer a framebuffer
     fn blit_buffer(
         &self,
         src_data: &[u8],
-        src_x: u32, src_y: u32, src_width: u32,
-        dst_x: u32, dst_y: u32,
-        width: u32, height: u32,
+        src_x: u32,
+        src_y: u32,
+        src_width: u32,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
     ) -> Result<(), &'static str> {
         if self.framebuffer.address.is_null() {
             return Err("Framebuffer not initialized");
         }
-        
+
         let src_pitch = src_width * 4; // Asumiendo 32 bits por píxel
         let dst_pitch = self.framebuffer.pitch;
-        
+
         unsafe {
             for y in 0..height {
                 let src_offset = ((src_y + y) * src_pitch + src_x * 4) as usize;
                 let dst_offset = ((dst_y + y) * dst_pitch + dst_x * 4) as usize;
-                
+
                 let src_ptr = src_data.as_ptr().add(src_offset);
                 let dst_ptr = self.framebuffer.address.add(dst_offset);
-                
+
                 core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, (width * 4) as usize);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Renderizar frame con Vulkan
     fn render_frame_vulkan(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se implementaría el renderizado con Vulkan
         // Por ahora, simulamos el renderizado
         Ok(())
     }
-    
+
     /// Renderizar frame con DirectFB
     fn render_frame_directfb(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se implementaría el renderizado con DirectFB
         // Por ahora, simulamos el renderizado
         Ok(())
     }
-    
+
     /// Configurar posición de superficie
-    pub fn set_surface_position(&mut self, surface_id: ObjectId, position: (i32, i32)) -> Result<(), &'static str> {
+    pub fn set_surface_position(
+        &mut self,
+        surface_id: ObjectId,
+        position: (i32, i32),
+    ) -> Result<(), &'static str> {
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             surface.position = position;
         }
         Ok(())
     }
-    
+
     /// Configurar visibilidad de superficie
-    pub fn set_surface_visible(&mut self, surface_id: ObjectId, visible: bool) -> Result<(), &'static str> {
+    pub fn set_surface_visible(
+        &mut self,
+        surface_id: ObjectId,
+        visible: bool,
+    ) -> Result<(), &'static str> {
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             surface.visible = visible;
         }
         Ok(())
     }
-    
+
     /// Configurar alpha de superficie
-    pub fn set_surface_alpha(&mut self, surface_id: ObjectId, alpha: f32) -> Result<(), &'static str> {
+    pub fn set_surface_alpha(
+        &mut self,
+        surface_id: ObjectId,
+        alpha: f32,
+    ) -> Result<(), &'static str> {
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             surface.alpha = alpha.max(0.0).min(1.0);
         }
         Ok(())
     }
-    
+
     /// Remover superficie
     pub fn remove_surface(&mut self, surface_id: ObjectId) -> Result<(), &'static str> {
         if let Some(surface) = self.surfaces.remove(&surface_id) {
@@ -554,7 +615,7 @@ impl WaylandRenderer {
         }
         Ok(())
     }
-    
+
     /// Obtener estadísticas del renderizador
     pub fn get_stats(&self) -> RendererStats {
         RendererStats {

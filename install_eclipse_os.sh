@@ -79,9 +79,9 @@ create_partitions() {
         return 1
     fi
     
-    # Crear partición EFI (100MB)
-    echo "   💾 Creando partición EFI (100MB)..."
-    if ! parted "$disk" mkpart EFI fat32 1MiB 101MiB; then
+    # Crear partición EFI (10GB para modelos de IA)
+    echo "   💾 Creando partición EFI (10GB para modelos de IA)..."
+    if ! parted "$disk" mkpart EFI fat32 1MiB 10GiB; then
         echo "❌ Error: No se pudo crear partición EFI"
         return 1
     fi
@@ -93,7 +93,7 @@ create_partitions() {
     
     # Crear partición root (resto del disco)
     echo "   🗂️  Creando partición root (resto del disco)..."
-    if ! parted "$disk" mkpart ROOT ext4 101MiB 100%; then
+    if ! parted "$disk" mkpart ROOT ext4 10GiB 100%; then
         echo "❌ Error: No se pudo crear partición root"
         return 1
     fi
@@ -226,6 +226,37 @@ install_bootloader() {
         echo "❌ Error: Kernel no encontrado"
         echo "   Ejecuta: ./build.sh"
         return 1
+    fi
+    
+    # Instalar modelos de IA
+    echo "   🤖 Instalando modelos de IA..."
+    if [ -d "eclipse_kernel/models" ]; then
+        # Crear directorio para modelos de IA
+        mkdir -p /mnt/eclipse-efi/ai_models
+        
+        # Copiar todos los modelos
+        if ! cp -r eclipse_kernel/models/* /mnt/eclipse-efi/ai_models/; then
+            echo "❌ Error: No se pudieron copiar los modelos de IA"
+            return 1
+        fi
+        
+        # Verificar que se copiaron correctamente
+        model_count=$(find /mnt/eclipse-efi/ai_models -name "*.json" -o -name "*.bin" -o -name "*.safetensors" | wc -l)
+        echo "     ✓ $model_count archivos de modelos copiados"
+        
+        # Mostrar modelos instalados
+        echo "     📋 Modelos instalados:"
+        for model_dir in /mnt/eclipse-efi/ai_models/*/; do
+            if [ -d "$model_dir" ]; then
+                model_name=$(basename "$model_dir")
+                echo "       - $model_name"
+            fi
+        done
+        
+        echo "   ✅ Modelos de IA instalados exitosamente"
+    else
+        echo "   ⚠️  Advertencia: Directorio de modelos de IA no encontrado"
+        echo "     Ejecuta: ./eclipse_kernel/scripts/download_ai_models.sh"
     fi
     
     # Instalar módulos userland
@@ -375,11 +406,12 @@ install_eclipse_os() {
     echo ""
     echo "📋 Resumen de la instalación:"
     echo "  - Disco: $disk"
-    echo "  - Partición EFI: ${disk}1 (FAT32)"
+    echo "  - Partición EFI: ${disk}1 (FAT32, 10GB para modelos de IA)"
     echo "  - Partición root: ${disk}2 (EXT4)"
     echo "  - Bootloader: UEFI"
     echo "  - Kernel: Eclipse OS v0.4.0"
     echo "  - Userland: Módulos compilados e instalados"
+    echo "  - Modelos de IA: Espacio reservado en partición EFI"
     echo ""
     echo "🔄 Reinicia el sistema para usar Eclipse OS"
     echo ""

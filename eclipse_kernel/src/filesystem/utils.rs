@@ -1,6 +1,6 @@
 //! Utilidades del sistema de archivos para Eclipse OS
 
-use crate::filesystem::{MAX_PATH_LEN, MAX_FILENAME_LEN};
+use crate::filesystem::{MAX_FILENAME_LEN, MAX_PATH_LEN};
 
 // Componente de path
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +21,7 @@ impl PathComponent {
         let mut component = Self::new();
         let bytes = s.as_bytes();
         let len = bytes.len().min(MAX_FILENAME_LEN - 1);
-        
+
         for i in 0..len {
             component.name[i] = bytes[i];
         }
@@ -50,7 +50,7 @@ impl Path {
     pub fn from_str(s: &str) -> Self {
         let mut path = Self::new();
         path.is_absolute = s.starts_with('/');
-        
+
         let parts: core::str::Split<char> = s.split('/');
         for part in parts {
             if !part.is_empty() {
@@ -94,16 +94,14 @@ pub struct FileSystemUtils;
 
 impl FileSystemUtils {
     pub fn is_valid_filename(name: &str) -> bool {
-        !name.is_empty() && 
-        name.len() <= MAX_FILENAME_LEN - 1 &&
-        !name.contains('/') &&
-        !name.contains('\0')
+        !name.is_empty()
+            && name.len() <= MAX_FILENAME_LEN - 1
+            && !name.contains('/')
+            && !name.contains('\0')
     }
 
     pub fn is_valid_path(path: &str) -> bool {
-        !path.is_empty() && 
-        path.len() <= MAX_PATH_LEN - 1 &&
-        !path.contains('\0')
+        !path.is_empty() && path.len() <= MAX_PATH_LEN - 1 && !path.contains('\0')
     }
 
     pub fn normalize_path(path: &str) -> &str {

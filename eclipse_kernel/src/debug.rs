@@ -439,3 +439,18 @@ pub fn set_debug_level(level: DebugLevel) {
 pub fn get_debugger_stats() -> Option<(usize, u64, u64)> {
     get_kernel_debugger().map(|debugger| debugger.get_stats())
 }
+
+pub fn serial_write_char(c: u8) {
+    unsafe {
+        let port = 0x3F8; // COM1
+        // Espera a que el buffer de transmisión esté vacío
+        while (x86::io::inb(port + 5) & 0x20) == 0 {}
+        x86::io::outb(port, c);
+    }
+}
+
+pub fn serial_write_str(s: &str) {
+    for byte in s.bytes() {
+        serial_write_char(byte);
+    }
+}

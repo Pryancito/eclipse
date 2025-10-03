@@ -1,10 +1,10 @@
 //! Protocolo Wayland para Eclipse OS
-//! 
+//!
 //! Implementa los mensajes y estructuras básicas del protocolo Wayland.
 
-use core::fmt;
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 /// ID de objeto Wayland
 pub type ObjectId = u32;
@@ -52,24 +52,28 @@ impl Message {
             arguments: Vec::new(),
         }
     }
-    
+
     pub fn add_argument(&mut self, arg: Argument) {
         self.arguments.push(arg);
     }
-    
+
     pub fn calculate_size(&mut self) {
         // Calcular tamaño total del mensaje
         let mut size = 8; // Header básico
-        
+
         for arg in &self.arguments {
             size += match arg {
-                Argument::Int(_) | Argument::Uint(_) | Argument::Fixed(_) | Argument::Object(_) | Argument::NewId(_) => 4,
+                Argument::Int(_)
+                | Argument::Uint(_)
+                | Argument::Fixed(_)
+                | Argument::Object(_)
+                | Argument::NewId(_) => 4,
                 Argument::String(s) => 4 + s.len() + (4 - (s.len() % 4)) % 4, // String + padding
-                Argument::Array(a) => 4 + a.len() + (4 - (a.len() % 4)) % 4, // Array + padding
+                Argument::Array(a) => 4 + a.len() + (4 - (a.len() % 4)) % 4,  // Array + padding
                 Argument::Fd(_) => 4,
             };
         }
-        
+
         self.size = size as Size;
     }
 }
@@ -96,17 +100,17 @@ impl WaylandClient {
             objects: Vec::new(),
         }
     }
-    
+
     pub fn send_message(&self, message: &Message) -> Result<(), &'static str> {
         // En un sistema real, aquí se enviaría el mensaje por el socket
         // Por ahora, simulamos el envío
         Ok(())
     }
-    
+
     pub fn add_object(&mut self, object_id: ObjectId) {
         self.objects.push(object_id);
     }
-    
+
     pub fn remove_object(&mut self, object_id: ObjectId) {
         self.objects.retain(|&id| id != object_id);
     }
@@ -127,27 +131,27 @@ impl WaylandServer {
             next_object_id: 1,
         }
     }
-    
+
     pub fn add_client(&mut self, display_fd: i32) -> ObjectId {
         let client_id = self.next_client_id;
         self.next_client_id += 1;
-        
+
         let client = WaylandClient::new(client_id, display_fd);
         self.clients.push(client);
-        
+
         client_id
     }
-    
+
     pub fn remove_client(&mut self, client_id: ObjectId) {
         self.clients.retain(|client| client.id != client_id);
     }
-    
+
     pub fn get_next_object_id(&mut self) -> ObjectId {
         let id = self.next_object_id;
         self.next_object_id += 1;
         id
     }
-    
+
     pub fn broadcast_message(&self, message: &Message) -> Result<(), &'static str> {
         for client in &self.clients {
             client.send_message(message)?;

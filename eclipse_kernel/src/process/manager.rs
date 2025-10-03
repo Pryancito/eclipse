@@ -1,14 +1,13 @@
 //! Gestor de Procesos para Eclipse OS
-//! 
+//!
 //! Coordina procesos, threads y scheduling
 
 use crate::process::process::{
-    ProcessControlBlock, ProcessId, ProcessState, ProcessPriority, 
-    ThreadInfo, ThreadId, get_next_tid
+    get_next_tid, ProcessControlBlock, ProcessId, ProcessPriority, ProcessState, ThreadId,
+    ThreadInfo,
 };
 use crate::process::scheduler::{
-    ProcessScheduler, ThreadScheduler, SchedulingAlgorithm, 
-    SchedulerStats, ThreadSchedulerStats
+    ProcessScheduler, SchedulerStats, SchedulingAlgorithm, ThreadScheduler, ThreadSchedulerStats,
 };
 
 /// Máximo número de procesos en el sistema
@@ -60,14 +59,11 @@ impl ProcessManager {
     pub fn init(&mut self) -> Result<(), &'static str> {
         // Crear el proceso kernel (PID 0)
         let kernel_pid = 0;
-        let mut kernel_process = ProcessControlBlock::new(
-            kernel_pid,
-            "kernel",
-            ProcessPriority::Critical
-        );
+        let mut kernel_process =
+            ProcessControlBlock::new(kernel_pid, "kernel", ProcessPriority::Critical);
         kernel_process.set_state(ProcessState::Running);
         kernel_process.creation_time = self.system_time;
-        
+
         self.processes[kernel_pid as usize] = Some(kernel_process);
         self.current_process = Some(kernel_pid);
         self.active_processes = 1;
@@ -79,7 +75,11 @@ impl ProcessManager {
     }
 
     /// Crear un nuevo proceso
-    pub fn create_process(&mut self, name: &str, priority: ProcessPriority) -> Result<ProcessId, &'static str> {
+    pub fn create_process(
+        &mut self,
+        name: &str,
+        priority: ProcessPriority,
+    ) -> Result<ProcessId, &'static str> {
         // Buscar un slot libre
         for i in 1..MAX_PROCESSES {
             if self.processes[i].is_none() {
@@ -115,10 +115,10 @@ impl ProcessManager {
         if let Some(ref mut process) = self.processes[pid as usize] {
             process.terminate(0); // Código de salida 0
             process.set_state(ProcessState::Terminated);
-            
+
             // Remover del scheduler
             self.process_scheduler.remove_process(pid);
-            
+
             // Si es el proceso actual, limpiar
             if self.current_process == Some(pid) {
                 self.current_process = None;
@@ -132,7 +132,11 @@ impl ProcessManager {
     }
 
     /// Crear un nuevo thread
-    pub fn create_thread(&mut self, pid: ProcessId, priority: ProcessPriority) -> Result<ThreadId, &'static str> {
+    pub fn create_thread(
+        &mut self,
+        pid: ProcessId,
+        priority: ProcessPriority,
+    ) -> Result<ThreadId, &'static str> {
         // Verificar que el proceso existe
         if pid as usize >= MAX_PROCESSES || self.processes[pid as usize].is_none() {
             return Err("Parent process not found");
@@ -172,10 +176,10 @@ impl ProcessManager {
             if let Some(ref mut thread) = self.threads[i] {
                 if thread.tid == tid {
                     thread.set_state(ProcessState::Terminated);
-                    
+
                     // Remover del scheduler
                     // (En una implementación real, necesitaríamos una función remove_thread)
-                    
+
                     // Si es el thread actual, limpiar
                     if self.current_thread == Some(tid) {
                         self.current_thread = None;
@@ -196,7 +200,7 @@ impl ProcessManager {
         if let Some(next_pid) = self.process_scheduler.select_next_process(&self.processes) {
             // Realizar context switch
             let old_pid = self.process_scheduler.context_switch(next_pid);
-            
+
             // Actualizar estado del proceso anterior
             if let Some(old_pid) = old_pid {
                 if let Some(ref mut process) = self.processes[old_pid as usize] {
@@ -224,7 +228,7 @@ impl ProcessManager {
         if let Some(next_tid) = self.thread_scheduler.select_next_thread() {
             // Realizar context switch
             let old_tid = self.thread_scheduler.context_switch(next_tid);
-            
+
             // Actualizar estado del thread anterior
             if let Some(old_tid) = old_tid {
                 if let Some(ref mut thread) = self.find_thread_mut(old_tid) {

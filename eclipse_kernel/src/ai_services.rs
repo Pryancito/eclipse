@@ -1,19 +1,19 @@
 //! Servicios de IA integrados en Eclipse OS
-//! 
+//!
 //! Este módulo proporciona servicios de IA que se integran directamente
 //! con el sistema operativo Eclipse OS.
 
 #![no_std]
 
+use crate::ai_pretrained_models::{
+    get_model_manager, load_pretrained_model, run_model_inference, ModelSource, ModelState,
+    PretrainedModelInfo, PretrainedModelType,
+};
+use crate::{syslog_err, syslog_info, syslog_warn, KernelError, KernelResult};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::ai_pretrained_models::{
-    PretrainedModelType, PretrainedModelInfo, ModelSource, ModelState,
-    load_pretrained_model, run_model_inference, get_model_manager
-};
-use crate::{KernelResult, KernelError, syslog_info, syslog_warn, syslog_err};
 
 /// Servicio de IA del sistema
 pub struct AIService {
@@ -36,14 +36,14 @@ pub enum AIServiceState {
 /// Tipo de servicio de IA
 #[derive(Debug, Clone, PartialEq)]
 pub enum AIServiceType {
-    ProcessOptimization,    // Optimización de procesos
-    SecurityMonitoring,     // Monitoreo de seguridad
-    PerformanceTuning,      // Ajuste de rendimiento
-    UserAssistance,         // Asistencia al usuario
-    SystemDiagnostics,      // Diagnósticos del sistema
-    PredictiveMaintenance,  // Mantenimiento predictivo
-    ResourceAllocation,     // Asignación de recursos
-    AnomalyDetection,       // Detección de anomalías
+    ProcessOptimization,   // Optimización de procesos
+    SecurityMonitoring,    // Monitoreo de seguridad
+    PerformanceTuning,     // Ajuste de rendimiento
+    UserAssistance,        // Asistencia al usuario
+    SystemDiagnostics,     // Diagnósticos del sistema
+    PredictiveMaintenance, // Mantenimiento predictivo
+    ResourceAllocation,    // Asignación de recursos
+    AnomalyDetection,      // Detección de anomalías
 }
 
 /// Configuración del servicio de IA
@@ -86,18 +86,21 @@ impl AIServiceManager {
     /// Inicializar el gestor de servicios de IA
     pub fn initialize(&mut self) -> KernelResult<()> {
         syslog_info!("AI_SERVICES", "Inicializando gestor de servicios de IA");
-        
+
         self.global_state = AIServiceState::Initializing;
-        
+
         // Configurar servicios por defecto
         self.setup_default_services()?;
-        
+
         // Cargar modelos requeridos
         self.load_required_models()?;
-        
+
         self.global_state = AIServiceState::Ready;
-        syslog_info!("AI_SERVICES", "Gestor de servicios de IA inicializado correctamente");
-        
+        syslog_info!(
+            "AI_SERVICES",
+            "Gestor de servicios de IA inicializado correctamente"
+        );
+
         Ok(())
     }
 
@@ -109,13 +112,15 @@ impl AIServiceManager {
             model_requirements: [
                 PretrainedModelType::ProcessClassifier,
                 PretrainedModelType::PerformancePredictor,
-            ].to_vec(),
+            ]
+            .to_vec(),
             priority: 8,
             auto_start: true,
             max_memory_mb: 256,
             update_interval_ms: 5000,
         };
-        self.configs.insert("process_optimization".to_string(), process_opt_config);
+        self.configs
+            .insert("process_optimization".to_string(), process_opt_config);
 
         // Servicio de monitoreo de seguridad
         let security_config = AIServiceConfig {
@@ -123,13 +128,15 @@ impl AIServiceManager {
             model_requirements: [
                 PretrainedModelType::SecurityAnalyzer,
                 PretrainedModelType::AnomalyDetector,
-            ].to_vec(),
+            ]
+            .to_vec(),
             priority: 9,
             auto_start: true,
             max_memory_mb: 512,
             update_interval_ms: 1000,
         };
-        self.configs.insert("security_monitoring".to_string(), security_config);
+        self.configs
+            .insert("security_monitoring".to_string(), security_config);
 
         // Servicio de asistencia al usuario
         let user_assist_config = AIServiceConfig {
@@ -137,13 +144,15 @@ impl AIServiceManager {
             model_requirements: [
                 PretrainedModelType::TinyLlama,
                 PretrainedModelType::DistilBERT,
-            ].to_vec(),
+            ]
+            .to_vec(),
             priority: 5,
             auto_start: false,
             max_memory_mb: 128,
             update_interval_ms: 0,
         };
-        self.configs.insert("user_assistance".to_string(), user_assist_config);
+        self.configs
+            .insert("user_assistance".to_string(), user_assist_config);
 
         syslog_info!("AI_SERVICES", "Servicios por defecto configurados");
         Ok(())
@@ -155,15 +164,28 @@ impl AIServiceManager {
 
         for (service_name, config) in &self.configs {
             if config.auto_start {
-                syslog_info!("AI_SERVICES", &alloc::format!("Cargando modelos para servicio: {}", service_name));
-                
+                syslog_info!(
+                    "AI_SERVICES",
+                    &alloc::format!("Cargando modelos para servicio: {}", service_name)
+                );
+
                 for model_type in &config.model_requirements {
                     match self.load_model_for_service(model_type) {
                         Ok(model_id) => {
-                            syslog_info!("AI_SERVICES", &alloc::format!("Modelo {:?} cargado con ID: {}", model_type, model_id));
+                            syslog_info!(
+                                "AI_SERVICES",
+                                &alloc::format!(
+                                    "Modelo {:?} cargado con ID: {}",
+                                    model_type,
+                                    model_id
+                                )
+                            );
                         }
                         Err(e) => {
-                            syslog_warn!("AI_SERVICES", &alloc::format!("Error cargando modelo {:?}: {}", model_type, e));
+                            syslog_warn!(
+                                "AI_SERVICES",
+                                &alloc::format!("Error cargando modelo {:?}: {}", model_type, e)
+                            );
                         }
                     }
                 }
@@ -194,16 +216,22 @@ impl AIServiceManager {
     /// Iniciar un servicio de IA
     pub fn start_service(&mut self, service_name: &str) -> KernelResult<()> {
         if let Some(config) = self.configs.get(service_name) {
-            syslog_info!("AI_SERVICES", &alloc::format!("Iniciando servicio: {}", service_name));
-            
+            syslog_info!(
+                "AI_SERVICES",
+                &alloc::format!("Iniciando servicio: {}", service_name)
+            );
+
             let service = AIService {
                 is_initialized: AtomicBool::new(true),
                 active_models: BTreeMap::new(),
                 service_state: AIServiceState::Ready,
             };
-            
+
             self.services.insert(service_name.to_string(), service);
-            syslog_info!("AI_SERVICES", &alloc::format!("Servicio {} iniciado correctamente", service_name));
+            syslog_info!(
+                "AI_SERVICES",
+                &alloc::format!("Servicio {} iniciado correctamente", service_name)
+            );
             Ok(())
         } else {
             Err("Servicio no encontrado".into())
@@ -211,34 +239,31 @@ impl AIServiceManager {
     }
 
     /// Procesar con un servicio de IA
-    pub fn process_with_service(&self, service_name: &str, input: &str) -> KernelResult<AIProcessingResult> {
+    pub fn process_with_service(
+        &self,
+        service_name: &str,
+        input: &str,
+    ) -> KernelResult<AIProcessingResult> {
         if let Some(service) = self.services.get(service_name) {
             if let Some(config) = self.configs.get(service_name) {
-                syslog_info!("AI_SERVICES", &alloc::format!("Procesando con servicio: {}", service_name));
-                
+                syslog_info!(
+                    "AI_SERVICES",
+                    &alloc::format!("Procesando con servicio: {}", service_name)
+                );
+
                 let start_time = 0; // En una implementación real, usaríamos un timer
-                
+
                 // Simular procesamiento basado en el tipo de servicio
                 let result = match config.service_type {
-                    AIServiceType::ProcessOptimization => {
-                        self.process_optimization(input)
-                    }
-                    AIServiceType::SecurityMonitoring => {
-                        self.process_security_monitoring(input)
-                    }
-                    AIServiceType::UserAssistance => {
-                        self.process_user_assistance(input)
-                    }
-                    AIServiceType::SystemDiagnostics => {
-                        self.process_system_diagnostics(input)
-                    }
-                    _ => {
-                        self.process_generic(input)
-                    }
+                    AIServiceType::ProcessOptimization => self.process_optimization(input),
+                    AIServiceType::SecurityMonitoring => self.process_security_monitoring(input),
+                    AIServiceType::UserAssistance => self.process_user_assistance(input),
+                    AIServiceType::SystemDiagnostics => self.process_system_diagnostics(input),
+                    _ => self.process_generic(input),
                 }?;
 
                 let processing_time = 0; // En una implementación real, calcularíamos el tiempo
-                
+
                 Ok(AIProcessingResult {
                     service_type: config.service_type.clone(),
                     confidence: result.confidence,
@@ -261,7 +286,8 @@ impl AIServiceManager {
             "Optimizar asignación de memoria para proceso principal".to_string(),
             "Reducir prioridad de procesos en segundo plano".to_string(),
             "Ajustar quantum de CPU para mejor rendimiento".to_string(),
-        ].to_vec();
+        ]
+        .to_vec();
 
         let mut metrics = BTreeMap::new();
         metrics.insert("cpu_usage".to_string(), 0.75);
@@ -284,7 +310,8 @@ impl AIServiceManager {
             "Detectar actividad sospechosa en red".to_string(),
             "Verificar integridad de archivos del sistema".to_string(),
             "Actualizar políticas de firewall".to_string(),
-        ].to_vec();
+        ]
+        .to_vec();
 
         let mut metrics = BTreeMap::new();
         metrics.insert("threat_level".to_string(), 0.15);
@@ -307,7 +334,8 @@ impl AIServiceManager {
             "Comando sugerido: ls -la para listar archivos".to_string(),
             "Usar htop para monitorear procesos".to_string(),
             "Verificar logs del sistema con journalctl".to_string(),
-        ].to_vec();
+        ]
+        .to_vec();
 
         let mut metrics = BTreeMap::new();
         metrics.insert("nlp_confidence".to_string(), 0.88);
@@ -330,7 +358,8 @@ impl AIServiceManager {
             "Verificar espacio en disco: 85% utilizado".to_string(),
             "Optimizar configuración de red".to_string(),
             "Revisar configuración de memoria virtual".to_string(),
-        ].to_vec();
+        ]
+        .to_vec();
 
         let mut metrics = BTreeMap::new();
         metrics.insert("disk_usage".to_string(), 0.85);
@@ -351,7 +380,8 @@ impl AIServiceManager {
         let recommendations = [
             "Análisis completado".to_string(),
             "Sistema funcionando normalmente".to_string(),
-        ].to_vec();
+        ]
+        .to_vec();
 
         let mut metrics = BTreeMap::new();
         metrics.insert("general_health".to_string(), 0.95);
@@ -377,7 +407,10 @@ impl AIServiceManager {
     /// Detener un servicio
     pub fn stop_service(&mut self, service_name: &str) -> KernelResult<()> {
         if self.services.remove(service_name).is_some() {
-            syslog_info!("AI_SERVICES", &alloc::format!("Servicio {} detenido", service_name));
+            syslog_info!(
+                "AI_SERVICES",
+                &alloc::format!("Servicio {} detenido", service_name)
+            );
             Ok(())
         } else {
             Err("Servicio no encontrado".into())
@@ -391,14 +424,14 @@ static mut AI_SERVICE_MANAGER: Option<AIServiceManager> = None;
 /// Inicializar servicios de IA
 pub fn init_ai_services() -> KernelResult<()> {
     syslog_info!("AI_SERVICES", "Inicializando servicios de IA del sistema");
-    
+
     unsafe {
         AI_SERVICE_MANAGER = Some(AIServiceManager::new());
         if let Some(ref mut manager) = AI_SERVICE_MANAGER {
             manager.initialize()?;
         }
     }
-    
+
     syslog_info!("AI_SERVICES", "Servicios de IA inicializados correctamente");
     Ok(())
 }
@@ -409,7 +442,10 @@ pub fn get_ai_service_manager() -> Option<&'static mut AIServiceManager> {
 }
 
 /// Procesar con un servicio de IA específico
-pub fn process_with_ai_service(service_name: &str, input: &str) -> KernelResult<AIProcessingResult> {
+pub fn process_with_ai_service(
+    service_name: &str,
+    input: &str,
+) -> KernelResult<AIProcessingResult> {
     if let Some(manager) = get_ai_service_manager() {
         manager.process_with_service(service_name, input)
     } else {

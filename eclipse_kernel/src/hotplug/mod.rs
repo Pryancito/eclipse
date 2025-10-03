@@ -1,16 +1,16 @@
 //! Sistema de Hot-Plug para Eclipse OS
-//! 
+//!
 //! Implementa detección y manejo de dispositivos USB conectados/desconectados
 //! en tiempo real, incluyendo soporte completo para ratón y teclado USB.
 
-pub mod manager;
-pub mod usb_hotplug;
 pub mod events;
+pub mod manager;
 pub mod notifications;
+pub mod usb_hotplug;
 
 // Re-exportar tipos principales
+pub use events::{UsbDeviceInfo, UsbDeviceState, UsbDeviceType, UsbHotplugEvent, UsbSpeed};
 pub use manager::HotplugManager;
-pub use events::{UsbDeviceType, UsbHotplugEvent, UsbDeviceInfo, UsbDeviceState, UsbSpeed};
 
 /// Configuración del sistema de hot-plug
 #[derive(Debug, Clone)]

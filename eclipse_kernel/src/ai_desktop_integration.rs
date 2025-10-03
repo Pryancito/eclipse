@@ -1,15 +1,15 @@
 //! Integración de IA con el Escritorio de Eclipse OS
-//! 
+//!
 //! Este módulo integra los modelos de IA pre-entrenados con el sistema
 //! de escritorio para proporcionar una experiencia de usuario inteligente.
 
 #![no_std]
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
 
-use crate::ai_pretrained_models::{load_pretrained_model, run_model_inference, get_model_manager};
+use crate::ai_pretrained_models::{get_model_manager, load_pretrained_model, run_model_inference};
 use crate::desktop_ai::{DesktopRenderer, DesktopWindow, UIChange};
 use crate::drivers::framebuffer::Color as FbColor;
 
@@ -19,7 +19,7 @@ pub struct AIDesktopIntegration {
     language_model_id: Option<usize>,
     vision_model_id: Option<usize>,
     anomaly_detector_id: Option<usize>,
-    
+
     /// Estado de la integración
     is_active: bool,
     /// Historial de interacciones
@@ -101,12 +101,17 @@ impl AIDesktopIntegration {
                 Ok(response) => {
                     // Analizar respuesta y generar cambios en la UI
                     ui_changes = self.analyze_command_response(command, &response)?;
-                    
+
                     // Registrar interacción
                     self.record_interaction(command, &response, &ui_changes, true);
                 }
                 Err(e) => {
-                    self.record_interaction(command, &alloc::format!("Error: {}", e), &ui_changes, false);
+                    self.record_interaction(
+                        command,
+                        &alloc::format!("Error: {}", e),
+                        &ui_changes,
+                        false,
+                    );
                     return Err(e);
                 }
             }
@@ -120,26 +125,30 @@ impl AIDesktopIntegration {
     }
 
     /// Analizar respuesta del comando y generar cambios en la UI
-    fn analyze_command_response(&self, command: &str, response: &str) -> Result<Vec<UIChange>, &'static str> {
+    fn analyze_command_response(
+        &self,
+        command: &str,
+        response: &str,
+    ) -> Result<Vec<UIChange>, &'static str> {
         let mut changes = Vec::new();
 
         // Análisis básico de comandos (en implementación real usaría NLP avanzado)
         let command_lower = command.to_lowercase();
-        
+
         if command_lower.contains("crear ventana") || command_lower.contains("nueva ventana") {
             changes.push(UIChange::WindowMove(1, 100, 100));
             changes.push(UIChange::WindowResize(1, 400, 300));
             changes.push(UIChange::TextUpdate(1, "Nueva Ventana"));
         }
-        
+
         if command_lower.contains("cambiar color") || command_lower.contains("color") {
             changes.push(UIChange::ColorChange(1, FbColor::BLUE));
         }
-        
+
         if command_lower.contains("mover cursor") || command_lower.contains("cursor") {
             changes.push(UIChange::CursorMove(200, 150));
         }
-        
+
         if command_lower.contains("optimizar") || command_lower.contains("rendimiento") {
             // Simular optimización del sistema
             changes.push(UIChange::TextUpdate(2, "Sistema optimizado por IA"));
@@ -151,12 +160,12 @@ impl AIDesktopIntegration {
     /// Procesamiento de comando sin IA (fallback)
     fn process_command_fallback(&self, command: &str) -> Result<Vec<UIChange>, &'static str> {
         let mut changes = Vec::new();
-        
+
         // Comandos básicos sin IA
         if command.contains("ventana") {
             changes.push(UIChange::WindowMove(1, 50, 50));
         }
-        
+
         Ok(changes)
     }
 
@@ -179,7 +188,13 @@ impl AIDesktopIntegration {
     }
 
     /// Registrar interacción con el escritorio
-    fn record_interaction(&mut self, command: &str, response: &str, ui_changes: &[UIChange], success: bool) {
+    fn record_interaction(
+        &mut self,
+        command: &str,
+        response: &str,
+        ui_changes: &[UIChange],
+        success: bool,
+    ) {
         let interaction = DesktopInteraction {
             timestamp: get_time_ms(),
             user_action: command.to_string(),
@@ -187,9 +202,9 @@ impl AIDesktopIntegration {
             ui_changes: ui_changes.to_vec(),
             success,
         };
-        
+
         self.interaction_history.push(interaction);
-        
+
         // Limitar historial para evitar uso excesivo de memoria
         if self.interaction_history.len() > 100 {
             self.interaction_history.remove(0);
@@ -199,7 +214,7 @@ impl AIDesktopIntegration {
     /// Obtener sugerencias inteligentes para el usuario
     pub fn get_smart_suggestions(&self) -> Vec<String> {
         let mut suggestions = Vec::new();
-        
+
         // Analizar historial de interacciones para sugerencias
         if let Some(last_interaction) = self.interaction_history.last() {
             match last_interaction.user_action.to_lowercase().as_str() {
@@ -223,16 +238,23 @@ impl AIDesktopIntegration {
         } else {
             // Sugerencias por defecto
             suggestions.push("Hola! ¿En qué puedo ayudarte?".to_string());
-            suggestions.push("Puedes pedirme que cree ventanas, cambie colores, o optimice el sistema".to_string());
+            suggestions.push(
+                "Puedes pedirme que cree ventanas, cambie colores, o optimice el sistema"
+                    .to_string(),
+            );
         }
-        
+
         suggestions
     }
 
     /// Obtener estadísticas de la integración
     pub fn get_integration_stats(&self) -> DesktopIntegrationStats {
         let total_interactions = self.interaction_history.len();
-        let successful_interactions = self.interaction_history.iter().filter(|i| i.success).count();
+        let successful_interactions = self
+            .interaction_history
+            .iter()
+            .filter(|i| i.success)
+            .count();
         let success_rate = if total_interactions > 0 {
             successful_interactions as f32 / total_interactions as f32
         } else {
@@ -254,12 +276,12 @@ impl AIDesktopIntegration {
     /// Obtener uso de memoria
     fn get_memory_usage(&self) -> u32 {
         let mut usage = 0;
-        
+
         if let Some(manager) = get_model_manager() {
             let stats = manager.get_stats();
             usage = stats.total_memory_usage;
         }
-        
+
         usage
     }
 
@@ -308,9 +330,7 @@ pub fn init_ai_desktop_integration() -> Result<(), &'static str> {
 
 /// Obtener integración de escritorio
 pub fn get_ai_desktop_integration() -> Option<&'static mut AIDesktopIntegration> {
-    unsafe {
-        AI_DESKTOP_INTEGRATION.as_mut()
-    }
+    unsafe { AI_DESKTOP_INTEGRATION.as_mut() }
 }
 
 /// Procesar comando del usuario en el escritorio

@@ -1,5 +1,5 @@
 //! Sistema de eventos para GUI
-//! 
+//!
 //! Maneja eventos de teclado, ratón y sistema
 
 use crate::gui::framebuffer::Point;
@@ -12,7 +12,7 @@ pub enum EventType {
     KeyDown,
     KeyUp,
     KeyPress,
-    
+
     /// Eventos de ratón
     MouseMove,
     MouseDown,
@@ -20,7 +20,7 @@ pub enum EventType {
     MouseClick,
     MouseDoubleClick,
     MouseWheel,
-    
+
     /// Eventos de ventana
     WindowCreate,
     WindowDestroy,
@@ -34,7 +34,7 @@ pub enum EventType {
     WindowMaximize,
     WindowRestore,
     WindowClose,
-    
+
     /// Eventos de sistema
     SystemShutdown,
     SystemRestart,
@@ -47,15 +47,45 @@ pub enum EventType {
 #[repr(u16)]
 pub enum KeyCode {
     // Teclas alfanuméricas
-    A = 0x1E, B = 0x30, C = 0x2E, D = 0x20, E = 0x12, F = 0x21, G = 0x22, H = 0x23,
-    I = 0x17, J = 0x24, K = 0x25, L = 0x26, M = 0x32, N = 0x31, O = 0x18, P = 0x19,
-    Q = 0x10, R = 0x13, S = 0x1F, T = 0x14, U = 0x16, V = 0x2F, W = 0x11, X = 0x2D,
-    Y = 0x15, Z = 0x2C,
-    
+    A = 0x1E,
+    B = 0x30,
+    C = 0x2E,
+    D = 0x20,
+    E = 0x12,
+    F = 0x21,
+    G = 0x22,
+    H = 0x23,
+    I = 0x17,
+    J = 0x24,
+    K = 0x25,
+    L = 0x26,
+    M = 0x32,
+    N = 0x31,
+    O = 0x18,
+    P = 0x19,
+    Q = 0x10,
+    R = 0x13,
+    S = 0x1F,
+    T = 0x14,
+    U = 0x16,
+    V = 0x2F,
+    W = 0x11,
+    X = 0x2D,
+    Y = 0x15,
+    Z = 0x2C,
+
     // Números
-    Num0 = 0x0B, Num1 = 0x02, Num2 = 0x03, Num3 = 0x04, Num4 = 0x05,
-    Num5 = 0x06, Num6 = 0x07, Num7 = 0x08, Num8 = 0x09, Num9 = 0x0A,
-    
+    Num0 = 0x0B,
+    Num1 = 0x02,
+    Num2 = 0x03,
+    Num3 = 0x04,
+    Num4 = 0x05,
+    Num5 = 0x06,
+    Num6 = 0x07,
+    Num7 = 0x08,
+    Num8 = 0x09,
+    Num9 = 0x0A,
+
     // Teclas especiales
     Escape = 0x01,
     Tab = 0x0F,
@@ -68,17 +98,27 @@ pub enum KeyCode {
     End = 0x4F,
     PageUp = 0x49,
     PageDown = 0x51,
-    
+
     // Teclas de función
-    F1 = 0x3B, F2 = 0x3C, F3 = 0x3D, F4 = 0x3E, F5 = 0x3F, F6 = 0x40,
-    F7 = 0x41, F8 = 0x42, F9 = 0x43, F10 = 0x44, F11 = 0x57, F12 = 0x58,
-    
+    F1 = 0x3B,
+    F2 = 0x3C,
+    F3 = 0x3D,
+    F4 = 0x3E,
+    F5 = 0x3F,
+    F6 = 0x40,
+    F7 = 0x41,
+    F8 = 0x42,
+    F9 = 0x43,
+    F10 = 0x44,
+    F11 = 0x57,
+    F12 = 0x58,
+
     // Teclas de flecha
     ArrowUp = 0x48,
     ArrowDown = 0x50,
     ArrowLeft = 0x4B,
     ArrowRight = 0x4D,
-    
+
     // Teclas modificadoras
     LeftShift = 0x2A,
     RightShift = 0x36,
@@ -89,14 +129,14 @@ pub enum KeyCode {
     LeftSuper = 0xE05B, // Tecla Windows
     RightSuper = 0xE05C,
     Menu = 0xE05D,
-    
+
     // Otras teclas
     CapsLock = 0x3A,
     NumLock = 0x45,
     ScrollLock = 0x46,
     PrintScreen = 0xE037,
     Pause = 0xE046, // Pause/Break
-    
+
     Unknown = 0xFFFF,
 }
 
@@ -124,7 +164,7 @@ impl KeyModifiers {
             scroll_lock: false,
         }
     }
-    
+
     pub fn none() -> Self {
         Self::new()
     }
@@ -197,7 +237,7 @@ impl Event {
             Event::System(e) => e.event_type,
         }
     }
-    
+
     /// Obtener el timestamp del evento
     pub fn timestamp(&self) -> u64 {
         match self {
@@ -226,41 +266,41 @@ impl EventQueue {
             count: 0,
         }
     }
-    
+
     /// Agregar evento a la cola
     pub fn push(&mut self, event: Event) -> bool {
         if self.count >= self.events.len() {
             return false; // Cola llena
         }
-        
+
         self.events[self.tail] = Some(event);
         self.tail = (self.tail + 1) % self.events.len();
         self.count += 1;
         true
     }
-    
+
     /// Obtener siguiente evento de la cola
     pub fn pop(&mut self) -> Option<Event> {
         if self.count == 0 {
             return None;
         }
-        
+
         let event = self.events[self.head].take();
         self.head = (self.head + 1) % self.events.len();
         self.count -= 1;
         event
     }
-    
+
     /// Verificar si la cola está vacía
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
-    
+
     /// Obtener número de eventos en la cola
     pub fn len(&self) -> usize {
         self.count
     }
-    
+
     /// Limpiar la cola
     pub fn clear(&mut self) {
         self.events = [None; 256];
@@ -296,24 +336,24 @@ impl EventSystem {
             handler_count: 0,
         }
     }
-    
+
     /// Agregar manejador de eventos
     pub fn add_handler(&mut self, handler: EventHandler) -> bool {
         if self.handler_count >= self.event_handlers.len() {
             return false;
         }
-        
+
         self.event_handlers[self.handler_count] = Some(handler);
         self.handler_count += 1;
         true
     }
-    
+
     /// Procesar eventos pendientes
     pub fn process_events(&mut self) {
         while let Some(event) = self.event_queue.pop() {
             // Actualizar estado interno
             self.update_state(&event);
-            
+
             // Llamar a los manejadores de eventos
             for i in 0..self.handler_count {
                 if let Some(handler) = self.event_handlers[i] {
@@ -322,7 +362,7 @@ impl EventSystem {
             }
         }
     }
-    
+
     /// Actualizar estado interno basado en el evento
     fn update_state(&mut self, event: &Event) {
         match event {
@@ -331,7 +371,7 @@ impl EventSystem {
             }
             Event::Mouse(mouse_event) => {
                 self.mouse_position = mouse_event.position;
-                
+
                 if let Some(button) = mouse_event.button {
                     let button_index = match button {
                         MouseButton::Left => 0,
@@ -340,7 +380,7 @@ impl EventSystem {
                         MouseButton::Extra1 => 3,
                         MouseButton::Extra2 => 4,
                     };
-                    
+
                     match mouse_event.event_type {
                         EventType::MouseDown => {
                             self.mouse_buttons[button_index] = true;
@@ -352,23 +392,21 @@ impl EventSystem {
                     }
                 }
             }
-            Event::Window(window_event) => {
-                match window_event.event_type {
-                    EventType::WindowFocus => {
-                        self.focused_window = Some(window_event.window_id);
-                    }
-                    EventType::WindowUnfocus => {
-                        if self.focused_window == Some(window_event.window_id) {
-                            self.focused_window = None;
-                        }
-                    }
-                    _ => {}
+            Event::Window(window_event) => match window_event.event_type {
+                EventType::WindowFocus => {
+                    self.focused_window = Some(window_event.window_id);
                 }
-            }
+                EventType::WindowUnfocus => {
+                    if self.focused_window == Some(window_event.window_id) {
+                        self.focused_window = None;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
-    
+
     /// Actualizar modificadores de teclado
     fn update_key_modifiers(&mut self, key_event: &KeyEvent) {
         match key_event.key_code {
@@ -402,9 +440,14 @@ impl EventSystem {
             _ => {}
         }
     }
-    
+
     /// Enviar evento de teclado
-    pub fn send_key_event(&mut self, key_code: KeyCode, event_type: EventType, character: Option<char>) {
+    pub fn send_key_event(
+        &mut self,
+        key_code: KeyCode,
+        event_type: EventType,
+        character: Option<char>,
+    ) {
         let event = KeyEvent {
             event_type,
             key_code,
@@ -412,12 +455,18 @@ impl EventSystem {
             character,
             timestamp: 0, // TODO: Obtener timestamp actual
         };
-        
+
         self.event_queue.push(Event::Key(event));
     }
-    
+
     /// Enviar evento de ratón
-    pub fn send_mouse_event(&mut self, event_type: EventType, position: Point, button: Option<MouseButton>, wheel_delta: i32) {
+    pub fn send_mouse_event(
+        &mut self,
+        event_type: EventType,
+        position: Point,
+        button: Option<MouseButton>,
+        wheel_delta: i32,
+    ) {
         let event = MouseEvent {
             event_type,
             position,
@@ -426,12 +475,18 @@ impl EventSystem {
             modifiers: self.key_modifiers,
             timestamp: 0, // TODO: Obtener timestamp actual
         };
-        
+
         self.event_queue.push(Event::Mouse(event));
     }
-    
+
     /// Enviar evento de ventana
-    pub fn send_window_event(&mut self, event_type: EventType, window_id: WindowId, position: Option<Point>, size: Option<(u32, u32)>) {
+    pub fn send_window_event(
+        &mut self,
+        event_type: EventType,
+        window_id: WindowId,
+        position: Option<Point>,
+        size: Option<(u32, u32)>,
+    ) {
         let event = WindowEvent {
             event_type,
             window_id,
@@ -439,15 +494,15 @@ impl EventSystem {
             size,
             timestamp: 0, // TODO: Obtener timestamp actual
         };
-        
+
         self.event_queue.push(Event::Window(event));
     }
-    
+
     /// Obtener posición actual del ratón
     pub fn get_mouse_position(&self) -> Point {
         self.mouse_position
     }
-    
+
     /// Verificar si un botón del ratón está presionado
     pub fn is_mouse_button_pressed(&self, button: MouseButton) -> bool {
         let button_index = match button {
@@ -459,7 +514,7 @@ impl EventSystem {
         };
         self.mouse_buttons[button_index]
     }
-    
+
     /// Obtener modificadores actuales
     pub fn get_key_modifiers(&self) -> KeyModifiers {
         self.key_modifiers
@@ -479,9 +534,7 @@ pub fn init_event_system() {
 
 /// Obtener referencia al sistema de eventos
 pub fn get_event_system() -> Option<&'static mut EventSystem> {
-    unsafe {
-        EVENT_SYSTEM.as_mut()
-    }
+    unsafe { EVENT_SYSTEM.as_mut() }
 }
 
 /// Procesar eventos pendientes
@@ -504,7 +557,12 @@ pub fn send_key_event(key_code: KeyCode, event_type: EventType, character: Optio
 }
 
 /// Enviar evento de ratón
-pub fn send_mouse_event(event_type: EventType, position: Point, button: Option<MouseButton>, wheel_delta: i32) {
+pub fn send_mouse_event(
+    event_type: EventType,
+    position: Point,
+    button: Option<MouseButton>,
+    wheel_delta: i32,
+) {
     if let Some(system) = get_event_system() {
         system.send_mouse_event(event_type, position, button, wheel_delta);
     }

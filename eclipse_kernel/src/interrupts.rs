@@ -1,5 +1,5 @@
 //! Configuración de interrupciones y timers para Eclipse OS
-//! 
+//!
 //! Este módulo maneja la configuración de interrupciones y timers del sistema
 
 use core::arch::asm;
@@ -60,7 +60,7 @@ impl InterruptManager {
     /// Crear nuevo gestor de interrupciones
     pub fn new() -> Self {
         Self {
-            timer_frequency: 100,  // 100 Hz por defecto
+            timer_frequency: 100, // 100 Hz por defecto
             timer_ticks: 0,
         }
     }
@@ -69,13 +69,13 @@ impl InterruptManager {
     pub fn setup_userland(&mut self) -> Result<(), &'static str> {
         // Configurar PIC
         self.setup_pic()?;
-        
+
         // Configurar PIT
         self.setup_pit()?;
-        
+
         // Habilitar interrupciones
         self.enable_interrupts();
-        
+
         Ok(())
     }
 
@@ -84,28 +84,28 @@ impl InterruptManager {
         unsafe {
             // Inicializar PIC Master
             asm!("out dx, al", in("dx") PIC_MASTER_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x20u8);  // Vector base 0x20
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x04u8);  // Slave en IRQ2
+            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x20u8); // Vector base 0x20
+            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0x04u8); // Slave en IRQ2
             asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") PIC_ICW4_8086);
 
             // Inicializar PIC Slave
             asm!("out dx, al", in("dx") PIC_SLAVE_COMMAND, in("al") PIC_ICW1_INIT | PIC_ICW1_ICW4);
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x28u8);  // Vector base 0x28
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x02u8);  // Slave ID
+            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x28u8); // Vector base 0x28
+            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0x02u8); // Slave ID
             asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") PIC_ICW4_8086);
 
             // Configurar máscaras de interrupciones
-            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0xFCu8);  // Habilitar timer y keyboard
-            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0xFFu8);   // Deshabilitar todas las interrupciones del slave
+            asm!("out dx, al", in("dx") PIC_MASTER_DATA, in("al") 0xFCu8); // Habilitar timer y keyboard
+            asm!("out dx, al", in("dx") PIC_SLAVE_DATA, in("al") 0xFFu8); // Deshabilitar todas las interrupciones del slave
         }
-        
+
         Ok(())
     }
 
     /// Configurar PIT (Programmable Interval Timer)
     fn setup_pit(&self) -> Result<(), &'static str> {
         let divisor = PIT_FREQUENCY / self.timer_frequency;
-        
+
         if divisor > 65535 {
             return Err("Frecuencia de timer demasiado baja");
         }
@@ -113,12 +113,12 @@ impl InterruptManager {
         unsafe {
             // Configurar canal 0 del PIT
             asm!("out dx, al", in("dx") PIT_COMMAND, in("al") PIT_BOTH | PIT_MODE3 | PIT_BCD);
-            
+
             // Establecer divisor
             asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") (divisor & 0xFF) as u8);
             asm!("out dx, al", in("dx") PIT_CHANNEL0, in("al") ((divisor >> 8) & 0xFF) as u8);
         }
-        
+
         Ok(())
     }
 
@@ -161,7 +161,7 @@ impl InterruptManager {
 
         self.timer_frequency = frequency;
         self.setup_pit()?;
-        
+
         Ok(())
     }
 
@@ -218,7 +218,8 @@ impl TimerManager {
     pub fn get_elapsed_ms(&self) -> u64 {
         let current_time = self.interrupt_manager.get_timer_ticks();
         if current_time >= self.start_time {
-            (current_time - self.start_time) * 1000 / (self.interrupt_manager.get_timer_frequency() as u64)
+            (current_time - self.start_time) * 1000
+                / (self.interrupt_manager.get_timer_frequency() as u64)
         } else {
             0
         }

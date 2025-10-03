@@ -1,13 +1,7 @@
-//! Superblock para Eclipse OS
-//! 
-//! El superblock contiene información sobre el sistema de archivos,
-//! incluyendo el tipo, tamaño, número de inodos y bloques libres.
+//! Interfaz con el superbloque y la información del sistema de archivos
 
-use crate::filesystem::{
-    BLOCK_SIZE,
-    MAX_FILE_SIZE,
-    ROOT_INODE,
-};
+use crate::filesystem::vfs::VfsError;
+use alloc::string::String;
 
 // Tamaño del superblock
 pub const SUPERBLOCK_SIZE: usize = 1024;
@@ -161,21 +155,21 @@ impl SuperBlock {
             filesystem_type: FileSystemType::EclipseFS,
             version: 1,
             state: FileSystemState::Clean,
-            block_size: BLOCK_SIZE as u32,
-            fragment_size: BLOCK_SIZE as u32,
+            block_size: 4096, // Default to 4KB
+            fragment_size: 4096, // Default to 4KB
             total_blocks: 0,
             free_blocks: 0,
             total_inodes: 0,
             free_inodes: 0,
             first_data_block: 1,
-            root_inode: ROOT_INODE,
+            root_inode: 1, // Default to root inode
             group_inode: 0,
             free_block_bitmap_inode: 0,
             free_inode_bitmap_inode: 0,
             first_free_inode: 2,
             first_free_block: 0,
             block_groups: 0,
-            max_file_size: MAX_FILE_SIZE,
+            max_file_size: 1024 * 1024 * 1024, // Default to 1GB
             max_filesystem_size: 0,
             last_mount_time: 0,
             last_write_time: 0,
@@ -196,28 +190,28 @@ impl SuperBlock {
         self.filesystem_type = FileSystemType::EclipseFS;
         self.version = 1;
         self.state = FileSystemState::Clean;
-        self.block_size = BLOCK_SIZE as u32;
-        self.fragment_size = BLOCK_SIZE as u32;
-        self.root_inode = ROOT_INODE;
+        self.block_size = 4096;
+        self.fragment_size = 4096;
+        self.root_inode = 1;
         self.first_free_inode = 2;
-        self.max_file_size = MAX_FILE_SIZE;
+        self.max_file_size = 1024 * 1024 * 1024;
         self.max_mount_count = 65535;
-        
+
         // Generar UUID único (simplificado)
         self.generate_uuid();
-        
+
         // Establecer nombre del volumen
         self.set_volume_name("EclipseOS");
-        
+
         Ok(())
     }
 
     /// Verificar si el superblock es válido
     pub fn is_valid(&self) -> bool {
-        self.magic == 0x45434C50 && 
-        self.filesystem_type == FileSystemType::EclipseFS &&
-        self.block_size > 0 &&
-        self.total_blocks > 0
+        self.magic == 0x45434C50
+            && self.filesystem_type == FileSystemType::EclipseFS
+            && self.block_size > 0
+            && self.total_blocks > 0
     }
 
     /// Verificar si el sistema de archivos está limpio
@@ -274,8 +268,8 @@ impl SuperBlock {
     fn generate_uuid(&mut self) {
         // Implementación simplificada - UUID fijo
         self.filesystem_uuid = [
-            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
         ];
     }
 
@@ -283,7 +277,7 @@ impl SuperBlock {
     pub fn set_volume_name(&mut self, name: &str) {
         let name_bytes = name.as_bytes();
         let len = name_bytes.len().min(15);
-        
+
         for i in 0..16 {
             if i < len {
                 self.volume_name[i] = name_bytes[i];
@@ -303,24 +297,28 @@ impl SuperBlock {
                 break;
             }
         }
-        
+
         // Convertir a string (simplificado)
-        unsafe {
-            core::str::from_utf8_unchecked(&self.volume_name[0..len])
-        }
+        unsafe { core::str::from_utf8_unchecked(&self.volume_name[0..len]) }
     }
 
     /// Calcular número de grupos de bloques
     pub fn calculate_block_groups(&mut self) {
         if self.block_size > 0 && self.total_blocks > 0 {
             let blocks_per_group = (self.block_size * 8) as u64; // 8 bits por byte
-            self.block_groups = ((self.total_blocks + blocks_per_group - 1) / blocks_per_group) as u32;
+            self.block_groups =
+                ((self.total_blocks + blocks_per_group - 1) / blocks_per_group) as u32;
         }
     }
 
     /// Obtener información del sistema de archivos
     pub fn get_filesystem_info(&self) -> (u64, u64, u32, u32) {
-        (self.total_blocks, self.free_blocks, self.total_inodes, self.free_inodes)
+        (
+            self.total_blocks,
+            self.free_blocks,
+            self.total_inodes,
+            self.free_inodes,
+        )
     }
 
     /// Serializar superblock a bytes
@@ -473,129 +471,267 @@ impl SuperBlock {
         let mut offset = 0;
 
         // Magic number
-        let magic = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let magic = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Tipo de sistema de archivos
-        let type_value = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let type_value = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         let filesystem_type = FileSystemType::from_u32(type_value);
         offset += 4;
 
         // Versión
-        let version = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let version = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Estado
-        let state_value = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let state_value = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         let state = FileSystemState::from_u32(state_value);
         offset += 4;
 
         // Tamaño de bloque
-        let block_size = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let block_size = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Tamaño de fragmento
-        let fragment_size = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let fragment_size = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Total de bloques
         let total_blocks = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Bloques libres
         let free_blocks = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Total de inodos
-        let total_inodes = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let total_inodes = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Inodos libres
-        let free_inodes = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let free_inodes = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Primer bloque de datos
-        let first_data_block = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let first_data_block = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Inodo raíz
-        let root_inode = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let root_inode = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Inodo de grupo
-        let group_inode = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let group_inode = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Inodo de bitmap de bloques libres
-        let free_block_bitmap_inode = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let free_block_bitmap_inode = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Inodo de bitmap de inodos libres
-        let free_inode_bitmap_inode = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let free_inode_bitmap_inode = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Primer inodo libre
-        let first_free_inode = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let first_free_inode = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Primer bloque libre
         let first_free_block = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Grupos de bloques
-        let block_groups = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let block_groups = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // Tamaño máximo de archivo
         let max_file_size = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Tamaño máximo del sistema de archivos
         let max_filesystem_size = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Timestamps
         let last_mount_time = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let last_write_time = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let last_check_time = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Contadores
-        let mount_count = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let mount_count = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
-        let max_mount_count = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let max_mount_count = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
-        let max_lifetime = u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        let max_lifetime = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         offset += 4;
 
         // UUID

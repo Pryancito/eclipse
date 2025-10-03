@@ -1,23 +1,23 @@
 //! Sistema de métricas y monitoreo del kernel Eclipse
-//! 
+//!
 //! Proporciona recolección y análisis de métricas del sistema en tiempo real
 //! para monitoreo de rendimiento y diagnóstico.
 
-use core::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
 use crate::synchronization::Mutex;
+use crate::{syslog_debug, syslog_info, syslog_warn, KernelError, KernelResult};
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
-use crate::{KernelError, KernelResult, syslog_info, syslog_warn, syslog_debug};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Tipo de métrica
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MetricType {
-    Counter,    // Contador incremental
-    Gauge,      // Valor actual
-    Histogram,  // Distribución de valores
-    Timer,      // Tiempo de ejecución
+    Counter,   // Contador incremental
+    Gauge,     // Valor actual
+    Histogram, // Distribución de valores
+    Timer,     // Tiempo de ejecución
 }
 
 /// Estructura de una métrica
@@ -38,7 +38,7 @@ pub struct SystemMetrics {
     pub cpu_frequency_mhz: AtomicU32,
     pub context_switches: AtomicU64,
     pub interrupts_handled: AtomicU64,
-    
+
     // Métricas de memoria
     pub total_memory_kb: AtomicU64,
     pub free_memory_kb: AtomicU64,
@@ -46,7 +46,7 @@ pub struct SystemMetrics {
     pub memory_allocations: AtomicU64,
     pub memory_deallocations: AtomicU64,
     pub memory_leaks: AtomicU64,
-    
+
     // Métricas de procesos
     pub total_processes: AtomicU32,
     pub running_processes: AtomicU32,
@@ -54,7 +54,7 @@ pub struct SystemMetrics {
     pub zombie_processes: AtomicU32,
     pub process_creations: AtomicU64,
     pub process_terminations: AtomicU64,
-    
+
     // Métricas de hilos
     pub total_threads: AtomicU32,
     pub running_threads: AtomicU32,
@@ -62,7 +62,7 @@ pub struct SystemMetrics {
     pub blocked_threads: AtomicU32,
     pub thread_creations: AtomicU64,
     pub thread_terminations: AtomicU64,
-    
+
     // Métricas de I/O
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
@@ -70,46 +70,46 @@ pub struct SystemMetrics {
     pub network_packets_received: AtomicU64,
     pub io_operations: AtomicU64,
     pub io_errors: AtomicU64,
-    
+
     // Métricas de sistema de archivos
     pub files_opened: AtomicU64,
     pub files_closed: AtomicU64,
     pub files_created: AtomicU64,
     pub files_deleted: AtomicU64,
     pub filesystem_operations: AtomicU64,
-    
+
     // Métricas de red
     pub tcp_connections: AtomicU32,
     pub udp_connections: AtomicU32,
     pub network_bytes_sent: AtomicU64,
     pub network_bytes_received: AtomicU64,
     pub network_errors: AtomicU64,
-    
+
     // Métricas de drivers
     pub drivers_loaded: AtomicU32,
     pub drivers_failed: AtomicU32,
     pub driver_operations: AtomicU64,
     pub driver_errors: AtomicU64,
-    
+
     // Métricas de seguridad
     pub security_violations: AtomicU64,
     pub authentication_attempts: AtomicU64,
     pub authorization_checks: AtomicU64,
     pub security_events: AtomicU64,
-    
+
     // Métricas de IA
     pub ai_inferences: AtomicU64,
     pub ai_training_cycles: AtomicU64,
     pub ai_errors: AtomicU64,
     pub ai_response_time_ms: AtomicU64,
-    
+
     // Métricas de rendimiento
     pub kernel_uptime_ms: AtomicU64,
     pub system_calls: AtomicU64,
     pub page_faults: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
-    
+
     // Métricas de energía
     pub power_consumption_watts: AtomicU32,
     pub temperature_celsius: AtomicU32,
@@ -126,7 +126,7 @@ impl SystemMetrics {
             cpu_frequency_mhz: AtomicU32::new(0),
             context_switches: AtomicU64::new(0),
             interrupts_handled: AtomicU64::new(0),
-            
+
             // Memoria
             total_memory_kb: AtomicU64::new(0),
             free_memory_kb: AtomicU64::new(0),
@@ -134,7 +134,7 @@ impl SystemMetrics {
             memory_allocations: AtomicU64::new(0),
             memory_deallocations: AtomicU64::new(0),
             memory_leaks: AtomicU64::new(0),
-            
+
             // Procesos
             total_processes: AtomicU32::new(0),
             running_processes: AtomicU32::new(0),
@@ -142,7 +142,7 @@ impl SystemMetrics {
             zombie_processes: AtomicU32::new(0),
             process_creations: AtomicU64::new(0),
             process_terminations: AtomicU64::new(0),
-            
+
             // Hilos
             total_threads: AtomicU32::new(0),
             running_threads: AtomicU32::new(0),
@@ -150,7 +150,7 @@ impl SystemMetrics {
             blocked_threads: AtomicU32::new(0),
             thread_creations: AtomicU64::new(0),
             thread_terminations: AtomicU64::new(0),
-            
+
             // I/O
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
@@ -158,46 +158,46 @@ impl SystemMetrics {
             network_packets_received: AtomicU64::new(0),
             io_operations: AtomicU64::new(0),
             io_errors: AtomicU64::new(0),
-            
+
             // Sistema de archivos
             files_opened: AtomicU64::new(0),
             files_closed: AtomicU64::new(0),
             files_created: AtomicU64::new(0),
             files_deleted: AtomicU64::new(0),
             filesystem_operations: AtomicU64::new(0),
-            
+
             // Red
             tcp_connections: AtomicU32::new(0),
             udp_connections: AtomicU32::new(0),
             network_bytes_sent: AtomicU64::new(0),
             network_bytes_received: AtomicU64::new(0),
             network_errors: AtomicU64::new(0),
-            
+
             // Drivers
             drivers_loaded: AtomicU32::new(0),
             drivers_failed: AtomicU32::new(0),
             driver_operations: AtomicU64::new(0),
             driver_errors: AtomicU64::new(0),
-            
+
             // Seguridad
             security_violations: AtomicU64::new(0),
             authentication_attempts: AtomicU64::new(0),
             authorization_checks: AtomicU64::new(0),
             security_events: AtomicU64::new(0),
-            
+
             // IA
             ai_inferences: AtomicU64::new(0),
             ai_training_cycles: AtomicU64::new(0),
             ai_errors: AtomicU64::new(0),
             ai_response_time_ms: AtomicU64::new(0),
-            
+
             // Rendimiento
             kernel_uptime_ms: AtomicU64::new(0),
             system_calls: AtomicU64::new(0),
             page_faults: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
-            
+
             // Energía
             power_consumption_watts: AtomicU32::new(0),
             temperature_celsius: AtomicU32::new(0),
@@ -363,56 +363,72 @@ impl SystemMetrics {
     /// Obtener resumen de métricas
     pub fn get_summary(&self) -> String {
         let mut summary = String::new();
-        
+
         // CPU
-        summary.push_str(&format!("CPU: {}% @ {}MHz\n", 
+        summary.push_str(&format!(
+            "CPU: {}% @ {}MHz\n",
             self.cpu_usage_percent.load(Ordering::SeqCst),
-            self.cpu_frequency_mhz.load(Ordering::SeqCst)));
-        
+            self.cpu_frequency_mhz.load(Ordering::SeqCst)
+        ));
+
         // Memoria
         let total_mem = self.total_memory_kb.load(Ordering::SeqCst);
         let free_mem = self.free_memory_kb.load(Ordering::SeqCst);
         let used_mem = self.used_memory_kb.load(Ordering::SeqCst);
-        summary.push_str(&format!("Memoria: {}KB total, {}KB libre, {}KB usado\n", 
-            total_mem, free_mem, used_mem));
-        
+        summary.push_str(&format!(
+            "Memoria: {}KB total, {}KB libre, {}KB usado\n",
+            total_mem, free_mem, used_mem
+        ));
+
         // Procesos
-        summary.push_str(&format!("Procesos: {} total, {} ejecutándose, {} bloqueados, {} zombies\n",
+        summary.push_str(&format!(
+            "Procesos: {} total, {} ejecutándose, {} bloqueados, {} zombies\n",
             self.total_processes.load(Ordering::SeqCst),
             self.running_processes.load(Ordering::SeqCst),
             self.blocked_processes.load(Ordering::SeqCst),
-            self.zombie_processes.load(Ordering::SeqCst)));
-        
+            self.zombie_processes.load(Ordering::SeqCst)
+        ));
+
         // Hilos
-        summary.push_str(&format!("Hilos: {} total, {} ejecutándose, {} listos, {} bloqueados\n",
+        summary.push_str(&format!(
+            "Hilos: {} total, {} ejecutándose, {} listos, {} bloqueados\n",
             self.total_threads.load(Ordering::SeqCst),
             self.running_threads.load(Ordering::SeqCst),
             self.ready_threads.load(Ordering::SeqCst),
-            self.blocked_threads.load(Ordering::SeqCst)));
-        
+            self.blocked_threads.load(Ordering::SeqCst)
+        ));
+
         // I/O
-        summary.push_str(&format!("I/O: {} operaciones, {} errores\n",
+        summary.push_str(&format!(
+            "I/O: {} operaciones, {} errores\n",
             self.io_operations.load(Ordering::SeqCst),
-            self.io_errors.load(Ordering::SeqCst)));
-        
+            self.io_errors.load(Ordering::SeqCst)
+        ));
+
         // Red
-        summary.push_str(&format!("Red: {} enviados, {} recibidos, {} errores\n",
+        summary.push_str(&format!(
+            "Red: {} enviados, {} recibidos, {} errores\n",
             self.network_packets_sent.load(Ordering::SeqCst),
             self.network_packets_received.load(Ordering::SeqCst),
-            self.network_errors.load(Ordering::SeqCst)));
-        
+            self.network_errors.load(Ordering::SeqCst)
+        ));
+
         // IA
-        summary.push_str(&format!("IA: {} inferencias, {} errores\n",
+        summary.push_str(&format!(
+            "IA: {} inferencias, {} errores\n",
             self.ai_inferences.load(Ordering::SeqCst),
-            self.ai_errors.load(Ordering::SeqCst)));
-        
+            self.ai_errors.load(Ordering::SeqCst)
+        ));
+
         // Rendimiento
-        summary.push_str(&format!("Rendimiento: {} system calls, {} page faults, {} cache hits, {} cache misses\n",
+        summary.push_str(&format!(
+            "Rendimiento: {} system calls, {} page faults, {} cache hits, {} cache misses\n",
             self.system_calls.load(Ordering::SeqCst),
             self.page_faults.load(Ordering::SeqCst),
             self.cache_hits.load(Ordering::SeqCst),
-            self.cache_misses.load(Ordering::SeqCst)));
-        
+            self.cache_misses.load(Ordering::SeqCst)
+        ));
+
         summary
     }
 }
@@ -473,7 +489,7 @@ impl MetricsCollector {
         }
 
         let current_time = self.get_current_time();
-        
+
         // Solo recolectar si ha pasado el intervalo
         if current_time - self.last_collection < self.collection_interval_ms {
             return Ok(());
@@ -492,16 +508,17 @@ impl MetricsCollector {
     fn simulate_metric_collection(&self) {
         // Simular métricas de CPU
         self.metrics.update_cpu_metrics(45, 3600);
-        
+
         // Simular métricas de memoria
-        self.metrics.update_memory_metrics(8388608, 4194304, 4194304); // 8GB total, 4GB libre, 4GB usado
-        
+        self.metrics
+            .update_memory_metrics(8388608, 4194304, 4194304); // 8GB total, 4GB libre, 4GB usado
+
         // Simular métricas de procesos
         self.metrics.update_process_metrics(25, 3, 20, 2);
-        
+
         // Simular métricas de hilos
         self.metrics.update_thread_metrics(150, 10, 140, 0);
-        
+
         // Simular algunas operaciones
         self.metrics.increment_system_calls();
         self.metrics.increment_io_operations();
@@ -529,7 +546,9 @@ static METRICS_COLLECTOR: Mutex<Option<MetricsCollector>> = Mutex::new(None);
 
 /// Inicializar el sistema de métricas
 pub fn init_metrics() -> KernelResult<()> {
-    let mut collector = METRICS_COLLECTOR.lock().map_err(|_| KernelError::InternalError)?;
+    let mut collector = METRICS_COLLECTOR
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     *collector = Some(MetricsCollector::new());
     if let Some(ref mut metrics_collector) = *collector {
         metrics_collector.initialize()
@@ -545,7 +564,9 @@ pub fn get_metrics_collector() -> &'static Mutex<Option<MetricsCollector>> {
 
 /// Recolectar métricas del sistema
 pub fn collect_system_metrics() -> KernelResult<()> {
-    let mut collector = METRICS_COLLECTOR.lock().map_err(|_| KernelError::InternalError)?;
+    let mut collector = METRICS_COLLECTOR
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref mut metrics_collector) = *collector {
         metrics_collector.collect_metrics()
     } else {
@@ -555,7 +576,9 @@ pub fn collect_system_metrics() -> KernelResult<()> {
 
 /// Generar reporte de métricas
 pub fn generate_metrics_report() -> KernelResult<String> {
-    let collector = METRICS_COLLECTOR.lock().map_err(|_| KernelError::InternalError)?;
+    let collector = METRICS_COLLECTOR
+        .lock()
+        .map_err(|_| KernelError::InternalError)?;
     if let Some(ref metrics_collector) = *collector {
         Ok(metrics_collector.generate_report())
     } else {

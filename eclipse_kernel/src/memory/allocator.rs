@@ -1,10 +1,10 @@
 //! Asignador de Memoria para Eclipse OS
-//! 
+//!
 //! Implementa asignación dinámica de memoria con diferentes estrategias
 
+use crate::memory::manager::PAGE_SIZE;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
-use crate::memory::manager::PAGE_SIZE;
 
 /// Estrategias de asignación de memoria
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +42,7 @@ impl BlockAllocator {
     pub fn new(strategy: AllocationStrategy) -> Self {
         Self {
             strategy,
-            min_block_size: 16, // 16 bytes mínimo
+            min_block_size: 16,            // 16 bytes mínimo
             max_block_size: PAGE_SIZE * 4, // 16KB máximo
         }
     }
@@ -145,7 +145,7 @@ impl SimpleAllocator {
     pub fn allocate(&mut self, size: usize, align: usize) -> Option<NonNull<u8>> {
         // Alinear la dirección
         let aligned_addr = (self.next_free + align as u64 - 1) & !(align as u64 - 1);
-        
+
         // Verificar si hay suficiente espacio
         if aligned_addr + size as u64 <= self.heap_start + self.heap_size as u64 {
             let ptr = NonNull::new(aligned_addr as *mut u8)?;

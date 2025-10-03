@@ -1,13 +1,13 @@
 //! Demostración Simple de IA para Eclipse OS
-//! 
+//!
 //! Este módulo demuestra las capacidades básicas de IA
 //! sin dependencias externas complejas.
 
 #![no_std]
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
 
 /// Demostración simple de IA
 pub struct SimpleAIDemo {
@@ -29,16 +29,16 @@ impl SimpleAIDemo {
     /// Ejecutar demostración
     pub fn run_demo(&mut self) -> Result<(), &'static str> {
         self.is_running = true;
-        
+
         // Simular carga de modelos
         self.simulate_model_loading()?;
-        
+
         // Simular inferencia
         self.simulate_inference()?;
-        
+
         // Mostrar estadísticas
         self.show_statistics()?;
-        
+
         self.is_running = false;
         Ok(())
     }
@@ -50,7 +50,7 @@ impl SimpleAIDemo {
         self.loaded_models.push(String::from("DistilBERT-Base"));
         self.loaded_models.push(String::from("MobileNetV2"));
         self.loaded_models.push(String::from("AnomalyDetector"));
-        
+
         Ok(())
     }
 
@@ -78,7 +78,7 @@ impl SimpleAIDemo {
                 _ => {}
             }
         }
-        
+
         Ok(())
     }
 
@@ -95,7 +95,7 @@ impl SimpleAIDemo {
             // Simular procesamiento
             let _response = self.generate_simulated_response(_input);
         }
-        
+
         Ok(())
     }
 
@@ -110,7 +110,7 @@ impl SimpleAIDemo {
         for _input in test_inputs {
             let _analysis = self.generate_simulated_analysis(_input);
         }
-        
+
         Ok(())
     }
 
@@ -147,10 +147,16 @@ impl SimpleAIDemo {
     /// Generar análisis simulado
     fn generate_simulated_analysis(&self, input: &str) -> String {
         match input {
-            "analizar logs del sistema" => String::from("Análisis: Sistema estable, sin errores críticos detectados"),
-            "clasificar proceso como crítico" => String::from("Clasificación: Proceso marcado como crítico para el sistema"),
-            "detectar anomalía en red" => String::from("Detección: Patrón de tráfico anómalo identificado en puerto 8080"),
-            _ => String::from("Análisis simulado completado")
+            "analizar logs del sistema" => {
+                String::from("Análisis: Sistema estable, sin errores críticos detectados")
+            }
+            "clasificar proceso como crítico" => {
+                String::from("Clasificación: Proceso marcado como crítico para el sistema")
+            }
+            "detectar anomalía en red" => {
+                String::from("Detección: Patrón de tráfico anómalo identificado en puerto 8080")
+            }
+            _ => String::from("Análisis simulado completado"),
         }
     }
 
@@ -161,7 +167,9 @@ impl SimpleAIDemo {
 
     /// Detectar anomalías simuladas
     fn detect_simulated_anomalies(&self) -> String {
-        String::from("Anomalías detectadas: 1) Pico de CPU inusual, 2) Acceso de memoria sospechoso")
+        String::from(
+            "Anomalías detectadas: 1) Pico de CPU inusual, 2) Acceso de memoria sospechoso",
+        )
     }
 
     /// Mostrar estadísticas
@@ -171,10 +179,10 @@ impl SimpleAIDemo {
             total_models: self.loaded_models.len(),
             loaded_models: self.loaded_models.len(),
             total_memory_usage: 256, // MB
-            max_memory: 1024, // MB
+            max_memory: 1024,        // MB
             total_inferences: 42,
         };
-        
+
         Ok(())
     }
 }
@@ -212,7 +220,5 @@ pub fn run_simple_ai_demo() -> Result<(), &'static str> {
 
 /// Obtener instancia de la demostración
 pub fn get_simple_ai_demo() -> Option<&'static mut SimpleAIDemo> {
-    unsafe {
-        SIMPLE_AI_DEMO.as_mut()
-    }
+    unsafe { SIMPLE_AI_DEMO.as_mut() }
 }

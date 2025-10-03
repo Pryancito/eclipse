@@ -1,14 +1,14 @@
 //! Manager principal del sistema de Hot-Plug
-//! 
+//!
 //! Coordina el sistema de hot-plug USB y proporciona una interfaz unificada.
 
-use super::{HotplugConfig, UsbDeviceInfo, UsbDeviceType, UsbHotplugEvent};
-use super::usb_hotplug::UsbHotplugManager;
 use super::events::UsbEventStats;
 use super::notifications::UsbSystemNotification;
+use super::usb_hotplug::UsbHotplugManager;
+use super::{HotplugConfig, UsbDeviceInfo, UsbDeviceType, UsbHotplugEvent};
+use crate::syslog;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use crate::syslog;
 
 /// Manager principal del sistema de hot-plug
 pub struct HotplugManager {
@@ -30,13 +30,21 @@ impl HotplugManager {
             return Err("El sistema de hot-plug ya está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Inicializando sistema de hot-plug...");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Inicializando sistema de hot-plug...",
+        );
 
         // Inicializar USB
         self.usb_manager.initialize()?;
 
         self.is_initialized = true;
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Sistema de hot-plug inicializado correctamente");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Sistema de hot-plug inicializado correctamente",
+        );
         Ok(())
     }
 
@@ -46,22 +54,38 @@ impl HotplugManager {
             return Err("El sistema de hot-plug no está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Iniciando sistema de hot-plug...");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Iniciando sistema de hot-plug...",
+        );
 
         // Iniciar polling USB
         self.usb_manager.start_polling()?;
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Sistema de hot-plug iniciado correctamente");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Sistema de hot-plug iniciado correctamente",
+        );
         Ok(())
     }
 
     /// Detener el sistema de hot-plug
     pub fn stop(&mut self) {
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Deteniendo sistema de hot-plug...");
-        
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Deteniendo sistema de hot-plug...",
+        );
+
         self.usb_manager.stop_polling();
-        
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Sistema de hot-plug detenido");
+
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Sistema de hot-plug detenido",
+        );
     }
 
     /// Procesar eventos pendientes
@@ -72,12 +96,17 @@ impl HotplugManager {
     }
 
     /// Simular conexión de dispositivo USB
-    pub fn simulate_usb_device_connection(&mut self, device_type: UsbDeviceType, port: u8) -> Result<u32, String> {
+    pub fn simulate_usb_device_connection(
+        &mut self,
+        device_type: UsbDeviceType,
+        port: u8,
+    ) -> Result<u32, String> {
         if !self.is_initialized {
             return Err("El sistema de hot-plug no está inicializado".to_string());
         }
 
-        self.usb_manager.simulate_device_connection(device_type, port)
+        self.usb_manager
+            .simulate_device_connection(device_type, port)
     }
 
     /// Simular desconexión de dispositivo USB
@@ -156,7 +185,11 @@ impl HotplugManager {
         }
 
         let device_count = self.usb_device_count();
-        let event_count = if self.has_pending_events() { "Sí" } else { "No" };
+        let event_count = if self.has_pending_events() {
+            "Sí"
+        } else {
+            "No"
+        };
         let stats = self.get_stats();
 
         alloc::format!(
@@ -173,25 +206,44 @@ impl HotplugManager {
             return Err("El sistema de hot-plug no está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Iniciando demostración del sistema de hot-plug USB...");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Iniciando demostración del sistema de hot-plug USB...",
+        );
 
         // Simular conexión de ratón
         let mouse_id = self.simulate_usb_device_connection(UsbDeviceType::Mouse, 1)?;
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", &alloc::format!("Ratón USB conectado con ID: {}", mouse_id));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            &alloc::format!("Ratón USB conectado con ID: {}", mouse_id),
+        );
 
         // Procesar eventos
         self.process_events();
 
         // Simular conexión de teclado
         let keyboard_id = self.simulate_usb_device_connection(UsbDeviceType::Keyboard, 2)?;
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", &alloc::format!("Teclado USB conectado con ID: {}", keyboard_id));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            &alloc::format!("Teclado USB conectado con ID: {}", keyboard_id),
+        );
 
         // Procesar eventos
         self.process_events();
 
         // Simular conexión de dispositivo de almacenamiento
         let storage_id = self.simulate_usb_device_connection(UsbDeviceType::Storage, 3)?;
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", &alloc::format!("Dispositivo de almacenamiento USB conectado con ID: {}", storage_id));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            &alloc::format!(
+                "Dispositivo de almacenamiento USB conectado con ID: {}",
+                storage_id
+            ),
+        );
 
         // Procesar eventos
         self.process_events();
@@ -202,12 +254,20 @@ impl HotplugManager {
 
         // Simular desconexión de ratón
         self.simulate_usb_device_disconnection(mouse_id)?;
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Ratón USB desconectado");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Ratón USB desconectado",
+        );
 
         // Procesar eventos
         self.process_events();
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "HOTPLUG", "Demostración del sistema de hot-plug USB completada");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "HOTPLUG",
+            "Demostración del sistema de hot-plug USB completada",
+        );
         Ok(())
     }
 }

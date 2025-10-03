@@ -1,10 +1,10 @@
 //! DRM Wayland para Eclipse OS
-//! 
+//!
 //! Implementa la integración con DRM (Direct Rendering Manager) para Wayland.
 
 use super::protocol::*;
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Gestor DRM para Wayland
 pub struct DrmManager {
@@ -19,21 +19,21 @@ impl DrmManager {
             current_device: None,
         }
     }
-    
+
     /// Inicializar DRM
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // En un sistema real, aquí se inicializaría DRM
         // Por ahora, simulamos la inicialización
         Ok(())
     }
-    
+
     /// Agregar dispositivo DRM
     pub fn add_device(&mut self, device: DrmDevice) -> ObjectId {
         let device_id = self.devices.len() as ObjectId + 1;
         self.devices.push(device);
         device_id
     }
-    
+
     /// Obtener dispositivo actual
     pub fn get_current_device(&self) -> Option<&DrmDevice> {
         if let Some(id) = self.current_device {

@@ -22,12 +22,12 @@ impl CacheEntry {
             access_count: 0,
         }
     }
-    
+
     pub fn update_access(&mut self) {
         self.last_access = get_current_time();
         self.access_count += 1;
     }
-    
+
     pub fn is_valid(&self) -> bool {
         self.inode != 0
     }
@@ -71,18 +71,18 @@ impl FileCache {
                 return self.entries[i].as_mut().unwrap();
             }
         }
-        
+
         // Si no hay slots libres, usar algoritmo LRU
         let lru_index = self.find_lru_entry();
         self.entries[lru_index] = Some(CacheEntry::new(inode));
         self.entries[lru_index].as_mut().unwrap()
     }
-    
+
     /// Encontrar la entrada menos recientemente usada
     fn find_lru_entry(&self) -> usize {
         let mut lru_index = 0;
         let mut oldest_time = u64::MAX;
-        
+
         for (i, entry) in self.entries.iter().enumerate() {
             if let Some(cache_entry) = entry {
                 if cache_entry.last_access < oldest_time {
@@ -93,10 +93,10 @@ impl FileCache {
                 return i; // Slot libre encontrado
             }
         }
-        
+
         lru_index
     }
-    
+
     /// Limpiar entradas sucias
     pub fn flush_dirty_entries(&mut self) {
         for entry in &mut self.entries {
@@ -108,7 +108,7 @@ impl FileCache {
             }
         }
     }
-    
+
     /// Obtener estadísticas del cache
     pub fn get_stats(&self) -> (u64, u64, f64) {
         let hit_rate = if self.hit_count + self.miss_count > 0 {

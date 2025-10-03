@@ -24,17 +24,21 @@ impl<T> Mutex<T> {
             data: core::cell::UnsafeCell::new(data),
         }
     }
-    
+
     /// Intentar adquirir el mutex
     pub fn try_lock(&self, thread_id: u32) -> bool {
-        if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             self.owner.store(thread_id, Ordering::Release);
             true
         } else {
             false
         }
     }
-    
+
     /// Liberar el mutex
     pub fn unlock(&self, thread_id: u32) -> bool {
         if self.owner.load(Ordering::Acquire) == thread_id {
@@ -45,12 +49,12 @@ impl<T> Mutex<T> {
             false
         }
     }
-    
+
     /// Verificar si está bloqueado
     pub fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Acquire)
     }
-    
+
     /// Adquirir el mutex (bloqueante)
     pub fn lock(&self) -> Result<MutexGuard<T>, &'static str> {
         // En una implementación real, esto sería bloqueante
@@ -59,7 +63,7 @@ impl<T> Mutex<T> {
             Err("Mutex ya está bloqueado")
         } else {
             self.try_lock(0); // Usar thread_id 0 para simplicidad
-            Ok(MutexGuard { 
+            Ok(MutexGuard {
                 mutex: self,
                 _phantom: core::marker::PhantomData,
             })
@@ -75,7 +79,7 @@ pub struct MutexGuard<'a, T> {
 
 impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
     type Target = T;
-    
+
     fn deref(&self) -> &Self::Target {
         // En una implementación real, esto devolvería una referencia al valor protegido
         // Por ahora, devolvemos un puntero nulo (esto es solo para compilación)
@@ -106,27 +110,31 @@ impl Semaphore {
             max_count,
         }
     }
-    
+
     /// Intentar adquirir el semáforo
     pub fn try_acquire(&self) -> bool {
         let current = self.count.load(Ordering::Acquire);
         if current > 0 {
-            self.count.compare_exchange(current, current - 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            self.count
+                .compare_exchange(current, current - 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
         } else {
             false
         }
     }
-    
+
     /// Liberar el semáforo
     pub fn release(&self) -> bool {
         let current = self.count.load(Ordering::Acquire);
         if current < self.max_count {
-            self.count.compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            self.count
+                .compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
         } else {
             false
         }
     }
-    
+
     /// Obtener el conteo actual
     pub fn get_count(&self) -> u32 {
         self.count.load(Ordering::Acquire)
@@ -151,46 +159,46 @@ impl SynchronizationManager {
             next_semaphore_id: 1,
         }
     }
-    
+
     /// Inicializar el administrador de sincronización
     pub fn init(&mut self) {
         // Crear mutex del kernel
         self.mutexes[0] = Some(Mutex::new(()));
-        
+
         // Crear semáforo del kernel
         self.semaphores[0] = Some(Semaphore::new(1, 1));
     }
-    
+
     /// Crear un nuevo mutex
     pub fn create_mutex(&mut self) -> Option<u32> {
         let mutex_id = self.next_mutex_id;
         self.next_mutex_id += 1;
-        
+
         for i in 1..256 {
             if self.mutexes[i].is_none() {
                 self.mutexes[i] = Some(Mutex::new(()));
                 return Some(mutex_id);
             }
         }
-        
+
         None
     }
-    
+
     /// Crear un nuevo semáforo
     pub fn create_semaphore(&mut self, initial_count: u32, max_count: u32) -> Option<u32> {
         let semaphore_id = self.next_semaphore_id;
         self.next_semaphore_id += 1;
-        
+
         for i in 1..256 {
             if self.semaphores[i].is_none() {
                 self.semaphores[i] = Some(Semaphore::new(initial_count, max_count));
                 return Some(semaphore_id);
             }
         }
-        
+
         None
     }
-    
+
     /// Obtener un mutex por ID
     pub fn get_mutex(&self, mutex_id: u32) -> Option<&Mutex<()>> {
         for i in 0..256 {
@@ -202,7 +210,7 @@ impl SynchronizationManager {
         }
         None
     }
-    
+
     /// Obtener un semáforo por ID
     pub fn get_semaphore(&self, semaphore_id: u32) -> Option<&Semaphore> {
         for i in 0..256 {

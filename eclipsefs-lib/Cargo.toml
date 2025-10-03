@@ -1,0 +1,24 @@
+[package]
+name = "eclipsefs-lib"
+version = "0.6.0"
+edition = "2021"
+authors = ["Eclipse OS Team"]
+description = "Librería EclipseFS con soporte para std y no_std"
+license = "MIT"
+
+[features]
+default = ["std"]
+std = ["alloc", "byteorder"]
+alloc = []
+no_std = ["alloc"]
+
+[dependencies]
+# Dependencias para no_std
+heapless = { version = "0.8", optional = true }
+
+# Dependencias para std
+byteorder = { version = "1.4", optional = true }
+
+# Dependencias condicionales
+[target.'cfg(not(feature = "std"))'.dependencies]
+heapless = "0.8"

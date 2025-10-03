@@ -4,6 +4,10 @@ SECTIONS
 {
     . = 0x200000;
     
+    .init : {
+        *(.init)
+    }
+
     .text : {
         *(.text .text.*)
     }

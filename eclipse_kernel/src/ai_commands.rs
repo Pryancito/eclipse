@@ -1,18 +1,18 @@
 //! Comandos de IA integrados en Eclipse OS
-//! 
+//!
 //! Este módulo proporciona comandos de shell para interactuar
 //! con los servicios de IA del sistema.
 
 #![no_std]
 
+use crate::ai_services::{
+    get_ai_services_status, init_ai_services, process_with_ai_service, start_ai_service,
+    AIProcessingResult, AIServiceType,
+};
+use crate::{syslog_err, syslog_info, syslog_warn, KernelError, KernelResult};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
-use crate::ai_services::{
-    AIServiceType, AIProcessingResult, init_ai_services, 
-    process_with_ai_service, start_ai_service, get_ai_services_status
-};
-use crate::{KernelResult, KernelError, syslog_info, syslog_warn, syslog_err};
 
 /// Comando de IA
 pub struct AICommand {
@@ -37,23 +37,69 @@ impl AICommandManager {
     /// Inicializar comandos de IA
     pub fn initialize(&mut self) -> KernelResult<()> {
         syslog_info!("AI_COMMANDS", "Inicializando comandos de IA");
-        
+
         // Registrar comandos básicos
-        self.register_command("ai-status", "Mostrar estado de servicios de IA", "ai-status", ai_status_command)?;
-        self.register_command("ai-start", "Iniciar un servicio de IA", "ai-start <service>", ai_start_command)?;
-        self.register_command("ai-process", "Procesar con un servicio de IA", "ai-process <service> <input>", ai_process_command)?;
-        self.register_command("ai-optimize", "Optimizar sistema con IA", "ai-optimize", ai_optimize_command)?;
-        self.register_command("ai-security", "Análisis de seguridad con IA", "ai-security", ai_security_command)?;
-        self.register_command("ai-help", "Mostrar ayuda de comandos de IA", "ai-help [command]", ai_help_command)?;
-        self.register_command("ai-models", "Listar modelos de IA disponibles", "ai-models", ai_models_command)?;
-        self.register_command("ai-diagnose", "Diagnosticar sistema con IA", "ai-diagnose", ai_diagnose_command)?;
-        
+        self.register_command(
+            "ai-status",
+            "Mostrar estado de servicios de IA",
+            "ai-status",
+            ai_status_command,
+        )?;
+        self.register_command(
+            "ai-start",
+            "Iniciar un servicio de IA",
+            "ai-start <service>",
+            ai_start_command,
+        )?;
+        self.register_command(
+            "ai-process",
+            "Procesar con un servicio de IA",
+            "ai-process <service> <input>",
+            ai_process_command,
+        )?;
+        self.register_command(
+            "ai-optimize",
+            "Optimizar sistema con IA",
+            "ai-optimize",
+            ai_optimize_command,
+        )?;
+        self.register_command(
+            "ai-security",
+            "Análisis de seguridad con IA",
+            "ai-security",
+            ai_security_command,
+        )?;
+        self.register_command(
+            "ai-help",
+            "Mostrar ayuda de comandos de IA",
+            "ai-help [command]",
+            ai_help_command,
+        )?;
+        self.register_command(
+            "ai-models",
+            "Listar modelos de IA disponibles",
+            "ai-models",
+            ai_models_command,
+        )?;
+        self.register_command(
+            "ai-diagnose",
+            "Diagnosticar sistema con IA",
+            "ai-diagnose",
+            ai_diagnose_command,
+        )?;
+
         syslog_info!("AI_COMMANDS", "Comandos de IA registrados correctamente");
         Ok(())
     }
 
     /// Registrar un comando
-    fn register_command(&mut self, name: &str, description: &str, usage: &str, handler: fn(&[String]) -> KernelResult<String>) -> KernelResult<()> {
+    fn register_command(
+        &mut self,
+        name: &str,
+        description: &str,
+        usage: &str,
+        handler: fn(&[String]) -> KernelResult<String>,
+    ) -> KernelResult<()> {
         let command = AICommand {
             name: name.to_string(),
             description: description.to_string(),
@@ -90,14 +136,14 @@ static mut AI_COMMAND_MANAGER: Option<AICommandManager> = None;
 /// Inicializar comandos de IA
 pub fn init_ai_commands() -> KernelResult<()> {
     syslog_info!("AI_COMMANDS", "Inicializando comandos de IA del sistema");
-    
+
     unsafe {
         AI_COMMAND_MANAGER = Some(AICommandManager::new());
         if let Some(ref mut manager) = AI_COMMAND_MANAGER {
             manager.initialize()?;
         }
     }
-    
+
     syslog_info!("AI_COMMANDS", "Comandos de IA inicializados correctamente");
     Ok(())
 }
@@ -153,8 +199,15 @@ fn ai_start_command(args: &[String]) -> KernelResult<String> {
 
     let service_name = &args[0];
     match start_ai_service(service_name) {
-        Ok(_) => Ok(alloc::format!("Servicio {} iniciado correctamente", service_name)),
-        Err(e) => Ok(alloc::format!("Error iniciando servicio {}: {}", service_name, e)),
+        Ok(_) => Ok(alloc::format!(
+            "Servicio {} iniciado correctamente",
+            service_name
+        )),
+        Err(e) => Ok(alloc::format!(
+            "Error iniciando servicio {}: {}",
+            service_name,
+            e
+        )),
     }
 }
 
@@ -172,22 +225,32 @@ fn ai_process_command(args: &[String]) -> KernelResult<String> {
             let mut output = String::new();
             output.push_str(&alloc::format!("=== RESULTADO DE PROCESAMIENTO ===\n"));
             output.push_str(&alloc::format!("Servicio: {:?}\n", result.service_type));
-            output.push_str(&alloc::format!("Confianza: {:.2}%\n", result.confidence * 100.0));
-            output.push_str(&alloc::format!("Tiempo de procesamiento: {}ms\n\n", result.processing_time_ms));
-            
+            output.push_str(&alloc::format!(
+                "Confianza: {:.2}%\n",
+                result.confidence * 100.0
+            ));
+            output.push_str(&alloc::format!(
+                "Tiempo de procesamiento: {}ms\n\n",
+                result.processing_time_ms
+            ));
+
             output.push_str("=== RECOMENDACIONES ===\n");
             for (i, rec) in result.recommendations.iter().enumerate() {
                 output.push_str(&alloc::format!("{}. {}\n", i + 1, rec));
             }
-            
+
             output.push_str("\n=== MÉTRICAS ===\n");
             for (key, value) in &result.metrics {
                 output.push_str(&alloc::format!("{}: {:.2}\n", key, value));
             }
-            
+
             Ok(output)
         }
-        Err(e) => Ok(alloc::format!("Error procesando con servicio {}: {}", service_name, e)),
+        Err(e) => Ok(alloc::format!(
+            "Error procesando con servicio {}: {}",
+            service_name,
+            e
+        )),
     }
 }
 
@@ -203,14 +266,20 @@ fn ai_optimize_command(args: &[String]) -> KernelResult<String> {
             let mut output = String::new();
             output.push_str("=== OPTIMIZACIÓN DEL SISTEMA ===\n\n");
             output.push_str("Análisis completado con IA:\n\n");
-            
+
             for (i, rec) in result.recommendations.iter().enumerate() {
                 output.push_str(&alloc::format!("{}. {}\n", i + 1, rec));
             }
-            
-            output.push_str(&alloc::format!("\nConfianza del análisis: {:.1}%\n", result.confidence * 100.0));
-            output.push_str(&alloc::format!("Tiempo de procesamiento: {}ms\n", result.processing_time_ms));
-            
+
+            output.push_str(&alloc::format!(
+                "\nConfianza del análisis: {:.1}%\n",
+                result.confidence * 100.0
+            ));
+            output.push_str(&alloc::format!(
+                "Tiempo de procesamiento: {}ms\n",
+                result.processing_time_ms
+            ));
+
             Ok(output)
         }
         Err(e) => Ok(alloc::format!("Error en optimización: {}", e)),
@@ -229,21 +298,30 @@ fn ai_security_command(args: &[String]) -> KernelResult<String> {
             let mut output = String::new();
             output.push_str("=== ANÁLISIS DE SEGURIDAD ===\n\n");
             output.push_str("Estado de seguridad analizado con IA:\n\n");
-            
+
             for (i, rec) in result.recommendations.iter().enumerate() {
                 output.push_str(&alloc::format!("{}. {}\n", i + 1, rec));
             }
-            
-            output.push_str(&alloc::format!("\nNivel de confianza: {:.1}%\n", result.confidence * 100.0));
-            
+
+            output.push_str(&alloc::format!(
+                "\nNivel de confianza: {:.1}%\n",
+                result.confidence * 100.0
+            ));
+
             if let Some(threat_level) = result.metrics.get("threat_level") {
-                output.push_str(&alloc::format!("Nivel de amenaza: {:.1}%\n", threat_level * 100.0));
+                output.push_str(&alloc::format!(
+                    "Nivel de amenaza: {:.1}%\n",
+                    threat_level * 100.0
+                ));
             }
-            
+
             if let Some(security_score) = result.metrics.get("security_score") {
-                output.push_str(&alloc::format!("Puntuación de seguridad: {:.1}%\n", security_score * 100.0));
+                output.push_str(&alloc::format!(
+                    "Puntuación de seguridad: {:.1}%\n",
+                    security_score * 100.0
+                ));
             }
-            
+
             Ok(output)
         }
         Err(e) => Ok(alloc::format!("Error en análisis de seguridad: {}", e)),
@@ -260,7 +338,11 @@ fn ai_help_command(args: &[String]) -> KernelResult<String> {
         if let Some(manager) = get_ai_command_manager() {
             for command_name in manager.list_commands() {
                 if let Some(command) = manager.get_command_info(&command_name) {
-                    output.push_str(&alloc::format!("{} - {}\n", command.name, command.description));
+                    output.push_str(&alloc::format!(
+                        "{} - {}\n",
+                        command.name,
+                        command.description
+                    ));
                     output.push_str(&alloc::format!("  Uso: {}\n\n", command.usage));
                 }
             }
@@ -274,7 +356,10 @@ fn ai_help_command(args: &[String]) -> KernelResult<String> {
                 output.push_str(&alloc::format!("Descripción: {}\n", command.description));
                 output.push_str(&alloc::format!("Uso: {}\n", command.usage));
             } else {
-                output.push_str(&alloc::format!("Comando '{}' no encontrado\n", command_name));
+                output.push_str(&alloc::format!(
+                    "Comando '{}' no encontrado\n",
+                    command_name
+                ));
             }
         }
     }
@@ -290,26 +375,27 @@ fn ai_models_command(args: &[String]) -> KernelResult<String> {
 
     let mut output = String::new();
     output.push_str("=== MODELOS DE IA DISPONIBLES ===\n\n");
-    
+
     output.push_str("Modelos de Lenguaje Natural:\n");
     output.push_str("  - TinyLlama-1.1B: Modelo de lenguaje pequeño y eficiente\n");
     output.push_str("  - DistilBERT-base: BERT comprimido para tareas de NLP\n");
     output.push_str("  - TinyBERT: BERT ultra-comprimido\n");
     output.push_str("  - MobileBERT: BERT optimizado para dispositivos móviles\n\n");
-    
+
     output.push_str("Modelos de Visión:\n");
     output.push_str("  - MobileNetV2: Red neuronal móvil para clasificación\n");
     output.push_str("  - EfficientNetLite: EfficientNet optimizado\n");
     output.push_str("  - TinyYOLO: YOLO pequeño para detección de objetos\n\n");
-    
+
     output.push_str("Modelos Especializados:\n");
     output.push_str("  - ProcessClassifier-v1: Clasificación de procesos del sistema\n");
     output.push_str("  - SecurityAnalyzer-v2: Análisis de seguridad\n");
     output.push_str("  - AnomalyDetector-v1: Detección de anomalías\n");
     output.push_str("  - PerformancePredictor-v1: Predicción de rendimiento\n");
     output.push_str("  - TimeSeriesPredictor: Predicción de series temporales\n\n");
-    
-    output.push_str("Estado: Todos los modelos están simulados para compatibilidad con el kernel\n");
+
+    output
+        .push_str("Estado: Todos los modelos están simulados para compatibilidad con el kernel\n");
 
     Ok(output)
 }
@@ -326,19 +412,25 @@ fn ai_diagnose_command(args: &[String]) -> KernelResult<String> {
             let mut output = String::new();
             output.push_str("=== DIAGNÓSTICO DEL SISTEMA ===\n\n");
             output.push_str("Análisis completo realizado con IA:\n\n");
-            
+
             for (i, rec) in result.recommendations.iter().enumerate() {
                 output.push_str(&alloc::format!("{}. {}\n", i + 1, rec));
             }
-            
-            output.push_str(&alloc::format!("\nConfianza del diagnóstico: {:.1}%\n", result.confidence * 100.0));
-            output.push_str(&alloc::format!("Tiempo de análisis: {}ms\n", result.processing_time_ms));
-            
+
+            output.push_str(&alloc::format!(
+                "\nConfianza del diagnóstico: {:.1}%\n",
+                result.confidence * 100.0
+            ));
+            output.push_str(&alloc::format!(
+                "Tiempo de análisis: {}ms\n",
+                result.processing_time_ms
+            ));
+
             output.push_str("\n=== MÉTRICAS DEL SISTEMA ===\n");
             for (key, value) in &result.metrics {
                 output.push_str(&alloc::format!("{}: {:.2}\n", key, value));
             }
-            
+
             Ok(output)
         }
         Err(e) => Ok(alloc::format!("Error en diagnóstico: {}", e)),

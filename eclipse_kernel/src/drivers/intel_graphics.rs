@@ -1,14 +1,14 @@
 //! Driver Intel Graphics para Eclipse OS
-//! 
+//!
 //! Implementa un driver básico para gráficos integrados Intel
 //! con soporte para aceleración 2D y gestión de memoria.
 
-use core::ptr;
-use core::mem;
-use crate::drivers::pci::{PciDevice, GpuInfo, GpuType};
-use crate::drivers::framebuffer::{FramebufferDriver, PixelFormat, Color};
 use crate::desktop_ai::{Point, Rect};
+use crate::drivers::framebuffer::{Color, FramebufferDriver, FramebufferInfo, PixelFormat};
+use crate::drivers::pci::{GpuInfo, GpuType, PciDevice};
 use alloc::format;
+use core::mem;
+use core::ptr;
 
 /// IDs de dispositivos Intel Graphics conocidos
 pub const INTEL_HD_GRAPHICS_2000: u16 = 0x0102;
@@ -53,15 +53,15 @@ pub struct IntelGraphicsInfo {
 /// Generaciones de Intel Graphics
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IntelGeneration {
-    Gen1, // Iron Lake
-    Gen2, // Sandy Bridge
-    Gen3, // Ivy Bridge
-    Gen4, // Haswell
-    Gen5, // Broadwell
-    Gen6, // Skylake
-    Gen7, // Kaby Lake
-    Gen8, // Coffee Lake
-    Gen9, // Ice Lake
+    Gen1,  // Iron Lake
+    Gen2,  // Sandy Bridge
+    Gen3,  // Ivy Bridge
+    Gen4,  // Haswell
+    Gen5,  // Broadwell
+    Gen6,  // Skylake
+    Gen7,  // Kaby Lake
+    Gen8,  // Coffee Lake
+    Gen9,  // Ice Lake
     Gen10, // Tiger Lake
     Gen11, // Alder Lake
     Gen12, // Raptor Lake
@@ -81,7 +81,7 @@ impl IntelGeneration {
             _ => IntelGeneration::Unknown,
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             IntelGeneration::Gen1 => "Iron Lake",
@@ -119,11 +119,11 @@ impl IntelGraphicsDriver {
     pub fn new(pci_device: PciDevice) -> Self {
         let device_id = pci_device.device_id;
         let generation = IntelGeneration::from_device_id(device_id);
-        
+
         // Determinar capacidades basadas en la generación
-        let (memory_size, max_resolution, supports_2d, supports_3d, supports_hdmi, supports_dp) = 
+        let (memory_size, max_resolution, supports_2d, supports_3d, supports_hdmi, supports_dp) =
             Self::get_capabilities_for_generation(generation);
-        
+
         let info = IntelGraphicsInfo {
             device_id,
             generation,
@@ -134,7 +134,7 @@ impl IntelGraphicsDriver {
             supports_hdmi,
             supports_dp,
         };
-        
+
         Self {
             pci_device,
             info,
@@ -146,9 +146,11 @@ impl IntelGraphicsDriver {
             mmio_size: 0,
         }
     }
-    
+
     /// Obtener capacidades basadas en la generación
-    fn get_capabilities_for_generation(generation: IntelGeneration) -> (u64, (u32, u32), bool, bool, bool, bool) {
+    fn get_capabilities_for_generation(
+        generation: IntelGeneration,
+    ) -> (u64, (u32, u32), bool, bool, bool, bool) {
         match generation {
             IntelGeneration::Gen1 => (64 * 1024 * 1024, (1920, 1080), true, false, false, false),
             IntelGeneration::Gen2 => (128 * 1024 * 1024, (2560, 1440), true, true, true, false),
@@ -165,121 +167,139 @@ impl IntelGraphicsDriver {
             IntelGeneration::Unknown => (256 * 1024 * 1024, (1920, 1080), true, false, true, false),
         }
     }
-    
-    /// Inicializar el driver Intel Graphics
+
+    /// Inicializar el driver Intel Graphics (compatibilidad legacy)
     pub fn initialize(&mut self) -> Result<(), &'static str> {
+        self.initialize_for_boot(None)
+    }
+
+    /// Inicializar el driver Intel Graphics
+    pub fn initialize_for_boot(
+        &mut self,
+        framebuffer: Option<&FramebufferInfo>,
+    ) -> Result<(), &'static str> {
         if self.state != IntelDriverState::Uninitialized {
             return Err("Driver ya inicializado");
         }
-        
+
         self.state = IntelDriverState::Initializing;
-        
+
         // Configurar PCI
         self.configure_pci()?;
-        
-        // Configurar memoria
+
+        // Configurar memoria y MMIO
         self.configure_memory()?;
-        
-        // Configurar MMIO
         self.configure_mmio()?;
-        
-        // Inicializar framebuffer
-        self.initialize_framebuffer()?;
-        
-        // Configurar aceleración 2D
+
+        // Usar framebuffer existente si se proporciona
+        if let Some(info) = framebuffer {
+            self.attach_existing_framebuffer(info);
+        } else {
+            self.initialize_framebuffer()?;
+        }
+
         if self.info.supports_2d {
             self.configure_2d_acceleration()?;
         }
-        
+
         self.state = IntelDriverState::Ready;
         Ok(())
     }
-    
+
+    /// Adjuntar un framebuffer existente proporcionado por el bootloader/UEFI
+    pub fn attach_existing_framebuffer(&mut self, info: &FramebufferInfo) {
+        let mut fb = FramebufferDriver::new();
+        if fb
+            .init_from_uefi(
+                info.base_address,
+                info.width,
+                info.height,
+                info.pixels_per_scan_line,
+                info.pixel_format,
+                info.red_mask | info.green_mask | info.blue_mask,
+            )
+            .is_ok()
+        {
+            fb.lock_as_primary();
+            self.framebuffer = Some(fb);
+        }
+    }
+
     /// Configurar PCI
     fn configure_pci(&mut self) -> Result<(), &'static str> {
         // Habilitar memoria y I/O
         let command = self.read_pci_config(0x04) | 0x07; // MEM, IO, BUS_MASTER
         self.write_pci_config(0x04, command);
-        
+
         // Configurar BAR0 (memoria)
         let bar0 = self.read_pci_config(0x10);
-        if bar0 & 0x01 == 0 { // Es memoria
+        if bar0 & 0x01 == 0 {
+            // Es memoria
             self.memory_base = (bar0 & 0xFFFFFFF0) as u64;
             self.memory_size = self.info.memory_size;
         }
-        
+
         // Configurar BAR2 (MMIO)
         let bar2 = self.read_pci_config(0x18);
-        if bar2 & 0x01 == 0 { // Es memoria
+        if bar2 & 0x01 == 0 {
+            // Es memoria
             self.mmio_base = (bar2 & 0xFFFFFFF0) as u64;
             self.mmio_size = 0x100000; // 1MB para MMIO
         }
-        
+
         Ok(())
     }
-    
+
     /// Configurar memoria
     fn configure_memory(&mut self) -> Result<(), &'static str> {
         if self.memory_base == 0 {
             return Err("No se pudo configurar memoria");
         }
-        
+
         // Configurar tamaño de memoria
         self.write_mmio(INTEL_GMCH_CTRL, (self.memory_size / (1024 * 1024)) as u32);
-        
+
         Ok(())
     }
-    
+
     /// Configurar MMIO
     fn configure_mmio(&mut self) -> Result<(), &'static str> {
         if self.mmio_base == 0 {
             return Err("No se pudo configurar MMIO");
         }
-        
+
         // Configurar registros básicos
         self.write_mmio(INTEL_GMCH_STATUS, 0x00000000);
         self.write_mmio(INTEL_PCH_CTRL, 0x00000000);
         self.write_mmio(INTEL_PCH_STATUS, 0x00000000);
-        
+
         Ok(())
     }
-    
+
     /// Inicializar framebuffer
     fn initialize_framebuffer(&mut self) -> Result<(), &'static str> {
         let (width, height) = self.info.max_resolution;
         let bpp = 32;
         let pitch = width * (bpp / 8);
         let size = pitch * height;
-        
+
         // Crear framebuffer
-        let framebuffer_info = crate::drivers::framebuffer::FramebufferInfo {
-            base_address: self.memory_base,
-            width,
-            height,
-            pixels_per_scan_line: width,
-            pixel_format: crate::drivers::framebuffer::PixelFormat::BGRA8888 as u32,
-            red_mask: 0x00FF0000,
-            green_mask: 0x0000FF00,
-            blue_mask: 0x000000FF,
-            reserved_mask: 0xFF000000,
-        };
-        
         let framebuffer = FramebufferDriver::new();
         self.framebuffer = Some(framebuffer);
-        
+
         Ok(())
     }
-    
+
     /// Configurar aceleración 2D
     fn configure_2d_acceleration(&mut self) -> Result<(), &'static str> {
         // Configurar registros de aceleración 2D
         self.write_mmio(0x7000, 0x00000001); // Habilitar 2D
         self.write_mmio(0x7004, 0x00000000); // Reset 2D
         self.write_mmio(0x7008, 0x00000001); // Configurar 2D
-        
+
         Ok(())
     }
-    
+
     /// Leer configuración PCI
     fn read_pci_config(&self, offset: u8) -> u32 {
         let address = 0x80000000u32
@@ -287,13 +307,13 @@ impl IntelGraphicsDriver {
             | ((self.pci_device.device as u32) << 11)
             | ((self.pci_device.function as u32) << 8)
             | ((offset as u32) & 0xFC);
-        
+
         unsafe {
             ptr::write_volatile(0xCF8 as *mut u32, address);
             ptr::read_volatile(0xCFC as *mut u32)
         }
     }
-    
+
     /// Escribir configuración PCI
     fn write_pci_config(&self, offset: u8, value: u32) {
         let address = 0x80000000u32
@@ -301,120 +321,122 @@ impl IntelGraphicsDriver {
             | ((self.pci_device.device as u32) << 11)
             | ((self.pci_device.function as u32) << 8)
             | ((offset as u32) & 0xFC);
-        
+
         unsafe {
             ptr::write_volatile(0xCF8 as *mut u32, address);
             ptr::write_volatile(0xCFC as *mut u32, value);
         }
     }
-    
+
     /// Leer MMIO
     fn read_mmio(&self, offset: u32) -> u32 {
         if self.mmio_base == 0 {
             return 0;
         }
-        
-        unsafe {
-            ptr::read_volatile((self.mmio_base + offset as u64) as *const u32)
-        }
+
+        unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u32) }
     }
-    
+
     /// Escribir MMIO
     fn write_mmio(&self, offset: u32, value: u32) {
         if self.mmio_base == 0 {
             return;
         }
-        
+
         unsafe {
             ptr::write_volatile((self.mmio_base + offset as u64) as *mut u32, value);
         }
     }
-    
+
     /// Obtener información del driver
     pub fn get_info(&self) -> &IntelGraphicsInfo {
         &self.info
     }
-    
+
     /// Obtener estado del driver
     pub fn get_state(&self) -> IntelDriverState {
         self.state
     }
-    
+
     /// Obtener framebuffer
     pub fn get_framebuffer(&mut self) -> Option<&mut FramebufferDriver> {
         self.framebuffer.as_mut()
     }
-    
+
     /// Verificar si está listo
     pub fn is_ready(&self) -> bool {
         self.state == IntelDriverState::Ready
     }
-    
+
     /// Obtener información de memoria
     pub fn get_memory_info(&self) -> (u64, u64) {
         (self.memory_base, self.memory_size)
     }
-    
+
     /// Obtener información de MMIO
     pub fn get_mmio_info(&self) -> (u64, u64) {
         (self.mmio_base, self.mmio_size)
     }
-    
+
     /// Convertir color a pixel
     fn color_to_pixel(&self, color: Color, format: PixelFormat) -> u32 {
         match format {
             PixelFormat::BGRA8888 => {
-                ((color.a as u32) << 24) | 
-                ((color.b as u32) << 16) | 
-                ((color.g as u32) << 8) | 
-                (color.r as u32)
-            },
+                ((color.a as u32) << 24)
+                    | ((color.b as u32) << 16)
+                    | ((color.g as u32) << 8)
+                    | (color.r as u32)
+            }
             PixelFormat::RGBA8888 => {
-                ((color.a as u32) << 24) | 
-                ((color.r as u32) << 16) | 
-                ((color.g as u32) << 8) | 
-                (color.b as u32)
-            },
+                ((color.a as u32) << 24)
+                    | ((color.r as u32) << 16)
+                    | ((color.g as u32) << 8)
+                    | (color.b as u32)
+            }
             _ => {
                 // Fallback a BGRA8888
-                ((color.a as u32) << 24) | 
-                ((color.b as u32) << 16) | 
-                ((color.g as u32) << 8) | 
-                (color.r as u32)
+                ((color.a as u32) << 24)
+                    | ((color.b as u32) << 16)
+                    | ((color.g as u32) << 8)
+                    | (color.r as u32)
             }
         }
     }
-    
+
     /// Renderizar operación 2D acelerada
-    pub fn render_2d(&mut self, operation: Intel2DOperation, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    pub fn render_2d(
+        &mut self,
+        operation: Intel2DOperation,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         if !self.is_ready() || !self.info.supports_2d {
             return Err("2D no disponible");
         }
-        
+
         match operation {
             Intel2DOperation::FillRect(rect, color) => {
                 self.fill_rect_2d(rect, color)?;
-            },
+            }
             Intel2DOperation::DrawRect(rect, color, thickness) => {
                 self.draw_rect_2d(rect, color, thickness)?;
-            },
+            }
             Intel2DOperation::DrawLine(start, end, color, thickness) => {
                 self.draw_line_2d(start, end, color, thickness)?;
-            },
+            }
             Intel2DOperation::Blit(src_rect, dst_rect) => {
                 self.blit_2d(src_rect, dst_rect)?;
-            },
+            }
             Intel2DOperation::DrawCircle(center, radius, color, filled) => {
                 self.draw_circle_2d(center, radius, color, filled)?;
-            },
+            }
             Intel2DOperation::DrawTriangle(p1, p2, p3, color, filled) => {
                 self.draw_triangle_2d(p1, p2, p3, color, filled)?;
-            },
+            }
         }
-        
+
         Ok(())
     }
-    
+
     /// Rellenar rectángulo con aceleración 2D
     fn fill_rect_2d(&mut self, rect: Rect, color: Color) -> Result<(), &'static str> {
         // Configurar operación 2D
@@ -423,18 +445,18 @@ impl IntelGraphicsDriver {
         self.write_mmio(0x7108, rect.width as u32); // Width
         self.write_mmio(0x710C, rect.height as u32); // Height
         self.write_mmio(0x7110, self.color_to_pixel(color, PixelFormat::BGRA8888)); // Color
-        
+
         // Ejecutar operación
         self.write_mmio(0x7000, 0x00000002); // FillRect command
-        
+
         // Esperar completado
         while self.read_mmio(0x7000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Blit con aceleración 2D
     fn blit_2d(&mut self, src_rect: Rect, dst_rect: Rect) -> Result<(), &'static str> {
         // Configurar operación Blit
@@ -444,20 +466,26 @@ impl IntelGraphicsDriver {
         self.write_mmio(0x720C, dst_rect.y as u32); // Dst Y
         self.write_mmio(0x7210, src_rect.width as u32); // Width
         self.write_mmio(0x7214, src_rect.height as u32); // Height
-        
+
         // Ejecutar operación
         self.write_mmio(0x7000, 0x00000004); // Blit command
-        
+
         // Esperar completado
         while self.read_mmio(0x7000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar línea con aceleración 2D
-    fn draw_line_2d(&mut self, start: Point, end: Point, color: Color, thickness: u32) -> Result<(), &'static str> {
+    fn draw_line_2d(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+    ) -> Result<(), &'static str> {
         // Configurar operación Line
         self.write_mmio(0x7300, start.x as u32); // Start X
         self.write_mmio(0x7304, start.y as u32); // Start Y
@@ -465,26 +493,43 @@ impl IntelGraphicsDriver {
         self.write_mmio(0x730C, end.y as u32); // End Y
         self.write_mmio(0x7310, self.color_to_pixel(color, PixelFormat::BGRA8888)); // Color
         self.write_mmio(0x7314, thickness); // Thickness
-        
+
         // Ejecutar operación
         self.write_mmio(0x7000, 0x00000008); // Line command
-        
+
         // Esperar completado
         while self.read_mmio(0x7000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar rectángulo con aceleración 2D
-    fn draw_rect_2d(&mut self, rect: Rect, color: Color, thickness: u32) -> Result<(), &'static str> {
+    fn draw_rect_2d(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+    ) -> Result<(), &'static str> {
         // Dibujar los 4 lados del rectángulo
-        let top_left = Point { x: rect.x, y: rect.y };
-        let top_right = Point { x: rect.x + rect.width, y: rect.y };
-        let bottom_left = Point { x: rect.x, y: rect.y + rect.height };
-        let bottom_right = Point { x: rect.x + rect.width, y: rect.y + rect.height };
-        
+        let top_left = Point {
+            x: rect.x,
+            y: rect.y,
+        };
+        let top_right = Point {
+            x: rect.x + rect.width,
+            y: rect.y,
+        };
+        let bottom_left = Point {
+            x: rect.x,
+            y: rect.y + rect.height,
+        };
+        let bottom_right = Point {
+            x: rect.x + rect.width,
+            y: rect.y + rect.height,
+        };
+
         // Línea superior
         self.draw_line_2d(top_left, top_right, color, thickness)?;
         // Línea derecha
@@ -493,32 +538,45 @@ impl IntelGraphicsDriver {
         self.draw_line_2d(bottom_right, bottom_left, color, thickness)?;
         // Línea izquierda
         self.draw_line_2d(bottom_left, top_left, color, thickness)?;
-        
+
         Ok(())
     }
-    
+
     /// Dibujar círculo con aceleración 2D
-    fn draw_circle_2d(&mut self, center: Point, radius: u32, color: Color, filled: bool) -> Result<(), &'static str> {
+    fn draw_circle_2d(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+    ) -> Result<(), &'static str> {
         // Configurar operación de círculo
         self.write_mmio(0x7400, center.x as u32); // Center X
         self.write_mmio(0x7404, center.y as u32); // Center Y
         self.write_mmio(0x7408, radius); // Radius
         self.write_mmio(0x740C, self.color_to_pixel(color, PixelFormat::BGRA8888)); // Color
         self.write_mmio(0x7410, if filled { 1 } else { 0 }); // Filled flag
-        
+
         // Ejecutar operación
         self.write_mmio(0x7000, 0x00000010); // DrawCircle command
-        
+
         // Esperar completado
         while self.read_mmio(0x7000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar triángulo con aceleración 2D
-    fn draw_triangle_2d(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool) -> Result<(), &'static str> {
+    fn draw_triangle_2d(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+    ) -> Result<(), &'static str> {
         if filled {
             // Rellenar triángulo usando scanline
             self.fill_triangle_2d(p1, p2, p3, color)?;
@@ -528,12 +586,18 @@ impl IntelGraphicsDriver {
             self.draw_line_2d(p2, p3, color, 1)?;
             self.draw_line_2d(p3, p1, color, 1)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Rellenar triángulo con aceleración 2D
-    fn fill_triangle_2d(&mut self, p1: Point, p2: Point, p3: Point, color: Color) -> Result<(), &'static str> {
+    fn fill_triangle_2d(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+    ) -> Result<(), &'static str> {
         // Configurar operación de triángulo
         self.write_mmio(0x7500, p1.x as u32); // P1 X
         self.write_mmio(0x7504, p1.y as u32); // P1 Y
@@ -542,15 +606,15 @@ impl IntelGraphicsDriver {
         self.write_mmio(0x7510, p3.x as u32); // P3 X
         self.write_mmio(0x7514, p3.y as u32); // P3 Y
         self.write_mmio(0x7518, self.color_to_pixel(color, PixelFormat::BGRA8888)); // Color
-        
+
         // Ejecutar operación
         self.write_mmio(0x7000, 0x00000020); // FillTriangle command
-        
+
         // Esperar completado
         while self.read_mmio(0x7000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
 }
@@ -559,9 +623,9 @@ impl IntelGraphicsDriver {
 #[derive(Debug, Clone)]
 pub enum Intel2DOperation {
     FillRect(Rect, Color),
-    DrawRect(Rect, Color, u32), // rect, color, thickness
-    DrawLine(Point, Point, Color, u32), // start, end, color, thickness
-    Blit(Rect, Rect), // source, destination
+    DrawRect(Rect, Color, u32),          // rect, color, thickness
+    DrawLine(Point, Point, Color, u32),  // start, end, color, thickness
+    Blit(Rect, Rect),                    // source, destination
     DrawCircle(Point, u32, Color, bool), // center, radius, color, filled
     DrawTriangle(Point, Point, Point, Color, bool), // p1, p2, p3, color, filled
 }

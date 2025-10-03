@@ -104,7 +104,9 @@ impl XhciController {
                 break;
             }
 
-            if next_ptr == 0 { break; }
+            if next_ptr == 0 {
+                break;
+            }
             xecp_dw_offset = next_ptr as usize;
         }
 
@@ -149,7 +151,7 @@ impl XhciController {
         // HCSParams1 para número de puertos (bits 31:24) en capability regs +0x04
         let hcsparams1 = self.mmio_read32(0x04);
         let num_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
-        
+
         // En xHCI, el conjunto de puertos típicamente comienza en op_base + 0x400
         let ports_base = op_base + 0x400;
         for i in 0..num_ports {
@@ -168,7 +170,7 @@ impl XhciController {
         let op_base = cap_length;
         let hcsparams1 = self.mmio_read32(0x04);
         let num_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
-        
+
         let ports_base = op_base + 0x400;
         for i in 0..num_ports {
             let portsc_off = ports_base + i * 0x10;
@@ -187,7 +189,9 @@ impl XhciController {
             let mut tries = 0;
             while tries < 100000 {
                 let cur = self.mmio_read32(portsc_off);
-                if (cur & (1 << 4)) == 0 { break; }
+                if (cur & (1 << 4)) == 0 {
+                    break;
+                }
                 tries += 1;
             }
 
@@ -205,13 +209,13 @@ impl XhciController {
         let hcsparams1 = self.mmio_read32(0x04);
         let num_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
         let ports_base = op_base + 0x400;
-        
+
         for i in 0..num_ports {
             let portsc_off = ports_base + i * 0x10;
             let status = self.mmio_read32(portsc_off);
             let ccs = (status >> 0) & 1; // Current Connect Status
             let ped = (status >> 2) & 1; // Port Enabled/Disabled
-            
+
             if ccs == 1 && ped == 1 {
                 // Intentar habilitar slot y configurar dispositivo
                 let _ = self.enable_slot_and_configure(i);
@@ -224,9 +228,7 @@ impl XhciController {
         // Por ahora solo reportamos que detectamos algo
         // TODO: Implementar Enable Slot, Address Device, y Transfer Ring setup
         // para HID (teclado/ratón) básico
-        
+
         Ok(())
     }
 }
-
-

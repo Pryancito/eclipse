@@ -1,10 +1,10 @@
 //! Drivers de entrada para Eclipse OS
-//! 
+//!
 //! Basado en los drivers de entrada de Redox OS
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
 
@@ -116,7 +116,7 @@ impl Driver for InputDriver {
 
         self.add_device(input_info)?;
         device.driver_id = Some(self.info.id);
-        
+
         Ok(())
     }
 

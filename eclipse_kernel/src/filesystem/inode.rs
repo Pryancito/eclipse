@@ -1,20 +1,11 @@
 //! Estructura de inodos para Eclipse OS
-//! 
+//!
 //! Los inodos contienen metadatos de archivos y directorios, incluyendo
 //! permisos, tamaño, timestamps y punteros a bloques de datos.
 
 use crate::filesystem::{
-    BLOCK_SIZE,
-    INODE_TYPE_FILE,
-    INODE_TYPE_DIR,
-    INODE_TYPE_SYMLINK,
-    INODE_TYPE_CHARDEV,
-    INODE_TYPE_BLOCKDEV,
-    INODE_TYPE_FIFO,
-    INODE_TYPE_SOCKET,
-    PERM_READ,
-    PERM_WRITE,
-    PERM_EXECUTE,
+    BLOCK_SIZE, INODE_TYPE_BLOCKDEV, INODE_TYPE_CHARDEV, INODE_TYPE_DIR, INODE_TYPE_FIFO,
+    INODE_TYPE_FILE, INODE_TYPE_SOCKET, INODE_TYPE_SYMLINK, PERM_EXECUTE, PERM_READ, PERM_WRITE,
 };
 
 // Número de punteros directos en el inodo
@@ -99,19 +90,37 @@ impl InodePermissions {
 
     pub fn to_u16(&self) -> u16 {
         let mut perms = 0u16;
-        
-        if self.owner_read { perms |= PERM_READ << 6; }
-        if self.owner_write { perms |= PERM_WRITE << 6; }
-        if self.owner_execute { perms |= PERM_EXECUTE << 6; }
-        
-        if self.group_read { perms |= PERM_READ << 3; }
-        if self.group_write { perms |= PERM_WRITE << 3; }
-        if self.group_execute { perms |= PERM_EXECUTE << 3; }
-        
-        if self.other_read { perms |= PERM_READ; }
-        if self.other_write { perms |= PERM_WRITE; }
-        if self.other_execute { perms |= PERM_EXECUTE; }
-        
+
+        if self.owner_read {
+            perms |= PERM_READ << 6;
+        }
+        if self.owner_write {
+            perms |= PERM_WRITE << 6;
+        }
+        if self.owner_execute {
+            perms |= PERM_EXECUTE << 6;
+        }
+
+        if self.group_read {
+            perms |= PERM_READ << 3;
+        }
+        if self.group_write {
+            perms |= PERM_WRITE << 3;
+        }
+        if self.group_execute {
+            perms |= PERM_EXECUTE << 3;
+        }
+
+        if self.other_read {
+            perms |= PERM_READ;
+        }
+        if self.other_write {
+            perms |= PERM_WRITE;
+        }
+        if self.other_execute {
+            perms |= PERM_EXECUTE;
+        }
+
         perms
     }
 
@@ -308,7 +317,11 @@ impl Inode {
     pub fn get_data_block(&self, block_index: u64) -> Option<u64> {
         if block_index < DIRECT_POINTERS as u64 {
             let block = self.direct_blocks[block_index as usize];
-            if block != 0 { Some(block) } else { None }
+            if block != 0 {
+                Some(block)
+            } else {
+                None
+            }
         } else if block_index < (DIRECT_POINTERS + BLOCK_SIZE / 8) as u64 {
             // Implementación simplificada para punteros indirectos
             None
@@ -334,12 +347,12 @@ impl Inode {
         for i in 0..DIRECT_POINTERS {
             self.direct_blocks[i] = 0;
         }
-        
+
         // Limpiar punteros indirectos
         self.single_indirect = 0;
         self.double_indirect = 0;
         self.triple_indirect = 0;
-        
+
         self.blocks = 0;
         self.size = 0;
     }
@@ -485,34 +498,64 @@ impl Inode {
 
         // Tamaño
         let size = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Bloques
         let blocks = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Timestamps
         let atime = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let mtime = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let ctime = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
@@ -520,34 +563,61 @@ impl Inode {
         let mut direct_blocks = [0u64; DIRECT_POINTERS];
         for i in 0..DIRECT_POINTERS {
             direct_blocks[i] = u64::from_le_bytes([
-                bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-                bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
             ]);
             offset += 8;
         }
 
         // Punteros indirectos
         let single_indirect = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let double_indirect = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         let triple_indirect = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
         ]);
         offset += 8;
 
         // Flags
         let flags = u32::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
         ]);
 
         Self {

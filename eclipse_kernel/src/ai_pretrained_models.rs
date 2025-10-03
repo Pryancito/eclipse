@@ -1,41 +1,41 @@
 //! Sistema de Modelos de IA Pre-entrenados para Eclipse OS
-//! 
+//!
 //! Este módulo implementa la carga y gestión de modelos de IA pre-entrenados
 //! optimizados para sistemas operativos embebidos usando bibliotecas reales.
 
 #![no_std]
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "ai-models")]
 use crate::ai_inference_engine::{
     init_inference_engine, load_model as load_real_model, run_inference as run_real_inference,
-    ModelType, InferenceResult, InferenceError
+    InferenceError, InferenceResult, ModelType,
 };
 
 /// Tipo de modelo pre-entrenado
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PretrainedModelType {
     // Modelos de lenguaje natural
-    TinyLlama,              // Modelo de lenguaje pequeño
-    DistilBERT,             // BERT comprimido
-    TinyBERT,               // BERT ultra-comprimido
-    MobileBERT,             // BERT para móviles
-    
+    TinyLlama,  // Modelo de lenguaje pequeño
+    DistilBERT, // BERT comprimido
+    TinyBERT,   // BERT ultra-comprimido
+    MobileBERT, // BERT para móviles
+
     // Modelos de visión
-    MobileNetV2,            // Red neuronal móvil
-    EfficientNetLite,       // EfficientNet optimizado
-    TinyYOLO,               // YOLO pequeño
-    
+    MobileNetV2,      // Red neuronal móvil
+    EfficientNetLite, // EfficientNet optimizado
+    TinyYOLO,         // YOLO pequeño
+
     // Modelos especializados
-    AnomalyDetector,        // Detector de anomalías
-    TimeSeriesPredictor,    // Predictor de series temporales
-    ProcessClassifier,      // Clasificador de procesos
-    SecurityAnalyzer,       // Analizador de seguridad
-    PerformancePredictor,   // Predictor de rendimiento
+    AnomalyDetector,      // Detector de anomalías
+    TimeSeriesPredictor,  // Predictor de series temporales
+    ProcessClassifier,    // Clasificador de procesos
+    SecurityAnalyzer,     // Analizador de seguridad
+    PerformancePredictor, // Predictor de rendimiento
 }
 
 impl core::fmt::Display for PretrainedModelType {
@@ -60,11 +60,11 @@ impl core::fmt::Display for PretrainedModelType {
 /// Fuente del modelo
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelSource {
-    HuggingFace(String),    // Modelo de Hugging Face
-    ONNXModelZoo(String),   // Modelo de ONNX Model Zoo
-    LocalFile(String),      // Archivo local
-    Embedded,               // Modelo embebido en el kernel
-    Custom(String),         // Fuente personalizada
+    HuggingFace(String),  // Modelo de Hugging Face
+    ONNXModelZoo(String), // Modelo de ONNX Model Zoo
+    LocalFile(String),    // Archivo local
+    Embedded,             // Modelo embebido en el kernel
+    Custom(String),       // Fuente personalizada
 }
 
 /// Información del modelo pre-entrenado
@@ -134,7 +134,7 @@ impl PretrainedModelManager {
 
         // Crear catálogo de modelos disponibles
         self.create_model_catalog()?;
-        
+
         self.is_initialized.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -154,7 +154,8 @@ impl PretrainedModelManager {
                 inference_time_ms: 150,
                 compatible_hardware: ["x86_64".to_string(), "ARM64".to_string()].to_vec(),
                 license: "Apache-2.0".to_string(),
-                description: "Modelo de lenguaje pequeño para procesamiento de comandos naturales".to_string(),
+                description: "Modelo de lenguaje pequeño para procesamiento de comandos naturales"
+                    .to_string(),
             },
             PretrainedModelInfo {
                 name: "DistilBERT-Base".to_string(),
@@ -221,7 +222,7 @@ impl PretrainedModelManager {
 
         // Crear modelo (simulado - en implementación real se cargaría desde archivo)
         let model_info = self.get_model_info(model_name)?;
-        
+
         // Verificar memoria disponible
         if self.total_memory_usage + model_info.memory_usage > self.max_memory_mb {
             return Err("Memoria insuficiente para cargar modelo");
@@ -242,14 +243,15 @@ impl PretrainedModelManager {
         // Cargar modelo real usando el motor de inferencia
         #[cfg(feature = "ai-models")]
         {
-            let model_type = self.convert_to_real_model_type(&self.models[model_id].info.model_type);
+            let model_type =
+                self.convert_to_real_model_type(&self.models[model_id].info.model_type);
             let model_path = self.get_model_path(model_name);
-            
+
             match load_real_model(model_name, &model_path, model_type) {
                 Ok(_) => {
                     self.models[model_id].state = ModelState::Loaded;
                     self.models[model_id].state = ModelState::Ready;
-                },
+                }
                 Err(_) => {
                     self.models[model_id].state = ModelState::Error;
                     return Err("Error cargando modelo real");
@@ -264,10 +266,10 @@ impl PretrainedModelManager {
             self.models[model_id].state = ModelState::Loaded;
             self.models[model_id].state = ModelState::Ready;
         }
-        
+
         // Actualizar uso de memoria
         self.total_memory_usage += self.models[model_id].info.memory_usage;
-        
+
         // Registrar dirección de memoria (simulada)
         self.models[model_id].memory_address = Some(0x1000000 + (model_id as u64 * 0x100000));
 
@@ -346,12 +348,14 @@ impl PretrainedModelManager {
                 Ok(inference_result) => {
                     // Actualizar métricas con datos reales
                     model.last_inference = get_time_ms();
-                    alloc::format!("[{}] {} ({}ms, confianza: {:.2}%)", 
-                                 model.info.name, 
-                                 inference_result.output,
-                                 inference_result.processing_time_ms,
-                                 inference_result.confidence * 100.0)
-                },
+                    alloc::format!(
+                        "[{}] {} ({}ms, confianza: {:.2}%)",
+                        model.info.name,
+                        inference_result.output,
+                        inference_result.processing_time_ms,
+                        inference_result.confidence * 100.0
+                    )
+                }
                 Err(_) => {
                     model.error_count += 1;
                     model.state = ModelState::Error;
@@ -367,13 +371,13 @@ impl PretrainedModelManager {
             let processing_time = Self::simulate_processing_time_static(&model_info);
             let result = Self::generate_model_response_static(&model_info, input, processing_time);
             let error_condition = Self::simulate_error_condition_static();
-            
+
             if error_condition {
                 model.error_count += 1;
                 model.state = ModelState::Error;
                 return Err("Error durante la inferencia");
             }
-            
+
             result
         };
 
@@ -388,7 +392,7 @@ impl PretrainedModelManager {
         let base_time = 10; // ms
         let param_factor = (info.parameters as f64 / 1_000_000.0) * 0.1; // 0.1ms por millón de parámetros
         let memory_factor = (info.memory_usage as f64 / 100.0) * 0.05; // 0.05ms por 100MB
-        
+
         (base_time as f64 + param_factor + memory_factor) as u64
     }
 
@@ -398,60 +402,75 @@ impl PretrainedModelManager {
         let base_time = 10; // ms
         let param_factor = (info.parameters as f64 / 1_000_000.0) * 0.1; // 0.1ms por millón de parámetros
         let memory_factor = (info.memory_usage as f64 / 100.0) * 0.05; // 0.05ms por 100MB
-        
+
         (base_time as f64 + param_factor + memory_factor) as u64
     }
 
     /// Generar respuesta del modelo
-    fn generate_model_response(&self, info: &PretrainedModelInfo, input: &str, processing_time: u64) -> String {
+    fn generate_model_response(
+        &self,
+        info: &PretrainedModelInfo,
+        input: &str,
+        processing_time: u64,
+    ) -> String {
         match info.model_type {
-            PretrainedModelType::TinyLlama => {
-                self.generate_llm_response(input, processing_time)
-            },
-            PretrainedModelType::DistilBERT => {
-                self.generate_nlp_response(input, processing_time)
-            },
+            PretrainedModelType::TinyLlama => self.generate_llm_response(input, processing_time),
+            PretrainedModelType::DistilBERT => self.generate_nlp_response(input, processing_time),
             PretrainedModelType::AnomalyDetector => {
                 self.generate_anomaly_response(input, processing_time)
-            },
+            }
             PretrainedModelType::ProcessClassifier => {
                 self.generate_process_response(input, processing_time)
-            },
+            }
             PretrainedModelType::SecurityAnalyzer => {
                 self.generate_security_response(input, processing_time)
-            },
+            }
             PretrainedModelType::PerformancePredictor => {
                 self.generate_performance_response(input, processing_time)
-            },
+            }
             _ => {
-                alloc::format!("[{}] Procesado en {}ms: '{}'", info.name, processing_time, input)
+                alloc::format!(
+                    "[{}] Procesado en {}ms: '{}'",
+                    info.name,
+                    processing_time,
+                    input
+                )
             }
         }
     }
 
     /// Generar respuesta del modelo (versión estática)
-    fn generate_model_response_static(info: &PretrainedModelInfo, input: &str, processing_time: u64) -> String {
+    fn generate_model_response_static(
+        info: &PretrainedModelInfo,
+        input: &str,
+        processing_time: u64,
+    ) -> String {
         match info.model_type {
             PretrainedModelType::TinyLlama => {
                 Self::generate_llm_response_static(input, processing_time)
-            },
+            }
             PretrainedModelType::DistilBERT => {
                 Self::generate_nlp_response_static(input, processing_time)
-            },
+            }
             PretrainedModelType::AnomalyDetector => {
                 Self::generate_anomaly_response_static(input, processing_time)
-            },
+            }
             PretrainedModelType::ProcessClassifier => {
                 Self::generate_process_response_static(input, processing_time)
-            },
+            }
             PretrainedModelType::SecurityAnalyzer => {
                 Self::generate_security_response_static(input, processing_time)
-            },
+            }
             PretrainedModelType::PerformancePredictor => {
                 Self::generate_performance_response_static(input, processing_time)
-            },
+            }
             _ => {
-                alloc::format!("[{}] Procesado en {}ms: '{}'", info.name, processing_time, input)
+                alloc::format!(
+                    "[{}] Procesado en {}ms: '{}'",
+                    info.name,
+                    processing_time,
+                    input
+                )
             }
         }
     }
@@ -462,21 +481,34 @@ impl PretrainedModelManager {
             "Entiendo tu consulta. Basándome en el contexto del sistema Eclipse OS...",
             "Como modelo de lenguaje integrado en el kernel, puedo ayudarte con...",
             "Analizando tu solicitud desde la perspectiva del sistema operativo...",
-            "Procesando tu entrada con capacidades de comprensión de lenguaje natural..."
+            "Procesando tu entrada con capacidades de comprensión de lenguaje natural...",
         ];
-        
+
         let response_idx = input.len() % responses.len();
-        alloc::format!("[TinyLlama] {} ({}ms) - Input: '{}'", 
-                      responses[response_idx], processing_time, input)
+        alloc::format!(
+            "[TinyLlama] {} ({}ms) - Input: '{}'",
+            responses[response_idx],
+            processing_time,
+            input
+        )
     }
 
     /// Generar respuesta de NLP
     fn generate_nlp_response(&self, input: &str, processing_time: u64) -> String {
-        let sentiment = if input.contains("error") || input.contains("problema") { "negativo" } else { "positivo" };
+        let sentiment = if input.contains("error") || input.contains("problema") {
+            "negativo"
+        } else {
+            "positivo"
+        };
         let confidence = 0.85 + (processing_time as f64 / 1000.0) * 0.1;
-        
-        alloc::format!("[DistilBERT] Sentimiento: {} (confianza: {:.2}) - '{}' ({}ms)", 
-                      sentiment, confidence, input, processing_time)
+
+        alloc::format!(
+            "[DistilBERT] Sentimiento: {} (confianza: {:.2}) - '{}' ({}ms)",
+            sentiment,
+            confidence,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de detección de anomalías
@@ -484,40 +516,70 @@ impl PretrainedModelManager {
         let is_anomaly = input.len() > 50 || input.contains("sospechoso");
         let status = if is_anomaly { "ANÓMALO" } else { "Normal" };
         let risk_level = if is_anomaly { "ALTO" } else { "BAJO" };
-        
-        alloc::format!("[AnomalyDetector] Estado: {} - Nivel de riesgo: {} - '{}' ({}ms)", 
-                      status, risk_level, input, processing_time)
+
+        alloc::format!(
+            "[AnomalyDetector] Estado: {} - Nivel de riesgo: {} - '{}' ({}ms)",
+            status,
+            risk_level,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de clasificación de procesos
     fn generate_process_response(&self, input: &str, processing_time: u64) -> String {
-        let process_type = if input.contains("kernel") { "Sistema" } 
-                          else if input.contains("user") { "Usuario" } 
-                          else { "Desconocido" };
-        
-        alloc::format!("[ProcessClassifier] Tipo: {} - '{}' ({}ms)", 
-                      process_type, input, processing_time)
+        let process_type = if input.contains("kernel") {
+            "Sistema"
+        } else if input.contains("user") {
+            "Usuario"
+        } else {
+            "Desconocido"
+        };
+
+        alloc::format!(
+            "[ProcessClassifier] Tipo: {} - '{}' ({}ms)",
+            process_type,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de análisis de seguridad
     fn generate_security_response(&self, input: &str, processing_time: u64) -> String {
-        let threat_level = if input.contains("ataque") { "CRÍTICO" }
-                          else if input.contains("sospechoso") { "ALTO" }
-                          else { "BAJO" };
-        
-        alloc::format!("[SecurityAnalyzer] Nivel de amenaza: {} - '{}' ({}ms)", 
-                      threat_level, input, processing_time)
+        let threat_level = if input.contains("ataque") {
+            "CRÍTICO"
+        } else if input.contains("sospechoso") {
+            "ALTO"
+        } else {
+            "BAJO"
+        };
+
+        alloc::format!(
+            "[SecurityAnalyzer] Nivel de amenaza: {} - '{}' ({}ms)",
+            threat_level,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de predicción de rendimiento
     fn generate_performance_response(&self, input: &str, processing_time: u64) -> String {
         let performance_score = 85 + (processing_time % 15);
-        let recommendation = if performance_score > 90 { "Excelente" }
-                           else if performance_score > 75 { "Bueno" }
-                           else { "Necesita optimización" };
-        
-        alloc::format!("[PerformancePredictor] Puntuación: {}% - Recomendación: {} - '{}' ({}ms)", 
-                      performance_score, recommendation, input, processing_time)
+        let recommendation = if performance_score > 90 {
+            "Excelente"
+        } else if performance_score > 75 {
+            "Bueno"
+        } else {
+            "Necesita optimización"
+        };
+
+        alloc::format!(
+            "[PerformancePredictor] Puntuación: {}% - Recomendación: {} - '{}' ({}ms)",
+            performance_score,
+            recommendation,
+            input,
+            processing_time
+        )
     }
 
     /// Simular condición de error
@@ -538,21 +600,34 @@ impl PretrainedModelManager {
             "Entiendo tu consulta. Basándome en el contexto del sistema Eclipse OS...",
             "Como modelo de lenguaje integrado en el kernel, puedo ayudarte con...",
             "Analizando tu solicitud desde la perspectiva del sistema operativo...",
-            "Procesando tu entrada con capacidades de comprensión de lenguaje natural..."
+            "Procesando tu entrada con capacidades de comprensión de lenguaje natural...",
         ];
-        
+
         let response_idx = input.len() % responses.len();
-        alloc::format!("[TinyLlama] {} ({}ms) - Input: '{}'", 
-                      responses[response_idx], processing_time, input)
+        alloc::format!(
+            "[TinyLlama] {} ({}ms) - Input: '{}'",
+            responses[response_idx],
+            processing_time,
+            input
+        )
     }
 
     /// Generar respuesta de NLP (versión estática)
     fn generate_nlp_response_static(input: &str, processing_time: u64) -> String {
-        let sentiment = if input.contains("error") || input.contains("problema") { "negativo" } else { "positivo" };
+        let sentiment = if input.contains("error") || input.contains("problema") {
+            "negativo"
+        } else {
+            "positivo"
+        };
         let confidence = 0.85 + (processing_time as f64 / 1000.0) * 0.1;
-        
-        alloc::format!("[DistilBERT] Sentimiento: {} (confianza: {:.2}) - '{}' ({}ms)", 
-                      sentiment, confidence, input, processing_time)
+
+        alloc::format!(
+            "[DistilBERT] Sentimiento: {} (confianza: {:.2}) - '{}' ({}ms)",
+            sentiment,
+            confidence,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de detección de anomalías (versión estática)
@@ -560,47 +635,81 @@ impl PretrainedModelManager {
         let is_anomaly = input.len() > 50 || input.contains("sospechoso");
         let status = if is_anomaly { "ANÓMALO" } else { "Normal" };
         let risk_level = if is_anomaly { "ALTO" } else { "BAJO" };
-        
-        alloc::format!("[AnomalyDetector] Estado: {} - Nivel de riesgo: {} - '{}' ({}ms)", 
-                      status, risk_level, input, processing_time)
+
+        alloc::format!(
+            "[AnomalyDetector] Estado: {} - Nivel de riesgo: {} - '{}' ({}ms)",
+            status,
+            risk_level,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de clasificación de procesos (versión estática)
     fn generate_process_response_static(input: &str, processing_time: u64) -> String {
-        let process_type = if input.contains("kernel") { "Sistema" } 
-                          else if input.contains("user") { "Usuario" } 
-                          else { "Desconocido" };
-        
-        alloc::format!("[ProcessClassifier] Tipo: {} - '{}' ({}ms)", 
-                      process_type, input, processing_time)
+        let process_type = if input.contains("kernel") {
+            "Sistema"
+        } else if input.contains("user") {
+            "Usuario"
+        } else {
+            "Desconocido"
+        };
+
+        alloc::format!(
+            "[ProcessClassifier] Tipo: {} - '{}' ({}ms)",
+            process_type,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de análisis de seguridad (versión estática)
     fn generate_security_response_static(input: &str, processing_time: u64) -> String {
-        let threat_level = if input.contains("ataque") { "CRÍTICO" }
-                          else if input.contains("sospechoso") { "ALTO" }
-                          else { "BAJO" };
-        
-        alloc::format!("[SecurityAnalyzer] Nivel de amenaza: {} - '{}' ({}ms)", 
-                      threat_level, input, processing_time)
+        let threat_level = if input.contains("ataque") {
+            "CRÍTICO"
+        } else if input.contains("sospechoso") {
+            "ALTO"
+        } else {
+            "BAJO"
+        };
+
+        alloc::format!(
+            "[SecurityAnalyzer] Nivel de amenaza: {} - '{}' ({}ms)",
+            threat_level,
+            input,
+            processing_time
+        )
     }
 
     /// Generar respuesta de predicción de rendimiento (versión estática)
     fn generate_performance_response_static(input: &str, processing_time: u64) -> String {
         let performance_score = 85 + (processing_time % 15);
-        let recommendation = if performance_score > 90 { "Excelente" }
-                           else if performance_score > 75 { "Bueno" }
-                           else { "Necesita optimización" };
-        
-        alloc::format!("[PerformancePredictor] Puntuación: {}% - Recomendación: {} - '{}' ({}ms)", 
-                      performance_score, recommendation, input, processing_time)
+        let recommendation = if performance_score > 90 {
+            "Excelente"
+        } else if performance_score > 75 {
+            "Bueno"
+        } else {
+            "Necesita optimización"
+        };
+
+        alloc::format!(
+            "[PerformancePredictor] Puntuación: {}% - Recomendación: {} - '{}' ({}ms)",
+            performance_score,
+            recommendation,
+            input,
+            processing_time
+        )
     }
 
     /// Obtener estadísticas del gestor
     pub fn get_stats(&self) -> ModelManagerStats {
         ModelManagerStats {
             total_models: self.models.len(),
-            loaded_models: self.models.iter().filter(|m| m.state == ModelState::Ready).count(),
+            loaded_models: self
+                .models
+                .iter()
+                .filter(|m| m.state == ModelState::Ready)
+                .count(),
             total_memory_usage: self.total_memory_usage,
             max_memory: self.max_memory_mb,
             total_inferences: self.models.iter().map(|m| m.inference_count).sum(),
@@ -633,13 +742,14 @@ impl PretrainedModelManager {
 
         let model = &self.models[model_id];
         let current_time = get_time_ms();
-        
+
         Ok(ModelMetrics {
             model_name: model.info.name.clone(),
             inference_count: model.inference_count,
             error_count: model.error_count,
             success_rate: if model.inference_count > 0 {
-                ((model.inference_count - model.error_count) as f64 / model.inference_count as f64) * 100.0
+                ((model.inference_count - model.error_count) as f64 / model.inference_count as f64)
+                    * 100.0
             } else {
                 0.0
             },
@@ -657,12 +767,13 @@ impl PretrainedModelManager {
         let mut freed_models = 0;
 
         // Crear lista de modelos a remover (en orden inverso para evitar problemas de índices)
-        let models_to_remove: Vec<usize> = self.models
+        let models_to_remove: Vec<usize> = self
+            .models
             .iter()
             .enumerate()
             .filter(|(_, model)| {
-                model.state == ModelState::Ready && 
-                current_time.saturating_sub(model.last_inference) > inactive_threshold
+                model.state == ModelState::Ready
+                    && current_time.saturating_sub(model.last_inference) > inactive_threshold
             })
             .map(|(idx, _)| idx)
             .rev()
@@ -681,9 +792,18 @@ impl PretrainedModelManager {
     /// Verificar salud del sistema de modelos
     pub fn health_check(&self) -> SystemHealth {
         let total_models = self.models.len();
-        let ready_models = self.models.iter().filter(|m| m.state == ModelState::Ready).count();
-        let error_models = self.models.iter().filter(|m| m.state == ModelState::Error).count();
-        let memory_usage_percent = (self.total_memory_usage as f64 / self.max_memory_mb as f64) * 100.0;
+        let ready_models = self
+            .models
+            .iter()
+            .filter(|m| m.state == ModelState::Ready)
+            .count();
+        let error_models = self
+            .models
+            .iter()
+            .filter(|m| m.state == ModelState::Error)
+            .count();
+        let memory_usage_percent =
+            (self.total_memory_usage as f64 / self.max_memory_mb as f64) * 100.0;
 
         let health_status = if error_models > total_models / 2 {
             HealthStatus::Critical
@@ -699,27 +819,35 @@ impl PretrainedModelManager {
             ready_models,
             error_models,
             memory_usage_percent,
-            recommendations: self.generate_health_recommendations(health_status, memory_usage_percent),
+            recommendations: self
+                .generate_health_recommendations(health_status, memory_usage_percent),
         }
     }
 
     /// Generar recomendaciones de salud
-    fn generate_health_recommendations(&self, status: HealthStatus, memory_usage: f64) -> Vec<String> {
+    fn generate_health_recommendations(
+        &self,
+        status: HealthStatus,
+        memory_usage: f64,
+    ) -> Vec<String> {
         let mut recommendations = Vec::new();
 
         match status {
             HealthStatus::Critical => {
-                recommendations.push("Sistema en estado crítico - reiniciar servicios de IA".to_string());
+                recommendations
+                    .push("Sistema en estado crítico - reiniciar servicios de IA".to_string());
                 recommendations.push("Verificar logs de errores inmediatamente".to_string());
-            },
+            }
             HealthStatus::Warning => {
                 if memory_usage > 90.0 {
-                    recommendations.push("Uso de memoria alto - considerar optimización".to_string());
+                    recommendations
+                        .push("Uso de memoria alto - considerar optimización".to_string());
                 }
                 if memory_usage > 80.0 {
-                    recommendations.push("Liberar modelos inactivos para optimizar memoria".to_string());
+                    recommendations
+                        .push("Liberar modelos inactivos para optimizar memoria".to_string());
                 }
-            },
+            }
             HealthStatus::Healthy => {
                 recommendations.push("Sistema funcionando correctamente".to_string());
                 if memory_usage > 70.0 {
@@ -735,18 +863,22 @@ impl PretrainedModelManager {
     pub fn get_detailed_report(&self) -> SystemReport {
         let stats = self.get_stats();
         let health = self.health_check();
-        
+
         SystemReport {
             timestamp: get_time_ms(),
             stats,
             health,
-            model_details: self.models.iter().map(|m| ModelDetail {
-                name: m.info.name.clone(),
-                state: m.state,
-                inference_count: m.inference_count,
-                error_count: m.error_count,
-                memory_address: m.memory_address,
-            }).collect(),
+            model_details: self
+                .models
+                .iter()
+                .map(|m| ModelDetail {
+                    name: m.info.name.clone(),
+                    state: m.state,
+                    inference_count: m.inference_count,
+                    error_count: m.error_count,
+                    memory_address: m.memory_address,
+                })
+                .collect(),
         }
     }
 }
@@ -838,9 +970,7 @@ pub fn init_pretrained_models() -> Result<(), &'static str> {
 
 /// Obtener gestor de modelos
 pub fn get_model_manager() -> Option<&'static mut PretrainedModelManager> {
-    unsafe {
-        MODEL_MANAGER.as_mut()
-    }
+    unsafe { MODEL_MANAGER.as_mut() }
 }
 
 /// Cargar modelo específico

@@ -1,7 +1,7 @@
-use core::fmt;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
+use core::fmt;
 
 /// Estructura para manejar la comunicación con UEFI GOP
 pub struct UefiGopManager {
@@ -43,14 +43,14 @@ impl UefiGopManager {
     pub fn initialize(&mut self) -> Result<(), String> {
         // En un sistema real, esto obtendría el protocolo GOP de la System Table de UEFI
         // Por ahora, simulamos la inicialización
-        
+
         // Simular obtención del protocolo GOP
         self.gop_protocol = self.get_gop_protocol_from_uefi()?;
-        
+
         if self.gop_protocol.is_null() {
             return Err("No se pudo obtener protocolo GOP de UEFI".to_string());
         }
-        
+
         Ok(())
     }
 
@@ -60,7 +60,7 @@ impl UefiGopManager {
         // 1. Obtener la System Table de UEFI
         // 2. Buscar el protocolo GOP en la lista de protocolos
         // 3. Retornar el puntero al protocolo
-        
+
         // Por ahora, simulamos que obtenemos el protocolo
         unsafe {
             // Simular puntero válido
@@ -76,7 +76,7 @@ impl UefiGopManager {
         }
 
         let mut modes = Vec::new();
-        
+
         // En un sistema real, esto iteraría a través de los modos disponibles
         // Por ahora, simulamos algunos modos comunes
         let simulated_modes = [
@@ -98,7 +98,7 @@ impl UefiGopManager {
                 width: *width,
                 height: *height,
                 pixels_per_scan_line: *width, // Simplificado
-                pixel_format: 0x00E07F00, // RGB
+                pixel_format: 0x00E07F00,     // RGB
                 framebuffer_base: 0xE0000000 + (i as u64 * 0x1000000), // Simulado
             });
         }
@@ -107,16 +107,24 @@ impl UefiGopManager {
     }
 
     /// Buscar un modo de video específico
-    pub fn find_mode(&self, width: u32, height: u32, bits_per_pixel: u32) -> Result<UefiModeInfo, String> {
+    pub fn find_mode(
+        &self,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> Result<UefiModeInfo, String> {
         let modes = self.list_available_modes()?;
-        
+
         for mode in modes {
             if mode.width == width && mode.height == height && mode.pixel_format == bits_per_pixel {
                 return Ok(mode);
             }
         }
-        
-        Err(format!("Modo {}x{} @{}bpp no encontrado", width, height, bits_per_pixel))
+
+        Err(format!(
+            "Modo {}x{} @{}bpp no encontrado",
+            width, height, bits_per_pixel
+        ))
     }
 
     /// Cambiar a un modo de video específico
@@ -127,14 +135,14 @@ impl UefiGopManager {
 
         // En un sistema real, esto llamaría a SetMode en el protocolo GOP
         // Por ahora, simulamos el cambio de modo
-        
+
         // Simular llamada a UEFI GOP SetMode
         match self.simulate_uefi_set_mode(mode_number) {
             Ok(_) => {
                 self.current_mode = mode_number;
                 Ok(())
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
@@ -145,12 +153,12 @@ impl UefiGopManager {
         // if result != EFI_SUCCESS {
         //     return Err("Error estableciendo modo de video en UEFI".to_string());
         // }
-        
+
         // Simular validación del modo
         if mode_number > 10 {
             return Err("Modo de video inválido".to_string());
         }
-        
+
         // Simular éxito
         Ok(())
     }
@@ -163,7 +171,7 @@ impl UefiGopManager {
 
         // En un sistema real, esto obtendría la información del modo actual
         // Por ahora, simulamos la información
-        
+
         // Simular obtención de información del modo actual
         Ok(UefiModeInfo {
             mode_number: self.current_mode,
@@ -176,13 +184,18 @@ impl UefiGopManager {
     }
 
     /// Cambiar resolución (función de alto nivel)
-    pub fn change_resolution(&mut self, width: u32, height: u32, bits_per_pixel: u32) -> Result<UefiModeInfo, String> {
+    pub fn change_resolution(
+        &mut self,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> Result<UefiModeInfo, String> {
         // Buscar el modo solicitado
         let mode_info = self.find_mode(width, height, bits_per_pixel)?;
-        
+
         // Cambiar al modo
         self.set_mode(mode_info.mode_number)?;
-        
+
         // Retornar la información del modo
         Ok(mode_info)
     }
@@ -208,7 +221,10 @@ impl UefiGopManager {
         if self.gop_protocol.is_null() {
             "Protocolo GOP: No inicializado".to_string()
         } else {
-            format!("Protocolo GOP: Inicializado (modo actual: {})", self.current_mode)
+            format!(
+                "Protocolo GOP: Inicializado (modo actual: {})",
+                self.current_mode
+            )
         }
     }
 }
@@ -236,7 +252,7 @@ pub mod graphics_integration {
                 notify_graphics_system_resolution_change(width, height, bits_per_pixel);
                 Ok(mode_info)
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
@@ -247,7 +263,7 @@ pub mod graphics_integration {
         // - El sistema de eventos
         // - Los drivers de gráficos
         // - Las aplicaciones que necesiten redimensionarse
-        
+
         // Por ahora, solo registramos el cambio
         // En un sistema real, esto sería una llamada a una función del sistema
     }
@@ -284,7 +300,7 @@ mod tests {
     fn test_list_modes() {
         let mut manager = UefiGopManager::new();
         manager.initialize().unwrap();
-        
+
         let modes = manager.list_available_modes();
         assert!(modes.is_ok());
         assert!(!modes.unwrap().is_empty());
@@ -294,7 +310,7 @@ mod tests {
     fn test_find_mode() {
         let mut manager = UefiGopManager::new();
         manager.initialize().unwrap();
-        
+
         let mode = manager.find_mode(1024, 768, 32);
         assert!(mode.is_ok());
     }
@@ -303,7 +319,7 @@ mod tests {
     fn test_change_resolution() {
         let mut manager = UefiGopManager::new();
         manager.initialize().unwrap();
-        
+
         let result = manager.change_resolution(1024, 768, 32);
         assert!(result.is_ok());
     }

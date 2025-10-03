@@ -1,10 +1,10 @@
 //! Driver de ratón para Eclipse OS
-//! 
+//!
 //! Define las interfaces y tipos básicos para drivers de ratón.
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
 };
 
 /// Botones del ratón
@@ -55,22 +55,22 @@ impl MouseEvent {
 pub trait MouseDriver {
     /// Leer siguiente evento del ratón
     fn read_event(&mut self) -> Option<MouseEvent>;
-    
+
     /// Verificar si un botón está presionado
     fn is_button_pressed(&self, button: MouseButton) -> bool;
-    
+
     /// Obtener posición actual del ratón
     fn get_position(&self) -> (i32, i32);
-    
+
     /// Establecer posición del ratón
     fn set_position(&mut self, x: i32, y: i32);
-    
+
     /// Obtener valor de la rueda
     fn get_wheel(&self) -> i8;
-    
+
     /// Limpiar buffer de eventos
     fn clear_buffer(&mut self);
-    
+
     /// Verificar si hay eventos pendientes
     fn has_events(&self) -> bool;
 }

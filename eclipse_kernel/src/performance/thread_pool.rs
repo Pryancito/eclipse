@@ -3,10 +3,10 @@
 //! Este módulo implementa un thread pool optimizado para
 //! mejorar el rendimiento del sistema multihilo
 
-use crate::process::{ThreadId, ProcessId};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use alloc::vec::Vec;
+use crate::process::{ProcessId, ThreadId};
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Estado de un worker thread
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,7 +82,7 @@ impl ThreadPool {
     /// Crear un nuevo thread pool
     pub fn new() -> Self {
         let config = ThreadPoolConfig::default();
-        
+
         Self {
             config,
             workers: Vec::new(),
@@ -100,7 +100,7 @@ impl ThreadPool {
         // Limpiar workers existentes
         self.workers.clear();
         self.task_queue.clear();
-        
+
         // Crear workers iniciales
         for i in 0..self.config.initial_threads {
             let worker = WorkerThread {
@@ -110,13 +110,18 @@ impl ThreadPool {
                 task_count: 0,
                 total_work_time: 0,
                 last_activity: self.get_current_time(),
-                cpu_affinity: if self.config.enable_cpu_affinity { Some(i) } else { None },
+                cpu_affinity: if self.config.enable_cpu_affinity {
+                    Some(i)
+                } else {
+                    None
+                },
             };
             self.workers.push(worker);
         }
-        
-        self.active_workers.store(self.config.initial_threads, Ordering::Release);
-        
+
+        self.active_workers
+            .store(self.config.initial_threads, Ordering::Release);
+
         Ok(())
     }
 
@@ -125,19 +130,19 @@ impl ThreadPool {
         if self.task_queue.len() >= self.config.task_queue_size {
             return Err("Task queue is full");
         }
-        
+
         // Asignar ID a la tarea
         task.task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        
+
         // Guardar el task_id antes de mover la tarea
         let task_id = task.task_id;
-        
+
         // Agregar a la cola de tareas
         self.task_queue.push_back(task);
-        
+
         // Intentar asignar la tarea a un worker
         self.assign_tasks();
-        
+
         Ok(task_id)
     }
 
@@ -161,7 +166,7 @@ impl ThreadPool {
                 return Some(index);
             }
         }
-        
+
         // Si no hay workers idle y podemos crear más
         if self.workers.len() < self.config.max_threads && self.config.enable_dynamic_scaling {
             self.create_new_worker()
@@ -180,12 +185,16 @@ impl ThreadPool {
             task_count: 0,
             total_work_time: 0,
             last_activity: self.get_current_time(),
-            cpu_affinity: if self.config.enable_cpu_affinity { Some(worker_id as usize) } else { None },
+            cpu_affinity: if self.config.enable_cpu_affinity {
+                Some(worker_id as usize)
+            } else {
+                None
+            },
         };
-        
+
         self.workers.push(worker);
         self.active_workers.fetch_add(1, Ordering::Relaxed);
-        
+
         Some(self.workers.len() - 1)
     }
 
@@ -197,7 +206,7 @@ impl ThreadPool {
             worker.state = WorkerState::Busy;
             worker.task_count += 1;
             worker.last_activity = current_time;
-            
+
             // Simular ejecución de la tarea directamente
             let work_time = task.estimated_duration;
             worker.total_work_time += work_time;
@@ -205,7 +214,7 @@ impl ThreadPool {
             self.total_tasks_completed.fetch_add(1, Ordering::Relaxed);
             worker.state = WorkerState::Idle;
             worker.last_activity = end_time;
-            
+
             // Ejecutar callback si existe
             if let Some(callback) = task.callback {
                 callback();
@@ -217,19 +226,19 @@ impl ThreadPool {
     fn simulate_task_execution(&mut self, worker: &mut WorkerThread, task: &Task) {
         // En un sistema real, esto ejecutaría la tarea real
         // Por ahora, simulamos con el tiempo estimado
-        
+
         let work_time = task.estimated_duration;
         worker.total_work_time += work_time;
         self.total_work_time.fetch_add(work_time, Ordering::Relaxed);
-        
+
         // Marcar tarea como completada
         self.total_tasks_completed.fetch_add(1, Ordering::Relaxed);
-        
+
         // Marcar worker como idle
         worker.state = WorkerState::Idle;
         let current_time = self.get_current_time();
         worker.last_activity = current_time;
-        
+
         // Ejecutar callback si existe
         if let Some(callback) = task.callback {
             callback();
@@ -241,14 +250,14 @@ impl ThreadPool {
         if self.config.enable_dynamic_scaling {
             self.scale_pool();
         }
-        
+
         if self.config.enable_work_stealing {
             self.steal_work();
         }
-        
+
         self.cleanup_idle_workers();
         self.update_utilization();
-        
+
         Ok(())
     }
 
@@ -256,12 +265,15 @@ impl ThreadPool {
     fn scale_pool(&mut self) {
         let current_utilization = self.pool_utilization.load(Ordering::Acquire);
         let active_workers = self.active_workers.load(Ordering::Relaxed);
-        
+
         // Si la utilización es alta y hay tareas en cola, agregar workers
-        if current_utilization > 80 && !self.task_queue.is_empty() && active_workers < self.config.max_threads {
+        if current_utilization > 80
+            && !self.task_queue.is_empty()
+            && active_workers < self.config.max_threads
+        {
             self.create_new_worker();
         }
-        
+
         // Si la utilización es baja y hay muchos workers, remover algunos
         if current_utilization < 20 && active_workers > self.config.min_threads {
             self.remove_idle_worker();
@@ -272,19 +284,23 @@ impl ThreadPool {
     fn steal_work(&mut self) {
         // Implementación simple de work stealing
         // En un sistema real, esto sería más complejo
-        
-        let busy_workers: Vec<usize> = self.workers.iter()
+
+        let busy_workers: Vec<usize> = self
+            .workers
+            .iter()
             .enumerate()
             .filter(|(_, worker)| worker.state == WorkerState::Busy)
             .map(|(index, _)| index)
             .collect();
-        
-        let idle_workers: Vec<usize> = self.workers.iter()
+
+        let idle_workers: Vec<usize> = self
+            .workers
+            .iter()
             .enumerate()
             .filter(|(_, worker)| worker.state == WorkerState::Idle)
             .map(|(index, _)| index)
             .collect();
-        
+
         // Si hay workers idle y tareas en cola, redistribuir
         if !idle_workers.is_empty() && !self.task_queue.is_empty() {
             self.assign_tasks();
@@ -297,12 +313,13 @@ impl ThreadPool {
         let timeout = self.config.thread_timeout;
         let min_threads = self.config.min_threads;
         let current_len = self.workers.len();
-        
+
         // Remover workers que han estado idle por mucho tiempo
         self.workers.retain(|worker| {
-            if worker.state == WorkerState::Idle && 
-               current_time - worker.last_activity > timeout &&
-               current_len > min_threads {
+            if worker.state == WorkerState::Idle
+                && current_time - worker.last_activity > timeout
+                && current_len > min_threads
+            {
                 self.active_workers.fetch_sub(1, Ordering::Relaxed);
                 false
             } else {
@@ -313,7 +330,11 @@ impl ThreadPool {
 
     /// Remover un worker idle
     fn remove_idle_worker(&mut self) {
-        if let Some(index) = self.workers.iter().position(|w| w.state == WorkerState::Idle) {
+        if let Some(index) = self
+            .workers
+            .iter()
+            .position(|w| w.state == WorkerState::Idle)
+        {
             self.workers.remove(index);
             self.active_workers.fetch_sub(1, Ordering::Relaxed);
         }
@@ -322,13 +343,16 @@ impl ThreadPool {
     /// Actualizar utilización del pool
     fn update_utilization(&mut self) {
         let active_workers = self.active_workers.load(Ordering::Relaxed);
-        let busy_workers = self.workers.iter()
+        let busy_workers = self
+            .workers
+            .iter()
             .filter(|w| w.state == WorkerState::Busy)
             .count();
-        
+
         if active_workers > 0 {
             let utilization = (busy_workers as f64 / active_workers as f64) * 100.0;
-            self.pool_utilization.store(utilization as u64, Ordering::Release);
+            self.pool_utilization
+                .store(utilization as u64, Ordering::Release);
         }
     }
 
@@ -340,11 +364,13 @@ impl ThreadPool {
     /// Obtener estadísticas del pool
     pub fn get_stats(&self) -> ThreadPoolStats {
         let active_workers = self.active_workers.load(Ordering::Relaxed);
-        let busy_workers = self.workers.iter()
+        let busy_workers = self
+            .workers
+            .iter()
             .filter(|w| w.state == WorkerState::Busy)
             .count();
         let idle_workers = active_workers - busy_workers;
-        
+
         ThreadPoolStats {
             total_workers: self.workers.len(),
             active_workers,
@@ -362,7 +388,7 @@ impl ThreadPool {
     fn calculate_average_task_duration(&self) -> u64 {
         let completed_tasks = self.total_tasks_completed.load(Ordering::Relaxed);
         let total_work_time = self.total_work_time.load(Ordering::Relaxed);
-        
+
         if completed_tasks > 0 {
             total_work_time / completed_tasks as u64
         } else {
@@ -374,9 +400,9 @@ impl ThreadPool {
     pub fn update_config(&mut self, config: ThreadPoolConfig) {
         let min_threads = config.min_threads;
         let max_threads = config.max_threads;
-        
+
         self.config = config;
-        
+
         // Ajustar número de workers si es necesario
         if self.workers.len() < min_threads {
             while self.workers.len() < min_threads {

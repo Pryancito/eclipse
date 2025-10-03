@@ -1,5 +1,5 @@
 //! Sistema de drivers para Eclipse OS
-//! 
+//!
 //! Este módulo implementa un sistema de drivers básico que incluye:
 //! - Gestión de dispositivos de hardware
 //! - Drivers para dispositivos de almacenamiento
@@ -8,60 +8,69 @@
 //! - Drivers de audio
 //! - Drivers de entrada (teclado, mouse)
 
+pub mod acceleration_2d;
+pub mod amd_graphics;
+pub mod block;
+pub mod binary_driver_manager;
+pub mod bochs_vbe;
 pub mod device;
-pub mod storage;
-pub mod network;
-pub mod video;
+pub mod direct_framebuffer;
+pub mod drm;
+pub mod drm_integration;
+pub mod drm_manager;
 pub mod framebuffer;
 pub mod framebuffer_manager;
-pub mod input;
-pub mod pci;
-pub mod pci_driver;
-pub mod nvidia_pci_driver;
-pub mod direct_framebuffer;
-pub mod resolution_manager;
 pub mod framebuffer_updater;
-pub mod uefi_gop;
-pub mod uefi_graphics;
-pub mod hardware_framebuffer;
 pub mod gpu_control;
-pub mod binary_driver_manager;
-pub mod ipc;
-pub mod intel_graphics;
-pub mod nvidia_graphics;
-pub mod nvidia_smi;
-pub mod nvidia_cuda;
-pub mod nvidia_vulkan;
-pub mod nvidia_rtx;
-pub mod nvidia_integration;
-pub mod nvidia_example;
-pub mod amd_graphics;
 pub mod gpu_manager;
-pub mod drm;
-pub mod drm_manager;
-pub mod drm_integration;
-pub mod acceleration_2d;
-pub mod usb;
-pub mod usb_keyboard;
-pub mod usb_mouse;
-pub mod usb_hub;
-pub mod usb_hid;
-pub mod usb_keyboard_real;
-pub mod usb_mouse_real;
-pub mod usb_manager;
-pub mod keyboard;
-pub mod mouse;
-pub mod input_system;
 pub mod gui_integration;
+pub mod hardware_framebuffer;
+pub mod input;
+pub mod input_system;
+pub mod intel_graphics;
+pub mod ipc;
+pub mod keyboard;
 pub mod manager;
 pub mod modular;
-pub mod virtio_gpu;
-pub mod bochs_vbe;
-pub mod vmware_svga;
+pub mod mouse;
+pub mod network;
+pub mod nvidia_cuda;
+pub mod nvidia_example;
+pub mod nvidia_graphics;
+pub mod nvidia_integration;
+pub mod nvidia_pci_driver;
+pub mod nvme;
+pub mod sata_ahci;
+pub mod nvidia_rtx;
+pub mod nvidia_smi;
+pub mod nvidia_vulkan;
+pub mod pci;
+pub mod pci_driver;
+pub mod pci_polished;
+pub mod virtio_polished;
+pub mod resolution_manager;
+pub mod storage;
+pub mod uefi_gop;
+pub mod uefi_graphics;
+pub mod usb;
+pub mod usb_hid;
+pub mod usb_hub;
+pub mod usb_keyboard;
+pub mod usb_keyboard_real;
+pub mod usb_manager;
+pub mod usb_mouse;
+pub mod usb_mouse_real;
 pub mod usb_xhci;
+pub mod virtio_blk;
+pub mod virtio_std;
+pub mod ata_direct;
+pub mod ahci;
+pub mod virtio_gpu;
+pub mod vmware_svga;
+pub mod storage_manager;
 
 // Re-exportar componentes principales
-pub use device::{DeviceType, DeviceState, DeviceError};
+pub use device::{DeviceError, DeviceState, DeviceType};
 pub use manager::DriverResult;
 
 // Constantes del sistema de drivers
@@ -122,13 +131,12 @@ impl DriverSystemInfo {
 pub fn init_driver_system() -> DriverResult<()> {
     // Inicializar gestor de drivers
     manager::init_driver_manager()?;
-    
+
     // Inicializar drivers básicos
     storage::init_storage_drivers()?;
     network::init_network_drivers()?;
-    video::init_video_drivers()?;
     input::init_input_drivers()?;
-    
+
     Ok(())
 }
 

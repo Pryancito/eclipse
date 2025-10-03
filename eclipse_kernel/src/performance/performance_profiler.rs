@@ -3,10 +3,10 @@
 //! Este módulo proporciona profiling y análisis de rendimiento
 //! para el sistema multihilo
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Evento de rendimiento
 #[derive(Debug, Clone)]
@@ -124,7 +124,7 @@ impl PerformanceProfiler {
         self.events.clear();
         self.thread_stats.clear();
         self.process_stats.clear();
-        
+
         // Inicializar métricas
         self.metrics = PerformanceMetrics {
             total_events: 0,
@@ -137,11 +137,12 @@ impl PerformanceProfiler {
             page_fault_rate: 0.0,
             system_call_rate: 0.0,
         };
-        
+
         // Activar profiling
         self.profiling_active.store(1, Ordering::Release);
-        self.start_time.store(self.get_current_time(), Ordering::Release);
-        
+        self.start_time
+            .store(self.get_current_time(), Ordering::Release);
+
         Ok(())
     }
 
@@ -150,15 +151,15 @@ impl PerformanceProfiler {
         if self.profiling_active.load(Ordering::Acquire) == 0 {
             return;
         }
-        
+
         // Agregar evento
         self.events.push(event.clone());
-        
+
         // Limitar número de eventos en memoria
         if self.events.len() > self.max_events {
             self.events.remove(0);
         }
-        
+
         // Actualizar estadísticas
         self.update_thread_stats(&event);
         self.update_process_stats(&event);
@@ -170,12 +171,12 @@ impl PerformanceProfiler {
         let event = PerformanceEvent {
             event_type: PerformanceEventType::Custom(optimization_type.to_string()),
             timestamp: self.get_current_time(),
-            thread_id: 0, // Kernel thread
+            thread_id: 0,  // Kernel thread
             process_id: 0, // Kernel process
             duration,
             data: Vec::new(),
         };
-        
+
         self.record_event(event);
         self.total_optimizations.fetch_add(1, Ordering::Relaxed);
     }
@@ -183,12 +184,12 @@ impl PerformanceProfiler {
     /// Actualizar estadísticas de thread
     fn update_thread_stats(&mut self, event: &PerformanceEvent) {
         let thread_id = event.thread_id;
-        
+
         if let Some(stats) = self.thread_stats.get_mut(&thread_id) {
             stats.event_count += 1;
             stats.total_duration += event.duration;
             stats.average_duration = stats.total_duration / stats.event_count;
-            
+
             match event.event_type {
                 PerformanceEventType::ContextSwitch => stats.context_switches += 1,
                 PerformanceEventType::CacheHit => stats.cache_hits += 1,
@@ -208,14 +209,14 @@ impl PerformanceProfiler {
                 cache_hits: 0,
                 cache_misses: 0,
             };
-            
+
             match event.event_type {
                 PerformanceEventType::ContextSwitch => stats.context_switches = 1,
                 PerformanceEventType::CacheHit => stats.cache_hits = 1,
                 PerformanceEventType::CacheMiss => stats.cache_misses = 1,
                 _ => {}
             }
-            
+
             self.thread_stats.insert(thread_id, stats);
         }
     }
@@ -223,7 +224,7 @@ impl PerformanceProfiler {
     /// Actualizar estadísticas de proceso
     fn update_process_stats(&mut self, event: &PerformanceEvent) {
         let process_id = event.process_id;
-        
+
         if let Some(stats) = self.process_stats.get_mut(&process_id) {
             stats.total_events += 1;
             stats.total_duration += event.duration;
@@ -238,7 +239,7 @@ impl PerformanceProfiler {
                 memory_utilization: 0.0,
                 priority: 5, // Prioridad por defecto
             };
-            
+
             self.process_stats.insert(process_id, stats);
         }
     }
@@ -248,22 +249,23 @@ impl PerformanceProfiler {
         let current_time = self.get_current_time();
         let start_time = self.start_time.load(Ordering::Acquire);
         let last_update = self.last_update_time.load(Ordering::Acquire);
-        
+
         // Actualizar tiempo de última actualización
         self.last_update_time.store(current_time, Ordering::Release);
-        
+
         // Calcular eventos por segundo
         if current_time > start_time {
             let time_delta = current_time - start_time;
-            self.metrics.events_per_second = self.events.len() as f64 / (time_delta as f64 / 1_000_000_000.0);
+            self.metrics.events_per_second =
+                self.events.len() as f64 / (time_delta as f64 / 1_000_000_000.0);
         }
-        
+
         // Calcular duración promedio de eventos
         if !self.events.is_empty() {
             let total_duration: u64 = self.events.iter().map(|e| e.duration).sum();
             self.metrics.average_event_duration = total_duration / self.events.len() as u64;
         }
-        
+
         // Calcular métricas específicas
         self.calculate_context_switch_rate();
         self.calculate_cache_hit_rate();
@@ -271,32 +273,39 @@ impl PerformanceProfiler {
         self.calculate_system_call_rate();
         self.calculate_cpu_utilization();
         self.calculate_memory_utilization();
-        
+
         self.metrics.total_events = self.events.len() as u64;
     }
 
     /// Calcular tasa de context switches
     fn calculate_context_switch_rate(&mut self) {
-        let context_switches = self.events.iter()
+        let context_switches = self
+            .events
+            .iter()
             .filter(|e| e.event_type == PerformanceEventType::ContextSwitch)
             .count();
-        
+
         let time_delta = self.get_current_time() - self.start_time.load(Ordering::Acquire);
         if time_delta > 0 {
-            self.metrics.context_switch_rate = (context_switches as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
+            self.metrics.context_switch_rate =
+                (context_switches as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
         }
     }
 
     /// Calcular tasa de cache hits
     fn calculate_cache_hit_rate(&mut self) {
-        let cache_hits = self.events.iter()
+        let cache_hits = self
+            .events
+            .iter()
             .filter(|e| e.event_type == PerformanceEventType::CacheHit)
             .count();
-        
-        let cache_misses = self.events.iter()
+
+        let cache_misses = self
+            .events
+            .iter()
             .filter(|e| e.event_type == PerformanceEventType::CacheMiss)
             .count();
-        
+
         let total_cache_accesses = cache_hits + cache_misses;
         if total_cache_accesses > 0 {
             self.metrics.cache_hit_rate = (cache_hits as f64 / total_cache_accesses as f64) * 100.0;
@@ -305,25 +314,31 @@ impl PerformanceProfiler {
 
     /// Calcular tasa de page faults
     fn calculate_page_fault_rate(&mut self) {
-        let page_faults = self.events.iter()
+        let page_faults = self
+            .events
+            .iter()
             .filter(|e| e.event_type == PerformanceEventType::PageFault)
             .count();
-        
+
         let time_delta = self.get_current_time() - self.start_time.load(Ordering::Acquire);
         if time_delta > 0 {
-            self.metrics.page_fault_rate = (page_faults as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
+            self.metrics.page_fault_rate =
+                (page_faults as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
         }
     }
 
     /// Calcular tasa de system calls
     fn calculate_system_call_rate(&mut self) {
-        let system_calls = self.events.iter()
+        let system_calls = self
+            .events
+            .iter()
             .filter(|e| e.event_type == PerformanceEventType::SystemCall)
             .count();
-        
+
         let time_delta = self.get_current_time() - self.start_time.load(Ordering::Acquire);
         if time_delta > 0 {
-            self.metrics.system_call_rate = (system_calls as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
+            self.metrics.system_call_rate =
+                (system_calls as f64 / (time_delta as f64 / 1_000_000_000.0)) * 100.0;
         }
     }
 
@@ -331,10 +346,8 @@ impl PerformanceProfiler {
     fn calculate_cpu_utilization(&mut self) {
         // Simulación de cálculo de utilización de CPU
         // En un sistema real, esto usaría métricas reales del sistema
-        let total_cpu_time: u64 = self.thread_stats.values()
-            .map(|stats| stats.cpu_time)
-            .sum();
-        
+        let total_cpu_time: u64 = self.thread_stats.values().map(|stats| stats.cpu_time).sum();
+
         let time_delta = self.get_current_time() - self.start_time.load(Ordering::Acquire);
         if time_delta > 0 {
             self.metrics.cpu_utilization = (total_cpu_time as f64 / time_delta as f64) * 100.0;
@@ -345,10 +358,12 @@ impl PerformanceProfiler {
     fn calculate_memory_utilization(&mut self) {
         // Simulación de cálculo de utilización de memoria
         // En un sistema real, esto usaría métricas reales del sistema
-        let total_memory_usage: u64 = self.thread_stats.values()
+        let total_memory_usage: u64 = self
+            .thread_stats
+            .values()
             .map(|stats| stats.memory_usage)
             .sum();
-        
+
         // Simular memoria total del sistema (1GB)
         let total_memory = 1024 * 1024 * 1024;
         self.metrics.memory_utilization = (total_memory_usage as f64 / total_memory as f64) * 100.0;
@@ -386,7 +401,8 @@ impl PerformanceProfiler {
 
     /// Activar/desactivar profiling
     pub fn set_profiling_active(&self, active: bool) {
-        self.profiling_active.store(if active { 1 } else { 0 }, Ordering::Release);
+        self.profiling_active
+            .store(if active { 1 } else { 0 }, Ordering::Release);
     }
 
     /// Limpiar datos de profiling
@@ -405,7 +421,8 @@ impl PerformanceProfiler {
             page_fault_rate: 0.0,
             system_call_rate: 0.0,
         };
-        self.start_time.store(self.get_current_time(), Ordering::Release);
+        self.start_time
+            .store(self.get_current_time(), Ordering::Release);
     }
 
     /// Obtener tiempo actual (simulado)

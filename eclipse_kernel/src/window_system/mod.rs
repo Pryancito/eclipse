@@ -1,15 +1,15 @@
 //! Sistema de Ventanas Eclipse OS
-//! 
+//!
 //! Implementa un sistema de ventanas similar a X11/Wayland para Eclipse OS
 //! con gestión completa de ventanas, eventos y composición.
 
-pub mod window_manager;
-pub mod window;
-pub mod event_system;
 pub mod client_api;
 pub mod compositor;
-pub mod protocol;
+pub mod event_system;
 pub mod geometry;
+pub mod protocol;
+pub mod window;
+pub mod window_manager;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -115,7 +115,7 @@ pub fn init_window_system() -> Result<(), &'static str> {
         if WINDOW_SYSTEM.is_some() {
             return Err("Sistema de ventanas ya inicializado");
         }
-        
+
         let mut system = WindowSystem::new()?;
         system.initialize()?;
         WINDOW_SYSTEM = Some(system);
@@ -126,7 +126,9 @@ pub fn init_window_system() -> Result<(), &'static str> {
 /// Obtener referencia al sistema de ventanas
 pub fn get_window_system() -> Result<&'static mut WindowSystem, &'static str> {
     unsafe {
-        WINDOW_SYSTEM.as_mut().ok_or("Sistema de ventanas no inicializado")
+        WINDOW_SYSTEM
+            .as_mut()
+            .ok_or("Sistema de ventanas no inicializado")
     }
 }
 

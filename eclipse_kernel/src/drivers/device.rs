@@ -1,5 +1,5 @@
 //! Estructuras base para dispositivos en Eclipse OS
-//! 
+//!
 //! Basado en la arquitectura de drivers de Redox OS
 
 use core::fmt;
@@ -165,7 +165,7 @@ impl DeviceInfo {
     pub fn set_name(&mut self, name: &str) {
         let name_bytes = name.as_bytes();
         let len = name_bytes.len().min(31);
-        
+
         for i in 0..32 {
             if i < len {
                 self.name[i] = name_bytes[i];
@@ -184,11 +184,9 @@ impl DeviceInfo {
                 break;
             }
         }
-        
+
         // Convertir a string (simplificado)
-        unsafe {
-            core::str::from_utf8_unchecked(&self.name[0..len])
-        }
+        unsafe { core::str::from_utf8_unchecked(&self.name[0..len]) }
     }
 }
 
@@ -220,12 +218,12 @@ impl Device {
         }
 
         self.info.state = DeviceState::Initializing;
-        
+
         // Implementación simplificada - siempre exitosa
         self.is_initialized = true;
         self.is_enabled = true;
         self.info.state = DeviceState::Ready;
-        
+
         Ok(())
     }
 

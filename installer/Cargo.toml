@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+eclipsefs-lib = { path = "../eclipsefs-lib", features = ["std"] }
 
 [profile.dev]
 opt-level = 0

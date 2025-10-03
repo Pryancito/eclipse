@@ -1,5 +1,5 @@
 //! Sistema de eventos del sistema de ventanas
-//! 
+//!
 //! Maneja eventos de entrada (ratón, teclado) y eventos de ventanas,
 //! similar al sistema de eventos de X11 y Wayland.
 
@@ -8,8 +8,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::geometry::{Point, Rectangle};
-use super::protocol::{InputEventData, InputEventType, KeyModifiers, ProtocolMessage, MessageBuilder};
-use super::{WindowId, ClientId};
+use super::protocol::{
+    InputEventData, InputEventType, KeyModifiers, MessageBuilder, ProtocolMessage,
+};
+use super::{ClientId, WindowId};
 
 /// Evento del sistema de ventanas
 #[derive(Debug, Clone)]
@@ -34,17 +36,43 @@ pub struct InputEvent {
 /// Tipos de eventos de ventana
 #[derive(Debug, Clone)]
 pub enum WindowEventType {
-    Created { window_id: WindowId },
-    Destroyed { window_id: WindowId },
-    Moved { window_id: WindowId, x: i32, y: i32 },
-    Resized { window_id: WindowId, width: u32, height: u32 },
-    Mapped { window_id: WindowId },
-    Unmapped { window_id: WindowId },
-    Focused { window_id: WindowId },
-    Unfocused { window_id: WindowId },
-    Minimized { window_id: WindowId },
-    Maximized { window_id: WindowId },
-    Restored { window_id: WindowId },
+    Created {
+        window_id: WindowId,
+    },
+    Destroyed {
+        window_id: WindowId,
+    },
+    Moved {
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+    },
+    Resized {
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+    },
+    Mapped {
+        window_id: WindowId,
+    },
+    Unmapped {
+        window_id: WindowId,
+    },
+    Focused {
+        window_id: WindowId,
+    },
+    Unfocused {
+        window_id: WindowId,
+    },
+    Minimized {
+        window_id: WindowId,
+    },
+    Maximized {
+        window_id: WindowId,
+    },
+    Restored {
+        window_id: WindowId,
+    },
 }
 
 /// Eventos del sistema
@@ -147,7 +175,7 @@ impl EventSystem {
 
         // Procesar eventos de entrada del sistema
         self.process_input_events()?;
-        
+
         // Procesar eventos de ventanas
         self.process_window_events()?;
 
@@ -158,7 +186,7 @@ impl EventSystem {
     fn process_input_events(&mut self) -> Result<(), &'static str> {
         // En una implementación real, esto leería de los drivers de entrada
         // Por ahora, simulamos algunos eventos básicos
-        
+
         // Simular movimiento del ratón si hay cambios
         if self.mouse_state.wheel_delta.x != 0 || self.mouse_state.wheel_delta.y != 0 {
             self.queue_input_event(InputEvent {
@@ -170,7 +198,7 @@ impl EventSystem {
                 timestamp: self.get_timestamp(),
                 window_id: self.window_under_cursor,
             });
-            
+
             // Resetear delta del wheel
             self.mouse_state.wheel_delta = Point::new(0, 0);
         }
@@ -182,7 +210,7 @@ impl EventSystem {
     fn process_window_events(&mut self) -> Result<(), &'static str> {
         // Procesar eventos pendientes en la cola
         // En una implementación real, esto manejaría eventos del window manager
-        
+
         Ok(())
     }
 
@@ -214,7 +242,7 @@ impl EventSystem {
     /// Simular movimiento del ratón (para testing)
     pub fn simulate_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse_state.position = Point::new(x, y);
-        
+
         self.queue_input_event(InputEvent {
             event_type: InputEventType::MouseMove,
             data: InputEventData::MouseMove { x, y },
@@ -296,14 +324,18 @@ impl EventSystem {
         if self.focused_window != window_id {
             // Enviar evento de pérdida de foco a la ventana anterior
             if let Some(old_window) = self.focused_window {
-                self.queue_window_event(WindowEventType::Unfocused { window_id: old_window });
+                self.queue_window_event(WindowEventType::Unfocused {
+                    window_id: old_window,
+                });
             }
-            
+
             // Enviar evento de foco a la nueva ventana
             if let Some(new_window) = window_id {
-                self.queue_window_event(WindowEventType::Focused { window_id: new_window });
+                self.queue_window_event(WindowEventType::Focused {
+                    window_id: new_window,
+                });
             }
-            
+
             self.focused_window = window_id;
         }
     }
@@ -357,7 +389,11 @@ impl EventSystem {
     }
 
     /// Convertir evento a mensaje de protocolo
-    pub fn event_to_protocol_message(&self, event: &InputEvent, client_id: ClientId) -> ProtocolMessage {
+    pub fn event_to_protocol_message(
+        &self,
+        event: &InputEvent,
+        client_id: ClientId,
+    ) -> ProtocolMessage {
         MessageBuilder::new(super::protocol::MessageType::SendEvent, client_id)
             .window_id(event.window_id.unwrap_or(0))
             .input_event(event.event_type.clone(), event.data.clone())
@@ -400,7 +436,7 @@ pub fn init_event_system() -> Result<(), &'static str> {
         if EVENT_SYSTEM.is_some() {
             return Err("Sistema de eventos ya inicializado");
         }
-        
+
         let mut system = EventSystem::new()?;
         system.initialize()?;
         EVENT_SYSTEM = Some(system);
@@ -411,7 +447,9 @@ pub fn init_event_system() -> Result<(), &'static str> {
 /// Obtener referencia al sistema de eventos
 pub fn get_event_system() -> Result<&'static mut EventSystem, &'static str> {
     unsafe {
-        EVENT_SYSTEM.as_mut().ok_or("Sistema de eventos no inicializado")
+        EVENT_SYSTEM
+            .as_mut()
+            .ok_or("Sistema de eventos no inicializado")
     }
 }
 

@@ -1,10 +1,10 @@
 //! Drivers de video para Eclipse OS
-//! 
+//!
 //! Basado en los drivers de video de Redox OS
 
 use crate::drivers::{
     device::{Device, DeviceInfo, DeviceType},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
 
@@ -117,13 +117,14 @@ impl Driver for VideoDriver {
 
         // Configurar nombre
         video_info.name[..device.info.name.len()].copy_from_slice(&device.info.name);
-        
+
         // Calcular tamaño del framebuffer
-        video_info.framebuffer_size = (video_info.width * video_info.height * video_info.bpp as u32 / 8) as u64;
+        video_info.framebuffer_size =
+            (video_info.width * video_info.height * video_info.bpp as u32 / 8) as u64;
 
         self.add_device(video_info)?;
         device.driver_id = Some(self.info.id);
-        
+
         Ok(())
     }
 

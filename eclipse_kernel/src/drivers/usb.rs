@@ -1,19 +1,19 @@
 //! Driver USB real para Eclipse OS
-//! 
+//!
 //! Implementa soporte completo para dispositivos USB reales incluyendo
 //! teclado, ratón y otros dispositivos HID con comunicación real por USB.
 
 use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceType, DeviceOperations},
-    manager::{Driver, DriverInfo, DriverResult, DriverError},
+    device::{Device, DeviceInfo, DeviceOperations, DeviceType},
+    manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
 
 // Importar tipos necesarios para no_std
-use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use alloc::format;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // Constantes USB
 const USB_MAX_DEVICES: u8 = 127;
@@ -252,10 +252,10 @@ pub struct UsbHostController {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UsbControllerType {
-    OHCI,  // Open Host Controller Interface
-    EHCI,  // Enhanced Host Controller Interface
-    XHCI,  // eXtensible Host Controller Interface
-    UHCI,  // Universal Host Controller Interface
+    OHCI, // Open Host Controller Interface
+    EHCI, // Enhanced Host Controller Interface
+    XHCI, // eXtensible Host Controller Interface
+    UHCI, // Universal Host Controller Interface
 }
 
 impl UsbHostController {
@@ -379,19 +379,19 @@ impl UsbDriver {
     /// Obtener estadísticas USB
     pub fn get_usb_stats(&self) -> UsbStats {
         let mut stats = UsbStats::new();
-        
+
         for i in 0..MAX_DEVICES {
             if let Some(ref device) = self.devices[i] {
                 stats.total_devices += 1;
-                
+
                 if device.is_attached {
                     stats.attached_devices += 1;
                 }
-                
+
                 if device.is_configured {
                     stats.configured_devices += 1;
                 }
-                
+
                 match device.device_descriptor.device_class {
                     UsbDeviceClass::HID => stats.hid_devices += 1,
                     UsbDeviceClass::MassStorage => stats.storage_devices += 1,
@@ -402,7 +402,7 @@ impl UsbDriver {
                 }
             }
         }
-        
+
         stats.controller_count = self.controller_count;
         stats
     }
@@ -433,7 +433,7 @@ impl Driver for UsbDriver {
         self.info.is_loaded = true;
         self.initialize_controllers()?;
         self.is_initialized = true;
-        
+
         Ok(())
     }
 
@@ -442,14 +442,14 @@ impl Driver for UsbDriver {
             self.devices[i] = None;
         }
         self.device_count = 0;
-        
+
         for i in 0..4 {
             if let Some(ref mut controller) = self.controllers[i] {
                 controller.disable();
             }
         }
         self.controller_count = 0;
-        
+
         self.info.is_loaded = false;
         self.is_initialized = false;
         Ok(())
@@ -562,7 +562,12 @@ impl UsbSetupPacket {
     }
 
     /// Crear setup packet para GET_DESCRIPTOR
-    pub fn get_descriptor(descriptor_type: u8, descriptor_index: u8, language_id: u16, length: u16) -> Self {
+    pub fn get_descriptor(
+        descriptor_type: u8,
+        descriptor_index: u8,
+        language_id: u16,
+        length: u16,
+    ) -> Self {
         Self {
             request_type: 0x80, // Device to host, standard, device
             request: UsbStandardRequest::GetDescriptor as u8,
@@ -634,15 +639,15 @@ impl RealUsbController {
     fn enable_xhci(&mut self) -> DriverResult<()> {
         unsafe {
             let regs = self.base_address as *mut u32;
-            
+
             // Leer CAPLENGTH para obtener offset de operacional registers
             let caplength = core::ptr::read_volatile(regs) & 0xFF;
             let op_regs = self.base_address + caplength as u64;
-            
+
             // Habilitar controlador
             let usbcmd = core::ptr::read_volatile((op_regs + 0x00) as *const u32);
             core::ptr::write_volatile((op_regs + 0x00) as *mut u32, usbcmd | 0x01);
-            
+
             // Esperar a que se habilite
             for _ in 0..1000 {
                 let usbsts = core::ptr::read_volatile((op_regs + 0x04) as *const u32);
@@ -651,11 +656,11 @@ impl RealUsbController {
                 }
                 core::hint::spin_loop();
             }
-            
+
             // Configurar interrupciones
             core::ptr::write_volatile((op_regs + 0x20) as *mut u32, 0x01); // IMAN
             core::ptr::write_volatile((op_regs + 0x24) as *mut u32, 0x01); // IMOD
-            
+
             self.interrupt_enabled = true;
             self.is_enabled = true;
         }
@@ -666,11 +671,11 @@ impl RealUsbController {
     fn enable_ehci(&mut self) -> DriverResult<()> {
         unsafe {
             let regs = self.base_address as *mut u32;
-            
+
             // Habilitar controlador
             let usbcmd = core::ptr::read_volatile(regs);
             core::ptr::write_volatile(regs, usbcmd | 0x01);
-            
+
             // Esperar a que se habilite
             for _ in 0..1000 {
                 let usbsts = core::ptr::read_volatile((self.base_address + 0x04) as *const u32);
@@ -679,7 +684,7 @@ impl RealUsbController {
                 }
                 core::hint::spin_loop();
             }
-            
+
             self.is_enabled = true;
         }
         Ok(())
@@ -689,7 +694,7 @@ impl RealUsbController {
     fn enable_ohci(&mut self) -> DriverResult<()> {
         unsafe {
             let regs = self.base_address as *mut u32;
-            
+
             // Reset controlador
             core::ptr::write_volatile(regs, 0x04); // HcControl |= HCR
             for _ in 0..1000 {
@@ -699,7 +704,7 @@ impl RealUsbController {
                 }
                 core::hint::spin_loop();
             }
-            
+
             // Habilitar controlador
             core::ptr::write_volatile(regs, 0x80); // HcControl |= HCE
             self.is_enabled = true;
@@ -711,7 +716,7 @@ impl RealUsbController {
     fn enable_uhci(&mut self) -> DriverResult<()> {
         unsafe {
             let regs = self.base_address as *mut u16;
-            
+
             // Reset controlador
             core::ptr::write_volatile(regs, 0x04); // USBCMD |= RSE
             for _ in 0..1000 {
@@ -721,7 +726,7 @@ impl RealUsbController {
                 }
                 core::hint::spin_loop();
             }
-            
+
             // Habilitar controlador
             core::ptr::write_volatile(regs, 0x01); // USBCMD |= RS
             self.is_enabled = true;
@@ -749,27 +754,27 @@ impl RealUsbController {
     fn detect_device_on_port(&mut self, port: u8) -> DriverResult<UsbDeviceInfo> {
         // Reset puerto
         self.reset_port(port)?;
-        
+
         // Asignar dirección
         let address = self.next_address;
         self.next_address += 1;
-        
+
         // Crear dispositivo
         let mut device = UsbDeviceInfo::new(address);
         device.port_number = port;
-        
+
         // Obtener descriptor del dispositivo
         if let Ok(descriptor) = self.get_device_descriptor(address) {
             device.device_descriptor = descriptor;
         }
-        
+
         // Configurar dispositivo
         self.set_device_address(address)?;
         self.set_device_configuration(address, 1)?;
-        
+
         device.is_attached = true;
         device.is_configured = true;
-        
+
         Ok(device)
     }
 
@@ -789,14 +794,20 @@ impl RealUsbController {
             let regs = self.base_address as *mut u32;
             let caplength = core::ptr::read_volatile(regs) & 0xFF;
             let op_regs = self.base_address + caplength as u64;
-            
+
             // Reset puerto
-            let portsc = core::ptr::read_volatile((op_regs + 0x400 + (port as u64 * 0x10)) as *const u32);
-            core::ptr::write_volatile((op_regs + 0x400 + (port as u64 * 0x10)) as *mut u32, portsc | 0x08);
-            
+            let portsc =
+                core::ptr::read_volatile((op_regs + 0x400 + (port as u64 * 0x10)) as *const u32);
+            core::ptr::write_volatile(
+                (op_regs + 0x400 + (port as u64 * 0x10)) as *mut u32,
+                portsc | 0x08,
+            );
+
             // Esperar reset
             for _ in 0..1000 {
-                let portsc = core::ptr::read_volatile((op_regs + 0x400 + (port as u64 * 0x10)) as *const u32);
+                let portsc = core::ptr::read_volatile(
+                    (op_regs + 0x400 + (port as u64 * 0x10)) as *const u32,
+                );
                 if (portsc & 0x08) == 0 {
                     break;
                 }
@@ -809,11 +820,18 @@ impl RealUsbController {
     /// Reset puerto EHCI
     fn reset_port_ehci(&self, port: u8) -> DriverResult<()> {
         unsafe {
-            let portsc = core::ptr::read_volatile((self.base_address + 0x44 + (port as u64 * 4)) as *const u32);
-            core::ptr::write_volatile((self.base_address + 0x44 + (port as u64 * 4)) as *mut u32, portsc | 0x01);
-            
+            let portsc = core::ptr::read_volatile(
+                (self.base_address + 0x44 + (port as u64 * 4)) as *const u32,
+            );
+            core::ptr::write_volatile(
+                (self.base_address + 0x44 + (port as u64 * 4)) as *mut u32,
+                portsc | 0x01,
+            );
+
             for _ in 0..1000 {
-                let portsc = core::ptr::read_volatile((self.base_address + 0x44 + (port as u64 * 4)) as *const u32);
+                let portsc = core::ptr::read_volatile(
+                    (self.base_address + 0x44 + (port as u64 * 4)) as *const u32,
+                );
                 if (portsc & 0x01) == 0 {
                     break;
                 }
@@ -826,11 +844,18 @@ impl RealUsbController {
     /// Reset puerto OHCI
     fn reset_port_ohci(&self, port: u8) -> DriverResult<()> {
         unsafe {
-            let portsc = core::ptr::read_volatile((self.base_address + 0x54 + (port as u64 * 4)) as *const u32);
-            core::ptr::write_volatile((self.base_address + 0x54 + (port as u64 * 4)) as *mut u32, portsc | 0x01);
-            
+            let portsc = core::ptr::read_volatile(
+                (self.base_address + 0x54 + (port as u64 * 4)) as *const u32,
+            );
+            core::ptr::write_volatile(
+                (self.base_address + 0x54 + (port as u64 * 4)) as *mut u32,
+                portsc | 0x01,
+            );
+
             for _ in 0..1000 {
-                let portsc = core::ptr::read_volatile((self.base_address + 0x54 + (port as u64 * 4)) as *const u32);
+                let portsc = core::ptr::read_volatile(
+                    (self.base_address + 0x54 + (port as u64 * 4)) as *const u32,
+                );
                 if (portsc & 0x01) == 0 {
                     break;
                 }
@@ -843,11 +868,18 @@ impl RealUsbController {
     /// Reset puerto UHCI
     fn reset_port_uhci(&self, port: u8) -> DriverResult<()> {
         unsafe {
-            let portsc = core::ptr::read_volatile((self.base_address + 0x10 + (port as u64 * 2)) as *const u16);
-            core::ptr::write_volatile((self.base_address + 0x10 + (port as u64 * 2)) as *mut u16, portsc | 0x01);
-            
+            let portsc = core::ptr::read_volatile(
+                (self.base_address + 0x10 + (port as u64 * 2)) as *const u16,
+            );
+            core::ptr::write_volatile(
+                (self.base_address + 0x10 + (port as u64 * 2)) as *mut u16,
+                portsc | 0x01,
+            );
+
             for _ in 0..1000 {
-                let portsc = core::ptr::read_volatile((self.base_address + 0x10 + (port as u64 * 2)) as *const u16);
+                let portsc = core::ptr::read_volatile(
+                    (self.base_address + 0x10 + (port as u64 * 2)) as *const u16,
+                );
                 if (portsc & 0x01) == 0 {
                     break;
                 }
@@ -861,9 +893,9 @@ impl RealUsbController {
     fn get_device_descriptor(&self, address: u8) -> DriverResult<UsbDeviceDescriptor> {
         let setup = UsbSetupPacket::get_descriptor(1, 0, 0, 18); // Device descriptor
         let mut data = [0u8; 18];
-        
+
         self.control_transfer(address, &setup, &mut data)?;
-        
+
         // Parsear descriptor
         let descriptor = UsbDeviceDescriptor {
             length: data[0],
@@ -888,7 +920,7 @@ impl RealUsbController {
             serial_number_string: data[16],
             num_configurations: data[17],
         };
-        
+
         Ok(descriptor)
     }
 
@@ -907,7 +939,12 @@ impl RealUsbController {
     }
 
     /// Realizar transferencia de control USB
-    fn control_transfer(&self, address: u8, setup: &UsbSetupPacket, data: &mut [u8]) -> DriverResult<()> {
+    fn control_transfer(
+        &self,
+        address: u8,
+        setup: &UsbSetupPacket,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         match self.controller_type {
             UsbControllerType::XHCI => self.control_transfer_xhci(address, setup, data),
             UsbControllerType::EHCI => self.control_transfer_ehci(address, setup, data),
@@ -917,7 +954,12 @@ impl RealUsbController {
     }
 
     /// Transferencia de control XHCI
-    fn control_transfer_xhci(&self, address: u8, setup: &UsbSetupPacket, data: &mut [u8]) -> DriverResult<()> {
+    fn control_transfer_xhci(
+        &self,
+        address: u8,
+        setup: &UsbSetupPacket,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         // Implementación simplificada para XHCI
         // En una implementación real, esto configuraría TRBs y esperaría completación
         unsafe {
@@ -930,7 +972,12 @@ impl RealUsbController {
     }
 
     /// Transferencia de control EHCI
-    fn control_transfer_ehci(&self, address: u8, setup: &UsbSetupPacket, data: &mut [u8]) -> DriverResult<()> {
+    fn control_transfer_ehci(
+        &self,
+        address: u8,
+        setup: &UsbSetupPacket,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         // Implementación simplificada para EHCI
         unsafe {
             for byte in data.iter_mut() {
@@ -941,7 +988,12 @@ impl RealUsbController {
     }
 
     /// Transferencia de control OHCI
-    fn control_transfer_ohci(&self, address: u8, setup: &UsbSetupPacket, data: &mut [u8]) -> DriverResult<()> {
+    fn control_transfer_ohci(
+        &self,
+        address: u8,
+        setup: &UsbSetupPacket,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         // Implementación simplificada para OHCI
         unsafe {
             for byte in data.iter_mut() {
@@ -952,7 +1004,12 @@ impl RealUsbController {
     }
 
     /// Transferencia de control UHCI
-    fn control_transfer_uhci(&self, address: u8, setup: &UsbSetupPacket, data: &mut [u8]) -> DriverResult<()> {
+    fn control_transfer_uhci(
+        &self,
+        address: u8,
+        setup: &UsbSetupPacket,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         // Implementación simplificada para UHCI
         unsafe {
             for byte in data.iter_mut() {
@@ -1016,18 +1073,18 @@ impl RealUsbController {
 
     /// Obtener dispositivos HID detectados
     pub fn get_hid_devices(&self) -> Vec<&UsbDeviceInfo> {
-        self.devices.iter()
+        self.devices
+            .iter()
             .filter(|device| device.device_descriptor.device_class == UsbDeviceClass::HID)
             .collect()
     }
 
     /// Obtener dispositivos por vendor/product ID
     pub fn get_device_by_vid_pid(&self, vendor_id: u16, product_id: u16) -> Option<&UsbDeviceInfo> {
-        self.devices.iter()
-            .find(|device| {
-                device.device_descriptor.vendor_id == vendor_id &&
-                device.device_descriptor.product_id == product_id
-            })
+        self.devices.iter().find(|device| {
+            device.device_descriptor.vendor_id == vendor_id
+                && device.device_descriptor.product_id == product_id
+        })
     }
 }
 
@@ -1065,7 +1122,7 @@ impl RealUsbDriver {
         for controller in &mut self.controllers {
             controller.enable()?;
             controller.detect_devices()?;
-            
+
             // Agregar dispositivos detectados
             for device in controller.devices.clone() {
                 self.devices.push(device);
@@ -1077,13 +1134,19 @@ impl RealUsbDriver {
 
     /// Obtener dispositivos HID (teclado/ratón)
     pub fn get_hid_devices(&self) -> Vec<&UsbDeviceInfo> {
-        self.devices.iter()
+        self.devices
+            .iter()
             .filter(|device| device.device_descriptor.device_class == UsbDeviceClass::HID)
             .collect()
     }
 
     /// Leer datos de dispositivo HID
-    pub fn read_hid_device_data(&self, address: u8, endpoint: u8, data: &mut [u8]) -> DriverResult<()> {
+    pub fn read_hid_device_data(
+        &self,
+        address: u8,
+        endpoint: u8,
+        data: &mut [u8],
+    ) -> DriverResult<()> {
         for controller in &self.controllers {
             if controller.is_enabled {
                 return controller.read_hid_data(address, endpoint, data);
@@ -1097,20 +1160,24 @@ impl RealUsbDriver {
         let mut stats = String::new();
         stats.push_str("=== DRIVER USB REAL ===\n");
         stats.push_str(&format!("Controladores: {}\n", self.controllers.len()));
-        stats.push_str(&format!("Dispositivos detectados: {}\n", self.devices.len()));
-        
+        stats.push_str(&format!(
+            "Dispositivos detectados: {}\n",
+            self.devices.len()
+        ));
+
         let hid_devices = self.get_hid_devices();
         stats.push_str(&format!("Dispositivos HID: {}\n", hid_devices.len()));
-        
+
         for (i, device) in hid_devices.iter().enumerate() {
-            stats.push_str(&format!("  HID {}: VID={:04X} PID={:04X} Addr={}\n", 
-                i + 1, 
+            stats.push_str(&format!(
+                "  HID {}: VID={:04X} PID={:04X} Addr={}\n",
+                i + 1,
                 device.device_descriptor.vendor_id,
                 device.device_descriptor.product_id,
                 device.address
             ));
         }
-        
+
         stats
     }
 }

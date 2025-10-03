@@ -21,6 +21,8 @@ use crate::journald::JournalManager;
 use crate::serial_logger::SerialLogger;
 use crate::notifications::NotificationManager;
 use crate::resource_manager::ResourceManager;
+use eclipse_ipc::{UnixBus, IpcMessage, socket_path_from_env};
+use std::time::Duration as StdDuration;
 
 /// Estado de un servicio
 #[derive(Debug, Clone, PartialEq)]
@@ -98,30 +100,43 @@ impl SystemdDaemon {
     pub async fn initialize(&self) -> Result<()> {
         info!("Inicializando Eclipse SystemD Daemon v0.2.0");
         
-        // Registrar inicio en el journal
-        self.journal_manager.log_info("systemd", "Iniciando Eclipse SystemD Daemon v0.2.0")?;
-        
         // Escribir mensaje de inicio a serial
         self.serial_logger.write_system_startup().await?;
         
+        // Asegurar directorios básicos para logs/runtime
+        self.serial_logger.write_info("systemd", "📁 Creando directorios del sistema...").await?;
+        let _ = std::fs::create_dir_all("/var/log");
+        let _ = std::fs::create_dir_all("/run");
+        self.serial_logger.write_info("systemd", "✅ Directorios del sistema creados").await?;
+
+        // Registrar inicio en el journal
+        self.journal_manager.log_info("systemd", "Iniciando Eclipse SystemD Daemon v0.2.0")?;
+        
         // Cargar todos los archivos .service
+        self.serial_logger.write_info("systemd", "📋 Cargando archivos de servicios...").await?;
         self.load_service_files().await?;
         
         // Inicializar targets
+        self.serial_logger.write_info("systemd", "🎯 Inicializando targets del sistema...").await?;
         self.target_manager.write().await.initialize()?;
+        self.serial_logger.write_info("systemd", "✅ Targets inicializados").await?;
 
         // Crear canal de notificaciones
+        self.serial_logger.write_info("systemd", "🔔 Configurando sistema de notificaciones...").await?;
         self.notification_manager.create_channel("systemd", 100)?;
         self.notification_manager.create_channel("services", 100)?;
+        self.serial_logger.write_info("systemd", "✅ Sistema de notificaciones configurado").await?;
 
         // Inicializar manager de recursos
+        self.serial_logger.write_info("systemd", "💾 Inicializando gestor de recursos...").await?;
         self.resource_manager.register_service("systemd", Some(std::process::id()))?;
+        self.serial_logger.write_info("systemd", "✅ Gestor de recursos inicializado").await?;
 
         // Marcar como ejecutándose
         *self.is_running.write().await = true;
         
+        self.serial_logger.write_info("systemd", "🎉 Eclipse SystemD completamente inicializado y listo").await?;
         self.journal_manager.log_info("systemd", "Daemon systemd inicializado correctamente")?;
-        self.serial_logger.write_info("systemd", "Daemon systemd inicializado correctamente").await?;
         info!("Daemon systemd inicializado correctamente");
         Ok(())
     }
@@ -198,6 +213,9 @@ impl SystemdDaemon {
         Box::pin(async move {
         info!("Iniciando Iniciando servicio: {}", service_name);
         
+        // Escribir a serial que estamos iniciando el servicio
+        self.serial_logger.write_info("systemd", &format!("🔧 Preparando servicio: {}", service_name)).await?;
+        
         // Verificar si el servicio existe
         let service_file = {
             let services = self.services.read().await;
@@ -207,6 +225,7 @@ impl SystemdDaemon {
         let service_file = match service_file {
             Some(sf) => sf,
             None => {
+                self.serial_logger.write_error("systemd", &format!("❌ Servicio no encontrado: {}", service_name)).await?;
                 return Err(anyhow::anyhow!("Servicio no encontrado: {}", service_name));
             }
         };
@@ -215,22 +234,38 @@ impl SystemdDaemon {
         {
             let running = self.running_services.read().await;
             if running.contains_key(service_name) {
-                return Err(anyhow::anyhow!("Servicio ya está ejecutándose: {}", service_name));
+                self.serial_logger.write_info("systemd", &format!("✅ Servicio ya ejecutándose: {}", service_name)).await?;
+                return Ok(());
             }
         }
 
         // Resolver dependencias
         let dependencies = self.dependency_resolver.resolve_dependencies(&service_file)?;
+        if !dependencies.is_empty() {
+            self.serial_logger.write_info("systemd", &format!("🔗 Resolviendo dependencias para {}: {:?}", service_name, dependencies)).await?;
+        }
+        
         for dep in &dependencies {
             if !self.is_service_running(dep).await {
+                self.serial_logger.write_info("systemd", &format!("📦 Iniciando dependencia: {} -> {}", dep, service_name)).await?;
                 info!("Dependencia Iniciando dependencia: {}", dep);
                 self.start_service(dep).await?;
             }
         }
 
         // Ejecutar el servicio
+        self.serial_logger.write_info("systemd", &format!("🚀 Ejecutando servicio: {}", service_name)).await?;
         self.execute_service(service_name, &service_file).await?;
+
+        // Orquestación simple: no bloquear por clientes.
+        // Wayland puede arrancar solo; COSMIC reconectará por su cuenta.
+        // Dejamos el pequeño retraso, pero no exigimos dependencia fuerte.
+        if service_name == "eclipse-wayland.service" {
+            self.serial_logger.write_info("systemd", "⏳ Esperando estabilización de Wayland...").await?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
         
+        self.serial_logger.write_info("systemd", &format!("✅ Servicio iniciado exitosamente: {}", service_name)).await?;
         info!("Servicio Servicio iniciado: {}", service_name);
         Ok(())
         })
@@ -318,6 +353,10 @@ impl SystemdDaemon {
         let group = ServiceParser::get_entry(service_file, "Service", "Group")
             .unwrap_or(&root_group);
 
+        // Escribir información del servicio a serial
+        self.serial_logger.write_info("systemd", &format!("📝 Configuración del servicio {}: Tipo={}, Usuario={}, Grupo={}", service_name, service_type, user, group)).await?;
+        self.serial_logger.write_info("systemd", &format!("💻 Comando a ejecutar: {}", exec_start)).await?;
+
         // Crear comando
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -332,6 +371,9 @@ impl SystemdDaemon {
         match cmd.spawn() {
             Ok(child) => {
                 let pid = child.id();
+                
+                // Escribir a serial que el proceso se inició
+                self.serial_logger.write_info("systemd", &format!("🎯 Proceso iniciado con PID: {} para servicio: {}", pid, service_name)).await?;
                 
                 // Crear entrada de servicio en ejecución
                 let running_service = RunningService {
@@ -349,16 +391,21 @@ impl SystemdDaemon {
                 // Registrar servicio en el manager de recursos
                 if let Err(e) = self.resource_manager.register_service(service_name, Some(pid)) {
                     warn!("Advertencia  Error registrando servicio en resource manager: {}", e);
+                    self.serial_logger.write_warning("systemd", &format!("⚠️ Error registrando servicio en resource manager: {}", e)).await?;
                 }
 
                 // Enviar notificación de servicio listo
                 if let Err(e) = self.notification_manager.notify_service_ready(service_name, pid) {
                     warn!("Advertencia  Error enviando notificación de servicio listo: {}", e);
+                    self.serial_logger.write_warning("systemd", &format!("⚠️ Error enviando notificación de servicio listo: {}", e)).await?;
                 }
 
                 debug!("Servicio Proceso iniciado con PID: {}", pid);
             }
             Err(e) => {
+                // Escribir error a serial
+                self.serial_logger.write_error("systemd", &format!("💥 Error ejecutando servicio {}: {}", service_name, e)).await?;
+                
                 // Enviar notificación de error
                 if let Err(ne) = self.notification_manager.notify_service_error(service_name, &e.to_string(), None) {
                     warn!("Advertencia  Error enviando notificación de error: {}", ne);
@@ -374,14 +421,23 @@ impl SystemdDaemon {
     pub async fn start_target(&self, target_name: &str) -> Result<()> {
         info!("Target Iniciando target: {}", target_name);
         
+        // Escribir a serial que estamos iniciando el target
+        self.serial_logger.write_info("systemd", &format!("🚀 Iniciando target: {}", target_name)).await?;
+        
         let services = self.target_manager.read().await.get_target_services(target_name)?;
+        
+        self.serial_logger.write_info("systemd", &format!("📋 Servicios a iniciar: {}", services.join(", "))).await?;
         
         for service_name in &services {
             if !self.is_service_running(service_name).await {
+                self.serial_logger.write_info("systemd", &format!("⚡ Iniciando servicio: {}", service_name)).await?;
                 self.start_service(service_name).await?;
+            } else {
+                self.serial_logger.write_info("systemd", &format!("✅ Servicio ya ejecutándose: {}", service_name)).await?;
             }
         }
         
+        self.serial_logger.write_info("systemd", &format!("🎉 Target completado: {}", target_name)).await?;
         info!("Servicio Target iniciado: {}", target_name);
         Ok(())
     }
@@ -403,13 +459,37 @@ impl SystemdDaemon {
     pub async fn run(&self) -> Result<()> {
         info!("Reiniciando Iniciando loop principal del daemon systemd");
         self.journal_manager.log_info("systemd", "Iniciando loop principal del daemon")?;
-        
+        // IPC: monitorización básica de ready/health
+        let ipc_path = socket_path_from_env();
+        let ipc = UnixBus::connect_with_retry(&ipc_path, 10, StdDuration::from_millis(200))
+            .ok();
+
         while *self.is_running.read().await {
             // Monitorear servicios en ejecución
             self.monitor_services().await?;
             
             // Procesar cola de eventos
             self.process_event_queue().await?;
+
+            // Leer señales ready/health de servicios
+            if let Some(ref bus) = ipc {
+                let mut buf = [0u8; 2048];
+                if let Ok(Some(msg)) = bus.recv_timeout(&mut buf, StdDuration::from_millis(10)) {
+                    match msg {
+                        IpcMessage::Ready { service, .. } => {
+                            let _ = self.journal_manager.log_info("systemd", &format!("Servicio listo: {}", service));
+                        }
+                        IpcMessage::Health { service, ok } => {
+                            let lvl = if ok { "ok" } else { "fail" };
+                            let _ = self.journal_manager.log_info("systemd", &format!("Health {}: {}", service, lvl));
+                        }
+                        IpcMessage::Pong { service } => {
+                            let _ = self.journal_manager.log_debug("systemd", &format!("Pong de {}", service));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             
             // Sincronizar journal
             self.journal_manager.sync()?;

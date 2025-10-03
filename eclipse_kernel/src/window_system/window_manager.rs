@@ -1,5 +1,5 @@
 //! Gestor de ventanas del sistema de ventanas
-//! 
+//!
 //! Maneja la creación, destrucción y gestión de ventanas,
 //! similar al window manager de X11/Wayland.
 
@@ -8,12 +8,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::geometry::{Point, Size, Rectangle};
+use super::client_api::{get_client_api, ClientAPI};
+use super::compositor::{get_window_compositor, WindowCompositor};
+use super::geometry::{Point, Rectangle, Size};
 use super::protocol::WindowFlags;
 use super::window::{Window, WindowState, WindowType};
-use super::compositor::{WindowCompositor, get_window_compositor};
-use super::client_api::{ClientAPI, get_client_api};
-use super::{WindowId, ClientId};
+use super::{ClientId, WindowId};
 
 /// Gestor de ventanas
 pub struct WindowManager {
@@ -67,8 +67,15 @@ impl WindowManager {
         let window_id = self.next_window_id.fetch_add(1, Ordering::SeqCst);
         let geometry = Rectangle::new(x, y, width, height);
 
-        let window = Window::new(window_id, client_id, title.clone(), geometry, flags, window_type);
-        
+        let window = Window::new(
+            window_id,
+            client_id,
+            title.clone(),
+            geometry,
+            flags,
+            window_type,
+        );
+
         self.windows.insert(window_id, window);
         self.window_stack.push(window_id);
 
@@ -119,7 +126,7 @@ impl WindowManager {
     pub fn map_window(&mut self, window_id: WindowId) -> Result<(), &'static str> {
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.map();
-            
+
             // Marcar para redibujado en el compositor
             if let Ok(compositor) = get_window_compositor() {
                 compositor.mark_window_dirty(window_id)?;
@@ -179,7 +186,12 @@ impl WindowManager {
     }
 
     /// Redimensionar una ventana
-    pub fn resize_window(&mut self, window_id: WindowId, width: u32, height: u32) -> Result<(), &'static str> {
+    pub fn resize_window(
+        &mut self,
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), &'static str> {
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.resize(width, height);
 
@@ -200,7 +212,11 @@ impl WindowManager {
     }
 
     /// Establecer título de una ventana
-    pub fn set_window_title(&mut self, window_id: WindowId, title: String) -> Result<(), &'static str> {
+    pub fn set_window_title(
+        &mut self,
+        window_id: WindowId,
+        title: String,
+    ) -> Result<(), &'static str> {
         if let Some(window) = self.windows.get_mut(&window_id) {
             window.set_title(title.clone());
 
@@ -257,7 +273,7 @@ impl WindowManager {
     pub fn bring_window_to_front(&mut self, window_id: WindowId) -> Result<(), &'static str> {
         // Remover de la posición actual en el stack
         self.window_stack.retain(|&id| id != window_id);
-        
+
         // Agregar al final (frente)
         self.window_stack.push(window_id);
 
@@ -350,7 +366,7 @@ impl WindowManager {
     /// Obtener ventanas en un área
     pub fn get_windows_in_area(&self, area: Rectangle) -> Vec<WindowId> {
         let mut windows = Vec::new();
-        
+
         for &window_id in &self.window_stack {
             if let Some(window) = self.windows.get(&window_id) {
                 if window.is_visible() && window.intersects(&area) {
@@ -358,7 +374,7 @@ impl WindowManager {
                 }
             }
         }
-        
+
         windows
     }
 
@@ -397,7 +413,8 @@ impl WindowManager {
         self.window_stack
             .iter()
             .filter(|&&window_id| {
-                self.windows.get(&window_id)
+                self.windows
+                    .get(&window_id)
                     .map(|w| w.is_visible())
                     .unwrap_or(false)
             })
@@ -444,7 +461,7 @@ pub fn init_window_manager() -> Result<(), &'static str> {
         if WINDOW_MANAGER.is_some() {
             return Err("Gestor de ventanas ya inicializado");
         }
-        
+
         let mut manager = WindowManager::new()?;
         manager.initialize()?;
         WINDOW_MANAGER = Some(manager);
@@ -455,7 +472,9 @@ pub fn init_window_manager() -> Result<(), &'static str> {
 /// Obtener referencia al gestor de ventanas
 pub fn get_window_manager() -> Result<&'static mut WindowManager, &'static str> {
     unsafe {
-        WINDOW_MANAGER.as_mut().ok_or("Gestor de ventanas no inicializado")
+        WINDOW_MANAGER
+            .as_mut()
+            .ok_or("Gestor de ventanas no inicializado")
     }
 }
 

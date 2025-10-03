@@ -1,31 +1,69 @@
 //! Driver USB para teclado
-//! 
+//!
 //! Implementa soporte completo para teclados USB con funcionalidades avanzadas.
 
-use crate::drivers::framebuffer::{FramebufferDriver, Color};
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
 use crate::syslog;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 
 /// Códigos de teclas USB (HID Usage Tables)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UsbKeyCode {
     // Teclas de función
-    F1 = 0x3A, F2 = 0x3B, F3 = 0x3C, F4 = 0x3D,
-    F5 = 0x3E, F6 = 0x3F, F7 = 0x40, F8 = 0x41,
-    F9 = 0x42, F10 = 0x43, F11 = 0x44, F12 = 0x45,
+    F1 = 0x3A,
+    F2 = 0x3B,
+    F3 = 0x3C,
+    F4 = 0x3D,
+    F5 = 0x3E,
+    F6 = 0x3F,
+    F7 = 0x40,
+    F8 = 0x41,
+    F9 = 0x42,
+    F10 = 0x43,
+    F11 = 0x44,
+    F12 = 0x45,
 
     // Teclas de letras
-    A = 0x04, B = 0x05, C = 0x06, D = 0x07, E = 0x08,
-    F = 0x09, G = 0x0A, H = 0x0B, I = 0x0C, J = 0x0D,
-    K = 0x0E, L = 0x0F, M = 0x10, N = 0x11, O = 0x12,
-    P = 0x13, Q = 0x14, R = 0x15, S = 0x16, T = 0x17,
-    U = 0x18, V = 0x19, W = 0x1A, X = 0x1B, Y = 0x1C, Z = 0x1D,
+    A = 0x04,
+    B = 0x05,
+    C = 0x06,
+    D = 0x07,
+    E = 0x08,
+    F = 0x09,
+    G = 0x0A,
+    H = 0x0B,
+    I = 0x0C,
+    J = 0x0D,
+    K = 0x0E,
+    L = 0x0F,
+    M = 0x10,
+    N = 0x11,
+    O = 0x12,
+    P = 0x13,
+    Q = 0x14,
+    R = 0x15,
+    S = 0x16,
+    T = 0x17,
+    U = 0x18,
+    V = 0x19,
+    W = 0x1A,
+    X = 0x1B,
+    Y = 0x1C,
+    Z = 0x1D,
 
     // Números
-    Num1 = 0x1E, Num2 = 0x1F, Num3 = 0x20, Num4 = 0x21, Num5 = 0x22,
-    Num6 = 0x23, Num7 = 0x24, Num8 = 0x25, Num9 = 0x26, Num0 = 0x27,
+    Num1 = 0x1E,
+    Num2 = 0x1F,
+    Num3 = 0x20,
+    Num4 = 0x21,
+    Num5 = 0x22,
+    Num6 = 0x23,
+    Num7 = 0x24,
+    Num8 = 0x25,
+    Num9 = 0x26,
+    Num0 = 0x27,
 
     // Teclas especiales
     Enter = 0x28,
@@ -76,8 +114,8 @@ pub enum UsbKeyCode {
     NumAdd = 0x57,
     NumEnter = 0x58,
     NumDecimal = 0x63,
-    NumPadPlus = 0x157,  // Alias para NumAdd (valor diferente)
-    NumPadStar = 0x155,  // Alias para NumMultiply (valor diferente)
+    NumPadPlus = 0x157, // Alias para NumAdd (valor diferente)
+    NumPadStar = 0x155, // Alias para NumMultiply (valor diferente)
 
     // Teclas de sistema
     PrintScreen = 0x46,
@@ -102,59 +140,341 @@ impl UsbKeyCode {
     pub fn to_ascii(&self, shift_pressed: bool, caps_lock: bool) -> Option<char> {
         let ch = match self {
             // Letras
-            UsbKeyCode::A => if shift_pressed || caps_lock { 'A' } else { 'a' },
-            UsbKeyCode::B => if shift_pressed || caps_lock { 'B' } else { 'b' },
-            UsbKeyCode::C => if shift_pressed || caps_lock { 'C' } else { 'c' },
-            UsbKeyCode::D => if shift_pressed || caps_lock { 'D' } else { 'd' },
-            UsbKeyCode::E => if shift_pressed || caps_lock { 'E' } else { 'e' },
-            UsbKeyCode::F => if shift_pressed || caps_lock { 'F' } else { 'f' },
-            UsbKeyCode::G => if shift_pressed || caps_lock { 'G' } else { 'g' },
-            UsbKeyCode::H => if shift_pressed || caps_lock { 'H' } else { 'h' },
-            UsbKeyCode::I => if shift_pressed || caps_lock { 'I' } else { 'i' },
-            UsbKeyCode::J => if shift_pressed || caps_lock { 'J' } else { 'j' },
-            UsbKeyCode::K => if shift_pressed || caps_lock { 'K' } else { 'k' },
-            UsbKeyCode::L => if shift_pressed || caps_lock { 'L' } else { 'l' },
-            UsbKeyCode::M => if shift_pressed || caps_lock { 'M' } else { 'm' },
-            UsbKeyCode::N => if shift_pressed || caps_lock { 'N' } else { 'n' },
-            UsbKeyCode::O => if shift_pressed || caps_lock { 'O' } else { 'o' },
-            UsbKeyCode::P => if shift_pressed || caps_lock { 'P' } else { 'p' },
-            UsbKeyCode::Q => if shift_pressed || caps_lock { 'Q' } else { 'q' },
-            UsbKeyCode::R => if shift_pressed || caps_lock { 'R' } else { 'r' },
-            UsbKeyCode::S => if shift_pressed || caps_lock { 'S' } else { 's' },
-            UsbKeyCode::T => if shift_pressed || caps_lock { 'T' } else { 't' },
-            UsbKeyCode::U => if shift_pressed || caps_lock { 'U' } else { 'u' },
-            UsbKeyCode::V => if shift_pressed || caps_lock { 'V' } else { 'v' },
-            UsbKeyCode::W => if shift_pressed || caps_lock { 'W' } else { 'w' },
-            UsbKeyCode::X => if shift_pressed || caps_lock { 'X' } else { 'x' },
-            UsbKeyCode::Y => if shift_pressed || caps_lock { 'Y' } else { 'y' },
-            UsbKeyCode::Z => if shift_pressed || caps_lock { 'Z' } else { 'z' },
-            
+            UsbKeyCode::A => {
+                if shift_pressed || caps_lock {
+                    'A'
+                } else {
+                    'a'
+                }
+            }
+            UsbKeyCode::B => {
+                if shift_pressed || caps_lock {
+                    'B'
+                } else {
+                    'b'
+                }
+            }
+            UsbKeyCode::C => {
+                if shift_pressed || caps_lock {
+                    'C'
+                } else {
+                    'c'
+                }
+            }
+            UsbKeyCode::D => {
+                if shift_pressed || caps_lock {
+                    'D'
+                } else {
+                    'd'
+                }
+            }
+            UsbKeyCode::E => {
+                if shift_pressed || caps_lock {
+                    'E'
+                } else {
+                    'e'
+                }
+            }
+            UsbKeyCode::F => {
+                if shift_pressed || caps_lock {
+                    'F'
+                } else {
+                    'f'
+                }
+            }
+            UsbKeyCode::G => {
+                if shift_pressed || caps_lock {
+                    'G'
+                } else {
+                    'g'
+                }
+            }
+            UsbKeyCode::H => {
+                if shift_pressed || caps_lock {
+                    'H'
+                } else {
+                    'h'
+                }
+            }
+            UsbKeyCode::I => {
+                if shift_pressed || caps_lock {
+                    'I'
+                } else {
+                    'i'
+                }
+            }
+            UsbKeyCode::J => {
+                if shift_pressed || caps_lock {
+                    'J'
+                } else {
+                    'j'
+                }
+            }
+            UsbKeyCode::K => {
+                if shift_pressed || caps_lock {
+                    'K'
+                } else {
+                    'k'
+                }
+            }
+            UsbKeyCode::L => {
+                if shift_pressed || caps_lock {
+                    'L'
+                } else {
+                    'l'
+                }
+            }
+            UsbKeyCode::M => {
+                if shift_pressed || caps_lock {
+                    'M'
+                } else {
+                    'm'
+                }
+            }
+            UsbKeyCode::N => {
+                if shift_pressed || caps_lock {
+                    'N'
+                } else {
+                    'n'
+                }
+            }
+            UsbKeyCode::O => {
+                if shift_pressed || caps_lock {
+                    'O'
+                } else {
+                    'o'
+                }
+            }
+            UsbKeyCode::P => {
+                if shift_pressed || caps_lock {
+                    'P'
+                } else {
+                    'p'
+                }
+            }
+            UsbKeyCode::Q => {
+                if shift_pressed || caps_lock {
+                    'Q'
+                } else {
+                    'q'
+                }
+            }
+            UsbKeyCode::R => {
+                if shift_pressed || caps_lock {
+                    'R'
+                } else {
+                    'r'
+                }
+            }
+            UsbKeyCode::S => {
+                if shift_pressed || caps_lock {
+                    'S'
+                } else {
+                    's'
+                }
+            }
+            UsbKeyCode::T => {
+                if shift_pressed || caps_lock {
+                    'T'
+                } else {
+                    't'
+                }
+            }
+            UsbKeyCode::U => {
+                if shift_pressed || caps_lock {
+                    'U'
+                } else {
+                    'u'
+                }
+            }
+            UsbKeyCode::V => {
+                if shift_pressed || caps_lock {
+                    'V'
+                } else {
+                    'v'
+                }
+            }
+            UsbKeyCode::W => {
+                if shift_pressed || caps_lock {
+                    'W'
+                } else {
+                    'w'
+                }
+            }
+            UsbKeyCode::X => {
+                if shift_pressed || caps_lock {
+                    'X'
+                } else {
+                    'x'
+                }
+            }
+            UsbKeyCode::Y => {
+                if shift_pressed || caps_lock {
+                    'Y'
+                } else {
+                    'y'
+                }
+            }
+            UsbKeyCode::Z => {
+                if shift_pressed || caps_lock {
+                    'Z'
+                } else {
+                    'z'
+                }
+            }
+
             // Números
-            UsbKeyCode::Num0 => if shift_pressed { ')' } else { '0' },
-            UsbKeyCode::Num1 => if shift_pressed { '!' } else { '1' },
-            UsbKeyCode::Num2 => if shift_pressed { '@' } else { '2' },
-            UsbKeyCode::Num3 => if shift_pressed { '#' } else { '3' },
-            UsbKeyCode::Num4 => if shift_pressed { '$' } else { '4' },
-            UsbKeyCode::Num5 => if shift_pressed { '%' } else { '5' },
-            UsbKeyCode::Num6 => if shift_pressed { '^' } else { '6' },
-            UsbKeyCode::Num7 => if shift_pressed { '&' } else { '7' },
-            UsbKeyCode::Num8 => if shift_pressed { '*' } else { '8' },
-            UsbKeyCode::Num9 => if shift_pressed { '(' } else { '9' },
-            
+            UsbKeyCode::Num0 => {
+                if shift_pressed {
+                    ')'
+                } else {
+                    '0'
+                }
+            }
+            UsbKeyCode::Num1 => {
+                if shift_pressed {
+                    '!'
+                } else {
+                    '1'
+                }
+            }
+            UsbKeyCode::Num2 => {
+                if shift_pressed {
+                    '@'
+                } else {
+                    '2'
+                }
+            }
+            UsbKeyCode::Num3 => {
+                if shift_pressed {
+                    '#'
+                } else {
+                    '3'
+                }
+            }
+            UsbKeyCode::Num4 => {
+                if shift_pressed {
+                    '$'
+                } else {
+                    '4'
+                }
+            }
+            UsbKeyCode::Num5 => {
+                if shift_pressed {
+                    '%'
+                } else {
+                    '5'
+                }
+            }
+            UsbKeyCode::Num6 => {
+                if shift_pressed {
+                    '^'
+                } else {
+                    '6'
+                }
+            }
+            UsbKeyCode::Num7 => {
+                if shift_pressed {
+                    '&'
+                } else {
+                    '7'
+                }
+            }
+            UsbKeyCode::Num8 => {
+                if shift_pressed {
+                    '*'
+                } else {
+                    '8'
+                }
+            }
+            UsbKeyCode::Num9 => {
+                if shift_pressed {
+                    '('
+                } else {
+                    '9'
+                }
+            }
+
             // Símbolos
             UsbKeyCode::Space => ' ',
-            UsbKeyCode::Minus => if shift_pressed { '_' } else { '-' },
-            UsbKeyCode::Equal => if shift_pressed { '+' } else { '=' },
-            UsbKeyCode::LeftBracket => if shift_pressed { '{' } else { '[' },
-            UsbKeyCode::RightBracket => if shift_pressed { '}' } else { ']' },
-            UsbKeyCode::Backslash => if shift_pressed { '|' } else { '\\' },
-            UsbKeyCode::Semicolon => if shift_pressed { ':' } else { ';' },
-            UsbKeyCode::Quote => if shift_pressed { '"' } else { '\'' },
-            UsbKeyCode::Grave => if shift_pressed { '~' } else { '`' },
-            UsbKeyCode::Comma => if shift_pressed { '<' } else { ',' },
-            UsbKeyCode::Period => if shift_pressed { '>' } else { '.' },
-            UsbKeyCode::Slash => if shift_pressed { '?' } else { '/' },
-            
+            UsbKeyCode::Minus => {
+                if shift_pressed {
+                    '_'
+                } else {
+                    '-'
+                }
+            }
+            UsbKeyCode::Equal => {
+                if shift_pressed {
+                    '+'
+                } else {
+                    '='
+                }
+            }
+            UsbKeyCode::LeftBracket => {
+                if shift_pressed {
+                    '{'
+                } else {
+                    '['
+                }
+            }
+            UsbKeyCode::RightBracket => {
+                if shift_pressed {
+                    '}'
+                } else {
+                    ']'
+                }
+            }
+            UsbKeyCode::Backslash => {
+                if shift_pressed {
+                    '|'
+                } else {
+                    '\\'
+                }
+            }
+            UsbKeyCode::Semicolon => {
+                if shift_pressed {
+                    ':'
+                } else {
+                    ';'
+                }
+            }
+            UsbKeyCode::Quote => {
+                if shift_pressed {
+                    '"'
+                } else {
+                    '\''
+                }
+            }
+            UsbKeyCode::Grave => {
+                if shift_pressed {
+                    '~'
+                } else {
+                    '`'
+                }
+            }
+            UsbKeyCode::Comma => {
+                if shift_pressed {
+                    '<'
+                } else {
+                    ','
+                }
+            }
+            UsbKeyCode::Period => {
+                if shift_pressed {
+                    '>'
+                } else {
+                    '.'
+                }
+            }
+            UsbKeyCode::Slash => {
+                if shift_pressed {
+                    '?'
+                } else {
+                    '/'
+                }
+            }
+
             // Teclado numérico
             UsbKeyCode::NumPadPlus => '+',
             UsbKeyCode::NumPadStar => '*',
@@ -163,7 +483,7 @@ impl UsbKeyCode {
             UsbKeyCode::NumSubtract => '-',
             UsbKeyCode::NumDivide => '/',
             UsbKeyCode::NumDecimal => '.',
-            
+
             // Teclas especiales que no producen caracteres
             _ => return None,
         };
@@ -226,9 +546,9 @@ impl Default for ModifierState {
 //         }
 //     }
 // }
-// 
+//
 // impl KeyboardEvent {
-    /// Convertir a KeyboardEvent del input_system
+/// Convertir a KeyboardEvent del input_system
 //     pub fn to_input_system_keyboard_event(&self) -> crate::drivers::input_system::KeyboardEvent {
 //         crate::drivers::input_system::KeyboardEvent {
 //             key_code: self.key_code,
@@ -313,15 +633,23 @@ impl UsbKeyboardDriver {
             return Err("El driver del teclado ya está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", &alloc::format!(
-            "Inicializando driver USB para teclado (ID: {})",
-            self.device_id
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_KEYBOARD",
+            &alloc::format!(
+                "Inicializando driver USB para teclado (ID: {})",
+                self.device_id
+            ),
+        );
 
         // Simular inicialización del dispositivo USB
         self.is_initialized = true;
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", "Driver USB para teclado inicializado correctamente");
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_KEYBOARD",
+            "Driver USB para teclado inicializado correctamente",
+        );
         Ok(())
     }
 
@@ -487,7 +815,8 @@ impl UsbKeyboardDriver {
     }
 
     fn process_key_releases(&mut self, current_keys: &[u8]) {
-        let current_key_set: alloc::collections::BTreeSet<u8> = current_keys.iter().cloned().collect();
+        let current_key_set: alloc::collections::BTreeSet<u8> =
+            current_keys.iter().cloned().collect();
         let mut keys_to_release = Vec::new();
 
         for (&key_code, &timestamp) in &self.pressed_keys {
@@ -713,22 +1042,26 @@ impl UsbKeyboardDriver {
             return Err("El driver del teclado no está inicializado".to_string());
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", &alloc::format!(
-            "Configurando LEDs del teclado: {:?}", leds
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_KEYBOARD",
+            &alloc::format!("Configurando LEDs del teclado: {:?}", leds),
+        );
 
         // Simular envío de comando de LEDs al dispositivo USB
         // En un driver real, esto enviaría un report HID al dispositivo
         let led_byte = leds.to_byte();
-        
+
         // Simular delay de comunicación USB
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
 
-        syslog::log_kernel(syslog::SyslogSeverity::Info, "USB_KEYBOARD", &alloc::format!(
-            "LEDs del teclado configurados: 0x{:02X}", led_byte
-        ));
+        syslog::log_kernel(
+            syslog::SyslogSeverity::Info,
+            "USB_KEYBOARD",
+            &alloc::format!("LEDs del teclado configurados: 0x{:02X}", led_byte),
+        );
 
         Ok(())
     }
@@ -797,11 +1130,21 @@ impl KeyboardLeds {
     /// Convertir a byte para envío USB
     pub fn to_byte(&self) -> u8 {
         let mut byte = 0;
-        if self.num_lock { byte |= 0x01; }
-        if self.caps_lock { byte |= 0x02; }
-        if self.scroll_lock { byte |= 0x04; }
-        if self.compose { byte |= 0x08; }
-        if self.kana { byte |= 0x10; }
+        if self.num_lock {
+            byte |= 0x01;
+        }
+        if self.caps_lock {
+            byte |= 0x02;
+        }
+        if self.scroll_lock {
+            byte |= 0x04;
+        }
+        if self.compose {
+            byte |= 0x08;
+        }
+        if self.kana {
+            byte |= 0x10;
+        }
         byte
     }
 }

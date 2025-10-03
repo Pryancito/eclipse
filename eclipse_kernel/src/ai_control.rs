@@ -1,19 +1,19 @@
 //! Sistema de control del sistema operativo por IA
-//! 
+//!
 //! Este módulo implementa el control directo del sistema operativo
 //! por parte de la IA, permitiendo intervenciones automáticas y
 //! gestión inteligente de recursos.
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ai_integration::{AIIntegration, AIIntervention, AICommand, AICommandResult};
 use crate::ai_communication::{AICommunicationChannel, CommunicationType};
+use crate::ai_integration::{AICommand, AICommandResult, AIIntegration, AIIntervention};
 
 /// Controlador de sistema operativo por IA
 pub struct AISystemController {
@@ -117,13 +117,13 @@ impl AISystemController {
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         // Activar controlador
         self.is_active.store(true, Ordering::Release);
-        
+
         // Cargar políticas de control por defecto
         self.load_default_policies()?;
-        
+
         // Iniciar monitoreo del sistema
         self.start_system_monitoring()?;
-        
+
         Ok(())
     }
 
@@ -138,7 +138,8 @@ impl AISystemController {
             enabled: true,
             threshold: 0.85,
         };
-        self.control_policies.insert("memory_management".to_string(), memory_policy);
+        self.control_policies
+            .insert("memory_management".to_string(), memory_policy);
 
         // Política de gestión de CPU
         let cpu_policy = ControlPolicy {
@@ -149,7 +150,8 @@ impl AISystemController {
             enabled: true,
             threshold: 0.90,
         };
-        self.control_policies.insert("cpu_management".to_string(), cpu_policy);
+        self.control_policies
+            .insert("cpu_management".to_string(), cpu_policy);
 
         // Política de seguridad
         let security_policy = ControlPolicy {
@@ -160,7 +162,8 @@ impl AISystemController {
             enabled: true,
             threshold: 0.05,
         };
-        self.control_policies.insert("security_monitoring".to_string(), security_policy);
+        self.control_policies
+            .insert("security_monitoring".to_string(), security_policy);
 
         // Política de rendimiento
         let performance_policy = ControlPolicy {
@@ -171,7 +174,8 @@ impl AISystemController {
             enabled: true,
             threshold: 1000.0,
         };
-        self.control_policies.insert("performance_optimization".to_string(), performance_policy);
+        self.control_policies
+            .insert("performance_optimization".to_string(), performance_policy);
 
         Ok(())
     }
@@ -187,7 +191,7 @@ impl AISystemController {
     pub fn update_system_metrics(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se obtendrían métricas reales
         // Por ahora, simulamos datos
-        
+
         self.system_metrics.cpu_usage = 0.25;
         self.system_metrics.memory_usage = 0.60;
         self.system_metrics.disk_usage = 0.40;
@@ -197,7 +201,7 @@ impl AISystemController {
         self.system_metrics.response_time = 150.0;
         self.system_metrics.error_rate = 0.02;
         self.system_metrics.throughput = 1000.0;
-        
+
         Ok(())
     }
 
@@ -223,18 +227,10 @@ impl AISystemController {
     /// Evalúa la condición de una política
     fn evaluate_policy_condition(&self, policy: &ControlPolicy) -> Result<bool, &'static str> {
         match policy.condition.as_str() {
-            "memory_usage > 0.85" => {
-                Ok(self.system_metrics.memory_usage > policy.threshold)
-            }
-            "cpu_usage > 0.90" => {
-                Ok(self.system_metrics.cpu_usage > policy.threshold)
-            }
-            "error_rate > 0.05" => {
-                Ok(self.system_metrics.error_rate > policy.threshold)
-            }
-            "response_time > 1000" => {
-                Ok(self.system_metrics.response_time > policy.threshold)
-            }
+            "memory_usage > 0.85" => Ok(self.system_metrics.memory_usage > policy.threshold),
+            "cpu_usage > 0.90" => Ok(self.system_metrics.cpu_usage > policy.threshold),
+            "error_rate > 0.05" => Ok(self.system_metrics.error_rate > policy.threshold),
+            "response_time > 1000" => Ok(self.system_metrics.response_time > policy.threshold),
             _ => {
                 // En una implementación real, aquí se evaluaría la condición
                 // usando un motor de expresiones
@@ -244,7 +240,11 @@ impl AISystemController {
     }
 
     /// Ejecuta la acción de una política
-    fn execute_policy_action(&mut self, policy_name: &str, policy: &ControlPolicy) -> Result<(), &'static str> {
+    fn execute_policy_action(
+        &mut self,
+        policy_name: &str,
+        policy: &ControlPolicy,
+    ) -> Result<(), &'static str> {
         let intervention_type = match policy.action.as_str() {
             "optimize_memory" => AIIntervention::MemoryOptimization,
             "optimize_cpu" => AIIntervention::PerformanceTuning,
@@ -293,7 +293,13 @@ impl AISystemController {
     }
 
     /// Registra una intervención
-    fn record_intervention(&mut self, command: &AICommand, result: bool, impact: f32, details: &str) -> Result<(), &'static str> {
+    fn record_intervention(
+        &mut self,
+        command: &AICommand,
+        result: bool,
+        impact: f32,
+        details: &str,
+    ) -> Result<(), &'static str> {
         let record = InterventionRecord {
             id: command.id,
             timestamp: command.timestamp,
@@ -306,7 +312,7 @@ impl AISystemController {
         };
 
         self.intervention_history.push(record);
-        
+
         // Limitar tamaño del historial
         if self.intervention_history.len() > 1000 {
             self.intervention_history.remove(0);
@@ -342,7 +348,11 @@ impl AISystemController {
     }
 
     /// Ajusta los umbrales basado en el aprendizaje
-    fn adjust_thresholds(&mut self, successful: &[&InterventionRecord], failed: &[&InterventionRecord]) -> Result<(), &'static str> {
+    fn adjust_thresholds(
+        &mut self,
+        successful: &[&InterventionRecord],
+        failed: &[&InterventionRecord],
+    ) -> Result<(), &'static str> {
         if !self.control_config.adaptive_thresholds {
             return Ok(());
         }
@@ -373,7 +383,11 @@ impl AISystemController {
     }
 
     /// Calcula la tasa de éxito para un tipo de intervención
-    fn calculate_success_rate(&self, interventions: &[&InterventionRecord], intervention_type: &str) -> f32 {
+    fn calculate_success_rate(
+        &self,
+        interventions: &[&InterventionRecord],
+        intervention_type: &str,
+    ) -> f32 {
         let relevant_interventions: Vec<&InterventionRecord> = interventions
             .iter()
             .filter(|r| r.action.contains(intervention_type))
@@ -392,7 +406,7 @@ impl AISystemController {
     fn optimize_policies_simple(&mut self) -> Result<(), &'static str> {
         // En una implementación real, aquí se optimizarían las políticas
         // basado en el historial de intervenciones
-        
+
         // Por ahora, solo habilitamos/deshabilitamos políticas basado en su éxito
         for (policy_name, policy) in &mut self.control_policies {
             // Simular análisis simple basado en el número de intervenciones
@@ -417,9 +431,13 @@ impl AISystemController {
     /// Obtiene estadísticas del controlador
     pub fn get_controller_stats(&self) -> ControllerStats {
         let total_interventions = self.intervention_history.len();
-        let successful_interventions = self.intervention_history.iter().filter(|r| r.result).count();
+        let successful_interventions = self
+            .intervention_history
+            .iter()
+            .filter(|r| r.result)
+            .count();
         let failed_interventions = total_interventions - successful_interventions;
-        
+
         ControllerStats {
             total_interventions,
             successful_interventions,
@@ -487,7 +505,5 @@ pub fn init_ai_system_controller() -> Result<(), &'static str> {
 
 /// Obtiene la instancia global del controlador
 pub fn get_ai_system_controller() -> Option<&'static mut AISystemController> {
-    unsafe {
-        AI_SYSTEM_CONTROLLER.as_mut()
-    }
+    unsafe { AI_SYSTEM_CONTROLLER.as_mut() }
 }

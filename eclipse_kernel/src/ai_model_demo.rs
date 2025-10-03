@@ -1,5 +1,5 @@
 //! Demostración de Modelos de IA Pre-entrenados en Eclipse OS
-//! 
+//!
 //! Este módulo demuestra cómo usar modelos de IA pre-entrenados
 //! en el sistema operativo Eclipse OS.
 
@@ -8,10 +8,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::ai_pretrained_models::{
-    load_pretrained_model, run_model_inference, get_model_manager
-};
-use crate::{syslog_warn, syslog_info, syslog::{}};
+use crate::ai_pretrained_models::{get_model_manager, load_pretrained_model, run_model_inference};
+use crate::{syslog_info, syslog_warn};
 /// Demostración de modelos pre-entrenados
 pub struct AIModelDemo {
     /// Estado de la demostración
@@ -32,38 +30,47 @@ impl AIModelDemo {
     /// Ejecutar demostración completa
     pub fn run_demo(&mut self) -> Result<(), &'static str> {
         self.is_running = true;
-        
+
         // Mostrar encabezado
         self.show_header()?;
-        
+
         // Demostrar carga de modelos
         self.demo_model_loading()?;
-        
+
         // Demostrar inferencia
         self.demo_model_inference()?;
-        
+
         // Demostrar gestión de memoria
         self.demo_memory_management()?;
-        
+
         // Mostrar estadísticas
         self.show_statistics()?;
-        
+
         self.is_running = false;
         Ok(())
     }
 
     /// Mostrar encabezado
     fn show_header(&self) -> Result<(), &'static str> {
-        syslog_info!("AI_DEMO", "=== ECLIPSE OS - MODELOS DE IA PRE-ENTRENADOS ===");
-        syslog_info!("AI_DEMO", "Sistema de carga y gestión de modelos de IA pre-entrenados");
+        syslog_info!(
+            "AI_DEMO",
+            "=== ECLIPSE OS - MODELOS DE IA PRE-ENTRENADOS ==="
+        );
+        syslog_info!(
+            "AI_DEMO",
+            "Sistema de carga y gestión de modelos de IA pre-entrenados"
+        );
         syslog_info!("AI_DEMO", "Optimizado para sistemas operativos embebidos");
         Ok(())
     }
 
     /// Demostrar carga de modelos
     fn demo_model_loading(&mut self) -> Result<(), &'static str> {
-        syslog_info!("AI_DEMO", "--- DEMOSTRACIÓN: Carga de Modelos Pre-entrenados ---");
-        
+        syslog_info!(
+            "AI_DEMO",
+            "--- DEMOSTRACIÓN: Carga de Modelos Pre-entrenados ---"
+        );
+
         // Listar modelos disponibles
         syslog_info!("AI_DEMO", "Modelos disponibles:");
         syslog_info!("AI_DEMO", "  - TinyLlama-1.1B (Lenguaje natural)");
@@ -101,7 +108,7 @@ impl AIModelDemo {
     /// Demostrar inferencia con modelos
     fn demo_model_inference(&self) -> Result<(), &'static str> {
         syslog_info!("AI_DEMO", "--- DEMOSTRACIÓN: Inferencia con Modelos ---");
-        
+
         if self.loaded_models.is_empty() {
             syslog_warn!("AI_DEMO", "No hay modelos cargados para inferencia");
             return Ok(());
@@ -110,11 +117,11 @@ impl AIModelDemo {
         // Probar TinyLlama
         if let Some(tinyllama_id) = self.loaded_models.first() {
             syslog_info!("AI_DEMO", "Probando TinyLlama (ID: {})", tinyllama_id);
-        let test_inputs = [
-            "¿Cómo optimizar la memoria del sistema?",
-            "Explica el funcionamiento del kernel",
-            "¿Qué procesos están consumiendo más CPU?",
-        ];
+            let test_inputs = [
+                "¿Cómo optimizar la memoria del sistema?",
+                "Explica el funcionamiento del kernel",
+                "¿Qué procesos están consumiendo más CPU?",
+            ];
 
             for input in test_inputs {
                 syslog_info!("AI_DEMO", "Entrada: {}", input);
@@ -133,11 +140,11 @@ impl AIModelDemo {
         if self.loaded_models.len() > 1 {
             let distilbert_id = self.loaded_models[1];
             syslog_info!("AI_DEMO", "Probando DistilBERT (ID: {})", distilbert_id);
-        let test_inputs = [
-            "analizar logs del sistema",
-            "clasificar proceso como crítico",
-            "detectar anomalía en red",
-        ];
+            let test_inputs = [
+                "analizar logs del sistema",
+                "clasificar proceso como crítico",
+                "detectar anomalía en red",
+            ];
 
             for input in test_inputs {
                 syslog_info!("AI_DEMO", "Entrada: {}", input);
@@ -158,15 +165,23 @@ impl AIModelDemo {
     /// Demostrar gestión de memoria
     fn demo_memory_management(&self) -> Result<(), &'static str> {
         syslog_info!("AI_DEMO", "--- DEMOSTRACIÓN: Gestión de Memoria ---");
-        
+
         if let Some(manager) = get_model_manager() {
             let stats = manager.get_stats();
             syslog_info!("AI_DEMO", "Estadísticas del gestor de modelos:");
             syslog_info!("AI_DEMO", "  - Modelos totales: {}", stats.total_models);
             syslog_info!("AI_DEMO", "  - Modelos cargados: {}", stats.loaded_models);
-            syslog_info!("AI_DEMO", "  - Memoria usada: {} MB", stats.total_memory_usage);
+            syslog_info!(
+                "AI_DEMO",
+                "  - Memoria usada: {} MB",
+                stats.total_memory_usage
+            );
             syslog_info!("AI_DEMO", "  - Memoria máxima: {} MB", stats.max_memory);
-            syslog_info!("AI_DEMO", "  - Inferencias totales: {}", stats.total_inferences);
+            syslog_info!(
+                "AI_DEMO",
+                "  - Inferencias totales: {}",
+                stats.total_inferences
+            );
         } else {
             syslog_warn!("AI_DEMO", "Gestor de modelos no disponible");
         }
@@ -177,12 +192,12 @@ impl AIModelDemo {
     /// Mostrar estadísticas finales
     fn show_statistics(&self) -> Result<(), &'static str> {
         syslog_info!("AI_DEMO", "--- ESTADÍSTICAS FINALES ---");
-        
+
         syslog_info!("AI_DEMO", "Sistema de modelos pre-entrenados: Funcional");
         syslog_info!("AI_DEMO", "Carga dinámica de modelos: Funcional");
         syslog_info!("AI_DEMO", "Inferencia en tiempo real: Funcional");
         syslog_info!("AI_DEMO", "Gestión de memoria: Funcional");
-        
+
         syslog_info!("AI_DEMO", "Características implementadas:");
         syslog_info!("AI_DEMO", "  - Carga de modelos desde Hugging Face");
         syslog_info!("AI_DEMO", "  - Soporte para modelos ONNX");
@@ -190,10 +205,13 @@ impl AIModelDemo {
         syslog_info!("AI_DEMO", "  - Inferencia optimizada para embebidos");
         syslog_info!("AI_DEMO", "  - Compatibilidad con no_std");
         syslog_info!("AI_DEMO", "  - Modelos especializados para SO");
-        
-        syslog_info!("AI_DEMO", "Eclipse OS con modelos pre-entrenados está listo");
+
+        syslog_info!(
+            "AI_DEMO",
+            "Eclipse OS con modelos pre-entrenados está listo"
+        );
         syslog_info!("AI_DEMO", "para ejecutar IA avanzada en sistemas embebidos");
-        
+
         Ok(())
     }
 }
@@ -222,7 +240,5 @@ pub fn run_ai_model_demo() -> Result<(), &'static str> {
 
 /// Obtener instancia de la demostración
 pub fn get_ai_model_demo() -> Option<&'static mut AIModelDemo> {
-    unsafe {
-        AI_MODEL_DEMO.as_mut()
-    }
+    unsafe { AI_MODEL_DEMO.as_mut() }
 }

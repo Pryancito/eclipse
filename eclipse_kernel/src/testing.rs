@@ -1,5 +1,5 @@
 //! Sistema de pruebas y validación para Eclipse OS
-//! 
+//!
 //! Este módulo proporciona funciones para probar y validar
 //! el funcionamiento del kernel Eclipse OS.
 
@@ -21,14 +21,14 @@ impl KernelTester {
             failed_tests: 0,
         }
     }
-    
+
     /// Ejecutar una prueba
     pub fn run_test<F>(&mut self, name: &str, test_fn: F) -> KernelResult<()>
     where
         F: FnOnce() -> KernelResult<()>,
     {
         self.test_count += 1;
-        
+
         match test_fn() {
             Ok(()) => {
                 self.passed_tests += 1;
@@ -40,7 +40,7 @@ impl KernelTester {
             }
         }
     }
-    
+
     /// Obtener estadísticas de las pruebas
     pub fn get_stats(&self) -> (u32, u32, u32) {
         (self.test_count, self.passed_tests, self.failed_tests)
@@ -50,14 +50,14 @@ impl KernelTester {
 /// Función de conveniencia para ejecutar todas las pruebas
 pub fn run_all_tests() -> KernelResult<()> {
     let mut tester = KernelTester::new();
-    
+
     // Ejecutar pruebas básicas
     tester.run_test("memory_test", memory_test)?;
     tester.run_test("vga_test", vga_test)?;
     tester.run_test("interrupt_test", interrupt_test)?;
-    
+
     let (total, passed, failed) = tester.get_stats();
-    
+
     if failed > 0 {
         Err(crate::KernelError::Unknown)
     } else {

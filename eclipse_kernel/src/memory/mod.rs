@@ -1,18 +1,18 @@
 //! Módulo de Gestión de Memoria para Eclipse OS
-//! 
+//!
 //! Este módulo proporciona todas las funcionalidades de gestión de memoria:
 //! - Paginación de 4 niveles
 //! - Asignación dinámica de memoria
 //! - Gestión de memoria física
 //! - Protección de memoria
 
+pub mod allocator;
 pub mod manager;
 pub mod paging;
-pub mod allocator;
 
 // Re-exportar las estructuras principales
-pub use manager::{init_memory_manager, get_memory_manager};
-pub use paging::{init_paging, enable_paging};
+pub use manager::{get_memory_manager, init_memory_manager};
+pub use paging::{enable_paging, init_paging};
 
 /// Constantes de memoria
 pub const PAGE_SIZE: usize = 4096;
@@ -36,13 +36,13 @@ pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16MB
 pub fn init_memory_system(physical_base: u64, memory_size: u64) -> Result<(), &'static str> {
     // Inicializar el gestor de memoria
     init_memory_manager(physical_base, memory_size)?;
-    
+
     // Inicializar el sistema de paginación
     let _paging = init_paging()?;
-    
+
     // Habilitar paginación
     enable_paging();
-    
+
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 //! Driver NVIDIA para ReactOS Rust
-//! 
+//!
 //! Implementa soporte completo para tarjetas gráficas NVIDIA
 
 use core::ptr;
@@ -15,37 +15,37 @@ pub enum NvidiaModel {
     RTX4080,
     RTX4070,
     RTX4060,
-    
+
     // GeForce RTX 30 Series
     RTX3090,
     RTX3080,
     RTX3070,
     RTX3060,
-    
+
     // GeForce RTX 20 Series
     RTX2080,
     RTX2070,
     RTX2060,
-    
+
     // GeForce GTX 16 Series
     GTX1660,
     GTX1650,
-    
+
     // GeForce GTX 10 Series
     GTX1080,
     GTX1070,
     GTX1060,
     GTX1050,
-    
+
     // Quadro Series
     QuadroRTX8000,
     QuadroRTX6000,
     QuadroRTX5000,
-    
+
     // Tesla Series
     TeslaV100,
     TeslaT4,
-    
+
     Unknown,
 }
 
@@ -57,35 +57,35 @@ impl NvidiaModel {
             0x2704 => NvidiaModel::RTX4080,
             0x2782 => NvidiaModel::RTX4070,
             0x2786 => NvidiaModel::RTX4060,
-            
+
             0x2204 => NvidiaModel::RTX3090,
             0x2206 => NvidiaModel::RTX3080,
             0x2484 => NvidiaModel::RTX3070,
             0x2503 => NvidiaModel::RTX3060,
-            
+
             0x1E87 => NvidiaModel::RTX2080,
             0x1F07 => NvidiaModel::RTX2070,
             0x1F08 => NvidiaModel::RTX2060,
-            
+
             0x2184 => NvidiaModel::GTX1660,
             0x1F82 => NvidiaModel::GTX1650,
-            
+
             0x1B80 => NvidiaModel::GTX1080,
             0x1B81 => NvidiaModel::GTX1070,
             0x1C03 => NvidiaModel::GTX1060,
             0x1C8C => NvidiaModel::GTX1050,
-            
+
             0x1E30 => NvidiaModel::QuadroRTX8000,
             0x1E78 => NvidiaModel::QuadroRTX6000,
             0x1EBB => NvidiaModel::QuadroRTX5000,
-            
+
             0x1DB6 => NvidiaModel::TeslaV100,
             0x1EB8 => NvidiaModel::TeslaT4,
-            
+
             _ => NvidiaModel::Unknown,
         }
     }
-    
+
     /// Obtener nombre del modelo
     pub fn name(&self) -> &'static str {
         match self {
@@ -93,35 +93,35 @@ impl NvidiaModel {
             NvidiaModel::RTX4080 => "GeForce RTX 4080",
             NvidiaModel::RTX4070 => "GeForce RTX 4070",
             NvidiaModel::RTX4060 => "GeForce RTX 4060",
-            
+
             NvidiaModel::RTX3090 => "GeForce RTX 3090",
             NvidiaModel::RTX3080 => "GeForce RTX 3080",
             NvidiaModel::RTX3070 => "GeForce RTX 3070",
             NvidiaModel::RTX3060 => "GeForce RTX 3060",
-            
+
             NvidiaModel::RTX2080 => "GeForce RTX 2080",
             NvidiaModel::RTX2070 => "GeForce RTX 2070",
             NvidiaModel::RTX2060 => "GeForce RTX 2060",
-            
+
             NvidiaModel::GTX1660 => "GeForce GTX 1660",
             NvidiaModel::GTX1650 => "GeForce GTX 1650",
-            
+
             NvidiaModel::GTX1080 => "GeForce GTX 1080",
             NvidiaModel::GTX1070 => "GeForce GTX 1070",
             NvidiaModel::GTX1060 => "GeForce GTX 1060",
             NvidiaModel::GTX1050 => "GeForce GTX 1050",
-            
+
             NvidiaModel::QuadroRTX8000 => "Quadro RTX 8000",
             NvidiaModel::QuadroRTX6000 => "Quadro RTX 6000",
             NvidiaModel::QuadroRTX5000 => "Quadro RTX 5000",
-            
+
             NvidiaModel::TeslaV100 => "Tesla V100",
             NvidiaModel::TeslaT4 => "Tesla T4",
-            
+
             NvidiaModel::Unknown => "NVIDIA Unknown",
         }
     }
-    
+
     /// Obtener cantidad de memoria VRAM típica en MB
     pub fn vram_mb(&self) -> u32 {
         match self {
@@ -129,31 +129,31 @@ impl NvidiaModel {
             NvidiaModel::RTX4080 => 16384,
             NvidiaModel::RTX4070 => 12288,
             NvidiaModel::RTX4060 => 8192,
-            
+
             NvidiaModel::RTX3090 => 24576,
             NvidiaModel::RTX3080 => 10240,
             NvidiaModel::RTX3070 => 8192,
             NvidiaModel::RTX3060 => 12288,
-            
+
             NvidiaModel::RTX2080 => 8192,
             NvidiaModel::RTX2070 => 8192,
             NvidiaModel::RTX2060 => 6144,
-            
+
             NvidiaModel::GTX1660 => 6144,
             NvidiaModel::GTX1650 => 4096,
-            
+
             NvidiaModel::GTX1080 => 8192,
             NvidiaModel::GTX1070 => 8192,
             NvidiaModel::GTX1060 => 6144,
             NvidiaModel::GTX1050 => 2048,
-            
+
             NvidiaModel::QuadroRTX8000 => 49152,
             NvidiaModel::QuadroRTX6000 => 24576,
             NvidiaModel::QuadroRTX5000 => 16384,
-            
+
             NvidiaModel::TeslaV100 => 16384,
             NvidiaModel::TeslaT4 => 16384,
-            
+
             NvidiaModel::Unknown => 0,
         }
     }
@@ -343,54 +343,54 @@ impl NvidiaDriver {
             compute_shaders: 0,
         }
     }
-    
+
     /// Inicializar el driver NVIDIA
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         if self.state != NvidiaDriverState::Uninitialized {
             return Err("Driver ya inicializado");
         }
-        
+
         self.state = NvidiaDriverState::Initializing;
-        
+
         // Detectar GPU NVIDIA
         if !self.detect_gpu() {
             self.state = NvidiaDriverState::Error;
             return Err("No se pudo detectar GPU NVIDIA");
         }
-        
+
         // Configurar PCI
         if !self.setup_pci() {
             self.state = NvidiaDriverState::Error;
             return Err("Error configurando PCI");
         }
-        
+
         // Mapear memoria MMIO
         if !self.map_mmio() {
             self.state = NvidiaDriverState::Error;
             return Err("Error mapeando memoria MMIO");
         }
-        
+
         // Inicializar GPU
         if !self.init_gpu() {
             self.state = NvidiaDriverState::Error;
             return Err("Error inicializando GPU");
         }
-        
+
         // Configurar framebuffer
         if !self.setup_framebuffer() {
             self.state = NvidiaDriverState::Error;
             return Err("Error configurando framebuffer");
         }
-        
+
         // Habilitar características avanzadas
         self.enable_advanced_features();
-        
+
         self.state = NvidiaDriverState::Ready;
         self.initialized = true;
-        
+
         Ok(())
     }
-    
+
     /// Detectar GPU NVIDIA
     fn detect_gpu(&mut self) -> bool {
         // En un sistema real, esto escanearía el bus PCI
@@ -400,13 +400,13 @@ impl NvidiaDriver {
         self.gpu_info.revision_id = 0xA1;
         self.gpu_info.vram_total = 24576 * 1024 * 1024; // 24GB
         self.gpu_info.vram_free = self.gpu_info.vram_total;
-        
+
         // Configurar características específicas del modelo
         self.configure_model_features();
-        
+
         true
     }
-    
+
     /// Configurar características específicas del modelo
     fn configure_model_features(&mut self) {
         match self.gpu_info.model {
@@ -457,7 +457,7 @@ impl NvidiaDriver {
             }
         }
     }
-    
+
     /// Configurar PCI
     fn setup_pci(&mut self) -> bool {
         // En un sistema real, esto configuraría el dispositivo PCI
@@ -468,71 +468,71 @@ impl NvidiaDriver {
         self.mmio_base = 0xFD000000; // Base MMIO típica
         self.vram_base = 0x100000000; // 4GB
         self.vram_size = self.gpu_info.vram_total;
-        
+
         true
     }
-    
+
     /// Mapear memoria MMIO
     fn map_mmio(&mut self) -> bool {
         // En un sistema real, esto mapearía la memoria MMIO del hardware
         // Para demostración, simulamos el mapeo exitoso
         true
     }
-    
+
     /// Inicializar GPU
     fn init_gpu(&mut self) -> bool {
         // Inicializar registros de la GPU
         self.write_register(0x0000, 0x00000001); // Habilitar GPU
         self.write_register(0x0004, 0x00000000); // Reset
         self.write_register(0x0008, 0x00000001); // Habilitar memoria
-        
+
         // Configurar relojes
         self.set_core_clock(2100); // 2100 MHz
         self.set_memory_clock(10500); // 10500 MHz
-        
+
         // Habilitar características
         if self.ray_tracing_supported {
             self.enable_ray_tracing();
         }
-        
+
         if self.dlss_supported {
             self.enable_dlss();
         }
-        
+
         true
     }
-    
+
     /// Configurar framebuffer
     fn setup_framebuffer(&mut self) -> bool {
         // Configurar framebuffer en VRAM
         self.framebuffer_base = self.vram_base;
         self.framebuffer_size = 1920 * 1080 * 4; // 1080p RGBA
-        
+
         // Configurar modo de video
         self.set_video_mode(1920, 1080, 32);
-        
+
         true
     }
-    
+
     /// Habilitar características avanzadas
     fn enable_advanced_features(&mut self) {
         if self.config.enable_ray_tracing && self.ray_tracing_supported {
             self.enable_ray_tracing();
         }
-        
+
         if self.config.enable_dlss && self.dlss_supported {
             self.enable_dlss();
         }
-        
+
         if self.config.enable_rtx_voice {
             self.enable_rtx_voice();
         }
-        
+
         if self.config.enable_ansel {
             self.enable_ansel();
         }
     }
-    
+
     /// Escribir registro de GPU
     fn write_register(&self, offset: u32, value: u32) {
         // En un sistema real, esto escribiría a los registros MMIO de la GPU
@@ -541,7 +541,7 @@ impl NvidiaDriver {
             ptr::write_volatile(reg_ptr, value);
         }
     }
-    
+
     /// Leer registro de GPU
     fn read_register(&self, offset: u32) -> u32 {
         // En un sistema real, esto leería de los registros MMIO de la GPU
@@ -550,46 +550,46 @@ impl NvidiaDriver {
             ptr::read_volatile(reg_ptr)
         }
     }
-    
+
     /// Establecer reloj del núcleo
     fn set_core_clock(&mut self, mhz: u32) {
         self.gpu_info.core_clock = mhz;
         self.write_register(0x1000, mhz);
     }
-    
+
     /// Establecer reloj de memoria
     fn set_memory_clock(&mut self, mhz: u32) {
         self.gpu_info.memory_clock = mhz;
         self.write_register(0x1004, mhz);
     }
-    
+
     /// Habilitar ray tracing
     fn enable_ray_tracing(&self) {
         self.write_register(0x2000, 0x00000001);
     }
-    
+
     /// Habilitar DLSS
     fn enable_dlss(&self) {
         self.write_register(0x2004, 0x00000001);
     }
-    
+
     /// Habilitar RTX Voice
     fn enable_rtx_voice(&self) {
         self.write_register(0x2008, 0x00000001);
     }
-    
+
     /// Habilitar Ansel
     fn enable_ansel(&self) {
         self.write_register(0x200C, 0x00000001);
     }
-    
+
     /// Establecer modo de video
     fn set_video_mode(&mut self, width: u32, height: u32, bpp: u32) {
         self.write_register(0x3000, width);
         self.write_register(0x3004, height);
         self.write_register(0x3008, bpp);
     }
-    
+
     /// Actualizar estadísticas
     pub fn update_stats(&mut self) {
         // Leer estadísticas del hardware
@@ -602,7 +602,7 @@ impl NvidiaDriver {
         self.stats.memory_clock = self.read_register(0x4018);
         self.stats.vram_used = self.read_register(0x401C) as u64;
         self.stats.vram_total = self.gpu_info.vram_total;
-        
+
         // Actualizar información de GPU
         self.gpu_info.utilization = self.stats.gpu_utilization;
         self.gpu_info.temperature = self.stats.temperature;
@@ -613,79 +613,75 @@ impl NvidiaDriver {
         self.gpu_info.vram_used = self.stats.vram_used;
         self.gpu_info.vram_free = self.stats.vram_total - self.stats.vram_used;
     }
-    
+
     /// Renderizar frame
     pub fn render_frame(&mut self, framebuffer: &mut [u8]) -> Result<(), &'static str> {
         if self.state != NvidiaDriverState::Ready && self.state != NvidiaDriverState::Active {
             return Err("Driver no está listo");
         }
-        
+
         self.state = NvidiaDriverState::Active;
-        
+
         // Copiar datos del framebuffer a VRAM
         unsafe {
             let vram_ptr = self.framebuffer_base as *mut u8;
-            ptr::copy_nonoverlapping(
-                framebuffer.as_ptr(),
-                vram_ptr,
-                framebuffer.len()
-            );
+            ptr::copy_nonoverlapping(framebuffer.as_ptr(), vram_ptr, framebuffer.len());
         }
-        
+
         // Iniciar renderizado
         self.write_register(0x5000, 0x00000001);
-        
+
         // Esperar a que termine el renderizado
         while self.read_register(0x5004) & 0x1 == 0 {
             // Polling del estado de renderizado
         }
-        
+
         self.stats.frames_rendered += 1;
-        
+
         Ok(())
     }
-    
+
     /// Obtener información de la GPU
     pub fn get_gpu_info(&self) -> &NvidiaGpuInfo {
         &self.gpu_info
     }
-    
+
     /// Obtener estadísticas
     pub fn get_stats(&self) -> &NvidiaStats {
         &self.stats
     }
-    
+
     /// Obtener configuración
     pub fn get_config(&self) -> &NvidiaConfig {
         &self.config
     }
-    
+
     /// Establecer configuración
     pub fn set_config(&mut self, config: NvidiaConfig) {
         self.config = config;
         self.enable_advanced_features();
     }
-    
+
     /// Verificar si está inicializado
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
-    
+
     /// Verificar si soporta ray tracing
     pub fn supports_ray_tracing(&self) -> bool {
         self.ray_tracing_supported
     }
-    
+
     /// Verificar si soporta DLSS
     pub fn supports_dlss(&self) -> bool {
         self.dlss_supported
     }
-    
+
     /// Obtener versión del driver
     pub fn get_driver_version(&self) -> u32 {
         self.driver_version
     }
-    
+
     /// Obtener versión del firmware
     pub fn get_firmware_version(&self) -> u32 {
         self.firmware_version
@@ -699,19 +695,17 @@ static mut NVIDIA_DRIVER: Option<NvidiaDriver> = None;
 pub fn init_nvidia_driver() -> Result<(), &'static str> {
     let mut driver = NvidiaDriver::new();
     driver.initialize()?;
-    
+
     unsafe {
         NVIDIA_DRIVER = Some(driver);
     }
-    
+
     Ok(())
 }
 
 /// Obtener referencia al driver NVIDIA
 pub fn get_nvidia_driver() -> Option<&'static mut NvidiaDriver> {
-    unsafe {
-        NVIDIA_DRIVER.as_mut()
-    }
+    unsafe { NVIDIA_DRIVER.as_mut() }
 }
 
 /// Verificar si hay GPU NVIDIA disponible

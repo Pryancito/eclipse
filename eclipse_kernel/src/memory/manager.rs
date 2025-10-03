@@ -1,5 +1,5 @@
 //! Gestor de Memoria Avanzado para Eclipse OS
-//! 
+//!
 //! Implementa paginación, memoria virtual y asignación dinámica
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -153,13 +153,13 @@ impl MemoryManager {
     pub fn init(&mut self) -> Result<(), &'static str> {
         // Configurar mapeo de identidad para el kernel
         self.setup_identity_mapping()?;
-        
+
         // Configurar mapeo virtual del kernel
         self.setup_kernel_mapping()?;
-        
+
         // Inicializar bitmap de páginas libres
         self.init_free_pages_bitmap();
-        
+
         Ok(())
     }
 
@@ -167,25 +167,23 @@ impl MemoryManager {
     fn setup_identity_mapping(&mut self) -> Result<(), &'static str> {
         // Mapear los primeros 2MB de memoria física
         let flags = PAGE_PRESENT | PAGE_WRITABLE;
-        
+
         // Configurar PML4
-        self.pml4.set_entry(0, PageTableEntry::new_with_flags(
-            &self.pdpt as *const _ as u64,
-            flags
-        ));
-        
-        // Configurar PDPT
-        self.pdpt.set_entry(0, PageTableEntry::new_with_flags(
-            &self.pd as *const _ as u64,
-            flags
-        ));
-        
-        // Configurar PD con páginas de 2MB
-        self.pd.set_entry(0, PageTableEntry::new_with_flags(
+        self.pml4.set_entry(
             0,
-            flags | PAGE_SIZE_2MB
-        ));
-        
+            PageTableEntry::new_with_flags(&self.pdpt as *const _ as u64, flags),
+        );
+
+        // Configurar PDPT
+        self.pdpt.set_entry(
+            0,
+            PageTableEntry::new_with_flags(&self.pd as *const _ as u64, flags),
+        );
+
+        // Configurar PD con páginas de 2MB
+        self.pd
+            .set_entry(0, PageTableEntry::new_with_flags(0, flags | PAGE_SIZE_2MB));
+
         Ok(())
     }
 
@@ -194,13 +192,13 @@ impl MemoryManager {
         // Mapear el kernel en la zona virtual alta
         let kernel_virtual_index = (KERNEL_VIRTUAL_BASE >> 39) & 0x1ff;
         let flags = PAGE_PRESENT | PAGE_WRITABLE;
-        
+
         // Configurar entrada en PML4 para el kernel
-        self.pml4.set_entry(kernel_virtual_index as usize, PageTableEntry::new_with_flags(
-            &self.pdpt as *const _ as u64,
-            flags
-        ));
-        
+        self.pml4.set_entry(
+            kernel_virtual_index as usize,
+            PageTableEntry::new_with_flags(&self.pdpt as *const _ as u64, flags),
+        );
+
         Ok(())
     }
 
@@ -210,7 +208,7 @@ impl MemoryManager {
         for i in 0..1024 {
             self.free_pages_bitmap[i] = 0;
         }
-        
+
         // Marcar las páginas usadas por el kernel como ocupadas
         let kernel_pages = (self.physical_memory_size / PAGE_SIZE as u64) / 8; // Aproximadamente
         for i in 0..kernel_pages as usize {
@@ -231,11 +229,12 @@ impl MemoryManager {
                     if (*bitmap_byte & (1 << bit_index)) == 0 {
                         // Marcar como ocupada
                         *bitmap_byte |= 1 << bit_index;
-                        
+
                         // Calcular dirección física
                         let page_index = byte_index * 64 + bit_index;
-                        let physical_addr = self.physical_memory_base + (page_index as u64 * PAGE_SIZE as u64);
-                        
+                        let physical_addr =
+                            self.physical_memory_base + (page_index as u64 * PAGE_SIZE as u64);
+
                         return Some(physical_addr);
                     }
                 }
@@ -249,14 +248,19 @@ impl MemoryManager {
         let page_index = ((physical_addr - self.physical_memory_base) / PAGE_SIZE as u64) as usize;
         let byte_index = page_index / 64;
         let bit_index = page_index % 64;
-        
+
         if byte_index < 1024 {
             self.free_pages_bitmap[byte_index] &= !(1 << bit_index);
         }
     }
 
     /// Mapear una página virtual a una página física
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
+    pub fn map_page(
+        &mut self,
+        virtual_addr: u64,
+        physical_addr: u64,
+        flags: u64,
+    ) -> Result<(), &'static str> {
         let pml4_index = (virtual_addr >> 39) & 0x1ff;
         let pdpt_index = (virtual_addr >> 30) & 0x1ff;
         let pd_index = (virtual_addr >> 21) & 0x1ff;
@@ -267,10 +271,10 @@ impl MemoryManager {
             // Crear nueva tabla PDPT
             let new_pdpt = PageTable::new();
             let pdpt_addr = &new_pdpt as *const _ as u64;
-            self.pml4.set_entry(pml4_index as usize, PageTableEntry::new_with_flags(
-                pdpt_addr,
-                PAGE_PRESENT | PAGE_WRITABLE
-            ));
+            self.pml4.set_entry(
+                pml4_index as usize,
+                PageTableEntry::new_with_flags(pdpt_addr, PAGE_PRESENT | PAGE_WRITABLE),
+            );
         }
 
         // Similar para PDPT, PD y PT...
@@ -335,7 +339,7 @@ pub fn init_memory_manager(physical_base: u64, memory_size: u64) -> Result<(), &
             manager.init()?;
         }
     }
-    
+
     MEMORY_INITIALIZED.store(true, Ordering::Release);
     Ok(())
 }

@@ -3,11 +3,11 @@
 //! Implementa un driver básico para gráficos AMD
 //! con soporte para aceleración 2D y gestión de memoria.
 
-use core::ptr;
-use crate::drivers::pci::{PciDevice, GpuInfo, GpuType};
-use crate::drivers::framebuffer::{FramebufferDriver, PixelFormat, Color, FramebufferInfo};
 use crate::desktop_ai::{Point, Rect};
+use crate::drivers::framebuffer::{Color, FramebufferDriver, FramebufferInfo, PixelFormat};
+use crate::drivers::pci::{GpuInfo, GpuType, PciDevice};
 use alloc::format;
+use core::ptr;
 
 // IDs de Vendor AMD
 const AMD_VENDOR_ID: u16 = 0x1002;
@@ -141,7 +141,7 @@ impl AmdGraphicsDriver {
                 supports_opengl: true,
                 supports_hdmi: true,
                 supports_dp: true,
-                compute_units: 0, // Placeholder
+                compute_units: 0,     // Placeholder
                 stream_processors: 0, // Placeholder
             },
             state: AmdDriverState::Uninitialized,
@@ -162,14 +162,16 @@ impl AmdGraphicsDriver {
 
         // Configurar BAR0 (memoria)
         let bar0 = self.read_pci_config(0x10);
-        if bar0 & 0x01 == 0 { // Es memoria
+        if bar0 & 0x01 == 0 {
+            // Es memoria
             self.memory_base = (bar0 & 0xFFFFFFF0) as u64;
             self.memory_size = self.info.memory_size;
         }
 
         // Configurar BAR2 (MMIO)
         let bar2 = self.read_pci_config(0x18);
-        if bar2 & 0x01 == 0 { // Es memoria
+        if bar2 & 0x01 == 0 {
+            // Es memoria
             self.mmio_base = (bar2 & 0xFFFFFFF0) as u64;
             self.mmio_size = 0x100000; // 1MB para MMIO
         }
@@ -182,7 +184,7 @@ impl AmdGraphicsDriver {
 
         // Configurar registros MMIO para modo de video
         self.configure_video_mode()?;
-        
+
         // Simular configuración de registros MMIO
         self.write_mmio(0x0000, 0xDEADBEEF); // Ejemplo de escritura en registro
         let value = self.read_mmio(0x0000); // Ejemplo de lectura
@@ -192,13 +194,31 @@ impl AmdGraphicsDriver {
         }
 
         // Asignar framebuffer si está disponible
-        if let Some(_fb_info) = framebuffer_info {
-            let framebuffer = FramebufferDriver::new();
-            self.framebuffer = Some(framebuffer);
+        if let Some(info) = framebuffer_info {
+            self.attach_existing_framebuffer(&info);
         }
 
         self.state = AmdDriverState::Ready;
         Ok(())
+    }
+
+    /// Adjuntar framebuffer existente
+    pub fn attach_existing_framebuffer(&mut self, info: &FramebufferInfo) {
+        let mut fb = FramebufferDriver::new();
+        if fb
+            .init_from_uefi(
+                info.base_address,
+                info.width,
+                info.height,
+                info.pixels_per_scan_line,
+                info.pixel_format,
+                info.red_mask | info.green_mask | info.blue_mask,
+            )
+            .is_ok()
+        {
+            fb.lock_as_primary();
+            self.framebuffer = Some(fb);
+        }
     }
 
     /// Leer registro PCI config
@@ -213,13 +233,17 @@ impl AmdGraphicsDriver {
 
     /// Leer registro MMIO
     fn read_mmio(&self, offset: u32) -> u32 {
-        if self.mmio_base == 0 { return 0; }
+        if self.mmio_base == 0 {
+            return 0;
+        }
         unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u32) }
     }
 
     /// Escribir registro MMIO
     fn write_mmio(&self, offset: u32, value: u32) {
-        if self.mmio_base == 0 { return; }
+        if self.mmio_base == 0 {
+            return;
+        }
         unsafe { ptr::write_volatile((self.mmio_base + offset as u64) as *mut u32, value) }
     }
 
@@ -255,7 +279,11 @@ impl AmdGraphicsDriver {
     }
 
     /// Renderizar operación 2D
-    pub fn render_2d(&mut self, operation: Amd2DOperation, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    pub fn render_2d(
+        &mut self,
+        operation: Amd2DOperation,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         if !self.is_ready() {
             return Err("Driver AMD no está listo");
         }
@@ -280,38 +308,61 @@ impl AmdGraphicsDriver {
                 self.draw_triangle_2d(p1, p2, p3, color, filled, fb)?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Rellenar rectángulo con aceleración 2D AMD
-    fn fill_rect_2d(&mut self, rect: Rect, color: Color, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn fill_rect_2d(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Configurar operación 2D AMD
         self.write_mmio(0x8000, rect.x as u32); // X
         self.write_mmio(0x8004, rect.y as u32); // Y
         self.write_mmio(0x8008, rect.width as u32); // Width
         self.write_mmio(0x800C, rect.height as u32); // Height
         self.write_mmio(0x8010, self.color_to_pixel(color)); // Color
-        
+
         // Ejecutar operación
         self.write_mmio(0x8000, 0x00000001); // FillRect command
-        
+
         // Esperar completado
         while self.read_mmio(0x8000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar rectángulo con aceleración 2D AMD
-    fn draw_rect_2d(&mut self, rect: Rect, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn draw_rect_2d(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Dibujar los 4 lados del rectángulo
-        let top_left = Point { x: rect.x, y: rect.y };
-        let top_right = Point { x: rect.x + rect.width, y: rect.y };
-        let bottom_left = Point { x: rect.x, y: rect.y + rect.height };
-        let bottom_right = Point { x: rect.x + rect.width, y: rect.y + rect.height };
-        
+        let top_left = Point {
+            x: rect.x,
+            y: rect.y,
+        };
+        let top_right = Point {
+            x: rect.x + rect.width,
+            y: rect.y,
+        };
+        let bottom_left = Point {
+            x: rect.x,
+            y: rect.y + rect.height,
+        };
+        let bottom_right = Point {
+            x: rect.x + rect.width,
+            y: rect.y + rect.height,
+        };
+
         // Línea superior
         self.draw_line_2d(top_left, top_right, color, thickness, fb)?;
         // Línea derecha
@@ -320,12 +371,19 @@ impl AmdGraphicsDriver {
         self.draw_line_2d(bottom_right, bottom_left, color, thickness, fb)?;
         // Línea izquierda
         self.draw_line_2d(bottom_left, top_left, color, thickness, fb)?;
-        
+
         Ok(())
     }
-    
+
     /// Dibujar línea con aceleración 2D AMD
-    fn draw_line_2d(&mut self, start: Point, end: Point, color: Color, thickness: u32, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn draw_line_2d(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: Color,
+        thickness: u32,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Configurar operación de línea AMD
         self.write_mmio(0x9000, start.x as u32); // Start X
         self.write_mmio(0x9004, start.y as u32); // Start Y
@@ -333,20 +391,25 @@ impl AmdGraphicsDriver {
         self.write_mmio(0x900C, end.y as u32); // End Y
         self.write_mmio(0x9010, self.color_to_pixel(color)); // Color
         self.write_mmio(0x9014, thickness); // Thickness
-        
+
         // Ejecutar operación
         self.write_mmio(0x9000, 0x00000002); // DrawLine command
-        
+
         // Esperar completado
         while self.read_mmio(0x9000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Blit con aceleración 2D AMD
-    fn blit_2d(&mut self, src_rect: Rect, dst_rect: Rect, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn blit_2d(
+        &mut self,
+        src_rect: Rect,
+        dst_rect: Rect,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Configurar operación Blit AMD
         self.write_mmio(0xA000, src_rect.x as u32); // Src X
         self.write_mmio(0xA004, src_rect.y as u32); // Src Y
@@ -354,40 +417,55 @@ impl AmdGraphicsDriver {
         self.write_mmio(0xA00C, dst_rect.y as u32); // Dst Y
         self.write_mmio(0xA010, src_rect.width as u32); // Width
         self.write_mmio(0xA014, src_rect.height as u32); // Height
-        
+
         // Ejecutar operación
         self.write_mmio(0xA000, 0x00000004); // Blit command
-        
+
         // Esperar completado
         while self.read_mmio(0xA000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar círculo con aceleración 2D AMD
-    fn draw_circle_2d(&mut self, center: Point, radius: u32, color: Color, filled: bool, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn draw_circle_2d(
+        &mut self,
+        center: Point,
+        radius: u32,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Configurar operación de círculo AMD
         self.write_mmio(0xB000, center.x as u32); // Center X
         self.write_mmio(0xB004, center.y as u32); // Center Y
         self.write_mmio(0xB008, radius); // Radius
         self.write_mmio(0xB00C, self.color_to_pixel(color)); // Color
         self.write_mmio(0xB010, if filled { 1 } else { 0 }); // Filled flag
-        
+
         // Ejecutar operación
         self.write_mmio(0xB000, 0x00000008); // DrawCircle command
-        
+
         // Esperar completado
         while self.read_mmio(0xB000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
-    
+
     /// Dibujar triángulo con aceleración 2D AMD
-    fn draw_triangle_2d(&mut self, p1: Point, p2: Point, p3: Point, color: Color, filled: bool, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn draw_triangle_2d(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        filled: bool,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         if filled {
             // Rellenar triángulo usando scanline
             self.fill_triangle_2d(p1, p2, p3, color, fb)?;
@@ -397,12 +475,19 @@ impl AmdGraphicsDriver {
             self.draw_line_2d(p2, p3, color, 1, fb)?;
             self.draw_line_2d(p3, p1, color, 1, fb)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Rellenar triángulo con aceleración 2D AMD
-    fn fill_triangle_2d(&mut self, p1: Point, p2: Point, p3: Point, color: Color, fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    fn fill_triangle_2d(
+        &mut self,
+        p1: Point,
+        p2: Point,
+        p3: Point,
+        color: Color,
+        fb: &mut FramebufferDriver,
+    ) -> Result<(), &'static str> {
         // Configurar operación de triángulo AMD
         self.write_mmio(0xC000, p1.x as u32); // P1 X
         self.write_mmio(0xC004, p1.y as u32); // P1 Y
@@ -411,15 +496,15 @@ impl AmdGraphicsDriver {
         self.write_mmio(0xC010, p3.x as u32); // P3 X
         self.write_mmio(0xC014, p3.y as u32); // P3 Y
         self.write_mmio(0xC018, self.color_to_pixel(color)); // Color
-        
+
         // Ejecutar operación
         self.write_mmio(0xC000, 0x00000010); // FillTriangle command
-        
+
         // Esperar completado
         while self.read_mmio(0xC000) & 0x80000000 != 0 {
             // Busy wait
         }
-        
+
         Ok(())
     }
 
@@ -432,9 +517,9 @@ impl AmdGraphicsDriver {
 /// Operaciones 2D soportadas por el driver AMD
 pub enum Amd2DOperation {
     FillRect(Rect, Color),
-    DrawRect(Rect, Color, u32), // rect, color, thickness
-    DrawLine(Point, Point, Color, u32), // start, end, color, thickness
-    Blit(Rect, Rect), // source, destination
+    DrawRect(Rect, Color, u32),          // rect, color, thickness
+    DrawLine(Point, Point, Color, u32),  // start, end, color, thickness
+    Blit(Rect, Rect),                    // source, destination
     DrawCircle(Point, u32, Color, bool), // center, radius, color, filled
     DrawTriangle(Point, Point, Point, Color, bool), // p1, p2, p3, color, filled
 }
@@ -450,30 +535,33 @@ impl AmdGraphicsDriver {
         // Configurar registros de control de video AMD
         self.write_mmio(AMD_VIDEO_CONTROL, 0x00000001); // Habilitar video
         self.write_mmio(AMD_VIDEO_MODE, 0x00000020); // Modo 32-bit
-        
+
         // Configurar sincronización AMD
         self.write_mmio(AMD_H_SYNC_START, 0x00000000);
         self.write_mmio(AMD_H_SYNC_END, 0x00000000);
         self.write_mmio(AMD_V_SYNC_START, 0x00000000);
         self.write_mmio(AMD_V_SYNC_END, 0x00000000);
-        
+
         Ok(())
     }
 
     /// Reconfigurar tarjeta gráfica para nuevo framebuffer
-    pub fn reconfigure_graphics_card(&mut self, new_fb_info: &FramebufferInfo) -> Result<(), &'static str> {
+    pub fn reconfigure_graphics_card(
+        &mut self,
+        new_fb_info: &FramebufferInfo,
+    ) -> Result<(), &'static str> {
         // 1. Deshabilitar video temporalmente
         self.write_mmio(AMD_VIDEO_CONTROL, 0x00000000);
-        
+
         // 2. Configurar nueva resolución
         self.write_mmio(AMD_WIDTH, new_fb_info.width);
         self.write_mmio(AMD_HEIGHT, new_fb_info.height);
         self.write_mmio(AMD_STRIDE, new_fb_info.pixels_per_scan_line);
-        
+
         // 3. Configurar nueva dirección de framebuffer
         self.write_mmio(AMD_FB_BASE_LOW, new_fb_info.base_address as u32);
         self.write_mmio(AMD_FB_BASE_HIGH, (new_fb_info.base_address >> 32) as u32);
-        
+
         // 4. Configurar formato de pixel
         let pixel_format = match new_fb_info.pixel_format {
             32 => 0x00000020, // 32-bit RGBA
@@ -482,13 +570,13 @@ impl AmdGraphicsDriver {
             _ => 0x00000020,  // Default 32-bit
         };
         self.write_mmio(AMD_PIXEL_FORMAT, pixel_format);
-        
+
         // 5. Reconfigurar sincronización para nueva resolución
         self.reconfigure_timing(new_fb_info)?;
-        
+
         // 6. Habilitar video con nueva configuración
         self.write_mmio(AMD_VIDEO_CONTROL, 0x00000001);
-        
+
         Ok(())
     }
 
@@ -497,14 +585,14 @@ impl AmdGraphicsDriver {
         // Calcular timing basado en resolución (específico para AMD)
         let h_total = fb_info.width + 120; // H total (AMD usa más blanking)
         let v_total = fb_info.height + 60; // V total
-        
+
         self.write_mmio(AMD_H_TOTAL, h_total);
         self.write_mmio(AMD_V_TOTAL, v_total);
         self.write_mmio(AMD_H_SYNC_START, fb_info.width);
         self.write_mmio(AMD_H_SYNC_END, fb_info.width + 30);
         self.write_mmio(AMD_V_SYNC_START, fb_info.height);
         self.write_mmio(AMD_V_SYNC_END, fb_info.height + 8);
-        
+
         Ok(())
     }
 
@@ -516,13 +604,17 @@ impl AmdGraphicsDriver {
     }
 
     /// Llamar a servicios de firmware UEFI
-    pub fn call_uefi_graphics_service(&self, service: u32, params: &[u32]) -> Result<u32, &'static str> {
+    pub fn call_uefi_graphics_service(
+        &self,
+        service: u32,
+        params: &[u32],
+    ) -> Result<u32, &'static str> {
         // Implementar llamadas a servicios UEFI para AMD
         self.write_mmio(AMD_UEFI_SERVICE, service);
         for (i, param) in params.iter().enumerate() {
             self.write_mmio(AMD_UEFI_PARAM_BASE + i as u32, *param);
         }
-        
+
         // Leer resultado
         let result = self.read_mmio(AMD_UEFI_RESULT);
         Ok(result)

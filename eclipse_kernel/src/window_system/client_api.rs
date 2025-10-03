@@ -1,20 +1,20 @@
 //! API para aplicaciones cliente del sistema de ventanas
-//! 
+//!
 //! Proporciona una interfaz similar a X11/Wayland para que las aplicaciones
 //! puedan crear ventanas, manejar eventos y renderizar contenido.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::geometry::{Point, Size, Rectangle};
+use super::event_system::{InputEvent, WindowEvent, WindowEventType};
+use super::geometry::{Point, Rectangle, Size};
 use super::protocol::{
-    ProtocolMessage, MessageBuilder, MessageType, MessageData, WindowFlags, 
-    ProtocolError, InputEventType, InputEventData
+    InputEventData, InputEventType, MessageBuilder, MessageData, MessageType, ProtocolError,
+    ProtocolMessage, WindowFlags,
 };
-use super::event_system::{WindowEvent, InputEvent, WindowEventType};
-use super::{WindowId, ClientId};
+use super::{ClientId, WindowId};
 
 /// Información de un cliente conectado
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl ClientAPI {
         }
 
         let client_id = self.next_client_id.fetch_add(1, Ordering::SeqCst);
-        
+
         let client_info = ClientInfo {
             client_id,
             name,
@@ -86,14 +86,14 @@ impl ClientAPI {
         };
 
         self.clients.insert(client_id, client_info);
-        
+
         // Enviar mensaje de bienvenida
         let welcome_message = MessageBuilder::new(MessageType::WindowCreated, client_id)
             .sequence(0)
             .build();
-        
+
         self.outgoing_messages.push_back(welcome_message);
-        
+
         Ok(client_id)
     }
 
@@ -105,10 +105,10 @@ impl ClientAPI {
             for window_id in window_ids {
                 self.destroy_window(window_id)?;
             }
-            
+
             self.clients.remove(&client_id);
         }
-        
+
         Ok(())
     }
 
@@ -129,7 +129,7 @@ impl ClientAPI {
 
         // Generar ID de ventana único
         let window_id = self.generate_window_id();
-        
+
         let window_info = WindowInfo {
             window_id,
             client_id,
@@ -141,7 +141,7 @@ impl ClientAPI {
         };
 
         self.windows.insert(window_id, window_info);
-        
+
         // Agregar ventana al cliente
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.windows.push(window_id);
@@ -153,9 +153,9 @@ impl ClientAPI {
             .sequence(0)
             .window_created(window_id)
             .build();
-        
+
         self.outgoing_messages.push_back(response);
-        
+
         Ok(window_id)
     }
 
@@ -172,10 +172,10 @@ impl ClientAPI {
                 .window_id(window_id)
                 .sequence(0)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         }
-        
+
         Ok(())
     }
 
@@ -191,17 +191,22 @@ impl ClientAPI {
                 .sequence(0)
                 .move_window(x, y)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
     /// Redimensionar una ventana
-    pub fn resize_window(&mut self, window_id: WindowId, width: u32, height: u32) -> Result<(), &'static str> {
+    pub fn resize_window(
+        &mut self,
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), &'static str> {
         if let Some(window_info) = self.windows.get_mut(&window_id) {
             window_info.geometry.width = width;
             window_info.geometry.height = height;
@@ -212,17 +217,21 @@ impl ClientAPI {
                 .sequence(0)
                 .resize_window(width, height)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
     /// Establecer título de ventana
-    pub fn set_window_title(&mut self, window_id: WindowId, title: String) -> Result<(), &'static str> {
+    pub fn set_window_title(
+        &mut self,
+        window_id: WindowId,
+        title: String,
+    ) -> Result<(), &'static str> {
         if let Some(window_info) = self.windows.get_mut(&window_id) {
             window_info.title = title.clone();
 
@@ -232,12 +241,12 @@ impl ClientAPI {
                 .sequence(0)
                 .set_window_title(title)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
@@ -252,12 +261,12 @@ impl ClientAPI {
                 .window_id(window_id)
                 .sequence(0)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
@@ -272,12 +281,12 @@ impl ClientAPI {
                 .window_id(window_id)
                 .sequence(0)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
@@ -289,12 +298,12 @@ impl ClientAPI {
                 .window_id(window_id)
                 .sequence(0)
                 .build();
-            
+
             self.outgoing_messages.push_back(response);
         } else {
             return Err("Ventana no encontrada");
         }
-        
+
         Ok(())
     }
 
@@ -305,7 +314,14 @@ impl ClientAPI {
         }
 
         match message.data {
-            MessageData::CreateWindow { title, x, y, width, height, flags } => {
+            MessageData::CreateWindow {
+                title,
+                x,
+                y,
+                width,
+                height,
+                flags,
+            } => {
                 self.create_window(message.client_id, title, x, y, width, height, flags)?;
             }
             MessageData::DestroyWindow => {
@@ -332,20 +348,24 @@ impl ClientAPI {
                 // Otros tipos de mensaje (simplificado)
             }
         }
-        
+
         Ok(())
     }
 
     /// Enviar evento a un cliente
-    pub fn send_event_to_client(&mut self, client_id: ClientId, event: InputEvent) -> Result<(), &'static str> {
+    pub fn send_event_to_client(
+        &mut self,
+        client_id: ClientId,
+        event: InputEvent,
+    ) -> Result<(), &'static str> {
         let window_id = event.window_id.unwrap_or(0);
-        
+
         let message = MessageBuilder::new(MessageType::EventReceived, client_id)
             .window_id(window_id)
             .sequence(0)
             .input_event(event.event_type, event.data)
             .build();
-        
+
         self.outgoing_messages.push_back(message);
         Ok(())
     }
@@ -398,13 +418,13 @@ impl ClientAPI {
     /// Obtener ventanas visibles en un área
     pub fn get_windows_in_area(&self, area: Rectangle) -> Vec<WindowId> {
         let mut windows = Vec::new();
-        
+
         for (window_id, window_info) in &self.windows {
             if window_info.visible && window_info.geometry.intersects(&area) {
                 windows.push(*window_id);
             }
         }
-        
+
         windows
     }
 
@@ -454,7 +474,7 @@ pub fn init_client_api() -> Result<(), &'static str> {
         if CLIENT_API.is_some() {
             return Err("API de cliente ya inicializada");
         }
-        
+
         let mut api = ClientAPI::new()?;
         api.initialize()?;
         CLIENT_API = Some(api);
@@ -464,9 +484,7 @@ pub fn init_client_api() -> Result<(), &'static str> {
 
 /// Obtener referencia a la API de cliente
 pub fn get_client_api() -> Result<&'static mut ClientAPI, &'static str> {
-    unsafe {
-        CLIENT_API.as_mut().ok_or("API de cliente no inicializada")
-    }
+    unsafe { CLIENT_API.as_mut().ok_or("API de cliente no inicializada") }
 }
 
 /// Verificar si la API de cliente está inicializada

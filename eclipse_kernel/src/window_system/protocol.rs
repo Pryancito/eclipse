@@ -1,5 +1,5 @@
 //! Protocolo de comunicación del sistema de ventanas
-//! 
+//!
 //! Define mensajes y protocolos para comunicación entre clientes y servidor,
 //! similar a X11 y Wayland.
 
@@ -7,8 +7,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::geometry::{Point, Size, Rectangle};
-use super::{WindowId, ClientId};
+use super::geometry::{Point, Rectangle, Size};
+use super::{ClientId, WindowId};
 
 /// Tipo de mensaje del protocolo
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -23,7 +23,7 @@ pub enum MessageType {
     UnmapWindow,
     FocusWindow,
     SendEvent,
-    
+
     // Mensajes del servidor al cliente
     WindowCreated,
     WindowDestroyed,
@@ -34,7 +34,7 @@ pub enum MessageType {
     WindowFocused,
     EventReceived,
     Error,
-    
+
     // Mensajes de ping/pong
     Ping,
     Pong,
@@ -90,44 +90,44 @@ pub enum MessageData {
         height: u32,
         flags: WindowFlags,
     },
-    
+
     // Destruir ventana
     DestroyWindow,
-    
+
     // Mover ventana
     MoveWindow {
         x: i32,
         y: i32,
     },
-    
+
     // Redimensionar ventana
     ResizeWindow {
         width: u32,
         height: u32,
     },
-    
+
     // Establecer título
     SetWindowTitle {
         title: String,
     },
-    
+
     // Evento de entrada
     InputEvent {
         event_type: InputEventType,
         data: InputEventData,
     },
-    
+
     // Respuesta de ventana creada
     WindowCreated {
         window_id: WindowId,
     },
-    
+
     // Error
     Error {
         error_code: ProtocolError,
         message: String,
     },
-    
+
     // Ping/Pong
     Ping,
     Pong,
@@ -294,7 +294,10 @@ impl MessageBuilder {
     }
 
     pub fn error(mut self, error_code: ProtocolError, message: String) -> Self {
-        self.message.data = MessageData::Error { error_code, message };
+        self.message.data = MessageData::Error {
+            error_code,
+            message,
+        };
         self
     }
 
@@ -321,16 +324,23 @@ impl MessageSerializer {
     pub fn serialize(message: &ProtocolMessage) -> Result<Vec<u8>, ProtocolError> {
         // Implementación simplificada usando un formato binario básico
         let mut data = Vec::new();
-        
+
         // Header del mensaje
         data.extend_from_slice(&(message.message_type.clone() as u32).to_le_bytes());
         data.extend_from_slice(&message.client_id.to_le_bytes());
         data.extend_from_slice(&message.window_id.unwrap_or(0).to_le_bytes());
         data.extend_from_slice(&message.sequence.to_le_bytes());
-        
+
         // Datos específicos del mensaje
         match &message.data {
-            MessageData::CreateWindow { title, x, y, width, height, flags } => {
+            MessageData::CreateWindow {
+                title,
+                x,
+                y,
+                width,
+                height,
+                flags,
+            } => {
                 data.push(1); // Tipo de datos
                 data.extend_from_slice(&title.len().to_le_bytes());
                 data.extend_from_slice(title.as_bytes());
@@ -364,7 +374,10 @@ impl MessageSerializer {
                 data.extend_from_slice(&title.len().to_le_bytes());
                 data.extend_from_slice(title.as_bytes());
             }
-            MessageData::InputEvent { event_type, data: event_data } => {
+            MessageData::InputEvent {
+                event_type,
+                data: event_data,
+            } => {
                 data.push(6);
                 data.push(event_type.clone() as u8);
                 // Serializar datos del evento (simplificado)
@@ -390,7 +403,10 @@ impl MessageSerializer {
                 data.push(7);
                 data.extend_from_slice(&window_id.to_le_bytes());
             }
-            MessageData::Error { error_code, message } => {
+            MessageData::Error {
+                error_code,
+                message,
+            } => {
                 data.push(8);
                 data.push(error_code.clone() as u8);
                 data.extend_from_slice(&message.len().to_le_bytes());
@@ -403,7 +419,7 @@ impl MessageSerializer {
                 data.push(10);
             }
         }
-        
+
         Ok(data)
     }
 
@@ -414,13 +430,16 @@ impl MessageSerializer {
         }
 
         let mut offset = 0;
-        
+
         // Deserializar header
         let message_type_u32 = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        
+
         let message_type = match message_type_u32 {
             0 => MessageType::CreateWindow,
             1 => MessageType::DestroyWindow,
@@ -441,28 +460,41 @@ impl MessageSerializer {
             16 => MessageType::Pong,
             _ => return Err(ProtocolError::InvalidMessage),
         };
-        
+
         let client_id = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        
+
         let window_id_raw = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        let window_id = if window_id_raw != 0 { Some(window_id_raw) } else { None };
-        
+        let window_id = if window_id_raw != 0 {
+            Some(window_id_raw)
+        } else {
+            None
+        };
+
         let sequence = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        
+
         // Deserializar datos específicos (simplificado)
         let message_data = if offset < data.len() {
             let data_type = data[offset];
             offset += 1;
-            
+
             match data_type {
                 1 => {
                     // CreateWindow
@@ -470,37 +502,53 @@ impl MessageSerializer {
                         return Err(ProtocolError::InvalidMessage);
                     }
                     let title_len = u32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]) as usize;
                     offset += 4;
-                    
+
                     if offset + title_len > data.len() {
                         return Err(ProtocolError::InvalidMessage);
                     }
-                    let title = String::from_utf8_lossy(&data[offset..offset + title_len]).into_owned();
+                    let title =
+                        String::from_utf8_lossy(&data[offset..offset + title_len]).into_owned();
                     offset += title_len;
-                    
+
                     if offset + 20 > data.len() {
                         return Err(ProtocolError::InvalidMessage);
                     }
-                    
+
                     let x = i32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
                     let y = i32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
                     let width = u32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
                     let height = u32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
-                    
+
                     let flags = WindowFlags {
                         resizable: data[offset] != 0,
                         movable: data[offset + 1] != 0,
@@ -510,7 +558,7 @@ impl MessageSerializer {
                         always_on_top: data[offset + 5] != 0,
                         transparent: data[offset + 6] != 0,
                     };
-                    
+
                     MessageData::CreateWindow {
                         title,
                         x,
@@ -527,7 +575,10 @@ impl MessageSerializer {
                         return Err(ProtocolError::InvalidMessage);
                     }
                     let window_id = u32::from_le_bytes([
-                        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     MessageData::WindowCreated { window_id }
                 }
@@ -538,7 +589,7 @@ impl MessageSerializer {
         } else {
             MessageData::Ping
         };
-        
+
         Ok(ProtocolMessage {
             message_type,
             client_id,

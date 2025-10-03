@@ -1,11 +1,9 @@
-// Sistema de escritorio controlado por IA
-// Renderizado inteligente con optimizaciones de rendimiento
-
-use core::fmt::Write;
-use crate::drivers::framebuffer::{FramebufferDriver, Color as FbColor};
-use crate::main_unified::VgaWriter;
-use crate::drivers::video::VideoInterface::VGA;
-use crate::drivers::framebuffer::Color as VgaColor;
+#![no_std]
+extern crate alloc;
+use crate::cosmic::smart_notifications::SmartNotification;
+use crate::drivers::framebuffer::{Color, FramebufferDriver};
+use crate::drivers::gpu_control::GpuController;
+use alloc::string::String;
 
 // Tipos básicos para el escritorio
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,7 +45,7 @@ pub enum UIChange {
     WindowMove(usize, u32, u32),
     WindowResize(usize, u32, u32),
     TextUpdate(usize, &'static str),
-    ColorChange(usize, FbColor),
+    ColorChange(usize, Color),
     CursorMove(u32, u32),
 }
 
@@ -61,7 +59,7 @@ pub struct DesktopWindow {
     pub height: u32,
     pub title: &'static str,
     pub content: &'static str,
-    pub color: FbColor,
+    pub color: Color,
     pub visible: bool,
 }
 
@@ -170,7 +168,7 @@ impl DesktopRenderer {
     // Renderizado principal del escritorio
     pub fn render_desktop(&mut self) -> Result<(), &'static str> {
         let start_time = get_time_ms();
-        
+
         // Verificar si necesitamos redibujar
         if !self.state.needs_redraw {
             return Ok(());
@@ -202,14 +200,26 @@ impl DesktopRenderer {
     fn render_background(&mut self) -> Result<(), &'static str> {
         if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
             // Fondo azul oscuro
-            fb.fill_rect(0, 0, fb.info.width, fb.info.height, FbColor::DARK_BLUE);
-            
+            fb.fill_rect(0, 0, fb.info.width, fb.info.height, Color::DARK_BLUE);
+
             // Patrón de cuadrícula sutil
             for x in (0..fb.info.width).step_by(20) {
-                fb.draw_line(x as i32, 0, x as i32, fb.info.height as i32, FbColor::DARKER_BLUE);
+                fb.draw_line(
+                    x as i32,
+                    0,
+                    x as i32,
+                    fb.info.height as i32,
+                    Color::DARKER_BLUE,
+                );
             }
             for y in (0..fb.info.height).step_by(20) {
-                fb.draw_line(0, y as i32, fb.info.width as i32, y as i32, FbColor::DARKER_BLUE);
+                fb.draw_line(
+                    0,
+                    y as i32,
+                    fb.info.width as i32,
+                    y as i32,
+                    Color::DARKER_BLUE,
+                );
             }
         } else {
             // Fallback VGA - comentado temporalmente
@@ -253,14 +263,18 @@ impl DesktopRenderer {
     }
 
     // Renderizar una ventana individual
-    fn render_window(&mut self, fb: &mut FramebufferDriver, window: &DesktopWindow) -> Result<(), &'static str> {
+    fn render_window(
+        &mut self,
+        fb: &mut FramebufferDriver,
+        window: &DesktopWindow,
+    ) -> Result<(), &'static str> {
         // Sombra de la ventana
         fb.fill_rect(
             window.x + 2,
             window.y + 2,
             window.width,
             window.height,
-            FbColor::BLACK,
+            Color::BLACK,
         );
 
         // Fondo de la ventana
@@ -278,17 +292,11 @@ impl DesktopRenderer {
             window.y,
             window.width,
             window.height,
-            FbColor::WHITE,
+            Color::WHITE,
         );
 
         // Barra de título
-        fb.fill_rect(
-            window.x,
-            window.y,
-            window.width,
-            30,
-            FbColor::DARK_GRAY,
-        );
+        fb.fill_rect(window.x, window.y, window.width, 30, Color::DARK_GRAY);
 
         // Título de la ventana (simplificado)
         // En un sistema real, aquí se renderizaría texto
@@ -297,7 +305,7 @@ impl DesktopRenderer {
             (window.y + 15) as i32,
             (window.x + 20) as i32,
             (window.y + 15) as i32,
-            FbColor::WHITE,
+            Color::WHITE,
         );
 
         Ok(())
@@ -313,24 +321,12 @@ impl DesktopRenderer {
                 fb.info.height - taskbar_height,
                 fb.info.width,
                 taskbar_height,
-                FbColor::GRAY,
+                Color::GRAY,
             );
 
             // Botón de inicio (simplificado)
-            fb.fill_rect(
-                10,
-                fb.info.height - 40,
-                80,
-                30,
-                FbColor::DARK_GRAY,
-            );
-            fb.draw_rect(
-                10,
-                fb.info.height - 40,
-                80,
-                30,
-                FbColor::WHITE,
-            );
+            fb.fill_rect(10, fb.info.height - 40, 80, 30, Color::DARK_GRAY);
+            fb.draw_rect(10, fb.info.height - 40, 80, 30, Color::WHITE);
         } else {
             // Fallback VGA
             unsafe {
@@ -347,11 +343,23 @@ impl DesktopRenderer {
             // Cursor simple (cruz)
             let x = self.state.cursor_x;
             let y = self.state.cursor_y;
-            
+
             // Línea horizontal
-            fb.draw_line((x - 5) as i32, y as i32, (x + 5) as i32, y as i32, FbColor::WHITE);
+            fb.draw_line(
+                (x - 5) as i32,
+                y as i32,
+                (x + 5) as i32,
+                y as i32,
+                Color::WHITE,
+            );
             // Línea vertical
-            fb.draw_line(x as i32, (y - 5) as i32, x as i32, (y + 5) as i32, FbColor::WHITE);
+            fb.draw_line(
+                x as i32,
+                (y - 5) as i32,
+                x as i32,
+                (y + 5) as i32,
+                Color::WHITE,
+            );
         }
         Ok(())
     }
@@ -391,7 +399,7 @@ impl DesktopRenderer {
             height: 200,
             title: "Terminal",
             content: "Eclipse OS Terminal\n$ ",
-            color: FbColor::BLACK,
+            color: Color::BLACK,
             visible: true,
         };
         self.state.add_window(window)
@@ -438,12 +446,17 @@ pub static mut DESKTOP_RENDERER: DesktopRenderer = DesktopRenderer::new();
 
 // Funciones de interfaz para la IA
 pub fn ai_render_desktop() -> Result<(), &'static str> {
-    unsafe {
-        DESKTOP_RENDERER.render_desktop()
-    }
+    unsafe { DESKTOP_RENDERER.render_desktop() }
 }
 
-pub fn ai_create_window(id: usize, x: u32, y: u32, width: u32, height: u32, title: &'static str) -> Result<(), &'static str> {
+pub fn ai_create_window(
+    id: usize,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    title: &'static str,
+) -> Result<(), &'static str> {
     unsafe {
         let window = DesktopWindow {
             id,
@@ -453,7 +466,7 @@ pub fn ai_create_window(id: usize, x: u32, y: u32, width: u32, height: u32, titl
             height,
             title,
             content: "",
-            color: FbColor::WHITE,
+            color: Color::WHITE,
             visible: true,
         };
         DESKTOP_RENDERER.state.add_window(window)
@@ -467,7 +480,5 @@ pub fn ai_update_ui(changes: &[UIChange]) {
 }
 
 pub fn ai_get_performance_stats() -> PerformanceStats {
-    unsafe {
-        DESKTOP_RENDERER.get_performance_stats()
-    }
+    unsafe { DESKTOP_RENDERER.get_performance_stats() }
 }

@@ -6,10 +6,10 @@ use crate::KernelResult;
 /// Inicializar el sistema de archivos de Eclipse
 pub fn init_eclipse_filesystem() -> KernelResult<()> {
     // Inicializando sistema de archivos Eclipse
-    
+
     // Aquí se implementan las funcionalidades específicas de filesystem de Eclipse
     // como el VFS avanzado, drivers de filesystem, etc.
-    
+
     // Sistema de archivos Eclipse inicializado
     Ok(())
 }
@@ -18,6 +18,6 @@ pub fn init_eclipse_filesystem() -> KernelResult<()> {
 pub fn process_filesystem_events() -> KernelResult<()> {
     // Procesar eventos específicos de filesystem de Eclipse
     // como I/O completions, mount/unmount events, etc.
-    
+
     Ok(())
 }

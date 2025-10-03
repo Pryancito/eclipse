@@ -1,10 +1,12 @@
-use super::ipc::{Driver, DriverInfo, DriverState, DriverCapability, DriverMessage, DriverResponse};
-use super::pci::{PciDevice, PciManager, GpuInfo, GpuType};
+use super::ipc::{
+    Driver, DriverCapability, DriverInfo, DriverMessage, DriverResponse, DriverState,
+};
+use super::pci::{GpuInfo, GpuType, PciDevice, PciManager};
 use crate::hardware_detection::HardwareDetectionResult;
-use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Driver específico para GPUs NVIDIA
 pub struct NvidiaPciDriver {
@@ -22,7 +24,9 @@ impl NvidiaPciDriver {
             name: String::from("NVIDIA PCI Driver"),
             version: String::from("1.0.0"),
             author: String::from("Eclipse OS Team"),
-            description: String::from("Driver específico para GPUs NVIDIA con detección avanzada de memoria"),
+            description: String::from(
+                "Driver específico para GPUs NVIDIA con detección avanzada de memoria",
+            ),
             state: DriverState::Unloaded,
             dependencies: {
                 let mut deps = Vec::new();
@@ -51,7 +55,7 @@ impl NvidiaPciDriver {
     /// Detectar y configurar GPUs NVIDIA
     fn detect_nvidia_gpus(&mut self, hw_result: &HardwareDetectionResult) -> Result<(), String> {
         self.nvidia_gpus.clear();
-        
+
         // Usar la información de hardware ya detectada
         for gpu in &hw_result.available_gpus {
             if matches!(gpu.gpu_type, GpuType::Nvidia) {
@@ -74,14 +78,14 @@ impl NvidiaPciDriver {
         if let Some(gpu_index) = self.active_gpu {
             if gpu_index < self.nvidia_gpus.len() {
                 let gpu = &self.nvidia_gpus[gpu_index];
-                
+
                 // Habilitar MMIO y Bus Master - TEMPORALMENTE DESHABILITADO
                 // self.pci_manager.enable_mmio_and_bus_master(
-                //     gpu.pci_device.bus, 
-                //     gpu.pci_device.device, 
+                //     gpu.pci_device.bus,
+                //     gpu.pci_device.device,
                 //     gpu.pci_device.function
                 // )?;
-                
+
                 self.memory_mapped = true;
                 // MMIO habilitado para GPU NVIDIA
                 Ok(())
@@ -116,9 +120,7 @@ impl NvidiaPciDriver {
     /// Ejecutar comando específico del driver NVIDIA
     fn execute_command(&self, command: &str, args: &[u8]) -> DriverResponse {
         match command {
-            "detect_gpus" => {
-                DriverResponse::Success
-            }
+            "detect_gpus" => DriverResponse::Success,
             "get_gpu_count" => {
                 let count = self.nvidia_gpus.len() as u32;
                 DriverResponse::SuccessWithData(count.to_le_bytes().to_vec())
@@ -145,7 +147,7 @@ impl NvidiaPciDriver {
             "get_gpu_info" => {
                 if let Some(gpu) = self.get_active_gpu_info() {
                     let mut data = Vec::new();
-                    
+
                     // Información básica
                     data.extend_from_slice(&gpu.pci_device.vendor_id.to_le_bytes());
                     data.extend_from_slice(&gpu.pci_device.device_id.to_le_bytes());
@@ -153,7 +155,7 @@ impl NvidiaPciDriver {
                     data.extend_from_slice(&gpu.pci_device.bus.to_le_bytes());
                     data.extend_from_slice(&gpu.pci_device.device.to_le_bytes());
                     data.extend_from_slice(&gpu.pci_device.function.to_le_bytes());
-                    
+
                     // Información de BARs
                     if let Some(pci_device) = self.pci_manager.get_device(0) {
                         let bars = pci_device.read_all_bars();
@@ -161,10 +163,10 @@ impl NvidiaPciDriver {
                             data.extend_from_slice(&bar.to_le_bytes());
                         }
                     }
-                    
+
                     // Estado de MMIO
                     data.push(if self.memory_mapped { 1 } else { 0 });
-                    
+
                     DriverResponse::SuccessWithData(data)
                 } else {
                     DriverResponse::Error(String::from("No hay GPU activa"))
@@ -180,10 +182,10 @@ impl NvidiaPciDriver {
             "get_memory_info" => {
                 if let Some(gpu) = self.get_active_gpu_info() {
                     let mut data = Vec::new();
-                    
+
                     // Tamaño total de memoria
                     data.extend_from_slice(&gpu.memory_size.to_le_bytes());
-                    
+
                     // Información de BARs detallada
                     if let Some(pci_device) = self.pci_manager.get_device(0) {
                         let bars = pci_device.read_all_bars();
@@ -191,14 +193,14 @@ impl NvidiaPciDriver {
                         for i in 0..6 {
                             bar_sizes.push(pci_device.calculate_bar_size(i));
                         }
-                        
+
                         for (i, (bar, size)) in bars.iter().zip(bar_sizes.iter()).enumerate() {
                             data.push(i as u8);
                             data.extend_from_slice(&bar.to_le_bytes());
                             data.extend_from_slice(&size.to_le_bytes());
                         }
                     }
-                    
+
                     DriverResponse::SuccessWithData(data)
                 } else {
                     DriverResponse::Error(String::from("No hay GPU activa"))
@@ -219,15 +221,18 @@ impl NvidiaPciDriver {
 
 impl NvidiaPciDriver {
     /// Inicializar con información de hardware detectada
-    pub fn initialize_with_hardware(&mut self, hw_result: &HardwareDetectionResult) -> Result<(), String> {
+    pub fn initialize_with_hardware(
+        &mut self,
+        hw_result: &HardwareDetectionResult,
+    ) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
-        
+
         // Detectar GPUs NVIDIA usando la información ya detectada
         self.detect_nvidia_gpus(hw_result)?;
-        
+
         // Habilitar MMIO para la GPU activa
         self.enable_mmio()?;
-        
+
         self.info.state = DriverState::Ready;
         Ok(())
     }
@@ -236,7 +241,7 @@ impl NvidiaPciDriver {
 impl Driver for NvidiaPciDriver {
     fn initialize(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
-        
+
         // El driver necesita información de hardware externa
         // Por ahora, solo configuramos el estado
         self.info.state = DriverState::Ready;
@@ -245,12 +250,12 @@ impl Driver for NvidiaPciDriver {
 
     fn shutdown(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Unloading;
-        
+
         // Limpiar recursos
         self.nvidia_gpus.clear();
         self.active_gpu = None;
         self.memory_mapped = false;
-        
+
         self.info.state = DriverState::Unloaded;
         // NVIDIA PCI Driver cerrado correctamente
         Ok(())
@@ -265,7 +270,7 @@ impl Driver for NvidiaPciDriver {
 
     fn resume(&mut self) -> Result<(), String> {
         self.info.state = DriverState::Initializing;
-        
+
         // El resume necesita información de hardware externa
         // Por ahora, solo configuramos el estado
         self.info.state = DriverState::Ready;
@@ -278,30 +283,22 @@ impl Driver for NvidiaPciDriver {
 
     fn handle_message(&mut self, message: DriverMessage) -> DriverResponse {
         match message {
-            DriverMessage::Initialize => {
-                match self.initialize() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Shutdown => {
-                match self.shutdown() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Suspend => {
-                match self.suspend() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
-            DriverMessage::Resume => {
-                match self.resume() {
-                    Ok(_) => DriverResponse::Success,
-                    Err(e) => DriverResponse::Error(e),
-                }
-            }
+            DriverMessage::Initialize => match self.initialize() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Shutdown => match self.shutdown() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Suspend => match self.suspend() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
+            DriverMessage::Resume => match self.resume() {
+                Ok(_) => DriverResponse::Success,
+                Err(e) => DriverResponse::Error(e),
+            },
             DriverMessage::GetStatus => {
                 let status = if self.nvidia_gpus.is_empty() {
                     "No GPUs detected"
@@ -313,7 +310,10 @@ impl Driver for NvidiaPciDriver {
                 DriverResponse::SuccessWithData(status.as_bytes().to_vec())
             }
             DriverMessage::GetCapabilities => {
-                let caps: Vec<String> = self.info.capabilities.iter()
+                let caps: Vec<String> = self
+                    .info
+                    .capabilities
+                    .iter()
                     .map(|c| format!("{:?}", c))
                     .collect();
                 let caps_str = caps.join(",");

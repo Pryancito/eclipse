@@ -1,5 +1,5 @@
 //! Gestión de Procesos para Eclipse OS
-//! 
+//!
 //! Implementa PCB, estados de proceso y operaciones básicas
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -83,13 +83,30 @@ pub struct CpuContext {
 impl Default for CpuContext {
     fn default() -> Self {
         Self {
-            rax: 0, rbx: 0, rcx: 0, rdx: 0,
-            rsi: 0, rdi: 0, rbp: 0, rsp: 0,
-            r8: 0, r9: 0, r10: 0, r11: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
-            rip: 0, rflags: 0x202, // RFLAGS con IF=1
-            cs: 0x08, ds: 0x10, ss: 0x10,
-            es: 0x10, fs: 0x10, gs: 0x10,
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            rsp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            rflags: 0x202, // RFLAGS con IF=1
+            cs: 0x08,
+            ds: 0x10,
+            ss: 0x10,
+            es: 0x10,
+            fs: 0x10,
+            gs: 0x10,
         }
     }
 }

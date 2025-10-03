@@ -1,7 +1,7 @@
-use core::fmt;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use alloc::format;
+use core::fmt;
 
 /// Estructura para manejar la comunicación directa con UEFI GOP
 pub struct UefiGraphicsManager {
@@ -51,29 +51,29 @@ impl UefiGraphicsManager {
         // Por ahora, simulamos la inicialización exitosa
         self.system_table = 0x1000 as *mut core::ffi::c_void; // Dirección simulada
         self.gop_protocol = 0x2000 as *mut core::ffi::c_void; // Dirección simulada
-        
+
         // Detectar modos disponibles
         self.detect_available_modes()?;
-        
+
         Ok(())
     }
 
     /// Detectar modos de video disponibles
     fn detect_available_modes(&mut self) -> Result<(), &'static str> {
         self.available_modes.clear();
-        
+
         // Modos de video comunes que UEFI suele soportar
         let common_modes = [
-            (0, 640, 480, 32, 60),     // VGA
-            (1, 800, 600, 32, 60),     // SVGA
-            (2, 1024, 768, 32, 60),    // XGA
-            (3, 1280, 720, 32, 60),    // HD
-            (4, 1280, 1024, 32, 60),   // SXGA
-            (5, 1366, 768, 32, 60),    // HD WXGA
-            (6, 1440, 900, 32, 60),    // WXGA+
-            (7, 1600, 900, 32, 60),    // HD+
-            (8, 1680, 1050, 32, 60),   // WSXGA+
-            (9, 1920, 1080, 32, 60),   // Full HD
+            (0, 640, 480, 32, 60),   // VGA
+            (1, 800, 600, 32, 60),   // SVGA
+            (2, 1024, 768, 32, 60),  // XGA
+            (3, 1280, 720, 32, 60),  // HD
+            (4, 1280, 1024, 32, 60), // SXGA
+            (5, 1366, 768, 32, 60),  // HD WXGA
+            (6, 1440, 900, 32, 60),  // WXGA+
+            (7, 1600, 900, 32, 60),  // HD+
+            (8, 1680, 1050, 32, 60), // WSXGA+
+            (9, 1920, 1080, 32, 60), // Full HD
         ];
 
         for (mode_num, width, height, bpp, refresh) in common_modes.iter() {
@@ -82,7 +82,7 @@ impl UefiGraphicsManager {
                 width: *width,
                 height: *height,
                 pixels_per_scan_line: *width, // Asumimos stride = width
-                pixel_format: 0x00E07F00, // Formato RGB
+                pixel_format: 0x00E07F00,     // Formato RGB
                 framebuffer_base: 0xFD000000, // Dirección base segura que se sobrescribirá
                 refresh_rate: *refresh,
             });
@@ -95,7 +95,7 @@ impl UefiGraphicsManager {
     pub fn list_available_modes(&self) -> String {
         let mut result = String::new();
         result.push_str("Modos UEFI GOP disponibles:\n");
-        
+
         for mode in &self.available_modes {
             result.push_str(&format!(
                 "  Modo {}: {}x{} @{}bpp ({}Hz) - FB: 0x{:X}\n",
@@ -107,21 +107,26 @@ impl UefiGraphicsManager {
                 mode.framebuffer_base
             ));
         }
-        
+
         result
     }
 
     /// Buscar un modo específico
     pub fn find_mode(&self, width: u32, height: u32, bits_per_pixel: u32) -> Option<&UefiModeInfo> {
         self.available_modes.iter().find(|mode| {
-            mode.width == width && 
-            mode.height == height && 
-            (mode.pixel_format >> 16) == bits_per_pixel
+            mode.width == width
+                && mode.height == height
+                && (mode.pixel_format >> 16) == bits_per_pixel
         })
     }
 
     /// Cambiar a un modo específico
-    pub fn set_mode(&mut self, width: u32, height: u32, bits_per_pixel: u32) -> Result<UefiModeInfo, UefiResult> {
+    pub fn set_mode(
+        &mut self,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> Result<UefiModeInfo, UefiResult> {
         // Buscar el modo solicitado
         let mode = match self.find_mode(width, height, bits_per_pixel) {
             Some(mode) => *mode,
@@ -145,12 +150,12 @@ impl UefiGraphicsManager {
         // 1. Llamaríamos a UEFI GOP SetMode
         // 2. Esperaríamos a que el hardware se reconfigurara
         // 3. Verificaríamos que el cambio fue exitoso
-        
+
         // Simulamos el proceso
         self.simulate_uefi_setmode(mode)?;
         self.simulate_hardware_reconfiguration(mode)?;
         self.simulate_mode_verification(mode)?;
-        
+
         Ok(())
     }
 
@@ -180,7 +185,9 @@ impl UefiGraphicsManager {
 
     /// Obtener información del modo actual
     pub fn get_current_mode(&self) -> Option<&UefiModeInfo> {
-        self.available_modes.iter().find(|mode| mode.mode_number == self.current_mode)
+        self.available_modes
+            .iter()
+            .find(|mode| mode.mode_number == self.current_mode)
     }
 
     /// Verificar si UEFI GOP está disponible
@@ -200,7 +207,12 @@ impl UefiGraphicsManager {
     }
 
     /// Cambiar resolución de forma segura
-    pub fn change_resolution_safe(&mut self, width: u32, height: u32, bits_per_pixel: u32) -> Result<UefiModeInfo, UefiResult> {
+    pub fn change_resolution_safe(
+        &mut self,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> Result<UefiModeInfo, UefiResult> {
         // Validar parámetros
         if width == 0 || height == 0 || bits_per_pixel == 0 {
             return Err(UefiResult::InvalidMode);

@@ -6,10 +6,10 @@ use crate::KernelResult;
 /// Inicializar el sistema de memoria de Eclipse
 pub fn init_eclipse_memory() -> KernelResult<()> {
     // Inicializando sistema de memoria Eclipse
-    
+
     // Aquí se implementan las funcionalidades específicas de memoria de Eclipse
     // como el sistema de paginación avanzado, gestión de frames, etc.
-    
+
     // Sistema de memoria Eclipse inicializado
     Ok(())
 }
@@ -18,6 +18,6 @@ pub fn init_eclipse_memory() -> KernelResult<()> {
 pub fn process_memory_events() -> KernelResult<()> {
     // Procesar eventos específicos de memoria de Eclipse
     // como page faults, memory pressure, etc.
-    
+
     Ok(())
 }
