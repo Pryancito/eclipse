@@ -60,13 +60,27 @@ impl VirtioBlkDriver {
         
         serial_write_str("VIRTIO: PciRoot creado correctamente, procediendo con transporte...\n");
         
-        let transport = PciTransport::new::<KernelHal, _>(root.root_mut(), device_function)
+        serial_write_str("VIRTIO: Creando PciTransport...\n");
+        serial_write_str("VIRTIO: Antes de PciTransport::new - device_function: ");
+        serial_write_str(&format!("bus:{} dev:{} func:{}", device_function.bus, device_function.device, device_function.function));
+        serial_write_str("\n");
+        
+        // Verificar que root.root_mut() no sea null
+        serial_write_str("VIRTIO: Verificando root.root_mut()...\n");
+        let root_mut = root.root_mut();
+        serial_write_str("VIRTIO: root.root_mut() obtenido exitosamente\n");
+        
+        serial_write_str("VIRTIO: Llamando a PciTransport::new...\n");
+        let transport = PciTransport::new::<KernelHal, _>(root_mut, device_function)
             .map_err(|e| format!("VirtIO: error creando transporte PCI: {:?}", e))?;
+        serial_write_str("VIRTIO: PciTransport creado exitosamente\n");
 
+        serial_write_str("VIRTIO: Creando VirtIOBlk...\n");
+        serial_write_str("VIRTIO: Antes de VirtIOBlk::new\n");
         let virtio_blk = VirtIOBlk::<KernelHal, _>::new(transport)
             .map_err(|e| format!("VirtIOBlk::new falló: {:?}", e))?;
+        serial_write_str("VIRTIO: VirtIOBlk creado exitosamente\n");
 
-        fb.write_text_kernel("VirtIO-Block inicializado", Color::GREEN);
         serial_write_str("VIRTIO: dispositivo VirtIO-Block inicializado correctamente\n");
 
         Ok(Self {
@@ -90,7 +104,11 @@ impl BlockDevice for VirtioBlkDriver {
 
         let mut blk = self.virtio_blk.lock();
         crate::debug::serial_write_str("VIRTIO: lock adquirido, llamando a driver...\n");
+        
+        crate::debug::serial_write_str("VIRTIO: antes de blk.read_blocks...\n");
         let result = blk.read_blocks(block_address as usize, buffer);
+        crate::debug::serial_write_str("VIRTIO: después de blk.read_blocks...\n");
+        
         crate::debug::serial_write_str(&alloc::format!(
             "VIRTIO: read_blocks resultado = {:?}\n",
             result

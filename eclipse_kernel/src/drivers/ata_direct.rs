@@ -589,7 +589,7 @@ impl AtaDirectDriver {
             
             // Leer datos desde el buffer del dispositivo
             let data_buffer = (mem_addr + 0x1000) as *const u8;
-            for i in 0..512 {
+        for i in 0..512 {
                 buffer[i] = *data_buffer.add(i);
             }
         }

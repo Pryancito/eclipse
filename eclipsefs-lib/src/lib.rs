@@ -5,6 +5,8 @@ pub mod filesystem;
 pub mod format;
 pub mod node;
 pub mod types;
+// pub mod ai_features;
+// pub mod quantum_crypto;
 
 // Re-exportar los tipos principales
 pub use error::{EclipseFSError, EclipseFSResult};
@@ -18,11 +20,21 @@ pub use types::{
 pub use filesystem::EclipseFS;
 pub use node::{EclipseFSNode, NodeKind};
 
+// Re-exportar nuevas características avanzadas (temporalmente deshabilitadas)
+// pub use ai_features::{AIEngine, AIFeaturesConfig, AccessPrediction, PerformanceMetrics, OptimizationRecommendation};
+// pub use quantum_crypto::{PostQuantumCrypto, PostQuantumConfig, PostQuantumAlgorithm, SecurityLevel, QuantumThreatLevel};
+
 // Módulos específicos solo para std
 #[cfg(feature = "std")]
 pub mod reader;
 #[cfg(feature = "std")]
 pub mod writer;
+#[cfg(feature = "std")]
+pub mod cache;
+#[cfg(feature = "std")]
+pub mod defragmentation;
+#[cfg(feature = "std")]
+pub mod load_balancing;
 
 #[cfg(feature = "std")]
 pub use reader::EclipseFSReader;

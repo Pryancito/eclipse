@@ -13,12 +13,13 @@ alloc = []
 no_std = ["alloc"]
 
 [dependencies]
-# Dependencias para no_std
-heapless = { version = "0.8", optional = true }
+# Dependencias siempre disponibles (necesarias para no_std)
+heapless = "0.8"
+hash32 = "0.3"
 
 # Dependencias para std
-byteorder = { version = "1.4", optional = true }
+byteorder = { version = "1.4", optional = true, features = ["i128"] }
 
 # Dependencias condicionales
-[target.'cfg(not(feature = "std"))'.dependencies]
-heapless = "0.8"
+# [target.'cfg(not(feature = "std"))'.dependencies]
+# heapless se maneja a través de features

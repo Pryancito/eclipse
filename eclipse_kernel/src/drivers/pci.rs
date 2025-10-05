@@ -5,6 +5,7 @@
 
 use crate::syslog_info;
 use alloc::format;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr;
 
@@ -709,6 +710,24 @@ impl PciManager {
     /// Obtener información de un dispositivo específico
     pub fn get_device(&self, index: usize) -> Option<&PciDevice> {
         self.devices.get(index)?.as_ref()
+    }
+
+    /// Escanear todos los buses PCI (alias para scan_devices)
+    pub fn scan_all_buses(&mut self) {
+        self.scan_devices();
+    }
+
+    /// Buscar dispositivos por clase y subclase
+    pub fn find_devices_by_class_subclass(&self, class: u8, subclass: u8) -> Vec<PciDevice> {
+        let mut result = Vec::new();
+        for i in 0..self.device_count {
+            if let Some(device) = &self.devices[i] {
+                if device.class_code == class && device.subclass_code == subclass {
+                    result.push(*device);
+                }
+            }
+        }
+        result
     }
 }
 

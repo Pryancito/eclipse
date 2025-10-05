@@ -35,6 +35,12 @@ pub struct EclipseFSNode {
     pub mtime: u64,
     pub ctime: u64,
     pub nlink: u32,
+    // Mejoras inspiradas en RedoxFS
+    pub version: u32,              // Versión del nodo para Copy-on-Write
+    pub parent_version: u32,       // Versión del padre cuando se creó
+    pub is_snapshot: bool,         // Si es una copia CoW
+    pub original_inode: u32,       // Inode original (para snapshots)
+    pub checksum: u32,             // CRC32 del contenido del nodo
 }
 
 #[cfg(not(feature = "std"))]
@@ -51,12 +57,19 @@ pub struct EclipseFSNode {
     pub mtime: u64,
     pub ctime: u64,
     pub nlink: u32,
+    // Mejoras inspiradas en RedoxFS
+    pub version: u32,              // Versión del nodo para Copy-on-Write
+    pub parent_version: u32,       // Versión del padre cuando se creó
+    pub is_snapshot: bool,         // Si es una copia CoW
+    pub original_inode: u32,       // Inode original (para snapshots)
+    pub checksum: u32,             // CRC32 del contenido del nodo
 }
 
 impl EclipseFSNode {
-    /// Crear un nuevo directorio
+    /// Crear un nuevo directorio (inspirado en RedoxFS)
     pub fn new_dir() -> Self {
-        Self {
+        let now = Self::now();
+        let mut node = Self {
             kind: NodeKind::Directory,
             #[cfg(feature = "std")]
             data: Vec::new(),
@@ -70,16 +83,25 @@ impl EclipseFSNode {
             mode: 0o40755,
             uid: 0,
             gid: 0,
-            atime: Self::now(),
-            mtime: Self::now(),
-            ctime: Self::now(),
+            atime: now,
+            mtime: now,
+            ctime: now,
             nlink: 2, // . y ..
-        }
+            // Nuevos campos RedoxFS
+            version: 1,
+            parent_version: 0,
+            is_snapshot: false,
+            original_inode: 0,
+            checksum: 0,
+        };
+        node.update_checksum();
+        node
     }
 
-    /// Crear un nuevo archivo
+    /// Crear un nuevo archivo (inspirado en RedoxFS)
     pub fn new_file() -> Self {
-        Self {
+        let now = Self::now();
+        let mut node = Self {
             kind: NodeKind::File,
             #[cfg(feature = "std")]
             data: Vec::new(),
@@ -93,15 +115,25 @@ impl EclipseFSNode {
             mode: 0o100644,
             uid: 0,
             gid: 0,
-            atime: Self::now(),
-            mtime: Self::now(),
-            ctime: Self::now(),
+            atime: now,
+            mtime: now,
+            ctime: now,
             nlink: 1,
-        }
+            // Nuevos campos RedoxFS
+            version: 1,
+            parent_version: 0,
+            is_snapshot: false,
+            original_inode: 0,
+            checksum: 0,
+        };
+        node.update_checksum();
+        node
     }
 
-    /// Crear un nuevo enlace simbólico
+    /// Crear un nuevo enlace simbólico (inspirado en RedoxFS)
     pub fn new_symlink(target: &str) -> Self {
+        let now = Self::now();
+        
         #[cfg(feature = "std")]
         let data = target.as_bytes().to_vec();
 
@@ -114,7 +146,7 @@ impl EclipseFSNode {
             data.extend_from_slice(target_bytes).ok();
         }
 
-        Self {
+        let mut node = Self {
             kind: NodeKind::Symlink,
             data,
             #[cfg(feature = "std")]
@@ -125,11 +157,19 @@ impl EclipseFSNode {
             mode: 0o120777,
             uid: 0,
             gid: 0,
-            atime: Self::now(),
-            mtime: Self::now(),
-            ctime: Self::now(),
+            atime: now,
+            mtime: now,
+            ctime: now,
             nlink: 1,
-        }
+            // Nuevos campos RedoxFS
+            version: 1,
+            parent_version: 0,
+            is_snapshot: false,
+            original_inode: 0,
+            checksum: 0,
+        };
+        node.update_checksum();
+        node
     }
 
     /// Agregar un hijo al directorio
@@ -325,5 +365,95 @@ impl EclipseFSNode {
         // En un sistema real, esto debería obtener el timestamp actual
         // Para ahora, retornamos un valor fijo
         1640995200 // 2022-01-01 00:00:00 UTC
+    }
+    
+    /// Calcular checksum CRC32 del nodo (inspirado en RedoxFS)
+    fn calculate_crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFFFFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        crc ^ 0xFFFFFFFF
+    }
+    
+    /// Actualizar checksum del nodo
+    pub fn update_checksum(&mut self) {
+        let node_data = self.serialize_for_checksum();
+        self.checksum = Self::calculate_crc32(&node_data);
+    }
+    
+    /// Serializar nodo para cálculo de checksum
+    fn serialize_for_checksum(&self) -> heapless::Vec<u8, 1024> {
+        let mut data = heapless::Vec::new();
+        
+        // Serializar campos críticos para checksum
+        let _ = data.extend_from_slice(&(self.kind.clone() as u8).to_le_bytes());
+        let _ = data.extend_from_slice(&self.size.to_le_bytes());
+        let _ = data.extend_from_slice(&self.mode.to_le_bytes());
+        let _ = data.extend_from_slice(&self.uid.to_le_bytes());
+        let _ = data.extend_from_slice(&self.gid.to_le_bytes());
+        let _ = data.extend_from_slice(&self.mtime.to_le_bytes());
+        let _ = data.extend_from_slice(&self.version.to_le_bytes());
+        let _ = data.extend_from_slice(&self.data);
+        
+        // Serializar children para directorios
+        if self.kind == NodeKind::Directory {
+            #[cfg(feature = "std")]
+            {
+                for (name, inode) in &self.children {
+                    let _ = data.extend_from_slice(name.as_bytes());
+                    let _ = data.extend_from_slice(&inode.to_le_bytes());
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                for (name, inode) in &self.children {
+                    let _ = data.extend_from_slice(name.as_bytes());
+                    let _ = data.extend_from_slice(&inode.to_le_bytes());
+                }
+            }
+        }
+        
+        data
+    }
+    
+    /// Verificar integridad del nodo
+    pub fn verify_integrity(&self) -> EclipseFSResult<()> {
+        let expected_checksum = Self::calculate_crc32(&self.serialize_for_checksum());
+        if self.checksum != expected_checksum {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        Ok(())
+    }
+    
+    /// Crear snapshot Copy-on-Write del nodo (inspirado en RedoxFS)
+    pub fn create_snapshot(&self, new_inode: u32) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.version += 1;
+        snapshot.parent_version = self.version;
+        snapshot.is_snapshot = true;
+        snapshot.original_inode = new_inode; // Se actualizará con el inode real
+        snapshot.ctime = Self::now();
+        snapshot.update_checksum();
+        snapshot
+    }
+    
+    /// Incrementar versión del nodo (para Copy-on-Write)
+    pub fn increment_version(&mut self) {
+        self.version += 1;
+        self.ctime = Self::now();
+        self.update_checksum();
+    }
+    
+    /// Verificar si el nodo es una versión más reciente que otro
+    pub fn is_newer_than(&self, other: &Self) -> bool {
+        self.version > other.version
     }
 }

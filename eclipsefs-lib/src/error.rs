@@ -46,6 +46,20 @@ pub enum EclipseFSError {
     AclError,
 }
 
+impl From<&str> for EclipseFSError {
+    fn from(msg: &str) -> Self {
+        // Mapear strings a errores específicos
+        match msg {
+            msg if msg.contains("deshabilitada") => EclipseFSError::InvalidOperation,
+            msg if msg.contains("no encontrada") => EclipseFSError::NotFound,
+            msg if msg.contains("no es para firmas") => EclipseFSError::InvalidOperation,
+            msg if msg.contains("no coincide") => EclipseFSError::InvalidOperation,
+            msg if msg.contains("deshabilitada") => EclipseFSError::InvalidOperation,
+            _ => EclipseFSError::InvalidOperation,
+        }
+    }
+}
+
 impl fmt::Display for EclipseFSError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

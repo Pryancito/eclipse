@@ -8,6 +8,7 @@ use crate::drivers::{
     manager::{Driver, DriverError, DriverInfo, DriverResult},
     MAX_DEVICES,
 };
+use crate::debug::serial_write_str;
 
 // Importar tipos necesarios para no_std
 use alloc::format;
@@ -413,9 +414,26 @@ impl UsbDriver {
             if let Some(ref mut controller) = self.controllers[i] {
                 controller.enable()?;
                 controller.reset()?;
+                
                 controller.detect_devices()?;
             }
         }
+        
+        // Asegurar que los puertos USB tengan energía (después de inicializar controladores)
+        self.ensure_usb_port_power()?;
+        
+        Ok(())
+    }
+
+    /// Asegurar que todos los puertos USB tengan energía
+    fn ensure_usb_port_power(&self) -> DriverResult<()> {
+        // Esta función se puede extender para diferentes tipos de controladores
+        // Por ahora, asumimos que el controlador xHCI maneja esto automáticamente
+        // pero podemos agregar lógica específica aquí si es necesario
+        
+        // Log de diagnóstico
+        serial_write_str("USB: Verificando estado de energía de puertos\n");
+        
         Ok(())
     }
 }

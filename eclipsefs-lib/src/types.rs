@@ -14,7 +14,7 @@ pub enum EncryptionType {
     ChaCha20,
 }
 
-/// Información de cifrado
+/// Información de cifrado (inspirado en RedoxFS)
 #[derive(Debug, Clone)]
 pub struct EncryptionInfo {
     pub encryption_type: EncryptionType,
@@ -23,6 +23,11 @@ pub struct EncryptionInfo {
     pub iv: Vec<u8>,
     #[cfg(not(feature = "std"))]
     pub iv: Vec<u8, 32>,
+    // Nuevos campos para RedoxFS
+    pub key_version: u32,        // Versión de la clave de encriptación
+    pub salt: [u8; 32],         // Salt para derivación de clave
+    pub key_checksum: u32,      // Checksum de la clave
+    pub is_transparent: bool,   // Si la encriptación es transparente
 }
 
 /// Tipo de compresión
@@ -136,7 +141,69 @@ impl EncryptionInfo {
             iv: Vec::new(),
             #[cfg(not(feature = "std"))]
             iv: Vec::new(),
+            // Nuevos campos RedoxFS
+            key_version: 1,
+            salt: [0u8; 32],
+            key_checksum: 0,
+            is_transparent: false,
         }
+    }
+    
+    /// Crear configuración de encriptación transparente (inspirado en RedoxFS)
+    pub fn new_transparent(encryption_type: EncryptionType, key_id: u32) -> Self {
+        let mut info = Self::new();
+        info.encryption_type = encryption_type;
+        info.key_id = key_id;
+        info.is_transparent = true;
+        info.key_version = 1;
+        
+        // Generar salt aleatorio (simulado para no_std)
+        for i in 0..32 {
+            info.salt[i] = (i as u8).wrapping_add(0x42);
+        }
+        
+        // Calcular checksum de la clave (simulado)
+        info.key_checksum = Self::calculate_key_checksum(&info.salt, key_id);
+        
+        info
+    }
+    
+    /// Calcular checksum de clave (inspirado en RedoxFS)
+    fn calculate_key_checksum(salt: &[u8; 32], key_id: u32) -> u32 {
+        let mut crc: u32 = 0xFFFFFFFF;
+        
+        // Procesar salt
+        for &byte in salt {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        
+        // Procesar key_id
+        let key_bytes = key_id.to_le_bytes();
+        for &byte in &key_bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        
+        crc ^ 0xFFFFFFFF
+    }
+    
+    /// Verificar integridad de la clave
+    pub fn verify_key_integrity(&self) -> bool {
+        let expected_checksum = Self::calculate_key_checksum(&self.salt, self.key_id);
+        self.key_checksum == expected_checksum
     }
 }
 

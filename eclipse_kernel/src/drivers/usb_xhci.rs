@@ -3,6 +3,9 @@
 use crate::drivers::manager::DriverResult;
 use crate::drivers::pci::PciDevice;
 use core::ptr::{read_volatile, write_volatile};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 pub struct XhciController {
     pub pci: PciDevice,
@@ -157,10 +160,31 @@ impl XhciController {
         for i in 0..num_ports {
             let portsc_off = ports_base + i * 0x10;
             let mut v = self.mmio_read32(portsc_off);
-            // Bit Port Power puede ser RW; establecemos si parece estar disponible
-            // Usamos máscara conservadora: set bit 9 si está a cero y no está RO
-            v |= 1 << 9; // PP
-            self.mmio_write32(portsc_off, v);
+            
+            // Verificar si el puerto soporta Port Power (bit 9)
+            // Si el bit PP es RW (no RO), lo habilitamos
+            if (v & (1 << 9)) == 0 {  // Si PP está deshabilitado
+                // Habilitar Port Power
+                v |= 1 << 9; // PP (Port Power)
+                self.mmio_write32(portsc_off, v);
+                
+                // Esperar a que se establezca la potencia
+                let mut tries = 0;
+                while tries < 1000 {
+                    let status = self.mmio_read32(portsc_off);
+                    if (status & (1 << 9)) != 0 {  // Verificar que PP esté activo
+                        break;
+                    }
+                    tries += 1;
+                }
+            }
+            
+            // También habilitar Port Enable si está disponible
+            let mut v2 = self.mmio_read32(portsc_off);
+            if (v2 & (1 << 2)) == 0 {  // Si PE (Port Enable) está deshabilitado
+                v2 |= 1 << 2; // PE (Port Enable)
+                self.mmio_write32(portsc_off, v2);
+            }
         }
     }
 
@@ -231,4 +255,96 @@ impl XhciController {
 
         Ok(())
     }
+
+    /// Verifica el estado de energía de todos los puertos USB
+    pub fn check_port_power_status(&self) -> Vec<PortPowerStatus> {
+        let mut statuses = Vec::new();
+        let cap_length = self.mmio_read8(0x00) as usize;
+        let op_base = cap_length;
+        let hcsparams1 = self.mmio_read32(0x04);
+        let num_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
+        let ports_base = op_base + 0x400;
+
+        for i in 0..num_ports {
+            let portsc_off = ports_base + i * 0x10;
+            let status = self.mmio_read32(portsc_off);
+            
+            let power_status = PortPowerStatus {
+                port_number: i as u8,
+                has_power: (status & (1 << 9)) != 0,  // PP (Port Power)
+                is_enabled: (status & (1 << 2)) != 0,  // PE (Port Enable)
+                is_connected: (status & (1 << 0)) != 0, // CCS (Current Connect Status)
+                speed: ((status >> 10) & 0xF) as u8,   // Port Speed
+                port_type: ((status >> 5) & 0x7) as u8, // Port Type
+            };
+            
+            statuses.push(power_status);
+        }
+        
+        statuses
+    }
+
+    /// Fuerza el encendido de energía en todos los puertos USB
+    pub fn force_enable_all_port_power(&self) -> DriverResult<()> {
+        let cap_length = self.mmio_read8(0x00) as usize;
+        let op_base = cap_length;
+        let hcsparams1 = self.mmio_read32(0x04);
+        let num_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
+        let ports_base = op_base + 0x400;
+
+        for i in 0..num_ports {
+            let portsc_off = ports_base + i * 0x10;
+            
+            // Forzar Port Power ON
+            let mut v = self.mmio_read32(portsc_off);
+            v |= 1 << 9; // PP (Port Power) - Forzar ON
+            self.mmio_write32(portsc_off, v);
+            
+            // Forzar Port Enable ON
+            let mut v2 = self.mmio_read32(portsc_off);
+            v2 |= 1 << 2; // PE (Port Enable) - Forzar ON
+            self.mmio_write32(portsc_off, v2);
+            
+            // Pequeña pausa para estabilización
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Diagnóstico completo del estado USB
+    pub fn get_usb_diagnostic_info(&self) -> String {
+        let mut info = String::new();
+        info.push_str("=== DIAGNÓSTICO USB xHCI ===\n");
+        
+        let statuses = self.check_port_power_status();
+        info.push_str(&format!("Puertos detectados: {}\n", statuses.len()));
+        
+        for status in statuses {
+            info.push_str(&format!(
+                "Puerto {}: Energía={}, Habilitado={}, Conectado={}, Velocidad={}, Tipo={}\n",
+                status.port_number,
+                if status.has_power { "ON" } else { "OFF" },
+                if status.is_enabled { "ON" } else { "OFF" },
+                if status.is_connected { "SÍ" } else { "NO" },
+                status.speed,
+                status.port_type
+            ));
+        }
+        
+        info
+    }
+}
+
+/// Estado de energía de un puerto USB
+#[derive(Debug, Clone, Copy)]
+pub struct PortPowerStatus {
+    pub port_number: u8,
+    pub has_power: bool,
+    pub is_enabled: bool,
+    pub is_connected: bool,
+    pub speed: u8,
+    pub port_type: u8,
 }

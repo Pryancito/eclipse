@@ -45,6 +45,13 @@ impl EclipseFSReader {
             inode_table_offset,
             inode_table_size,
             total_inodes,
+            // Nuevos campos RedoxFS
+            header_checksum: 0,
+            metadata_checksum: 0,
+            data_checksum: 0,
+            creation_time: 0,
+            last_check: 0,
+            flags: 0,
         };
 
         header.validate()?;
@@ -219,6 +226,12 @@ impl EclipseFSReader {
             mtime,
             ctime,
             nlink,
+            // Nuevos campos RedoxFS
+            version: 1,
+            parent_version: 0,
+            is_snapshot: false,
+            original_inode: 0,
+            checksum: 0,
         })
     }
 

@@ -967,9 +967,29 @@ pub fn mount_fat32_from_storage(
     
     crate::debug::serial_write_str("FAT32: Boot signature válida (0x55AA)\n");
     
+    // Debug: mostrar primeros 128 bytes del boot sector
+    crate::debug::serial_write_str("FAT32: Primeros 128 bytes del boot sector:\n");
+    for i in 0..16 {
+        let start = i * 8;
+        let end = start + 8;
+        if end <= boot_sector_buffer.len() {
+            let hex_str = boot_sector_buffer[start..end]
+                .iter()
+                .map(|b| alloc::format!("{:02X}", b))
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            crate::debug::serial_write_str(&alloc::format!("{:02X}: {}\n", start, hex_str));
+        }
+    }
+    
     // Verificar que es FAT32
     let fs_type_start = 82; // Offset del tipo de sistema de archivos en boot sector
     let fs_type_bytes = &boot_sector_buffer[fs_type_start..fs_type_start + 8];
+    
+    crate::debug::serial_write_str(&alloc::format!(
+        "FAT32: Bytes del tipo FS en offset {}: {:?}\n",
+        fs_type_start, fs_type_bytes
+    ));
     
     // Convertir a string, reemplazando bytes nulos con espacios
     let mut fs_type_str = String::new();

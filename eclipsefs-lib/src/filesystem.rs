@@ -1,10 +1,17 @@
 //! Implementación del sistema de archivos EclipseFS
 
 use crate::{
-    Acl, AclEntry, AclEntryType, CompressionInfo, CompressionType, DfResult, EclipseFSError,
-    EclipseFSHeader, EclipseFSNode, EclipseFSResult, EncryptionInfo, EncryptionType, FindResult,
+    Acl, AclEntry, CompressionInfo, CompressionType, DfResult, EclipseFSError,
+    EclipseFSHeader, EclipseFSNode, EclipseFSResult, EncryptionInfo, FindResult,
     FsckResult, InodeTableEntry, NodeKind, Snapshot, TransparentEncryptionConfig,
 };
+
+#[cfg(feature = "std")]
+use crate::cache::{CacheConfig, IntelligentCache};
+#[cfg(feature = "std")]
+use crate::defragmentation::{DefragmentationConfig, IntelligentDefragmenter};
+#[cfg(feature = "std")]
+use crate::load_balancing::{LoadBalancingConfig, IntelligentLoadBalancer};
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -15,17 +22,29 @@ use heapless::{FnvIndexMap, String, Vec};
 #[cfg(not(feature = "std"))]
 // Tamaños máximos (menores) para escenarios no_std tempranos
 const MAX_NODES: usize = 512; // Capacidad ampliada para imágenes reales
+#[allow(dead_code)]
 const MAX_DATA_SIZE: usize = 8 * 1024; // 8KB por archivo/symlink en memoria
+#[allow(dead_code)]
 const MAX_CHILDREN: usize = 256; // Hasta 256 hijos por directorio
+#[allow(dead_code)]
 const MAX_NAME_LEN: usize = 128; // Nombres hasta 128 caracteres
 
-/// Estructura principal del sistema de archivos EclipseFS
+/// Estructura principal del sistema de archivos EclipseFS (inspirado en RedoxFS)
 #[cfg(feature = "std")]
 pub struct EclipseFS {
     nodes: HashMap<u32, EclipseFSNode>,
     next_inode: u32,
     root_inode: u32,
     umask: u16,
+    // Nuevos campos para Copy-on-Write y encriptación
+    snapshots: HashMap<u32, Snapshot>,           // Snapshots activos
+    encryption_config: Option<EncryptionInfo>,   // Configuración de encriptación
+    cow_enabled: bool,                           // Copy-on-Write habilitado
+    version_history: HashMap<u32, Vec<u32>>,    // Historial de versiones por inode
+    // Optimizaciones avanzadas RedoxFS
+    cache: Option<IntelligentCache>,             // Sistema de caché inteligente
+    defragmenter: Option<IntelligentDefragmenter>, // Sistema de defragmentación
+    load_balancer: Option<IntelligentLoadBalancer>, // Sistema de balanceo de carga
 }
 
 #[cfg(not(feature = "std"))]
@@ -34,10 +53,17 @@ pub struct EclipseFS {
     next_inode: u32,
     root_inode: u32,
     umask: u16,
+    // Nuevos campos para Copy-on-Write y encriptación
+    snapshots: FnvIndexMap<u32, Snapshot, 16>,        // Snapshots activos (limitado para no_std)
+    encryption_config: Option<EncryptionInfo>,        // Configuración de encriptación
+    cow_enabled: bool,                                 // Copy-on-Write habilitado
+    version_history: FnvIndexMap<u32, heapless::Vec<u32, 8>, 64>, // Historial de versiones
+    // Optimizaciones avanzadas RedoxFS (solo std)
+    // cache, defragmenter, load_balancer no disponibles en no_std
 }
 
 impl EclipseFS {
-    /// Crear un nuevo sistema de archivos EclipseFS
+    /// Crear un nuevo sistema de archivos EclipseFS (inspirado en RedoxFS)
     pub fn new() -> Self {
         let mut fs = Self {
             #[cfg(feature = "std")]
@@ -47,6 +73,24 @@ impl EclipseFS {
             next_inode: 1,
             root_inode: 1,
             umask: 0o022,
+            // Inicializar nuevos campos RedoxFS
+            #[cfg(feature = "std")]
+            snapshots: HashMap::new(),
+            #[cfg(not(feature = "std"))]
+            snapshots: FnvIndexMap::new(),
+            encryption_config: None,
+            cow_enabled: false,
+            #[cfg(feature = "std")]
+            version_history: HashMap::new(),
+            #[cfg(not(feature = "std"))]
+            version_history: FnvIndexMap::new(),
+            // Inicializar optimizaciones avanzadas
+            #[cfg(feature = "std")]
+            cache: None,
+            #[cfg(feature = "std")]
+            defragmenter: None,
+            #[cfg(feature = "std")]
+            load_balancer: None,
         };
         
         // Crear el directorio raíz
@@ -59,14 +103,273 @@ impl EclipseFS {
         fs
     }
     
+    /// Habilitar Copy-on-Write (inspirado en RedoxFS)
+    pub fn enable_copy_on_write(&mut self) {
+        self.cow_enabled = true;
+    }
+    
+    /// Deshabilitar Copy-on-Write
+    pub fn disable_copy_on_write(&mut self) {
+        self.cow_enabled = false;
+    }
+    
+    /// Configurar encriptación transparente (inspirado en RedoxFS)
+    pub fn set_transparent_encryption(&mut self, encryption_info: EncryptionInfo) -> EclipseFSResult<()> {
+        if !encryption_info.verify_key_integrity() {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
+        self.encryption_config = Some(encryption_info);
+        Ok(())
+    }
+    
+    /// Deshabilitar encriptación transparente
+    pub fn disable_encryption(&mut self) {
+        self.encryption_config = None;
+    }
+    
+    /// Crear snapshot del sistema de archivos (inspirado en RedoxFS)
+    pub fn create_filesystem_snapshot(&mut self, snapshot_id: u32, description: &str) -> EclipseFSResult<()> {
+        #[cfg(feature = "std")]
+        {
+            if self.snapshots.contains_key(&snapshot_id) {
+                return Err(EclipseFSError::DuplicateEntry);
+            }
+            
+            let snapshot = Snapshot {
+                id: snapshot_id.to_string(),
+                timestamp: Self::current_timestamp(),
+                description: description.to_string(),
+            };
+            
+            self.snapshots.insert(snapshot_id, snapshot);
+        }
+        
+        #[cfg(not(feature = "std"))]
+        {
+            if self.snapshots.contains_key(&snapshot_id) {
+                return Err(EclipseFSError::DuplicateEntry);
+            }
+            
+            let mut id_str = String::new();
+            // Convertir u32 a string manualmente para no_std
+            let mut temp = snapshot_id;
+            let mut digits = heapless::Vec::<u8, 16>::new();
+            if temp == 0 {
+                let _ = digits.push(b'0');
+            } else {
+                while temp > 0 {
+                    let _ = digits.push((temp % 10) as u8 + b'0');
+                    temp /= 10;
+                }
+            }
+            for &digit in digits.iter().rev() {
+                let _ = id_str.push(digit as char);
+            }
+            
+            let mut desc_str = String::new();
+            let _ = desc_str.push_str(description);
+            
+            let snapshot = Snapshot {
+                id: id_str,
+                timestamp: Self::current_timestamp(),
+                description: desc_str,
+            };
+            
+            let _ = self.snapshots.insert(snapshot_id, snapshot);
+        }
+        
+        Ok(())
+    }
+    
+    /// Eliminar snapshot
+    pub fn remove_snapshot(&mut self, snapshot_id: u32) -> EclipseFSResult<()> {
+        #[cfg(feature = "std")]
+        {
+            self.snapshots.remove(&snapshot_id).ok_or(EclipseFSError::NotFound)?;
+        }
+        
+        #[cfg(not(feature = "std"))]
+        {
+            self.snapshots.remove(&snapshot_id).ok_or(EclipseFSError::NotFound)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Obtener timestamp actual (simulado para no_std)
+    fn current_timestamp() -> u64 {
+        // En un sistema real, esto vendría del kernel o RTC
+        1640995200 // 2022-01-01 00:00:00 UTC
+    }
+    
+    /// Habilitar sistema de caché inteligente (inspirado en RedoxFS)
+    #[cfg(feature = "std")]
+    pub fn enable_intelligent_cache(&mut self, config: CacheConfig) -> EclipseFSResult<()> {
+        self.cache = Some(IntelligentCache::new(config));
+        Ok(())
+    }
+    
+    /// Habilitar sistema de defragmentación inteligente (inspirado en RedoxFS)
+    #[cfg(feature = "std")]
+    pub fn enable_intelligent_defragmentation(&mut self, config: DefragmentationConfig) -> EclipseFSResult<()> {
+        self.defragmenter = Some(IntelligentDefragmenter::new(config));
+        Ok(())
+    }
+    
+    /// Habilitar sistema de balanceo de carga inteligente (inspirado en RedoxFS)
+    #[cfg(feature = "std")]
+    pub fn enable_intelligent_load_balancing(&mut self, config: LoadBalancingConfig) -> EclipseFSResult<()> {
+        self.load_balancer = Some(IntelligentLoadBalancer::new(config));
+        Ok(())
+    }
+    
+    /// Ejecutar optimizaciones avanzadas (inspirado en RedoxFS)
+    #[cfg(feature = "std")]
+    pub fn run_advanced_optimizations(&mut self) -> EclipseFSResult<OptimizationReport> {
+        let mut report = OptimizationReport::new();
+        
+        // Ejecutar defragmentación si está habilitada
+        if let Some(ref mut defragmenter) = self.defragmenter {
+            match defragmenter.defragment() {
+                Ok(result) => {
+                    report.defragmentation_result = Some(result);
+                }
+                Err(e) => {
+                    report.errors.push(format!("Error en defragmentación: {:?}", e));
+                }
+            }
+        }
+        
+        // Ejecutar rebalanceo de carga si está habilitado
+        if let Some(ref mut load_balancer) = self.load_balancer {
+            match load_balancer.rebalance() {
+                Ok(result) => {
+                    report.rebalancing_result = Some(result);
+                }
+                Err(e) => {
+                    report.errors.push(format!("Error en rebalanceo: {:?}", e));
+                }
+            }
+        }
+        
+        // Obtener estadísticas de caché
+        if let Some(ref cache) = self.cache {
+            report.cache_stats = Some(cache.get_stats());
+        }
+        
+        Ok(report)
+    }
+    
+    /// Obtener estadísticas completas del sistema (inspirado en RedoxFS)
+    #[cfg(feature = "std")]
+    pub fn get_system_stats(&self) -> SystemStats {
+        SystemStats {
+            total_nodes: self.nodes.len(),
+            total_snapshots: self.snapshots.len(),
+            cow_enabled: self.cow_enabled,
+            encryption_enabled: self.encryption_config.is_some(),
+            cache_enabled: self.cache.is_some(),
+            defragmentation_enabled: self.defragmenter.is_some(),
+            load_balancing_enabled: self.load_balancer.is_some(),
+            cache_stats: self.cache.as_ref().map(|c| c.get_stats()),
+            defragmentation_stats: self.defragmenter.as_ref().map(|d| d.get_stats()),
+            load_balancing_stats: self.load_balancer.as_ref().map(|l| l.get_stats()),
+        }
+    }
+    
     /// Obtener un nodo por su inode
     pub fn get_node(&self, inode: u32) -> Option<&EclipseFSNode> {
         self.nodes.get(&inode)
     }
     
-    /// Obtener un nodo mutable por su inode
+    /// Obtener un nodo mutable por su inode (con Copy-on-Write)
     pub fn get_node_mut(&mut self, inode: u32) -> Option<&mut EclipseFSNode> {
+        if self.cow_enabled {
+            self.perform_copy_on_write(inode).ok()?;
+        }
         self.nodes.get_mut(&inode)
+    }
+    
+    /// Realizar Copy-on-Write para un nodo (inspirado en RedoxFS)
+    fn perform_copy_on_write(&mut self, inode: u32) -> EclipseFSResult<()> {
+        // Obtener el nodo original
+        let original_node = self.nodes.get(&inode).ok_or(EclipseFSError::NotFound)?.clone();
+        
+        // Crear una copia del nodo con nueva versión
+        let mut cow_node = original_node.create_snapshot(inode);
+        cow_node.increment_version();
+        
+        // Actualizar el historial de versiones
+        self.update_version_history(inode, cow_node.version);
+        
+        // Reemplazar el nodo original con la copia
+        let _ = self.nodes.insert(inode, cow_node);
+        
+        Ok(())
+    }
+    
+    /// Actualizar historial de versiones
+    fn update_version_history(&mut self, inode: u32, version: u32) {
+        #[cfg(feature = "std")]
+        {
+            self.version_history.entry(inode).or_insert_with(Vec::new).push(version);
+        }
+        
+        #[cfg(not(feature = "std"))]
+        {
+            if let Some(versions) = self.version_history.get_mut(&inode) {
+                let _ = versions.push(version);
+            } else {
+                let mut versions = heapless::Vec::new();
+                let _ = versions.push(version);
+                let _ = self.version_history.insert(inode, versions);
+            }
+        }
+    }
+    
+    /// Obtener historial de versiones de un nodo
+    pub fn get_version_history(&self, inode: u32) -> Option<&[u32]> {
+        #[cfg(feature = "std")]
+        {
+            self.version_history.get(&inode).map(|v| v.as_slice())
+        }
+        
+        #[cfg(not(feature = "std"))]
+        {
+            self.version_history.get(&inode).map(|v| v.as_slice())
+        }
+    }
+    
+    /// Restaurar nodo a una versión anterior (inspirado en RedoxFS)
+    pub fn restore_node_version(&mut self, inode: u32, target_version: u32) -> EclipseFSResult<()> {
+        if !self.cow_enabled {
+            return Err(EclipseFSError::InvalidOperation);
+        }
+        
+        // Verificar que la versión existe en el historial
+        let versions = self.get_version_history(inode).ok_or(EclipseFSError::NotFound)?;
+        if !versions.contains(&target_version) {
+            return Err(EclipseFSError::NotFound);
+        }
+        
+        // Obtener el nodo actual
+        let current_node = self.nodes.get(&inode).ok_or(EclipseFSError::NotFound)?;
+        
+        // Crear una nueva versión basada en la versión objetivo
+        let mut restored_node = current_node.clone();
+        restored_node.version = target_version + 1;
+        restored_node.parent_version = target_version;
+        restored_node.is_snapshot = true;
+        restored_node.increment_version();
+        
+        // Actualizar el historial
+        self.update_version_history(inode, restored_node.version);
+        
+        // Reemplazar el nodo
+        let _ = self.nodes.insert(inode, restored_node);
+        
+        Ok(())
     }
     
     /// Asignar un nuevo inode
@@ -638,8 +941,8 @@ impl EclipseFS {
         Ok(Vec::new())
     }
 
-#[cfg(not(feature = "std"))]
-pub fn load_from_buffer(&mut self, data: &[u8]) -> EclipseFSResult<()> {
+    #[cfg(not(feature = "std"))]
+    pub fn load_from_buffer(&mut self, data: &[u8]) -> EclipseFSResult<()> {
         let header = EclipseFSHeader::from_bytes(data)?;
 
         let table_offset = header.inode_table_offset as usize;
@@ -701,7 +1004,7 @@ pub fn load_from_buffer(&mut self, data: &[u8]) -> EclipseFSResult<()> {
     #[cfg(not(feature = "std"))]
     pub fn load_from_stream<F>(
         &mut self,
-        header: &EclipseFSHeader,
+        _header: &EclipseFSHeader,
         inode_entries: &[InodeTableEntry],
         mut fetch: F,
     ) -> EclipseFSResult<()>
@@ -1001,5 +1304,104 @@ pub fn load_from_buffer(&mut self, data: &[u8]) -> EclipseFSResult<()> {
     }
     pub fn load_from_file(&mut self, _path: &str) -> EclipseFSResult<()> {
         Ok(())
+    }
+}
+
+/// Reporte de optimizaciones (inspirado en RedoxFS)
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct OptimizationReport {
+    pub defragmentation_result: Option<crate::defragmentation::DefragmentationResult>,
+    pub rebalancing_result: Option<crate::load_balancing::RebalancingResult>,
+    pub cache_stats: Option<crate::cache::CacheStats>,
+    pub errors: Vec<String>,
+}
+
+#[cfg(feature = "std")]
+impl OptimizationReport {
+    pub fn new() -> Self {
+        Self {
+            defragmentation_result: None,
+            rebalancing_result: None,
+            cache_stats: None,
+            errors: Vec::new(),
+        }
+    }
+    
+    pub fn print_summary(&self) {
+        println!("=== EclipseFS Optimization Report ===");
+        
+        if let Some(ref defrag) = self.defragmentation_result {
+            println!("Defragmentation:");
+            println!("  Files Processed: {}", defrag.files_processed);
+            println!("  Fragments Consolidated: {}", defrag.fragments_consolidated);
+            println!("  Space Freed: {} bytes", defrag.space_freed);
+            println!("  Time Taken: {} ms", defrag.time_taken_ms);
+        }
+        
+        if let Some(ref rebalance) = self.rebalancing_result {
+            println!("Load Rebalancing:");
+            println!("  Files Moved: {}", rebalance.files_moved);
+            println!("  Nodes Affected: {}", rebalance.nodes_affected);
+            println!("  Load Improvement: {:.2}", rebalance.load_improvement);
+            println!("  Time Taken: {} ms", rebalance.time_taken_ms);
+        }
+        
+        if let Some(ref cache) = self.cache_stats {
+            println!("Cache Statistics:");
+            cache.print_summary();
+        }
+        
+        if !self.errors.is_empty() {
+            println!("Errors:");
+            for error in &self.errors {
+                println!("  {}", error);
+            }
+        }
+    }
+}
+
+/// Estadísticas completas del sistema (inspirado en RedoxFS)
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct SystemStats {
+    pub total_nodes: usize,
+    pub total_snapshots: usize,
+    pub cow_enabled: bool,
+    pub encryption_enabled: bool,
+    pub cache_enabled: bool,
+    pub defragmentation_enabled: bool,
+    pub load_balancing_enabled: bool,
+    pub cache_stats: Option<crate::cache::CacheStats>,
+    pub defragmentation_stats: Option<crate::defragmentation::DefragmentationStats>,
+    pub load_balancing_stats: Option<crate::load_balancing::LoadBalancingStats>,
+}
+
+#[cfg(feature = "std")]
+impl SystemStats {
+    pub fn print_summary(&self) {
+        println!("=== EclipseFS System Statistics ===");
+        println!("Total Nodes: {}", self.total_nodes);
+        println!("Total Snapshots: {}", self.total_snapshots);
+        println!("Copy-on-Write: {}", if self.cow_enabled { "Enabled" } else { "Disabled" });
+        println!("Encryption: {}", if self.encryption_enabled { "Enabled" } else { "Disabled" });
+        println!("Intelligent Cache: {}", if self.cache_enabled { "Enabled" } else { "Disabled" });
+        println!("Defragmentation: {}", if self.defragmentation_enabled { "Enabled" } else { "Disabled" });
+        println!("Load Balancing: {}", if self.load_balancing_enabled { "Enabled" } else { "Disabled" });
+        
+        if let Some(ref cache) = self.cache_stats {
+            println!("\nCache Statistics:");
+            cache.print_summary();
+        }
+        
+        if let Some(ref defrag) = self.defragmentation_stats {
+            println!("\nDefragmentation Statistics:");
+            defrag.print_summary();
+        }
+        
+        if let Some(ref load_bal) = self.load_balancing_stats {
+            println!("\nLoad Balancing Statistics:");
+            load_bal.print_summary();
+        }
     }
 }

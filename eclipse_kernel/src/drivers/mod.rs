@@ -64,10 +64,21 @@ pub mod usb_xhci;
 pub mod virtio_blk;
 pub mod virtio_std;
 pub mod ata_direct;
-pub mod ahci;
 pub mod virtio_gpu;
 pub mod vmware_svga;
 pub mod storage_manager;
+pub mod storage_device_wrapper;
+pub mod power_management;
+pub mod usb_mass_storage;
+pub mod usb_diagnostic;
+pub mod usb_events;
+pub mod usb_hotplug;
+pub mod usb_audio;
+pub mod usb_video;
+pub mod usb_network;
+pub mod usb_user_api;
+pub mod usb_power_management;
+pub mod ahci;
 
 // Re-exportar componentes principales
 pub use device::{DeviceError, DeviceState, DeviceType};

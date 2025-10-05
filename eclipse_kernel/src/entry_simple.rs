@@ -12,7 +12,23 @@ use eclipse_kernel::drivers::framebuffer::{
     FramebufferInfo, FramebufferDriver, Color,
     get_framebuffer, init_framebuffer
 };
+use eclipse_kernel::syscalls::handler::init_syscall_system;
+use eclipse_kernel::interrupts::manager::initialize_interrupt_system;
 // panic_handler definido en lib.rs
+
+// Nota PVH para QEMU
+#[link_section = ".note"]
+#[no_mangle]
+pub static PVH_NOTE: [u8; 24] = [
+    // Elf64_Nhdr
+    4, 0, 0, 0,           // n_namesz = 4
+    8, 0, 0, 0,           // n_descsz = 8  
+    9, 0, 0, 0,           // n_type = NT_PVH
+    // name = "Xen\0"
+    0x58, 0x65, 0x6e, 0x00,
+    // desc = entry point
+    0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, // 0x200000
+];
 
 /// Función principal del kernel (llamada desde start.asm)
 #[no_mangle]
@@ -42,6 +58,13 @@ pub extern "C" fn multiboot2_entry(framebuffer_info_ptr: *const FramebufferInfo)
             fb_info.pixel_format,
             fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
         );
+
+        // Inicializar sistema de syscalls
+        let _syscall_handler = init_syscall_system();
+
+        // Inicializar sistema de interrupciones
+        let kernel_code_selector = 0x08; // Selector de código del kernel
+        let _ = initialize_interrupt_system(kernel_code_selector);
 
         // Obtener el framebuffer mutable
         if let Some(fb) = get_framebuffer() {

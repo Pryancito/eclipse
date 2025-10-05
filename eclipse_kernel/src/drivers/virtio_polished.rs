@@ -384,36 +384,52 @@ impl VirtioSimulatedDevice {
     
     // NEW: Function to generate a realistic EclipseFS superblock block
     fn generate_realistic_eclipsefs_superblock_block(&self, buffer: &mut [u8], block_offset: u64) {
-        use eclipsefs_lib::format::{self, constants, tlv_tags, EclipseFSHeader, BLOCK_SIZE};
-
         buffer.fill(0);
 
         // Generar header EclipseFS en los primeros 8 bloques (4096 bytes)
         if block_offset < 8 {
             if block_offset == 0 {
-                // Primer bloque: header completo
-                buffer[0..9].copy_from_slice(format::ECLIPSEFS_MAGIC);
-                buffer[9..13].copy_from_slice(&format::ECLIPSEFS_VERSION.to_le_bytes());
-                // inode_table_offset = 4096 (bloque 8)
-                buffer[13..21].copy_from_slice(&4096u64.to_le_bytes());
-                // inode_table_size = 8 bytes (1 entrada)
-                buffer[21..29].copy_from_slice(&8u64.to_le_bytes());
-                // total_inodes = 1
-                buffer[29..33].copy_from_slice(&1u32.to_le_bytes());
+                // Primer bloque: header completo con estructura exacta según eclipsefs-lib
+                let signature = b"ECLIPSEFS";
+                buffer[0..9].copy_from_slice(signature);
+                buffer[9..13].copy_from_slice(&0x00020000u32.to_le_bytes()); // v2.0
+                buffer[13..21].copy_from_slice(&512u64.to_le_bytes()); // inode_table_offset (512 bytes después del header)
+                buffer[21..29].copy_from_slice(&32u64.to_le_bytes()); // inode_table_size (2 inodos * 16 bytes)
+                buffer[29..33].copy_from_slice(&2u32.to_le_bytes()); // total_inodes
+                
+                // Nuevos campos inspirados en RedoxFS (posiciones exactas según from_bytes)
+                buffer[33..37].copy_from_slice(&0x12345678u32.to_le_bytes()); // header_checksum (simulado)
+                buffer[37..41].copy_from_slice(&0x87654321u32.to_le_bytes()); // metadata_checksum (simulado)
+                buffer[41..45].copy_from_slice(&0xDEADBEEFu32.to_le_bytes()); // data_checksum (simulado)
+                buffer[45..53].copy_from_slice(&1640995200u64.to_le_bytes()); // creation_time
+                buffer[53..61].copy_from_slice(&1640995200u64.to_le_bytes()); // last_check
+                buffer[61..65].copy_from_slice(&0u32.to_le_bytes()); // flags
+                
+                // Rellenar el resto del bloque con ceros
+                for i in 65..512 {
+                    buffer[i] = 0;
+                }
             } else {
                 // Bloques 1-7: padding con ceros
                 buffer.fill(0);
             }
-        } else if block_offset == 8 {
-            // Bloque 8: tabla de inodos (8 bytes para 1 inodo)
+        } else if block_offset == 1 {
+            // Bloque 1: tabla de inodos (32 bytes para 2 inodos de 8 bytes cada uno)
+            // Inodo 1 (root): inode=1, offset_relativo=0 (justo después de la tabla de inodos)
             buffer[0..4].copy_from_slice(&1u32.to_le_bytes()); // inode 1
-            buffer[4..8].copy_from_slice(&0u32.to_le_bytes()); // offset relativo 0
-        } else if block_offset == 9 {
-            // Tercer bloque: registro del nodo raíz
+            buffer[4..8].copy_from_slice(&0u32.to_le_bytes()); // offset relativo 0 (después de tabla de inodos)
+            // Inodo 2: inode=2, offset_relativo=512 (sector siguiente)
+            buffer[8..12].copy_from_slice(&2u32.to_le_bytes()); // inode 2
+            buffer[12..16].copy_from_slice(&512u32.to_le_bytes()); // offset relativo 512
+            
+            serial_write_str("VIRTIO_SIMULATED: Tabla de inodos - inode1=1, offset1=0, inode2=2, offset2=512\n");
+        } else if block_offset == 2 {
+            // Bloque 2: registro del nodo raíz
             buffer[0..4].copy_from_slice(&1u32.to_le_bytes()); // inode
             buffer[4..8].copy_from_slice(&111u32.to_le_bytes()); // record_size
             let mut cursor = 8;
             
+            // TLV tags básicos para directorio raíz
             let mut write_tlv = |tag: u16, value: &[u8]| {
                 if cursor + 6 + value.len() <= buffer.len() {
                     buffer[cursor..cursor + 2].copy_from_slice(&tag.to_le_bytes());
@@ -423,22 +439,21 @@ impl VirtioSimulatedDevice {
                 }
             };
 
-            write_tlv(tlv_tags::NODE_TYPE, &[2]); // Directorio
-            write_tlv(tlv_tags::MODE, &0o40755u32.to_le_bytes());
-            write_tlv(tlv_tags::UID, &0u32.to_le_bytes());
-            write_tlv(tlv_tags::GID, &0u32.to_le_bytes());
-            write_tlv(tlv_tags::SIZE, &0u64.to_le_bytes());
-            write_tlv(tlv_tags::ATIME, &0u64.to_le_bytes());
-            write_tlv(tlv_tags::MTIME, &0u64.to_le_bytes());
-            write_tlv(tlv_tags::CTIME, &0u64.to_le_bytes());
-            write_tlv(tlv_tags::NLINK, &2u32.to_le_bytes());
+            write_tlv(1, &[2]); // NODE_TYPE = 2 (directorio)
+            write_tlv(2, &0o40755u32.to_le_bytes()); // MODE
+            write_tlv(3, &0u32.to_le_bytes()); // UID
+            write_tlv(4, &0u32.to_le_bytes()); // GID
+            write_tlv(5, &0u64.to_le_bytes()); // SIZE
+            write_tlv(6, &1640995200u64.to_le_bytes()); // ATIME
+            write_tlv(7, &1640995200u64.to_le_bytes()); // MTIME
+            write_tlv(8, &1640995200u64.to_le_bytes()); // CTIME
+            write_tlv(9, &2u32.to_le_bytes()); // NLINK
         } else {
             // Para otros bloques, generar datos simulados consistentes
             for (i, byte) in buffer.iter_mut().enumerate() {
                 *byte = ((block_offset as u8).wrapping_add(i as u8)).wrapping_mul(13);
             }
         }
-        // Los demás bloques permanecen en cero
 
         serial_write_str("VIRTIO_SIMULATED: Bloque EclipseFS generado\n");
     }

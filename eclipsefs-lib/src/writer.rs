@@ -2,7 +2,7 @@
 
 use crate::{
     format::constants, format::tlv_tags, EclipseFSError, EclipseFSHeader, EclipseFSNode,
-    EclipseFSResult, InodeTableEntry, NodeKind,
+    EclipseFSResult, NodeKind,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::collections::BTreeMap;

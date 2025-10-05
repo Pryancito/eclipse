@@ -22,7 +22,7 @@ bootloader = { version = "0.9.8", features = ["map_physical_memory"] }
 volatile = "0.2.6"
 heapless = "0.8"
 linked_list_allocator = "0.10"
-eclipsefs-lib = { path = "../eclipsefs-lib", default-features = false }
+eclipsefs-lib = { path = "../eclipsefs-lib", default-features = false, features = ["alloc"] }
 # Dependencias para acceso a hardware PCI/MMIO
 bitflags = "2.4"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

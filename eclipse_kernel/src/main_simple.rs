@@ -43,6 +43,7 @@ use crate::drivers::usb::UsbDriver;
 use crate::drivers::usb_keyboard::{KeyboardConfig, KeyboardEvent, UsbKeyCode, UsbKeyboardDriver};
 use crate::drivers::usb_mouse::{MouseButton, MouseConfig, MouseEvent, UsbMouseDriver};
 use crate::drivers::usb_xhci::XhciController;
+use crate::drivers::usb_diagnostic;
 use crate::drivers::virtio_gpu::VirtioGpuDriver;
 use crate::drivers::vmware_svga::VmwareSvgaDriver;
 use crate::filesystem::vfs::{get_vfs, init_vfs};
@@ -327,6 +328,12 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         fb.write_text_kernel("No se detectó GPU primaria", Color::YELLOW);
     }
 
+    // --- Diagnóstico USB ---
+    serial_write_str("KERNEL_MAIN: Iniciando diagnóstico USB...\n");
+    fb.write_text_kernel("Diagnóstico USB...", Color::WHITE);
+    usb_diagnostic::usb_diagnostic_main();
+    fb.write_text_kernel("Diagnóstico USB completado", Color::GREEN);
+
     if hw.available_gpus.is_empty() {
         fb.write_text_kernel("No se detectaron GPUs adicionales", Color::YELLOW);
     } else {
@@ -393,65 +400,50 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: VFS Initialized.\n");
     fb.write_text_kernel("VFS inicializado.", Color::GREEN);
 
-    // Estrategia simple: intentar montar EclipseFS directamente
+    // Estrategia: intentar montar EclipseFS directamente desde la segunda partición
     if storage_manager.device_count() > 0 {
-        serial_write_str("KERNEL_MAIN: Intentando montar FAT32 desde dispositivos de almacenamiento...\n");
-        fb.write_text_kernel("Intentando montar FAT32 desde dispositivos de almacenamiento...", Color::WHITE);
+        serial_write_str("KERNEL_MAIN: Intentando montar EclipseFS desde segunda partición...\n");
+        fb.write_text_kernel("Intentando montar EclipseFS desde segunda partición...", Color::WHITE);
 
-        match mount_fat32_from_storage(&storage_manager) {
+        // Intentar montar EclipseFS desde el almacenamiento
+        match mount_eclipsefs_from_storage(&storage_manager) {
             Ok(()) => {
-                serial_write_str("KERNEL_MAIN: FAT32 montado exitosamente!\n");
-                fb.write_text_kernel("FAT32 montado exitosamente!", Color::GREEN);
-                {
-                    let vfs_guard = get_vfs();
-                    if let Some(vfs) = vfs_guard.as_ref() {
-                        vfs.debug_list_mounts();
-                    }
-                }
-
-                serial_write_str("KERNEL_MAIN: Intentando montar EclipseFS desde segunda partición...\n");
-                fb.write_text_kernel("Intentando montar EclipseFS desde segunda partición...", Color::WHITE);
-
-                match mount_eclipsefs_from_storage(&storage_manager) {
-                    Ok(()) => {
-                        serial_write_str("KERNEL_MAIN: EclipseFS montado exitosamente!\n");
-                        fb.write_text_kernel("EclipseFS montado exitosamente!", Color::GREEN);
-                        {
-                            let vfs_guard = get_vfs();
-                            if let Some(vfs) = vfs_guard.as_ref() {
-                                vfs.debug_list_mounts();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        serial_write_str(&alloc::format!("KERNEL_MAIN: Error montando EclipseFS: {:?}\n", e));
-                        fb.write_text_kernel(&alloc::format!("Error montando EclipseFS: {:?}", e), Color::YELLOW);
-                    }
+                serial_write_str("KERNEL_MAIN: ¡EclipseFS montado exitosamente!\n");
+                fb.write_text_kernel("¡EclipseFS montado exitosamente!", Color::GREEN);
+                if let Some(vfs_guard) = get_vfs().as_ref() {
+                    vfs_guard.debug_list_mounts();
                 }
             }
             Err(e) => {
-                serial_write_str(&alloc::format!("KERNEL_MAIN: Error montando FAT32: {:?}\n", e));
-                fb.write_text_kernel(&alloc::format!("Error montando FAT32: {:?}", e), Color::RED);
+                serial_write_str(&alloc::format!("KERNEL_MAIN: Error al montar EclipseFS: {:?}\n", e));
+                fb.write_text_kernel(&alloc::format!("Error al montar EclipseFS: {:?}", e), Color::YELLOW);
 
-                serial_write_str("KERNEL_MAIN: Intentando fallback con EclipseFS desde bootloader...\n");
-                fb.write_text_kernel("Intentando fallback con EclipseFS desde bootloader...", Color::YELLOW);
-                mount_eclipsefs_from_bootloader_data(fb);
+                // Investigar el contenido del disco
+                serial_write_str("KERNEL_MAIN: Investigando el contenido del disco...\n");
+                investigate_disk_contents(&storage_manager);
+            }
+        }
+
+        // Intentar montar FAT32 como fallback si EclipseFS falla o no está presente
+        match mount_fat32_from_storage(&storage_manager) {
+            Ok(()) => {
+                serial_write_str("KERNEL_MAIN: ¡FAT32 montado exitosamente como fallback!\n");
+                fb.write_text_kernel("¡FAT32 montado exitosamente como fallback!", Color::GREEN);
+            }
+            Err(e) => {
+                serial_write_str(&alloc::format!("KERNEL_MAIN: Error al montar FAT32 como fallback: {:?}\n", e));
+                fb.write_text_kernel(&alloc::format!("Error al montar FAT32 como fallback: {:?}", e), Color::RED);
             }
         }
     } else {
         serial_write_str("KERNEL_MAIN: No storage devices found. Trying bootloader data...\n");
         fb.write_text_kernel("No se encontraron dispositivos de almacenamiento.", Color::YELLOW);
-        fb.write_text_kernel("Intentando montar desde datos del bootloader...", Color::WHITE);
-        mount_eclipsefs_from_bootloader_data(fb);
     }
-    // --- Inicialización del Shell Avanzado ---
-    serial_write_str("KERNEL_MAIN: Initializing advanced shell...\n");
-    fb.write_text_kernel("Inicializando shell avanzado...", Color::WHITE);
-    
-    // let mut shell = AdvancedShell::new(); // Comentado temporalmente
-    serial_write_str("KERNEL_MAIN: Advanced shell initialized.\n");
-    fb.write_text_kernel("Shell avanzado inicializado.", Color::GREEN);
-
+loop {
+    unsafe {
+        core::arch::asm!("hlt");
+    }
+}
     // --- Inicialización del Sistema de IA ---
     serial_write_str("KERNEL_MAIN: Initializing AI system...\n");
     fb.write_text_kernel("Inicializando sistema de IA...", Color::WHITE);
@@ -907,5 +899,104 @@ fn demonstrate_ai_features(
             fb.write_text_kernel("  Funcionalidad de IA en desarrollo", Color::LIGHT_GRAY);
         }
     }
+}
+
+fn investigate_disk_contents(storage: &StorageManager) {
+    crate::debug::serial_write_str("DISK_INVESTIGATION: Iniciando investigación del disco...\n");
+    
+    // Verificar si hay dispositivos VirtIO disponibles
+    if storage.devices.len() < 3 {
+        crate::debug::serial_write_str("DISK_INVESTIGATION: No hay suficientes dispositivos (necesario dispositivo 2)\n");
+        return;
+    }
+    
+    let virtio_device = &storage.devices[2];
+    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Dispositivo VirtIO: {:?}\n", virtio_device.info));
+    
+    // Crear buffer para leer sectores
+    let mut sector_buffer = [0u8; 512];
+    
+    // Investigar diferentes sectores
+    let sectors_to_check = [0, 1, 2, 3, 2048, 2049, 2050, 4096, 8192];
+    
+    for &sector in &sectors_to_check {
+        crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Leyendo sector {}\n", sector));
+        
+        match storage.read_device_sector_with_type(&virtio_device.info, sector, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
+            Ok(()) => {
+                // Verificar si el sector tiene datos no nulos
+                let has_data = sector_buffer.iter().any(|&b| b != 0);
+                if has_data {
+                    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Sector {} tiene datos!\n", sector));
+                    
+                    // Mostrar primeros 32 bytes
+                    let hex_str = sector_buffer[0..32]
+                        .iter()
+                        .map(|b| alloc::format!("{:02X}", b))
+                        .collect::<alloc::vec::Vec<_>>()
+                        .join(" ");
+                    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Primeros 32 bytes: {}\n", hex_str));
+                    
+                    // Verificar si es un boot sector válido
+                    if sector_buffer[510] == 0x55 && sector_buffer[511] == 0xAA {
+                        crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Sector {} tiene boot signature válida!\n", sector));
+                    }
+                    
+                    // Verificar si es EclipseFS
+                    if &sector_buffer[0..9] == b"ECLIPSEFS" {
+                        crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Sector {} contiene EclipseFS!\n", sector));
+                    }
+                } else {
+                    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Sector {} está vacío\n", sector));
+                }
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Error leyendo sector {}: {}\n", sector, e));
+            }
+        }
+    }
+    
+    // Intentar leer la tabla de particiones MBR (sector 0)
+    crate::debug::serial_write_str("DISK_INVESTIGATION: Analizando tabla de particiones MBR...\n");
+    match storage.read_device_sector_with_type(&virtio_device.info, 0, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
+        Ok(()) => {
+            // Verificar boot signature
+            if sector_buffer[510] == 0x55 && sector_buffer[511] == 0xAA {
+                crate::debug::serial_write_str("DISK_INVESTIGATION: MBR tiene boot signature válida\n");
+                
+                // Analizar entradas de partición (offset 446, 16 bytes cada una)
+                for i in 0..4 {
+                    let offset = 446 + (i * 16);
+                    let partition_type = sector_buffer[offset + 4];
+                    let partition_start = u32::from_le_bytes([
+                        sector_buffer[offset + 8],
+                        sector_buffer[offset + 9],
+                        sector_buffer[offset + 10],
+                        sector_buffer[offset + 11],
+                    ]);
+                    let partition_size = u32::from_le_bytes([
+                        sector_buffer[offset + 12],
+                        sector_buffer[offset + 13],
+                        sector_buffer[offset + 14],
+                        sector_buffer[offset + 15],
+                    ]);
+                    
+                    if partition_type != 0 {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "DISK_INVESTIGATION: Partición {} - Tipo: 0x{:02X}, Inicio: {}, Tamaño: {} sectores\n",
+                            i + 1, partition_type, partition_start, partition_size
+                        ));
+                    }
+                }
+            } else {
+                crate::debug::serial_write_str("DISK_INVESTIGATION: MBR no tiene boot signature válida\n");
+            }
+        }
+        Err(e) => {
+            crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Error leyendo MBR: {}\n", e));
+        }
+    }
+    
+    crate::debug::serial_write_str("DISK_INVESTIGATION: Investigación completada\n");
 }
 

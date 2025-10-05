@@ -811,8 +811,8 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
-    // Configurar paginación identidad extendida (16 GiB, páginas de 2 MiB) para cubrir direcciones altas del kernel
-    // Allocate: 1 página para PML4, 2 para PDPT (para cubrir 512 GiB cada uno), 16 para PD (1 por GiB)
+    // Configurar paginación identidad extendida (64 GiB, páginas de 2 MiB) para cubrir direcciones altas del kernel y VirtIO
+    // Allocate: 1 página para PML4, 2 para PDPT (para cubrir 512 GiB cada uno), 64 para PD (1 por GiB)
     let pml4_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
@@ -825,9 +825,9 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
 
-    // 16 PD para cubrir 16 GiB
-    let mut pd_phys_arr: [u64; 16] = [0; 16];
-    for gi_b in 0..16 {
+    // 64 PD para cubrir 64 GiB (incluyendo direcciones VirtIO altas)
+    let mut pd_phys_arr: [u64; 64] = [0; 64];
+    for gi_b in 0..64 {
         pd_phys_arr[gi_b] = bs
             .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
@@ -838,7 +838,7 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_phys_high as *mut u8, 0, 4096);
-        for gi_b in 0..16 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
+        for gi_b in 0..64 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
 
         // Flags
         let p_w = 0x003u64; // Present | Write
@@ -848,9 +848,9 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         let pml4 = pml4_phys as *mut u64;
         *pml4.add(0) = (pdpt_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
 
-        // PDPT[0..7] -> PDs (cada entrada mapea 1 GiB)
+        // PDPT[0..63] -> PDs (cada entrada mapea 1 GiB) - Primeros 64 GiB en el primer PDPT
         let pdpt = pdpt_phys as *mut u64;
-        for gi_b in 0..8u64 {
+        for gi_b in 0..64u64 {
             *pdpt.add(gi_b as usize) = (pd_phys_arr[gi_b as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
             let pd = pd_phys_arr[gi_b as usize] as *mut u64;
             for i in 0..512u64 {
@@ -862,21 +862,30 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
             }
         }
 
-        // PDPT[8..15] -> PDs usando pdpt_phys_high (para direcciones altas)
-        let pdpt_high = pdpt_phys_high as *mut u64;
-        for gi_b in 8..16u64 {
-            let pd_idx = gi_b - 8; // 0..7 para el segundo PDPT
-            *pdpt_high.add(pd_idx as usize) = (pd_phys_arr[gi_b as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
-            let pd = pd_phys_arr[gi_b as usize] as *mut u64;
-            for i in 0..512u64 {
-                // Identidad para direcciones altas
-                let phys_base = gi_b * 0x4000_0000u64 + i * 0x20_0000u64;
-                *pd.add(i as usize) = (phys_base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
-            }
+        // El segundo PDPT no se usa ahora - todo está en el primero
+        serial_write_str("BL: DEBUG - Todo mapeado en primer PDPT (0-64 GiB)\r\n");
+        
+        // Debug específico para verificar mapeo de 32 GiB
+        let pdpt = pdpt_phys as *mut u64;
+        let entry_32 = unsafe { *pdpt.add(32) };
+        serial_write_str("BL: DEBUG - Verificando PDPT[32] (32 GiB)\r\n");
+        serial_write_hex64(entry_32);
+        serial_write_str("\r\n");
+        
+        if entry_32 != 0 {
+            let pd_addr = entry_32 & 0x000F_FFFF_FFFF_F000u64;
+            serial_write_str("BL: DEBUG - PD físico: ");
+            serial_write_hex64(pd_addr);
+            serial_write_str("\r\n");
+        } else {
+            serial_write_str("BL: ERROR - PDPT[32] está vacío!\r\n");
         }
 
         // Conectar el segundo PDPT al PML4 en la entrada 1 (para direcciones >= 512 GiB)
         *pml4.add(1) = (pdpt_phys_high & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        
+        serial_write_str("BL: DEBUG - PML4[0] apunta a PDPT (0-64 GiB)\r\n");
+        serial_write_str("BL: DEBUG - VirtIO 0x800000000 (32 GiB) está en PDPT[32]\r\n");
 
         // Mapear framebuffer si es necesario (dirección típica 0x80000000+)
         // Nota: framebuffer_info no está disponible aquí, se maneja después
@@ -884,7 +893,9 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         // Mapear kernel específicamente: VA 0x200000 -> PA 0x0020_0000
         // No se realiza alias específico para el kernel; el mapeo identidad cubre VA=PA
 
-        // Nota: mantenemos mapeo identidad 0–8 GiB
+        // Nota: mantenemos mapeo identidad 0–64 GiB (incluyendo VirtIO en 0x800000000+)
+        serial_write_str("BL: DEBUG - Mapeo de identidad extendido configurado para 64 GiB\r\n");
+        serial_write_str("BL: DEBUG - VirtIO debería poder acceder a 0x800000000+\r\n");
     }
 
     unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }

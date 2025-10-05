@@ -4,7 +4,7 @@
 
 use crate::gdt::{setup_userland_gdt, GdtManager};
 use crate::idt::{setup_userland_idt, IdtManager};
-use crate::interrupts::{setup_userland_interrupts, InterruptManager};
+use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
 use crate::paging::{setup_userland_paging, PagingManager};
 use core::arch::asm;
 use core::ptr;
@@ -148,7 +148,7 @@ impl ProcessTransfer {
     /// Configurar interrupciones
     fn setup_interrupts(&self) -> Result<(), &'static str> {
         // Configurar interrupciones reales para userland
-        setup_userland_interrupts()
+        initialize_interrupt_system(0x08)
     }
 
     /// Ejecutar proceso del userland
