@@ -12,6 +12,7 @@ use crate::drivers::usb_events::{
 use crate::drivers::usb_xhci::XhciController;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Manager de hot-plug USB
@@ -286,8 +287,8 @@ impl UsbHotPlugManager {
     fn simulate_new_device_connection(&self) -> Result<UsbDeviceInfo, UsbError> {
         let device_id = self.get_next_device_id();
         
-        // Simular diferentes tipos de dispositivos
-        let device_type = (device_id % 4) as u8;
+        // Simular diferentes tipos de dispositivos con más variedad (12 tipos)
+        let device_type = (device_id % 12) as u8;
         
         match device_type {
             0 => Ok(UsbDeviceInfo::new(
@@ -323,16 +324,115 @@ impl UsbHotPlugManager {
                 UsbControllerType::XHCI,
                 UsbDeviceSpeed::High,
             )),
-            _ => Ok(UsbDeviceInfo::new(
+            3 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x046D, // Logitech
+                0xC077, // USB Mouse
+                0x03,   // HID
+                0x01,   // Boot Interface
+                0x02,   // Mouse
+                8,      // Puerto 8
+                UsbControllerType::EHCI,
+                UsbDeviceSpeed::High,
+            )),
+            4 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x0951, // Kingston
+                0x1666, // USB Flash Drive
+                0x08,   // Mass Storage
+                0x06,   // SCSI
+                0x50,   // Bulk-Only
+                9,      // Puerto 9
+                UsbControllerType::XHCI,
+                UsbDeviceSpeed::Super,
+            )),
+            5 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x0D8C, // C-Media
+                0x0134, // USB Audio Device
+                0x01,   // Audio
+                0x01,   // Audio Control
+                0x00,   // No Protocol
+                10,     // Puerto 10
+                UsbControllerType::EHCI,
+                UsbDeviceSpeed::High,
+            )),
+            6 => Ok(UsbDeviceInfo::new(
                 device_id,
                 0x1BCF, // Sunplus Innovation
                 0x2B8A, // USB Camera
                 0x0E,   // Video
                 0x01,   // Video Control
                 0x00,   // No protocol
-                7,      // Puerto 7
+                11,     // Puerto 11
+                UsbControllerType::XHCI,
+                UsbDeviceSpeed::Super,
+            )),
+            7 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x046D, // Logitech
+                0xC31C, // USB Keyboard
+                0x03,   // HID
+                0x01,   // Boot Interface
+                0x01,   // Keyboard
+                12,     // Puerto 12
+                UsbControllerType::EHCI,
+                UsbDeviceSpeed::High,
+            )),
+            8 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x04E8, // Samsung
+                0x6860, // USB Laser Printer
+                0x07,   // Printer
+                0x01,   // Printer
+                0x01,   // Unidirectional
+                13,     // Puerto 13
+                UsbControllerType::EHCI,
+                UsbDeviceSpeed::High,
+            )),
+            9 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x03F0, // HP
+                0x0217, // USB Inkjet Printer
+                0x07,   // Printer
+                0x01,   // Printer
+                0x02,   // Bidirectional
+                14,     // Puerto 14
                 UsbControllerType::XHCI,
                 UsbDeviceSpeed::High,
+            )),
+            10 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x0BDA, // Realtek
+                0x8153, // USB 3.0 Hub
+                0x09,   // Hub
+                0x00,   // No subclass
+                0x03,   // SuperSpeed Hub
+                15,     // Puerto 15
+                UsbControllerType::XHCI,
+                UsbDeviceSpeed::Super,
+            )),
+            11 => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x04B8, // Epson
+                0x0202, // USB Scanner
+                0x06,   // Still Image
+                0x01,   // Still Image
+                0x01,   // Picture Transfer Protocol
+                16,     // Puerto 16
+                UsbControllerType::EHCI,
+                UsbDeviceSpeed::High,
+            )),
+            _ => Ok(UsbDeviceInfo::new(
+                device_id,
+                0x1234, // Generic
+                0x5678, // Generic Device
+                0xFF,   // Vendor Specific
+                0x00,   // No Subclass
+                0x00,   // No Protocol
+                17,     // Puerto 17
+                UsbControllerType::XHCI,
+                UsbDeviceSpeed::Super,
             )),
         }
     }
@@ -403,9 +503,25 @@ impl UsbHotPlugManager {
     /// Inicializar driver del dispositivo
     fn initialize_device_driver(&self, device: &UsbDeviceInfo) -> Result<(), UsbError> {
         match device.device_class {
+            0x01 => { // Audio
+                serial_write_str("USB_HOTPLUG: Inicializando driver Audio USB\n");
+                // Aquí se inicializaría el driver de audio USB
+            }
+            0x02 => { // Communications
+                serial_write_str("USB_HOTPLUG: Inicializando driver Communications USB\n");
+                // Aquí se inicializaría el driver de comunicaciones
+            }
             0x03 => { // HID
                 serial_write_str("USB_HOTPLUG: Inicializando driver HID\n");
                 // Aquí se inicializaría el driver HID específico
+            }
+            0x06 => { // Still Image (Scanner)
+                serial_write_str("USB_HOTPLUG: Inicializando driver Scanner USB\n");
+                // Aquí se inicializaría el driver de escáner
+            }
+            0x07 => { // Printer
+                serial_write_str("USB_HOTPLUG: Inicializando driver Printer USB\n");
+                // Aquí se inicializaría el driver de impresora
             }
             0x08 => { // Mass Storage
                 serial_write_str("USB_HOTPLUG: Inicializando driver Mass Storage\n");
@@ -415,9 +531,17 @@ impl UsbHotPlugManager {
                 serial_write_str("USB_HOTPLUG: Inicializando driver Hub\n");
                 // Aquí se inicializaría el driver de hub
             }
+            0x0E => { // Video
+                serial_write_str("USB_HOTPLUG: Inicializando driver Video USB\n");
+                // Aquí se inicializaría el driver de video
+            }
+            0xFF => { // Vendor Specific
+                serial_write_str("USB_HOTPLUG: Inicializando driver Vendor Specific\n");
+                // Aquí se inicializaría el driver específico del fabricante
+            }
             _ => {
                 serial_write_str(&alloc::format!(
-                    "USB_HOTPLUG: Clase de dispositivo {} no soportada aún\n",
+                    "USB_HOTPLUG: Driver genérico para clase 0x{:02X}\n",
                     device.device_class
                 ));
             }
@@ -456,6 +580,70 @@ impl UsbHotPlugManager {
             active_controllers: self.controllers.iter().filter(|c| c.is_active).count(),
             events_processed: self.event_queue.len(),
             monitoring_enabled: self.monitoring_enabled.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Obtener información detallada de dispositivos conectados
+    pub fn get_connected_devices_info(&self) -> String {
+        let mut info = String::new();
+        info.push_str("=== DISPOSITIVOS USB CONECTADOS ===\n");
+        
+        for (device_id, device) in &self.connected_devices {
+            let device_name = self.get_device_name(device);
+            let vendor_name = self.get_vendor_name(device.vendor_id);
+            
+            info.push_str(&alloc::format!(
+                "ID: {} - {} {} (VID:{:04X} PID:{:04X}) - Puerto: {} - Velocidad: {:?} - Controlador: {:?}\n",
+                device_id,
+                vendor_name,
+                device_name,
+                device.vendor_id,
+                device.product_id,
+                device.port_number,
+                device.speed,
+                device.controller_type
+            ));
+        }
+        
+        info.push_str(&alloc::format!("\nTotal: {} dispositivos conectados\n", self.connected_devices.len()));
+        info
+    }
+
+    /// Obtener nombre descriptivo del dispositivo
+    fn get_device_name(&self, device: &UsbDeviceInfo) -> &'static str {
+        match (device.vendor_id, device.product_id) {
+            (0x058F, 0x6387) => "USB Mass Storage",
+            (0x045E, 0x00CB) => "Xbox Controller",
+            (0x0BDA, 0x8176) => "USB WiFi Adapter",
+            (0x1BCF, 0x2B8A) => "USB Camera",
+            (0x046D, 0xC077) => "USB Mouse",
+            (0x0951, 0x1666) => "USB Flash Drive",
+            (0x0D8C, 0x0134) => "USB Audio Device",
+            (0x046D, 0xC31C) => "USB Keyboard",
+            (0x04E8, 0x6860) => "USB Laser Printer",
+            (0x03F0, 0x0217) => "USB Inkjet Printer",
+            (0x0BDA, 0x8153) => "USB 3.0 Hub",
+            (0x04B8, 0x0202) => "USB Scanner",
+            (0x1234, 0x5678) => "Generic USB Device",
+            _ => "Unknown Device",
+        }
+    }
+
+    /// Obtener nombre del vendor
+    fn get_vendor_name(&self, vendor_id: u16) -> &'static str {
+        match vendor_id {
+            0x058F => "Alcor Micro",
+            0x045E => "Microsoft",
+            0x0BDA => "Realtek",
+            0x1BCF => "Sunplus Innovation",
+            0x046D => "Logitech",
+            0x0951 => "Kingston",
+            0x0D8C => "C-Media",
+            0x04E8 => "Samsung",
+            0x03F0 => "HP",
+            0x04B8 => "Epson",
+            0x1234 => "Generic",
+            _ => "Unknown Vendor",
         }
     }
 
@@ -512,6 +700,10 @@ pub fn usb_hotplug_main() {
         stats.total_devices,
         stats.total_controllers
     ));
+    
+    // Mostrar información detallada de dispositivos conectados
+    let devices_info = hotplug_manager.get_connected_devices_info();
+    serial_write_str(&devices_info);
     
     serial_write_str("USB_HOTPLUG: Sistema de hot-plug USB iniciado\n");
 }

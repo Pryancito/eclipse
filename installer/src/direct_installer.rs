@@ -116,7 +116,7 @@ impl DirectInstaller {
         println!("  - Particion root: {}2 (EclipseFS)", disk.name);
         println!("  - Bootloader: UEFI");
         println!("  - Kernel: Eclipse OS v0.6.0");
-        println!("  - Sistema de archivos: EclipseFS (RAM-based)");
+        println!("  - Sistema de archivos: EclipseFS v2.0 (RAM-based)");
         println!("  - Eclipse-systemd: Instalado en /sbin/init");
         println!("  - Wayland Compositor: eclipse_wayland en /usr/bin");
         println!("  - COSMIC Desktop: eclipse_cosmic en /usr/bin");
@@ -176,10 +176,10 @@ impl DirectInstaller {
             return Err(format!("No se pudo crear tabla GPT en {}: {}", disk.name, String::from_utf8_lossy(&output.stderr)));
         }
 
-        // Crear partición EFI (10GB para modelos de IA)
-        println!("   Creando particion EFI (10GB para modelos de IA)...");
+        // Crear partición EFI (100MB)
+        println!("   Creando particion EFI (100MB)...");
         let output = std::process::Command::new("parted")
-            .args(&[&disk.name, "mkpart", "EFI", "fat32", "1MiB", "10GiB"])
+            .args(&[&disk.name, "mkpart", "EFI", "fat32", "1MiB", "100MiB"])
             .output()
             .map_err(|e| format!("Error ejecutando parted: {}", e))?;
 
@@ -197,10 +197,10 @@ impl DirectInstaller {
             return Err(format!("No se pudo marcar particion EFI como ESP: {}", String::from_utf8_lossy(&output.stderr)));
         }
 
-        // Crear partición root (resto del disco)
+        // Crear partición root (resto del disco, 100MB)
         println!("   Creando particion root (resto del disco)...");
         let output = std::process::Command::new("parted")
-            .args(&[&disk.name, "mkpart", "ROOT", "ext4", "10GiB", "100%"])
+            .args(&[&disk.name, "mkpart", "ROOT", "ext4", "100MiB", "100%"])
             .output()
             .map_err(|e| format!("Error ejecutando parted: {}", e))?;
 

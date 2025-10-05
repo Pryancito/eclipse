@@ -139,6 +139,7 @@ impl EclipseFSHeader {
         let version_major = (self.version >> 16) as u16;
         let version_minor = (self.version & 0xFFFF) as u16;
 
+        // Solo soporte para versión 2.0
         if version_major != ECLIPSEFS_VERSION_MAJOR || version_minor != ECLIPSEFS_VERSION_MINOR {
             return Err(crate::EclipseFSError::UnsupportedVersion);
         }

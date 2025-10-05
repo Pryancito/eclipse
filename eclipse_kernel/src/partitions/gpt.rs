@@ -148,11 +148,12 @@ pub fn parse_gpt(device: &mut dyn crate::partitions::BlockDevice) -> Result<Part
                     36
                 );
             }
-            let partition_name = decode_utf16_name(&name_copy);
+            let descriptive_name = decode_utf16_name(&name_copy);
             
             let mut partition = Partition::new(start_lba, size_lba, fs_type.to_partition_code());
             partition.filesystem_type = fs_type;
-            partition.name = partition_name.clone();
+            // Generar nombre de dispositivo Linux (será sobrescrito por el storage_manager)
+            partition.name = alloc::format!("Partition {}", entry_index + 1);
             partition.guid = Some(entry.unique_partition_guid);
             partition.attributes = entry.attributes;
             

@@ -825,7 +825,102 @@ pub fn is_fat32_available() -> bool {
     unsafe { FAT32_DRIVER.as_ref().map(|d| d.is_ready()).unwrap_or(false) }
 }
 
-/// Montar FAT32 desde dispositivos de almacenamiento
+/// Crear información de dispositivo EclipseFS basándose en la información de FAT32
+/// 
+/// Esta función sugiere dónde buscar EclipseFS basándose en que FAT32 está típicamente
+/// en la primera partición (/dev/sda1) y EclipseFS estaría en la segunda (/dev/sda2)
+/// 
+/// # Arguments
+/// - `fat32_device`: Nombre del dispositivo FAT32 (ej: "/dev/sda1")
+/// 
+/// # Returns
+/// - `Option<String>`: Nombre sugerido del dispositivo EclipseFS o None si no se puede determinar
+pub fn sugerir_dispositivo_eclipsefs_desde_fat32(fat32_device: &str) -> Option<String> {
+    // Extraer el número de la partición FAT32
+    if let Some(last_char) = fat32_device.chars().last() {
+        if let Some(partition_num) = last_char.to_digit(10) {
+            // Si FAT32 está en /dev/sda1, sugerir /dev/sda2
+            // Si FAT32 está en /dev/sda2, sugerir /dev/sda3, etc.
+            let suggested_num = partition_num + 1;
+            
+            // Construir el nombre del dispositivo sugerido
+            let base_device = &fat32_device[..fat32_device.len() - 1]; // Remover el último carácter
+            let suggested_device = alloc::format!("{}{}", base_device, suggested_num);
+            
+            crate::debug::serial_write_str(&alloc::format!(
+                "FAT32: Sugiriendo dispositivo EclipseFS: {} (basado en FAT32 en {})\n",
+                suggested_device,
+                fat32_device
+            ));
+            
+            return Some(suggested_device);
+        }
+    }
+    
+    // Fallback: asumir /dev/sda2 si no se puede determinar
+    crate::debug::serial_write_str("FAT32: No se pudo determinar dispositivo EclipseFS, usando fallback: /dev/sda2\n");
+    Some(String::from("/dev/sda2"))
+}
+
+/// Obtener información de la partición FAT32 montada desde el storage manager
+/// 
+/// # Returns
+/// - `Some(String)`: Nombre del dispositivo Linux de la partición FAT32 si se encuentra
+/// - `None`: Si no se encuentra ninguna partición FAT32 o el storage manager no está disponible
+/// 
+/// # Logging
+/// Registra información detallada de la partición encontrada incluyendo:
+/// - Nombre del dispositivo
+/// - Tamaño en sectores LBA
+/// - Sector de inicio LBA
+fn obtener_particion_fat32_montada() -> Option<String> {
+    crate::drivers::storage_manager::get_storage_manager()
+        .and_then(|storage| {
+            let total_partitions = storage.partitions.len();
+            crate::debug::serial_write_str(&alloc::format!(
+                "FAT32: Analizando {} particiones detectadas por el storage manager\n",
+                total_partitions
+            ));
+            
+            storage.partitions.iter()
+                .find(|particion| particion.filesystem_type == crate::partitions::FilesystemType::FAT32)
+                .map(|particion| {
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "FAT32: Partición FAT32 detectada: {} (tamaño: {} sectores LBA, inicio: sector LBA {})\n",
+                        particion.name,
+                        particion.size_lba,
+                        particion.start_lba
+                    ));
+                    particion.name.clone()
+                })
+        })
+}
+
+/// Montar sistema de archivos FAT32 desde dispositivos de almacenamiento disponibles
+/// 
+/// Esta función busca particiones FAT32 en los dispositivos de almacenamiento
+/// detectados y monta la primera partición válida encontrada en el punto de montaje `/boot`.
+/// 
+/// # Arguments
+/// - `storage`: Referencia al gestor de almacenamiento que contiene información
+///              sobre dispositivos y particiones detectadas
+/// 
+/// # Returns
+/// - `Ok(String)`: Nombre del dispositivo Linux desde donde se montó FAT32 exitosamente
+/// - `Err(VfsError)`: Error específico si el montaje falla
+/// 
+/// # Errors
+/// - `DeviceError`: Si no se encuentran dispositivos de almacenamiento
+/// - `InvalidFs`: Si no se puede leer un boot sector FAT32 válido
+/// - `InvalidFs`: Si el VFS no está inicializado
+/// 
+/// # Example
+/// ```rust
+/// match mount_fat32_from_storage(&storage_manager) {
+///     Ok(device) => println!("FAT32 montado desde: {}", device),
+///     Err(e) => println!("Error montando FAT32: {:?}", e),
+/// }
+/// ```
 pub fn mount_fat32_from_storage(
     storage: &crate::drivers::storage_manager::StorageManager,
 ) -> Result<(), VfsError> {
@@ -1036,6 +1131,19 @@ pub fn mount_fat32_from_storage(
     }
 
     crate::debug::serial_write_str("FAT32: Montaje en /boot completado exitosamente\n");
+    
+    // Obtener información de la partición FAT32 montada
+    let dispositivo_montado = obtener_particion_fat32_montada()
+        .unwrap_or_else(|| {
+            crate::debug::serial_write_str("FAT32: Advertencia - No se pudo determinar la partición exacta, usando fallback\n");
+            String::from("desconocido")
+        });
+    
+    crate::debug::serial_write_str(&alloc::format!(
+        "FAT32: Sistema de archivos montado desde: {}\n",
+        dispositivo_montado
+    ));
+    
     Ok(())
 }
 

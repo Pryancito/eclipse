@@ -395,8 +395,9 @@ impl EclipseFSInstaller {
         file.write_all(b"ECLIPSEFS")
             .map_err(|e| format!("Error escribiendo magic: {}", e))?;
         
-        // Versión v0.2.0
-        file.write_all(&2u32.to_le_bytes())
+        // Versión v2.0 (major=2, minor=0) -> 0x00020000
+        let version = (2u32 << 16) | 0u32; // (major << 16) | minor
+        file.write_all(&version.to_le_bytes())
             .map_err(|e| format!("Error escribiendo versión: {}", e))?;
         
         // Inode table offset (32 bytes después del header)

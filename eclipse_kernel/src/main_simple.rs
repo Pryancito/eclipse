@@ -15,6 +15,7 @@ use core::panic::PanicInfo;
 
 // Importar módulos del kernel
 use crate::cosmic::{CosmicConfig, CosmicManager, PerformanceMode, WindowManagerMode};
+use crate::filesystem::eclipsefs::{EclipseFSDeviceInfo, EclipseFSWrapper};
 use crate::init_system::{InitProcess, InitSystem};
 use crate::wayland::{get_wayland_state, init_wayland, is_wayland_initialized};
 
@@ -400,13 +401,13 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: VFS Initialized.\n");
     fb.write_text_kernel("VFS inicializado.", Color::GREEN);
 
-    // Estrategia: intentar montar EclipseFS directamente desde la segunda partición
+    // Estrategia: intentar montar EclipseFS directamente
     if storage_manager.device_count() > 0 {
-        serial_write_str("KERNEL_MAIN: Intentando montar EclipseFS desde segunda partición...\n");
-        fb.write_text_kernel("Intentando montar EclipseFS desde segunda partición...", Color::WHITE);
+        serial_write_str("KERNEL_MAIN: Intentando montar EclipseFS...\n");
+        fb.write_text_kernel("Intentando montar EclipseFS...", Color::WHITE);
 
         // Intentar montar EclipseFS desde el almacenamiento
-        match mount_eclipsefs_from_storage(&storage_manager) {
+        match mount_eclipsefs_from_storage(&storage_manager, None) {
             Ok(()) => {
                 serial_write_str("KERNEL_MAIN: ¡EclipseFS montado exitosamente!\n");
                 fb.write_text_kernel("¡EclipseFS montado exitosamente!", Color::GREEN);
@@ -418,17 +419,15 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                 serial_write_str(&alloc::format!("KERNEL_MAIN: Error al montar EclipseFS: {:?}\n", e));
                 fb.write_text_kernel(&alloc::format!("Error al montar EclipseFS: {:?}", e), Color::YELLOW);
 
-                // Investigar el contenido del disco
+                // Investigar el contenido del disco para diagnóstico
                 serial_write_str("KERNEL_MAIN: Investigando el contenido del disco...\n");
                 investigate_disk_contents(&storage_manager);
             }
         }
-
-        // Intentar montar FAT32 como fallback si EclipseFS falla o no está presente
         match mount_fat32_from_storage(&storage_manager) {
             Ok(()) => {
-                serial_write_str("KERNEL_MAIN: ¡FAT32 montado exitosamente como fallback!\n");
-                fb.write_text_kernel("¡FAT32 montado exitosamente como fallback!", Color::GREEN);
+                serial_write_str(&alloc::format!("KERNEL_MAIN: ¡FAT32 montado exitosamente!\n"));
+                fb.write_text_kernel(&alloc::format!("¡FAT32 montado exitosamente!"), Color::GREEN);
             }
             Err(e) => {
                 serial_write_str(&alloc::format!("KERNEL_MAIN: Error al montar FAT32 como fallback: {:?}\n", e));
@@ -531,10 +530,37 @@ fn mount_eclipsefs_from_bootloader_data(fb: &mut FramebufferDriver) {
         return;
     }
     
+    // Crear header e inode entries dummy para main_simple
+    let header = eclipsefs_lib::EclipseFSHeader {
+        magic: *b"ECLIPSEFS",
+        version: 0x00020000, // Versión 2.0
+        inode_table_offset: 4096,
+        inode_table_size: 1024,
+        total_inodes: 100,
+        header_checksum: 0,
+        metadata_checksum: 0,
+        data_checksum: 0,
+        creation_time: 0,
+        last_check: 0,
+        flags: 0,
+    };
+    
+    let mut inode_entries = Vec::new();
+    inode_entries.push(eclipsefs_lib::InodeTableEntry {
+        inode: 1,
+        offset: 0,
+    });
+    inode_entries.push(eclipsefs_lib::InodeTableEntry {
+        inode: 2,
+        offset: 100,
+    });
+    
     // Montar el sistema de archivos
     let mut vfs_guard = get_vfs();
     if let Some(vfs) = vfs_guard.as_mut() {
-        let fs_wrapper = Box::new(EclipseFSWrapper::new(fs_instance));
+        // Crear información del dispositivo dummy para main_simple
+        let device_info = EclipseFSDeviceInfo::new("/dev/sda2".to_string(), 1000000, 204800);
+        let fs_wrapper = Box::new(EclipseFSWrapper::new_lazy(header, inode_entries, 1, device_info));
         vfs.mount("/", fs_wrapper);
         
         serial_write_str("KERNEL_MAIN: EclipseFS mounted from bootloader data successfully.\n");

@@ -129,26 +129,51 @@ impl AtaDirectDriver {
         serial_write_str(&format!("ATA_DIRECT: Inicializando driver ATA {:?} en puerto {:#x}\n", 
                                  self.controller_type, self.base_port));
         
+        // Verificar que los puertos estén disponibles
+        serial_write_str("ATA_DIRECT: Verificando disponibilidad de puertos...\n");
+        let status = self.read_port(ATA_STATUS_PORT - self.base_port);
+        serial_write_str(&format!("ATA_DIRECT: Status inicial: 0x{:02X}\n", status));
+        
         // Resetear controladora
-        self.reset_controller()?;
+        serial_write_str("ATA_DIRECT: Iniciando reset de controladora...\n");
+        match self.reset_controller() {
+            Ok(_) => {
+                serial_write_str("ATA_DIRECT: Reset de controladora exitoso\n");
+            }
+            Err(e) => {
+                serial_write_str(&format!("ATA_DIRECT: Error en reset de controladora: {}\n", e));
+                return Err(e);
+            }
+        }
         
         // Detectar dispositivos en ambos canales (master y slave)
+        serial_write_str("ATA_DIRECT: Iniciando detección de dispositivos...\n");
         for device in 0..2 {
-            if let Ok(device_info) = self.identify_device(device) {
-                self.device_info = Some(device_info);
-                self.supports_lba48 = self.device_info.as_ref().unwrap().supports_lba48;
-                serial_write_str(&format!("ATA_DIRECT: Dispositivo detectado en canal {}: {:?}\n", 
-                                         device, self.device_info.as_ref().unwrap().model));
-                break;
+            serial_write_str(&format!("ATA_DIRECT: Probando dispositivo {} (master={}, slave={})...\n", 
+                                     device, if device == 0 { "MASTER" } else { "SLAVE" }, if device == 0 { "SLAVE" } else { "MASTER" }));
+            
+            match self.identify_device(device) {
+                Ok(device_info) => {
+                    self.device_info = Some(device_info);
+                    self.supports_lba48 = self.device_info.as_ref().unwrap().supports_lba48;
+                    serial_write_str(&format!("ATA_DIRECT: ✅ Dispositivo detectado en canal {}: {:?}\n", 
+                                             device, self.device_info.as_ref().unwrap().model));
+                    break;
+                }
+                Err(e) => {
+                    serial_write_str(&format!("ATA_DIRECT: ❌ Error detectando dispositivo {}: {}\n", device, e));
+                    // Continuar con el siguiente dispositivo
+                }
             }
         }
         
         if self.device_info.is_none() {
+            serial_write_str("ATA_DIRECT: ❌ No se encontró ningún dispositivo ATA válido\n");
             return Err("No se encontró dispositivo ATA válido");
         }
         
         self.is_initialized = true;
-        serial_write_str("ATA_DIRECT: Driver ATA inicializado correctamente\n");
+        serial_write_str("ATA_DIRECT: ✅ Driver ATA inicializado correctamente\n");
         Ok(())
     }
 
@@ -177,18 +202,43 @@ impl AtaDirectDriver {
         
         // Seleccionar dispositivo (master=0xA0, slave=0xB0)
         let device_select = if device == 0 { 0xA0 } else { 0xB0 };
+        serial_write_str(&format!("ATA_DIRECT: Seleccionando dispositivo con valor 0x{:02X}...\n", device_select));
         self.write_port(ATA_DEVICE_PORT - self.base_port, device_select);
         
         // Esperar un poco
         self.io_delay();
         
+        // Verificar estado antes del comando
+        let status_before = self.read_port(ATA_STATUS_PORT - self.base_port);
+        serial_write_str(&format!("ATA_DIRECT: Status antes del comando IDENTIFY: 0x{:02X}\n", status_before));
+        
         // Enviar comando IDENTIFY
+        serial_write_str(&format!("ATA_DIRECT: Enviando comando IDENTIFY (0x{:02X})...\n", ATA_CMD_IDENTIFY));
         self.write_port(ATA_COMMAND_PORT - self.base_port, ATA_CMD_IDENTIFY);
         
         // Esperar a que el dispositivo esté listo
-        self.wait_for_ready()?;
+        serial_write_str("ATA_DIRECT: Esperando que el dispositivo esté listo...\n");
+        match self.wait_for_ready() {
+            Ok(_) => {
+                serial_write_str("ATA_DIRECT: Dispositivo listo para transferencia\n");
+            }
+            Err(e) => {
+                serial_write_str(&format!("ATA_DIRECT: Error esperando dispositivo listo: {}\n", e));
+                return Err(e);
+            }
+        }
+        
+        // Verificar que tenemos datos listos
+        let status_drq = self.read_port(ATA_STATUS_PORT - self.base_port);
+        serial_write_str(&format!("ATA_DIRECT: Status DRQ: 0x{:02X} (DRQ bit: {})\n", 
+                                 status_drq, if status_drq & ATA_STATUS_DRQ != 0 { "SET" } else { "CLEAR" }));
+        
+        if status_drq & ATA_STATUS_DRQ == 0 {
+            return Err("Dispositivo no tiene datos listos (DRQ no activo)");
+        }
         
         // Leer datos de identificación (256 palabras = 512 bytes)
+        serial_write_str("ATA_DIRECT: Leyendo datos de identificación...\n");
         let mut identify_data = [0u16; 256];
         for i in 0..256 {
             identify_data[i] = self.read_port_word(ATA_DATA_PORT - self.base_port);
@@ -196,8 +246,11 @@ impl AtaDirectDriver {
         
         // Verificar que el dispositivo respondió
         if identify_data[0] == 0 {
+            serial_write_str("ATA_DIRECT: ❌ Dispositivo no responde (identify_data[0] == 0)\n");
             return Err("Dispositivo no responde");
         }
+        
+        serial_write_str(&format!("ATA_DIRECT: ✅ Dispositivo responde (identify_data[0] = 0x{:04X})\n", identify_data[0]));
         
         // Parsear información del dispositivo
         let mut device_info = AtaDeviceInfo {
@@ -260,18 +313,32 @@ impl AtaDirectDriver {
     /// Esperar a que el dispositivo esté listo
     fn wait_for_ready(&self) -> Result<(), &'static str> {
         let mut timeout = 10000; // Timeout de 10ms
+        serial_write_str("ATA_DIRECT: Esperando que dispositivo esté listo...\n");
+        
         while timeout > 0 {
             let status = self.read_port(ATA_STATUS_PORT - self.base_port);
+            
+            if timeout % 1000 == 0 { // Log cada 1000 iteraciones
+                serial_write_str(&format!("ATA_DIRECT: Status durante wait_for_ready: 0x{:02X} (BSY={}, DRDY={}, ERR={})\n", 
+                                         status, 
+                                         if status & ATA_STATUS_BSY != 0 { "SET" } else { "CLEAR" },
+                                         if status & ATA_STATUS_DRDY != 0 { "SET" } else { "CLEAR" },
+                                         if status & ATA_STATUS_ERR != 0 { "SET" } else { "CLEAR" }));
+            }
+            
             if status & ATA_STATUS_BSY == 0 {
                 if status & ATA_STATUS_ERR != 0 {
                     let error = self.read_port(ATA_ERROR_PORT - self.base_port);
+                    serial_write_str(&format!("ATA_DIRECT: ❌ Error ATA detectado: 0x{:02X}\n", error));
                     return Err("Error ATA");
                 }
+                serial_write_str("ATA_DIRECT: ✅ Dispositivo listo\n");
                 return Ok(());
             }
             timeout -= 1;
             self.io_delay();
         }
+        serial_write_str("ATA_DIRECT: ❌ Timeout esperando dispositivo ATA\n");
         Err("Timeout esperando dispositivo ATA")
     }
 

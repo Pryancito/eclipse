@@ -103,6 +103,27 @@ impl Vfs {
         });
         crate::debug::serial_write_str("VFS: montaje añadido\n");
     }
+    
+    /// 🚀 MÉTODO REDOXFS-STYLE: Montar sin allocación dinámica
+    /// Usa el Box que ya fue creado por new_static()
+    pub fn mount_static(&mut self, path: &str, fs: Box<dyn FileSystem>) {
+        crate::debug::serial_write_str(&alloc::format!("VFS: montando {} (RedoxFS-style, sin allocación dinámica)\n", path));
+        if let Some(_existing) = self.get_mount(path) {
+            if let Some(pos) = self.mounts.iter().position(|mp| mp.path == path) {
+                self.mounts[pos] = MountPoint {
+                    fs: Arc::new(Mutex::new(fs)),
+                    path: path.to_string(),
+                };
+                crate::debug::serial_write_str("VFS: reemplazo de montaje existente (RedoxFS-style)\n");
+                return;
+            }
+        }
+        self.mounts.push(MountPoint {
+            fs: Arc::new(Mutex::new(fs)),
+            path: path.to_string(),
+        });
+        crate::debug::serial_write_str("VFS: montaje añadido (RedoxFS-style)\n");
+    }
 
     pub fn get_root_fs(&self) -> Option<Arc<Mutex<Box<dyn FileSystem>>>> {
         self.get_mount("/")
