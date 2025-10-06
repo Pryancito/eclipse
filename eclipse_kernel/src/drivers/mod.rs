@@ -29,6 +29,8 @@ pub mod input;
 pub mod input_system;
 pub mod intel_graphics;
 pub mod intel_raid;
+pub mod intel_ahci_raid;
+pub mod intel_raid_driver;
 pub mod ipc;
 pub mod keyboard;
 pub mod manager;

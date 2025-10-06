@@ -424,7 +424,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                 investigate_disk_contents(&storage_manager);
             }
         }
-        match mount_fat32_from_storage(&storage_manager) {
+        match mount_fat32_from_storage(&storage_manager, None) {
             Ok(()) => {
                 serial_write_str(&alloc::format!("KERNEL_MAIN: ¡FAT32 montado exitosamente!\n"));
                 fb.write_text_kernel(&alloc::format!("¡FAT32 montado exitosamente!"), Color::GREEN);
@@ -438,11 +438,6 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         serial_write_str("KERNEL_MAIN: No storage devices found. Trying bootloader data...\n");
         fb.write_text_kernel("No se encontraron dispositivos de almacenamiento.", Color::YELLOW);
     }
-loop {
-    unsafe {
-        core::arch::asm!("hlt");
-    }
-}
     // --- Inicialización del Sistema de IA ---
     serial_write_str("KERNEL_MAIN: Initializing AI system...\n");
     fb.write_text_kernel("Inicializando sistema de IA...", Color::WHITE);
@@ -766,14 +761,44 @@ fn initialize_ai_services(fb: &mut FramebufferDriver) -> AIService {
 
     let model_listing_result = if let Some(root_fs) = root_fs_arc {
         let fs_guard = root_fs.lock();
-        match fs_guard.readdir_path("/ai_models") {
-            Ok(list) => Ok(list),
+        serial_write_str("AI_INIT: Intentando acceder a /ai_models...\n");
+        
+        // Primero verificar si el directorio existe
+        match fs_guard.resolve_path("/ai_models") {
+            Ok(inode) => {
+                serial_write_str(&alloc::format!("AI_INIT: /ai_models existe - inode: {}\n", inode));
+                fb.write_text_kernel(&alloc::format!("/ai_models existe - inode: {}", inode), Color::GREEN);
+                
+                // Obtener información del inode
+                match fs_guard.stat(inode) {
+                    Ok(stat) => {
+                        serial_write_str(&alloc::format!("AI_INIT: /ai_models stat - tamaño: {}, modo: {}\n", stat.size, stat.mode));
+                        fb.write_text_kernel(&alloc::format!("Tamaño: {}, Modo: {}", stat.size, stat.mode), Color::CYAN);
+                    }
+                    Err(err) => {
+                        serial_write_str(&alloc::format!("AI_INIT: Error obteniendo stat de /ai_models: {:?}\n", err));
+                    }
+                }
+            }
             Err(err) => {
-                serial_write_str("AI_INIT: readdir_path fallo\n");
+                serial_write_str(&alloc::format!("AI_INIT: /ai_models NO existe - error: {:?}\n", err));
+                fb.write_text_kernel(&alloc::format!("/ai_models NO existe - error: {:?}", err), Color::RED);
+            }
+        }
+        
+        // Ahora intentar leer el directorio
+        match fs_guard.readdir_path("/ai_models") {
+            Ok(list) => {
+                serial_write_str(&alloc::format!("AI_INIT: readdir_path exitoso - {} elementos encontrados\n", list.len()));
+                Ok(list)
+            }
+            Err(err) => {
+                serial_write_str(&alloc::format!("AI_INIT: readdir_path fallo - error: {:?}\n", err));
                 Err(err)
             }
         }
     } else {
+        serial_write_str("AI_INIT: root_fs no disponible\n");
         Err(VfsError::InvalidOperation)
     };
 

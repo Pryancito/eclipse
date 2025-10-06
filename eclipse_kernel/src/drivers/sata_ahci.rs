@@ -40,17 +40,33 @@ impl SataAhciDriver {
         let bar5 = self.read_pci_config_u32(0x24);
         serial_write_str(&format!("SATA_AHCI: BAR5 = 0x{:08X}\n", bar5));
         
+        // Si BAR5 no está configurado, intentar con BAR0
         if bar5 == 0 {
-            return Err(String::from("BAR5 no configurado"));
+            serial_write_str("SATA_AHCI: BAR5 no configurado, intentando con BAR0\n");
+            let bar0 = self.read_pci_config_u32(0x10);
+            serial_write_str(&format!("SATA_AHCI: BAR0 = 0x{:08X}\n", bar0));
+            
+            if bar0 == 0 {
+                return Err(String::from("Ni BAR5 ni BAR0 están configurados"));
+            }
+            
+            // Extraer la dirección base de BAR0 (limpiar bits de control)
+            self.ahci_base = (bar0 & 0xFFFFFFF0) as u64;
+            serial_write_str(&format!("SATA_AHCI: AHCI Base Address desde BAR0 = 0x{:08X}\n", self.ahci_base));
+        } else {
+            // Extraer la dirección base de BAR5 (limpiar bits de control)
+            self.ahci_base = (bar5 & 0xFFFFFFF0) as u64;
+            serial_write_str(&format!("SATA_AHCI: AHCI Base Address desde BAR5 = 0x{:08X}\n", self.ahci_base));
         }
-        
-        // Extraer la dirección base (limpiar bits de control)
-        self.ahci_base = (bar5 & 0xFFFFFFF0) as u64;
-        serial_write_str(&format!("SATA_AHCI: AHCI Base Address = 0x{:08X}\n", self.ahci_base));
         
         // Leer el registro CAP (Capabilities)
         let cap = self.read_ahci_register(0x00);
         serial_write_str(&format!("SATA_AHCI: CAP = 0x{:08X}\n", cap));
+        
+        // Verificar que CAP sea válido (no todo ceros o todo unos)
+        if cap == 0 || cap == 0xFFFFFFFF {
+            return Err(String::from("Registro CAP inválido - controladora AHCI no responde"));
+        }
         
         // Leer el registro GHC (Global Host Control)
         let ghc = self.read_ahci_register(0x04);
