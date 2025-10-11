@@ -113,6 +113,7 @@ pub mod eclipse_core; // Módulo core nativo de Eclipse
 pub mod elf_loader; // Cargador de ejecutables ELF64
 pub mod filesystem;
 pub mod gdt; // Global Descriptor Table
+pub mod input; // Sistema de entrada unificado (teclado/ratón/HID)
 pub mod memory; // Sistema de gestión de memoria avanzado
 pub mod partitions; // Sistema de detección de particiones
 pub mod syscalls; // Sistema de syscalls

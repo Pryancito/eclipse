@@ -99,12 +99,20 @@ impl UsbHotPlugManager {
 
     /// Escanear controladores USB disponibles
     fn scan_usb_controllers(&mut self) -> Result<(), UsbError> {
+        serial_write_str("USB_HOTPLUG: Escaneando controladores PCI USB...\n");
+        
         let mut pci_manager = PciManager::new();
         pci_manager.scan_all_buses();
         
         // Buscar controladores xHCI (USB 3.0+)
+        serial_write_str("USB_HOTPLUG: Buscando controladores xHCI (clase 0x0C, subclase 0x03)...\n");
         let xhci_devices = pci_manager.find_devices_by_class_subclass(0x0C, 0x03);
+        serial_write_str(&alloc::format!("USB_HOTPLUG: {} controladores xHCI encontrados\n", xhci_devices.len()));
         for pci_device in xhci_devices {
+            serial_write_str(&alloc::format!(
+                "USB_HOTPLUG: Registrando controlador xHCI - Vendor:0x{:04X} Device:0x{:04X}\n",
+                pci_device.vendor_id, pci_device.device_id
+            ));
             self.controllers.push(UsbControllerInfo {
                 controller_type: UsbControllerType::XHCI,
                 pci_device,
@@ -115,8 +123,14 @@ impl UsbHotPlugManager {
         }
         
         // Buscar controladores EHCI (USB 2.0)
+        serial_write_str("USB_HOTPLUG: Buscando controladores EHCI (clase 0x0C, subclase 0x20)...\n");
         let ehci_devices = pci_manager.find_devices_by_class_subclass(0x0C, 0x20);
+        serial_write_str(&alloc::format!("USB_HOTPLUG: {} controladores EHCI encontrados\n", ehci_devices.len()));
         for pci_device in ehci_devices {
+            serial_write_str(&alloc::format!(
+                "USB_HOTPLUG: Registrando controlador EHCI - Vendor:0x{:04X} Device:0x{:04X}\n",
+                pci_device.vendor_id, pci_device.device_id
+            ));
             self.controllers.push(UsbControllerInfo {
                 controller_type: UsbControllerType::EHCI,
                 pci_device,
@@ -127,8 +141,14 @@ impl UsbHotPlugManager {
         }
         
         // Buscar controladores OHCI (USB 1.1)
+        serial_write_str("USB_HOTPLUG: Buscando controladores OHCI (clase 0x0C, subclase 0x10)...\n");
         let ohci_devices = pci_manager.find_devices_by_class_subclass(0x0C, 0x10);
+        serial_write_str(&alloc::format!("USB_HOTPLUG: {} controladores OHCI encontrados\n", ohci_devices.len()));
         for pci_device in ohci_devices {
+            serial_write_str(&alloc::format!(
+                "USB_HOTPLUG: Registrando controlador OHCI - Vendor:0x{:04X} Device:0x{:04X}\n",
+                pci_device.vendor_id, pci_device.device_id
+            ));
             self.controllers.push(UsbControllerInfo {
                 controller_type: UsbControllerType::OHCI,
                 pci_device,
@@ -139,8 +159,14 @@ impl UsbHotPlugManager {
         }
         
         // Buscar controladores UHCI (USB 1.1)
+        serial_write_str("USB_HOTPLUG: Buscando controladores UHCI (clase 0x0C, subclase 0x00)...\n");
         let uhci_devices = pci_manager.find_devices_by_class_subclass(0x0C, 0x00);
+        serial_write_str(&alloc::format!("USB_HOTPLUG: {} controladores UHCI encontrados\n", uhci_devices.len()));
         for pci_device in uhci_devices {
+            serial_write_str(&alloc::format!(
+                "USB_HOTPLUG: Registrando controlador UHCI - Vendor:0x{:04X} Device:0x{:04X}\n",
+                pci_device.vendor_id, pci_device.device_id
+            ));
             self.controllers.push(UsbControllerInfo {
                 controller_type: UsbControllerType::UHCI,
                 pci_device,
@@ -149,6 +175,11 @@ impl UsbHotPlugManager {
                 last_port_check: get_current_timestamp(),
             });
         }
+        
+        serial_write_str(&alloc::format!(
+            "USB_HOTPLUG: Escaneo completado - Total de {} controladores USB encontrados\n",
+            self.controllers.len()
+        ));
         
         Ok(())
     }
@@ -583,6 +614,14 @@ impl UsbHotPlugManager {
         }
     }
 
+    /// Obtener dispositivos HID (teclado/ratón) conectados
+    pub fn get_hid_devices(&self) -> Vec<&UsbDeviceInfo> {
+        self.connected_devices
+            .values()
+            .filter(|device| device.device_class == 0x03) // HID class
+            .collect()
+    }
+    
     /// Obtener información detallada de dispositivos conectados
     pub fn get_connected_devices_info(&self) -> String {
         let mut info = String::new();
@@ -671,7 +710,7 @@ pub struct UsbHotPlugStats {
 }
 
 /// Función principal de hot-plug USB
-pub fn usb_hotplug_main() {
+pub fn usb_hotplug_main() -> UsbHotPlugManager {
     serial_write_str("USB_HOTPLUG: Iniciando sistema de hot-plug USB\n");
     
     let mut hotplug_manager = UsbHotPlugManager::new();
@@ -682,7 +721,7 @@ pub fn usb_hotplug_main() {
             "USB_HOTPLUG: Error al inicializar: {:?}\n",
             e
         ));
-        return;
+        return hotplug_manager;
     }
     
     // Procesar eventos iniciales
@@ -706,4 +745,56 @@ pub fn usb_hotplug_main() {
     serial_write_str(&devices_info);
     
     serial_write_str("USB_HOTPLUG: Sistema de hot-plug USB iniciado\n");
+    
+    // Registrar dispositivos HID en el HID Manager
+    serial_write_str("USB_HOTPLUG: Registrando dispositivos HID detectados...\n");
+    let hid_devices = hotplug_manager.get_hid_devices();
+    serial_write_str(&alloc::format!("USB_HOTPLUG: Encontrados {} dispositivos HID\n", hid_devices.len()));
+    
+    for device in hid_devices {
+        serial_write_str(&alloc::format!(
+            "USB_HOTPLUG: Registrando HID - VID:0x{:04X} PID:0x{:04X} Protocolo:{}\n",
+            device.vendor_id, device.product_id, device.device_protocol
+        ));
+        
+        // Convertir UsbDeviceInfo a HidDeviceInfo
+        let hid_info = crate::drivers::usb_hid::HidDeviceInfo {
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
+            version: 0x0110,
+            manufacturer: String::from(device.get_vendor_name()),
+            product: String::from(if device.device_protocol == 0x01 { 
+                "USB Keyboard" 
+            } else if device.device_protocol == 0x02 { 
+                "USB Mouse" 
+            } else { 
+                "USB HID Device" 
+            }),
+            serial_number: String::from(""),
+            device_class: device.device_class,
+            device_subclass: device.device_subclass,
+            device_protocol: device.device_protocol,
+            max_packet_size: 8,
+            country_code: 0,
+            num_descriptors: 1,
+            report_descriptor_length: 63,
+        };
+        
+        match crate::drivers::usb_hid::register_hid_device(hid_info, device.port_number as u8, 0x81) {
+            Ok(id) => {
+                serial_write_str(&alloc::format!(
+                    "USB_HOTPLUG: ✅ Dispositivo HID registrado (ID: {})\n",
+                    id
+                ));
+            }
+            Err(e) => {
+                serial_write_str(&alloc::format!(
+                    "USB_HOTPLUG: ⚠️  Error registrando HID: {}\n",
+                    e
+                ));
+            }
+        }
+    }
+    
+    hotplug_manager
 }

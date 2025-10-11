@@ -37,7 +37,7 @@ impl StaticBlockCache {
     }
 
     /// Obtener bloque del cache o cargarlo del disco
-    pub fn get_or_load_block(&mut self, block_num: u64, storage: &mut StorageManager, partition_index: u32) -> Result<&mut [u8; BLOCK_SIZE], &'static str> {
+    pub fn get_or_load_block(&mut self, block_num: u64, storage: &mut StorageManager, partition_index: u32, device_name: &str) -> Result<&mut [u8; BLOCK_SIZE], &'static str> {
         // Buscar en cache primero
         if let Some(slot) = self.find_cached_block(block_num) {
             self.access_times[slot] = self.get_current_time();
@@ -47,7 +47,7 @@ impl StaticBlockCache {
 
         // Si no está en cache, cargarlo del disco
         crate::debug::serial_write_str(&alloc::format!("BLOCK_CACHE: Cache miss para bloque {}, cargando del disco\n", block_num));
-        self.load_block_from_disk(block_num, storage, partition_index)
+        self.load_block_from_disk(block_num, storage, partition_index, device_name)
     }
 
     /// Buscar bloque en cache
@@ -61,14 +61,14 @@ impl StaticBlockCache {
     }
 
     /// Cargar bloque del disco al cache
-    fn load_block_from_disk(&mut self, block_num: u64, storage: &mut StorageManager, partition_index: u32) -> Result<&mut [u8; BLOCK_SIZE], &'static str> {
+    fn load_block_from_disk(&mut self, block_num: u64, storage: &mut StorageManager, partition_index: u32, device_name: &str) -> Result<&mut [u8; BLOCK_SIZE], &'static str> {
         // Buscar slot libre o usar LRU
         let slot = self.find_free_slot().unwrap_or_else(|| self.find_lru_slot());
 
         // Escribir bloque sucio si es necesario
         if self.dirty_flags[slot] {
             if let Some(dirty_block_num) = self.block_numbers[slot] {
-                self.write_block_to_disk(dirty_block_num, &self.blocks[slot].unwrap(), storage, partition_index)?;
+                self.write_block_to_disk(dirty_block_num, &self.blocks[slot].unwrap(), storage, partition_index, device_name)?;
             }
         }
 
@@ -78,9 +78,9 @@ impl StaticBlockCache {
         self.dirty_flags[slot] = false;
         self.access_times[slot] = self.get_current_time();
 
-        // Leer del disco usando el storage manager
+        // Leer del disco usando el storage manager con el device_name correcto
         let buffer = self.blocks[slot].as_mut().unwrap();
-        storage.read_from_partition(partition_index, block_num, buffer)
+        storage.read_from_partition(device_name, partition_index, block_num, buffer)
             .map_err(|_| "Error leyendo bloque del disco")?;
 
         crate::debug::serial_write_str(&alloc::format!("BLOCK_CACHE: Bloque {} cargado exitosamente en slot {}\n", block_num, slot));
@@ -88,8 +88,8 @@ impl StaticBlockCache {
     }
 
     /// Escribir bloque al disco
-    fn write_block_to_disk(&self, block_num: u64, data: &[u8; BLOCK_SIZE], storage: &mut StorageManager, partition_index: u32) -> Result<(), &'static str> {
-        storage.write_to_partition(partition_index, block_num, data)
+    fn write_block_to_disk(&self, block_num: u64, data: &[u8; BLOCK_SIZE], storage: &mut StorageManager, partition_index: u32, device_name: &str) -> Result<(), &'static str> {
+        storage.write_to_partition(device_name, partition_index, block_num, data)
             .map_err(|_| "Error escribiendo bloque al disco")?;
         Ok(())
     }
@@ -131,13 +131,13 @@ impl StaticBlockCache {
     }
 
     /// Sincronizar todos los bloques sucios
-    pub fn sync(&mut self, storage: &mut StorageManager, partition_index: u32) -> Result<(), &'static str> {
+    pub fn sync(&mut self, storage: &mut StorageManager, partition_index: u32, device_name: &str) -> Result<(), &'static str> {
         crate::debug::serial_write_str("BLOCK_CACHE: Sincronizando bloques sucios...\n");
         
         for i in 0..CACHE_SIZE {
             if self.dirty_flags[i] {
                 if let Some(block_num) = self.block_numbers[i] {
-                    self.write_block_to_disk(block_num, &self.blocks[i].unwrap(), storage, partition_index)?;
+                    self.write_block_to_disk(block_num, &self.blocks[i].unwrap(), storage, partition_index, device_name)?;
                     self.dirty_flags[i] = false;
                     crate::debug::serial_write_str(&alloc::format!("BLOCK_CACHE: Bloque {} sincronizado\n", block_num));
                 }
@@ -187,7 +187,8 @@ pub fn read_data_from_offset(
     storage: &mut StorageManager,
     partition_index: u32,
     offset: u64,
-    buffer: &mut [u8]
+    buffer: &mut [u8],
+    device_name: &str,
 ) -> Result<usize, &'static str> {
     let block_size = BLOCK_SIZE as u64;
     let start_block = offset / block_size;
@@ -199,7 +200,7 @@ pub fn read_data_from_offset(
     let mut current_block = start_block;
     
     while remaining > 0 && bytes_read < buffer.len() {
-        let block_data = cache.get_or_load_block(current_block, storage, partition_index)?;
+        let block_data = cache.get_or_load_block(current_block, storage, partition_index, device_name)?;
         let available = block_data.len() - current_offset;
         let to_copy = remaining.min(available);
         

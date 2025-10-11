@@ -29,8 +29,9 @@ use crate::drivers::intel_graphics::{IntelDriverState, IntelGraphicsDriver};
 use crate::drivers::nvidia_graphics::{NvidiaDriverState, NvidiaGraphicsDriver};
 use crate::drivers::pci::{GpuInfo, GpuType, PciDevice};
 use crate::hardware_detection::{detect_graphics_hardware, GraphicsMode, HardwareDetectionResult};
+use crate::debug::serial_write_str;
 
-static FONT_DATA: [(char, [u8; 8]); 95] = [
+static FONT_DATA: [(char, [u8; 8]); 104] = [
     // Your character-bitmap tuples
     (
         'A',
@@ -651,50 +652,209 @@ static FONT_DATA: [(char, [u8; 8]); 95] = [
     (
         'á',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00001000, //    ´
+            0b00000000, //
+            0b00111100, //   ****
+            0b00000100, //      *
+            0b00111100, //   ****
+            0b01000100, //  *   *
+            0b00111110, //   *****
+            0b00000000, //
         ],
     ),
     (
         'é',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00001000, //    ´
+            0b00000000, //
+            0b00111100, //   ****
+            0b01000010, //  *    *
+            0b01111110, //  ******
+            0b01000000, //  *
+            0b00111100, //   ****
+            0b00000000, //
         ],
     ),
     (
         'í',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00001000, //    ´
+            0b00000000, //
+            0b00011100, //    ***
+            0b00001000, //     *
+            0b00001000, //     *
+            0b00001000, //     *
+            0b00111110, //   *****
+            0b00000000, //
         ],
     ),
     (
         'ó',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00001000, //    ´
+            0b00000000, //
+            0b00111100, //   ****
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b00111100, //   ****
+            0b00000000, //
         ],
     ),
     (
         'ú',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00001000, //    ´
+            0b00000000, //
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b01000110, //  *   **
+            0b00111010, //   *** *
+            0b00000000, //
         ],
     ),
     (
         'ñ',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00110010, //   **  *
+            0b01001100, //  *  **
+            0b01010100, //  * * *
+            0b01100100, //  **  *
+            0b01000100, //  *   *
+            0b01000100, //  *   *
+            0b01000100, //  *   *
+            0b00000000, //
         ],
     ),
     (
         'ü',
         [
-            0b00000000, 0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100,
-            0b00000000,
+            0b00100100, //   *  *
+            0b00000000, //
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b01000110, //  *   **
+            0b00111010, //   *** *
+            0b00000000, //
+        ],
+    ),
+    (
+        '$',
+        [
+            0b00010000, //    *
+            0b00111110, //   *****
+            0b01010000, //  * *
+            0b00111100, //   ****
+            0b00010010, //    *  *
+            0b01111100, //  *****
+            0b00010000, //    *
+            0b00000000, //
+        ],
+    ),
+    (
+        '%',
+        [
+            0b01100010, //  **   *
+            0b01100100, //  **  *
+            0b00001000, //     *
+            0b00010000, //    *
+            0b00100000, //   *
+            0b01001100, //  *  **
+            0b10001100, // *   **
+            0b00000000, //
+        ],
+    ),
+    (
+        '&',
+        [
+            0b00110000, //   **
+            0b01001000, //  *  *
+            0b01001000, //  *  *
+            0b00110000, //   **
+            0b01001010, //  *  * *
+            0b01000100, //  *   *
+            0b00111010, //   *** *
+            0b00000000, //
+        ],
+    ),
+    (
+        '\'',
+        [
+            0b00010000, //    *
+            0b00010000, //    *
+            0b00100000, //   *
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+        ],
+    ),
+    (
+        '<',
+        [
+            0b00000100, //      *
+            0b00001000, //     *
+            0b00010000, //    *
+            0b00100000, //   *
+            0b00010000, //    *
+            0b00001000, //     *
+            0b00000100, //      *
+            0b00000000, //
+        ],
+    ),
+    (
+        '>',
+        [
+            0b00100000, //   *
+            0b00010000, //    *
+            0b00001000, //     *
+            0b00000100, //      *
+            0b00001000, //     *
+            0b00010000, //    *
+            0b00100000, //   *
+            0b00000000, //
+        ],
+    ),
+    (
+        '^',
+        [
+            0b00010000, //    *
+            0b00101000, //   * *
+            0b01000100, //  *   *
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+        ],
+    ),
+    (
+        '_',
+        [
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b11111111, // ********
+            0b00000000, //
+        ],
+    ),
+    (
+        '°',
+        [
+            0b00111100, //   ****
+            0b01000010, //  *    *
+            0b01000010, //  *    *
+            0b00111100, //   ****
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
+            0b00000000, //
         ],
     ),
 ];
@@ -927,50 +1087,16 @@ impl Font {
 
     /// Obtener patrón de bits para un carácter (8x8)
     fn get_char_pattern(&self, ch: char) -> [u8; 8] {
-        match ch {
-            'A' => [0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00],
-            'B' => [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
-            'C' => [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
-            'D' => [0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00],
-            'E' => [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00],
-            'F' => [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00],
-            'G' => [0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00],
-            'H' => [0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00],
-            'I' => [0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00],
-            'J' => [0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00],
-            'K' => [0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00],
-            'L' => [0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00],
-            'M' => [0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00],
-            'N' => [0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00],
-            'O' => [0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00],
-            'P' => [0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00],
-            'Q' => [0x3C, 0x66, 0x66, 0x66, 0x6A, 0x6C, 0x36, 0x00],
-            'R' => [0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00],
-            'S' => [0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00],
-            'T' => [0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
-            'U' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00],
-            'V' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00],
-            'W' => [0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00],
-            'X' => [0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00],
-            'Y' => [0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00],
-            'Z' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00],
-            '0' => [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],
-            '1' => [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
-            '2' => [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00],
-            '3' => [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],
-            '4' => [0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00],
-            '5' => [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],
-            '6' => [0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],
-            '7' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00],
-            '8' => [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
-            '9' => [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x66, 0x3C, 0x00],
-            '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
-            ',' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30],
-            ':' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00],
-            ';' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x30],
-            '!' => [0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x18, 0x00],
-            '?' => [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x00, 0x18, 0x00],
-            _ => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // Carácter no soportado
+        let target = if ch.is_ascii_lowercase() { ch.to_ascii_uppercase() } else { ch };
+        if let Some((_, pattern)) = FONT_DATA.iter().find(|(c, _)| *c == target) {
+            *pattern
+        } else {
+            // Fallback: buscar '?'
+            if let Some((_, pattern)) = FONT_DATA.iter().find(|(c, _)| *c == '?') {
+                *pattern
+            } else {
+                [0; 8]
+            }
         }
     }
 
@@ -2435,10 +2561,19 @@ impl FramebufferDriver {
         let fb_width = self.info.width;
         let fb_height = self.info.height;
 
+        // Normalizar el carácter: convertir minúsculas a mayúsculas si no hay glifo específico
+        let target_char = if FONT_DATA.iter().any(|(c, _)| *c == ch) {
+            ch
+        } else if ch.is_ascii_lowercase() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+
         // Bitmap 8x8: cada byte es una fila, bit 7..0 son columnas
         let char_bitmap: [u8; 8] = *FONT_DATA
             .iter()
-            .find(|(c, _)| *c == ch)
+            .find(|(c, _)| *c == target_char)
             .map(|(_, bitmap)| bitmap)
             .unwrap_or(&[0; 8]);
 
@@ -2600,9 +2735,16 @@ impl FramebufferDriver {
             return;
         }
 
+        // ✅ VALIDACIÓN: Verificar límites
+        if x >= self.info.width || y >= self.info.height {
+            return;
+        }
+
         unsafe {
+            // Calcular offset correctamente usando pixels_per_scan_line
             let offset = (y * self.info.pixels_per_scan_line) + x;
-            let ptr = (self.info.base_address as *mut u32).add(offset as usize);
+            let fb_ptr = self.info.base_address as *mut u32;
+            let ptr = fb_ptr.add(offset as usize);
             // Escribe el valor del color directamente en la memoria
             core::ptr::write_volatile(ptr, color.to_u32());
         }
@@ -4070,9 +4212,20 @@ impl FramebufferDriver {
 static mut SYSTEM_FRAMEBUFFER: Option<FramebufferDriver> = None;
 
 /// Obtener información de framebuffer del hardware detectado
-/// Retorna (width, height, base_address)
-fn get_hardware_framebuffer_info(hw_result: &HardwareDetectionResult) -> (u32, u32, u64) {
-    // Si tenemos una GPU primaria detectada, usar su información real del PCI
+/// Retorna (width, height, pixels_per_scan_line, base_address)
+fn get_hardware_framebuffer_info(hw_result: &HardwareDetectionResult) -> (u32, u32, u32, u64) {
+    // PRIMERO: Intentar usar los parámetros del framebuffer actual si está disponible
+    if let Some(current_fb_info) = get_framebuffer_info() {
+        // Usar los parámetros reales del framebuffer actual
+        serial_write_str(&alloc::format!(
+            "FRAMEBUFFER: Usando parámetros actuales - {}x{}, ppsl={}, addr=0x{:X}\n",
+            current_fb_info.width, current_fb_info.height, 
+            current_fb_info.pixels_per_scan_line, current_fb_info.base_address
+        ));
+        return (current_fb_info.width, current_fb_info.height, current_fb_info.pixels_per_scan_line, current_fb_info.base_address);
+    }
+
+    // FALLBACK: Si no hay framebuffer actual, usar detección de hardware
     if let Some(primary_gpu) = &hw_result.primary_gpu {
         // Usar la resolución máxima de la GPU como base
         let (max_width, max_height) = primary_gpu.max_resolution;
@@ -4089,16 +4242,24 @@ fn get_hardware_framebuffer_info(hw_result: &HardwareDetectionResult) -> (u32, u
             768
         };
 
+        // Calcular pixels_per_scan_line correctamente (debe ser múltiplo de 8 para alineación)
+        let pixels_per_scan_line = ((width + 7) / 8) * 8;
+
         // Obtener la dirección base real desde las BARs del PCI
         let base_address = get_pci_framebuffer_base_address(&primary_gpu.pci_device);
 
-        (width, height, base_address)
+        serial_write_str(&alloc::format!(
+            "FRAMEBUFFER: Usando parámetros detectados - {}x{}, ppsl={}, addr=0x{:X}\n",
+            width, height, pixels_per_scan_line, base_address
+        ));
+
+        (width, height, pixels_per_scan_line, base_address)
     } else {
         // Si no hay GPU primaria, usar configuración por defecto
         match hw_result.graphics_mode {
-            GraphicsMode::HardwareAccelerated => (1920, 1080, 0xE0000000),
-            GraphicsMode::Framebuffer => (1024, 768, 0xF0000000),
-            GraphicsMode::VGA => (640, 480, 0xB8000), // VGA text mode
+            GraphicsMode::HardwareAccelerated => (1920, 1080, 1920, 0xE0000000),
+            GraphicsMode::Framebuffer => (1024, 768, 1024, 0xF0000000),
+            GraphicsMode::VGA => (640, 480, 640, 0xB8000), // VGA text mode
         }
     }
 }
@@ -4140,6 +4301,14 @@ fn get_pci_framebuffer_base_address(pci_device: &PciDevice) -> u64 {
 /// Fase 3: Transicionar a hardware específico
 pub fn init_framebuffer_with_phase_transition() -> Result<(), &'static str> {
     // ========================================
+    // FASE 1: NO PRESERVAR CONTENIDO (evitar panic por memoria)
+    // ========================================
+    // La preservación de contenido requiere mucha memoria y puede causar panic
+    // En su lugar, simplemente limpiaremos la pantalla después de la transición
+    
+    serial_write_str("FRAMEBUFFER: Iniciando transición sin preservación de contenido\n");
+
+    // ========================================
     // FASE 2: DETECCIÓN DE HARDWARE
     // ========================================
     let hw_result = detect_graphics_hardware();
@@ -4151,25 +4320,25 @@ pub fn init_framebuffer_with_phase_transition() -> Result<(), &'static str> {
     // FASE 3: TRANSICIÓN A HARDWARE DETECTADO
     // ========================================
     // Crear nuevo framebuffer específico para el hardware detectado
-    match hw_result.graphics_mode {
+    let result = match hw_result.graphics_mode {
         GraphicsMode::HardwareAccelerated => {
             // Para hardware acelerado, crear framebuffer optimizado
             init_framebuffer(
-                hw_fb_info.2,                         // base_address del hardware
+                hw_fb_info.3,                         // base_address del hardware
                 hw_fb_info.0,                         // width del hardware
                 hw_fb_info.1,                         // height del hardware
-                hw_fb_info.0, // pixels_per_scan_line (asumir width por ahora)
-                0,            // PixelRedGreenBlueReserved8BitPerColor
+                hw_fb_info.2,                         // pixels_per_scan_line correcto
+                0,                                    // PixelRedGreenBlueReserved8BitPerColor
                 0x00FF0000 | 0x0000FF00 | 0x000000FF, // RGB bitmask
             )
         }
         GraphicsMode::Framebuffer => {
             // Para framebuffer básico, crear uno optimizado con datos del hardware
             init_framebuffer(
-                hw_fb_info.2, // base_address del hardware
+                hw_fb_info.3, // base_address del hardware
                 hw_fb_info.0, // width del hardware
                 hw_fb_info.1, // height del hardware
-                hw_fb_info.0, // pixels_per_scan_line
+                hw_fb_info.2, // pixels_per_scan_line correcto
                 0,            // RGB
                 0x00FF0000 | 0x0000FF00 | 0x000000FF,
             )
@@ -4177,15 +4346,27 @@ pub fn init_framebuffer_with_phase_transition() -> Result<(), &'static str> {
         GraphicsMode::VGA => {
             // Para VGA, usar configuración básica con datos del hardware
             init_framebuffer(
-                hw_fb_info.2, // base_address del hardware
+                hw_fb_info.3, // base_address del hardware
                 hw_fb_info.0, // width del hardware
                 hw_fb_info.1, // height del hardware
-                hw_fb_info.0, // pixels_per_scan_line
+                hw_fb_info.2, // pixels_per_scan_line correcto
                 0,            // RGB
                 0x00FF0000 | 0x0000FF00 | 0x000000FF,
             )
         }
+    };
+
+    // ========================================
+    // FASE 4: LIMPIAR PANTALLA DESPUÉS DE LA TRANSICIÓN
+    // ========================================
+    if result.is_ok() {
+        if let Some(new_fb) = get_framebuffer() {
+            serial_write_str("FRAMEBUFFER: Limpiando pantalla después de transición\n");
+            new_fb.clear_screen(Color::BLACK);
+        }
     }
+
+    result
 }
 
 /// Inicializar framebuffer del sistema (función base)
@@ -4260,30 +4441,30 @@ pub fn transition_gop_to_hardware() -> Result<(u32, u32, u64), &'static str> {
     let transition_result = match hw_result.graphics_mode {
         GraphicsMode::HardwareAccelerated => {
             init_framebuffer(
-                hw_fb_info.2,                         // base_address del hardware
+                hw_fb_info.3,                         // base_address del hardware
                 hw_fb_info.0,                         // width del hardware
                 hw_fb_info.1,                         // height del hardware
-                hw_fb_info.0,                         // pixels_per_scan_line
+                hw_fb_info.2,                         // pixels_per_scan_line correcto
                 0,                                    // PixelRedGreenBlueReserved8BitPerColor
                 0x00FF0000 | 0x0000FF00 | 0x000000FF, // RGB bitmask
             )
         }
         GraphicsMode::Framebuffer => {
             init_framebuffer(
-                hw_fb_info.2, // base_address del hardware
+                hw_fb_info.3, // base_address del hardware
                 hw_fb_info.0, // width del hardware
                 hw_fb_info.1, // height del hardware
-                hw_fb_info.0, // pixels_per_scan_line
+                hw_fb_info.2, // pixels_per_scan_line correcto
                 0,            // RGB
                 0x00FF0000 | 0x0000FF00 | 0x000000FF,
             )
         }
         GraphicsMode::VGA => {
             init_framebuffer(
-                hw_fb_info.2, // base_address del hardware
+                hw_fb_info.3, // base_address del hardware
                 hw_fb_info.0, // width del hardware
                 hw_fb_info.1, // height del hardware
-                hw_fb_info.0, // pixels_per_scan_line
+                hw_fb_info.2, // pixels_per_scan_line correcto
                 0,            // RGB
                 0x00FF0000 | 0x0000FF00 | 0x000000FF,
             )
@@ -4292,8 +4473,8 @@ pub fn transition_gop_to_hardware() -> Result<(u32, u32, u64), &'static str> {
 
     match transition_result {
         Ok(_) => {
-            // Retornar información del nuevo framebuffer para que el caller pueda actualizar su referencia
-            Ok(hw_fb_info)
+            // Retornar información del nuevo framebuffer para uso externo (solo width, height, base_address)
+            Ok((hw_fb_info.0, hw_fb_info.1, hw_fb_info.3))
         }
         Err(e) => Err(e),
     }

@@ -487,3 +487,85 @@ pub fn usb_network_main() {
         stats.up_devices
     ));
 }
+
+/// Buffer de paquetes de red
+const MAX_NETWORK_PACKETS: usize = 256;
+const MAX_PACKET_SIZE: usize = 2048;
+
+#[derive(Clone)]
+pub struct NetworkPacket {
+    pub data: Vec<u8>,
+    pub device_id: u32,
+    pub timestamp: u64,
+}
+
+/// Buffers de transmisión y recepción
+pub struct NetworkBuffers {
+    tx_queue: Vec<NetworkPacket>,
+    rx_queue: Vec<NetworkPacket>,
+}
+
+impl NetworkBuffers {
+    pub fn new() -> Self {
+        Self {
+            tx_queue: Vec::with_capacity(MAX_NETWORK_PACKETS),
+            rx_queue: Vec::with_capacity(MAX_NETWORK_PACKETS),
+        }
+    }
+
+    /// Encolar paquete para transmisión
+    pub fn enqueue_tx(&mut self, packet: NetworkPacket) -> Result<(), &'static str> {
+        if self.tx_queue.len() >= MAX_NETWORK_PACKETS {
+            return Err("Cola de transmisión llena");
+        }
+        self.tx_queue.push(packet);
+        Ok(())
+    }
+
+    /// Desencolar paquete para transmisión
+    pub fn dequeue_tx(&mut self) -> Option<NetworkPacket> {
+        if !self.tx_queue.is_empty() {
+            Some(self.tx_queue.remove(0))
+        } else {
+            None
+        }
+    }
+
+    /// Encolar paquete recibido
+    pub fn enqueue_rx(&mut self, packet: NetworkPacket) -> Result<(), &'static str> {
+        if self.rx_queue.len() >= MAX_NETWORK_PACKETS {
+            return Err("Cola de recepción llena");
+        }
+        self.rx_queue.push(packet);
+        Ok(())
+    }
+
+    /// Desencolar paquete recibido
+    pub fn dequeue_rx(&mut self) -> Option<NetworkPacket> {
+        if !self.rx_queue.is_empty() {
+            Some(self.rx_queue.remove(0))
+        } else {
+            None
+        }
+    }
+
+    /// Obtener tamaño de colas
+    pub fn get_queue_sizes(&self) -> (usize, usize) {
+        (self.tx_queue.len(), self.rx_queue.len())
+    }
+}
+
+/// Buffers globales de red
+static mut NETWORK_BUFFERS: Option<NetworkBuffers> = None;
+
+/// Inicializar buffers de red
+pub fn init_network_buffers() {
+    unsafe {
+        NETWORK_BUFFERS = Some(NetworkBuffers::new());
+    }
+}
+
+/// Obtener buffers de red
+pub fn get_network_buffers() -> Option<&'static mut NetworkBuffers> {
+    unsafe { NETWORK_BUFFERS.as_mut() }
+}

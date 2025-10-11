@@ -29,8 +29,8 @@ impl<'a> BlockDevice for StorageDeviceWrapper<'a> {
         
         // Buscar el índice del dispositivo en el storage manager
         for (index, device) in self.storage_manager.devices.iter().enumerate() {
-            if core::ptr::eq(&device.info, self.device_info) {
-                return self.storage_manager.write_device_sector(index, lba, buffer);
+            if core::ptr::eq(device, self.device_info) {
+                return self.storage_manager.write_device_sector(&device.name, lba, buffer);
             }
         }
         
@@ -45,7 +45,7 @@ impl<'a> BlockDevice for StorageDeviceWrapper<'a> {
         ));
         
         // Intentar lectura real del disco
-        match self.storage_manager.read_device_sector_real(self.device_info, lba, buffer) {
+        match self.storage_manager.read_device_sector_real(&self.device_info.name, lba, buffer) {
             Ok(_) => {
                 crate::debug::serial_write_str("STORAGE_WRAPPER: Lectura real exitosa\n");
                 Ok(())
@@ -103,8 +103,8 @@ impl<'a> BlockDevice for EclipseFSDeviceWrapper<'a> {
         
         // Buscar el índice del dispositivo en el storage manager
         for (index, device) in self.storage_manager.devices.iter().enumerate() {
-            if core::ptr::eq(&device.info, self.device_info) {
-                return self.storage_manager.write_device_sector(index, lba, buffer);
+            if core::ptr::eq(device, self.device_info) {
+                return self.storage_manager.write_device_sector(&device.name, lba, buffer);
             }
         }
         
@@ -119,7 +119,7 @@ impl<'a> BlockDevice for EclipseFSDeviceWrapper<'a> {
         ));
         
         // Intentar lectura real del disco
-        match self.storage_manager.read_device_sector_real(self.device_info, lba, buffer) {
+        match self.storage_manager.read_device_sector_real(&self.device_info.name, lba, buffer) {
             Ok(_) => {
                 crate::debug::serial_write_str("ECLIPSEFS_WRAPPER: Lectura real exitosa\n");
                 Ok(())

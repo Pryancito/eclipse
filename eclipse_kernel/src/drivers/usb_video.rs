@@ -501,3 +501,166 @@ pub fn usb_video_main() {
         stats.initialized_devices
     ));
 }
+
+/// Frame de video
+pub struct VideoFrame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub format: VideoFormat,
+    pub timestamp: u64,
+    pub sequence: u32,
+    pub device_id: u32,
+}
+
+impl VideoFrame {
+    pub fn new(width: u32, height: u32, format: VideoFormat, device_id: u32) -> Self {
+        let size = match format {
+            VideoFormat::RGB24 => (width * height * 3) as usize,
+            VideoFormat::RGB32 => (width * height * 4) as usize,
+            VideoFormat::YUYV => (width * height * 2) as usize,
+            VideoFormat::MJPEG | VideoFormat::H264 | VideoFormat::H265 => {
+                // Para formatos comprimidos, usar un tamaño estimado
+                (width * height / 2) as usize
+            }
+            _ => (width * height * 3) as usize,
+        };
+
+        Self {
+            data: vec![0u8; size],
+            width,
+            height,
+            format,
+            timestamp: 0,
+            sequence: 0,
+            device_id,
+        }
+    }
+
+    pub fn get_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// Buffer de frames de video
+const MAX_VIDEO_FRAMES: usize = 8; // Triple buffering + extra
+
+pub struct VideoStreamBuffer {
+    frames: Vec<VideoFrame>,
+    current_read: usize,
+    current_write: usize,
+    frame_count: u32,
+}
+
+impl VideoStreamBuffer {
+    pub fn new(width: u32, height: u32, format: VideoFormat, device_id: u32) -> Self {
+        let mut frames = Vec::with_capacity(MAX_VIDEO_FRAMES);
+        for _ in 0..MAX_VIDEO_FRAMES {
+            frames.push(VideoFrame::new(width, height, format, device_id));
+        }
+
+        Self {
+            frames,
+            current_read: 0,
+            current_write: 0,
+            frame_count: 0,
+        }
+    }
+
+    pub fn get_write_frame(&mut self) -> &mut VideoFrame {
+        &mut self.frames[self.current_write]
+    }
+
+    pub fn advance_write(&mut self) {
+        self.current_write = (self.current_write + 1) % MAX_VIDEO_FRAMES;
+        self.frame_count += 1;
+    }
+
+    pub fn get_read_frame(&self) -> &VideoFrame {
+        &self.frames[self.current_read]
+    }
+
+    pub fn advance_read(&mut self) {
+        self.current_read = (self.current_read + 1) % MAX_VIDEO_FRAMES;
+    }
+
+    pub fn frames_available(&self) -> usize {
+        if self.current_write >= self.current_read {
+            self.current_write - self.current_read
+        } else {
+            MAX_VIDEO_FRAMES - self.current_read + self.current_write
+        }
+    }
+}
+
+/// Manager de streaming de video
+pub struct VideoStreamManager {
+    streams: Vec<VideoStreamBuffer>,
+}
+
+impl VideoStreamManager {
+    pub fn new() -> Self {
+        Self {
+            streams: Vec::new(),
+        }
+    }
+
+    pub fn create_stream(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: VideoFormat,
+        device_id: u32,
+    ) -> Result<usize, &'static str> {
+        let stream_id = self.streams.len();
+        self.streams.push(VideoStreamBuffer::new(width, height, format, device_id));
+        Ok(stream_id)
+    }
+
+    pub fn get_stream(&mut self, stream_id: usize) -> Option<&mut VideoStreamBuffer> {
+        self.streams.get_mut(stream_id)
+    }
+
+    pub fn capture_frame(&mut self, stream_id: usize, data: &[u8]) -> Result<(), &'static str> {
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            let frame_count = stream.frame_count;
+            let frame = stream.get_write_frame();
+            let to_copy = data.len().min(frame.data.len());
+            frame.data[..to_copy].copy_from_slice(&data[..to_copy]);
+            frame.timestamp = 0; // TODO: Get real timestamp
+            frame.sequence = frame_count;
+            stream.advance_write();
+            Ok(())
+        } else {
+            Err("Stream no encontrado")
+        }
+    }
+
+    pub fn read_frame(&mut self, stream_id: usize) -> Result<Vec<u8>, &'static str> {
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            if stream.frames_available() > 0 {
+                let frame = stream.get_read_frame();
+                let data = frame.data.clone();
+                stream.advance_read();
+                Ok(data)
+            } else {
+                Err("No hay frames disponibles")
+            }
+        } else {
+            Err("Stream no encontrado")
+        }
+    }
+}
+
+/// Manager global de streaming de video
+static mut VIDEO_STREAM_MANAGER: Option<VideoStreamManager> = None;
+
+pub fn init_video_stream_manager() {
+    unsafe {
+        VIDEO_STREAM_MANAGER = Some(VideoStreamManager::new());
+    }
+}
+
+pub fn get_video_stream_manager() -> Option<&'static mut VideoStreamManager> {
+    unsafe { VIDEO_STREAM_MANAGER.as_mut() }
+}

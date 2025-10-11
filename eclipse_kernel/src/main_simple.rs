@@ -255,14 +255,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
 
     fb.write_text_kernel("GDT inicializada.", Color::GREEN);
     serial_write_str("KERNEL_MAIN: GDT initialized.\n");
-
-    // --- Inicialización del Sistema de Interrupciones (DESHABILITADO) ---
-    serial_write_str("KERNEL_MAIN: Skipping interrupt system initialization for hardware compatibility...\n");
-    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad.", Color::YELLOW);
     
-    // Las interrupciones causan excepciones en hardware real, omitimos por ahora
-    serial_write_str("KERNEL_MAIN: Interrupt system initialization skipped for hardware compatibility.\n");
-
     // --- Inicialización del Gestor de Paginación ---
     serial_write_str("KERNEL_MAIN: Initializing Paging Manager...\n");
     
@@ -296,7 +289,37 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         GraphicsMode::Framebuffer => fb.write_text_kernel("Modo gráfico: Framebuffer", Color::CYAN),
         GraphicsMode::VGA => fb.write_text_kernel("Modo gráfico: VGA", Color::CYAN),
         GraphicsMode::HardwareAccelerated => {
-            fb.write_text_kernel("Modo gráfico: Acelerado", Color::CYAN)
+            fb.write_text_kernel("Modo gráfico: Acelerado", Color::CYAN);
+            
+            // Cambiar al framebuffer acelerado con preservación de contenido
+            serial_write_str("KERNEL_MAIN: Cambiando a framebuffer acelerado con preservación...\n");
+            fb.write_text_kernel("Transición inteligente...", Color::YELLOW);
+            
+            match crate::drivers::framebuffer::init_framebuffer_with_phase_transition() {
+                Ok(_) => {
+                    serial_write_str("KERNEL_MAIN: Framebuffer acelerado inicializado exitosamente\n");
+                    
+                    // Obtener el nuevo framebuffer acelerado
+                    if let Some(new_fb) = crate::drivers::framebuffer::get_framebuffer() {
+                        // Re-renderizar mensajes esenciales
+                        new_fb.write_text_kernel("Eclipse OS Kernel v0.6.0", Color::WHITE);
+                        new_fb.write_text_kernel("GDT inicializada.", Color::GREEN);
+                        new_fb.write_text_kernel("Detección de GPU completada", Color::GREEN);
+                        new_fb.write_text_kernel("Modo gráfico: Acelerado", Color::CYAN);
+                        new_fb.write_text_kernel("Framebuffer acelerado activo", Color::GREEN);
+                        new_fb.write_text_kernel("Transición inteligente completada", Color::GREEN);
+                        
+                        serial_write_str("KERNEL_MAIN: Transición inteligente completada\n");
+                        
+                        // Actualizar la referencia del framebuffer
+                        *fb = new_fb.clone();
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("KERNEL_MAIN: Error en transición inteligente: {}\n", e));
+                    fb.write_text_kernel("Error en transición - usando original", Color::RED);
+                }
+            }
         }
     }
 
@@ -329,7 +352,21 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         fb.write_text_kernel("No se detectó GPU primaria", Color::YELLOW);
     }
 
-    // --- Diagnóstico USB ---
+    // --- Inicializar sistema de entrada ANTES del diagnóstico USB ---
+    serial_write_str("KERNEL_MAIN: Initializing input system (before USB diagnostic)...\n");
+    fb.write_text_kernel("Inicializando sistema de entrada...", Color::YELLOW);
+    
+    serial_write_str("KERNEL_MAIN: [1/2] Inicializando InputManager...\n");
+    crate::input::init_input_manager();
+    serial_write_str("KERNEL_MAIN: [1/2] ✅ InputManager inicializado\n");
+    
+    serial_write_str("KERNEL_MAIN: [2/2] Inicializando HidManager...\n");
+    crate::drivers::usb_hid::init_hid_manager();
+    serial_write_str("KERNEL_MAIN: [2/2] ✅ HidManager inicializado\n");
+    
+    fb.write_text_kernel("Sistema de entrada inicializado.", Color::GREEN);
+    
+    // --- Diagnóstico USB (ahora registrará dispositivos HID automáticamente) ---
     serial_write_str("KERNEL_MAIN: Iniciando diagnóstico USB...\n");
     fb.write_text_kernel("Diagnóstico USB...", Color::WHITE);
     usb_diagnostic::usb_diagnostic_main();
@@ -372,14 +409,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: Initializing storage drivers...\n");
     fb.write_text_kernel("Inicializando drivers de almacenamiento...", Color::WHITE);
     
-    let mut storage_manager = StorageManager::new();
-    
     match init_storage_manager() {
         Ok(()) => {
             serial_write_str("KERNEL_MAIN: Storage drivers initialized.\n");
-            if let Some(manager) = get_storage_manager() {
-                storage_manager = manager.clone();
-            }
         }
         Err(err) => {
             serial_write_str(&alloc::format!(
@@ -402,7 +434,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     fb.write_text_kernel("VFS inicializado.", Color::GREEN);
 
     // Estrategia: intentar montar EclipseFS directamente
-    if storage_manager.device_count() > 0 {
+    if let Some(storage_manager) = get_storage_manager() {
+        if storage_manager.device_count() > 0 {
         serial_write_str("KERNEL_MAIN: Intentando montar EclipseFS...\n");
         fb.write_text_kernel("Intentando montar EclipseFS...", Color::WHITE);
 
@@ -413,6 +446,36 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                 fb.write_text_kernel("¡EclipseFS montado exitosamente!", Color::GREEN);
                 if let Some(vfs_guard) = get_vfs().as_ref() {
                     vfs_guard.debug_list_mounts();
+                }
+                // Listar raíz y verificar presencia de /ai_models inmediatamente tras el montaje
+                list_root_directory(fb);
+                if let Some(vfs_guard) = get_vfs().as_ref() {
+                    if let Some(root_fs) = vfs_guard.get_root_fs() {
+                        let fs_guard = root_fs.lock();
+                        serial_write_str("KERNEL_MAIN: Verificando /ai_models justo tras el montaje...\n");
+                        match fs_guard.resolve_path("/ai_models") {
+                            Ok(inode) => {
+                                serial_write_str(&alloc::format!("KERNEL_MAIN: /ai_models encontrado (inode {})\n", inode));
+                                fb.write_text_kernel(&alloc::format!("/ai_models encontrado (inode {})", inode), Color::GREEN);
+                                match fs_guard.readdir_path("/ai_models") {
+                                    Ok(list) => {
+                                        serial_write_str(&alloc::format!("KERNEL_MAIN: /ai_models contiene {} entradas\n", list.len()));
+                                        let preview = list.iter().take(10).cloned().collect::<alloc::vec::Vec<_>>();
+                                        for name in preview {
+                                            fb.write_text_kernel(&alloc::format!("  ai: {}", name), Color::LIGHT_GRAY);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        serial_write_str(&alloc::format!("KERNEL_MAIN: Error leyendo /ai_models: {:?}\n", e));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                serial_write_str(&alloc::format!("KERNEL_MAIN: /ai_models NO existe tras montaje: {:?}\n", err));
+                                fb.write_text_kernel(&alloc::format!("/ai_models NO existe tras montaje: {:?}", err), Color::YELLOW);
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -434,9 +497,10 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                 fb.write_text_kernel(&alloc::format!("Error al montar FAT32 como fallback: {:?}", e), Color::RED);
             }
         }
-    } else {
+        } else {
         serial_write_str("KERNEL_MAIN: No storage devices found. Trying bootloader data...\n");
         fb.write_text_kernel("No se encontraron dispositivos de almacenamiento.", Color::YELLOW);
+        }
     }
     // --- Inicialización del Sistema de IA ---
     serial_write_str("KERNEL_MAIN: Initializing AI system...\n");
@@ -458,14 +522,66 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: AI system initialized.\n");
     fb.write_text_kernel("Sistema de IA inicializado.", Color::GREEN);
 
+    // Verificar estado del HidManager después del diagnóstico USB
+    serial_write_str("KERNEL_MAIN: Verificando dispositivos HID registrados...\n");
+    if let Some(manager) = crate::drivers::usb_hid::get_hid_manager() {
+        let (total, keyboards, mice) = manager.get_stats();
+        serial_write_str(&alloc::format!(
+            "KERNEL_MAIN: ✅ HidManager - Total: {}, Teclados: {}, Ratones: {}\n",
+            total, keyboards, mice
+        ));
+        fb.write_text_kernel(&alloc::format!("HID: {} dispositivos ({} kbd, {} mouse)", total, keyboards, mice), Color::GREEN);
+    } else {
+        serial_write_str("KERNEL_MAIN: ⚠️  ERROR - HidManager no disponible\n");
+        fb.write_text_kernel("ERROR: HidManager no disponible", Color::RED);
+    }
+
     // Bucle infinito para mantener el kernel en ejecución
     serial_write_str("KERNEL_MAIN: Entering main loop.\n");
     fb.write_text_kernel("Kernel en ejecución. Sistema listo.", Color::GREEN);
     
     let mut interrupt_counter = 0u32;
     let mut shell_demo_counter = 0u32;
+    let mut input_poll_counter = 0u32;
     
     loop {
+        // Poll de dispositivos de entrada cada 10 iteraciones (más frecuente)
+        if input_poll_counter % 10 == 0 {
+            // Log de debug solo las primeras 5 veces
+            if input_poll_counter < 50 {
+                serial_write_str("MAIN_LOOP: Polling dispositivos HID...\n");
+            }
+            
+            crate::drivers::usb_hid::poll_hid_devices().ok();
+            crate::input::poll_input_events();
+            
+            // Procesar eventos de entrada
+            while let Some(event) = crate::input::get_next_input_event() {
+                match event {
+                    crate::input::InputEvent::Keyboard(kb_event) => {
+                        if kb_event.pressed {
+                            serial_write_str(&alloc::format!(
+                                "INPUT: Tecla presionada - código: 0x{:02X}\n",
+                                kb_event.key_code
+                            ));
+                            fb.write_text_kernel(&alloc::format!("Tecla: 0x{:02X}", kb_event.key_code), Color::YELLOW);
+                        }
+                    }
+                    crate::input::InputEvent::Mouse(mouse_event) => {
+                        serial_write_str(&alloc::format!(
+                            "INPUT: Ratón - X:{} Y:{} Botones: L:{} R:{} M:{}\n",
+                            mouse_event.x,
+                            mouse_event.y,
+                            mouse_event.left_button,
+                            mouse_event.right_button,
+                            mouse_event.middle_button
+                        ));
+                    }
+                }
+            }
+        }
+        input_poll_counter += 1;
+        
         // Cada 1000 iteraciones, mostrar estadísticas de interrupciones
         if interrupt_counter % 1000 == 0 {
             let stats = get_interrupt_stats();
@@ -786,14 +902,14 @@ fn initialize_ai_services(fb: &mut FramebufferDriver) -> AIService {
             }
         }
         
-        // Ahora intentar leer el directorio
+        // Ahora intentar leer el directorio (con fallback)
         match fs_guard.readdir_path("/ai_models") {
             Ok(list) => {
                 serial_write_str(&alloc::format!("AI_INIT: readdir_path exitoso - {} elementos encontrados\n", list.len()));
                 Ok(list)
             }
             Err(err) => {
-                serial_write_str(&alloc::format!("AI_INIT: readdir_path fallo - error: {:?}\n", err));
+                serial_write_str(&alloc::format!("AI_INIT: readdir_path fallo en /ai_models - error: {:?}\n", err));
                 Err(err)
             }
         }
@@ -962,7 +1078,7 @@ fn investigate_disk_contents(storage: &StorageManager) {
     }
     
     let virtio_device = &storage.devices[2];
-    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Dispositivo VirtIO: {:?}\n", virtio_device.info));
+    crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Dispositivo VirtIO: {:?}\n", virtio_device));
     
     // Crear buffer para leer sectores
     let mut sector_buffer = [0u8; 512];
@@ -973,7 +1089,7 @@ fn investigate_disk_contents(storage: &StorageManager) {
     for &sector in &sectors_to_check {
         crate::debug::serial_write_str(&alloc::format!("DISK_INVESTIGATION: Leyendo sector {}\n", sector));
         
-        match storage.read_device_sector_with_type(&virtio_device.info, sector, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
+        match storage.read_device_sector_with_type(virtio_device, sector, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
             Ok(()) => {
                 // Verificar si el sector tiene datos no nulos
                 let has_data = sector_buffer.iter().any(|&b| b != 0);
@@ -1009,7 +1125,7 @@ fn investigate_disk_contents(storage: &StorageManager) {
     
     // Intentar leer la tabla de particiones MBR (sector 0)
     crate::debug::serial_write_str("DISK_INVESTIGATION: Analizando tabla de particiones MBR...\n");
-    match storage.read_device_sector_with_type(&virtio_device.info, 0, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
+    match storage.read_device_sector_with_type(virtio_device, 0, &mut sector_buffer, crate::drivers::storage_manager::StorageSectorType::FAT32) {
         Ok(()) => {
             // Verificar boot signature
             if sector_buffer[510] == 0x55 && sector_buffer[511] == 0xAA {

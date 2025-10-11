@@ -929,7 +929,7 @@ pub fn obtener_dispositivos_fat32_candidatos() -> Vec<Fat32DeviceInfo> {
     
     // Buscar particiones FAT32 con la misma lógica que EclipseFS
     for partition in &storage.partitions {
-        if partition.filesystem_type == crate::partitions::FilesystemType::FAT32 {
+        if partition.filesystem_type == "FAT32" {
             let size_mb = (partition.size_lba * 512) / (1024 * 1024);
             crate::debug::serial_write_str(&alloc::format!(
                 "FAT32: Candidato encontrado: {} (tipo: FAT32, {} MB, inicio LBA: {})\n",
@@ -991,7 +991,7 @@ fn obtener_particion_fat32_montada() -> Option<String> {
             ));
             
             storage.partitions.iter()
-                .find(|particion| particion.filesystem_type == crate::partitions::FilesystemType::FAT32)
+                .find(|particion| particion.filesystem_type == "FAT32")
                 .map(|particion| {
                     crate::debug::serial_write_str(&alloc::format!(
                         "FAT32: Partición FAT32 detectada: {} (tamaño: {} sectores LBA, inicio: sector LBA {})\n",
@@ -1087,7 +1087,7 @@ pub fn mount_fat32_from_storage(
     
     // Leer directamente desde la partición usando el offset correcto
     match storage.read_device_sector_real(
-        &storage.devices[0].info,  // Usar el primer dispositivo
+        &device_info.device_name,  // Usar el nombre del dispositivo real de la partición
         device_info.start_lba,     // Usar el offset de la partición
         &mut boot_sector_buffer
     ) {
@@ -1125,7 +1125,7 @@ pub fn mount_fat32_from_storage(
                 
                 // Leer MBR para encontrar partición FAT32
                 let mut mbr_buffer = [0u8; 512];
-                if let Err(e) = device.read_blocks(0, &mut mbr_buffer) {
+                if let Err(e) = storage.read_device_sector(&device.name, 0, &mut mbr_buffer) {
                     crate::debug::serial_write_str(&alloc::format!(
                         "FAT32: [dev {}] Error leyendo MBR: {}\n",
                         dev_index, e
@@ -1188,7 +1188,7 @@ pub fn mount_fat32_from_storage(
                     dev_index, start_lba
                 ));
                 
-                if let Err(e) = device.read_blocks(start_lba, &mut boot_sector_buffer) {
+                if let Err(e) = storage.read_device_sector(&device.name, start_lba, &mut boot_sector_buffer) {
                     crate::debug::serial_write_str(&alloc::format!(
                         "FAT32: [dev {}] Error leyendo boot sector FAT32: {}\n",
                         dev_index, e
@@ -1202,13 +1202,29 @@ pub fn mount_fat32_from_storage(
         }
     }
     
-    // Verificar boot signature
+    // Verificar boot signature; si falla, probar heurística 4KiB (firma suele estar en sector +7)
     if boot_sector_buffer[510] != 0x55 || boot_sector_buffer[511] != 0xAA {
+        crate::debug::serial_write_str("FAT32: Boot signature inválida en LBA inicial; probando offsets alternativos...\n");
+        let mut alt_boot = [0u8; 512];
+        let mut found = false;
+        for add in [7u64,1,2,3,4,5,6,8] {
+            let try_lba = device_info.start_lba + add;
+            if let Ok(()) = storage.read_device_sector_real(&device_info.device_name, try_lba, &mut alt_boot) {
+                if alt_boot[510] == 0x55 && alt_boot[511] == 0xAA {
+                    crate::debug::serial_write_str(&alloc::format!("FAT32: ✅ Boot signature válida en LBA {} (offset +{})\n", try_lba, add));
+                    boot_sector_buffer.copy_from_slice(&alt_boot);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
         crate::debug::serial_write_str(&alloc::format!(
             "FAT32: Boot signature inválida: 0x{:02X}{:02X}\n",
             boot_sector_buffer[511], boot_sector_buffer[510]
         ));
         return Err(VfsError::InvalidFs("Boot signature inválida".into()));
+        }
     }
     
     crate::debug::serial_write_str("FAT32: Boot signature válida (0x55AA)\n");

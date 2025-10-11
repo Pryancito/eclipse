@@ -401,3 +401,114 @@ pub fn usb_audio_main() {
         stats.initialized_devices
     ));
 }
+
+/// Buffers de audio para streaming
+const MAX_AUDIO_BUFFER_SIZE: usize = 16384; // 16KB por buffer
+const NUM_AUDIO_BUFFERS: usize = 4; // Double/triple buffering
+
+pub struct AudioStreamBuffer {
+    pub data: Vec<u8>,
+    pub filled: usize,
+    pub timestamp: u64,
+    pub device_id: u32,
+}
+
+impl AudioStreamBuffer {
+    pub fn new(device_id: u32) -> Self {
+        Self {
+            data: vec![0u8; MAX_AUDIO_BUFFER_SIZE],
+            filled: 0,
+            timestamp: 0,
+            device_id,
+        }
+    }
+
+    pub fn write_samples(&mut self, samples: &[u8]) -> Result<usize, &'static str> {
+        let available = MAX_AUDIO_BUFFER_SIZE - self.filled;
+        let to_write = samples.len().min(available);
+        
+        self.data[self.filled..self.filled + to_write].copy_from_slice(&samples[..to_write]);
+        self.filled += to_write;
+        
+        Ok(to_write)
+    }
+
+    pub fn read_samples(&mut self, buffer: &mut [u8]) -> usize {
+        let to_read = buffer.len().min(self.filled);
+        buffer[..to_read].copy_from_slice(&self.data[..to_read]);
+        
+        // Shift remaining data
+        self.data.copy_within(to_read..self.filled, 0);
+        self.filled -= to_read;
+        
+        to_read
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.filled >= MAX_AUDIO_BUFFER_SIZE
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.filled == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.filled = 0;
+    }
+}
+
+/// Manager de streaming de audio
+pub struct AudioStreamManager {
+    playback_buffers: Vec<AudioStreamBuffer>,
+    capture_buffers: Vec<AudioStreamBuffer>,
+}
+
+impl AudioStreamManager {
+    pub fn new() -> Self {
+        Self {
+            playback_buffers: Vec::new(),
+            capture_buffers: Vec::new(),
+        }
+    }
+
+    pub fn create_playback_stream(&mut self, device_id: u32) -> Result<usize, &'static str> {
+        let index = self.playback_buffers.len();
+        self.playback_buffers.push(AudioStreamBuffer::new(device_id));
+        Ok(index)
+    }
+
+    pub fn create_capture_stream(&mut self, device_id: u32) -> Result<usize, &'static str> {
+        let index = self.capture_buffers.len();
+        self.capture_buffers.push(AudioStreamBuffer::new(device_id));
+        Ok(index)
+    }
+
+    pub fn write_playback(&mut self, stream_id: usize, samples: &[u8]) -> Result<usize, &'static str> {
+        if let Some(buffer) = self.playback_buffers.get_mut(stream_id) {
+            buffer.write_samples(samples)
+        } else {
+            Err("Stream de playback no encontrado")
+        }
+    }
+
+    pub fn read_capture(&mut self, stream_id: usize, buffer: &mut [u8]) -> Result<usize, &'static str> {
+        if let Some(stream_buffer) = self.capture_buffers.get_mut(stream_id) {
+            Ok(stream_buffer.read_samples(buffer))
+        } else {
+            Err("Stream de captura no encontrado")
+        }
+    }
+}
+
+/// Manager global de streaming de audio
+static mut AUDIO_STREAM_MANAGER: Option<AudioStreamManager> = None;
+
+pub fn init_audio_stream_manager() {
+    unsafe {
+        AUDIO_STREAM_MANAGER = Some(AudioStreamManager::new());
+    }
+}
+
+pub fn get_audio_stream_manager() -> Option<&'static mut AudioStreamManager> {
+    unsafe { AUDIO_STREAM_MANAGER.as_mut() }
+}

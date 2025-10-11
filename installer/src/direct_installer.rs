@@ -138,17 +138,14 @@ impl DirectInstaller {
             return Err(format!("{} no es un dispositivo de bloque valido", disk.name));
         }
 
-        // Verificar que no esté montado
-        let mount_output = std::process::Command::new("mount")
-            .output()
-            .map_err(|e| format!("Error ejecutando mount: {}", e))?;
+        // Verificar que no esté montado leyendo /proc/mounts
+        let mounts = std::fs::read_to_string("/proc/mounts")
+            .map_err(|e| format!("Error leyendo /proc/mounts: {}", e))?;
         
-        let mount_str = String::from_utf8_lossy(&mount_output.stdout);
-        if mount_str.contains(&disk.name) {
+        if mounts.contains(&disk.name) {
             println!("   Desmontando particiones existentes en {}...", disk.name);
-            let _ = std::process::Command::new("umount")
-                .args(&["-f", "-l", &format!("{}*", disk.name)])
-                .output();
+            // Desmontar usando wrapper nativo
+            let _ = eclipse_installer_lib::sys::mount::force_umount(&disk.name);
             // Esperar un momento para que el desmontaje se complete
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
@@ -210,8 +207,8 @@ impl DirectInstaller {
 
         // Sincronizar cambios
         println!("   Sincronizando cambios...");
-        let _ = std::process::Command::new("sync").output();
-        let _ = std::process::Command::new("partprobe").arg(&disk.name).output();
+        // Sincronizar usando wrapper nativo
+        eclipse_installer_lib::sys::mount::sync_fs();
 
         // Verificar que las particiones existen
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -261,16 +258,10 @@ impl DirectInstaller {
         fs::create_dir_all(&self.efi_mount_point)
             .map_err(|e| format!("Error creando directorio EFI: {}", e))?;
 
-        // Montar partición EFI
+        // Montar partición EFI usando wrapper nativo
         println!("   Montando particion EFI...");
-        let output = std::process::Command::new("mount")
-            .args(&[&efi_partition, &self.efi_mount_point])
-            .output()
-            .map_err(|e| format!("Error ejecutando mount: {}", e))?;
-
-        if !output.status.success() {
-            return Err(format!("No se pudo montar particion EFI: {}", String::from_utf8_lossy(&output.stderr)));
-        }
+        eclipse_installer_lib::sys::mount::mount_fat32(&efi_partition, &self.efi_mount_point)
+            .map_err(|e| format!("Error montando partición EFI: {}", e))?;
 
         // Crear estructura EFI
         println!("   Creando estructura EFI...");
@@ -509,20 +500,13 @@ impl DirectInstaller {
         
         // Verificar si el punto de montaje existe antes de desmontar
         if std::path::Path::new(&self.root_mount_point).exists() {
-            let output = std::process::Command::new("umount")
-                .args(&[&self.root_mount_point])
-                .output();
-
-            match output {
-                Ok(result) => {
-                    if !result.status.success() {
-                        println!("     Advertencia: No se pudo desmontar partición root: {}", String::from_utf8_lossy(&result.stderr));
-                    } else {
-                        println!("     Partición root desmontada");
-                    }
+            // Desmontar usando wrapper nativo
+            match eclipse_installer_lib::sys::mount::safe_umount(&self.root_mount_point) {
+                Ok(_) => {
+                    println!("     Partición root desmontada");
                 }
                 Err(e) => {
-                    println!("     Advertencia: Error ejecutando umount para root: {}", e);
+                    println!("     Advertencia: No se pudo desmontar partición root: {}", e);
                 }
             }
         } else {
@@ -534,20 +518,13 @@ impl DirectInstaller {
         
         // Verificar si el punto de montaje existe antes de desmontar
         if std::path::Path::new(&self.efi_mount_point).exists() {
-            let output = std::process::Command::new("umount")
-                .args(&[&self.efi_mount_point])
-                .output();
-
-            match output {
-                Ok(result) => {
-                    if !result.status.success() {
-                        println!("     Advertencia: No se pudo desmontar partición EFI: {}", String::from_utf8_lossy(&result.stderr));
-                    } else {
-                        println!("     Partición EFI desmontada");
-                    }
+            // Desmontar usando wrapper nativo
+            match eclipse_installer_lib::sys::mount::safe_umount(&self.efi_mount_point) {
+                Ok(_) => {
+                    println!("     Partición EFI desmontada");
                 }
                 Err(e) => {
-                    println!("     Advertencia: Error ejecutando umount para EFI: {}", e);
+                    println!("     Advertencia: No se pudo desmontar partición EFI: {}", e);
                 }
             }
         } else {
@@ -679,15 +656,9 @@ Desarrollado con amor en Rust
         fs::write(format!("{}/README.txt", self.efi_mount_point), readme_content)
             .map_err(|e| format!("Error creando README.txt: {}", e))?;
 
-        // Desmontar partición EFI
-        let output = std::process::Command::new("umount")
-            .arg(&self.efi_mount_point)
-            .output()
-            .map_err(|e| format!("Error ejecutando umount: {}", e))?;
-
-        if !output.status.success() {
-            eprintln!("Advertencia: Error desmontando particion EFI: {}", String::from_utf8_lossy(&output.stderr));
-        }
+        // Desmontar partición EFI usando wrapper nativo
+        eclipse_installer_lib::sys::mount::safe_umount(&self.efi_mount_point)
+            .map_err(|e| format!("Error desmontando EFI: {}", e))?;
 
         // Limpiar directorio de montaje
         let _ = fs::remove_dir(&self.efi_mount_point);
@@ -700,23 +671,23 @@ Desarrollado con amor en Rust
         println!("Discos disponibles:");
         println!("==================");
         
-        let output = std::process::Command::new("lsblk")
-            .args(&["-d", "-o", "NAME,SIZE,MODEL,TYPE"])
-            .output()
-            .map_err(|e| format!("Error ejecutando lsblk: {}", e))?;
+        // Listar discos usando wrapper nativo
+        let disks = eclipse_installer_lib::sys::disk::list_disks()
+            .map_err(|e| format!("Error listando discos: {}", e))?;
 
-        if !output.status.success() {
-            return Err(format!("Error listando discos: {}", String::from_utf8_lossy(&output.stderr)));
-        }
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let mut count = 1;
-        
-        for line in output_str.lines() {
-            if line.contains("disk") {
-                println!("  {}. {}", count, line);
-                count += 1;
-            }
+        for (i, disk) in disks.iter().enumerate() {
+            let size_gb = disk.size_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+            let model = disk.model.as_deref().unwrap_or("Unknown");
+            let removable = if disk.is_removable { "removable" } else { "disk" };
+            
+            println!(
+                "  {}. {} - {:.2} GB - {} ({})",
+                i + 1,
+                disk.name,
+                size_gb,
+                model,
+                removable
+            );
         }
         
         println!();

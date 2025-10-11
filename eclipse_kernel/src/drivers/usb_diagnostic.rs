@@ -224,7 +224,7 @@ pub fn usb_diagnostic_main() {
     
     // Iniciar sistema de hot-plug
     serial_write_str("USB_DIAGNOSTIC: Iniciando sistema de hot-plug USB...\n");
-    usb_hotplug_main();
+    let _hotplug_manager = usb_hotplug_main();
     
     // Iniciar APIs de user mode
     serial_write_str("USB_DIAGNOSTIC: Iniciando APIs USB para user mode...\n");

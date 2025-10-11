@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use alloc::format;
 use core::any::Any;
 use core::cmp;
+use eclipsefs_lib::format::tlv_tags;
 
 const HEADER_SIZE_BYTES: usize = 4096; // 8 sectores (header real)
 const HEADER_SIZE_BLOCKS: u64 = (HEADER_SIZE_BYTES / 512) as u64;
@@ -89,7 +90,8 @@ impl EclipseFSWrapper {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Cargando nodo {} bajo demanda (offset: {})\n", inode_num, entry.offset));
 
         // Calcular el offset absoluto en el disco
-        let absolute_offset = self.header.inode_table_offset + self.header.inode_table_size + entry.offset;
+        // entry.offset ya es absoluto (se calculó como inode_table_offset + inode_table_size + rel_offset)
+        let absolute_offset = entry.offset;
         
         // Buffer para leer el nodo (asumimos tamaño máximo de 4KB por nodo)
         let mut node_buffer = [0u8; 4096];
@@ -100,7 +102,8 @@ impl EclipseFSWrapper {
             storage,
             self.partition_index,
             absolute_offset,
-            &mut node_buffer
+            &mut node_buffer,
+            &self.device_info.device_name,
         ).map_err(|_| VfsError::InvalidOperation)?;
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
@@ -118,7 +121,8 @@ impl EclipseFSWrapper {
         // Sincronizar cache de bloques
         get_block_cache().sync(
             &mut StorageManager::new(),
-            self.partition_index
+            self.partition_index,
+            &self.device_info.device_name,
         ).map_err(|_| VfsError::InvalidOperation)?;
         
         crate::debug::serial_write_str("ECLIPSEFS: Sincronización completada\n");
@@ -135,6 +139,193 @@ impl EclipseFSWrapper {
         
         // Simular creación exitosa
         Ok(parent_inode + 1)
+    }
+
+    /// Leer el registro completo de un inodo desde disco a un buffer temporal
+    fn read_inode_record_into<'a>(
+        &self,
+        inode_num: u32,
+        storage: &mut StorageManager,
+        out: &'a mut [u8],
+    ) -> Result<&'a [u8], VfsError> {
+        // Buscar entrada de tabla de inodos
+        let entry = self
+            .inode_table_entries
+            .iter()
+            .find(|e| e.inode == inode_num as u64)
+            .ok_or(VfsError::FileNotFound)?;
+
+        // entry.offset ya es absoluto (calculado como inode_table_offset + inode_table_size + rel_offset)
+        let absolute_offset = entry.offset;
+
+        // Leer cabecera fija del registro (8 bytes: inode u32, record_size u32)
+        let mut header_buf = [0u8; 8];
+        read_data_from_offset(
+            get_block_cache(),
+            storage,
+            self.partition_index,
+            absolute_offset,
+            &mut header_buf,
+            &self.device_info.device_name,
+        )
+        .map_err(|e| {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Error leyendo cabecera de inodo {} en offset {}: {}\n",
+                inode_num, absolute_offset, e
+            ));
+            VfsError::InvalidOperation
+        })?;
+
+        let record_size = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]) as usize;
+        let total_to_read = 8usize.saturating_add(record_size).min(out.len());
+
+        // Leer el registro completo (cabecera + TLVs)
+        read_data_from_offset(
+            get_block_cache(),
+            storage,
+            self.partition_index,
+            absolute_offset,
+            &mut out[..total_to_read],
+            &self.device_info.device_name,
+        )
+        .map_err(|e| {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Error leyendo registro de inodo {} ({} bytes) en offset {}: {}\n",
+                inode_num, total_to_read, absolute_offset, e
+            ));
+            VfsError::InvalidOperation
+        })?;
+
+        Ok(&out[..total_to_read])
+    }
+
+    /// Extraer entradas de directorio desde un registro de inodo (TLV DIRECTORY_ENTRIES)
+    fn parse_directory_entries(&self, record: &[u8]) -> Vec<(String, u32)> {
+        let mut entries = Vec::new();
+        if record.len() < 8 { 
+            crate::debug::serial_write_str("ECLIPSEFS: Record demasiado corto para parsear entradas\n");
+            return entries; 
+        }
+        
+        let mut cursor = 8; // saltar cabecera (inode, record_size)
+        crate::debug::serial_write_str(&alloc::format!(
+            "ECLIPSEFS: Parseando record de {} bytes, cursor inicial: {}\n",
+            record.len(), cursor
+        ));
+        
+        while cursor + 6 <= record.len() {
+            let tag = u16::from_le_bytes([record[cursor], record[cursor + 1]]);
+            let len = u32::from_le_bytes([
+                record[cursor + 2],
+                record[cursor + 3],
+                record[cursor + 4],
+                record[cursor + 5],
+            ]) as usize;
+            cursor += 6;
+            if cursor + len > record.len() { 
+                crate::debug::serial_write_str("ECLIPSEFS: TLV se extiende más allá del record\n");
+                break; 
+            }
+
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: TLV tag={}, len={}\n",
+                tag, len
+            ));
+
+            if tag == tlv_tags::DIRECTORY_ENTRIES {
+                crate::debug::serial_write_str("ECLIPSEFS: Encontrado TLV DIRECTORY_ENTRIES\n");
+                let mut off = 0usize;
+                while off + 8 <= len {
+                    let name_len = u32::from_le_bytes([
+                        record[cursor + off],
+                        record[cursor + off + 1],
+                        record[cursor + off + 2],
+                        record[cursor + off + 3],
+                    ]) as usize;
+                    let inode = u32::from_le_bytes([
+                        record[cursor + off + 4],
+                        record[cursor + off + 5],
+                        record[cursor + off + 6],
+                        record[cursor + off + 7],
+                    ]);
+                    off += 8;
+                    if off + name_len > len { break; }
+                    let name_bytes = &record[cursor + off..cursor + off + name_len];
+                    let name = core::str::from_utf8(name_bytes).unwrap_or("").to_string();
+                    entries.push((name, inode));
+                    off += name_len;
+                }
+            }
+
+            cursor += len;
+        }
+        
+        if entries.is_empty() {
+            crate::debug::serial_write_str("ECLIPSEFS: No se encontró TLV DIRECTORY_ENTRIES en el record\n");
+        } else {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Parseadas {} entradas de directorio\n",
+                entries.len()
+            ));
+        }
+        
+        entries
+    }
+
+    /// Extraer metadatos básicos (modo, tamaño, uid/gid, tiempos) de un registro
+    fn parse_stat_from_record(&self, inode: u32, record: &[u8]) -> StatInfo {
+        let mut mode: u16 = 0o40755; // directorio por defecto
+        let mut size: u64 = 0;
+        let mut uid: u32 = 0;
+        let mut gid: u32 = 0;
+        let mut atime: u64 = 0;
+        let mut mtime: u64 = 0;
+        let mut ctime: u64 = 0;
+        let mut nlink: u32 = 1;
+
+        let mut cursor = 8;
+        while cursor + 6 <= record.len() {
+            let tag = u16::from_le_bytes([record[cursor], record[cursor + 1]]);
+            let len = u32::from_le_bytes([
+                record[cursor + 2],
+                record[cursor + 3],
+                record[cursor + 4],
+                record[cursor + 5],
+            ]) as usize;
+            cursor += 6;
+            if cursor + len > record.len() { break; }
+            let val = &record[cursor..cursor + len];
+            match tag {
+                t if t == tlv_tags::MODE && len >= 4 => {
+                    mode = u32::from_le_bytes([val[0], val[1], val[2], val[3]]) as u16;
+                }
+                t if t == tlv_tags::SIZE && len >= 8 => {
+                    size = u64::from_le_bytes([val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7]]);
+                }
+                t if t == tlv_tags::UID && len >= 4 => {
+                    uid = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+                }
+                t if t == tlv_tags::GID && len >= 4 => {
+                    gid = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+                }
+                t if t == tlv_tags::ATIME && len >= 8 => {
+                    atime = u64::from_le_bytes([val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7]]);
+                }
+                t if t == tlv_tags::MTIME && len >= 8 => {
+                    mtime = u64::from_le_bytes([val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7]]);
+                }
+                t if t == tlv_tags::CTIME && len >= 8 => {
+                    ctime = u64::from_le_bytes([val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7]]);
+                }
+                t if t == tlv_tags::NLINK && len >= 4 => {
+                    nlink = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+                }
+                _ => {}
+            }
+            cursor += len;
+        }
+
+        StatInfo { inode, size, mode, uid, gid, atime, mtime, ctime, nlink }
     }
 }
 
@@ -180,8 +371,8 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     // 🎯 ESTRATEGIA CORRECTA: Usar sistema de nombres de dispositivos estilo Linux
     crate::debug::serial_write_str("ECLIPSEFS: (root) 🎯 ESTRATEGIA CORRECTA - Usando sistema de nombres estilo Linux\n");
     
-    let device_info = &storage.devices[device_index].info;
-    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Dispositivo seleccionado: {} (Tipo: {:?})\n", device_info.device_name, device_info.controller_type));
+    let device_info = &storage.devices[device_index];
+    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Dispositivo seleccionado: {} (Tipo: {:?})\n", device_info.name, device_info.controller_type));
     
     // 📋 BUSCAR PARTICIONES ECLIPSEFS:
     // - Primero buscar cualquier partición que pueda ser EclipseFS (incluyendo /dev/sdap1, etc.)
@@ -192,7 +383,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     // Buscar cualquier partición que pueda ser EclipseFS (incluyendo nombres alternativos)
     for partition in &storage.partitions {
         // Buscar particiones que no sean FAT32 y que tengan un tamaño razonable
-        if partition.filesystem_type != crate::partitions::FilesystemType::FAT32 {
+        if partition.filesystem_type != "FAT32" {
             let size_mb = (partition.size_lba * 512) / (1024 * 1024);
             if size_mb >= 1 {
                 eclipsefs_partition = Some(partition);
@@ -211,7 +402,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
         for partition in &storage.partitions {
             crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Verificando partición: {} (tipo: {:?})\n", partition.name, partition.filesystem_type));
             
-            if partition.filesystem_type == crate::partitions::FilesystemType::EclipseFS {
+            if partition.filesystem_type == "EclipseFS" {
                 eclipsefs_partition = Some(partition);
                 crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) ✅ Encontrada partición EclipseFS en {}\n", partition.name));
                 break;
@@ -226,7 +417,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
             let storage_partitions = ["/dev/sda2", "/dev/sda1", "/dev/sdb1", "/dev/sdb2", "/dev/sdc1", "/dev/sdc2", "/dev/vda1", "/dev/vda2", "/dev/vdb1", "/dev/vdb2", "/dev/hda1", "/dev/hda2", "/dev/hdb1", "/dev/hdb2", "/dev/hdc1", "/dev/hdc2"];
             for partition_name in &storage_partitions {
                 if let Some(partition) = storage.find_partition_by_name(partition_name) {
-                    if partition.filesystem_type == crate::partitions::FilesystemType::EclipseFS {
+                    if partition.filesystem_type == "EclipseFS" {
                         eclipsefs_partition = Some(partition);
                         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) ✅ Encontrada partición EclipseFS tradicional en {}\n", partition_name));
                         break;
@@ -267,8 +458,8 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     crate::debug::serial_write_str("ECLIPSEFS: (root) Leyendo realmente desde el disco\n");
     
     // Leer el boot sector desde la partición usando el storage manager
-    // CORRECCIÓN: Usar el índice correcto de la partición (/dev/sda2 = índice 1)
-    let partition_index = if partition.name == "/dev/sda2" { 1 } else { 0 };
+    // CORRECCIÓN: Usar el índice correcto de la partición (/dev/sda2 = índice 2)
+    let partition_index = if partition.name == "/dev/sda2" { 2 } else { 1 };
     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Usando índice de partición {} para {}\n", partition_index, partition.name));
     
     // NUEVA ESTRATEGIA: Buscar EclipseFS en diferentes sectores dentro de la partición
@@ -279,7 +470,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     for sector in 0..10 {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Probando sector {} dentro de la partición\n", sector));
         
-        match storage.read_from_partition(partition_index, sector, &mut boot_sector[..]) {
+        match storage.read_from_partition(&partition.device_name, partition_index, sector, &mut boot_sector[..]) {
             Ok(()) => {
                 crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Sector {} leído exitosamente\n", sector));
                 
@@ -304,7 +495,30 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     }
     
     if !eclipsefs_found {
-        crate::debug::serial_write_str("ECLIPSEFS: (root) ❌ EclipseFS no encontrado en los primeros 10 sectores de la partición\n");
+        crate::debug::serial_write_str("ECLIPSEFS: (root) ❌ No encontrado en 512B sec 0..9; probando heurística 4KiB (saltos de 8 sectores)\n");
+        // Heurística 4KiB: probar sectores 0,8,16,...,56 dentro de la partición
+        for mult in 0..8u64 {
+            let sector = mult * 8;
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Heurística 4KiB - probando sector {} ({}*8)\n", sector, mult));
+            match storage.read_from_partition(&partition.device_name, partition_index, sector, &mut boot_sector[..]) {
+                Ok(()) => {
+                    let magic = &boot_sector[0..9];
+                    if magic == b"ECLIPSEFS" {
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) ✅ Encontrado con heurística 4KiB en sector {}\n", sector));
+                        eclipsefs_found = true;
+                        sector_offset = sector;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Error leyendo sector {} (4KiB): {:?}\n", sector, e));
+                }
+            }
+        }
+    }
+
+    if !eclipsefs_found {
+        crate::debug::serial_write_str("ECLIPSEFS: (root) ❌ EclipseFS no encontrado tras heurísticas\n");
         return Err(VfsError::DeviceError("EclipseFS no encontrado en la partición".into()));
     }
     
@@ -382,7 +596,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
         crate::debug::serial_write_str("\n");
         
         storage
-            .read_from_partition(partition_index, block, slice)
+            .read_from_partition(&partition.device_name, partition_index, block, slice)
             .map_err(|e| {
                 crate::debug::serial_write_str("ECLIPSEFS: Error leyendo bloque ");
                 serial_write_decimal(block);
@@ -525,7 +739,7 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     while bytes_filled < inode_table_size_usize {
         let block = absolute_offset / 512;
         storage
-            .read_from_partition(partition_index, block, &mut block_buffer)
+            .read_from_partition(&partition.device_name, partition_index, block, &mut block_buffer)
             .map_err(|e| {
                 crate::debug::serial_write_str("ECLIPSEFS: Error leyendo tabla de inodos\n");
                 VfsError::DeviceError(e.into())
@@ -827,11 +1041,11 @@ pub fn obtener_dispositivos_eclipsefs_candidatos() -> Vec<EclipseFSDeviceInfo> {
             crate::debug::serial_write_str("ECLIPSEFS: /dev/sda2 no encontrado, buscando otras particiones no-FAT32...\n");
             for particion in &storage.partitions {
                 // Buscar particiones que no sean FAT32 (para evitar conflicto con EFI)
-                if particion.filesystem_type != crate::partitions::FilesystemType::FAT32 {
+                if particion.filesystem_type != "FAT32" {
                     // Verificar que tenga un tamaño mínimo razonable (al menos 1MB)
                     let size_mb = (particion.size_lba * 512) / (1024 * 1024);
                     if size_mb >= 1 {
-                        let info = if particion.filesystem_type == crate::partitions::FilesystemType::Unknown {
+                        let info = if particion.filesystem_type == "Unknown" {
                             EclipseFSDeviceInfo::with_info(
                                 particion.name.clone(),
                                 particion.size_lba,
@@ -967,30 +1181,9 @@ impl FileSystem for EclipseFSWrapper {
     
     fn read(&self, inode: u32, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo inodo {} offset {} ({} bytes)\n", inode, offset, buffer.len()));
-        
-        // Crear un storage manager temporal para la operación de lectura
-        let mut storage = StorageManager::new();
-        
-        // Cargar el nodo bajo demanda
-        let node = self.load_node_lazy(inode, &mut storage)?;
-        
-        // Si es un archivo, obtener los datos
-        if node.kind == eclipsefs_lib::NodeKind::File {
-            let data = node.get_data();
-        let start = offset as usize;
-            let end = (start + buffer.len()).min(data.len());
-            
-            if start < data.len() {
-                let len = end - start;
-                buffer[..len].copy_from_slice(&data[start..end]);
-                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leídos {} bytes del inodo {}\n", len, inode));
-                Ok(len)
-            } else {
-                Ok(0)
-            }
-        } else {
-            Err(VfsError::InvalidOperation)
-        }
+        // Lectura de archivos reales desde TLVs: pendiente en el formato
+        let _ = (inode, offset, buffer);
+        Err(VfsError::FileNotFound)
     }
     fn write(&mut self, inode: u32, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Escribiendo {} bytes al inodo {} offset {}\n", 
@@ -1004,36 +1197,45 @@ impl FileSystem for EclipseFSWrapper {
     }
 
     fn stat(&self, inode: u32) -> Result<StatInfo, VfsError> {
-        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Stat inodo {} (lazy)\n", inode));
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Stat inodo {} (lazy real)\n", inode));
         
-        // Crear un storage manager temporal para la operación de lectura
+        // Crear StorageManager temporal (simplificado)
         let mut storage = StorageManager::new();
         
-        // Cargar el nodo bajo demanda
-        let node = self.load_node_lazy(inode, &mut storage)?;
-        
-    Ok(StatInfo {
-            inode,
-        size: node.size,
-            mode: node.mode as u16,
-        uid: node.uid,
-        gid: node.gid,
-        atime: node.atime,
-        mtime: node.mtime,
-        ctime: node.ctime,
-            nlink: node.nlink,
-        })
+        let mut temp = [0u8; 8192];
+        let rec = self.read_inode_record_into(inode, &mut storage, &mut temp)?;
+        Ok(self.parse_stat_from_record(inode, rec))
     }
 
     fn readdir(&self, inode: u32) -> Result<Vec<String>, VfsError> {
-        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Readdir inodo {} (lazy)\n", inode));
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Readdir inodo {} (lazy real)\n", inode));
         
-        // Para la implementación lazy, por ahora devolvemos un directorio básico
-        // TODO: Implementar lectura de directorio lazy
-        let mut entries = Vec::new();
-        entries.push(".".to_string());
-        entries.push("..".to_string());
-        Ok(entries)
+        // Crear StorageManager temporal (simplificado)
+        let mut storage = StorageManager::new();
+        
+        let mut temp = [0u8; 8192];
+        
+        // Debug: mostrar información de la entrada antes de leer
+        if let Some(entry) = self.inode_table_entries.iter().find(|e| e.inode == inode as u64) {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Entrada encontrada - inode={}, offset={}\n",
+                entry.inode, entry.offset
+            ));
+        } else {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - No se encontró entrada para inodo {}\n",
+                inode
+            ));
+            return Err(VfsError::FileNotFound);
+        }
+        
+        let rec = self.read_inode_record_into(inode, &mut storage, &mut temp)?;
+        let pairs = self.parse_directory_entries(rec);
+        let mut list = Vec::new();
+        list.push(".".to_string());
+        list.push("..".to_string());
+        for (name, _ino) in pairs { list.push(name); }
+        Ok(list)
     }
     
     fn truncate(&mut self, _inode: u32, _size: u64) -> Result<(), VfsError> { Ok(()) }
@@ -1044,19 +1246,26 @@ impl FileSystem for EclipseFSWrapper {
     fn chown(&mut self, _inode: u32, _uid: u32, _gid: u32) -> Result<(), VfsError> { Ok(()) }
 
     fn resolve_path(&self, path: &str) -> Result<u32, VfsError> {
-        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Resolviendo ruta '{}' (lazy)\n", path));
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Resolviendo ruta '{}' (lazy real)\n", path));
+        let norm = normalize_path(path);
+        if norm == "/" { return Ok(1); }
         
-        // Para la implementación lazy, por ahora solo resolvemos rutas básicas
-        match path {
-            "/" => Ok(1), // Root inode
-            "/bin" => Ok(2),
-            "/etc" => Ok(3),
-            "/home" => Ok(4),
-            _ => {
-                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta '{}' no encontrada\n", path));
-                Err(VfsError::FileNotFound)
+        // Crear StorageManager temporal (simplificado)
+        let mut storage = StorageManager::new();
+        
+        let mut temp = [0u8; 8192];
+        let mut current_inode = 1u32;
+        for comp in norm.trim_start_matches('/').split('/') {
+            if comp.is_empty() { continue; }
+            let rec = self.read_inode_record_into(current_inode, &mut storage, &mut temp)?;
+            let pairs = self.parse_directory_entries(rec);
+            if let Some((_, next)) = pairs.into_iter().find(|(n, _)| n == comp) {
+                current_inode = next;
+            } else {
+                return Err(VfsError::FileNotFound);
             }
         }
+        Ok(current_inode)
     }
 
     fn readdir_path(&self, path: &str) -> Result<Vec<String>, VfsError> {

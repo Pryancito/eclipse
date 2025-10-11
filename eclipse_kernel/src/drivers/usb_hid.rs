@@ -726,6 +726,271 @@ impl HidDriver {
     pub fn get_report_descriptor_length(&self) -> u16 {
         self.report_descriptor.to_bytes().len() as u16
     }
+
+    /// Leer reporte de entrada del dispositivo
+    pub fn read_input_report(&mut self, buffer: &mut [u8]) -> Result<usize, &'static str> {
+        use crate::debug::serial_write_str;
+        
+        static mut READ_DEBUG_COUNT: u32 = 0;
+        
+        if !self.initialized {
+            return Err("Driver no inicializado");
+        }
+
+        // Para teclado, leer desde el puerto PS/2 (0x60)
+        // QEMU emula el teclado USB como PS/2 en puerto 0x60
+        if self.info.device_protocol == 0x01 && buffer.len() >= 8 {
+            // Leer estado del puerto PS/2
+            let status = unsafe { x86::io::inb(0x64) };
+            
+            // Debug: mostrar status las primeras veces
+            unsafe {
+                if READ_DEBUG_COUNT < 5 {
+                    serial_write_str(&alloc::format!(
+                        "HID_KBD: Puerto 0x64 status: 0x{:02X} (bit0={} - hay datos)\n",
+                        status, (status & 0x01)
+                    ));
+                    READ_DEBUG_COUNT += 1;
+                }
+            }
+            
+            // Verificar si hay datos disponibles (bit 0 = 1)
+            if (status & 0x01) != 0 {
+                let scancode = unsafe { x86::io::inb(0x60) };
+                
+                serial_write_str(&alloc::format!(
+                    "HID_KBD: ✅ Scancode PS/2 leído: 0x{:02X}\n",
+                    scancode
+                ));
+                
+                // Ignorar scancodes de liberación (bit 7 = 1)
+                if (scancode & 0x80) == 0 {
+                    let hid_code = self.ps2_to_hid_keycode(scancode);
+                    
+                    serial_write_str(&alloc::format!(
+                        "HID_KBD: ✅ Convertido a HID: 0x{:02X}\n",
+                        hid_code
+                    ));
+                    
+                    // Construir reporte HID básico desde scancode PS/2
+                    buffer[0] = 0; // Modificadores (TODO: detectar Shift/Ctrl/Alt)
+                    buffer[1] = 0; // Reservado
+                    buffer[2] = hid_code;
+                    buffer[3] = 0;
+                    buffer[4] = 0;
+                    buffer[5] = 0;
+                    buffer[6] = 0;
+                    buffer[7] = 0;
+                    
+                    return Ok(8);
+                } else {
+                    serial_write_str(&alloc::format!(
+                        "HID_KBD: Scancode de liberación ignorado: 0x{:02X}\n",
+                        scancode
+                    ));
+                }
+            }
+        }
+
+        // En una implementación real USB, aquí se leería del endpoint USB
+        Ok(0)
+    }
+    
+    /// Convertir scancode PS/2 a código HID
+    fn ps2_to_hid_keycode(&self, scancode: u8) -> u8 {
+        // Mapeo simplificado de PS/2 a HID
+        match scancode {
+            0x1E => 0x04, // A
+            0x30 => 0x05, // B
+            0x2E => 0x06, // C
+            0x20 => 0x07, // D
+            0x12 => 0x08, // E
+            0x21 => 0x09, // F
+            0x22 => 0x0A, // G
+            0x23 => 0x0B, // H
+            0x17 => 0x0C, // I
+            0x24 => 0x0D, // J
+            0x25 => 0x0E, // K
+            0x26 => 0x0F, // L
+            0x32 => 0x10, // M
+            0x31 => 0x11, // N
+            0x18 => 0x12, // O
+            0x19 => 0x13, // P
+            0x10 => 0x14, // Q
+            0x13 => 0x15, // R
+            0x1F => 0x16, // S
+            0x14 => 0x17, // T
+            0x16 => 0x18, // U
+            0x2F => 0x19, // V
+            0x11 => 0x1A, // W
+            0x2D => 0x1B, // X
+            0x15 => 0x1C, // Y
+            0x2C => 0x1D, // Z
+            0x02 => 0x1E, // 1
+            0x03 => 0x1F, // 2
+            0x04 => 0x20, // 3
+            0x05 => 0x21, // 4
+            0x06 => 0x22, // 5
+            0x07 => 0x23, // 6
+            0x08 => 0x24, // 7
+            0x09 => 0x25, // 8
+            0x0A => 0x26, // 9
+            0x0B => 0x27, // 0
+            0x1C => 0x28, // Enter
+            0x01 => 0x29, // Escape
+            0x0E => 0x2A, // Backspace
+            0x0F => 0x2B, // Tab
+            0x39 => 0x2C, // Space
+            _ => 0x00,    // Desconocido
+        }
+    }
+
+    /// Enviar reporte de salida al dispositivo
+    pub fn write_output_report(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        if !self.initialized {
+            return Err("Driver no inicializado");
+        }
+
+        // En una implementación real, aquí se escribiría al endpoint USB
+        Ok(())
+    }
+
+    /// Procesar reporte de entrada y convertirlo en evento
+    pub fn process_input_report(&self, report: &[u8]) -> Result<HidEvent, &'static str> {
+        match self.info.device_protocol {
+            0x01 => self.process_keyboard_report(report),
+            0x02 => self.process_mouse_report(report),
+            _ => Err("Tipo de dispositivo no soportado"),
+        }
+    }
+
+    /// Procesar reporte de teclado
+    fn process_keyboard_report(&self, report: &[u8]) -> Result<HidEvent, &'static str> {
+        if report.len() < 8 {
+            return Err("Reporte de teclado inválido");
+        }
+
+        let modifiers = report[0];
+        let keys = &report[2..8];
+
+        Ok(HidEvent::Keyboard {
+            modifiers,
+            keys: [keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]],
+        })
+    }
+
+    /// Procesar reporte de ratón
+    fn process_mouse_report(&self, report: &[u8]) -> Result<HidEvent, &'static str> {
+        if report.len() < 4 {
+            return Err("Reporte de ratón inválido");
+        }
+
+        let buttons = report[0];
+        let x = report[1] as i8;
+        let y = report[2] as i8;
+        let wheel = if report.len() > 3 { report[3] as i8 } else { 0 };
+
+        Ok(HidEvent::Mouse {
+            buttons,
+            x,
+            y,
+            wheel,
+        })
+    }
+}
+
+/// Eventos HID
+#[derive(Debug, Clone, Copy)]
+pub enum HidEvent {
+    Keyboard {
+        modifiers: u8,
+        keys: [u8; 6],
+    },
+    Mouse {
+        buttons: u8,
+        x: i8,
+        y: i8,
+        wheel: i8,
+    },
+    Gamepad {
+        buttons: u16,
+        left_stick_x: i16,
+        left_stick_y: i16,
+        right_stick_x: i16,
+        right_stick_y: i16,
+    },
+}
+
+/// Buffer de eventos HID global
+static mut HID_EVENT_BUFFER: Option<VecDeque<HidEvent>> = None;
+const MAX_HID_EVENTS: usize = 64;
+
+/// Inicializar el buffer de eventos HID
+pub fn init_hid_event_buffer() {
+    unsafe {
+        HID_EVENT_BUFFER = Some(VecDeque::with_capacity(MAX_HID_EVENTS));
+    }
+}
+
+/// Agregar evento al buffer
+pub fn push_hid_event(event: HidEvent) -> Result<(), &'static str> {
+    unsafe {
+        if let Some(buffer) = &mut HID_EVENT_BUFFER {
+            if buffer.len() < MAX_HID_EVENTS {
+                buffer.push_back(event);
+                Ok(())
+            } else {
+                // Buffer lleno, descartar evento más antiguo
+                buffer.pop_front();
+                buffer.push_back(event);
+                Ok(())
+            }
+        } else {
+            Err("Buffer de eventos no inicializado")
+        }
+    }
+}
+
+/// Obtener siguiente evento del buffer
+pub fn pop_hid_event() -> Option<HidEvent> {
+    unsafe {
+        if let Some(buffer) = &mut HID_EVENT_BUFFER {
+            buffer.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
+/// Obtener evento sin removerlo del buffer
+pub fn peek_hid_event() -> Option<HidEvent> {
+    unsafe {
+        if let Some(buffer) = &HID_EVENT_BUFFER {
+            buffer.front().copied()
+        } else {
+            None
+        }
+    }
+}
+
+/// Limpiar buffer de eventos
+pub fn clear_hid_events() {
+    unsafe {
+        if let Some(buffer) = &mut HID_EVENT_BUFFER {
+            buffer.clear();
+        }
+    }
+}
+
+/// Obtener número de eventos en el buffer
+pub fn get_hid_event_count() -> usize {
+    unsafe {
+        if let Some(buffer) = &HID_EVENT_BUFFER {
+            buffer.len()
+        } else {
+            0
+        }
+    }
 }
 
 /// Función de conveniencia para crear un driver HID
@@ -735,4 +1000,154 @@ pub fn create_hid_driver(
     endpoint_address: u8,
 ) -> HidDriver {
     HidDriver::new(info, device_address, endpoint_address)
+}
+
+/// Manager global de dispositivos HID
+pub struct HidManager {
+    devices: Vec<HidDriver>,
+    keyboard_devices: Vec<usize>,
+    mouse_devices: Vec<usize>,
+}
+
+impl HidManager {
+    pub fn new() -> Self {
+        Self {
+            devices: Vec::new(),
+            keyboard_devices: Vec::new(),
+            mouse_devices: Vec::new(),
+        }
+    }
+
+    /// Registrar un nuevo dispositivo HID
+    pub fn register_device(&mut self, mut driver: HidDriver) -> Result<usize, &'static str> {
+        driver.initialize()?;
+        
+        let index = self.devices.len();
+        let protocol = driver.info.device_protocol;
+        
+        self.devices.push(driver);
+        
+        // Clasificar dispositivo
+        match protocol {
+            0x01 => self.keyboard_devices.push(index),
+            0x02 => self.mouse_devices.push(index),
+            _ => {}
+        }
+        
+        Ok(index)
+    }
+
+    /// Obtener dispositivo por índice
+    pub fn get_device(&mut self, index: usize) -> Option<&mut HidDriver> {
+        self.devices.get_mut(index)
+    }
+
+    /// Obtener todos los dispositivos de teclado
+    pub fn get_keyboard_devices(&self) -> &[usize] {
+        &self.keyboard_devices
+    }
+
+    /// Obtener todos los dispositivos de ratón
+    pub fn get_mouse_devices(&self) -> &[usize] {
+        &self.mouse_devices
+    }
+
+    /// Poll de todos los dispositivos HID
+    pub fn poll_all(&mut self) -> Result<(), &'static str> {
+        use crate::debug::serial_write_str;
+        
+        static mut POLL_DEBUG_COUNT: u32 = 0;
+        
+        let mut report_buffer = [0u8; 64];
+        let device_count = self.devices.len();
+        
+        unsafe {
+            if POLL_DEBUG_COUNT < 5 {
+                serial_write_str(&alloc::format!(
+                    "HID_MANAGER: Poll #{} - {} dispositivos registrados\n",
+                    POLL_DEBUG_COUNT, device_count
+                ));
+                POLL_DEBUG_COUNT += 1;
+            }
+        }
+        
+        for (idx, driver) in self.devices.iter_mut().enumerate() {
+            match driver.read_input_report(&mut report_buffer) {
+                Ok(bytes_read) => {
+                    if bytes_read > 0 {
+                        serial_write_str(&alloc::format!(
+                            "HID_MANAGER: ✅ Dispositivo {} reportó {} bytes\n",
+                            idx, bytes_read
+                        ));
+                        
+                        if let Ok(event) = driver.process_input_report(&report_buffer[..bytes_read]) {
+                            serial_write_str("HID_MANAGER: ✅ Evento procesado, añadiendo a cola\n");
+                            push_hid_event(event)?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    unsafe {
+                        if POLL_DEBUG_COUNT < 3 {
+                            serial_write_str(&alloc::format!(
+                                "HID_MANAGER: Error dispositivo {}: {}\n",
+                                idx, e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Obtener estadísticas
+    pub fn get_stats(&self) -> (usize, usize, usize) {
+        (
+            self.devices.len(),
+            self.keyboard_devices.len(),
+            self.mouse_devices.len(),
+        )
+    }
+}
+
+/// Manager global de HID
+static mut HID_MANAGER: Option<HidManager> = None;
+
+/// Inicializar el manager de HID
+pub fn init_hid_manager() {
+    unsafe {
+        HID_MANAGER = Some(HidManager::new());
+    }
+    init_hid_event_buffer();
+}
+
+/// Obtener el manager de HID
+pub fn get_hid_manager() -> Option<&'static mut HidManager> {
+    unsafe { HID_MANAGER.as_mut() }
+}
+
+/// Registrar dispositivo HID en el manager global
+pub fn register_hid_device(
+    info: HidDeviceInfo,
+    device_address: u8,
+    endpoint_address: u8,
+) -> Result<usize, &'static str> {
+    let driver = create_hid_driver(info, device_address, endpoint_address);
+    
+    if let Some(manager) = get_hid_manager() {
+        manager.register_device(driver)
+    } else {
+        Err("HID manager no inicializado")
+    }
+}
+
+/// Poll de todos los dispositivos HID
+pub fn poll_hid_devices() -> Result<(), &'static str> {
+    if let Some(manager) = get_hid_manager() {
+        manager.poll_all()
+    } else {
+        Err("HID manager no inicializado")
+    }
 }
