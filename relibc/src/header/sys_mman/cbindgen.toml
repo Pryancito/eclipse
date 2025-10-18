@@ -1,0 +1,10 @@
+sys_includes = ["stdarg.h", "stdint.h", "sys/types.h"]
+include_guard = "_SYS_MMAN_H"
+trailer = "#include <bits/sys/mman.h>"
+language = "C"
+style = "Tag"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true

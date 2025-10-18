@@ -1,0 +1,85 @@
+[package]
+name = "redoxfs"
+description = "The Redox Filesystem"
+repository = "https://gitlab.redox-os.org/redox-os/redoxfs"
+version = "0.8.0"
+license-file = "LICENSE"
+readme = "README.md"
+authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+edition = "2021"
+
+[lib]
+name = "redoxfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redoxfs"
+path = "src/bin/mount.rs"
+doc = false
+required-features = ["std"]
+
+[[bin]]
+name = "redoxfs-ar"
+path = "src/bin/ar.rs"
+doc = false
+required-features = ["std"]
+
+[[bin]]
+name = "redoxfs-clone"
+path = "src/bin/clone.rs"
+doc = false
+required-features = ["std"]
+
+[[bin]]
+name = "redoxfs-mkfs"
+path = "src/bin/mkfs.rs"
+doc = false
+required-features = ["std"]
+
+[dependencies]
+aes = { version = "0.8", default-features = false }
+argon2 = { version = "0.4", default-features = false, features = ["alloc"] }
+base64ct = { version = "1", default-features = false }
+bitflags = "2"
+endian-num = "0.1"
+env_logger = { version = "0.11", optional = true }
+getrandom = { version = "0.2.5", optional = true }
+libc = "0.2"
+libredox = { version = "0.1.6", features = ["call"], optional = true }
+log = { version = "0.4.14", default-features = false, optional = true }
+lz4_flex = { version = "0.11", default-features = false, features = ["checked-decode"] }
+range-tree = { version = "0.1", optional = true }
+redox-path = "0.3.0"
+redox-scheme = { version = "0.7.0", optional = true }
+redox_syscall = "0.5.15"
+seahash = { version = "4.1.0", default-features = false }
+termion = { version = "4", optional = true }
+uuid = { version = "1.4", default-features = false }
+xts-mode = { version = "0.5", default-features = false }
+
+[features]
+default = ["std", "log"]
+std = [
+    "env_logger",
+    "fuser",
+    "getrandom",
+    "libc",
+    "libredox",
+    "range-tree",
+    "termion",
+    "time",
+    "uuid/v4",
+    "redox_syscall/std",
+    "redox-scheme",
+]
+
+[target.'cfg(not(target_os = "redox"))'.dependencies]
+fuser = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
+time = { version = "0.3", optional = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[dev-dependencies]
+assert_cmd = "2.0.17"

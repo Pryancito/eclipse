@@ -1,0 +1,17 @@
+#TODO missing script for Meson (use system libraries), see https://github.com/mpv-player/mpv#compilation
+#TODO port to orbital
+#TODO missing dependencies
+[source]
+git = "https://github.com/mpv-player/mpv"
+rev = "818ce7c51a6b9179307950e919983e0909942098"
+[build]
+template = "custom"
+dependencies = [
+    "ffmpeg6",
+    "libass",
+    "libjpeg",
+    "libiconv",
+    "zlib",
+    "mesa",
+    "pulseaudio",
+]

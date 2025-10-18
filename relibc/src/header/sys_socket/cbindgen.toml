@@ -1,0 +1,13 @@
+sys_includes = ["stddef.h", "stdint.h", "sys/types.h", "sys/uio.h"]
+include_guard = "_SYS_SOCKET_H"
+trailer = "#include <bits/sys/socket.h>"
+language = "C"
+style = "Tag"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
+
+[export.rename]
+"iovec" = "struct iovec"

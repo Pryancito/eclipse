@@ -1,0 +1,5 @@
+#TODO port to orbital
+[source]
+git = "https://github.com/That1M8Head/sued"
+[build]
+template = "cargo"

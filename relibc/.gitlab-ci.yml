@@ -1,0 +1,56 @@
+image: "redoxos/redoxer:latest"
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+stages:
+    - build
+    - test
+before_script:
+    cargo install cbindgen
+
+default:
+    cache:
+        paths:
+            - target/
+
+build:linux:
+    stage: build
+    script:
+        - rustup show # Ensure correct toolchain is downloaded and installed
+        - make -j "$(nproc)" all
+
+build:redox:
+    stage: build
+    variables:
+        TARGET: x86_64-unknown-redox
+    script:
+        - ./redoxer.sh -j "$(nproc)" all
+
+test:linux:
+    stage: test
+    needs:
+        - build:linux
+    dependencies:
+        - build:linux
+    script:
+        - make test
+
+test:redox:
+    stage: test
+    needs:
+        - build:redox
+    dependencies:
+        - build:redox
+    variables:
+        TARGET: x86_64-unknown-redox
+    script:
+        # TODO: sigaction and sigaltstack sometimes hangs with multi core
+        - REDOXER_QEMU_ARGS="-smp 1" ./redoxer.sh test SKIP_REDOX=1
+
+fmt:
+    stage: test
+    needs: []
+    script:
+        - rustup component add rustfmt-preview
+        - ./fmt.sh -- --check

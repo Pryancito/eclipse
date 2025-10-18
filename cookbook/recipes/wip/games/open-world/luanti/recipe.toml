@@ -1,0 +1,23 @@
+#TODO not compiled or tested
+# build instructions: https://github.com/minetest/minetest/blob/master/doc/compiling/linux.md
+# customization - https://github.com/minetest/minetest/tree/master/doc/compiling#cmake-options
+[source]
+git = "https://github.com/minetest/minetest"
+branch = "stable-5"
+script = """
+git clone --depth 1 https://github.com/minetest/irrlicht.git "${COOKBOOK_SOURCE}"/lib/irrlichtmt
+"""
+[build]
+template = "cmake"
+dependencies = [
+    "freetype2",
+    "sqlite3",
+    "zlib",
+    "libpng",
+    "libjpeg",
+    "libogg",
+    "libvorbis",
+    "openal",
+    "curl",
+    "zstd",
+]

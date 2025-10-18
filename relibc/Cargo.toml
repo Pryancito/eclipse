@@ -1,0 +1,85 @@
+[package]
+name = "relibc"
+version = "0.2.5"
+authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+edition = "2024"
+
+[lib]
+name = "relibc"
+crate-type = ["staticlib"]
+
+[workspace]
+members = [
+    "src/crt0",
+    "src/crti",
+    "src/crtn",
+    "redox-rt",
+    "ld_so",
+    "generic-rt",
+]
+exclude = ["tests", "dlmalloc-rs"]
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+bitflags = "2"
+cbitset = "0.2"
+posix-regex = { version = "0.1.4", features = ["no_std"] }
+
+# TODO: For some reason, rand_jitter hasn't been updated to use the latest rand_core
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+rand_xorshift = "0.3"
+rand_jitter = "0.5"
+
+memchr = { version = "2.2.0", default-features = false }
+plain = "0.2"
+unicode-width = "0.1"
+__libc_only_for_layout_checks = { package = "libc", version = "0.2.149", optional = true }
+md5-crypto = { package = "md-5", version = "0.10.6", default-features = false }
+sha-crypt = { version = "0.5", default-features = false }
+base64ct = { version = "1.6", default-features = false, features = ["alloc"] }
+bcrypt-pbkdf = { version = "0.10", default-features = false, features = [
+    "alloc",
+] }
+scrypt = { version = "0.11", default-features = false, features = ["simple"] }
+pbkdf2 = { version = "0.12", features = ["sha2"] }
+sha2 = { version = "0.10", default-features = false }
+generic-rt = { path = "generic-rt" }
+chrono-tz = {version = "0.10", default-features = false}
+chrono = {version = "0.4", default-features = false, features = ["alloc"]}
+libm = "0.2"
+object = { version = "0.36.7", git = "https://gitlab.redox-os.org/andypython/object", default-features = false, features = ["elf", "read_core"] }
+spin = "0.9.8"
+argon2 = "0.5.3"
+
+[dependencies.dlmalloc]
+path = "dlmalloc-rs"
+default-features = false
+features = ["c_api"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sc = "0.2.3"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall = "0.5.13"
+redox-rt = { path = "redox-rt" }
+redox-path = "0.3"
+redox_event = { git = "https://gitlab.redox-os.org/redox-os/event.git", default-features = false, features = [
+    "redox_syscall",
+] }
+
+[features]
+default = ["check_against_libc_crate"]
+trace = []
+check_against_libc_crate = ["__libc_only_for_layout_checks"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[patch.crates-io]
+cc-11 = { git = "https://github.com/tea/cc-rs", branch = "riscv-abi-arch-fix", package = "cc" }
+redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/syscall.git", branch = "master" }

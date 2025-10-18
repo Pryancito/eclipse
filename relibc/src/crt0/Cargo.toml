@@ -1,0 +1,9 @@
+[package]
+name = "crt0"
+version = "0.1.0"
+authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+edition = "2024"
+
+[lib]
+name = "crt0"
+crate-type = ["staticlib"]

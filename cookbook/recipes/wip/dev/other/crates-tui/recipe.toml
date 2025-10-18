@@ -1,0 +1,8 @@
+#TODO port to the Orbital clipboard
+[source]
+git = "https://github.com/ratatui-org/crates-tui"
+[build]
+template = "cargo"
+dependencies = [
+    "openssl1",
+]

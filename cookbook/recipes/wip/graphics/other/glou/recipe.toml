@@ -1,0 +1,5 @@
+#TODO port to orbital
+[source]
+git = "https://github.com/Nurrl/glou"
+[build]
+template = "cargo"

@@ -1,0 +1,5 @@
+#TODO port to orbital
+[source]
+git = "https://github.com/Beastwick18/nyaa"
+[build]
+template = "cargo"

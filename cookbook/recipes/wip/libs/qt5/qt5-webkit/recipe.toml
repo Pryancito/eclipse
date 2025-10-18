@@ -1,0 +1,42 @@
+#TODO probably wrong branch
+#TODO maybe incomplete script, see https://github.com/qtwebkit/qtwebkit/wiki/Building-QtWebKit-on-Linux
+#TODO determine dependencies
+[source]
+git = "https://github.com/movableink/webkit"
+[build]
+template = "custom"
+dependencies = [
+    "qt5-base",
+    "qt5-guiaddons",
+    "qt5-connectivity",
+    "qt5-networkauth",
+    "qt5-positioning",
+    "qt5-sensors",
+    "qt5-declarative",
+    "qt5-webchannel",
+    "sqlite3",
+    "libicu",
+    "libhyphen",
+    "libxml2",
+    "libxslt",
+    "libjpeg",
+    "libpng",
+    "zlib",
+    "glib",
+    "gstreamer",
+]
+script = """
+COOKBOOK_CONFIGURE="cmake"
+COOKBOOK_CONFIGURE_FLAGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_CROSSCOMPILING=True
+    -DCMAKE_EXE_LINKER_FLAGS="-static"
+    -DCMAKE_INSTALL_PREFIX="/"
+    -DCMAKE_PREFIX_PATH="${COOKBOOK_SYSROOT}"
+    -DCMAKE_SYSTEM_NAME=Generic
+    -DCMAKE_SYSTEM_PROCESSOR="$(echo "${TARGET}" | cut -d - -f1)"
+    -DCMAKE_VERBOSE_MAKEFILE=On
+"${COOKBOOK_SOURCE}"
+)
+cookbook_configure
+"""

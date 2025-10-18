@@ -1,0 +1,23 @@
+#TODO missing CMake configuration, see https://wiki.hyprland.org/Getting-Started/Installation/#cmake-recommended
+[source]
+git = "https://github.com/hyprwm/Hyprland"
+[build]
+template = "custom"
+dependencies = [
+    "libinput",
+    "libxkbcommon",
+    "libxcb",
+    "pango",
+    "cairo",
+    "pixman",
+    "libwayland",
+    "seatd",
+    "libxrender",
+    "libx11",
+    "libxcomposite",
+    "libxfixes",
+]
+script = """
+mkdir -pv "${COOKBOOK_STAGE}"/usr/share/wayland-sessions
+cp -rv "${COOKBOOK_SOURCE}"/example/hyprland.desktop "${COOKBOOK_STAGE}"/usr/share/wayland-sessions
+"""

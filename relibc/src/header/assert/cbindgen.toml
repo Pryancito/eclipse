@@ -1,0 +1,10 @@
+sys_includes = ["features.h"]
+include_guard = "_RELIBC_ASSERT_H"
+trailer = "#include <bits/assert.h>"
+language = "C"
+style = "Tag"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true

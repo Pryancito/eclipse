@@ -1,0 +1,115 @@
+[source]
+same_as = "../drivers"
+
+[build]
+template = "custom"
+script = """
+BINS=(
+    acpid
+    fbbootlogd
+    fbcond
+    inputd
+    lived
+    nvmed
+    pcid
+    pcid-spawner
+    rtcd
+    vesad
+)
+
+virt_bins()
+{
+    BINS+=(virtio-blkd virtio-gpud)
+}
+
+x86_common_bins()
+{
+    BINS+=(ahcid ided ps2d vesad bgad nvidiad amdd inteld)
+    virt_bins
+}
+
+aarch64_bins()
+{
+    case "${BOARD}" in
+        raspi3b*)
+            BINS+=(bcm2835-sdhcid)
+        ;;
+        *)
+        #qemu-virt
+            virt_bins
+        ;;
+    esac
+}
+
+case "${TARGET}" in
+    i686-unknown-redox)
+        x86_common_bins
+        ;;
+    x86_64-unknown-redox)
+        x86_common_bins
+        ;;
+    aarch64-unknown-redox)
+        aarch64_bins
+        ;;
+    *)
+        ;;
+esac
+
+mkdir -pv "${COOKBOOK_STAGE}/bin" "${COOKBOOK_STAGE}/lib/drivers"
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=s
+export CARGO_PROFILE_RELEASE_PANIC=abort
+"${COOKBOOK_CARGO}" build ${build_flags} \
+    --manifest-path "${COOKBOOK_SOURCE}/Cargo.toml" \
+    $(for bin in "${BINS[@]}"; do echo "-p" "${bin}"; done)
+for bin in "${BINS[@]}"
+do
+    case "${bin}" in
+      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd)
+        cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/bin"
+        ;;
+      bgad | nvidiad | amdd | inteld)
+        # GPU drivers van a /lib/drivers para que pcid-spawner los encuentre
+        cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
+        ;;
+      *)
+        cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
+        ;;
+    esac
+done
+
+mkdir -pv "${COOKBOOK_STAGE}/etc/pcid"
+cp -v "${COOKBOOK_SOURCE}/initfs.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs.toml"
+cp -v "${COOKBOOK_SOURCE}/initfs_graphics.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs_graphics.toml"
+
+# Crear script de inicialización de gráficos
+cat > "${COOKBOOK_STAGE}/etc/init_graphics.rc" << 'GRAPHICS_INIT'
+# Graphics drivers initialization script
+# Priority: NVIDIA > AMD > Intel > BGA (QEMU) > VESA (fallback)
+
+echo "[init_graphics] Iniciando controlador PCI..."
+
+# Start PS/2 and ACPI first
+ps2d us
+acpid
+
+# Start pcid (required for pcid-spawner to work)
+pcid
+
+echo "[init_graphics] Detectando hardware gráfico..."
+
+# Launch pcid-spawner ONLY for graphics drivers
+# These drivers will try to claim the "display" scheme
+pcid-spawner /etc/pcid/initfs_graphics.toml
+
+# Launch vesad as fallback ONLY if no hardware driver claimed "display"
+# vesad will fail silently if another driver already owns "display"
+vesad
+
+echo "[init_graphics] Sistema gráfico inicializado"
+
+# Now load remaining drivers (storage, etc.)
+pcid-spawner /etc/pcid/initfs.toml
+GRAPHICS_INIT
+
+chmod +x "${COOKBOOK_STAGE}/etc/init_graphics.rc"
+"""

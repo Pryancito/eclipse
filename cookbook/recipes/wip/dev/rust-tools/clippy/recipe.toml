@@ -1,0 +1,5 @@
+#TODO camino crate error
+[source]
+git = "https://github.com/rust-lang/rust-clippy"
+[build]
+template = "cargo"

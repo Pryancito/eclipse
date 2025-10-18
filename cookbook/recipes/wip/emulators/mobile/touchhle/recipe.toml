@@ -1,0 +1,8 @@
+#TODO make boost work
+[source]
+git = "https://github.com/hikari-no-yume/touchHLE"
+[build]
+template = "cargo"
+dependencies = [
+    "boost",
+]

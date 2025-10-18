@@ -1,0 +1,15 @@
+--- a/installer/src/lib.rs
++++ b/installer/src/lib.rs
+@@ -585,7 +585,10 @@ where
+ 
+     // The rest of the disk is RedoxFS, reserving the GPT table mirror at the end of disk
+     let redoxfs_start = efi_end + 1;
+-    let redoxfs_end = ((((disk_size - gpt_reserved) / mibi) * mibi) / block_size) - 1;
++    // Calculate total blocks and reserve 34 sectors (17KB) for GPT backup table at end
++    let total_blocks = disk_size / block_size;
++    let gpt_backup_sectors = 34;
++    let redoxfs_end = total_blocks.saturating_sub(gpt_backup_sectors + 1);
+ 
+     // Format and install BIOS partition
+     {
+

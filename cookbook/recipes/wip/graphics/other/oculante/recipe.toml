@@ -1,0 +1,8 @@
+#TODO needs to be ported to Orbital
+[source]
+git = "https://github.com/woelper/oculante"
+[build]
+template = "cargo"
+dependencies = [
+    "gtk3",
+]

@@ -1,0 +1,12 @@
+#TODO port to Orbital
+[source]
+git = "https://github.com/alacritty/alacritty"
+[build]
+template = "custom"
+dependencies = [
+    "freetype2",
+    "fontconfig",
+]
+script = """
+cookbook_cargo_packages alacritty
+"""

@@ -1,0 +1,14 @@
+#TODO port to orbital
+#TODO build instructions - https://github.com/H-M-H/Weylus#building
+[source]
+git = "https://github.com/H-M-H/Weylus"
+[build]
+template = "custom"
+dependencies = [
+    "pango",
+    "gstreamer",
+    "dbus",
+]
+script = """
+cookbook_cargo_packages weylus
+"""

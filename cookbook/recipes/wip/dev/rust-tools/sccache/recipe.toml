@@ -1,0 +1,8 @@
+#TODO libc error
+[source]
+git = "https://github.com/mozilla/sccache"
+[build]
+template = "cargo"
+dependencies = [
+    "openssl1",
+]

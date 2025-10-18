@@ -1,0 +1,34 @@
+use crate::platform::types::*;
+
+pub const O_RDONLY: c_int = 0x0001_0000;
+pub const O_WRONLY: c_int = 0x0002_0000;
+pub const O_RDWR: c_int = 0x0003_0000;
+pub const O_ACCMODE: c_int = 0x0003_0000;
+pub const O_NONBLOCK: c_int = 0x0004_0000;
+pub const O_APPEND: c_int = 0x0008_0000;
+pub const O_SHLOCK: c_int = 0x0010_0000;
+pub const O_EXLOCK: c_int = 0x0020_0000;
+pub const O_ASYNC: c_int = 0x0040_0000;
+pub const O_FSYNC: c_int = 0x0080_0000;
+pub const O_SYNC: c_int = O_FSYNC;
+pub const O_CLOEXEC: c_int = 0x0100_0000;
+pub const O_CREAT: c_int = 0x0200_0000;
+pub const O_TRUNC: c_int = 0x0400_0000;
+pub const O_EXCL: c_int = 0x0800_0000;
+pub const O_DIRECTORY: c_int = 0x1000_0000;
+pub const O_PATH: c_int = 0x2000_0000;
+pub const O_SYMLINK: c_int = 0x4000_0000;
+// Negative to allow it to be used as int
+pub const O_NOFOLLOW: c_int = -0x8000_0000;
+
+pub const FD_CLOEXEC: c_int = 0x0100_0000;
+
+pub const O_NOCTTY: c_int = 0x00000200;
+
+// Defined for compatibility
+pub const O_NDELAY: c_int = O_NONBLOCK;
+
+// Flags for capability based "at" functions
+pub const AT_FDCWD: c_int = -100;
+pub const AT_SYMLINK_NOFOLLOW: c_int = 0x0200;
+pub const AT_EMPTY_PATH: c_int = 0x4000;

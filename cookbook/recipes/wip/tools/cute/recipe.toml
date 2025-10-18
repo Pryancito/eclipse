@@ -1,0 +1,8 @@
+#TODO port to orbital
+[source]
+git = "https://github.com/PThorpe92/CuTE"
+[build]
+template = "cargo"
+dependencies = [
+    "openssl1",
+]

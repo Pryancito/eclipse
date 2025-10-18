@@ -1,0 +1,59 @@
+# X11 configuration
+
+include = ["desktop.toml"]
+
+# Override the default settings here
+
+# General settings
+[general]
+# Filesystem size in MiB
+filesystem_size = 2048
+
+# Package settings
+[packages]
+gtk3 = {}
+libnettle = {}
+llvm18 = {}
+mesa-x11 = {}
+mesa-demos-x11 = {}
+sqlite3 = {}
+twm = {}
+webkitgtk3 = {}
+xev = {}
+xeyes = {}
+xinit = {}
+xkbcomp = {}
+xkbutils = {}
+xkeyboard-config = {}
+xserver-xorg = {}
+xserver-xorg-video-dummy = {}
+xterm = {}
+
+[[files]]
+path = "/usr/lib/init.d/20_xenv"
+data = """
+export DISPLAY :0
+export G_MESSAGES_DEBUG all
+export LD_DEBUG all
+export WEBKIT_DEBUG all
+glib-compile-schemas /usr/share/glib-2.0/schemas/
+"""
+
+[[files]]
+path = "/usr/lib/init.d/40_x"
+data = """
+bash /usr/bin/orbital-x11
+"""
+
+[[files]]
+path = "/usr/bin/orbital-x11"
+data = """
+#!/usr/bin/env bash
+
+set -ex
+
+X "${DISPLAY}" -verbose 6 &
+sleep 1
+twm &
+xterm &
+"""

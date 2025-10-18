@@ -1,0 +1,9 @@
+#TODO not compiled or tested
+# build instructions: https://github.com/nihui/vkpeak#build-from-source
+[source]
+git = "https://github.com/nihui/vkpeak"
+[build]
+template = "cmake"
+dependencies = [
+    "libvulkan",
+]

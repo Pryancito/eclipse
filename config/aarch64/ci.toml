@@ -1,0 +1,74 @@
+# The Redox build server configuration
+
+# General settings
+[general]
+# Do not prompt if settings are not defined
+prompt = false
+
+# Package settings
+[packages]
+base = {}
+base-initfs = {}
+bootloader = {}
+ca-certificates = {}
+contain = {}
+coreutils = {}
+curl = {}
+dash = {}
+diffutils = {}
+drivers = {}
+expat = {}
+extrautils = {}
+findutils = {}
+freetype2 = {}
+# gdbserver = {} # wrong libc type
+# gnu-binutils = {} # bfd doesn't recognize redox
+hicolor-icon-theme = {}
+installer = {}
+installer-gui = {}
+ion = {}
+kernel = {}
+libffi = {}
+libgcc = {}
+libjpeg = {}
+libogg = {}
+liborbital = {}
+libpng = {}
+libstdcxx = {}
+libvorbis = {}
+libxkbcommon = {}
+libxml2 = {}
+# mesa = {} # libudev was not found
+# mesa-glu = {} # depends on mesa
+# mpc = {} # libmpfr not found
+nano = {}
+nasm = {}
+ncurses = {}
+netdb = {}
+netsurf = {}
+netutils = {}
+nghttp2 = {}
+openssl1 = {}
+orbdata = {}
+orbital = {}
+orbterm = {}
+orbutils = {}
+orbutils-background = {}
+orbutils-launcher = {}
+orbutils-orblogin = {}
+patch = {}
+pcre = {}
+pkgutils = {}
+redoxfs = {}
+relibc = {}
+resist = {}
+ripgrep = {}
+# strace = {} # unknown syscall
+sdl1 = {}
+sed = {}
+smith = {}
+terminfo = {}
+userutils = {}
+uutils = {}
+vim = {}
+zlib = {}

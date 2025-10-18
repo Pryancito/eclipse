@@ -1,314 +1,65 @@
-# Eclipse OS - Sistema Operativo en Rust
-
-Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser eficiente, seguro y fácil de usar. Combina un kernel híbrido con un sistema de userland robusto y un sistema de display avanzado usando DRM (Direct Rendering Manager).
-
-## Características Principales
-
-### 🚀 Kernel Híbrido
-- **Arquitectura x86_64**: Soporte completo para procesadores de 64 bits
-- **Multiboot2**: Compatible con bootloaders estándar
-- **UEFI**: Soporte nativo para firmware UEFI moderno
-- **Gestión de memoria**: Sistema de memoria avanzado con paginación
-- **Interrupciones**: Manejo completo de interrupciones del sistema
-- **Drivers**: Drivers para VGA, teclado, mouse y más
-
-### 🖥️ Sistema de Display Avanzado
-- **DRM (Direct Rendering Manager)**: Control total de la pantalla en userland
-- **VGA Text Mode**: Modo de texto tradicional para compatibilidad
-- **Aceleración por hardware**: Rendimiento optimizado
-- **Múltiples monitores**: Soporte para configuraciones multi-pantalla
-- **Resoluciones modernas**: Soporte para resoluciones hasta 4K
-
-### 🏗️ Userland Robusto
-- **Módulos dinámicos**: Sistema de carga de módulos en tiempo de ejecución
-- **IPC (Inter-Process Communication)**: Comunicación eficiente entre procesos
-- **Sistema de archivos**: Soporte para FAT32, NTFS y sistemas personalizados
-- **Aplicaciones**: Framework para desarrollo de aplicaciones nativas
-
-### 🔧 Herramientas de Desarrollo
-- **Scripts de construcción**: Automatización completa del proceso de build
-- **Instalador**: Instalador automático para hardware real
-- **QEMU**: Soporte completo para emulación
-- **Debugging**: Herramientas de depuración integradas
-
-## Arquitectura del Sistema
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Eclipse OS v0.6.0                        │
-├─────────────────────────────────────────────────────────────┤
-│  Userland Applications                                      │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
-│  │   GUI Apps  │ │  Shell Apps │ │ System Apps │          │
-│  └─────────────┘ └─────────────┘ └─────────────┘          │
-├─────────────────────────────────────────────────────────────┤
-│  System Services                                            │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
-│  │ DRM Display │ │ File System │ │   Network   │          │
-│  └─────────────┘ └─────────────┘ └─────────────┘          │
-├─────────────────────────────────────────────────────────────┤
-│  Eclipse Kernel (Hybrid)                                    │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
-│  │   Memory    │ │ Interrupts  │ │   Drivers   │          │
-│  │ Management  │ │   Handler   │ │   (VGA,etc) │          │
-│  └─────────────┘ └─────────────┘ └─────────────┘          │
-├─────────────────────────────────────────────────────────────┤
-│  Hardware Layer                                             │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
-│  │   CPU       │ │   Memory    │ │   I/O       │          │
-│  │ (x86_64)    │ │   (RAM)     │ │  Devices    │          │
-│  └─────────────┘ └─────────────┘ └─────────────┘          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Instalación y Uso
-
-### Requisitos del Sistema
-
-- **Procesador**: x86_64 (64-bit)
-- **Memoria**: Mínimo 512MB RAM
-- **Almacenamiento**: 1GB de espacio libre
-- **Firmware**: UEFI o BIOS compatible
-- **Rust**: 1.70+ para compilación
-
-### Compilación Rápida
-
-```bash
-# Clonar el repositorio
-git clone https://github.com/Pryancito/eclipse.git
-cd eclipse
-
-# Compilar todo el sistema
-./build.sh
-
-# El sistema se compilará y creará una distribución en eclipse-os-build/
-
-cd install
-cargo run
-```
-
-### Compilación con DRM
-
-```bash
-# Compilar con sistema DRM habilitado
-./build.sh
-
-# Ejecutar con DRM
-cd eclipse-os-build/userland/bin
-./start_drm.sh
-```
-
-### Pruebas en QEMU
-
-```bash
-# Probar en QEMU con VGA
-qemu-system-x86_64 -kernel eclipse-os-build/boot/eclipse_kernel
-
-# Probar en QEMU con UEFI
-qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
-  -drive file=eclipse-os-build/efi/boot/bootx64.efi,format=raw
-```
-
-### Instalación en Hardware Real
-
-```bash
-# Crear imagen booteable
-./create_bootable_iso.sh
-
-# Grabar en USB
-sudo dd if=eclipse-os-hardware.iso of=/dev/sdX bs=4M status=progress
-
-# O usar el instalador
-cd installer
-cargo run --release
-```
-
-## Sistema de Display
-
-### DRM (Direct Rendering Manager)
-
-Eclipse OS incluye un sistema DRM completo para control avanzado de la pantalla:
-
-```rust
-use eclipse_userland::drm_display;
-
-// Mostrar "Eclipse OS" centrado
-drm_display::show_eclipse_os_centered()?;
-
-// Mostrar pantalla negra
-drm_display::show_black_screen()?;
-
-// Mostrar mensaje de bienvenida completo
-drm_display::show_eclipse_welcome()?;
-```
-
-### Características del DRM
-
-- **Control total de la pantalla**: Acceso directo al hardware gráfico
-- **Aceleración por hardware**: Rendimiento optimizado
-- **Múltiples monitores**: Soporte para configuraciones complejas
-- **Resoluciones modernas**: Hasta 4K y más
-- **Sin limitaciones de VGA**: Libertad total en el diseño
-
-### Configuración del Display
-
-El sistema se configura automáticamente, pero puedes personalizar:
-
-```ini
-[display]
-driver = "drm"              # Usar DRM como driver principal
-fallback = "vga"            # Fallback a VGA si DRM falla
-primary_device = "/dev/dri/card0"  # Dispositivo DRM principal
-```
-
-## Estructura del Proyecto
-
-```
-eclipse-os/
-├── eclipse_kernel/          # Kernel principal
-│   ├── src/
-│   │   ├── main.rs         # Punto de entrada del kernel
-│   │   ├── vga_centered_display.rs  # Sistema VGA
-│   │   ├── boot_messages.rs        # Mensajes de arranque
-│   │   └── ...             # Otros módulos del kernel
-│   └── Cargo.toml
-├── userland/                # Sistema userland
-│   ├── src/
-│   │   ├── drm_display.rs  # Sistema DRM
-│   │   ├── framebuffer_display.rs  # Sistema framebuffer
-│   │   └── ...             # Otros módulos userland
-│   ├── drm_display/        # Módulo DRM independiente
-│   └── Cargo.toml
-├── bootloader-uefi/         # Bootloader UEFI personalizado
-├── installer/               # Instalador del sistema
-├── eclipse-apps/            # Aplicaciones del sistema
-├── build.sh                 # Script de construcción principal
-└── README.md               # Este archivo
-```
-
-## Desarrollo
-
-### Agregar Nuevas Características
-
-1. **Módulos del Kernel**: Agregar en `eclipse_kernel/src/`
-2. **Módulos Userland**: Agregar en `userland/src/`
-3. **Aplicaciones**: Agregar en `eclipse-apps/`
-4. **Drivers**: Agregar en `eclipse_kernel/src/drivers/`
-
-### Compilación de Módulos Individuales
-
-```bash
-# Compilar solo el kernel
-cd eclipse_kernel
-cargo build --release
-
-# Compilar solo el userland
-cd userland
-cargo build --release
-
-# Compilar solo el sistema DRM
-cd userland/drm_display
-cargo build --release
-```
-
-### Testing
-
-```bash
-# Ejecutar tests del kernel
-cd eclipse_kernel
-cargo test
-
-# Ejecutar tests del userland
-cd userland
-cargo test
-
-# Ejecutar tests del DRM
-cd userland/drm_display
-cargo test
-```
-
-## Troubleshooting
-
-### Pantalla Verde en QEMU
-
-Si ves una pantalla verde en QEMU:
-
-1. **Verificar configuración VGA**: El kernel usa VGA por defecto
-2. **Probar en hardware real**: El problema puede ser específico de QEMU
-3. **Usar DRM**: Cambiar al sistema DRM en userland
-4. **Verificar logs**: Revisar mensajes de debug del kernel
-
-### Problemas de DRM
-
-Si el sistema DRM no funciona:
-
-1. **Verificar permisos**: Usuario debe estar en grupo `video`
-2. **Verificar dispositivo**: `/dev/dri/card0` debe existir
-3. **Usar fallback VGA**: El sistema tiene fallback automático
-4. **Revisar logs**: Verificar mensajes de error
-
-### Problemas de Compilación
-
-Si hay errores de compilación:
-
-1. **Actualizar Rust**: `rustup update`
-2. **Limpiar cache**: `cargo clean`
-3. **Verificar dependencias**: Instalar dependencias del sistema
-4. **Revisar logs**: Verificar mensajes de error específicos
-
-## Contribuir
-
-### Cómo Contribuir
-
-1. **Fork** el repositorio
-2. **Crear** una rama para tu feature
-3. **Commit** tus cambios
-4. **Push** a la rama
-5. **Crear** un Pull Request
-
-### Estándares de Código
-
-- **Rust**: Seguir las convenciones de Rust
-- **Documentación**: Documentar todas las funciones públicas
-- **Tests**: Incluir tests para nuevas funcionalidades
-- **Commits**: Usar mensajes de commit descriptivos
-
-## Licencia
-
-Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detalles.
-
-## Estado del Proyecto
-
-- **Versión**: 0.6.0
-- **Estado**: En desarrollo activo
-- **Kernel**: Funcional con VGA y UEFI
-- **Userland**: Sistema DRM implementado
-- **Aplicaciones**: En desarrollo
-- **Hardware**: Probado en QEMU y hardware real
-
-## Roadmap
-
-### Próximas Versiones
-
-- **v0.6.0**: Sistema de ventanas completo
-- **v0.7.0**: Aplicaciones de usuario
-- **v0.8.0**: Red y conectividad
-- **v1.0.0**: Release estable
-
-### Características Planificadas
-
-- **Sistema de ventanas**: GUI completa
-- **Aplicaciones nativas**: Editor, navegador, etc.
-- **Soporte de red**: TCP/IP completo
-- **Sistema de paquetes**: Gestor de paquetes nativo
-- **Multiusuario**: Soporte para múltiples usuarios
-
-## Contacto
-
-- **GitHub**: https://github.com/Pryancito/eclipse
-- **Issues**: https://github.com/Pryancito/eclipse/issues
-- **Discussions**: https://github.com/Pryancito/eclipse/discussions
-
----
-
-**Eclipse OS** - Un sistema operativo moderno para el futuro
+<p align="center">
+<img alt="Redox" width="346" src="https://gitlab.redox-os.org/redox-os/assets/raw/master/logos/redox/logo.png">
+</p>
+
+This repository is the **Build System** for Redox OS.
+
+Redox is under active development by a vibrant community, you can see the key links below:
+
+- [The **main website** for Redox OS](https://www.redox-os.org).
+- [The Redox Book](https://doc.redox-os.org/book/) and [Build Instructions](https://doc.redox-os.org/book/podman-build.html).
+- [Redox Chat and Support](https://matrix.to/#/#redox-join:matrix.org).
+- [Patreon](https://www.patreon.com/redox_os), [Donate](https://redox-os.org/donate/) and [Merch](https://redox-os.creator-spring.com/).
+- Scroll down for a list of key Redox components and their repositories.
+
+[Redox](https://www.redox-os.org) is an open-source operating system written in Rust, a language with focus on safety, efficiency and high performance. Redox uses a microkernel architecture, and aims to be reliable, secure, usable, correct, and free. Redox is inspired by previous operating systems, such as seL4, MINIX, Plan 9, Linux and BSD.
+
+Redox _is not_ just a kernel, it's a **full-featured operating system**, providing components (file system, display server, core utilities, etc.) that together make up a functional and convenient operating system. Redox uses the COSMIC desktop apps, and provides source code compatibility with many Rust, Linux and BSD programs.
+
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+## More Links
+
+- [Book](https://doc.redox-os.org/book/)
+- [Contribute](CONTRIBUTING.md)
+- [Hardware Compatibility](https://doc.redox-os.org/book/hardware-support.html)
+- Run Redox in a [Virtual Machine](https://doc.redox-os.org/book/running-vm.html) or on [Real Hardware](https://doc.redox-os.org/book/real-hardware.html)
+- [Trying Out Redox](https://doc.redox-os.org/book/trying-out-redox.html)
+- [Building Redox](https://doc.redox-os.org/book/podman-build.html)
+- [Build System Documentation](https://doc.redox-os.org/book/build-system-reference.html)
+- [Developer FAQ](https://doc.redox-os.org/book/developer-faq.html)
+- [Chat/Discussions/Help](https://doc.redox-os.org/book/chat.html)
+
+## Ecosystem
+
+Some of the key repositories on the Redox GitLab:
+
+| Essential Repositories                                                               | Maintainer
+|-------------------------------------------------------------------------------------------------------------|---------------------------
+| [Kernel](https://gitlab.redox-os.org/redox-os/kernel)                                                       | **@jackpot51**
+| [Base (essential system components)](https://gitlab.redox-os.org/redox-os/base)                             | **@jackpot51**
+| [RedoxFS (default filesystem)](https://gitlab.redox-os.org/redox-os/redoxfs)                                | **@jackpot51**
+| [Drivers](https://gitlab.redox-os.org/redox-os/drivers)                                                     | **@jackpot51**
+| [relibc (C POSIX library written in Rust)](https://gitlab.redox-os.org/redox-os/relibc)                     | **@jackpot51**
+| [Ion (defauilt shell)](https://gitlab.redox-os.org/redox-os/ion)                                            | **@jackpot51**
+| [Termion (terminal library)](https://gitlab.redox-os.org/redox-os/termion)                                  | **@jackpot51**
+| [netstack (network stack)](https://gitlab.redox-os.org/redox-os/netstack)                                   | **@jackpot51**
+| [pkgutils (current package manager)](https://gitlab.redox-os.org/redox-os/pkgutils)                         | **@jackpot51**
+| [Orbital (display server and window manager)](https://gitlab.redox-os.org/redox-os/orbital)                 | **@jackpot51**
+| This repo - the root of the Build System                                                                    | **@jackpot51**
+| [Cookbook (build system for system components and programs)](https://gitlab.redox-os.org/redox-os/cookbook) | **@jackpot51** **@hatred_45**
+| [Redoxer (tool for easy Redox development on Linux)](https://gitlab.redox-os.org/redox-os/redoxer)          | **@jackpot51**
+| [The Redox Book](https://gitlab.redox-os.org/redox-os/book)                                                 | **@jackpot51** **@hatred_45**
+| [Website](https://gitlab.redox-os.org/redox-os/website)                                                     | **@jackpot51** **@hatred_45**
+
+## What it looks like
+
+See [Redox in Action](https://www.redox-os.org/screens/) for photos and videos.
+
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/orbital-visual.png">
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-programs.png">
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-term-screenfetch.png">
+
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/cosmic-edit-redox.png">
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/website/-/raw/master/static/img/screenshot/image-viewer.png">
+<img alt="Redox" height="150" src="https://gitlab.redox-os.org/redox-os/assets/raw/master/screenshots/Boot.png">

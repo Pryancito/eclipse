@@ -1,0 +1,9 @@
+.idea/
+prefix/
+sysroot/
+**/target/
+.gdb_history
+*.patch
+*.swp
+*.swo
+/.vim

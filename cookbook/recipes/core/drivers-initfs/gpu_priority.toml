@@ -1,0 +1,39 @@
+# GPU Driver Priority Configuration
+# Este archivo controla qué driver GPU se carga primero
+# 
+# Los drivers se intentan en orden:
+# 1. nvidiad (NVIDIA - vendor 0x10DE)
+# 2. amdd (AMD - vendor 0x1002)  
+# 3. inteld (Intel - vendor 0x8086)
+# 4. vesad (fallback - usa framebuffer UEFI genérico)
+#
+# Si un driver específico (nvidia/amd/intel) detecta su hardware,
+# vesad NO se cargará para ese dispositivo.
+
+# NVIDIA GPUs - PRIORIDAD ALTA
+[[match]]
+class = 0x03
+vendor = 0x10DE
+name = "nvidiad"
+priority = 10
+
+# AMD GPUs - PRIORIDAD ALTA
+[[match]]
+class = 0x03
+vendor = 0x1002
+name = "amdd"
+priority = 10
+
+# Intel GPUs - PRIORIDAD ALTA
+[[match]]
+class = 0x03
+vendor = 0x8086
+name = "inteld"
+priority = 10
+
+# VESA/Generic - PRIORIDAD BAJA (solo si no hay driver específico)
+[[match]]
+class = 0x03
+name = "vesad"
+priority = 1
+

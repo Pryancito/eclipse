@@ -1,0 +1,5 @@
+#TODO can't find the Cargo.toml
+[source]
+git = "https://github.com/mstange/samply"
+[build]
+template = "cargo"

@@ -1,0 +1,12 @@
+sys_includes = ["time.h"]
+include_guard = "_RELIBC_SEMAPHORE_H"
+language = "C"
+style = "Type"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
+
+[export.rename]
+"timespec" = "struct timespec"

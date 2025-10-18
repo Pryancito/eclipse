@@ -1,0 +1,32 @@
+# build instructions: https://developer.gimp.org/core/setup/build/3.0/INSTALL
+#TODO make dependencies work
+[source]
+tar = "https://download.gimp.org/gimp/v3.0/gimp-3.0.4.tar.xz"
+[build]
+template = "custom"
+dependencies = [
+    "gtk3",
+    "gobject-introspection",
+    "glib",
+    "cairo",
+    "pango",
+    "liblcms",
+    "libmypaint",
+    "gexiv2",
+    "gegl",
+    "babl",
+    "librsvg",
+    "libtiff",
+    "libjpeg",
+    "libpng",
+    "fontconfig",
+    "freetype2",
+    "atk",
+    "harfbuzz",
+    "bzip2",
+    "zlib",
+]
+script = """
+DYNAMIC_INIT
+cookbook_configure
+"""
