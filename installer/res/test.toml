@@ -51,7 +51,6 @@ data = """
 rm -r /tmp
 mkdir -m a=rwxt /tmp
 
-randd
 ipcd
 ptyd
 sudo --daemon

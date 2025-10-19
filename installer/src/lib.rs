@@ -3,10 +3,8 @@ extern crate serde_derive;
 
 mod config;
 mod disk_wrapper;
-mod gpu_detect;
 
 pub use crate::config::file::FileConfig;
-pub use crate::gpu_detect::{detect_gpu, generate_init_graphics_rc, GpuInfo};
 pub use crate::config::package::PackageConfig;
 pub use crate::config::Config;
 use crate::disk_wrapper::DiskWrapper;
@@ -234,41 +232,11 @@ pub fn install_dir(
 
     let output_dir = output_dir.to_owned();
 
-    // Detect GPU and create init_graphics.rc
-    println!("Detecting GPU hardware...");
-    let gpu_info = gpu_detect::detect_gpu();
-    if let Some(ref gpu) = gpu_info {
-        println!("  Detected: {} GPU ({:04X}:{:04X})", 
-                 match gpu.vendor {
-                     gpu_detect::GpuVendor::Nvidia => "NVIDIA",
-                     gpu_detect::GpuVendor::Amd => "AMD",
-                     gpu_detect::GpuVendor::Intel => "Intel",
-                     gpu_detect::GpuVendor::Bochs => "Bochs (QEMU)",
-                     gpu_detect::GpuVendor::VirtIO => "VirtIO (QEMU)",
-                     gpu_detect::GpuVendor::Unknown => "Unknown",
-                 },
-                 gpu.vendor_id, gpu.device_id);
-        println!("  Driver: {}", gpu.driver_name());
-    } else {
-        println!("  No specific GPU detected, will use VESA fallback");
-    }
-    
-    // Generate init_graphics.rc
-    let init_graphics_content = gpu_detect::generate_init_graphics_rc(gpu_info.as_ref());
-    
     for file in &config.files {
         if !file.postinstall {
             file.create(&output_dir)?;
         }
     }
-
-    // Write init_graphics.rc to initfs
-    let init_graphics_path = output_dir.join("etc/init_graphics.rc");
-    if let Some(parent) = init_graphics_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&init_graphics_path, init_graphics_content)?;
-    println!("  Created: {}", init_graphics_path.display());
 
     install_packages(&config, output_dir.to_str().unwrap(), cookbook);
 
@@ -617,10 +585,7 @@ where
 
     // The rest of the disk is RedoxFS, reserving the GPT table mirror at the end of disk
     let redoxfs_start = efi_end + 1;
-    // Calculate total blocks and reserve 34 sectors (17KB) for GPT backup table at end
-    let total_blocks = disk_size / block_size;
-    let gpt_backup_sectors = 34;
-    let redoxfs_end = total_blocks.saturating_sub(gpt_backup_sectors + 1);
+    let redoxfs_end = ((((disk_size - gpt_reserved) / mibi) * mibi) / block_size) - 1;
 
     // Format and install BIOS partition
     {

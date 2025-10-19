@@ -28,11 +28,10 @@ patchelf = {}
 [[files]]
 path = "/usr/lib/init.d/20_orbital"
 data = """
-audiod &
-sleep 5
+audiod
 export BROWSER /bin/netsurf-fb
 export VT 3
-orbital orblogin launcher &
+orbital orblogin launcher
 unset BROWSER
 unset VT
 """

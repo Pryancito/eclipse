@@ -8,6 +8,7 @@ BINS=(
     acpid
     fbbootlogd
     fbcond
+    hwd
     inputd
     lived
     nvmed
@@ -24,7 +25,7 @@ virt_bins()
 
 x86_common_bins()
 {
-    BINS+=(ahcid ided ps2d vesad bgad nvidiad amdd inteld)
+    BINS+=(ahcid ided ps2d vesad)
     virt_bins
 }
 
@@ -64,12 +65,8 @@ export CARGO_PROFILE_RELEASE_PANIC=abort
 for bin in "${BINS[@]}"
 do
     case "${bin}" in
-      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd)
+      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd | hwd)
         cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/bin"
-        ;;
-      bgad | nvidiad | amdd | inteld)
-        # GPU drivers van a /lib/drivers para que pcid-spawner los encuentre
-        cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
         ;;
       *)
         cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
@@ -79,37 +76,4 @@ done
 
 mkdir -pv "${COOKBOOK_STAGE}/etc/pcid"
 cp -v "${COOKBOOK_SOURCE}/initfs.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs.toml"
-cp -v "${COOKBOOK_SOURCE}/initfs_graphics.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs_graphics.toml"
-
-# Crear script de inicialización de gráficos
-cat > "${COOKBOOK_STAGE}/etc/init_graphics.rc" << 'GRAPHICS_INIT'
-# Graphics drivers initialization script
-# Priority: NVIDIA > AMD > Intel > BGA (QEMU) > VESA (fallback)
-
-echo "[init_graphics] Iniciando controlador PCI..."
-
-# Start PS/2 and ACPI first
-ps2d us
-acpid
-
-# Start pcid (required for pcid-spawner to work)
-pcid
-
-echo "[init_graphics] Detectando hardware gráfico..."
-
-# Launch pcid-spawner ONLY for graphics drivers
-# These drivers will try to claim the "display" scheme
-pcid-spawner /etc/pcid/initfs_graphics.toml
-
-# Launch vesad as fallback ONLY if no hardware driver claimed "display"
-# vesad will fail silently if another driver already owns "display"
-vesad
-
-echo "[init_graphics] Sistema gráfico inicializado"
-
-# Now load remaining drivers (storage, etc.)
-pcid-spawner /etc/pcid/initfs.toml
-GRAPHICS_INIT
-
-chmod +x "${COOKBOOK_STAGE}/etc/init_graphics.rc"
 """

@@ -7,7 +7,7 @@ use rand::{
     Rng, SeedableRng,
     distributions::{Alphanumeric, Distribution, Uniform},
 };
-use rand_jitter::{JitterRng, rand_core::RngCore as JitterRngCore};
+use rand_jitter::JitterRng;
 use rand_xorshift::XorShiftRng;
 
 use crate::{
@@ -735,14 +735,7 @@ where
 
     for _ in 0..100 {
         let char_iter = iter::repeat(())
-            .map(|()| {
-                // Use a simple character generation with direct random bytes from JitterRng
-                let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                // JitterRng provides next_u64() method directly
-                let random_val = rng.next_u64();
-                let idx = (random_val as usize) % chars.len();
-                chars[idx] as char
-            })
+            .map(|()| rng.sample(Alphanumeric))
             .take(6)
             .enumerate();
         unsafe {
