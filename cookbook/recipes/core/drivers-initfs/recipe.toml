@@ -8,7 +8,6 @@ BINS=(
     acpid
     fbbootlogd
     fbcond
-    hwd
     inputd
     lived
     nvmed
@@ -16,6 +15,9 @@ BINS=(
     pcid-spawner
     rtcd
     vesad
+    xhcid
+    usbhidd
+    usbhubd
 )
 
 virt_bins()
@@ -25,7 +27,7 @@ virt_bins()
 
 x86_common_bins()
 {
-    BINS+=(ahcid ided ps2d vesad)
+    BINS+=(ahcid ided ps2d vesad bgad nvidiad amdd inteld)
     virt_bins
 }
 
@@ -65,10 +67,15 @@ export CARGO_PROFILE_RELEASE_PANIC=abort
 for bin in "${BINS[@]}"
 do
     case "${bin}" in
-      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd | hwd)
+      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd | xhcid)
         cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/bin"
         ;;
+      bgad | nvidiad | amdd | inteld)
+        # GPU drivers van a /lib/drivers para que pcid-spawner los encuentre
+        cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
+        ;;
       *)
+        # USB drivers and other drivers go to /lib/drivers
         cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/lib/drivers"
         ;;
     esac
@@ -76,4 +83,10 @@ done
 
 mkdir -pv "${COOKBOOK_STAGE}/etc/pcid"
 cp -v "${COOKBOOK_SOURCE}/initfs.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs.toml"
+
+# Copy graphics-specific configuration
+cp -v "${COOKBOOK_RECIPE}/initfs_graphics.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs_graphics.toml"
+
+# Copy USB-specific configuration for keyboard/mouse support
+cp -v "${COOKBOOK_RECIPE}/initfs_usb.toml" "${COOKBOOK_STAGE}/etc/pcid/initfs_usb.toml"
 """
