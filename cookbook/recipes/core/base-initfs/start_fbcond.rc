@@ -1,0 +1,11 @@
+# Script para iniciar fbcond después del arranque completo
+# Compatible con Ion shell
+
+echo "[start_fbcond] Esperando que el sistema esté completamente arrancado..."
+sleep 15
+
+echo "[start_fbcond] Iniciando fbcond en terminal 2..."
+fbcond 2 &
+
+sleep 2
+echo "[start_fbcond] fbcond iniciado"

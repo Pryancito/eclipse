@@ -1,0 +1,40 @@
+## USB Host Controllers for InitFS ##
+## This file configures USB host controller drivers needed for USB keyboards/mice
+## NOTE: usbhidd is NOT launched directly - it's a subdriver spawned by xhcid
+
+# XHCI USB 3.0/2.0/1.1 Controller (most modern systems)
+# xhcid will automatically spawn usbhidd when it detects HID devices
+[[drivers]]
+name = "XHCI USB 3.0 Controller"
+class = 0x0C
+subclass = 0x03
+prog_if = 0x30
+command = ["/scheme/initfs/bin/xhcid"]
+
+# EHCI USB 2.0 Controller (older systems or companion controller)
+# NOTE: Disabled because 'ehcid' is not built in this project
+# To enable EHCI support, add the 'ehcid' binary to the build and place it in /bin
+# [[drivers]]
+# name = "EHCI USB 2.0 Controller"
+# class = 0x0C
+# subclass = 0x03
+# prog_if = 0x20
+# command = ["/scheme/initfs/bin/ehcid"]
+
+# OHCI USB 1.1 Controller (legacy)
+# Uncomment if you have very old hardware
+#[[drivers]]
+#name = "OHCI USB 1.1 Controller"
+#class = 0x0C
+#subclass = 0x03
+#prog_if = 0x10
+#command = ["/scheme/initfs/bin/ohcid"]
+
+# UHCI USB 1.1 Controller (legacy Intel)
+# Uncomment if you have very old Intel hardware
+#[[drivers]]
+#name = "UHCI USB 1.1 Controller"
+#class = 0x0C
+#subclass = 0x03
+#prog_if = 0x00
+#command = ["/scheme/initfs/bin/uhcid"]

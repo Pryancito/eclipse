@@ -13,12 +13,23 @@ INITFS_RM_BINS='redoxfs-ar redoxfs-mkfs'
 rm -rf "${COOKBOOK_BUILD}/initfs"
 mkdir -p "${COOKBOOK_BUILD}/initfs/etc"
 
+# Copy sysroot content (base files)
 cp -r "${COOKBOOK_SYSROOT}/"* "${COOKBOOK_BUILD}/initfs"
+
+# Copy drivers-initfs staged files (drivers and binaries)
+# This must be done AFTER copying sysroot but BEFORE moving /usr folders
+# The stage directory is created by the drivers-initfs dependency
+DRIVERS_INITFS_DIR="${COOKBOOK_BUILD%/build}/drivers-initfs/target/${TARGET}/stage"
+if [ -d "${DRIVERS_INITFS_DIR}" ]; then
+    cp -rv "${DRIVERS_INITFS_DIR}/"* "${COOKBOOK_BUILD}/initfs/"
+fi
 
 # TODO: Move init.rc to another recipe, perhaps initfs-misc? Then it can be installed as a regular dependency.
 cp "${COOKBOOK_RECIPE}/init.rc" "${COOKBOOK_BUILD}/initfs/etc/init.rc"
 cp "${COOKBOOK_RECIPE}/init_drivers.rc" "${COOKBOOK_BUILD}/initfs/etc/init_drivers.rc"
 cp "${COOKBOOK_RECIPE}/init_graphics.rc" "${COOKBOOK_BUILD}/initfs/etc/init_graphics.rc"
+cp "${COOKBOOK_RECIPE}/wait_for_display.rc" "${COOKBOOK_BUILD}/initfs/etc/wait_for_display.rc"
+cp "${COOKBOOK_RECIPE}/start_fbcond.rc" "${COOKBOOK_BUILD}/initfs/etc/start_fbcond.rc"
 if [ -e ${COOKBOOK_RECIPE}/${TARGET}/init_drivers.rc.${BOARD} ]; then
     cp "${COOKBOOK_RECIPE}/${TARGET}/init_drivers.rc.${BOARD}" "${COOKBOOK_BUILD}/initfs/etc/init_drivers.rc"
 elif [ -e ${COOKBOOK_RECIPE}/${TARGET}/init_drivers.rc ]; then

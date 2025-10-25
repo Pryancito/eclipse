@@ -20,6 +20,7 @@ ramfs logging
 run /scheme/initfs/etc/init_graphics.rc
 
 # Boot framebuffer services
+echo "[init] Iniciando servicios de framebuffer..."
 fbbootlogd
 fbcond 2
 
@@ -28,10 +29,13 @@ fbcond 2
 # lived
 
 # Load remaining PCI drivers (storage, network, etc.)
+echo "[init] DEBUG: Ejecutando init_drivers.rc..."
 run /scheme/initfs/etc/init_drivers.rc
+echo "[init] DEBUG: init_drivers.rc completado"
 unset RSDP_ADDR RSDP_SIZE
 
 # Mount rootfs - mounts to /scheme/file
+echo "[init] DEBUG: Intentando montar filesystem UUID=$REDOXFS_UUID BLOCK=$REDOXFS_BLOCK"
 redoxfs --uuid $REDOXFS_UUID file $REDOXFS_BLOCK
 unset REDOXFS_UUID REDOXFS_BLOCK REDOXFS_PASSWORD_ADDR REDOXFS_PASSWORD_SIZE
 

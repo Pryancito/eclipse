@@ -8,8 +8,10 @@ BINS=(
     acpid
     fbbootlogd
     fbcond
+    gpuinfo
     inputd
     lived
+    nvidia-info
     nvmed
     pcid
     pcid-spawner
@@ -67,7 +69,7 @@ export CARGO_PROFILE_RELEASE_PANIC=abort
 for bin in "${BINS[@]}"
 do
     case "${bin}" in
-      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd | xhcid)
+      pcid | pcid-spawner | fbbootlogd | fbcond | inputd | vesad | lived | ps2d | acpid | bcm2835-sdhcid | rtcd | xhcid | gpuinfo | nvidia-info)
         cp -v "target/${TARGET}/${build_type}/${bin}" "${COOKBOOK_STAGE}/bin"
         ;;
       bgad | nvidiad | amdd | inteld)

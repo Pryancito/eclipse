@@ -1,0 +1,9 @@
+# Script para esperar a que el display esté listo
+# Compatible con Ion shell
+
+echo "[wait_for_display] Verificando disponibilidad del display..."
+
+# Dar tiempo para que el driver se inicialice
+sleep 2
+
+echo "[wait_for_display] Display debería estar listo"
