@@ -1,5 +1,0 @@
-#TODO missing script for building
-[source]
-git = "https://gitlab.xiph.org/xiph/rnnoise"
-[build]
-template = "custom"

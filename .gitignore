@@ -5,5 +5,3 @@ eclipse-os.img
 */target/
 target/
 Cargo.lock
-build
-podman

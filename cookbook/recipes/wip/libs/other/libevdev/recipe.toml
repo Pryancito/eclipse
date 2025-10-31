@@ -1,5 +1,0 @@
-#TODO compilation error
-[source]
-tar = "https://www.freedesktop.org/software/libevdev/libevdev-1.13.1.tar.xz"
-[build]
-template = "configure"

@@ -1,5 +1,0 @@
-#TODO port to orbital (after a patch on ring)
-[source]
-git = "https://github.com/ulyssa/iamb"
-[build]
-template = "cargo"

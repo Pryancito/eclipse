@@ -1,9 +1,0 @@
-#TODO camino crate error
-[source]
-git = "https://github.com/pksunkara/cargo-workspaces"
-[build]
-template = "custom"
-script = """
-COOKBOOK_SOURCE="${COOKBOOK_SOURCE}"/cargo-workspaces
-cookbook_cargo
-"""

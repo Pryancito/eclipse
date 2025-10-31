@@ -1,6 +1,0 @@
-#TODO nonsense error "Cargo.toml doesn't exist"
-#TODO configure the CLI and service
-[source]
-git = "https://github.com/influxdata/influxdb"
-[build]
-template = "cargo"

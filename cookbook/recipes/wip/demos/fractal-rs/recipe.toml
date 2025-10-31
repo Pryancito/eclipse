@@ -1,8 +1,0 @@
-#TODO glutin crate error
-[source]
-git = "https://github.com/aetherknight/fractal-rs"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_packages fractal-piston
-"""

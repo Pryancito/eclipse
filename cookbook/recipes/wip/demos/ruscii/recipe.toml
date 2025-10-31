@@ -1,8 +1,0 @@
-#TODO device_query crate error
-[source]
-git = "https://github.com/lemunozm/ruscii"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_examples pong space_invaders
-"""

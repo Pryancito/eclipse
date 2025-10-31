@@ -1,5 +1,0 @@
-#TODO termsize crate error
-[source]
-git = "https://github.com/the-lean-crate/cargo-diet"
-[build]
-template = "cargo"

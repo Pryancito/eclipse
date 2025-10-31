@@ -1,4 +1,0 @@
-# Load remaining non-graphics drivers (storage, network, etc.)
-# Note: ps2d, acpid, pcid, xhcid already running from init_graphics.rc
-# This loads storage drivers (AHCI, IDE, NVMe, virtio-blk)
-pcid-spawner /etc/pcid/initfs.toml

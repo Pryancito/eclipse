@@ -1,0 +1,21 @@
+[package]
+name = "eclipse-bootloader-uefi"
+version = "0.6.0"
+edition = "2021"
+
+[[bin]]
+name = "eclipse-bootloader"
+path = "src/main.rs"
+
+[dependencies]
+uefi = "0.25.0"
+goblin = { version = "0.7", default-features = false, features = ["elf32", "elf64", "alloc"] }
+
+[profile.dev]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+[package.metadata.cargo-xbuild]
+sysroot_path = "sysroot"

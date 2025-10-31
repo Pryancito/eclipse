@@ -1,5 +1,0 @@
-#TODO compiled but not tested
-[source]
-git = "https://github.com/yozhgoor/cargo-temp"
-[build]
-template = "cargo"

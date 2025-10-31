@@ -1,5 +1,0 @@
-#TODO Not compiled or tested
-[source]
-git = "https://github.com/dalance/cargo-trend"
-[build]
-template = "cargo"

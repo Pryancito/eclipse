@@ -1,7 +1,0 @@
-#TODO not compiled or tested
-# cmake information: https://github.com/ocornut/imgui/pull/3027
-[source]
-git = "https://github.com/Qix-/imgui"
-branch = "cmake"
-[build]
-template = "cmake"

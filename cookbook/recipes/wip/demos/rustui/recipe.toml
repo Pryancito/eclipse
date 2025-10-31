@@ -1,9 +1,0 @@
-#TODO not compiled or tested
-[source]
-git = "https://github.com/broccolingual/rustui"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_examples hello_world colors inputs file_reader
-cookbook_cargo_packages tetris
-"""

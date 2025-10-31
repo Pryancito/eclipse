@@ -1,5 +1,0 @@
-#TODO missing script for GN, see https://skia.org/docs/user/build/
-[source]
-git = "https://skia.googlesource.com/skia"
-[build]
-template = "custom"

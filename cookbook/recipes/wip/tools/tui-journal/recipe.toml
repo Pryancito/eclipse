@@ -1,9 +1,0 @@
-#TODO port to Orbital
-[source]
-git = "https://github.com/AmmarAbouZor/tui-journal"
-[build]
-template = "cargo"
-dependencies = [
-    "openssl1",
-    "sqlite3",
-]

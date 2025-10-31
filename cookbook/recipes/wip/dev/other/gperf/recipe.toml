@@ -1,5 +1,0 @@
-#TODO compiled but not fully tested
-[source]
-tar = "http://ftp.gnu.org/pub/gnu/gperf/gperf-3.1.tar.gz"
-[build]
-template = "configure"

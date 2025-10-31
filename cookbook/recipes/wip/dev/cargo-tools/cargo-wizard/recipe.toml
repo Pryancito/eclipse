@@ -1,5 +1,0 @@
-#TODO camino crate error
-[source]
-git = "https://github.com/Kobzol/cargo-wizard"
-[build]
-template = "cargo"

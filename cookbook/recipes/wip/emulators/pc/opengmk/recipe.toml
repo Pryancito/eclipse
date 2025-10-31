@@ -1,8 +1,0 @@
-#TODO libsoundio-sys crate error, require ALSA (needs to be ported)
-[source]
-git = "https://github.com/OpenGMK/OpenGMK"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_packages gm8emulator
-"""

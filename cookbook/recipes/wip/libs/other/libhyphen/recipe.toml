@@ -1,5 +1,0 @@
-#TODO missing script for building, see https://github.com/hunspell/hyphen/blob/master/README#L49
-[source]
-git = "https://github.com/hunspell/hyphen"
-[build]
-template = "custom"

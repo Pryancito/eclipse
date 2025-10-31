@@ -1,5 +1,0 @@
-#TODO lacking a build system
-[source]
-git = "https://github.com/XProger/OpenLara"
-[build]
-template = "custom"

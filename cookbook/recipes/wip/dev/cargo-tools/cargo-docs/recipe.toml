@@ -1,5 +1,0 @@
-#TODO openssl-sys crate error
-[source]
-git = "https://github.com/btwiuse/cargo-docs"
-[build]
-template = "cargo"

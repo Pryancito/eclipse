@@ -1,8 +1,0 @@
-#TODO iroh-quinn-udp crate error
-[source]
-git = "https://github.com/fishfolk/bones"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_packages demo_hello_world
-"""

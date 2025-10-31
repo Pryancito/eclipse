@@ -1,8 +1,0 @@
-#TODO port to orbital
-[source]
-git = "https://github.com/replydev/cotp"
-[build]
-template = "cargo"
-dependencies = [
-    "libxkbcommon",
-]

@@ -1,8 +1,0 @@
-#TODO camino crate error
-[source]
-git = "https://github.com/xd009642/tarpaulin"
-[build]
-template = "cargo"
-dependencies = [
-    "openssl1",
-]

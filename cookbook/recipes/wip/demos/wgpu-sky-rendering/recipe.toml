@@ -1,5 +1,0 @@
-#TODO compiled but not tested
-[source]
-git = "https://github.com/bmatthieu3/wgpu-sky-rendering"
-[build]
-template = "cargo"

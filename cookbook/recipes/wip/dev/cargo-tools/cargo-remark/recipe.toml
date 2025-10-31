@@ -1,8 +1,0 @@
-#TODO camino crate error
-[source]
-git = "https://github.com/kobzol/cargo-remark"
-[build]
-template = "custom"
-script = """
-cookbook_cargo --no-default-features
-"""

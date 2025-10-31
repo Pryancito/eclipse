@@ -1,5 +1,0 @@
-#TODO port to Orbital, see https://github.com/orhun/menyoki/blob/master/IMPLEMENTATION.md#implementing-for-other-platforms
-[source]
-git = "https://github.com/orhun/menyoki"
-[build]
-template = "cargo"

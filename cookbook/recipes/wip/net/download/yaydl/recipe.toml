@@ -1,8 +1,0 @@
-#TODO compilation error (after cargo update)
-[source]
-git = "https://github.com/dertuxmalwieder/yaydl"
-[build]
-template = "cargo"
-dependencies = [
-    "openssl1",
-]

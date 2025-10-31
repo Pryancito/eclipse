@@ -1,9 +1,0 @@
-#TODO not compiled or tested
-# build instructions: https://github.com/arximboldi/zug#usage
-[source]
-git = "https://github.com/arximboldi/zug"
-[build]
-template = "cmake"
-dependencies = [
-    "boost",
-]

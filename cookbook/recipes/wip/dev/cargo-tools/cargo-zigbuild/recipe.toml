@@ -1,8 +1,0 @@
-#TODO make zig work
-[source]
-git = "https://github.com/rust-cross/cargo-zigbuild"
-[build]
-template = "cargo"
-dependencies = [
-    "zig"
-]

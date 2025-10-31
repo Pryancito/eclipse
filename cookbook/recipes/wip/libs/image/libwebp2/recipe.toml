@@ -1,6 +1,0 @@
-#TODO not compiled or tested
-# build instructions: https://chromium.googlesource.com/codecs/libwebp2/#compiling
-[source]
-git = "https://chromium.googlesource.com/codecs/libwebp2"
-[build]
-template = "cmake"

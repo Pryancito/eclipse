@@ -1,8 +1,0 @@
-#TODO tikv-jemalloc-sys crate error
-[source]
-git = "https://github.com/biomejs/biome"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_packages biome_cli
-"""

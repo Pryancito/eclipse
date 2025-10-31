@@ -1,7 +1,0 @@
-[**.c]
-indent_size = 4
-indent_style = space
-
-[**.yml]
-indent_size = 4
-indent_style = space

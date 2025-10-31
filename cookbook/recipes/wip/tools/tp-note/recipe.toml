@@ -1,8 +1,0 @@
-#TODO port to Orbital
-[source]
-git = "https://gitlab.com/getreu/tp-note"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_packages tpnote
-"""

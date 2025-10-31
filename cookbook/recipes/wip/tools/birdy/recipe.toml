@@ -1,5 +1,0 @@
-#TODO port to Orbital
-[source]
-git = "https://github.com/kakoc/birdy"
-[build]
-template = "cargo"

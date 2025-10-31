@@ -1,0 +1,29 @@
+[package]
+name = "eclipse-systemd"
+version = "0.6.0"
+edition = "2021"
+authors = ["Eclipse Rust Team"]
+description = "Sistema de inicialización systemd completamente funcional para Eclipse OS"
+
+[dependencies]
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+env_logger = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1.0"
+eclipse_ipc = { path = "../libs/ipc", package = "eclipse_ipc" }
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"

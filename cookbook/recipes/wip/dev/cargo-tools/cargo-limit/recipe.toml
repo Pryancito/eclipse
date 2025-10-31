@@ -1,5 +1,0 @@
-#TODO camino crate error
-[source]
-git = "https://github.com/cargo-limit/cargo-limit"
-[build]
-template = "cargo"

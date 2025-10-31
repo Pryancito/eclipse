@@ -1,8 +1,0 @@
-#TODO glutin crate error
-[source]
-git = "https://github.com/alexheretic/gfx-shader-watch"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_examples watch-shaders
-"""

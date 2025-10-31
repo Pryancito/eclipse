@@ -1,8 +1,0 @@
-[workspace]
-members = [
-    "pkgar",
-    "pkgar-core",
-    "pkgar-keys",
-    "pkgar-repo",
-]
-resolver = "2"

@@ -1,8 +1,0 @@
-#TODO make gnutls work
-[source]
-tar = "https://camaya.net/download/gloox-1.0.27.tar.bz2"
-[build]
-template = "configure"
-dependencies = [
-    "gnutls3",
-]

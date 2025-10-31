@@ -1,6 +1,0 @@
-#TODO not compiled or tested
-# build instructions: https://github.com/NilsBrause/waylandpp#building
-[source]
-git = "https://github.com/NilsBrause/waylandpp"
-[build]
-template = "cmake"

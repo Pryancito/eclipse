@@ -1,5 +1,0 @@
-#TODO not compiled or tested
-[source]
-git = "https://github.com/dbus2/busd"
-[build]
-template = "cargo"

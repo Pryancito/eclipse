@@ -1,5 +1,0 @@
-#TODO camino crate compilation error
-[source]
-git = "https://github.com/Canop/bacon"
-[build]
-template = "cargo"

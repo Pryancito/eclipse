@@ -1,8 +1,0 @@
-#TODO async-io crate error
-[source]
-git = "https://github.com/bevyengine/bevy"
-[build]
-template = "custom"
-script = """
-cookbook_cargo_examples hello_world
-"""
