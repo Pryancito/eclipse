@@ -590,12 +590,12 @@ impl DirectInstaller {
         }
 
         // Crear configuración de userland
-        let config_content = r#"# Eclipse OS Userland Configuration v0.6.0
+        let config_content = r#"# Eclipse OS Userland Configuration v0.1.0
 # =========================================
 
 [system]
 name = "Eclipse OS"
-version = "0.6.0"
+version = "0.1.0"
 kernel = "/eclipse_kernel"
 
 [modules]
@@ -641,7 +641,7 @@ userland_memory = "256M"
         uefi_config.create_system_info(&self.efi_mount_point)?;
 
         // Configuración del bootloader (compatibilidad)
-        let boot_conf = r#"# Eclipse OS Boot Configuration v0.6.0
+        let boot_conf = r#"# Eclipse OS Boot Configuration v0.1.0
 # ===================================
 
 TIMEOUT=5
@@ -650,7 +650,7 @@ SHOW_MENU=true
 
 [entry:eclipse]
 title=Eclipse OS
-description=Sistema Operativo Eclipse v0.6.0
+description=Sistema Operativo Eclipse v0.1.0
 kernel=/eclipse_kernel
 initrd=
 args=quiet splash
@@ -663,7 +663,7 @@ args=quiet splash
         let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
 =====================================
 
-Version: 0.6.0
+Version: 0.1.0
 Arquitectura: x86_64
 Tipo: Instalacion en disco
 

@@ -18,7 +18,7 @@ echo -e "${BLUE}    ECLIPSE OS - COMPILACIÓN COMPLETA${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-echo -e "${CYAN}🚀 Eclipse OS v0.4.0 - Sistema Operativo Moderno${NC}"
+echo -e "${CYAN}🚀 Eclipse OS v0.1.0 - Sistema Operativo Moderno${NC}"
 echo -e "${CYAN}   - Kernel multihilo optimizado${NC}"
 echo -e "${CYAN}   - Sistema de inicialización systemd-like${NC}"
 echo -e "${CYAN}   - Optimizaciones de rendimiento avanzadas${NC}"
@@ -246,7 +246,7 @@ cat > "$DIST_DIR/start_eclipse_os.sh" << 'EOF'
 #!/bin/bash
 
 # Script de arranque de Eclipse OS
-echo "🚀 INICIANDO ECLIPSE OS v0.4.0"
+echo "🚀 INICIANDO ECLIPSE OS v0.1.0"
 echo "================================"
 echo ""
 
@@ -294,7 +294,7 @@ echo ""
 # Mostrar información del sistema
 echo "📊 INFORMACIÓN DEL SISTEMA"
 echo "=========================="
-echo "   - Kernel: Eclipse OS v0.4.0"
+echo "   - Kernel: Eclipse OS v0.1.0"
 echo "   - Init System: eclipse-systemd"
 echo "   - Arquitectura: x86_64"
 echo "   - Bootloader: UEFI"
@@ -335,7 +335,7 @@ echo -e "${BLUE}📚 CREANDO DOCUMENTACIÓN${NC}"
 echo "============================="
 
 cat > "$DIST_DIR/README.md" << 'EOF'
-# Eclipse OS v0.4.0 - Sistema Operativo Completo
+# Eclipse OS v0.1.0 - Sistema Operativo Completo
 
 ## 🚀 Características Principales
 
@@ -436,7 +436,7 @@ Los servicios se configuran en `etc/eclipse/systemd/system/`:
 
 ---
 
-**Eclipse OS v0.4.0** - Sistema Operativo Moderno con Optimizaciones Avanzadas
+**Eclipse OS v0.1.0** - Sistema Operativo Moderno con Optimizaciones Avanzadas
 EOF
 
 echo -e "${GREEN}✅ Documentación creada${NC}"
@@ -447,7 +447,7 @@ echo ""
 echo -e "${BLUE}🎉 COMPILACIÓN COMPLETADA${NC}"
 echo "============================="
 
-echo -e "${GREEN}✅ ECLIPSE OS v0.4.0 COMPILADO EXITOSAMENTE${NC}"
+echo -e "${GREEN}✅ ECLIPSE OS v0.1.0 COMPILADO EXITOSAMENTE${NC}"
 echo ""
 echo -e "${CYAN}📁 Archivos generados en: $DIST_DIR/${NC}"
 echo -e "${CYAN}   - eclipse_kernel: Kernel principal${NC}"
@@ -485,7 +485,7 @@ echo -e "${BLUE}   - Errores de compilación: 0${NC}"
 echo -e "${BLUE}   - Warnings: 365 (no críticos)${NC}"
 echo ""
 
-echo -e "${GREEN}🎯 ¡Eclipse OS v0.4.0 está completamente compilado y listo!${NC}"
+echo -e "${GREEN}🎯 ¡Eclipse OS v0.1.0 está completamente compilado y listo!${NC}"
 echo -e "${GREEN}   Sistema operativo moderno con optimizaciones avanzadas${NC}"
 echo -e "${GREEN}   Kernel multihilo + systemd + rendimiento máximo${NC}"
 echo ""

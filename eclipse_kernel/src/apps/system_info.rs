@@ -67,8 +67,8 @@ impl SystemInfo {
     pub fn new() -> Self {
         Self {
             os_name: "Eclipse OS".to_string(),
-            os_version: "1.0.0".to_string(),
-            kernel_version: "1.0.0".to_string(),
+            os_version: "0.1.0".to_string(),
+            kernel_version: "0.1.0".to_string(),
             architecture: "x86_64".to_string(),
             cpu_info: CpuInfo {
                 model: "Intel Core i7-12700K".to_string(),

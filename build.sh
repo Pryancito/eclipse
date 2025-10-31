@@ -39,7 +39,7 @@ UEFI_TARGET="x86_64-unknown-uefi"
 BUILD_DIR="eclipse-os-build"
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.6.0 ║"
+echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.1.0 ║"
 echo "║ EclipseFS + Kernel + Bootloader + Userland + Aplicaciones Wayland + Instalador ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
@@ -93,7 +93,7 @@ build_eclipsefs_lib() {
 
 # Función para compilar el kernel
 build_kernel() {
-    print_step "Compilando kernel Eclipse OS v0.6.0..."
+    print_step "Compilando kernel Eclipse OS v0.1.0..."
     
     # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
@@ -504,35 +504,36 @@ create_basic_distribution() {
         fi
         
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
-        if [ -f "eclipse-apps/services/waylandd/target/release/eclipse_wayland" ]; then
-            cp "eclipse-apps/services/waylandd/target/release/eclipse_wayland" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/eclipse_wayland"
-            print_status "eclipse_wayland instalado en /usr/bin/"
-        fi
-        
-        if [ -f "eclipse-apps/apps/cosmic/target/release/eclipse_cosmic" ]; then
-            cp "eclipse-apps/apps/cosmic/target/release/eclipse_cosmic" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/eclipse_cosmic"
-            print_status "eclipse_cosmic instalado en /usr/bin/"
-        fi
-        
-        if [ -f "eclipse-apps/apps/rwaybar/target/release/rwaybar" ]; then
-            cp "eclipse-apps/apps/rwaybar/target/release/rwaybar" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/rwaybar"
-            print_status "rwaybar instalado en /usr/bin/"
-        fi
-        
-        if [ -f "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" ]; then
-            cp "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/eclipse_taskbar"
-            print_status "eclipse_taskbar instalado en /usr/bin/"
-        fi
+        # Nota: Estos binarios no existen en la versión actual del proyecto
+        # if [ -f "eclipse-apps/services/waylandd/target/release/eclipse_wayland" ]; then
+        #     cp "eclipse-apps/services/waylandd/target/release/eclipse_wayland" "$BUILD_DIR/usr/bin/"
+        #     chmod +x "$BUILD_DIR/usr/bin/eclipse_wayland"
+        #     print_status "eclipse_wayland instalado en /usr/bin/"
+        # fi
+
+        # if [ -f "eclipse-apps/apps/cosmic/target/release/eclipse_cosmic" ]; then
+        #     cp "eclipse-apps/apps/cosmic/target/release/eclipse_cosmic" "$BUILD_DIR/usr/bin/"
+        #     chmod +x "$BUILD_DIR/usr/bin/eclipse_cosmic"
+        #     print_status "eclipse_cosmic instalado en /usr/bin/"
+        # fi
+
+        # if [ -f "eclipse-apps/apps/rwaybar/target/release/rwaybar" ]; then
+        #     cp "eclipse-apps/apps/rwaybar/target/release/rwaybar" "$BUILD_DIR/usr/bin/"
+        #     chmod +x "$BUILD_DIR/usr/bin/rwaybar"
+        #     print_status "rwaybar instalado en /usr/bin/"
+        # fi
+
+        # if [ -f "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" ]; then
+        #     cp "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" "$BUILD_DIR/usr/bin/"
+        #     chmod +x "$BUILD_DIR/usr/bin/eclipse_taskbar"
+        #     print_status "eclipse_taskbar instalado en /usr/bin/"
+        # fi
         
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
 name = "Eclipse OS"
-version = "0.6.0"
+version = "0.1.0"
 kernel = "/boot/eclipse_kernel"
 init_system = "systemd"
 
@@ -551,12 +552,13 @@ wayland_terminal = "/userland/bin/wayland_terminal"
 wayland_text_editor = "/userland/bin/wayland_text_editor"
 
 [desktop_environment]
-wayland_server = "/userland/bin/eclipse_wayland"
-cosmic_desktop = "/userland/bin/eclipse_cosmic"
-rwaybar = "/userland/bin/rwaybar"
-eclipse_taskbar = "/userland/bin/eclipse_taskbar"
-eclipse_notifications = "/userland/bin/eclipse_notifications"
-eclipse_window_manager = "/userland/bin/eclipse_window_manager"
+# Nota: Algunos componentes del desktop environment no están implementados aún
+# wayland_server = "/userland/bin/eclipse_wayland"
+# cosmic_desktop = "/userland/bin/eclipse_cosmic"
+# rwaybar = "/userland/bin/rwaybar"
+# eclipse_taskbar = "/userland/bin/eclipse_taskbar"
+# eclipse_notifications = "/userland/bin/eclipse_notifications"
+# eclipse_window_manager = "/userland/bin/eclipse_window_manager"
 
 [display]
 driver = "drm"
@@ -624,40 +626,13 @@ cleanup() {
 # Registrar función de limpieza
 trap cleanup EXIT INT TERM
 
-echo "🚀 Iniciando eclipse_wayland (servidor Wayland + IPC)..."
-./eclipse_wayland &
-WAYLANDD_PID=$!
-sleep 3
-
-echo "🖥️ Iniciando eclipse_cosmic (desktop environment)..."
-./eclipse_cosmic &
-COSMIC_PID=$!
-sleep 3
-
-echo "📊 Iniciando rwaybar (barra de tareas Wayland)..."
-./rwaybar --config /userland/config/rwaybar.toml &
-RWAYBAR_PID=$!
-sleep 2
-
-echo "🔔 Iniciando eclipse_notifications..."
-./eclipse_notifications &
-NOTIFICATIONS_PID=$!
-sleep 1
-
-echo "🖼️ Iniciando eclipse_window_manager..."
-./eclipse_window_manager &
-WINDOW_MANAGER_PID=$!
-sleep 1
-
-echo "✅ Eclipse OS Desktop Environment iniciado completamente!"
-echo "   - eclipse_wayland PID: $WAYLANDD_PID"
-echo "   - eclipse_cosmic PID: $COSMIC_PID"
-echo "   - rwaybar PID: $RWAYBAR_PID"
-echo "   - eclipse_notifications PID: $NOTIFICATIONS_PID"
-echo "   - eclipse_window_manager PID: $WINDOW_MANAGER_PID"
+echo "🚀 Iniciando Eclipse OS..."
+echo "   Nota: Desktop environment completo no implementado aún"
+echo "   Solo systemd disponible por ahora"
 
 # Mantener el script en ejecución
-wait $WINDOW_MANAGER_PID $NOTIFICATIONS_PID $RWAYBAR_PID $COSMIC_PID $WAYLANDD_PID
+# Nota: En futuras versiones se implementará el wait para los PIDs del desktop environment
+sleep infinity
 EOF
         chmod +x "$BUILD_DIR/userland/bin/start_desktop.sh"
         print_status "Script de inicio del desktop environment creado"
@@ -767,43 +742,44 @@ tooltip_format = "Volume: {volume}%"
 [bar.custom]
 position = "right"
 format = "🌙 Eclipse OS"
-tooltip_format = "Eclipse OS v0.6.0 - Desktop Environment"
+tooltip_format = "Eclipse OS v0.1.0 - Desktop Environment"
 EOF
-        print_status "Configuración de rwaybar creada"
+    print_status "Configuración de rwaybar creada"
         
         print_success "Módulos userland copiados a la distribución"
     fi
     
     # Copiar binarios de eclipse-apps si existen
-    if [ -f "eclipse-apps/target/release/eclipse_wayland" ]; then
-        cp "eclipse-apps/target/release/eclipse_wayland" "$BUILD_DIR/userland/bin/"
-        print_status "eclipse_wayland copiado"
-    fi
+    # Nota: Estos binarios no existen en la versión actual
+    # if [ -f "eclipse-apps/target/release/eclipse_wayland" ]; then
+    #     cp "eclipse-apps/target/release/eclipse_wayland" "$BUILD_DIR/userland/bin/"
+    #     print_status "eclipse_wayland copiado"
+    # fi
 
-    if [ -f "eclipse-apps/target/release/eclipse_cosmic" ]; then
-        cp "eclipse-apps/target/release/eclipse_cosmic" "$BUILD_DIR/userland/bin/"
-        print_status "eclipse_cosmic copiado"
-    fi
+    # if [ -f "eclipse-apps/target/release/eclipse_cosmic" ]; then
+    #     cp "eclipse-apps/target/release/eclipse_cosmic" "$BUILD_DIR/userland/bin/"
+    #     print_status "eclipse_cosmic copiado"
+    # fi
 
-    if [ -f "eclipse-apps/target/release/rwaybar" ]; then
-        cp "eclipse-apps/target/release/rwaybar" "$BUILD_DIR/userland/bin/"
-        print_status "rwaybar copiado"
-    fi
+    # if [ -f "eclipse-apps/target/release/rwaybar" ]; then
+    #     cp "eclipse-apps/target/release/rwaybar" "$BUILD_DIR/userland/bin/"
+    #     print_status "rwaybar copiado"
+    # fi
 
-    if [ -f "eclipse-apps/target/release/eclipse_taskbar" ]; then
-        cp "eclipse-apps/target/release/eclipse_taskbar" "$BUILD_DIR/userland/bin/"
-        print_status "eclipse_taskbar copiado"
-    fi
+    # if [ -f "eclipse-apps/target/release/eclipse_taskbar" ]; then
+    #     cp "eclipse-apps/target/release/eclipse_taskbar" "$BUILD_DIR/userland/bin/"
+    #     print_status "eclipse_taskbar copiado"
+    # fi
 
-    if [ -f "eclipse-apps/target/release/eclipse_notifications" ]; then
-        cp "eclipse-apps/target/release/eclipse_notifications" "$BUILD_DIR/userland/bin/"
-        print_status "eclipse_notifications copiado"
-    fi
+    # if [ -f "eclipse-apps/target/release/eclipse_notifications" ]; then
+    #     cp "eclipse-apps/target/release/eclipse_notifications" "$BUILD_DIR/userland/bin/"
+    #     print_status "eclipse_notifications copiado"
+    # fi
 
-    if [ -f "eclipse-apps/target/release/eclipse_window_manager" ]; then
-        cp "eclipse-apps/target/release/eclipse_window_manager" "$BUILD_DIR/userland/bin/"
-        print_status "eclipse_window_manager copiado"
-    fi
+    # if [ -f "eclipse-apps/target/release/eclipse_window_manager" ]; then
+    #     cp "eclipse-apps/target/release/eclipse_window_manager" "$BUILD_DIR/userland/bin/"
+    #     print_status "eclipse_window_manager copiado"
+    # fi
 
     # Copiar unidades/targets de systemd para eclipse-apps
     if [ -d "eclipse-apps/systemd/services" ]; then
@@ -825,7 +801,7 @@ EOF
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
-# Configuración UEFI para Eclipse OS v0.6.0
+# Configuración UEFI para Eclipse OS v0.1.0
 # Bootloader personalizado - no requiere GRUB
 
 [system]
@@ -863,12 +839,8 @@ show_build_summary() {
     echo "  Editor de texto Wayland: wayland_apps/wayland_text_editor/target/release/wayland_text_editor"
     echo ""
     echo "Desktop Environment:"
-    echo "  eclipse_wayland: eclipse-apps/target/release/eclipse_wayland"
-    echo "  eclipse_cosmic: eclipse-apps/target/release/eclipse_cosmic"
-    echo "  rwaybar: eclipse-apps/target/release/rwaybar"
-    echo "  eclipse_taskbar: eclipse-apps/target/release/eclipse_taskbar"
-    echo "  eclipse_notifications: eclipse-apps/target/release/eclipse_notifications"
-    echo "  eclipse_window_manager: eclipse-apps/target/release/eclipse_window_manager"
+    echo "  Nota: Desktop environment no implementado en esta versión"
+    echo "  eclipse-systemd: eclipse-apps/systemd/target/release/eclipse-systemd"
     echo ""
     echo "Distribución creada en: $BUILD_DIR/"
     echo "  - Kernel: $BUILD_DIR/boot/eclipse_kernel"
@@ -885,12 +857,12 @@ show_build_summary() {
     echo "  - Instalador: $BUILD_DIR/userland/bin/eclipse-installer"
     echo "  - Systemd: $BUILD_DIR/userland/bin/eclipse-systemd"
     echo ""
-    echo "Eclipse OS v0.6.0 está listo para usar!"
+    echo "Eclipse OS v0.1.0 está listo para usar!"
 }
 
-# Función para compilar eclipse-apps (IPC + waylandd + cosmic + rwaybar + notificaciones + window manager)
+# Función para compilar eclipse-apps (IPC + systemd)
 build_eclipse_apps() {
-    print_step "Compilando workspace eclipse-apps (IPC + waylandd + cosmic + rwaybar + notificaciones + window manager)..."
+    print_step "Compilando workspace eclipse-apps (IPC + systemd)..."
 
     if [ ! -d "eclipse-apps" ]; then
         print_status "Directorio eclipse-apps no encontrado, saltando..."
@@ -899,27 +871,13 @@ build_eclipse_apps() {
 
     cd eclipse-apps
 
-    print_status "Compilando librerías IPC..."
-    cargo build -p ipc_simple --release || { cd ..; print_error "Fallo compilando ipc_simple"; return 1; }
-    cargo build -p ipc_common --release || { cd ..; print_error "Fallo compilando ipc_common"; return 1; }
+    print_status "Compilando librería eclipse_ipc..."
+    cd libs/ipc && cargo build --release || { cd ../..; print_error "Fallo compilando eclipse_ipc"; return 1; }
+    cd ../..
 
-    print_status "Compilando eclipse_wayland..."
-    cargo build -p eclipse_wayland --release || { cd ..; print_error "Fallo compilando eclipse_wayland"; return 1; }
-
-    print_status "Compilando eclipse_cosmic..."
-    cargo build -p eclipse_cosmic --release || { cd ..; print_error "Fallo compilando eclipse_cosmic"; return 1; }
-
-    print_status "Compilando rwaybar..."
-    cargo build -p rwaybar --release || { cd ..; print_error "Fallo compilando rwaybar"; return 1; }
-
-    print_status "Compilando eclipse_taskbar..."
-    cargo build -p eclipse_taskbar --release || { cd ..; print_error "Fallo compilando eclipse_taskbar"; return 1; }
-
-    print_status "Compilando eclipse_notifications..."
-    cargo build -p eclipse_notifications --release || { cd ..; print_error "Fallo compilando eclipse_notifications"; return 1; }
-
-    print_status "Compilando eclipse_window_manager..."
-    cargo build -p eclipse_window_manager --release || { cd ..; print_error "Fallo compilando eclipse_window_manager"; return 1; }
+    print_status "Compilando eclipse-systemd..."
+    cd systemd && cargo build --release || { cd ..; print_error "Fallo compilando eclipse-systemd"; return 1; }
+    cd ..
 
     print_success "eclipse-apps compilado completamente"
     cd ..

@@ -45,27 +45,32 @@ fn main() {
         println!("   Puede ser necesario deshabilitar Secure Boot para Eclipse OS");
     }
     
-    // Instalar automáticamente a /dev/sda
-    println!("Instalando Eclipse OS automáticamente a /dev/sda...");
-    
-    // Crear un disco virtual para /dev/sda
-    let disk = DiskInfo {
-        name: "/dev/sda".to_string(),
-        size: "250GB".to_string(),
-        model: "Virtual Disk".to_string(),
-        disk_type: "SSD".to_string(),
-    };
-    
-    // Ejecutar instalación directa
-    let direct_installer = DirectInstaller::new();
-    match direct_installer.install_eclipse_os(&disk, true) {
-        Ok(_) => {
-            println!();
-            println!("¡Instalación completada exitosamente!");
+    // Mostrar menú principal
+    loop {
+        show_main_menu();
+        
+        let choice = read_input("Selecciona una opción: ");
+        
+        match choice.trim() {
+            "1" => {
+                install_eclipse_os_direct();
+            }
+            "2" => {
+                show_disk_info();
+            }
+            "3" => {
+                show_help();
+            }
+            "4" => {
+                println!("¡Hasta luego!");
+                break;
+            }
+            _ => {
+                println!("Opción inválida. Intenta de nuevo.");
+            }
         }
-        Err(e) => {
-            println!("Error durante la instalación: {}", e);
-        }
+        
+        println!();
     }
 }
 

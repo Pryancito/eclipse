@@ -354,7 +354,7 @@ impl Terminal {
             }
             "config.ini" => {
                 terminal.print_info("[system]");
-                terminal.print_info("version=1.0.0");
+                terminal.print_info("version=0.1.0");
                 terminal.print_info("kernel=eclipse");
                 terminal.print_info("");
                 terminal.print_info("[graphics]");

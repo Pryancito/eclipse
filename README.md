@@ -35,7 +35,7 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Eclipse OS v0.6.0                        │
+│                    Eclipse OS v0.1.0                        │
 ├─────────────────────────────────────────────────────────────┤
 │  Userland Applications                                      │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
