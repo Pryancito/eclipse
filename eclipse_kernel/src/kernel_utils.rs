@@ -79,7 +79,7 @@ fn demonstrate_config_system() -> KernelResult<()> {
         }
         Err(e) => {
             syslog_err!("DEMO", "Error generando reporte de configuración");
-            return Err(e);
+            return Err(e.into());
         }
     }
 

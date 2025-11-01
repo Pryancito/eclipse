@@ -44,6 +44,8 @@ use crate::drivers::usb::UsbDriver;
 use crate::drivers::usb_keyboard::{KeyboardConfig, KeyboardEvent, UsbKeyCode, UsbKeyboardDriver};
 use crate::drivers::usb_mouse::{MouseButton, MouseConfig, MouseEvent, UsbMouseDriver};
 use crate::drivers::usb_xhci::XhciController;
+use crate::drivers::usb_xhci_improved::ImprovedXhciController;
+use crate::drivers::usb_xhci_interrupts::{init_xhci_interrupts, process_xhci_events, XhciEvent};
 use crate::drivers::usb_diagnostic;
 use crate::drivers::virtio_gpu::VirtioGpuDriver;
 use crate::drivers::vmware_svga::VmwareSvgaDriver;
@@ -62,6 +64,9 @@ use crate::drivers::storage_manager::{init_storage_manager, get_storage_manager,
 use crate::filesystem::fat32::mount_fat32_from_storage;
 use crate::filesystem::eclipsefs::mount_eclipsefs_from_storage;
 use crate::debug::serial_write_str;
+use crate::logging::{init_logger, set_debug_mode, LoggerConfig, LogLevel};
+use crate::error_recovery::{init_error_recovery, display_recovery_status, BootMode, RecoveryAction, InitError};
+use crate::{try_init, try_init_with_fallback};
 use crate::paging::PagingManager;
 use crate::idt::{setup_userland_idt, get_interrupt_stats, InterruptStats};
 // use crate::advanced_shell::AdvancedShell; // Comentado temporalmente
@@ -242,7 +247,7 @@ fn verify_framebuffer_memory(fb: &mut FramebufferDriver) -> bool {
     true
 }
 
-/// Función principal del kernel
+/// Función principal del kernel con recuperación de errores
 pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: Entered.\n");
     #[cfg(feature = "alloc")]
@@ -251,17 +256,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     }
 
     fb.clear_screen(Color::BLACK);
-    fb.write_text_kernel("Eclipse OS Kernel v0.6.0", Color::WHITE);
-
-    fb.write_text_kernel("GDT inicializada.", Color::GREEN);
-    serial_write_str("KERNEL_MAIN: GDT initialized.\n");
-
-    // --- Inicialización del Sistema de Interrupciones (DESHABILITADO) ---
-    serial_write_str("KERNEL_MAIN: Skipping interrupt system initialization for hardware compatibility...\n");
-    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad.", Color::YELLOW);
-    
-    // Las interrupciones causan excepciones en hardware real, omitimos por ahora
-    serial_write_str("KERNEL_MAIN: Interrupt system initialization skipped for hardware compatibility.\n");
+    fb.write_text_kernel("Eclipse OS Kernel v0.1.0", Color::WHITE);
 
     // --- Inicialización del Gestor de Paginación ---
     serial_write_str("KERNEL_MAIN: Initializing Paging Manager...\n");
@@ -282,6 +277,40 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     }
     
     serial_write_str("KERNEL_MAIN: Paging Manager initialized.\n");
+
+
+    // --- FASE 1: Sistemas críticos ---
+    fb.write_text_kernel("FASE 1: Sistemas críticos", Color::CYAN);
+    match init_critical_systems(fb) {
+        Ok(_) => fb.write_text_kernel("  Sistemas críticos: OK", Color::GREEN),
+        Err(RecoveryAction::Panic(msg)) => {
+            fb.clear_screen(Color::RED);
+            fb.write_text_kernel("ERROR CRÍTICO - SISTEMA INESTABLE", Color::WHITE);
+            fb.write_text_kernel(&msg, Color::WHITE);
+            loop {
+                unsafe { core::arch::asm!("hlt"); }
+            }
+        }
+        Err(RecoveryAction::SwitchMode(_mode)) => {
+            fb.write_text_kernel("  Cambiando a modo de recuperación", Color::YELLOW);
+            loop {
+                unsafe { core::arch::asm!("hlt"); }
+            }
+        }
+        Err(RecoveryAction::Continue) => {
+            fb.write_text_kernel("  Sistemas críticos en modo degradado", Color::YELLOW);
+        }
+    }
+
+    // Reducir logging a solo errores para evitar uso intensivo de heap
+    use crate::logging::{configure_logger, LogLevel, LoggerConfig};
+    configure_logger(LoggerConfig {
+        min_level: LogLevel::Error,
+        allowed_modules: alloc::vec::Vec::new(),
+        enable_timestamps: false,
+        enable_framebuffer: false,
+        fb_line: 1,
+    });
 
 
     // --- Detección de Hardware (MEJORADA) ---
@@ -334,6 +363,104 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     fb.write_text_kernel("Diagnóstico USB...", Color::WHITE);
     usb_diagnostic::usb_diagnostic_main();
     fb.write_text_kernel("Diagnóstico USB completado", Color::GREEN);
+
+    // --- Inicialización de controlador XHCI mejorado ---
+    serial_write_str("KERNEL_MAIN: Buscando controladores USB...\n");
+    fb.write_text_kernel("Buscando controladores USB...", Color::WHITE);
+    
+    let mut pci_for_xhci = PciManager::new();
+    pci_for_xhci.scan_devices();
+    
+    // Buscar todos los controladores USB (clase 0x0C, subclase 0x03)
+    let mut xhci_initialized = false;
+    let devices = pci_for_xhci.get_devices();
+    
+    // Primero listar todos los controladores USB
+    for device_opt in devices.iter() {
+        if let Some(device) = device_opt {
+            if device.class_code == 0x0C && device.subclass_code == 0x03 {
+                let controller_type = match device.prog_if {
+                    0x00 => "UHCI",
+                    0x10 => "OHCI",
+                    0x20 => "EHCI",
+                    0x30 => "XHCI",
+                    _ => "Unknown",
+                };
+                
+                serial_write_str(&alloc::format!(
+                    "KERNEL_MAIN: Controlador USB {} {:04X}:{:04X} (prog_if: 0x{:02X}) en {}:{}:{}\n",
+                    controller_type,
+                    device.vendor_id, device.device_id,
+                    device.prog_if,
+                    device.bus, device.device, device.function
+                ));
+                
+                fb.write_text_kernel(&alloc::format!(
+                    "USB {}: {:04X}:{:04X} (0x{:02X})",
+                    controller_type,
+                    device.vendor_id, device.device_id,
+                    device.prog_if
+                ), Color::CYAN);
+            }
+        }
+    }
+    
+    fb.write_text_kernel("Inicializando controladores XHCI mejorados...", Color::WHITE);
+    
+    // Ahora intentar inicializar XHCI específicamente
+    for device_opt in devices.iter() {
+        if let Some(device) = device_opt {
+            if device.class_code == 0x0C && device.subclass_code == 0x03 && device.prog_if == 0x30 {
+                serial_write_str(&alloc::format!(
+                    "KERNEL_MAIN: Encontrado controlador XHCI {:04X}:{:04X} en {}:{}:{}\n",
+                    device.vendor_id, device.device_id,
+                    device.bus, device.device, device.function
+                ));
+                
+                fb.write_text_kernel(&alloc::format!(
+                    "Controlador XHCI: {:04X}:{:04X}",
+                    device.vendor_id, device.device_id
+                ), Color::CYAN);
+                
+                // Crear e inicializar el controlador mejorado
+                let mut xhci = ImprovedXhciController::new(*device);
+                match xhci.initialize() {
+                    Ok(()) => {
+                        fb.write_text_kernel("✓ XHCI inicializado exitosamente", Color::GREEN);
+                        xhci_initialized = true;
+                        
+                        // Mostrar información diagnóstica
+                        let diag_info = xhci.get_diagnostic_info();
+                        for line in diag_info.lines().take(5) {
+                            fb.write_text_kernel(line, Color::LIGHT_GRAY);
+                        }
+                        
+                        // Inicializar sistema de interrupciones
+                        let bars = device.read_all_bars();
+                        let mmio_base = (bars[0] & 0xFFFFFFF0) as u64;
+                        match init_xhci_interrupts(mmio_base, 1) {
+                            Ok(()) => {
+                                fb.write_text_kernel("✓ Interrupciones XHCI habilitadas", Color::GREEN);
+                            }
+                            Err(e) => {
+                                fb.write_text_kernel(&alloc::format!("⚠ Error interrupciones: {}", e), Color::YELLOW);
+                            }
+                        }
+                        
+                        // Solo inicializar el primer controlador por ahora
+                        break;
+                    }
+                    Err(e) => {
+                        fb.write_text_kernel(&alloc::format!("✗ Error XHCI: {:?}", e), Color::RED);
+                    }
+                }
+            }
+        }
+    }
+    
+    if !xhci_initialized {
+        fb.write_text_kernel("No se encontraron controladores XHCI", Color::YELLOW);
+    }
 
     if hw.available_gpus.is_empty() {
         fb.write_text_kernel("No se detectaron GPUs adicionales", Color::YELLOW);
@@ -438,32 +565,346 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         serial_write_str("KERNEL_MAIN: No storage devices found. Trying bootloader data...\n");
         fb.write_text_kernel("No se encontraron dispositivos de almacenamiento.", Color::YELLOW);
     }
-    // --- Inicialización del Sistema de IA ---
-    serial_write_str("KERNEL_MAIN: Initializing AI system...\n");
-    fb.write_text_kernel("Inicializando sistema de IA...", Color::WHITE);
+
+    // FASE 4: Sistema de procesos
+    match crate::process::init_process_system() {
+        Ok(_) => fb.write_text_kernel("Sistema de procesos iniciado correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar el sistema de procesos", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: process system init FAIL\n");
+        }
+    }
+
+    // FASE 5: Sistema de módulos
+    match crate::modules::init_module_system() {
+        Ok(_) => fb.write_text_kernel("Sistema de modulos iniciado correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar el sistema de modulos", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: module system init FAIL\n");
+        }
+    }
+    // FASE 7: Configuración del kernel
+    match crate::config::init_kernel_config() {
+        Ok(_) => fb.write_text_kernel("Configuracion del kernel iniciada correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar la configuracion del kernel", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: kernel config init FAIL\n");
+        }
+    }
+
+    // FASE 8: Sistema de red
+    match crate::network::init_network_stack() {
+        Ok(_) => fb.write_text_kernel("Sistema de red iniciado correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar el sistema de red", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: network init FAIL\n");
+        }
+    }
+
+    // FASE 9: Shell interactivo
+    match crate::shell::init_shell() {
+        Ok(_) => fb.write_text_kernel("Shell iniciado correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar el shell", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: shell init FAIL\n");
+        }
+    }
+    // FASE 10: Gestión de energía
+    match crate::power::init_power_management() {
+        Ok(_) => fb.write_text_kernel("Gestión de energía iniciada correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar la gestión de energía", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: power init FAIL\n");
+        }
+    }
+
+    // FASE 11: Sistema de archivos virtual
+    match crate::virtual_fs::init_virtual_fs() {
+        Ok(_) => fb.write_text_kernel("Sistema de archivos virtual iniciado correctamente", Color::GREEN),
+        Err(_) => {
+            fb.write_text_kernel("Error al iniciar el sistema de archivos virtual", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: VFS init FAIL\n");
+        }
+    }
+
+    // FASE 12: Sistema de entrada (teclado y ratón)
+    serial_write_str("KERNEL_MAIN: Inicializando sistema de entrada...\n");
+    fb.write_text_kernel("Inicializando sistema de entrada...", Color::WHITE);
+    match crate::drivers::input_system::init_input_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Sistema de entrada iniciado (teclado y ratón)", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Input system initialized\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ Error al iniciar entrada: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: Input system init FAIL: {}\n", e));
+        }
+    }
+
+    // Entrar al loop principal mejorado
+    serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado.\n");
+    fb.write_text_kernel("Iniciando loop principal mejorado...", Color::GREEN);
     
-    // Inicializar servicios de IA
-    let ai_service = initialize_ai_services(fb);
+    // Llamar al loop principal mejorado (nunca retorna)
+    crate::main_loop::main_loop(fb, xhci_initialized)
+}
+
+/// Inicializa los sistemas críticos que no pueden fallar
+fn init_critical_systems(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
+    fb.write_text_kernel("INIT_CRITICAL: Iniciando...", Color::CYAN);
+
+    // Inicializar sistema de logging
+    fb.write_text_kernel("INIT_CRITICAL: Logging...", Color::YELLOW);
+    match init_logger() {
+        Ok(_) => {
+            fb.write_text_kernel("INIT_CRITICAL: Logger OK", Color::GREEN);
+            set_debug_mode(true);
+        },
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("INIT_CRITICAL: Logger FAIL - {}", e), Color::RED);
+            return Err(RecoveryAction::Panic(alloc::format!("Logger init failed: {}", e)));
+        }
+    }
+
+    // Inicializar sistema de recuperación de errores
+    fb.write_text_kernel("INIT_CRITICAL: Error recovery...", Color::YELLOW);
+    match init_error_recovery() {
+        Ok(_) => fb.write_text_kernel("INIT_CRITICAL: Error recovery OK", Color::GREEN),
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("INIT_CRITICAL: Error recovery FAIL - {:?}", e), Color::RED);
+            return Err(RecoveryAction::Continue);
+        }
+    }
+
+    // Inicializar allocator de memoria
+    fb.write_text_kernel("INIT_CRITICAL: Memory allocator...", Color::YELLOW);
+    match crate::error_recovery::init_components::init_memory_allocator() {
+        Ok(_) => fb.write_text_kernel("INIT_CRITICAL: Memory allocator OK", Color::GREEN),
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("INIT_CRITICAL: Memory FAIL - {:?}", e), Color::RED);
+            return Err(RecoveryAction::Continue);
+        }
+    }
+
+    fb.write_text_kernel("INIT_CRITICAL: Completado", Color::GREEN);
+    Ok(())
+}
+
+/// Inicializa los componentes principales con posibilidad de recuperación
+fn init_main_components(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
+    // Sistema de interrupciones (deshabilitado por compatibilidad)
+    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad.", Color::YELLOW);
+    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad", Color::YELLOW);
+
+    // Inicializar gestor de paginación
+    let paging_manager = try_init_with_fallback!("paging_system",
+        crate::error_recovery::init_components::init_paging_system(),
+        crate::paging::PagingManager::new() // Fallback básico
+    )?;
     
-    // Inicializar sistema de escritura inteligente
-    // let ai_typing_config = AiTypingConfig { ... }; // Comentado temporalmente
-    // let mut ai_typing_system = create_ai_typing_system(); // Comentado temporalmente
-    serial_write_str("KERNEL_MAIN: AI typing system initialized.\n");
-    fb.write_text_kernel("Sistema de escritura inteligente inicializado.", Color::GREEN);
+    // Almacenar el PagingManager en el global
+    {
+        let mut pm_guard = PAGING_MANAGER.lock();
+        *pm_guard = Some(paging_manager);
+    }
+    fb.write_text_kernel("Gestor de paginación inicializado", Color::GREEN);
+
+    // Detección de hardware
+    let hw_result = try_init!("hardware_detection",
+        crate::error_recovery::init_components::init_hardware_detection()
+    )?;
+
+    // Procesar resultados de hardware
+    process_hardware_results(fb, &hw_result);
+
+    // Inicializar sistema de archivos
+    try_init!("filesystem", {
+        crate::error_recovery::init_components::init_filesystem()
+    })?;
+
+    Ok(())
+}
+
+/// Inicializa funcionalidades avanzadas que pueden fallar sin detener el sistema
+fn init_advanced_features(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
+    // Servicios de IA (pueden fallar en modo seguro)
+    try_init!("ai_services",
+        crate::error_recovery::init_components::init_ai_services()
+    ).unwrap_or_else(|_| {
+        fb.write_text_kernel("Servicios de IA no disponibles en este modo de boot", Color::YELLOW);
+    });
+
+    Ok(())
+}
+
+/// Procesa los resultados de la detección de hardware
+fn process_hardware_results(fb: &mut FramebufferDriver, hw: &HardwareDetectionResult) {
+    fb.write_text_kernel("Detección de GPU completada", Color::GREEN);
+
+    match hw.graphics_mode {
+        GraphicsMode::Framebuffer => fb.write_text_kernel("Modo gráfico: Framebuffer", Color::CYAN),
+        GraphicsMode::VGA => fb.write_text_kernel("Modo gráfico: VGA", Color::CYAN),
+        GraphicsMode::HardwareAccelerated => {
+            fb.write_text_kernel("Modo gráfico: Acelerado", Color::CYAN)
+        }
+    }
+
+    if let Some(primary) = hw.primary_gpu.as_ref() {
+        fb.write_text_kernel(
+            &alloc::format!(
+                "GPU primaria: {:04X}:{:04X} ({:?})",
+                primary.pci_device.vendor_id,
+                primary.pci_device.device_id,
+                primary.gpu_type
+            ),
+            Color::WHITE,
+        );
+        fb.write_text_kernel(
+            &alloc::format!(
+                "Memoria estimada: {} MB",
+                primary.memory_size / (1024 * 1024)
+            ),
+            Color::WHITE,
+        );
+        fb.write_text_kernel(
+            &alloc::format!(
+                "Resolución máxima: {}x{}",
+                primary.max_resolution.0,
+                primary.max_resolution.1
+            ),
+            Color::WHITE,
+        );
+    } else {
+        fb.write_text_kernel("No se detectó GPU primaria", Color::YELLOW);
+    }
+}
+
+/// Modo de recuperación cuando ocurren errores críticos
+fn init_recovery_mode(fb: &mut FramebufferDriver, mode: BootMode) -> ! {
+    fb.clear_screen(Color::YELLOW);
+    fb.write_text_kernel("MODO DE RECUPERACIÓN ACTIVADO", Color::BLACK);
+
+    match mode {
+        BootMode::Safe => {
+            fb.write_text_kernel("Modo Seguro: Funcionalidades avanzadas deshabilitadas", Color::BLACK);
+            fb.write_text_kernel("Modo seguro: funcionalidades limitadas", Color::YELLOW);
+        }
+        BootMode::Minimal => {
+            fb.write_text_kernel("Modo Mínimo: Solo funcionalidades esenciales", Color::BLACK);
+            fb.write_text_kernel("Modo mínimo: sistema básico únicamente", Color::YELLOW);
+        }
+        BootMode::Recovery => {
+            fb.write_text_kernel("Modo Recuperación: Diagnóstico del sistema", Color::BLACK);
+            fb.write_text_kernel("Modo de recuperación - verificar configuración", Color::RED);
+        }
+        _ => {
+            fb.write_text_kernel("Modo de recuperación desconocido", Color::RED);
+    }
+    }
+
+    display_recovery_status(fb);
+
+    // Bucle simplificado para modo de recuperación
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}
+
+/// Continúa la inicialización de componentes no críticos
+fn continue_initialization(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
+    let state = crate::error_recovery::get_recovery_state();
+
+    // Diagnóstico USB (solo si está disponible)
+    if state.is_feature_available("usb") {
+        try_init!("usb_diagnostic", {
+            usb_diagnostic::usb_diagnostic_main();
+            Ok(())
+        }).unwrap_or_else(|_| {
+            fb.write_text_kernel("Diagnóstico USB no disponible", Color::YELLOW);
+        });
+    }
+
+    // Inicialización de drivers de almacenamiento
+    let mut storage_manager = StorageManager::new();
+    try_init!("storage_drivers", {
+        init_storage_manager().map_err(|e| InitError::recoverable("storage", &alloc::format!("Error inicializando almacenamiento: {}", e)))
+    }).unwrap_or_else(|_| {
+        fb.write_text_kernel("Drivers de almacenamiento no disponibles", Color::YELLOW);
+    });
     
-    // Inicializar modelos pre-entrenados
-    // let mut model_manager = PretrainedModelManager::new(64); // Comentado temporalmente
-    // initialize_pretrained_models(&mut model_manager, fb); // Comentado temporalmente
-    
-    serial_write_str("KERNEL_MAIN: AI system initialized.\n");
-    fb.write_text_kernel("Sistema de IA inicializado.", Color::GREEN);
+    // Obtener el storage manager si está disponible
+            if let Some(manager) = get_storage_manager() {
+                storage_manager = manager.clone();
+            }
+
+    // Intentar montar sistemas de archivos
+    if storage_manager.device_count() > 0 && state.is_feature_available("filesystem") {
+        try_init!("filesystem_mounting", {
+            // Intentar EclipseFS primero
+        match mount_eclipsefs_from_storage(&storage_manager, None) {
+            Ok(()) => {
+                if let Some(vfs_guard) = get_vfs().as_ref() {
+                    vfs_guard.debug_list_mounts();
+                }
+                    Ok(())
+            }
+            Err(e) => {
+                    // Intentar FAT32 como fallback
+                    mount_fat32_from_storage(&storage_manager, None)
+                        .map_err(|_| InitError::recoverable("filesystem", "No se pudo montar ningún sistema de archivos"))
+                }
+            }
+        }).unwrap_or_else(|_| {
+            fb.write_text_kernel("Sistema de archivos no disponible", Color::YELLOW);
+        });
+    }
+
+    // Inicializar servicios de IA si están disponibles
+    if state.is_feature_available("ai_services") {
+        try_init!("ai_services_init", {
+            initialize_ai_services(fb);
+            Ok(())
+        }).unwrap_or_else(|_| {
+            fb.write_text_kernel("Servicios de IA no disponibles", Color::YELLOW);
+        });
+            }
+
+    Ok(())
+}
+
+/// Bucle principal del kernel con scheduler de procesos
+fn kernel_main_loop(fb: &mut FramebufferDriver) -> ! {
+    // Inicializar componentes restantes que no son críticos
+    if let Err(_) = continue_initialization(fb) {
+        fb.write_text_kernel("Componentes no críticos fallaron", Color::YELLOW);
+    }
+
+    // Ejecutar demostración de dispositivos virtuales
+    if let Err(e) = crate::virtual_devices::demo_device_usage() {
+        let _ = e;
+        fb.write_text_kernel("Error en demostración de dispositivos", Color::YELLOW);
+    }
+
+    // Ejecutar demostración del sistema de red
+    if let Err(e) = crate::network::demo_network_system() {
+        let _ = e;
+        fb.write_text_kernel("Error en demostración de red", Color::YELLOW);
+    }
+    // Ejecutar demostración del sistema de archivos virtual
+    if let Err(e) = crate::virtual_fs::demo_virtual_filesystem() {
+        let _ = e;
+        fb.write_text_kernel("Error en demostración del VFS", Color::YELLOW);
+    }
 
     // Bucle infinito para mantener el kernel en ejecución
-    serial_write_str("KERNEL_MAIN: Entering main loop.\n");
+    fb.write_text_kernel("Entrando al bucle principal con scheduler", Color::CYAN);
     fb.write_text_kernel("Kernel en ejecución. Sistema listo.", Color::GREEN);
     
     let mut interrupt_counter = 0u32;
     let mut shell_demo_counter = 0u32;
+    let mut scheduler_tick_counter = 0u32;
     
     loop {
         // Cada 1000 iteraciones, mostrar estadísticas de interrupciones
@@ -482,6 +923,34 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                 );
             }
         }
+
+        // Cada 100 iteraciones, mostrar estadísticas de procesos
+        if scheduler_tick_counter % 100 == 0 {
+            let (running, ready, blocked) = crate::process::get_process_stats();
+            let proc_info = crate::process::get_process_system_info();
+            fb.write_text_kernel(
+                &alloc::format!(
+                    "Procesos: Ejecutando={}, Listos={}, Bloqueados={}, Total={}",
+                    running, ready, blocked, proc_info.total_processes
+                ),
+                Color::MAGENTA,
+            );
+        }
+
+        // Cada 200 iteraciones, mostrar estadísticas de módulos
+        if scheduler_tick_counter % 200 == 0 {
+            let modules = crate::modules::api::list_modules();
+            fb.write_text_kernel(
+                &alloc::format!("Módulos: {}", modules.len()),
+                Color::GREEN,
+            );
+        }
+
+        // Simular timer tick cada 50 iteraciones (scheduler)
+        if scheduler_tick_counter % 50 == 0 {
+            // El sistema de procesos existente maneja el scheduling automáticamente
+            // No necesitamos llamar on_timer_tick manualmente
+        }
         
         // Cada 5000 iteraciones, demostrar funcionalidades del shell
         if shell_demo_counter % 5000 == 0 {
@@ -495,6 +964,7 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         
         interrupt_counter = interrupt_counter.wrapping_add(1);
         shell_demo_counter = shell_demo_counter.wrapping_add(1);
+        scheduler_tick_counter = scheduler_tick_counter.wrapping_add(1);
         
         unsafe {
             core::arch::asm!("hlt");
@@ -554,7 +1024,10 @@ fn mount_eclipsefs_from_bootloader_data(fb: &mut FramebufferDriver) {
     let mut vfs_guard = get_vfs();
     if let Some(vfs) = vfs_guard.as_mut() {
         // Crear información del dispositivo dummy para main_simple
-        let device_info = EclipseFSDeviceInfo::new("/dev/sda2".to_string(), 1000000, 204800);
+        // Usar formato correcto según el tipo de disco
+        // NVMe: /dev/nvme0n1p2
+        // SATA: /dev/sda2
+        let device_info = EclipseFSDeviceInfo::new("/dev/nvme0n1p2".to_string(), 1000000, 204800);
         let fs_wrapper = Box::new(EclipseFSWrapper::new_lazy(header, inode_entries, 1, device_info));
         vfs.mount("/", fs_wrapper);
         

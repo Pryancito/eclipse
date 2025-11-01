@@ -25,8 +25,10 @@ pub const MAX_INTERFACES: usize = 16;
 pub const MAX_ROUTES: usize = 256;
 pub const MAX_SOCKETS: usize = 1024;
 pub const MAX_CONNECTIONS: usize = 512;
-pub const BUFFER_POOL_SIZE: usize = 1024;
-pub const MAX_PACKET_SIZE: usize = 65536;
+// Reducimos drásticamente el tamaño de los pools y paquetes para evitar
+// consumir el heap completo durante la inicialización en entornos de demo.
+pub const BUFFER_POOL_SIZE: usize = 64;
+pub const MAX_PACKET_SIZE: usize = 2048;
 
 // Tipos de error de red
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,4 +72,22 @@ pub fn init_network() {
     // Inicializar sistema de red
     // En una implementación real, esto configuraría el sistema global
     let _ = init_network_system();
+}
+
+/// Inicialización del stack de red (para compatibilidad con el kernel)
+pub fn init_network_stack() -> NetworkResult<()> {
+    init_network_system()
+}
+
+/// Demostración del sistema de red
+pub fn demo_network_system() -> NetworkResult<()> {
+    // Esta función demuestra las capacidades del sistema de red
+    // En una implementación completa, crearía interfaces virtuales,
+    // probaría envío/recepción de paquetes, etc.
+
+    // Por ahora, solo verificamos que el sistema esté inicializado
+    let info = get_network_system_info();
+    let _ = info;
+
+    Ok(())
 }

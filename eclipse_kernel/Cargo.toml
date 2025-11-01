@@ -16,6 +16,8 @@ crate-type = ["lib", "staticlib"]
 name = "eclipse_kernel"
 path = "src/main.rs"
 
+# build-dependencies removidas - usamos nasm directamente
+
 [dependencies]
 x86_64 = "0.14.9"
 bootloader = { version = "0.9.8", features = ["map_physical_memory"] }
@@ -48,6 +50,7 @@ spin = "0.9"
 virtio-drivers-and-devices = "0.2.3"
 virtio-spec = "0.3.2"
 polished_pci = { version = "0.2.2", default-features = false }
+xhci = { version = "0.9", default-features = false }
 
 [features]
 default = ["no_std", "alloc"]
@@ -73,6 +76,12 @@ cosmic-full = []
 [profile.dev]
 panic = "abort"
 lto = false
+opt-level = "z"
+overflow-checks = false
+
+[profile.release]
+panic = "abort"
+lto = true
 opt-level = "z"
 overflow-checks = false
 

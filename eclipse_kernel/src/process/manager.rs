@@ -9,12 +9,7 @@ use crate::process::process::{
 use crate::process::scheduler::{
     ProcessScheduler, SchedulerStats, SchedulingAlgorithm, ThreadScheduler, ThreadSchedulerStats,
 };
-
-/// Máximo número de procesos en el sistema
-const MAX_PROCESSES: usize = 1024;
-
-/// Máximo número de threads por proceso
-const MAX_THREADS_PER_PROCESS: usize = 64;
+use crate::process::{MAX_PROCESSES, MAX_THREADS_PER_PROCESS};
 
 /// Gestor principal de procesos
 #[derive(Debug)]

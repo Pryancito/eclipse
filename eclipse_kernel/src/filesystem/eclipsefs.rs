@@ -223,7 +223,21 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
         // Si aún no se encontró, buscar por nombres específicos como fallback
         if eclipsefs_partition.is_none() {
             crate::debug::serial_write_str("ECLIPSEFS: (root) No se encontró EclipseFS en particiones detectadas, intentando búsqueda por nombres...\n");
-            let storage_partitions = ["/dev/sda2", "/dev/sda1", "/dev/sdb1", "/dev/sdb2", "/dev/sdc1", "/dev/sdc2", "/dev/vda1", "/dev/vda2", "/dev/vdb1", "/dev/vdb2", "/dev/hda1", "/dev/hda2", "/dev/hdb1", "/dev/hdb2", "/dev/hdc1", "/dev/hdc2"];
+            // Lista de particiones candidatas (orden de prioridad):
+            // 1. NVMe (más común en sistemas modernos)
+            // 2. SATA/AHCI (tradicional)
+            // 3. VirtIO (virtualización)
+            // 4. IDE (legacy)
+            let storage_partitions = [
+                // NVMe devices (formato: /dev/nvmeXn1pY)
+                "/dev/nvme0n1p2", "/dev/nvme0n1p1", "/dev/nvme1n1p2", "/dev/nvme1n1p1",
+                // SATA/AHCI devices
+                "/dev/sda2", "/dev/sda1", "/dev/sdb2", "/dev/sdb1", "/dev/sdc2", "/dev/sdc1",
+                // VirtIO devices
+                "/dev/vda2", "/dev/vda1", "/dev/vdb2", "/dev/vdb1",
+                // IDE legacy
+                "/dev/hda2", "/dev/hda1", "/dev/hdb2", "/dev/hdb1", "/dev/hdc2", "/dev/hdc1"
+            ];
             for partition_name in &storage_partitions {
                 if let Some(partition) = storage.find_partition_by_name(partition_name) {
                     if partition.filesystem_type == crate::partitions::FilesystemType::EclipseFS {
@@ -252,7 +266,10 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     
     // Leer el superblock de EclipseFS directamente desde /dev/sda2
     // Como el driver ATA directo falla, vamos a leer directamente desde el sector donde está EclipseFS
-    let sector_offset = if partition.name == "/dev/sda2" {
+    // Determinar sector offset según el dispositivo
+    // Particiones 2 típicamente empiezan después de la partición 1 (boot)
+    let is_second_partition = partition.name.ends_with("2") || partition.name.ends_with("p2");
+    let sector_offset = if is_second_partition {
         // EclipseFS está instalado en /dev/sda2, que empieza en el sector 20973568 (según el instalador)
         // Pero vamos a leer directamente desde el inicio de la partición
         20973568
@@ -268,7 +285,12 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     
     // Leer el boot sector desde la partición usando el storage manager
     // CORRECCIÓN: Usar el índice correcto de la partición (/dev/sda2 = índice 1)
-    let partition_index = if partition.name == "/dev/sda2" { 1 } else { 0 };
+    // Determinar índice de partición (0=primera, 1=segunda, etc.)
+    let partition_index = if partition.name.ends_with("2") || partition.name.ends_with("p2") {
+        1
+    } else {
+        0
+    };
     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Usando índice de partición {} para {}\n", partition_index, partition.name));
     
     // NUEVA ESTRATEGIA: Buscar EclipseFS en diferentes sectores dentro de la partición
@@ -619,7 +641,8 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
                     .ok_or(EclipseFSError::IoError)?;
                 
                 // Leer directamente desde el sector donde está EclipseFS
-                let sector_offset = if eclipsefs_partition.name == "/dev/sda2" {
+                let is_second_partition = eclipsefs_partition.name.ends_with("2") || eclipsefs_partition.name.ends_with("p2");
+                let sector_offset = if is_second_partition {
                     20973568 + block  // EclipseFS está en /dev/sda2 + offset del bloque
                 } else {
                     eclipsefs_partition.start_lba + block
@@ -791,7 +814,8 @@ pub fn obtener_dispositivos_eclipsefs_candidatos() -> Vec<EclipseFSDeviceInfo> {
         
         // Priorizar específicamente /dev/sda2 (donde está instalado EclipseFS v2.0)
         for particion in &storage.partitions {
-            if particion.name == "/dev/sda2" {
+            let is_second_partition = particion.name.ends_with("2") || particion.name.ends_with("p2");
+            if is_second_partition {
                 let size_mb = (particion.size_lba * 512) / (1024 * 1024);
                 if size_mb >= 1 {
                     let info = EclipseFSDeviceInfo::with_info(

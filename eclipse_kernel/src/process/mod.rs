@@ -16,9 +16,11 @@ pub use manager::{get_process_manager, init_process_manager};
 pub use process::{ProcessId, ProcessPriority, ProcessState, ThreadId};
 pub use scheduler::SchedulingAlgorithm;
 
-/// Constantes del sistema de procesos
-pub const MAX_PROCESSES: usize = 1024;
-pub const MAX_THREADS_PER_PROCESS: usize = 64;
+/// Constantes del sistema de procesos (ajustadas para entorno de demo).
+/// Valores enormes multiplicaban el tamaño de las tablas estáticas y
+/// agotaban la memoria disponible durante la inicialización.
+pub const MAX_PROCESSES: usize = 64;
+pub const MAX_THREADS_PER_PROCESS: usize = 8;
 pub const DEFAULT_QUANTUM: u64 = 100; // 100ms
 pub const THREAD_QUANTUM: u64 = 50; // 50ms
 

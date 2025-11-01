@@ -952,7 +952,10 @@ pub fn obtener_dispositivos_fat32_candidatos() -> Vec<Fat32DeviceInfo> {
         // Lista de nombres alternativos a probar (similar a EclipseFS)
         let nombres_alternativos = [
             "/dev/sda1", "/dev/sdb1", "/dev/sdc1", "/dev/sdd1",
-            "/dev/sda2", "/dev/sdb2", "/dev/sdc2", "/dev/sdd2",
+            // NVMe partitions
+            "/dev/nvme0n1p1", "/dev/nvme0n1p2", "/dev/nvme1n1p1", "/dev/nvme1n1p2",
+            // SATA/AHCI partitions
+            "/dev/sda1", "/dev/sda2", "/dev/sdb1", "/dev/sdb2", "/dev/sdc1", "/dev/sdc2", "/dev/sdd1", "/dev/sdd2",
             "/dev/sdap1", "/dev/sdap2", "/dev/sdbp1", "/dev/sdbp2",
             "/dev/hda1", "/dev/hdb1", "/dev/hdc1", "/dev/hdd1",
         ];

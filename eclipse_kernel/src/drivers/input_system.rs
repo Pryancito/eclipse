@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use crate::drivers::keyboard::{KeyCode, KeyEvent, KeyState};
 use crate::drivers::manager::Driver;
@@ -19,6 +20,28 @@ use crate::drivers::usb_mouse::{
     MouseButton as UsbMouseButton, MouseButtonState, MouseEvent, MousePosition, UsbMouseDriver,
 };
 use crate::drivers::usb_mouse_real::UsbMouseReal;
+
+/// Sistema de entrada global
+pub static GLOBAL_INPUT_SYSTEM: Mutex<Option<InputSystem>> = Mutex::new(None);
+
+/// Inicializa el sistema de entrada global
+pub fn init_input_system() -> Result<(), &'static str> {
+    let config = InputSystemConfig::default();
+    let mut system = InputSystem::new(config);
+    system.initialize()?;
+    
+    *GLOBAL_INPUT_SYSTEM.lock() = Some(system);
+    Ok(())
+}
+
+/// Obtiene referencia al sistema de entrada global
+pub fn with_input_system<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut InputSystem) -> R,
+{
+    let mut guard = GLOBAL_INPUT_SYSTEM.lock();
+    guard.as_mut().map(f)
+}
 
 /// Sistema de entrada unificado para Eclipse OS
 /// Gestiona eventos de teclado y mouse de forma centralizada

@@ -128,7 +128,14 @@ pub mod math_utils; // Utilidades matemáticas
 pub mod network;
 pub mod paging; // Sistema de paginación
 pub mod performance; // Sistema de optimización de rendimiento multihilo
-pub mod process;
+pub mod process; // Sistema de procesos básico
+pub mod devices; // Sistema de dispositivos virtuales
+pub mod virtual_devices; // Dispositivos virtuales de ejemplo
+#[macro_use]
+pub mod config; // Sistema de configuración del kernel
+pub mod shell; // Shell interactivo básico
+pub mod power; // Sistema de gestión de energía
+pub mod virtual_fs; // Sistema de archivos virtual
 pub mod process_memory; // Gestión de memoria para procesos
 pub mod process_transfer; // Transferencia de control del kernel al userland
 pub mod synchronization; // Sistema de sincronización multihilo
@@ -152,12 +159,14 @@ pub mod ai_services; // Servicios de IA integrados
 pub mod ai_shell; // Shell integrado con comandos de IA
 pub mod ai_simple_demo; // Demostración simple de IA
 pub mod ai_typing_system; // Sistema de escritura inteligente con IA
-pub mod config; // Sistema de configuración dinámica del kernel
 pub mod cosmic;
 pub mod hotplug; // Sistema de hotplug para dispositivos USB
 pub mod ipc; // Sistema de comunicación inter-proceso
 pub mod kernel_utils;
+pub mod logging; // Sistema de logging estructurado avanzado
+pub mod modules; // Sistema de módulos del kernel
 pub mod main_simple;
+pub mod main_loop; // Loop principal mejorado del kernel
 pub mod main_unified; // Main unificado con funcionalidades de escritorio
 pub mod main_with_init; // Main con integración systemd
 pub mod metrics; // Sistema de métricas y monitoreo del kernel
@@ -167,6 +176,7 @@ pub mod vga_centered_display;
 pub mod wayland; // Módulo para mostrar texto centrado en VGA
 pub mod window_system; // Sistema de ventanas X11/Wayland-like // Utilidades del kernel Eclipse
 pub mod debug;
+pub mod error_recovery; // Sistema de recuperación de errores durante el boot
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -225,6 +235,10 @@ pub enum KernelError {
     ConfigurationError,
     InvalidConfiguration,
     ConfigurationNotFound,
+    ConfigParseError,
+    ConfigNotFound,
+    ConfigTypeError,
+    ConfigError,
 
     // Errores de hardware
     HardwareError,
@@ -304,6 +318,10 @@ impl core::fmt::Display for KernelError {
             KernelError::ConfigurationError => "Error de configuración",
             KernelError::InvalidConfiguration => "Configuración inválida",
             KernelError::ConfigurationNotFound => "Configuración no encontrada",
+            KernelError::ConfigParseError => "Error al parsear configuración",
+            KernelError::ConfigNotFound => "Configuración no encontrada",
+            KernelError::ConfigTypeError => "Tipo de configuración incorrecto",
+            KernelError::ConfigError => "Error de configuración",
 
             // Errores de hardware
             KernelError::HardwareError => "Error de hardware",
@@ -336,6 +354,17 @@ impl From<&str> for KernelError {
     }
 }
 
+impl From<crate::config::ConfigError> for KernelError {
+    fn from(error: crate::config::ConfigError) -> Self {
+        match error {
+            crate::config::ConfigError::ParseError => KernelError::ConfigParseError,
+            crate::config::ConfigError::NotFound => KernelError::ConfigNotFound,
+            crate::config::ConfigError::WrongType => KernelError::ConfigTypeError,
+            crate::config::ConfigError::Other(_) => KernelError::ConfigError,
+        }
+    }
+}
+
 pub type KernelResult<T> = Result<T, KernelError>;
 
 pub const KERNEL_VERSION: &str = "0.4.0";
@@ -353,7 +382,7 @@ pub fn initialize() -> KernelResult<()> {
 
     // Inicializar el sistema de configuración
 
-    config::init_config()?;
+    config::init_kernel_config()?;
 
     // Inicializar el sistema de plugins
 

@@ -1,621 +1,366 @@
-//! Driver USB Mass Storage para Eclipse OS
-//!
-//! Implementa soporte completo para dispositivos USB de almacenamiento
-//! incluyendo pendrives, discos duros externos y otros dispositivos USB MSC
+/// Driver USB Mass Storage (Bulk-Only Transport)
+///
+/// Este driver implementa el protocolo USB Mass Storage Class (MSC):
+/// - USB Bulk-Only Transport (BOT) especificación 1.0
+/// - SCSI Transparent Command Set
+/// - Soporta pendrives, discos externos USB, etc.
+///
+/// Basado en USB Mass Storage Class Spec 1.0
 
-use crate::drivers::{
-    device::{Device, DeviceInfo, DeviceOperations, DeviceType},
-    manager::{Driver, DriverError, DriverInfo, DriverResult},
-    MAX_DEVICES,
-};
-
-use alloc::string::{String, ToString};
+use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
+use alloc::string::String;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// Constantes USB Mass Storage
-const USB_MSC_MAX_DEVICES: u8 = 16;
-const USB_MSC_BLOCK_SIZE: u32 = 512;
-const USB_MSC_MAX_TRANSFER_SIZE: u32 = 65536;
+use crate::drivers::manager::DriverResult;
+use crate::drivers::usb_xhci_control::*;
 
-// Códigos de comando SCSI
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScsiCommand {
-    TestUnitReady = 0x00,
-    RequestSense = 0x03,
-    FormatUnit = 0x04,
-    Read6 = 0x08,
-    Write6 = 0x0A,
-    ReadCapacity = 0x25,
-    Read10 = 0x28,
-    Write10 = 0x2A,
-    Read12 = 0xA8,
-    Write12 = 0xAA,
-    Inquiry = 0x12,
-    ModeSense = 0x1A,
-    ModeSelect = 0x15,
-    PreventAllowMediumRemoval = 0x1E,
-    StartStopUnit = 0x1B,
-    SynchronizeCache = 0x35,
-    ReadToc = 0x43,
-    ReadDiscInformation = 0x51,
-    GetConfiguration = 0x46,
-    GetEventStatusNotification = 0x4A,
+/// Constantes del protocolo Mass Storage
+pub const MSC_SUBCLASS_RBC: u8 = 0x01;      // Reduced Block Commands
+pub const MSC_SUBCLASS_MMC5: u8 = 0x02;     // CD/DVD
+pub const MSC_SUBCLASS_QIC157: u8 = 0x03;   // Tape
+pub const MSC_SUBCLASS_UFI: u8 = 0x04;      // Floppy
+pub const MSC_SUBCLASS_SFF8070I: u8 = 0x05; // Removable
+pub const MSC_SUBCLASS_SCSI: u8 = 0x06;     // SCSI Transparent
+
+/// Protocolos Mass Storage
+pub const MSC_PROTOCOL_CBI: u8 = 0x00;      // Control/Bulk/Interrupt
+pub const MSC_PROTOCOL_CB: u8 = 0x01;       // Control/Bulk
+pub const MSC_PROTOCOL_BOT: u8 = 0x50;      // Bulk-Only Transport
+
+/// Command Block Wrapper (CBW) - 31 bytes
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct CommandBlockWrapper {
+    pub signature: u32,          // 'USBC' = 0x43425355
+    pub tag: u32,                // Único para cada CBW
+    pub data_transfer_length: u32, // Bytes a transferir
+    pub flags: u8,               // Bit 7: Dirección (0=OUT, 1=IN)
+    pub lun: u8,                 // Logical Unit Number (0-15)
+    pub command_length: u8,      // Longitud del comando SCSI (1-16)
+    pub command: [u8; 16],       // Comando SCSI
 }
 
-// Tipos de dispositivo USB Mass Storage
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UsbMscDeviceType {
-    Unknown,
-    DirectAccess,        // Disco duro, SSD
-    SequentialAccess,    // Unidad de cinta
-    Printer,            // Impresora
-    Processor,          // Procesador
-    WriteOnce,          // Dispositivo de escritura única
-    CDROM,              // CD-ROM, DVD-ROM
-    Scanner,            // Escáner
-    OpticalMemory,      // Dispositivo óptico
-    MediumChanger,      // Cambiador de medios
-    Communication,      // Dispositivo de comunicación
-    Security,           // Dispositivo de seguridad
-    WellKnown,          // Dispositivo conocido
-    Other,              // Otro tipo
+impl CommandBlockWrapper {
+    /// Signature para CBW
+    pub const SIGNATURE: u32 = 0x43425355;  // 'USBC'
+    
+    /// Crea un nuevo CBW
+    pub fn new(tag: u32, data_length: u32, direction_in: bool, lun: u8) -> Self {
+        Self {
+            signature: Self::SIGNATURE,
+            tag,
+            data_transfer_length: data_length,
+            flags: if direction_in { 0x80 } else { 0x00 },
+            lun: lun & 0x0F,
+            command_length: 0,
+            command: [0; 16],
+        }
+    }
+    
+    /// Configura el comando SCSI
+    pub fn set_command(&mut self, command: &[u8]) {
+        let len = command.len().min(16);
+        self.command[..len].copy_from_slice(&command[..len]);
+        self.command_length = len as u8;
+    }
+    
+    /// Convierte a bytes
+    pub fn to_bytes(&self) -> [u8; 31] {
+        unsafe {
+            core::mem::transmute_copy(self)
+        }
+    }
 }
 
-// Descriptor de dispositivo USB Mass Storage
+/// Command Status Wrapper (CSW) - 13 bytes
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct CommandStatusWrapper {
+    pub signature: u32,          // 'USBS' = 0x53425355
+    pub tag: u32,                // Debe coincidir con el CBW
+    pub data_residue: u32,       // Diferencia entre datos esperados y transferidos
+    pub status: u8,              // 0=Success, 1=Failed, 2=Phase Error
+}
+
+impl CommandStatusWrapper {
+    /// Signature para CSW
+    pub const SIGNATURE: u32 = 0x53425355;  // 'USBS'
+    
+    /// Status codes
+    pub const STATUS_PASSED: u8 = 0x00;
+    pub const STATUS_FAILED: u8 = 0x01;
+    pub const STATUS_PHASE_ERROR: u8 = 0x02;
+    
+    /// Crea desde bytes
+    pub fn from_bytes(bytes: &[u8; 13]) -> Self {
+        unsafe {
+            core::mem::transmute_copy(bytes)
+        }
+    }
+    
+    /// Verifica si el status es exitoso
+    pub fn is_success(&self) -> bool {
+        self.status == Self::STATUS_PASSED
+    }
+}
+
+/// Comandos SCSI para Mass Storage
+pub mod scsi {
+    /// TEST UNIT READY (0x00)
+    pub fn test_unit_ready() -> Vec<u8> {
+        vec![0x00, 0, 0, 0, 0, 0]
+    }
+    
+    /// REQUEST SENSE (0x03)
+    pub fn request_sense(alloc_length: u8) -> Vec<u8> {
+        vec![0x03, 0, 0, 0, alloc_length, 0]
+    }
+    
+    /// INQUIRY (0x12) - obtiene información del dispositivo
+    pub fn inquiry(alloc_length: u8) -> Vec<u8> {
+        vec![0x12, 0, 0, 0, alloc_length, 0]
+    }
+    
+    /// READ CAPACITY (10) (0x25) - obtiene capacidad del dispositivo
+    pub fn read_capacity_10() -> Vec<u8> {
+        vec![0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+    
+    /// READ (10) (0x28) - lee sectores
+    pub fn read_10(lba: u32, sectors: u16) -> Vec<u8> {
+        vec![
+            0x28,  // Opcode
+            0,     // Flags
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0,     // Reserved
+            (sectors >> 8) as u8,
+            sectors as u8,
+            0,     // Control
+        ]
+    }
+    
+    /// WRITE (10) (0x2A) - escribe sectores
+    pub fn write_10(lba: u32, sectors: u16) -> Vec<u8> {
+        vec![
+            0x2A,  // Opcode
+            0,     // Flags
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0,     // Reserved
+            (sectors >> 8) as u8,
+            sectors as u8,
+            0,     // Control
+        ]
+    }
+}
+
+/// Información de dispositivo Mass Storage (desde INQUIRY)
 #[derive(Debug, Clone)]
-pub struct UsbMscDeviceInfo {
-    pub device_id: u32,
-    pub name: [u8; 64],
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub device_class: u8,
-    pub device_subclass: u8,
-    pub device_protocol: u8,
-    pub max_lun: u8,
-    pub current_lun: u8,
-    pub block_size: u32,
-    pub total_blocks: u64,
-    pub total_capacity: u64,  // En bytes
-    pub is_removable: bool,
-    pub is_write_protected: bool,
-    pub is_ready: bool,
-    pub device_type: UsbMscDeviceType,
-    pub serial_number: [u8; 32],
-    pub firmware_version: [u8; 16],
-    pub is_initialized: bool,
+pub struct MassStorageInfo {
+    pub device_type: u8,         // 0=Direct Access (disk), etc.
+    pub removable: bool,
+    pub vendor: String,          // 8 chars
+    pub product: String,         // 16 chars
+    pub revision: String,        // 4 chars
 }
 
-// Controlador USB Mass Storage
-pub struct UsbMscController {
-    pub controller_id: u32,
-    pub name: [u8; 32],
-    pub is_enabled: bool,
-    pub devices: Vec<UsbMscDeviceInfo>,
-    pub max_devices: u8,
-    pub transfer_buffer: [u8; USB_MSC_MAX_TRANSFER_SIZE as usize],
-    pub is_busy: bool,
-}
-
-impl UsbMscController {
-    pub fn new(controller_id: u32) -> Self {
-        let mut name = [0u8; 32];
-        let name_str = b"USB MSC Controller";
-        let copy_len = core::cmp::min(name_str.len(), 31);
-        name[..copy_len].copy_from_slice(&name_str[..copy_len]);
+impl MassStorageInfo {
+    /// Parsea desde respuesta INQUIRY (36 bytes mínimo)
+    pub fn from_inquiry_response(data: &[u8]) -> Option<Self> {
+        if data.len() < 36 {
+            return None;
+        }
         
+        let device_type = data[0] & 0x1F;
+        let removable = (data[1] & 0x80) != 0;
+        
+        let vendor = String::from_utf8_lossy(&data[8..16]).trim().to_string();
+        let product = String::from_utf8_lossy(&data[16..32]).trim().to_string();
+        let revision = String::from_utf8_lossy(&data[32..36]).trim().to_string();
+        
+        Some(Self {
+            device_type,
+            removable,
+            vendor,
+            product,
+            revision,
+        })
+    }
+    
+    /// Obtiene el tipo de dispositivo como string
+    pub fn device_type_string(&self) -> &'static str {
+        match self.device_type {
+            0x00 => "Direct Access (Disk)",
+            0x01 => "Sequential Access (Tape)",
+            0x05 => "CD-ROM",
+            0x07 => "Optical Memory",
+            0x0E => "Simplified Direct Access",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// Capacidad del dispositivo (desde READ CAPACITY)
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceCapacity {
+    pub last_lba: u32,           // Último sector válido
+    pub block_size: u32,         // Tamaño de bloque en bytes
+}
+
+impl DeviceCapacity {
+    /// Parsea desde respuesta READ CAPACITY (8 bytes)
+    pub fn from_response(data: &[u8]) -> Option<Self> {
+        if data.len() < 8 {
+            return None;
+        }
+        
+        let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        
+        Some(Self {
+            last_lba,
+            block_size,
+        })
+    }
+    
+    /// Calcula el número total de bloques
+    pub fn total_blocks(&self) -> u32 {
+        self.last_lba + 1
+    }
+    
+    /// Calcula el tamaño total en MB
+    pub fn total_mb(&self) -> u64 {
+        ((self.total_blocks() as u64) * (self.block_size as u64)) / (1024 * 1024)
+    }
+}
+
+/// Dispositivo Mass Storage
+pub struct MassStorageDevice {
+    slot_id: u8,
+    interface_number: u8,
+    endpoint_in: u8,             // Bulk IN
+    endpoint_out: u8,            // Bulk OUT
+    max_packet_size: u16,
+    lun: u8,                     // Logical Unit Number
+    tag_counter: u32,            // Para generar tags únicos
+    info: Option<MassStorageInfo>,
+    capacity: Option<DeviceCapacity>,
+}
+
+impl MassStorageDevice {
+    /// Crea un nuevo dispositivo Mass Storage
+    pub fn new(slot_id: u8, interface_number: u8) -> Self {
         Self {
-            controller_id,
-            name,
-            is_enabled: false,
-            devices: Vec::new(),
-            max_devices: USB_MSC_MAX_DEVICES,
-            transfer_buffer: [0u8; USB_MSC_MAX_TRANSFER_SIZE as usize],
-            is_busy: false,
+            slot_id,
+            interface_number,
+            endpoint_in: 0x81,   // Por defecto
+            endpoint_out: 0x01,  // Por defecto
+            max_packet_size: 512,
+            lun: 0,
+            tag_counter: 0,
+            info: None,
+            capacity: None,
         }
     }
     
-    /// Habilitar controlador
-    pub fn enable(&mut self) -> DriverResult<()> {
-        if self.is_enabled {
-            return Ok(());
-        }
-        
-        // TODO: Implementar inicialización real del controlador USB MSC
-        // Por ahora simulamos la habilitación
-        
-        self.is_enabled = true;
-        Ok(())
+    /// Configura endpoints
+    pub fn set_endpoints(&mut self, ep_in: u8, ep_out: u8, max_packet: u16) {
+        self.endpoint_in = ep_in;
+        self.endpoint_out = ep_out;
+        self.max_packet_size = max_packet;
     }
     
-    /// Deshabilitar controlador
-    pub fn disable(&mut self) -> DriverResult<()> {
-        if !self.is_enabled {
-            return Ok(());
-        }
-        
-        // Limpiar dispositivos
-        self.devices.clear();
-        self.is_enabled = false;
-        Ok(())
+    /// Genera un tag único
+    fn next_tag(&mut self) -> u32 {
+        self.tag_counter = self.tag_counter.wrapping_add(1);
+        self.tag_counter
     }
     
-    /// Detectar dispositivos USB Mass Storage
-    pub fn detect_devices(&mut self) -> DriverResult<u32> {
-        if !self.is_enabled {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        // Limpiar dispositivos existentes
-        self.devices.clear();
-        
-        // TODO: Implementar detección real de dispositivos USB MSC
-        // Por ahora simulamos algunos dispositivos
-        
-        // Simular pendrive USB
-        let mut pendrive = UsbMscDeviceInfo {
-            device_id: 1,
-            name: [0u8; 64],
-            vendor_id: 0x1234,
-            product_id: 0x5678,
-            device_class: 0x08,  // Mass Storage
-            device_subclass: 0x06,  // SCSI
-            device_protocol: 0x50,  // Bulk-Only Transport
-            max_lun: 0,
-            current_lun: 0,
-            block_size: USB_MSC_BLOCK_SIZE,
-            total_blocks: 2048000,  // 1GB
-            total_capacity: 2048000 * USB_MSC_BLOCK_SIZE as u64,
-            is_removable: true,
-            is_write_protected: false,
-            is_ready: true,
-            device_type: UsbMscDeviceType::DirectAccess,
-            serial_number: [0u8; 32],
-            firmware_version: [0u8; 16],
-            is_initialized: false,
-        };
-        
-        // Configurar nombre del pendrive
-        let name_str = b"USB Pendrive";
-        let copy_len = core::cmp::min(name_str.len(), 63);
-        pendrive.name[..copy_len].copy_from_slice(&name_str[..copy_len]);
-        
-        // Configurar número de serie
-        let serial_str = b"1234567890";
-        let copy_len = core::cmp::min(serial_str.len(), 31);
-        pendrive.serial_number[..copy_len].copy_from_slice(&serial_str[..copy_len]);
-        
-        // Configurar versión de firmware
-        let fw_str = b"1.00";
-        let copy_len = core::cmp::min(fw_str.len(), 15);
-        pendrive.firmware_version[..copy_len].copy_from_slice(&fw_str[..copy_len]);
-        
-        self.devices.push(pendrive);
-        
-        // Simular disco duro externo
-        let mut hdd = UsbMscDeviceInfo {
-            device_id: 2,
-            name: [0u8; 64],
-            vendor_id: 0xABCD,
-            product_id: 0xEF01,
-            device_class: 0x08,  // Mass Storage
-            device_subclass: 0x06,  // SCSI
-            device_protocol: 0x50,  // Bulk-Only Transport
-            max_lun: 0,
-            current_lun: 0,
-            block_size: USB_MSC_BLOCK_SIZE,
-            total_blocks: 10485760,  // 5GB
-            total_capacity: 10485760 * USB_MSC_BLOCK_SIZE as u64,
-            is_removable: true,
-            is_write_protected: false,
-            is_ready: true,
-            device_type: UsbMscDeviceType::DirectAccess,
-            serial_number: [0u8; 32],
-            firmware_version: [0u8; 16],
-            is_initialized: false,
-        };
-        
-        // Configurar nombre del HDD
-        let name_str = b"USB External HDD";
-        let copy_len = core::cmp::min(name_str.len(), 63);
-        hdd.name[..copy_len].copy_from_slice(&name_str[..copy_len]);
-        
-        // Configurar número de serie
-        let serial_str = b"HDD123456789";
-        let copy_len = core::cmp::min(serial_str.len(), 31);
-        hdd.serial_number[..copy_len].copy_from_slice(&serial_str[..copy_len]);
-        
-        // Configurar versión de firmware
-        let fw_str = b"2.10";
-        let copy_len = core::cmp::min(fw_str.len(), 15);
-        hdd.firmware_version[..copy_len].copy_from_slice(&fw_str[..copy_len]);
-        
-        self.devices.push(hdd);
-        
-        Ok(self.devices.len() as u32)
+    /// Obtiene información del dispositivo
+    pub fn info(&self) -> Option<&MassStorageInfo> {
+        self.info.as_ref()
     }
     
-    /// Inicializar dispositivo USB MSC
-    pub fn initialize_device(&mut self, device_id: u32) -> DriverResult<()> {
-        if !self.is_enabled {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        // Buscar dispositivo
-        let device_index = self.devices.iter()
-            .position(|d| d.device_id == device_id)
-            .ok_or(DriverError::DeviceNotFound)?;
-        
-        if self.devices[device_index].is_initialized {
-            return Ok(());
-        }
-        
-        // TODO: Implementar inicialización real del dispositivo
-        // Por ahora simulamos la inicialización
-        
-        // Simular comando INQUIRY
-        self.send_scsi_command(device_id, ScsiCommand::Inquiry, &[], &mut [])?;
-        
-        // Simular comando READ CAPACITY
-        let mut capacity_data = [0u8; 8];
-        self.send_scsi_command(device_id, ScsiCommand::ReadCapacity, &[], &mut capacity_data)?;
-        
-        // Simular comando TEST UNIT READY
-        self.send_scsi_command(device_id, ScsiCommand::TestUnitReady, &[], &mut [])?;
-        
-        self.devices[device_index].is_initialized = true;
-        self.devices[device_index].is_ready = true;
-        
-        Ok(())
+    /// Obtiene capacidad del dispositivo
+    pub fn capacity(&self) -> Option<&DeviceCapacity> {
+        self.capacity.as_ref()
     }
     
-    /// Leer bloques del dispositivo
-    pub fn read_blocks(&mut self, device_id: u32, lba: u64, block_count: u32, buffer: &mut [u8]) -> DriverResult<()> {
-        if !self.is_enabled {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        // Buscar dispositivo
-        let device = self.devices.iter()
-            .find(|d| d.device_id == device_id)
-            .ok_or(DriverError::DeviceNotFound)?;
-        
-        if !device.is_initialized {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        if !device.is_ready {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        // Verificar límites
-        if lba + block_count as u64 > device.total_blocks {
-            return Err(DriverError::InvalidParameter);
-        }
-        
-        // TODO: Implementar lectura real de bloques
-        // Por ahora simulamos la lectura
-        
-        let bytes_to_read = block_count * device.block_size;
-        if buffer.len() < bytes_to_read as usize {
-            return Err(DriverError::InvalidParameter);
-        }
-        
-        // Simular datos leídos
-        for i in 0..bytes_to_read as usize {
-            buffer[i] = ((lba as u8 + (i / device.block_size as usize) as u8) ^ 0xAA) as u8;
-        }
-        
-        Ok(())
-    }
-    
-    /// Escribir bloques al dispositivo
-    pub fn write_blocks(&mut self, device_id: u32, lba: u64, block_count: u32, buffer: &[u8]) -> DriverResult<()> {
-        if !self.is_enabled {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        // Buscar dispositivo
-        let device = self.devices.iter()
-            .find(|d| d.device_id == device_id)
-            .ok_or(DriverError::DeviceNotFound)?;
-        
-        if !device.is_initialized {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        if !device.is_ready {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        if device.is_write_protected {
-            return Err(DriverError::InvalidParameter);
-        }
-        
-        // Verificar límites
-        if lba + block_count as u64 > device.total_blocks {
-            return Err(DriverError::InvalidParameter);
-        }
-        
-        // TODO: Implementar escritura real de bloques
-        // Por ahora simulamos la escritura
-        
-        let bytes_to_write = block_count * device.block_size;
-        if buffer.len() < bytes_to_write as usize {
-            return Err(DriverError::InvalidParameter);
-        }
-        
-        // Simular escritura
-        // En una implementación real, enviaríamos los datos al dispositivo
-        
-        Ok(())
-    }
-    
-    /// Enviar comando SCSI
-    fn send_scsi_command(&mut self, device_id: u32, command: ScsiCommand, data_in: &[u8], data_out: &mut [u8]) -> DriverResult<()> {
-        if !self.is_enabled {
-            return Err(DriverError::DeviceNotReady);
-        }
-        
-        if self.is_busy {
-            return Err(DriverError::DeviceBusy);
-        }
-        
-        self.is_busy = true;
-        
-        // TODO: Implementar envío real de comandos SCSI
-        // Por ahora simulamos el comando
-        
-        match command {
-            ScsiCommand::Inquiry => {
-                // Simular respuesta INQUIRY
-                if data_out.len() >= 36 {
-                    data_out[0] = 0x00; // Peripheral Device Type
-                    data_out[1] = 0x00; // Removable
-                    data_out[2] = 0x02; // Version
-                    data_out[3] = 0x02; // Response Data Format
-                    data_out[4] = 31;   // Additional Length
-                    data_out[5] = 0x00; // Reserved
-                    data_out[6] = 0x00; // Reserved
-                    data_out[7] = 0x00; // Reserved
-                    
-                    // Vendor Identification
-                    let vendor = b"Eclipse";
-                    let copy_len = core::cmp::min(vendor.len(), 8);
-                    data_out[8..8+copy_len].copy_from_slice(&vendor[..copy_len]);
-                    
-                    // Product Identification
-                    let product = b"USB Storage";
-                    let copy_len = core::cmp::min(product.len(), 16);
-                    data_out[16..16+copy_len].copy_from_slice(&product[..copy_len]);
-                    
-                    // Product Revision Level
-                    let revision = b"1.00";
-                    let copy_len = core::cmp::min(revision.len(), 4);
-                    data_out[32..32+copy_len].copy_from_slice(&revision[..copy_len]);
-                }
-            },
-            ScsiCommand::ReadCapacity => {
-                // Simular respuesta READ CAPACITY
-                if data_out.len() >= 8 {
-                    // LBA del último bloque
-                    data_out[0] = 0x00;
-                    data_out[1] = 0x1F;
-                    data_out[2] = 0xFF;
-                    data_out[3] = 0xFF;
-                    
-                    // Tamaño del bloque
-                    data_out[4] = 0x00;
-                    data_out[5] = 0x00;
-                    data_out[6] = 0x02;
-                    data_out[7] = 0x00; // 512 bytes
-                }
-            },
-            ScsiCommand::TestUnitReady => {
-                // Simular respuesta TEST UNIT READY
-                // Comando exitoso si no hay error
-            },
-            _ => {
-                // Otros comandos
-            }
-        }
-        
-        self.is_busy = false;
-        Ok(())
-    }
-    
-    /// Obtener dispositivos USB MSC
-    pub fn get_devices(&self) -> &Vec<UsbMscDeviceInfo> {
-        &self.devices
-    }
-    
-    /// Obtener dispositivo por ID
-    pub fn get_device(&self, device_id: u32) -> Option<&UsbMscDeviceInfo> {
-        self.devices.iter().find(|d| d.device_id == device_id)
-    }
-    
-    /// Verificar si el controlador está ocupado
-    pub fn is_busy(&self) -> bool {
-        self.is_busy
+    /// Slot ID
+    pub fn slot_id(&self) -> u8 {
+        self.slot_id
     }
 }
 
-/// Driver USB Mass Storage
-pub struct UsbMscDriver {
-    pub info: DriverInfo,
-    pub controllers: Vec<UsbMscController>,
-    pub devices: Vec<UsbMscDeviceInfo>,
-    pub is_initialized: bool,
+/// Manager de dispositivos Mass Storage
+pub struct MassStorageManager {
+    devices: Vec<MassStorageDevice>,
 }
 
-impl UsbMscDriver {
+impl MassStorageManager {
+    /// Crea un nuevo manager
     pub fn new() -> Self {
-        let mut info = DriverInfo::new();
-        info.set_name("usb_mass_storage");
-        info.device_type = DeviceType::Storage;
-        info.version = 2;
-        
         Self {
-            info,
-            controllers: Vec::new(),
             devices: Vec::new(),
-            is_initialized: false,
         }
     }
     
-    /// Agregar controlador USB MSC
-    pub fn add_controller(&mut self, controller: UsbMscController) -> DriverResult<()> {
-        if self.controllers.len() >= 4 {
-            return Err(DriverError::OutOfMemory);
-        }
+    /// Registra un dispositivo
+    pub fn register_device(&mut self, device: MassStorageDevice) {
+        crate::debug::serial_write_str(&format!(
+            "USB_MSC: Registrando dispositivo Mass Storage (slot={})\n",
+            device.slot_id
+        ));
         
-        self.controllers.push(controller);
-        Ok(())
+        self.devices.push(device);
     }
     
-    /// Inicializar todos los controladores
-    pub fn initialize_all_controllers(&mut self) -> DriverResult<()> {
-        for controller in &mut self.controllers {
-            controller.enable()?;
-            controller.detect_devices()?;
-            
-            // Agregar dispositivos detectados
-            for device in controller.devices.clone() {
-                self.devices.push(device);
-            }
-        }
-        
-        self.is_initialized = true;
-        Ok(())
+    /// Obtiene un dispositivo por índice
+    pub fn get_device(&self, index: usize) -> Option<&MassStorageDevice> {
+        self.devices.get(index)
     }
     
-    /// Inicializar dispositivo específico
-    pub fn initialize_device(&mut self, device_id: u32) -> DriverResult<()> {
-        for controller in &mut self.controllers {
-            if controller.is_enabled {
-                if let Ok(_) = controller.initialize_device(device_id) {
-                    return Ok(());
-                }
-            }
-        }
-        Err(DriverError::DeviceNotFound)
+    /// Obtiene un dispositivo mutable por índice
+    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut MassStorageDevice> {
+        self.devices.get_mut(index)
     }
     
-    /// Leer bloques de dispositivo
-    pub fn read_device_blocks(&mut self, device_id: u32, lba: u64, block_count: u32, buffer: &mut [u8]) -> DriverResult<()> {
-        for controller in &mut self.controllers {
-            if controller.is_enabled {
-                if let Ok(_) = controller.read_blocks(device_id, lba, block_count, buffer) {
-                    return Ok(());
-                }
-            }
-        }
-        Err(DriverError::DeviceNotFound)
-    }
-    
-    /// Escribir bloques a dispositivo
-    pub fn write_device_blocks(&mut self, device_id: u32, lba: u64, block_count: u32, buffer: &[u8]) -> DriverResult<()> {
-        for controller in &mut self.controllers {
-            if controller.is_enabled {
-                if let Ok(_) = controller.write_blocks(device_id, lba, block_count, buffer) {
-                    return Ok(());
-                }
-            }
-        }
-        Err(DriverError::DeviceNotFound)
-    }
-    
-    /// Obtener dispositivos USB MSC
-    pub fn get_devices(&self) -> &Vec<UsbMscDeviceInfo> {
-        &self.devices
-    }
-    
-    /// Obtener dispositivo por ID
-    pub fn get_device(&self, device_id: u32) -> Option<&UsbMscDeviceInfo> {
-        self.devices.iter().find(|d| d.device_id == device_id)
-    }
-    
-    /// Obtener dispositivos por tipo
-    pub fn get_devices_by_type(&self, device_type: UsbMscDeviceType) -> Vec<&UsbMscDeviceInfo> {
-        self.devices.iter()
-            .filter(|device| device.device_type == device_type)
-            .collect()
-    }
-    
-    /// Obtener dispositivos removibles
-    pub fn get_removable_devices(&self) -> Vec<&UsbMscDeviceInfo> {
-        self.devices.iter()
-            .filter(|device| device.is_removable)
-            .collect()
-    }
-    
-    /// Verificar si hay dispositivos conectados
-    pub fn has_devices(&self) -> bool {
-        !self.devices.is_empty()
-    }
-    
-    /// Obtener estadísticas
-    pub fn get_stats(&self) -> String {
-        let mut stats = String::new();
-        stats.push_str("USB Mass Storage Driver Stats:\n");
-        stats.push_str(&format!("Controllers: {}\n", self.controllers.len()));
-        stats.push_str(&format!("Devices: {}\n", self.devices.len()));
-        
-        for device in &self.devices {
-            stats.push_str(&format!("  Device {}: {} ({})\n", 
-                device.device_id,
-                core::str::from_utf8(&device.name[..device.name.iter().position(|&x| x == 0).unwrap_or(device.name.len())]).unwrap_or("Unknown"),
-                if device.is_removable { "Removable" } else { "Fixed" }
-            ));
-        }
-        
-        stats
+    /// Número de dispositivos
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
     }
 }
 
-impl Driver for UsbMscDriver {
-    fn get_info(&self) -> &DriverInfo {
-        &self.info
+/// Requests específicos para Mass Storage Class
+pub mod msc_requests {
+    use super::*;
+    
+    /// Bulk-Only Mass Storage Reset (0xFF)
+    pub fn bulk_only_mass_storage_reset(interface: u8) -> SetupPacket {
+        SetupPacket::new(
+            0x21,  // Class, Interface
+            0xFF,  // Bulk-Only Mass Storage Reset
+            0,
+            interface as u16,
+            0,
+        )
     }
     
-    fn initialize(&mut self) -> DriverResult<()> {
-        if self.is_initialized {
-            return Ok(());
-        }
-        
-        self.initialize_all_controllers()?;
-        Ok(())
-    }
-    
-    fn cleanup(&mut self) -> DriverResult<()> {
-        for controller in &mut self.controllers {
-            let _ = controller.disable();
-        }
-        
-        self.controllers.clear();
-        self.devices.clear();
-        self.is_initialized = false;
-        
-        Ok(())
-    }
-    
-    fn probe_device(&mut self, device_info: &DeviceInfo) -> bool {
-        device_info.device_type == DeviceType::Storage
-    }
-    
-    fn attach_device(&mut self, device: &mut Device) -> DriverResult<()> {
-        // TODO: Implementar attach de dispositivo
-        Ok(())
-    }
-    
-    fn detach_device(&mut self, device_id: u32) -> DriverResult<()> {
-        // TODO: Implementar detach de dispositivo
-        Ok(())
-    }
-    
-    fn handle_interrupt(&mut self, _irq: u32) -> DriverResult<()> {
-        // TODO: Implementar manejo de interrupciones
-        Ok(())
+    /// Get Max LUN (0xFE)
+    pub fn get_max_lun(interface: u8) -> SetupPacket {
+        SetupPacket::new(
+            0xA1,  // Class, Interface, Device to Host
+            0xFE,  // Get Max LUN
+            0,
+            interface as u16,
+            1,     // 1 byte de respuesta
+        )
     }
 }

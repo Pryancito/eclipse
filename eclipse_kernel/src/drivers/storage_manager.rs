@@ -541,11 +541,13 @@ impl StorageManager {
                 serial_write_str(&format!("STORAGE_MANAGER: PciManager Dispositivo {} - VID:{:#x} DID:{:#x} Class:{:#x} Subclass:{:#x} ProgIF:{:#x}\n", 
                                          i, device.vendor_id, device.device_id, device.class_code, device.subclass_code, device.prog_if));
                 
-                // FILTRAR DISPOSITIVOS RAID: Solo agregar controladores de almacenamiento
+                // FILTRAR DISPOSITIVOS: Solo agregar controladores de almacenamiento
+                let is_virtio_block = device.vendor_id == 0x1AF4 && device.device_id == 0x1001;
                 let is_storage_controller = (device.class_code == 0x01 && (device.subclass_code == 0x06 || device.subclass_code == 0x04 || device.subclass_code == 0x01)) || // SATA/RAID/IDE
-                                           (device.class_code == 0x01 && device.subclass_code == 0x08); // NVMe
+                                           (device.class_code == 0x01 && device.subclass_code == 0x08) || // NVMe
+                                           is_virtio_block; // VirtIO Block
                 
-                serial_write_str(&format!("STORAGE_MANAGER: PciManager is_storage_controller: {}\n", is_storage_controller));
+                serial_write_str(&format!("STORAGE_MANAGER: PciManager is_storage_controller: {} (virtio_block={})\n", is_storage_controller, is_virtio_block));
                 
                 // Solo agregar controladores de almacenamiento, no dispositivos individuales
                 if is_storage_controller {
@@ -563,9 +565,33 @@ impl StorageManager {
                 let base_class = device.class_code;
                 let subclass = device.subclass_code;
 
-                serial_write_str(&format!("STORAGE_MANAGER: PCI Manual - VID:{:#x} DID:{:#x} Class:{}.{}\n", 
+                serial_write_str(&format!("STORAGE_MANAGER: PCI Manual - VID:{:#x} DID:{:#x} Class:{}.{}.{}\n", 
                                          device.vendor_id, device.device_id, 
-                                         base_class, subclass));
+                                         base_class, subclass, device.prog_if));
+
+                // DETECCIÓN ESPECIAL: VirtIO Block Device
+                if device.vendor_id == 0x1AF4 && device.device_id == 0x1001 {
+                    serial_write_str("STORAGE_MANAGER: ✅ VirtIO Block Device encontrado - usando driver VirtIO específico\n");
+                    
+                    let device_info = StorageDeviceInfo {
+                        controller_type: StorageControllerType::VirtIO,
+                        model: format!("VirtIO Block {:04X}:{:04X}", device.vendor_id, device.device_id),
+                        serial: String::from("VIRTIO-SERIAL"),
+                        firmware: String::from("VirtIO"),
+                        capacity: 0, // Se detectará después
+                        block_size: 512,
+                        max_lba: 0,
+                        device_name: String::new(), // Se asignará después
+                    };
+                    
+                    self.devices.push(StorageDevice {
+                        info: device_info,
+                    });
+                    
+                    serial_write_str(&format!("STORAGE_MANAGER: VirtIO Block agregado: {:04X}:{:04X}\n", 
+                                             device.vendor_id, device.device_id));
+                    continue; // Saltar al siguiente dispositivo
+                }
 
                 // Listado de dispositivos PCI removido para limpiar pantalla
 
@@ -2679,6 +2705,27 @@ impl StorageManager {
         (StorageControllerType::ATA, 50, "Controladora genérica")
     }
     
+    /// Obtiene el nombre de partición correcto según el tipo de dispositivo
+    pub fn get_partition_name(device_name: &str, partition_number: u8) -> String {
+        if device_name.starts_with("/dev/nvme") {
+            // NVMe: /dev/nvme0n1p1, /dev/nvme0n1p2, etc.
+            format!("{}p{}", device_name, partition_number)
+        } else {
+            // SATA/AHCI/VirtIO/IDE: /dev/sda1, /dev/sda2, etc.
+            format!("{}{}", device_name, partition_number)
+        }
+    }
+    
+    /// Detecta si un dispositivo es NVMe basándose en su nombre
+    pub fn is_nvme_device(device_name: &str) -> bool {
+        device_name.starts_with("/dev/nvme")
+    }
+    
+    /// Detecta si un dispositivo es SATA/AHCI basándose en su nombre
+    pub fn is_sata_device(device_name: &str) -> bool {
+        device_name.starts_with("/dev/sd")
+    }
+    
     /// 🎯 Asignar nombres de dispositivos estilo Linux según el tipo de controladora
     fn assign_linux_device_names(&mut self) {
         serial_write_str("STORAGE_MANAGER: 🎯 Asignando nombres estilo Linux...\n");
@@ -2744,7 +2791,9 @@ impl StorageManager {
                         name
                     },
                     StorageControllerType::NVMe => {
-                        let name = format!("/dev/nvme{}", nvme_count);
+                        // Formato correcto NVMe: /dev/nvme0n1, /dev/nvme1n1, etc.
+                        // El "n1" indica namespace 1 (los NVMe pueden tener múltiples namespaces)
+                        let name = format!("/dev/nvme{}n1", nvme_count);
                         nvme_count += 1;
                         name
                     },
@@ -2780,8 +2829,16 @@ impl StorageManager {
             }
         }
         
-        serial_write_str(&format!("STORAGE_MANAGER: ✅ Nombres asignados - Intel RAID: {}, SATA: {}, NVMe: {}, VirtIO: {}, Otros: {}\n", 
+        serial_write_str(&format!("STORAGE_MANAGER: ✅ Nombres asignados - Intel RAID: {}, SATA/AHCI: {}, NVMe: {}, VirtIO: {}, Otros: {}\n", 
                                  intel_raid_count, sata_count, nvme_count, virtio_count, other_count));
+        
+        // Log detallado de tipos de dispositivos
+        if nvme_count > 0 {
+            serial_write_str(&format!("STORAGE_MANAGER: 💾 {} dispositivos NVMe detectados (formato: /dev/nvmeXn1)\n", nvme_count));
+        }
+        if sata_count > 0 {
+            serial_write_str(&format!("STORAGE_MANAGER: 💿 {} dispositivos SATA/AHCI detectados (formato: /dev/sdX)\n", sata_count));
+        }
     }
 
     /// 🎯 Detectar particiones y asignar nombres como Linux (/dev/sda1, /dev/sda2, etc.)
@@ -3111,7 +3168,16 @@ impl StorageManager {
                         // Verificar si la partición está activa (tipo GUID no es cero)
                         if !self.is_zero_partition_entry(partition_entry) {
                             let partition_number = i + 1;
-                            let partition_name = format!("{}{}", device_name, partition_number); // /dev/sda1, /dev/sda2, etc.
+                            
+                            // Formato correcto según tipo de dispositivo:
+                            // - NVMe: /dev/nvme0n1p1, /dev/nvme0n1p2, etc.
+                            // - SATA/AHCI: /dev/sda1, /dev/sda2, etc.
+                            // - VirtIO: /dev/vda1, /dev/vda2, etc.
+                            let partition_name = if device_name.starts_with("/dev/nvme") {
+                                format!("{}p{}", device_name, partition_number)  // NVMe: nvme0n1p1
+                            } else {
+                                format!("{}{}", device_name, partition_number)   // SATA: sda1
+                            };
                             
                             // Leer información de la partición
                             let start_sector = u64::from_le_bytes([
@@ -3202,7 +3268,13 @@ impl StorageManager {
                 // Verificar si la partición está activa (tipo no es 0)
                 if partition_entry[4] != 0 {
                     let partition_number = i + 1;
-                    let partition_name = format!("{}{}", device_name, partition_number);
+                    
+                    // Formato correcto según tipo de dispositivo
+                    let partition_name = if device_name.starts_with("/dev/nvme") {
+                        format!("{}p{}", device_name, partition_number)  // NVMe: nvme0n1p1
+                    } else {
+                        format!("{}{}", device_name, partition_number)   // SATA: sda1
+                    };
                     
                     let start_sector = u32::from_le_bytes([
                         partition_entry[8], partition_entry[9], partition_entry[10], partition_entry[11],

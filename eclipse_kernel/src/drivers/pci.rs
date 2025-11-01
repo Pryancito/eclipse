@@ -697,6 +697,11 @@ impl PciManager {
         self.device_count
     }
 
+    /// Obtiene una referencia al array de dispositivos
+    pub fn get_devices(&self) -> &[Option<PciDevice>; 256] {
+        &self.devices
+    }
+
     /// Obtener número total de dispositivos detectados (aunque no se almacenen todos)
     pub fn total_device_count(&self) -> usize {
         self.total_device_count

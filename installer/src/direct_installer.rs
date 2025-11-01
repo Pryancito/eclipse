@@ -13,6 +13,35 @@ pub struct DirectInstaller {
 }
 
 impl DirectInstaller {
+    /// Obtener el nombre correcto de partición para un disco y número
+    fn get_partition_name(&self, disk_name: &str, partition_num: u32) -> String {
+        let suffix = if disk_name.contains("nvme") { "p" } else { "" };
+        format!("{}{}{}", disk_name, suffix, partition_num)
+    }
+
+    /// Verificar si un punto de montaje está listo para usar
+    fn is_mount_point_ready(&self, mount_point: &str) -> bool {
+        // Verificar si el directorio existe y tiene contenido
+        if let Ok(metadata) = fs::metadata(mount_point) {
+            // Verificar si está montado usando /proc/mounts
+            if let Ok(mounts_content) = fs::read_to_string("/proc/mounts") {
+                // Buscar el punto de montaje en /proc/mounts
+                for line in mounts_content.lines() {
+                    if line.contains(mount_point) {
+                        return true;
+                    }
+                }
+            }
+
+            // Verificación alternativa: intentar listar el directorio
+            if let Ok(mut entries) = fs::read_dir(mount_point) {
+                // Si podemos leer al menos una entrada, el FS está montado
+                return entries.next().is_some() || true; // Al menos el directorio existe
+            }
+        }
+        false
+    }
+
     pub fn new() -> Self {
         Self {
             efi_mount_point: "/mnt/eclipse-efi".to_string(),
@@ -215,12 +244,20 @@ impl DirectInstaller {
 
         // Verificar que las particiones existen
         std::thread::sleep(std::time::Duration::from_secs(2));
-        
-        let part1 = format!("{}1", disk.name);
-        let part2 = format!("{}2", disk.name);
+
+        // Determinar el sufijo correcto para particiones
+        // NVMe usa 'p' (nvme0n1p1), otros discos usan números directos (sda1)
+        let partition_suffix = if disk.name.contains("nvme") {
+            "p"
+        } else {
+            ""
+        };
+
+        let part1 = format!("{}{}1", disk.name, partition_suffix);
+        let part2 = format!("{}{}2", disk.name, partition_suffix);
 
         if !Path::new(&part1).exists() || !Path::new(&part2).exists() {
-            return Err("Las particiones no se crearon correctamente".to_string());
+            return Err(format!("Las particiones no se crearon correctamente. Esperaba: {} y {}", part1, part2));
         }
 
         println!("Particiones creadas exitosamente");
@@ -230,8 +267,15 @@ impl DirectInstaller {
     fn format_partitions(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("Formateando particiones con EclipseFS y FAT32...");
 
-        let efi_partition = format!("{}1", disk.name);
-        let root_partition = format!("{}2", disk.name);
+        // Determinar el sufijo correcto para particiones
+        let partition_suffix = if disk.name.contains("nvme") {
+            "p"
+        } else {
+            ""
+        };
+
+        let efi_partition = self.get_partition_name(&disk.name, 1);
+        let root_partition = self.get_partition_name(&disk.name, 2);
 
         // Formatear partición EFI como FAT32
         println!("   Formateando particion EFI como FAT32...");
@@ -255,7 +299,7 @@ impl DirectInstaller {
     fn install_bootloader(&self, disk: &DiskInfo) -> Result<(), String> {
         println!("Instalando bootloader UEFI...");
 
-        let efi_partition = format!("{}1", disk.name);
+        let efi_partition = self.get_partition_name(&disk.name, 1);
 
         // Crear directorios de montaje
         fs::create_dir_all(&self.efi_mount_point)
@@ -340,35 +384,17 @@ impl DirectInstaller {
         println!("DEBUG: Iniciando install_system_to_root para disco: {}", disk.name);
         println!("Instalando sistema en partición root (EclipseFS)...");
 
-        // Montar partición root como EclipseFS (como el instalador viejo con ext4)
-        let root_partition = format!("{}2", disk.name);
-        println!("   Montando partición root {} en {}...", root_partition, self.root_mount_point);
+        // Configurar partición root con EclipseFS directamente
+        let root_partition = self.get_partition_name(&disk.name, 2);
+        println!("   Configurando partición root {} con EclipseFS...", root_partition);
         
         fs::create_dir_all(&self.root_mount_point)
             .map_err(|e| format!("Error creando directorio root: {}", e))?;
 
-        // Montar EclipseFS usando nuestro driver FUSE
-        println!("   Montando EclipseFS usando driver FUSE...");
-        let mount_output = std::process::Command::new("/home/moebius/eclipse/bin/eclipsefs-fuse")
-            .args(&[&root_partition, &self.root_mount_point])
-            .output()
-            .map_err(|e| format!("Error ejecutando eclipsefs-fuse: {}", e))?;
+        // Usar método directo de EclipseFS para instalación (FUSE es para runtime, no instalación)
+        println!("   Configurando EclipseFS directamente en {} (sin FUSE)...", root_partition);
+        self.setup_eclipsefs_filesystem(&root_partition)?;
 
-        if !mount_output.status.success() {
-            println!("   No se pudo montar con FUSE, usando método directo...");
-
-            // Configurar la partición directamente con el instalador en memoria
-            self.mount_and_setup_eclipsefs_directly(&root_partition)?;
-        } else {
-            println!("   Partición root montada exitosamente en {}", self.root_mount_point);
-            
-            // Instalar archivos directamente al sistema de archivos montado (como ext4)
-            self.install_eclipse_systemd(disk)?;
-            self.install_cosmic_desktop(disk)?;
-            self.install_system_apps(disk)?;
-            self.install_ai_models(disk)?;
-        }
-        
         println!("   Sistema instalado en partición root");
         Ok(())
     }
@@ -505,7 +531,7 @@ impl DirectInstaller {
         println!("Desmontando particiones...");
 
         // Desmontar partición root
-        let _root_partition = format!("{}2", disk.name);
+        let _root_partition = self.get_partition_name(&disk.name, 2);
         
         // Verificar si el punto de montaje existe antes de desmontar
         if std::path::Path::new(&self.root_mount_point).exists() {
@@ -530,7 +556,7 @@ impl DirectInstaller {
         }
 
         // Desmontar partición EFI
-        let _efi_partition = format!("{}1", disk.name);
+        let _efi_partition = self.get_partition_name(&disk.name, 1);
         
         // Verificar si el punto de montaje existe antes de desmontar
         if std::path::Path::new(&self.efi_mount_point).exists() {

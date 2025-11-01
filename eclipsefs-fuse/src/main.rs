@@ -210,28 +210,28 @@ impl Filesystem for EclipseFSFuse {
     }
 
     fn write(&mut self, _req: &Request, _ino: u64, _fh: u64, _offset: i64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
-        // EclipseFS es de solo lectura por ahora
-        reply.error(libc::EROFS);
+        // EclipseFS no soporta escritura por ahora - devolver operación no soportada
+        reply.error(libc::ENOTSUP);
     }
 
     fn unlink(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        // EclipseFS es de solo lectura por ahora
-        reply.error(libc::EROFS);
+        // EclipseFS no soporta escritura por ahora - devolver operación no soportada
+        reply.error(libc::ENOTSUP);
     }
 
     fn rmdir(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        // EclipseFS es de solo lectura por ahora
-        reply.error(libc::EROFS);
+        // EclipseFS no soporta escritura por ahora - devolver operación no soportada
+        reply.error(libc::ENOTSUP);
     }
 
     fn mkdir(&mut self, _req: &Request, _parent: u64, _name: &OsStr, _mode: u32, reply: ReplyEntry) {
-        // EclipseFS es de solo lectura por ahora
-        reply.error(libc::EROFS);
+        // EclipseFS no soporta escritura por ahora - devolver operación no soportada
+        reply.error(libc::ENOTSUP);
     }
 
     fn create(&mut self, _req: &Request, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
-        // EclipseFS es de solo lectura por ahora
-        reply.error(libc::EROFS);
+        // EclipseFS no soporta escritura por ahora - devolver operación no soportada
+        reply.error(libc::ENOTSUP);
     }
 }
 
@@ -266,8 +266,8 @@ fn main() {
     
     println!("EclipseFS inicializado correctamente");
     
-    // Montar el sistema de archivos
-    let options = vec!["-o", "ro", "-o", "allow_other"];
+    // Montar el sistema de archivos en modo read-write para permitir instalación
+    let options = vec!["-o", "rw", "-o", "allow_other"];
     let fuse_args: Vec<&OsStr> = options.iter().map(|s| OsStr::new(s)).collect();
     
     fuse::mount(fuse_fs, &mount_point, &fuse_args).unwrap();

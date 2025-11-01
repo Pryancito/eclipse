@@ -681,7 +681,7 @@ impl WaylandAppManager {
 
         // Limpiar aplicaciones
         if let Some(ref mut client) = self.client {
-            for mut app in &mut self.apps {
+            for app in &mut self.apps {
                 let _ = app.cleanup(client);
             }
         }

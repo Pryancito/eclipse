@@ -26,6 +26,7 @@ pub enum DriverError {
     InvalidParameter,
     OutOfMemory,
     IoError,
+    Timeout,
     Unknown,
 }
 
@@ -41,6 +42,7 @@ impl DriverError {
             DriverError::InvalidParameter => "Invalid parameter",
             DriverError::OutOfMemory => "Out of memory",
             DriverError::IoError => "I/O error",
+            DriverError::Timeout => "Timeout",
             DriverError::Unknown => "Unknown error",
         }
     }

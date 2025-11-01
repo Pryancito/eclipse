@@ -461,19 +461,27 @@ impl SystemdDaemon {
         self.journal_manager.log_info("systemd", "Iniciando loop principal del daemon")?;
         // IPC: monitorización básica de ready/health
         let ipc_path = socket_path_from_env();
-        let ipc = UnixBus::connect_with_retry(&ipc_path, 10, StdDuration::from_millis(200));
+        let ipc_result = UnixBus::connect_with_retry(&ipc_path, 10, StdDuration::from_millis(200)).await;
+
+        let mut ipc_bus = match ipc_result {
+            Ok(bus) => Some(bus),
+            Err(e) => {
+                warn!("No se pudo conectar al bus IPC: {}", e);
+                None
+            }
+        };
 
         while *self.is_running.read().await {
             // Monitorear servicios en ejecución
             self.monitor_services().await?;
-            
+
             // Procesar cola de eventos
             self.process_event_queue().await?;
 
             // Leer señales ready/health de servicios
-            if let Some(ref bus) = ipc {
-                let mut buf = [0u8; 2048];
-                if let Ok(Some(msg)) = bus.recv_timeout::<IpcMessage>(&mut buf, StdDuration::from_millis(10)) {
+            if let Some(ref mut bus) = ipc_bus {
+                let mut buf = Vec::new();
+                if let Ok(Some(msg)) = bus.recv_timeout::<IpcMessage>(&mut buf, StdDuration::from_millis(10)).await {
                     match msg {
                         IpcMessage::Ready { service, .. } => {
                             let _ = self.journal_manager.log_info("systemd", &format!("Servicio listo: {}", service));

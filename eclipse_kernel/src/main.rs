@@ -60,10 +60,12 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     }
     serial_write_str("KERNEL: SSE/MMX configured.\n");
     
+    serial_write_str("KERNEL: Initializing framebuffer...\n");
     if framebuffer_info_ptr != 0 {
-        serial_write_str("KERNEL: Framebuffer info found. Initializing...\n");
+        serial_write_str("KERNEL: Framebuffer info found.\n");
         unsafe {
             let fb_info = core::ptr::read_volatile(framebuffer_info_ptr as *const FramebufferInfo);
+            serial_write_str("KERNEL: Calling init_framebuffer...\n");
             match init_framebuffer(
                 fb_info.base_address,
                 fb_info.width,
@@ -73,15 +75,15 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
                 fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask,
             ) {
                 Ok(()) => {
-                    serial_write_str("KERNEL: Framebuffer initialized successfully.\n");
+                    serial_write_str("KERNEL: Framebuffer initialized OK.\n");
                 }
-                Err(e) => {
-                    serial_write_str(&alloc::format!("KERNEL: ERROR - Framebuffer initialization failed: {}\n", e));
+                Err(_e) => {
+                    serial_write_str("KERNEL: ERROR - Framebuffer init failed.\n");
                 }
             }
         }
     } else {
-        serial_write_str("KERNEL: WARNING - No framebuffer info received.\n");
+        serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
     }
 
     serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");

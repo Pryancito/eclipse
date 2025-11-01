@@ -1,721 +1,578 @@
-//! Sistema de configuración dinámica del kernel Eclipse
+//! Sistema Básico de Configuración del Kernel para Eclipse OS
 //!
-//! Permite configurar parámetros del kernel en tiempo de ejecución
-//! con validación y persistencia de configuraciones.
+//! Este módulo implementa un sistema completo de configuración que permite:
+//! - Configuración centralizada de opciones del kernel
+//! - Carga de configuración desde memoria o archivos
+//! - Acceso seguro y eficiente a configuraciones
+//! - Soporte para diferentes tipos de valores de configuración
+//! - Configuraciones por defecto y override
 
-use crate::synchronization::Mutex;
-use crate::{KernelError, KernelResult};
-use alloc::collections::BTreeMap;
-use alloc::format;
+#![no_std]
+#![allow(unused_imports)]
+
+extern crate alloc;
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use alloc::collections::BTreeMap;
+use alloc::format;
+use core::fmt;
 
-/// Tipo de valor de configuración
-#[derive(Debug, Clone, PartialEq)]
+// Importar macros de logging
+
+/// Tipos de valores de configuración soportados
+#[derive(Debug, Clone)]
 pub enum ConfigValue {
-    Boolean(bool),
-    Integer(i64),
-    UnsignedInteger(u64),
-    Float(f64),
+    /// Valor booleano
+    Bool(bool),
+    /// Valor entero de 8 bits
+    I8(i8),
+    /// Valor entero de 16 bits
+    I16(i16),
+    /// Valor entero de 32 bits
+    I32(i32),
+    /// Valor entero de 64 bits
+    I64(i64),
+    /// Valor entero sin signo de 8 bits
+    U8(u8),
+    /// Valor entero sin signo de 16 bits
+    U16(u16),
+    /// Valor entero sin signo de 32 bits
+    U32(u32),
+    /// Valor entero sin signo de 64 bits
+    U64(u64),
+    /// Valor de punto flotante de 32 bits
+    F32(f32),
+    /// Valor de punto flotante de 64 bits
+    F64(f64),
+    /// Cadena de texto
     String(String),
+    /// Lista de valores
     Array(Vec<ConfigValue>),
 }
 
-/// Nivel de configuración
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ConfigLevel {
-    System,  // Configuración del sistema
-    Kernel,  // Configuración del kernel
-    Driver,  // Configuración de drivers
-    User,    // Configuración de usuario
-    Runtime, // Configuración en tiempo de ejecución
+impl ConfigValue {
+    /// Convierte el valor a booleano
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            ConfigValue::Bool(b) => Some(*b),
+            ConfigValue::U8(0) => Some(false),
+            ConfigValue::U8(1) => Some(true),
+            ConfigValue::U32(0) => Some(false),
+            ConfigValue::U32(1) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Convierte el valor a u32
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            ConfigValue::U32(n) => Some(*n),
+            ConfigValue::U64(n) if *n <= u32::MAX as u64 => Some(*n as u32),
+            ConfigValue::I32(n) if *n >= 0 => Some(*n as u32),
+            ConfigValue::I64(n) if *n >= 0 && *n <= u32::MAX as i64 => Some(*n as u32),
+            _ => None,
+        }
+    }
+
+    /// Convierte el valor a u64
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            ConfigValue::U64(n) => Some(*n),
+            ConfigValue::U32(n) => Some(*n as u64),
+            ConfigValue::I64(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    }
+
+    /// Convierte el valor a string
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            ConfigValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Convierte el valor a array
+    pub fn as_array(&self) -> Option<&[ConfigValue]> {
+        match self {
+            ConfigValue::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
 }
 
-/// Prioridad de configuración
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ConfigPriority {
-    Low = 1,
-    Normal = 2,
-    High = 3,
-    Critical = 4,
+impl fmt::Display for ConfigValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigValue::Bool(b) => write!(f, "{}", b),
+            ConfigValue::I8(n) => write!(f, "{}", n),
+            ConfigValue::I16(n) => write!(f, "{}", n),
+            ConfigValue::I32(n) => write!(f, "{}", n),
+            ConfigValue::I64(n) => write!(f, "{}", n),
+            ConfigValue::U8(n) => write!(f, "{}", n),
+            ConfigValue::U16(n) => write!(f, "{}", n),
+            ConfigValue::U32(n) => write!(f, "{}", n),
+            ConfigValue::U64(n) => write!(f, "{}", n),
+            ConfigValue::F32(n) => write!(f, "{}", n),
+            ConfigValue::F64(n) => write!(f, "{}", n),
+            ConfigValue::String(s) => write!(f, "\"{}\"", s),
+            ConfigValue::Array(arr) => {
+                write!(f, "[")?;
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
 }
 
-/// Estructura de una configuración
-#[derive(Debug, Clone)]
-pub struct ConfigItem {
-    pub key: String,
-    pub value: ConfigValue,
-    pub level: ConfigLevel,
-    pub priority: ConfigPriority,
-    pub description: String,
-    pub default_value: ConfigValue,
-    pub min_value: Option<ConfigValue>,
-    pub max_value: Option<ConfigValue>,
-    pub valid_values: Option<Vec<ConfigValue>>,
-    pub readonly: bool,
-    pub persistent: bool,
+/// Categorías de configuración del kernel
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConfigCategory {
+    /// Configuración general del kernel
+    Kernel,
+    /// Configuración de memoria
+    Memory,
+    /// Configuración del scheduler de procesos
+    Scheduler,
+    /// Configuración de dispositivos
+    Devices,
+    /// Configuración de logging
+    Logging,
+    /// Configuración de módulos
+    Modules,
+    /// Configuración de red
+    Network,
+    /// Configuración de seguridad
+    Security,
+    /// Configuración de debugging
+    Debug,
 }
 
-/// Configuraciones del kernel
+/// Estructura principal de configuración del kernel
 #[derive(Debug)]
 pub struct KernelConfig {
-    // Configuraciones de logging
-    pub log_level: AtomicU32,
-    pub log_to_serial: AtomicBool,
-    pub log_to_file: AtomicBool,
-    pub log_buffer_size: AtomicU32,
-
-    // Configuraciones de memoria
-    pub memory_pool_size: AtomicU64,
-    pub memory_allocation_strategy: AtomicU32,
-    pub memory_debug_enabled: AtomicBool,
-    pub memory_leak_detection: AtomicBool,
-
-    // Configuraciones de procesos
-    pub max_processes: AtomicU32,
-    pub process_stack_size: AtomicU32,
-    pub process_priority_levels: AtomicU32,
-    pub process_timeout_ms: AtomicU64,
-
-    // Configuraciones de hilos
-    pub max_threads: AtomicU32,
-    pub thread_stack_size: AtomicU32,
-    pub thread_quantum_ms: AtomicU32,
-    pub thread_preemption: AtomicBool,
-
-    // Configuraciones de I/O
-    pub io_buffer_size: AtomicU32,
-    pub io_timeout_ms: AtomicU64,
-    pub io_retry_attempts: AtomicU32,
-    pub io_async_enabled: AtomicBool,
-
-    // Configuraciones de red
-    pub network_buffer_size: AtomicU32,
-    pub tcp_timeout_ms: AtomicU64,
-    pub udp_timeout_ms: AtomicU64,
-    pub max_connections: AtomicU32,
-
-    // Configuraciones de drivers
-    pub driver_timeout_ms: AtomicU64,
-    pub driver_retry_attempts: AtomicU32,
-    pub driver_debug_enabled: AtomicBool,
-    pub driver_auto_load: AtomicBool,
-
-    // Configuraciones de seguridad
-    pub security_enabled: AtomicBool,
-    pub authentication_required: AtomicBool,
-    pub encryption_enabled: AtomicBool,
-    pub audit_logging: AtomicBool,
-
-    // Configuraciones de IA
-    pub ai_enabled: AtomicBool,
-    pub ai_model_path: String,
-    pub ai_inference_timeout_ms: AtomicU64,
-    pub ai_training_enabled: AtomicBool,
-
-    // Configuraciones de rendimiento
-    pub cpu_frequency_governor: String,
-    pub power_saving_mode: AtomicBool,
-    pub cache_size: AtomicU32,
-    pub prefetch_enabled: AtomicBool,
-
-    // Configuraciones de métricas
-    pub metrics_enabled: AtomicBool,
-    pub metrics_collection_interval_ms: AtomicU64,
-    pub metrics_retention_days: AtomicU32,
-    pub metrics_export_enabled: AtomicBool,
+    /// Configuraciones organizadas por categoría
+    categories: BTreeMap<ConfigCategory, BTreeMap<String, ConfigValue>>,
+    /// Configuraciones planas (para acceso rápido)
+    flat_config: BTreeMap<String, ConfigValue>,
+    /// Indica si la configuración está inicializada
+    initialized: bool,
 }
 
 impl KernelConfig {
-    /// Crear nueva configuración del kernel
+    /// Crea una nueva instancia de KernelConfig con valores por defecto
     pub fn new() -> Self {
-        Self {
-            // Logging
-            log_level: AtomicU32::new(2), // Info level
-            log_to_serial: AtomicBool::new(true),
-            log_to_file: AtomicBool::new(false),
-            log_buffer_size: AtomicU32::new(4096),
-
-            // Memoria
-            memory_pool_size: AtomicU64::new(134217728), // 128MB
-            memory_allocation_strategy: AtomicU32::new(0), // First fit
-            memory_debug_enabled: AtomicBool::new(false),
-            memory_leak_detection: AtomicBool::new(true),
-
-            // Procesos
-            max_processes: AtomicU32::new(256),
-            process_stack_size: AtomicU32::new(8192), // 8KB
-            process_priority_levels: AtomicU32::new(16),
-            process_timeout_ms: AtomicU64::new(5000),
-
-            // Hilos
-            max_threads: AtomicU32::new(1024),
-            thread_stack_size: AtomicU32::new(4096), // 4KB
-            thread_quantum_ms: AtomicU32::new(10),
-            thread_preemption: AtomicBool::new(true),
-
-            // I/O
-            io_buffer_size: AtomicU32::new(8192),
-            io_timeout_ms: AtomicU64::new(3000),
-            io_retry_attempts: AtomicU32::new(3),
-            io_async_enabled: AtomicBool::new(true),
-
-            // Red
-            network_buffer_size: AtomicU32::new(16384),
-            tcp_timeout_ms: AtomicU64::new(30000),
-            udp_timeout_ms: AtomicU64::new(5000),
-            max_connections: AtomicU32::new(1000),
-
-            // Drivers
-            driver_timeout_ms: AtomicU64::new(10000),
-            driver_retry_attempts: AtomicU32::new(3),
-            driver_debug_enabled: AtomicBool::new(false),
-            driver_auto_load: AtomicBool::new(true),
-
-            // Seguridad
-            security_enabled: AtomicBool::new(true),
-            authentication_required: AtomicBool::new(false),
-            encryption_enabled: AtomicBool::new(true),
-            audit_logging: AtomicBool::new(true),
-
-            // IA
-            ai_enabled: AtomicBool::new(true),
-            ai_model_path: String::from("/system/ai/models/"),
-            ai_inference_timeout_ms: AtomicU64::new(1000),
-            ai_training_enabled: AtomicBool::new(false),
-
-            // Rendimiento
-            cpu_frequency_governor: String::from("ondemand"),
-            power_saving_mode: AtomicBool::new(false),
-            cache_size: AtomicU32::new(32768), // 32KB
-            prefetch_enabled: AtomicBool::new(true),
-
-            // Métricas
-            metrics_enabled: AtomicBool::new(true),
-            metrics_collection_interval_ms: AtomicU64::new(1000),
-            metrics_retention_days: AtomicU32::new(7),
-            metrics_export_enabled: AtomicBool::new(false),
-        }
-    }
-
-    /// Obtener nivel de logging
-    pub fn get_log_level(&self) -> u32 {
-        self.log_level.load(Ordering::SeqCst)
-    }
-
-    /// Establecer nivel de logging
-    pub fn set_log_level(&self, level: u32) -> Result<(), KernelError> {
-        if level > 5 {
-            return Err(KernelError::InvalidParameter);
-        }
-        self.log_level.store(level, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Verificar si el logging a serial está habilitado
-    pub fn is_log_to_serial_enabled(&self) -> bool {
-        self.log_to_serial.load(Ordering::SeqCst)
-    }
-
-    /// Habilitar/deshabilitar logging a serial
-    pub fn set_log_to_serial(&self, enabled: bool) {
-        self.log_to_serial.store(enabled, Ordering::SeqCst);
-    }
-
-    /// Obtener tamaño del pool de memoria
-    pub fn get_memory_pool_size(&self) -> u64 {
-        self.memory_pool_size.load(Ordering::SeqCst)
-    }
-
-    /// Establecer tamaño del pool de memoria
-    pub fn set_memory_pool_size(&self, size: u64) -> Result<(), KernelError> {
-        if size < 1048576 {
-            // Mínimo 1MB
-            return Err(KernelError::InvalidParameter);
-        }
-        self.memory_pool_size.store(size, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Obtener número máximo de procesos
-    pub fn get_max_processes(&self) -> u32 {
-        self.max_processes.load(Ordering::SeqCst)
-    }
-
-    /// Establecer número máximo de procesos
-    pub fn set_max_processes(&self, max: u32) -> Result<(), KernelError> {
-        if max == 0 || max > 65536 {
-            return Err(KernelError::InvalidParameter);
-        }
-        self.max_processes.store(max, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Obtener número máximo de hilos
-    pub fn get_max_threads(&self) -> u32 {
-        self.max_threads.load(Ordering::SeqCst)
-    }
-
-    /// Establecer número máximo de hilos
-    pub fn set_max_threads(&self, max: u32) -> Result<(), KernelError> {
-        if max == 0 || max > 65536 {
-            return Err(KernelError::InvalidParameter);
-        }
-        self.max_threads.store(max, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Verificar si la IA está habilitada
-    pub fn is_ai_enabled(&self) -> bool {
-        self.ai_enabled.load(Ordering::SeqCst)
-    }
-
-    /// Habilitar/deshabilitar IA
-    pub fn set_ai_enabled(&self, enabled: bool) {
-        self.ai_enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    /// Obtener ruta de modelos de IA
-    pub fn get_ai_model_path(&self) -> &str {
-        &self.ai_model_path
-    }
-
-    /// Establecer ruta de modelos de IA
-    pub fn set_ai_model_path(&mut self, path: String) {
-        self.ai_model_path = path;
-    }
-
-    /// Verificar si las métricas están habilitadas
-    pub fn is_metrics_enabled(&self) -> bool {
-        self.metrics_enabled.load(Ordering::SeqCst)
-    }
-
-    /// Habilitar/deshabilitar métricas
-    pub fn set_metrics_enabled(&self, enabled: bool) {
-        self.metrics_enabled.store(enabled, Ordering::SeqCst);
-    }
-
-    /// Obtener intervalo de recolección de métricas
-    pub fn get_metrics_collection_interval(&self) -> u64 {
-        self.metrics_collection_interval_ms.load(Ordering::SeqCst)
-    }
-
-    /// Establecer intervalo de recolección de métricas
-    pub fn set_metrics_collection_interval(&self, interval_ms: u64) -> Result<(), KernelError> {
-        if interval_ms < 100 || interval_ms > 60000 {
-            return Err(KernelError::InvalidParameter);
-        }
-        self.metrics_collection_interval_ms
-            .store(interval_ms, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-/// Gestor de configuración
-pub struct ConfigManager {
-    config: KernelConfig,
-    items: BTreeMap<String, ConfigItem>,
-    dirty: bool,
-}
-
-impl ConfigManager {
-    /// Crear un nuevo gestor de configuración
-    pub fn new() -> Self {
-        let mut manager = Self {
-            config: KernelConfig::new(),
-            items: BTreeMap::new(),
-            dirty: false,
+        let mut config = Self {
+            categories: BTreeMap::new(),
+            flat_config: BTreeMap::new(),
+            initialized: false,
         };
-        manager.initialize_default_configs();
-        manager
+
+        // Inicializar con valores por defecto
+        config.initialize_defaults();
+        config
     }
 
-    /// Inicializar configuraciones por defecto
-    fn initialize_default_configs(&mut self) {
-        // Configuraciones de logging
-        self.add_config_item(ConfigItem {
-            key: "logging.level".to_string(),
-            value: ConfigValue::UnsignedInteger(2),
-            level: ConfigLevel::System,
-            priority: ConfigPriority::High,
-            description: "Nivel de logging del sistema".to_string(),
-            default_value: ConfigValue::UnsignedInteger(2),
-            min_value: Some(ConfigValue::UnsignedInteger(0)),
-            max_value: Some(ConfigValue::UnsignedInteger(5)),
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+    /// Inicializa la configuración con valores por defecto
+    fn initialize_defaults(&mut self) {
+        // Configuración del kernel
+        self.set_default(ConfigCategory::Kernel, "version", ConfigValue::String(String::from("0.1.0")));
+        self.set_default(ConfigCategory::Kernel, "hostname", ConfigValue::String(String::from("eclipse-os")));
+        self.set_default(ConfigCategory::Kernel, "panic_on_error", ConfigValue::Bool(false));
+        self.set_default(ConfigCategory::Kernel, "debug_mode", ConfigValue::Bool(false));
 
-        self.add_config_item(ConfigItem {
-            key: "logging.serial_enabled".to_string(),
-            value: ConfigValue::Boolean(true),
-            level: ConfigLevel::System,
-            priority: ConfigPriority::High,
-            description: "Habilitar logging a puerto serial".to_string(),
-            default_value: ConfigValue::Boolean(true),
-            min_value: None,
-            max_value: None,
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración de memoria
+        self.set_default(ConfigCategory::Memory, "heap_size", ConfigValue::U64(1024 * 1024)); // 1MB
+        self.set_default(ConfigCategory::Memory, "stack_size", ConfigValue::U64(64 * 1024)); // 64KB
+        self.set_default(ConfigCategory::Memory, "page_size", ConfigValue::U64(4096)); // 4KB
+        self.set_default(ConfigCategory::Memory, "enable_paging", ConfigValue::Bool(true));
 
-        // Configuraciones de memoria
-        self.add_config_item(ConfigItem {
-            key: "memory.pool_size".to_string(),
-            value: ConfigValue::UnsignedInteger(134217728),
-            level: ConfigLevel::Kernel,
-            priority: ConfigPriority::Critical,
-            description: "Tamaño del pool de memoria en bytes".to_string(),
-            default_value: ConfigValue::UnsignedInteger(134217728),
-            min_value: Some(ConfigValue::UnsignedInteger(1048576)),
-            max_value: Some(ConfigValue::UnsignedInteger(1073741824)),
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración del scheduler
+        self.set_default(ConfigCategory::Scheduler, "time_slice", ConfigValue::U32(10)); // 10ms
+        self.set_default(ConfigCategory::Scheduler, "max_processes", ConfigValue::U32(256));
+        self.set_default(ConfigCategory::Scheduler, "enable_preemption", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Scheduler, "priority_levels", ConfigValue::U8(32));
 
-        // Configuraciones de procesos
-        self.add_config_item(ConfigItem {
-            key: "process.max_count".to_string(),
-            value: ConfigValue::UnsignedInteger(256),
-            level: ConfigLevel::Kernel,
-            priority: ConfigPriority::High,
-            description: "Número máximo de procesos".to_string(),
-            default_value: ConfigValue::UnsignedInteger(256),
-            min_value: Some(ConfigValue::UnsignedInteger(1)),
-            max_value: Some(ConfigValue::UnsignedInteger(65536)),
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración de dispositivos
+        self.set_default(ConfigCategory::Devices, "max_devices", ConfigValue::U32(128));
+        self.set_default(ConfigCategory::Devices, "auto_detect_devices", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Devices, "device_scan_interval", ConfigValue::U32(1000)); // 1s
 
-        // Configuraciones de IA
-        self.add_config_item(ConfigItem {
-            key: "ai.enabled".to_string(),
-            value: ConfigValue::Boolean(true),
-            level: ConfigLevel::System,
-            priority: ConfigPriority::Normal,
-            description: "Habilitar sistema de IA".to_string(),
-            default_value: ConfigValue::Boolean(true),
-            min_value: None,
-            max_value: None,
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración de logging
+        self.set_default(ConfigCategory::Logging, "log_level", ConfigValue::String(String::from("INFO")));
+        self.set_default(ConfigCategory::Logging, "max_log_files", ConfigValue::U32(10));
+        self.set_default(ConfigCategory::Logging, "log_file_size", ConfigValue::U64(1024 * 1024)); // 1MB
+        self.set_default(ConfigCategory::Logging, "enable_syslog", ConfigValue::Bool(true));
 
-        // Configuraciones de métricas
-        self.add_config_item(ConfigItem {
-            key: "metrics.enabled".to_string(),
-            value: ConfigValue::Boolean(true),
-            level: ConfigLevel::System,
-            priority: ConfigPriority::Normal,
-            description: "Habilitar recolección de métricas".to_string(),
-            default_value: ConfigValue::Boolean(true),
-            min_value: None,
-            max_value: None,
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración de módulos
+        self.set_default(ConfigCategory::Modules, "max_modules", ConfigValue::U32(64));
+        self.set_default(ConfigCategory::Modules, "module_path", ConfigValue::String(String::from("/modules")));
+        self.set_default(ConfigCategory::Modules, "auto_load_modules", ConfigValue::Bool(true));
 
-        self.add_config_item(ConfigItem {
-            key: "metrics.collection_interval".to_string(),
-            value: ConfigValue::UnsignedInteger(1000),
-            level: ConfigLevel::System,
-            priority: ConfigPriority::Normal,
-            description: "Intervalo de recolección de métricas en ms".to_string(),
-            default_value: ConfigValue::UnsignedInteger(1000),
-            min_value: Some(ConfigValue::UnsignedInteger(100)),
-            max_value: Some(ConfigValue::UnsignedInteger(60000)),
-            valid_values: None,
-            readonly: false,
-            persistent: true,
-        });
+        // Configuración de red
+        self.set_default(ConfigCategory::Network, "enable_networking", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Network, "max_connections", ConfigValue::U32(1024));
+        self.set_default(ConfigCategory::Network, "default_gateway", ConfigValue::String(String::from("192.168.1.1")));
+        self.set_default(ConfigCategory::Network, "dhcp_enabled", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Network, "dns_server", ConfigValue::String(String::from("8.8.8.8")));
+        self.set_default(ConfigCategory::Network, "hostname", ConfigValue::String(String::from("eclipse-os")));
+        self.set_default(ConfigCategory::Network, "domain_name", ConfigValue::String(String::from("local")));
+        self.set_default(ConfigCategory::Network, "mtu", ConfigValue::U32(1500));
+
+        // Configuración de seguridad
+        self.set_default(ConfigCategory::Security, "enable_kaslr", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Security, "enable_smap", ConfigValue::Bool(true));
+        self.set_default(ConfigCategory::Security, "enable_smep", ConfigValue::Bool(true));
+
+        // Configuración de debug
+        self.set_default(ConfigCategory::Debug, "enable_kernel_debug", ConfigValue::Bool(false));
+        self.set_default(ConfigCategory::Debug, "debug_port", ConfigValue::U16(1234));
+        self.set_default(ConfigCategory::Debug, "enable_stack_trace", ConfigValue::Bool(true));
     }
 
-    /// Agregar un elemento de configuración
-    pub fn add_config_item(&mut self, item: ConfigItem) {
-        self.items.insert(item.key.clone(), item);
-        self.dirty = true;
+    /// Establece un valor por defecto
+    fn set_default(&mut self, category: ConfigCategory, key: &str, value: ConfigValue) {
+        let cat_map = self.categories.entry(category).or_insert_with(BTreeMap::new);
+        cat_map.insert(key.to_string(), value.clone());
+
+        // También agregar a la configuración plana
+        let flat_key = format!("{}.{}", category_to_string(category), key);
+        self.flat_config.insert(flat_key, value);
     }
 
-    /// Obtener un valor de configuración
-    pub fn get_config(&self, key: &str) -> Option<&ConfigValue> {
-        self.items.get(key).map(|item| &item.value)
+    /// Obtiene un valor de configuración
+    pub fn get(&self, category: ConfigCategory, key: &str) -> Option<&ConfigValue> {
+        self.categories.get(&category)?.get(key)
     }
 
-    /// Establecer un valor de configuración
-    pub fn set_config(&mut self, key: &str, value: ConfigValue) -> Result<(), KernelError> {
-        if let Some(item) = self.items.get(key) {
-            if item.readonly {
-                return Err(KernelError::AccessDenied);
-            }
+    /// Obtiene un valor de configuración usando clave plana
+    pub fn get_flat(&self, key: &str) -> Option<&ConfigValue> {
+        self.flat_config.get(key)
+    }
 
-            // Validar valor
-            if let Err(e) = self.validate_config_value(item, &value) {
-                return Err(e);
-            }
+    /// Establece un valor de configuración
+    pub fn set(&mut self, category: ConfigCategory, key: &str, value: ConfigValue) {
+        let cat_map = self.categories.entry(category).or_insert_with(BTreeMap::new);
+        cat_map.insert(key.to_string(), value.clone());
 
-            // Si la validación es exitosa, actualizar el valor
-            if let Some(item) = self.items.get_mut(key) {
-                item.value = value;
-                self.dirty = true;
-                self.apply_config_change(key)?;
-            }
-            Ok(())
+        // Actualizar también la configuración plana
+        let flat_key = format!("{}.{}", category_to_string(category), key);
+        self.flat_config.insert(flat_key, value);
+    }
+
+    /// Verifica si la configuración está inicializada
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Marca la configuración como inicializada
+    pub fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    /// Lista todas las configuraciones por categoría
+    pub fn list_by_category(&self, category: ConfigCategory) -> Vec<(&str, &ConfigValue)> {
+        if let Some(cat_map) = self.categories.get(&category) {
+            cat_map.iter().map(|(k, v)| (k.as_str(), v)).collect()
         } else {
-            Err(KernelError::ConfigurationNotFound)
+            Vec::new()
         }
     }
 
-    /// Validar un valor de configuración
-    fn validate_config_value(
-        &self,
-        item: &ConfigItem,
-        value: &ConfigValue,
-    ) -> Result<(), KernelError> {
-        // Verificar tipo de valor
-        if !self.is_value_type_compatible(&item.value, value) {
-            return Err(KernelError::InvalidParameter);
-        }
-
-        // Verificar rango mínimo
-        if let Some(ref min_val) = item.min_value {
-            if !self.is_value_greater_or_equal(value, min_val) {
-                return Err(KernelError::InvalidParameter);
-            }
-        }
-
-        // Verificar rango máximo
-        if let Some(ref max_val) = item.max_value {
-            if !self.is_value_less_or_equal(value, max_val) {
-                return Err(KernelError::InvalidParameter);
-            }
-        }
-
-        // Verificar valores válidos
-        if let Some(ref valid_vals) = item.valid_values {
-            if !valid_vals.contains(value) {
-                return Err(KernelError::InvalidParameter);
-            }
-        }
-
-        Ok(())
+    /// Lista todas las configuraciones
+    pub fn list_all(&self) -> Vec<(String, &ConfigValue)> {
+        self.flat_config.iter().map(|(k, v)| (k.clone(), v)).collect()
     }
 
-    /// Verificar compatibilidad de tipos
-    fn is_value_type_compatible(&self, expected: &ConfigValue, actual: &ConfigValue) -> bool {
-        match (expected, actual) {
-            (ConfigValue::Boolean(_), ConfigValue::Boolean(_)) => true,
-            (ConfigValue::Integer(_), ConfigValue::Integer(_)) => true,
-            (ConfigValue::UnsignedInteger(_), ConfigValue::UnsignedInteger(_)) => true,
-            (ConfigValue::Float(_), ConfigValue::Float(_)) => true,
-            (ConfigValue::String(_), ConfigValue::String(_)) => true,
-            (ConfigValue::Array(_), ConfigValue::Array(_)) => true,
-            _ => false,
-        }
-    }
+    /// Carga configuración desde un array de bytes (formato simple)
+    pub fn load_from_bytes(&mut self, data: &[u8]) -> Result<(), ConfigError> {
+        // Implementación simple: parsea líneas de formato "categoria.clave=valor"
+        let content = core::str::from_utf8(data).map_err(|_| ConfigError::ParseError)?;
 
-    /// Verificar si un valor es mayor o igual
-    fn is_value_greater_or_equal(&self, value: &ConfigValue, min: &ConfigValue) -> bool {
-        match (value, min) {
-            (ConfigValue::Integer(a), ConfigValue::Integer(b)) => a >= b,
-            (ConfigValue::UnsignedInteger(a), ConfigValue::UnsignedInteger(b)) => a >= b,
-            (ConfigValue::Float(a), ConfigValue::Float(b)) => a >= b,
-            _ => false,
-        }
-    }
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // Ignorar líneas vacías y comentarios
+            }
 
-    /// Verificar si un valor es menor o igual
-    fn is_value_less_or_equal(&self, value: &ConfigValue, max: &ConfigValue) -> bool {
-        match (value, max) {
-            (ConfigValue::Integer(a), ConfigValue::Integer(b)) => a <= b,
-            (ConfigValue::UnsignedInteger(a), ConfigValue::UnsignedInteger(b)) => a <= b,
-            (ConfigValue::Float(a), ConfigValue::Float(b)) => a <= b,
-            _ => false,
-        }
-    }
+            if let Some((key, value_str)) = line.split_once('=') {
+                let key = key.trim();
+                let value_str = value_str.trim();
 
-    /// Aplicar cambio de configuración
-    fn apply_config_change(&mut self, key: &str) -> Result<(), KernelError> {
-        match key {
-            "logging.level" => {
-                if let Some(ConfigValue::UnsignedInteger(level)) = self.get_config(key) {
-                    self.config.set_log_level(*level as u32)?;
-                    let msg = format!("Nivel de logging cambiado a {}", level);
-                    // logging silenciado
-                }
-            }
-            "logging.serial_enabled" => {
-                if let Some(ConfigValue::Boolean(enabled)) = self.get_config(key) {
-                    self.config.set_log_to_serial(*enabled);
-                    let status = if *enabled {
-                        "habilitado"
-                    } else {
-                        "deshabilitado"
-                    };
-                    let msg = format!("Logging a serial {}", status);
-                }
-            }
-            "memory.pool_size" => {
-                if let Some(ConfigValue::UnsignedInteger(size)) = self.get_config(key) {
-                    self.config.set_memory_pool_size(*size)?;
-                    let msg = format!("Tamaño del pool de memoria cambiado a {} bytes", size);
-                }
-            }
-            "process.max_count" => {
-                if let Some(ConfigValue::UnsignedInteger(max)) = self.get_config(key) {
-                    self.config.set_max_processes(*max as u32)?;
-                    let msg = format!("Número máximo de procesos cambiado a {}", max);
-                }
-            }
-            "ai.enabled" => {
-                if let Some(ConfigValue::Boolean(enabled)) = self.get_config(key) {
-                    self.config.set_ai_enabled(*enabled);
-                    let status = if *enabled {
-                        "habilitado"
-                    } else {
-                        "deshabilitado"
-                    };
-                    let msg = format!("Sistema de IA {}", status);
-                }
-            }
-            "metrics.enabled" => {
-                if let Some(ConfigValue::Boolean(enabled)) = self.get_config(key) {
-                    self.config.set_metrics_enabled(*enabled);
-                    let status = if *enabled {
-                        "habilitada"
-                    } else {
-                        "deshabilitada"
-                    };
-                    let msg = format!("Recolección de métricas {}", status);
-                }
-            }
-            "metrics.collection_interval" => {
-                if let Some(ConfigValue::UnsignedInteger(interval)) = self.get_config(key) {
-                    self.config.set_metrics_collection_interval(*interval)?;
-                    let _msg = format!(
-                        "Intervalo de recolección de métricas cambiado a {} ms",
-                        interval
-                    );
-                }
-            }
-            _ => {
-                let _msg = format!("Configuración '{}' no tiene aplicación automática", key);
-            }
-        }
-        Ok(())
-    }
-
-    /// Obtener la configuración del kernel
-    pub fn get_kernel_config(&self) -> &KernelConfig {
-        &self.config
-    }
-
-    /// Obtener todas las configuraciones
-    pub fn get_all_configs(&self) -> &BTreeMap<String, ConfigItem> {
-        &self.items
-    }
-
-    /// Generar reporte de configuración
-    pub fn generate_config_report(&self) -> String {
-        let mut report = String::new();
-        report.push_str("=== CONFIGURACIÓN DEL KERNEL ECLIPSE ===\n");
-
-        for (key, item) in &self.items {
-            report.push_str(&format!("{}: ", key));
-            match &item.value {
-                ConfigValue::Boolean(b) => report.push_str(&format!("{}", b)),
-                ConfigValue::Integer(i) => report.push_str(&format!("{}", i)),
-                ConfigValue::UnsignedInteger(u) => report.push_str(&format!("{}", u)),
-                ConfigValue::Float(f) => report.push_str(&format!("{:.2}", f)),
-                ConfigValue::String(s) => report.push_str(&format!("\"{}\"", s)),
-                ConfigValue::Array(arr) => {
-                    report.push_str("[");
-                    for (i, val) in arr.iter().enumerate() {
-                        if i > 0 {
-                            report.push_str(", ");
-                        }
-                        match val {
-                            ConfigValue::Boolean(b) => report.push_str(&format!("{}", b)),
-                            ConfigValue::Integer(i) => report.push_str(&format!("{}", i)),
-                            ConfigValue::UnsignedInteger(u) => report.push_str(&format!("{}", u)),
-                            ConfigValue::Float(f) => report.push_str(&format!("{:.2}", f)),
-                            ConfigValue::String(s) => report.push_str(&format!("\"{}\"", s)),
-                            _ => report.push_str("?"),
+                if let Some((cat_str, key_part)) = key.split_once('.') {
+                    if let Some(category) = string_to_category(cat_str) {
+                        if let Some(value) = parse_config_value(value_str) {
+                            self.set(category, key_part, value);
                         }
                     }
-                    report.push_str("]");
                 }
             }
-            report.push_str(&format!(" ({})", item.description));
-            if item.readonly {
-                report.push_str(" [READONLY]");
-            }
-            report.push_str("\n");
         }
 
-        report.push_str("==========================================\n");
-        report
+        self.mark_initialized();
+        Ok(())
+    }
+
+    /// Obtiene estadísticas de la configuración
+    pub fn get_stats(&self) -> ConfigStats {
+        let total_configs = self.flat_config.len();
+        let categories_count = self.categories.len();
+
+        ConfigStats {
+            total_configs,
+            categories_count,
+            initialized: self.initialized,
+        }
     }
 }
 
-/// Instancia global del gestor de configuración
-static CONFIG_MANAGER: Mutex<Option<ConfigManager>> = Mutex::new(None);
+/// Estadísticas de la configuración
+#[derive(Debug, Clone)]
+pub struct ConfigStats {
+    /// Número total de configuraciones
+    pub total_configs: usize,
+    /// Número de categorías
+    pub categories_count: usize,
+    /// Indica si está inicializada
+    pub initialized: bool,
+}
 
-/// Inicializar el sistema de configuración
-pub fn init_config() -> KernelResult<()> {
-    let mut manager = CONFIG_MANAGER
-        .lock()
-        .map_err(|_| KernelError::InternalError)?;
-    *manager = Some(ConfigManager::new());
+/// Errores de configuración
+#[derive(Debug, Clone)]
+pub enum ConfigError {
+    /// Error de parsing
+    ParseError,
+    /// Configuración no encontrada
+    NotFound,
+    /// Tipo incorrecto
+    WrongType,
+    /// Error genérico
+    Other(String),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::ParseError => write!(f, "Error de parsing de configuración"),
+            ConfigError::NotFound => write!(f, "Configuración no encontrada"),
+            ConfigError::WrongType => write!(f, "Tipo de configuración incorrecto"),
+            ConfigError::Other(msg) => write!(f, "Error: {}", msg),
+        }
+    }
+}
+
+/// Convierte una categoría a string
+fn category_to_string(category: ConfigCategory) -> &'static str {
+    match category {
+        ConfigCategory::Kernel => "kernel",
+        ConfigCategory::Memory => "memory",
+        ConfigCategory::Scheduler => "scheduler",
+        ConfigCategory::Devices => "devices",
+        ConfigCategory::Logging => "logging",
+        ConfigCategory::Modules => "modules",
+        ConfigCategory::Network => "network",
+        ConfigCategory::Security => "security",
+        ConfigCategory::Debug => "debug",
+    }
+}
+
+/// Convierte un string a categoría
+fn string_to_category(s: &str) -> Option<ConfigCategory> {
+    match s {
+        "kernel" => Some(ConfigCategory::Kernel),
+        "memory" => Some(ConfigCategory::Memory),
+        "scheduler" => Some(ConfigCategory::Scheduler),
+        "devices" => Some(ConfigCategory::Devices),
+        "logging" => Some(ConfigCategory::Logging),
+        "modules" => Some(ConfigCategory::Modules),
+        "network" => Some(ConfigCategory::Network),
+        "security" => Some(ConfigCategory::Security),
+        "debug" => Some(ConfigCategory::Debug),
+        _ => None,
+    }
+}
+
+/// Parsea un valor de configuración desde string
+fn parse_config_value(s: &str) -> Option<ConfigValue> {
+    // Remover comillas si existen
+    let s = s.trim_matches('"');
+
+    // Intentar parsear como booleano
+    if s.eq_ignore_ascii_case("true") {
+        return Some(ConfigValue::Bool(true));
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return Some(ConfigValue::Bool(false));
+    }
+
+    // Intentar parsear como número
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(ConfigValue::U64(n));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(ConfigValue::I64(n));
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(ConfigValue::F64(n));
+    }
+
+    // Por defecto, tratar como string
+    Some(ConfigValue::String(String::from(s)))
+}
+
+/// Instancia global de configuración del kernel
+static mut KERNEL_CONFIG: Option<KernelConfig> = None;
+
+/// Inicializa el sistema de configuración del kernel
+pub fn init_kernel_config() -> Result<(), ConfigError> {
+    unsafe {
+        KERNEL_CONFIG = Some(KernelConfig::new());
+    }
+
+    // Log removido
     Ok(())
 }
 
-/// Obtener el gestor de configuración
-pub fn get_config_manager() -> &'static Mutex<Option<ConfigManager>> {
-    &CONFIG_MANAGER
-}
-
-/// Obtener un valor de configuración
-pub fn get_config_value(key: &str) -> KernelResult<ConfigValue> {
-    let manager = CONFIG_MANAGER
-        .lock()
-        .map_err(|_| KernelError::InternalError)?;
-    if let Some(ref config_manager) = *manager {
-        config_manager
-            .get_config(key)
-            .cloned()
-            .ok_or(KernelError::ConfigurationNotFound)
-    } else {
-        Err(KernelError::InternalError)
+/// Obtiene una referencia a la configuración del kernel
+pub fn get_kernel_config() -> Option<&'static mut KernelConfig> {
+    unsafe {
+        KERNEL_CONFIG.as_mut()
     }
 }
 
-/// Establecer un valor de configuración
-pub fn set_config_value(key: &str, value: ConfigValue) -> KernelResult<()> {
-    let mut manager = CONFIG_MANAGER
-        .lock()
-        .map_err(|_| KernelError::InternalError)?;
-    if let Some(ref mut config_manager) = *manager {
-        config_manager.set_config(key, value)
+/// Carga configuración desde bytes
+pub fn load_config_from_bytes(data: &[u8]) -> Result<(), ConfigError> {
+    if let Some(config) = get_kernel_config() {
+        config.load_from_bytes(data)?;
+        // Log removido
+        Ok(())
     } else {
-        Err(KernelError::InternalError)
+        Err(ConfigError::Other("Sistema de configuración no inicializado".to_string()))
     }
 }
 
-/// Generar reporte de configuración
-pub fn generate_config_report() -> KernelResult<String> {
-    let manager = CONFIG_MANAGER
-        .lock()
-        .map_err(|_| KernelError::InternalError)?;
-    if let Some(ref config_manager) = *manager {
-        Ok(config_manager.generate_config_report())
-    } else {
-        Err(KernelError::InternalError)
+/// Funciones helper para acceder a configuraciones comunes
+
+/// Obtiene el hostname configurado
+pub fn get_hostname() -> Option<String> {
+    get_kernel_config()?
+        .get(ConfigCategory::Kernel, "hostname")
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_string())
+}
+
+/// Obtiene el tamaño del heap configurado
+pub fn get_heap_size() -> Option<u64> {
+    get_kernel_config()?
+        .get(ConfigCategory::Memory, "heap_size")
+        .and_then(|v| v.as_u64())
+}
+
+/// Obtiene el slice de tiempo del scheduler
+pub fn get_scheduler_time_slice() -> Option<u32> {
+    get_kernel_config()?
+        .get(ConfigCategory::Scheduler, "time_slice")
+        .and_then(|v| v.as_u32())
+}
+
+/// Verifica si el modo debug está habilitado
+pub fn is_debug_mode() -> bool {
+    get_kernel_config()
+        .and_then(|c| c.get(ConfigCategory::Kernel, "debug_mode"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Verifica si el networking está habilitado
+pub fn is_networking_enabled() -> bool {
+    get_kernel_config()
+        .and_then(|c| c.get(ConfigCategory::Network, "enable_networking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Genera un reporte de la configuración actual
+pub fn generate_config_report() -> Result<String, ConfigError> {
+    let config = get_kernel_config().ok_or(ConfigError::Other("Configuración no inicializada".to_string()))?;
+
+    let mut report = String::from("=== REPORTE DE CONFIGURACIÓN DEL KERNEL ===\n\n");
+
+    // Estadísticas generales
+    let stats = config.get_stats();
+    report.push_str(&format!("Configuraciones totales: {}\n", stats.total_configs));
+    report.push_str(&format!("Categorías: {}\n", stats.categories_count));
+    report.push_str(&format!("Inicializada: {}\n\n", stats.initialized));
+
+    // Configuraciones por categoría
+    for category in &[
+        ConfigCategory::Kernel,
+        ConfigCategory::Memory,
+        ConfigCategory::Scheduler,
+        ConfigCategory::Devices,
+        ConfigCategory::Logging,
+        ConfigCategory::Modules,
+        ConfigCategory::Network,
+        ConfigCategory::Security,
+        ConfigCategory::Debug,
+    ] {
+        report.push_str(&format!("{}:\n", category_to_string(*category).to_uppercase()));
+
+        let configs = config.list_by_category(*category);
+        if configs.is_empty() {
+            report.push_str("  (sin configuraciones)\n");
+        } else {
+            for (key, value) in configs {
+                report.push_str(&format!("  {} = {}\n", key, value));
+            }
+        }
+        report.push_str("\n");
     }
+
+    report.push_str("=== FIN DEL REPORTE ===\n");
+
+    Ok(report)
+}
+
+// Macros para facilitar el acceso a configuraciones
+
+#[macro_export]
+macro_rules! config_get {
+    ($category:expr, $key:expr) => {
+        $crate::config::get_kernel_config()
+            .and_then(|c| c.get($category, $key))
+    };
+}
+
+#[macro_export]
+macro_rules! config_get_bool {
+    ($category:expr, $key:expr) => {
+        $crate::config::get_kernel_config()
+            .and_then(|c| c.get($category, $key))
+            .and_then(|v| v.as_bool())
+    };
+}
+
+#[macro_export]
+macro_rules! config_get_u32 {
+    ($category:expr, $key:expr) => {
+        $crate::config::get_kernel_config()
+            .and_then(|c| c.get($category, $key))
+            .and_then(|v| v.as_u32())
+    };
+}
+
+#[macro_export]
+macro_rules! config_get_string {
+    ($category:expr, $key:expr) => {
+        $crate::config::get_kernel_config()
+            .and_then(|c| c.get($category, $key))
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string())
+    };
 }
