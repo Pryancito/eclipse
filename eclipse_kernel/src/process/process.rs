@@ -3,6 +3,11 @@
 //! Implementa PCB, estados de proceso y operaciones básicas
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use super::file_descriptor::FileDescriptorTable;
+use super::stack_allocator::StackInfo;
+use alloc::string::String;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 /// ID único de proceso
 pub type ProcessId = u32;
@@ -122,21 +127,26 @@ pub struct MemoryInfo {
     pub stack_pointer: u64,
     /// Tamaño del stack
     pub stack_size: u64,
-    /// Dirección del heap
-    pub heap_pointer: u64,
-    /// Tamaño del heap
-    pub heap_size: u64,
+    /// Dirección de inicio del heap
+    pub heap_start: u64,
+    /// Dirección actual del break (fin del heap)
+    pub heap_break: u64,
+    /// Límite máximo del heap
+    pub heap_limit: u64,
 }
 
 impl Default for MemoryInfo {
     fn default() -> Self {
+        // Heap comienza después del código (típicamente en 0x600000)
+        let heap_start = 0x600000;
         Self {
             base_address: 0,
             size: 0,
             stack_pointer: 0,
             stack_size: 0x10000, // 64KB de stack
-            heap_pointer: 0,
-            heap_size: 0x100000, // 1MB de heap
+            heap_start,
+            heap_break: heap_start, // Heap vacío inicialmente
+            heap_limit: heap_start + 0x1000000, // Límite de 16MB de heap
         }
     }
 }
@@ -177,7 +187,13 @@ pub struct ProcessControlBlock {
     /// Recursos abiertos
     pub open_files: u32,
     /// Directorio de trabajo actual
-    pub working_directory: u64,
+    pub working_directory: String,
+    /// Tabla de file descriptors
+    pub fd_table: FileDescriptorTable,
+    /// Información del stack del proceso
+    pub stack_info: Option<StackInfo>,
+    /// Variables de entorno del proceso
+    pub environment: HashMap<String, String>,
 }
 
 impl ProcessControlBlock {
@@ -199,8 +215,20 @@ impl ProcessControlBlock {
             envp: 0,
             exit_code: None,
             pending_signals: 0,
-            open_files: 0,
-            working_directory: 0,
+            open_files: 3, // stdin, stdout, stderr
+            working_directory: String::from("/"),
+            fd_table: FileDescriptorTable::new(),
+            stack_info: None, // Se asignará cuando sea necesario
+            environment: {
+                let mut env = HashMap::new();
+                // Variables de entorno por defecto
+                env.insert(String::from("PATH"), String::from("/bin:/usr/bin"));
+                env.insert(String::from("HOME"), String::from("/"));
+                env.insert(String::from("SHELL"), String::from("/bin/ion"));
+                env.insert(String::from("USER"), String::from("root"));
+                env.insert(String::from("TERM"), String::from("linux"));
+                env
+            },
         };
 
         // Copiar nombre

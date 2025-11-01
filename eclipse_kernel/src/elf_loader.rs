@@ -5,6 +5,29 @@
 use alloc::vec::Vec;
 use core::mem;
 use core::ptr;
+use spin::Mutex;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Sistema de ELF loader global
+static ELF_LOADER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Inicializar el cargador ELF
+pub fn init_elf_loader() -> Result<(), &'static str> {
+    if ELF_LOADER_INITIALIZED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    
+    // Inicializar estructuras globales del ELF loader si es necesario
+    // Por ahora, el loader es stateless, así que solo marcamos como inicializado
+    
+    ELF_LOADER_INITIALIZED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Verificar si el ELF loader está inicializado
+pub fn is_elf_loader_initialized() -> bool {
+    ELF_LOADER_INITIALIZED.load(Ordering::Acquire)
+}
 
 /// Estructura del header ELF64
 #[repr(C)]

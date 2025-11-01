@@ -263,6 +263,11 @@ pub fn get_advanced_driver_manager() -> &'static mut AdvancedDriverManager {
 }
 
 /// Inicializar gestor avanzado
+/// Inicializar el sistema de drivers modulares (alias para compatibilidad)
+pub fn init_modular_driver_system() -> Result<(), DriverError> {
+    init_advanced_driver_manager()
+}
+
 pub fn init_advanced_driver_manager() -> Result<(), DriverError> {
     unsafe { ADVANCED_DRIVER_MANAGER.init() }
 }

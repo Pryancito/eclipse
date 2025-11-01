@@ -8,8 +8,10 @@ pub mod apic;
 pub mod irq;
 pub mod handlers;
 pub mod manager;
+pub mod timer;
 
 pub use manager::InterruptManager;
 pub use irq::IrqManager;
 pub use pic::PicManager;
 pub use apic::ApicManager;
+pub use timer::{SystemTimer, TimerConfig, init_system_timer, get_system_timer, on_timer_interrupt};

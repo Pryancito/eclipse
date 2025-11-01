@@ -7,6 +7,24 @@ use crate::drivers::usb_events::{UsbDeviceInfo, UsbControllerType, UsbDeviceSpee
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use spin::Mutex;
+
+/// Gestor global de audio USB
+static USB_AUDIO_DRIVER: Mutex<Option<UsbAudioDriver>> = Mutex::new(None);
+
+/// Inicializar el sistema de audio USB
+pub fn init_usb_audio_system() -> Result<(), &'static str> {
+    let mut driver_guard = USB_AUDIO_DRIVER.lock();
+    let mut driver = UsbAudioDriver::new();
+    driver.initialize()?;
+    *driver_guard = Some(driver);
+    Ok(())
+}
+
+/// Obtener driver de audio USB
+pub fn get_usb_audio_driver() -> Option<&'static Mutex<Option<UsbAudioDriver>>> {
+    Some(&USB_AUDIO_DRIVER)
+}
 
 /// Configuración de audio USB
 #[derive(Debug, Clone)]

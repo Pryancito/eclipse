@@ -220,6 +220,12 @@ impl ProcessScheduler {
         }
     }
 
+    /// Obtener el siguiente proceso (simple, sin removerlo)
+    pub fn get_next_process(&self) -> Option<ProcessId> {
+        // Retorna el próximo proceso en la cola Ready sin removerlo
+        self.ready_queue.peek()
+    }
+
     /// Selección Round Robin
     fn select_round_robin(&mut self) -> Option<ProcessId> {
         self.ready_queue.dequeue()

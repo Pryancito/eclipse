@@ -15,18 +15,18 @@ static PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static GENERAL_PROTECTION_FAULTS: AtomicU64 = AtomicU64::new(0);
 static DIVISION_BY_ZERO: AtomicU64 = AtomicU64::new(0);
 
-/// Handler de timer mejorado
+/// Handler de timer mejorado con context switching
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler() {
     TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    
+    // Llamar al sistema de timer para manejar ticks y scheduling
+    super::timer::on_timer_interrupt();
     
     // Enviar EOI al PIC
     unsafe {
         asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
     }
-    
-    // En una implementación completa, esto actualizaría el scheduler
-    // y manejaría el time slicing
 }
 
 /// Handler de teclado mejorado
@@ -150,15 +150,40 @@ pub extern "C" fn nmi_handler() {
 /// Handler de syscall mejorado
 #[no_mangle]
 pub extern "C" fn syscall_handler() {
-    // System call handler
-    // En una implementación completa, esto procesaría syscalls del userland
+    // System call handler - procesa syscalls del userland
     unsafe {
-        // Obtener número de syscall desde RAX
-        let mut syscall_num: u64;
-        asm!("mov {}, rax", out(reg) syscall_num, options(nostack, nomem));
+        // Obtener registros de syscall
+        let mut rax: u64; // Número de syscall
+        let mut rdi: u64; // Argumento 1
+        let mut rsi: u64; // Argumento 2
+        let mut rdx: u64; // Argumento 3
+        let mut r10: u64; // Argumento 4 (en lugar de rcx)
+        let mut r8: u64;  // Argumento 5
+        let mut r9: u64;  // Argumento 6
+        
+        asm!(
+            "mov {}, rax",
+            "mov {}, rdi",
+            "mov {}, rsi",
+            "mov {}, rdx",
+            "mov {}, r10",
+            "mov {}, r8",
+            "mov {}, r9",
+            out(reg) rax,
+            out(reg) rdi,
+            out(reg) rsi,
+            out(reg) rdx,
+            out(reg) r10,
+            out(reg) r8,
+            out(reg) r9,
+            options(nostack, nomem)
+        );
         
         // Procesar syscall
-        process_syscall(syscall_num);
+        let result = process_syscall(rax, rdi, rsi, rdx, r10, r8, r9);
+        
+        // Poner resultado en RAX
+        asm!("mov rax, {}", in(reg) result, options(nostack, nomem));
     }
 }
 
@@ -168,14 +193,66 @@ pub extern "C" fn syscall_handler() {
 
 /// Procesar scancode del teclado
 fn process_keyboard_scancode(scancode: u8) {
-    // En una implementación completa, esto procesaría el scancode
-    // y lo convertiría a caracteres o comandos
-    if scancode & 0x80 == 0 {
-        // Tecla presionada
-        // Procesar tecla presionada
-    } else {
-        // Tecla liberada
-        // Procesar tecla liberada
+    use crate::drivers::keyboard::KeyCode;
+    use crate::drivers::stdin::process_key_event;
+    
+    // Verificar si es key press o release
+    let pressed = (scancode & 0x80) == 0;
+    let scancode_clean = scancode & 0x7F;
+    
+    // Mapeo simple de scancodes PS/2 a KeyCode
+    let keycode = match scancode_clean {
+        0x01 => Some(KeyCode::Escape),
+        0x02 => Some(KeyCode::Key1),
+        0x03 => Some(KeyCode::Key2),
+        0x04 => Some(KeyCode::Key3),
+        0x05 => Some(KeyCode::Key4),
+        0x06 => Some(KeyCode::Key5),
+        0x07 => Some(KeyCode::Key6),
+        0x08 => Some(KeyCode::Key7),
+        0x09 => Some(KeyCode::Key8),
+        0x0A => Some(KeyCode::Key9),
+        0x0B => Some(KeyCode::Key0),
+        0x0E => Some(KeyCode::Backspace),
+        0x0F => Some(KeyCode::Tab),
+        0x10 => Some(KeyCode::Q),
+        0x11 => Some(KeyCode::W),
+        0x12 => Some(KeyCode::E),
+        0x13 => Some(KeyCode::R),
+        0x14 => Some(KeyCode::T),
+        0x15 => Some(KeyCode::Y),
+        0x16 => Some(KeyCode::U),
+        0x17 => Some(KeyCode::I),
+        0x18 => Some(KeyCode::O),
+        0x19 => Some(KeyCode::P),
+        0x1C => Some(KeyCode::Enter),
+        0x1D => Some(KeyCode::Ctrl),
+        0x1E => Some(KeyCode::A),
+        0x1F => Some(KeyCode::S),
+        0x20 => Some(KeyCode::D),
+        0x21 => Some(KeyCode::F),
+        0x22 => Some(KeyCode::G),
+        0x23 => Some(KeyCode::H),
+        0x24 => Some(KeyCode::J),
+        0x25 => Some(KeyCode::K),
+        0x26 => Some(KeyCode::L),
+        0x2A => Some(KeyCode::LeftShift),
+        0x2C => Some(KeyCode::Z),
+        0x2D => Some(KeyCode::X),
+        0x2E => Some(KeyCode::C),
+        0x2F => Some(KeyCode::V),
+        0x30 => Some(KeyCode::B),
+        0x31 => Some(KeyCode::N),
+        0x32 => Some(KeyCode::M),
+        0x39 => Some(KeyCode::Space),
+        _ => None,
+    };
+    
+    // Procesar el evento si tenemos un keycode válido
+    if let Some(key) = keycode {
+        // TODO: Rastrear estado de Shift para mayúsculas
+        let shift = false; // Por ahora, siempre minúsculas
+        process_key_event(key, pressed, shift);
     }
 }
 
@@ -230,17 +307,29 @@ fn process_division_by_zero() {
 }
 
 /// Procesar syscall
-fn process_syscall(syscall_num: u64) {
-    // En una implementación completa, esto procesaría el syscall
-    // y llamaría a la función correspondiente
-    match syscall_num {
-        0 => {
-            // Syscall de ejemplo
-            serial_write_str("INFO: Example syscall received\n");
+fn process_syscall(rax: u64, rdi: u64, rsi: u64, rdx: u64, r10: u64, r8: u64, r9: u64) -> u64 {
+    use crate::syscalls::{get_syscall_registry, SyscallArgs};
+    
+    let syscall_num = rax;
+    
+    // Crear argumentos de syscall
+    let args = SyscallArgs::from_registers(rdi, rsi, rdx, r10, r8, r9);
+    
+    // Obtener el registro de syscalls
+    let registry_guard = get_syscall_registry().lock();
+    
+    if let Some(registry) = registry_guard.as_ref() {
+        // Ejecutar la syscall
+        let result = registry.execute(syscall_num as usize, &args);
+        
+        // Convertir resultado a u64
+        match result {
+            crate::syscalls::SyscallResult::Success(value) => value,
+            crate::syscalls::SyscallResult::Error(error) => error.to_errno() as u64,
         }
-        _ => {
-            serial_write_str("ERROR: Unknown syscall number\n");
-        }
+    } else {
+        serial_write_str("ERROR: Syscall registry not initialized\n");
+        (-1i64) as u64 // Error: syscall registry no inicializado
     }
 }
 

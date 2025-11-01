@@ -545,6 +545,11 @@ impl MetricsCollector {
 static METRICS_COLLECTOR: Mutex<Option<MetricsCollector>> = Mutex::new(None);
 
 /// Inicializar el sistema de métricas
+/// Inicializar el sistema de métricas (alias para compatibilidad)
+pub fn init_metrics_system() -> KernelResult<()> {
+    init_metrics()
+}
+
 pub fn init_metrics() -> KernelResult<()> {
     let mut collector = METRICS_COLLECTOR
         .lock()

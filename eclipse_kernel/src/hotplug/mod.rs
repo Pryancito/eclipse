@@ -12,6 +12,9 @@ pub mod usb_hotplug;
 pub use events::{UsbDeviceInfo, UsbDeviceState, UsbDeviceType, UsbHotplugEvent, UsbSpeed};
 pub use manager::HotplugManager;
 
+use alloc::string::String;
+use spin::Mutex;
+
 /// Configuración del sistema de hot-plug
 #[derive(Debug, Clone)]
 pub struct HotplugConfig {
@@ -34,4 +37,24 @@ impl Default for HotplugConfig {
             max_devices: 32,
         }
     }
+}
+
+/// Gestor de hotplug global
+static HOTPLUG_MANAGER: Mutex<Option<HotplugManager>> = Mutex::new(None);
+
+/// Inicializar el sistema de hotplug
+pub fn init_hotplug_manager(config: HotplugConfig) -> Result<(), String> {
+    let mut manager_guard = HOTPLUG_MANAGER.lock();
+    
+    // Crear el gestor con el config
+    let manager = HotplugManager::new(config);
+    
+    *manager_guard = Some(manager);
+    
+    Ok(())
+}
+
+/// Obtener referencia al gestor de hotplug
+pub fn get_hotplug_manager() -> Option<&'static Mutex<Option<HotplugManager>>> {
+    Some(&HOTPLUG_MANAGER)
 }

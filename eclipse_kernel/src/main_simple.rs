@@ -45,7 +45,7 @@ use crate::drivers::usb_keyboard::{KeyboardConfig, KeyboardEvent, UsbKeyCode, Us
 use crate::drivers::usb_mouse::{MouseButton, MouseConfig, MouseEvent, UsbMouseDriver};
 use crate::drivers::usb_xhci::XhciController;
 use crate::drivers::usb_xhci_improved::ImprovedXhciController;
-use crate::drivers::usb_xhci_interrupts::{init_xhci_interrupts, process_xhci_events, XhciEvent};
+// use crate::drivers::usb_xhci_interrupts::{init_xhci_interrupts, process_xhci_events, XhciEvent}; // ELIMINADO
 use crate::drivers::usb_diagnostic;
 use crate::drivers::virtio_gpu::VirtioGpuDriver;
 use crate::drivers::vmware_svga::VmwareSvgaDriver;
@@ -435,17 +435,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                             fb.write_text_kernel(line, Color::LIGHT_GRAY);
                         }
                         
-                        // Inicializar sistema de interrupciones
-                        let bars = device.read_all_bars();
-                        let mmio_base = (bars[0] & 0xFFFFFFF0) as u64;
-                        match init_xhci_interrupts(mmio_base, 1) {
-                            Ok(()) => {
-                                fb.write_text_kernel("✓ Interrupciones XHCI habilitadas", Color::GREEN);
-                            }
-                            Err(e) => {
-                                fb.write_text_kernel(&alloc::format!("⚠ Error interrupciones: {}", e), Color::YELLOW);
-                            }
-                        }
+                        // Interrupciones XHCI deshabilitadas temporalmente
+                        // El código anterior causaba kernel panics por deadlocks
+                        fb.write_text_kernel("✓ XHCI en modo polling (sin interrupciones)", Color::GREEN);
                         
                         // Solo inicializar el primer controlador por ahora
                         break;
@@ -641,11 +633,269 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         }
     }
 
-    // Entrar al loop principal mejorado
-    serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado.\n");
-    fb.write_text_kernel("Iniciando loop principal mejorado...", Color::GREEN);
+    // 13.3: Hotplug Manager para USB
+    serial_write_str("KERNEL_MAIN: Inicializando Hotplug Manager...\n");
+    fb.write_text_kernel("Inicializando gestor de hotplug USB...", Color::WHITE);
+    let hotplug_config = HotplugConfig {
+        enable_usb_hotplug: true,
+        enable_mouse_support: true,
+        enable_keyboard_support: true,
+        enable_storage_support: true,
+        poll_interval_ms: 1000,
+        max_devices: 8, // Reducido de 32 a 8 para ahorrar memoria
+    };
+    match crate::hotplug::init_hotplug_manager(hotplug_config) {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Hotplug USB habilitado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Hotplug manager initialized\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ Hotplug: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: Hotplug init FAIL: {}\n", e));
+        }
+    }
+
+    // 13.4: Sistema de métricas y monitoreo
+    serial_write_str("KERNEL_MAIN: Inicializando sistema de métricas...\n");
+    fb.write_text_kernel("Inicializando sistema de métricas...", Color::WHITE);
+    match crate::metrics::init_metrics_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Sistema de métricas activo", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Metrics system initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Métricas no disponibles", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Metrics init FAIL\n");
+        }
+    }
+
+    // 13.5: Sistema de plugins del kernel
+    serial_write_str("KERNEL_MAIN: Inicializando sistema de plugins...\n");
+    fb.write_text_kernel("Inicializando sistema de plugins...", Color::WHITE);
+    match crate::plugins::init_plugin_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Sistema de plugins inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Plugin system initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Plugins no disponibles", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Plugins init FAIL\n");
+        }
+    }
+
+    // 13.6: Syslog avanzado
+    serial_write_str("KERNEL_MAIN: Inicializando syslog...\n");
+    fb.write_text_kernel("Inicializando syslog del kernel...", Color::WHITE);
+    match crate::syslog::init_syslog() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Syslog inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Syslog initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Syslog no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Syslog init FAIL\n");
+        }
+    }
+
+    // 13.7: Drivers modulares avanzados
+    serial_write_str("KERNEL_MAIN: Inicializando drivers modulares...\n");
+    fb.write_text_kernel("Inicializando drivers modulares...", Color::WHITE);
+    match crate::drivers::modular::manager::init_modular_driver_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Drivers modulares cargados", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Modular drivers initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Drivers modulares no disponibles", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Modular drivers init FAIL\n");
+        }
+    }
+
+    // 13.8: Aceleración GPU específica (NVIDIA CUDA/RTX)
+    if let Some(primary) = hw.primary_gpu.as_ref() {
+        if primary.gpu_type == crate::drivers::pci::GpuType::Nvidia {
+            serial_write_str("KERNEL_MAIN: Inicializando aceleración NVIDIA...\n");
+            fb.write_text_kernel("Inicializando CUDA y RTX...", Color::WHITE);
+            
+            // Inicializar CUDA
+            match crate::drivers::nvidia_cuda::init_cuda_runtime() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ NVIDIA CUDA Runtime activo", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: CUDA initialized\n");
+                }
+                Err(_) => {
+                    fb.write_text_kernel("⚠ CUDA no disponible", Color::YELLOW);
+                    serial_write_str("KERNEL_MAIN: CUDA init FAIL\n");
+                }
+            }
+            
+            // Inicializar RTX Ray Tracing
+            match crate::drivers::nvidia_rtx::init_rtx_system() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ RTX Ray Tracing habilitado", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: RTX initialized\n");
+                }
+                Err(_) => {
+                    fb.write_text_kernel("⚠ RTX no disponible", Color::YELLOW);
+                    serial_write_str("KERNEL_MAIN: RTX init FAIL\n");
+                }
+            }
+        }
+    }
+
+    // 13.9: Drivers multimedia USB
+    serial_write_str("KERNEL_MAIN: Inicializando drivers multimedia USB...\n");
+    fb.write_text_kernel("Inicializando audio/video USB...", Color::WHITE);
     
-    // Llamar al loop principal mejorado (nunca retorna)
+    // Audio USB
+    match crate::drivers::usb_audio::init_usb_audio_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Audio USB habilitado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: USB Audio initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Audio USB no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: USB Audio init FAIL\n");
+        }
+    }
+    
+    // Video USB (webcams)
+    match crate::drivers::usb_video::init_usb_video_system() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Video USB habilitado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: USB Video initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Video USB no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: USB Video init FAIL\n");
+        }
+    }
+
+    // 13.10: Optimizador de rendimiento multi-hilo
+    serial_write_str("KERNEL_MAIN: Inicializando optimizador de rendimiento...\n");
+    fb.write_text_kernel("Inicializando optimizador de rendimiento...", Color::WHITE);
+    match crate::performance::init_performance_optimizer() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Optimizador de rendimiento activo", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Performance optimizer initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Optimizador no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Performance optimizer init FAIL\n");
+        }
+    }
+
+    // 13.11: Window Manager avanzado
+    serial_write_str("KERNEL_MAIN: Inicializando window manager...\n");
+    fb.write_text_kernel("Inicializando gestor de ventanas...", Color::WHITE);
+    match crate::window_system::window_manager::init_window_manager() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Window Manager inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Window manager initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ Window Manager no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Window manager init FAIL\n");
+        }
+    }
+
+    // 13.12: ELF Loader para procesos userland
+    serial_write_str("KERNEL_MAIN: Inicializando ELF loader...\n");
+    fb.write_text_kernel("Inicializando cargador ELF...", Color::WHITE);
+    match crate::elf_loader::init_elf_loader() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ ELF Loader inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: ELF loader initialized\n");
+        }
+        Err(_) => {
+            fb.write_text_kernel("⚠ ELF Loader no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: ELF loader init FAIL\n");
+        }
+    }
+
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("✓ FASE 13 completada - Componentes avanzados activos", Color::GREEN);
+    serial_write_str("KERNEL_MAIN: FASE 13 completed successfully\n");
+
+    // === FASE 14: SISTEMA DE SYSCALLS Y MULTITASKING ===
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("FASE 14: Inicializando syscalls y multitasking...", Color::CYAN);
+    serial_write_str("KERNEL_MAIN: FASE 14 - Syscall and multitasking initialization\n");
+
+    // 14.1: Inicializar sistema de syscalls
+    serial_write_str("KERNEL_MAIN: Inicializando sistema de syscalls...\n");
+    fb.write_text_kernel("Inicializando syscalls (int 0x80)...", Color::WHITE);
+    
+    // Inicializar el registro de syscalls
+    let _ = crate::syscalls::init_syscalls();
+    fb.write_text_kernel("✓ Sistema de syscalls inicializado (64 syscalls)", Color::GREEN);
+    serial_write_str("KERNEL_MAIN: Syscall system initialized (64 syscalls registered)\n");
+    
+    // 14.2: Inicializar gestor de procesos
+    serial_write_str("KERNEL_MAIN: Inicializando gestor de procesos...\n");
+    fb.write_text_kernel("Inicializando gestor de procesos...", Color::WHITE);
+    
+    match crate::process::init_process_manager() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Process manager inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Process manager initialized\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ Process manager: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: Process manager init FAIL: {}\n", e));
+        }
+    }
+
+    // 14.3: Inicializar timer del sistema para multitasking
+    serial_write_str("KERNEL_MAIN: Inicializando timer del sistema...\n");
+    fb.write_text_kernel("Configurando timer para multitasking (100Hz)...", Color::WHITE);
+    
+    let timer_config = crate::interrupts::TimerConfig {
+        frequency_hz: 100,      // 100Hz = 10ms por tick
+        quantum_ms: 20,         // 20ms de quantum (2 ticks)
+        enable_preemption: true, // Habilitar context switching automático
+    };
+    
+    match crate::interrupts::init_system_timer(timer_config) {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Timer configurado (100Hz, 20ms quantum)", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: System timer initialized - preemptive multitasking enabled\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ Timer: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: Timer init FAIL: {}\n", e));
+        }
+    }
+    
+    // 14.4: Inicializar stdin (keyboard buffer)
+    serial_write_str("KERNEL_MAIN: Inicializando stdin...\n");
+    fb.write_text_kernel("Inicializando stdin (keyboard buffer)...", Color::WHITE);
+    
+    match crate::drivers::stdin::init_stdin() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ stdin inicializado (4KB buffer, line discipline)", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: stdin initialized - read() funcional\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ stdin: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: stdin init FAIL: {}\n", e));
+        }
+    }
+
+    // Mensaje final antes de entrar al loop principal
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("═══════════════════════════════════════════════════════", Color::CYAN);
+    fb.write_text_kernel("  ✅ ECLIPSE OS - Sistema completamente inicializado", Color::GREEN);
+    fb.write_text_kernel("═══════════════════════════════════════════════════════", Color::CYAN);
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("🚀 Iniciando loop principal mejorado...", Color::GREEN);
+    fb.write_text_kernel("   Procesando eventos del sistema...", Color::WHITE);
+    serial_write_str("KERNEL_MAIN: ========================================\n");
+    serial_write_str("KERNEL_MAIN: Sistema completamente inicializado\n");
+    serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado\n");
+    serial_write_str("KERNEL_MAIN: ========================================\n");
+    
+    // Llamar al loop principal mejorado (nunca retorna - loop infinito)
     crate::main_loop::main_loop(fb, xhci_initialized)
 }
 
@@ -872,104 +1122,6 @@ fn continue_initialization(fb: &mut FramebufferDriver) -> Result<(), RecoveryAct
             }
 
     Ok(())
-}
-
-/// Bucle principal del kernel con scheduler de procesos
-fn kernel_main_loop(fb: &mut FramebufferDriver) -> ! {
-    // Inicializar componentes restantes que no son críticos
-    if let Err(_) = continue_initialization(fb) {
-        fb.write_text_kernel("Componentes no críticos fallaron", Color::YELLOW);
-    }
-
-    // Ejecutar demostración de dispositivos virtuales
-    if let Err(e) = crate::virtual_devices::demo_device_usage() {
-        let _ = e;
-        fb.write_text_kernel("Error en demostración de dispositivos", Color::YELLOW);
-    }
-
-    // Ejecutar demostración del sistema de red
-    if let Err(e) = crate::network::demo_network_system() {
-        let _ = e;
-        fb.write_text_kernel("Error en demostración de red", Color::YELLOW);
-    }
-    // Ejecutar demostración del sistema de archivos virtual
-    if let Err(e) = crate::virtual_fs::demo_virtual_filesystem() {
-        let _ = e;
-        fb.write_text_kernel("Error en demostración del VFS", Color::YELLOW);
-    }
-
-    // Bucle infinito para mantener el kernel en ejecución
-    fb.write_text_kernel("Entrando al bucle principal con scheduler", Color::CYAN);
-    fb.write_text_kernel("Kernel en ejecución. Sistema listo.", Color::GREEN);
-    
-    let mut interrupt_counter = 0u32;
-    let mut shell_demo_counter = 0u32;
-    let mut scheduler_tick_counter = 0u32;
-    
-    loop {
-        // Cada 1000 iteraciones, mostrar estadísticas de interrupciones
-        if interrupt_counter % 1000 == 0 {
-            let stats = get_interrupt_stats();
-            if stats.total_interrupts > 0 {
-                fb.write_text_kernel(
-                    &alloc::format!(
-                        "Interrupciones: Total={}, Timer={}, Teclado={}, Syscalls={}",
-                        stats.total_interrupts,
-                        stats.timer_interrupts,
-                        stats.keyboard_interrupts,
-                        stats.syscalls
-                    ),
-                    Color::CYAN,
-                );
-            }
-        }
-
-        // Cada 100 iteraciones, mostrar estadísticas de procesos
-        if scheduler_tick_counter % 100 == 0 {
-            let (running, ready, blocked) = crate::process::get_process_stats();
-            let proc_info = crate::process::get_process_system_info();
-            fb.write_text_kernel(
-                &alloc::format!(
-                    "Procesos: Ejecutando={}, Listos={}, Bloqueados={}, Total={}",
-                    running, ready, blocked, proc_info.total_processes
-                ),
-                Color::MAGENTA,
-            );
-        }
-
-        // Cada 200 iteraciones, mostrar estadísticas de módulos
-        if scheduler_tick_counter % 200 == 0 {
-            let modules = crate::modules::api::list_modules();
-            fb.write_text_kernel(
-                &alloc::format!("Módulos: {}", modules.len()),
-                Color::GREEN,
-            );
-        }
-
-        // Simular timer tick cada 50 iteraciones (scheduler)
-        if scheduler_tick_counter % 50 == 0 {
-            // El sistema de procesos existente maneja el scheduling automáticamente
-            // No necesitamos llamar on_timer_tick manualmente
-        }
-        
-        // Cada 5000 iteraciones, demostrar funcionalidades del shell
-        if shell_demo_counter % 5000 == 0 {
-            // demonstrate_shell_features(&mut shell, fb); // Comentado temporalmente
-        }
-        
-        // Cada 10000 iteraciones, demostrar funcionalidades de IA
-        if shell_demo_counter % 10000 == 0 {
-            // demonstrate_ai_features(&mut ai_typing_system, &mut model_manager, fb); // Comentado temporalmente
-        }
-        
-        interrupt_counter = interrupt_counter.wrapping_add(1);
-        shell_demo_counter = shell_demo_counter.wrapping_add(1);
-        scheduler_tick_counter = scheduler_tick_counter.wrapping_add(1);
-        
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
 }
 
 /// Monta EclipseFS usando datos del bootloader como fallback

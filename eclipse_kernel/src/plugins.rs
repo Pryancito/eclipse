@@ -521,6 +521,11 @@ impl core::fmt::Display for PluginType {
 static PLUGIN_MANAGER: Mutex<Option<PluginManager>> = Mutex::new(None);
 
 /// Inicializar el sistema de plugins
+/// Inicializar el sistema de plugins (alias para compatibilidad)
+pub fn init_plugin_system() -> KernelResult<()> {
+    init_plugins()
+}
+
 pub fn init_plugins() -> KernelResult<()> {
     let mut manager = PLUGIN_MANAGER
         .lock()

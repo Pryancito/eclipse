@@ -5,9 +5,6 @@ edition = "2021"
 authors = ["Eclipse Rust Team"]
 description = "Kernel nativo de Eclipse en Rust"
 
-[package.metadata.cargo-xbuild]
-sysroot_path = "sysroot"
-
 [lib]
 name = "eclipse_kernel"
 crate-type = ["lib", "staticlib"]

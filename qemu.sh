@@ -40,8 +40,8 @@ fi
 
 # Variables de configuración
 DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si se especifica DISK=/dev/nvme0n1
-MEMORY="4G"
-CPUS="2"
+MEMORY="8G"
+CPUS="4"
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
 USB_PORTS_2="${USB_PORTS_2:-4}"  # Número de puertos USB 2.0
 USB_PORTS_3="${USB_PORTS_3:-4}"  # Número de puertos USB 3.0

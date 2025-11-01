@@ -10,6 +10,10 @@
 pub mod manager;
 pub mod process;
 pub mod scheduler;
+pub mod file_descriptor;
+pub mod context_switch;
+pub mod stack_allocator;
+pub mod pipe;
 
 // Re-exportar las estructuras principales
 pub use manager::{get_process_manager, init_process_manager};
@@ -34,7 +38,8 @@ pub fn init_process_system() -> Result<(), &'static str> {
 
 /// Obtener información del sistema de procesos
 pub fn get_process_system_info() -> ProcessSystemInfo {
-    if let Some(manager) = get_process_manager() {
+    let manager_guard = get_process_manager().lock();
+    if let Some(ref manager) = *manager_guard {
         let stats = manager.get_stats();
         ProcessSystemInfo {
             total_processes: stats.total_processes,

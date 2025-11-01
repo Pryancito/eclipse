@@ -2488,10 +2488,6 @@ impl FramebufferDriver {
         for &byte in text.as_bytes() {
             // Si el texto se sale de la altura, hacer scroll (limpiar y volver arriba)
             if y + char_height > height {
-                // Bucle de espera aproximado para 5 segundos (ajustar según CPU)
-                for _ in 0..500_000_000 {
-                    core::hint::spin_loop();
-                }
                 self.clear_screen(Color::BLACK);
                 x = 10;
                 y = 5; // Empezar desde arriba con un pequeño margen

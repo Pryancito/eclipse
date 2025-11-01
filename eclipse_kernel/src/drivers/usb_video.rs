@@ -7,6 +7,24 @@ use crate::drivers::usb_events::{UsbDeviceInfo, UsbControllerType, UsbDeviceSpee
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use spin::Mutex;
+
+/// Gestor global de video USB
+static USB_VIDEO_DRIVER: Mutex<Option<UsbVideoDriver>> = Mutex::new(None);
+
+/// Inicializar el sistema de video USB
+pub fn init_usb_video_system() -> Result<(), &'static str> {
+    let mut driver_guard = USB_VIDEO_DRIVER.lock();
+    let mut driver = UsbVideoDriver::new();
+    driver.initialize()?;
+    *driver_guard = Some(driver);
+    Ok(())
+}
+
+/// Obtener driver de video USB
+pub fn get_usb_video_driver() -> Option<&'static Mutex<Option<UsbVideoDriver>>> {
+    Some(&USB_VIDEO_DRIVER)
+}
 
 /// Configuración de video USB
 #[derive(Debug, Clone)]

@@ -149,9 +149,37 @@ pub struct PerformanceMetrics {
 }
 
 /// Inicializar el sistema de optimización de rendimiento
+/// Inicializar el optimizador de rendimiento (alias para compatibilidad)
+pub fn init_performance_optimizer() -> Result<(), &'static str> {
+    init_performance_system().map(|_| ())
+}
+
 pub fn init_performance_system() -> Result<PerformanceManager, &'static str> {
-    let config = PerformanceConfig::default();
+    // Usar configuración conservadora para reducir consumo de memoria
+    let mut config = PerformanceConfig::default();
+    // Deshabilitar algunas optimizaciones para reducir memoria
+    config.enable_adaptive_scheduling = false;
+    
     let mut manager = PerformanceManager::new(config);
-    manager.initialize()?;
+    
+    // Configurar ThreadPool con configuración más conservadora
+    use crate::performance::thread_pool::ThreadPoolConfig;
+    let mut pool_config = ThreadPoolConfig::default();
+    pool_config.initial_threads = 1; // Reducir de 4 a 1 para ahorrar memoria
+    pool_config.min_threads = 1;
+    pool_config.max_threads = 4; // Reducir de 16 a 4
+    pool_config.task_queue_size = 100; // Reducir de 1000 a 100
+    manager.thread_pool.update_config(pool_config);
+    
+    // Inicializar solo componentes críticos para ahorrar memoria
+    manager.load_balancer.initialize()?;
+    // Saltar inicializaciones pesadas temporalmente
+    // manager.context_optimizer.initialize()?;
+    // manager.cache_optimizer.initialize()?;
+    // manager.memory_optimizer.initialize()?;
+    // manager.profiler.initialize()?;
+    manager.thread_pool.initialize()?;
+    // manager.adaptive_scheduler.initialize()?;
+    
     Ok(manager)
 }

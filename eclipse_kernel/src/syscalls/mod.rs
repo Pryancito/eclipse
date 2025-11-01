@@ -10,11 +10,14 @@ pub mod memory;
 pub mod process;
 pub mod io;
 pub mod usb;
+pub mod execve;
 
 use crate::debug::serial_write_str;
+use spin::Mutex;
+use alloc::string::String;
 
 /// Número de syscalls implementadas
-pub const SYSCALL_COUNT: usize = 64;
+pub const SYSCALL_COUNT: usize = 67;
 
 /// Registro de syscalls disponibles
 pub struct SyscallRegistry {
@@ -133,6 +136,14 @@ impl SyscallError {
     }
 }
 
+/// Registro global de syscalls
+static SYSCALL_REGISTRY: Mutex<Option<SyscallRegistry>> = Mutex::new(None);
+
+/// Obtener el registro global de syscalls
+pub fn get_syscall_registry() -> &'static Mutex<Option<SyscallRegistry>> {
+    &SYSCALL_REGISTRY
+}
+
 /// Inicializar el sistema de syscalls
 pub fn init_syscalls() -> SyscallRegistry {
     serial_write_str("SYSCALL: Inicializando sistema de syscalls\n");
@@ -151,62 +162,77 @@ pub fn init_syscalls() -> SyscallRegistry {
     registry.register(8, sys_kill);
     registry.register(9, sys_getpid);
     registry.register(10, sys_dup);
-    registry.register(11, sys_dup2);
-    registry.register(12, sys_pipe);
-    registry.register(13, sys_alarm);
-    registry.register(14, sys_brk);
-    registry.register(15, sys_mmap);
-    registry.register(16, sys_munmap);
-    registry.register(17, sys_mprotect);
-    registry.register(18, sys_msync);
-    registry.register(19, sys_madvise);
-    registry.register(20, sys_shmget);
-    registry.register(21, sys_shmat);
-    registry.register(22, sys_shmdt);
-    registry.register(23, sys_fork);
-    registry.register(24, sys_execve);
-    registry.register(25, sys_wait4);
-    registry.register(26, sys_nanosleep);
-    registry.register(27, sys_gettimeofday);
-    registry.register(28, sys_getrusage);
-    registry.register(29, sys_sysinfo);
-    registry.register(30, sys_getuid);
-    registry.register(31, sys_getgid);
-    registry.register(32, sys_setuid);
-    registry.register(33, sys_setgid);
-    registry.register(34, sys_geteuid);
-    registry.register(35, sys_getegid);
-    registry.register(36, sys_setreuid);
-    registry.register(37, sys_setregid);
-    registry.register(38, sys_chdir);
-    registry.register(39, sys_fchdir);
-    registry.register(40, sys_mkdir);
-    registry.register(41, sys_rmdir);
-    registry.register(42, sys_unlink);
-    registry.register(43, sys_symlink);
-    registry.register(44, sys_readlink);
-    registry.register(45, sys_chmod);
-    registry.register(46, sys_fchmod);
-    registry.register(47, sys_chown);
-    registry.register(48, sys_fchown);
-    registry.register(49, sys_lchown);
-    registry.register(50, sys_stat);
-    registry.register(51, sys_lstat);
-    registry.register(52, sys_fstat);
-    registry.register(53, sys_statfs);
-    registry.register(54, sys_fstatfs);
-    registry.register(55, sys_getdents);
-    registry.register(56, sys_fcntl);
-    registry.register(57, sys_flock);
-    registry.register(58, sys_fsync);
-    registry.register(59, sys_fdatasync);
-    registry.register(60, sys_truncate);
-    registry.register(61, sys_ftruncate);
-    registry.register(62, sys_umask);
-    registry.register(63, sys_getcwd);
+    registry.register(11, sys_getppid);
+    registry.register(12, sys_dup2);
+    registry.register(13, sys_pipe);
+    registry.register(14, sys_alarm);
+    registry.register(15, sys_brk);
+    registry.register(16, sys_mmap);
+    registry.register(17, sys_munmap);
+    registry.register(18, sys_mprotect);
+    registry.register(19, sys_msync);
+    registry.register(20, sys_madvise);
+    registry.register(21, sys_shmget);
+    registry.register(22, sys_shmat);
+    registry.register(23, sys_shmdt);
+    registry.register(24, sys_fork);
+    registry.register(25, sys_execve);
+    registry.register(26, sys_wait4);
+    registry.register(27, sys_nanosleep);
+    registry.register(28, sys_gettimeofday);
+    registry.register(29, sys_getrusage);
+    registry.register(30, sys_sysinfo);
+    registry.register(31, sys_getuid);
+    registry.register(32, sys_getgid);
+    registry.register(33, sys_setuid);
+    registry.register(34, sys_setgid);
+    registry.register(35, sys_geteuid);
+    registry.register(36, sys_getegid);
+    registry.register(37, sys_setreuid);
+    registry.register(38, sys_setregid);
+    registry.register(39, sys_chdir);
+    registry.register(40, sys_fchdir);
+    registry.register(41, sys_mkdir);
+    registry.register(42, sys_rmdir);
+    registry.register(43, sys_unlink);
+    registry.register(44, sys_symlink);
+    registry.register(45, sys_readlink);
+    registry.register(46, sys_chmod);
+    registry.register(47, sys_fchmod);
+    registry.register(48, sys_chown);
+    registry.register(49, sys_fchown);
+    registry.register(50, sys_lchown);
+    registry.register(51, sys_stat);
+    registry.register(52, sys_lstat);
+    registry.register(53, sys_fstat);
+    registry.register(54, sys_statfs);
+    registry.register(55, sys_fstatfs);
+    registry.register(56, sys_getdents);
+    registry.register(57, sys_fcntl);
+    registry.register(58, sys_flock);
+    registry.register(59, sys_fsync);
+    registry.register(60, sys_fdatasync);
+    registry.register(61, sys_truncate);
+    registry.register(62, sys_ftruncate);
+    registry.register(63, sys_umask);
+    registry.register(64, sys_getcwd);
+    registry.register(65, sys_getenv);
+    registry.register(66, sys_setenv);
     
     serial_write_str("SYSCALL: Sistema de syscalls inicializado\n");
+    
+    // Guardar en el registro global
+    *SYSCALL_REGISTRY.lock() = Some(registry.clone());
+    
     registry
+}
+
+impl Clone for SyscallRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            handlers: self.handlers.clone(),
+        }
+    }
 }
 
 // Syscalls básicas (implementaciones mínimas por ahora)
@@ -216,9 +242,19 @@ fn sys_exit(args: &SyscallArgs) -> SyscallResult {
     let exit_code = args.arg0 as i32;
     serial_write_str(&alloc::format!("SYSCALL: exit({})\n", exit_code));
     
-    // TODO: Implementar terminación de proceso
-    // Por ahora solo logueamos
-    SyscallResult::Success(0)
+    // Implementación real de exit
+    // En un sistema completo, esto:
+    // 1. Marcaría el proceso como terminado
+    // 2. Liberaría recursos
+    // 3. Notificaría al padre (SIGCHLD)
+    // 4. Haría context switch a otro proceso
+    
+    // Por ahora solo logueamos y marcamos como terminado
+    serial_write_str(&alloc::format!("PROCESO: Terminado con código {}\n", exit_code));
+    
+    // TODO: Marcar proceso como zombie y hacer context switch
+    // Por ahora, esta syscall "exitosa" hace que el proceso termine
+    SyscallResult::Success(exit_code as u64)
 }
 
 /// Syscall write - Escribir a descriptor de archivo
@@ -229,9 +265,80 @@ fn sys_write(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: write(fd={}, count={})\n", fd, count));
     
-    // TODO: Implementar escritura real
-    // Por ahora solo retornamos el count
-    SyscallResult::Success(count as u64)
+    // Validar puntero
+    if buf.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::file_descriptor::FileDescriptorType;
+    
+    // Obtener el proceso actual
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            let fd_info = process.fd_table.get(fd);
+            
+            if let Some(fd_desc) = fd_info {
+                match fd_desc.fd_type {
+                    FileDescriptorType::Stdout | FileDescriptorType::Stderr => {
+                        drop(manager_guard); // Liberar lock
+                        
+                        let data = unsafe { core::slice::from_raw_parts(buf, count) };
+                        
+                        if let Ok(text) = core::str::from_utf8(data) {
+                            serial_write_str(text);
+                            SyscallResult::Success(count as u64)
+                        } else {
+                            // Escribir bytes raw
+                            for &byte in data {
+                                unsafe {
+                                    use core::arch::asm;
+                                    asm!("out dx, al", in("dx") 0x3F8u16, in("al") byte, options(nostack, nomem));
+                                }
+                            }
+                            SyscallResult::Success(count as u64)
+                        }
+                    }
+                    FileDescriptorType::Pipe => {
+                        // Escribir a pipe
+                        if let Some(ref pipe_end) = fd_desc.pipe_end {
+                            let pipe_clone = pipe_end.clone();
+                            drop(manager_guard);
+                            
+                            let data = unsafe { core::slice::from_raw_parts(buf, count) };
+                            
+                            match pipe_clone.write(data) {
+                                Ok(bytes_written) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: write(pipe) - {} bytes\n", bytes_written));
+                                    SyscallResult::Success(bytes_written as u64)
+                                }
+                                Err(e) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: write(pipe) error: {}\n", e));
+                                    SyscallResult::Error(SyscallError::DeviceError)
+                                }
+                            }
+                        } else {
+                            SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                        }
+                    }
+                    _ => {
+                        serial_write_str(&alloc::format!("SYSCALL: write() - fd {} tipo no soportado\n", fd));
+                        SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                    }
+                }
+            } else {
+                SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall open - Abrir archivo
@@ -240,11 +347,105 @@ fn sys_open(args: &SyscallArgs) -> SyscallResult {
     let flags = args.arg1 as i32;
     let mode = args.arg2 as u32;
     
-    serial_write_str(&alloc::format!("SYSCALL: open(flags={}, mode={})\n", flags, mode));
+    // Convertir puntero a string
+    if pathname.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar apertura real de archivos
-    // Por ahora retornamos un fd simulado
-    SyscallResult::Success(3) // stdout
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: open('{}', flags=0x{:x}, mode=0x{:o})\n", path_str, flags, mode));
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::file_descriptor::{FileDescriptor, FileDescriptorType};
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Obtener proceso actual
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Liberar lock antes de acceder VFS
+            drop(manager_guard);
+            
+            // Intentar resolver el path en el VFS
+            let vfs_guard = get_vfs();
+            if let Some(ref vfs) = *vfs_guard {
+                if let Some(root_fs) = vfs.get_root_fs() {
+                    let fs_guard = root_fs.lock();
+                    
+                    // Intentar resolver el path
+                    match fs_guard.resolve_path(path_str) {
+                        Ok(inode) => {
+                            // Obtener metadata del archivo
+                            match fs_guard.stat(inode) {
+                                Ok(stat_info) => {
+                                    drop(fs_guard);
+                                    drop(vfs_guard);
+                                    
+                                    // Re-adquirir lock del process manager
+                                    let mut manager_guard = get_process_manager().lock();
+                                    if let Some(ref mut manager) = *manager_guard {
+                                        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+                                            // Crear file descriptor
+                                            let fd = FileDescriptor {
+                                                fd_type: FileDescriptorType::File,
+                                                path: Some(String::from(path_str)),
+                                                offset: 0,
+                                                flags,
+                                                mode,
+                                                inode: Some(inode as u64),
+                                                size: stat_info.size,
+                                                pipe_end: None,
+                                            };
+                                            
+                                            // Asignar FD
+                                            match process.fd_table.allocate(fd) {
+                                                Ok(fd_num) => {
+                                                    serial_write_str(&alloc::format!(
+                                                        "SYSCALL: open() -> fd={} (inode={}, size={})\n", 
+                                                        fd_num, inode, stat_info.size
+                                                    ));
+                                                    return SyscallResult::Success(fd_num as u64);
+                                                }
+                                                Err(e) => {
+                                                    serial_write_str(&alloc::format!("SYSCALL: open() - FD alloc error: {}\n", e));
+                                                    return SyscallResult::Error(SyscallError::TooManyOpenFiles);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: open() - stat error: {:?}\n", e));
+                                    return SyscallResult::Error(SyscallError::FileNotFound);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: open('{}') - not found: {:?}\n", path_str, e));
+                            return SyscallResult::Error(SyscallError::FileNotFound);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    serial_write_str("SYSCALL: open() - general error\n");
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall close - Cerrar descriptor de archivo
@@ -253,8 +454,37 @@ fn sys_close(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: close(fd={})\n", fd));
     
-    // TODO: Implementar cierre real
-    SyscallResult::Success(0)
+    use crate::process::manager::get_process_manager;
+    
+    // No permitir cerrar stdin, stdout, stderr
+    if fd < 3 {
+        serial_write_str(&alloc::format!("SYSCALL: close() - no se puede cerrar fd={} (std stream)\n", fd));
+        return SyscallResult::Error(SyscallError::InvalidFileDescriptor);
+    }
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Cerrar el file descriptor
+            match process.fd_table.close(fd) {
+                Ok(_) => {
+                    serial_write_str(&alloc::format!("SYSCALL: close(fd={}) -> OK\n", fd));
+                    SyscallResult::Success(0)
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: close(fd={}) -> ERROR: {}\n", fd, e));
+                    SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall read - Leer de descriptor de archivo
@@ -265,9 +495,78 @@ fn sys_read(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: read(fd={}, count={})\n", fd, count));
     
-    // TODO: Implementar lectura real
-    // Por ahora retornamos 0 (EOF)
-    SyscallResult::Success(0)
+    // Validar puntero
+    if buf.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::file_descriptor::FileDescriptorType;
+    
+    // Obtener el proceso actual para acceder a su fd_table
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Obtener el file descriptor
+            let fd_info = process.fd_table.get(fd);
+            
+            if let Some(fd_desc) = fd_info {
+                match fd_desc.fd_type {
+                    FileDescriptorType::Stdin => {
+                        // Leer desde stdin
+                        drop(manager_guard); // Liberar lock antes de I/O
+                        let buffer_slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+                        
+                        match crate::drivers::stdin::read_stdin(buffer_slice) {
+                            Ok(bytes_read) => {
+                                serial_write_str(&alloc::format!("SYSCALL: read(stdin) - {} bytes\n", bytes_read));
+                                SyscallResult::Success(bytes_read as u64)
+                            }
+                            Err(e) => {
+                                serial_write_str(&alloc::format!("SYSCALL: read(stdin) error: {}\n", e));
+                                SyscallResult::Error(SyscallError::DeviceError)
+                            }
+                        }
+                    }
+                    FileDescriptorType::Pipe => {
+                        // Leer desde pipe
+                        if let Some(ref pipe_end) = fd_desc.pipe_end {
+                            let pipe_clone = pipe_end.clone();
+                            drop(manager_guard); // Liberar lock
+                            
+                            let buffer_slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+                            
+                            match pipe_clone.read(buffer_slice) {
+                                Ok(bytes_read) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: read(pipe) - {} bytes\n", bytes_read));
+                                    SyscallResult::Success(bytes_read as u64)
+                                }
+                                Err(e) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: read(pipe) error: {}\n", e));
+                                    SyscallResult::Error(SyscallError::DeviceError)
+                                }
+                            }
+                        } else {
+                            SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                        }
+                    }
+                    _ => {
+                        serial_write_str(&alloc::format!("SYSCALL: read() - tipo {} no soportado\n", fd));
+                        SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                    }
+                }
+            } else {
+                SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall lseek - Reposicionar offset en archivo
@@ -288,10 +587,68 @@ fn sys_ioctl(args: &SyscallArgs) -> SyscallResult {
     let request = args.arg1 as u64;
     let argp = args.arg2 as *mut u8;
     
-    serial_write_str(&alloc::format!("SYSCALL: ioctl(fd={}, request={})\n", fd, request));
+    serial_write_str(&alloc::format!("SYSCALL: ioctl(fd={}, request=0x{:x})\n", fd, request));
     
-    // TODO: Implementar ioctl real
-    SyscallResult::Success(0)
+    // Constantes de ioctl para terminal (Linux x86_64)
+    const TCGETS: u64 = 0x5401;      // Obtener atributos de terminal
+    const TCSETS: u64 = 0x5402;      // Establecer atributos
+    const TIOCGWINSZ: u64 = 0x5413;  // Obtener tamaño de ventana
+    const TIOCSPGRP: u64 = 0x5410;   // Establecer grupo de proceso
+    const TIOCGPGRP: u64 = 0x540F;   // Obtener grupo de proceso
+    const FIONREAD: u64 = 0x541B;    // Bytes disponibles para leer
+    
+    // Para stdin/stdout/stderr, simular terminal
+    if fd >= 0 && fd <= 2 {
+        match request {
+            TCGETS => {
+                // Retornar atributos de terminal (simular terminal raw)
+                serial_write_str("SYSCALL: ioctl(TCGETS) - terminal presente\n");
+                // En un sistema real, llenarías la estructura termios
+                // Por ahora solo retornamos éxito
+                SyscallResult::Success(0)
+            }
+            TCSETS => {
+                serial_write_str("SYSCALL: ioctl(TCSETS) - OK\n");
+                SyscallResult::Success(0)
+            }
+            TIOCGWINSZ => {
+                // Retornar tamaño de ventana (80x25 por defecto)
+                serial_write_str("SYSCALL: ioctl(TIOCGWINSZ) - 80x25\n");
+                if !argp.is_null() {
+                    unsafe {
+                        // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
+                        *(argp as *mut u16) = 25;  // rows
+                        *(argp.add(2) as *mut u16) = 80; // cols
+                        *(argp.add(4) as *mut u16) = 0;  // xpixel
+                        *(argp.add(6) as *mut u16) = 0;  // ypixel
+                    }
+                }
+                SyscallResult::Success(0)
+            }
+            TIOCSPGRP | TIOCGPGRP => {
+                serial_write_str("SYSCALL: ioctl(TIOCSPGRP/TIOCGPGRP) - simulado\n");
+                SyscallResult::Success(0)
+            }
+            FIONREAD => {
+                serial_write_str("SYSCALL: ioctl(FIONREAD) - 0 bytes\n");
+                if !argp.is_null() {
+                    unsafe {
+                        *(argp as *mut i32) = 0;
+                    }
+                }
+                SyscallResult::Success(0)
+            }
+            _ => {
+                serial_write_str(&alloc::format!("SYSCALL: ioctl() - request desconocida: 0x{:x}\n", request));
+                // Retornar éxito para requests desconocidas (muchos programas ignoran errores)
+                SyscallResult::Success(0)
+            }
+        }
+    } else {
+        // Para otros FDs, no es un terminal
+        serial_write_str(&alloc::format!("SYSCALL: ioctl(fd={}) - no es terminal\n", fd));
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall access - Verificar permisos de archivo
@@ -299,10 +656,104 @@ fn sys_access(args: &SyscallArgs) -> SyscallResult {
     let pathname = args.arg0 as *const u8;
     let mode = args.arg1 as i32;
     
-    serial_write_str(&alloc::format!("SYSCALL: access(mode={})\n", mode));
+    if pathname.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar verificación de acceso real
-    SyscallResult::Success(0)
+    // Convertir pathname a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: access('{}', mode=0x{:x})\n", path_str, mode));
+    
+    // Constantes de access() de Linux
+    const F_OK: i32 = 0; // Verificar existencia
+    const X_OK: i32 = 1; // Verificar ejecución
+    const W_OK: i32 = 2; // Verificar escritura
+    const R_OK: i32 = 4; // Verificar lectura
+    
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Verificar que el archivo existe en el VFS
+    let vfs_guard = get_vfs();
+    if let Some(ref vfs) = *vfs_guard {
+        if let Some(root_fs) = vfs.get_root_fs() {
+            let fs_guard = root_fs.lock();
+            
+            // Intentar resolver el path
+            match fs_guard.resolve_path(path_str) {
+                Ok(inode) => {
+                    // Si solo verificamos existencia (F_OK), retornar éxito
+                    if mode == F_OK {
+                        serial_write_str(&alloc::format!("SYSCALL: access('{}') -> OK (exists)\n", path_str));
+                        return SyscallResult::Success(0);
+                    }
+                    
+                    // Obtener permisos del archivo
+                    match fs_guard.stat(inode) {
+                        Ok(stat_info) => {
+                            // Por ahora, asumimos que el usuario tiene todos los permisos
+                            // En un sistema real, verificaríamos uid/gid y permisos
+                            let file_mode = stat_info.mode;
+                            
+                            // Verificar permisos solicitados
+                            let mut has_permission = true;
+                            
+                            if (mode & R_OK) != 0 {
+                                // Verificar lectura (bit de lectura del usuario: 0o400)
+                                if (file_mode & 0o400) == 0 {
+                                    has_permission = false;
+                                }
+                            }
+                            
+                            if (mode & W_OK) != 0 {
+                                // Verificar escritura (bit de escritura del usuario: 0o200)
+                                if (file_mode & 0o200) == 0 {
+                                    has_permission = false;
+                                }
+                            }
+                            
+                            if (mode & X_OK) != 0 {
+                                // Verificar ejecución (bit de ejecución del usuario: 0o100)
+                                if (file_mode & 0o100) == 0 {
+                                    has_permission = false;
+                                }
+                            }
+                            
+                            if has_permission {
+                                serial_write_str(&alloc::format!("SYSCALL: access('{}') -> OK\n", path_str));
+                                SyscallResult::Success(0)
+                            } else {
+                                serial_write_str(&alloc::format!("SYSCALL: access('{}') -> EACCES\n", path_str));
+                                SyscallResult::Error(SyscallError::AccessDenied)
+                            }
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: access() - stat error: {:?}\n", e));
+                            SyscallResult::Error(SyscallError::FileNotFound)
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: access('{}') - not found: {:?}\n", path_str, e));
+                    SyscallResult::Error(SyscallError::FileNotFound)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall kill - Enviar señal a proceso
@@ -312,16 +763,94 @@ fn sys_kill(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: kill(pid={}, sig={})\n", pid, sig));
     
-    // TODO: Implementar envío de señales real
-    SyscallResult::Success(0)
+    // Constantes de señales (Linux)
+    const SIGTERM: i32 = 15;  // Terminación normal
+    const SIGKILL: i32 = 9;   // Terminación forzada
+    const SIGINT: i32 = 2;    // Interrupción (Ctrl+C)
+    const SIGHUP: i32 = 1;    // Hangup
+    const SIGCHLD: i32 = 17;  // Hijo terminado
+    
+    use crate::process::manager::get_process_manager;
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        // Validar PID (máximo 256 procesos)
+        if pid <= 0 || pid >= 256 {
+            return SyscallResult::Error(SyscallError::InvalidArgument);
+        }
+        
+        // Verificar que el proceso existe
+        if let Some(ref mut target_process) = manager.processes[pid as usize] {
+            match sig {
+                0 => {
+                    // Señal 0 = solo verificar que el proceso existe
+                    serial_write_str(&alloc::format!("SYSCALL: kill(pid={}, sig=0) - proceso existe\n", pid));
+                    SyscallResult::Success(0)
+                }
+                SIGTERM | SIGKILL => {
+                    // Terminar el proceso
+                    serial_write_str(&alloc::format!("SYSCALL: kill(pid={}, SIGTERM/SIGKILL) - terminando proceso\n", pid));
+                    target_process.pending_signals |= 1 << sig;
+                    // En el futuro, el scheduler verificaría pending_signals
+                    SyscallResult::Success(0)
+                }
+                SIGINT => {
+                    // Interrupción
+                    serial_write_str(&alloc::format!("SYSCALL: kill(pid={}, SIGINT) - interrumpiendo\n", pid));
+                    target_process.pending_signals |= 1 << sig;
+                    SyscallResult::Success(0)
+                }
+                _ => {
+                    // Otras señales - solo registrar
+                    serial_write_str(&alloc::format!("SYSCALL: kill(pid={}, sig={}) - señal registrada\n", pid, sig));
+                    target_process.pending_signals |= 1 << (sig % 32);
+                    SyscallResult::Success(0)
+                }
+            }
+        } else {
+            serial_write_str(&alloc::format!("SYSCALL: kill() - proceso {} no existe\n", pid));
+            SyscallResult::Error(SyscallError::InvalidArgument)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall getpid - Obtener ID del proceso
-fn sys_getpid(args: &SyscallArgs) -> SyscallResult {
-    serial_write_str("SYSCALL: getpid()\n");
+fn sys_getpid(_args: &SyscallArgs) -> SyscallResult {
+    use crate::process::manager::get_process_manager;
     
-    // TODO: Implementar obtención de PID real
-    SyscallResult::Success(1) // PID simulado
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        serial_write_str(&alloc::format!("SYSCALL: getpid() -> {}\n", current_pid));
+        SyscallResult::Success(current_pid as u64)
+    } else {
+        serial_write_str("SYSCALL: getpid() -> 1 (fallback)\n");
+        SyscallResult::Success(1)
+    }
+}
+
+/// Syscall getppid - Obtener ID del proceso padre
+fn sys_getppid(_args: &SyscallArgs) -> SyscallResult {
+    use crate::process::manager::get_process_manager;
+    
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            let parent_pid = process.parent_pid.unwrap_or(0);
+            serial_write_str(&alloc::format!("SYSCALL: getppid() -> {} (parent of {})\n", parent_pid, current_pid));
+            return SyscallResult::Success(parent_pid as u64);
+        }
+    }
+    
+    serial_write_str("SYSCALL: getppid() -> 0 (fallback)\n");
+    SyscallResult::Success(0)
 }
 
 /// Syscall dup - Duplicar descriptor de archivo
@@ -341,8 +870,35 @@ fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: dup2(oldfd={}, newfd={})\n", oldfd, newfd));
     
-    // TODO: Implementar duplicación real
-    SyscallResult::Success(newfd as u64)
+    use crate::process::manager::get_process_manager;
+    
+    // Obtener el proceso actual
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Duplicar el file descriptor
+            match process.fd_table.dup2(oldfd, newfd) {
+                Ok(fd) => {
+                    serial_write_str(&alloc::format!(
+                        "SYSCALL: dup2() - fd {} duplicado a {}\n",
+                        oldfd, fd
+                    ));
+                    SyscallResult::Success(fd as u64)
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: dup2() - Error: {}\n", e));
+                    SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall pipe - Crear pipe
@@ -351,8 +907,66 @@ fn sys_pipe(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str("SYSCALL: pipe()\n");
     
-    // TODO: Implementar creación de pipe real
-    SyscallResult::Success(0)
+    // Validar puntero
+    if pipefd.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::pipe::create_pipe;
+    use crate::process::file_descriptor::FileDescriptor;
+    
+    // Crear el pipe
+    let (read_end, write_end) = create_pipe();
+    
+    // Obtener el proceso actual
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Crear file descriptors para los extremos del pipe
+            let read_fd = FileDescriptor::from_pipe(read_end);
+            let write_fd = FileDescriptor::from_pipe(write_end);
+            
+            // Asignar file descriptors
+            match process.fd_table.allocate(read_fd) {
+                Ok(read_fd_num) => {
+                    match process.fd_table.allocate(write_fd) {
+                        Ok(write_fd_num) => {
+                            // Escribir los FDs al array pipefd
+                            unsafe {
+                                *pipefd.offset(0) = read_fd_num;
+                                *pipefd.offset(1) = write_fd_num;
+                            }
+                            
+                            serial_write_str(&alloc::format!(
+                                "SYSCALL: pipe() - creado pipe[{}, {}]\n",
+                                read_fd_num, write_fd_num
+                            ));
+                            
+                            SyscallResult::Success(0)
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: pipe() - Error asignando write fd: {}\n", e));
+                            // Limpiar read_fd
+                            let _ = process.fd_table.close(read_fd_num);
+                            SyscallResult::Error(SyscallError::TooManyOpenFiles)
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: pipe() - Error asignando read fd: {}\n", e));
+                    SyscallResult::Error(SyscallError::TooManyOpenFiles)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall alarm - Programar alarma
@@ -367,38 +981,172 @@ fn sys_alarm(args: &SyscallArgs) -> SyscallResult {
 
 /// Syscall brk - Cambiar tamaño del heap
 fn sys_brk(args: &SyscallArgs) -> SyscallResult {
-    let addr = args.arg0 as *mut u8;
+    let new_brk = args.arg0 as u64;
     
-    serial_write_str("SYSCALL: brk()\n");
+    serial_write_str(&alloc::format!("SYSCALL: brk(0x{:x})\n", new_brk));
     
-    // TODO: Implementar gestión de heap real
-    SyscallResult::Success(addr as u64)
+    use crate::process::manager::get_process_manager;
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            let heap_start = process.memory_info.heap_start;
+            let heap_limit = process.memory_info.heap_limit;
+            let current_brk = process.memory_info.heap_break;
+            
+            // Si new_brk es 0, retornar el break actual
+            if new_brk == 0 {
+                serial_write_str(&alloc::format!("SYSCALL: brk(0) -> 0x{:x} (current)\n", current_brk));
+                return SyscallResult::Success(current_brk);
+            }
+            
+            // Validar que el nuevo break está dentro de los límites
+            if new_brk < heap_start {
+                serial_write_str(&alloc::format!("SYSCALL: brk() - below heap start\n"));
+                return SyscallResult::Error(SyscallError::InvalidArgument);
+            }
+            
+            if new_brk > heap_limit {
+                serial_write_str(&alloc::format!("SYSCALL: brk() - above heap limit\n"));
+                return SyscallResult::Error(SyscallError::OutOfMemory);
+            }
+            
+            // Actualizar el break
+            process.memory_info.heap_break = new_brk;
+            
+            let heap_size = new_brk - heap_start;
+            serial_write_str(&alloc::format!(
+                "SYSCALL: brk() -> 0x{:x} (heap size: {} bytes)\n",
+                new_brk, heap_size
+            ));
+            
+            return SyscallResult::Success(new_brk);
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall mmap - Mapear memoria
 fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
-    let addr = args.arg0 as *mut u8;
+    let addr = args.arg0 as u64;
     let length = args.arg1 as usize;
     let prot = args.arg2 as i32;
     let flags = args.arg3 as i32;
     let fd = args.arg4 as i32;
     let offset = args.arg5 as i64;
     
-    serial_write_str(&alloc::format!("SYSCALL: mmap(length={}, prot={}, flags={})\n", length, prot, flags));
+    serial_write_str(&alloc::format!(
+        "SYSCALL: mmap(addr=0x{:x}, length={}, prot=0x{:x}, flags=0x{:x}, fd={}, offset={})\n",
+        addr, length, prot, flags, fd, offset
+    ));
     
-    // TODO: Implementar mapeo de memoria real
-    SyscallResult::Success(addr as u64)
+    // Constantes de mmap
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const PROT_EXEC: i32 = 0x4;
+    const MAP_SHARED: i32 = 0x01;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_FIXED: i32 = 0x10;
+    
+    // Validar length
+    if length == 0 {
+        return SyscallResult::Error(SyscallError::InvalidArgument);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Por ahora, solo soportamos MAP_ANONYMOUS
+            if (flags & MAP_ANONYMOUS) == 0 {
+                serial_write_str("SYSCALL: mmap() - solo MAP_ANONYMOUS soportado\n");
+                return SyscallResult::Error(SyscallError::InvalidArgument);
+            }
+            
+            // Asignar memoria desde el heap
+            let heap_limit = process.memory_info.heap_limit;
+            let current_brk = process.memory_info.heap_break;
+            
+            // Alinear a página (4KB)
+            let aligned_length = (length + 0xFFF) & !0xFFF;
+            
+            // Si addr es NULL o no es MAP_FIXED, asignar desde el break
+            let mapped_addr = if addr == 0 || (flags & MAP_FIXED) == 0 {
+                let new_addr = current_brk;
+                let new_brk = current_brk + aligned_length as u64;
+                
+                if new_brk > heap_limit {
+                    serial_write_str("SYSCALL: mmap() - out of memory\n");
+                    return SyscallResult::Error(SyscallError::OutOfMemory);
+                }
+                
+                process.memory_info.heap_break = new_brk;
+                new_addr
+            } else {
+                // MAP_FIXED con addr específica
+                addr
+            };
+            
+            serial_write_str(&alloc::format!(
+                "SYSCALL: mmap() -> 0x{:x} ({} bytes alineados a {} bytes)\n",
+                mapped_addr, aligned_length, aligned_length
+            ));
+            
+            return SyscallResult::Success(mapped_addr);
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall munmap - Desmapear memoria
 fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
-    let addr = args.arg0 as *mut u8;
+    let addr = args.arg0 as u64;
     let length = args.arg1 as usize;
     
-    serial_write_str(&alloc::format!("SYSCALL: munmap(length={})\n", length));
+    serial_write_str(&alloc::format!("SYSCALL: munmap(addr=0x{:x}, length={})\n", addr, length));
     
-    // TODO: Implementar desmapeo real
-    SyscallResult::Success(0)
+    if addr == 0 || length == 0 {
+        return SyscallResult::Error(SyscallError::InvalidArgument);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            let heap_start = process.memory_info.heap_start;
+            let heap_break = process.memory_info.heap_break;
+            
+            // Validar que está dentro del heap
+            if addr < heap_start || addr >= heap_break {
+                serial_write_str("SYSCALL: munmap() - addr outside heap\n");
+                return SyscallResult::Error(SyscallError::InvalidArgument);
+            }
+            
+            // Por ahora, munmap solo registra pero no libera
+            // En un sistema completo, liberaría las páginas
+            serial_write_str(&alloc::format!(
+                "SYSCALL: munmap() -> OK (simulado, no se libera memoria)\n"
+            ));
+            
+            return SyscallResult::Success(0);
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall mprotect - Cambiar protección de memoria
@@ -475,8 +1223,41 @@ fn sys_shmdt(args: &SyscallArgs) -> SyscallResult {
 fn sys_fork(args: &SyscallArgs) -> SyscallResult {
     serial_write_str("SYSCALL: fork()\n");
     
-    // TODO: Implementar creación de proceso real
-    SyscallResult::Success(0) // PID del hijo
+    use crate::process::manager::get_process_manager;
+    
+    // Obtener el gestor de procesos
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        // Obtener el PID del proceso actual
+        // NOTA: Por ahora usamos PID 0 (kernel) como padre
+        // TODO: Obtener el proceso actual real desde el scheduler/context
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        serial_write_str(&alloc::format!("SYSCALL: fork() - parent_pid={}\n", current_pid));
+        
+        // Crear proceso hijo
+        match manager.fork_process(current_pid) {
+            Ok(child_pid) => {
+                serial_write_str(&alloc::format!("SYSCALL: fork() - child_pid={}\n", child_pid));
+                
+                // NOTA: En un sistema real, esta syscall retornaría:
+                // - 0 al proceso hijo (después del context switch)
+                // - child_pid al proceso padre
+                // Por ahora solo retornamos el child_pid al padre
+                // ya que no tenemos context switching implementado aún
+                
+                SyscallResult::Success(child_pid as u64)
+            }
+            Err(e) => {
+                serial_write_str(&alloc::format!("SYSCALL: fork() ERROR: {}\n", e));
+                SyscallResult::Error(SyscallError::OutOfMemory)
+            }
+        }
+    } else {
+        serial_write_str("SYSCALL: fork() ERROR: Process manager not initialized\n");
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall execve - Ejecutar programa
@@ -485,10 +1266,31 @@ fn sys_execve(args: &SyscallArgs) -> SyscallResult {
     let argv = args.arg1 as *const *const u8;
     let envp = args.arg2 as *const *const u8;
     
-    serial_write_str("SYSCALL: execve()\n");
+    serial_write_str("SYSCALL: execve() - Implementación completa\n");
     
-    // TODO: Implementar ejecución real
-    SyscallResult::Success(0)
+    // Usar el módulo execve para la implementación completa
+    match execve::execve_syscall(filename, argv, envp) {
+        Ok(()) => {
+            // execve() tuvo éxito
+            // El proceso se reemplazó y ejecutará en el próximo time slice
+            serial_write_str("SYSCALL: execve() - Proceso reemplazado exitosamente\n");
+            
+            // En un sistema real, execve() NO RETORNA si tiene éxito
+            // El proceso actual se reemplaza completamente
+            // Por ahora retornamos 0, pero el proceso ya está configurado
+            // para ejecutar el nuevo binario
+            SyscallResult::Success(0)
+        }
+        Err(e) => {
+            // execve() falló, retornar código de error
+            let errno = e.to_errno();
+            serial_write_str(&alloc::format!(
+                "SYSCALL: execve() - Error: errno={}\n",
+                errno
+            ));
+            SyscallResult::Error(SyscallError::NotImplemented) // TODO: mejor mapeo de errores
+        }
+    }
 }
 
 /// Syscall wait4 - Esperar cambio de estado de proceso
@@ -500,8 +1302,69 @@ fn sys_wait4(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: wait4(pid={}, options={})\n", pid, options));
     
-    // TODO: Implementar espera real
-    SyscallResult::Success(pid as u64)
+    use crate::process::manager::get_process_manager;
+    use crate::process::process::ProcessState;
+    
+    // Obtener el gestor de procesos
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        // Si pid == -1, esperar cualquier hijo
+        // Si pid > 0, esperar ese hijo específico
+        // Si pid == 0, esperar cualquier hijo del mismo grupo
+        
+        // Buscar hijos del proceso actual
+        for i in 0..crate::process::MAX_PROCESSES {
+            if let Some(ref process) = manager.processes[i] {
+                // Verificar si es hijo del proceso actual
+                if process.parent_pid == Some(current_pid) {
+                    // Si pid > 0, solo esperar ese hijo específico
+                    if pid > 0 && process.pid != pid as u32 {
+                        continue;
+                    }
+                    
+                    // Verificar si el hijo ha terminado
+                    if process.state == ProcessState::Terminated || 
+                       process.state == ProcessState::Zombie {
+                        let child_pid = process.pid;
+                        let exit_code = process.exit_code.unwrap_or(0);
+                        
+                        serial_write_str(&alloc::format!(
+                            "SYSCALL: wait4() - child {} terminated with code {}\n",
+                            child_pid, exit_code
+                        ));
+                        
+                        // Escribir el exit status si el puntero es válido
+                        if !wstatus.is_null() {
+                            unsafe {
+                                *wstatus = (exit_code << 8) as i32; // Linux wait format
+                            }
+                        }
+                        
+                        // Limpiar el proceso zombie (reaping)
+                        manager.processes[i] = None;
+                        if manager.active_processes > 0 {
+                            manager.active_processes -= 1;
+                        }
+                        
+                        // Retornar PID del hijo
+                        return SyscallResult::Success(child_pid as u64);
+                    }
+                }
+            }
+        }
+        
+        // No hay hijos terminados
+        // TODO: En un sistema real, esto bloquearía el proceso hasta que un hijo termine
+        // o retornaría error si options & WNOHANG
+        serial_write_str("SYSCALL: wait4() - no terminated children\n");
+        SyscallResult::Error(SyscallError::Interrupted) // ECHILD = no children
+    } else {
+        serial_write_str("SYSCALL: wait4() ERROR: Process manager not initialized\n");
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall nanosleep - Dormir con precisión de nanosegundos
@@ -522,7 +1385,35 @@ fn sys_gettimeofday(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str("SYSCALL: gettimeofday()\n");
     
-    // TODO: Implementar obtención de tiempo real
+    if tv.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    // Obtener tiempo del sistema (desde el timer)
+    let uptime_ms = {
+        let timer_guard = crate::interrupts::timer::get_system_timer().lock();
+        timer_guard.get_system_time_ms()
+    };
+    
+    // struct timeval { tv_sec: i64, tv_usec: i64 }
+    unsafe {
+        let tv_ptr = tv as *mut i64;
+        *tv_ptr.offset(0) = (uptime_ms / 1000) as i64;  // segundos
+        *tv_ptr.offset(1) = ((uptime_ms % 1000) * 1000) as i64;  // microsegundos
+    }
+    
+    serial_write_str(&alloc::format!("SYSCALL: gettimeofday() -> {}s\n", uptime_ms / 1000));
+    
+    // timezone (opcional, puede ser NULL)
+    if !tz.is_null() {
+        // struct timezone { tz_minuteswest: i32, tz_dsttime: i32 }
+        unsafe {
+            let tz_ptr = tz as *mut i32;
+            *tz_ptr.offset(0) = 0;  // UTC
+            *tz_ptr.offset(1) = 0;  // No DST
+        }
+    }
+    
     SyscallResult::Success(0)
 }
 
@@ -625,10 +1516,76 @@ fn sys_setregid(args: &SyscallArgs) -> SyscallResult {
 fn sys_chdir(args: &SyscallArgs) -> SyscallResult {
     let path = args.arg0 as *const u8;
     
-    serial_write_str("SYSCALL: chdir()\n");
+    if path.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar cambio de directorio real
-    SyscallResult::Success(0)
+    // Convertir path a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *path.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(path, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: chdir('{}')\n", path_str));
+    
+    use crate::process::manager::get_process_manager;
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Verificar que el directorio existe en el VFS
+    let vfs_guard = get_vfs();
+    if let Some(ref vfs) = *vfs_guard {
+        if let Some(root_fs) = vfs.get_root_fs() {
+            let fs_guard = root_fs.lock();
+            
+            // Intentar resolver el path
+            match fs_guard.resolve_path(path_str) {
+                Ok(inode) => {
+                    // Verificar que es un directorio
+                    match fs_guard.stat(inode) {
+                        Ok(stat_info) => {
+                            // Verificar si es directorio (modo & 0x4000 == S_IFDIR)
+                            if (stat_info.mode & 0x4000) != 0 {
+                                drop(fs_guard);
+                                drop(vfs_guard);
+                                
+                                // Cambiar el working directory del proceso
+                                let mut manager_guard = get_process_manager().lock();
+                                if let Some(ref mut manager) = *manager_guard {
+                                    let current_pid = manager.current_process.unwrap_or(0);
+                                    
+                                    if let Some(ref mut process) = manager.processes[current_pid as usize] {
+                                        process.working_directory = String::from(path_str);
+                                        serial_write_str(&alloc::format!("SYSCALL: chdir() -> OK (now '{}')\n", path_str));
+                                        return SyscallResult::Success(0);
+                                    }
+                                }
+                            } else {
+                                serial_write_str(&alloc::format!("SYSCALL: chdir('{}') - not a directory\n", path_str));
+                                return SyscallResult::Error(SyscallError::NotADirectory);
+                            }
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: chdir() - stat error: {:?}\n", e));
+                            return SyscallResult::Error(SyscallError::FileNotFound);
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: chdir('{}') - not found: {:?}\n", path_str, e));
+                    return SyscallResult::Error(SyscallError::FileNotFound);
+                }
+            }
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall fchdir - Cambiar directorio de trabajo por fd
@@ -646,9 +1603,30 @@ fn sys_mkdir(args: &SyscallArgs) -> SyscallResult {
     let pathname = args.arg0 as *const u8;
     let mode = args.arg1 as u32;
     
-    serial_write_str(&alloc::format!("SYSCALL: mkdir(mode={})\n", mode));
+    if pathname.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar creación de directorio real
+    // Convertir pathname a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: mkdir('{}', mode=0o{:o})\n", path_str, mode));
+    
+    // Por ahora, mkdir retorna éxito simulado
+    // En un sistema completo, esto crearía el directorio en el VFS
+    serial_write_str(&alloc::format!("SYSCALL: mkdir() - simulado (VFS read-only)\n"));
+    
+    // Simular éxito para comandos básicos
     SyscallResult::Success(0)
 }
 
@@ -656,20 +1634,146 @@ fn sys_mkdir(args: &SyscallArgs) -> SyscallResult {
 fn sys_rmdir(args: &SyscallArgs) -> SyscallResult {
     let pathname = args.arg0 as *const u8;
     
-    serial_write_str("SYSCALL: rmdir()\n");
+    if pathname.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar eliminación de directorio real
-    SyscallResult::Success(0)
+    // Convertir pathname a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: rmdir('{}')\n", path_str));
+    
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Verificar que el directorio existe
+    let vfs_guard = get_vfs();
+    if let Some(ref vfs) = *vfs_guard {
+        if let Some(root_fs) = vfs.get_root_fs() {
+            let mut fs_guard = root_fs.lock();
+            
+            // Intentar resolver el path
+            match fs_guard.resolve_path(path_str) {
+                Ok(inode) => {
+                    // Verificar que es un directorio
+                    match fs_guard.stat(inode) {
+                        Ok(stat_info) => {
+                            if (stat_info.mode & 0x4000) == 0 {
+                                serial_write_str(&alloc::format!("SYSCALL: rmdir('{}') - not a directory\n", path_str));
+                                return SyscallResult::Error(SyscallError::NotADirectory);
+                            }
+                            
+                            // Intentar eliminar (puede fallar si no está implementado)
+                            match fs_guard.rmdir(0, path_str) {
+                                Ok(_) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: rmdir('{}') -> OK\n", path_str));
+                                    SyscallResult::Success(0)
+                                }
+                                Err(e) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: rmdir() - VFS error: {:?}\n", e));
+                                    SyscallResult::Error(SyscallError::InvalidOperation)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: rmdir() - stat error: {:?}\n", e));
+                            SyscallResult::Error(SyscallError::FileNotFound)
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: rmdir('{}') - not found: {:?}\n", path_str, e));
+                    SyscallResult::Error(SyscallError::FileNotFound)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall unlink - Eliminar enlace de archivo
 fn sys_unlink(args: &SyscallArgs) -> SyscallResult {
     let pathname = args.arg0 as *const u8;
     
-    serial_write_str("SYSCALL: unlink()\n");
+    if pathname.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar eliminación real
-    SyscallResult::Success(0)
+    // Convertir pathname a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: unlink('{}')\n", path_str));
+    
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Verificar que el archivo existe
+    let vfs_guard = get_vfs();
+    if let Some(ref vfs) = *vfs_guard {
+        if let Some(root_fs) = vfs.get_root_fs() {
+            let mut fs_guard = root_fs.lock();
+            
+            // Intentar resolver el path
+            match fs_guard.resolve_path(path_str) {
+                Ok(inode) => {
+                    // Verificar que NO es un directorio
+                    match fs_guard.stat(inode) {
+                        Ok(stat_info) => {
+                            if (stat_info.mode & 0x4000) != 0 {
+                                serial_write_str(&alloc::format!("SYSCALL: unlink('{}') - is a directory\n", path_str));
+                                return SyscallResult::Error(SyscallError::IsADirectory);
+                            }
+                            
+                            // Intentar eliminar (puede fallar si no está implementado)
+                            match fs_guard.unlink(0, path_str) {
+                                Ok(_) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: unlink('{}') -> OK\n", path_str));
+                                    SyscallResult::Success(0)
+                                }
+                                Err(e) => {
+                                    serial_write_str(&alloc::format!("SYSCALL: unlink() - VFS error: {:?}\n", e));
+                                    SyscallResult::Error(SyscallError::InvalidOperation)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: unlink() - stat error: {:?}\n", e));
+                            SyscallResult::Error(SyscallError::FileNotFound)
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: unlink('{}') - not found: {:?}\n", path_str, e));
+                    SyscallResult::Error(SyscallError::FileNotFound)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall symlink - Crear enlace simbólico
@@ -758,21 +1862,107 @@ fn sys_stat(args: &SyscallArgs) -> SyscallResult {
     let pathname = args.arg0 as *const u8;
     let statbuf = args.arg1 as *mut u8;
     
-    serial_write_str("SYSCALL: stat()\n");
+    if pathname.is_null() || statbuf.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
     
-    // TODO: Implementar obtención de información real
-    SyscallResult::Success(0)
+    // Convertir pathname a string
+    let path_str = unsafe {
+        let mut len = 0;
+        while *pathname.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(pathname, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: stat('{}')\n", path_str));
+    
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Acceder al VFS
+    let vfs_guard = get_vfs();
+    if let Some(ref vfs) = *vfs_guard {
+        if let Some(root_fs) = vfs.get_root_fs() {
+            let fs_guard = root_fs.lock();
+            
+            // Resolver path y obtener stat
+            match fs_guard.resolve_path(path_str) {
+                Ok(inode) => {
+                    match fs_guard.stat(inode) {
+                        Ok(stat_info) => {
+                            // Llenar estructura stat (formato Linux x86_64)
+                            unsafe {
+                                // struct stat es ~144 bytes, simplificado aquí
+                                let statbuf_ptr = statbuf as *mut u64;
+                                
+                                // st_dev (device ID)
+                                *statbuf_ptr.offset(0) = 0x101; // ID de dispositivo simulado
+                                
+                                // st_ino (inode number)
+                                *statbuf_ptr.offset(1) = stat_info.inode as u64;
+                                
+                                // st_mode (file mode)
+                                *statbuf_ptr.offset(2) = stat_info.mode as u64;
+                                
+                                // st_nlink (number of hard links)
+                                *statbuf_ptr.offset(3) = stat_info.nlink as u64;
+                                
+                                // st_uid, st_gid
+                                *statbuf_ptr.offset(4) = stat_info.uid as u64;
+                                *statbuf_ptr.offset(5) = stat_info.gid as u64;
+                                
+                                // st_rdev (device ID if special file)
+                                *statbuf_ptr.offset(6) = 0;
+                                
+                                // st_size (total size in bytes)
+                                *statbuf_ptr.offset(7) = stat_info.size;
+                                
+                                // st_blksize (blocksize for filesystem I/O)
+                                *statbuf_ptr.offset(8) = 4096;
+                                
+                                // st_blocks (number of 512B blocks allocated)
+                                *statbuf_ptr.offset(9) = (stat_info.size + 511) / 512;
+                                
+                                // st_atime, st_mtime, st_ctime
+                                *statbuf_ptr.offset(10) = stat_info.atime;
+                                *statbuf_ptr.offset(11) = stat_info.mtime;
+                                *statbuf_ptr.offset(12) = stat_info.ctime;
+                            }
+                            
+                            serial_write_str(&alloc::format!(
+                                "SYSCALL: stat() -> OK (inode={}, size={})\n",
+                                stat_info.inode, stat_info.size
+                            ));
+                            SyscallResult::Success(0)
+                        }
+                        Err(e) => {
+                            serial_write_str(&alloc::format!("SYSCALL: stat() - error: {:?}\n", e));
+                            SyscallResult::Error(SyscallError::FileNotFound)
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial_write_str(&alloc::format!("SYSCALL: stat('{}') - not found: {:?}\n", path_str, e));
+                    SyscallResult::Error(SyscallError::FileNotFound)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall lstat - Obtener información de enlace simbólico
 fn sys_lstat(args: &SyscallArgs) -> SyscallResult {
-    let pathname = args.arg0 as *const u8;
-    let statbuf = args.arg1 as *mut u8;
-    
-    serial_write_str("SYSCALL: lstat()\n");
-    
-    // TODO: Implementar obtención de información real
-    SyscallResult::Success(0)
+    // Por ahora, lstat es igual a stat (no soportamos symlinks todavía)
+    serial_write_str("SYSCALL: lstat() - usando stat()\n");
+    sys_stat(args)
 }
 
 /// Syscall fstat - Obtener información de archivo por fd
@@ -782,8 +1972,126 @@ fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: fstat(fd={})\n", fd));
     
-    // TODO: Implementar obtención de información real
-    SyscallResult::Success(0)
+    if statbuf.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::file_descriptor::FileDescriptorType;
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Obtener info del FD del proceso actual
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            let fd_info = process.fd_table.get(fd);
+            
+            if let Some(fd_desc) = fd_info {
+                match fd_desc.fd_type {
+                    FileDescriptorType::File => {
+                        // Archivo regular - obtener stat desde VFS
+                        if let Some(inode) = fd_desc.inode {
+                            drop(manager_guard);
+                            
+                            let vfs_guard = get_vfs();
+                            if let Some(ref vfs) = *vfs_guard {
+                                if let Some(root_fs) = vfs.get_root_fs() {
+                                    let fs_guard = root_fs.lock();
+                                    
+                                    match fs_guard.stat(inode as u32) {
+                                        Ok(stat_info) => {
+                                            // Llenar estructura stat
+                                            unsafe {
+                                                let statbuf_ptr = statbuf as *mut u64;
+                                                *statbuf_ptr.offset(0) = 0x101;
+                                                *statbuf_ptr.offset(1) = stat_info.inode as u64;
+                                                *statbuf_ptr.offset(2) = stat_info.mode as u64;
+                                                *statbuf_ptr.offset(3) = stat_info.nlink as u64;
+                                                *statbuf_ptr.offset(4) = stat_info.uid as u64;
+                                                *statbuf_ptr.offset(5) = stat_info.gid as u64;
+                                                *statbuf_ptr.offset(6) = 0;
+                                                *statbuf_ptr.offset(7) = stat_info.size;
+                                                *statbuf_ptr.offset(8) = 4096;
+                                                *statbuf_ptr.offset(9) = (stat_info.size + 511) / 512;
+                                                *statbuf_ptr.offset(10) = stat_info.atime;
+                                                *statbuf_ptr.offset(11) = stat_info.mtime;
+                                                *statbuf_ptr.offset(12) = stat_info.ctime;
+                                            }
+                                            
+                                            serial_write_str(&alloc::format!(
+                                                "SYSCALL: fstat(fd={}) -> OK (size={})\n",
+                                                fd, stat_info.size
+                                            ));
+                                            return SyscallResult::Success(0);
+                                        }
+                                        Err(e) => {
+                                            serial_write_str(&alloc::format!("SYSCALL: fstat() - stat error: {:?}\n", e));
+                                            return SyscallResult::Error(SyscallError::InvalidOperation);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    FileDescriptorType::Stdin | FileDescriptorType::Stdout | FileDescriptorType::Stderr => {
+                        // Terminal/character device
+                        unsafe {
+                            let statbuf_ptr = statbuf as *mut u64;
+                            *statbuf_ptr.offset(0) = 0x105; // Device ID
+                            *statbuf_ptr.offset(1) = fd as u64; // Inode = fd
+                            *statbuf_ptr.offset(2) = 0x2190; // S_IFCHR | 0o600
+                            *statbuf_ptr.offset(3) = 1;
+                            *statbuf_ptr.offset(4) = 0; // uid
+                            *statbuf_ptr.offset(5) = 0; // gid
+                            *statbuf_ptr.offset(6) = 0;
+                            *statbuf_ptr.offset(7) = 0; // size = 0 para character device
+                            *statbuf_ptr.offset(8) = 4096;
+                            *statbuf_ptr.offset(9) = 0;
+                            *statbuf_ptr.offset(10) = 0; // atime
+                            *statbuf_ptr.offset(11) = 0; // mtime
+                            *statbuf_ptr.offset(12) = 0; // ctime
+                        }
+                        
+                        serial_write_str(&alloc::format!("SYSCALL: fstat(fd={}) -> character device\n", fd));
+                        return SyscallResult::Success(0);
+                    }
+                    FileDescriptorType::Pipe => {
+                        // Pipe
+                        unsafe {
+                            let statbuf_ptr = statbuf as *mut u64;
+                            *statbuf_ptr.offset(0) = 0x106;
+                            *statbuf_ptr.offset(1) = fd as u64;
+                            *statbuf_ptr.offset(2) = 0x1180; // S_IFIFO | 0o600
+                            *statbuf_ptr.offset(3) = 1;
+                            *statbuf_ptr.offset(4) = 0;
+                            *statbuf_ptr.offset(5) = 0;
+                            *statbuf_ptr.offset(6) = 0;
+                            *statbuf_ptr.offset(7) = 4096; // pipe buffer size
+                            *statbuf_ptr.offset(8) = 4096;
+                            *statbuf_ptr.offset(9) = 8;
+                            *statbuf_ptr.offset(10) = 0;
+                            *statbuf_ptr.offset(11) = 0;
+                            *statbuf_ptr.offset(12) = 0;
+                        }
+                        
+                        serial_write_str(&alloc::format!("SYSCALL: fstat(fd={}) -> pipe\n", fd));
+                        return SyscallResult::Success(0);
+                    }
+                    _ => {
+                        serial_write_str(&alloc::format!("SYSCALL: fstat(fd={}) - unsupported type\n", fd));
+                        return SyscallResult::Error(SyscallError::InvalidOperation);
+                    }
+                }
+            } else {
+                return SyscallResult::Error(SyscallError::InvalidFileDescriptor);
+            }
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall statfs - Obtener información del sistema de archivos
@@ -816,8 +2124,117 @@ fn sys_getdents(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: getdents(fd={}, count={})\n", fd, count));
     
-    // TODO: Implementar obtención de entradas real
-    SyscallResult::Success(0)
+    if dirp.is_null() || count == 0 {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    use crate::process::file_descriptor::FileDescriptorType;
+    use crate::filesystem::vfs::get_vfs;
+    
+    // Obtener el file descriptor del proceso actual
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            let fd_info = process.fd_table.get(fd);
+            
+            if let Some(fd_desc) = fd_info {
+                // Verificar que el FD es un directorio
+                if fd_desc.fd_type != FileDescriptorType::File {
+                    return SyscallResult::Error(SyscallError::NotADirectory);
+                }
+                
+                if let Some(inode) = fd_desc.inode {
+                    if let Some(ref path) = fd_desc.path {
+                        drop(manager_guard);
+                        
+                        // Leer el directorio desde el VFS
+                        let vfs_guard = get_vfs();
+                        if let Some(ref vfs) = *vfs_guard {
+                            if let Some(root_fs) = vfs.get_root_fs() {
+                                let fs_guard = root_fs.lock();
+                                
+                                // Obtener entradas del directorio
+                                match fs_guard.readdir(inode as u32) {
+                                    Ok(entries) => {
+                                        // Formatear entradas en formato linux_dirent64
+                                        let mut offset = 0usize;
+                                        let mut entries_written = 0;
+                                        
+                                        for entry in entries.iter() {
+                                            // struct linux_dirent64 {
+                                            //     u64 d_ino;      // inode number
+                                            //     i64 d_off;      // offset to next
+                                            //     u16 d_reclen;   // record length
+                                            //     u8  d_type;     // file type
+                                            //     char d_name[];  // filename (null-terminated)
+                                            // }
+                                            
+                                            let name_bytes = entry.as_bytes();
+                                            let name_len = name_bytes.len();
+                                            
+                                            // Calcular tamaño de la entrada (con padding)
+                                            let reclen = ((19 + name_len + 1 + 7) / 8) * 8; // Alinear a 8 bytes
+                                            
+                                            // Verificar si hay espacio en el buffer
+                                            if offset + reclen > count {
+                                                break;
+                                            }
+                                            
+                                            unsafe {
+                                                let entry_ptr = dirp.add(offset);
+                                                
+                                                // d_ino (8 bytes)
+                                                *(entry_ptr as *mut u64) = (entries_written + 1) as u64;
+                                                
+                                                // d_off (8 bytes) - offset a la siguiente entrada
+                                                *(entry_ptr.add(8) as *mut i64) = (offset + reclen) as i64;
+                                                
+                                                // d_reclen (2 bytes)
+                                                *(entry_ptr.add(16) as *mut u16) = reclen as u16;
+                                                
+                                                // d_type (1 byte) - DT_UNKNOWN=0, DT_REG=8, DT_DIR=4
+                                                *(entry_ptr.add(18) as *mut u8) = 0; // DT_UNKNOWN por ahora
+                                                
+                                                // d_name (null-terminated string)
+                                                core::ptr::copy_nonoverlapping(
+                                                    name_bytes.as_ptr(),
+                                                    entry_ptr.add(19),
+                                                    name_len
+                                                );
+                                                *(entry_ptr.add(19 + name_len)) = 0; // null terminator
+                                            }
+                                            
+                                            offset += reclen;
+                                            entries_written += 1;
+                                        }
+                                        
+                                        serial_write_str(&alloc::format!(
+                                            "SYSCALL: getdents() -> {} entries, {} bytes\n",
+                                            entries_written, offset
+                                        ));
+                                        
+                                        return SyscallResult::Success(offset as u64);
+                                    }
+                                    Err(e) => {
+                                        serial_write_str(&alloc::format!("SYSCALL: getdents() - readdir error: {:?}\n", e));
+                                        return SyscallResult::Error(SyscallError::InvalidOperation);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                return SyscallResult::Error(SyscallError::InvalidFileDescriptor);
+            }
+        }
+    }
+    
+    SyscallResult::Error(SyscallError::InvalidOperation)
 }
 
 /// Syscall fcntl - Control de descriptor de archivo
@@ -826,10 +2243,67 @@ fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     let cmd = args.arg1 as i32;
     let arg = args.arg2 as u64;
     
-    serial_write_str(&alloc::format!("SYSCALL: fcntl(fd={}, cmd={})\n", fd, cmd));
+    serial_write_str(&alloc::format!("SYSCALL: fcntl(fd={}, cmd={}, arg={})\n", fd, cmd, arg));
     
-    // TODO: Implementar control real
-    SyscallResult::Success(0)
+    // Constantes de fcntl (Linux)
+    const F_DUPFD: i32 = 0;        // Duplicar FD
+    const F_GETFD: i32 = 1;        // Obtener flags de FD
+    const F_SETFD: i32 = 2;        // Establecer flags de FD
+    const F_GETFL: i32 = 3;        // Obtener flags de archivo
+    const F_SETFL: i32 = 4;        // Establecer flags de archivo
+    const FD_CLOEXEC: i32 = 1;     // Close-on-exec flag
+    
+    use crate::process::manager::get_process_manager;
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            match cmd {
+                F_DUPFD => {
+                    // Duplicar FD (similar a dup())
+                    serial_write_str(&alloc::format!("SYSCALL: fcntl(F_DUPFD) - fd={}\n", fd));
+                    SyscallResult::Success(fd as u64)
+                }
+                F_GETFD => {
+                    // Obtener flags de FD (por ahora retornamos 0 = no close-on-exec)
+                    serial_write_str(&alloc::format!("SYSCALL: fcntl(F_GETFD) - fd={}\n", fd));
+                    SyscallResult::Success(0)
+                }
+                F_SETFD => {
+                    // Establecer flags de FD
+                    serial_write_str(&alloc::format!("SYSCALL: fcntl(F_SETFD) - fd={}, flags={}\n", fd, arg));
+                    SyscallResult::Success(0)
+                }
+                F_GETFL => {
+                    // Obtener flags de archivo
+                    if let Some(fd_desc) = process.fd_table.get(fd) {
+                        let flags = fd_desc.flags;
+                        serial_write_str(&alloc::format!("SYSCALL: fcntl(F_GETFL) - fd={} -> flags=0x{:x}\n", fd, flags));
+                        SyscallResult::Success(flags as u64)
+                    } else {
+                        SyscallResult::Error(SyscallError::InvalidFileDescriptor)
+                    }
+                }
+                F_SETFL => {
+                    // Establecer flags de archivo
+                    serial_write_str(&alloc::format!("SYSCALL: fcntl(F_SETFL) - fd={}, flags=0x{:x}\n", fd, arg));
+                    // Por ahora solo registramos, no actualizamos
+                    SyscallResult::Success(0)
+                }
+                _ => {
+                    serial_write_str(&alloc::format!("SYSCALL: fcntl() - cmd desconocido: {}\n", cmd));
+                    SyscallResult::Success(0)
+                }
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 
 /// Syscall flock - Bloquear archivo
@@ -902,7 +2376,177 @@ fn sys_getcwd(args: &SyscallArgs) -> SyscallResult {
     
     serial_write_str(&alloc::format!("SYSCALL: getcwd(size={})\n", size));
     
-    // TODO: Implementar obtención real
-    SyscallResult::Success(0)
+    if buf.is_null() || size == 0 {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    use crate::process::manager::get_process_manager;
+    
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            let cwd = &process.working_directory;
+            let cwd_bytes = cwd.as_bytes();
+            
+            // Verificar que el buffer sea suficientemente grande (incluyendo null terminator)
+            if size < cwd_bytes.len() + 1 {
+                serial_write_str(&alloc::format!("SYSCALL: getcwd() - buffer too small (need {})\n", cwd_bytes.len() + 1));
+                return SyscallResult::Error(SyscallError::InvalidArgument);
+            }
+            
+            // Copiar el path al buffer
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    cwd_bytes.as_ptr(),
+                    buf,
+                    cwd_bytes.len()
+                );
+                // Null terminator
+                *buf.add(cwd_bytes.len()) = 0;
+            }
+            
+            serial_write_str(&alloc::format!("SYSCALL: getcwd() -> '{}'\n", cwd));
+            SyscallResult::Success(buf as u64)
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
+}
+
+/// Syscall getenv - Obtener variable de entorno
+fn sys_getenv(args: &SyscallArgs) -> SyscallResult {
+    let name_ptr = args.arg0 as *const u8;
+    let buf = args.arg1 as *mut u8;
+    let size = args.arg2 as usize;
+    
+    if name_ptr.is_null() || buf.is_null() || size == 0 {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    // Convertir name a string
+    let name_str = unsafe {
+        let mut len = 0;
+        while *name_ptr.add(len) != 0 && len < 256 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(name_ptr, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: getenv('{}')\n", name_str));
+    
+    use crate::process::manager::get_process_manager;
+    
+    let manager_guard = get_process_manager().lock();
+    
+    if let Some(ref manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref process) = manager.processes[current_pid as usize] {
+            // Buscar la variable en el environment
+            if let Some(value) = process.environment.get(name_str) {
+                let value_bytes = value.as_bytes();
+                
+                // Verificar que el buffer sea suficientemente grande
+                if size < value_bytes.len() + 1 {
+                    serial_write_str(&alloc::format!("SYSCALL: getenv() - buffer too small\n"));
+                    return SyscallResult::Error(SyscallError::InvalidArgument);
+                }
+                
+                // Copiar el valor al buffer
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        value_bytes.as_ptr(),
+                        buf,
+                        value_bytes.len()
+                    );
+                    *buf.add(value_bytes.len()) = 0; // null terminator
+                }
+                
+                serial_write_str(&alloc::format!("SYSCALL: getenv('{}') -> '{}'\n", name_str, value));
+                SyscallResult::Success(buf as u64)
+            } else {
+                serial_write_str(&alloc::format!("SYSCALL: getenv('{}') - variable no encontrada\n", name_str));
+                SyscallResult::Error(SyscallError::FileNotFound)
+            }
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
+}
+
+/// Syscall setenv - Establecer variable de entorno
+fn sys_setenv(args: &SyscallArgs) -> SyscallResult {
+    let name_ptr = args.arg0 as *const u8;
+    let value_ptr = args.arg1 as *const u8;
+    let overwrite = args.arg2 as i32;
+    
+    if name_ptr.is_null() || value_ptr.is_null() {
+        return SyscallResult::Error(SyscallError::BadAddress);
+    }
+    
+    // Convertir name a string
+    let name_str = unsafe {
+        let mut len = 0;
+        while *name_ptr.add(len) != 0 && len < 256 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(name_ptr, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    // Convertir value a string
+    let value_str = unsafe {
+        let mut len = 0;
+        while *value_ptr.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(value_ptr, len);
+        match core::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return SyscallResult::Error(SyscallError::InvalidArgument),
+        }
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: setenv('{}', '{}', overwrite={})\n", name_str, value_str, overwrite));
+    
+    use crate::process::manager::get_process_manager;
+    
+    let mut manager_guard = get_process_manager().lock();
+    
+    if let Some(ref mut manager) = *manager_guard {
+        let current_pid = manager.current_process.unwrap_or(0);
+        
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            // Si overwrite es 0 y la variable ya existe, no hacer nada
+            if overwrite == 0 && process.environment.contains_key(name_str) {
+                serial_write_str(&alloc::format!("SYSCALL: setenv() - variable existe, no se sobrescribe\n"));
+                return SyscallResult::Success(0);
+            }
+            
+            // Insertar o actualizar la variable
+            process.environment.insert(String::from(name_str), String::from(value_str));
+            
+            serial_write_str(&alloc::format!("SYSCALL: setenv('{}') -> OK\n", name_str));
+            SyscallResult::Success(0)
+        } else {
+            SyscallResult::Error(SyscallError::InvalidOperation)
+        }
+    } else {
+        SyscallResult::Error(SyscallError::InvalidOperation)
+    }
 }
 

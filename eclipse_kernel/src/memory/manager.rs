@@ -181,8 +181,20 @@ impl MemoryManager {
         );
 
         // Configurar PD con páginas de 2MB
-        self.pd
-            .set_entry(0, PageTableEntry::new_with_flags(0, flags | PAGE_SIZE_2MB));
+        // Necesitamos mapear más de 2MB para acomodar el heap del kernel (32MB) y
+        // otras secciones de datos. Mapeamos los primeros 64MB de memoria física
+        // usando páginas enormes (2MB) para tener margen suficiente.
+        let identity_map_size: u64 = 64 * 1024 * 1024; // 64MB
+        let huge_page_size: u64 = 2 * 1024 * 1024; // 2MB
+        let required_entries = (identity_map_size / huge_page_size) as usize;
+
+        for i in 0..required_entries {
+            let phys_addr = (i as u64) * huge_page_size;
+            self.pd.set_entry(
+                i,
+                PageTableEntry::new_with_flags(phys_addr, flags | PAGE_SIZE_2MB),
+            );
+        }
 
         Ok(())
     }
@@ -198,6 +210,10 @@ impl MemoryManager {
             kernel_virtual_index as usize,
             PageTableEntry::new_with_flags(&self.pdpt as *const _ as u64, flags),
         );
+
+        // Nota: las mismas entradas del PD que configuramos para el mapeo de identidad
+        // también proporcionan el mapeo en la zona virtual alta del kernel, ya que
+        // apuntamos a la misma tabla de directorio de páginas (PD).
 
         Ok(())
     }

@@ -1,6 +1,29 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{format, vec};
+use spin::Mutex;
+
+/// Gestor global de CUDA
+static CUDA_INTEGRATION: Mutex<Option<CudaIntegration>> = Mutex::new(None);
+
+/// Inicializar el runtime de CUDA
+pub fn init_cuda_runtime() -> Result<(), &'static str> {
+    let mut cuda_guard = CUDA_INTEGRATION.lock();
+    let mut cuda = CudaIntegration::new()?;
+    
+    // Crear contexto en el primer dispositivo
+    if cuda.device_count > 0 {
+        cuda.create_context(0)?;
+    }
+    
+    *cuda_guard = Some(cuda);
+    Ok(())
+}
+
+/// Obtener integración de CUDA
+pub fn get_cuda_integration() -> Option<&'static Mutex<Option<CudaIntegration>>> {
+    Some(&CUDA_INTEGRATION)
+}
 
 /// Integración con CUDA para computación paralela
 pub struct CudaIntegration {

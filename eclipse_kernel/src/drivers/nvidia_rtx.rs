@@ -1,6 +1,23 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::{format, vec};
+use spin::Mutex;
+
+/// Gestor global de RTX
+static RTX_INTEGRATION: Mutex<Option<RtxIntegration>> = Mutex::new(None);
+
+/// Inicializar el sistema RTX
+pub fn init_rtx_system() -> Result<(), &'static str> {
+    let mut rtx_guard = RTX_INTEGRATION.lock();
+    let rtx = RtxIntegration::new()?;
+    *rtx_guard = Some(rtx);
+    Ok(())
+}
+
+/// Obtener integración de RTX
+pub fn get_rtx_integration() -> Option<&'static Mutex<Option<RtxIntegration>>> {
+    Some(&RTX_INTEGRATION)
+}
 
 /// Integración con RTX para ray tracing
 pub struct RtxIntegration {

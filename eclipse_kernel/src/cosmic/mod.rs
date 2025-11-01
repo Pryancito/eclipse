@@ -437,7 +437,9 @@ pub struct CosmicManager {
 }
 
 impl CosmicManager {
-    /// Crear nuevo gestor de COSMIC
+    /// Crear nuevo gestor de COSMIC (versión COMPLETA - consume mucha memoria)
+    /// ADVERTENCIA: Esta versión puede causar kernel panic por falta de memoria
+    /// Usar `new_minimal()` para un COSMIC más ligero
     pub fn new() -> Self {
         Self {
             config: CosmicConfig::default(),
@@ -524,6 +526,99 @@ impl CosmicManager {
             // === SISTEMA DE EFECTOS HERMOSOS ===
             beautiful_effects: BeautifulEffects::new(),
             // === SISTEMA DE DISEÑO MODERNO ===
+            modern_design: ModernDesign::new(),
+        }
+    }
+
+    /// Crear gestor COSMIC MINIMAL (versión ligera, recomendada)
+    /// Solo inicializa componentes esenciales para ahorrar memoria
+    pub fn new_minimal() -> Self {
+        use crate::debug::serial_write_str;
+        serial_write_str("COSMIC: Creando gestor minimal (modo ahorro de memoria)...\n");
+        
+        Self {
+            config: CosmicConfig::default(),
+            state: CosmicState {
+                initialized: false,
+                compositor_running: false,
+                window_manager_active: false,
+                ai_features_enabled: false,
+                theme_applied: false,
+                cuda_enabled: false,
+                active_windows: Vec::new(),
+                performance_stats: CosmicPerformanceStats::default(),
+                needs_full_redraw: true,
+            },
+            integration: None,
+            wayland_integration: None,
+            theme: None,
+            ai_features: None,
+            
+            // Solo componentes básicos esenciales
+            start_menu: start_menu::StartMenu::new(),
+            taskbar: taskbar::Taskbar::new(),
+            window_operations: window_operations::WindowOperationsManager::new(),
+
+            // Componentes Lunar en modo minimal (sin inicialización pesada)
+            ai_renderer: AIRenderer::new(),
+            cuda_acceleration: CosmicCuda::new(),
+            visual_effects: CosmicVisualEffects::new(),
+            ai_performance: AIPerformanceModel::new(),
+            modern_gui: None,
+            widget_manager: None,
+            ai_autodiagnostic: AIAutoDiagnostic::new(),
+            animation_manager: AnimationManager::new(),
+            uuid_generator: CounterUUIDGenerator::new(),
+            unified_stats: UnifiedPerformanceStats::default(),
+            frame_count: 0,
+            current_fps: 0.0,
+            opengl_renderer: OpenGLRenderer::new(),
+
+            // Componentes Epoch simplificados
+            advanced_compositor: AdvancedCompositor::new(),
+            applet_system: AppletSystem::new(),
+            notification_system_advanced: NotificationSystem::new(),
+            desktop_portal: DesktopPortal::new(),
+            ai_learning: AILearningSystem::new(),
+            preference_tracker: UserPreferenceTracker::new(),
+            adaptive_behavior_engine: AdaptiveBehaviorEngine::new(),
+            ai_learning_persistence: AILearningPersistence::new(),
+
+            // Componentes básicos (ligeros)
+            smart_widgets: SmartWidgetManager::new(),
+            notification_system: NotificationSystem::new(),
+            global_search: GlobalSearchSystem::new(),
+            plugin_system: PluginSystem::new(PluginSystemConfig::default()),
+            dynamic_themes: DynamicThemeSystem::new(),
+            window_manager: WindowManager::new(),
+
+            // Componentes avanzados con resolución reducida para ahorrar RAM
+            advanced_visual_effects: AdvancedVisualEffects::new(800, 600), // Reducido de 1920x1080
+            icon_system: IconSystem::new(),
+            input_system: InputSystem::new(),
+            visual_shaders: VisualShaderSystem::new(),
+            visual_logs: VisualLogSystem::new(),
+            floating_widgets: FloatingWidgetSystem::new(),
+            advanced_particles: AdvancedParticleSystem::new(),
+            touch_gestures: TouchGestureSystem::new(),
+            ai_themes: AIThemeSystem::new(),
+            audio_visual: AudioVisualSystem::new(),
+            ai_engine: AIEngine::new(),
+            smart_notifications: SmartNotificationSystem::new(),
+            intelligent_window_manager: IntelligentWindowManager::new(),
+            user_behavior_predictor: UserBehaviorPredictor::new(),
+            ai_error_detection: AIErrorDetectionSystem::new(),
+            ai_content_generator: AIContentGenerator::new(),
+            optimized_renderer: OptimizedRenderer::new(),
+            intelligent_recommendations: IntelligentRecommendations::new(),
+            ai_desktop_director: AIDesktopDirector::new(),
+
+            // Motor IA y sistemas inteligentes
+            ai_inference_engine: crate::ai_inference::AIInferenceEngine::new(),
+            intelligent_performance:
+                crate::cosmic::intelligent_performance::IntelligentPerformanceAnalyzer::new(),
+            intelligent_assistant: crate::cosmic::intelligent_assistant::IntelligentAssistant::new(),
+            beautiful_effects: BeautifulEffects::new(),
             modern_design: ModernDesign::new(),
         }
     }

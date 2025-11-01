@@ -103,13 +103,30 @@ impl ProcessManager {
 
     /// Terminar un proceso
     pub fn terminate_process(&mut self, pid: ProcessId) -> Result<(), &'static str> {
+        use crate::process::stack_allocator::deallocate_process_stack;
+        use crate::debug::serial_write_str;
+        
         if pid as usize >= MAX_PROCESSES {
             return Err("Invalid process ID");
         }
 
         if let Some(ref mut process) = self.processes[pid as usize] {
+            serial_write_str(&alloc::format!("TERMINATE: Terminando proceso {}\n", pid));
+            
             process.terminate(0); // Código de salida 0
             process.set_state(ProcessState::Terminated);
+
+            // Liberar stack del proceso si existe
+            if process.stack_info.is_some() {
+                match deallocate_process_stack(pid) {
+                    Ok(_) => {
+                        serial_write_str(&alloc::format!("TERMINATE: Stack del proceso {} liberado\n", pid));
+                    }
+                    Err(e) => {
+                        serial_write_str(&alloc::format!("TERMINATE: Error liberando stack: {}\n", e));
+                    }
+                }
+            }
 
             // Remover del scheduler
             self.process_scheduler.remove_process(pid);
@@ -124,6 +141,88 @@ impl ProcessManager {
         } else {
             Err("Process not found")
         }
+    }
+
+    /// Fork - crear proceso hijo (copia del proceso actual)
+    pub fn fork_process(&mut self, parent_pid: ProcessId) -> Result<ProcessId, &'static str> {
+        use crate::process::stack_allocator::allocate_process_stack;
+        use crate::debug::serial_write_str;
+        
+        if parent_pid as usize >= MAX_PROCESSES {
+            return Err("Invalid parent PID");
+        }
+
+        // Obtener el proceso padre
+        let parent_process = self.processes[parent_pid as usize]
+            .as_ref()
+            .ok_or("Parent process not found")?
+            .clone();
+
+        // Buscar un slot libre para el hijo
+        for i in 1..MAX_PROCESSES {
+            if self.processes[i].is_none() {
+                let child_pid = i as ProcessId;
+                
+                serial_write_str(&alloc::format!("FORK: Creando proceso hijo {} (padre: {})\n", child_pid, parent_pid));
+                
+                // Asignar stack NUEVO para el hijo
+                let child_stack = match allocate_process_stack(child_pid) {
+                    Ok(stack) => stack,
+                    Err(e) => {
+                        serial_write_str(&alloc::format!("FORK: Error asignando stack: {}\n", e));
+                        return Err(e);
+                    }
+                };
+                
+                serial_write_str(&alloc::format!(
+                    "FORK: Stack asignado para hijo {} -> 0x{:016x}\n",
+                    child_pid, child_stack.top
+                ));
+                
+                // Crear proceso hijo como copia del padre
+                let mut child_process = parent_process.clone();
+                child_process.pid = child_pid;
+                child_process.parent_pid = Some(parent_pid);
+                child_process.state = ProcessState::Ready; // El hijo empieza Ready
+                child_process.creation_time = self.system_time;
+                child_process.cpu_time = 0; // El hijo empieza con tiempo 0
+                
+                // IMPORTANTE: Configurar RAX = 0 en el hijo
+                // Esto hace que fork() retorne 0 al proceso hijo
+                child_process.cpu_context.rax = 0;
+                
+                // CRÍTICO: Configurar stack NUEVO para el hijo
+                child_process.cpu_context.rsp = child_stack.top;
+                child_process.cpu_context.rbp = child_stack.top;
+                child_process.stack_info = Some(child_stack);
+                
+                serial_write_str(&alloc::format!(
+                    "FORK: Hijo {} configurado con RSP=0x{:016x}\n",
+                    child_pid, child_stack.top
+                ));
+                
+                // El hijo hereda la tabla de file descriptors (copia)
+                // En un sistema real, aquí se marcaría el espacio de memoria como copy-on-write
+                
+                self.processes[i] = Some(child_process);
+                self.active_processes += 1;
+
+                // Agregar al scheduler
+                if self.process_scheduler.add_process(child_pid) {
+                    serial_write_str(&alloc::format!("FORK: Proceso hijo {} creado exitosamente\n", child_pid));
+                    return Ok(child_pid);
+                } else {
+                    // Si falla el scheduler, limpiar y liberar stack
+                    use crate::process::stack_allocator::deallocate_process_stack;
+                    let _ = deallocate_process_stack(child_pid);
+                    self.processes[i] = None;
+                    self.active_processes -= 1;
+                    return Err("Failed to add child process to scheduler");
+                }
+            }
+        }
+
+        Err("No free process slots available")
     }
 
     /// Crear un nuevo thread
@@ -359,20 +458,20 @@ pub struct ProcessManagerStats {
 }
 
 /// Instancia global del gestor de procesos
-static mut PROCESS_MANAGER: Option<ProcessManager> = None;
+use spin::Mutex;
+
+static PROCESS_MANAGER: Mutex<Option<ProcessManager>> = Mutex::new(None);
 
 /// Inicializar el gestor de procesos global
 pub fn init_process_manager() -> Result<(), &'static str> {
-    unsafe {
-        PROCESS_MANAGER = Some(ProcessManager::new());
-        if let Some(ref mut manager) = PROCESS_MANAGER {
-            manager.init()?;
-        }
-    }
+    let mut manager_guard = PROCESS_MANAGER.lock();
+    let mut manager = ProcessManager::new();
+    manager.init()?;
+    *manager_guard = Some(manager);
     Ok(())
 }
 
 /// Obtener el gestor de procesos global
-pub fn get_process_manager() -> Option<&'static mut ProcessManager> {
-    unsafe { PROCESS_MANAGER.as_mut() }
+pub fn get_process_manager() -> &'static Mutex<Option<ProcessManager>> {
+    &PROCESS_MANAGER
 }

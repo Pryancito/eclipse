@@ -33,6 +33,7 @@ pub mod intel_ahci_raid;
 pub mod intel_raid_driver;
 pub mod ipc;
 pub mod keyboard;
+pub mod stdin;
 pub mod manager;
 pub mod modular;
 pub mod mouse;
@@ -67,7 +68,7 @@ pub mod usb_xhci;
 pub mod usb_xhci_improved;
 pub mod usb_xhci_transfer;
 pub mod usb_xhci_enumerate;
-pub mod usb_xhci_interrupts;
+// pub mod usb_xhci_interrupts; // ELIMINADO - causaba kernel panics por problemas de concurrencia
 pub mod usb_xhci_port;
 pub mod usb_xhci_context;
 pub mod usb_xhci_enumerator;
