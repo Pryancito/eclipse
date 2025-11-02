@@ -59,8 +59,11 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
-const KERNEL_VIRT_BASE: u64 = 0x200000;
+const KERNEL_VIRT_BASE: u64 = 0x200000; // Dirección fija del kernel (non-PIE)
 const MAX_KERNEL_ALLOCATION: u64 = 64 * 1024 * 1024; // 64 MiB como límite razonable para el kernel
+
+/// Guardar entry point para evitar corrupción por llamadas a funciones
+static mut SAVED_ENTRY_REG: u64 = 0;
 
 #[inline(always)]
 fn pages_for_size(size: usize) -> usize { (size + 0xFFF) / 0x1000 }
@@ -567,12 +570,13 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         if phdr.p_type != PT_LOAD { continue; }
         if phdr.p_memsz == 0 { continue; }
 
-        if phdr.p_vaddr < KERNEL_VIRT_BASE {
-            unsafe {
-                serial_write_str("DEBUG: Segmento con vaddr por debajo de KERNEL_VIRT_BASE, ignorado\r\n");
-            }
-            continue;
-        }
+        // Eliminar verificación de KERNEL_VIRT_BASE - aceptar cualquier dirección para kernel PIE
+        // if phdr.p_vaddr < KERNEL_VIRT_BASE {
+        //     unsafe {
+        //         serial_write_str("DEBUG: Segmento con vaddr por debajo de KERNEL_VIRT_BASE, ignorado\r\n");
+        //     }
+        //     continue;
+        // }
 
         let seg_end = phdr.p_vaddr.checked_add(phdr.p_memsz).ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
         if seg_end <= KERNEL_VIRT_BASE { continue; }
@@ -623,10 +627,9 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         }
         Err(st_addr) => {
             unsafe {
-                serial_write_str("DEBUG: allocate_address fallo con status=0x");
-                serial_write_hex64(st_addr.status().0 as u64);
-                serial_write_str(", intentando AnyPages\r\n");
+                serial_write_str("DEBUG: allocate_address fallo, usando AnyPages\r\n");
             }
+            // Usar AnyPages para que UEFI elija una dirección disponible
             match bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_CODE, total_pages) {
                 Ok(addr) => {
                     allocated_addr = addr;
@@ -670,9 +673,13 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         }
 
         // Calcular dirección física donde cargar el segmento
-        // El kernel se carga en la dirección física asignada, y los segmentos se cargan
-        // en sus offsets relativos desde el inicio del kernel
-        let offset = phdr.p_vaddr.checked_sub(KERNEL_VIRT_BASE).unwrap_or(0);
+        // Para kernel PIE: usar p_vaddr directamente como offset desde la base de carga
+        // Para kernel con dirección fija: restar KERNEL_VIRT_BASE
+        let offset = if KERNEL_VIRT_BASE == 0x0 {
+            phdr.p_vaddr // PIE: usar vaddr directamente
+        } else {
+            phdr.p_vaddr.checked_sub(KERNEL_VIRT_BASE).unwrap_or(0) // Fixed: restar base
+        };
         let dest_phys = allocated_addr + offset;
         
         unsafe {
@@ -890,9 +897,6 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         // Mapear framebuffer si es necesario (dirección típica 0x80000000+)
         // Nota: framebuffer_info no está disponible aquí, se maneja después
 
-        // Mapear kernel específicamente: VA 0x200000 -> PA 0x0020_0000
-        // No se realiza alias específico para el kernel; el mapeo identidad cubre VA=PA
-
         // Nota: mantenemos mapeo identidad 0–64 GiB (incluyendo VirtIO en 0x800000000+)
         serial_write_str("BL: DEBUG - Mapeo de identidad extendido configurado para 64 GiB\r\n");
         serial_write_str("BL: DEBUG - VirtIO debería poder acceder a 0x800000000+\r\n");
@@ -900,6 +904,73 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
 
     unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }
     Ok((pml4_phys, stack_top))
+}
+
+/// Mapea la dirección virtual del kernel a su dirección física real
+/// Debe ser llamado DESPUÉS de cargar el kernel para conocer su dirección física
+fn map_kernel_virtual_to_physical(pml4_phys: u64, kernel_virt: u64, kernel_phys: u64, kernel_size: u64) {
+    unsafe {
+        serial_write_str("BL: Mapeando kernel VA 0x");
+        serial_write_hex64(kernel_virt);
+        serial_write_str(" -> PA 0x");
+        serial_write_hex64(kernel_phys);
+        serial_write_str(" (tamaño: 0x");
+        serial_write_hex64(kernel_size);
+        serial_write_str(")\r\n");
+    }
+    
+    let p_w: u64 = 0x003; // Present | Write
+    let ps: u64 = 0x080;   // Page Size (2MiB)
+    let addr_mask: u64 = 0x000F_FFFF_FFFF_F000u64;
+    
+    // Alinear a 2MB
+    let virt_start = kernel_virt & !0x1F_FFFFu64;
+    let phys_start = kernel_phys & !0x1F_FFFFu64;
+    let virt_end = (kernel_virt + kernel_size + 0x1F_FFFFu64) & !0x1F_FFFFu64;
+    
+    let pml4_ptr = pml4_phys as *mut u64;
+    
+    let mut virt_addr = virt_start;
+    let mut phys_addr = phys_start;
+    
+    while virt_addr < virt_end {
+        let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+        let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+        
+        unsafe {
+            // Obtener o crear PDPT
+            let pdpt_entry = pml4_ptr.add(pml4_idx);
+            let pdpt_phys = if *pdpt_entry & 0x1 != 0 {
+                *pdpt_entry & addr_mask
+            } else {
+                // Ya debería existir del mapeo de identidad, pero verificamos
+                serial_write_str("BL: ERROR - PDPT no existe para mapeo del kernel!\r\n");
+                return;
+            };
+            
+            // Obtener o crear PD
+            let pdpt_ptr = pdpt_phys as *mut u64;
+            let pd_entry = pdpt_ptr.add(pdpt_idx);
+            let pd_phys = if *pd_entry & 0x1 != 0 {
+                *pd_entry & addr_mask
+            } else {
+                serial_write_str("BL: ERROR - PD no existe para mapeo del kernel!\r\n");
+                return;
+            };
+            
+            // Mapear en PD
+            let pd_ptr = pd_phys as *mut u64;
+            *pd_ptr.add(pd_idx) = (phys_addr & addr_mask) | p_w | ps;
+        }
+        
+        virt_addr += 0x20_0000; // 2MB
+        phys_addr += 0x20_0000; // 2MB
+    }
+    
+    unsafe {
+        serial_write_str("BL: Mapeo del kernel completado\r\n");
+    }
 }
 
 fn load_eclipsefs_data(image: uefi::Handle, st: &mut SystemTable<Boot>) -> Result<(u64, u64), &'static str> {
@@ -1145,8 +1216,13 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
 
-    // CARGAR EL KERNEL ANTES DE EXIT_BOOT_SERVICES
-    let (kernel_entry, kernel_base, kernel_size, entry_reg) = {
+    // CARGAR EL KERNEL ANTES DE EXIT_BOOT_SERVICES Y SALTAR INMEDIATAMENTE
+    // No almacenar entry_point en variables que puedan corromperse
+    let mut kernel_entry_phys: u64 = 0;
+    let mut kernel_base: u64 = 0;
+    let mut kernel_size: u64 = 0;
+    
+    {
         let bs = system_table.boot_services();
         let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
 
@@ -1163,7 +1239,35 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_hex64(total_len);
                     serial_write_str("\r\n");
                 }
-                (entry_point, kernel_phys_base, total_len, entry_point)
+                
+                // Mapear la dirección virtual del kernel (0x200000) a su dirección física real
+                map_kernel_virtual_to_physical(pml4_phys, 0x200000, kernel_phys_base, total_len);
+                
+                // Calcular el entry point físico sumando el offset al base físico
+                let entry_offset = entry_point.saturating_sub(KERNEL_VIRT_BASE);
+                let entry_phys_calc = kernel_phys_base + entry_offset;
+                
+                unsafe {
+                    serial_write_str("DEBUG PRE-ASIGNACION: entry_phys_calc = 0x");
+                    serial_write_hex64(entry_phys_calc);
+                    serial_write_str(", kernel_phys_base = 0x");
+                    serial_write_hex64(kernel_phys_base);
+                    serial_write_str(", entry_offset = 0x");
+                    serial_write_hex64(entry_offset);
+                    serial_write_str("\r\n");
+                }
+                
+                // Asignar a variables fuera del scope para evitar corrupción
+                kernel_entry_phys = entry_phys_calc;
+                kernel_base = kernel_phys_base;
+                kernel_size = total_len;
+                
+                // DEBUG INMEDIATO: verificar que se asignó correctamente
+                unsafe {
+                    serial_write_str("DEBUG: kernel_entry_phys ASIGNADO = 0x");
+                    serial_write_hex64(kernel_entry_phys);
+                    serial_write_str("\r\n");
+                }
             },
             Err(e) => {
                 unsafe {
@@ -1189,10 +1293,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str("\r\n");
                 }
                 // Mantener valores por defecto si falla la carga
-                (0x200000u64, KERNEL_PHYS_LOAD_ADDR, 0, 0x200000u64)
+                kernel_entry_phys = 0x200000;
+                kernel_base = KERNEL_PHYS_LOAD_ADDR;
+                kernel_size = 0;
             }
         }
-    };
+    }
 
     // Volcar log a archivo antes de ExitBootServices y mapear framebuffer
     {
@@ -1216,33 +1322,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Configurar paginación identidad y pila y saltar al kernel (sin usar la pila después de cambiarla)
     unsafe {
 
-        // Debug: mostrar valores antes de configurar CR3
-        serial_write_str("BL: entry_reg=0x");
-        {
-            let mut buf = [0u8; 16];
-            let mut n = 0usize;
-            for i in (0..16).rev() {
-                let nyb = ((entry_reg >> (i*4)) & 0xF) as u8;
-                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
-            }
-            for i in 0..n { serial_write_byte(buf[i]); }
-        }
-        serial_write_str(" pml4_phys=0x");
-        {
-            let mut buf = [0u8; 16];
-            let mut n = 0usize;
-            for i in (0..16).rev() {
-                let nyb = ((pml4_phys >> (i*4)) & 0xF) as u8;
-                buf[n] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; n+=1;
-            }
-            for i in 0..n { serial_write_byte(buf[i]); }
-        }
-        serial_write_str("\r\n");
-
         // DEBUG: Verificar estado antes del salto
         serial_write_str("BL: DEBUG antes del salto:\r\n");
-        serial_write_str("BL: entry_reg=");
-        serial_write_hex64(entry_reg);
+        serial_write_str("BL: kernel_entry_phys=");
+        serial_write_hex64(kernel_entry_phys);
         serial_write_str(" pml4_phys=");
         serial_write_hex64(pml4_phys);
         serial_write_str(" stack_top=");
@@ -1251,9 +1334,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // Verificar que el código esté en la dirección física correcta
         serial_write_str("BL: verificando kernel en PA ");
-        serial_write_hex64(entry_reg);
+        serial_write_hex64(kernel_base);
         serial_write_str(": ");
-        let kernel_ptr = entry_reg as *const u8;
+        let kernel_ptr = kernel_base as *const u8;
         for i in 0..16 {
             let byte = unsafe { *kernel_ptr.add(i) };
             serial_write_hex8(byte);
@@ -1266,7 +1349,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         // Verificar que el kernel esté realmente cargado ANTES del salto
         serial_write_str("BL: verificando kernel ANTES del salto: ");
-        let kernel_check_ptr = entry_reg as *const u8;
+        let kernel_check_ptr = kernel_base as *const u8;
         for i in 0..32 {
             let byte = unsafe { *kernel_check_ptr.add(i) };
             serial_write_hex8(byte);
@@ -1330,7 +1413,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
                 
                 // RECTÁNGULO 2: KERNEL CARGADO - VERDE si OK, ROJO si ERROR
-                let kernel_loaded = entry_reg != 0 && kernel_size > 0;
+                let kernel_loaded = kernel_entry_phys != 0 && kernel_size > 0;
                 let color2 = if kernel_loaded { 0x0000FF00 } else { 0x00FF0000 }; // Verde o Rojo
                 {
                     let y_start: u32 = 100;
@@ -1423,7 +1506,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
                 
                 // Estado 3: ENTRY POINT OK - GRIS si OK, ROJO si ERROR
-                let entry_ok = entry_reg != 0 && (entry_reg & 0xFFF) == 0; // Verificar alineación
+                let entry_ok = kernel_entry_phys != 0 && (kernel_entry_phys & 0xFFF) == 0; // Verificar alineación
                 let color_s3 = if entry_ok { 0x00808080 } else { 0x00FF0000 }; // Gris o Rojo
                 {
                     let y_start: u32 = 600;
@@ -1507,7 +1590,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 serial_write_str("\r\nBL: RSP (Stack): ");
                 serial_write_hex64(rsp_alineado);
                 serial_write_str("\r\nBL: Entry Point: ");
-                serial_write_hex64(entry_reg);
+                serial_write_hex64(kernel_entry_phys);
                 serial_write_str("\r\nBL: Framebuffer Info: ");
                 serial_write_hex64(framebuffer_info_ptr);
                 
@@ -1564,19 +1647,17 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         // Debug adicional del entry point
         serial_write_str("BL: Entry point calculado: 0x");
-        serial_write_hex64(entry_reg);
+        serial_write_hex64(kernel_entry_phys);
         serial_write_str("\r\n");
         serial_write_str("BL: Framebuffer info ptr: 0x");
         serial_write_hex64(framebuffer_info_ptr);
         serial_write_str("\r\n");
         
-        // Debug crítico: verificar que entry_reg no sea 0xB0000
-        if entry_reg == 0xB0000 {
-            serial_write_str("BL: ERROR CRITICO - entry_reg es 0xB0000! Esto es incorrecto!\r\n");
-            serial_write_str("BL: Abortando salto al kernel para evitar crash\r\n");
-            return Status::SUCCESS;
-        }
-
+        // Debug crítico: mostrar entry_reg exacto antes del salto
+        serial_write_str("BL: VALOR FINAL entry_phys antes del ASM: 0x");
+        serial_write_hex64(kernel_entry_phys);
+        serial_write_str("\r\n");
+        
         // Pasar el puntero a la estructura de framebuffer en rdi (primer argumento de la ABI x86_64)
         // Usar la dirección física calculada del entry point del kernel
         core::arch::asm!(
@@ -1588,7 +1669,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             cr3 = in(reg) cr3_value,
             rsp = in(reg) rsp_alineado,
             fbinfo = in(reg) framebuffer_info_ptr,
-            entry = in(reg) entry_reg
+            entry = in(reg) kernel_entry_phys
         );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)

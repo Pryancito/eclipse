@@ -1108,8 +1108,13 @@ main() {
     # Crear distribución completa para compatibilidad con instalador
     create_basic_distribution
     
-    # Crear imagen booteable USB
-    create_bootable_image
+    # Crear imagen booteable USB solo si se solicita explícitamente
+    if [ "$1" = "image" ]; then
+        create_bootable_image
+    else
+        echo ""
+        print_status "Imagen de disco NO creada. Para crearla ejecuta: ./build.sh image"
+    fi
     
     show_build_summary
 }

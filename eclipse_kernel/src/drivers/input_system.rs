@@ -43,6 +43,135 @@ where
     guard.as_mut().map(f)
 }
 
+/// Agrega un evento de entrada al sistema global
+/// 
+/// Esta función es thread-safe y puede ser llamada desde drivers USB HID, PS/2, etc.
+pub fn push_input_event(event: InputEvent) -> Result<(), &'static str> {
+    with_input_system(|system| {
+        system.add_event(event);
+    }).ok_or("InputSystem no inicializado")
+}
+
+/// Crea y agrega un evento de teclado al sistema
+pub fn push_keyboard_event(key_event: KeyboardEvent, device_id: u32) -> Result<(), &'static str> {
+    let timestamp = with_input_system(|s| s.current_timestamp).unwrap_or(0);
+    let event = InputEvent::new(
+        InputEventType::Keyboard(key_event),
+        device_id,
+        timestamp,
+    );
+    push_input_event(event)
+}
+
+/// Crea y agrega un evento de ratón al sistema
+pub fn push_mouse_event(mouse_event: MouseEvent, device_id: u32) -> Result<(), &'static str> {
+    let timestamp = with_input_system(|s| s.current_timestamp).unwrap_or(0);
+    let event = InputEvent::new(
+        InputEventType::Mouse(mouse_event),
+        device_id,
+        timestamp,
+    );
+    push_input_event(event)
+}
+
+/// API para que aplicaciones consuman eventos de entrada
+/// 
+/// Obtiene el siguiente evento disponible del InputSystem global
+pub fn get_next_input_event() -> Option<InputEvent> {
+    with_input_system(|system| {
+        system.get_next_event()
+    }).flatten()
+}
+
+/// Verifica si hay eventos de entrada pendientes
+pub fn has_input_events() -> bool {
+    with_input_system(|system| {
+        system.has_events()
+    }).unwrap_or(false)
+}
+
+/// Obtiene el número de eventos pendientes
+pub fn input_event_count() -> usize {
+    with_input_system(|system| {
+        system.event_count()
+    }).unwrap_or(0)
+}
+
+/// Limpia todos los eventos pendientes
+pub fn clear_input_events() {
+    with_input_system(|system| {
+        system.clear_events();
+    });
+}
+
+/// Obtiene estadísticas del InputSystem
+pub fn get_input_stats() -> Option<InputSystemStats> {
+    with_input_system(|system| {
+        system.get_stats().clone()
+    })
+}
+
+/// Obtiene eventos de un tipo específico
+pub fn get_keyboard_events(max_count: usize) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    
+    with_input_system(|system| {
+        let mut count = 0;
+        let mut remaining_events = Vec::new();
+        
+        while count < max_count {
+            if let Some(event) = system.get_next_event() {
+                if event.is_keyboard() {
+                    events.push(event);
+                    count += 1;
+                } else {
+                    // Re-encolar eventos que no son de teclado
+                    remaining_events.push(event);
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // Re-encolar eventos no procesados
+        for event in remaining_events {
+            system.add_event(event);
+        }
+    });
+    
+    events
+}
+
+/// Obtiene eventos de ratón
+pub fn get_mouse_events(max_count: usize) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    
+    with_input_system(|system| {
+        let mut count = 0;
+        let mut remaining_events = Vec::new();
+        
+        while count < max_count {
+            if let Some(event) = system.get_next_event() {
+                if event.is_mouse() {
+                    events.push(event);
+                    count += 1;
+                } else {
+                    remaining_events.push(event);
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // Re-encolar eventos no procesados
+        for event in remaining_events {
+            system.add_event(event);
+        }
+    });
+    
+    events
+}
+
 /// Sistema de entrada unificado para Eclipse OS
 /// Gestiona eventos de teclado y mouse de forma centralizada
 

@@ -13,6 +13,7 @@ pub mod dma;
 pub mod shared_memory;
 pub mod virtual_memory;
 pub mod memory_manager;
+pub mod physical;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;

@@ -58,6 +58,7 @@ pub mod uefi_gop;
 pub mod uefi_graphics;
 pub mod usb;
 pub mod usb_hid;
+pub mod usb_hid_reader; // Lector seguro de datos HID desde XHCI
 pub mod usb_hub;
 pub mod usb_keyboard;
 pub mod usb_keyboard_real;
@@ -66,6 +67,8 @@ pub mod usb_mouse;
 pub mod usb_mouse_real;
 pub mod usb_xhci;
 pub mod usb_xhci_improved;
+pub mod usb_xhci_global;
+pub mod usb_xhci_with_crate; // Acceso global seguro al XHCI
 pub mod usb_xhci_transfer;
 pub mod usb_xhci_enumerate;
 // pub mod usb_xhci_interrupts; // ELIMINADO - causaba kernel panics por problemas de concurrencia

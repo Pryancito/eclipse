@@ -10,6 +10,10 @@ PHDRS
 
 SECTIONS
 {
+    /* Dirección fija en 2MB - kernel NO relocatable (non-PIE)
+     * TODO: Investigar soporte PIE cuando el bootloader esté más maduro
+     * Intentamos PIE pero el bootloader tiene problemas con la relocación.
+     */
     . = 0x200000;
     
     .init : {

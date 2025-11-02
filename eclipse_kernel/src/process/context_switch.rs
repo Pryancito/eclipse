@@ -10,17 +10,27 @@ use core::arch::asm;
 
 /// Guardar contexto del proceso actual
 pub fn save_context(context: &mut CpuContext) {
-    // Por ahora, guardado simplificado
-    // En un sistema completo, esto se haría con assembly optimizado
     unsafe {
-        // Guardar registros críticos
         let mut temp: u64;
         
+        // Guardar todos los registros de propósito general
         asm!("mov {}, rax", out(reg) temp, options(nostack, nomem));
         context.rax = temp;
         
         asm!("mov {}, rbx", out(reg) temp, options(nostack, nomem));
         context.rbx = temp;
+        
+        asm!("mov {}, rcx", out(reg) temp, options(nostack, nomem));
+        context.rcx = temp;
+        
+        asm!("mov {}, rdx", out(reg) temp, options(nostack, nomem));
+        context.rdx = temp;
+        
+        asm!("mov {}, rsi", out(reg) temp, options(nostack, nomem));
+        context.rsi = temp;
+        
+        asm!("mov {}, rdi", out(reg) temp, options(nostack, nomem));
+        context.rdi = temp;
         
         asm!("mov {}, rsp", out(reg) temp, options(nostack, nomem));
         context.rsp = temp;
@@ -28,33 +38,94 @@ pub fn save_context(context: &mut CpuContext) {
         asm!("mov {}, rbp", out(reg) temp, options(nostack, nomem));
         context.rbp = temp;
         
+        // Registros extendidos R8-R15
+        asm!("mov {}, r8", out(reg) temp, options(nostack, nomem));
+        context.r8 = temp;
+        
+        asm!("mov {}, r9", out(reg) temp, options(nostack, nomem));
+        context.r9 = temp;
+        
+        asm!("mov {}, r10", out(reg) temp, options(nostack, nomem));
+        context.r10 = temp;
+        
+        asm!("mov {}, r11", out(reg) temp, options(nostack, nomem));
+        context.r11 = temp;
+        
+        asm!("mov {}, r12", out(reg) temp, options(nostack, nomem));
+        context.r12 = temp;
+        
+        asm!("mov {}, r13", out(reg) temp, options(nostack, nomem));
+        context.r13 = temp;
+        
+        asm!("mov {}, r14", out(reg) temp, options(nostack, nomem));
+        context.r14 = temp;
+        
+        asm!("mov {}, r15", out(reg) temp, options(nostack, nomem));
+        context.r15 = temp;
+        
+        // Guardar RIP (instruction pointer) - usar dirección de retorno
+        asm!("lea {}, [rip]", out(reg) temp, options(nostack, nomem));
+        context.rip = temp;
+        
         // Guardar flags
         asm!("pushfq", "pop {}", out(reg) temp, options(nomem));
         context.rflags = temp;
         
-        // Segmentos (valores fijos por ahora)
-        context.cs = 0x08;
-        context.ds = 0x10;
-        context.ss = 0x10;
-        context.es = 0x10;
+        // Guardar selectores de segmento
+        asm!("mov {0:x}, cs", out(reg) temp, options(nostack, nomem));
+        context.cs = temp as u16;
+        
+        asm!("mov {0:x}, ds", out(reg) temp, options(nostack, nomem));
+        context.ds = temp as u16;
+        
+        asm!("mov {0:x}, ss", out(reg) temp, options(nostack, nomem));
+        context.ss = temp as u16;
+        
+        asm!("mov {0:x}, es", out(reg) temp, options(nostack, nomem));
+        context.es = temp as u16;
+        
+        asm!("mov {0:x}, fs", out(reg) temp, options(nostack, nomem));
+        context.fs = temp as u16;
+        
+        asm!("mov {0:x}, gs", out(reg) temp, options(nostack, nomem));
+        context.gs = temp as u16;
     }
 }
 
 /// Cargar contexto de un proceso
 pub unsafe fn load_context(context: &CpuContext) {
-    // Carga simplificada por ahora
-    // En un sistema completo, esto se haría con assembly optimizado
-    
-    // Cargar registros críticos
+    // Cargar todos los registros de propósito general
     asm!("mov rax, {}", in(reg) context.rax, options(nostack, nomem));
     asm!("mov rbx, {}", in(reg) context.rbx, options(nostack, nomem));
+    asm!("mov rcx, {}", in(reg) context.rcx, options(nostack, nomem));
+    asm!("mov rdx, {}", in(reg) context.rdx, options(nostack, nomem));
+    asm!("mov rsi, {}", in(reg) context.rsi, options(nostack, nomem));
+    asm!("mov rdi, {}", in(reg) context.rdi, options(nostack, nomem));
     asm!("mov rbp, {}", in(reg) context.rbp, options(nostack, nomem));
+    
+    // Registros extendidos R8-R15
+    asm!("mov r8, {}", in(reg) context.r8, options(nostack, nomem));
+    asm!("mov r9, {}", in(reg) context.r9, options(nostack, nomem));
+    asm!("mov r10, {}", in(reg) context.r10, options(nostack, nomem));
+    asm!("mov r11, {}", in(reg) context.r11, options(nostack, nomem));
+    asm!("mov r12, {}", in(reg) context.r12, options(nostack, nomem));
+    asm!("mov r13, {}", in(reg) context.r13, options(nostack, nomem));
+    asm!("mov r14, {}", in(reg) context.r14, options(nostack, nomem));
+    asm!("mov r15, {}", in(reg) context.r15, options(nostack, nomem));
+    
+    // Cargar selectores de segmento
+    asm!("mov ds, {0:x}", in(reg) context.ds as u64, options(nostack, nomem));
+    asm!("mov es, {0:x}", in(reg) context.es as u64, options(nostack, nomem));
+    asm!("mov fs, {0:x}", in(reg) context.fs as u64, options(nostack, nomem));
+    asm!("mov gs, {0:x}", in(reg) context.gs as u64, options(nostack, nomem));
     
     // Cargar flags
     asm!("push {}", "popfq", in(reg) context.rflags, options(nomem));
     
-    // Cargar stack (último)
+    // Cargar stack pointer (último, para no perder el contexto)
     asm!("mov rsp, {}", in(reg) context.rsp, options(nostack, nomem));
+    
+    // Note: RIP se cargará con un ret o jmp desde el código que llama a load_context
 }
 
 /// Cambiar al siguiente proceso

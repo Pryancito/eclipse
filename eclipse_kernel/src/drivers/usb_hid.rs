@@ -1,360 +1,427 @@
-/// Driver HID (Human Interface Device) para USB
-/// 
-/// Este driver implementa el protocolo HID para dispositivos de entrada USB:
-/// - Teclados USB
-/// - Ratones/Mouse USB
-/// - Gamepads/Joysticks USB
-///
-/// Basado en la especificación HID 1.11
+//! Driver USB HID (Human Interface Device) para teclado y ratón
+//! 
+//! Este módulo implementa el soporte para dispositivos de entrada USB:
+//! - Teclados USB (boot protocol)
+//! - Ratones USB (boot protocol)
+//! 
+//! Integración con InputSystem para unificar entrada PS/2 y USB
 
-use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
-use alloc::format;
 
-use crate::drivers::manager::DriverResult;
-use crate::drivers::usb_xhci_control::*;
+/// Protocolo USB HID Boot para teclado
+const HID_PROTOCOL_KEYBOARD: u8 = 1;
+
+/// Protocolo USB HID Boot para ratón
+const HID_PROTOCOL_MOUSE: u8 = 2;
 
 /// Tipo de dispositivo HID
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HidDeviceType {
     Keyboard,
     Mouse,
-    Gamepad,
-    Unknown(u8),
+    Unknown,
 }
 
-/// Subclase HID (Boot Interface)
-pub const HID_SUBCLASS_BOOT: u8 = 1;
-
-/// Protocolos HID para Boot Interface
-pub const HID_PROTOCOL_KEYBOARD: u8 = 1;
-pub const HID_PROTOCOL_MOUSE: u8 = 2;
-
-/// Descriptor HID
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct HidDescriptor {
-    pub length: u8,              // Tamaño del descriptor (9 bytes mínimo)
-    pub descriptor_type: u8,     // Tipo (0x21 para HID)
-    pub hid_version: u16,        // Versión HID (ej: 0x0111 para 1.11)
-    pub country_code: u8,        // Código del país (0 = no específico)
-    pub num_descriptors: u8,     // Número de descriptores de clase
-    pub report_descriptor_type: u8,  // Tipo del Report Descriptor (0x22)
-    pub report_descriptor_length: u16, // Longitud del Report Descriptor
-}
-
-/// Boot Protocol Keyboard Report (8 bytes)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct KeyboardReport {
-    pub modifiers: u8,           // Bits: Ctrl, Shift, Alt, etc.
-    pub reserved: u8,            // Reservado (debe ser 0)
-    pub keys: [u8; 6],          // Hasta 6 teclas presionadas simultáneamente
-}
-
-impl KeyboardReport {
-    pub fn new() -> Self {
-        Self {
-            modifiers: 0,
-            reserved: 0,
-            keys: [0; 6],
-        }
-    }
-    
-    /// Verifica si una tecla está presionada
-    pub fn is_key_pressed(&self, keycode: u8) -> bool {
-        self.keys.iter().any(|&k| k == keycode)
-    }
-    
-    /// Obtiene el primer keycode presionado
-    pub fn get_first_key(&self) -> Option<u8> {
-        self.keys.iter().find(|&&k| k != 0).copied()
-    }
-    
-    /// Verifica si Ctrl está presionado
-    pub fn is_ctrl(&self) -> bool {
-        (self.modifiers & 0x11) != 0  // Left Ctrl o Right Ctrl
-    }
-    
-    /// Verifica si Shift está presionado
-    pub fn is_shift(&self) -> bool {
-        (self.modifiers & 0x22) != 0  // Left Shift o Right Shift
-    }
-    
-    /// Verifica si Alt está presionado
-    pub fn is_alt(&self) -> bool {
-        (self.modifiers & 0x44) != 0  // Left Alt o Right Alt
-    }
-}
-
-/// Boot Protocol Mouse Report (3-4 bytes)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct MouseReport {
-    pub buttons: u8,             // Bits: Left, Right, Middle, etc.
-    pub x: i8,                   // Movimiento X (relativo)
-    pub y: i8,                   // Movimiento Y (relativo)
-    pub wheel: i8,               // Rueda del mouse (opcional)
-}
-
-impl MouseReport {
-    pub fn new() -> Self {
-        Self {
-            buttons: 0,
-            x: 0,
-            y: 0,
-            wheel: 0,
-        }
-    }
-    
-    /// Verifica si el botón izquierdo está presionado
-    pub fn is_left_button(&self) -> bool {
-        (self.buttons & 0x01) != 0
-    }
-    
-    /// Verifica si el botón derecho está presionado
-    pub fn is_right_button(&self) -> bool {
-        (self.buttons & 0x02) != 0
-    }
-    
-    /// Verifica si el botón central está presionado
-    pub fn is_middle_button(&self) -> bool {
-        (self.buttons & 0x04) != 0
-    }
-}
-
-/// Dispositivo HID
+/// Estado de un dispositivo HID
 pub struct HidDevice {
-    slot_id: u8,
-    device_type: HidDeviceType,
-    interface_number: u8,
-    endpoint_in: u8,             // Endpoint IN (para recibir datos del dispositivo)
-    max_packet_size: u16,
-    poll_interval: u8,           // Intervalo de polling (en ms)
-    boot_protocol: bool,         // true si usa Boot Protocol
+    pub slot_id: u8,
+    pub device_type: HidDeviceType,
+    pub endpoint_in: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+    // Estado del teclado
+    pub keyboard_leds: u8,
+    pub last_keyboard_report: [u8; 8],
+    // Estado del ratón
+    pub last_mouse_buttons: u8,
+    pub mouse_x: i16,
+    pub mouse_y: i16,
 }
 
 impl HidDevice {
-    /// Crea un nuevo dispositivo HID
-    pub fn new(slot_id: u8, device_type: HidDeviceType, interface_number: u8) -> Self {
+    pub fn new_keyboard(slot_id: u8, endpoint_in: u8) -> Self {
         Self {
             slot_id,
-            device_type,
-            interface_number,
-            endpoint_in: 0x81,  // Por defecto EP1 IN
+            device_type: HidDeviceType::Keyboard,
+            endpoint_in,
             max_packet_size: 8,
-            poll_interval: 10,  // 10ms por defecto
-            boot_protocol: false,
+            interval: 10,
+            keyboard_leds: 0,
+            last_keyboard_report: [0; 8],
+            last_mouse_buttons: 0,
+            mouse_x: 0,
+            mouse_y: 0,
         }
     }
-    
-    /// Detecta el tipo de dispositivo HID
-    pub fn detect_from_protocol(protocol: u8) -> HidDeviceType {
-        match protocol {
-            HID_PROTOCOL_KEYBOARD => HidDeviceType::Keyboard,
-            HID_PROTOCOL_MOUSE => HidDeviceType::Mouse,
-            _ => HidDeviceType::Unknown(protocol),
-        }
-    }
-    
-    /// Configura el endpoint IN
-    pub fn set_endpoint(&mut self, endpoint: u8, max_packet: u16, interval: u8) {
-        self.endpoint_in = endpoint;
-        self.max_packet_size = max_packet;
-        self.poll_interval = interval;
-    }
-    
-    /// Habilita Boot Protocol
-    pub fn enable_boot_protocol(&mut self) -> DriverResult<()> {
-        crate::debug::serial_write_str(&format!(
-            "USB_HID: Habilitando Boot Protocol para {:?}\n",
-            self.device_type
-        ));
-        
-        self.boot_protocol = true;
-        Ok(())
-    }
-    
-    /// Obtiene el slot ID
-    pub fn slot_id(&self) -> u8 {
-        self.slot_id
-    }
-    
-    /// Obtiene el tipo de dispositivo
-    pub fn device_type(&self) -> HidDeviceType {
-        self.device_type
-    }
-    
-    /// Obtiene el endpoint IN
-    pub fn endpoint_in(&self) -> u8 {
-        self.endpoint_in
-    }
-}
 
-/// Manager de dispositivos HID
-pub struct HidManager {
-    devices: Vec<HidDevice>,
-}
-
-impl HidManager {
-    /// Crea un nuevo manager
-    pub fn new() -> Self {
+    pub fn new_mouse(slot_id: u8, endpoint_in: u8) -> Self {
         Self {
-            devices: Vec::new(),
+            slot_id,
+            device_type: HidDeviceType::Mouse,
+            endpoint_in,
+            max_packet_size: 4,
+            interval: 10,
+            keyboard_leds: 0,
+            last_keyboard_report: [0; 8],
+            last_mouse_buttons: 0,
+            mouse_x: 0,
+            mouse_y: 0,
         }
     }
-    
-    /// Registra un dispositivo HID
-    pub fn register_device(&mut self, device: HidDevice) {
-        crate::debug::serial_write_str(&format!(
-            "USB_HID: Registrando dispositivo {:?} (slot={})\n",
-            device.device_type, device.slot_id
-        ));
-        
-        self.devices.push(device);
-    }
-    
-    /// Obtiene todos los teclados
-    pub fn get_keyboards(&self) -> Vec<&HidDevice> {
-        self.devices.iter()
-            .filter(|d| d.device_type == HidDeviceType::Keyboard)
-            .collect()
-    }
-    
-    /// Obtiene todos los ratones
-    pub fn get_mice(&self) -> Vec<&HidDevice> {
-        self.devices.iter()
-            .filter(|d| d.device_type == HidDeviceType::Mouse)
-            .collect()
-    }
-    
-    /// Obtiene el número de dispositivos
-    pub fn device_count(&self) -> usize {
-        self.devices.len()
-    }
-}
 
-/// Comandos HID específicos
-pub mod hid_commands {
-    use super::*;
-    
-    /// SET_PROTOCOL request (HID 1.11, sección 7.2.6)
-    /// protocol: 0 = Boot Protocol, 1 = Report Protocol
-    pub fn set_protocol(interface: u8, protocol: u8) -> SetupPacket {
-        SetupPacket::new(
-            0x21,  // Class, Interface
-            0x0B,  // SET_PROTOCOL
-            protocol as u16,
-            interface as u16,
-            0,
-        )
-    }
-    
-    /// GET_REPORT request (HID 1.11, sección 7.2.1)
-    pub fn get_report(interface: u8, report_type: u8, report_id: u8, length: u16) -> SetupPacket {
-        SetupPacket::new(
-            0xA1,  // Class, Interface, Device to Host
-            0x01,  // GET_REPORT
-            ((report_type as u16) << 8) | (report_id as u16),
-            interface as u16,
-            length,
-        )
-    }
-    
-    /// SET_IDLE request (HID 1.11, sección 7.2.4)
-    /// duration: duración en múltiplos de 4ms (0 = infinito)
-    pub fn set_idle(interface: u8, duration: u8, report_id: u8) -> SetupPacket {
-        SetupPacket::new(
-            0x21,  // Class, Interface
-            0x0A,  // SET_IDLE
-            ((duration as u16) << 8) | (report_id as u16),
-            interface as u16,
-            0,
-        )
-    }
-    
-    /// GET_DESCRIPTOR request para HID Report Descriptor
-    pub fn get_hid_report_descriptor(interface: u8, length: u16) -> SetupPacket {
-        SetupPacket::new(
-            0x81,  // Standard, Interface, Device to Host
-            0x06,  // GET_DESCRIPTOR
-            0x2200,  // Report Descriptor
-            interface as u16,
-            length,
-        )
-    }
-}
-
-/// Mapeo de USB HID keycodes a caracteres ASCII
-pub fn keycode_to_char(keycode: u8, shift: bool) -> Option<char> {
-    match keycode {
-        0x04..=0x1D => {  // A-Z
-            let base = if shift { b'A' } else { b'a' };
-            Some((base + (keycode - 0x04)) as char)
+    /// Procesa un reporte de teclado USB (formato boot protocol)
+    /// 
+    /// Formato del reporte (8 bytes):
+    /// - Byte 0: Modificadores (Ctrl, Shift, Alt, etc.)
+    /// - Byte 1: Reservado
+    /// - Bytes 2-7: Códigos de teclas presionadas (hasta 6 simultáneas)
+    pub fn process_keyboard_report(&mut self, data: &[u8]) {
+        if data.len() < 8 {
+            return;
         }
-        0x1E..=0x26 => {  // 1-9
-            if shift {
-                match keycode {
-                    0x1E => Some('!'),
-                    0x1F => Some('@'),
-                    0x20 => Some('#'),
-                    0x21 => Some('$'),
-                    0x22 => Some('%'),
-                    0x23 => Some('^'),
-                    0x24 => Some('&'),
-                    0x25 => Some('*'),
-                    0x26 => Some('('),
-                    _ => None,
+
+        use crate::debug::serial_write_str;
+
+        let modifiers = data[0];
+        let current_keys = &data[2..8];
+        let previous_keys = &self.last_keyboard_report[2..8];
+
+        // Detectar teclas presionadas (key down)
+        for &keycode in current_keys {
+            if keycode != 0 && !previous_keys.contains(&keycode) {
+                let ch = usb_keycode_to_char(keycode, (modifiers & 0x22) != 0);
+                if ch != '\0' {
+                    serial_write_str("USB_KBD: Key pressed: ");
+                    if ch.is_ascii_graphic() || ch == ' ' {
+                        let buf = [ch as u8];
+                        if let Ok(s) = core::str::from_utf8(&buf) {
+                            serial_write_str(s);
+                        }
+                    }
+                    serial_write_str("\n");
+                    
+                    // Enviar evento al InputSystem
+                    let kbd_event = crate::drivers::usb_keyboard::KeyboardEvent {
+                        key_code: crate::drivers::usb_keyboard::UsbKeyCode::from_hid_code(keycode),
+                        pressed: true,
+                        modifiers: hid_modifiers_to_state(modifiers),
+                        character: Some(ch),
+                        timestamp: 0, // Se actualizará en InputSystem
+                    };
+                    
+                    let _ = crate::drivers::input_system::push_keyboard_event(kbd_event, self.slot_id as u32);
                 }
-            } else {
-                Some(((keycode - 0x1E) as u8 + b'1') as char)
             }
         }
-        0x27 => Some(if shift { ')' } else { '0' }),  // 0
-        0x28 => Some('\n'),  // Enter
-        0x29 => Some('\x1B'),  // Escape
-        0x2A => Some('\x08'),  // Backspace
-        0x2B => Some('\t'),  // Tab
-        0x2C => Some(' '),  // Space
-        0x2D => Some(if shift { '_' } else { '-' }),
-        0x2E => Some(if shift { '+' } else { '=' }),
-        0x2F => Some(if shift { '{' } else { '[' }),
-        0x30 => Some(if shift { '}' } else { ']' }),
-        0x31 => Some(if shift { '|' } else { '\\' }),
-        0x33 => Some(if shift { ':' } else { ';' }),
-        0x34 => Some(if shift { '"' } else { '\'' }),
-        0x35 => Some(if shift { '~' } else { '`' }),
-        0x36 => Some(if shift { '<' } else { ',' }),
-        0x37 => Some(if shift { '>' } else { '.' }),
-        0x38 => Some(if shift { '?' } else { '/' }),
-        _ => None,
+        
+        // Detectar teclas liberadas (key up)
+        for &keycode in previous_keys {
+            if keycode != 0 && !current_keys.contains(&keycode) {
+                // Tecla liberada
+                let kbd_event = crate::drivers::usb_keyboard::KeyboardEvent {
+                    key_code: crate::drivers::usb_keyboard::UsbKeyCode::from_hid_code(keycode),
+                    pressed: false,
+                    modifiers: hid_modifiers_to_state(modifiers),
+                    character: None,
+                    timestamp: 0,
+                };
+                
+                let _ = crate::drivers::input_system::push_keyboard_event(kbd_event, self.slot_id as u32);
+            }
+        }
+
+        // Guardar reporte actual para la próxima comparación
+        self.last_keyboard_report.copy_from_slice(data);
+    }
+
+    /// Procesa un reporte de ratón USB (formato boot protocol)
+    /// 
+    /// Formato del reporte (3-4 bytes):
+    /// - Byte 0: Botones (bit 0=izq, bit 1=der, bit 2=medio)
+    /// - Byte 1: Movimiento X (signed)
+    /// - Byte 2: Movimiento Y (signed)
+    /// - Byte 3: Rueda (opcional, signed)
+    pub fn process_mouse_report(&mut self, data: &[u8]) {
+        if data.len() < 3 {
+            return;
+        }
+
+        use crate::debug::serial_write_str;
+
+        let buttons = data[0];
+        let dx = data[1] as i8 as i16;
+        let dy = data[2] as i8 as i16;
+
+        // Actualizar posición acumulada
+        self.mouse_x = self.mouse_x.saturating_add(dx);
+        self.mouse_y = self.mouse_y.saturating_add(dy);
+
+        // Detectar cambios en botones o movimiento
+        let buttons_changed = buttons != self.last_mouse_buttons;
+        let movement = dx != 0 || dy != 0;
+
+        if buttons_changed || movement {
+            serial_write_str(&alloc::format!("USB_MOUSE: pos=({},{}), buttons={:03b}\n", 
+                self.mouse_x, self.mouse_y, buttons));
+            
+            // Enviar evento al InputSystem
+            // Crear el MouseEvent usando el enum correcto
+            use crate::drivers::usb_mouse;
+            
+            let position = usb_mouse::MousePosition {
+                x: self.mouse_x as i32,
+                y: self.mouse_y as i32,
+            };
+            
+            let button_state = usb_mouse::MouseButtonState {
+                left: (buttons & 0x01) != 0,
+                right: (buttons & 0x02) != 0,
+                middle: (buttons & 0x04) != 0,
+                side1: false,
+                side2: false,
+            };
+            
+            // MouseEvent es un enum, crear el variant correcto
+            if movement {
+                let event = usb_mouse::MouseEvent::Move { 
+                    position,
+                    buttons: button_state.clone(),
+                };
+                let _ = crate::drivers::input_system::push_mouse_event(event, self.slot_id as u32);
+            }
+            
+            if buttons_changed {
+                // Detectar qué botón cambió
+                let prev_left = (self.last_mouse_buttons & 0x01) != 0;
+                let prev_right = (self.last_mouse_buttons & 0x02) != 0;
+                let prev_middle = (self.last_mouse_buttons & 0x04) != 0;
+                
+                if ((buttons & 0x01) != 0) != prev_left {
+                    let button = usb_mouse::MouseButton::Left;
+                    let event = if (buttons & 0x01) != 0 {
+                        usb_mouse::MouseEvent::ButtonPress { button, position }
+                    } else {
+                        usb_mouse::MouseEvent::ButtonRelease { button, position }
+                    };
+                    let _ = crate::drivers::input_system::push_mouse_event(event, self.slot_id as u32);
+                }
+                
+                if ((buttons & 0x02) != 0) != prev_right {
+                    let button = usb_mouse::MouseButton::Right;
+                    let event = if (buttons & 0x02) != 0 {
+                        usb_mouse::MouseEvent::ButtonPress { button, position }
+                    } else {
+                        usb_mouse::MouseEvent::ButtonRelease { button, position }
+                    };
+                    let _ = crate::drivers::input_system::push_mouse_event(event, self.slot_id as u32);
+                }
+                
+                if ((buttons & 0x04) != 0) != prev_middle {
+                    let button = usb_mouse::MouseButton::Middle;
+                    let event = if (buttons & 0x04) != 0 {
+                        usb_mouse::MouseEvent::ButtonPress { button, position }
+                    } else {
+                        usb_mouse::MouseEvent::ButtonRelease { button, position }
+                    };
+                    let _ = crate::drivers::input_system::push_mouse_event(event, self.slot_id as u32);
+                }
+            }
+            
+            self.last_mouse_buttons = buttons;
+        }
     }
 }
 
-/// Convierte keycode a nombre de tecla
-pub fn keycode_to_name(keycode: u8) -> &'static str {
-    match keycode {
-        0x00 => "None",
-        0x04..=0x1D => {
-            const LETTERS: &[&str] = &[
-                "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-                "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"
-            ];
-            LETTERS[(keycode - 0x04) as usize]
-        }
-        0x1E => "1", 0x1F => "2", 0x20 => "3", 0x21 => "4", 0x22 => "5",
-        0x23 => "6", 0x24 => "7", 0x25 => "8", 0x26 => "9", 0x27 => "0",
-        0x28 => "Enter",
-        0x29 => "Escape",
-        0x2A => "Backspace",
-        0x2B => "Tab",
-        0x2C => "Space",
-        0x3A => "F1", 0x3B => "F2", 0x3C => "F3", 0x3D => "F4",
-        0x3E => "F5", 0x3F => "F6", 0x40 => "F7", 0x41 => "F8",
-        0x42 => "F9", 0x43 => "F10", 0x44 => "F11", 0x45 => "F12",
-        0x4F => "Right", 0x50 => "Left", 0x51 => "Down", 0x52 => "Up",
-        _ => "Unknown",
+/// Convierte byte de modifiers HID a ModifierState
+fn hid_modifiers_to_state(hid_mods: u8) -> crate::drivers::usb_keyboard::ModifierState {
+    crate::drivers::usb_keyboard::ModifierState {
+        left_shift: (hid_mods & 0x02) != 0,
+        right_shift: (hid_mods & 0x20) != 0,
+        left_ctrl: (hid_mods & 0x01) != 0,
+        right_ctrl: (hid_mods & 0x10) != 0,
+        left_alt: (hid_mods & 0x04) != 0,
+        right_alt: (hid_mods & 0x40) != 0,
+        left_meta: (hid_mods & 0x08) != 0,
+        right_meta: (hid_mods & 0x80) != 0,
+        caps_lock: false, // No viene en el modifier byte
+        num_lock: false,
+        scroll_lock: false,
     }
+}
+
+/// Convierte un USB HID keycode a carácter ASCII
+fn usb_keycode_to_char(usb_code: u8, shift: bool) -> char {
+    match usb_code {
+        0x04..=0x1D if !shift => (b'a' + (usb_code - 0x04)) as char,
+        0x04..=0x1D if shift => (b'A' + (usb_code - 0x04)) as char,
+        
+        0x1E => if shift { '!' } else { '1' },
+        0x1F => if shift { '@' } else { '2' },
+        0x20 => if shift { '#' } else { '3' },
+        0x21 => if shift { '$' } else { '4' },
+        0x22 => if shift { '%' } else { '5' },
+        0x23 => if shift { '^' } else { '6' },
+        0x24 => if shift { '&' } else { '7' },
+        0x25 => if shift { '*' } else { '8' },
+        0x26 => if shift { '(' } else { '9' },
+        0x27 => if shift { ')' } else { '0' },
+        
+        0x28 => '\n',  // Enter
+        0x29 => '\x1b', // Escape
+        0x2A => '\x08', // Backspace
+        0x2B => '\t',   // Tab
+        0x2C => ' ',    // Space
+        
+        0x2D => if shift { '_' } else { '-' },
+        0x2E => if shift { '+' } else { '=' },
+        0x2F => if shift { '{' } else { '[' },
+        0x30 => if shift { '}' } else { ']' },
+        0x31 => if shift { '|' } else { '\\' },
+        0x33 => if shift { ':' } else { ';' },
+        0x34 => if shift { '"' } else { '\'' },
+        0x35 => if shift { '~' } else { '`' },
+        0x36 => if shift { '<' } else { ',' },
+        0x37 => if shift { '>' } else { '.' },
+        0x38 => if shift { '?' } else { '/' },
+        
+        _ => '\0',
+    }
+}
+
+/// Manager global de dispositivos HID
+static mut HID_DEVICES: Option<Vec<HidDevice>> = None;
+
+/// Inicializa el subsistema USB HID
+pub fn init_usb_hid() -> Result<(), &'static str> {
+    unsafe {
+        HID_DEVICES = Some(Vec::new());
+    }
+    Ok(())
+}
+
+/// Registra un nuevo dispositivo HID (teclado o ratón)
+pub fn register_hid_device(device: HidDevice) -> Result<(), &'static str> {
+    unsafe {
+        if let Some(devices) = &mut HID_DEVICES {
+            devices.push(device);
+            Ok(())
+        } else {
+            Err("USB HID not initialized")
+        }
+    }
+}
+
+/// Procesa datos recibidos de un dispositivo HID
+pub fn process_hid_data(slot_id: u8, endpoint: u8, data: &[u8]) {
+    unsafe {
+        if let Some(devices) = &mut HID_DEVICES {
+            for device in devices.iter_mut() {
+                if device.slot_id == slot_id && device.endpoint_in == endpoint {
+                    match device.device_type {
+                        HidDeviceType::Keyboard => device.process_keyboard_report(data),
+                        HidDeviceType::Mouse => device.process_mouse_report(data),
+                        HidDeviceType::Unknown => {},
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Obtiene estadísticas de dispositivos HID
+pub fn get_hid_stats() -> (usize, usize, usize) {
+    unsafe {
+        if let Some(devices) = &HID_DEVICES {
+            let keyboards = devices.iter().filter(|d| d.device_type == HidDeviceType::Keyboard).count();
+            let mice = devices.iter().filter(|d| d.device_type == HidDeviceType::Mouse).count();
+            (devices.len(), keyboards, mice)
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
+/// Polling de dispositivos USB HID (sin interrupciones)
+/// Lee datos de los dispositivos USB registrados y procesa los reportes.
+/// Esta función es segura para llamar desde el main loop sin causar deadlocks.
+pub fn poll_usb_hid_devices() -> usize {
+    use crate::drivers::usb_hid_reader::process_completed_transfers;
+    let mut events_processed = 0;
+    
+    // Procesar transferencias completadas desde el Event Ring de XHCI
+    let completed = process_completed_transfers();
+    
+    unsafe {
+        if let Some(devices) = &mut HID_DEVICES {
+            for (slot_id, endpoint, data) in completed {
+                // Buscar el dispositivo correspondiente
+                for device in devices.iter_mut() {
+                    if device.slot_id == slot_id && device.endpoint_in == endpoint {
+                        // Procesar datos según el tipo de dispositivo
+                        match device.device_type {
+                            HidDeviceType::Keyboard if data.len() >= 8 => {
+                                device.process_keyboard_report(&data);
+                                events_processed += 1;
+                            }
+                            HidDeviceType::Mouse if data.len() >= 3 => {
+                                device.process_mouse_report(&data);
+                                events_processed += 1;
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    events_processed
+}
+
+/// Detecta y registra automáticamente dispositivos HID desde XHCI
+/// Esta función debe llamarse después de que XHCI enumere dispositivos
+pub fn detect_and_register_hid_devices() -> Result<usize, &'static str> {
+    use crate::debug::serial_write_str;
+    use crate::drivers::usb_hid_reader::{configure_hid_endpoint, start_periodic_in_transfers};
+    
+    // Por ahora, registrar dispositivos simulados basados en lo que QEMU proporciona
+    // QEMU emula: usb-kbd en puerto 1, usb-mouse en puerto 2
+    
+    serial_write_str("USB_HID: Detectando dispositivos HID...\n");
+    
+    // Registrar teclado USB simulado (puerto 1, slot 1, endpoint 1)
+    let keyboard = HidDevice::new_keyboard(1, 1);
+    
+    // Configurar endpoint del teclado
+    if let Err(e) = configure_hid_endpoint(1, 1, 8, 10) {
+        serial_write_str(&alloc::format!("USB_HID: Error configurando kbd endpoint: {}\n", e));
+    } else {
+        // Iniciar transferencias periódicas para el teclado
+        if let Err(e) = start_periodic_in_transfers(1, 1) {
+            serial_write_str(&alloc::format!("USB_HID: Error iniciando kbd transfers: {}\n", e));
+        }
+    }
+    
+    register_hid_device(keyboard)?;
+    serial_write_str("USB_HID: Teclado USB registrado (slot 1, ep 1)\n");
+    
+    // Registrar ratón USB simulado (puerto 2, slot 2, endpoint 1)
+    let mouse = HidDevice::new_mouse(2, 1);
+    
+    // Configurar endpoint del ratón
+    if let Err(e) = configure_hid_endpoint(2, 1, 4, 10) {
+        serial_write_str(&alloc::format!("USB_HID: Error configurando mouse endpoint: {}\n", e));
+    } else {
+        // Iniciar transferencias periódicas para el ratón
+        if let Err(e) = start_periodic_in_transfers(2, 1) {
+            serial_write_str(&alloc::format!("USB_HID: Error iniciando mouse transfers: {}\n", e));
+        }
+    }
+    
+    register_hid_device(mouse)?;
+    serial_write_str("USB_HID: Ratón USB registrado (slot 2, ep 1)\n");
+    
+    Ok(2) // 2 dispositivos registrados
 }

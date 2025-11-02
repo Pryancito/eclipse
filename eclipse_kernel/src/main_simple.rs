@@ -429,6 +429,17 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                         fb.write_text_kernel("✓ XHCI inicializado exitosamente", Color::GREEN);
                         xhci_initialized = true;
                         
+                        // Guardar dirección MMIO globalmente para acceso desde main_loop
+                        let mmio_base = xhci.get_mmio_base();
+                        crate::drivers::usb_xhci_global::set_xhci_mmio_base(mmio_base);
+                        serial_write_str(&alloc::format!("KERNEL_MAIN: XHCI MMIO base guardado: 0x{:016X}\n", mmio_base));
+                        
+                        // Guardar información del Event Ring para polling
+                        if let Some((ring_base, ring_size)) = xhci.get_event_ring_info() {
+                            crate::drivers::usb_hid_reader::set_event_ring_info(ring_base, ring_size);
+                            serial_write_str(&alloc::format!("KERNEL_MAIN: Event Ring info guardada: 0x{:016X}, {} TRBs\n", ring_base, ring_size));
+                        }
+                        
                         // Mostrar información diagnóstica
                         let diag_info = xhci.get_diagnostic_info();
                         for line in diag_info.lines().take(5) {
@@ -438,6 +449,32 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
                         // Interrupciones XHCI deshabilitadas temporalmente
                         // El código anterior causaba kernel panics por deadlocks
                         fb.write_text_kernel("✓ XHCI en modo polling (sin interrupciones)", Color::GREEN);
+                        
+                        // Inicializar soporte USB HID para teclado y ratón
+                        fb.write_text_kernel("Inicializando USB HID (teclado/ratón)...", Color::CYAN);
+                        match crate::drivers::usb_hid::init_usb_hid() {
+                            Ok(_) => {
+                                fb.write_text_kernel("✓ USB HID inicializado", Color::GREEN);
+                                serial_write_str("KERNEL_MAIN: USB HID initialized\n");
+                                
+                                // Detectar y registrar dispositivos HID automáticamente
+                                match crate::drivers::usb_hid::detect_and_register_hid_devices() {
+                                    Ok(count) => {
+                                        fb.write_text_kernel(
+                                            &alloc::format!("✓ {} dispositivos HID detectados", count),
+                                            Color::GREEN
+                                        );
+                                        serial_write_str(&alloc::format!("KERNEL_MAIN: {} HID devices registered\n", count));
+                                    }
+                                    Err(e) => {
+                                        fb.write_text_kernel(&alloc::format!("⚠ HID detect: {}", e), Color::YELLOW);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                fb.write_text_kernel(&alloc::format!("⚠ USB HID: {}", e), Color::YELLOW);
+                            }
+                        }
                         
                         // Solo inicializar el primer controlador por ahora
                         break;

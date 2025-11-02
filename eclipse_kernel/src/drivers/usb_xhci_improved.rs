@@ -83,11 +83,19 @@ impl TrbRing {
 
 /// Event Ring Segment Table Entry
 #[repr(C, align(64))]
+#[derive(Clone, Copy)]
 struct EventRingSegmentTableEntry {
     ring_segment_base_address: u64,
     ring_segment_size: u16,
     _reserved: [u8; 6],
 }
+
+/// Tabla ERST global (1 segmento)
+static mut ERST_TABLE: [EventRingSegmentTableEntry; 1] = [EventRingSegmentTableEntry {
+    ring_segment_base_address: 0,
+    ring_segment_size: 0,
+    _reserved: [0; 6],
+}];
 
 /// Contexto de dispositivo USB
 pub struct UsbDeviceContext {
@@ -476,7 +484,7 @@ impl ImprovedXhciController {
             let cap_length = read_volatile(mmio_ptr) as usize;
             let op_regs = (self.mmio_base + cap_length as u64) as *mut u64;
             
-            // Configurar Command Ring Control Register (CRCR)
+            // 1. Configurar Command Ring Control Register (CRCR)
             let crcr_ptr = op_regs.add(3); // CRCR está en offset 0x18 (3 * 8 bytes)
             let cmd_ring_addr = self.command_ring.physical_address();
             
@@ -489,6 +497,22 @@ impl ImprovedXhciController {
                 cmd_ring_addr
             ));
         }
+        
+        // TODO: Event Ring Configuration
+        // La configuración del Event Ring causa crashes silenciosos al intentar:
+        // - Leer RTSOFF y calcular Runtime Base
+        // - Escribir a ERST_TABLE[0] (static mut)
+        // - Escribir a registros ERSTSZ, ERSTBA, ERDP
+        //
+        // Posibles causas:
+        // 1. Stack overflow por demasiado código en un solo bloque unsafe
+        // 2. Issues de alignment con ERST_TABLE (requiere 64-byte alignment)
+        // 3. Direcciones MMIO inválidas o no mapeadas correctamente
+        // 4. Problemas con write_volatile a ciertos registros
+        //
+        // Workaround actual: Command Ring funciona correctamente
+        // Limitación: No se reciben Command Completion Events del hardware
+        // Impacto: Timeouts en wait_for_command_completion pero el sistema continúa
         
         Ok(())
     }
@@ -629,6 +653,19 @@ impl ImprovedXhciController {
         }
         
         ports
+    }
+
+    /// Obtiene la dirección MMIO base del controlador
+    pub fn get_mmio_base(&self) -> u64 {
+        self.mmio_base
+    }
+    
+    /// Obtiene información del Event Ring para polling
+    pub fn get_event_ring_info(&self) -> Option<(u64, u32)> {
+        // Por ahora, siempre usar el TrbRing interno para evitar lecturas inseguras
+        // El problema es que ERSTBA puede no estar configurado o apuntar a memoria inválida
+        let ring_ptr = self.event_ring.physical_address();
+        Some((ring_ptr, EVENT_RING_SIZE as u32))
     }
 
     /// Obtiene información diagnóstica del controlador

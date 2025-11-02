@@ -1,0 +1,14 @@
+[package]
+name = "input_test"
+version = "0.1.0"
+edition = "2021"
+authors = ["Eclipse OS Team"]
+description = "Aplicación de test para el Sistema de Entrada Unificado"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+

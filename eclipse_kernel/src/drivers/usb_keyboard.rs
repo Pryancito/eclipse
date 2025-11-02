@@ -136,6 +136,122 @@ pub enum UsbKeyCode {
 }
 
 impl UsbKeyCode {
+    /// Convierte un código HID (u8) a UsbKeyCode
+    pub fn from_hid_code(hid_code: u8) -> Self {
+        match hid_code {
+            // Letras
+            0x04 => UsbKeyCode::A,
+            0x05 => UsbKeyCode::B,
+            0x06 => UsbKeyCode::C,
+            0x07 => UsbKeyCode::D,
+            0x08 => UsbKeyCode::E,
+            0x09 => UsbKeyCode::F,
+            0x0A => UsbKeyCode::G,
+            0x0B => UsbKeyCode::H,
+            0x0C => UsbKeyCode::I,
+            0x0D => UsbKeyCode::J,
+            0x0E => UsbKeyCode::K,
+            0x0F => UsbKeyCode::L,
+            0x10 => UsbKeyCode::M,
+            0x11 => UsbKeyCode::N,
+            0x12 => UsbKeyCode::O,
+            0x13 => UsbKeyCode::P,
+            0x14 => UsbKeyCode::Q,
+            0x15 => UsbKeyCode::R,
+            0x16 => UsbKeyCode::S,
+            0x17 => UsbKeyCode::T,
+            0x18 => UsbKeyCode::U,
+            0x19 => UsbKeyCode::V,
+            0x1A => UsbKeyCode::W,
+            0x1B => UsbKeyCode::X,
+            0x1C => UsbKeyCode::Y,
+            0x1D => UsbKeyCode::Z,
+            
+            // Números
+            0x1E => UsbKeyCode::Num1,
+            0x1F => UsbKeyCode::Num2,
+            0x20 => UsbKeyCode::Num3,
+            0x21 => UsbKeyCode::Num4,
+            0x22 => UsbKeyCode::Num5,
+            0x23 => UsbKeyCode::Num6,
+            0x24 => UsbKeyCode::Num7,
+            0x25 => UsbKeyCode::Num8,
+            0x26 => UsbKeyCode::Num9,
+            0x27 => UsbKeyCode::Num0,
+            
+            // Teclas especiales
+            0x28 => UsbKeyCode::Enter,
+            0x29 => UsbKeyCode::Escape,
+            0x2A => UsbKeyCode::Backspace,
+            0x2B => UsbKeyCode::Tab,
+            0x2C => UsbKeyCode::Space,
+            0x2D => UsbKeyCode::Minus,
+            0x2E => UsbKeyCode::Equal,
+            0x2F => UsbKeyCode::LeftBracket,
+            0x30 => UsbKeyCode::RightBracket,
+            0x31 => UsbKeyCode::Backslash,
+            0x33 => UsbKeyCode::Semicolon,
+            0x34 => UsbKeyCode::Quote,
+            0x35 => UsbKeyCode::Grave,
+            0x36 => UsbKeyCode::Comma,
+            0x37 => UsbKeyCode::Period,
+            0x38 => UsbKeyCode::Slash,
+            0x39 => UsbKeyCode::CapsLock,
+            
+            // Teclas de función
+            0x3A => UsbKeyCode::F1,
+            0x3B => UsbKeyCode::F2,
+            0x3C => UsbKeyCode::F3,
+            0x3D => UsbKeyCode::F4,
+            0x3E => UsbKeyCode::F5,
+            0x3F => UsbKeyCode::F6,
+            0x40 => UsbKeyCode::F7,
+            0x41 => UsbKeyCode::F8,
+            0x42 => UsbKeyCode::F9,
+            0x43 => UsbKeyCode::F10,
+            0x44 => UsbKeyCode::F11,
+            0x45 => UsbKeyCode::F12,
+            
+            // Navegación
+            0x4A => UsbKeyCode::Home,
+            0x4B => UsbKeyCode::PageUp,
+            0x4C => UsbKeyCode::Delete,
+            0x4D => UsbKeyCode::End,
+            0x4E => UsbKeyCode::PageDown,
+            0x4F => UsbKeyCode::Right,
+            0x50 => UsbKeyCode::Left,
+            0x51 => UsbKeyCode::Down,
+            0x52 => UsbKeyCode::Up,
+            
+            // Teclado numérico
+            0x53 => UsbKeyCode::NumLock,
+            0x54 => UsbKeyCode::NumDivide,
+            0x55 => UsbKeyCode::NumMultiply,
+            0x56 => UsbKeyCode::NumSubtract,
+            0x57 => UsbKeyCode::NumAdd,
+            0x58 => UsbKeyCode::NumEnter,
+            0x63 => UsbKeyCode::NumDecimal,
+            
+            // Modificadores
+            0xE0 => UsbKeyCode::LeftCtrl,
+            0xE1 => UsbKeyCode::LeftShift,
+            0xE2 => UsbKeyCode::LeftAlt,
+            0xE3 => UsbKeyCode::LeftMeta,
+            0xE4 => UsbKeyCode::RightCtrl,
+            0xE5 => UsbKeyCode::RightShift,
+            0xE6 => UsbKeyCode::RightAlt,
+            0xE7 => UsbKeyCode::RightMeta,
+            
+            // Sistema
+            0x46 => UsbKeyCode::PrintScreen,
+            0x47 => UsbKeyCode::ScrollLock,
+            0x48 => UsbKeyCode::Pause,
+            0x65 => UsbKeyCode::Menu,
+            
+            _ => UsbKeyCode::Unknown,
+        }
+    }
+    
     /// Convertir código de tecla a carácter ASCII
     pub fn to_ascii(&self, shift_pressed: bool, caps_lock: bool) -> Option<char> {
         let ch = match self {

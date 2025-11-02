@@ -377,8 +377,8 @@ fn run_scheduled_tasks(fb: &mut FramebufferDriver) -> usize {
     
     // Tareas críticas y de alta prioridad
     let tasks = [
-        //(&TASK_KEYBOARD_INPUT, process_keyboard_task as fn(&mut FramebufferDriver) -> usize),
-        //(&TASK_MOUSE_INPUT, process_mouse_task as fn(&mut FramebufferDriver) -> usize),
+        (&TASK_KEYBOARD_INPUT, process_keyboard_task as fn(&mut FramebufferDriver) -> usize),
+        (&TASK_MOUSE_INPUT, process_mouse_task as fn(&mut FramebufferDriver) -> usize),
         (&TASK_PROCESS_XHCI, process_xhci_task as fn(&mut FramebufferDriver) -> usize),
         (&TASK_POWER_MANAGEMENT, power_management_task_wrapper as fn(&mut FramebufferDriver) -> usize),
     ];
@@ -410,34 +410,49 @@ fn run_scheduled_tasks(fb: &mut FramebufferDriver) -> usize {
 
 /// Loop principal mejorado
 pub fn main_loop(fb: &mut FramebufferDriver, xhci_initialized: bool) -> ! {
-    // Configurar estado inicial
-    MAIN_LOOP_STATE.xhci_initialized.store(xhci_initialized, Ordering::Relaxed);
-    MAIN_LOOP_STATE.running.store(true, Ordering::Relaxed);
+    use crate::debug::serial_write_str;
     
-    fb.write_text_kernel("🚀 Loop principal mejorado iniciado", Color::GREEN);
-    fb.write_text_kernel("Sistema listo. Procesando eventos...", Color::WHITE);
+    serial_write_str("MAIN_LOOP: ========================================\n");
+    serial_write_str("MAIN_LOOP: INICIADO - Con soporte USB HID polling\n");
+    serial_write_str("MAIN_LOOP: ========================================\n");
+    
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("========================================", Color::CYAN);
+    fb.write_text_kernel("   ECLIPSE OS - MAIN LOOP ACTIVO", Color::GREEN);
+    fb.write_text_kernel("   Teclado/Raton USB listo (polling)", Color::WHITE);
+    fb.write_text_kernel("========================================", Color::CYAN);
+    fb.write_text_kernel("", Color::WHITE);
+    
+    let mut counter = 0u64;
+    let mut last_hid_poll = 0u64;
+    let mut last_stats = 0u64;
     
     loop {
-        // Incrementar contador de ticks
-        MAIN_LOOP_STATE.increment_tick();
+        counter = counter.wrapping_add(1);
         
-        // Actualizar estadísticas
-        MAIN_LOOP_STATE.stats_iterations.fetch_add(1, Ordering::Relaxed);
-        
-        // Ejecutar tareas programadas
-        let tasks_run = run_scheduled_tasks(fb);
-        
-        // Gestión de energía: si no hay tareas, usar HLT
-        if tasks_run == 0 {
-            if MAIN_LOOP_STATE.enable_power_management.load(Ordering::Relaxed) {
-                unsafe {
-                    core::arch::asm!("hlt");
-                }
+        // Polling USB HID cada 100,000 iteraciones (~cada ~10ms dependiendo de la CPU)
+        // Solo si XHCI está inicializado
+        if xhci_initialized && counter.wrapping_sub(last_hid_poll) > 100_000 {
+            let events = crate::drivers::usb_hid::poll_usb_hid_devices();
+            if events > 0 {
+                serial_write_str(&alloc::format!("USB_HID: {} eventos procesados\n", events));
             }
+            last_hid_poll = counter;
         }
         
-        // Pequeña pausa para evitar saturar la CPU
-        for _ in 0..10 {
+        // Mostrar estadísticas cada ~200 millones de iteraciones
+        if counter.wrapping_sub(last_stats) > 200_000_000 {
+            let (total, kbd, mouse) = crate::drivers::usb_hid::get_hid_stats();
+            serial_write_str(&alloc::format!(
+                "MAIN_LOOP: Activo - {} HID devices ({} kbd, {} mouse)\n", 
+                total, kbd, mouse
+            ));
+            fb.write_text_kernel("Sistema estable - loop activo", Color::GREEN);
+            last_stats = counter;
+        }
+        
+        // Pausa breve para no saturar la CPU
+        for _ in 0..1000 {
             core::hint::spin_loop();
         }
     }
