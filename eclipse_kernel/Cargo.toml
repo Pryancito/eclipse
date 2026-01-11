@@ -48,6 +48,7 @@ virtio-drivers-and-devices = "0.2.3"
 virtio-spec = "0.3.2"
 polished_pci = { version = "0.2.2", default-features = false }
 xhci = { version = "0.9", default-features = false }
+smoltcp = { version = "0.10", default-features = false, features = ["alloc", "log", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-raw", "socket-udp", "socket-tcp", "socket-icmp"] }
 
 [features]
 default = ["no_std", "alloc"]

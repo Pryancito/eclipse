@@ -94,6 +94,7 @@ pub mod usb_network;
 pub mod usb_user_api;
 pub mod usb_power_management;
 pub mod ahci;
+pub mod virtio_net;
 
 // Re-exportar componentes principales
 pub use device::{DeviceError, DeviceState, DeviceType};

@@ -76,7 +76,16 @@ pub fn init_network() {
 
 /// Inicialización del stack de red (para compatibilidad con el kernel)
 pub fn init_network_stack() -> NetworkResult<()> {
-    init_network_system()
+    // Inicializar sistema base
+    init_network_system()?;
+    
+    // Inicializar drivers reales (VirtIO + Smoltcp)
+    if let Err(e) = crate::drivers::network::init_network_drivers() {
+        // Loguear error pero no fallar fatalmente si no hay drivers
+        // crate::debug::serial_write_str(&alloc::format!("Network driver init warning: {:?}\n", e));
+    }
+    
+    Ok(())
 }
 
 /// Demostración del sistema de red
