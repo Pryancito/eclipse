@@ -145,6 +145,21 @@ pub struct WindowFlags {
     pub transparent: bool,
 }
 
+
+impl WindowFlags {
+    pub fn empty() -> Self {
+        Self {
+            resizable: false,
+            movable: false,
+            minimizable: false,
+            maximizable: false,
+            closeable: false,
+            always_on_top: false,
+            transparent: false,
+        }
+    }
+}
+
 impl Default for WindowFlags {
     fn default() -> Self {
         Self {

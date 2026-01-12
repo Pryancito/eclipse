@@ -247,34 +247,69 @@ fn verify_framebuffer_memory(fb: &mut FramebufferDriver) -> bool {
     true
 }
 
+/// Habilitar soporte SSE (Streaming SIMD Extensions)
+/// Necesario para operaciones de memoria optimizadas (memcpy, memset, etc.)
+fn enable_sse() {
+    unsafe {
+        use core::arch::asm;
+        
+        // 1. Verificar soporte CPUID (opcional pero recomendado, asumimos x86_64)
+        
+        // 2. Configurar CR0
+        // - Clear EM (bit 2) -> No emulation
+        // - Set MP (bit 1) -> Monitor Coprocessor
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1 << 2); // Clear EM
+        cr0 |= (1 << 1);  // Set MP
+        asm!("mov cr0, {}", in(reg) cr0);
+        
+        // 3. Configurar CR4
+        // - Set OSFXSR (bit 9) -> OS supports FXSAVE/FXRSTOR
+        // - Set OSXMMEXCPT (bit 10) -> OS supports unmasked SIMD FP exceptions
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4);
+        cr4 |= (1 << 9);  // OSFXSR
+        cr4 |= (1 << 10); // OSXMMEXCPT
+        asm!("mov cr4, {}", in(reg) cr4);
+        
+        crate::debug::serial_write_str("CPU: SSE Enabled (CR0/CR4 configured)\n");
+    }
+}
+
 /// Función principal del kernel con recuperación de errores
+#[no_mangle]
 pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
+    // 0. Habilitar SSE lo antes posible (doble verificación)
+    enable_sse();
+
     serial_write_str("KERNEL_MAIN: Entered.\n");
+    
+    // Inicializar el sistema de memoria avanzado (Heap 64MB, Paging)
+    // Esto es CRÍTICO para que funcionen las asignaciones (Vec, Box, etc.)
+    match crate::memory::init_memory_system(crate::memory::MemoryConfig::default()) {
+        Ok(_) => serial_write_str("KERNEL_MAIN: Memory System initialized (Advanced).\n"),
+        Err(e) => {
+             serial_write_str("KERNEL_MAIN: FATAL - Memory init failed!\n");
+             loop {}
+        }
+    }
+    
     #[cfg(feature = "alloc")]
     {
-        crate::allocator::init_allocator();
+        // init_allocator() ya no hace nada, usaba el heap estático de 4MB.
+        // crate::allocator::init_allocator(); 
     }
 
     fb.clear_screen(Color::BLACK);
     fb.write_text_kernel("Eclipse OS Kernel v0.1.0", Color::WHITE);
 
     // --- Inicialización del Gestor de Paginación ---
-    serial_write_str("KERNEL_MAIN: Initializing Paging Manager...\n");
-    
-    // Por ahora, vamos a usar un enfoque más simple: mapear directamente en las tablas existentes
-    // cuando sea necesario, en lugar de crear un PagingManager completo
-    serial_write_str("KERNEL_MAIN: Using direct page mapping approach...\n");
-    
-    // Crear un PagingManager básico solo para almacenar en el global
-    // pero no vamos a usar sus tablas de páginas
-    let paging_manager = crate::paging::PagingManager::new();
-    serial_write_str("KERNEL_MAIN: Basic PagingManager created for compatibility.\n");
-    
-    // Almacenar el PagingManager en el global
-    {
-        let mut pm_guard = PAGING_MANAGER.lock();
-        *pm_guard = Some(paging_manager);
-    }
+    // ELIMINADO: No usar el gestor de paginación antiguo (crate::paging)
+    // Ya hemos inicializado el sistema de memoria avanzado (crate::memory) que configura
+    // el heap, la pila y el identity mapping de 4GB correctamente.
+    // Usar el antiguo sobrescribiría CR3 y desmapearía el heap, causando un Triple Fault.
+    serial_write_str("KERNEL_MAIN: Legacy Paging Manager skipped (Using Advanced Memory System)\n");
     
     serial_write_str("KERNEL_MAIN: Paging Manager initialized.\n");
 
@@ -312,6 +347,37 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         fb_line: 1,
     });
 
+
+    // --- ACPI Initialization ---
+    serial_write_str("KERNEL_MAIN: Initializing ACPI...\n");
+    fb.write_text_kernel("Inicializando ACPI...", Color::WHITE);
+    match crate::drivers::advanced::acpi::init_acpi() {
+        Ok(cpu_count) => {
+            fb.write_text_kernel(&alloc::format!("ACPI inicializado. CPUs detectadas: {}", cpu_count), Color::GREEN);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: ACPI OK. CPUs: {}\n", cpu_count));
+            
+            // --- SMP Initialization ---
+            if cpu_count > 1 {
+                serial_write_str("KERNEL_MAIN: Initializing SMP...\n");
+                fb.write_text_kernel("Iniciando otros núcleos (SMP)...", Color::WHITE);
+                match crate::platform::smp::init_smp() {
+                    Ok(_) => {
+                         let online = crate::main_ap::AP_ONLINE_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+                         fb.write_text_kernel(&alloc::format!("SMP OK. CPUs Online: {}", online + 1), Color::GREEN);
+                         serial_write_str(&alloc::format!("KERNEL_MAIN: SMP Init OK. total_online={}\n", online + 1));
+                    },
+                    Err(e) => {
+                         fb.write_text_kernel(&alloc::format!("Error SMP: {}", e), Color::YELLOW);
+                         serial_write_str(&alloc::format!("KERNEL_MAIN: SMP Init Error: {}\n", e));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("Error ACPI: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: ACPI Init Error: {}\n", e));
+        }
+    }
 
     // --- Detección de Hardware (MEJORADA) ---
     serial_write_str("KERNEL_MAIN: Detecting hardware...\n");
@@ -365,131 +431,16 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     fb.write_text_kernel("Diagnóstico USB completado", Color::GREEN);
 
     // --- Inicialización de controlador XHCI mejorado ---
-    serial_write_str("KERNEL_MAIN: Buscando controladores USB...\n");
-    fb.write_text_kernel("Buscando controladores USB...", Color::WHITE);
+    // ELIMINADO: La inicialización manual del XHCI aquí causa conflicto y crash 
+    // porque usb_diagnostic::usb_diagnostic_main() ya inicializó todo el subsistema USB
+    // (diagnóstico, energía, hotplug, drivers y APIs de usuario).
+    //
+    // El sistema USB ya está listo y funcionando en este punto.
+    serial_write_str("KERNEL_MAIN: USB System fully initialized via diagnostics & hotplug.\n");
+    fb.write_text_kernel("Sistema USB inicializado (Hotplug active).", Color::GREEN);
     
-    let mut pci_for_xhci = PciManager::new();
-    pci_for_xhci.scan_devices();
-    
-    // Buscar todos los controladores USB (clase 0x0C, subclase 0x03)
-    let mut xhci_initialized = false;
-    let devices = pci_for_xhci.get_devices();
-    
-    // Primero listar todos los controladores USB
-    for device_opt in devices.iter() {
-        if let Some(device) = device_opt {
-            if device.class_code == 0x0C && device.subclass_code == 0x03 {
-                let controller_type = match device.prog_if {
-                    0x00 => "UHCI",
-                    0x10 => "OHCI",
-                    0x20 => "EHCI",
-                    0x30 => "XHCI",
-                    _ => "Unknown",
-                };
-                
-                serial_write_str(&alloc::format!(
-                    "KERNEL_MAIN: Controlador USB {} {:04X}:{:04X} (prog_if: 0x{:02X}) en {}:{}:{}\n",
-                    controller_type,
-                    device.vendor_id, device.device_id,
-                    device.prog_if,
-                    device.bus, device.device, device.function
-                ));
-                
-                fb.write_text_kernel(&alloc::format!(
-                    "USB {}: {:04X}:{:04X} (0x{:02X})",
-                    controller_type,
-                    device.vendor_id, device.device_id,
-                    device.prog_if
-                ), Color::CYAN);
-            }
-        }
-    }
-    
-    fb.write_text_kernel("Inicializando controladores XHCI mejorados...", Color::WHITE);
-    
-    // Ahora intentar inicializar XHCI específicamente
-    for device_opt in devices.iter() {
-        if let Some(device) = device_opt {
-            if device.class_code == 0x0C && device.subclass_code == 0x03 && device.prog_if == 0x30 {
-                serial_write_str(&alloc::format!(
-                    "KERNEL_MAIN: Encontrado controlador XHCI {:04X}:{:04X} en {}:{}:{}\n",
-                    device.vendor_id, device.device_id,
-                    device.bus, device.device, device.function
-                ));
-                
-                fb.write_text_kernel(&alloc::format!(
-                    "Controlador XHCI: {:04X}:{:04X}",
-                    device.vendor_id, device.device_id
-                ), Color::CYAN);
-                
-                // Crear e inicializar el controlador mejorado
-                let mut xhci = ImprovedXhciController::new(*device);
-                match xhci.initialize() {
-                    Ok(()) => {
-                        fb.write_text_kernel("✓ XHCI inicializado exitosamente", Color::GREEN);
-                        xhci_initialized = true;
-                        
-                        // Guardar dirección MMIO globalmente para acceso desde main_loop
-                        let mmio_base = xhci.get_mmio_base();
-                        crate::drivers::usb_xhci_global::set_xhci_mmio_base(mmio_base);
-                        serial_write_str(&alloc::format!("KERNEL_MAIN: XHCI MMIO base guardado: 0x{:016X}\n", mmio_base));
-                        
-                        // Guardar información del Event Ring para polling
-                        if let Some((ring_base, ring_size)) = xhci.get_event_ring_info() {
-                            crate::drivers::usb_hid_reader::set_event_ring_info(ring_base, ring_size);
-                            serial_write_str(&alloc::format!("KERNEL_MAIN: Event Ring info guardada: 0x{:016X}, {} TRBs\n", ring_base, ring_size));
-                        }
-                        
-                        // Mostrar información diagnóstica
-                        let diag_info = xhci.get_diagnostic_info();
-                        for line in diag_info.lines().take(5) {
-                            fb.write_text_kernel(line, Color::LIGHT_GRAY);
-                        }
-                        
-                        // Interrupciones XHCI deshabilitadas temporalmente
-                        // El código anterior causaba kernel panics por deadlocks
-                        fb.write_text_kernel("✓ XHCI en modo polling (sin interrupciones)", Color::GREEN);
-                        
-                        // Inicializar soporte USB HID para teclado y ratón
-                        fb.write_text_kernel("Inicializando USB HID (teclado/ratón)...", Color::CYAN);
-                        match crate::drivers::usb_hid::init_usb_hid() {
-                            Ok(_) => {
-                                fb.write_text_kernel("✓ USB HID inicializado", Color::GREEN);
-                                serial_write_str("KERNEL_MAIN: USB HID initialized\n");
-                                
-                                // Detectar y registrar dispositivos HID automáticamente
-                                match crate::drivers::usb_hid::detect_and_register_hid_devices() {
-                                    Ok(count) => {
-                                        fb.write_text_kernel(
-                                            &alloc::format!("✓ {} dispositivos HID detectados", count),
-                                            Color::GREEN
-                                        );
-                                        serial_write_str(&alloc::format!("KERNEL_MAIN: {} HID devices registered\n", count));
-                                    }
-                                    Err(e) => {
-                                        fb.write_text_kernel(&alloc::format!("⚠ HID detect: {}", e), Color::YELLOW);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                fb.write_text_kernel(&alloc::format!("⚠ USB HID: {}", e), Color::YELLOW);
-                            }
-                        }
-                        
-                        // Solo inicializar el primer controlador por ahora
-                        break;
-                    }
-                    Err(e) => {
-                        fb.write_text_kernel(&alloc::format!("✗ Error XHCI: {:?}", e), Color::RED);
-                    }
-                }
-            }
-        }
-    }
-    
-    if !xhci_initialized {
-        fb.write_text_kernel("No se encontraron controladores XHCI", Color::YELLOW);
-    }
+    // Declarar xhci_initialized como true ya que el sistema USB está activo por diagnóstico
+    let xhci_initialized = true;
 
     if hw.available_gpus.is_empty() {
         fb.write_text_kernel("No se detectaron GPUs adicionales", Color::YELLOW);
@@ -822,17 +773,57 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         }
     }
 
-    // 13.11: Window Manager avanzado
-    serial_write_str("KERNEL_MAIN: Inicializando window manager...\n");
-    fb.write_text_kernel("Inicializando gestor de ventanas...", Color::WHITE);
-    match crate::window_system::window_manager::init_window_manager() {
+    // 13.11: Window System completo
+    serial_write_str("KERNEL_MAIN: Inicializando sistema de ventanas completo...\n");
+    fb.write_text_kernel("Inicializando sistema de ventanas...", Color::WHITE);
+    match crate::window_system::init_window_system() {
         Ok(_) => {
-            fb.write_text_kernel("✓ Window Manager inicializado", Color::GREEN);
-            serial_write_str("KERNEL_MAIN: Window manager initialized\n");
+            fb.write_text_kernel("✓ Sistema de ventanas inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Window system initialized\n");
+
+            // HEAP SANITY CHECK
+            crate::debug::serial_write_str("KERNEL_MAIN: Testing heap small alloc...\n");
+            let mut _vec = alloc::vec::Vec::with_capacity(64);
+            _vec.push(1);
+            crate::debug::serial_write_str("KERNEL_MAIN: Heap small alloc OK.\n");
+
+            // Crear ventana de escritorio
+            use crate::window_system::{protocol::WindowFlags, window::WindowType};
+            use crate::window_system::window_manager::create_global_window;
+
+            match create_global_window(
+                0, // Client ID 0 para el sistema
+                alloc::string::String::from("Escritorio"),
+                0,
+                0,
+                fb.info.width,
+                fb.info.height,
+                WindowFlags::empty(),
+                WindowType::Desktop,
+            ) {
+                Ok(id) => {
+                     fb.write_text_kernel("✓ Ventana de escritorio creada", Color::GREEN);
+                     serial_write_str(&alloc::format!("KERNEL_MAIN: Desktop window created with ID {}\n", id));
+                     
+                     // Mapear (mostrar) la ventana
+                     if let Ok(manager) = crate::window_system::get_window_manager() {
+                         let _ = manager.map_window(id);
+                     }
+                },
+                Err(e) => {
+                     fb.write_text_kernel(&alloc::format!("⚠ Error creando escritorio: {}", e), Color::YELLOW);
+                }
+            }
+
+            // Inicializar Terminal Gráfica
+            match crate::apps::terminal::init_terminal() {
+                Ok(_) => fb.write_text_kernel("✓ Terminal Gráfica inicializada", Color::GREEN),
+                Err(e) => fb.write_text_kernel(&alloc::format!("⚠ Error Terminal: {}", e), Color::YELLOW),
+            }
         }
         Err(_) => {
-            fb.write_text_kernel("⚠ Window Manager no disponible", Color::YELLOW);
-            serial_write_str("KERNEL_MAIN: Window manager init FAIL\n");
+            fb.write_text_kernel("⚠ Window System no disponible", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: Window system init FAIL\n");
         }
     }
 

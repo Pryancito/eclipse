@@ -61,13 +61,18 @@ impl MemoryBlock {
     
     /// Dividir el bloque en dos si es posible
     pub fn split(&mut self, requested_size: usize) -> Option<NonNull<MemoryBlock>> {
-        let min_split_size = requested_size + core::mem::size_of::<MemoryBlock>();
+        let min_split_size = requested_size + core::mem::size_of::<MemoryBlock>() + MIN_BLOCK_SIZE;
         
         if self.size < min_split_size {
             return None;
         }
         
-        let remaining_size = self.size - requested_size;
+        // CORRECCIÓN CRÍTICA: Debemos restar el tamaño del header del nuevo bloque
+        // self.size es el tamaño de DATOS disponibles.
+        // Al dividir, usamos 'requested_size' para DATOS del primer bloque.
+        // El espacio restante es (self.size - requested_size).
+        // DE ESE espacio, debemos restar el tamaño del HEADER del nuevo bloque.
+        let remaining_size = self.size - requested_size - core::mem::size_of::<MemoryBlock>();
         self.size = requested_size;
         
         // Crear un nuevo bloque con el espacio restante
@@ -323,44 +328,33 @@ impl HeapAllocator {
     
     /// Obtener el índice del pool para un tamaño dado
     fn get_pool_index(size: usize) -> usize {
-        for (i, pool) in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288].iter().enumerate() {
-            if size <= *pool {
-                return i;
-            }
-        }
-        POOL_COUNT // Bloque grande
+        // CORRECCIÓN: Deshabilitamos los pools para evitar romper la cadena física de bloques.
+        // Al obligar a usar "Bloques Grandes" (POOL_COUNT), mantenemos todos los bloques
+        // en una única lista enlazada física (large_blocks), permitiendo que split/merge
+        // funcionen correctamente sin perder referencias al resto del heap.
+        POOL_COUNT 
     }
     
     /// Asignar memoria
     pub fn allocate(&mut self, size: usize, align: usize) -> *mut u8 {
         if size == 0 {
+            crate::debug::serial_write_str("HEAP: Request for 0 bytes\n");
             return ptr::null_mut();
         }
         
-        // Alinear el tamaño
-        let aligned_size = (size + align - 1) & !(align - 1);
-        
-        // Buscar en el pool apropiado
-        let pool_index = Self::get_pool_index(aligned_size);
-        
-        if pool_index < POOL_COUNT {
-            // Buscar en el pool
-            if let Some(block) = self.pools[pool_index].get_free_block() {
-                unsafe {
-                    let block_ref = &mut *block.as_ptr();
-                    let data_ptr = block_ref.get_data_ptr();
-                    
-                    self.stats.total_allocations += 1;
-                    self.stats.active_allocations += 1;
-                    self.stats.total_allocated += aligned_size as u64;
-                    self.stats.current_usage += aligned_size as u64;
-                    
-                    return data_ptr;
-                }
-            }
+        // Alinear el tamaño al alineamiento del bloque para garantizar
+        // que el siguiente bloque (si hay split) comience en una dirección alineada.
+        let block_align = core::mem::align_of::<MemoryBlock>();
+        let global_align = align.max(block_align);
+        let aligned_size = (size + global_align - 1) & !(global_align - 1);
+
+        // crate::debug::serial_write_str(" [H] ");
+        if size > 100000 {
+             crate::debug::serial_write_str("HEAP: Large Alloc > 100KB\n");
         }
-        
-        // Buscar en bloques grandes
+
+        // Buscar en bloques grandes (que ahora son TODOS los bloques)
+        // Note: find_large_block uses aligned_size for splitting
         if let Some(block) = self.find_large_block(aligned_size) {
             unsafe {
                 let block_ref = &mut *block.as_ptr();
@@ -371,6 +365,10 @@ impl HeapAllocator {
                 self.stats.total_allocated += aligned_size as u64;
                 self.stats.current_usage += aligned_size as u64;
                 
+                if aligned_size > 100000 {
+                     crate::debug::serial_write_str(&alloc::format!("HEAP: Alloc success, ptr=0x{:p}\n", data_ptr));
+                }
+
                 return data_ptr;
             }
         }
@@ -391,6 +389,7 @@ impl HeapAllocator {
         }
         
         // No hay memoria disponible
+        crate::debug::serial_write_str("HEAP PANIC: OOM detected (Static Log)\n");
         ptr::null_mut()
     }
     
@@ -412,28 +411,12 @@ impl HeapAllocator {
                     self.stats.total_freed += block_ref.size as u64;
                     self.stats.current_usage -= block_ref.size as u64;
                     
-                    // Intentar fusionar con bloques adyacentes
+                    // CORRECCIÓN: Intentar fusionar.
+                    // Si se fusiona con el anterior, 'block' deja de ser válido.
+                    // Si se fusiona con el siguiente, 'block' crece.
+                    // En NINGÚN CASO debemos mover 'block' a listas de Pools o reinsertarlo
+                    // en large_blocks, porque YA ESTÁ en la cadena física correctamente.
                     self.merge_blocks(block);
-                    
-                    // Devolver al pool apropiado
-                    let pool_index = Self::get_pool_index(block_ref.size);
-                    if pool_index < POOL_COUNT {
-                        self.pools[pool_index].return_block(block);
-                    } else {
-                        // Bloque grande
-                        if self.large_blocks.is_none() {
-                            self.large_blocks = Some(block);
-                        } else {
-                            unsafe {
-                                let block_ref = &mut *block.as_ptr();
-                                block_ref.next = self.large_blocks;
-                                if let Some(large_block) = self.large_blocks {
-                                    (*large_block.as_ptr()).prev = Some(block);
-                                }
-                                self.large_blocks = Some(block);
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -442,17 +425,32 @@ impl HeapAllocator {
     /// Buscar un bloque grande que pueda satisfacer la solicitud
     fn find_large_block(&mut self, size: usize) -> Option<NonNull<MemoryBlock>> {
         let mut current = self.large_blocks;
+        let debug = size > 100000;
         
         while let Some(block) = current {
             unsafe {
                 let block_ref = &mut *block.as_ptr();
+                if debug {
+                     // crate::debug::serial_write_str("HEAP: Check block... ");
+                }
+                
                 if block_ref.is_free && block_ref.size >= size {
+                    if debug {
+                        crate::debug::serial_write_str("HEAP: Found candidate block. Splitting...\n");
+                    }
+
                     // Dividir el bloque si es necesario
                     if let Some(new_block) = block_ref.split(size) {
+                        if debug {
+                             crate::debug::serial_write_str("HEAP: Split OK.\n");
+                        }
                         // El bloque original ahora tiene el tamaño solicitado
                         block_ref.is_free = false;
                         return Some(block);
                     } else {
+                        if debug {
+                             crate::debug::serial_write_str("HEAP: Exact fit / No split.\n");
+                        }
                         // El bloque es del tamaño exacto
                         block_ref.is_free = false;
                         return Some(block);
@@ -462,6 +460,9 @@ impl HeapAllocator {
             }
         }
         
+        if debug {
+            crate::debug::serial_write_str("HEAP: No large block found.\n");
+        }
         None
     }
     
@@ -615,26 +616,36 @@ pub fn init_heap(heap_size: u64) -> Result<(), &'static str> {
     serial_write_str("HEAP: Inicializando heap del kernel...\n");
     
     // Asignar páginas físicas para el heap
-    let mut physical_pages = Vec::new();
+    // Asignar y mapear páginas físicas para el heap
+    // IMPORTANTE: No usar Vec ni ninguna estructura que asigne memoria aquí,
+    // porque el allocator aún no está listo.
+    
+    let heap_base_addr = 0xFFFF_8000_0000_0000; // Dirección virtual del heap
     let pages_needed = (heap_size / PAGE_SIZE as u64) as usize;
     
-    for _ in 0..pages_needed {
+    // serial_write_str(&alloc::format!("HEAP: Mapping range 0x{:016X} - 0x{:016X}\n", heap_base_addr, heap_base_addr + heap_size));
+    serial_write_str("HEAP: Mapping range 0xFFFF800000000000 - +64MB\n");
+
+    for i in 0..pages_needed {
         if let Some(physical_addr) = allocate_physical_page() {
-            physical_pages.push(physical_addr);
+             let virtual_addr = heap_base_addr + (i * PAGE_SIZE) as u64;
+             
+             // Debug log for the area where the crash happens (approx offset 0x4EE80 / 4096 = 78)
+             if i == 78 {
+                 crate::debug::serial_write_str("HEAP: Mapping Index 78 (Crash Zone). Phys Addr: ");
+                 crate::memory::paging::print_hex(physical_addr);
+                 crate::debug::serial_write_str("\n");
+             }
+
+             // 0x07 = PRESENT | WRITABLE | USER (aunque sea kernel heap, user es harmless aqui, WRITABLE es critico)
+             crate::memory::paging::map_virtual_page(virtual_addr, physical_addr, 0x03)?; // 0x03 = PRESENT | WRITE
         } else {
             return Err("No hay suficientes páginas físicas para el heap");
         }
     }
     
-    // Mapear las páginas virtualmente
-    let heap_base = 0xFFFF_8000_0000_0000; // Dirección virtual del heap
-    for (i, physical_addr) in physical_pages.iter().enumerate() {
-        let virtual_addr = heap_base + (i * PAGE_SIZE) as u64;
-        crate::memory::paging::map_virtual_page(virtual_addr, *physical_addr, 0x07)?;
-    }
-    
     // Crear el allocator de heap
-    let allocator = HeapAllocator::new(heap_base as *mut u8, heap_size as usize);
+    let allocator = HeapAllocator::new(heap_base_addr as *mut u8, heap_size as usize);
     
     // Guardar globalmente
     unsafe {
@@ -654,6 +665,7 @@ fn get_heap_allocator() -> &'static mut HeapAllocator {
 
 /// Asignar memoria del kernel
 pub fn kernel_alloc(size: usize, align: usize) -> *mut u8 {
+    // crate::debug::serial_write_str(" [K] ");
     let allocator = get_heap_allocator();
     allocator.allocate(size, align)
 }

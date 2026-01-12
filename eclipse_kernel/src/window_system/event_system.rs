@@ -446,16 +446,12 @@ pub fn init_event_system() -> Result<(), &'static str> {
 
 /// Obtener referencia al sistema de eventos
 pub fn get_event_system() -> Result<&'static mut EventSystem, &'static str> {
-    unsafe {
-        EVENT_SYSTEM
-            .as_mut()
-            .ok_or("Sistema de eventos no inicializado")
-    }
+    super::get_event_system()
 }
 
 /// Verificar si el sistema de eventos está inicializado
 pub fn is_event_system_initialized() -> bool {
-    unsafe { EVENT_SYSTEM.is_some() }
+    get_event_system().is_ok()
 }
 
 /// Simular movimiento del ratón globalmente

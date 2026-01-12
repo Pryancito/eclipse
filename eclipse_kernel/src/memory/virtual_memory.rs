@@ -237,7 +237,7 @@ impl VirtualMemoryRegion {
             let virtual_page = self.virtual_base + (i * PAGE_SIZE) as u64;
             
             // Obtener la dirección física antes de desmapear
-            if let Some(physical_page) = crate::memory::paging::translate_virtual_address(virtual_page) {
+            if let Some((physical_page, _flags)) = crate::memory::paging::translate_virtual_address(virtual_page) {
                 let physical_page = physical_page & !0xFFF; // Alinear a página
                 crate::memory::paging::unmap_virtual_page(virtual_page)?;
                 deallocate_physical_page(physical_page)?;
@@ -262,7 +262,7 @@ impl VirtualMemoryRegion {
             let virtual_page = self.virtual_base + (i * PAGE_SIZE) as u64;
             
             // Obtener la dirección física actual
-            if let Some(physical_page) = crate::memory::paging::translate_virtual_address(virtual_page) {
+            if let Some((physical_page, _flags)) = crate::memory::paging::translate_virtual_address(virtual_page) {
                 let physical_page = physical_page & !0xFFF; // Alinear a página
                 
                 // Desmapear y volver a mapear con nuevos permisos

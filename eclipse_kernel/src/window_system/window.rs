@@ -28,6 +28,7 @@ pub enum WindowType {
     Tooltip,
     Menu,
     Popup,
+    Desktop,
 }
 
 /// Información de una ventana

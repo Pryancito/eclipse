@@ -10,6 +10,7 @@ pub mod geometry;
 pub mod protocol;
 pub mod window;
 pub mod window_manager;
+pub mod font;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -165,4 +166,10 @@ pub fn get_client_api() -> Result<&'static mut client_api::ClientAPI, &'static s
 pub fn get_compositor() -> Result<&'static mut compositor::WindowCompositor, &'static str> {
     let system = get_window_system()?;
     Ok(&mut system.compositor)
+}
+
+/// Obtener el sistema de eventos global
+pub fn get_event_system() -> Result<&'static mut event_system::EventSystem, &'static str> {
+    let system = get_window_system()?;
+    Ok(&mut system.event_system)
 }

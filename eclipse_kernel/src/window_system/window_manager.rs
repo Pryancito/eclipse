@@ -60,6 +60,7 @@ impl WindowManager {
         flags: WindowFlags,
         window_type: WindowType,
     ) -> Result<WindowId, &'static str> {
+        crate::debug::serial_write_str("WM: create_window start\n");
         if !self.initialized.load(Ordering::Acquire) {
             return Err("Gestor de ventanas no inicializado");
         }
@@ -67,6 +68,7 @@ impl WindowManager {
         let window_id = self.next_window_id.fetch_add(1, Ordering::SeqCst);
         let geometry = Rectangle::new(x, y, width, height);
 
+        crate::debug::serial_write_str("WM: Allocating Window struct...\n");
         let window = Window::new(
             window_id,
             client_id,
@@ -75,13 +77,16 @@ impl WindowManager {
             flags,
             window_type,
         );
+        crate::debug::serial_write_str("WM: Window struct allocated.\n");
 
         self.windows.insert(window_id, window);
         self.window_stack.push(window_id);
 
         // Registrar ventana en el compositor
         if let Ok(compositor) = get_window_compositor() {
-            compositor.register_window(window_id, geometry)?;
+            crate::debug::serial_write_str("WM: Registering with compositor...\n");
+            compositor.register_window(window_id, geometry, window_type)?;
+            crate::debug::serial_write_str("WM: Registered with compositor.\n");
         }
 
         // Registrar ventana en la API de cliente
@@ -494,18 +499,19 @@ pub fn create_global_window(
     flags: WindowFlags,
     window_type: WindowType,
 ) -> Result<WindowId, &'static str> {
-    let manager = get_window_manager()?;
+    let manager = super::get_window_manager()?;
+    crate::debug::serial_write_str(&alloc::format!("WM: Creating global window '{}' size {}x{}\n", title, width, height));
     manager.create_window(client_id, title, x, y, width, height, flags, window_type)
 }
 
 /// Destruir ventana globalmente
 pub fn destroy_global_window(window_id: WindowId) -> Result<(), &'static str> {
-    let manager = get_window_manager()?;
+    let manager = super::get_window_manager()?;
     manager.destroy_window(window_id)
 }
 
 /// Obtener ventana bajo punto globalmente
 pub fn get_global_window_at(point: Point) -> Result<Option<WindowId>, &'static str> {
-    let manager = get_window_manager()?;
+    let manager = super::get_window_manager()?;
     Ok(manager.get_window_at(point))
 }

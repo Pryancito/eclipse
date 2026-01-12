@@ -9,8 +9,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::client_api::{ClientAPI, WindowInfo};
 use super::geometry::{Point, Rectangle, Size};
+use super::window::WindowType;
 use super::{ClientId, WindowId};
 use crate::drivers::framebuffer::{Color, FramebufferDriver};
+use super::font::get_char_bitmap;
 
 /// Buffer de composición
 #[derive(Debug, Clone)]
@@ -22,15 +24,42 @@ pub struct CompositionBuffer {
 
 impl CompositionBuffer {
     pub fn new(width: u32, height: u32) -> Self {
-        // Crear buffer pequeño inicial para evitar colgadas
-        let buffer_size = 1024; // Solo 1KB inicialmente
+        // Sanitize inputs to prevent OOM
+        let safe_width = if width > 2048 { 2048 } else { if width == 0 { 1 } else { width } };
+        let safe_height = if height > 2048 { 2048 } else { if height == 0 { 1 } else { height } };
+
+        let size = (safe_width * safe_height) as usize;
+        crate::debug::serial_write_str(&alloc::format!("COMP: New buffer {}x{} (size={})\n", safe_width, safe_height, size));
 
         Self {
-            width,
-            height,
+            width: safe_width,
+            height: safe_height,
             data: {
-                let mut vec = Vec::new();
-                vec.resize(buffer_size, 0u32);
+                crate::debug::serial_write_str("COMP: Allocating buffer data (Manual Atomic)...\n");
+                
+                let mut vec: Vec<u32> = Vec::with_capacity(size);
+                let ptr = vec.as_mut_ptr();
+                
+                unsafe {
+                    // SKIP ZEROING TO AVOID CRASH
+                    // The memory at 0xffff80000004ee80 seems to be unmapped or causing Triple Faults.
+                    // We will return dirty memory for now to allow the kernel to boot.
+                    
+                    // Disable interrupts to prevent context switching or timer interference
+                    // core::arch::asm!("cli");
+                    
+                    // Manual zeroing loop using volatile writes to avoid SIMD/Memset optimizations
+                    // for i in 0..size {
+                    //    core::ptr::write_volatile(ptr.add(i), 0);
+                    // }
+                    
+                    // Re-enable interrupts
+                    // core::arch::asm!("sti");
+                    
+                    vec.set_len(size);
+                }
+                
+                crate::debug::serial_write_str("COMP: Zeroing SKIPPED (Debug).\n");
                 vec
             },
         }
@@ -117,6 +146,34 @@ impl CompositionBuffer {
             }
         }
     }
+
+    /// Dibujar un carácter
+    pub fn draw_char(&mut self, ch: char, x: i32, y: i32, color: Color) {
+        if let Some(bitmap) = get_char_bitmap(ch) {
+            let argb = color_to_argb(color);
+            for (row_idx, row) in bitmap.iter().enumerate() {
+                for col_idx in 0..8 {
+                    if (row >> (7 - col_idx)) & 1 == 1 {
+                        let px = x + col_idx as i32;
+                        let py = y + row_idx as i32;
+                        if px >= 0 && py >= 0 && (px as u32) < self.width && (py as u32) < self.height {
+                            let index = (py as u32 * self.width + px as u32) as usize;
+                            self.data[index] = argb;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dibujar texto
+    pub fn draw_text(&mut self, text: &str, x: i32, y: i32, color: Color) {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            self.draw_char(ch, cursor_x, y, color);
+            cursor_x += 8; // Ancho fijo de 8x8
+        }
+    }
 }
 
 /// Información de renderizado de una ventana
@@ -127,6 +184,7 @@ pub struct WindowRenderInfo {
     pub buffer: CompositionBuffer,
     pub needs_redraw: bool,
     pub z_order: i32,
+    pub window_type: WindowType,
 }
 
 /// Compositor de ventanas
@@ -176,22 +234,28 @@ impl WindowCompositor {
         &mut self,
         window_id: WindowId,
         geometry: Rectangle,
+        window_type: WindowType,
     ) -> Result<(), &'static str> {
         if !self.initialized.load(Ordering::Acquire) {
             return Err("Compositor no inicializado");
         }
 
+        crate::debug::serial_write_str("COMP: register_window start, allocating buffer...\n");
         let buffer = CompositionBuffer::new(geometry.width, geometry.height);
+        crate::debug::serial_write_str("COMP: buffer allocated, creating info...\n");
         let render_info = WindowRenderInfo {
             window_id,
             geometry,
             buffer,
             needs_redraw: true,
             z_order: 0,
+            window_type,
         };
 
+        crate::debug::serial_write_str("COMP: inserting into map...\n");
         self.window_buffers.insert(window_id, render_info);
         self.z_order.push(window_id);
+        crate::debug::serial_write_str("COMP: register_window DONE\n");
 
         Ok(())
     }
@@ -288,89 +352,103 @@ impl WindowCompositor {
     /// Renderizar una ventana individual
     fn render_window(&mut self, window_id: WindowId) -> Result<(), &'static str> {
         if let Some(render_info) = self.window_buffers.get_mut(&window_id) {
-            // Limpiar buffer de la ventana con color de fondo
-            render_info.buffer.clear(Color::LIGHT_GRAY);
+            if render_info.window_type == WindowType::Desktop {
+                 // Para ventanas de escritorio, dibujamos solo el contenido sin bordes ni barra de título
+                 let content_rect = Rectangle::new(
+                     0,
+                     0,
+                     render_info.geometry.width,
+                     render_info.geometry.height,
+                 );
+                 render_info.buffer.clear(Color::BLUE); // Fondo azul para escritorio
+                 // render_info.buffer.draw_rect(content_rect, Color::BLUE);
+            } else {
+                // Limpiar buffer de la ventana con color de fondo
+                render_info.buffer.clear(Color::LIGHT_GRAY);
 
-            // Dibujar barra de título
-            let title_bar_height = 30;
-            let title_bar_rect = Rectangle::new(0, 0, render_info.geometry.width, title_bar_height);
-            render_info
-                .buffer
-                .draw_rect(title_bar_rect, Color::DARK_GRAY);
+                // Dibujar barra de título
+                let title_bar_height = 30;
+                let title_bar_rect = Rectangle::new(0, 0, render_info.geometry.width, title_bar_height);
+                render_info
+                    .buffer
+                    .draw_rect(title_bar_rect, Color::DARK_GRAY);
 
-            // Dibujar bordes de la ventana
-            let border_color = Color::BLACK;
-            let border_width = 2;
+                // Dibujar bordes de la ventana
+                let border_color = Color::BLACK;
+                let border_width = 2;
 
-            // Borde superior
-            let border_rect = Rectangle::new(0, 0, render_info.geometry.width, border_width);
-            render_info.buffer.draw_rect(border_rect, border_color);
+                // Borde superior
+                let border_rect = Rectangle::new(0, 0, render_info.geometry.width, border_width);
+                render_info.buffer.draw_rect(border_rect, border_color);
 
-            // Borde izquierdo
-            let border_rect = Rectangle::new(0, 0, border_width, render_info.geometry.height);
-            render_info.buffer.draw_rect(border_rect, border_color);
+                // Borde izquierdo
+                let border_rect = Rectangle::new(0, 0, border_width, render_info.geometry.height);
+                render_info.buffer.draw_rect(border_rect, border_color);
 
-            // Borde derecho
-            let border_rect = Rectangle::new(
-                (render_info.geometry.width - border_width) as i32,
-                0,
-                border_width,
-                render_info.geometry.height,
-            );
-            render_info.buffer.draw_rect(border_rect, border_color);
+                // Borde derecho
+                let border_rect = Rectangle::new(
+                    (render_info.geometry.width - border_width) as i32,
+                    0,
+                    border_width,
+                    render_info.geometry.height,
+                );
+                render_info.buffer.draw_rect(border_rect, border_color);
 
-            // Borde inferior
-            let border_rect = Rectangle::new(
-                0,
-                (render_info.geometry.height - border_width) as i32,
-                render_info.geometry.width,
-                border_width,
-            );
-            render_info.buffer.draw_rect(border_rect, border_color);
+                // Borde inferior
+                let border_rect = Rectangle::new(
+                    0,
+                    (render_info.geometry.height - border_width) as i32,
+                    render_info.geometry.width,
+                    border_width,
+                );
+                render_info.buffer.draw_rect(border_rect, border_color);
 
-            // Dibujar botones de la barra de título (simplificados)
-            let button_size = 20;
-            let button_y = 5;
-            let button_spacing = 25;
+                // Dibujar botones de la barra de título (simplificados)
+                let button_size = 20;
+                let button_y = 5;
+                let button_spacing = 25;
 
-            // Botón cerrar (rojo)
-            let close_rect = Rectangle::new(
-                (render_info.geometry.width - button_spacing) as i32,
-                button_y,
-                button_size,
-                button_size,
-            );
-            render_info.buffer.draw_rect(close_rect, Color::RED);
+                // Botón cerrar (rojo)
+                let close_rect = Rectangle::new(
+                    (render_info.geometry.width - button_spacing) as i32,
+                    button_y,
+                    button_size,
+                    button_size,
+                );
+                render_info.buffer.draw_rect(close_rect, Color::RED);
 
-            // Botón minimizar (amarillo)
-            let minimize_rect = Rectangle::new(
-                (render_info.geometry.width - button_spacing * 2) as i32,
-                button_y,
-                button_size,
-                button_size,
-            );
-            render_info.buffer.draw_rect(minimize_rect, Color::YELLOW);
+                // Botón minimizar (amarillo)
+                let minimize_rect = Rectangle::new(
+                    (render_info.geometry.width - button_spacing * 2) as i32,
+                    button_y,
+                    button_size,
+                    button_size,
+                );
+                render_info.buffer.draw_rect(minimize_rect, Color::YELLOW);
 
-            // Botón maximizar (verde)
-            let maximize_rect = Rectangle::new(
-                (render_info.geometry.width - button_spacing * 3) as i32,
-                button_y,
-                button_size,
-                button_size,
-            );
-            render_info.buffer.draw_rect(maximize_rect, Color::GREEN);
+                // Botón maximizar (verde)
+                let maximize_rect = Rectangle::new(
+                    (render_info.geometry.width - button_spacing * 3) as i32,
+                    button_y,
+                    button_size,
+                    button_size,
+                );
+                render_info.buffer.draw_rect(maximize_rect, Color::GREEN);
 
-            // Dibujar contenido de la ventana (área de trabajo)
-            let content_rect = Rectangle::new(
-                border_width as i32,
-                (title_bar_height + border_width) as i32,
-                render_info.geometry.width - (border_width * 2),
-                render_info.geometry.height - (title_bar_height + border_width * 2),
-            );
-            render_info.buffer.draw_rect(content_rect, Color::WHITE);
+                // Dibujar contenido de la ventana (área de trabajo)
+                let content_rect = Rectangle::new(
+                    border_width as i32,
+                    (title_bar_height + border_width) as i32,
+                    render_info.geometry.width - (border_width * 2),
+                    render_info.geometry.height - (title_bar_height + border_width * 2),
+                );
+                render_info.buffer.draw_rect(content_rect, Color::WHITE);
+                
+                // Dibujar patrón de cuadros en el área de contenido
+                Self::draw_window_content_pattern_static(&mut render_info.buffer, content_rect);
+            }
 
-            // Dibujar patrón de cuadros en el área de contenido
-            Self::draw_window_content_pattern_static(&mut render_info.buffer, content_rect);
+
 
             // Marcar como no necesita redibujado
             render_info.needs_redraw = false;
@@ -433,6 +511,8 @@ impl WindowCompositor {
         &mut self,
         framebuffer: &mut FramebufferDriver,
     ) -> Result<(), &'static str> {
+
+
         // Componer frame si es necesario
         self.compose_frame()?;
 
@@ -549,16 +629,12 @@ pub fn init_window_compositor() -> Result<(), &'static str> {
 
 /// Obtener referencia al compositor
 pub fn get_window_compositor() -> Result<&'static mut WindowCompositor, &'static str> {
-    unsafe {
-        WINDOW_COMPOSITOR
-            .as_mut()
-            .ok_or("Compositor no inicializado")
-    }
+    super::get_compositor()
 }
 
 /// Verificar si el compositor está inicializado
 pub fn is_window_compositor_initialized() -> bool {
-    unsafe { WINDOW_COMPOSITOR.is_some() }
+    get_window_compositor().is_ok()
 }
 
 /// Componer frame globalmente

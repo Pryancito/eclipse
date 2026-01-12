@@ -8,6 +8,7 @@
 //! - Drivers de audio
 //! - Drivers de entrada (teclado, mouse)
 
+pub mod advanced;
 pub mod acceleration_2d;
 pub mod amd_graphics;
 pub mod block;

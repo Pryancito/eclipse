@@ -263,18 +263,68 @@ impl Default for ApicManager {
     }
 }
 
-/// Función de utilidad para inicializar el APIC
+/// Delivery Modes para IPI
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u32)]
+pub enum IpiDeliveryMode {
+    Fixed = 0x000,
+    LowestPriority = 0x001,
+    Smi = 0x002,
+    Nmi = 0x004,
+    Init = 0x005,
+    StartUp = 0x006,
+    ExtInt = 0x007,
+}
+
+static mut GLOBAL_APIC_MANAGER: Option<ApicManager> = None;
+
+/// Inicializar el APIC globalmente
 pub fn initialize_apic() -> Result<(), &'static str> {
-    let apic_manager = ApicManager::new();
-    if apic_manager.is_available() {
-        apic_manager.initialize()
+    let mut manager = ApicManager::new();
+    if manager.is_available() {
+        manager.initialize()?;
+        unsafe {
+            GLOBAL_APIC_MANAGER = Some(manager);
+        }
+        Ok(())
     } else {
         Err("APIC no disponible")
     }
 }
 
+/// Obtener la base del APIC
+pub fn get_apic_base() -> u64 {
+    unsafe {
+        if let Some(manager) = &GLOBAL_APIC_MANAGER {
+            manager.get_apic_base()
+        } else {
+            0
+        }
+    }
+}
+
+/// Enviar IPI (Inter-Processor Interrupt)
+pub fn send_ipi(destination: u8, vector: u8, mode: IpiDeliveryMode) {
+    unsafe {
+        if let Some(manager) = &GLOBAL_APIC_MANAGER {
+             // We map our Enum to the u32 expected by internal send_ipi
+             // But internal send_ipi expects u32 mode. 
+             // Let's modify the internal one or casting.
+             // The internal `send_ipi` took `u32`.
+             let mode_val = mode as u32;
+             // Note: internal send_ipi returns Result, here we swallow it or panic? 
+             // For now we swallow as signature in smp.rs is unsafe block.
+             let _ = manager.send_ipi(destination, vector, mode_val);
+        }
+    }
+}
+
 /// Función de utilidad para enviar EOI
 pub fn send_apic_eoi() {
-    let apic_manager = ApicManager::new();
-    apic_manager.send_eoi();
+    unsafe {
+        if let Some(manager) = &GLOBAL_APIC_MANAGER {
+            manager.send_eoi();
+        }
+    }
 }

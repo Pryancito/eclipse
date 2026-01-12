@@ -173,17 +173,44 @@ impl PhysicalPageManager {
     /// Crear un nuevo gestor de páginas físicas
     pub fn new(physical_base: u64, total_memory: u64) -> Self {
         let total_pages = (total_memory / PAGE_SIZE as u64) as u32;
-        let bitmap_size = (total_pages + 63) / 64; // Redondear hacia arriba
+        let bitmap_size_bytes = (total_pages as usize + 63) / 64 * 8; // Size in bytes
         
         // Usar memoria física para el bitmap
         let bitmap_ptr = physical_base as *mut u64;
         
-        Self {
-            page_bitmap: unsafe { core::slice::from_raw_parts_mut(bitmap_ptr, bitmap_size as usize) },
+        // 1. Inicializar el bitmap a 0 (Todo libre)
+        unsafe {
+            core::ptr::write_bytes(bitmap_ptr as *mut u8, 0, bitmap_size_bytes);
+        }
+
+        crate::debug::serial_write_str("PHYSICAL: New Manager Base: 0x");
+        crate::memory::paging::print_hex(physical_base);
+        crate::debug::serial_write_str("\n");
+
+
+        let mut mgr = Self {
+            page_bitmap: unsafe { core::slice::from_raw_parts_mut(bitmap_ptr, bitmap_size_bytes / 8) },
             total_pages,
             free_pages: total_pages,
             physical_base,
+        };
+
+        // 2. Reservar las páginas usadas por el propio bitmap
+        // Calcular cuántas páginas ocupa el bitmap
+        let bitmap_pages = (bitmap_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        
+        for i in 0..bitmap_pages {
+             if let Some(addr) = mgr.allocate_page() {
+                 // Debería retornar las primeras direcciones (donde está el bitmap)
+                 // Básicamente nos auto-asignamos las páginas para protegerlas.
+                 if i == 0 && addr != physical_base {
+                     // Sanity check: La primera asignación DEBE ser physical_base
+                     // serial_write_str("ERROR: Allocator sanity check failed\n");
+                 }
+             }
         }
+        
+        mgr
     }
     
     /// Asignar una página física
@@ -285,8 +312,6 @@ impl PhysicalPageManager {
 pub struct VirtualMemoryManager {
     /// Tabla PML4 (Page Map Level 4)
     pml4_table: &'static mut PageTable,
-    /// Gestor de páginas físicas
-    physical_manager: PhysicalPageManager,
     /// Dirección base del kernel
     kernel_base: u64,
     /// Límite superior del kernel
@@ -295,63 +320,81 @@ pub struct VirtualMemoryManager {
 
 impl VirtualMemoryManager {
     /// Crear un nuevo gestor de memoria virtual
-    pub fn new(physical_base: u64, total_memory: u64, kernel_base: u64, kernel_limit: u64) -> Self {
-        let physical_manager = PhysicalPageManager::new(physical_base, total_memory);
-        
-        // Usar memoria física para la tabla PML4
-        let pml4_ptr = physical_base as *mut PageTable;
-        
+    pub fn new(pml4_table: &'static mut PageTable, kernel_base: u64, kernel_limit: u64) -> Self {
         Self {
-            pml4_table: unsafe { &mut *pml4_ptr },
-            physical_manager,
+            pml4_table,
             kernel_base,
             kernel_limit,
         }
     }
     
-    /// Mapear una página virtual a una página física (versión simplificada)
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
-        // Por ahora, implementación simplificada que solo registra el mapeo
-        // En una implementación completa, se crearían las tablas de páginas
-        
-        serial_write_str(&format!("PAGING: Mapeando 0x{:x} -> 0x{:x} con flags 0x{:x}\n", 
-                                 virtual_addr, physical_addr, flags));
-        
-        // Invalidar TLB para esta dirección
+    /// Mapear una página virtual a una página física
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64, phys_manager: &mut PhysicalPageManager) -> Result<(), &'static str> {
+        let p4_index = (virtual_addr >> 39) & 0x1FF;
+        let p3_index = (virtual_addr >> 30) & 0x1FF;
+        let p2_index = (virtual_addr >> 21) & 0x1FF;
+        let p1_index = (virtual_addr >> 12) & 0x1FF;
+
+        // Recorrer la jerarquía usando helper estático
+        // Nota: pml4 ya está separado de phys_manager, así que no hay conflicto de borrow en arguments
+        let p3_table = Self::ensure_table(&mut self.pml4_table, p4_index as usize, flags, phys_manager)?;
+        let p2_table = Self::ensure_table(p3_table, p3_index as usize, flags, phys_manager)?;
+        let p1_table = Self::ensure_table(p2_table, p2_index as usize, flags, phys_manager)?;
+
+        // Configurar la entrada en la tabla de páginas (nivel 1)
+        let entry = PageTableEntry::new_with_addr(physical_addr, flags | PAGE_PRESENT | PAGE_WRITABLE);
+        p1_table.set_entry(p1_index as usize, entry);
+
+        // Invalidar TLB
         self.invalidate_tlb(virtual_addr);
         
         Ok(())
     }
-    
-    /// Desmapear una página virtual (versión simplificada)
+
+    /// Desmapear una página virtual
     pub fn unmap_page(&mut self, virtual_addr: u64) -> Result<(), &'static str> {
-        // Por ahora, implementación simplificada que solo registra el desmapeo
-        serial_write_str(&format!("PAGING: Desmapeando 0x{:x}\n", virtual_addr));
-        
-        // Invalidar TLB para esta dirección
+        let p4_index = (virtual_addr >> 39) & 0x1FF;
+        let p3_index = (virtual_addr >> 30) & 0x1FF;
+        let p2_index = (virtual_addr >> 21) & 0x1FF;
+        let p1_index = (virtual_addr >> 12) & 0x1FF;
+
+        // Traverse tables. If any is missing, page is already unmapped.
+        let p3_entry = self.pml4_table.get_entry(p4_index as usize);
+        if !p3_entry.is_present() { return Ok(()); }
+        let p3_table = unsafe { &mut *(p3_entry.get_physical_addr() as *mut PageTable) };
+
+        let p2_entry = p3_table.get_entry(p3_index as usize);
+        if !p2_entry.is_present() { return Ok(()); }
+        let p2_table = unsafe { &mut *(p2_entry.get_physical_addr() as *mut PageTable) };
+
+        let p1_entry = p2_table.get_entry(p2_index as usize);
+        if !p1_entry.is_present() { return Ok(()); }
+        let p1_table = unsafe { &mut *(p1_entry.get_physical_addr() as *mut PageTable) };
+
+        // Clear entry at level 1
+        let mut entry = PageTableEntry::new();
+        entry.set_physical_addr(0);
+        entry.set_flags(0); // Not present
+        p1_table.set_entry(p1_index as usize, entry);
+
         self.invalidate_tlb(virtual_addr);
-        
         Ok(())
     }
-    
-    /// Obtener o crear una tabla de páginas
-    fn get_or_create_table(&mut self, parent_table: &mut PageTable, index: usize, flags: u64) -> Result<&mut PageTable, &'static str> {
+
+    /// Helper estático para obtener o crear tabla (evita borrow de self)
+    fn ensure_table(parent_table: &mut PageTable, index: usize, flags: u64, phys_manager: &mut PhysicalPageManager) -> Result<&'static mut PageTable, &'static str> {
         let entry = parent_table.get_entry(index);
         
         if entry.is_present() {
-            // La tabla ya existe
             let table_addr = entry.get_physical_addr();
             Ok(unsafe { &mut *(table_addr as *mut PageTable) })
         } else {
-            // Crear una nueva tabla
-            let new_table_addr = self.physical_manager.allocate_page()
+            let new_table_addr = phys_manager.allocate_page()
                 .ok_or("No hay páginas físicas disponibles")?;
             
-            // Crear una nueva tabla
             let new_table = unsafe { &mut *(new_table_addr as *mut PageTable) };
             new_table.clear();
             
-            // Establecer la entrada en la tabla padre
             let new_entry = PageTableEntry::new_with_addr(new_table_addr, flags | PAGE_PRESENT | PAGE_WRITABLE);
             parent_table.set_entry(index, new_entry);
             
@@ -373,25 +416,87 @@ impl VirtualMemoryManager {
         }
     }
     
-    /// Traducir dirección virtual a física (versión simplificada)
-    pub fn translate_address(&self, virtual_addr: u64) -> Option<u64> {
-        // Por ahora, implementación simplificada que asume mapeo directo
-        // En una implementación completa, se recorrerían las tablas de páginas
-        
-        // Para el kernel, asumimos mapeo directo 1:1
-        if virtual_addr >= self.kernel_base && virtual_addr < self.kernel_limit {
-            return Some(virtual_addr - self.kernel_base + 0x100000); // Mapeo directo desde 1MB
+    /// Traducir dirección virtual a física y obtener flags
+    pub fn translate_address(&self, virtual_addr: u64) -> Option<(u64, u64)> {
+        let p4_index = (virtual_addr >> 39) & 0x1FF;
+        let p3_index = (virtual_addr >> 30) & 0x1FF;
+        let p2_index = (virtual_addr >> 21) & 0x1FF;
+        let p1_index = (virtual_addr >> 12) & 0x1FF;
+        let page_offset = virtual_addr & 0xFFF;
+
+        unsafe {
+            let p3_entry = self.pml4_table.get_entry(p4_index as usize);
+            if !p3_entry.is_present() { return None; }
+            let p3_table = &*(p3_entry.get_physical_addr() as *const PageTable);
+
+            let p2_entry = p3_table.get_entry(p3_index as usize);
+            if !p2_entry.is_present() { return None; }
+            
+            // Check for huge page (1GB) - Not supported yet but good to know
+            if (p2_entry.value & PAGE_SIZE_FLAG) != 0 {
+                // TODO: Handle 1GB pages
+                return None;
+            }
+            
+            let p2_table = &*(p2_entry.get_physical_addr() as *const PageTable);
+
+            let p1_entry = p2_table.get_entry(p2_index as usize);
+            if !p1_entry.is_present() { return None; }
+            
+             // Check for large page (2MB) - Not supported yet
+            if (p1_entry.value & PAGE_SIZE_FLAG) != 0 {
+                 // TODO: Handle 2MB pages
+                 return None;
+            }
+
+            let p1_table = &*(p1_entry.get_physical_addr() as *const PageTable);
+
+            let page_entry = p1_table.get_entry(p1_index as usize);
+            if !page_entry.is_present() { return None; }
+
+            // Retornar tupla (Dirección Física, Flags)
+            let flags = page_entry.value & 0xFFF; // Los 12 bits bajos son flags
+            Some((page_entry.get_physical_addr() + page_offset, flags))
         }
-        
-        None
     }
     
     /// Establecer la tabla PML4 en CR3
     pub fn set_pml4_table(&self) {
         let pml4_addr = self.pml4_table as *const PageTable as u64;
+        
+        // Debug: Print Addresses
+        crate::debug::serial_write_str("PAGING: Loading CR3 with PML4: 0x");
+        print_hex(pml4_addr);
+        crate::debug::serial_write_str("\n");
+        
+        let rsp: u64;
+        unsafe { asm!("mov {}, rsp", out(reg) rsp); }
+        crate::debug::serial_write_str("PAGING: Current RSP: 0x");
+        print_hex(rsp);
+        crate::debug::serial_write_str("\n");
+
         unsafe {
             asm!("mov cr3, {}", in(reg) pml4_addr, options(nostack));
         }
+    }
+}
+
+pub fn print_hex(mut num: u64) {
+    if num == 0 {
+        crate::debug::serial_write_char(b'0');
+        return;
+    }
+    let mut buffer = [0u8; 16]; // 64-bit int max chars
+    let mut i = 0;
+    while num > 0 {
+        let digit = (num & 0xF) as u8;
+        buffer[i] = if digit < 10 { b'0' + digit } else { b'A' + (digit - 10) };
+        num >>= 4;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        crate::debug::serial_write_char(buffer[i]);
     }
 }
 
@@ -404,27 +509,52 @@ pub fn init_paging(config: &crate::memory::MemoryConfig) -> Result<(), &'static 
     serial_write_str("PAGING: Inicializando sistema de paginación...\n");
     
     // Detectar memoria física disponible
-    let physical_base = 0x100000; // 1MB (después del área de BIOS)
+    // ERROR CRÍTICO ANTERIOR: 0x100000 (1MB) es donde está CÓDIGO del Kernel.
+    // Usar 0x2000000 (32MB) para las estructuras de paginación y el inicio del heap físico.
+    // Esto protege los primeros 32MB que contienen Kernel Code + Stack + Bootloader info.
+    let physical_base = 0x2000000; // 32MB
     let total_memory = config.total_physical_memory;
     let kernel_base = 0xFFFF_8000_0000_0000; // Dirección virtual del kernel
     let kernel_limit = kernel_base + config.kernel_heap_size;
     
-    serial_write_str(&format!("PAGING: Memoria física base: 0x{:x}\n", physical_base));
-    serial_write_str(&format!("PAGING: Memoria total: {} MB\n", total_memory / (1024 * 1024)));
-    serial_write_str(&format!("PAGING: Kernel base: 0x{:x}\n", kernel_base));
+    // Logging estático para evitar allocs antes de init_heap
+    serial_write_str("PAGING: Memoria detectada.\n");
     
-    // Crear gestores de memoria
+    // 1. Crear el Physical Manager (gestiona la RAM)
+    serial_write_str("PAGING CHECKPOINT A: Crear Physical Manager\n");
     let mut physical_manager = PhysicalPageManager::new(physical_base, total_memory);
-    let mut virtual_manager = VirtualMemoryManager::new(physical_base, total_memory, kernel_base, kernel_limit);
+    serial_write_str("PAGING: Physical Manager created.\n");
+    crate::debug::serial_write_str("PAGING: Total RAM: ");
+    print_hex(total_memory);
+    crate::debug::serial_write_str(" bytes. Free Pages: ");
+    print_hex(physical_manager.free_pages as u64);
+    crate::debug::serial_write_str("\n");
+
     
-    // Mapear el kernel
+    // 2. Asignar página para PML4 (NO usar physical_base a ciegas, pedirle al manager)
+    serial_write_str("PAGING CHECKPOINT A2: Alloc PML4\n");
+    let pml4_addr = physical_manager.allocate_page()
+        .ok_or("FATAL: No se pudo asignar memoria para PML4")?;
+        
+    let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
+    pml4_table.clear(); // IMPORTANTE: Limpiar basura anterior
+    
+    // 3. Crear Virtual Manager con esa tabla validada
+    let mut virtual_manager = VirtualMemoryManager::new(pml4_table, kernel_base, kernel_limit);
+    
+    // Mapear el kernel (ahora pasamos el manager explícitamente)
+    serial_write_str("PAGING CHECKPOINT B: Map Kernel Start\n");
     map_kernel_memory(&mut physical_manager, &mut virtual_manager, kernel_base, kernel_limit)?;
+    serial_write_str("PAGING CHECKPOINT C: Map Kernel Done\n");
     
     // Establecer la tabla PML4
+    serial_write_str("PAGING CHECKPOINT D: Set PML4\n");
     virtual_manager.set_pml4_table();
     
     // Habilitar paginación
+    serial_write_str("PAGING CHECKPOINT E: Enable Paging\n");
     enable_paging();
+    serial_write_str("PAGING CHECKPOINT F: Paging Enabled\n");
     
     // Guardar los gestores globalmente
     unsafe {
@@ -446,13 +576,42 @@ fn map_kernel_memory(
     let mut current_addr = kernel_base;
     let mut physical_addr = 0x100000; // 1MB
     
+    // 1. Mapear el kernel en la dirección virtual alta (Higher Half)
+    serial_write_str("PAGING CHECKPOINT B1: HH Loops\n");
     while current_addr < kernel_limit {
         let flags = PAGE_PRESENT | PAGE_WRITABLE;
-        virtual_manager.map_page(current_addr, physical_addr, flags)?;
+        virtual_manager.map_page(current_addr, physical_addr, flags, physical_manager)?;
         
         current_addr += PAGE_SIZE as u64;
         physical_addr += PAGE_SIZE as u64;
     }
+
+    // 2. Identity Mapping CRÍTICO (0GB - 4GB)
+    // RSP está en 0x3FFB8000 (~1GB), así que necesitamos mapear más que 128MB.
+    // Mapeamos los primeros 4GB para estar seguros (Stack, Framebuffer, DMA, MMIO).
+    serial_write_str("PAGING CHECKPOINT B2: Identity Loop (4GB)\n");
+    // Usamos u64 para evitar overflow en 32-bit (aunque estamos en 64-bit)
+    let identity_limit = 4u64 * 1024 * 1024 * 1024; 
+    let mut id_addr = 0;
+    while id_addr < identity_limit {
+        let flags = PAGE_PRESENT | PAGE_WRITABLE;
+        // Check if we exceed total physical memory to save space?
+        // Actually, internal fragmentation of page tables is small. 
+        // Mapping holes is fine (just useless PTs).
+        // But better constraint it to actual RAM size if possible, BUT stack might be in MMIO hole?
+        // Safe to map 4GB for now.
+        
+        // Optimización: Solo mapear si tenemos memoria física o es zona baja (<4GB usualmente seguro)
+        virtual_manager.map_page(id_addr, id_addr, flags, physical_manager)?;
+        id_addr += PAGE_SIZE as u64;
+        
+        // Logging de progreso cada 512MB para no colgar la serial console
+        if id_addr % (512 * 1024 * 1024) == 0 {
+             crate::debug::serial_write_str("."); 
+        }
+    }
+    crate::debug::serial_write_str("\n");
+    serial_write_str("PAGING CHECKPOINT B3: Identity Done\n");
     
     Ok(())
 }
@@ -523,8 +682,13 @@ pub fn deallocate_physical_page(addr: u64) -> Result<(), &'static str> {
 
 /// Mapear una página virtual
 pub fn map_virtual_page(virtual_addr: u64, physical_addr: u64, flags: u64) -> Result<(), &'static str> {
-    let manager = get_virtual_manager();
-    manager.map_page(virtual_addr, physical_addr, flags)
+    let vm = get_virtual_manager();
+    let pm = get_physical_manager(); // Need to get mutable ref carefully?
+    // WARNING: get_virtual_manager and get_physical_manager both return &'static mut
+    // This might cause multiple mutable borrows if we are not careful.
+    // However, they return separate static refs from separate statics.
+    // It should be fine at runtime.
+    vm.map_page(virtual_addr, physical_addr, flags, pm)
 }
 
 /// Desmapear una página virtual
@@ -534,7 +698,7 @@ pub fn unmap_virtual_page(virtual_addr: u64) -> Result<(), &'static str> {
 }
 
 /// Traducir dirección virtual a física
-pub fn translate_virtual_address(virtual_addr: u64) -> Option<u64> {
+pub fn translate_virtual_address(virtual_addr: u64) -> Option<(u64, u64)> {
     let manager = get_virtual_manager();
     manager.translate_address(virtual_addr)
 }

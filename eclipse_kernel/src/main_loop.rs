@@ -211,7 +211,14 @@ static TASK_KEYBOARD_INPUT: ScheduledTask = ScheduledTask::new(
 static TASK_MOUSE_INPUT: ScheduledTask = ScheduledTask::new(
     "mouse_input",
     TaskPriority::High,
+
     5,  // cada 5 ticks (muy frecuente para input responsivo)
+);
+
+static TASK_TERMINAL_UPDATE: ScheduledTask = ScheduledTask::new(
+    "terminal_update",
+    TaskPriority::Normal,
+    30, // 30ms (~30 FPS)
 );
 
 /// Procesa eventos XHCI mediante polling simple (sin interrupciones)
@@ -262,7 +269,13 @@ fn process_keyboard_task(fb: &mut FramebufferDriver) -> usize {
             while let Some(mut event) = input_sys.get_next_event() {
                 if let InputEventType::Keyboard(kbd_event) = &event.event_type {
                     // Procesar el evento de teclado
-                    if kbd_event.pressed {
+                    if crate::window_system::is_window_system_initialized() {
+                        // Enviar al sistema de ventanas
+                        let _ = crate::window_system::event_system::simulate_global_key_press(
+                             kbd_event.key_code as u8 as u32,
+                             kbd_event.pressed
+                        );
+                    } else if kbd_event.pressed {
                         fb.write_text_kernel(
                             &alloc::format!(
                                 "⌨️  Tecla: {:?} (char: {:?})",
@@ -316,7 +329,9 @@ fn process_mouse_task(fb: &mut FramebufferDriver) -> usize {
                 match mouse_event {
                     MouseEvent::Move { position, buttons } => {
                         // Solo mostrar si hay botones presionados (para no saturar)
-                        if buttons.left || buttons.right || buttons.middle {
+                        if crate::window_system::is_window_system_initialized() {
+                             let _ = crate::window_system::event_system::simulate_global_mouse_move(position.x, position.y);
+                        } else if buttons.left || buttons.right || buttons.middle {
                             fb.write_text_kernel(
                                 &alloc::format!(
                                     "🖱️  Ratón: ({}, {}) [L:{} R:{} M:{}]",
@@ -331,13 +346,20 @@ fn process_mouse_task(fb: &mut FramebufferDriver) -> usize {
                         count += 1;
                     }
                     MouseEvent::ButtonPress { button, position } => {
-                        fb.write_text_kernel(
-                            &alloc::format!("🖱️  Click {:?} en ({}, {})", button, position.x, position.y),
-                            Color::GREEN,
-                        );
+                        if crate::window_system::is_window_system_initialized() {
+                             let _ = crate::window_system::event_system::simulate_global_mouse_click(*button as u8, true);
+                        } else {
+                            fb.write_text_kernel(
+                                &alloc::format!("🖱️  Click {:?} en ({}, {})", button, position.x, position.y),
+                                Color::GREEN,
+                            );
+                        }
                         count += 1;
                     }
                     MouseEvent::ButtonRelease { button, position: _ } => {
+                        if crate::window_system::is_window_system_initialized() {
+                             let _ = crate::window_system::event_system::simulate_global_mouse_click(*button as u8, false);
+                        }
                         count += 1;
                     }
                     MouseEvent::Scroll { delta, position: _ } => {
@@ -369,6 +391,13 @@ fn power_management_task() {
     }
 }
 
+fn process_terminal_task(_fb: &mut FramebufferDriver) -> usize {
+    if crate::window_system::is_window_system_initialized() {
+        crate::apps::terminal::update_terminal();
+    }
+    0
+}
+
 /// Ejecuta todas las tareas programadas
 fn run_scheduled_tasks(fb: &mut FramebufferDriver) -> usize {
     let current_tick = MAIN_LOOP_STATE.get_tick();
@@ -380,6 +409,7 @@ fn run_scheduled_tasks(fb: &mut FramebufferDriver) -> usize {
         (&TASK_KEYBOARD_INPUT, process_keyboard_task as fn(&mut FramebufferDriver) -> usize),
         (&TASK_MOUSE_INPUT, process_mouse_task as fn(&mut FramebufferDriver) -> usize),
         (&TASK_PROCESS_XHCI, process_xhci_task as fn(&mut FramebufferDriver) -> usize),
+        (&TASK_TERMINAL_UPDATE, process_terminal_task as fn(&mut FramebufferDriver) -> usize),
         (&TASK_POWER_MANAGEMENT, power_management_task_wrapper as fn(&mut FramebufferDriver) -> usize),
     ];
 
@@ -429,6 +459,9 @@ pub fn main_loop(fb: &mut FramebufferDriver, xhci_initialized: bool) -> ! {
     
     loop {
         counter = counter.wrapping_add(1);
+
+        // Ejecutar tareas programadas (input, terminal, procesos)
+        run_scheduled_tasks(fb);
         
         // Polling USB HID cada 100,000 iteraciones (~cada ~10ms dependiendo de la CPU)
         // Solo si XHCI está inicializado
@@ -439,6 +472,8 @@ pub fn main_loop(fb: &mut FramebufferDriver, xhci_initialized: bool) -> ! {
             }
             last_hid_poll = counter;
         }
+
+
         
         // Mostrar estadísticas cada ~200 millones de iteraciones
         if counter.wrapping_sub(last_stats) > 200_000_000 {
@@ -451,6 +486,17 @@ pub fn main_loop(fb: &mut FramebufferDriver, xhci_initialized: bool) -> ! {
             last_stats = counter;
         }
         
+        // Renderizar sistema de ventanas si está activo
+        if crate::window_system::is_window_system_initialized() {
+            if let Err(e) = crate::window_system::compositor::render_global_to_framebuffer(fb) {
+                 // Si falla, loguear en pantalla
+                 fb.write_text_kernel(
+                     &alloc::format!("RENDER ERROR: {}", e),
+                     Color::RED,
+                 );
+            }
+        }
+
         // Pausa breve para no saturar la CPU
         for _ in 0..1000 {
             core::hint::spin_loop();

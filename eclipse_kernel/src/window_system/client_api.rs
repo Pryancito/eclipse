@@ -67,6 +67,16 @@ impl ClientAPI {
 
     pub fn initialize(&mut self) -> Result<(), &'static str> {
         self.initialized.store(true, Ordering::SeqCst);
+        
+        // Registrar Cliente Sistema (ID 0)
+        let system_client = ClientInfo {
+            client_id: 0,
+            name: String::from("System"),
+            windows: Vec::new(),
+            connected: true,
+        };
+        self.clients.insert(0, system_client);
+        
         Ok(())
     }
 
@@ -484,12 +494,12 @@ pub fn init_client_api() -> Result<(), &'static str> {
 
 /// Obtener referencia a la API de cliente
 pub fn get_client_api() -> Result<&'static mut ClientAPI, &'static str> {
-    unsafe { CLIENT_API.as_mut().ok_or("API de cliente no inicializada") }
+    super::get_client_api()
 }
 
 /// Verificar si la API de cliente está inicializada
 pub fn is_client_api_initialized() -> bool {
-    unsafe { CLIENT_API.is_some() }
+    get_client_api().is_ok()
 }
 
 /// Conectar un cliente globalmente

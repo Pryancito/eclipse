@@ -31,4 +31,29 @@ fn main() {
     // Decir a cargo que incluya la biblioteca
     println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-lib=static=context_switch");
+
+    // --- Compilar Trampoline para SMP ---
+    println!("cargo:rerun-if-changed=src/platform/trampoline.asm");
+    let tram_obj = format!("{}/trampoline.o", out_dir);
+    let tram_lib = format!("{}/libtrampoline.a", out_dir);
+
+    let tram_status = Command::new("nasm")
+        .args(&["-f", "elf64", "-o", &tram_obj, "src/platform/trampoline.asm"])
+        .status()
+        .expect("Failed to run nasm for trampoline");
+
+    if !tram_status.success() {
+        panic!("nasm failed to assemble trampoline.asm");
+    }
+
+    let tram_ar = Command::new("ar")
+        .args(&["rcs", &tram_lib, &tram_obj])
+        .status()
+        .expect("Failed to run ar for trampoline");
+    
+    if !tram_ar.success() {
+        panic!("ar failed to create static library for trampoline");
+    }
+
+    println!("cargo:rustc-link-lib=static=trampoline");
 }

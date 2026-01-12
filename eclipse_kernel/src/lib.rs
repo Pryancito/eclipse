@@ -134,6 +134,7 @@ pub mod virtual_devices; // Dispositivos virtuales de ejemplo
 #[macro_use]
 pub mod config; // Sistema de configuración del kernel
 pub mod shell; // Shell interactivo básico
+pub mod platform;
 pub mod power; // Sistema de gestión de energía
 pub mod virtual_fs; // Sistema de archivos virtual
 pub mod process_memory; // Gestión de memoria para procesos
@@ -165,6 +166,7 @@ pub mod ipc; // Sistema de comunicación inter-proceso
 pub mod kernel_utils;
 pub mod logging; // Sistema de logging estructurado avanzado
 pub mod modules; // Sistema de módulos del kernel
+pub mod main_ap;
 pub mod main_simple;
 pub mod main_loop; // Loop principal mejorado del kernel
 pub mod main_unified; // Main unificado con funcionalidades de escritorio
