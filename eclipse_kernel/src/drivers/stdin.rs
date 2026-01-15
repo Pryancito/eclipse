@@ -204,7 +204,7 @@ pub fn keycode_to_ascii(key: KeyCode, shift: bool) -> Option<u8> {
         
         // Símbolos
         KeyCode::Minus => Some(if shift { b'_' } else { b'-' }),
-        KeyCode::Equals | KeyCode::Equal => Some(if shift { b'+' } else { b'=' }),
+        KeyCode::Equal => Some(if shift { b'+' } else { b'=' }),
         KeyCode::LeftBracket => Some(if shift { b'{' } else { b'[' }),
         KeyCode::RightBracket => Some(if shift { b'}' } else { b']' }),
         KeyCode::Backslash => Some(if shift { b'|' } else { b'\\' }),

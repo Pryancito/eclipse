@@ -7,6 +7,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
+use crate::drivers::keyboard::{BasicKeyboardDriver, KeyboardDriver};
 
 /// Shell interactiva de Eclipse OS
 pub struct EclipseShell {
@@ -14,6 +15,7 @@ pub struct EclipseShell {
     history: Vec<String>,
     commands: Vec<ShellCommand>,
     running: bool,
+    keyboard: BasicKeyboardDriver,
 }
 
 /// Comando del shell
@@ -31,6 +33,7 @@ impl EclipseShell {
             history: Vec::new(),
             commands: Vec::new(),
             running: false,
+            keyboard: BasicKeyboardDriver::new(),
         };
         
         shell.register_commands();
@@ -71,10 +74,34 @@ impl EclipseShell {
         
         while self.running {
             self.show_prompt();
-            // En un shell real, aquí se leería la entrada del usuario
-            // Por ahora, simulamos algunos comandos
-            self.simulate_user_input();
+            let command_line = self.read_line();
+            if !command_line.is_empty() {
+                self.execute_command(&command_line);
+            }
         }
+    }
+
+    /// Leer una línea completa desde el teclado
+    fn read_line(&mut self) -> String {
+        let mut line = String::new();
+        loop {
+            if let Some(c) = self.keyboard.read_char() {
+                if c == '\n' {
+                    print!("\n");
+                    break;
+                } else if c == '\x08' { // Backspace
+                    if !line.is_empty() {
+                        line.pop();
+                        // Borrar caracter en pantalla (backspace, space, backspace)
+                        print!("\x08 \x08"); 
+                    }
+                } else {
+                    print!("{}", c);
+                    line.push(c);
+                }
+            }
+        }
+        line
     }
     
     /// Mostrar mensaje de bienvenida
@@ -95,27 +122,6 @@ impl EclipseShell {
     /// Mostrar prompt
     fn show_prompt(&self) {
         print!("{}> ", self.prompt);
-    }
-    
-    /// Simular entrada del usuario (para demostración)
-    fn simulate_user_input(&mut self) {
-        let demo_commands = vec![
-            "help",
-            "info",
-            "memory",
-            "process",
-            "network",
-            "demo",
-            "exit"
-        ];
-        
-        for cmd in demo_commands {
-            println!("{}", cmd);
-            self.execute_command(cmd);
-            println!();
-        }
-        
-        self.running = false;
     }
     
     /// Ejecutar comando

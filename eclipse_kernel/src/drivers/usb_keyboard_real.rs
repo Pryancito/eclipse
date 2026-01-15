@@ -423,6 +423,17 @@ impl KeyboardDriver for UsbKeyboardReal {
         self.get_next_key_event()
     }
 
+    fn read_char(&mut self) -> Option<char> {
+        if let Some(event) = self.read_key() {
+             // Solo eventos de pression, ignorar modificadores sueltos
+             if event.state == crate::drivers::keyboard::KeyState::Pressed {
+                 let shift = (event.modifiers & 1) != 0; // Simple check for now
+                 return event.key.to_char(shift);
+             }
+        }
+        None
+    }
+
     fn is_key_pressed(&self, key: KeyCode) -> bool {
         self.is_key_pressed(key)
     }
