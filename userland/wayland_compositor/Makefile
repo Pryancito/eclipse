@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -static -nostdlib -ffreestanding -no-pie -fno-pic -m64
-LDFLAGS = -static -nostdlib -Ttext=0x400000 -Wl,--build-id=none
+CFLAGS = -static -nostdlib -ffreestanding -no-pie -fno-pic -m64 -fno-stack-protector -fcf-protection=none
+LDFLAGS = -static -nostdlib -Ttext=0x400000 -Wl,--build-id=none -Wl,-z,norelro
 
 all: wayland_compositor
 

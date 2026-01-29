@@ -16,6 +16,7 @@
 // #include <unistd.h>
 
 // Definiciones de syscalls
+#define SYS_EXIT 0
 #define SYS_WRITE 1
 #define SYS_READ 2
 #define SYS_OPEN 3
@@ -89,6 +90,12 @@ static inline long sys_close(int fd) {
 
 static inline long sys_ioctl(int fd, unsigned long request, void *arg) {
     return syscall3(SYS_IOCTL, fd, request, (long)arg);
+}
+
+static inline void sys_exit(int code) {
+    syscall1(SYS_EXIT, code);
+    // Should not reach here
+    while(1) {}
 }
 
 // Funciones auxiliares
@@ -342,4 +349,10 @@ int main(int argc, char *argv[]) {
 
     wl_log("Wayland compositor terminado exitosamente");
     return 0;
+}
+
+// Entry point for freestanding binary
+void _start(void) {
+    int result = main(0, NULL);
+    sys_exit(result);
 }
