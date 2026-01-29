@@ -63,23 +63,29 @@ impl ProcessMemoryManager {
         let stack_start = stack_end.checked_sub(stack_size)
             .ok_or("Desbordamiento al calcular stack_start")?;
 
-        // Verificar que todas las direcciones estén alineadas
-        // Esto debería siempre ser cierto por construcción, pero verificamos por seguridad
-        debug_assert_eq!(text_start % self.page_size, 0, "text_start no alineado: 0x{:x}", text_start);
-        debug_assert_eq!(text_end % self.page_size, 0, "text_end no alineado: 0x{:x}", text_end);
-        debug_assert_eq!(data_start % self.page_size, 0, "data_start no alineado: 0x{:x}", data_start);
-        debug_assert_eq!(data_end % self.page_size, 0, "data_end no alineado: 0x{:x}", data_end);
-        debug_assert_eq!(heap_start % self.page_size, 0, "heap_start no alineado: 0x{:x}", heap_start);
-        debug_assert_eq!(heap_end % self.page_size, 0, "heap_end no alineado: 0x{:x}", heap_end);
-        debug_assert_eq!(stack_start % self.page_size, 0, "stack_start no alineado: 0x{:x}", stack_start);
-        debug_assert_eq!(stack_end % self.page_size, 0, "stack_end no alineado: 0x{:x}", stack_end);
-
         // Validar que las direcciones no estén mal alineadas (esto indica un bug en align_to_page)
-        if text_start % self.page_size != 0 || text_end % self.page_size != 0 ||
-           data_start % self.page_size != 0 || data_end % self.page_size != 0 ||
-           heap_start % self.page_size != 0 || heap_end % self.page_size != 0 ||
-           stack_start % self.page_size != 0 || stack_end % self.page_size != 0 {
-            return Err("Error interno: dirección no alineada a página");
+        // En desarrollo, los debug_assert_eq! captarán estos errores.
+        // En producción, verificamos por seguridad adicional.
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(text_start % self.page_size, 0, "text_start no alineado: 0x{:x}", text_start);
+            debug_assert_eq!(text_end % self.page_size, 0, "text_end no alineado: 0x{:x}", text_end);
+            debug_assert_eq!(data_start % self.page_size, 0, "data_start no alineado: 0x{:x}", data_start);
+            debug_assert_eq!(data_end % self.page_size, 0, "data_end no alineado: 0x{:x}", data_end);
+            debug_assert_eq!(heap_start % self.page_size, 0, "heap_start no alineado: 0x{:x}", heap_start);
+            debug_assert_eq!(heap_end % self.page_size, 0, "heap_end no alineado: 0x{:x}", heap_end);
+            debug_assert_eq!(stack_start % self.page_size, 0, "stack_start no alineado: 0x{:x}", stack_start);
+            debug_assert_eq!(stack_end % self.page_size, 0, "stack_end no alineado: 0x{:x}", stack_end);
+        }
+        
+        #[cfg(not(debug_assertions))]
+        {
+            if text_start % self.page_size != 0 || text_end % self.page_size != 0 ||
+               data_start % self.page_size != 0 || data_end % self.page_size != 0 ||
+               heap_start % self.page_size != 0 || heap_end % self.page_size != 0 ||
+               stack_start % self.page_size != 0 || stack_end % self.page_size != 0 {
+                return Err("Error interno: dirección no alineada a página");
+            }
         }
 
         self.next_vaddr = heap_end;
@@ -232,8 +238,15 @@ impl ProcessMemoryManager {
     }
 
     /// Alinear tamaño a múltiplo de página
+    /// 
+    /// # Errores
+    /// 
+    /// Retorna el tamaño alineado o satura a u64::MAX si hay overflow.
+    /// En práctica, el overflow no debería ocurrir ya que page_size es pequeño (0x1000).
     fn align_to_page(&self, size: u64) -> u64 {
-        (size + self.page_size - 1) & !(self.page_size - 1)
+        // Usar saturating_add para prevenir overflow, aunque es improbable con page_size típico
+        let aligned = size.saturating_add(self.page_size).saturating_sub(1);
+        aligned & !(self.page_size - 1)
     }
 
     /// Expandir heap del proceso

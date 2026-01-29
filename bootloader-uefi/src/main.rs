@@ -265,7 +265,22 @@ fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_
 
     // Calcular límites alineados a 2MiB para evitar mapeos parciales
     let phys_start = fb_base & !0x1F_FFFFu64; // 2MiB aligned down
-    let phys_end = (fb_base.saturating_add(fb_size).saturating_add(0x1F_FFFFu64)) & !0x1F_FFFFu64; // 2MiB aligned up
+    
+    // Validar que fb_base + fb_size no desborde
+    let fb_end = fb_base.checked_add(fb_size)
+        .unwrap_or_else(|| {
+            // SAFETY: solo escribe a puerto serie
+            unsafe { serial_write_str("BL: ERROR - framebuffer address overflow\r\n"); }
+            // Si desborda, usar el valor máximo seguro
+            u64::MAX - 0x1F_FFFFu64
+        });
+    
+    let phys_end = fb_end.checked_add(0x1F_FFFFu64)
+        .map(|v| v & !0x1F_FFFFu64)
+        .unwrap_or_else(|| {
+            // Si desborda, usar el máximo alineado posible
+            u64::MAX & !0x1F_FFFFu64
+        });
 
     // SAFETY: Asumimos que pml4_phys apunta a memoria válida alineada a 4KB
     // Esta es una precondición de la función
@@ -466,7 +481,10 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         
         // Calcular direcciones virtuales del segmento con alineación de página
         let vaddr_start = phdr.p_vaddr & !0xFFFu64;
-        let vaddr_end = (vaddr_end_unaligned + 0xFFF) & !0xFFFu64;
+        // Validar que la suma no desborde antes de alinear
+        let vaddr_end = vaddr_end_unaligned.checked_add(0xFFF)
+            .map(|v| v & !0xFFFu64)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
 
         if vaddr_start < min_vaddr { min_vaddr = vaddr_start; }
         if vaddr_end > max_vaddr { max_vaddr = vaddr_end; }
@@ -510,14 +528,30 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
 
-        // Calcular direcciones virtuales del segmento
+        // Calcular direcciones virtuales del segmento con overflow protection
         let vaddr_start = phdr.p_vaddr & !0xFFFu64;
-        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+        
+        // Reutilizar el mismo patrón de validación que en el primer pase
+        let vaddr_end_unaligned = phdr.p_vaddr.checked_add(phdr.p_memsz)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+        
+        let vaddr_end = vaddr_end_unaligned.checked_add(0xFFF)
+            .map(|v| v & !0xFFFu64)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
 
         if seg_idx < MAX_PH {
             segmap.vstart[seg_idx] = vaddr_start;
-            segmap.pstart[seg_idx] = kernel_phys_base + (vaddr_start - min_vaddr); // Dirección física correspondiente
-            segmap.len[seg_idx] = vaddr_end.saturating_sub(vaddr_start);
+            
+            // Calcular dirección física con overflow protection
+            let offset = vaddr_start.checked_sub(min_vaddr)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
+            segmap.pstart[seg_idx] = kernel_phys_base.checked_add(offset)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
+            segmap.len[seg_idx] = vaddr_end.checked_sub(vaddr_start)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
             seg_idx += 1;
         }
     }
