@@ -294,6 +294,31 @@ impl ProcessScheduler {
         // En una implementación real, tendríamos múltiples colas con diferentes quantums
         self.select_priority(processes)
     }
+    
+    /// Main scheduling function - selects and switches to next process
+    pub fn schedule(&mut self, processes: &[Option<ProcessControlBlock>]) -> Option<ProcessId> {
+        // If current process is still ready, add it back to ready queue
+        if let Some(current_pid) = self.current_process {
+            if let Some(Some(pcb)) = processes.get(current_pid as usize) {
+                use crate::process::process::ProcessState;
+                // Only re-queue if process is still in Running state (not blocked/zombie)
+                if pcb.state == ProcessState::Running {
+                    // Move to Ready state and add to queue
+                    self.ready_queue.enqueue(current_pid);
+                }
+            }
+        }
+        
+        // Select next process from ready queue
+        let next_pid = self.select_next_process(processes);
+        
+        if let Some(pid) = next_pid {
+            // Perform context switch bookkeeping
+            self.context_switch(pid);
+        }
+        
+        next_pid
+    }
 
     /// Realizar context switch
     pub fn context_switch(&mut self, new_pid: ProcessId) -> Option<ProcessId> {

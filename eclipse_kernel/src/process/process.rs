@@ -133,6 +133,8 @@ pub struct MemoryInfo {
     pub heap_break: u64,
     /// Límite máximo del heap
     pub heap_limit: u64,
+    /// Dirección física de la tabla PML4 del proceso
+    pub pml4_addr: u64,
 }
 
 impl Default for MemoryInfo {
@@ -147,6 +149,7 @@ impl Default for MemoryInfo {
             heap_start,
             heap_break: heap_start, // Heap vacío inicialmente
             heap_limit: heap_start + 0x1000000, // Límite de 16MB de heap
+            pml4_addr: 0, // Will be set during process creation/fork
         }
     }
 }
@@ -242,6 +245,11 @@ impl ProcessControlBlock {
     /// Cambiar estado del proceso
     pub fn set_state(&mut self, new_state: ProcessState) {
         self.state = new_state;
+    }
+    
+    /// Obtener estado del proceso
+    pub fn get_state(&self) -> ProcessState {
+        self.state
     }
 
     /// Actualizar contexto de CPU

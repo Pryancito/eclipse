@@ -1,10 +1,13 @@
 use std::process::Command;
+use std::fs;
+use std::path::Path;
 
 fn main() {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    
     // Compilar el archivo assembly para cambio de contexto usando nasm
     println!("cargo:rerun-if-changed=src/context_switch.asm");
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
     let obj_file = format!("{}/context_switch.o", out_dir);
     let lib_file = format!("{}/libcontext_switch.a", out_dir);
 
@@ -56,4 +59,54 @@ fn main() {
     }
 
     println!("cargo:rustc-link-lib=static=trampoline");
+
+    // --- Compilar Syscall Entry ---
+    println!("cargo:rerun-if-changed=src/syscall_entry.asm");
+    let syscall_obj = format!("{}/syscall_entry.o", out_dir);
+    let syscall_lib = format!("{}/libsyscall_entry.a", out_dir);
+
+    let syscall_status = Command::new("nasm")
+        .args(&["-f", "elf64", "-o", &syscall_obj, "src/syscall_entry.asm"])
+        .status()
+        .expect("Failed to run nasm for syscall_entry");
+
+    if !syscall_status.success() {
+        panic!("nasm failed to assemble syscall_entry.asm");
+    }
+
+    let syscall_ar = Command::new("ar")
+        .args(&["rcs", &syscall_lib, &syscall_obj])
+        .status()
+        .expect("Failed to run ar for syscall_entry");
+    
+    if !syscall_ar.success() {
+        panic!("ar failed to create static library for syscall_entry");
+    }
+
+    println!("cargo:rustc-link-lib=static=syscall_entry");
+    
+    // --- Copy mini-systemd binary ---
+    println!("cargo:rerun-if-changed=../userland/mini-systemd/target/x86_64-unknown-none/release/mini-systemd");
+    
+    let mini_systemd_src = Path::new("../userland/mini-systemd/target/x86_64-unknown-none/release/mini-systemd");
+    let mini_systemd_dst = Path::new(&out_dir).join("mini-systemd.bin");
+    
+    if mini_systemd_src.exists() {
+        match fs::copy(&mini_systemd_src, &mini_systemd_dst) {
+            Ok(_) => {
+                println!("cargo:warning=Copied mini-systemd binary to build directory");
+            }
+            Err(e) => {
+                println!("cargo:warning=Failed to copy mini-systemd: {}", e);
+                println!("cargo:warning=Will use fake ELF data instead");
+                // Create empty file so build doesn't fail
+                fs::write(&mini_systemd_dst, &[]).expect("Failed to create empty mini-systemd.bin");
+            }
+        }
+    } else {
+        println!("cargo:warning=mini-systemd binary not found, will use fake ELF data");
+        // Create empty file so build doesn't fail
+        fs::write(&mini_systemd_dst, &[]).expect("Failed to create empty mini-systemd.bin");
+    }
 }
+
