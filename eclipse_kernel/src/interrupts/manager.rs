@@ -208,6 +208,11 @@ impl InterruptManager {
             registered_irqs: if self.is_initialized() { self.irq_manager.list_registered_irqs() } else { Vec::new() },
         }
     }
+
+    /// Cargar IDT en el procesador actual (usado por APs)
+    pub fn load_idt(&self) {
+        self.idt_manager.get_idt().load();
+    }
 }
 
 impl Default for InterruptManager {

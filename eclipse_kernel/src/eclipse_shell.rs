@@ -55,6 +55,7 @@ impl EclipseShell {
         self.add_command("demo", "Ejecutar demostración", Self::cmd_demo);
         self.add_command("clear", "Limpiar pantalla", Self::cmd_clear);
         self.add_command("history", "Mostrar historial", Self::cmd_history);
+        self.add_command("test_alloc", "Probar asignación dinámica", Self::cmd_test_alloc);
         self.add_command("exit", "Salir del shell", Self::cmd_exit);
     }
     
@@ -325,6 +326,26 @@ impl EclipseShell {
         history
     }
     
+    fn cmd_test_alloc(_args: &[String]) -> String {
+        let mut result = String::new();
+        writeln!(&mut result, "Probando asignación dinámica...").unwrap();
+        
+        let mut vec = Vec::new();
+        for i in 0..100 {
+            vec.push(i);
+        }
+        
+        writeln!(&mut result, "Vector creado con {} elementos.", vec.len()).unwrap();
+        writeln!(&mut result, "Primer elemento: {}", vec[0]).unwrap();
+        writeln!(&mut result, "Último elemento: {}", vec[99]).unwrap();
+        writeln!(&mut result, "Dirección base aparente: {:p}", vec.as_ptr()).unwrap();
+        
+        // El vector se liberará aquí al salir del scope
+        writeln!(&mut result, "Prueba de alloc/dealloc exitosa (si ves esto).").unwrap();
+        
+        result
+    }
+
     fn cmd_exit(_args: &[String]) -> String {
         "Cerrando Eclipse OS Shell...".to_string()
     }

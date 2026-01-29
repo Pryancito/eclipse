@@ -15,3 +15,10 @@ pub use irq::IrqManager;
 pub use pic::PicManager;
 pub use apic::ApicManager;
 pub use timer::{SystemTimer, TimerConfig, init_system_timer, get_system_timer, on_timer_interrupt};
+
+/// Inicializar la IDT en el núcleo actual (usado por APs)
+pub fn init_idt() {
+    if let Some(manager) = manager::get_interrupt_manager() {
+        manager.load_idt();
+    }
+}

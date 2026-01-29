@@ -471,7 +471,7 @@ pub fn kernel_main(mut fb: &mut FramebufferDriver) {
     // Asegurar allocador inicializado antes de usar alloc en este main
     #[cfg(feature = "alloc")]
     {
-        crate::allocator::init_allocator();
+
     }
     let hw_result = detect_graphics_hardware();
     let is_qemu_bochs = hw_result.primary_gpu.as_ref().map(|g| matches!(g.gpu_type, GpuType::QemuBochs)).unwrap_or(false);

@@ -334,17 +334,19 @@ pub fn send_apic_eoi() {
 /// útil para identificar el BSP (Bootstrap Processor)
 pub fn get_current_lapic_id() -> u8 {
     unsafe {
-        let mut ebx: u32;
-        let eax: u32 = 1;  // CPUID función 1
+        let mut ebx_val: u32;
         core::arch::asm!(
+            "push rbx",
             "cpuid",
-            inout("eax") eax => _,
-            out("ebx") ebx,
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx_val,
+            inout("eax") 1 => _,
             out("ecx") _,
             out("edx") _,
             options(nostack, preserves_flags)
         );
         // LAPIC ID está en bits 24-31 de EBX
-        ((ebx >> 24) & 0xFF) as u8
+        ((ebx_val >> 24) & 0xFF) as u8
     }
 }

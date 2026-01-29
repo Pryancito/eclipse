@@ -176,11 +176,14 @@ pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // crate::debug::serial_write_str(" [G] ");
-        heap::kernel_alloc(layout.size(), layout.align())
+        // Usar directamente el LockedHeap estático
+        use core::alloc::GlobalAlloc;
+        crate::memory::heap::ALLOCATOR.alloc(layout)
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        heap::kernel_dealloc(ptr);
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        use core::alloc::GlobalAlloc;
+        crate::memory::heap::ALLOCATOR.dealloc(ptr, layout);
     }
 }
 

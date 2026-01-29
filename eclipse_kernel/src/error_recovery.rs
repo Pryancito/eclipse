@@ -224,7 +224,7 @@ pub mod init_components {
     pub fn init_memory_allocator() -> InitResult<()> {
         #[cfg(feature = "alloc")]
         {
-            crate::allocator::init_allocator();
+
             // log removido
             Ok(())
         }

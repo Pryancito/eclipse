@@ -6,12 +6,8 @@
 
 use crate::memory::KernelAllocator;
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+// #[global_allocator]
+// static ALLOCATOR: KernelAllocator = KernelAllocator;
+// Global allocator is now defined in src/memory/heap.rs
 
-/// Inicializa el allocador global
-pub fn init_allocator() {
-    // No hace nada. La inicialización real ocurre en memory::init_memory_system()
-    // llamado desde main_simple.rs.
-    // Mantenemos esta función para compatibilidad con código existente.
-}
+
