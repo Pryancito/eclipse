@@ -112,38 +112,18 @@ impl ProcessTransfer {
             return Err("Stack pointer fuera del espacio de direcciones canónico");
         }
         
-        // NOTA: No podemos verificar si hay código en entry_point sin antes mapear
-        // esa dirección en las tablas de páginas actuales. Intentar leer de 0x400000
-        // sin que esté mapeado causaría un triple fault.
-        // 
-        // En su lugar, asumimos que no hay código cargado hasta que el sistema
-        // de carga de ELF se implemente completamente.
-        crate::debug::serial_write_str("PROCESS_TRANSFER: Userland code loading not yet implemented\n");
-        crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
-        crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
-        return Err("Transferencia al userland diferida: carga de código no implementada");
-        
-        // TODO: El código siguiente está deshabilitado hasta que se implemente
-        // la carga real de binarios ELF en memoria física y el mapeo correspondiente.
-        // Cuando se implemente, eliminar el return anterior y descomentar este bloque.
-        
-        /* Código para implementación futura:
+        // Configurar el entorno de ejecución del userland
         match self.setup_userland_environment() {
             Ok(pml4_addr) => {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
                 
-                // Map userland code (Identity map around entry point)
-                // Solo mapear si está en el rango canónico inferior
-                if context.rip < CANONICAL_ADDR_LIMIT {
-                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, USERLAND_CODE_MAP_SIZE)?;
-                }
-                
-                // Map stack memory
-                // Stack pointer debe tener al menos 1MB de espacio reservado
+                // Mapear el stack
                 let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
                 map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
                 
-                // Execute process
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Stack memory mapped successfully\n");
+                
+                // Ejecutar el proceso
                 self.execute_userland_process(context, pml4_addr)?;
                 
                 Ok(())
@@ -160,7 +140,139 @@ impl ProcessTransfer {
                 Err("Transferencia al userland diferida: fallo en configuración del entorno")
             }
         }
-        */
+    }
+
+    /// Transferir a userland con segmentos ELF cargados
+    /// 
+    /// Esta función maneja la transferencia de control del kernel al userland,
+    /// mapeando todos los segmentos ELF previamente cargados en memoria física
+    /// al espacio de direcciones del proceso.
+    /// 
+    /// # Argumentos
+    /// - `context`: Contexto de ejecución del proceso (registros, flags, etc.)
+    /// - `loaded_process`: Proceso ELF cargado con información de segmentos
+    /// 
+    /// # Seguridad
+    /// - Aplica el modelo W^X (Write XOR Execute) para prevenir vulnerabilidades
+    /// - Segmentos ejecutables no son escribibles
+    /// - Segmentos escribibles tienen NX (No-Execute) habilitado
+    /// 
+    /// # Retorna
+    /// - `Ok(())` si la transferencia fue exitosa (no retorna en caso de éxito)
+    /// - `Err(&str)` si hay un error en la configuración o mapeo
+    pub fn transfer_to_userland_with_segments(
+        &mut self,
+        context: ProcessContext,
+        loaded_process: &crate::elf_loader::LoadedProcess,
+    ) -> Result<(), &'static str> {
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Starting userland transfer with ELF segments\n");
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: context rip=0x{:x} rsp=0x{:x}\n",
+            context.rip, context.rsp
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: {} ELF segments loaded\n",
+            loaded_process.segments.len()
+        ));
+        
+        // Verificar que las direcciones estén en el espacio canónico inferior
+        if context.rip >= CANONICAL_ADDR_LIMIT {
+            return Err("Entry point fuera del espacio de direcciones canónico");
+        }
+        
+        if context.rsp >= CANONICAL_ADDR_LIMIT {
+            return Err("Stack pointer fuera del espacio de direcciones canónico");
+        }
+        
+        // Configurar el entorno de ejecución del userland
+        match self.setup_userland_environment() {
+            Ok(pml4_addr) => {
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
+                
+                // Mapear todos los segmentos ELF cargados
+                for segment in &loaded_process.segments {
+                    if segment.physical_pages.is_empty() {
+                        continue;
+                    }
+                    
+                    // Determinar los flags de página según los permisos del segmento ELF
+                    // Aplicar modelo W^X (Write XOR Execute) para seguridad
+                    let mut flags = crate::memory::paging::PAGE_PRESENT | crate::memory::paging::PAGE_USER;
+                    
+                    // Verificar y aplicar permisos según flags del ELF
+                    let is_writable = (segment.flags & crate::elf_loader::PF_W) != 0;
+                    let is_executable = (segment.flags & crate::elf_loader::PF_X) != 0;
+                    
+                    // Aplicar W^X: un segmento no puede ser tanto escribible como ejecutable
+                    if is_writable && is_executable {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "PROCESS_TRANSFER: WARNING - Segment at 0x{:x} has both W and X flags, enforcing W^X\n",
+                            segment.vaddr
+                        ));
+                        // Dar prioridad a ejecutable sobre escribible para código
+                        // Esto es más seguro que permitir escritura
+                        if is_executable {
+                            // Ejecutable pero no escribible
+                            // No agregar PAGE_WRITABLE, no agregar PAGE_NO_EXECUTE
+                        } else {
+                            // Escribible pero no ejecutable
+                            flags |= crate::memory::paging::PAGE_WRITABLE;
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                    } else {
+                        // Caso normal: W^X ya se cumple
+                        if is_writable {
+                            flags |= crate::memory::paging::PAGE_WRITABLE;
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                        if !is_executable {
+                            // Si no es ejecutable, marcar explícitamente como NX
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                        // Si es ejecutable y no escribible, solo tiene PRESENT y USER
+                    }
+                    
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "PROCESS_TRANSFER: Mapping segment at vaddr=0x{:x}, {} pages, flags=0x{:x} (W={} X={})\n",
+                        segment.vaddr, segment.physical_pages.len(), flags,
+                        is_writable, is_executable
+                    ));
+                    
+                    // Mapear las páginas físicas a las direcciones virtuales
+                    crate::memory::paging::map_preallocated_pages(
+                        pml4_addr,
+                        segment.vaddr,
+                        &segment.physical_pages,
+                        flags,
+                    )?;
+                }
+                
+                crate::debug::serial_write_str("PROCESS_TRANSFER: All ELF segments mapped successfully\n");
+                
+                // Mapear el stack
+                let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
+                map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
+                
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Stack memory mapped successfully\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Ready to transfer control to userland\n");
+                
+                // Ejecutar el proceso
+                self.execute_userland_process(context, pml4_addr)?;
+                
+                Ok(())
+            }
+            Err(e) => {
+                // La configuración del entorno falló
+                crate::debug::serial_write_str(&alloc::format!(
+                    "PROCESS_TRANSFER: Userland environment setup failed: {}\n", e
+                ));
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - setup failed\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+                
+                // Retornar el error para que el sistema sepa que la transferencia fue diferida
+                Err("Transferencia al userland diferida: fallo en configuración del entorno")
+            }
+        }
     }
 
     /// Configurar el entorno de ejecución del userland
@@ -264,16 +376,16 @@ impl Default for ProcessTransfer {
 }
 
 pub fn transfer_to_eclipse_systemd(
-    entry_point: u64,
+    loaded_process: &crate::elf_loader::LoadedProcess,
     stack_pointer: u64,
     argc: u64,
     argv: u64,
     envp: u64,
 ) -> Result<(), &'static str> {
     let mut transfer = ProcessTransfer::new();
-    let mut context = ProcessContext::new(entry_point, stack_pointer);
+    let mut context = ProcessContext::new(loaded_process.entry_point, stack_pointer);
     context.set_args(argc, argv, envp);
-    transfer.transfer_to_userland(context)?;
+    transfer.transfer_to_userland_with_segments(context, loaded_process)?;
     Ok(())
 }
 

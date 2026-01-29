@@ -247,7 +247,7 @@ impl InitSystem {
 
         // 4. Transferir control al userland
         self.transfer_control_to_userland(
-            loaded_process.entry_point,
+            &loaded_process,
             process_memory.stack_pointer,
             argc,
             argv,
@@ -437,19 +437,15 @@ impl InitSystem {
         })
     }
 
-    /// Transferir control al userland
+    /// Transferir control al userland (función antigua, no usada)
+    #[allow(dead_code)]
     fn transfer_to_userland(
         &self,
-        context: crate::process_transfer::ProcessContext,
+        _context: crate::process_transfer::ProcessContext,
     ) -> Result<(), &'static str> {
-        // Transferir control al proceso userland
-        crate::process_transfer::transfer_to_eclipse_systemd(
-            context.rip,
-            context.rsp,
-            context.rsi,
-            context.rdi,
-            0, // envp
-        )
+        // Esta función está deprecada y no se usa en el flujo principal
+        // Se mantiene solo para compatibilidad
+        Err("Función deprecada - usar transfer_control_to_userland")
     }
 
     /// Obtener información del proceso init
@@ -668,14 +664,14 @@ impl InitSystem {
     /// Transferir control al userland
     fn transfer_control_to_userland(
         &self,
-        entry_point: u64,
+        loaded_process: &crate::elf_loader::LoadedProcess,
         stack_pointer: u64,
         argc: u64,
         argv: u64,
         envp: u64,
     ) -> Result<(), &'static str> {
         // Transferir control al proceso eclipse-systemd
-        transfer_to_eclipse_systemd(entry_point, stack_pointer, argc, argv, envp)
+        transfer_to_eclipse_systemd(loaded_process, stack_pointer, argc, argv, envp)
     }
 
     /// Enviar mensaje de inicio de eclipse-systemd a la interfaz serial
