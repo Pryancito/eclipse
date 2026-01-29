@@ -1,0 +1,15 @@
+[package]
+name = "eclipsefs-cli"
+version = "1.0.0"
+edition = "2021"
+authors = ["Pryancito"]
+description = "Command-line tool for managing EclipseFS filesystems"
+
+[[bin]]
+name = "eclipsefs"
+path = "src/main.rs"
+
+[dependencies]
+eclipsefs-lib = { path = "../eclipsefs-lib" }
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
