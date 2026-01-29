@@ -5,7 +5,7 @@
 
 set -e
 
-echo "Probando PRUEBAS DE ECLIPSE SYSTEMD v0.6.0"
+echo "Probando PRUEBAS DE ECLIPSE SYSTEMD v0.1.0"
 echo "====================================="
 
 # Colores para output

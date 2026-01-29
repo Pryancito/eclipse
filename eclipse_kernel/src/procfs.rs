@@ -93,7 +93,7 @@ Writeback:       0 kB
 
 /// Create /proc/version
 fn create_version(vfs: &mut crate::virtual_fs::VirtualFileSystem) -> FsResult<()> {
-    let version = "Eclipse OS version 0.6.0 (eclipse-kernel) (gcc version 11.4.0) #1 SMP PREEMPT Wed Jan 29 00:00:00 UTC 2026\n";
+    let version = "Eclipse OS version 0.1.0 (eclipse-kernel) (gcc version 11.4.0) #1 SMP PREEMPT Wed Jan 29 00:00:00 UTC 2026\n";
     vfs.create_file("/proc/version", FilePermissions::default())?;
     vfs.write_file("/proc/version", version.as_bytes())
 }

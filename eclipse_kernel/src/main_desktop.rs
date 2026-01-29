@@ -58,7 +58,7 @@ impl DesktopSystem {
         
         // Renderizar fondo
         vga.set_color(VgaColor::Blue, VgaColor::Black);
-        vga.write_string("Eclipse OS Desktop v0.6.0\n");
+        vga.write_string("Eclipse OS Desktop v0.1.0\n");
         vga.write_string("Sistema de Escritorio Controlado por IA\n");
         vga.write_string("========================================\n\n");
         
@@ -172,7 +172,7 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         VGA.init_vga_mode();
         VGA.set_color(VgaColor::LightGreen, VgaColor::Black);
-        VGA.write_string("Eclipse OS Kernel v0.6.0\n");
+        VGA.write_string("Eclipse OS Kernel v0.1.0\n");
         VGA.write_string("Sistema de Escritorio Controlado por IA\n");
         VGA.write_string("========================================\n\n");
         VGA.set_color(VgaColor::White, VgaColor::Black);

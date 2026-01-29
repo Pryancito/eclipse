@@ -5,7 +5,7 @@
 
 set -e
 
-echo "Iniciando Instalando Eclipse SystemD v0.6.0"
+echo "Iniciando Instalando Eclipse SystemD v0.1.0"
 echo "====================================="
 
 # Verificar prerrequisitos

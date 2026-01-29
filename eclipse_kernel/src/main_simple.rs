@@ -1511,12 +1511,12 @@ fn demonstrate_shell_features(_shell: &mut (), fb: &mut FramebufferDriver) {
     // Simular ejecución del comando (sin implementación real por ahora)
     match command {
         "info" => {
-            fb.write_text_kernel("  Sistema: Eclipse OS v0.6.0", Color::LIGHT_GRAY);
+            fb.write_text_kernel("  Sistema: Eclipse OS v0.1.0", Color::LIGHT_GRAY);
             fb.write_text_kernel("  Arquitectura: x86_64", Color::LIGHT_GRAY);
             fb.write_text_kernel("  Kernel: Monolítico con módulos", Color::LIGHT_GRAY);
         }
         "version" => {
-            fb.write_text_kernel("  Eclipse OS Kernel v0.6.0", Color::LIGHT_GRAY);
+            fb.write_text_kernel("  Eclipse OS Kernel v0.1.0", Color::LIGHT_GRAY);
             fb.write_text_kernel("  Compilado: Rust 1.70+", Color::LIGHT_GRAY);
             fb.write_text_kernel("  Características: IA, Wayland, COSMIC", Color::LIGHT_GRAY);
         }

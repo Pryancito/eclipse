@@ -456,5 +456,5 @@ if graphics::can_use_advanced_multi_gpu() {
 ## Versión
 
 Sistema de Fases de Gráficos v1.0  
-Eclipse OS v0.6.0  
+Eclipse OS v0.1.0  
 Última actualización: Enero 2026

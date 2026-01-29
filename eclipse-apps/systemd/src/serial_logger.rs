@@ -87,7 +87,7 @@ impl SerialLogger {
 ║                        ECLIPSE-SYSTEMD INICIADO                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Eclipse SystemD v0.6.0 - Sistema de inicialización moderno
+Eclipse SystemD v0.1.0 - Sistema de inicialización moderno
 Sistema de logging habilitado (Archivo + Serial)
 Estado: Iniciando servicios del sistema...
 

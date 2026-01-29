@@ -13,7 +13,7 @@ impl UefiConfigManager {
     }
 
     pub fn create_uefi_config(&self, mount_point: &str) -> Result<(), String> {
-        let config_content = r#"# Configuración UEFI para Eclipse OS v0.6.0
+        let config_content = r#"# Configuración UEFI para Eclipse OS v0.1.0
 # Bootloader personalizado - no requiere GRUB
 
 [system]
@@ -69,7 +69,7 @@ show_menu = true
 quiet_boot = false
 
 [entry:eclipse]
-title = "Eclipse OS v0.6.0"
+title = "Eclipse OS v0.1.0"
 description = "Sistema Operativo Eclipse"
 kernel = "/eclipse_kernel"
 initrd = ""
@@ -90,7 +90,7 @@ args = "quiet splash"
 
 # Entrada principal
 [eclipse-main]
-title = "Eclipse OS v0.6.0"
+title = "Eclipse OS v0.1.0"
 description = "Sistema Operativo Eclipse - Modo Normal"
 kernel = "/eclipse_kernel"
 initrd = ""
@@ -99,7 +99,7 @@ enabled = true
 
 # Entrada de debug
 [eclipse-debug]
-title = "Eclipse OS v0.6.0 (Debug)"
+title = "Eclipse OS v0.1.0 (Debug)"
 description = "Sistema Operativo Eclipse - Modo Debug"
 kernel = "/eclipse_kernel"
 initrd = ""
@@ -108,7 +108,7 @@ enabled = true
 
 # Entrada de recuperación
 [eclipse-recovery]
-title = "Eclipse OS v0.6.0 (Recovery)"
+title = "Eclipse OS v0.1.0 (Recovery)"
 description = "Sistema Operativo Eclipse - Modo Recuperación"
 kernel = "/eclipse_kernel"
 initrd = ""
@@ -125,7 +125,7 @@ enabled = false
     }
 
     pub fn create_module_config(&self, mount_point: &str) -> Result<(), String> {
-        let module_config_content = r#"# Configuración de módulos para Eclipse OS v0.6.0
+        let module_config_content = r#"# Configuración de módulos para Eclipse OS v0.1.0
 # ================================================
 
 [module_loader]
@@ -188,13 +188,13 @@ services = [
         let system_info_content = r#"Eclipse OS - Información del Sistema
 =====================================
 
-Versión: 0.6.0
+Versión: 0.1.0
 Arquitectura: x86_64
 Tipo de instalación: Disco completo
 Fecha de instalación: [AUTO-GENERATED]
 
 Componentes instalados:
-- Kernel: Eclipse OS v0.6.0
+- Kernel: Eclipse OS v0.1.0
 - Bootloader: UEFI personalizado
 - Sistema de archivos: EXT4 (root) + FAT32 (EFI)
 - Userland: Módulos compilados en Rust

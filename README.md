@@ -296,7 +296,7 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ## Estado del Proyecto
 
-- **Versión**: 0.6.0
+- **Versión**: 0.1.0
 - **Estado**: En desarrollo activo
 - **Kernel**: Funcional con VGA y UEFI
 - **Userland**: Sistema DRM implementado
@@ -306,14 +306,6 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 - **Hardware**: Probado en QEMU y hardware real
 
 ## Roadmap
-
-### Próximas Versiones
-
-- **v0.6.0**: Sistema de ventanas completo con compositor
-- **v0.7.0**: Sistema de widgets y UI completa
-- **v0.8.0**: Aplicaciones de usuario y red
-- **v0.9.0**: Optimizaciones Multi-GPU
-- **v1.0.0**: Release estable
 
 ### Características Planificadas
 

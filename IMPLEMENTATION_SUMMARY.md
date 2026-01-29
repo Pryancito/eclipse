@@ -234,4 +234,4 @@ Todos los cambios son backward-compatible y no afectan el funcionamiento de las 
 
 **Versión**: 1.0  
 **Fecha**: Enero 2026  
-**Eclipse OS**: v0.6.0
+**Eclipse OS**: v0.1.0

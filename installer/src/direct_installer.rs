@@ -51,7 +51,7 @@ impl DirectInstaller {
 
     pub fn install_eclipse_os(&self, disk: &DiskInfo, auto_install: bool) -> Result<(), String> {
         println!("DEBUG: Iniciando install_eclipse_os con disco: {}", disk.name);
-        println!("Instalador de Eclipse OS v0.6.0");
+        println!("Instalador de Eclipse OS v0.1.0");
         println!("================================");
         println!();
 
@@ -144,7 +144,7 @@ impl DirectInstaller {
         println!("  - Particion EFI: {}1 (FAT32)", disk.name);
         println!("  - Particion root: {}2 (EclipseFS)", disk.name);
         println!("  - Bootloader: UEFI");
-        println!("  - Kernel: Eclipse OS v0.6.0");
+        println!("  - Kernel: Eclipse OS v0.1.0");
         println!("  - Sistema de archivos: EclipseFS v2.0 (RAM-based)");
         println!("  - Eclipse-systemd: Instalado en /sbin/init");
         println!("  - Wayland Compositor: eclipse_wayland en /usr/bin");
@@ -1233,7 +1233,7 @@ tmpfs           /tmp            tmpfs   defaults        0       0
             .map_err(|e| format!("Error creando /etc/fstab: {}", e))?;
         
         // Crear /proc/version
-        fs::write(format!("{}/proc/version", temp_root), "Eclipse OS Kernel v0.6.0\n")
+        fs::write(format!("{}/proc/version", temp_root), "Eclipse OS Kernel v0.1.0\n")
             .map_err(|e| format!("Error creando /proc/version: {}", e))?;
         
         // Crear /proc/cpuinfo
@@ -1285,7 +1285,7 @@ model name	: Eclipse CPU
     /// Crear archivos de log iniciales
     fn create_initial_log_files(&self, temp_root: &str) -> Result<(), String> {
         // Log de arranque del kernel
-        let boot_log = r#"Eclipse OS Kernel v0.6.0 - Boot Log
+        let boot_log = r#"Eclipse OS Kernel v0.1.0 - Boot Log
 =====================================
 
 [KERNEL] Iniciando kernel Eclipse OS...
@@ -1333,7 +1333,7 @@ model name	: Eclipse CPU
         let systemd_log = r#"Eclipse OS Systemd Log
 ======================
 
-[SYSTEMD] Iniciando sistema de init Eclipse OS v0.6.0
+[SYSTEMD] Iniciando sistema de init Eclipse OS v0.1.0
 [SYSTEMD] Cargando configuración desde /etc/eclipse/systemd/
 [SYSTEMD] Inicializando sistema de logging
 [SYSTEMD] Creando directorios del sistema

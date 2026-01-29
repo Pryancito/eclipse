@@ -649,7 +649,7 @@ impl EclipseFSInstaller {
         println!("       📄 Creando archivos de sistema...");
         
         // /proc/version
-        self.create_file("/proc/version", b"Eclipse OS Kernel v0.6.0\n")?;
+        self.create_file("/proc/version", b"Eclipse OS Kernel v0.1.0\n")?;
         println!("         ✓ /proc/version creado");
         
         // /proc/cpuinfo

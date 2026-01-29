@@ -107,7 +107,7 @@ impl SystemdDaemon {
 
     /// Inicializa el daemon systemd
     pub async fn initialize(&self) -> Result<()> {
-        info!("Inicializando Eclipse SystemD Daemon v0.6.0");
+        info!("Inicializando Eclipse SystemD Daemon v0.1.0");
         
         // Escribir mensaje de inicio a serial
         self.serial_logger.write_system_startup().await?;
@@ -119,7 +119,7 @@ impl SystemdDaemon {
         self.serial_logger.write_info("systemd", "✅ Directorios del sistema creados").await?;
 
         // Registrar inicio en el journal
-        self.journal_manager.log_info("systemd", "Iniciando Eclipse SystemD Daemon v0.6.0")?;
+        self.journal_manager.log_info("systemd", "Iniciando Eclipse SystemD Daemon v0.1.0")?;
         
         // Cargar todos los archivos .service
         self.serial_logger.write_info("systemd", "📋 Cargando archivos de servicios...").await?;

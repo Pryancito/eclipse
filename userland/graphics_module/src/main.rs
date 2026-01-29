@@ -2,7 +2,7 @@ use anyhow::Result;
 use graphics_module::GraphicsDriver;
 
 fn main() -> Result<()> {
-    println!("🎨 Eclipse OS Graphics Module v0.6.0");
+    println!("🎨 Eclipse OS Graphics Module v0.1.0");
     println!("=====================================");
     
     // Crear driver gráfico
