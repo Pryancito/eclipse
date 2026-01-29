@@ -1,4 +1,30 @@
 //! Entry point for Application Processors (secondary cores)
+//!
+//! Este módulo contiene el punto de entrada para los Application Processors (APs),
+//! es decir, todos los núcleos de CPU excepto el Bootstrap Processor (BSP).
+//!
+//! # Proceso de Inicialización de APs
+//!
+//! 1. El AP se despierta mediante la secuencia INIT-SIPI-SIPI enviada por el BSP
+//! 2. Incrementa el contador global AP_ONLINE_COUNT para señalizar que está vivo
+//! 3. Lee su propio LAPIC ID usando CPUID para identificarse
+//! 4. Inicializa su Local APIC para poder recibir interrupciones
+//! 5. Carga la IDT (Interrupt Descriptor Table)
+//! 6. Habilita interrupciones con la instrucción STI
+//! 7. Entra en un loop HLT esperando tareas del scheduler
+//!
+//! # Limitaciones Actuales
+//!
+//! - El AP usa un stack temporal en 0x8000 (heredado del trampoline)
+//! - No hay integración completa con el scheduler
+//! - Los APs permanecen en modo idle después de inicializarse
+//!
+//! # Mejoras Futuras
+//!
+//! - Asignar stack dedicado de kernel por CPU
+//! - Implementar thread-local storage (TLS) por CPU
+//! - Integración con scheduler para ejecutar tareas
+//! - Soporte para migración de tareas entre núcleos
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::drivers::advanced::acpi::get_acpi_manager;

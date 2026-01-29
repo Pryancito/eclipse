@@ -1,6 +1,21 @@
 //! Soporte de Multi-Procesamiento Simétrico (SMP)
 //! 
 //! Este módulo maneja el inicio de los Application Processors (APs).
+//! 
+//! # Características Implementadas
+//! 
+//! - Detección automática del Bootstrap Processor (BSP) usando CPUID
+//! - Secuencia INIT-SIPI-SIPI según especificación Intel
+//! - Temporización precisa usando TSC (Time Stamp Counter)
+//! - Inicialización de LAPIC e IDT en cada Application Processor
+//! - Contador atómico de APs activos
+//! 
+//! # Mejoras Futuras
+//! 
+//! - Stacks dedicados por CPU (actualmente usa stack temporal en 0x8000)
+//! - Integración completa con el scheduler
+//! - Soporte para NUMA (Non-Uniform Memory Access)
+//! - Balanceo de carga entre núcleos
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::drivers::advanced::acpi::get_acpi_manager;
