@@ -58,6 +58,11 @@ const KERNEL_DS: u64 = 0x10;
 const USER_CS: u64 = 0x2B;      // RPL=3, index=5 (0x28 + 3)
 const USER_DS: u64 = 0x23;      // RPL=3, index=4 (0x20 + 3)
 
+/// User segment base for SYSRET calculation
+/// SYSRET sets: CS = USER_SEGMENT_BASE + 16, SS = USER_SEGMENT_BASE + 8
+/// This value (0x1B) results in CS=0x2B and SS=0x23 when SYSRET executes
+const USER_SEGMENT_BASE: u64 = 0x1B;
+
 /// Per-CPU kernel data
 #[repr(C)]
 pub struct KernelCpuData {
@@ -130,10 +135,19 @@ pub fn init_syscall() -> Result<(), &'static str> {
         wrmsr(IA32_EFER, efer);
         
         // Set up STAR register (kernel/user code segments)
-        // Bits 63:48 = User CS (will be +16 for SS)
-        // Bits 47:32 = Kernel CS (will be +8 for SS)
-        let star = (USER_CS << 48) | (KERNEL_CS << 32);
+        // Bits 63:48 = User segment base (SYSRET adds +16 for CS, +8 for SS)
+        // Bits 47:32 = Kernel CS (SYSCALL adds +8 for SS)
+        // 
+        // SYSRET sets: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+        // We want: CS = 0x2B (USER_CS), SS = 0x23 (USER_DS)
+        // Therefore: STAR[63:48] = 0x2B - 16 = 0x1B (USER_SEGMENT_BASE)
+        let star = (USER_SEGMENT_BASE << 48) | (KERNEL_CS << 32);
         wrmsr(IA32_STAR, star);
+        
+        serial_write_str(&alloc::format!(
+            "SYSCALL: STAR MSR configured - KernelCS=0x{:x}, UserBase=0x{:x} (UserCS=0x{:x}, UserSS=0x{:x})\n",
+            KERNEL_CS, USER_SEGMENT_BASE, USER_SEGMENT_BASE + 16, USER_SEGMENT_BASE + 8
+        ));
         
         // Set up LSTAR register (syscall entry point)
         let entry_point = syscall_entry as u64;
