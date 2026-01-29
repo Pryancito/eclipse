@@ -142,6 +142,19 @@ drm_display::show_black_screen()?;
 drm_display::show_eclipse_welcome()?;
 ```
 
+### Sistema de Gráficos Multi-Fase
+
+Eclipse OS implementa un sistema de inicialización de gráficos en 6 fases:
+
+1. **Fase 1 - UEFI Bootloader**: Inicialización básica con GOP (Graphics Output Protocol)
+2. **Fase 2 - UEFI Kernel Detection**: Detección de hardware gráfico disponible
+3. **Fase 3 - DRM Kernel Runtime**: Control avanzado con Direct Rendering Manager
+4. **Fase 4 - Advanced Multi-GPU**: Gestión de múltiples GPUs con drivers específicos (NVIDIA, AMD, Intel)
+5. **Fase 5 - Window System**: Sistema de ventanas con compositor avanzado
+6. **Fase 6 - Widget System**: Sistema de widgets para interfaces de usuario completas
+
+Cada fase se construye sobre la anterior, proporcionando funcionalidades incrementales y permitiendo fallback a fases anteriores en caso de problemas.
+
 ### Características del DRM
 
 - **Control total de la pantalla**: Acceso directo al hardware gráfico
@@ -149,6 +162,8 @@ drm_display::show_eclipse_welcome()?;
 - **Múltiples monitores**: Soporte para configuraciones complejas
 - **Resoluciones modernas**: Hasta 4K y más
 - **Sin limitaciones de VGA**: Libertad total en el diseño
+- **Multi-GPU**: Soporte para múltiples tarjetas gráficas
+- **Drivers específicos**: Optimizaciones para NVIDIA, AMD e Intel
 
 ### Configuración del Display
 
@@ -159,6 +174,8 @@ El sistema se configura automáticamente, pero puedes personalizar:
 driver = "drm"              # Usar DRM como driver principal
 fallback = "vga"            # Fallback a VGA si DRM falla
 primary_device = "/dev/dri/card0"  # Dispositivo DRM principal
+multi_gpu = true            # Habilitar soporte multi-GPU
+compositor = true           # Habilitar compositor de ventanas
 ```
 
 ## Estructura del Proyecto
@@ -283,6 +300,8 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 - **Estado**: En desarrollo activo
 - **Kernel**: Funcional con VGA y UEFI
 - **Userland**: Sistema DRM implementado
+- **Gráficos**: Sistema de 6 fases con soporte Multi-GPU
+- **Sistema de Ventanas**: En integración
 - **Aplicaciones**: En desarrollo
 - **Hardware**: Probado en QEMU y hardware real
 
@@ -290,14 +309,17 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ### Próximas Versiones
 
-- **v0.6.0**: Sistema de ventanas completo
-- **v0.7.0**: Aplicaciones de usuario
-- **v0.8.0**: Red y conectividad
+- **v0.6.0**: Sistema de ventanas completo con compositor
+- **v0.7.0**: Sistema de widgets y UI completa
+- **v0.8.0**: Aplicaciones de usuario y red
+- **v0.9.0**: Optimizaciones Multi-GPU
 - **v1.0.0**: Release estable
 
 ### Características Planificadas
 
-- **Sistema de ventanas**: GUI completa
+- **Sistema de ventanas**: GUI completa con compositor avanzado
+- **Multi-GPU avanzado**: Soporte completo para NVIDIA, AMD e Intel
+- **Widgets modernos**: Sistema de widgets para interfaces avanzadas
 - **Aplicaciones nativas**: Editor, navegador, etc.
 - **Soporte de red**: TCP/IP completo
 - **Sistema de paquetes**: Gestor de paquetes nativo
