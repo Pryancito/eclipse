@@ -150,14 +150,11 @@ impl EclipseFSInstaller {
             },
             Err(e) => {
                 if e == eclipsefs_lib::EclipseFSError::DuplicateEntry {
-                    // El archivo ya existe, intentar sobrescribirlo
-                    let file_path = format!("/{}", path_parts.join("/"));
-                    if let Ok(file_inode) = self.filesystem.lookup_path(&file_path) {
-                        match self.filesystem.write_file(file_inode, &content) {
-                            Ok(_) => return Ok(()),
-                            Err(e) => return Err(format!("Error sobrescribiendo archivo {}: {:?}", path, e)),
-                        }
-                    }
+                    // El archivo ya existe - esto es una duplicación que debemos prevenir
+                    eprintln!("⚠️  WARNING: Intento de crear archivo duplicado: {}", path);
+                    eprintln!("    Este archivo ya existe en el sistema de archivos.");
+                    eprintln!("    Ignorando esta operación para prevenir duplicados.");
+                    return Ok(()); // Retornar Ok para continuar, pero no crear el duplicado
                 }
                 Err(format!("Error creando archivo {}: {:?}", path, e))
             },

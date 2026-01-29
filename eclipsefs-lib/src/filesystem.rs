@@ -571,10 +571,18 @@ impl EclipseFS {
         
         self.add_node(inode, file_node)?;
         
-        // Agregar el hijo al padre
+        // Agregar el hijo al padre con verificación adicional para prevenir duplicados
         let parent_node = self
             .get_node_mut(parent_inode)
             .ok_or(EclipseFSError::NotFound)?;
+        
+        // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
+        if parent_node.has_child(name) {
+            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            self.nodes.remove(&inode);
+            return Err(EclipseFSError::DuplicateEntry);
+        }
+        
         parent_node.add_child(name, inode)?;
         
         Ok(inode)
@@ -609,10 +617,18 @@ impl EclipseFS {
         
         self.add_node(inode, dir_node)?;
         
-        // Agregar el hijo al padre
+        // Agregar el hijo al padre con verificación adicional para prevenir duplicados
         let parent_node = self
             .get_node_mut(parent_inode)
             .ok_or(EclipseFSError::NotFound)?;
+        
+        // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
+        if parent_node.has_child(name) {
+            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            self.nodes.remove(&inode);
+            return Err(EclipseFSError::DuplicateEntry);
+        }
+        
         parent_node.add_child(name, inode)?;
         
         Ok(inode)
@@ -645,10 +661,18 @@ impl EclipseFS {
         
         self.add_node(inode, symlink_node)?;
         
-        // Agregar el hijo al padre
+        // Agregar el hijo al padre con verificación adicional para prevenir duplicados
         let parent_node = self
             .get_node_mut(parent_inode)
             .ok_or(EclipseFSError::NotFound)?;
+        
+        // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
+        if parent_node.has_child(name) {
+            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            self.nodes.remove(&inode);
+            return Err(EclipseFSError::DuplicateEntry);
+        }
+        
         parent_node.add_child(name, inode)?;
         
         Ok(inode)
