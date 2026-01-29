@@ -27,6 +27,10 @@ pub mod real_graphics_manager;
 pub mod examples;
 
 use phases::{init_graphics_phase_manager, with_graphics_phase_manager, GraphicsPhase, GraphicsPhaseManager};
+use multi_gpu_manager::MultiGpuManager;
+use window_system::WindowCompositor;
+use widgets::WidgetManager;
+use spin::Mutex;
 
 /// Inicializar el sistema de gráficos
 pub fn init_graphics_system() -> Result<(), &'static str> {
@@ -158,28 +162,57 @@ pub fn init_full_graphics_system(
     Ok(())
 }
 
+/// Gestor global de Multi-GPU
+static MULTI_GPU_MANAGER: Mutex<Option<MultiGpuManager>> = Mutex::new(None);
+
+/// Gestor global de sistema de ventanas
+static WINDOW_COMPOSITOR: Mutex<Option<WindowCompositor>> = Mutex::new(None);
+
+/// Gestor global de widgets
+static WIDGET_MANAGER: Mutex<Option<WidgetManager>> = Mutex::new(None);
+
 /// Inicializar el sistema Multi-GPU
-/// TODO: Implementar detección y configuración de GPUs NVIDIA/AMD/Intel
 fn init_multi_gpu_system() -> Result<(), &'static str> {
-    // Inicializar el gestor de múltiples GPUs
-    // Esto detectará y configurará drivers específicos para NVIDIA, AMD e Intel
-    // Por ahora, retornar éxito como placeholder
+    // Crear nuevo gestor de múltiples GPUs
+    let mut manager = MultiGpuManager::new();
+    
+    // Intentar inicializar todos los drivers
+    // No es crítico si falla, ya que puede no haber GPUs soportadas
+    match manager.initialize_all_drivers() {
+        Ok(_) => {
+            // Éxito: al menos un driver fue inicializado
+        }
+        Err(e) => {
+            // No hay GPUs soportadas, pero no es un error crítico
+            // El sistema puede continuar sin Multi-GPU avanzado
+        }
+    }
+    
+    // Guardar el gestor globalmente
+    *MULTI_GPU_MANAGER.lock() = Some(manager);
+    
     Ok(())
 }
 
 /// Inicializar el compositor de ventanas
-/// TODO: Implementar inicialización del sistema de ventanas
 fn init_window_compositor() -> Result<(), &'static str> {
-    // Inicializar el sistema de ventanas y compositor
-    // Por ahora, retornar éxito como placeholder
+    // Crear nuevo compositor de ventanas
+    let compositor = WindowCompositor::new();
+    
+    // Guardar el compositor globalmente
+    *WINDOW_COMPOSITOR.lock() = Some(compositor);
+    
     Ok(())
 }
 
 /// Inicializar el gestor de widgets
-/// TODO: Implementar inicialización del sistema de widgets
 fn init_widget_manager() -> Result<(), &'static str> {
-    // Inicializar el sistema de widgets para la UI
-    // Por ahora, retornar éxito como placeholder
+    // Crear nuevo gestor de widgets
+    let manager = WidgetManager::new();
+    
+    // Guardar el gestor globalmente
+    *WIDGET_MANAGER.lock() = Some(manager);
+    
     Ok(())
 }
 
@@ -196,4 +229,46 @@ pub fn can_use_window_system() -> bool {
 /// Verificar si podemos usar el sistema de widgets
 pub fn can_use_widget_system() -> bool {
     with_graphics_phase_manager(|manager| manager.can_use_widget_system()).unwrap_or(false)
+}
+
+/// Obtener acceso al gestor Multi-GPU
+/// Ejecuta una función con acceso mutable al gestor
+pub fn with_multi_gpu_manager<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut MultiGpuManager) -> R,
+{
+    let mut manager = MULTI_GPU_MANAGER.lock();
+    if let Some(mgr) = manager.as_mut() {
+        Some(f(mgr))
+    } else {
+        None
+    }
+}
+
+/// Obtener acceso al compositor de ventanas
+/// Ejecuta una función con acceso mutable al compositor
+pub fn with_window_compositor<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut WindowCompositor) -> R,
+{
+    let mut compositor = WINDOW_COMPOSITOR.lock();
+    if let Some(comp) = compositor.as_mut() {
+        Some(f(comp))
+    } else {
+        None
+    }
+}
+
+/// Obtener acceso al gestor de widgets
+/// Ejecuta una función con acceso mutable al gestor
+pub fn with_widget_manager<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut WidgetManager) -> R,
+{
+    let mut manager = WIDGET_MANAGER.lock();
+    if let Some(mgr) = manager.as_mut() {
+        Some(f(mgr))
+    } else {
+        None
+    }
 }
