@@ -16,7 +16,7 @@ use core::panic::PanicInfo;
 // Importar módulos del kernel
 use crate::init_system::{InitSystem, InitProcess};
 use crate::wayland::{init_wayland, is_wayland_initialized, get_wayland_state};
-use crate::cosmic::{CosmicManager, CosmicConfig, WindowManagerMode, PerformanceMode};
+// MIGRATED TO USERLAND: use crate::cosmic::{CosmicManager, CosmicConfig, WindowManagerMode, PerformanceMode};
 // Lunar eliminado - características integradas en COSMIC
 // use crate::lunar::{LunarManager, LunarConfig};
 // use crate::lunar::ai_renderer::{ObjectType, ObjectContent};

@@ -1,6 +1,6 @@
 #![no_std]
 extern crate alloc;
-use crate::cosmic::smart_notifications::SmartNotification;
+// MIGRATED TO USERLAND: use crate::cosmic::smart_notifications::SmartNotification;
 use crate::drivers::framebuffer::{Color, FramebufferDriver};
 use crate::drivers::gpu_control::GpuController;
 use alloc::string::String;

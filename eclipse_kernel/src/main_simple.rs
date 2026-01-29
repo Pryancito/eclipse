@@ -14,7 +14,7 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 
 // Importar módulos del kernel
-use crate::cosmic::{CosmicConfig, CosmicManager, PerformanceMode, WindowManagerMode};
+// MIGRATED TO USERLAND: use crate::cosmic::{CosmicConfig, CosmicManager, PerformanceMode, WindowManagerMode};
 use crate::filesystem::eclipsefs::{EclipseFSDeviceInfo, EclipseFSWrapper};
 use crate::init_system::{InitProcess, InitSystem};
 use crate::wayland::{get_wayland_state, init_wayland, is_wayland_initialized};
