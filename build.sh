@@ -389,6 +389,54 @@ build_wayland_apps() {
     print_success "Aplicaciones Wayland compiladas exitosamente"
 }
 
+# Función para compilar Wayland Compositor
+build_wayland_compositor() {
+    print_step "Compilando Wayland Compositor..."
+
+    if [ ! -d "userland/wayland_compositor" ]; then
+        print_status "Directorio wayland_compositor no encontrado, saltando..."
+        return 0
+    fi
+
+    cd userland/wayland_compositor
+
+    print_status "Compilando wayland_compositor..."
+    make clean
+    make
+    if [ $? -ne 0 ]; then
+        print_error "Error al compilar wayland_compositor"
+        cd ../..
+        return 1
+    fi
+
+    print_success "Wayland Compositor compilado exitosamente"
+    cd ../..
+}
+
+# Función para compilar COSMIC Desktop
+build_cosmic_desktop() {
+    print_step "Compilando COSMIC Desktop..."
+
+    if [ ! -d "userland/cosmic_desktop" ]; then
+        print_status "Directorio cosmic_desktop no encontrado, saltando..."
+        return 0
+    fi
+
+    cd userland/cosmic_desktop
+
+    print_status "Compilando cosmic_desktop..."
+    make clean
+    make
+    if [ $? -ne 0 ]; then
+        print_error "Error al compilar cosmic_desktop"
+        cd ../..
+        return 1
+    fi
+
+    print_success "COSMIC Desktop compilado exitosamente"
+    cd ../..
+}
+
 # Función para compilar todos los módulos userland
 build_userland() {
     print_step "Compilando módulos userland..."
@@ -399,6 +447,8 @@ build_userland() {
     build_app_framework
     build_drm_system
     build_wayland_apps
+    build_wayland_compositor
+    build_cosmic_desktop
 
     print_success "Todos los módulos userland compilados exitosamente"
 }
@@ -488,6 +538,20 @@ create_basic_distribution() {
         if [ -f "wayland_apps/wayland_text_editor/target/release/wayland_text_editor" ]; then
             cp "wayland_apps/wayland_text_editor/target/release/wayland_text_editor" "$BUILD_DIR/userland/bin/"
             print_status "Editor de texto Wayland copiado"
+        fi
+
+        # Copiar Wayland Compositor si existe
+        if [ -f "userland/wayland_compositor/wayland_compositor" ]; then
+            cp "userland/wayland_compositor/wayland_compositor" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor"
+            print_status "Wayland Compositor copiado"
+        fi
+
+        # Copiar COSMIC Desktop si existe
+        if [ -f "userland/cosmic_desktop/cosmic_desktop" ]; then
+            cp "userland/cosmic_desktop/cosmic_desktop" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/cosmic_desktop"
+            print_status "COSMIC Desktop copiado"
         fi
 
         # Crear directorios /usr/bin y /usr/sbin si no existen

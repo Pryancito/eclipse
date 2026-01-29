@@ -91,6 +91,12 @@ static inline long sys_ioctl(int fd, unsigned long request, void *arg) {
     return syscall3(SYS_IOCTL, fd, request, (long)arg);
 }
 
+static inline void sys_exit(int code) {
+    syscall1(0, code);
+    // No debería llegar aquí
+    while(1) {}
+}
+
 // Funciones auxiliares
 static unsigned long strlen(const char *s) {
     unsigned long len = 0;
@@ -342,4 +348,10 @@ int main(int argc, char *argv[]) {
 
     wl_log("Wayland compositor terminado exitosamente");
     return 0;
+}
+
+// Entry point para freestanding binary
+void _start(void) {
+    int result = main(0, NULL);
+    sys_exit(result);
 }
