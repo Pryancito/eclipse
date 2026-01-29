@@ -361,11 +361,22 @@ impl EclipseFSNode {
         self.ctime = Self::now();
     }
 
-    /// Función auxiliar para obtener timestamp actual (stub)
+    /// Función auxiliar para obtener timestamp actual
     fn now() -> u64 {
-        // En un sistema real, esto debería obtener el timestamp actual
-        // Para ahora, retornamos un valor fijo
-        1640995200 // 2022-01-01 00:00:00 UTC
+        #[cfg(feature = "std")]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // En no_std sin reloj del sistema, usar un contador incremental
+            // o valor fijo. Este es un valor razonable por defecto.
+            1640995200 // 2022-01-01 00:00:00 UTC
+        }
     }
     
     /// Calcular checksum CRC32 del nodo (inspirado en RedoxFS)
