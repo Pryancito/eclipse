@@ -4,9 +4,6 @@
 
 extern crate alloc;
 
-use crate::gdt::{setup_userland_gdt, GdtManager};
-use crate::idt::{setup_userland_idt, IdtManager};
-use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
 use crate::memory::paging::{setup_userland_paging, map_userland_memory, identity_map_userland_writable};
 use core::arch::asm;
 use core::ptr;
@@ -295,24 +292,24 @@ impl ProcessTransfer {
 
     /// Configurar el entorno de ejecución del userland
     fn setup_userland_environment(&self) -> Result<u64, &'static str> {
-        self.setup_gdt()?;
-        self.setup_idt()?;
-        self.setup_interrupts()?;
+        // CRITICAL FIX: Do NOT call setup_gdt() and setup_idt() here!
+        // 
+        // These functions create new GDT/IDT tables on the stack, load them into
+        // GDTR/IDTR registers, and then return. When the function returns, the 
+        // stack-allocated GDT/IDT are freed, but the CPU is still pointing to them!
+        // This causes a triple fault when any interrupt or exception occurs.
+        //
+        // The GDT and IDT are already properly set up during kernel initialization
+        // with both kernel and userland segments, so we can safely skip these calls.
+        // 
+        // self.setup_gdt()?;  // REMOVED - causes triple fault
+        // self.setup_idt()?;  // REMOVED - causes triple fault
+        
+        // Initializing the interrupt system is also not needed here as it's already done
+        // self.setup_interrupts()?;  // REMOVED - already initialized
+        
         let pml4_addr = setup_userland_paging()?;
         Ok(pml4_addr)
-    }
-
-    fn setup_gdt(&self) -> Result<(), &'static str> {
-        setup_userland_gdt()
-    }
-
-    fn setup_idt(&self) -> Result<(), &'static str> {
-        let kernel_code_selector = 0x08; 
-        setup_userland_idt(kernel_code_selector)
-    }
-
-    fn setup_interrupts(&self) -> Result<(), &'static str> {
-        initialize_interrupt_system(0x08)
     }
 
     fn execute_userland_process(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
