@@ -143,6 +143,23 @@ impl ProcessTransfer {
     }
 
     /// Transferir a userland con segmentos ELF cargados
+    /// 
+    /// Esta función maneja la transferencia de control del kernel al userland,
+    /// mapeando todos los segmentos ELF previamente cargados en memoria física
+    /// al espacio de direcciones del proceso.
+    /// 
+    /// # Argumentos
+    /// - `context`: Contexto de ejecución del proceso (registros, flags, etc.)
+    /// - `loaded_process`: Proceso ELF cargado con información de segmentos
+    /// 
+    /// # Seguridad
+    /// - Aplica el modelo W^X (Write XOR Execute) para prevenir vulnerabilidades
+    /// - Segmentos ejecutables no son escribibles
+    /// - Segmentos escribibles tienen NX (No-Execute) habilitado
+    /// 
+    /// # Retorna
+    /// - `Ok(())` si la transferencia fue exitosa (no retorna en caso de éxito)
+    /// - `Err(&str)` si hay un error en la configuración o mapeo
     pub fn transfer_to_userland_with_segments(
         &mut self,
         context: ProcessContext,
@@ -179,21 +196,46 @@ impl ProcessTransfer {
                     }
                     
                     // Determinar los flags de página según los permisos del segmento ELF
+                    // Aplicar modelo W^X (Write XOR Execute) para seguridad
                     let mut flags = crate::memory::paging::PAGE_PRESENT | crate::memory::paging::PAGE_USER;
                     
-                    // PF_W (2) = writable
-                    if (segment.flags & 2) != 0 {
-                        flags |= crate::memory::paging::PAGE_WRITABLE;
-                    }
+                    // Verificar y aplicar permisos según flags del ELF
+                    let is_writable = (segment.flags & crate::elf_loader::PF_W) != 0;
+                    let is_executable = (segment.flags & crate::elf_loader::PF_X) != 0;
                     
-                    // PF_X (1) = executable, si NO es ejecutable, marcar como NX
-                    if (segment.flags & 1) == 0 {
-                        flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                    // Aplicar W^X: un segmento no puede ser tanto escribible como ejecutable
+                    if is_writable && is_executable {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "PROCESS_TRANSFER: WARNING - Segment at 0x{:x} has both W and X flags, enforcing W^X\n",
+                            segment.vaddr
+                        ));
+                        // Dar prioridad a ejecutable sobre escribible para código
+                        // Esto es más seguro que permitir escritura
+                        if is_executable {
+                            // Ejecutable pero no escribible
+                            // No agregar PAGE_WRITABLE, no agregar PAGE_NO_EXECUTE
+                        } else {
+                            // Escribible pero no ejecutable
+                            flags |= crate::memory::paging::PAGE_WRITABLE;
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                    } else {
+                        // Caso normal: W^X ya se cumple
+                        if is_writable {
+                            flags |= crate::memory::paging::PAGE_WRITABLE;
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                        if !is_executable {
+                            // Si no es ejecutable, marcar explícitamente como NX
+                            flags |= crate::memory::paging::PAGE_NO_EXECUTE;
+                        }
+                        // Si es ejecutable y no escribible, solo tiene PRESENT y USER
                     }
                     
                     crate::debug::serial_write_str(&alloc::format!(
-                        "PROCESS_TRANSFER: Mapping segment at vaddr=0x{:x}, {} pages, flags=0x{:x}\n",
-                        segment.vaddr, segment.physical_pages.len(), flags
+                        "PROCESS_TRANSFER: Mapping segment at vaddr=0x{:x}, {} pages, flags=0x{:x} (W={} X={})\n",
+                        segment.vaddr, segment.physical_pages.len(), flags,
+                        is_writable, is_executable
                     ));
                     
                     // Mapear las páginas físicas a las direcciones virtuales

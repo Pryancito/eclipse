@@ -65,9 +65,9 @@ pub struct Elf64Phdr {
 
 /// Constantes ELF
 const PT_LOAD: u32 = 1;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
+pub const PF_X: u32 = 1;  // Execute permission
+pub const PF_W: u32 = 2;  // Write permission
+pub const PF_R: u32 = 4;  // Read permission
 
 /// Información de un segmento cargado
 #[derive(Debug, Clone)]
@@ -214,7 +214,8 @@ impl ElfLoader {
         self.simulate_memory_mapping(vaddr, mem_size as u64, phdr.p_flags)?;
 
         // Copiar datos del archivo a la memoria y obtener las páginas físicas asignadas
-        let physical_pages = if file_size > 0 {
+        // Esto incluye tanto segmentos con datos (code/data) como segmentos BSS (solo memoria)
+        let physical_pages = if mem_size > 0 {
             self.copy_segment_data_with_pages(elf_data, file_offset, mem_size, vaddr)?
         } else {
             Vec::new()
@@ -294,7 +295,7 @@ impl ElfLoader {
         }
         
         // Copiar los datos del ELF a las páginas físicas asignadas
-        let mut bytes_copied = 0;
+        let mut bytes_processed = 0;
         for (page_idx, &page_addr) in allocated_pages.iter().enumerate() {
             let page_offset = page_idx * 4096;
             let bytes_in_page = core::cmp::min(4096, size - page_offset);
@@ -329,12 +330,12 @@ impl ElfLoader {
                 }
             }
             
-            bytes_copied += bytes_in_page;
+            bytes_processed += bytes_in_page;
         }
 
         crate::debug::serial_write_str(&alloc::format!(
-            "ELF_LOADER: Allocated {} physical pages and copied {} bytes for vaddr 0x{:x}\n",
-            allocated_pages.len(), bytes_copied, vaddr
+            "ELF_LOADER: Allocated {} physical pages and processed {} bytes for vaddr 0x{:x}\n",
+            allocated_pages.len(), bytes_processed, vaddr
         ));
 
         Ok(allocated_pages)
