@@ -177,7 +177,13 @@ impl JournalManager {
         
         // Escribir al archivo
         {
-            let mut writer = self.writer.lock().unwrap();
+            let mut writer = match self.writer.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!("Lock envenenado en write_entry (journald), recuperando...");
+                    poisoned.into_inner()
+                }
+            };
             writeln!(writer, "{}", json)?;
             writer.flush()?;
         }
@@ -431,7 +437,13 @@ impl JournalManager {
     /// Rota el archivo del journal
     fn rotate_journal(&self) -> Result<()> {
         // Cerrar el writer actual
-        drop(self.writer.lock().unwrap());
+        drop(match self.writer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado al cerrar writer en rotate_journal, recuperando...");
+                poisoned.into_inner()
+            }
+        });
 
         // Generar nombre del archivo rotado con timestamp
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
@@ -447,7 +459,13 @@ impl JournalManager {
             .open(&self.journal_file)?;
 
         // Actualizar writer
-        *self.writer.lock().unwrap() = BufWriter::new(file);
+        match self.writer.lock() {
+            Ok(mut writer) => *writer = BufWriter::new(file),
+            Err(poisoned) => {
+                error!("Lock envenenado al actualizar writer en rotate_journal, recuperando...");
+                *poisoned.into_inner() = BufWriter::new(file);
+            }
+        }
 
         // Comprimir archivo rotado si está habilitado
         if self.config.compress_old {
@@ -486,8 +504,10 @@ impl JournalManager {
 
     /// Limpia archivos antiguos del journal
     fn cleanup_old_files(&self) -> Result<()> {
-        let journal_dir = Path::new(&self.journal_file).parent().unwrap();
-        let journal_name = Path::new(&self.journal_file).file_name().unwrap();
+        let journal_dir = Path::new(&self.journal_file).parent()
+            .ok_or_else(|| anyhow::anyhow!("No se pudo obtener directorio padre del journal"))?;
+        let journal_name = Path::new(&self.journal_file).file_name()
+            .ok_or_else(|| anyhow::anyhow!("No se pudo obtener nombre del archivo journal"))?;
 
         let mut files = Vec::new();
         
@@ -522,7 +542,13 @@ impl JournalManager {
 
     /// Sincroniza el journal
     pub fn sync(&self) -> Result<()> {
-        self.writer.lock().unwrap().flush()?;
+        match self.writer.lock() {
+            Ok(mut writer) => writer.flush()?,
+            Err(poisoned) => {
+                error!("Lock envenenado en sync, recuperando...");
+                poisoned.into_inner().flush()?;
+            }
+        }
         Ok(())
     }
 }
