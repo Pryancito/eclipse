@@ -8,11 +8,10 @@
 ///   mkfs.eclipsefs --inodes 10000 /dev/sda2
 ///   mkfs.eclipsefs --block-size 8192 /dev/sda2
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write, Seek, SeekFrom, Read};
+use std::fs::OpenOptions;
+use std::io::{self, Write, Seek, SeekFrom};
 use std::path::PathBuf;
 use clap::Parser;
-use uuid::Uuid;
 use chrono::Utc;
 
 /// Argumentos de línea de comandos
