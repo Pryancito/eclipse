@@ -624,6 +624,34 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         }
     }
 
+    // FASE 12.1: Sistema PS/2 (teclado y ratón PS/2)
+    serial_write_str("KERNEL_MAIN: Inicializando dispositivos PS/2...\n");
+    fb.write_text_kernel("Inicializando dispositivos PS/2...", Color::WHITE);
+    match crate::drivers::ps2_integration::init_ps2_system() {
+        Ok(_) => {
+            let kb_enabled = crate::drivers::ps2_integration::is_ps2_keyboard_enabled();
+            let mouse_enabled = crate::drivers::ps2_integration::is_ps2_mouse_enabled();
+            
+            if kb_enabled && mouse_enabled {
+                fb.write_text_kernel("✓ PS/2: Teclado y Ratón habilitados", Color::GREEN);
+                serial_write_str("KERNEL_MAIN: PS/2 keyboard and mouse enabled\n");
+            } else if kb_enabled {
+                fb.write_text_kernel("✓ PS/2: Teclado habilitado", Color::GREEN);
+                serial_write_str("KERNEL_MAIN: PS/2 keyboard enabled\n");
+            } else if mouse_enabled {
+                fb.write_text_kernel("✓ PS/2: Ratón habilitado", Color::GREEN);
+                serial_write_str("KERNEL_MAIN: PS/2 mouse enabled\n");
+            } else {
+                fb.write_text_kernel("⚠ PS/2: Dispositivos no detectados", Color::YELLOW);
+                serial_write_str("KERNEL_MAIN: No PS/2 devices detected\n");
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ Error PS/2: {}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: PS/2 init FAIL: {}\n", e));
+        }
+    }
+
     // 13.3: Hotplug Manager para USB
     serial_write_str("KERNEL_MAIN: Inicializando Hotplug Manager...\n");
     fb.write_text_kernel("Inicializando gestor de hotplug USB...", Color::WHITE);
