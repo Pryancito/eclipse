@@ -683,67 +683,28 @@ impl InitSystem {
         // Escribir mensajes al framebuffer cuando systemd tome el control
         if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
             fb.write_text_kernel(
-                "=== ECLIPSE-SYSTEMD TOMANDO CONTROL ===",
+                "=== PREPARANDO ECLIPSE-SYSTEMD ===",
                 crate::drivers::framebuffer::Color::YELLOW,
             );
             fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
             fb.write_text_kernel(
-                "PID 1: eclipse-systemd iniciando...",
+                "PID 1: eclipse-systemd preparado",
                 crate::drivers::framebuffer::Color::CYAN,
             );
             fb.write_text_kernel(
-                "Sistema de logging activado",
-                crate::drivers::framebuffer::Color::GREEN,
-            );
-            fb.write_text_kernel(
-                "Cargando servicios del sistema...",
-                crate::drivers::framebuffer::Color::WHITE,
-            );
-            fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
-
-            // Mensajes de servicios que se van a iniciar
-            fb.write_text_kernel(
-                "Servicios a iniciar:",
-                crate::drivers::framebuffer::Color::MAGENTA,
-            );
-            fb.write_text_kernel(
-                "  - eclipse-gui.service (Wayland + COSMIC)",
-                crate::drivers::framebuffer::Color::LIGHT_GRAY,
-            );
-            fb.write_text_kernel(
-                "  - network.service (Gestión de red)",
-                crate::drivers::framebuffer::Color::LIGHT_GRAY,
-            );
-            fb.write_text_kernel(
-                "  - syslog.service (Sistema de logging)",
-                crate::drivers::framebuffer::Color::LIGHT_GRAY,
-            );
-            fb.write_text_kernel(
-                "  - eclipse-shell.service (Terminal)",
-                crate::drivers::framebuffer::Color::LIGHT_GRAY,
-            );
-            fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
-
-            // Mensaje de transición
-            fb.write_text_kernel(
-                "Transfiriendo control a userland...",
+                "⚠ Nota: Transferencia completa requiere memoria virtual",
                 crate::drivers::framebuffer::Color::YELLOW,
             );
             fb.write_text_kernel(
-                "Eclipse OS completamente operativo",
-                crate::drivers::framebuffer::Color::GREEN,
+                "Sistema continuará con kernel loop principal",
+                crate::drivers::framebuffer::Color::WHITE,
             );
         }
 
-        unsafe {
-            // Inicializar la interfaz serial si no está inicializada
-            // SERIAL.init();
-
-            // Enviar mensaje de inicio
-            // SERIAL.write_str("\n");
-            // SERIAL.write_str("Pasando control a systemd...\n");
-            // SERIAL.write_str("\n");
-        }
+        // Log serial para debugging
+        crate::debug::serial_write_str(
+            "INIT_SYSTEM: eclipse-systemd configurado pero no transferido (requiere VM completa)\n"
+        );
     }
 }
 
