@@ -3,15 +3,27 @@
 //! This module contains the mini-systemd binary embedded in the kernel
 
 /// Get the embedded mini-systemd binary
-/// Returns the binary data or None if not available
-pub fn get_embedded_systemd() -> Option<&'static [u8]> {
-    // For now, return None - we'll load it via VFS
-    // In production, this would include the actual binary
-    None
+/// Returns the binary data as a static byte slice
+pub fn get_embedded_systemd() -> &'static [u8] {
+    // Try to include the mini-systemd binary if it was copied during build
+    // If the file doesn't exist at build time, this will use an empty slice
+    const MINI_SYSTEMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mini-systemd.bin"));
+    
+    if MINI_SYSTEMD.is_empty() {
+        crate::debug::serial_write_str("EMBEDDED_SYSTEMD: Binary is empty, using fallback\n");
+        &[]
+    } else {
+        crate::debug::serial_write_str(&alloc::format!(
+            "EMBEDDED_SYSTEMD: Loaded {} bytes\n",
+            MINI_SYSTEMD.len()
+        ));
+        MINI_SYSTEMD
+    }
 }
 
-/// Get a fake minimal systemd ELF for testing
-pub fn get_test_systemd() -> &'static [u8] {
-    // This is a minimal ELF that will be replaced with real binary
-    &[]
+/// Check if embedded systemd is available
+pub fn has_embedded_systemd() -> bool {
+    const MINI_SYSTEMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mini-systemd.bin"));
+    !MINI_SYSTEMD.is_empty()
 }
+

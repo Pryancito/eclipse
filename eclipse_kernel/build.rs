@@ -1,10 +1,13 @@
 use std::process::Command;
+use std::fs;
+use std::path::Path;
 
 fn main() {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    
     // Compilar el archivo assembly para cambio de contexto usando nasm
     println!("cargo:rerun-if-changed=src/context_switch.asm");
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
     let obj_file = format!("{}/context_switch.o", out_dir);
     let lib_file = format!("{}/libcontext_switch.a", out_dir);
 
@@ -81,4 +84,25 @@ fn main() {
     }
 
     println!("cargo:rustc-link-lib=static=syscall_entry");
+    
+    // --- Copy mini-systemd binary ---
+    println!("cargo:rerun-if-changed=../userland/mini-systemd/target/x86_64-unknown-none/release/mini-systemd");
+    
+    let mini_systemd_src = Path::new("../userland/mini-systemd/target/x86_64-unknown-none/release/mini-systemd");
+    let mini_systemd_dst = Path::new(&out_dir).join("mini-systemd.bin");
+    
+    if mini_systemd_src.exists() {
+        match fs::copy(&mini_systemd_src, &mini_systemd_dst) {
+            Ok(_) => {
+                println!("cargo:warning=Copied mini-systemd binary to build directory");
+            }
+            Err(e) => {
+                println!("cargo:warning=Failed to copy mini-systemd: {}", e);
+                println!("cargo:warning=Will use fake ELF data instead");
+            }
+        }
+    } else {
+        println!("cargo:warning=mini-systemd binary not found, will use fake ELF data");
+    }
 }
+

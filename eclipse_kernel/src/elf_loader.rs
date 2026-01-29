@@ -362,7 +362,26 @@ impl Default for ElfLoader {
 
 /// Función de utilidad para cargar eclipse-systemd
 pub fn load_eclipse_systemd() -> LoadResult {
-    // Intentar cargar desde el sistema de archivos virtual primero
+    // Try embedded mini-systemd first
+    if crate::embedded_systemd::has_embedded_systemd() {
+        crate::debug::serial_write_str("ELF_LOADER: Loading embedded mini-systemd\n");
+        let embedded_data = crate::embedded_systemd::get_embedded_systemd();
+        
+        let mut loader = ElfLoader::new();
+        match loader.load_elf(embedded_data) {
+            Ok(process) => {
+                crate::debug::serial_write_str("ELF_LOADER: Successfully loaded embedded mini-systemd\n");
+                return Ok(process);
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ELF_LOADER: Failed to load embedded systemd: {}\n", e
+                ));
+            }
+        }
+    }
+    
+    // Fallback to VFS
     let elf_data = match load_systemd_from_vfs() {
         Ok(data) => {
             crate::debug::serial_write_str("ELF_LOADER: Loaded eclipse-systemd from VFS\n");

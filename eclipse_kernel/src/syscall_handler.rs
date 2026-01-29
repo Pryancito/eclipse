@@ -158,7 +158,10 @@ pub extern "C" fn rust_syscall_handler(syscall_num: u64, regs: *const u64) -> u6
 fn handle_syscall(num: u64, args: &SyscallArgs) -> SyscallResult {
     match num {
         1 => sys_write(args.arg0 as i32, args.arg1 as *const u8, args.arg2 as usize),
+        57 => sys_fork(),
+        59 => sys_execve(args.arg0 as *const u8, args.arg1 as *const *const u8, args.arg2 as *const *const u8),
         60 => sys_exit(args.arg0 as i32),
+        61 => sys_wait4(args.arg0 as i32, args.arg1 as *mut i32, args.arg2 as i32, args.arg3 as *mut u8),
         _ => {
             serial_write_str(&alloc::format!("SYSCALL: Unimplemented syscall {}\n", num));
             SyscallResult::Error(crate::syscalls::SyscallError::NotImplemented)
@@ -212,4 +215,74 @@ fn sys_exit(code: i32) -> SyscallResult {
             asm!("hlt", options(nomem, nostack));
         }
     }
+}
+
+/// sys_fork - Create child process
+fn sys_fork() -> SyscallResult {
+    serial_write_str("SYSCALL: fork() - creating child process\n");
+    
+    // For minimal implementation, just return simulated PID
+    // In real implementation, this would:
+    // 1. Copy parent's memory space
+    // 2. Copy parent's page tables
+    // 3. Create new process structure
+    // 4. Return 0 to child, child PID to parent
+    
+    // For now, simulate fork by returning a fake child PID
+    let child_pid = 2; // Simulated child PID
+    
+    serial_write_str(&alloc::format!("SYSCALL: fork() returning child PID {}\n", child_pid));
+    SyscallResult::Success(child_pid)
+}
+
+/// sys_execve - Execute program
+fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> SyscallResult {
+    serial_write_str("SYSCALL: execve() - executing program\n");
+    
+    if pathname.is_null() {
+        return SyscallResult::Error(crate::syscalls::SyscallError::InvalidArgument);
+    }
+    
+    // Read pathname from userland
+    // TODO: Validate pointer is in userland memory
+    let path_str = unsafe {
+        // Read until null terminator (max 256 bytes)
+        let mut len = 0;
+        while len < 256 && *pathname.add(len) != 0 {
+            len += 1;
+        }
+        
+        let path_slice = core::slice::from_raw_parts(pathname, len);
+        core::str::from_utf8(path_slice).unwrap_or("<invalid>")
+    };
+    
+    serial_write_str(&alloc::format!("SYSCALL: execve('{}', argv, envp)\n", path_str));
+    
+    // For minimal implementation, just log and return error
+    // In real implementation, this would:
+    // 1. Load ELF binary from VFS
+    // 2. Replace current process memory
+    // 3. Set up new stack with arguments
+    // 4. Jump to new entry point
+    
+    serial_write_str("SYSCALL: execve() not fully implemented\n");
+    SyscallResult::Error(crate::syscalls::SyscallError::NotImplemented)
+}
+
+/// sys_wait4 - Wait for process to change state
+fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, rusage: *mut u8) -> SyscallResult {
+    serial_write_str(&alloc::format!("SYSCALL: wait4(pid={}, options=0x{:x})\n", pid, options));
+    
+    // For minimal implementation, just return immediately
+    // In real implementation, this would:
+    // 1. Check if child with given PID exists
+    // 2. If not exited, block until it exits
+    // 3. Return child PID and exit status
+    // 4. Clean up zombie process
+    
+    // Simulate no children
+    serial_write_str("SYSCALL: wait4() - no children to wait for\n");
+    
+    // Return -ECHILD (no child processes)
+    SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
 }

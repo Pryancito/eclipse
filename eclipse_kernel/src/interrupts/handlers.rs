@@ -270,13 +270,60 @@ fn process_page_fault(fault_address: u64, error_code: u64) {
     let reserved = (error_code & 8) != 0;
     let instruction = (error_code & 16) != 0;
     
-    if present {
-        // Page fault en página presente - error de protección
-        serial_write_str("ERROR: Page fault - protection violation\n");
+    serial_write_str(&alloc::format!(
+        "PAGE_FAULT: addr=0x{:x}, error=0x{:x} ({}{}{}{}{})\n",
+        fault_address,
+        error_code,
+        if present { "P" } else { "NP" },
+        if write { "W" } else { "R" },
+        if user { "U" } else { "K" },
+        if reserved { "RSV" } else { "" },
+        if instruction { "I" } else { "" }
+    ));
+    
+    // Check if this is a userland fault
+    if user {
+        serial_write_str("PAGE_FAULT: Fault occurred in userland\n");
+        
+        // Check if address is in valid userland range
+        const USERLAND_MAX: u64 = 0x7FFF_FFFF_FFFF;
+        if fault_address > USERLAND_MAX {
+            serial_write_str(&alloc::format!(
+                "PAGE_FAULT: Invalid userland address 0x{:x} > 0x{:x}\n",
+                fault_address, USERLAND_MAX
+            ));
+        }
+        
+        // In a full implementation, we would:
+        // 1. Check if the page should be loaded from disk
+        // 2. Allocate physical memory and map it
+        // 3. Or terminate the process if invalid access
+        
+        serial_write_str("PAGE_FAULT: Userland fault - would terminate process\n");
+        // For now, halt to prevent cascading faults
+        loop {
+            unsafe {
+                asm!("hlt", options(nostack, nomem));
+            }
+        }
     } else {
-        // Page fault en página no presente - cargar página
-        // En una implementación completa, esto cargaría la página desde disco
-        serial_write_str("INFO: Page fault - loading page from disk\n");
+        // Kernel page fault
+        serial_write_str("PAGE_FAULT: Fault occurred in kernel\n");
+        
+        if present {
+            // Page fault en página presente - error de protección
+            serial_write_str("CRITICAL: Kernel protection violation\n");
+        } else {
+            // Page fault en página no presente - cargar página
+            serial_write_str("CRITICAL: Kernel accessed unmapped memory\n");
+        }
+        
+        serial_write_str("CRITICAL: Halting system due to kernel page fault\n");
+        loop {
+            unsafe {
+                asm!("hlt", options(nostack, nomem));
+            }
+        }
     }
 }
 
@@ -287,14 +334,53 @@ fn process_general_protection_fault(error_code: u64) {
     let table = (error_code & 4) != 0;
     let selector = (error_code >> 3) & 0x1FFF;
     
-    if external {
-        serial_write_str("ERROR: General protection fault - external event\n");
-    } else if descriptor {
-        serial_write_str("ERROR: General protection fault - descriptor error\n");
-    } else if table {
-        serial_write_str("ERROR: General protection fault - table error\n");
+    serial_write_str(&alloc::format!(
+        "GP_FAULT: error=0x{:x}, selector=0x{:x} ({}{}{})\n",
+        error_code,
+        selector,
+        if external { "EXT" } else { "" },
+        if descriptor { "IDT" } else { "GDT/LDT" },
+        if table { "LDT" } else { "GDT" }
+    ));
+    
+    // Check current privilege level to determine if userland
+    let cs: u64;
+    unsafe {
+        asm!("mov {}, cs", out(reg) cs, options(nostack, nomem));
+    }
+    let cpl = cs & 0x3; // Current Privilege Level is in bits 0-1
+    
+    if cpl == 3 {
+        // Userland fault
+        serial_write_str("GP_FAULT: Fault occurred in userland (CPL=3)\n");
+        serial_write_str("GP_FAULT: Userland process would be terminated\n");
+        
+        // For now, halt to prevent cascading faults
+        loop {
+            unsafe {
+                asm!("hlt", options(nostack, nomem));
+            }
+        }
     } else {
-        serial_write_str("ERROR: General protection fault - selector error\n");
+        // Kernel fault
+        serial_write_str("GP_FAULT: CRITICAL - Fault occurred in kernel\n");
+        
+        if external {
+            serial_write_str("GP_FAULT: External event triggered fault\n");
+        } else if descriptor {
+            serial_write_str("GP_FAULT: Descriptor/IDT error\n");
+        } else if table {
+            serial_write_str("GP_FAULT: LDT selector error\n");
+        } else {
+            serial_write_str("GP_FAULT: GDT selector error\n");
+        }
+        
+        serial_write_str("CRITICAL: Halting system due to kernel GP fault\n");
+        loop {
+            unsafe {
+                asm!("hlt", options(nostack, nomem));
+            }
+        }
     }
 }
 
