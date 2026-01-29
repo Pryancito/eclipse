@@ -290,7 +290,7 @@ impl DirectInstaller {
 
         // Formatear partición root como EclipseFS (solo crear estructura básica)
         println!("   Formateando particion root como EclipseFS...");
-        self.format_root_as_eclipsefs(&root_partition)?;
+        self.format_root_with_mkfs(&root_partition)?;
 
         println!("Particiones formateadas exitosamente");
         Ok(())
@@ -842,7 +842,32 @@ Desarrollado con amor en Rust
         Ok(())
     }
 
-    /// Formatear partición root como EclipseFS (solo estructura básica)
+    /// Formatear partición root con mkfs-eclipsefs
+    fn format_root_with_mkfs(&self, partition: &str) -> Result<(), String> {
+        println!("     🌟 Formateando partición con mkfs-eclipsefs...");
+        
+        // Verificar que mkfs-eclipsefs existe
+        let mkfs_path = "mkfs-eclipsefs/target/release/mkfs-eclipsefs";
+        if !Path::new(mkfs_path).exists() {
+            return Err(format!("mkfs-eclipsefs no encontrado en {}", mkfs_path));
+        }
+        
+        // Ejecutar mkfs-eclipsefs
+        let output = std::process::Command::new(mkfs_path)
+            .args(&["-f", "-L", "Eclipse OS Root", "-N", "10000", partition])
+            .output()
+            .map_err(|e| format!("Error ejecutando mkfs-eclipsefs: {}", e))?;
+        
+        if !output.status.success() {
+            return Err(format!("mkfs-eclipsefs falló: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        
+        println!("     ✅ EclipseFS formateado exitosamente con mkfs-eclipsefs");
+        Ok(())
+    }
+
+    /// Formatear partición root como EclipseFS (solo estructura básica) - DEPRECATED
+    /// Use format_root_with_mkfs instead
     fn format_root_as_eclipsefs(&self, partition: &str) -> Result<(), String> {
         println!("     🌟 Formateando partición como EclipseFS...");
         
@@ -866,8 +891,69 @@ Desarrollado con amor en Rust
         Ok(())
     }
 
-    /// Configurar el sistema de archivos EclipseFS como si estuviera montado
+    /// Configurar el sistema de archivos EclipseFS usando populate-eclipsefs
     fn setup_eclipsefs_filesystem(&self, partition: &str) -> Result<(), String> {
+        println!("       📁 Preparando archivos del sistema para EclipseFS...");
+        
+        // Crear directorio temporal para preparar archivos
+        let temp_dir = "/tmp/eclipse_installer_files";
+        std::process::Command::new("rm")
+            .args(&["-rf", temp_dir])
+            .output()
+            .ok();
+        
+        fs::create_dir_all(temp_dir)
+            .map_err(|e| format!("Error creando directorio temporal: {}", e))?;
+        
+        // Crear estructura de directorios estándar
+        let directories = vec![
+            "usr", "usr/bin", "usr/sbin", "usr/lib", "usr/share",
+            "bin", "sbin", "etc", "var", "var/log", "var/tmp",
+            "home", "root", "tmp", "proc", "sys", "dev", "boot",
+            "lib", "lib64", "opt", "mnt", "media", "run", "run/eclipse"
+        ];
+        
+        for dir in &directories {
+            let dir_path = format!("{}/{}", temp_dir, dir);
+            fs::create_dir_all(&dir_path)
+                .map_err(|e| format!("Error creando directorio {}: {}", dir, e))?;
+        }
+        
+        // Copiar archivos del sistema al directorio temporal
+        println!("       📦 Copiando archivos del sistema...");
+        self.copy_system_files_to_tempdir(temp_dir)?;
+        
+        // Copiar modelos AI al directorio temporal
+        println!("       🤖 Copiando modelos AI...");
+        self.copy_ai_models_to_tempdir(temp_dir)?;
+        
+        // Usar populate-eclipsefs para copiar todo al filesystem
+        println!("       💾 Poblando filesystem EclipseFS...");
+        let populate_path = "populate-eclipsefs/target/release/populate-eclipsefs";
+        if !Path::new(populate_path).exists() {
+            return Err(format!("populate-eclipsefs no encontrado en {}", populate_path));
+        }
+        
+        let output = std::process::Command::new(populate_path)
+            .args(&[partition, temp_dir])
+            .output()
+            .map_err(|e| format!("Error ejecutando populate-eclipsefs: {}", e))?;
+        
+        if !output.status.success() {
+            return Err(format!("populate-eclipsefs falló: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        
+        // Limpiar directorio temporal
+        let _ = std::process::Command::new("rm")
+            .args(&["-rf", temp_dir])
+            .output();
+        
+        println!("       ✅ Sistema de archivos EclipseFS poblado exitosamente");
+        Ok(())
+    }
+    
+    /// OLD METHOD - Configurar el sistema de archivos EclipseFS como si estuviera montado (DEPRECATED)
+    fn setup_eclipsefs_filesystem_old(&self, partition: &str) -> Result<(), String> {
         println!("       📁 Configurando estructura del sistema de archivos directamente en EclipseFS...");
         
         // Crear estructura usando EclipseFSInstaller directamente en la partición
@@ -903,8 +989,122 @@ Desarrollado con amor en Rust
         println!("       ✅ Sistema de archivos EclipseFS configurado");
         Ok(())
     }
+    
+    /// Copiar archivos del sistema al directorio temporal
+    fn copy_system_files_to_tempdir(&self, temp_dir: &str) -> Result<(), String> {
+        // Copiar eclipse-systemd
+        let systemd_paths = vec![
+            "eclipse-apps/systemd/target/release/eclipse-systemd",
+            "eclipse-apps/target/release/eclipse-systemd",
+        ];
+        
+        let mut systemd_copied = false;
+        for source in &systemd_paths {
+            if Path::new(source).exists() {
+                // Copiar a /sbin/eclipse-systemd
+                let sbin_dest = format!("{}/sbin/eclipse-systemd", temp_dir);
+                fs::copy(source, &sbin_dest)
+                    .map_err(|e| format!("Error copiando eclipse-systemd a /sbin: {}", e))?;
+                
+                // Copiar a /usr/sbin/eclipse-systemd
+                let usr_sbin_dest = format!("{}/usr/sbin/eclipse-systemd", temp_dir);
+                fs::copy(source, &usr_sbin_dest)
+                    .map_err(|e| format!("Error copiando eclipse-systemd a /usr/sbin: {}", e))?;
+                
+                // Hacer ejecutables
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&sbin_dest).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(&sbin_dest, perms.clone()).ok();
+                    fs::set_permissions(&usr_sbin_dest, perms).ok();
+                }
+                
+                systemd_copied = true;
+                println!("         ✓ eclipse-systemd copiado");
+                break;
+            }
+        }
+        
+        if !systemd_copied {
+            println!("         ⚠  eclipse-systemd no encontrado");
+        }
+        
+        // Copiar otros binarios del sistema
+        let binaries = vec![
+            ("userland/target/release/eclipse_userland", "bin/eclipse_userland"),
+            ("userland/module_loader/target/release/module_loader", "bin/module_loader"),
+            ("userland/graphics_module/target/release/graphics_module", "bin/graphics_module"),
+            ("userland/app_framework/target/release/app_framework", "bin/app_framework"),
+        ];
+        
+        for (source, dest_rel) in &binaries {
+            if Path::new(source).exists() {
+                let dest = format!("{}/{}", temp_dir, dest_rel);
+                fs::copy(source, &dest)
+                    .map_err(|e| format!("Error copiando {}: {}", source, e))?;
+                
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&dest).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(&dest, perms).ok();
+                }
+                
+                println!("         ✓ {} copiado", dest_rel);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Copiar modelos AI al directorio temporal
+    fn copy_ai_models_to_tempdir(&self, temp_dir: &str) -> Result<(), String> {
+        let source_path = Path::new(AI_MODELS_SOURCE);
+        
+        if !source_path.exists() {
+            println!("         ⚠  Directorio de modelos AI no encontrado");
+            return Ok(());
+        }
+        
+        let ai_models_dest = format!("{}/ai_models", temp_dir);
+        fs::create_dir_all(&ai_models_dest)
+            .map_err(|e| format!("Error creando directorio ai_models: {}", e))?;
+        
+        // Copiar recursivamente
+        self.copy_dir_to_tempdir(source_path, Path::new(&ai_models_dest))?;
+        
+        println!("         ✓ Modelos AI copiados");
+        Ok(())
+    }
+    
+    /// Copiar directorio recursivamente (para temp_dir, no para eclipsefs)
+    fn copy_dir_to_tempdir(&self, source: &Path, dest: &Path) -> Result<(), String> {
+        let entries = fs::read_dir(source)
+            .map_err(|e| format!("Error leyendo directorio {}: {}", source.display(), e))?;
+        
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Error leyendo entrada: {}", e))?;
+            let path = entry.path();
+            let file_name = path.file_name().ok_or("Sin nombre de archivo")?;
+            let dest_path = dest.join(file_name);
+            
+            if path.is_dir() {
+                fs::create_dir_all(&dest_path)
+                    .map_err(|e| format!("Error creando directorio {}: {}", dest_path.display(), e))?;
+                self.copy_dir_to_tempdir(&path, &dest_path)?;
+            } else {
+                fs::copy(&path, &dest_path)
+                    .map_err(|e| format!("Error copiando archivo {}: {}", path.display(), e))?;
+            }
+        }
+        
+        Ok(())
+    }
 
-    /// Copiar archivos del sistema directamente a EclipseFS
+    /// OLD - Copiar archivos del sistema directamente a EclipseFS (DEPRECATED)
     fn copy_system_files_to_eclipsefs(&self, eclipsefs: &mut EclipseFSInstaller) -> Result<(), String> {
         println!("       📦 Copiando archivos del sistema a EclipseFS...");
         
