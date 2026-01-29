@@ -1,0 +1,33 @@
+[package]
+name = "wayland_integration"
+version = "0.1.0"
+edition = "2021"
+description = "Wayland integration layer with libwayland and wlroots support for Eclipse OS"
+
+[dependencies]
+# Core dependencies
+heapless = "0.8"
+linked_list_allocator = "0.10"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[features]
+default = ["libwayland", "wlroots"]
+libwayland = []
+wlroots = []
+std = []
+
+[lib]
+name = "wayland_integration"
+path = "src/lib.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1

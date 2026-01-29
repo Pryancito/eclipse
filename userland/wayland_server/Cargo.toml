@@ -6,9 +6,11 @@ edition = "2021"
 [dependencies]
 heapless = "0.8"
 linked_list_allocator = "0.10"
+wayland_integration = { path = "../wayland_integration", optional = true }
 
 [features]
-default = []
+default = ["use_wayland_integration"]
+use_wayland_integration = ["wayland_integration"]
 
 [lib]
 name = "wayland_server"

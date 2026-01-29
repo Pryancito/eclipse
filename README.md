@@ -309,6 +309,7 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ### Características Planificadas
 
+- ✅ **Soporte Wayland**: Integración completa con libwayland y wlroots
 - **Sistema de ventanas**: GUI completa con compositor avanzado
 - **Multi-GPU avanzado**: Soporte completo para NVIDIA, AMD e Intel
 - **Widgets modernos**: Sistema de widgets para interfaces avanzadas
@@ -316,6 +317,48 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 - **Soporte de red**: TCP/IP completo
 - **Sistema de paquetes**: Gestor de paquetes nativo
 - **Multiusuario**: Soporte para múltiples usuarios
+
+## Soporte Wayland
+
+Eclipse OS ahora incluye soporte completo para Wayland con integración de libwayland y wlroots:
+
+### Bibliotecas Soportadas
+
+- **libwayland** - Biblioteca estándar del protocolo Wayland
+- **wlroots** - Biblioteca de compositor modular
+- **Implementación personalizada** - Fallback a implementación de Eclipse OS
+
+### Instalación de Dependencias
+
+```bash
+# Instalar libwayland
+sudo apt-get install libwayland-dev
+
+# Instalar wlroots (opcional, recomendado)
+sudo apt-get install libwlroots-dev
+
+# O compilar wlroots desde el código fuente
+git clone https://gitlab.freedesktop.org/wlroots/wlroots
+cd wlroots
+meson build
+ninja -C build
+sudo ninja -C build install
+```
+
+### Construcción con Wayland
+
+El sistema de construcción detecta automáticamente las bibliotecas disponibles:
+
+```bash
+./build.sh
+```
+
+El script mostrará qué backend de Wayland está usando:
+- "Found wlroots" - usando wlroots
+- "Found wayland-server" - usando libwayland
+- "Building with custom implementation" - sin bibliotecas del sistema
+
+Para más información, consulta [WAYLAND_INTEGRATION.md](WAYLAND_INTEGRATION.md)
 
 ## Contacto
 
