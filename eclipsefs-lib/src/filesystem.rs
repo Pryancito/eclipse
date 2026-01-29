@@ -702,11 +702,10 @@ impl EclipseFS {
     /// Escribir en un archivo
     pub fn write_file(&mut self, inode: u32, data: &[u8]) -> EclipseFSResult<()> {
         // Validar tamaño de datos (protección contra desbordamiento de memoria)
-        #[cfg(not(feature = "std"))]
-        const MAX_FILE_SIZE: usize = MAX_DATA_SIZE;
         #[cfg(feature = "std")]
         const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB límite razonable
         
+        #[cfg(feature = "std")]
         if data.len() > MAX_FILE_SIZE {
             return Err(EclipseFSError::InvalidFormat);
         }
@@ -825,20 +824,12 @@ impl EclipseFS {
             .collect();
 
         #[cfg(not(feature = "std"))]
-        let encrypted_data: Vec<u8, MAX_DATA_SIZE> = node.data.iter()
+        let encrypted_data: alloc::vec::Vec<u8> = node.data.iter()
             .enumerate()
             .map(|(i, &byte)| byte ^ key[i % key.len()])
             .collect();
         
-        #[cfg(feature = "std")]
-        {
-            node.data = encrypted_data;
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            node.data = alloc::vec::Vec::from(encrypted_data.as_slice());
-        }
-        
+        node.data = encrypted_data;
         node.update_checksum();
         Ok(())
     }
@@ -1016,14 +1007,14 @@ impl EclipseFS {
     }
     
     #[cfg(not(feature = "std"))]
-    fn simple_compress(data: &[u8]) -> Vec<u8, MAX_DATA_SIZE> {
-        let mut result = Vec::new();
+    fn simple_compress(data: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut result = alloc::vec::Vec::new();
         if data.is_empty() {
             return result;
         }
         
         let mut i = 0;
-        while i < data.len() && result.len() < MAX_DATA_SIZE - 2 {
+        while i < data.len() {
             let current = data[i];
             let mut count = 1;
             
@@ -1031,8 +1022,8 @@ impl EclipseFS {
                 count += 1;
             }
             
-            let _ = result.push(count as u8);
-            let _ = result.push(current);
+            result.push(count as u8);
+            result.push(current);
             i += count;
         }
         
@@ -1060,19 +1051,16 @@ impl EclipseFS {
     }
     
     #[cfg(not(feature = "std"))]
-    fn simple_decompress(data: &[u8]) -> Vec<u8, MAX_DATA_SIZE> {
-        let mut result = Vec::new();
+    fn simple_decompress(data: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut result = alloc::vec::Vec::new();
         let mut i = 0;
         
-        while i + 1 < data.len() && result.len() < MAX_DATA_SIZE {
+        while i + 1 < data.len() {
             let count = data[i] as usize;
             let value = data[i + 1];
             
             for _ in 0..count {
-                if result.len() >= MAX_DATA_SIZE {
-                    break;
-                }
-                let _ = result.push(value);
+                result.push(value);
             }
             
             i += 2;
@@ -1546,10 +1534,8 @@ impl EclipseFS {
     pub fn transparent_encrypt_data(
         &mut self,
         data: &[u8],
-    ) -> EclipseFSResult<Vec<u8, MAX_DATA_SIZE>> {
-        let mut result = Vec::new();
-        result.extend_from_slice(data).ok();
-        Ok(result)
+    ) -> EclipseFSResult<alloc::vec::Vec<u8>> {
+        Ok(alloc::vec::Vec::from(data))
     }
     #[cfg(feature = "std")]
     pub fn transparent_decrypt_data(&mut self, data: &[u8]) -> EclipseFSResult<Vec<u8>> {
@@ -1559,10 +1545,8 @@ impl EclipseFS {
     pub fn transparent_decrypt_data(
         &mut self,
         data: &[u8],
-    ) -> EclipseFSResult<Vec<u8, MAX_DATA_SIZE>> {
-        let mut result = Vec::new();
-        result.extend_from_slice(data).ok();
-        Ok(result)
+    ) -> EclipseFSResult<alloc::vec::Vec<u8>> {
+        Ok(alloc::vec::Vec::from(data))
     }
     pub fn rotate_transparent_keys(&mut self) -> EclipseFSResult<()> {
         Ok(())
@@ -1698,7 +1682,6 @@ impl EclipseFS {
         let mut tlv_header = [0u8; 6];
         let mut small_buf = [0u8; 16];
         let mut dir_buf = [0u8; 4096];
-        let mut data_buf = [0u8; MAX_DATA_SIZE];
 
         for entry in inode_entries.iter() {
             let inode = entry.inode as u32;
@@ -1739,7 +1722,7 @@ impl EclipseFS {
             let mut mtime = 0u64;
             let mut ctime = 0u64;
             let mut nlink = 1u32;
-            let mut data_len = 0usize;
+            let mut file_data = alloc::vec::Vec::new();
             let mut children: Vec<(String<MAX_NAME_LEN>, u32), MAX_CHILDREN> = Vec::new();
 
             let mut cursor = entry.offset + constants::NODE_RECORD_HEADER_SIZE as u64;
@@ -1914,18 +1897,18 @@ impl EclipseFS {
                         }
                     }
                     tlv_tags::CONTENT => {
-                        if length as usize <= data_buf.len() {
-                            fetch(cursor, &mut data_buf[..length as usize])?;
-                            data_len = length as usize;
-                        } else {
-                            let mut remaining = length;
-                            let mut temp_offset = cursor;
-                            while remaining > 0 {
-                                let chunk = core::cmp::min(remaining, dir_buf.len() as u64);
-                                fetch(temp_offset, &mut dir_buf[..chunk as usize])?;
-                                temp_offset += chunk;
-                                remaining -= chunk;
-                            }
+                        // Read file content in chunks if necessary
+                        file_data.clear();
+                        let mut remaining = length as usize;
+                        let mut temp_cursor = cursor;
+                        
+                        while remaining > 0 {
+                            let chunk_size = core::cmp::min(4096, remaining);
+                            let start_len = file_data.len();
+                            file_data.resize(start_len + chunk_size, 0);
+                            fetch(temp_cursor, &mut file_data[start_len..start_len + chunk_size])?;
+                            temp_cursor += chunk_size as u64;
+                            remaining -= chunk_size;
                         }
                     }
                     _ => {}
@@ -1937,15 +1920,15 @@ impl EclipseFS {
             let mut node = match node_type {
                 NodeKind::File => {
                     let mut n = EclipseFSNode::new_file();
-                    if data_len > 0 {
-                        n.set_data(&data_buf[..core::cmp::min(data_len, data_buf.len())])?;
+                    if !file_data.is_empty() {
+                        n.set_data(&file_data)?;
                     }
                     n
                 }
                 NodeKind::Directory => EclipseFSNode::new_dir(),
                 NodeKind::Symlink => {
-                    let target = if data_len > 0 {
-                        core::str::from_utf8(&data_buf[..data_len]).unwrap_or("")
+                    let target = if !file_data.is_empty() {
+                        core::str::from_utf8(&file_data).unwrap_or("")
                     } else {
                         ""
                     };
