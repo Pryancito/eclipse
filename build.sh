@@ -344,18 +344,17 @@ build_wayland_integration() {
     cd userland/wayland_integration
     
     print_status "Detectando bibliotecas del sistema (libwayland, wlroots)..."
-    cargo build --release 2>&1 | grep -i "warning.*wayland\|warning.*wlroots" || true
+    cargo build --release
     
     if [ $? -eq 0 ]; then
         print_success "Biblioteca de integración Wayland compilada exitosamente"
+        cd ../..
+        return 0
     else
         print_error "Error al compilar biblioteca de integración Wayland"
         cd ../..
         return 1
     fi
-    
-    cd ../..
-    return 0
 }
 
 # Función para compilar aplicaciones Wayland
