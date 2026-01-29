@@ -1058,6 +1058,50 @@ create_bootable_image() {
             print_status "Usando mkfs-eclipsefs para formateo profesional..."
             sudo ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "Eclipse OS Root" -N 10000 "${LOOP}p2"
             print_success "✓ Partición 2 formateada con mkfs-eclipsefs"
+            
+            # Poblar el filesystem con los archivos de BUILD_DIR
+            if [ -f "populate-eclipsefs/target/release/populate-eclipsefs" ] && [ -d "$BUILD_DIR" ]; then
+                print_status "Poblando filesystem EclipseFS con archivos del sistema..."
+                
+                # Crear directorios estándar en BUILD_DIR si no existen
+                mkdir -p "$BUILD_DIR"/{bin,sbin,usr/{bin,sbin,lib},etc,var,tmp,home,root,dev,proc,sys}
+                
+                # Copiar eclipse-systemd a las ubicaciones estándar si existe
+                if [ -f "eclipse-apps/systemd/target/release/eclipse-systemd" ]; then
+                    mkdir -p "$BUILD_DIR/sbin"
+                    mkdir -p "$BUILD_DIR/usr/sbin"
+                    cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/sbin/eclipse-systemd"
+                    cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/eclipse-systemd"
+                    chmod +x "$BUILD_DIR/sbin/eclipse-systemd"
+                    chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
+                    print_status "eclipse-systemd copiado a /sbin/ y /usr/sbin/"
+                fi
+                
+                # Copiar otros binarios importantes si existen
+                if [ -d "userland/target/release" ]; then
+                    mkdir -p "$BUILD_DIR/bin"
+                    mkdir -p "$BUILD_DIR/usr/bin"
+                    
+                    for binary in eclipse_userland module_loader graphics_module app_framework; do
+                        if [ -f "userland/target/release/$binary" ] || [ -f "userland/*/target/release/$binary" ]; then
+                            find userland -name "$binary" -path "*/release/$binary" -exec cp {} "$BUILD_DIR/bin/" \; 2>/dev/null
+                            print_status "$binary copiado a /bin/"
+                        fi
+                    done
+                fi
+                
+                # Usar populate-eclipsefs para copiar todo al filesystem
+                print_status "Ejecutando populate-eclipsefs..."
+                sudo ./populate-eclipsefs/target/release/populate-eclipsefs "${LOOP}p2" "$BUILD_DIR"
+                
+                if [ $? -eq 0 ]; then
+                    print_success "✓ Filesystem EclipseFS poblado exitosamente"
+                else
+                    print_error "Error al poblar filesystem EclipseFS"
+                fi
+            else
+                print_status "populate-eclipsefs o BUILD_DIR no encontrado, filesystem quedará vacío"
+            fi
         else
             # Fallback: header simple con Python
             print_status "mkfs-eclipsefs no encontrado, usando método simple..."
@@ -1134,9 +1178,9 @@ EOF
         sudo umount "$MOUNT_POINT"
         sudo rmdir "$MOUNT_POINT"
         
-        # Nota: No montamos EclipseFS aquí porque Linux no puede montarlo
-        # Solo el kernel Eclipse OS puede montar EclipseFS
-        print_status "Partición EclipseFS lista (solo montable por Eclipse OS kernel)"
+        # Partición EclipseFS ya fue poblada con populate-eclipsefs
+        print_success "Partición EclipseFS lista con archivos del sistema"
+        print_status "Puede montar con: sudo eclipsefs-fuse ${LOOP}p2 /mnt"
         
         # Desconectar loop device
         print_status "Limpiando loop device..."
@@ -1144,7 +1188,7 @@ EOF
         
         print_success "Imagen booteable con 2 particiones creada: $IMG_FILE ($(du -h "$IMG_FILE" | cut -f1))"
         print_status "  Partición 1: ESP (FAT32, 512MB) - Bootloader + Kernel"
-        print_status "  Partición 2: EclipseFS (ext4, resto) - Sistema"
+        print_status "  Partición 2: EclipseFS (poblada) - Sistema con archivos"
         
     else
         print_error "parted no encontrado. Se requiere para crear particiones GPT"
@@ -1263,6 +1307,37 @@ build_mkfs_eclipsefs() {
     cd ..
 }
 
+# Función para compilar populate-eclipsefs
+build_populate_eclipsefs() {
+    print_step "Compilando populate-eclipsefs..."
+    
+    if [ ! -d "populate-eclipsefs" ]; then
+        print_status "Directorio populate-eclipsefs no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd populate-eclipsefs
+    
+    print_status "Compilando populate-eclipsefs..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "populate-eclipsefs compilado exitosamente"
+        
+        local populate_path="target/release/populate-eclipsefs"
+        if [ -f "$populate_path" ]; then
+            local populate_size=$(du -h "$populate_path" | cut -f1)
+            print_status "populate-eclipsefs generado: $populate_path ($populate_size)"
+        fi
+    else
+        print_error "Error al compilar populate-eclipsefs"
+        cd ..
+        return 1
+    fi
+    
+    cd ..
+}
+
 # Función para compilar eclipsefs-cli
 build_eclipsefs_cli() {
     print_step "Compilando eclipsefs-cli..."
@@ -1299,6 +1374,7 @@ main() {
     # Ejecutar pasos de construcción
     build_eclipsefs_lib
     build_mkfs_eclipsefs
+    build_populate_eclipsefs
     build_eclipsefs_cli
     build_kernel
     build_bootloader
