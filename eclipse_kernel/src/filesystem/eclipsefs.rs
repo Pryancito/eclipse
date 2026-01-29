@@ -544,24 +544,27 @@ impl EclipseFSWrapper {
             
             // Buscar el nombre en los hijos del directorio
             if node.kind == eclipsefs_lib::NodeKind::Directory {
-                let mut found = false;
+                let mut found_inode = None;
                 // node.children es un FnvIndexMap<String, u32> que se itera como (key, value)
                 for (child_name, child_inode) in node.children.iter() {
                     if child_name.as_str() == *part {
-                        current_inode = *child_inode;
-                        found = true;
-                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Encontrado '{}' -> inodo {}\n", part, current_inode));
+                        found_inode = Some(*child_inode);
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Encontrado '{}' -> inodo {}\n", part, child_inode));
                         break;
                     }
                 }
                 
-                if !found {
-                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
-                    return Err(VfsError::FileNotFound);
-                }
+                let found_inode = match found_inode {
+                    Some(inode) => inode,
+                    None => {
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
+                        return Err(VfsError::FileNotFound);
+                    }
+                };
                 
-                // Después de encontrar el componente, verificar si es un symlink y seguirlo
-                let found_node = self.load_node_lazy(current_inode, &mut storage)?;
+                // Cargar el nodo encontrado para verificar si es un symlink
+                let found_node = self.load_node_lazy(found_inode, &mut storage)?;
+                
                 if found_node.kind == eclipsefs_lib::NodeKind::Symlink {
                     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' es un symlink, siguiendo...\n", part));
                     
@@ -591,6 +594,9 @@ impl EclipseFSWrapper {
                     // Resolver recursivamente el target del symlink con profundidad incrementada
                     current_inode = self.resolve_path_with_depth(&target_path, depth + 1, max_depth)?;
                     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Symlink resuelto a inodo {}\n", current_inode));
+                } else {
+                    // No es un symlink, usar el inode encontrado
+                    current_inode = found_inode;
                 }
             } else {
                 // Es un archivo y no es el último componente - error
