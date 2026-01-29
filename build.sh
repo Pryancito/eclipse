@@ -389,6 +389,52 @@ build_wayland_apps() {
     print_success "Aplicaciones Wayland compiladas exitosamente"
 }
 
+# Función para compilar Wayland Server (Rust)
+build_wayland_server() {
+    print_step "Compilando Wayland Server (Rust)..."
+
+    if [ ! -d "userland/wayland_server" ]; then
+        print_status "Directorio wayland_server no encontrado, saltando..."
+        return 0
+    fi
+
+    cd userland/wayland_server
+
+    print_status "Compilando wayland_server..."
+    cargo build --release
+    if [ $? -ne 0 ]; then
+        print_error "Error al compilar wayland_server"
+        cd ../..
+        return 1
+    fi
+
+    print_success "Wayland Server (Rust) compilado exitosamente"
+    cd ../..
+}
+
+# Función para compilar COSMIC Client (Rust)
+build_cosmic_client() {
+    print_step "Compilando COSMIC Client (Rust)..."
+
+    if [ ! -d "userland/cosmic_client" ]; then
+        print_status "Directorio cosmic_client no encontrado, saltando..."
+        return 0
+    fi
+
+    cd userland/cosmic_client
+
+    print_status "Compilando cosmic_client..."
+    cargo build --release
+    if [ $? -ne 0 ]; then
+        print_error "Error al compilar cosmic_client"
+        cd ../..
+        return 1
+    fi
+
+    print_success "COSMIC Client (Rust) compilado exitosamente"
+    cd ../..
+}
+
 # Función para compilar Wayland Compositor
 build_wayland_compositor() {
     print_step "Compilando Wayland Compositor..."
@@ -447,6 +493,8 @@ build_userland() {
     build_app_framework
     build_drm_system
     build_wayland_apps
+    build_wayland_server
+    build_cosmic_client
     build_wayland_compositor
     build_cosmic_desktop
 
@@ -540,16 +588,30 @@ create_basic_distribution() {
             print_status "Editor de texto Wayland copiado"
         fi
 
-        # Copiar Wayland Compositor si existe
-        if [ -f "userland/wayland_compositor/wayland_compositor" ]; then
-            cp "userland/wayland_compositor/wayland_compositor" "$BUILD_DIR/userland/bin/"
-            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor"
-            print_status "Wayland Compositor copiado"
+        # Copiar Wayland Server (Rust) si existe
+        if [ -f "userland/wayland_server/target/release/wayland_server" ]; then
+            cp "userland/wayland_server/target/release/wayland_server" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_server"
+            print_status "Wayland Server (Rust) copiado"
         fi
 
-        # Copiar COSMIC Desktop si existe
+        # Copiar COSMIC Client (Rust) si existe
+        if [ -f "userland/cosmic_client/target/release/cosmic_client" ]; then
+            cp "userland/cosmic_client/target/release/cosmic_client" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/cosmic_client"
+            print_status "COSMIC Client (Rust) copiado"
+        fi
+
+        # Copiar Wayland Compositor (C) si existe
+        if [ -f "userland/wayland_compositor/wayland_compositor" ]; then
+            cp "userland/wayland_compositor/wayland_compositor" "$BUILD_DIR/userland/bin/wayland_compositor_c"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor_c"
+            print_status "Wayland Compositor (C) copiado"
+        fi
+
+        # Copiar COSMIC Desktop (C) si existe
         if [ -f "userland/cosmic_desktop/cosmic_desktop" ]; then
-            cp "userland/cosmic_desktop/cosmic_desktop" "$BUILD_DIR/userland/bin/"
+            cp "userland/cosmic_desktop/cosmic_desktop" "$BUILD_DIR/userland/bin/cosmic_desktop_c"
             chmod +x "$BUILD_DIR/userland/bin/cosmic_desktop"
             print_status "COSMIC Desktop copiado"
         fi

@@ -1,0 +1,31 @@
+[package]
+name = "cosmic_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heapless = "0.8"
+linked_list_allocator = "0.10"
+
+[features]
+default = []
+
+[lib]
+name = "cosmic_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmic_client"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
