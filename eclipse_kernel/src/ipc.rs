@@ -282,32 +282,22 @@ impl IpcManager {
         // Validar mensaje antes de enviarlo
         if let Err(_) = self.validate_message(&message) {
             self.stats.validation_errors += 1;
-            return 0; // ID inválido
+            // Retornar 0 como ID inválido (los IDs válidos empiezan en 1)
+            return 0;
         }
 
         // Verificar límites de cola
         if self.message_queue.len() >= MAX_MESSAGE_QUEUE_SIZE {
             self.stats.messages_dropped += 1;
-            return 0; // Cola llena
+            // Retornar 0 como ID inválido cuando la cola está llena
+            return 0;
         }
 
         let message_id = NEXT_MESSAGE_ID.fetch_add(1, Ordering::SeqCst);
         
-        // Insertar mensaje manteniendo orden de prioridad
-        let mut inserted = false;
-        for i in 0..self.message_queue.len() {
-            if let Some((_, msg_priority, _)) = self.message_queue.get(i) {
-                if priority > *msg_priority {
-                    self.message_queue.insert(i, (message_id, priority, message));
-                    inserted = true;
-                    break;
-                }
-            }
-        }
-        
-        if !inserted {
-            self.message_queue.push_back((message_id, priority, message));
-        }
+        // Para mejor rendimiento, mantener colas separadas por prioridad
+        // o simplemente agregar al final para operaciones O(1)
+        self.message_queue.push_back((message_id, priority, message));
         
         self.stats.messages_sent += 1;
         message_id
@@ -315,12 +305,25 @@ impl IpcManager {
 
     /// Obtener mensaje del userland (respeta prioridades)
     pub fn receive_message(&mut self) -> Option<(IpcMessageId, IpcMessage)> {
-        if let Some((msg_id, _priority, message)) = self.message_queue.pop_front() {
-            self.stats.messages_received += 1;
-            Some((msg_id, message))
-        } else {
-            None
+        // Buscar el mensaje con mayor prioridad
+        let mut highest_priority_idx = 0;
+        let mut highest_priority = None;
+        
+        for (idx, (_, priority, _)) in self.message_queue.iter().enumerate() {
+            if highest_priority.is_none() || *priority > highest_priority.unwrap() {
+                highest_priority = Some(*priority);
+                highest_priority_idx = idx;
+            }
         }
+        
+        if highest_priority.is_some() {
+            if let Some((msg_id, _priority, message)) = self.message_queue.remove(highest_priority_idx) {
+                self.stats.messages_received += 1;
+                return Some((msg_id, message));
+            }
+        }
+        
+        None
     }
 
     /// Enviar respuesta al userland
@@ -356,17 +359,18 @@ impl IpcManager {
     ) -> Option<IpcMessage> {
         // Buscar primero en el mapa (más rápido)
         if let Some(response) = self.response_map.remove(&message_id) {
-            // Remover también de la cola
-            self.response_queue.retain(|(id, _)| *id != message_id);
+            // Nota: Mantenemos la entrada en response_queue para mantener consistencia
+            // Se limpiará en get_response o cleanup_old_responses
             return Some(response);
         }
 
         // Si no está en el mapa, esperar con timeout
         for _ in 0..timeout_iterations {
+            // Verificar si la respuesta ha llegado
             if let Some(response) = self.response_map.remove(&message_id) {
-                self.response_queue.retain(|(id, _)| *id != message_id);
                 return Some(response);
             }
+            // Aquí se podría añadir un yield o sleep en una implementación real
         }
 
         self.stats.timeout_errors += 1;
@@ -374,9 +378,13 @@ impl IpcManager {
     }
 
     /// Limpiar respuestas antiguas (garbage collection)
-    pub fn cleanup_old_responses(&mut self, max_age_iterations: usize) {
-        // En una implementación real, esto usaría timestamps
-        // Por ahora, limitamos el tamaño de la cola
+    pub fn cleanup_old_responses(&mut self) {
+        // Limpiar respuestas huérfanas (en queue pero no en map)
+        self.response_queue.retain(|(msg_id, _)| {
+            self.response_map.contains_key(msg_id)
+        });
+        
+        // Si la cola sigue siendo muy grande, remover las más antiguas
         while self.response_queue.len() > MAX_RESPONSE_QUEUE_SIZE / 2 {
             if let Some((msg_id, _)) = self.response_queue.pop_front() {
                 self.response_map.remove(&msg_id);

@@ -171,10 +171,15 @@ if let Some(error) = drm.get_last_error() {
 
 ## Compatibilidad
 
-✅ **100% compatible** con código existente
+⚠️ **Una cambio incompatible**: `DrmDriver::create_layer()` ahora retorna `Result<u32, &'static str>` en lugar de `u32`
+  - Código viejo: `let layer_id = drm.create_layer(rect);`
+  - Código nuevo: `let layer_id = drm.create_layer(rect)?;` o `let layer_id = drm.create_layer(rect).unwrap();`
+
+✅ La mayoría de cambios son **compatibles** con código existente
 ✅ Nuevas características son opcionales
-✅ Comportamiento por defecto sin cambios
+✅ Comportamiento por defecto sin cambios para IPC
 ✅ Estadísticas pueden deshabilitarse
+✅ ID de mensaje 0 ahora está reservado como indicador de error
 
 ## Métricas de Rendimiento
 

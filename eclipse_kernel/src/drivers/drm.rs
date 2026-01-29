@@ -724,14 +724,16 @@ impl DrmDriver {
             return Err("Texture size exceeds maximum");
         }
 
+        // Calcular tamaño de textura una sola vez
         let texture_size = (width * height * 4) as u64;
+        
         if self.current_gpu_memory + texture_size > self.max_gpu_memory {
             self.record_error("Memoria GPU insuficiente");
             return Err("Insufficient GPU memory");
         }
 
         // Verificar que los datos sean del tamaño correcto
-        let expected_size = (width * height * 4) as usize;
+        let expected_size = texture_size as usize;
         if data.len() != expected_size {
             self.record_error("Tamaño de datos de textura inválido");
             return Err("Invalid texture data size");

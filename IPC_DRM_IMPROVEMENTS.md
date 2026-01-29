@@ -394,10 +394,14 @@ if let Some(error) = drm.get_last_error() {
 
 ## Compatibility Notes
 
-- All changes are backward compatible
+- **Most changes are backward compatible** with existing code
+- **Breaking change**: `DrmDriver::create_layer()` now returns `Result<u32, &'static str>` instead of `u32`
+  - Old code: `let layer_id = drm.create_layer(rect);`
+  - New code: `let layer_id = drm.create_layer(rect)?;` or `let layer_id = drm.create_layer(rect).unwrap();`
 - New features are opt-in via configuration
-- Default behavior unchanged for existing code
+- Default behavior unchanged for existing IPC send/receive
 - Statistics can be disabled if not needed
+- Message ID 0 is now reserved as an invalid/error indicator
 
 ## Migration Guide
 
@@ -427,6 +431,15 @@ match drm.load_texture(id, data, w, h) {
     Ok(_) => println!("Texture loaded"),
     Err(e) => eprintln!("Failed: {}", e),
 }
+
+// Breaking change: create_layer now returns Result
+// Old code:
+// let layer_id = drm.create_layer(rect);
+
+// New code:
+let layer_id = drm.create_layer(rect)?;
+// or
+let layer_id = drm.create_layer(rect).unwrap();
 ```
 
 ## Performance Metrics
