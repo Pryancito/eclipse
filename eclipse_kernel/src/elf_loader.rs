@@ -90,6 +90,7 @@ pub struct LoadedProcess {
     pub data_start: u64,
     pub data_end: u64,
     pub segments: Vec<LoadedSegment>,  // Segmentos cargados
+    pub pml4_addr: u64,  // Address of page table (0 if not mapped to new page table)
 }
 
 /// Resultado de la carga de un proceso
@@ -156,6 +157,7 @@ impl ElfLoader {
             data_start: self.next_address,
             data_end: self.next_address,
             segments: self.segments.clone(),
+            pml4_addr: 0, // Will be set by caller if creating new page table
         };
 
         Ok(process)
@@ -498,4 +500,173 @@ fn create_fake_elf_data() -> Vec<u8> {
     data.resize(0x2000, 0);
 
     data
+}
+
+/// Map loaded ELF segments to a process's page table
+/// This function takes a LoadedProcess and maps all its segments to the given page table
+pub fn map_loaded_process_to_page_table(
+    process: &LoadedProcess,
+    pml4_addr: u64,
+) -> Result<(), &'static str> {
+    use crate::memory::paging::{map_preallocated_pages, PAGE_USER, PAGE_WRITABLE, PAGE_NO_EXECUTE};
+    use crate::debug::serial_write_str;
+    
+    serial_write_str(&alloc::format!(
+        "ELF_LOADER: Mapping {} segments to page table at 0x{:x}\n",
+        process.segments.len(), pml4_addr
+    ));
+    
+    for (idx, segment) in process.segments.iter().enumerate() {
+        if segment.physical_pages.is_empty() {
+            continue;
+        }
+        
+        // Determine page flags based on ELF segment flags
+        let mut flags = PAGE_USER; // Always user-accessible
+        
+        // Writable if PF_W is set
+        if (segment.flags & PF_W) != 0 {
+            flags |= PAGE_WRITABLE;
+        }
+        
+        // Non-executable if PF_X is NOT set (NX bit)
+        if (segment.flags & PF_X) == 0 {
+            flags |= PAGE_NO_EXECUTE;
+        }
+        
+        serial_write_str(&alloc::format!(
+            "ELF_LOADER:   Segment {}: vaddr=0x{:x}, {} pages, flags=0x{:x} (R{}{}) \n",
+            idx,
+            segment.vaddr,
+            segment.physical_pages.len(),
+            flags,
+            if (segment.flags & PF_W) != 0 { "W" } else { "" },
+            if (segment.flags & PF_X) != 0 { "X" } else { "" }
+        ));
+        
+        // Map the pre-allocated physical pages to the virtual address
+        map_preallocated_pages(
+            pml4_addr,
+            segment.vaddr,
+            &segment.physical_pages,
+            flags,
+        )?;
+    }
+    
+    serial_write_str("ELF_LOADER: All segments mapped successfully\n");
+    Ok(())
+}
+
+/// Load ELF binary from VFS and map to a new page table
+/// This is a higher-level function that:
+/// 1. Reads binary from VFS (or uses embedded)
+/// 2. Parses ELF
+/// 3. Creates new page table
+/// 4. Maps segments to page table
+/// Returns LoadedProcess with pml4_addr set
+pub fn load_elf_from_vfs_to_new_page_table(path: &str) -> LoadResult {
+    use crate::debug::serial_write_str;
+    use crate::memory::paging::{allocate_physical_page, PageTable, PAGE_SIZE};
+    
+    serial_write_str(&alloc::format!("ELF_LOADER: Loading {} from VFS\n", path));
+    
+    // 1. Try to read from VFS first
+    let elf_data = if let Ok(data) = read_binary_from_vfs(path) {
+        serial_write_str(&alloc::format!(
+            "ELF_LOADER: Read {} bytes from VFS\n",
+            data.len()
+        ));
+        data
+    } else {
+        // Fallback to embedded if path matches systemd
+        if path.contains("systemd") || path.contains("init") {
+            serial_write_str("ELF_LOADER: VFS failed, trying embedded binary\n");
+            if crate::embedded_systemd::has_embedded_systemd() {
+                crate::embedded_systemd::get_embedded_systemd().to_vec()
+            } else {
+                return Err("File not found in VFS and no embedded binary available");
+            }
+        } else {
+            return Err("File not found in VFS");
+        }
+    };
+    
+    // 2. Parse ELF and load segments
+    let mut loader = ElfLoader::new();
+    let mut process = loader.load_elf(&elf_data)?;
+    
+    serial_write_str(&alloc::format!(
+        "ELF_LOADER: Parsed ELF, entry=0x{:x}, {} segments\n",
+        process.entry_point,
+        process.segments.len()
+    ));
+    
+    // 3. Create new page table (PML4)
+    let pml4_phys = allocate_physical_page()
+        .ok_or("Failed to allocate page for PML4")?;
+    
+    // Zero out the new PML4
+    unsafe {
+        let pml4_ptr = pml4_phys as *mut PageTable;
+        core::ptr::write_bytes(pml4_ptr, 0, 1);
+    }
+    
+    serial_write_str(&alloc::format!(
+        "ELF_LOADER: Created new PML4 at 0x{:x}\n",
+        pml4_phys
+    ));
+    
+    // 4. Map all segments to the new page table
+    map_loaded_process_to_page_table(&process, pml4_phys)?;
+    
+    // 5. Set up stack pages (if needed)
+    // For now, we'll allocate a small stack (8KB = 2 pages)
+    let stack_pages = alloc::vec![
+        allocate_physical_page().ok_or("Failed to allocate stack page 1")?,
+        allocate_physical_page().ok_or("Failed to allocate stack page 2")?,
+    ];
+    
+    // Zero out stack pages
+    for &page_addr in &stack_pages {
+        unsafe {
+            core::ptr::write_bytes(page_addr as *mut u8, 0, PAGE_SIZE);
+        }
+    }
+    
+    // Map stack at the stack pointer location (grows downward)
+    let stack_base = process.stack_pointer - (PAGE_SIZE as u64 * 2);
+    use crate::memory::paging::{map_preallocated_pages, PAGE_USER, PAGE_WRITABLE, PAGE_NO_EXECUTE};
+    
+    map_preallocated_pages(
+        pml4_phys,
+        stack_base,
+        &stack_pages,
+        PAGE_USER | PAGE_WRITABLE | PAGE_NO_EXECUTE,
+    )?;
+    
+    serial_write_str(&alloc::format!(
+        "ELF_LOADER: Mapped stack at 0x{:x} (2 pages)\n",
+        stack_base
+    ));
+    
+    // 6. Update process with PML4 address
+    process.pml4_addr = pml4_phys;
+    
+    serial_write_str(&alloc::format!(
+        "ELF_LOADER: Process fully loaded and mapped to PML4 0x{:x}\n",
+        pml4_phys
+    ));
+    
+    Ok(process)
+}
+
+/// Read binary file from VFS
+fn read_binary_from_vfs(path: &str) -> Result<Vec<u8>, &'static str> {
+    use crate::vfs_global::get_vfs;
+    
+    let vfs = get_vfs();
+    let mut vfs_lock = vfs.lock();
+    
+    vfs_lock.read_file(path)
+        .map_err(|_| "Failed to read file from VFS")
 }

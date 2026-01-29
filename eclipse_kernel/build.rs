@@ -99,10 +99,14 @@ fn main() {
             Err(e) => {
                 println!("cargo:warning=Failed to copy mini-systemd: {}", e);
                 println!("cargo:warning=Will use fake ELF data instead");
+                // Create empty file so build doesn't fail
+                fs::write(&mini_systemd_dst, &[]).expect("Failed to create empty mini-systemd.bin");
             }
         }
     } else {
         println!("cargo:warning=mini-systemd binary not found, will use fake ELF data");
+        // Create empty file so build doesn't fail
+        fs::write(&mini_systemd_dst, &[]).expect("Failed to create empty mini-systemd.bin");
     }
 }
 

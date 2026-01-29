@@ -6,7 +6,7 @@
 /// Returns the binary data as a static byte slice
 pub fn get_embedded_systemd() -> &'static [u8] {
     // Try to include the mini-systemd binary if it was copied during build
-    // If the file doesn't exist at build time, this will use an empty slice
+    // If the file is empty, this will return an empty slice
     const MINI_SYSTEMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mini-systemd.bin"));
     
     if MINI_SYSTEMD.is_empty() {
