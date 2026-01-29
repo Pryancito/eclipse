@@ -1,12 +1,16 @@
 //! Sistema de fases de inicialización de gráficos
 //!
-//! Arquitectura de 3 fases:
+//! Arquitectura extendida de fases:
 //! 1. UEFI/GOP para bootloader
 //! 2. UEFI/GOP para kernel en detección de gráficos  
 //! 3. DRM/FB/GOP para kernel posterior
+//! 4. Multi-GPU avanzado con drivers específicos
+//! 5. Sistema de ventanas y compositor
+//! 6. Sistema de widgets y UI completa
 
 use crate::drivers::framebuffer::FramebufferInfo;
 use core::fmt;
+use spin::Mutex;
 
 /// Fases de inicialización de gráficos
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +21,12 @@ pub enum GraphicsPhase {
     UefiKernelDetection,
     /// Fase 3: DRM/FB/GOP para kernel posterior
     DrmKernelRuntime,
+    /// Fase 4: Multi-GPU avanzado con drivers específicos (NVIDIA, AMD, Intel)
+    AdvancedMultiGpu,
+    /// Fase 5: Sistema de ventanas y compositor
+    WindowSystem,
+    /// Fase 6: Sistema de widgets y UI completa
+    WidgetSystem,
     /// Fase de fallback: gráficos básicos
     FallbackBasic,
 }
@@ -27,6 +37,9 @@ impl fmt::Display for GraphicsPhase {
             GraphicsPhase::UefiBootloader => write!(f, "UEFI Bootloader"),
             GraphicsPhase::UefiKernelDetection => write!(f, "UEFI Kernel Detection"),
             GraphicsPhase::DrmKernelRuntime => write!(f, "DRM Kernel Runtime"),
+            GraphicsPhase::AdvancedMultiGpu => write!(f, "Advanced Multi-GPU"),
+            GraphicsPhase::WindowSystem => write!(f, "Window System"),
+            GraphicsPhase::WidgetSystem => write!(f, "Widget System"),
             GraphicsPhase::FallbackBasic => write!(f, "Fallback Basic"),
         }
     }
@@ -76,6 +89,11 @@ impl GraphicsPhaseState {
             (GraphicsPhase::UefiBootloader, GraphicsPhase::UefiKernelDetection) => true,
             (GraphicsPhase::UefiKernelDetection, GraphicsPhase::DrmKernelRuntime) => true,
             (GraphicsPhase::DrmKernelRuntime, GraphicsPhase::DrmKernelRuntime) => true, // Re-inicialización
+            (GraphicsPhase::DrmKernelRuntime, GraphicsPhase::AdvancedMultiGpu) => true,
+            (GraphicsPhase::AdvancedMultiGpu, GraphicsPhase::WindowSystem) => true,
+            (GraphicsPhase::WindowSystem, GraphicsPhase::WidgetSystem) => true,
+            // Permitir transiciones hacia atrás para fallback
+            (_, GraphicsPhase::FallbackBasic) => true,
             _ => false,
         }
     }
@@ -83,17 +101,21 @@ impl GraphicsPhaseState {
     /// Obtener timestamp simple
     fn get_timestamp() -> u64 {
         // En una implementación real, esto usaría un timer del sistema
-        // Por ahora, simulamos con un contador
-        unsafe {
-            static mut COUNTER: u64 = 0;
-            COUNTER += 1;
-            COUNTER
-        }
+        // Por ahora, simulamos con un contador atómico para thread-safety
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Marcar la fase como inicializada
     pub fn mark_initialized(&mut self, framebuffer_info: FramebufferInfo) {
         self.framebuffer_info = Some(framebuffer_info);
+        self.is_initialized = true;
+    }
+
+    /// Marcar la fase actual como inicializada sin framebuffer
+    /// (para fases avanzadas que no requieren framebuffer info)
+    pub fn mark_initialized_simple(&mut self) {
         self.is_initialized = true;
     }
 
@@ -105,6 +127,31 @@ impl GraphicsPhaseState {
     /// Verificar si estamos en fase de runtime
     pub fn is_runtime_phase(&self) -> bool {
         matches!(self.current_phase, GraphicsPhase::DrmKernelRuntime)
+    }
+
+    /// Verificar si estamos en fase avanzada de multi-GPU
+    pub fn is_advanced_multi_gpu_phase(&self) -> bool {
+        matches!(self.current_phase, GraphicsPhase::AdvancedMultiGpu)
+    }
+
+    /// Verificar si estamos en fase de sistema de ventanas
+    pub fn is_window_system_phase(&self) -> bool {
+        matches!(self.current_phase, GraphicsPhase::WindowSystem)
+    }
+
+    /// Verificar si estamos en fase de sistema de widgets
+    pub fn is_widget_system_phase(&self) -> bool {
+        matches!(self.current_phase, GraphicsPhase::WidgetSystem)
+    }
+
+    /// Verificar si estamos en una fase avanzada (multi-GPU o posterior)
+    pub fn is_advanced_phase(&self) -> bool {
+        matches!(
+            self.current_phase,
+            GraphicsPhase::AdvancedMultiGpu
+                | GraphicsPhase::WindowSystem
+                | GraphicsPhase::WidgetSystem
+        )
     }
 }
 
@@ -160,19 +207,70 @@ impl GraphicsPhaseManager {
             GraphicsPhase::UefiBootloader | GraphicsPhase::UefiKernelDetection
         )
     }
-}
 
-/// Instancia global del manager de fases
-static mut GRAPHICS_PHASE_MANAGER: Option<GraphicsPhaseManager> = None;
+    /// Inicializar fase avanzada de Multi-GPU
+    pub fn init_advanced_multi_gpu(&mut self) -> Result<(), &'static str> {
+        self.state.transition_to(GraphicsPhase::AdvancedMultiGpu)?;
+        self.state.mark_initialized_simple();
+        Ok(())
+    }
 
-/// Inicializar el manager de fases
-pub fn init_graphics_phase_manager() {
-    unsafe {
-        GRAPHICS_PHASE_MANAGER = Some(GraphicsPhaseManager::new());
+    /// Inicializar fase de sistema de ventanas
+    pub fn init_window_system(&mut self) -> Result<(), &'static str> {
+        self.state.transition_to(GraphicsPhase::WindowSystem)?;
+        self.state.mark_initialized_simple();
+        Ok(())
+    }
+
+    /// Inicializar fase de sistema de widgets
+    pub fn init_widget_system(&mut self) -> Result<(), &'static str> {
+        self.state.transition_to(GraphicsPhase::WidgetSystem)?;
+        self.state.mark_initialized_simple();
+        Ok(())
+    }
+
+    /// Verificar si podemos usar el sistema avanzado de multi-GPU
+    pub fn can_use_advanced_multi_gpu(&self) -> bool {
+        self.state.is_advanced_phase() && self.state.is_initialized
+    }
+
+    /// Verificar si podemos usar el sistema de ventanas
+    pub fn can_use_window_system(&self) -> bool {
+        matches!(
+            self.state.current_phase,
+            GraphicsPhase::WindowSystem | GraphicsPhase::WidgetSystem
+        ) && self.state.is_initialized
+    }
+
+    /// Verificar si podemos usar el sistema de widgets
+    pub fn can_use_widget_system(&self) -> bool {
+        matches!(self.state.current_phase, GraphicsPhase::WidgetSystem)
+            && self.state.is_initialized
     }
 }
 
+/// Instancia global del manager de fases con protección thread-safe
+static GRAPHICS_PHASE_MANAGER: Mutex<Option<GraphicsPhaseManager>> = Mutex::new(None);
+
+/// Inicializar el manager de fases
+pub fn init_graphics_phase_manager() {
+    *GRAPHICS_PHASE_MANAGER.lock() = Some(GraphicsPhaseManager::new());
+}
+
 /// Obtener el manager de fases
-pub fn get_graphics_phase_manager() -> Option<&'static mut GraphicsPhaseManager> {
-    unsafe { GRAPHICS_PHASE_MANAGER.as_mut() }
+pub fn get_graphics_phase_manager() -> Option<&'static Mutex<Option<GraphicsPhaseManager>>> {
+    Some(&GRAPHICS_PHASE_MANAGER)
+}
+
+/// Ejecutar función con el manager de fases
+pub fn with_graphics_phase_manager<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut GraphicsPhaseManager) -> R,
+{
+    let mut manager = GRAPHICS_PHASE_MANAGER.lock();
+    if let Some(mgr) = manager.as_mut() {
+        Some(f(mgr))
+    } else {
+        None
+    }
 }
