@@ -455,6 +455,7 @@ impl SystemdDaemon {
                     self.start_target(service_name).await?;
                 } else {
                     self.serial_logger.write_error("systemd", &format!("❌ Target no encontrado: {}", service_name)).await?;
+                    return Err(anyhow::anyhow!("Target no encontrado: {}", service_name));
                 }
             } else if !self.is_service_running(service_name).await {
                 self.serial_logger.write_info("systemd", &format!("⚡ Iniciando servicio: {}", service_name)).await?;
@@ -465,7 +466,7 @@ impl SystemdDaemon {
         }
         
         self.serial_logger.write_info("systemd", &format!("🎉 Target completado: {}", target_name)).await?;
-        info!("Servicio Target iniciado: {}", target_name);
+        info!("Target iniciado: {}", target_name);
         Ok(())
         })
     }
