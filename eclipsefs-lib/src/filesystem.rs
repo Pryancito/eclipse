@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use heapless::{FnvIndexMap, String, Vec};
 
 #[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
 // Tamaños máximos (menores) para escenarios no_std tempranos
 const MAX_NODES: usize = 512; // Capacidad ampliada para imágenes reales
 #[allow(dead_code)]
@@ -833,9 +836,7 @@ impl EclipseFS {
         }
         #[cfg(not(feature = "std"))]
         {
-            node.data.clear();
-            node.data.extend_from_slice(&encrypted_data)
-                .map_err(|_| EclipseFSError::OutOfMemory)?;
+            node.data = alloc::vec::Vec::from(encrypted_data.as_slice());
         }
         
         node.update_checksum();
@@ -898,9 +899,7 @@ impl EclipseFS {
         }
         #[cfg(not(feature = "std"))]
         {
-            node.data.clear();
-            node.data.extend_from_slice(&compressed)
-                .map_err(|_| EclipseFSError::OutOfMemory)?;
+            node.data = alloc::vec::Vec::from(compressed.as_slice());
         }
         
         node.size = original_size; // Guardar tamaño original
@@ -919,9 +918,7 @@ impl EclipseFS {
         }
         #[cfg(not(feature = "std"))]
         {
-            node.data.clear();
-            node.data.extend_from_slice(&decompressed)
-                .map_err(|_| EclipseFSError::OutOfMemory)?;
+            node.data = alloc::vec::Vec::from(decompressed.as_slice());
         }
         
         node.update_checksum();

@@ -7,11 +7,13 @@ use crate::extent::ExtentTree;
 use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
-use heapless::{FnvIndexMap, String, Vec};
+use heapless::{FnvIndexMap, String};
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 // Tamaños máximos coherentes con escenarios no_std reducidos
-pub const MAX_DATA_SIZE: usize = 8 * 1024; // 8KB por archivo/symlink
 pub const MAX_CHILDREN: usize = 256; // Hasta 256 entradas por directorio
 pub const MAX_NAME_LEN: usize = 128; // Nombres de hasta 128 caracteres
 
@@ -51,7 +53,7 @@ pub struct EclipseFSNode {
 #[derive(Debug, Clone)]
 pub struct EclipseFSNode {
     pub kind: NodeKind,
-    pub data: Vec<u8, MAX_DATA_SIZE>,
+    pub data: alloc::vec::Vec<u8>,
     pub children: FnvIndexMap<String<MAX_NAME_LEN>, u32, MAX_CHILDREN>,
     pub size: u64,
     pub mode: u32,
@@ -81,7 +83,7 @@ impl EclipseFSNode {
             #[cfg(feature = "std")]
             data: Vec::new(),
             #[cfg(not(feature = "std"))]
-            data: Vec::new(),
+            data: alloc::vec::Vec::new(),
             #[cfg(feature = "std")]
             children: HashMap::new(),
             #[cfg(not(feature = "std"))]
@@ -116,7 +118,7 @@ impl EclipseFSNode {
             #[cfg(feature = "std")]
             data: Vec::new(),
             #[cfg(not(feature = "std"))]
-            data: Vec::new(),
+            data: alloc::vec::Vec::new(),
             #[cfg(feature = "std")]
             children: HashMap::new(),
             #[cfg(not(feature = "std"))]
@@ -151,13 +153,7 @@ impl EclipseFSNode {
         let data = target.as_bytes().to_vec();
 
         #[cfg(not(feature = "std"))]
-        let mut data = Vec::new();
-        #[cfg(not(feature = "std"))]
-        let target_bytes = target.as_bytes();
-        #[cfg(not(feature = "std"))]
-        if target_bytes.len() <= MAX_DATA_SIZE {
-            data.extend_from_slice(target_bytes).ok();
-        }
+        let data = alloc::vec::Vec::from(target.as_bytes());
 
         let mut node = Self {
             kind: NodeKind::Symlink,
@@ -274,14 +270,7 @@ impl EclipseFSNode {
 
         #[cfg(not(feature = "std"))]
         {
-            if data.len() > MAX_DATA_SIZE {
-                return Err(EclipseFSError::InvalidOperation);
-            }
-
-            self.data.clear();
-            self.data
-                .extend_from_slice(data)
-                .map_err(|_| EclipseFSError::InvalidOperation)?;
+            self.data = alloc::vec::Vec::from(data);
         }
 
         self.size = data.len() as u64;
