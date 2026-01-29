@@ -95,9 +95,6 @@ impl ProcessTransfer {
     /// NOTA: Esta función actualmente solo valida requisitos previos.
     /// La transferencia real requiere soporte completo de memoria virtual.
     pub fn transfer_to_userland(&mut self, context: ProcessContext) -> Result<(), &'static str> {
-        // Configurar el proceso como activo
-        self.current_pid = 1; // eclipse-systemd será PID 1
-
         // NOTA: La transferencia completa al userland requiere:
         // 1. Soporte completo de memoria virtual y paginación
         // 2. Configuración adecuada de GDT/IDT para userland
@@ -112,8 +109,11 @@ impl ProcessTransfer {
             context.rip, context.rsp
         ));
         
+        // No configurar PID hasta que la transferencia sea exitosa
+        // (actualmente siempre falla por falta de soporte de VM)
+        
         // Retornar error indicando que falta soporte de VM
-        Err("Transferencia al userland requiere soporte completo de memoria virtual")
+        Err("Transferencia al userland requiere soporte completo de memoria virtual.")
     }
 
     /// Configurar el entorno de ejecución del userland

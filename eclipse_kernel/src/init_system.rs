@@ -688,15 +688,15 @@ impl InitSystem {
             );
             fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
             fb.write_text_kernel(
-                "PID 1: Configuración de eclipse-systemd iniciada",
+                "PID 1: Configuración de eclipse-systemd iniciada.",
                 crate::drivers::framebuffer::Color::CYAN,
             );
             fb.write_text_kernel(
-                "⚠ Pendiente: Soporte completo de memoria virtual",
+                "⚠ Pendiente: Soporte completo de memoria virtual.",
                 crate::drivers::framebuffer::Color::YELLOW,
             );
             fb.write_text_kernel(
-                "El sistema continuará con el kernel loop",
+                "El sistema continuará con el kernel loop.",
                 crate::drivers::framebuffer::Color::WHITE,
             );
         }
