@@ -1,0 +1,22 @@
+// Import extent tree
+use crate::extent::ExtentTree;
+
+// Add to std version node struct:
+    pub extent_tree: ExtentTree,   // Árbol de extents para archivos grandes
+    pub use_extents: bool,         // Si este nodo usa extents o datos inline
+
+// Add to no_std version node struct:
+    pub extent_tree: ExtentTree,   // Árbol de extents para archivos grandes
+    pub use_extents: bool,         // Si este nodo usa extents o datos inline
+
+// Add to new_dir() initializer:
+            extent_tree: ExtentTree::new(),
+            use_extents: false,
+
+// Add to new_file() initializer:
+            extent_tree: ExtentTree::new(),
+            use_extents: false,
+
+// Add to new_symlink() initializer:
+            extent_tree: ExtentTree::new(),
+            use_extents: false,

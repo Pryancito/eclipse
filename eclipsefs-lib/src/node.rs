@@ -1,6 +1,7 @@
 //! Definición de nodos de EclipseFS
 
 use crate::error::{EclipseFSError, EclipseFSResult};
+use crate::extent::ExtentTree;
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -41,6 +42,9 @@ pub struct EclipseFSNode {
     pub is_snapshot: bool,         // Si es una copia CoW
     pub original_inode: u32,       // Inode original (para snapshots)
     pub checksum: u32,             // CRC32 del contenido del nodo
+    // Nuevos campos para extent-based allocation (ext4/XFS)
+    pub extent_tree: ExtentTree,   // Árbol de extents para archivos grandes
+    pub use_extents: bool,         // Si este nodo usa extents o datos inline
 }
 
 #[cfg(not(feature = "std"))]
@@ -63,6 +67,9 @@ pub struct EclipseFSNode {
     pub is_snapshot: bool,         // Si es una copia CoW
     pub original_inode: u32,       // Inode original (para snapshots)
     pub checksum: u32,             // CRC32 del contenido del nodo
+    // Nuevos campos para extent-based allocation (ext4/XFS)
+    pub extent_tree: ExtentTree,   // Árbol de extents para archivos grandes
+    pub use_extents: bool,         // Si este nodo usa extents o datos inline
 }
 
 impl EclipseFSNode {
@@ -92,6 +99,9 @@ impl EclipseFSNode {
             parent_version: 0,
             is_snapshot: false,
             original_inode: 0,
+            // Extent-based allocation
+            extent_tree: ExtentTree::new(),
+            use_extents: false,
             checksum: 0,
         };
         node.update_checksum();
@@ -124,6 +134,9 @@ impl EclipseFSNode {
             parent_version: 0,
             is_snapshot: false,
             original_inode: 0,
+            // Extent-based allocation
+            extent_tree: ExtentTree::new(),
+            use_extents: false,
             checksum: 0,
         };
         node.update_checksum();
@@ -166,6 +179,9 @@ impl EclipseFSNode {
             parent_version: 0,
             is_snapshot: false,
             original_inode: 0,
+            // Extent-based allocation
+            extent_tree: ExtentTree::new(),
+            use_extents: false,
             checksum: 0,
         };
         node.update_checksum();

@@ -244,6 +244,9 @@ impl EclipseFSReader {
             is_snapshot: false,
             original_inode: 0,
             checksum: 0,
+            // Extent-based allocation
+            extent_tree: crate::extent::ExtentTree::new(),
+            use_extents: false,
         })
     }
 
