@@ -4,9 +4,6 @@
 
 extern crate alloc;
 
-use crate::gdt::{setup_userland_gdt, GdtManager};
-use crate::idt::{setup_userland_idt, IdtManager};
-use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
 use crate::memory::paging::{setup_userland_paging, map_userland_memory, identity_map_userland_writable};
 use core::arch::asm;
 use core::ptr;
@@ -313,19 +310,6 @@ impl ProcessTransfer {
         
         let pml4_addr = setup_userland_paging()?;
         Ok(pml4_addr)
-    }
-
-    fn setup_gdt(&self) -> Result<(), &'static str> {
-        setup_userland_gdt()
-    }
-
-    fn setup_idt(&self) -> Result<(), &'static str> {
-        let kernel_code_selector = 0x08; 
-        setup_userland_idt(kernel_code_selector)
-    }
-
-    fn setup_interrupts(&self) -> Result<(), &'static str> {
-        initialize_interrupt_system(0x08)
     }
 
     fn execute_userland_process(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
