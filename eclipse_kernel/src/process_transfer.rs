@@ -7,7 +7,7 @@ extern crate alloc;
 use crate::gdt::{setup_userland_gdt, GdtManager};
 use crate::idt::{setup_userland_idt, IdtManager};
 use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
-use crate::paging::{setup_userland_paging, PagingManager};
+use crate::memory::paging::{setup_userland_paging, map_userland_memory, identity_map_userland_memory};
 use core::arch::asm;
 use core::ptr;
 
@@ -91,9 +91,6 @@ impl ProcessTransfer {
     }
 
     /// Preparar para transferir control a un proceso del userland
-    /// 
-    /// NOTA: Esta función actualmente solo valida requisitos previos.
-    /// La transferencia real requiere soporte completo de memoria virtual.
     pub fn transfer_to_userland(&mut self, context: ProcessContext) -> Result<(), &'static str> {
         crate::debug::serial_write_str("PROCESS_TRANSFER: Starting userland transfer sequence\n");
         crate::debug::serial_write_str(&alloc::format!(
@@ -101,6 +98,7 @@ impl ProcessTransfer {
             context.rip, context.rsp
         ));
         
+<<<<<<< HEAD
         // NOTA: La transferencia completa al userland requiere:
         // 1. Código ejecutable real cargado en memoria en entry_point
         // 2. Memoria mapeada correctamente (código, datos, heap, stack)
@@ -114,38 +112,46 @@ impl ProcessTransfer {
         
         // Retornar error indicando que la transferencia fue diferida
         Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria.")
+=======
+        let pml4_addr = self.setup_userland_environment()?;
+        
+        // Map userland code (Identity map around entry point)
+        if context.rip < 0x800000000000 {
+             identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
+        }
+        
+        // Verify stack mapping if needed
+        if context.rsp > 0x100000000 {
+             let stack_base = context.rsp - 0x100000;
+             map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?; 
+        }
+        
+        // Execute process
+        self.execute_userland_process(context, pml4_addr)?;
+        
+        Ok(())
+>>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     }
 
     /// Configurar el entorno de ejecución del userland
-    fn setup_userland_environment(&self) -> Result<(), &'static str> {
-        // Configurar paginación real
-        self.setup_paging()?;
-
-        // Configurar GDT real
+    fn setup_userland_environment(&self) -> Result<u64, &'static str> {
         self.setup_gdt()?;
-
-        // Configurar IDT real
         self.setup_idt()?;
-
-        // Configurar interrupciones reales
         self.setup_interrupts()?;
-
-        Ok(())
+        let pml4_addr = setup_userland_paging()?;
+        Ok(pml4_addr)
     }
 
-    /// Configurar Global Descriptor Table (GDT)
     fn setup_gdt(&self) -> Result<(), &'static str> {
-        // Configurar GDT real para userland
         setup_userland_gdt()
     }
 
-    /// Configurar Interrupt Descriptor Table (IDT)
     fn setup_idt(&self) -> Result<(), &'static str> {
-        // Configurar IDT real para userland
-        let kernel_code_selector = 0x08; // Selector de código de kernel
+        let kernel_code_selector = 0x08; 
         setup_userland_idt(kernel_code_selector)
     }
 
+<<<<<<< HEAD
     /// Configurar paginación
     fn setup_paging(&self) -> Result<(), &'static str> {
         // Crear y configurar el gestor de paginación
@@ -159,35 +165,29 @@ impl ProcessTransfer {
     }
 
     /// Configurar interrupciones
+=======
+>>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     fn setup_interrupts(&self) -> Result<(), &'static str> {
-        // Configurar interrupciones reales para userland
         initialize_interrupt_system(0x08)
     }
 
-    /// Ejecutar proceso del userland
-    fn execute_userland_process(&self, context: ProcessContext) -> Result<(), &'static str> {
-        // Configurar registros para transferencia al userland
+    fn execute_userland_process(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
         self.setup_userland_registers(&context)?;
-
-        // Transferir control usando iretq
-        self.transfer_to_userland_with_iretq(context)?;
-
+        self.transfer_to_userland_with_iretq(context, pml4_addr)?;
         Ok(())
     }
 
-    /// Configurar registros para userland
     fn setup_userland_registers(&self, context: &ProcessContext) -> Result<(), &'static str> {
-        // Configurar registros de segmento
         unsafe {
             asm!("mov ds, ax", in("ax") context.ds, options(nomem, nostack));
             asm!("mov es, ax", in("ax") context.es, options(nomem, nostack));
             asm!("mov fs, ax", in("ax") context.fs, options(nomem, nostack));
             asm!("mov gs, ax", in("ax") context.gs, options(nomem, nostack));
         }
-
         Ok(())
     }
 
+<<<<<<< HEAD
     /// Transferir control al userland usando iretq
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
         crate::debug::serial_write_str(&alloc::format!(
@@ -255,15 +255,59 @@ impl ProcessTransfer {
                 options(noreturn)
             );
         }
+=======
+    fn transfer_to_userland_with_iretq(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Switching CR3 and executing iretq...\n");
+        
+        let context_ptr = &context as *const ProcessContext;
+        
+        unsafe {
+            // 1. Switch CR3
+             asm!("mov cr3, {}", in(reg) pml4_addr, options(nostack));
+            
+            // 2. Execute iretq
+            asm!(
+                "mov rsp, {tmp_stack}",  
+                
+                // Push stack frame for iretq: SS, RSP, RFLAGS, CS, RIP
+                // Offsets: SS=152, RSP=56, RFLAGS=136, CS=144, RIP=128
+                "push qword ptr [rax + 152]", // SS
+                "push qword ptr [rax + 56]",  // RSP
+                "push qword ptr [rax + 136]", // RFLAGS
+                "push qword ptr [rax + 144]", // CS
+                "push qword ptr [rax + 128]", // RIP
+                
+                // Restore GPRs
+                "mov rbx, [rax + 8]",
+                "mov rcx, [rax + 16]",
+                "mov rdx, [rax + 24]",
+                "mov rsi, [rax + 32]",
+                "mov rdi, [rax + 40]",
+                "mov rbp, [rax + 48]",
+                "mov r8,  [rax + 64]",
+                "mov r9,  [rax + 72]",
+                "mov r10, [rax + 80]",
+                "mov r11, [rax + 88]",
+                "mov r12, [rax + 96]",
+                "mov r13, [rax + 104]",
+                "mov r14, [rax + 112]",
+                "mov r15, [rax + 120]",
+                
+                // Restore RAX last (it currently holds context_ptr)
+                "mov rax, [rax]",
+                
+                "iretq",
+                
+                in("rax") context_ptr,
+                tmp_stack = in(reg) 0x500000u64,
+                options(noreturn)
+            );
+        }
+
+        Err("Critical: iretq failed or returned")
+>>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     }
 
-    /// Registrar inicio del proceso
-    fn log_process_start(&self, context: &ProcessContext) {
-        // En un sistema real, aquí registraríamos el inicio del proceso
-        // Por ahora, solo simulamos el registro
-    }
-
-    /// Obtener PID del proceso actual
     pub fn get_current_pid(&self) -> u32 {
         self.current_pid
     }
@@ -275,7 +319,6 @@ impl Default for ProcessTransfer {
     }
 }
 
-/// Función de utilidad para transferir control a eclipse-systemd
 pub fn transfer_to_eclipse_systemd(
     entry_point: u64,
     stack_pointer: u64,
@@ -284,39 +327,12 @@ pub fn transfer_to_eclipse_systemd(
     envp: u64,
 ) -> Result<(), &'static str> {
     let mut transfer = ProcessTransfer::new();
-
-    // Crear contexto del proceso
     let mut context = ProcessContext::new(entry_point, stack_pointer);
     context.set_args(argc, argv, envp);
-
-    // Transferir control
     transfer.transfer_to_userland(context)?;
-
     Ok(())
 }
 
-/// Función para simular la ejecución de eclipse-systemd
 pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
-    // En un sistema real, aquí eclipse-systemd se ejecutaría realmente
-    // Por ahora, solo simulamos la ejecución exitosa
-
-    // Simular inicialización de systemd
-    simulate_systemd_initialization()?;
-
-    // Simular bucle principal de systemd
-    simulate_systemd_main_loop()?;
-
-    Ok(())
-}
-
-/// Simular inicialización de systemd
-fn simulate_systemd_initialization() -> Result<(), &'static str> {
-    // Simular inicialización exitosa
-    Ok(())
-}
-
-/// Simular bucle principal de systemd
-fn simulate_systemd_main_loop() -> Result<(), &'static str> {
-    // Simular bucle principal exitoso
     Ok(())
 }
