@@ -73,7 +73,7 @@ impl EclipseFS {
             nodes: HashMap::new(),
             #[cfg(not(feature = "std"))]
             nodes: FnvIndexMap::new(),
-            next_inode: 1,
+            next_inode: 2,  // Start at 2 since root is 1
             root_inode: 1,
             umask: 0o022,
             // Inicializar nuevos campos RedoxFS
