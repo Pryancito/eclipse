@@ -394,6 +394,14 @@ El script mostrará qué backend de Wayland está usando:
 
 Para más información, consulta [WAYLAND_INTEGRATION.md](WAYLAND_INTEGRATION.md)
 
+## Documentación Adicional
+
+- **[FAQ](FAQ.md)** - Preguntas frecuentes y soluciones
+- **[CONTRIBUTING](CONTRIBUTING.md)** - Guía para contribuir al proyecto
+- **[SECURITY](SECURITY.md)** - Consideraciones de seguridad
+- **[CHANGELOG](CHANGELOG.md)** - Historial de cambios
+- **[Ejemplos](examples/)** - Ejemplos de uso y tutoriales
+
 ## Contacto
 
 - **GitHub**: https://github.com/Pryancito/eclipse
