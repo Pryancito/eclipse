@@ -201,8 +201,12 @@ impl DependencyResolver {
             if let Ok(deps) = self.resolve_service_dependencies(service) {
                 for dep in deps {
                     if services.contains(&dep) {
-                        graph.get_mut(&dep).unwrap().push(service.clone());
-                        *in_degree.get_mut(service).unwrap() += 1;
+                        if let Some(dep_list) = graph.get_mut(&dep) {
+                            dep_list.push(service.clone());
+                        }
+                        if let Some(degree) = in_degree.get_mut(service) {
+                            *degree += 1;
+                        }
                     }
                 }
             }
@@ -225,11 +229,12 @@ impl DependencyResolver {
             // Reducir grado de dependientes
             if let Some(dependents) = graph.get(&service) {
                 for dependent in dependents {
-                    let degree = in_degree.get_mut(dependent).unwrap();
-                    *degree -= 1;
-                    
-                    if *degree == 0 {
-                        queue.push_back(dependent.clone());
+                    if let Some(degree) = in_degree.get_mut(dependent) {
+                        *degree -= 1;
+                        
+                        if *degree == 0 {
+                            queue.push_back(dependent.clone());
+                        }
                     }
                 }
             }

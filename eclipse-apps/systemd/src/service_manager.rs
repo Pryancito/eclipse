@@ -76,8 +76,17 @@ impl ServiceManager {
 
     /// Registra un servicio
     pub fn register_service(&self, name: &str, service_file: ServiceFile) {
-        self.service_configs.lock().unwrap().insert(name.to_string(), service_file);
-        debug!("Registrando Servicio registrado: {}", name);
+        match self.service_configs.lock() {
+            Ok(mut configs) => {
+                configs.insert(name.to_string(), service_file);
+                debug!("Registrando Servicio registrado: {}", name);
+            }
+            Err(poisoned) => {
+                error!("Lock envenenado en register_service, recuperando...");
+                let mut configs = poisoned.into_inner();
+                configs.insert(name.to_string(), service_file);
+            }
+        }
     }
 
     /// Inicia un servicio
@@ -91,8 +100,13 @@ impl ServiceManager {
 
         // Obtener configuración del servicio
         let service_file = {
-            let configs = self.service_configs.lock().unwrap();
-            configs.get(name).cloned()
+            match self.service_configs.lock() {
+                Ok(configs) => configs.get(name).cloned(),
+                Err(poisoned) => {
+                    error!("Lock envenenado en start_service, recuperando...");
+                    poisoned.into_inner().get(name).cloned()
+                }
+            }
         };
 
         let service_file = match service_file {
@@ -111,7 +125,13 @@ impl ServiceManager {
     pub fn stop_service(&self, name: &str) -> Result<()> {
         info!("Deteniendo Deteniendo servicio: {}", name);
         
-        let mut running = self.running_services.lock().unwrap();
+        let mut running = match self.running_services.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en stop_service, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         if let Some(service_info) = running.get_mut(name) {
             service_info.state = ServiceState::Deactivating;
             
@@ -153,7 +173,13 @@ impl ServiceManager {
     pub fn reload_service(&self, name: &str) -> Result<()> {
         info!("Reiniciando Recargando servicio: {}", name);
         
-        let mut running = self.running_services.lock().unwrap();
+        let mut running = match self.running_services.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en reload_service, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         if let Some(service_info) = running.get_mut(name) {
             service_info.state = ServiceState::Reloading;
             
@@ -178,26 +204,46 @@ impl ServiceManager {
 
     /// Verifica si un servicio está ejecutándose
     pub fn is_service_running(&self, name: &str) -> bool {
-        let running = self.running_services.lock().unwrap();
-        running.contains_key(name)
+        match self.running_services.lock() {
+            Ok(running) => running.contains_key(name),
+            Err(poisoned) => {
+                error!("Lock envenenado en is_service_running, recuperando...");
+                poisoned.into_inner().contains_key(name)
+            }
+        }
     }
 
     /// Obtiene el estado de un servicio
     pub fn get_service_state(&self, name: &str) -> Option<ServiceState> {
-        let running = self.running_services.lock().unwrap();
-        running.get(name).map(|s| s.state.clone())
+        match self.running_services.lock() {
+            Ok(running) => running.get(name).map(|s| s.state.clone()),
+            Err(poisoned) => {
+                error!("Lock envenenado en get_service_state, recuperando...");
+                poisoned.into_inner().get(name).map(|s| s.state.clone())
+            }
+        }
     }
 
     /// Obtiene información de un servicio
     pub fn get_service_info(&self, name: &str) -> Option<ServiceInfo> {
-        let running = self.running_services.lock().unwrap();
-        running.get(name).cloned()
+        match self.running_services.lock() {
+            Ok(running) => running.get(name).cloned(),
+            Err(poisoned) => {
+                error!("Lock envenenado en get_service_info, recuperando...");
+                poisoned.into_inner().get(name).cloned()
+            }
+        }
     }
 
     /// Lista todos los servicios en ejecución
     pub fn list_running_services(&self) -> Vec<String> {
-        let running = self.running_services.lock().unwrap();
-        running.keys().cloned().collect()
+        match self.running_services.lock() {
+            Ok(running) => running.keys().cloned().collect(),
+            Err(poisoned) => {
+                error!("Lock envenenado en list_running_services, recuperando...");
+                poisoned.into_inner().keys().cloned().collect()
+            }
+        }
     }
 
     /// Ejecuta un servicio
@@ -258,7 +304,15 @@ impl ServiceManager {
                     exit_code: None,
                 };
                 
-                self.running_services.lock().unwrap().insert(name.to_string(), service_info);
+                match self.running_services.lock() {
+                    Ok(mut running) => {
+                        running.insert(name.to_string(), service_info);
+                    }
+                    Err(poisoned) => {
+                        error!("Lock envenenado insertando servicio, recuperando...");
+                        poisoned.into_inner().insert(name.to_string(), service_info);
+                    }
+                }
                 
                 debug!("Servicio Proceso iniciado con PID: {}", pid);
                 
@@ -380,14 +434,22 @@ impl ServiceManager {
             .arg(pid.to_string())
             .output() {
             warn!("Advertencia  Error enviando SIGKILL a {}: {}", pid, e);
+            return Err(anyhow::anyhow!("No se pudo enviar SIGKILL al proceso {}", pid));
         }
 
-        // Esperar un poco más para SIGKILL
-        thread::sleep(Duration::from_millis(200));
+        // Esperar hasta 2 segundos adicionales para SIGKILL con verificación
+        for i in 1..=4 {
+            thread::sleep(Duration::from_millis(500));
+            if !Self::is_process_running(pid) {
+                debug!("Proceso {} terminado con SIGKILL después de {} intentos", pid, i);
+                return Ok(());
+            }
+        }
+
+        // Si después de todo aún está ejecutándose, reportar error
         if Self::is_process_running(pid) {
-            warn!("Advertencia  Proceso {} no pudo ser terminado", pid);
-        } else {
-            debug!("Proceso {} terminado con SIGKILL", pid);
+            error!("Error Proceso {} no pudo ser terminado después de SIGTERM y SIGKILL", pid);
+            return Err(anyhow::anyhow!("Proceso {} resistió SIGTERM y SIGKILL", pid));
         }
 
         Ok(())

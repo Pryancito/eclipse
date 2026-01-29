@@ -4,7 +4,7 @@
 //! incluyendo CPU, memoria, I/O y otros recursos del sistema.
 
 use anyhow::Result;
-use log::{info, warn, debug};
+use log::{info, warn, debug, error};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,7 +95,13 @@ impl ResourceManager {
 
     /// Registra un servicio para monitoreo de recursos
     pub fn register_service(&self, service_name: &str, pid: Option<u32>) -> Result<()> {
-        let mut stats = self.service_stats.lock().unwrap();
+        let mut stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en register_service (resource_manager), recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         let service_stats = ServiceResourceStats {
             service_name: service_name.to_string(),
@@ -131,7 +137,13 @@ impl ResourceManager {
 
     /// Actualiza las estadísticas de un servicio
     pub fn update_service_stats(&self, service_name: &str, pid: Option<u32>) -> Result<()> {
-        let mut stats = self.service_stats.lock().unwrap();
+        let mut stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en update_service_stats, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(service_stat) = stats.get_mut(service_name) {
             // Actualizar uso de CPU
@@ -169,7 +181,13 @@ impl ResourceManager {
 
     /// Establece límites de recursos para un servicio
     pub fn set_service_limits(&self, service_name: &str, limits: ResourceLimits) -> Result<()> {
-        let mut stats = self.service_stats.lock().unwrap();
+        let mut stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en set_service_limits, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(service_stat) = stats.get_mut(service_name) {
             service_stat.limits = limits.clone();
@@ -187,19 +205,37 @@ impl ResourceManager {
 
     /// Obtiene estadísticas de recursos de un servicio
     pub fn get_service_stats(&self, service_name: &str) -> Option<ServiceResourceStats> {
-        let stats = self.service_stats.lock().unwrap();
+        let stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en get_service_stats, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         stats.get(service_name).cloned()
     }
 
     /// Obtiene estadísticas de todos los servicios
     pub fn get_all_service_stats(&self) -> Vec<ServiceResourceStats> {
-        let stats = self.service_stats.lock().unwrap();
+        let stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en get_all_service_stats, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         stats.values().cloned().collect()
     }
 
     /// Obtiene el historial de uso de un servicio
     pub fn get_service_history(&self, service_name: &str, limit: Option<usize>) -> Vec<(Instant, CpuUsage, MemoryUsage)> {
-        let history = self.usage_history.lock().unwrap();
+        let history = match self.usage_history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en get_service_history, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         if let Some(service_history) = history.get(service_name) {
             let limit = limit.unwrap_or(service_history.len());
             service_history.iter().rev().take(limit).cloned().collect()
@@ -211,7 +247,13 @@ impl ResourceManager {
     /// Verifica si un servicio excede sus límites
     pub fn check_resource_limits(&self, service_name: &str) -> Result<Vec<String>> {
         let mut violations = Vec::new();
-        let stats = self.service_stats.lock().unwrap();
+        let stats = match self.service_stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en check_resource_limits, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(service_stat) = stats.get(service_name) {
             let limits = &service_stat.limits;
@@ -262,7 +304,13 @@ impl ResourceManager {
         loop {
             // Actualizar estadísticas de todos los servicios
             let service_names: Vec<String> = {
-                let stats = self.service_stats.lock().unwrap();
+                let stats = match self.service_stats.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        error!("Lock envenenado en start_monitoring, recuperando...");
+                        poisoned.into_inner()
+                    }
+                };
                 stats.keys().cloned().collect()
             };
 
@@ -494,7 +542,13 @@ impl ResourceManager {
 
     /// Agrega entrada al historial de uso
     fn add_to_history(&self, service_name: &str, cpu: &CpuUsage, memory: &MemoryUsage) {
-        let mut history = self.usage_history.lock().unwrap();
+        let mut history = match self.usage_history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en add_to_history, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         let service_history = history.entry(service_name.to_string())
             .or_insert_with(Vec::new);

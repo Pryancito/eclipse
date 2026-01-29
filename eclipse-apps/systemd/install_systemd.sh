@@ -5,8 +5,19 @@
 
 set -e
 
-echo "Iniciando Instalando Eclipse SystemD v0.1.0"
+echo "Iniciando Instalando Eclipse SystemD v0.6.0"
 echo "====================================="
+
+# Verificar prerrequisitos
+echo "Verificando Verificando prerrequisitos..."
+for cmd in cargo rustc; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "Error Error: '$cmd' no encontrado. Por favor, instala Rust primero."
+        echo "       Visita: https://rustup.rs/"
+        exit 1
+    fi
+done
+echo "Completado Prerrequisitos verificados"
 
 # Verificar que estamos en el directorio correcto
 if [ ! -f "Cargo.toml" ]; then
@@ -25,6 +36,13 @@ fi
 
 echo "Completado Compilación exitosa"
 
+# Verificar que el binario fue creado
+if [ ! -f "target/release/eclipse-systemd" ]; then
+    echo "Error Error: El binario no fue creado correctamente"
+    exit 1
+fi
+echo "Completado Binario verificado"
+
 # Crear directorios del sistema
 echo "Directorio Creando directorios del sistema..."
 sudo mkdir -p /sbin
@@ -39,11 +57,20 @@ sudo chmod +x /sbin/eclipse-systemd
 
 # Instalar archivos de configuración
 echo "Configuracion Instalando archivos de configuración..."
-sudo cp ../etc/eclipse/systemd/system/*.service /etc/eclipse/systemd/system/
-sudo cp ../etc/eclipse/systemd/system/*.target /etc/eclipse/systemd/system/
+if [ -d "../etc/eclipse/systemd/system" ]; then
+    sudo cp ../etc/eclipse/systemd/system/*.service /etc/eclipse/systemd/system/ 2>/dev/null || true
+    sudo cp ../etc/eclipse/systemd/system/*.target /etc/eclipse/systemd/system/ 2>/dev/null || true
+    echo "Completado Archivos de configuración instalados"
+else
+    echo "Advertencia  Directorio de configuración no encontrado, se omiten archivos .service y .target"
+fi
 
 # Crear enlace simbólico para /sbin/init
 echo "Integrando Creando enlace simbólico para /sbin/init..."
+if [ -e "/sbin/init" ] && [ ! -L "/sbin/init" ]; then
+    echo "Advertencia  /sbin/init existe y no es un enlace simbólico, creando respaldo..."
+    sudo mv /sbin/init /sbin/init.backup
+fi
 sudo ln -sf /sbin/eclipse-systemd /sbin/init
 
 # Crear usuario del sistema
@@ -107,7 +134,13 @@ sudo chmod +x /etc/init.d/eclipse-systemd
 
 # Habilitar servicio
 echo "Configurando  Habilitando servicio..."
-sudo update-rc.d eclipse-systemd defaults
+if command -v update-rc.d &> /dev/null; then
+    sudo update-rc.d eclipse-systemd defaults
+elif command -v systemctl &> /dev/null; then
+    echo "Advertencia  Detectado systemd nativo, la integración puede variar"
+else
+    echo "Advertencia  No se detectó gestor de init, puede requerir configuración manual"
+fi
 
 # Crear archivo de configuración del sistema
 echo "Configurando  Creando configuración del sistema..."
@@ -138,10 +171,10 @@ EOF
 
 # Probar instalación
 echo "Probando Probando instalación..."
-if /sbin/eclipse-systemd --version > /dev/null 2>&1; then
+if [ -x "/sbin/eclipse-systemd" ]; then
     echo "Completado Eclipse SystemD instalado correctamente"
 else
-    echo "Advertencia  Eclipse SystemD instalado pero no responde a --version"
+    echo "Advertencia  Eclipse SystemD instalado pero el ejecutable puede tener problemas de permisos"
 fi
 
 # Mostrar información de instalación

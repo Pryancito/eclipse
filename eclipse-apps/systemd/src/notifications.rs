@@ -4,7 +4,7 @@
 //! que permite a los servicios enviar señales de estado.
 
 use anyhow::Result;
-use log::{info, warn, debug};
+use log::{info, warn, debug, error};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -78,14 +78,28 @@ impl NotificationManager {
             subscribers: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        self.channels.lock().unwrap().insert(name.to_string(), channel);
+        match self.channels.lock() {
+            Ok(mut channels) => {
+                channels.insert(name.to_string(), channel);
+            }
+            Err(poisoned) => {
+                error!("Lock envenenado en create_channel, recuperando...");
+                poisoned.into_inner().insert(name.to_string(), channel);
+            }
+        }
         info!("Notificacion Canal de notificaciones creado: {}", name);
         Ok(())
     }
 
     /// Envía una notificación
     pub fn send_notification(&self, channel_name: &str, notification: ServiceNotification) -> Result<()> {
-        let channels = self.channels.lock().unwrap();
+        let channels = match self.channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en send_notification, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(channel) = channels.get(channel_name) {
             // Enviar notificación a todos los suscriptores
@@ -104,11 +118,25 @@ impl NotificationManager {
 
     /// Suscribe a un canal de notificaciones
     pub fn subscribe(&self, channel_name: &str, subscriber_id: &str) -> Result<broadcast::Receiver<ServiceNotification>> {
-        let channels = self.channels.lock().unwrap();
+        let channels = match self.channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en subscribe, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(channel) = channels.get(channel_name) {
             let receiver = channel.sender.subscribe();
-            channel.subscribers.lock().unwrap().insert(subscriber_id.to_string(), channel.sender.subscribe());
+            match channel.subscribers.lock() {
+                Ok(mut subs) => {
+                    subs.insert(subscriber_id.to_string(), channel.sender.subscribe());
+                }
+                Err(poisoned) => {
+                    error!("Lock de suscriptores envenenado, recuperando...");
+                    poisoned.into_inner().insert(subscriber_id.to_string(), channel.sender.subscribe());
+                }
+            }
             debug!("Suscriptor Suscriptor {} agregado al canal {}", subscriber_id, channel_name);
             Ok(receiver)
         } else {
@@ -118,10 +146,24 @@ impl NotificationManager {
 
     /// Cancela la suscripción de un canal
     pub fn unsubscribe(&self, channel_name: &str, subscriber_id: &str) -> Result<()> {
-        let channels = self.channels.lock().unwrap();
+        let channels = match self.channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en unsubscribe, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         if let Some(channel) = channels.get(channel_name) {
-            channel.subscribers.lock().unwrap().remove(subscriber_id);
+            match channel.subscribers.lock() {
+                Ok(mut subs) => {
+                    subs.remove(subscriber_id);
+                }
+                Err(poisoned) => {
+                    error!("Lock de suscriptores envenenado, recuperando...");
+                    poisoned.into_inner().remove(subscriber_id);
+                }
+            }
             debug!("🚫 Suscriptor {} removido del canal {}", subscriber_id, channel_name);
             Ok(())
         } else {
@@ -194,14 +236,26 @@ impl NotificationManager {
 
     /// Obtiene el historial de notificaciones
     pub fn get_notification_history(&self, limit: Option<usize>) -> Vec<ServiceNotification> {
-        let history = self.history.lock().unwrap();
+        let history = match self.history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en get_notification_history, recuperando...");
+                poisoned.into_inner()
+            }
+        };
         let limit = limit.unwrap_or(history.len());
         history.iter().rev().take(limit).cloned().collect()
     }
 
     /// Obtiene estadísticas de notificaciones
     pub fn get_notification_stats(&self) -> NotificationStats {
-        let history = self.history.lock().unwrap();
+        let history = match self.history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en get_notification_stats, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         let mut type_counts = HashMap::new();
         let mut service_counts = HashMap::new();
@@ -220,7 +274,13 @@ impl NotificationManager {
 
     /// Agrega una notificación al historial
     fn add_to_history(&self, notification: ServiceNotification) {
-        let mut history = self.history.lock().unwrap();
+        let mut history = match self.history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Lock envenenado en add_to_history, recuperando...");
+                poisoned.into_inner()
+            }
+        };
 
         history.push(notification);
 
