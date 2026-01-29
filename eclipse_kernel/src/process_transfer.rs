@@ -84,6 +84,11 @@ pub struct ProcessTransfer {
     current_pid: u32,
 }
 
+/// Constantes para direcciones de memoria
+const USERLAND_CODE_MAP_SIZE: u64 = 0x200000; // 2MB para código userland
+const USERLAND_STACK_RESERVE: u64 = 0x100000; // 1MB de reserva para stack
+const CANONICAL_ADDR_LIMIT: u64 = 0x800000000000; // Límite de espacio de direcciones canónico inferior
+
 impl ProcessTransfer {
     /// Crear nuevo gestor de transferencia
     pub fn new() -> Self {
@@ -98,21 +103,46 @@ impl ProcessTransfer {
             context.rip, context.rsp
         ));
         
+        // Verificar que las direcciones estén en el espacio canónico inferior
+        if context.rip >= CANONICAL_ADDR_LIMIT {
+            return Err("Entry point fuera del espacio de direcciones canónico");
+        }
+        
+        if context.rsp >= CANONICAL_ADDR_LIMIT {
+            return Err("Stack pointer fuera del espacio de direcciones canónico");
+        }
+        
+        // Verificar si hay código ejecutable real en el punto de entrada
+        // Si el código en entry_point es ceros o inválido, no intentar la transferencia
+        let entry_code = unsafe {
+            core::slice::from_raw_parts(context.rip as *const u8, 16)
+        };
+        
+        // Verificar si hay al menos algunos bytes no-cero (indicando código potencialmente válido)
+        let has_code = entry_code.iter().any(|&b| b != 0);
+        
+        if !has_code {
+            crate::debug::serial_write_str("PROCESS_TRANSFER: No executable code found at entry point\n");
+            crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+            crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+            return Err("Transferencia al userland diferida: no hay código ejecutable en el punto de entrada");
+        }
+        
         // Intentar configurar el entorno de userland
         match self.setup_userland_environment() {
             Ok(pml4_addr) => {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
                 
                 // Map userland code (Identity map around entry point)
-                if context.rip < 0x800000000000 {
-                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
+                // Solo mapear si está en el rango canónico inferior
+                if context.rip < CANONICAL_ADDR_LIMIT {
+                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, USERLAND_CODE_MAP_SIZE)?;
                 }
                 
                 // Map stack memory
-                // Stack is at 0x1000000 (16MB) with size 0x800000 (8MB)
-                // So stack range is 0x800000 - 0x1000000
-                let stack_base = context.rsp.saturating_sub(0x100000); // 1MB below stack pointer
-                map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?;
+                // Stack pointer debe tener al menos 1MB de espacio reservado
+                let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
+                map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
                 
                 // Execute process
                 self.execute_userland_process(context, pml4_addr)?;
@@ -120,15 +150,15 @@ impl ProcessTransfer {
                 Ok(())
             }
             Err(e) => {
-                // La configuración del entorno falló, probablemente porque no hay código userland real
+                // La configuración del entorno falló
                 crate::debug::serial_write_str(&alloc::format!(
                     "PROCESS_TRANSFER: Userland environment setup failed: {}\n", e
                 ));
-                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - setup failed\n");
                 crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
                 
                 // Retornar el error para que el sistema sepa que la transferencia fue diferida
-                Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria")
+                Err("Transferencia al userland diferida: fallo en configuración del entorno")
             }
         }
     }
