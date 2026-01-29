@@ -305,7 +305,7 @@ impl ProcessTransfer {
         // self.setup_gdt()?;  // REMOVED - causes triple fault
         // self.setup_idt()?;  // REMOVED - causes triple fault
         
-        // Initialize interrupt system is also not needed here as it's already done
+        // Initializing the interrupt system is also not needed here as it's already done
         // self.setup_interrupts()?;  // REMOVED - already initialized
         
         let pml4_addr = setup_userland_paging()?;
