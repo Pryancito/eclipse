@@ -100,6 +100,7 @@ pub struct Taskbar {
     pub click_animation: f32,
     pub background_animation: f32,
     pub blur_effect: f32,
+    pub start_button_pressed: bool,
 }
 
 impl Taskbar {
@@ -115,6 +116,7 @@ impl Taskbar {
             click_animation: 0.0,
             background_animation: 0.0,
             blur_effect: 0.0,
+            start_button_pressed: false,
         }
     }
 
@@ -128,6 +130,11 @@ impl Taskbar {
             animation_time: 0.0,
             hover_item: None,
             click_animation: 0.0,
+            background_animation: 0.0,
+            blur_effect: 0.0,
+            start_button_pressed: false,
+        }
+    }
             background_animation: 0.0,
             blur_effect: 0.0,
         }
@@ -666,6 +673,26 @@ impl Taskbar {
     /// Obtener ventanas (compatibilidad con API antigua)
     pub fn get_windows(&self) -> &Vec<TaskbarItem, 16> {
         &self.items
+    }
+
+    /// Presionar botón de inicio
+    pub fn press_start_button(&mut self) {
+        self.start_button_pressed = true;
+    }
+
+    /// Soltar botón de inicio
+    pub fn release_start_button(&mut self) {
+        self.start_button_pressed = false;
+    }
+
+    /// Toggle botón de inicio
+    pub fn toggle_start_button(&mut self) {
+        self.start_button_pressed = !self.start_button_pressed;
+    }
+
+    /// Verificar si el botón de inicio está presionado
+    pub fn is_start_button_pressed(&self) -> bool {
+        self.start_button_pressed
     }
 }
 
