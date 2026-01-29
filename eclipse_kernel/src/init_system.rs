@@ -2,6 +2,37 @@
 //!
 //! Este módulo maneja la transición del kernel al userland,
 //! ejecutando eclipse-systemd como PID 1
+//!
+//! # Estado Actual de la Implementación
+//!
+//! ## ✅ Implementado
+//! - Estructura InitProcess con configuración completa de eclipse-systemd
+//! - Configuración de variables de entorno estándar
+//! - Verificación de ejecutables (simulada)
+//! - Integración con módulos elf_loader, process_memory y process_transfer
+//! - Mensajes de inicio en framebuffer
+//!
+//! ## ⚠️ Simulado (Pendiente de Implementación Real)
+//! - Lectura de archivos desde disco (usa datos ficticios)
+//! - Verificación de permisos de archivos
+//! - Mapeo de memoria virtual (simulado, no configura page tables reales)
+//! - Transferencia de control a userland (requiere paginación completa)
+//!
+//! ## 📋 Requiere para Funcionar Completamente
+//! - Sistema de archivos virtual (VFS) funcional
+//! - Soporte de lectura de archivos ELF desde /sbin/init
+//! - Configuración completa de tablas de páginas para userland
+//! - Implementación de syscalls básicas (fork, exec, wait)
+//!
+//! # Ejemplo de Uso
+//!
+//! ```rust,no_run
+//! use eclipse_kernel::init_system::InitSystem;
+//!
+//! let mut init_system = InitSystem::new();
+//! init_system.initialize()?;
+//! init_system.execute_init()?;  // Transfiere control a systemd
+//! ```
 
 use core::fmt::Write;
 // use crate::main_simple::SerialWriter;
@@ -165,6 +196,31 @@ impl InitSystem {
     }
 
     /// Ejecutar eclipse-systemd como PID 1
+    ///
+    /// Este método intenta transferir el control del kernel a eclipse-systemd.
+    ///
+    /// # Estado Actual
+    ///
+    /// Debido a limitaciones en la implementación actual del kernel:
+    /// - La carga de ELF usa datos ficticios (no lee el archivo real)
+    /// - El mapeo de memoria es simulado (no configura page tables)
+    /// - La transferencia de control falla sin paginación completa
+    ///
+    /// # Flujo de Ejecución
+    ///
+    /// 1. Verifica que eclipse-systemd existe
+    /// 2. Muestra mensaje de inicio en framebuffer
+    /// 3. Carga el ejecutable (simulado)
+    /// 4. Configura memoria del proceso (simulado)
+    /// 5. Prepara argumentos y entorno
+    /// 6. Intenta transferir control (falla con error documentado)
+    ///
+    /// # Errores
+    ///
+    /// Retorna error si:
+    /// - El sistema no fue inicializado
+    /// - El ejecutable no se encuentra (simulación)
+    /// - La transferencia de control falla (esperado sin VM completa)
     pub fn execute_init(&self) -> Result<(), &'static str> {
         if !self.is_initialized {
             return Err("Sistema de inicialización no inicializado");
