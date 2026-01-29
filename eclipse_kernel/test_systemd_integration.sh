@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Test script para verificar la integración eclipse-systemd en el kernel
-# Este script compila el kernel y verifica que los módulos de integración estén presentes
+# Script de prueba para verificar la integración de eclipse-systemd en el kernel
+# Este script verifica que los módulos de integración estén presentes y el código compile
 
 set -e  # Exit on error
 
@@ -88,10 +88,10 @@ else
     exit 1
 fi
 
-# 4. Compilar el kernel
+# 3. Compilar el kernel
 echo ""
 echo "─────────────────────────────────────────────────────────"
-echo "3. Compilando kernel con integración systemd..."
+echo "3. Verificando compilación del kernel..."
 echo "─────────────────────────────────────────────────────────"
 
 # Asegurarse de que el target esté instalado
@@ -102,16 +102,16 @@ fi
 
 # Compilar
 if cargo check --target x86_64-unknown-none 2>&1 | tee /tmp/cargo_check.log | grep -q "Finished"; then
-    success "Kernel compilado exitosamente"
+    success "Verificación de compilación exitosa"
 else
-    error "Error al compilar el kernel"
+    error "Error al verificar la compilación del kernel"
     echo ""
     echo "Últimas líneas del log de compilación:"
     tail -20 /tmp/cargo_check.log
     exit 1
 fi
 
-# 5. Verificar que no hay errores de compilación graves
+# 4. Verificar que no hay errores de compilación graves
 echo ""
 echo "─────────────────────────────────────────────────────────"
 echo "4. Verificando ausencia de errores críticos..."
@@ -125,7 +125,7 @@ else
     success "No se encontraron errores de compilación"
 fi
 
-# 6. Verificar documentación
+# 5. Verificar documentación
 echo ""
 echo "─────────────────────────────────────────────────────────"
 echo "5. Verificando documentación..."
@@ -144,7 +144,7 @@ else
     warning "Poca documentación en init_system.rs"
 fi
 
-# 7. Verificar integración con eclipse-systemd app
+# 6. Verificar integración con eclipse-systemd app
 echo ""
 echo "─────────────────────────────────────────────────────────"
 echo "6. Verificando aplicación eclipse-systemd..."
@@ -168,7 +168,7 @@ else
     warning "Directorio eclipse-apps/systemd no encontrado"
 fi
 
-# 8. Resumen
+# 7. Resumen
 echo ""
 echo "════════════════════════════════════════════════════════"
 echo "  RESUMEN DE LA INTEGRACIÓN"

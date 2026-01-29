@@ -966,7 +966,10 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
 /// Verificar si systemd está habilitado via parámetros del kernel
 fn check_systemd_kernel_param() -> bool {
     // TODO: En un sistema real, esto verificaría los parámetros de la línea de comando
-    // Por ahora, habilitar systemd por defecto
+    // Por ejemplo, parseando el comando del bootloader para buscar "init=/sbin/init"
+    // 
+    // Por ahora, retornar true para habilitar systemd por defecto.
+    // Cambiar a false para deshabilitar systemd y usar solo el kernel loop.
     true
 }
 
