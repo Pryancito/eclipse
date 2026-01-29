@@ -708,22 +708,102 @@ pub fn translate_virtual_address(virtual_addr: u64) -> Option<(u64, u64)> {
 /// Configura las tablas de páginas necesarias para ejecutar código en modo usuario.
 /// Retorna la dirección física de la tabla PML4 configurada.
 /// 
-/// # WARNING
-/// Esta es una implementación stub que retorna error porque no hay código userland real.
-/// Cuando se implemente completamente, debe:
-/// 1. Crear una nueva PML4 para el proceso userland
-/// 2. Crear y configurar PDPTs, PDs, y PTs necesarios
-/// 3. Mapear el código, datos, heap y stack del userland
-/// 4. Configurar permisos apropiados (USER, WRITABLE, etc.)
+/// Esta función crea una nueva estructura de páginas para el proceso userland,
+/// permitiendo que el código de usuario se ejecute de manera aislada del kernel.
 pub fn setup_userland_paging() -> Result<u64, &'static str> {
     serial_write_str("PAGING: Setting up userland paging tables\n");
     
-    // Por ahora, retornamos un error porque no hay código userland real para ejecutar.
-    // Cuando haya un binario real de eclipse-systemd en memoria, esta función deberá
-    // crear las tablas de páginas apropiadas.
+    // Crear una nueva PML4 para el proceso userland
+    let pml4_phys_addr = allocate_physical_page()
+        .ok_or("No hay páginas físicas disponibles para PML4")?;
     
-    Err("setup_userland_paging: No hay código userland real para mapear")
+    // Inicializar la PML4 limpia
+    let pml4_table = unsafe { &mut *(pml4_phys_addr as *mut PageTable) };
+    pml4_table.clear();
+    
+    // Copiar las entradas del kernel de la PML4 actual
+    // Esto asegura que el kernel siga siendo accesible después de cambiar CR3
+    // Las entradas superiores (256-511) generalmente contienen el espacio del kernel
+    unsafe {
+        let current_pml4_addr: u64;
+        asm!("mov {}, cr3", out(reg) current_pml4_addr, options(nostack));
+        
+        let current_pml4 = &*(current_pml4_addr as *const PageTable);
+        
+        // Copiar las entradas del kernel (mitad superior de la tabla)
+        for i in 256..512 {
+            pml4_table.entries[i] = current_pml4.entries[i];
+        }
+    }
+    
+    serial_write_str(&alloc::format!(
+        "PAGING: Created new PML4 at 0x{:x} with kernel mappings\n",
+        pml4_phys_addr
+    ));
+    
+    // Retornar la dirección física de la PML4
+    Ok(pml4_phys_addr)
 }
+
+/// Helper function to map a single page in a page table hierarchy
+fn map_page_in_table(
+    pml4_table: &mut PageTable,
+    virtual_addr: u64,
+    physical_addr: u64,
+    flags: u64,
+    phys_manager: &mut PhysicalPageManager
+) -> Result<(), &'static str> {
+    let p4_index = ((virtual_addr >> 39) & 0x1FF) as usize;
+    let p3_index = ((virtual_addr >> 30) & 0x1FF) as usize;
+    let p2_index = ((virtual_addr >> 21) & 0x1FF) as usize;
+    let p1_index = ((virtual_addr >> 12) & 0x1FF) as usize;
+    
+    // Get or create PDPT (Level 3)
+    let p4_entry = pml4_table.get_entry_mut(p4_index);
+    let p3_table = if p4_entry.is_present() {
+        unsafe { &mut *(p4_entry.get_physical_addr() as *mut PageTable) }
+    } else {
+        let new_table_addr = phys_manager.allocate_page()
+            .ok_or("No hay páginas físicas disponibles para PDPT")?;
+        let new_table = unsafe { &mut *(new_table_addr as *mut PageTable) };
+        new_table.clear();
+        *p4_entry = PageTableEntry::new_with_addr(new_table_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        new_table
+    };
+    
+    // Get or create PD (Level 2)
+    let p3_entry = p3_table.get_entry_mut(p3_index);
+    let p2_table = if p3_entry.is_present() {
+        unsafe { &mut *(p3_entry.get_physical_addr() as *mut PageTable) }
+    } else {
+        let new_table_addr = phys_manager.allocate_page()
+            .ok_or("No hay páginas físicas disponibles para PD")?;
+        let new_table = unsafe { &mut *(new_table_addr as *mut PageTable) };
+        new_table.clear();
+        *p3_entry = PageTableEntry::new_with_addr(new_table_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        new_table
+    };
+    
+    // Get or create PT (Level 1)
+    let p2_entry = p2_table.get_entry_mut(p2_index);
+    let p1_table = if p2_entry.is_present() {
+        unsafe { &mut *(p2_entry.get_physical_addr() as *mut PageTable) }
+    } else {
+        let new_table_addr = phys_manager.allocate_page()
+            .ok_or("No hay páginas físicas disponibles para PT")?;
+        let new_table = unsafe { &mut *(new_table_addr as *mut PageTable) };
+        new_table.clear();
+        *p2_entry = PageTableEntry::new_with_addr(new_table_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        new_table
+    };
+    
+    // Map the final page
+    let entry = PageTableEntry::new_with_addr(physical_addr, flags);
+    p1_table.set_entry(p1_index, entry);
+    
+    Ok(())
+}
+
 
 /// Mapear memoria para userland
 ///
@@ -733,24 +813,48 @@ pub fn setup_userland_paging() -> Result<u64, &'static str> {
 /// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
 /// - `virtual_addr`: Dirección virtual base a mapear
 /// - `size`: Tamaño del rango a mapear en bytes
-/// 
-/// # WARNING - STUB IMPLEMENTATION
-/// Esta función actualmente es un stub que solo registra la operación.
-/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
-/// habilitar la ejecución de código userland real.
 pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Result<(), &'static str> {
     serial_write_str(&alloc::format!(
         "PAGING: map_userland_memory(pml4=0x{:x}, vaddr=0x{:x}, size=0x{:x})\n",
         pml4_addr, virtual_addr, size
     ));
     
-    // En un sistema completo, esto:
-    // 1. Accedería a la tabla PML4 en pml4_addr
-    // 2. Crearía/navegaría por PDPTs, PDs, PTs según sea necesario
-    // 3. Asignaría páginas físicas para el rango virtual_addr..virtual_addr+size
-    // 4. Configuraría las entradas de página con los permisos apropiados
-    //
-    // Por ahora, solo simulamos éxito
+    // Acceder a la tabla PML4
+    let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
+    
+    // Obtener el gestor de memoria física
+    let phys_manager = get_physical_manager();
+    
+    // Alinear la dirección virtual al inicio de la página
+    let start_vaddr = virtual_addr & !0xFFF;
+    let end_vaddr = (virtual_addr + size + 0xFFF) & !0xFFF;
+    
+    // Flags: Present, Writable, User-accessible
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    
+    // Mapear cada página en el rango
+    let mut current_vaddr = start_vaddr;
+    while current_vaddr < end_vaddr {
+        // Asignar una nueva página física
+        let phys_addr = phys_manager.allocate_page()
+            .ok_or("No hay páginas físicas disponibles para userland")?;
+        
+        // Limpiar la página física (inicializar a 0)
+        unsafe {
+            core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE);
+        }
+        
+        // Mapear la página virtual a la física con permisos de usuario
+        map_page_in_table(pml4_table, current_vaddr, phys_addr, flags, phys_manager)?;
+        
+        current_vaddr += PAGE_SIZE as u64;
+    }
+    
+    serial_write_str(&alloc::format!(
+        "PAGING: Mapped {} pages for userland\n",
+        (end_vaddr - start_vaddr) / PAGE_SIZE as u64
+    ));
+    
     Ok(())
 }
 
@@ -763,21 +867,38 @@ pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Resu
 /// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
 /// - `physical_addr`: Dirección física/virtual base a mapear
 /// - `size`: Tamaño del rango a mapear en bytes
-/// 
-/// # WARNING - STUB IMPLEMENTATION
-/// Esta función actualmente es un stub que solo registra la operación.
-/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
-/// habilitar la ejecución de código userland real.
 pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u64) -> Result<(), &'static str> {
     serial_write_str(&alloc::format!(
         "PAGING: identity_map_userland_memory(pml4=0x{:x}, paddr=0x{:x}, size=0x{:x})\n",
         pml4_addr, physical_addr, size
     ));
     
-    // En un sistema completo, esto mapearía physical_addr -> physical_addr
-    // de forma que al acceder a la dirección virtual physical_addr se acceda
-    // a la dirección física physical_addr.
-    //
-    // Por ahora, solo simulamos éxito
+    // Acceder a la tabla PML4
+    let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
+    
+    // Obtener el gestor de memoria física
+    let phys_manager = get_physical_manager();
+    
+    // Alinear la dirección al inicio de la página
+    let start_addr = physical_addr & !0xFFF;
+    let end_addr = (physical_addr + size + 0xFFF) & !0xFFF;
+    
+    // Flags: Present, Writable, User-accessible
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    
+    // Mapear cada página en el rango con mapeo identidad
+    let mut current_addr = start_addr;
+    while current_addr < end_addr {
+        // Mapear virtual == física
+        map_page_in_table(pml4_table, current_addr, current_addr, flags, phys_manager)?;
+        
+        current_addr += PAGE_SIZE as u64;
+    }
+    
+    serial_write_str(&alloc::format!(
+        "PAGING: Identity-mapped {} pages for userland\n",
+        (end_addr - start_addr) / PAGE_SIZE as u64
+    ));
+    
     Ok(())
 }
