@@ -95,13 +95,24 @@ impl ProcessTransfer {
         // Configurar el proceso como activo
         self.current_pid = 1; // eclipse-systemd será PID 1
 
-        // Configurar el entorno de ejecución
-        self.setup_userland_environment()?;
-
-        // Transferir control
-        self.execute_userland_process(context)?;
-
-        Ok(())
+        // NOTA: La transferencia completa al userland requiere:
+        // 1. Soporte completo de memoria virtual y paginación
+        // 2. Configuración adecuada de GDT/IDT para userland
+        // 3. Sistema de archivos funcional para cargar el ejecutable
+        // 
+        // Por ahora, simulamos la preparación sin ejecutar operaciones
+        // que puedan causar un triple fault y reinicio del sistema
+        
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: Simulando transferencia a userland\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: entry_point=0x{:x} stack=0x{:x}\n",
+            context.rip, context.rsp
+        ));
+        
+        // Retornar error sin ejecutar operaciones peligrosas
+        Err("Transferencia al userland requiere soporte completo de memoria virtual")
     }
 
     /// Configurar el entorno de ejecución del userland
