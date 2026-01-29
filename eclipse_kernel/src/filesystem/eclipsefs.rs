@@ -1,4 +1,32 @@
 //! Wrapper VFS para la librería EclipseFS.
+//! 
+//! Este módulo implementa la integración del sistema de archivos EclipseFS con el VFS del kernel.
+//! Utiliza un enfoque de "carga bajo demanda" (lazy loading) para minimizar el uso de memoria:
+//! 
+//! - El header y la tabla de inodos se cargan al montar el filesystem
+//! - Los nodos individuales se leen del disco solo cuando se necesitan
+//! - Formato TLV (Type-Length-Value) para almacenamiento flexible de metadatos
+//! 
+//! ## Estructura en disco:
+//! 
+//! ```text
+//! +------------------+
+//! | Header (4KB)     |  <- Superbloque con metadatos del FS
+//! +------------------+
+//! | Inode Table      |  <- Tabla de índice (inode -> offset)
+//! +------------------+
+//! | Node Data        |  <- Datos de nodos en formato TLV
+//! | (archivos y dirs)|
+//! +------------------+
+//! ```
+//! 
+//! ## Formato TLV de nodos:
+//! 
+//! Cada nodo se almacena como una secuencia de entradas TLV:
+//! - Tag (2 bytes): tipo de campo (NODE_TYPE, MODE, UID, SIZE, etc.)
+//! - Length (4 bytes): tamaño del valor en bytes
+//! - Value (N bytes): datos del campo
+//!
 
 use crate::bootloader_data;
 use crate::drivers::storage_manager::{StorageManager, StorageSectorType};
@@ -89,7 +117,7 @@ impl EclipseFSWrapper {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Cargando nodo {} bajo demanda (offset: {})\n", inode_num, entry.offset));
 
         // Calcular el offset absoluto en el disco
-        let absolute_offset = self.header.inode_table_offset + self.header.inode_table_size + entry.offset;
+        let absolute_offset = entry.offset;
         
         // Buffer para leer el nodo (asumimos tamaño máximo de 4KB por nodo)
         let mut node_buffer = [0u8; 4096];
@@ -105,10 +133,348 @@ impl EclipseFSWrapper {
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
 
-        // Parsear el nodo desde el buffer
-        // Por ahora, crear un nodo de ejemplo
-        // TODO: Implementar parsing real del formato TLV
-        Ok(eclipsefs_lib::EclipseFSNode::new_file())
+        // Parsear el nodo desde el buffer usando formato TLV
+        self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)
+    }
+
+    /// Parsear un nodo desde un buffer TLV
+    /// 
+    /// ## Formato del nodo en disco:
+    /// 
+    /// ```text
+    /// +----------------------+
+    /// | Inode (4 bytes)      |  <- Número de inode
+    /// | Record Size (4 bytes)|  <- Tamaño total del registro
+    /// +----------------------+
+    /// | TLV Entry 1          |  <- Tag (2) + Length (4) + Value (N)
+    /// | TLV Entry 2          |
+    /// | ...                  |
+    /// +----------------------+
+    /// ```
+    /// 
+    /// ## Tags TLV soportados:
+    /// 
+    /// - 0x0001: NODE_TYPE (File=1, Directory=2, Symlink=3)
+    /// - 0x0002: MODE (permisos Unix)
+    /// - 0x0003: UID (user ID)
+    /// - 0x0004: GID (group ID)
+    /// - 0x0005: SIZE (tamaño en bytes)
+    /// - 0x0006: ATIME (timestamp de último acceso)
+    /// - 0x0007: MTIME (timestamp de última modificación)
+    /// - 0x0008: CTIME (timestamp de último cambio de metadatos)
+    /// - 0x0009: NLINK (número de hard links)
+    /// - 0x000A: CONTENT (datos del archivo)
+    /// - 0x000B: DIRECTORY_ENTRIES (hijos del directorio)
+    fn parse_node_from_buffer(&self, buffer: &[u8], expected_inode: u32) -> Result<eclipsefs_lib::EclipseFSNode, VfsError> {
+        // Leer cabecera del registro de nodo (8 bytes: inode + tamaño)
+        if buffer.len() < ecfs_constants::NODE_RECORD_HEADER_SIZE {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Buffer demasiado pequeño: {} bytes (mínimo {})\n",
+                buffer.len(), ecfs_constants::NODE_RECORD_HEADER_SIZE
+            ));
+            return Err(VfsError::InvalidFs("Nodo corrupto: buffer demasiado pequeño".into()));
+        }
+
+        let recorded_inode = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+        let record_size = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+
+        crate::debug::serial_write_str(&alloc::format!(
+            "ECLIPSEFS: Parseando nodo - inode esperado: {}, inode leído: {}, tamaño registro: {}\n",
+            expected_inode, recorded_inode, record_size
+        ));
+
+        if recorded_inode != expected_inode {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Inode no coincide (esperado {}, encontrado {})\n",
+                expected_inode, recorded_inode
+            ));
+            return Err(VfsError::InvalidFs("Nodo corrupto: inode no coincide".into()));
+        }
+
+        if record_size < ecfs_constants::NODE_RECORD_HEADER_SIZE {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Tamaño de registro inválido: {}\n", record_size
+            ));
+            return Err(VfsError::InvalidFs("Nodo corrupto: tamaño inválido".into()));
+        }
+
+        // Los datos TLV empiezan después de la cabecera
+        let tlv_size = record_size - ecfs_constants::NODE_RECORD_HEADER_SIZE;
+        
+        // CRÍTICO: Validar que el buffer contiene suficientes datos
+        if ecfs_constants::NODE_RECORD_HEADER_SIZE + tlv_size > buffer.len() {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Registro truncado: necesita {} bytes, buffer tiene {} bytes\n",
+                ecfs_constants::NODE_RECORD_HEADER_SIZE + tlv_size, buffer.len()
+            ));
+            return Err(VfsError::InvalidFs("Nodo corrupto: datos TLV truncados".into()));
+        }
+        
+        let tlv_data = &buffer[ecfs_constants::NODE_RECORD_HEADER_SIZE..ecfs_constants::NODE_RECORD_HEADER_SIZE + tlv_size];
+
+        // Parsear entradas TLV
+        let mut node_kind = eclipsefs_lib::NodeKind::File;
+        let mut mode = 0o100644u32; // Default para archivos
+        let mut mode_set = false; // Track si MODE fue establecido explícitamente
+        let mut uid = 0u32;
+        let mut gid = 0u32;
+        let mut size = 0u64;
+        let mut atime = 0u64;
+        let mut mtime = 0u64;
+        let mut ctime = 0u64;
+        let mut nlink = 1u32;
+        let mut data = heapless::Vec::<u8, 8192>::new();
+        let mut children = heapless::FnvIndexMap::<heapless::String<128>, u32, 256>::new();
+
+        let mut offset = 0;
+
+        while offset + 6 <= tlv_data.len() {
+            let tag = u16::from_le_bytes([tlv_data[offset], tlv_data[offset + 1]]);
+            let length = u32::from_le_bytes([
+                tlv_data[offset + 2],
+                tlv_data[offset + 3],
+                tlv_data[offset + 4],
+                tlv_data[offset + 5],
+            ]) as usize;
+            offset += 6;
+
+            if offset + length > tlv_data.len() {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: ADVERTENCIA - TLV truncado en tag 0x{:04X}, ignorando resto\n", tag
+                ));
+                break;
+            }
+
+            let value = &tlv_data[offset..offset + length];
+            offset += length;
+
+            match tag {
+                0x0001 => { // NODE_TYPE
+                    if !value.is_empty() {
+                        node_kind = match value[0] {
+                            1 => eclipsefs_lib::NodeKind::File,
+                            2 => eclipsefs_lib::NodeKind::Directory,
+                            3 => eclipsefs_lib::NodeKind::Symlink,
+                            _ => {
+                                crate::debug::serial_write_str(&alloc::format!(
+                                    "ECLIPSEFS: ADVERTENCIA - Tipo de nodo desconocido: {}, usando File\n", value[0]
+                                ));
+                                eclipsefs_lib::NodeKind::File
+                            }
+                        };
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Tipo de nodo: {:?}\n", node_kind));
+                    }
+                }
+                0x0002 => { // MODE
+                    if value.len() >= 4 {
+                        mode = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                        mode_set = true;
+                    }
+                }
+                0x0003 => { // UID
+                    if value.len() >= 4 {
+                        uid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    }
+                }
+                0x0004 => { // GID
+                    if value.len() >= 4 {
+                        gid = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    }
+                }
+                0x0005 => { // SIZE
+                    if value.len() >= 8 {
+                        size = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7],
+                        ]);
+                    }
+                }
+                0x0006 => { // ATIME
+                    if value.len() >= 8 {
+                        atime = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7],
+                        ]);
+                    }
+                }
+                0x0007 => { // MTIME
+                    if value.len() >= 8 {
+                        mtime = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7],
+                        ]);
+                    }
+                }
+                0x0008 => { // CTIME
+                    if value.len() >= 8 {
+                        ctime = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7],
+                        ]);
+                    }
+                }
+                0x0009 => { // NLINK
+                    if value.len() >= 4 {
+                        nlink = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    }
+                }
+                0x000A => { // CONTENT
+                    if value.len() > 8192 {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ECLIPSEFS: ADVERTENCIA - Contenido truncado: {} bytes -> 8192 bytes\n", value.len()
+                        ));
+                        let _ = data.extend_from_slice(&value[..8192]);
+                    } else {
+                        if data.extend_from_slice(value).is_err() {
+                            crate::debug::serial_write_str(&alloc::format!(
+                                "ECLIPSEFS: ERROR - Fallo al copiar contenido de {} bytes\n", value.len()
+                            ));
+                        } else {
+                            crate::debug::serial_write_str(&alloc::format!(
+                                "ECLIPSEFS: Contenido del archivo: {} bytes\n", value.len()
+                            ));
+                        }
+                    }
+                }
+                0x000B => { // DIRECTORY_ENTRIES
+                    children = self.deserialize_directory_entries(value)?;
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: Directorio con {} entradas\n", children.len()
+                    ));
+                }
+                _ => {
+                    // Ignorar tags desconocidos
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: ADVERTENCIA - Tag TLV desconocido: 0x{:04X}\n", tag
+                    ));
+                }
+            }
+        }
+        
+        // Ajustar mode según tipo de nodo si no fue establecido explícitamente
+        if !mode_set {
+            mode = match node_kind {
+                eclipsefs_lib::NodeKind::Directory => 0o040755,
+                eclipsefs_lib::NodeKind::File => 0o100644,
+                eclipsefs_lib::NodeKind::Symlink => 0o120777,
+            };
+        }
+
+        Ok(eclipsefs_lib::EclipseFSNode {
+            kind: node_kind,
+            data,
+            children,
+            size,
+            mode,
+            uid,
+            gid,
+            atime,
+            mtime,
+            ctime,
+            nlink,
+            version: 1,
+            parent_version: 0,
+            is_snapshot: false,
+            original_inode: 0,
+            checksum: 0,
+        })
+    }
+
+    /// Deserializar entradas de directorio desde formato binario
+    /// 
+    /// Formato: [name_len (4) | child_inode (4) | name (N bytes)] repetido
+    fn deserialize_directory_entries(&self, data: &[u8]) -> Result<heapless::FnvIndexMap<heapless::String<128>, u32, 256>, VfsError> {
+        let mut entries = heapless::FnvIndexMap::new();
+        let mut offset = 0;
+        let mut skipped_count = 0;
+        let mut truncation_count = 0;
+
+        while offset < data.len() {
+            if offset + 8 > data.len() {
+                break;
+            }
+
+            let name_len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            let child_inode = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            if offset + name_len > data.len() {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: ADVERTENCIA - Entrada de directorio truncada: esperaba {} bytes, solo {} disponibles\n",
+                    name_len, data.len() - offset
+                ));
+                break;
+            }
+
+            // Validar longitud de nombre antes de conversión
+            if name_len > 128 {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: ADVERTENCIA - Nombre de archivo demasiado largo ({} bytes), máximo 128. Saltando entrada.\n",
+                    name_len
+                ));
+                skipped_count += 1;
+                offset += name_len;
+                continue;
+            }
+
+            // Convertir bytes a String
+            let name_bytes = &data[offset..offset + name_len];
+            match core::str::from_utf8(name_bytes) {
+                Ok(name_str) => {
+                    let mut name = heapless::String::new();
+                    if name.push_str(name_str).is_ok() {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ECLIPSEFS: Entrada de directorio: '{}' -> inode {}\n",
+                            name_str, child_inode
+                        ));
+                        
+                        // Verificar si hay espacio en el mapa
+                        if entries.insert(name, child_inode).is_err() {
+                            crate::debug::serial_write_str(&alloc::format!(
+                                "ECLIPSEFS: ADVERTENCIA - Directorio lleno (máximo 256 entradas). Ignorando '{}'\n",
+                                name_str
+                            ));
+                            truncation_count += 1;
+                        }
+                    } else {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ECLIPSEFS: ADVERTENCIA - Fallo push_str para '{}' (probablemente demasiado largo)\n",
+                            name_str
+                        ));
+                        skipped_count += 1;
+                    }
+                }
+                Err(_) => {
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: ADVERTENCIA - Nombre de archivo no es UTF-8 válido ({} bytes). Saltando entrada.\n",
+                        name_len
+                    ));
+                    skipped_count += 1;
+                }
+            }
+            offset += name_len;
+        }
+
+        if skipped_count > 0 || truncation_count > 0 {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Resumen de directorio: {} entradas cargadas, {} saltadas, {} truncadas\n",
+                entries.len(), skipped_count, truncation_count
+            ));
+        }
+
+        Ok(entries)
     }
 
     /// Sincronizar todos los cambios al disco real
@@ -562,10 +928,35 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
         absolute_offset += to_copy as u64;
     }
 
-    let mut inode_entries: Vec<InodeTableEntry> = Vec::with_capacity(header.total_inodes as usize);
+    let mut inode_entries: Vec<InodeTableEntry> = Vec::new();
+    let mut valid_inode_count = 0;
+    let mut empty_inode_count = 0;
 
-    for idx in 0..header.total_inodes {
+    // Optimización: Limitar lectura a un máximo razonable de inodos
+    // Si hay más de 1000 inodos, es probable que muchos estén vacíos
+    // En un sistema real, solo deberíamos leer los que se usan realmente
+    let max_inodes_to_scan = core::cmp::min(header.total_inodes, 10000);
+    
+    crate::debug::serial_write_str(&alloc::format!(
+        "ECLIPSEFS: Escaneando tabla de inodos (total_inodes={}, max_scan={})\n",
+        header.total_inodes, max_inodes_to_scan
+    ));
+
+    // OPTIMIZACIÓN CRÍTICA: Escanear en bloques y salir temprano si encontramos muchos vacíos consecutivos
+    let mut consecutive_empty = 0;
+    const MAX_CONSECUTIVE_EMPTY: u32 = 100; // Salir después de 100 entradas vacías consecutivas
+
+    for idx in 0..max_inodes_to_scan {
         let entry_offset = (idx as usize) * (ecfs_constants::INODE_TABLE_ENTRY_SIZE);
+        
+        // Validar que no nos salimos del buffer
+        if entry_offset + 8 > inode_table_data.len() {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: Fin prematuro de tabla de inodos en índice {} (fuera de límites)\n", idx
+            ));
+            break;
+        }
+        
         let inode = u32::from_le_bytes([
             inode_table_data[entry_offset],
             inode_table_data[entry_offset + 1],
@@ -578,26 +969,84 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
             inode_table_data[entry_offset + 6],
             inode_table_data[entry_offset + 7],
         ]) as u64;
+        
+        // Filtrar entradas vacías (inode=0 indica entrada sin usar)
+        if inode == 0 {
+            empty_inode_count += 1;
+            consecutive_empty += 1;
+            
+            // OPTIMIZACIÓN: Si encontramos muchas entradas vacías consecutivas,
+            // probablemente el resto también esté vacío
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: Detectadas {} entradas vacías consecutivas. Asumiendo resto vacío.\n",
+                    consecutive_empty
+                ));
+                break;
+            }
+            continue;
+        }
+        
+        // Reiniciar contador de entradas vacías consecutivas
+        consecutive_empty = 0;
+        
         let node_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
         inode_entries.push(InodeTableEntry::new(inode, node_offset));
+        valid_inode_count += 1;
     }
 
-    // Debug: mostrar información del header
-    crate::debug::serial_write_str("ECLIPSEFS: Header info - inode_table_offset: ");
-    serial_write_decimal(header.inode_table_offset);
-    crate::debug::serial_write_str(", inode_table_size: ");
-    serial_write_decimal(header.inode_table_size);
-    crate::debug::serial_write_str(", total_inodes: ");
-    serial_write_decimal(header.total_inodes as u64);
-    crate::debug::serial_write_str("\n");
+    // Debug: mostrar información del header y estadísticas de la tabla
+    crate::debug::serial_write_str(&alloc::format!(
+        "ECLIPSEFS: Estadísticas de tabla de inodos:\n\
+         - Offset de tabla: {}\n\
+         - Tamaño de tabla: {} bytes\n\
+         - Total declarado: {} inodos\n\
+         - Escaneados: {} inodos\n\
+         - Válidos encontrados: {} inodos\n\
+         - Vacíos encontrados: {} inodos\n\
+         - Tasa de uso: {:.1}%\n",
+        header.inode_table_offset,
+        header.inode_table_size,
+        header.total_inodes,
+        max_inodes_to_scan,
+        valid_inode_count,
+        empty_inode_count,
+        if max_inodes_to_scan > 0 {
+            (valid_inode_count as f32 / max_inodes_to_scan as f32) * 100.0
+        } else {
+            0.0
+        }
+    ));
     
-    // Debug: mostrar información de las entradas de inodos
-    crate::debug::serial_write_str("ECLIPSEFS: Tabla de inodos parseada:\n");
-    for (i, entry) in inode_entries.iter().enumerate() {
+    // Debug: mostrar información de las entradas de inodos (solo las primeras 10 válidas y las últimas 5)
+    crate::debug::serial_write_str("ECLIPSEFS: Tabla de inodos parseada (mostrando primeras 10 y últimas 5 entradas válidas):\n");
+    let show_count = core::cmp::min(10, inode_entries.len());
+    for i in 0..show_count {
+        let entry = &inode_entries[i];
         crate::debug::serial_write_str(&alloc::format!(
             "  Entrada {}: inode={}, offset={}\n",
             i, entry.inode, entry.offset
         ));
+    }
+    
+    if inode_entries.len() > 15 {
+        crate::debug::serial_write_str("  ... (entradas intermedias omitidas) ...\n");
+        let last_start = inode_entries.len() - 5;
+        for i in last_start..inode_entries.len() {
+            let entry = &inode_entries[i];
+            crate::debug::serial_write_str(&alloc::format!(
+                "  Entrada {}: inode={}, offset={}\n",
+                i, entry.inode, entry.offset
+            ));
+        }
+    } else if inode_entries.len() > 10 {
+        for i in 10..inode_entries.len() {
+            let entry = &inode_entries[i];
+            crate::debug::serial_write_str(&alloc::format!(
+                "  Entrada {}: inode={}, offset={}\n",
+                i, entry.inode, entry.offset
+            ));
+        }
     }
     
     // Debug adicional: mostrar los bytes raw de la tabla de inodos
