@@ -181,6 +181,14 @@ unsafe fn serial_write_hex8(val: u8) {
 static mut LOG_BUF: [u8; 131072] = [0; 131072];
 static mut LOG_LEN: usize = 0;
 
+/// Agrega un byte al buffer de log.
+/// 
+/// # Safety
+/// 
+/// Esta función es unsafe porque accede a las variables globales mutables LOG_BUF y LOG_LEN.
+/// El llamador debe asegurar que:
+/// - No haya acceso concurrente a LOG_BUF o LOG_LEN desde múltiples hilos
+/// - Esta función solo se llame en contexto de bootloader single-threaded
 #[inline(always)]
 unsafe fn log_append_byte(b: u8) {
     if LOG_LEN < LOG_BUF.len() {
@@ -189,11 +197,28 @@ unsafe fn log_append_byte(b: u8) {
     }
 }
 
+/// Agrega múltiples bytes al buffer de log.
+/// 
+/// # Safety
+/// 
+/// Esta función es unsafe porque:
+/// - Accede a las variables globales mutables LOG_BUF y LOG_LEN
+/// - Usa copy_nonoverlapping para copiar datos
+/// 
+/// El llamador debe asegurar que:
+/// - No haya acceso concurrente a LOG_BUF o LOG_LEN
+/// - Esta función solo se llame en contexto de bootloader single-threaded
+/// - bytes apunte a memoria válida por al menos bytes.len() bytes
 #[inline(always)]
 unsafe fn log_append_bytes(bytes: &[u8]) {
     let avail = LOG_BUF.len().saturating_sub(LOG_LEN);
     let to_copy = core::cmp::min(avail, bytes.len());
     if to_copy > 0 {
+        // SAFETY: 
+        // - bytes.as_ptr() es válido para lectura de to_copy bytes (garantizado por bytes.len())
+        // - LOG_BUF.as_mut_ptr().add(LOG_LEN) es válido para escritura de to_copy bytes
+        //   (garantizado por la comprobación avail y to_copy <= avail)
+        // - Las regiones no se solapan (LOG_BUF es estático, bytes viene de otro lugar)
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), LOG_BUF.as_mut_ptr().add(LOG_LEN), to_copy);
         LOG_LEN += to_copy;
     }
@@ -325,6 +350,8 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
             }
         }
     }
+    // SAFETY: ehdr_buf está completamente inicializado con datos del archivo ELF.
+    // Usamos read_unaligned porque la alineación de la estructura puede no coincidir con el buffer.
     let ehdr: Elf64Ehdr = unsafe { core::ptr::read_unaligned(ehdr_buf.as_ptr() as *const Elf64Ehdr) };
 
     // Debug: verificar entry point
@@ -349,6 +376,12 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
     // Iterar program headers
     let phentsize = ehdr.e_phentsize as usize;
     let phnum = ehdr.e_phnum as usize;
+    
+    // Validar que phnum no sea excesivamente grande para prevenir ataques
+    if phnum > MAX_PH {
+        return Err(BootError::LoadElf(Status::UNSUPPORTED));
+    }
+    
     let mut ph_buf = [0u8; core::mem::size_of::<Elf64Phdr>()];
 
     // Asegurar tamaño de entrada de programa esperado para ELF64
@@ -380,12 +413,18 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
                 }
             }
         }
+        // SAFETY: ph_buf está completamente inicializado con phentsize bytes del archivo ELF.
+        // Usamos read_unaligned para evitar problemas de alineación.
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
 
-        // Calcular direcciones virtuales del segmento
+        // Validar que p_memsz no cause desbordamiento al sumarse con p_vaddr
+        let vaddr_end_unaligned = phdr.p_vaddr.checked_add(phdr.p_memsz)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+        
+        // Calcular direcciones virtuales del segmento con alineación de página
         let vaddr_start = phdr.p_vaddr & !0xFFFu64;
-        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+        let vaddr_end = (vaddr_end_unaligned + 0xFFF) & !0xFFFu64;
 
         if vaddr_start < min_vaddr { min_vaddr = vaddr_start; }
         if vaddr_end > max_vaddr { max_vaddr = vaddr_end; }
@@ -393,8 +432,15 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
 
     if min_vaddr == u64::MAX || max_vaddr <= min_vaddr { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
 
-    // Calcular tamaño total del kernel
-    let total_size = max_vaddr - min_vaddr;
+    // Calcular tamaño total del kernel con verificación de desbordamiento
+    let total_size = max_vaddr.checked_sub(min_vaddr)
+        .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+    
+    // Validar que el tamaño no exceda un límite razonable
+    if total_size > MAX_KERNEL_ALLOCATION {
+        return Err(BootError::LoadElf(Status::LOAD_ERROR));
+    }
+    
     let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
 
     // Reservar memoria física - usar BOOT_SERVICES_CODE para que UEFI no la reutilice después de exit

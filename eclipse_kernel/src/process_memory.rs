@@ -36,52 +36,55 @@ impl ProcessMemoryManager {
     }
 
     /// Asignar memoria para un proceso
-    pub fn allocate_process_memory(&mut self, text_size: u64, data_size: u64) -> ProcessMemory {
+    /// 
+    /// # Errores
+    /// 
+    /// Retorna un error si:
+    /// - Las direcciones calculadas no están alineadas a página (esto indica un error en la lógica)
+    /// - El tamaño solicitado causaría desbordamiento de dirección
+    pub fn allocate_process_memory(&mut self, text_size: u64, data_size: u64) -> Result<ProcessMemory, &'static str> {
         // Asegurar que next_vaddr esté alineado a página
         self.next_vaddr = self.align_to_page(self.next_vaddr);
 
         let text_start = self.next_vaddr;
-        let text_end = text_start + self.align_to_page(text_size);
+        let text_end = text_start.checked_add(self.align_to_page(text_size))
+            .ok_or("Desbordamiento al calcular text_end")?;
 
         let data_start = text_end;
-        let data_end = data_start + self.align_to_page(data_size);
+        let data_end = data_start.checked_add(self.align_to_page(data_size))
+            .ok_or("Desbordamiento al calcular data_end")?;
 
         let heap_start = data_end;
-        let heap_end = heap_start + 0x100000; // 1MB de heap inicial
+        let heap_end = heap_start.checked_add(0x100000) // 1MB de heap inicial
+            .ok_or("Desbordamiento al calcular heap_end")?;
 
         let stack_size = 0x800000; // 8MB de stack
         let stack_end = 0x7FFFFFFFFFFF;
-        let stack_start = stack_end - stack_size;
+        let stack_start = stack_end.checked_sub(stack_size)
+            .ok_or("Desbordamiento al calcular stack_start")?;
 
         // Verificar que todas las direcciones estén alineadas
-        if text_start % self.page_size != 0 {
-            panic!("text_start no alineado: 0x{:x}", text_start);
-        }
-        if text_end % self.page_size != 0 {
-            panic!("text_end no alineado: 0x{:x}", text_end);
-        }
-        if data_start % self.page_size != 0 {
-            panic!("data_start no alineado: 0x{:x}", data_start);
-        }
-        if data_end % self.page_size != 0 {
-            panic!("data_end no alineado: 0x{:x}", data_end);
-        }
-        if heap_start % self.page_size != 0 {
-            panic!("heap_start no alineado: 0x{:x}", heap_start);
-        }
-        if heap_end % self.page_size != 0 {
-            panic!("heap_end no alineado: 0x{:x}", heap_end);
-        }
-        if stack_start % self.page_size != 0 {
-            panic!("stack_start no alineado: 0x{:x}", stack_start);
-        }
-        if stack_end % self.page_size != 0 {
-            panic!("stack_end no alineado: 0x{:x}", stack_end);
+        // Esto debería siempre ser cierto por construcción, pero verificamos por seguridad
+        debug_assert_eq!(text_start % self.page_size, 0, "text_start no alineado: 0x{:x}", text_start);
+        debug_assert_eq!(text_end % self.page_size, 0, "text_end no alineado: 0x{:x}", text_end);
+        debug_assert_eq!(data_start % self.page_size, 0, "data_start no alineado: 0x{:x}", data_start);
+        debug_assert_eq!(data_end % self.page_size, 0, "data_end no alineado: 0x{:x}", data_end);
+        debug_assert_eq!(heap_start % self.page_size, 0, "heap_start no alineado: 0x{:x}", heap_start);
+        debug_assert_eq!(heap_end % self.page_size, 0, "heap_end no alineado: 0x{:x}", heap_end);
+        debug_assert_eq!(stack_start % self.page_size, 0, "stack_start no alineado: 0x{:x}", stack_start);
+        debug_assert_eq!(stack_end % self.page_size, 0, "stack_end no alineado: 0x{:x}", stack_end);
+
+        // Validar que las direcciones no estén mal alineadas (esto indica un bug en align_to_page)
+        if text_start % self.page_size != 0 || text_end % self.page_size != 0 ||
+           data_start % self.page_size != 0 || data_end % self.page_size != 0 ||
+           heap_start % self.page_size != 0 || heap_end % self.page_size != 0 ||
+           stack_start % self.page_size != 0 || stack_end % self.page_size != 0 {
+            return Err("Error interno: dirección no alineada a página");
         }
 
         self.next_vaddr = heap_end;
 
-        ProcessMemory {
+        Ok(ProcessMemory {
             text_start,
             text_end,
             data_start,
@@ -92,7 +95,7 @@ impl ProcessMemoryManager {
             stack_end,
             stack_pointer: stack_end, // Stack pointer apunta al final de la pila
             brk: heap_start,
-        }
+        })
     }
 
     /// Mapear memoria virtual
@@ -234,7 +237,9 @@ impl ProcessMemoryManager {
         process_mem: &mut ProcessMemory,
         size: u64,
     ) -> Result<u64, &'static str> {
-        let new_brk = process_mem.brk + self.align_to_page(size);
+        let aligned_size = self.align_to_page(size);
+        let new_brk = process_mem.brk.checked_add(aligned_size)
+            .ok_or("Desbordamiento al expandir heap")?;
 
         if new_brk > process_mem.heap_end {
             return Err("Heap excede límite máximo");
@@ -343,7 +348,7 @@ pub fn setup_eclipse_systemd_memory() -> Result<ProcessMemory, &'static str> {
     let mut manager = ProcessMemoryManager::new();
 
     // Asignar memoria para el proceso
-    let process_mem = manager.allocate_process_memory(0x1000, 0x1000);
+    let process_mem = manager.allocate_process_memory(0x1000, 0x1000)?;
 
     // Mapear segmento de texto (ejecutable)
     manager.map_memory(

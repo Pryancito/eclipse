@@ -294,10 +294,10 @@ impl InitSystem {
         let mut memory_manager = crate::process_memory::ProcessMemoryManager::new();
 
         // Configurar memoria del proceso
-        Ok(memory_manager.allocate_process_memory(
+        memory_manager.allocate_process_memory(
             loaded_process.entry_point,
             0x8000000, // 128MB de stack
-        ))
+        )
     }
 
     /// Configurar entorno del proceso
