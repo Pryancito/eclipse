@@ -332,6 +332,32 @@ build_drm_system() {
     cd ../..
 }
 
+# Función para compilar la biblioteca de integración Wayland
+build_wayland_integration() {
+    print_step "Compilando biblioteca de integración Wayland..."
+    
+    if [ ! -d "userland/wayland_integration" ]; then
+        print_status "Directorio wayland_integration no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd userland/wayland_integration
+    
+    print_status "Detectando bibliotecas del sistema (libwayland, wlroots)..."
+    cargo build --release 2>&1 | grep -i "warning.*wayland\|warning.*wlroots" || true
+    
+    if [ $? -eq 0 ]; then
+        print_success "Biblioteca de integración Wayland compilada exitosamente"
+    else
+        print_error "Error al compilar biblioteca de integración Wayland"
+        cd ../..
+        return 1
+    fi
+    
+    cd ../..
+    return 0
+}
+
 # Función para compilar aplicaciones Wayland
 build_wayland_apps() {
     print_step "Compilando aplicaciones Wayland..."
@@ -437,7 +463,7 @@ build_cosmic_client() {
 
 # Función para compilar Wayland Compositor
 build_wayland_compositor() {
-    print_step "Compilando Wayland Compositor..."
+    print_step "Compilando Wayland Compositor (C con soporte wlroots/libwayland)..."
 
     if [ ! -d "userland/wayland_compositor" ]; then
         print_status "Directorio wayland_compositor no encontrado, saltando..."
@@ -446,7 +472,9 @@ build_wayland_compositor() {
 
     cd userland/wayland_compositor
 
-    print_status "Compilando wayland_compositor..."
+    print_status "Compilando wayland_compositor con detección automática de bibliotecas..."
+    print_status "El Makefile detectará automáticamente wlroots, libwayland o usará implementación personalizada"
+    
     make clean
     make
     if [ $? -ne 0 ]; then
@@ -492,6 +520,7 @@ build_userland() {
     build_graphics_module
     build_app_framework
     build_drm_system
+    build_wayland_integration
     build_wayland_apps
     build_wayland_server
     build_cosmic_client
@@ -610,11 +639,19 @@ create_basic_distribution() {
             print_status "COSMIC Client (Rust) copiado"
         fi
 
-        # Copiar Wayland Compositor (C) si existe
-        if [ -f "userland/wayland_compositor/wayland_compositor" ]; then
-            cp "userland/wayland_compositor/wayland_compositor" "$BUILD_DIR/userland/bin/wayland_compositor_c"
-            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor_c"
-            print_status "Wayland Compositor (C) copiado"
+        # Copiar Wayland Compositor (C) si existe - soporta múltiples variantes
+        if [ -f "userland/wayland_compositor/wayland_compositor_wlroots" ]; then
+            cp "userland/wayland_compositor/wayland_compositor_wlroots" "$BUILD_DIR/userland/bin/wayland_compositor"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor"
+            print_status "Wayland Compositor (wlroots) copiado"
+        elif [ -f "userland/wayland_compositor/wayland_compositor_wayland" ]; then
+            cp "userland/wayland_compositor/wayland_compositor_wayland" "$BUILD_DIR/userland/bin/wayland_compositor"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor"
+            print_status "Wayland Compositor (libwayland) copiado"
+        elif [ -f "userland/wayland_compositor/wayland_compositor" ]; then
+            cp "userland/wayland_compositor/wayland_compositor" "$BUILD_DIR/userland/bin/wayland_compositor"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_compositor"
+            print_status "Wayland Compositor (custom) copiado"
         fi
 
         # Copiar COSMIC Desktop (C) si existe
