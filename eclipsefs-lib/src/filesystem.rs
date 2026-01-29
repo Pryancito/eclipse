@@ -14,6 +14,7 @@ use crate::defragmentation::{DefragmentationConfig, IntelligentDefragmenter};
 use crate::load_balancing::{LoadBalancingConfig, IntelligentLoadBalancer};
 #[cfg(feature = "std")]
 use crate::journal::{Journal, JournalConfig, JournalEntry, TransactionType};
+#[cfg(not(feature = "std"))]
 use crate::format::{EclipseFSHeader, InodeTableEntry};
 
 #[cfg(feature = "std")]
@@ -896,8 +897,11 @@ impl EclipseFS {
         })
     }
     
-    pub fn auto_compress_large_files(&mut self, threshold: u64) -> EclipseFSResult<u32> {
+    pub fn auto_compress_large_files(&mut self, #[cfg_attr(not(feature = "std"), allow(unused_variables))] threshold: u64) -> EclipseFSResult<u32> {
+        #[cfg(feature = "std")]
         let mut compressed_count = 0;
+        #[cfg(not(feature = "std"))]
+        let compressed_count = 0;
         
         #[cfg(feature = "std")]
         {
@@ -917,7 +921,10 @@ impl EclipseFS {
     }
     
     pub fn get_compression_stats(&self) -> (u32, u32, f32) {
+        #[cfg(feature = "std")]
         let mut total_files = 0;
+        #[cfg(not(feature = "std"))]
+        let total_files = 0;
         let compressed_files = 0;
         
         #[cfg(feature = "std")]
@@ -1168,7 +1175,7 @@ impl EclipseFS {
         self.create_snapshot("Auto snapshot")
     }
     
-    pub fn cleanup_old_snapshots(&mut self, keep_count: u32) -> EclipseFSResult<u32> {
+    pub fn cleanup_old_snapshots(&mut self, #[cfg_attr(not(feature = "std"), allow(unused_variables))] keep_count: u32) -> EclipseFSResult<u32> {
         #[cfg(feature = "std")]
         {
             let mut snapshots: Vec<_> = self.snapshots.iter()
