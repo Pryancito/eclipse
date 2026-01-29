@@ -270,6 +270,7 @@ impl EclipseFSNode {
 
         self.size = data.len() as u64;
         self.mtime = Self::now();
+        self.update_checksum(); // Update checksum after data changes
         Ok(())
     }
 
