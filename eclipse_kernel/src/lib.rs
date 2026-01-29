@@ -116,6 +116,7 @@ pub mod gdt; // Global Descriptor Table
 pub mod memory; // Sistema de gestión de memoria avanzado
 pub mod partitions; // Sistema de detección de particiones
 pub mod syscalls; // Sistema de syscalls
+pub mod syscall_handler; // Manejador de syscalls con SYSCALL/SYSRET
 pub mod gpu_fallback; // Sistema de fallback de UEFI/GOP a GPU hardware real
 pub mod graphics;
 pub mod graphics_optimization; // Optimizaciones de gráficos para hardware real

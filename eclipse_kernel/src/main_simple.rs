@@ -1042,6 +1042,21 @@ fn check_systemd_kernel_param() -> bool {
 fn init_and_execute_systemd(fb: &mut FramebufferDriver) -> Result<(), &'static str> {
     serial_write_str("SYSTEMD_INIT: Iniciando sistema de inicialización\n");
     
+    // Initialize syscall mechanism BEFORE transferring to userland
+    fb.write_text_kernel("⚙ Configurando syscalls...", Color::CYAN);
+    serial_write_str("SYSTEMD_INIT: Initializing syscall mechanism\n");
+    match crate::syscall_handler::init_syscall() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ Syscalls configurados", Color::GREEN);
+            serial_write_str("SYSTEMD_INIT: Syscalls initialized successfully\n");
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("✗ Error en syscalls: {}", e), Color::RED);
+            serial_write_str(&alloc::format!("SYSTEMD_INIT: Syscall init failed: {}\n", e));
+            return Err(e);
+        }
+    }
+    
     // Crear instancia del sistema de inicialización
     let mut init_system = InitSystem::new();
     
