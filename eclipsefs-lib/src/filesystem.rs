@@ -578,8 +578,16 @@ impl EclipseFS {
         
         // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
         if parent_node.has_child(name) {
-            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            // Si ya existe, liberar el inode que acabamos de crear
             self.nodes.remove(&inode);
+            
+            // Rollback de la última transacción del journal si está habilitado
+            #[cfg(feature = "std")]
+            if let Some(ref mut journal) = self.journal {
+                // Remover la última transacción que acabamos de agregar
+                let _ = journal.rollback();
+            }
+            
             return Err(EclipseFSError::DuplicateEntry);
         }
         
@@ -624,8 +632,16 @@ impl EclipseFS {
         
         // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
         if parent_node.has_child(name) {
-            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            // Si ya existe, liberar el inode que acabamos de crear
             self.nodes.remove(&inode);
+            
+            // Rollback de la última transacción del journal si está habilitado
+            #[cfg(feature = "std")]
+            if let Some(ref mut journal) = self.journal {
+                // Remover la última transacción que acabamos de agregar
+                let _ = journal.rollback();
+            }
+            
             return Err(EclipseFSError::DuplicateEntry);
         }
         
@@ -659,6 +675,15 @@ impl EclipseFS {
         let inode = self.allocate_inode();
         let symlink_node = EclipseFSNode::new_symlink(target);
         
+        // Log transaction to journal before making changes
+        #[cfg(feature = "std")]
+        {
+            let mut data = name.as_bytes().to_vec();
+            data.push(b'\0');
+            data.extend_from_slice(target.as_bytes());
+            self.log_transaction(TransactionType::WriteData, inode, parent_inode, &data)?;
+        }
+        
         self.add_node(inode, symlink_node)?;
         
         // Agregar el hijo al padre con verificación adicional para prevenir duplicados
@@ -668,8 +693,16 @@ impl EclipseFS {
         
         // Re-verificar que no haya duplicado antes de agregar (prevención de race conditions)
         if parent_node.has_child(name) {
-            // Si ya existe, liberar el inode que acabamos de crear y retornar error
+            // Si ya existe, liberar el inode que acabamos de crear
             self.nodes.remove(&inode);
+            
+            // Rollback de la última transacción del journal si está habilitado
+            #[cfg(feature = "std")]
+            if let Some(ref mut journal) = self.journal {
+                // Remover la última transacción que acabamos de agregar
+                let _ = journal.rollback();
+            }
+            
             return Err(EclipseFSError::DuplicateEntry);
         }
         
