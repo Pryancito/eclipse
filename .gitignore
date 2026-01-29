@@ -8,3 +8,4 @@ Cargo.lock
 # Build artifacts
 userland/wayland_compositor/wayland_compositor
 userland/cosmic_desktop/cosmic_desktop
+test_eclipsefs.img

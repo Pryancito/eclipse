@@ -46,7 +46,6 @@ eclipsefs <command> [OPTIONS]
 - `tree <device>` - Show filesystem tree
 - `check <device>` - Check filesystem integrity
 - `stats <device>` - Show detailed statistics
-- `export <device> <dest>` - Export filesystem to directory
 
 **Examples:**
 ```bash
@@ -61,9 +60,6 @@ eclipsefs tree test.img
 
 # Check integrity
 eclipsefs check /dev/sda2
-
-# Export entire filesystem
-eclipsefs export /dev/sda2 /tmp/export
 ```
 
 ## Building
