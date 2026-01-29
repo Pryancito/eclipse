@@ -308,7 +308,7 @@ impl DirectInstaller {
             .output();
         
         // Esperar a que el desmontaje se complete
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
         
         // Eliminar cualquier directorio residual (incluso si no está vacío)
         let _ = fs::remove_dir_all(&self.efi_mount_point);
@@ -406,7 +406,7 @@ impl DirectInstaller {
             .output();
         
         // Esperar a que el desmontaje se complete
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
         
         // Eliminar cualquier directorio residual (incluso si no está vacío)
         let _ = fs::remove_dir_all(&self.root_mount_point);
