@@ -260,7 +260,7 @@ fn sys_exit(code: i32) -> SyscallResult {
                 current_pid, code
             ));
             
-            // Get parent PID for SIGCHLD
+            // Get parent PID for SIGCHLD and wakeup
             if let Some(parent_pid) = process.parent_pid {
                 serial_write_str(&alloc::format!(
                     "SYSCALL: Sending SIGCHLD to parent PID {}\n",
@@ -271,6 +271,18 @@ fn sys_exit(code: i32) -> SyscallResult {
                 if let Some(ref mut parent) = manager.processes[parent_pid as usize] {
                     parent.pending_signals |= 1 << 17; // SIGCHLD = 17
                     serial_write_str("SYSCALL: SIGCHLD set for parent\n");
+                    
+                    // If parent is blocked (waiting for us), wake it up
+                    if parent.get_state() == crate::process::process::ProcessState::Blocked {
+                        serial_write_str(&alloc::format!(
+                            "SYSCALL: Waking up blocked parent PID {}\n",
+                            parent_pid
+                        ));
+                        
+                        // Move parent from blocked to ready queue
+                        manager.process_scheduler.unblock_process(parent_pid);
+                        parent.set_state(crate::process::process::ProcessState::Ready);
+                    }
                 }
             }
         } else {
@@ -279,12 +291,18 @@ fn sys_exit(code: i32) -> SyscallResult {
                 current_pid
             ));
         }
+        
+        // Remove current process from scheduler
+        manager.process_scheduler.remove_process(current_pid);
     }
     
-    // In real implementation, this would switch to another process
-    // For now, just halt
-    serial_write_str("SYSCALL: Process exited, halting system\n");
+    // Switch to another process
+    serial_write_str("SYSCALL: Process exited, switching to next process\n");
+    drop(manager_guard);
     
+    crate::process::context_switch::switch_to_next_process();
+    
+    // Should never get here - we switched away
     loop {
         unsafe {
             asm!("hlt", options(nomem, nostack));
@@ -439,10 +457,42 @@ fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, rusage: *mut u8) -> Sysc
         
         if has_children {
             // Have children but none are zombies yet
-            serial_write_str("SYSCALL: wait4() - children exist but not zombies yet\n");
-            // In real implementation, would block here
-            // For now, return error
-            SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+            // Check WNOHANG option (0x00000001)
+            const WNOHANG: i32 = 1;
+            if (options & WNOHANG) != 0 {
+                serial_write_str("SYSCALL: wait4() - WNOHANG set, returning 0\n");
+                return SyscallResult::Success(0); // Return 0 for no zombie with WNOHANG
+            }
+            
+            // Block current process until child exits
+            serial_write_str(&alloc::format!(
+                "SYSCALL: wait4() - blocking process {} until child exits\n",
+                current_pid
+            ));
+            
+            // Mark current process as Blocked
+            if let Some(ref mut current_proc) = manager.processes[current_pid as usize] {
+                current_proc.set_state(crate::process::process::ProcessState::Blocked);
+            }
+            
+            // Add to scheduler's blocked queue
+            manager.process_scheduler.block_current_process();
+            
+            // Drop the lock before context switch
+            drop(manager_guard);
+            
+            // Switch to another process
+            crate::process::context_switch::switch_to_next_process();
+            
+            // When we get here, we've been woken up by a child exit
+            // Re-check for zombie children
+            serial_write_str(&alloc::format!(
+                "SYSCALL: wait4() - process {} woken up, rechecking for zombies\n",
+                current_pid
+            ));
+            
+            // Recursive call to find the zombie (we were woken up, so one should exist)
+            return sys_wait4(pid, wstatus, options, rusage);
         } else {
             // No children at all
             serial_write_str("SYSCALL: wait4() - no children (ECHILD)\n");

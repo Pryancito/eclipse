@@ -133,45 +133,53 @@ pub fn switch_to_next_process() -> bool {
     let mut manager_guard = get_process_manager().lock();
     
     if let Some(ref mut manager) = *manager_guard {
-        // Obtener el proceso actual
+        // Get the current process
         let current_pid = manager.current_process;
         
-        // Guardar contexto del proceso actual si existe
+        // Save context of current process if it exists
         if let Some(pid) = current_pid {
             if let Some(ref mut process) = manager.processes[pid as usize] {
                 save_context(&mut process.cpu_context);
                 serial_write_str(&alloc::format!(
                     "CONTEXT_SWITCH: Saved context of process {}\n", pid
                 ));
+                
+                // Set current process to Ready state (will be re-queued by scheduler)
+                use crate::process::process::ProcessState;
+                if process.state == ProcessState::Running {
+                    process.set_state(ProcessState::Ready);
+                }
             }
         }
         
-        // Seleccionar el siguiente proceso del scheduler
-        if let Some(next_pid) = manager.process_scheduler.get_next_process() {
+        // Use scheduler to select next process
+        let next_pid = manager.process_scheduler.schedule(&manager.processes);
+        
+        if let Some(next_pid) = next_pid {
             if next_pid != current_pid.unwrap_or(u32::MAX) {
                 serial_write_str(&alloc::format!(
                     "CONTEXT_SWITCH: Switching from {:?} to {}\n",
                     current_pid, next_pid
                 ));
+            }
+            
+            // Update current process
+            manager.current_process = Some(next_pid);
+            
+            // Mark new process as Running
+            if let Some(ref mut process) = manager.processes[next_pid as usize] {
+                use crate::process::process::ProcessState;
+                process.set_state(ProcessState::Running);
                 
-                // Actualizar proceso actual
-                manager.current_process = Some(next_pid);
+                // Load context of new process
+                let context = process.cpu_context;
+                drop(manager_guard); // Release lock before changing context
                 
-                // Marcar proceso actual como Running
-                if let Some(ref mut process) = manager.processes[next_pid as usize] {
-                    use crate::process::process::ProcessState;
-                    process.set_state(ProcessState::Running);
-                    
-                    // Cargar contexto del nuevo proceso
-                    let context = process.cpu_context;
-                    drop(manager_guard); // Liberar el lock antes de cambiar contexto
-                    
-                    unsafe {
-                        load_context(&context);
-                    }
-                    
-                    return true;
+                unsafe {
+                    load_context(&context);
                 }
+                
+                return true;
             }
         }
     }
