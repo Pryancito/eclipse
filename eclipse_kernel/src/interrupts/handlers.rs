@@ -4,7 +4,7 @@
 //! de interrupciones y excepciones del sistema.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use crate::debug::serial_write_str;
 
 /// Contadores de interrupciones
@@ -14,6 +14,11 @@ static SERIAL_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static GENERAL_PROTECTION_FAULTS: AtomicU64 = AtomicU64::new(0);
 static DIVISION_BY_ZERO: AtomicU64 = AtomicU64::new(0);
+
+/// Estado de teclas modificadoras
+static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
 
 /// Handler de timer mejorado con context switching
 #[no_mangle]
@@ -244,14 +249,30 @@ fn process_keyboard_scancode(scancode: u8) {
         0x30 => Some(KeyCode::B),
         0x31 => Some(KeyCode::N),
         0x32 => Some(KeyCode::M),
+        0x36 => Some(KeyCode::RightShift),
+        0x38 => Some(KeyCode::LeftAlt),
         0x39 => Some(KeyCode::Space),
         _ => None,
     };
     
-    // Procesar el evento si tenemos un keycode válido
+    // Process the event if we have a valid keycode
     if let Some(key) = keycode {
-        // TODO: Rastrear estado de Shift para mayúsculas
-        let shift = false; // Por ahora, siempre minúsculas
+        // Track modifier key states
+        match key {
+            KeyCode::LeftShift | KeyCode::RightShift | KeyCode::Shift => {
+                SHIFT_PRESSED.store(pressed, Ordering::Relaxed);
+            }
+            KeyCode::Ctrl | KeyCode::LeftCtrl | KeyCode::RightCtrl => {
+                CTRL_PRESSED.store(pressed, Ordering::Relaxed);
+            }
+            KeyCode::Alt | KeyCode::LeftAlt | KeyCode::RightAlt => {
+                ALT_PRESSED.store(pressed, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        
+        // Get current Shift state for character processing
+        let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
         process_key_event(key, pressed, shift);
     }
 }

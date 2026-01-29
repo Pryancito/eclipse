@@ -213,9 +213,10 @@ fn test_snapshot_creation() {
     // Create a filesystem snapshot
     fs.create_filesystem_snapshot(1, "Test snapshot").unwrap();
     
-    // Note: list_snapshots is currently a stub that returns empty list
-    // TODO: Implement full snapshot listing functionality
-    // For now, verify that create_filesystem_snapshot succeeds
+    // Verify snapshot was created
+    let snapshots = fs.list_snapshots().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    
     let stats = fs.get_system_stats();
     assert_eq!(stats.total_snapshots, 1);
 }

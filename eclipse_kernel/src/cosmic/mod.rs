@@ -1695,7 +1695,7 @@ impl CosmicManager {
 
     /// Verificar si el botón de inicio está presionado
     pub fn is_start_button_pressed(&self) -> bool {
-        false // TODO: Implementar is_start_button_pressed
+        self.taskbar.is_start_button_pressed()
     }
 
     /// Obtener altura de la barra de tareas

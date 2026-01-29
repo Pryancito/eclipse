@@ -9,6 +9,21 @@ use alloc::string::String;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// Get current system timestamp in milliseconds
+fn get_timestamp() -> u64 {
+    // Use system timer if available
+    #[cfg(feature = "timer")]
+    {
+        crate::interrupts::timer::get_uptime_ms()
+    }
+    #[cfg(not(feature = "timer"))]
+    {
+        // If timer is not available, use a global counter
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
 /// Nivel de privacidad
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PrivacyLevel {
@@ -353,8 +368,8 @@ impl PrivacyManager {
             sharing_allowed: false,
             export_allowed: false,
             deletion_allowed: true,
-            created_at: 0, // TODO: Implementar timestamp real
-            updated_at: 0,
+            created_at: get_timestamp(),
+            updated_at: get_timestamp(),
             is_active: true,
         };
 
@@ -406,7 +421,7 @@ impl PrivacyManager {
                     self.stats.active_policies -= 1;
                 }
             }
-            policy.updated_at = 0; // TODO: Implementar timestamp real
+            policy.updated_at = get_timestamp();
             true
         } else {
             false
@@ -443,7 +458,7 @@ impl PrivacyManager {
             policy_id,
             data_type,
             granted: true,
-            granted_at: 0, // TODO: Implementar timestamp real
+            granted_at: get_timestamp(),
             expires_at: None,
             purpose,
             scope,
@@ -477,7 +492,7 @@ impl PrivacyManager {
             for consent in consents.iter_mut() {
                 if consent.policy_id == policy_id && consent.data_type == data_type && consent.granted {
                     consent.granted = false;
-                    consent.revoked_at = Some(0); // TODO: Implementar timestamp real
+                    consent.revoked_at = Some(get_timestamp());
                     self.stats.active_consents -= 1;
                     self.stats.consent_revoked_events += 1;
 
@@ -548,7 +563,7 @@ impl PrivacyManager {
             data_type,
             description,
             severity,
-            detected_at: 0, // TODO: Implementar timestamp real
+            detected_at: get_timestamp(),
             resolved_at: None,
             action_taken: String::new(),
             source: "privacy_manager".to_string(),
@@ -579,7 +594,7 @@ impl PrivacyManager {
     /// Resolver violación de privacidad
     pub fn resolve_violation(&mut self, violation_id: u32, action_taken: String, remediation: String) -> bool {
         if let Some(violation) = self.violations.iter_mut().find(|v| v.id == violation_id) {
-            violation.resolved_at = Some(0); // TODO: Implementar timestamp real
+            violation.resolved_at = Some(get_timestamp());
             violation.action_taken = action_taken;
             violation.remediation = remediation;
             self.stats.resolved_violations += 1;
