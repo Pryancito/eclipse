@@ -98,6 +98,22 @@ impl ProcessTransfer {
             context.rip, context.rsp
         ));
         
+        // Verificar si hay código ejecutable real en el punto de entrada
+        // Si el código en entry_point es ceros o inválido, no intentar la transferencia
+        let entry_code = unsafe {
+            core::slice::from_raw_parts(context.rip as *const u8, 16)
+        };
+        
+        // Verificar si hay al menos algunos bytes no-cero (indicando código potencialmente válido)
+        let has_code = entry_code.iter().any(|&b| b != 0);
+        
+        if !has_code {
+            crate::debug::serial_write_str("PROCESS_TRANSFER: No executable code found at entry point\n");
+            crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+            crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+            return Err("Transferencia al userland diferida: no hay código ejecutable en el punto de entrada");
+        }
+        
         // Intentar configurar el entorno de userland
         match self.setup_userland_environment() {
             Ok(pml4_addr) => {
@@ -120,15 +136,15 @@ impl ProcessTransfer {
                 Ok(())
             }
             Err(e) => {
-                // La configuración del entorno falló, probablemente porque no hay código userland real
+                // La configuración del entorno falló
                 crate::debug::serial_write_str(&alloc::format!(
                     "PROCESS_TRANSFER: Userland environment setup failed: {}\n", e
                 ));
-                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - setup failed\n");
                 crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
                 
                 // Retornar el error para que el sistema sepa que la transferencia fue diferida
-                Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria")
+                Err("Transferencia al userland diferida: fallo en configuración del entorno")
             }
         }
     }
