@@ -2155,3 +2155,90 @@ impl SystemStats {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_prevent_duplicate_files() {
+        let mut fs = EclipseFS::new();
+        let root_inode = crate::constants::ROOT_INODE;
+        
+        // Crear un archivo
+        let result1 = fs.create_file(root_inode, "test.txt");
+        assert!(result1.is_ok(), "First file creation should succeed");
+        
+        // Intentar crear el mismo archivo otra vez
+        let result2 = fs.create_file(root_inode, "test.txt");
+        assert!(result2.is_err(), "Duplicate file creation should fail");
+        assert_eq!(result2.unwrap_err(), EclipseFSError::DuplicateEntry);
+    }
+    
+    #[test]
+    fn test_prevent_duplicate_directories() {
+        let mut fs = EclipseFS::new();
+        let root_inode = crate::constants::ROOT_INODE;
+        
+        // Crear un directorio
+        let result1 = fs.create_directory(root_inode, "testdir");
+        assert!(result1.is_ok(), "First directory creation should succeed");
+        
+        // Intentar crear el mismo directorio otra vez
+        let result2 = fs.create_directory(root_inode, "testdir");
+        assert!(result2.is_err(), "Duplicate directory creation should fail");
+        assert_eq!(result2.unwrap_err(), EclipseFSError::DuplicateEntry);
+    }
+    
+    #[test]
+    fn test_prevent_duplicate_symlinks() {
+        let mut fs = EclipseFS::new();
+        let root_inode = crate::constants::ROOT_INODE;
+        
+        // Crear un enlace simbólico
+        let result1 = fs.create_symlink(root_inode, "link", "/target");
+        assert!(result1.is_ok(), "First symlink creation should succeed");
+        
+        // Intentar crear el mismo enlace simbólico otra vez
+        let result2 = fs.create_symlink(root_inode, "link", "/target2");
+        assert!(result2.is_err(), "Duplicate symlink creation should fail");
+        assert_eq!(result2.unwrap_err(), EclipseFSError::DuplicateEntry);
+    }
+    
+    #[test]
+    fn test_no_duplicate_in_node_children() {
+        let mut fs = EclipseFS::new();
+        let root_inode = crate::constants::ROOT_INODE;
+        
+        // Crear varios archivos
+        fs.create_file(root_inode, "file1.txt").unwrap();
+        fs.create_file(root_inode, "file2.txt").unwrap();
+        fs.create_file(root_inode, "file3.txt").unwrap();
+        
+        // Verificar que cada archivo está listado exactamente una vez
+        let root_node = fs.get_node(root_inode).unwrap();
+        
+        #[cfg(feature = "std")]
+        {
+            let children = root_node.get_children();
+            
+            // Contar cuántas veces aparece cada nombre
+            let mut name_counts = std::collections::HashMap::new();
+            for (name, _inode) in children {
+                *name_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+            
+            // Verificar que no hay duplicados
+            for (name, count) in name_counts {
+                assert_eq!(count, 1, "File '{}' appears {} times, expected 1", name, count);
+            }
+        }
+        
+        #[cfg(not(feature = "std"))]
+        {
+            // En no_std, simplemente verificamos que hay exactamente 3 hijos
+            assert_eq!(root_node.get_children().len(), 3);
+        }
+    }
+}
+
