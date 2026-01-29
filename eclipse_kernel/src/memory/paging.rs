@@ -968,3 +968,57 @@ pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u6
     
     Ok(())
 }
+
+/// Mapear páginas físicas pre-asignadas a direcciones virtuales
+///
+/// Mapea una lista de páginas físicas ya asignadas a un rango de direcciones virtuales.
+/// Útil para mapear segmentos ELF que ya han sido cargados en memoria física.
+///
+/// # Argumentos
+/// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
+/// - `virtual_addr`: Dirección virtual base donde mapear
+/// - `physical_pages`: Vector de direcciones físicas de páginas (4KB cada una)
+/// - `flags`: Flags de página (permisos)
+pub fn map_preallocated_pages(
+    pml4_addr: u64,
+    virtual_addr: u64,
+    physical_pages: &[u64],
+    flags: u64,
+) -> Result<(), &'static str> {
+    serial_write_str(&alloc::format!(
+        "PAGING: map_preallocated_pages(pml4=0x{:x}, vaddr=0x{:x}, {} pages, flags=0x{:x})\n",
+        pml4_addr, virtual_addr, physical_pages.len(), flags
+    ));
+    
+    if physical_pages.is_empty() {
+        return Ok(());
+    }
+    
+    // Acceder a la tabla PML4
+    let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
+    
+    // Obtener el gestor de memoria física
+    let phys_manager = get_physical_manager();
+    
+    // Alinear la dirección virtual al inicio de la página
+    let start_vaddr = virtual_addr & !0xFFF;
+    
+    // Mapear cada página física a su dirección virtual correspondiente
+    for (i, &phys_addr) in physical_pages.iter().enumerate() {
+        let current_vaddr = start_vaddr + (i as u64 * PAGE_SIZE as u64);
+        
+        // Mapear la página virtual a la física con los permisos especificados
+        map_page_in_table(pml4_table, current_vaddr, phys_addr, flags, phys_manager)?;
+    }
+    
+    serial_write_str(&alloc::format!(
+        "PAGING: Mapped {} pre-allocated pages starting at vaddr 0x{:x}\n",
+        physical_pages.len(), start_vaddr
+    ));
+    
+    // Invalidar TLB para asegurar que la CPU vea los nuevos mapeos
+    let end_vaddr = start_vaddr + (physical_pages.len() as u64 * PAGE_SIZE as u64);
+    flush_tlb_range(start_vaddr, end_vaddr);
+    
+    Ok(())
+}

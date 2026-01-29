@@ -69,6 +69,15 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+/// Información de un segmento cargado
+#[derive(Debug, Clone)]
+pub struct LoadedSegment {
+    pub vaddr: u64,
+    pub size: u64,
+    pub flags: u32,  // Flags del ELF (PF_R, PF_W, PF_X)
+    pub physical_pages: Vec<u64>,  // Páginas físicas asignadas
+}
+
 /// Información del proceso cargado
 #[derive(Debug, Clone)]
 pub struct LoadedProcess {
@@ -80,6 +89,7 @@ pub struct LoadedProcess {
     pub text_end: u64,
     pub data_start: u64,
     pub data_end: u64,
+    pub segments: Vec<LoadedSegment>,  // Segmentos cargados
 }
 
 /// Resultado de la carga de un proceso
@@ -89,6 +99,7 @@ pub type LoadResult = Result<LoadedProcess, &'static str>;
 pub struct ElfLoader {
     base_address: u64,
     next_address: u64,
+    segments: Vec<LoadedSegment>,  // Segmentos cargados
 }
 
 impl ElfLoader {
@@ -97,6 +108,7 @@ impl ElfLoader {
         Self {
             base_address: 0x400000, // Dirección base para userland
             next_address: 0x400000,
+            segments: Vec::new(),
         }
     }
 
@@ -127,6 +139,9 @@ impl ElfLoader {
             return Err("Archivo no es compatible con x86_64");
         }
 
+        // Limpiar segmentos anteriores
+        self.segments.clear();
+
         // Cargar segmentos
         self.load_segments(elf_data, &header)?;
 
@@ -140,6 +155,7 @@ impl ElfLoader {
             text_end: self.next_address,
             data_start: self.next_address,
             data_end: self.next_address,
+            segments: self.segments.clone(),
         };
 
         Ok(process)
@@ -197,10 +213,20 @@ impl ElfLoader {
         // Por ahora, solo simulamos la carga
         self.simulate_memory_mapping(vaddr, mem_size as u64, phdr.p_flags)?;
 
-        // Copiar datos del archivo a la memoria
-        if file_size > 0 {
-            self.copy_segment_data(elf_data, file_offset, file_size, vaddr)?;
-        }
+        // Copiar datos del archivo a la memoria y obtener las páginas físicas asignadas
+        let physical_pages = if file_size > 0 {
+            self.copy_segment_data_with_pages(elf_data, file_offset, mem_size, vaddr)?
+        } else {
+            Vec::new()
+        };
+
+        // Guardar información del segmento
+        self.segments.push(LoadedSegment {
+            vaddr,
+            size: mem_size as u64,
+            flags: phdr.p_flags,
+            physical_pages,
+        });
 
         // Actualizar la siguiente dirección disponible
         self.next_address = vaddr + mem_size as u64;
@@ -233,40 +259,85 @@ impl ElfLoader {
         Ok(())
     }
 
-    /// Copiar datos del segmento
-    fn copy_segment_data(
+    /// Copiar datos del segmento a páginas físicas (retorna las páginas asignadas)
+    fn copy_segment_data_with_pages(
         &self,
         elf_data: &[u8],
         offset: usize,
         size: usize,
         vaddr: u64,
-    ) -> Result<(), &'static str> {
-        // Copiar los datos del ELF a la dirección física correspondiente
-        // En este punto, la dirección virtual debería estar mapeada a memoria física
-
+    ) -> Result<Vec<u64>, &'static str> {
+        // Copiar los datos del ELF a páginas físicas asignadas
+        
         if offset + size > elf_data.len() {
             return Err("Datos de segmento fuera de rango");
         }
 
         if size == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
-        // Copiar los datos directamente a la dirección física
-        // Nota: Esta es una copia unsafe porque estamos escribiendo directamente a memoria
-        // En un sistema con paginación completa, esto se haría a través de las tablas de páginas
-        unsafe {
-            let src_ptr = elf_data.as_ptr().add(offset);
-            let dst_ptr = vaddr as *mut u8;
-            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+        // Alocar páginas físicas para este segmento
+        let num_pages = (size + 4095) / 4096; // Redondear hacia arriba
+        let mut allocated_pages = alloc::vec::Vec::new();
+        
+        for _ in 0..num_pages {
+            if let Some(page_addr) = crate::memory::paging::allocate_physical_page() {
+                allocated_pages.push(page_addr);
+            } else {
+                // Si falla la asignación, liberar las páginas ya asignadas
+                for page in allocated_pages {
+                    let _ = crate::memory::paging::deallocate_physical_page(page);
+                }
+                return Err("No hay suficiente memoria física para el segmento ELF");
+            }
+        }
+        
+        // Copiar los datos del ELF a las páginas físicas asignadas
+        let mut bytes_copied = 0;
+        for (page_idx, &page_addr) in allocated_pages.iter().enumerate() {
+            let page_offset = page_idx * 4096;
+            let bytes_in_page = core::cmp::min(4096, size - page_offset);
+            
+            if bytes_in_page == 0 {
+                break;
+            }
+            
+            // Copiar datos del archivo si están disponibles
+            let file_bytes_in_page = if offset + page_offset < elf_data.len() {
+                core::cmp::min(bytes_in_page, elf_data.len() - (offset + page_offset))
+            } else {
+                0
+            };
+            
+            unsafe {
+                let dst_ptr = page_addr as *mut u8;
+                
+                // Copiar datos del archivo
+                if file_bytes_in_page > 0 {
+                    let src_ptr = elf_data.as_ptr().add(offset + page_offset);
+                    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_bytes_in_page);
+                }
+                
+                // Llenar el resto con ceros (para BSS o padding)
+                if file_bytes_in_page < 4096 {
+                    core::ptr::write_bytes(
+                        dst_ptr.add(file_bytes_in_page),
+                        0,
+                        4096 - file_bytes_in_page
+                    );
+                }
+            }
+            
+            bytes_copied += bytes_in_page;
         }
 
         crate::debug::serial_write_str(&alloc::format!(
-            "ELF_LOADER: Copied {} bytes from offset 0x{:x} to vaddr 0x{:x}\n",
-            size, offset, vaddr
+            "ELF_LOADER: Allocated {} physical pages and copied {} bytes for vaddr 0x{:x}\n",
+            allocated_pages.len(), bytes_copied, vaddr
         ));
 
-        Ok(())
+        Ok(allocated_pages)
     }
 
     /// Configurar la pila del proceso
