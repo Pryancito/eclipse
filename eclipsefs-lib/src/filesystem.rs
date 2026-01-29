@@ -225,6 +225,36 @@ impl EclipseFS {
         1640995200 // 2022-01-01 00:00:00 UTC
     }
     
+    /// Validar nombre de archivo/directorio
+    /// Previene nombres inválidos que podrían causar problemas de seguridad o compatibilidad
+    fn validate_filename(name: &str) -> EclipseFSResult<()> {
+        // Verificar longitud
+        if name.is_empty() {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
+        #[cfg(feature = "std")]
+        const MAX_NAME_LENGTH: usize = 255;
+        #[cfg(not(feature = "std"))]
+        const MAX_NAME_LENGTH: usize = MAX_NAME_LEN;
+        
+        if name.len() > MAX_NAME_LENGTH {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
+        // Verificar caracteres inválidos (protección contra path traversal)
+        if name.contains('/') || name.contains('\0') {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
+        // Prevenir nombres especiales que podrían causar problemas
+        if name == "." || name == ".." {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
+        Ok(())
+    }
+    
     /// Habilitar sistema de caché inteligente (inspirado en RedoxFS)
     #[cfg(feature = "std")]
     pub fn enable_intelligent_cache(&mut self, config: CacheConfig) -> EclipseFSResult<()> {
@@ -511,6 +541,9 @@ impl EclipseFS {
     
     /// Crear un archivo
     pub fn create_file(&mut self, parent_inode: u32, name: &str) -> EclipseFSResult<u32> {
+        // Validar nombre del archivo
+        Self::validate_filename(name)?;
+        
         // Verificar que el padre existe y es un directorio
         {
             let parent_node = self
@@ -546,6 +579,9 @@ impl EclipseFS {
     
     /// Crear un directorio
     pub fn create_directory(&mut self, parent_inode: u32, name: &str) -> EclipseFSResult<u32> {
+        // Validar nombre del directorio
+        Self::validate_filename(name)?;
+        
         // Verificar que el padre existe y es un directorio
         {
             let parent_node = self
@@ -662,6 +698,16 @@ impl EclipseFS {
     
     /// Escribir en un archivo
     pub fn write_file(&mut self, inode: u32, data: &[u8]) -> EclipseFSResult<()> {
+        // Validar tamaño de datos (protección contra desbordamiento de memoria)
+        #[cfg(not(feature = "std"))]
+        const MAX_FILE_SIZE: usize = MAX_DATA_SIZE;
+        #[cfg(feature = "std")]
+        const MAX_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB límite razonable
+        
+        if data.len() > MAX_FILE_SIZE {
+            return Err(EclipseFSError::InvalidFormat);
+        }
+        
         // Log transaction to journal before making changes
         #[cfg(feature = "std")]
         self.log_transaction(TransactionType::WriteData, inode, 0, data)?;
