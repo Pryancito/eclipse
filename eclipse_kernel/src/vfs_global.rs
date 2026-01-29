@@ -187,16 +187,18 @@ fn create_minimal_elf_stub() -> alloc::vec::Vec<u8> {
     }
     
     // Now add actual executable code at offset 4096 (which maps to 0x400000)
-    // Simple userland program that makes a syscall and loops
-    // This represents eclipse-systemd stub
-    
-    // Simple infinite loop with HLT to be CPU-friendly:
+    // Simple userland program that represents eclipse-systemd stub
+    //
+    // IMPORTANT: We cannot use HLT in userland (ring 3) as it's a privileged instruction
+    // that will cause #GP (General Protection Fault). Instead, we use a simple infinite loop.
+    //
+    // Safe userland infinite loop:
     // .loop:
-    //   hlt       ; Halt until interrupt
+    //   pause     ; CPU hint for spin-wait loop (reduces power consumption)
     //   jmp .loop ; Jump back to loop
     elf.extend_from_slice(&[
-        0xF4,       // hlt
-        0xEB, 0xFD, // jmp -3 (loop back to hlt)
+        0xF3, 0x90, // pause (F3 90) - CPU-friendly spin-wait hint
+        0xEB, 0xFC, // jmp -4 (loop back to pause)
     ]);
     
     // Pad the code section to make it 4KB total
