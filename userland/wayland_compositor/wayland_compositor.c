@@ -219,6 +219,7 @@ void wayland_destroy_surface(WaylandSurface *surface) {
 
 // Procesar mensajes de clientes (simulado)
 void wayland_process_client_messages(WaylandCompositor *compositor) {
+    (void)compositor;
     // En una implementación real, aquí procesaríamos mensajes de protocolo Wayland
     // Como wl_display.sync, wl_compositor.create_surface, etc.
 
@@ -232,6 +233,7 @@ void wayland_process_client_messages(WaylandCompositor *compositor) {
 
 // Renderizar superficies (simulado)
 void wayland_render_surfaces(WaylandCompositor *compositor) {
+    (void)compositor;
     // En una implementación real, aquí renderizaríamos las superficies al framebuffer
     // usando el kernel framebuffer driver
 
@@ -333,6 +335,8 @@ int wayland_compositor_init(WaylandCompositor *compositor) {
 
 // Función principal
 int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
     WaylandCompositor compositor = {0};
 
     // Inicializar compositor
@@ -352,7 +356,9 @@ int main(int argc, char *argv[]) {
 }
 
 // Entry point for freestanding binary
+#if !defined(HAVE_WLROOTS) && !defined(HAVE_WAYLAND)
 void _start(void) {
     int result = main(0, NULL);
     sys_exit(result);
 }
+#endif

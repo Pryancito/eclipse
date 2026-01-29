@@ -81,7 +81,7 @@ impl Server {
         #[cfg(has_libwayland)]
         {
             if let Some(ref display) = self.display {
-                display.ptr as *mut core::ffi::c_void
+                display.as_ptr() as *mut core::ffi::c_void
             } else {
                 core::ptr::null_mut()
             }

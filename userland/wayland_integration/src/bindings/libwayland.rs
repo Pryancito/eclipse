@@ -111,6 +111,19 @@ impl Display {
             ffi::wl_display_run(self.ptr);
         }
     }
+
+    /// Get the underlying C pointer
+    pub fn as_ptr(&self) -> *mut ffi::wl_display {
+        #[cfg(has_libwayland)]
+        {
+            self.ptr
+        }
+        
+        #[cfg(not(has_libwayland))]
+        {
+            core::ptr::null_mut()
+        }
+    }
 }
 
 impl Drop for Display {
