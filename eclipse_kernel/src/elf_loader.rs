@@ -241,27 +241,44 @@ impl ElfLoader {
         size: usize,
         vaddr: u64,
     ) -> Result<(), &'static str> {
-        // En un sistema real, aquí copiaríamos los datos a la memoria virtual mapeada
-        // Por ahora, solo simulamos la copia
+        // Copiar los datos del ELF a la dirección física correspondiente
+        // En este punto, la dirección virtual debería estar mapeada a memoria física
 
         if offset + size > elf_data.len() {
             return Err("Datos de segmento fuera de rango");
         }
 
-        // Simular copia exitosa
+        if size == 0 {
+            return Ok(());
+        }
+
+        // Copiar los datos directamente a la dirección física
+        // Nota: Esta es una copia unsafe porque estamos escribiendo directamente a memoria
+        // En un sistema con paginación completa, esto se haría a través de las tablas de páginas
+        unsafe {
+            let src_ptr = elf_data.as_ptr().add(offset);
+            let dst_ptr = vaddr as *mut u8;
+            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+        }
+
+        crate::debug::serial_write_str(&alloc::format!(
+            "ELF_LOADER: Copied {} bytes from offset 0x{:x} to vaddr 0x{:x}\n",
+            size, offset, vaddr
+        ));
+
         Ok(())
     }
 
     /// Configurar la pila del proceso
     fn setup_stack(&mut self) -> u64 {
         // Reservar espacio para la pila (8MB)
-        let stack_size = 0x800000;
-        let stack_start = 0x7FFFFFFFFFFF - stack_size;
+        // Mantener la pila cerca del código para simplificar el mapeo de páginas
+        // (según USERLAND_TRANSFER_FIX.md, usar 0x1000000 = 16MB)
+        let stack_size = 0x800000; // 8MB
+        let stack_end = 0x1000000; // 16MB (apunta al final de la pila)
 
-        // Simular configuración de la pila
-        self.next_address = stack_start;
-
-        stack_start + stack_size // Stack pointer apunta al final de la pila
+        // La pila crece hacia abajo, así que el puntero inicia al final
+        stack_end
     }
 }
 

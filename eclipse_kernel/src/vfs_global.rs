@@ -130,11 +130,11 @@ fn create_minimal_elf_stub() -> alloc::vec::Vec<u8> {
     // p_type = PT_LOAD (1)
     elf.extend_from_slice(&[1, 0, 0, 0]);
     
-    // p_flags = PF_R | PF_X (5)
+    // p_flags = PF_R | PF_X (5) - Readable and Executable
     elf.extend_from_slice(&[5, 0, 0, 0]);
     
-    // p_offset = 0
-    elf.extend_from_slice(&[0; 8]);
+    // p_offset = 0x1000 (4096 - skip headers, actual code starts after headers)
+    elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
     
     // p_vaddr = 0x400000
     elf.extend_from_slice(&[0, 0, 0x40, 0, 0, 0, 0, 0]);
@@ -142,18 +142,36 @@ fn create_minimal_elf_stub() -> alloc::vec::Vec<u8> {
     // p_paddr = 0x400000
     elf.extend_from_slice(&[0, 0, 0x40, 0, 0, 0, 0, 0]);
     
-    // p_filesz = 4096
+    // p_filesz = 4096 (size in file)
     elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
     
-    // p_memsz = 4096
+    // p_memsz = 4096 (size in memory)
     elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
     
     // p_align = 4096
     elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
     
-    // Pad to minimum size
+    // Pad header to 4096 bytes
     while elf.len() < 4096 {
-        elf.push(0x90); // NOP instruction
+        elf.push(0);
+    }
+    
+    // Now add actual executable code at offset 4096 (which maps to 0x400000)
+    // Simple userland program that makes a syscall and loops
+    // This represents eclipse-systemd stub
+    
+    // Simple infinite loop with HLT to be CPU-friendly:
+    // .loop:
+    //   hlt       ; Halt until interrupt
+    //   jmp .loop ; Jump back to loop
+    elf.extend_from_slice(&[
+        0xF4,       // hlt
+        0xEB, 0xFD, // jmp -3 (loop back to hlt)
+    ]);
+    
+    // Pad the code section to make it 4KB total
+    while elf.len() < 8192 {
+        elf.push(0x90); // NOP padding
     }
     
     elf
