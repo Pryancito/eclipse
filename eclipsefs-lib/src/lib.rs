@@ -5,6 +5,8 @@ pub mod filesystem;
 pub mod format;
 pub mod node;
 pub mod types;
+pub mod extent;
+pub mod blocks;
 // pub mod ai_features;
 // pub mod quantum_crypto;
 
@@ -15,6 +17,8 @@ pub use types::{
     Acl, AclEntry, AclEntryType, CompressionInfo, CompressionType, DfResult, EncryptionInfo,
     EncryptionType, FindResult, FsckResult, Snapshot, TransparentEncryptionConfig,
 };
+pub use extent::{Extent, ExtentTree, ExtentStats, EXTENT_FLAG_UNWRITTEN, EXTENT_FLAG_COMPRESSED, EXTENT_FLAG_ENCRYPTED};
+pub use blocks::{BlockAllocator, AllocationGroup, AllocatorStats, BLOCK_SIZE};
 
 // Re-exportar tipos según la feature activa
 pub use filesystem::EclipseFS;
@@ -45,4 +49,4 @@ pub use writer::EclipseFSWriter;
 #[cfg(feature = "std")]
 pub use journal::{Journal, JournalConfig, JournalEntry, JournalStats, TransactionType};
 
-pub const ECLIPSEFS_VERSION: u32 = 0x00020000; // v0.2.0
+pub const ECLIPSEFS_VERSION: u32 = 0x00030000; // v0.3.0
