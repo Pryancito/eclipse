@@ -1073,17 +1073,61 @@ impl FileSystem for EclipseFSWrapper {
     fn resolve_path(&self, path: &str) -> Result<u32, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Resolviendo ruta '{}' (lazy)\n", path));
         
-        // Para la implementación lazy, por ahora solo resolvemos rutas básicas
-        match path {
-            "/" => Ok(1), // Root inode
-            "/bin" => Ok(2),
-            "/etc" => Ok(3),
-            "/home" => Ok(4),
-            _ => {
-                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta '{}' no encontrada\n", path));
-                Err(VfsError::FileNotFound)
+        let normalized = normalize_path(path);
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta normalizada: '{}'\n", normalized));
+        
+        // Raíz siempre es inode 1
+        if normalized == "/" {
+            return Ok(1);
+        }
+        
+        // Buscar en la tabla de inodos
+        let mut storage = StorageManager::new();
+        
+        // Empezar desde la raíz (inode 1) y navegar por cada componente de la ruta
+        let path_parts: Vec<&str> = normalized.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        let mut current_inode = 1u32; // Empezar desde la raíz
+        
+        for (idx, part) in path_parts.iter().enumerate() {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Buscando '{}' en inodo {}\n", part, current_inode));
+            
+            // Cargar el nodo actual
+            let node = self.load_node_lazy(current_inode, &mut storage)?;
+            
+            // Si es el último componente de la ruta, podríamos estar buscando un archivo
+            // De lo contrario, debe ser un directorio
+            if idx < path_parts.len() - 1 && node.kind != eclipsefs_lib::NodeKind::Directory {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' no es un directorio\n", part));
+                return Err(VfsError::NotADirectory);
+            }
+            
+            // Buscar el nombre en los hijos del directorio
+            if node.kind == eclipsefs_lib::NodeKind::Directory {
+                let mut found = false;
+                // node.children es un FnvIndexMap<String, u32> que se itera como (key, value)
+                for (child_name, child_inode) in node.children.iter() {
+                    if child_name.as_str() == *part {
+                        current_inode = *child_inode;
+                        found = true;
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Encontrado '{}' -> inodo {}\n", part, current_inode));
+                        break;
+                    }
+                }
+                
+                if !found {
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
+                    return Err(VfsError::FileNotFound);
+                }
+            } else {
+                // Es un archivo y no es el último componente - error
+                if idx < path_parts.len() - 1 {
+                    return Err(VfsError::NotADirectory);
+                }
             }
         }
+        
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta '{}' resuelta a inodo {}\n", path, current_inode));
+        Ok(current_inode)
     }
 
     fn readdir_path(&self, path: &str) -> Result<Vec<String>, VfsError> {
@@ -1094,13 +1138,26 @@ impl FileSystem for EclipseFSWrapper {
     fn read_file_path(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo archivo '{}' (lazy)\n", path));
         
-        // Para la implementación lazy, por ahora solo devolvemos datos de ejemplo
-        // TODO: Implementar lectura de archivos lazy
-        match path {
-            "/etc/passwd" => Ok(b"root:x:0:0:root:/root:/bin/bash\n".to_vec()),
-            "/etc/hostname" => Ok(b"eclipse-os\n".to_vec()),
-            _ => Err(VfsError::FileNotFound),
+        // Resolver la ruta a un inode
+        let inode = self.resolve_path(path)?;
+        
+        // Crear un storage manager para la operación de lectura
+        let mut storage = StorageManager::new();
+        
+        // Cargar el nodo
+        let node = self.load_node_lazy(inode, &mut storage)?;
+        
+        // Verificar que sea un archivo
+        if node.kind != eclipsefs_lib::NodeKind::File {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' no es un archivo\n", path));
+            return Err(VfsError::NotAFile);
         }
+        
+        // Obtener los datos del archivo
+        let data = node.get_data().to_vec();
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leídos {} bytes de '{}'\n", data.len(), path));
+        
+        Ok(data)
     }
 }
 

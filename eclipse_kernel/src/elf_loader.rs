@@ -399,10 +399,43 @@ pub fn load_eclipse_systemd() -> LoadResult {
     loader.load_elf(&elf_data)
 }
 
-/// Cargar systemd desde el VFS
+/// Cargar systemd desde el VFS o el sistema de archivos montado
 fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
     use crate::vfs_global::get_vfs;
+    use crate::filesystem::vfs::get_vfs as get_vfs_system;
     
+    // Primero intentar cargar desde el sistema de archivos montado (EclipseFS)
+    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar systemd desde el sistema de archivos montado...\n");
+    
+    let mut vfs_guard = get_vfs_system();
+    if let Some(vfs_system) = &*vfs_guard {
+        // Intentar cargar desde el filesystem montado en /
+        if let Some(root_fs) = vfs_system.get_mount("/") {
+            let fs_lock = root_fs.lock();
+            
+            let paths = ["/sbin/eclipse-systemd", "/usr/sbin/eclipse-systemd", "/sbin/init"];
+            
+            for path in &paths {
+                crate::debug::serial_write_str(&alloc::format!("ELF_LOADER: Intentando leer {} desde filesystem montado...\n", path));
+                match fs_lock.read_file_path(path) {
+                    Ok(data) => {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ELF_LOADER: ✓ Loaded {} bytes from {} (mounted filesystem)\n",
+                            data.len(), path
+                        ));
+                        return Ok(data);
+                    }
+                    Err(e) => {
+                        crate::debug::serial_write_str(&alloc::format!("ELF_LOADER: Error leyendo {}: {:?}\n", path, e));
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Si no se pudo cargar desde el filesystem montado, intentar desde el VFS en memoria
+    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar systemd desde VFS en memoria...\n");
     let vfs = get_vfs();
     let mut vfs_lock = vfs.lock();
     
@@ -413,7 +446,7 @@ fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
         match vfs_lock.read_file(path) {
             Ok(data) => {
                 crate::debug::serial_write_str(&alloc::format!(
-                    "ELF_LOADER: Loaded {} bytes from {}\n",
+                    "ELF_LOADER: Loaded {} bytes from {} (in-memory VFS)\n",
                     data.len(), path
                 ));
                 return Ok(data);
@@ -422,7 +455,7 @@ fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
         }
     }
     
-    Err("No se encontró systemd en VFS")
+    Err("No se encontró systemd en VFS ni en filesystem montado")
 }
 
 /// Crear datos ELF ficticios para simulación
