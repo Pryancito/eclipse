@@ -433,8 +433,7 @@ impl SystemdDaemon {
     }
 
     /// Inicia un target
-    pub fn start_target<'a>(&'a self, target_name: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
+    pub async fn start_target(&self, target_name: &str) -> Result<()> {
         info!("Target Iniciando target: {}", target_name);
         
         // Escribir a serial que estamos iniciando el target
@@ -445,19 +444,7 @@ impl SystemdDaemon {
         self.serial_logger.write_info("systemd", &format!("📋 Servicios a iniciar: {}", services.join(", "))).await?;
         
         for service_name in &services {
-            // Check if this is a target (ends with .target) or a service
-            if service_name.ends_with(".target") {
-                // Recursively start the target
-                let target_manager = self.target_manager.read().await;
-                if target_manager.target_exists(service_name) {
-                    drop(target_manager); // Release lock before recursive call
-                    self.serial_logger.write_info("systemd", &format!("🎯 Iniciando sub-target: {}", service_name)).await?;
-                    self.start_target(service_name).await?;
-                } else {
-                    self.serial_logger.write_error("systemd", &format!("❌ Target no encontrado: {}", service_name)).await?;
-                    return Err(anyhow::anyhow!("Target no encontrado: {}", service_name));
-                }
-            } else if !self.is_service_running(service_name).await {
+            if !self.is_service_running(service_name).await {
                 self.serial_logger.write_info("systemd", &format!("⚡ Iniciando servicio: {}", service_name)).await?;
                 self.start_service(service_name).await?;
             } else {
@@ -468,7 +455,6 @@ impl SystemdDaemon {
         self.serial_logger.write_info("systemd", &format!("🎉 Target completado: {}", target_name)).await?;
         info!("Target iniciado: {}", target_name);
         Ok(())
-        })
     }
 
     /// Obtiene el estado del sistema

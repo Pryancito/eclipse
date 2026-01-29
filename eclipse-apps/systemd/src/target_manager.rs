@@ -252,10 +252,14 @@ impl TargetManager {
         if let Some(target) = self.targets.get(target_name) {
             let mut all_services = Vec::new();
             
-            // Agregar servicios del target
-            all_services.extend(target.services.clone());
+            // Agregar servicios del target (filtrar targets)
+            for item in &target.services {
+                if !item.ends_with(".target") {
+                    all_services.push(item.clone());
+                }
+            }
             
-            // Agregar servicios de dependencias
+            // Agregar servicios de dependencias (recursivamente procesar targets)
             for dep in &target.dependencies {
                 if let Ok(dep_services) = self.get_target_services(dep) {
                     all_services.extend(dep_services);
