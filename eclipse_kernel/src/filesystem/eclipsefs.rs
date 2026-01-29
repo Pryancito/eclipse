@@ -377,6 +377,8 @@ impl EclipseFSWrapper {
             is_snapshot: false,
             original_inode: 0,
             checksum: 0,
+            extent_tree: eclipsefs_lib::ExtentTree::new(),
+            use_extents: false,
         })
     }
 

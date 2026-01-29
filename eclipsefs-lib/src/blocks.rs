@@ -22,6 +22,17 @@ const MAX_BLOCKS: usize = 4096;
 #[cfg(not(feature = "std"))]
 const MAX_GROUPS: usize = 16;
 
+/// Maximum delayed allocations for no_std
+#[cfg(not(feature = "std"))]
+const MAX_DELAYED: usize = 64;
+
+/// Type alias for list of extents, handling differences between std and no_std
+#[cfg(feature = "std")]
+pub type ExtentList = Vec<Extent>;
+
+#[cfg(not(feature = "std"))]
+pub type ExtentList = Vec<Extent, MAX_DELAYED>;
+
 /// Block allocation group (inspired by XFS allocation groups)
 /// Divides the filesystem into independent regions for parallel allocation
 #[derive(Debug, Clone)]
@@ -325,7 +336,7 @@ impl BlockAllocator {
     }
 
     /// Flush delayed allocations and return allocated extents
-    pub fn flush_delayed_allocations(&mut self) -> EclipseFSResult<Vec<Extent>> {
+    pub fn flush_delayed_allocations(&mut self) -> EclipseFSResult<ExtentList> {
         #[cfg(feature = "std")]
         let mut extents = Vec::new();
         #[cfg(not(feature = "std"))]
