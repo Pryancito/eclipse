@@ -1,4 +1,32 @@
 //! Wrapper VFS para la librería EclipseFS.
+//! 
+//! Este módulo implementa la integración del sistema de archivos EclipseFS con el VFS del kernel.
+//! Utiliza un enfoque de "carga bajo demanda" (lazy loading) para minimizar el uso de memoria:
+//! 
+//! - El header y la tabla de inodos se cargan al montar el filesystem
+//! - Los nodos individuales se leen del disco solo cuando se necesitan
+//! - Formato TLV (Type-Length-Value) para almacenamiento flexible de metadatos
+//! 
+//! ## Estructura en disco:
+//! 
+//! ```text
+//! +------------------+
+//! | Header (4KB)     |  <- Superbloque con metadatos del FS
+//! +------------------+
+//! | Inode Table      |  <- Tabla de índice (inode -> offset)
+//! +------------------+
+//! | Node Data        |  <- Datos de nodos en formato TLV
+//! | (archivos y dirs)|
+//! +------------------+
+//! ```
+//! 
+//! ## Formato TLV de nodos:
+//! 
+//! Cada nodo se almacena como una secuencia de entradas TLV:
+//! - Tag (2 bytes): tipo de campo (NODE_TYPE, MODE, UID, SIZE, etc.)
+//! - Length (4 bytes): tamaño del valor en bytes
+//! - Value (N bytes): datos del campo
+//!
 
 use crate::bootloader_data;
 use crate::drivers::storage_manager::{StorageManager, StorageSectorType};
@@ -110,6 +138,33 @@ impl EclipseFSWrapper {
     }
 
     /// Parsear un nodo desde un buffer TLV
+    /// 
+    /// ## Formato del nodo en disco:
+    /// 
+    /// ```text
+    /// +----------------------+
+    /// | Inode (4 bytes)      |  <- Número de inode
+    /// | Record Size (4 bytes)|  <- Tamaño total del registro
+    /// +----------------------+
+    /// | TLV Entry 1          |  <- Tag (2) + Length (4) + Value (N)
+    /// | TLV Entry 2          |
+    /// | ...                  |
+    /// +----------------------+
+    /// ```
+    /// 
+    /// ## Tags TLV soportados:
+    /// 
+    /// - 0x0001: NODE_TYPE (File=1, Directory=2, Symlink=3)
+    /// - 0x0002: MODE (permisos Unix)
+    /// - 0x0003: UID (user ID)
+    /// - 0x0004: GID (group ID)
+    /// - 0x0005: SIZE (tamaño en bytes)
+    /// - 0x0006: ATIME (timestamp de último acceso)
+    /// - 0x0007: MTIME (timestamp de última modificación)
+    /// - 0x0008: CTIME (timestamp de creación)
+    /// - 0x0009: NLINK (número de hard links)
+    /// - 0x000A: CONTENT (datos del archivo)
+    /// - 0x000B: DIRECTORY_ENTRIES (hijos del directorio)
     fn parse_node_from_buffer(&self, buffer: &[u8], expected_inode: u32) -> Result<eclipsefs_lib::EclipseFSNode, VfsError> {
         // Leer cabecera del registro de nodo (8 bytes: inode + tamaño)
         if buffer.len() < ecfs_constants::NODE_RECORD_HEADER_SIZE {
