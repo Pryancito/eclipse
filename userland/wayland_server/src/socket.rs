@@ -44,7 +44,7 @@ impl UnixSocket {
             return Err("Socket not in listening state");
         }
         // Call listen() syscall
-        self.state = SocketState::Listening;
+        // State is already Listening from bind()
         Ok(())
     }
 

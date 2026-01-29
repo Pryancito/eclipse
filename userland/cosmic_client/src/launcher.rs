@@ -88,9 +88,10 @@ impl AppLauncher {
                 let _ = filtered.push(app);
             }
         } else {
-            // Filter by search query
+            // Filter by search query (convert once)
+            let query_lower = self.search_query.as_str().to_lowercase();
             for app in self.apps.iter() {
-                if app.name.as_str().to_lowercase().contains(self.search_query.as_str().to_lowercase().as_str()) {
+                if app.name.as_str().to_lowercase().contains(&query_lower) {
                     let _ = filtered.push(app);
                 }
             }

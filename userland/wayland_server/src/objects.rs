@@ -61,8 +61,9 @@ impl Surface {
         self.committed = true;
     }
 
-    pub fn damage(&mut self, x: i32, y: i32, width: i32, height: i32) {
+    pub fn damage(&self, _x: i32, _y: i32, _width: i32, _height: i32) {
         // Mark region as damaged for redraw
+        // TODO: Implement damage tracking
     }
 }
 

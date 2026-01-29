@@ -620,8 +620,8 @@ create_basic_distribution() {
         # Copiar COSMIC Desktop (C) si existe
         if [ -f "userland/cosmic_desktop/cosmic_desktop" ]; then
             cp "userland/cosmic_desktop/cosmic_desktop" "$BUILD_DIR/userland/bin/cosmic_desktop_c"
-            chmod +x "$BUILD_DIR/userland/bin/cosmic_desktop"
-            print_status "COSMIC Desktop copiado"
+            chmod +x "$BUILD_DIR/userland/bin/cosmic_desktop_c"
+            print_status "COSMIC Desktop (C) copiado"
         fi
 
         # Crear directorios /usr/bin y /usr/sbin si no existen

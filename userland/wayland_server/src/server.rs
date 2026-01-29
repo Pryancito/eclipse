@@ -40,13 +40,11 @@ impl Client {
         };
         
         // Create wl_display object
-        if let Ok(_) = client.objects.push(WaylandObject::new(
+        let _ = client.objects.push(WaylandObject::new(
             1,
             InterfaceType::Display,
             ObjectState::Active,
-        )) {
-            // Success
-        }
+        ));
         
         client
     }
@@ -119,13 +117,12 @@ impl WaylandServer {
         let name = self.next_global_name;
         self.next_global_name += 1;
         
-        if let Err(_) = self.globals.push(RegistryGlobal {
+        let _ = self.globals.push(RegistryGlobal {
             name,
             interface,
             version,
-        }) {
-            // Failed to register global
-        }
+        });
+        // Note: In production, failing to register core globals should be a critical error
     }
 
     pub fn add_client(&mut self, socket_fd: i32) -> Result<u32, &'static str> {
@@ -160,11 +157,12 @@ impl WaylandServer {
         let client = self.get_client_mut(client_id)
             .ok_or("Client not found")?;
 
-        // Get the object the message is for
-        let obj = client.get_object(msg.header.object_id)
-            .ok_or("Object not found")?;
+        // Get the object interface type (copy it to avoid borrow conflicts)
+        let interface = client.get_object(msg.header.object_id)
+            .ok_or("Object not found")?
+            .interface;
 
-        match obj.interface {
+        match interface {
             InterfaceType::Display => self.handle_display_message(client_id, msg),
             InterfaceType::Registry => self.handle_registry_message(client_id, msg),
             InterfaceType::Compositor => self.handle_compositor_message(client_id, msg),
