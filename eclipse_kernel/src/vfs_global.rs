@@ -55,8 +55,38 @@ pub fn init_vfs() -> FsResult<()> {
     Ok(())
 }
 
-/// Create minimal systemd stub in VFS for testing
+/// Create minimal systemd stub in VFS for testing - only if not found on disk
 pub fn prepare_systemd_binary() -> FsResult<()> {
+    use crate::filesystem::vfs::get_vfs as get_vfs_system;
+    
+    // Primero verificar si systemd ya existe en el filesystem montado
+    crate::debug::serial_write_str("PREPARE_SYSTEMD: Verificando si systemd existe en filesystem montado...\n");
+    
+    if let Some(vfs_system) = get_vfs_system() {
+        let vfs_lock = vfs_system.lock();
+        
+        // Verificar si hay un filesystem montado en /
+        if let Some(root_fs) = vfs_lock.get_mount("/") {
+            let fs_lock = root_fs.lock();
+            
+            // Intentar leer systemd desde el filesystem montado
+            let paths = ["/sbin/eclipse-systemd", "/usr/sbin/eclipse-systemd", "/sbin/init"];
+            
+            for path in &paths {
+                if let Ok(data) = fs_lock.read_file_path(path) {
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "PREPARE_SYSTEMD: ✓ Encontrado {} en filesystem montado ({} bytes), no se creará stub\n",
+                        path, data.len()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+    }
+    
+    // Si no se encontró en el filesystem montado, crear stub en VFS en memoria
+    crate::debug::serial_write_str("PREPARE_SYSTEMD: No se encontró systemd en filesystem montado, creando stub en VFS...\n");
+    
     let vfs = get_vfs();
     let mut vfs_lock = vfs.lock();
     
@@ -70,6 +100,7 @@ pub fn prepare_systemd_binary() -> FsResult<()> {
     vfs_lock.create_file("/sbin/init", FilePermissions::default())?;
     vfs_lock.write_file("/sbin/init", &minimal_elf)?;
     
+    crate::debug::serial_write_str("PREPARE_SYSTEMD: Stub creado en VFS en memoria\n");
     Ok(())
 }
 
