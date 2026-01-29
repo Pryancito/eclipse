@@ -2,6 +2,8 @@
 //!
 //! Este módulo maneja la transición del kernel al userland ejecutando eclipse-systemd
 
+extern crate alloc;
+
 use crate::gdt::{setup_userland_gdt, GdtManager};
 use crate::idt::{setup_userland_idt, IdtManager};
 use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
@@ -177,47 +179,85 @@ impl ProcessTransfer {
 
     /// Transferir control al userland usando iretq
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
-        // Preparar stack para iretq
-        let stack_ptr = context.rsp;
-
-        // Colocar datos en la pila para iretq
+        // NOTA: Esta función debería transferir completamente el control al userland
+        // y NUNCA retornar. Sin embargo, sin soporte real de memoria virtual y paginación,
+        // no podemos ejecutar código en userland.
+        
         unsafe {
-            let stack_data = [
-                context.ss,     // SS
-                context.rsp,    // RSP
-                context.rflags, // RFLAGS
-                context.cs,     // CS
-                context.rip,    // RIP
-            ];
-
-            // Colocar datos en la pila
-            let stack_addr = stack_ptr as *mut u64;
-            for (i, &value) in stack_data.iter().enumerate() {
-                *stack_addr.add(i) = value;
-            }
-
-            // Configurar registros
-            asm!("mov rax, {}", in(reg) context.rax, options(nomem, nostack));
-            asm!("mov rbx, {}", in(reg) context.rbx, options(nomem, nostack));
-            asm!("mov rcx, {}", in(reg) context.rcx, options(nomem, nostack));
-            asm!("mov rdx, {}", in(reg) context.rdx, options(nomem, nostack));
-            asm!("mov rsi, {}", in(reg) context.rsi, options(nomem, nostack));
-            asm!("mov rdi, {}", in(reg) context.rdi, options(nomem, nostack));
-            asm!("mov rbp, {}", in(reg) context.rbp, options(nomem, nostack));
-            asm!("mov r8, {}", in(reg) context.r8, options(nomem, nostack));
-            asm!("mov r9, {}", in(reg) context.r9, options(nomem, nostack));
-            asm!("mov r10, {}", in(reg) context.r10, options(nomem, nostack));
-            asm!("mov r11, {}", in(reg) context.r11, options(nomem, nostack));
-            asm!("mov r12, {}", in(reg) context.r12, options(nomem, nostack));
-            asm!("mov r13, {}", in(reg) context.r13, options(nomem, nostack));
-            asm!("mov r14, {}", in(reg) context.r14, options(nomem, nostack));
-            asm!("mov r15, {}", in(reg) context.r15, options(nomem, nostack));
-
-            // Transferir control usando iretq
-            asm!("iretq", options(nomem, nostack));
+            // En un sistema real con paginación completa:
+            // 1. Configurar CR3 con la tabla de páginas del proceso
+            // 2. Preparar el stack del kernel con los valores para iretq
+            // 3. Cargar todos los registros
+            // 4. Ejecutar iretq para saltar al código userland
+            
+            // Por ahora, simulamos la transición mostrando que está configurado
+            // En un kernel funcional, este código configuraría el stack y ejecutaría:
+            /*
+            // Preparar el stack del kernel para iretq (crece hacia abajo)
+            asm!(
+                // Apilar los valores en el orden correcto para iretq:
+                // SS, RSP, RFLAGS, CS, RIP
+                "mov rsp, {tmp_stack}",  // Usar stack temporal del kernel
+                "push {ss}",              // Stack Segment
+                "push {rsp}",             // Stack Pointer
+                "push {rflags}",          // Flags
+                "push {cs}",              // Code Segment  
+                "push {rip}",             // Instruction Pointer
+                
+                // Cargar registros del contexto
+                "mov rax, {rax}",
+                "mov rbx, {rbx}",
+                "mov rcx, {rcx}",
+                "mov rdx, {rdx}",
+                "mov rsi, {rsi}",
+                "mov rdi, {rdi}",
+                "mov rbp, {rbp}",
+                "mov r8, {r8}",
+                "mov r9, {r9}",
+                "mov r10, {r10}",
+                "mov r11, {r11}",
+                "mov r12, {r12}",
+                "mov r13, {r13}",
+                "mov r14, {r14}",
+                "mov r15, {r15}",
+                
+                // Transferir control (NUNCA RETORNA)
+                "iretq",
+                
+                tmp_stack = in(reg) 0x500000u64,  // Stack temporal del kernel
+                ss = in(reg) context.ss,
+                rsp = in(reg) context.rsp,
+                rflags = in(reg) context.rflags,
+                cs = in(reg) context.cs,
+                rip = in(reg) context.rip,
+                rax = in(reg) context.rax,
+                rbx = in(reg) context.rbx,
+                rcx = in(reg) context.rcx,
+                rdx = in(reg) context.rdx,
+                rsi = in(reg) context.rsi,
+                rdi = in(reg) context.rdi,
+                rbp = in(reg) context.rbp,
+                r8 = in(reg) context.r8,
+                r9 = in(reg) context.r9,
+                r10 = in(reg) context.r10,
+                r11 = in(reg) context.r11,
+                r12 = in(reg) context.r12,
+                r13 = in(reg) context.r13,
+                r14 = in(reg) context.r14,
+                r15 = in(reg) context.r15,
+                options(noreturn)
+            );
+            */
+            
+            // Por ahora, solo registramos que la transferencia fue intentada
+            crate::debug::serial_write_str(&alloc::format!(
+                "PROCESS_TRANSFER: Transferencia simulada - entry=0x{:x} stack=0x{:x}\n",
+                context.rip, context.rsp
+            ));
         }
 
-        Ok(())
+        // En un sistema real, esta línea nunca se ejecutaría porque iretq nunca retorna
+        Err("Transferencia al userland no soportada sin memoria virtual completa")
     }
 
     /// Registrar inicio del proceso
