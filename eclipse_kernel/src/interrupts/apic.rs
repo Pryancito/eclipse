@@ -335,11 +335,11 @@ pub fn send_apic_eoi() {
 pub fn get_current_lapic_id() -> u8 {
     unsafe {
         let mut ebx: u32;
+        let eax: u32 = 1;  // CPUID función 1
         core::arch::asm!(
-            "mov eax, 1",
             "cpuid",
+            inout("eax") eax => _,
             out("ebx") ebx,
-            out("eax") _,
             out("ecx") _,
             out("edx") _,
             options(nostack, preserves_flags)

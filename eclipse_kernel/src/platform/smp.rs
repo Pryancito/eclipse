@@ -129,10 +129,17 @@ fn send_init_sipi() {
 }
 
 /// Delay en microsegundos usando TSC (Time Stamp Counter)
-/// Nota: Esta es una aproximación basada en un estimado conservador de frecuencia de CPU
+/// 
+/// Nota: Esta implementación usa una estimación conservadora de la frecuencia de CPU (2GHz).
+/// Para mayor precisión, se debería calibrar la frecuencia del TSC durante el boot
+/// usando un timer conocido (como el PIT) o leyendo la frecuencia del procesador desde CPUID.
+/// 
+/// La estimación conservadora de 2GHz es segura para la mayoría de CPUs modernos:
+/// - En CPUs más lentos (<2GHz), los delays serán más largos de lo necesario (seguro)
+/// - En CPUs más rápidos (>2GHz), los delays serán más cortos pero aún dentro del margen
+///   de tolerancia para la secuencia INIT-SIPI-SIPI según la especificación Intel
 fn delay_microseconds(us: u64) {
     // Estimamos una CPU de ~2GHz como base conservadora
-    // Ajustar este valor según la frecuencia real del CPU mejorará la precisión
     const ESTIMATED_CPU_MHZ: u64 = 2000;
     let cycles = us * ESTIMATED_CPU_MHZ;
     
