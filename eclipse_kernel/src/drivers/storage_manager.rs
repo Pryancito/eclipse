@@ -1202,7 +1202,7 @@ impl StorageManager {
 
     /// Leer un sector de un dispositivo específico con tipo de sector
     pub fn read_device_sector_with_type(&self, device_info: &StorageDeviceInfo, sector: u64, buffer: &mut [u8], sector_type: StorageSectorType) -> Result<(), &'static str> {
-        // Para EclipseFS, usar solo lectura real - si falla, panic
+        // Para EclipseFS, usar solo lectura real - si falla, retornar error
         if matches!(sector_type, StorageSectorType::EclipseFS) {
             match self.read_device_sector_real(device_info, sector, buffer) {
                 Ok(_) => {
@@ -1210,7 +1210,8 @@ impl StorageManager {
                     return Ok(());
                 }
                 Err(e) => {
-                    panic!("ECLIPSEFS: No se pueden leer datos reales del dispositivo. Error: {}. Sistema de archivos no disponible.", e);
+                    serial_write_str("ECLIPSEFS: Error al leer datos reales del dispositivo. Sistema de archivos no disponible.\n");
+                    return Err(e);
                 }
             }
         }

@@ -181,6 +181,14 @@ unsafe fn serial_write_hex8(val: u8) {
 static mut LOG_BUF: [u8; 131072] = [0; 131072];
 static mut LOG_LEN: usize = 0;
 
+/// Agrega un byte al buffer de log.
+/// 
+/// # Safety
+/// 
+/// Esta función es unsafe porque accede a las variables globales mutables LOG_BUF y LOG_LEN.
+/// El llamador debe asegurar que:
+/// - No haya acceso concurrente a LOG_BUF o LOG_LEN desde múltiples hilos
+/// - Esta función solo se llame en contexto de bootloader single-threaded
 #[inline(always)]
 unsafe fn log_append_byte(b: u8) {
     if LOG_LEN < LOG_BUF.len() {
@@ -189,11 +197,28 @@ unsafe fn log_append_byte(b: u8) {
     }
 }
 
+/// Agrega múltiples bytes al buffer de log.
+/// 
+/// # Safety
+/// 
+/// Esta función es unsafe porque:
+/// - Accede a las variables globales mutables LOG_BUF y LOG_LEN
+/// - Usa copy_nonoverlapping para copiar datos
+/// 
+/// El llamador debe asegurar que:
+/// - No haya acceso concurrente a LOG_BUF o LOG_LEN
+/// - Esta función solo se llame en contexto de bootloader single-threaded
+/// - bytes apunte a memoria válida por al menos bytes.len() bytes
 #[inline(always)]
 unsafe fn log_append_bytes(bytes: &[u8]) {
     let avail = LOG_BUF.len().saturating_sub(LOG_LEN);
     let to_copy = core::cmp::min(avail, bytes.len());
     if to_copy > 0 {
+        // SAFETY: 
+        // - bytes.as_ptr() es válido para lectura de to_copy bytes (garantizado por bytes.len())
+        // - LOG_BUF.as_mut_ptr().add(LOG_LEN) es válido para escritura de to_copy bytes
+        //   (garantizado por la comprobación avail y to_copy <= avail)
+        // - Las regiones no se solapan (LOG_BUF es estático, bytes viene de otro lugar)
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), LOG_BUF.as_mut_ptr().add(LOG_LEN), to_copy);
         LOG_LEN += to_copy;
     }
@@ -216,8 +241,21 @@ fn flush_log_to_file(bs: &BootServices, image_handle: Handle) {
     }
 }
 
-// Mapear el framebuffer en direcciones altas con identidad (2MiB pages) en nuestras tablas
+/// Mapear el framebuffer en direcciones altas con identidad (2MiB pages) en nuestras tablas
+/// 
+/// # Safety
+/// 
+/// Esta función manipula directamente las tablas de páginas de x86_64. Es unsafe porque:
+/// - Asume que pml4_phys apunta a una tabla PML4 válida y alineada a 4KB
+/// - Modifica estructuras de memoria críticas del sistema
+/// - Usa aritmética de punteros sin límites explícitos
+/// 
+/// El llamador debe asegurar que:
+/// - pml4_phys es una dirección física válida de una tabla PML4
+/// - fb_base y fb_size son válidos y no causan desbordamiento
+/// - Esta función se llama en contexto apropiado del bootloader antes de ExitBootServices
 fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_size: u64) {
+    // SAFETY: serial_write_str solo escribe a puertos serie, es seguro en contexto bootloader
     unsafe {
         serial_write_str("BL: mapeando framebuffer en page tables...\r\n");
     }
@@ -225,48 +263,92 @@ fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_
     let ps: u64 = 0x080;   // Page Size (2MiB)
     let addr_mask: u64 = 0x000F_FFFF_FFFF_F000u64;
 
+    // Calcular límites alineados a 2MiB para evitar mapeos parciales
     let phys_start = fb_base & !0x1F_FFFFu64; // 2MiB aligned down
-    let phys_end = (fb_base + fb_size + 0x1F_FFFFu64) & !0x1F_FFFFu64; // 2MiB aligned up
+    
+    // Validar que fb_base + fb_size no desborde
+    let fb_end = fb_base.checked_add(fb_size)
+        .unwrap_or_else(|| {
+            // SAFETY: solo escribe a puerto serie
+            unsafe { serial_write_str("BL: ERROR - framebuffer address overflow\r\n"); }
+            // Si desborda, usar el valor máximo seguro
+            u64::MAX - 0x1F_FFFFu64
+        });
+    
+    let phys_end = fb_end.checked_add(0x1F_FFFFu64)
+        .map(|v| v & !0x1F_FFFFu64)
+        .unwrap_or_else(|| {
+            // Si desborda, usar el máximo alineado posible
+            u64::MAX & !0x1F_FFFFu64
+        });
 
+    // SAFETY: Asumimos que pml4_phys apunta a memoria válida alineada a 4KB
+    // Esta es una precondición de la función
     let pml4_ptr = pml4_phys as *mut u64;
 
     let mut addr = phys_start;
     while addr < phys_end {
+        // Calcular índice PML4 (bits 39-47)
         let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+        
+        // SAFETY: pml4_idx está limitado a 0-511 por el mask 0x1FF, por lo que
+        // pml4_ptr.add(pml4_idx) siempre está dentro de los límites de la tabla PML4 (512 entradas)
         let pdpt_entry = unsafe { pml4_ptr.add(pml4_idx) };
+        
+        // SAFETY: pdpt_entry apunta a una entrada válida de la tabla PML4
         let mut pdpt_phys: u64 = unsafe { *pdpt_entry } & addr_mask;
+        
         if pdpt_phys == 0 {
+            // Necesitamos crear una nueva tabla PDPT
             if let Ok(new_pdpt) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+                // SAFETY: new_pdpt es memoria recién asignada de 4096 bytes por UEFI
                 unsafe { core::ptr::write_bytes(new_pdpt as *mut u8, 0, 4096); }
                 pdpt_phys = new_pdpt & addr_mask;
+                // SAFETY: pdpt_entry apunta a entrada válida en PML4
                 unsafe { *pdpt_entry = pdpt_phys | p_w; }
             } else {
+                // SAFETY: solo escribe a puerto serie
                 unsafe { serial_write_str("BL: ERROR alloc PDPT\r\n"); }
                 break;
             }
         }
 
+        // SAFETY: pdpt_phys ahora contiene una dirección válida de tabla PDPT
         let pdpt_ptr = pdpt_phys as *mut u64;
         let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+        
+        // SAFETY: pdpt_idx está limitado a 0-511, dentro de límites de PDPT
         let pd_entry = unsafe { pdpt_ptr.add(pdpt_idx) };
+        
+        // SAFETY: pd_entry apunta a entrada válida de PDPT
         let mut pd_phys: u64 = unsafe { *pd_entry } & addr_mask;
+        
         if pd_phys == 0 {
+            // Necesitamos crear una nueva tabla PD
             if let Ok(new_pd) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+                // SAFETY: new_pd es memoria recién asignada de 4096 bytes por UEFI
                 unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
                 pd_phys = new_pd & addr_mask;
+                // SAFETY: pd_entry apunta a entrada válida en PDPT
                 unsafe { *pd_entry = pd_phys | p_w; }
             } else {
+                // SAFETY: solo escribe a puerto serie
                 unsafe { serial_write_str("BL: ERROR alloc PD\r\n"); }
                 break;
             }
         }
 
+        // SAFETY: pd_phys ahora contiene una dirección válida de tabla PD
         let pd_ptr = pd_phys as *mut u64;
         let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+        
+        // SAFETY: pd_idx está limitado a 0-511, dentro de límites de PD
+        // Escribimos una entrada de página de 2MiB con mapeo de identidad
         unsafe {
             *pd_ptr.add(pd_idx) = (addr & addr_mask) | p_w | ps;
         }
 
+        // Avanzar al siguiente bloque de 2MiB, usando saturating_add para prevenir overflow
         addr = addr.saturating_add(0x20_0000u64); // next 2MiB
     }
 }
@@ -325,6 +407,8 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
             }
         }
     }
+    // SAFETY: ehdr_buf está completamente inicializado con datos del archivo ELF.
+    // Usamos read_unaligned porque la alineación de la estructura puede no coincidir con el buffer.
     let ehdr: Elf64Ehdr = unsafe { core::ptr::read_unaligned(ehdr_buf.as_ptr() as *const Elf64Ehdr) };
 
     // Debug: verificar entry point
@@ -349,6 +433,12 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
     // Iterar program headers
     let phentsize = ehdr.e_phentsize as usize;
     let phnum = ehdr.e_phnum as usize;
+    
+    // Validar que phnum no sea excesivamente grande para prevenir ataques
+    if phnum > MAX_PH {
+        return Err(BootError::LoadElf(Status::UNSUPPORTED));
+    }
+    
     let mut ph_buf = [0u8; core::mem::size_of::<Elf64Phdr>()];
 
     // Asegurar tamaño de entrada de programa esperado para ELF64
@@ -380,12 +470,21 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
                 }
             }
         }
+        // SAFETY: ph_buf está completamente inicializado con phentsize bytes del archivo ELF.
+        // Usamos read_unaligned para evitar problemas de alineación.
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
 
-        // Calcular direcciones virtuales del segmento
+        // Validar que p_memsz no cause desbordamiento al sumarse con p_vaddr
+        let vaddr_end_unaligned = phdr.p_vaddr.checked_add(phdr.p_memsz)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+        
+        // Calcular direcciones virtuales del segmento con alineación de página
         let vaddr_start = phdr.p_vaddr & !0xFFFu64;
-        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+        // Validar que la suma no desborde antes de alinear
+        let vaddr_end = vaddr_end_unaligned.checked_add(0xFFF)
+            .map(|v| v & !0xFFFu64)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
 
         if vaddr_start < min_vaddr { min_vaddr = vaddr_start; }
         if vaddr_end > max_vaddr { max_vaddr = vaddr_end; }
@@ -393,8 +492,15 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
 
     if min_vaddr == u64::MAX || max_vaddr <= min_vaddr { return Err(BootError::LoadElf(Status::LOAD_ERROR)); }
 
-    // Calcular tamaño total del kernel
-    let total_size = max_vaddr - min_vaddr;
+    // Calcular tamaño total del kernel con verificación de desbordamiento
+    let total_size = max_vaddr.checked_sub(min_vaddr)
+        .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+    
+    // Validar que el tamaño no exceda un límite razonable
+    if total_size > MAX_KERNEL_ALLOCATION {
+        return Err(BootError::LoadElf(Status::LOAD_ERROR));
+    }
+    
     let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
 
     // Reservar memoria física - usar BOOT_SERVICES_CODE para que UEFI no la reutilice después de exit
@@ -422,14 +528,30 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
         let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(ph_buf.as_ptr() as *const Elf64Phdr) };
         if phdr.p_type != PT_LOAD { continue; }
 
-        // Calcular direcciones virtuales del segmento
+        // Calcular direcciones virtuales del segmento con overflow protection
         let vaddr_start = phdr.p_vaddr & !0xFFFu64;
-        let vaddr_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFFu64;
+        
+        // Reutilizar el mismo patrón de validación que en el primer pase
+        let vaddr_end_unaligned = phdr.p_vaddr.checked_add(phdr.p_memsz)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+        
+        let vaddr_end = vaddr_end_unaligned.checked_add(0xFFF)
+            .map(|v| v & !0xFFFu64)
+            .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
 
         if seg_idx < MAX_PH {
             segmap.vstart[seg_idx] = vaddr_start;
-            segmap.pstart[seg_idx] = kernel_phys_base + (vaddr_start - min_vaddr); // Dirección física correspondiente
-            segmap.len[seg_idx] = vaddr_end.saturating_sub(vaddr_start);
+            
+            // Calcular dirección física con overflow protection
+            let offset = vaddr_start.checked_sub(min_vaddr)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
+            segmap.pstart[seg_idx] = kernel_phys_base.checked_add(offset)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
+            segmap.len[seg_idx] = vaddr_end.checked_sub(vaddr_start)
+                .ok_or(BootError::LoadElf(Status::LOAD_ERROR))?;
+            
             seg_idx += 1;
         }
     }

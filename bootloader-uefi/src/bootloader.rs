@@ -17,8 +17,12 @@ use uefi_services::println;
 
 #[entry]
 fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
-    // Inicializar servicios UEFI
-    uefi_services::init(&mut system_table).unwrap();
+    // Inicializar servicios UEFI con manejo de errores
+    if let Err(e) = uefi_services::init(&mut system_table) {
+        // No podemos usar println! aquí porque los servicios no están inicializados
+        // Retornar error directamente
+        return e.status();
+    }
     
     // Obtener servicios de boot
     let boot_services = system_table.boot_services();
