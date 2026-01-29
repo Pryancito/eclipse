@@ -5,7 +5,7 @@
 
 set -e
 
-echo "Probando PRUEBAS DE ECLIPSE SYSTEMD v0.1.0"
+echo "Probando PRUEBAS DE ECLIPSE SYSTEMD v0.6.0"
 echo "====================================="
 
 # Colores para output
@@ -68,8 +68,19 @@ fi
 echo ""
 echo "📄 PRUEBA 3: Parser de archivos .service"
 echo "----------------------------------------"
-service_dir="/home/moebius/eclipse/etc/eclipse/systemd/system"
-if [ -d "$service_dir" ]; then
+# Detectar directorio de servicios
+service_dir=""
+for possible_dir in "/home/moebius/eclipse/etc/eclipse/systemd/system" \
+                    "../etc/eclipse/systemd/system" \
+                    "../../etc/eclipse/systemd/system" \
+                    "/etc/eclipse/systemd/system"; do
+    if [ -d "$possible_dir" ]; then
+        service_dir="$possible_dir"
+        break
+    fi
+done
+
+if [ -n "$service_dir" ] && [ -d "$service_dir" ]; then
     service_count=$(find "$service_dir" -name "*.service" | wc -l)
     print_status "OK" "Encontrados $service_count archivos .service"
     
@@ -85,7 +96,7 @@ if [ -d "$service_dir" ]; then
         fi
     done
 else
-    print_status "WARNING" "Directorio de servicios no encontrado: $service_dir"
+    print_status "WARNING" "Directorio de servicios no encontrado en ubicaciones conocidas"
 fi
 
 # Prueba 4: Validador de sintaxis

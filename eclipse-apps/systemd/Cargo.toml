@@ -1,6 +1,6 @@
 [package]
 name = "eclipse-systemd"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Eclipse Rust Team"]
 description = "Sistema de inicialización systemd completamente funcional para Eclipse OS"

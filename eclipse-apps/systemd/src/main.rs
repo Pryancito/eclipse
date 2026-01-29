@@ -24,12 +24,12 @@ async fn main() -> Result<()> {
     
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                    ECLIPSE SYSTEMD                          ║");
-    println!("║                        v0.2.0                                ║");
+    println!("║                        v0.6.0                                ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("\nUSERLAND TOMANDO CONTROL DEL SISTEMA...");
     println!("===========================================");
     
-    info!("Eclipse SystemD v0.2.0 - Daemon completamente funcional");
+    info!("Eclipse SystemD v0.6.0 - Daemon completamente funcional");
     info!("Sistema de inicialización moderno para Eclipse OS");
     
     // Obtener argumentos de línea de comandos
