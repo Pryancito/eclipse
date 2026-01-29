@@ -453,7 +453,7 @@ impl SystemdDaemon {
         }
         
         self.serial_logger.write_info("systemd", &format!("🎉 Target completado: {}", target_name)).await?;
-        info!("Servicio Target iniciado: {}", target_name);
+        info!("Target iniciado: {}", target_name);
         Ok(())
     }
 

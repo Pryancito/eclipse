@@ -7,7 +7,7 @@ extern crate alloc;
 use crate::gdt::{setup_userland_gdt, GdtManager};
 use crate::idt::{setup_userland_idt, IdtManager};
 use crate::interrupts::manager::{initialize_interrupt_system, InterruptManager};
-use crate::memory::paging::{setup_userland_paging, map_userland_memory, identity_map_userland_memory};
+use crate::memory::paging::{setup_userland_paging, map_userland_memory, identity_map_userland_writable};
 use core::arch::asm;
 use core::ptr;
 
@@ -117,11 +117,20 @@ impl ProcessTransfer {
             Ok(pml4_addr) => {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
                 
-                // Mapear el stack
+                // CRITICAL FIX: Mapear el stack temporal del kernel (0x500000) en las tablas de usuario
+                // Este stack se usa durante la transferencia (iretq) y DEBE estar accesible
+                // después del cambio de CR3, de lo contrario ocurre un triple fault.
+                const TEMP_KERNEL_STACK: u64 = 0x500000;
+                const TEMP_STACK_SIZE: u64 = 0x1000; // 4KB es suficiente para el frame de iretq
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Mapping temporary kernel stack for CR3 switch...\n");
+                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK, TEMP_STACK_SIZE)?;
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Temporary kernel stack mapped successfully\n");
+                
+                // Mapear el stack del userland
                 let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
                 map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
                 
-                crate::debug::serial_write_str("PROCESS_TRANSFER: Stack memory mapped successfully\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Userland stack memory mapped successfully\n");
                 
                 // Ejecutar el proceso
                 self.execute_userland_process(context, pml4_addr)?;
@@ -249,11 +258,20 @@ impl ProcessTransfer {
                 
                 crate::debug::serial_write_str("PROCESS_TRANSFER: All ELF segments mapped successfully\n");
                 
-                // Mapear el stack
+                // CRITICAL FIX: Mapear el stack temporal del kernel (0x500000) en las tablas de usuario
+                // Este stack se usa durante la transferencia (iretq) y DEBE estar accesible
+                // después del cambio de CR3, de lo contrario ocurre un triple fault.
+                const TEMP_KERNEL_STACK: u64 = 0x500000;
+                const TEMP_STACK_SIZE: u64 = 0x1000; // 4KB es suficiente para el frame de iretq
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Mapping temporary kernel stack for CR3 switch...\n");
+                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK, TEMP_STACK_SIZE)?;
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Temporary kernel stack mapped successfully\n");
+                
+                // Mapear el stack del userland
                 let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
                 map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
                 
-                crate::debug::serial_write_str("PROCESS_TRANSFER: Stack memory mapped successfully\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Userland stack memory mapped successfully\n");
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Ready to transfer control to userland\n");
                 
                 // Ejecutar el proceso
@@ -321,13 +339,15 @@ impl ProcessTransfer {
         unsafe {
             // CRITICAL FIX: Build the iretq stack frame AND restore registers BEFORE switching CR3
             // 
-            // The temporary kernel stack at 0x500000 is only mapped in the kernel page tables,
-            // not in the userland page tables. Similarly, the context structure is on the kernel
-            // stack which may not be accessible after CR3 switch.
+            // UPDATE: The temporary kernel stack at 0x500000 is now identity-mapped in both
+            // kernel and userland page tables to enable safe CR3 switching. However, the
+            // context structure is still on the kernel stack which is not accessible after
+            // CR3 switch.
             // 
-            // Solution: Do ALL memory accesses (stack frame + context) BEFORE CR3 switch.
-            // We restore registers from the context into actual CPU registers, then switch CR3,
-            // then execute iretq. This way no memory access is needed after the CR3 switch.
+            // Solution: Do ALL context memory accesses BEFORE CR3 switch. We restore registers
+            // from the context into actual CPU registers, build the iretq frame on the mapped
+            // temporary stack, then switch CR3, then execute iretq. The temporary stack at
+            // 0x500000 remains accessible after CR3 switch because it's identity-mapped.
             asm!(
                 // 1. Setup temporary kernel stack and build iretq frame BEFORE CR3 switch
                 "mov rsp, {tmp_stack}",  
