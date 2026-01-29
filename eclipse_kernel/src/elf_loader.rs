@@ -290,15 +290,46 @@ impl Default for ElfLoader {
 
 /// Función de utilidad para cargar eclipse-systemd
 pub fn load_eclipse_systemd() -> LoadResult {
-    // En un sistema real, aquí cargaríamos el archivo desde el sistema de archivos
-    // Por ahora, simulamos la carga con datos ficticios
+    // Intentar cargar desde el sistema de archivos virtual primero
+    let elf_data = match load_systemd_from_vfs() {
+        Ok(data) => {
+            crate::debug::serial_write_str("ELF_LOADER: Loaded eclipse-systemd from VFS\n");
+            data
+        }
+        Err(_) => {
+            crate::debug::serial_write_str("ELF_LOADER: VFS not available, using fake ELF data\n");
+            create_fake_elf_data()
+        }
+    };
 
     let mut loader = ElfLoader::new();
+    loader.load_elf(&elf_data)
+}
 
-    // Simular datos ELF ficticios
-    let fake_elf_data = create_fake_elf_data();
-
-    loader.load_elf(&fake_elf_data)
+/// Cargar systemd desde el VFS
+fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
+    use crate::vfs_global::get_vfs;
+    
+    let vfs = get_vfs();
+    let mut vfs_lock = vfs.lock();
+    
+    // Intentar cargar /sbin/eclipse-systemd o /sbin/init
+    let paths = ["/sbin/eclipse-systemd", "/sbin/init"];
+    
+    for path in &paths {
+        match vfs_lock.read_file(path) {
+            Ok(data) => {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ELF_LOADER: Loaded {} bytes from {}\n",
+                    data.len(), path
+                ));
+                return Ok(data);
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    Err("No se encontró systemd en VFS")
 }
 
 /// Crear datos ELF ficticios para simulación
