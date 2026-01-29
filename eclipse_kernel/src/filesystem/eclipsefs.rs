@@ -223,7 +223,7 @@ impl EclipseFSWrapper {
         let mut mtime = 0u64;
         let mut ctime = 0u64;
         let mut nlink = 1u32;
-        let mut data = heapless::Vec::<u8, 8192>::new();
+        let mut data = alloc::vec::Vec::new();
         let mut children = heapless::FnvIndexMap::<heapless::String<128>, u32, 256>::new();
 
         let mut offset = 0;
@@ -319,22 +319,10 @@ impl EclipseFSWrapper {
                     }
                 }
                 0x000A => { // CONTENT
-                    if value.len() > 8192 {
-                        crate::debug::serial_write_str(&alloc::format!(
-                            "ECLIPSEFS: ADVERTENCIA - Contenido truncado: {} bytes -> 8192 bytes\n", value.len()
-                        ));
-                        let _ = data.extend_from_slice(&value[..8192]);
-                    } else {
-                        if data.extend_from_slice(value).is_err() {
-                            crate::debug::serial_write_str(&alloc::format!(
-                                "ECLIPSEFS: ERROR - Fallo al copiar contenido de {} bytes\n", value.len()
-                            ));
-                        } else {
-                            crate::debug::serial_write_str(&alloc::format!(
-                                "ECLIPSEFS: Contenido del archivo: {} bytes\n", value.len()
-                            ));
-                        }
-                    }
+                    data.extend_from_slice(value);
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: Contenido del archivo: {} bytes\n", value.len()
+                    ));
                 }
                 0x000B => { // DIRECTORY_ENTRIES
                     children = self.deserialize_directory_entries(value)?;

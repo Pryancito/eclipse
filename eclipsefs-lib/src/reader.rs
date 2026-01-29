@@ -18,7 +18,15 @@ pub struct EclipseFSReader {
 impl EclipseFSReader {
     /// Crear un nuevo lector desde un archivo
     pub fn new(file_path: &str) -> EclipseFSResult<Self> {
-        let mut file = File::open(file_path)?;
+        let mut file = File::open(file_path).map_err(|e| {
+            // Proporcionar contexto adicional sobre el error
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("Error: Permiso denegado al abrir '{}'. Intenta ejecutar con 'sudo'", file_path);
+                EclipseFSError::PermissionDenied
+            } else {
+                EclipseFSError::IoError
+            }
+        })?;
         let header = Self::read_header(&mut file)?;
         let inode_table = Self::read_inode_table(&mut file, &header)?;
 
