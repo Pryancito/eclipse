@@ -312,7 +312,7 @@ fn sys_exit(code: i32) -> SyscallResult {
 
 /// sys_fork - Create child process
 fn sys_fork() -> SyscallResult {
-    serial_write_str("SYSCALL: fork() - creating child process\n");
+    serial_write_str("SYSCALL: fork() - creating child process with COW\n");
     
     // Initialize process manager if needed
     init_process_manager_if_needed();
@@ -320,38 +320,94 @@ fn sys_fork() -> SyscallResult {
     // Get current process ID
     let parent_pid = get_current_pid();
     
-    // Create child process using process manager
-    let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
-    if let Some(ref mut manager) = *manager_guard {
-        match manager.create_process("child", crate::process::process::ProcessPriority::Normal) {
-            Ok(child_pid) => {
-                serial_write_str(&alloc::format!(
-                    "SYSCALL: fork() - parent PID {}, created child PID {}\n",
-                    parent_pid, child_pid
-                ));
-                
-                // Set parent-child relationship
-                if let Some(ref mut child) = manager.processes[child_pid as usize] {
-                    child.parent_pid = Some(parent_pid);
+    // Get current page table (CR3)
+    let current_pml4_addr: u64;
+    unsafe {
+        asm!("mov {}, cr3", out(reg) current_pml4_addr, options(nostack));
+    }
+    let current_pml4 = unsafe { &*(current_pml4_addr as *const crate::memory::paging::PageTable) };
+    
+    serial_write_str(&alloc::format!(
+        "SYSCALL: fork() - parent PID {}, current PML4 at 0x{:x}\n",
+        parent_pid, current_pml4_addr
+    ));
+    
+    // Clone page table with COW
+    let phys_manager = crate::memory::paging::get_physical_manager();
+    let child_pml4_result = crate::memory::paging::clone_page_table_cow(current_pml4, phys_manager);
+    
+    match child_pml4_result {
+        Ok(child_pml4) => {
+            let child_pml4_addr = child_pml4 as *const _ as u64;
+            serial_write_str(&alloc::format!(
+                "SYSCALL: fork() - COW page table cloned at 0x{:x}\n",
+                child_pml4_addr
+            ));
+            
+            // Create child process using process manager
+            let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
+            if let Some(ref mut manager) = *manager_guard {
+                match manager.create_process("child", crate::process::process::ProcessPriority::Normal) {
+                    Ok(child_pid) => {
+                        serial_write_str(&alloc::format!(
+                            "SYSCALL: fork() - parent PID {}, created child PID {}\n",
+                            parent_pid, child_pid
+                        ));
+                        
+                        // Copy parent's memory info first (to avoid borrow checker issues)
+                        let parent_memory_info = if let Some(ref parent) = manager.processes[parent_pid as usize] {
+                            parent.memory_info.clone()
+                        } else {
+                            crate::process::process::MemoryInfo::default()
+                        };
+                        
+                        // Set parent-child relationship and child's page table
+                        if let Some(ref mut child) = manager.processes[child_pid as usize] {
+                            child.parent_pid = Some(parent_pid);
+                            
+                            // Set child's page table address
+                            child.memory_info.pml4_addr = child_pml4_addr;
+                            
+                            // Copy parent's memory info (except pml4_addr which we already set)
+                            child.memory_info.base_address = parent_memory_info.base_address;
+                            child.memory_info.size = parent_memory_info.size;
+                            child.memory_info.stack_pointer = parent_memory_info.stack_pointer;
+                            child.memory_info.stack_size = parent_memory_info.stack_size;
+                            child.memory_info.heap_start = parent_memory_info.heap_start;
+                            child.memory_info.heap_break = parent_memory_info.heap_break;
+                            child.memory_info.heap_limit = parent_memory_info.heap_limit;
+                        }
+                        
+                        serial_write_str(&alloc::format!(
+                            "SYSCALL: fork() - child PID {} configured with COW page table\n",
+                            child_pid
+                        ));
+                        
+                        // In real fork:
+                        // - We've copied page tables with COW ✓
+                        // - TODO: Duplicate file descriptors
+                        // - TODO: Return 0 to child (when child is scheduled)
+                        // - Return child PID to parent
+                        
+                        // For now, we're always the parent
+                        SyscallResult::Success(child_pid as u64)
+                    }
+                    Err(e) => {
+                        serial_write_str(&alloc::format!("SYSCALL: fork() failed to create process: {}\n", e));
+                        // TODO: Free the cloned page table
+                        SyscallResult::Error(crate::syscalls::SyscallError::OutOfMemory)
+                    }
                 }
-                
-                // In real fork:
-                // 1. Copy parent's memory space (COW)
-                // 2. Duplicate page tables
-                // 3. Copy file descriptors
-                // 4. Return 0 to child, child PID to parent
-                
-                // For now, we're always the parent
-                SyscallResult::Success(child_pid as u64)
-            }
-            Err(e) => {
-                serial_write_str(&alloc::format!("SYSCALL: fork() failed: {}\n", e));
-                SyscallResult::Error(crate::syscalls::SyscallError::OutOfMemory)
+            } else {
+                serial_write_str("SYSCALL: fork() - process manager not initialized\n");
+                // TODO: Free the cloned page table
+                SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
             }
         }
-    } else {
-        serial_write_str("SYSCALL: fork() - process manager not initialized\n");
-        SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+        Err(e) => {
+            serial_write_str(&alloc::format!("SYSCALL: fork() - COW clone failed: {}\n", e));
+            SyscallResult::Error(crate::syscalls::SyscallError::OutOfMemory)
+        }
     }
 }
 
