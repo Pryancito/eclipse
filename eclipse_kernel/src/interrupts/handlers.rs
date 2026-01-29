@@ -285,6 +285,21 @@ fn process_page_fault(fault_address: u64, error_code: u64) {
     if user {
         serial_write_str("PAGE_FAULT: Fault occurred in userland\n");
         
+        // Check if this might be a COW fault (write to present page)
+        if write && present {
+            serial_write_str("PAGE_FAULT: Potential COW fault detected\n");
+            
+            // Try to handle as COW fault
+            if let Ok(pml4_addr) = get_current_pml4() {
+                let pml4 = unsafe { &mut *(pml4_addr as *mut crate::memory::paging::PageTable) };
+                
+                // For now, use a simplified approach since we don't have global physical manager
+                // In a real implementation, we'd get the manager from a global static
+                serial_write_str("PAGE_FAULT: COW handling not yet fully integrated\n");
+                // TODO: Integrate with global physical manager when available
+            }
+        }
+        
         // Check if address is in valid userland range
         const USERLAND_MAX: u64 = 0x7FFF_FFFF_FFFF;
         if fault_address > USERLAND_MAX {
@@ -293,11 +308,6 @@ fn process_page_fault(fault_address: u64, error_code: u64) {
                 fault_address, USERLAND_MAX
             ));
         }
-        
-        // In a full implementation, we would:
-        // 1. Check if the page should be loaded from disk
-        // 2. Allocate physical memory and map it
-        // 3. Or terminate the process if invalid access
         
         serial_write_str("PAGE_FAULT: Userland fault - would terminate process\n");
         // For now, halt to prevent cascading faults
@@ -324,6 +334,15 @@ fn process_page_fault(fault_address: u64, error_code: u64) {
                 asm!("hlt", options(nostack, nomem));
             }
         }
+    }
+}
+
+/// Get current PML4 address from CR3
+fn get_current_pml4() -> Result<u64, &'static str> {
+    unsafe {
+        let cr3: u64;
+        asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        Ok(cr3 & !0xFFF) // Mask off lower 12 bits
     }
 }
 

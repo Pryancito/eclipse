@@ -6,10 +6,12 @@
 //! - Protección de memoria (RWX)
 //! - TLB (Translation Lookaside Buffer)
 //! - Mapeo de memoria
+//! - COW (Copy-On-Write) para fork()
 
 use core::arch::asm;
 use crate::debug::serial_write_str;
 use alloc::format;
+use spin::Mutex;
 
 /// Tamaño de página estándar (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -27,6 +29,7 @@ pub const PAGE_ACCESSED: u64 = 1 << 5;
 pub const PAGE_DIRTY: u64 = 1 << 6;
 pub const PAGE_SIZE_FLAG: u64 = 1 << 7; // Para páginas de 2MB/1GB
 pub const PAGE_GLOBAL: u64 = 1 << 8;
+pub const PAGE_COW: u64 = 1 << 9; // Copy-On-Write flag (available OS bit)
 pub const PAGE_NO_EXECUTE: u64 = 1 << 63;
 
 /// Niveles de la jerarquía de páginas
@@ -117,6 +120,26 @@ impl PageTableEntry {
     /// Marcar como modificada
     pub fn set_dirty(&mut self) {
         self.value |= PAGE_DIRTY;
+    }
+    
+    /// Verificar si la página es COW (Copy-On-Write)
+    pub fn is_cow(&self) -> bool {
+        (self.value & PAGE_COW) != 0
+    }
+    
+    /// Marcar como COW
+    pub fn set_cow(&mut self) {
+        self.value |= PAGE_COW;
+    }
+    
+    /// Quitar marca COW
+    pub fn clear_cow(&mut self) {
+        self.value &= !PAGE_COW;
+    }
+    
+    /// Marcar como no escribible
+    pub fn clear_writable(&mut self) {
+        self.value &= !PAGE_WRITABLE;
     }
 }
 
@@ -1020,5 +1043,273 @@ pub fn map_preallocated_pages(
     let end_vaddr = start_vaddr + (physical_pages.len() as u64 * PAGE_SIZE as u64);
     flush_tlb_range(start_vaddr, end_vaddr);
     
+    Ok(())
+}
+// ============================================================================
+// COW (Copy-On-Write) Implementation
+// ============================================================================
+
+use alloc::collections::BTreeMap;
+
+lazy_static::lazy_static! {
+    /// Global reference counting map for COW pages
+    /// Maps physical page address to reference count
+    static ref PAGE_REFCOUNT: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+}
+
+/// Increment reference count for a physical page
+pub fn increment_page_refcount(phys_addr: u64) {
+    let page_addr = phys_addr & !0xFFF; // Align to page boundary
+    let mut refcount = PAGE_REFCOUNT.lock();
+    let count = refcount.entry(page_addr).or_insert(0);
+    *count += 1;
+}
+
+/// Decrement reference count for a physical page
+/// Returns true if page should be freed (refcount reached 0)
+pub fn decrement_page_refcount(phys_addr: u64) -> bool {
+    let page_addr = phys_addr & !0xFFF; // Align to page boundary
+    let mut refcount = PAGE_REFCOUNT.lock();
+    
+    if let Some(count) = refcount.get_mut(&page_addr) {
+        if *count > 0 {
+            *count -= 1;
+            if *count == 0 {
+                refcount.remove(&page_addr);
+                return true; // Should free
+            }
+        }
+    }
+    false // Still has references or not tracked
+}
+
+/// Get reference count for a physical page
+pub fn get_page_refcount(phys_addr: u64) -> u32 {
+    let page_addr = phys_addr & !0xFFF; // Align to page boundary
+    let refcount = PAGE_REFCOUNT.lock();
+    *refcount.get(&page_addr).unwrap_or(&0)
+}
+
+/// Clone page table for fork() - creates COW mapping
+pub fn clone_page_table_cow(
+    src_pml4: &PageTable,
+    phys_manager: &mut PhysicalPageManager
+) -> Result<&'static mut PageTable, &'static str> {
+    // Allocate new PML4 table
+    let new_pml4_addr = phys_manager.allocate_page()
+        .ok_or("Failed to allocate PML4 for clone")?;
+    let new_pml4 = unsafe { &mut *(new_pml4_addr as *mut PageTable) };
+    new_pml4.clear();
+    
+    serial_write_str(&alloc::format!("COW_CLONE: New PML4 at 0x{:x}\n", new_pml4_addr));
+    
+    // Iterate through PML4 entries (level 4)
+    for p4_idx in 0..PAGE_TABLE_ENTRIES {
+        let src_p4_entry = src_pml4.get_entry(p4_idx);
+        if !src_p4_entry.is_present() {
+            continue;
+        }
+        
+        // Allocate new PDPT table
+        let new_pdpt_addr = phys_manager.allocate_page()
+            .ok_or("Failed to allocate PDPT for clone")?;
+        let new_pdpt = unsafe { &mut *(new_pdpt_addr as *mut PageTable) };
+        new_pdpt.clear();
+        
+        let src_pdpt = unsafe { &*(src_p4_entry.get_physical_addr() as *const PageTable) };
+        
+        // Iterate through PDPT entries (level 3)
+        for p3_idx in 0..PAGE_TABLE_ENTRIES {
+            let src_p3_entry = src_pdpt.get_entry(p3_idx);
+            if !src_p3_entry.is_present() {
+                continue;
+            }
+            
+            // Allocate new PD table
+            let new_pd_addr = phys_manager.allocate_page()
+                .ok_or("Failed to allocate PD for clone")?;
+            let new_pd = unsafe { &mut *(new_pd_addr as *mut PageTable) };
+            new_pd.clear();
+            
+            let src_pd = unsafe { &*(src_p3_entry.get_physical_addr() as *const PageTable) };
+            
+            // Iterate through PD entries (level 2)
+            for p2_idx in 0..PAGE_TABLE_ENTRIES {
+                let src_p2_entry = src_pd.get_entry(p2_idx);
+                if !src_p2_entry.is_present() {
+                    continue;
+                }
+                
+                // Allocate new PT table
+                let new_pt_addr = phys_manager.allocate_page()
+                    .ok_or("Failed to allocate PT for clone")?;
+                let new_pt = unsafe { &mut *(new_pt_addr as *mut PageTable) };
+                new_pt.clear();
+                
+                let src_pt = unsafe { &*(src_p2_entry.get_physical_addr() as *const PageTable) };
+                
+                // Iterate through PT entries (level 1 - actual pages)
+                for p1_idx in 0..PAGE_TABLE_ENTRIES {
+                    let src_p1_entry = src_pt.get_entry(p1_idx);
+                    if !src_p1_entry.is_present() {
+                        continue;
+                    }
+                    
+                    // Clone the page entry with COW
+                    let mut new_entry = *src_p1_entry;
+                    let phys_addr = src_p1_entry.get_physical_addr();
+                    
+                    // If page is writable, mark as COW and make read-only
+                    if src_p1_entry.is_writable() && src_p1_entry.is_user_accessible() {
+                        new_entry.clear_writable(); // Make read-only
+                        new_entry.set_cow(); // Mark as COW
+                        
+                        // Also update source entry to be read-only COW
+                        let src_pt_mut = unsafe { &mut *(src_p2_entry.get_physical_addr() as *mut PageTable) };
+                        let mut src_entry_updated = *src_p1_entry;
+                        src_entry_updated.clear_writable();
+                        src_entry_updated.set_cow();
+                        src_pt_mut.set_entry(p1_idx, src_entry_updated);
+                        
+                        // Increment reference count for shared page
+                        increment_page_refcount(phys_addr);
+                        increment_page_refcount(phys_addr); // Once for parent, once for child
+                    } else {
+                        // Read-only pages can be shared without COW
+                        increment_page_refcount(phys_addr);
+                    }
+                    
+                    new_pt.set_entry(p1_idx, new_entry);
+                }
+                
+                // Set up PD entry to point to new PT
+                let new_p2_entry = PageTableEntry::new_with_addr(
+                    new_pt_addr,
+                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                );
+                new_pd.set_entry(p2_idx, new_p2_entry);
+            }
+            
+            // Set up PDPT entry to point to new PD
+            let new_p3_entry = PageTableEntry::new_with_addr(
+                new_pd_addr,
+                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+            );
+            new_pdpt.set_entry(p3_idx, new_p3_entry);
+        }
+        
+        // Set up PML4 entry to point to new PDPT
+        let new_p4_entry = PageTableEntry::new_with_addr(
+            new_pdpt_addr,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+        );
+        new_pml4.set_entry(p4_idx, new_p4_entry);
+    }
+    
+    serial_write_str("COW_CLONE: Page table cloning complete\n");
+    Ok(new_pml4)
+}
+
+/// Handle COW page fault - copy page on write
+pub fn handle_cow_fault(
+    pml4: &mut PageTable,
+    fault_addr: u64,
+    phys_manager: &mut PhysicalPageManager
+) -> Result<(), &'static str> {
+    serial_write_str(&alloc::format!("COW_FAULT: Handling fault at 0x{:x}\n", fault_addr));
+    
+    let p4_idx = ((fault_addr >> 39) & 0x1FF) as usize;
+    let p3_idx = ((fault_addr >> 30) & 0x1FF) as usize;
+    let p2_idx = ((fault_addr >> 21) & 0x1FF) as usize;
+    let p1_idx = ((fault_addr >> 12) & 0x1FF) as usize;
+    
+    // Walk page tables to find the entry
+    let p4_entry = pml4.get_entry(p4_idx);
+    if !p4_entry.is_present() {
+        return Err("PML4 entry not present");
+    }
+    
+    let p3_table = unsafe { &mut *(p4_entry.get_physical_addr() as *mut PageTable) };
+    let p3_entry = p3_table.get_entry(p3_idx);
+    if !p3_entry.is_present() {
+        return Err("PDPT entry not present");
+    }
+    
+    let p2_table = unsafe { &mut *(p3_entry.get_physical_addr() as *mut PageTable) };
+    let p2_entry = p2_table.get_entry(p2_idx);
+    if !p2_entry.is_present() {
+        return Err("PD entry not present");
+    }
+    
+    let p1_table = unsafe { &mut *(p2_entry.get_physical_addr() as *mut PageTable) };
+    let p1_entry = p1_table.get_entry(p1_idx);
+    if !p1_entry.is_present() {
+        return Err("PT entry not present");
+    }
+    
+    // Check if it's actually a COW page
+    if !p1_entry.is_cow() {
+        return Err("Not a COW page");
+    }
+    
+    let old_phys_addr = p1_entry.get_physical_addr();
+    let refcount = get_page_refcount(old_phys_addr);
+    
+    serial_write_str(&alloc::format!(
+        "COW_FAULT: Old page 0x{:x}, refcount={}\n",
+        old_phys_addr, refcount
+    ));
+    
+    if refcount <= 1 {
+        // We're the only one using this page, just make it writable
+        let mut new_entry = *p1_entry;
+        new_entry.set_writable();
+        new_entry.clear_cow();
+        p1_table.set_entry(p1_idx, new_entry);
+        
+        // Decrement refcount
+        decrement_page_refcount(old_phys_addr);
+        
+        serial_write_str("COW_FAULT: Only reference, making writable\n");
+    } else {
+        // Allocate new physical page
+        let new_phys_addr = phys_manager.allocate_page()
+            .ok_or("Failed to allocate page for COW")?;
+        
+        serial_write_str(&alloc::format!(
+            "COW_FAULT: Copying to new page 0x{:x}\n",
+            new_phys_addr
+        ));
+        
+        // Copy page contents
+        unsafe {
+            let src = old_phys_addr as *const u8;
+            let dst = new_phys_addr as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+        }
+        
+        // Update page table entry
+        let mut new_entry = *p1_entry;
+        new_entry.set_physical_addr(new_phys_addr);
+        new_entry.set_writable();
+        new_entry.clear_cow();
+        p1_table.set_entry(p1_idx, new_entry);
+        
+        // Decrement old page refcount
+        if decrement_page_refcount(old_phys_addr) {
+            // No more references, could free the page
+            serial_write_str(&alloc::format!(
+                "COW_FAULT: Old page 0x{:x} has no more refs\n",
+                old_phys_addr
+            ));
+        }
+    }
+    
+    // Invalidate TLB for this address
+    unsafe {
+        asm!("invlpg [{}]", in(reg) fault_addr, options(nostack));
+    }
+    
+    serial_write_str("COW_FAULT: Fault handled successfully\n");
     Ok(())
 }
