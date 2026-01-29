@@ -38,6 +38,7 @@ pub mod stdin;
 pub mod manager;
 pub mod modular;
 pub mod mouse;
+pub mod ps2_integration;
 pub mod network;
 pub mod nvidia_cuda;
 pub mod nvidia_example;

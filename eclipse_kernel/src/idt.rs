@@ -266,6 +266,13 @@ impl Idt {
         self.entries[36] =
             InterruptDescriptor::new_interrupt_gate(serial_handler as u64, selector, IDT_DPL_RING0);
 
+        // Mouse (IRQ 12 = IRQ 12 + 32 = 44)
+        self.entries[44] = InterruptDescriptor::new_interrupt_gate(
+            mouse_handler as u64,
+            selector,
+            IDT_DPL_RING0,
+        );
+
         // System call (INT 0x80)
         self.entries[0x80] = InterruptDescriptor::new_trap_gate(
             syscall_handler as u64,
@@ -337,6 +344,7 @@ pub struct InterruptStats {
     pub exceptions: u64,
     pub timer_interrupts: u64,
     pub keyboard_interrupts: u64,
+    pub mouse_interrupts: u64,
     pub serial_interrupts: u64,
     pub syscalls: u64,
     pub page_faults: u64,
@@ -350,6 +358,7 @@ impl Default for InterruptStats {
             exceptions: 0,
             timer_interrupts: 0,
             keyboard_interrupts: 0,
+            mouse_interrupts: 0,
             serial_interrupts: 0,
             syscalls: 0,
             page_faults: 0,
@@ -364,6 +373,7 @@ static INTERRUPT_STATS: InterruptStats = InterruptStats {
     exceptions: 0,
     timer_interrupts: 0,
     keyboard_interrupts: 0,
+    mouse_interrupts: 0,
     serial_interrupts: 0,
     syscalls: 0,
     page_faults: 0,
@@ -374,6 +384,7 @@ static TOTAL_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static EXCEPTIONS: AtomicU64 = AtomicU64::new(0);
 static TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static KEYBOARD_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static SERIAL_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -386,6 +397,7 @@ pub fn get_interrupt_stats() -> InterruptStats {
         exceptions: EXCEPTIONS.load(Ordering::Relaxed),
         timer_interrupts: TIMER_INTERRUPTS.load(Ordering::Relaxed),
         keyboard_interrupts: KEYBOARD_INTERRUPTS.load(Ordering::Relaxed),
+        mouse_interrupts: MOUSE_INTERRUPTS.load(Ordering::Relaxed),
         serial_interrupts: SERIAL_INTERRUPTS.load(Ordering::Relaxed),
         syscalls: SYSCALLS.load(Ordering::Relaxed),
         page_faults: PAGE_FAULTS.load(Ordering::Relaxed),
@@ -696,16 +708,26 @@ extern "C" fn timer_handler() {
 extern "C" fn keyboard_handler() {
     KEYBOARD_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     
-    // Keyboard interrupt - leer scancode
+    // Llamar al manejador PS/2 del teclado
+    crate::drivers::ps2_integration::handle_ps2_keyboard_interrupt();
+    
+    // Acknowledge interrupt (PIC primario)
     unsafe {
-        let mut scancode: u8;
-        asm!("in {}, 0x60", out(reg_byte) scancode, options(nostack, nomem));
-        
-        // Acknowledge interrupt
         asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
-        
-        // En una implementación completa, esto procesaría el scancode
-        // y lo enviaría al driver de teclado
+    }
+}
+
+/// Handler de ratón
+extern "C" fn mouse_handler() {
+    MOUSE_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    
+    // Llamar al manejador PS/2 del ratón
+    crate::drivers::ps2_integration::handle_ps2_mouse_interrupt();
+    
+    // Acknowledge interrupt (PIC secundario y primario para IRQ 12)
+    unsafe {
+        asm!("mov al, 0x20; out 0xA0, al", options(nostack, nomem)); // PIC secundario
+        asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem)); // PIC primario
     }
 }
 
