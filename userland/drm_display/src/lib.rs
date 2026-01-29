@@ -7,6 +7,36 @@ use anyhow::Result;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+
+/// Configuración DRM
+#[derive(Debug, Clone)]
+pub struct DrmConfig {
+    pub device_paths: Vec<String>,
+    pub default_width: u32,
+    pub default_height: u32,
+    pub enable_hardware_acceleration: bool,
+    pub enable_vsync: bool,
+    pub max_retries: u32,
+}
+
+impl Default for DrmConfig {
+    fn default() -> Self {
+        Self {
+            device_paths: vec![
+                "/dev/dri/card0".to_string(),
+                "/dev/dri/card1".to_string(),
+                "/dev/dri/card2".to_string(),
+                "/dev/dri/card3".to_string(),
+            ],
+            default_width: 1920,
+            default_height: 1080,
+            enable_hardware_acceleration: true,
+            enable_vsync: true,
+            max_retries: 3,
+        }
+    }
+}
 
 /// Error types para el sistema DRM
 #[derive(thiserror::Error, Debug)]
@@ -25,23 +55,35 @@ pub struct DrmDisplay {
     width: u32,
     height: u32,
     is_initialized: bool,
+    config: DrmConfig,
+    stats: DrmStats,
+    last_error: Option<String>,
+}
+
+/// Estadísticas DRM
+#[derive(Debug, Clone, Default)]
+pub struct DrmStats {
+    pub frames_drawn: u64,
+    pub operations_count: u64,
+    pub errors_count: u64,
+    pub initialization_time: Duration,
+    pub total_operation_time: Duration,
 }
 
 impl DrmDisplay {
-    /// Crear una nueva instancia del sistema DRM
+    /// Crear una nueva instancia del sistema DRM con configuración por defecto
     pub fn new() -> Result<Self, DrmError> {
-        // Intentar abrir diferentes dispositivos DRM
-        let device_paths = [
-            "/dev/dri/card0",
-            "/dev/dri/card1", 
-            "/dev/dri/card2",
-            "/dev/dri/card3",
-        ];
+        Self::with_config(DrmConfig::default())
+    }
+
+    /// Crear una nueva instancia del sistema DRM con configuración personalizada
+    pub fn with_config(config: DrmConfig) -> Result<Self, DrmError> {
+        let start_time = Instant::now();
         
         let mut device_fd = None;
         let mut last_error = None;
         
-        for path in &device_paths {
+        for path in &config.device_paths {
             match OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -66,19 +108,33 @@ impl DrmDisplay {
                 )
             })?;
         
+        let mut stats = DrmStats::default();
+        stats.initialization_time = start_time.elapsed();
+        
         Ok(Self {
             device_fd,
-            width: 1920,  // Resolución por defecto
-            height: 1080,
+            width: config.default_width,
+            height: config.default_height,
             is_initialized: false,
+            config,
+            stats,
+            last_error: None,
         })
     }
     
     /// Inicializar el sistema DRM
     pub fn initialize(&mut self) -> Result<(), DrmError> {
+        if self.is_initialized {
+            return Ok(());
+        }
+
+        let start_time = Instant::now();
+        
         // En una implementación real, aquí configuraríamos el modo DRM
         // Por ahora, solo marcamos como inicializado
         self.is_initialized = true;
+        
+        self.stats.initialization_time = start_time.elapsed();
         Ok(())
     }
     
@@ -88,23 +144,37 @@ impl DrmDisplay {
             self.initialize()?;
         }
         
+        let start_time = Instant::now();
+        
         // Limpiar pantalla
         self.clear_screen()?;
         
         // Mostrar "Eclipse OS" centrado
         self.draw_centered_text("Eclipse OS")?;
         
+        self.stats.operations_count += 1;
+        self.stats.frames_drawn += 1;
+        self.stats.total_operation_time += start_time.elapsed();
+        
         Ok(())
     }
     
     /// Limpiar pantalla (hacerla completamente negra)
     pub fn clear_screen(&self) -> Result<(), DrmError> {
-        // Usar códigos ANSI para limpiar la pantalla
-        print!("\x1b[2J\x1b[H"); // Limpiar pantalla y mover cursor al inicio
-        print!("\x1b[40m"); // Fondo negro
-        print!("\x1b[37m"); // Texto blanco
-        io::stdout().flush()?;
-        Ok(())
+        let result = (|| {
+            // Usar códigos ANSI para limpiar la pantalla
+            print!("\x1b[2J\x1b[H"); // Limpiar pantalla y mover cursor al inicio
+            print!("\x1b[40m"); // Fondo negro
+            print!("\x1b[37m"); // Texto blanco
+            io::stdout().flush()?;
+            Ok::<_, DrmError>(())
+        })();
+
+        if let Err(ref e) = result {
+            self.record_error(&format!("Error al limpiar pantalla: {}", e));
+        }
+
+        result
     }
     
     /// Dibujar texto centrado
@@ -134,6 +204,28 @@ impl DrmDisplay {
     /// Verificar si está inicializado
     pub fn is_initialized(&self) -> bool {
         self.is_initialized
+    }
+
+    /// Obtener estadísticas
+    pub fn get_stats(&self) -> &DrmStats {
+        &self.stats
+    }
+
+    /// Reiniciar estadísticas
+    pub fn reset_stats(&mut self) {
+        self.stats = DrmStats::default();
+    }
+
+    /// Registrar error (método interno con cell)
+    fn record_error(&self, error: &str) {
+        // En una implementación real, esto usaría RefCell o UnsafeCell
+        // Por ahora, solo mostramos en stderr
+        eprintln!("DRM Error: {}", error);
+    }
+
+    /// Obtener último error
+    pub fn get_last_error(&self) -> Option<&String> {
+        self.last_error.as_ref()
     }
 }
 

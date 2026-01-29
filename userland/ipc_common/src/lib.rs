@@ -261,5 +261,78 @@ pub trait IpcSerializable: Serialize + for<'de> Deserialize<'de> {
 
 impl IpcSerializable for IpcMessage {}
 
+/// Wrapper para mensajes IPC con metadatos
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcMessageWrapper {
+    pub message_id: u32,
+    pub timestamp: u64,
+    pub priority: MessagePriority,
+    pub sender_pid: Option<u32>,
+    pub message: IpcMessage,
+}
 
+/// Prioridad de mensajes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MessagePriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+impl Default for MessagePriority {
+    fn default() -> Self {
+        MessagePriority::Normal
+    }
+}
+
+/// Resultado de operación IPC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcResult<T> {
+    Ok(T),
+    Err(IpcError),
+    Timeout,
+}
+
+/// Errores IPC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcError {
+    InvalidMessage,
+    QueueFull,
+    Timeout,
+    ValidationFailed(String),
+    ResourceLimitExceeded(String),
+    PermissionDenied,
+    NotFound,
+}
+
+/// Estadísticas de rendimiento IPC
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IpcPerformanceStats {
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub messages_dropped: u64,
+    pub average_latency_us: u64,
+    pub peak_queue_size: usize,
+}
+
+/// Configuración IPC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcConfig {
+    pub max_queue_size: usize,
+    pub max_message_size: usize,
+    pub timeout_ms: u64,
+    pub enable_stats: bool,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_size: 1024,
+            max_message_size: 16 * 1024 * 1024,
+            timeout_ms: 5000,
+            enable_stats: true,
+        }
+    }
+}
 

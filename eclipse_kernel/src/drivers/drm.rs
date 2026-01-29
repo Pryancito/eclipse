@@ -252,7 +252,19 @@ pub struct DrmDriver {
     pub next_texture_id: u32,
     pub next_layer_id: u32,
     pub performance_stats: DrmPerformanceStats,
+    // Nuevos campos para mejoras
+    pub max_textures: u32,
+    pub max_gpu_memory: u64,
+    pub current_gpu_memory: u64,
+    pub error_count: u32,
+    pub last_error: Option<String>,
 }
+
+/// Límites de recursos DRM
+pub const MAX_TEXTURES: u32 = 256;
+pub const MAX_LAYERS: u32 = 64;
+pub const MAX_GPU_MEMORY: u64 = 512 * 1024 * 1024; // 512 MB
+pub const MAX_TEXTURE_SIZE: u32 = 8192; // 8K max dimension
 
 impl DrmDriver {
     /// Crear una nueva instancia del driver DRM
@@ -289,6 +301,12 @@ impl DrmDriver {
                 gpu_memory_used: 0,
                 cpu_usage_percent: 0.0,
             },
+            // Inicializar límites de recursos
+            max_textures: MAX_TEXTURES,
+            max_gpu_memory: MAX_GPU_MEMORY,
+            current_gpu_memory: 0,
+            error_count: 0,
+            last_error: None,
         }
     }
 
@@ -378,9 +396,8 @@ impl DrmDriver {
 
     /// Ejecutar operación DRM
     pub fn execute_operation(&mut self, operation: DrmOperation) -> Result<(), &'static str> {
-        if !self.is_ready() {
-            return Err("Driver DRM no está listo");
-        }
+        // Validar estado del driver
+        self.validate_ready()?;
 
         match operation {
             DrmOperation::SetMode {
@@ -696,6 +713,32 @@ impl DrmDriver {
         width: u32,
         height: u32,
     ) -> Result<(), &'static str> {
+        // Validar límites
+        if self.textures.len() >= self.max_textures as usize {
+            self.record_error("Límite de texturas alcanzado");
+            return Err("Maximum texture count reached");
+        }
+
+        if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+            self.record_error("Tamaño de textura excede el máximo");
+            return Err("Texture size exceeds maximum");
+        }
+
+        // Calcular tamaño de textura una sola vez
+        let texture_size = (width * height * 4) as u64;
+        
+        if self.current_gpu_memory + texture_size > self.max_gpu_memory {
+            self.record_error("Memoria GPU insuficiente");
+            return Err("Insufficient GPU memory");
+        }
+
+        // Verificar que los datos sean del tamaño correcto
+        let expected_size = texture_size as usize;
+        if data.len() != expected_size {
+            self.record_error("Tamaño de datos de textura inválido");
+            return Err("Invalid texture data size");
+        }
+
         let texture = GpuTexture {
             id,
             width,
@@ -709,9 +752,55 @@ impl DrmDriver {
         self.next_texture_id += 1;
 
         // Actualizar memoria GPU usada
-        self.performance_stats.gpu_memory_used += (width * height * 4) as u64;
+        self.current_gpu_memory += texture_size;
+        self.performance_stats.gpu_memory_used = self.current_gpu_memory;
         self.performance_stats.texture_operations += 1;
 
+        Ok(())
+    }
+
+    /// Descargar textura de GPU (liberar memoria)
+    pub fn unload_texture(&mut self, texture_id: u32) -> Result<(), &'static str> {
+        if let Some(texture) = self.textures.remove(&texture_id) {
+            let texture_size = (texture.width * texture.height * 4) as u64;
+            self.current_gpu_memory = self.current_gpu_memory.saturating_sub(texture_size);
+            self.performance_stats.gpu_memory_used = self.current_gpu_memory;
+            Ok(())
+        } else {
+            Err("Texture not found")
+        }
+    }
+
+    /// Registrar error
+    fn record_error(&mut self, error: &str) {
+        self.error_count += 1;
+        self.last_error = Some(error.to_string());
+    }
+
+    /// Obtener último error
+    pub fn get_last_error(&self) -> Option<&String> {
+        self.last_error.as_ref()
+    }
+
+    /// Obtener conteo de errores
+    pub fn get_error_count(&self) -> u32 {
+        self.error_count
+    }
+
+    /// Limpiar errores
+    pub fn clear_errors(&mut self) {
+        self.error_count = 0;
+        self.last_error = None;
+    }
+
+    /// Validar estado antes de operación
+    fn validate_ready(&self) -> Result<(), &'static str> {
+        if !self.is_ready() {
+            return Err("Driver DRM no está listo");
+        }
+        if self.state == DrmDriverState::Error {
+            return Err("Driver DRM en estado de error");
+        }
         Ok(())
     }
 
@@ -918,7 +1007,12 @@ impl DrmDriver {
     }
 
     /// Crear nueva capa de compositing
-    pub fn create_layer(&mut self, rect: Rect) -> u32 {
+    pub fn create_layer(&mut self, rect: Rect) -> Result<u32, &'static str> {
+        if self.layers.len() >= MAX_LAYERS as usize {
+            self.record_error("Límite de capas alcanzado");
+            return Err("Maximum layer count reached");
+        }
+
         let layer_id = self.next_layer_id;
         let layer = CompositingLayer {
             id: layer_id,
@@ -933,7 +1027,7 @@ impl DrmDriver {
 
         self.layers.insert(layer_id, layer);
         self.next_layer_id += 1;
-        layer_id
+        Ok(layer_id)
     }
 
     /// Eliminar capa de compositing
@@ -943,6 +1037,21 @@ impl DrmDriver {
         } else {
             Err("Capa no encontrada")
         }
+    }
+
+    /// Obtener uso de memoria GPU
+    pub fn get_gpu_memory_usage(&self) -> (u64, u64) {
+        (self.current_gpu_memory, self.max_gpu_memory)
+    }
+
+    /// Obtener conteo de recursos
+    pub fn get_resource_counts(&self) -> (usize, usize, u32, u32) {
+        (
+            self.textures.len(),
+            self.layers.len(),
+            self.max_textures,
+            MAX_LAYERS,
+        )
     }
 }
 
