@@ -84,6 +84,11 @@ pub struct ProcessTransfer {
     current_pid: u32,
 }
 
+/// Constantes para direcciones de memoria
+const USERLAND_CODE_MAP_SIZE: u64 = 0x200000; // 2MB para código userland
+const USERLAND_STACK_RESERVE: u64 = 0x100000; // 1MB de reserva para stack
+const CANONICAL_ADDR_LIMIT: u64 = 0x800000000000; // Límite de espacio de direcciones canónico inferior
+
 impl ProcessTransfer {
     /// Crear nuevo gestor de transferencia
     pub fn new() -> Self {
@@ -97,6 +102,15 @@ impl ProcessTransfer {
             "PROCESS_TRANSFER: context rip=0x{:x} rsp=0x{:x}\n",
             context.rip, context.rsp
         ));
+        
+        // Verificar que las direcciones estén en el espacio canónico inferior
+        if context.rip >= CANONICAL_ADDR_LIMIT {
+            return Err("Entry point fuera del espacio de direcciones canónico");
+        }
+        
+        if context.rsp >= CANONICAL_ADDR_LIMIT {
+            return Err("Stack pointer fuera del espacio de direcciones canónico");
+        }
         
         // Verificar si hay código ejecutable real en el punto de entrada
         // Si el código en entry_point es ceros o inválido, no intentar la transferencia
@@ -120,15 +134,15 @@ impl ProcessTransfer {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
                 
                 // Map userland code (Identity map around entry point)
-                if context.rip < 0x800000000000 {
-                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
+                // Solo mapear si está en el rango canónico inferior
+                if context.rip < CANONICAL_ADDR_LIMIT {
+                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, USERLAND_CODE_MAP_SIZE)?;
                 }
                 
                 // Map stack memory
-                // Stack is at 0x1000000 (16MB) with size 0x800000 (8MB)
-                // So stack range is 0x800000 - 0x1000000
-                let stack_base = context.rsp.saturating_sub(0x100000); // 1MB below stack pointer
-                map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?;
+                // Stack pointer debe tener al menos 1MB de espacio reservado
+                let stack_base = context.rsp.saturating_sub(USERLAND_STACK_RESERVE);
+                map_userland_memory(pml4_addr, stack_base, USERLAND_STACK_RESERVE + 4096)?;
                 
                 // Execute process
                 self.execute_userland_process(context, pml4_addr)?;

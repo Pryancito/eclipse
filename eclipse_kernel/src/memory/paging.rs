@@ -717,14 +717,22 @@ pub fn setup_userland_paging() -> Result<u64, &'static str> {
     let pml4_phys_addr = allocate_physical_page()
         .ok_or("No hay páginas físicas disponibles para PML4")?;
     
-    // Inicializar la PML4 limpia
+    // Inicializar la página física a cero ANTES de crear la referencia
+    unsafe {
+        core::ptr::write_bytes(pml4_phys_addr as *mut u8, 0, PAGE_SIZE);
+    }
+    
+    // Ahora es seguro crear la referencia
     let pml4_table = unsafe { &mut *(pml4_phys_addr as *mut PageTable) };
-    pml4_table.clear();
     
     // Copiar las entradas del kernel de la PML4 actual
     // Esto asegura que el kernel siga siendo accesible después de cambiar CR3
     // Las entradas superiores (256-511) generalmente contienen el espacio del kernel
+    // Nota: Se deshabilitan las interrupciones para evitar inconsistencias durante la copia
     unsafe {
+        // Deshabilitar interrupciones durante la sección crítica
+        asm!("cli", options(nostack));
+        
         let current_pml4_addr: u64;
         asm!("mov {}, cr3", out(reg) current_pml4_addr, options(nostack));
         
@@ -734,6 +742,9 @@ pub fn setup_userland_paging() -> Result<u64, &'static str> {
         for i in 256..512 {
             pml4_table.entries[i] = current_pml4.entries[i];
         }
+        
+        // Rehabilitar interrupciones
+        asm!("sti", options(nostack));
     }
     
     serial_write_str(&alloc::format!(
@@ -745,7 +756,36 @@ pub fn setup_userland_paging() -> Result<u64, &'static str> {
     Ok(pml4_phys_addr)
 }
 
-/// Helper function to map a single page in a page table hierarchy
+/// Invalidar rango de TLB
+///
+/// Invalida las entradas del TLB para un rango de direcciones virtuales.
+/// Esto asegura que la CPU vea los nuevos mapeos de páginas.
+fn flush_tlb_range(start_addr: u64, end_addr: u64) {
+    let mut addr = start_addr;
+    while addr < end_addr {
+        unsafe {
+            asm!("invlpg [{}]", in(reg) addr, options(nostack));
+        }
+        addr += PAGE_SIZE as u64;
+    }
+}
+
+/// Mapear una sola página en la jerarquía de tablas de páginas
+///
+/// Navega o crea la jerarquía de 4 niveles (PML4 → PDPT → PD → PT) y
+/// mapea una página virtual a una dirección física.
+///
+/// # Argumentos
+/// - `pml4_table`: Tabla PML4 raíz (debe ser válida)
+/// - `virtual_addr`: Dirección virtual a mapear (debe estar alineada a página)
+/// - `physical_addr`: Dirección física destino (debe estar alineada a página)
+/// - `flags`: Flags de la página (PRESENT, WRITABLE, USER, etc.)
+/// - `phys_manager`: Gestor de páginas físicas para asignar tablas intermedias
+///
+/// # Invariantes
+/// - `pml4_table` debe apuntar a una tabla de páginas válida
+/// - Las direcciones deben estar alineadas a 4KB
+/// - `phys_manager` debe tener páginas disponibles para tablas intermedias
 fn map_page_in_table(
     pml4_table: &mut PageTable,
     virtual_addr: u64,
@@ -819,18 +859,27 @@ pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Resu
         pml4_addr, virtual_addr, size
     ));
     
+    // Validar parámetros
+    if size == 0 {
+        return Err("El tamaño debe ser mayor que 0");
+    }
+    
+    if size > 0x40000000 {  // Límite de 1GB por llamada
+        return Err("Tamaño excesivo solicitado");
+    }
+    
     // Acceder a la tabla PML4
     let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
     
-    // Obtener el gestor de memoria física
+    // Obtener el gestor de memoria física (una sola vez para evitar múltiples borrows)
     let phys_manager = get_physical_manager();
     
     // Alinear la dirección virtual al inicio de la página
     let start_vaddr = virtual_addr & !0xFFF;
-    let end_vaddr = (virtual_addr + size + 0xFFF) & !0xFFF;
+    let end_vaddr = (virtual_addr.checked_add(size).ok_or("Desbordamiento al calcular end_vaddr")? + 0xFFF) & !0xFFF;
     
-    // Flags: Present, Writable, User-accessible
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    // Flags: Present, Writable, User-accessible, No-Execute (W^X: stack no debe ser ejecutable)
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
     
     // Mapear cada página en el rango
     let mut current_vaddr = start_vaddr;
@@ -851,9 +900,12 @@ pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Resu
     }
     
     serial_write_str(&alloc::format!(
-        "PAGING: Mapped {} pages for userland\n",
+        "PAGING: Mapped {} pages for userland (stack/heap)\n",
         (end_vaddr - start_vaddr) / PAGE_SIZE as u64
     ));
+    
+    // Invalidar TLB para asegurar que la CPU vea los nuevos mapeos
+    flush_tlb_range(start_vaddr, end_vaddr);
     
     Ok(())
 }
@@ -861,7 +913,7 @@ pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Resu
 /// Mapear memoria con mapeo identidad (virtual == física)
 ///
 /// Crea un mapeo donde las direcciones virtuales son iguales a las físicas.
-/// Útil para hardware memory-mapped y código que necesita conocer sus direcciones físicas.
+/// Útil para código ejecutable que ya está cargado en memoria.
 ///
 /// # Argumentos
 /// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
@@ -873,32 +925,46 @@ pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u6
         pml4_addr, physical_addr, size
     ));
     
+    // Validar parámetros
+    if size == 0 {
+        return Err("El tamaño debe ser mayor que 0");
+    }
+    
+    if size > 0x40000000 {  // Límite de 1GB por llamada
+        return Err("Tamaño excesivo solicitado");
+    }
+    
     // Acceder a la tabla PML4
     let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
     
-    // Obtener el gestor de memoria física
+    // Obtener el gestor de memoria física (una sola vez)
     let phys_manager = get_physical_manager();
     
     // Alinear la dirección al inicio de la página
     let start_addr = physical_addr & !0xFFF;
-    let end_addr = (physical_addr + size + 0xFFF) & !0xFFF;
+    let end_addr = (physical_addr.checked_add(size).ok_or("Desbordamiento al calcular end_addr")? + 0xFFF) & !0xFFF;
     
-    // Flags: Present, Writable, User-accessible
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    // Flags: Present, User-accessible, Read-only (W^X: código no debe ser escribible)
+    // Nota: No usamos PAGE_WRITABLE para código, solo PRESENT + USER
+    let flags = PAGE_PRESENT | PAGE_USER;
     
     // Mapear cada página en el rango con mapeo identidad
     let mut current_addr = start_addr;
     while current_addr < end_addr {
-        // Mapear virtual == física
+        // Mapear virtual == física (identity mapping)
+        // No asignamos páginas nuevas, mapeamos la física existente
         map_page_in_table(pml4_table, current_addr, current_addr, flags, phys_manager)?;
         
         current_addr += PAGE_SIZE as u64;
     }
     
     serial_write_str(&alloc::format!(
-        "PAGING: Identity-mapped {} pages for userland\n",
+        "PAGING: Identity-mapped {} pages for userland code\n",
         (end_addr - start_addr) / PAGE_SIZE as u64
     ));
+    
+    // Invalidar TLB para asegurar que la CPU vea los nuevos mapeos
+    flush_tlb_range(start_addr, end_addr);
     
     Ok(())
 }
