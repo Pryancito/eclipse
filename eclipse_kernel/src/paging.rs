@@ -157,6 +157,28 @@ impl PageDirectoryPointerTable {
         }
     }
 
+    /// Mapear directorio de páginas
+    pub fn map_page_directory(
+        &mut self,
+        virtual_addr: u64,
+        page_directory: &PageDirectory,
+    ) -> Result<(), &'static str> {
+        let index = ((virtual_addr >> 30) & 0x1FF) as usize;
+
+        if index >= 512 {
+            return Err("Índice de PDPT inválido");
+        }
+
+        let pd_addr = page_directory as *const PageDirectory as u64;
+        let entry = PageTableEntry::new_with_flags(
+            pd_addr,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+        );
+        self.entries[index] = entry;
+
+        Ok(())
+    }
+
     /// Mapear tabla de páginas
     pub fn map_page_table(
         &mut self,
@@ -278,8 +300,8 @@ impl PagingManager {
         // Configurar mapeo de PML4 -> PDPT
         self.pml4.map_pdpt(0, &self.pdpt)?;
 
-        // Configurar mapeo de PDPT -> PD (usar PageTable en lugar de PageDirectory)
-        // self.pdpt.map_page_table(0, &self.pd)?;
+        // Configurar mapeo de PDPT -> PD
+        self.pdpt.map_page_directory(0, &self.pd)?;
 
         // Configurar mapeo de PD -> PT
         self.pd.map_page_table(0, &self.pt)?;
