@@ -301,7 +301,19 @@ impl DirectInstaller {
 
         let efi_partition = self.get_partition_name(&disk.name, 1);
 
-        // Crear directorios de montaje
+        // Limpiar puntos de montaje previos que puedan estar en estado inconsistente
+        println!("   Limpiando puntos de montaje previos...");
+        let _ = std::process::Command::new("umount")
+            .args(&["-f", "-l", &self.efi_mount_point])
+            .output();
+        
+        // Esperar a que el desmontaje se complete
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Eliminar cualquier directorio residual (incluso si no está vacío)
+        let _ = fs::remove_dir_all(&self.efi_mount_point);
+
+        // Crear directorios de montaje limpios
         fs::create_dir_all(&self.efi_mount_point)
             .map_err(|e| format!("Error creando directorio EFI: {}", e))?;
 
@@ -387,6 +399,17 @@ impl DirectInstaller {
         // Configurar partición root con EclipseFS directamente
         let root_partition = self.get_partition_name(&disk.name, 2);
         println!("   Configurando partición root {} con EclipseFS...", root_partition);
+        
+        // Limpiar puntos de montaje previos que puedan estar en estado inconsistente
+        let _ = std::process::Command::new("umount")
+            .args(&["-f", "-l", &self.root_mount_point])
+            .output();
+        
+        // Esperar a que el desmontaje se complete
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Eliminar cualquier directorio residual (incluso si no está vacío)
+        let _ = fs::remove_dir_all(&self.root_mount_point);
         
         fs::create_dir_all(&self.root_mount_point)
             .map_err(|e| format!("Error creando directorio root: {}", e))?;
