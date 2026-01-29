@@ -18,14 +18,18 @@ pub struct EclipseFSWriter {
 
 impl EclipseFSWriter {
     /// Crear un nuevo escritor
-    pub fn new(file_path: &str) -> EclipseFSResult<Self> {
-        let file = File::create(file_path)?;
-
-        Ok(Self {
+    pub fn new(file: File) -> Self {
+        Self {
             file,
             nodes: BTreeMap::new(),
             next_inode: constants::ROOT_INODE + 1,
-        })
+        }
+    }
+
+    /// Crear un nuevo escritor desde un path
+    pub fn from_path(file_path: &str) -> EclipseFSResult<Self> {
+        let file = File::create(file_path)?;
+        Ok(Self::new(file))
     }
 
     /// Agregar un nodo
@@ -250,5 +254,31 @@ impl EclipseFSWriter {
         }
 
         size
+    }
+
+    /// Crear el nodo raíz
+    pub fn create_root(&mut self) -> EclipseFSResult<()> {
+        let root = EclipseFSNode::new_dir();
+        self.add_node(constants::ROOT_INODE, root)?;
+        Ok(())
+    }
+
+    /// Crear un nuevo nodo y retornar su inode
+    pub fn create_node(&mut self, node: EclipseFSNode) -> EclipseFSResult<u32> {
+        let inode = self.allocate_inode();
+        self.add_node(inode, node)?;
+        Ok(inode)
+    }
+
+    /// Obtener el nodo raíz
+    pub fn get_root(&mut self) -> EclipseFSResult<&mut EclipseFSNode> {
+        self.nodes
+            .get_mut(&constants::ROOT_INODE)
+            .ok_or(EclipseFSError::NotFound)
+    }
+
+    /// Obtener un nodo por su inode
+    pub fn get_node(&mut self, inode: u32) -> EclipseFSResult<&mut EclipseFSNode> {
+        self.nodes.get_mut(&inode).ok_or(EclipseFSError::NotFound)
     }
 }

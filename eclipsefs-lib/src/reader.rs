@@ -29,6 +29,18 @@ impl EclipseFSReader {
         })
     }
 
+    /// Crear un nuevo lector desde un File existente
+    pub fn from_file(mut file: File) -> EclipseFSResult<Self> {
+        let header = Self::read_header(&mut file)?;
+        let inode_table = Self::read_inode_table(&mut file, &header)?;
+
+        Ok(Self {
+            file,
+            header,
+            inode_table,
+        })
+    }
+
     /// Leer el header del sistema de archivos
     fn read_header(file: &mut File) -> EclipseFSResult<EclipseFSHeader> {
         let mut magic = [0u8; 9];
@@ -317,5 +329,28 @@ impl EclipseFSReader {
     /// Obtener la tabla de inodos
     pub fn get_inode_table(&self) -> &[InodeTableEntry] {
         &self.inode_table
+    }
+
+    /// Obtener el nodo raíz
+    pub fn get_root(&mut self) -> EclipseFSResult<EclipseFSNode> {
+        self.read_node(constants::ROOT_INODE)
+    }
+
+    /// Buscar un hijo en un directorio
+    pub fn lookup(&mut self, parent_inode: u64, name: &str) -> EclipseFSResult<u64> {
+        let parent = self.read_node(parent_inode as u32)?;
+        
+        if parent.kind != NodeKind::Directory {
+            return Err(EclipseFSError::InvalidOperation);
+        }
+        
+        parent.get_child_inode(name)
+            .map(|inode| inode as u64)
+            .ok_or(EclipseFSError::NotFound)
+    }
+
+    /// Obtener un nodo por su inode
+    pub fn get_node(&mut self, inode: u64) -> EclipseFSResult<EclipseFSNode> {
+        self.read_node(inode as u32)
     }
 }

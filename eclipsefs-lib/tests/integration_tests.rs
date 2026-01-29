@@ -2,7 +2,7 @@
 
 use eclipsefs_lib::{
     EclipseFS, Journal, JournalConfig, TransactionType,
-    JournalEntry, NodeKind, constants,
+    JournalEntry, constants,
 };
 
 #[test]
@@ -79,7 +79,7 @@ fn test_journal_recovery() {
     fs.write_file(file2, b"Data 2").unwrap();
     
     // Simulate crash recovery
-    let recovered = fs.recover_from_journal().unwrap();
+    let _recovered = fs.recover_from_journal().unwrap();
     
     // Verify files still exist
     let data1 = fs.read_file(file1).unwrap();

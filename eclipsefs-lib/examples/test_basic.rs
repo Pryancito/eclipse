@@ -23,7 +23,7 @@ fn main() -> EclipseFSResult<()> {
 
         // Crear archivo /bin/hello
         let mut hello_node = EclipseFSNode::new_file();
-        hello_node.set_data(b"Hello, EclipseFS!".to_vec())?;
+        hello_node.set_data(b"Hello, EclipseFS!")?;
         let hello_inode = writer.create_node(hello_node)?;
 
         // Crear enlace simbólico /bin/sh -> hello
@@ -46,11 +46,10 @@ fn main() -> EclipseFSResult<()> {
 
     // Leer y verificar la imagen
     {
-        let file = File::open(test_file).map_err(|e| {
+        let mut reader = EclipseFSReader::from_file(File::open(test_file).map_err(|e| {
             eprintln!("Error abriendo archivo: {}", e);
             eclipsefs_lib::EclipseFSError::IoError
-        })?;
-        let reader = EclipseFSReader::new(file).map_err(|e| {
+        })?).map_err(|e| {
             eprintln!("Error creando reader: {:?}", e);
             e
         })?;

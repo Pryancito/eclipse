@@ -2,8 +2,8 @@
 
 use crate::{
     Acl, AclEntry, CompressionInfo, CompressionType, DfResult, EclipseFSError,
-    EclipseFSHeader, EclipseFSNode, EclipseFSResult, EncryptionInfo, FindResult,
-    FsckResult, InodeTableEntry, NodeKind, Snapshot, TransparentEncryptionConfig,
+    EclipseFSNode, EclipseFSResult, EncryptionInfo, FindResult,
+    FsckResult, NodeKind, Snapshot, TransparentEncryptionConfig,
 };
 
 #[cfg(feature = "std")]
