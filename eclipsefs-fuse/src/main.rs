@@ -260,6 +260,12 @@ fn main() {
         Ok(fs) => fs,
         Err(e) => {
             eprintln!("Error inicializando EclipseFS: {}", e);
+            eprintln!("\nPosibles causas:");
+            eprintln!("  1. El dispositivo {} requiere permisos de root. Intenta con 'sudo'", device);
+            eprintln!("  2. El dispositivo no contiene un sistema de archivos EclipseFS válido");
+            eprintln!("  3. El sistema de archivos está corrupto");
+            eprintln!("\nPara diagnóstico detallado, ejecuta:");
+            eprintln!("  sudo eclipsefs info {}", device);
             std::process::exit(1);
         }
     };
