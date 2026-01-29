@@ -24,7 +24,7 @@ PROCESS_TRANSFER: 1 ELF segments loaded
 [System restarts here]
 ```
 
-User reported: "Al llegar aqui se reinicia" (When it gets here it restarts)
+User reported: "Al llegar aquí se reinicia" (When it gets here it restarts)
 
 ## Root Cause Analysis
 

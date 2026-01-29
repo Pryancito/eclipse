@@ -319,10 +319,15 @@ impl ProcessTransfer {
         let context_ptr = &context as *const ProcessContext;
         
         unsafe {
-            // CRITICAL FIX: Build the iretq stack frame BEFORE switching CR3
+            // CRITICAL FIX: Build the iretq stack frame AND restore registers BEFORE switching CR3
+            // 
             // The temporary kernel stack at 0x500000 is only mapped in the kernel page tables,
-            // not in the userland page tables. If we switch CR3 first, the stack becomes
-            // unmapped and any push operations will trigger a page fault -> triple fault -> reset.
+            // not in the userland page tables. Similarly, the context structure is on the kernel
+            // stack which may not be accessible after CR3 switch.
+            // 
+            // Solution: Do ALL memory accesses (stack frame + context) BEFORE CR3 switch.
+            // We restore registers from the context into actual CPU registers, then switch CR3,
+            // then execute iretq. This way no memory access is needed after the CR3 switch.
             asm!(
                 // 1. Setup temporary kernel stack and build iretq frame BEFORE CR3 switch
                 "mov rsp, {tmp_stack}",  
@@ -335,11 +340,9 @@ impl ProcessTransfer {
                 "push qword ptr [rax + 144]", // CS
                 "push qword ptr [rax + 128]", // RIP
                 
-                // 2. NOW switch CR3 to userland page tables
-                //    Stack frame is already built, so we don't need to access 0x500000 anymore
-                "mov cr3, {new_pml4}",
-                
-                // 3. Restore GPRs from context
+                // 2. Restore ALL GPRs from context BEFORE CR3 switch
+                //    This must happen before CR3 switch because the context structure
+                //    is on the kernel stack which may not be mapped in userland page tables
                 "mov rbx, [rax + 8]",
                 "mov rcx, [rax + 16]",
                 "mov rdx, [rax + 24]",
@@ -355,11 +358,21 @@ impl ProcessTransfer {
                 "mov r14, [rax + 112]",
                 "mov r15, [rax + 120]",
                 
-                // Restore RAX last (it currently holds context_ptr)
-                "mov rax, [rax]",
+                // Save RAX value to restore after CR3 switch
+                // We need to keep using RAX temporarily to hold the new CR3 value
+                "push qword ptr [rax]",      // Push context.rax to stack
+                "mov rax, {new_pml4}",       // Load new PML4 address into RAX
                 
-                // 4. Execute iretq to transfer to userland
+                // 3. NOW switch CR3 to userland page tables
+                //    ALL memory accesses are complete - no more access to kernel stack or context
+                "mov cr3, rax",
+                
+                // 4. Restore RAX from stack (it was pushed earlier)
+                "pop rax",
+                
+                // 5. Execute iretq to transfer to userland
                 //    This pops: RIP, CS, RFLAGS, RSP, SS and jumps to userland
+                //    The stack frame was built in step 1 while kernel memory was still accessible
                 "iretq",
                 
                 in("rax") context_ptr,
