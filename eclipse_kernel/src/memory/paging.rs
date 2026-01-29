@@ -992,6 +992,64 @@ pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u6
     Ok(())
 }
 
+/// Mapear memoria con mapeo identidad y permisos de escritura (virtual == física)
+///
+/// Similar a identity_map_userland_memory pero con permisos de escritura.
+/// Útil para stacks temporales que necesitan ser accesibles después del cambio de CR3.
+///
+/// # Argumentos
+/// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
+/// - `physical_addr`: Dirección física/virtual base a mapear
+/// - `size`: Tamaño del rango a mapear en bytes
+pub fn identity_map_userland_writable(pml4_addr: u64, physical_addr: u64, size: u64) -> Result<(), &'static str> {
+    serial_write_str(&alloc::format!(
+        "PAGING: identity_map_userland_writable(pml4=0x{:x}, paddr=0x{:x}, size=0x{:x})\n",
+        pml4_addr, physical_addr, size
+    ));
+    
+    // Validar parámetros
+    if size == 0 {
+        return Err("El tamaño debe ser mayor que 0");
+    }
+    
+    if size > 0x40000000 {  // Límite de 1GB por llamada
+        return Err("Tamaño excesivo solicitado");
+    }
+    
+    // Acceder a la tabla PML4
+    let pml4_table = unsafe { &mut *(pml4_addr as *mut PageTable) };
+    
+    // Obtener el gestor de memoria física (una sola vez)
+    let phys_manager = get_physical_manager();
+    
+    // Alinear la dirección al inicio de la página
+    let start_addr = physical_addr & !0xFFF;
+    let end_addr = (physical_addr.checked_add(size).ok_or("Desbordamiento al calcular end_addr")? + 0xFFF) & !0xFFF;
+    
+    // Flags: Present, Writable, User-accessible, No-Execute (stack temporal)
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
+    
+    // Mapear cada página en el rango con mapeo identidad
+    let mut current_addr = start_addr;
+    while current_addr < end_addr {
+        // Mapear virtual == física (identity mapping)
+        // No asignamos páginas nuevas, mapeamos la física existente
+        map_page_in_table(pml4_table, current_addr, current_addr, flags, phys_manager)?;
+        
+        current_addr += PAGE_SIZE as u64;
+    }
+    
+    serial_write_str(&alloc::format!(
+        "PAGING: Identity-mapped {} writable pages for userland\n",
+        (end_addr - start_addr) / PAGE_SIZE as u64
+    ));
+    
+    // Invalidar TLB para asegurar que la CPU vea los nuevos mapeos
+    flush_tlb_range(start_addr, end_addr);
+    
+    Ok(())
+}
+
 /// Mapear páginas físicas pre-asignadas a direcciones virtuales
 ///
 /// Mapea una lista de páginas físicas ya asignadas a un rango de direcciones virtuales.
