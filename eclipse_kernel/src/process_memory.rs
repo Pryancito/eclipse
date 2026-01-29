@@ -59,14 +59,10 @@ impl ProcessMemoryManager {
             .ok_or("Desbordamiento al calcular heap_end")?;
 
         let stack_size = 0x800000; // 8MB de stack
-<<<<<<< HEAD
         // Usar una dirección de stack más baja que esté en el mismo rango mapeado
         // que el código (0x400000). Esto evita necesidad de múltiples estructuras de paginación.
         // Stack en 0x800000 - 0x1000000 (8MB-16MB rango)
         let stack_end: u64 = 0x1000000; // 16MB
-=======
-        let stack_end: u64 = 0x7000_0000_0000; // Top of user space (safe canonical)
->>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
         let stack_start = stack_end.checked_sub(stack_size)
             .ok_or("Desbordamiento al calcular stack_start")?;
 
