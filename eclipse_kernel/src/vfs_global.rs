@@ -62,11 +62,10 @@ pub fn prepare_systemd_binary() -> FsResult<()> {
     // Primero verificar si systemd ya existe en el filesystem montado
     crate::debug::serial_write_str("PREPARE_SYSTEMD: Verificando si systemd existe en filesystem montado...\n");
     
-    if let Some(vfs_system) = get_vfs_system() {
-        let vfs_lock = vfs_system.lock();
-        
+    let mut vfs_guard = get_vfs_system();
+    if let Some(vfs_system) = &*vfs_guard {
         // Verificar si hay un filesystem montado en /
-        if let Some(root_fs) = vfs_lock.get_mount("/") {
+        if let Some(root_fs) = vfs_system.get_mount("/") {
             let fs_lock = root_fs.lock();
             
             // Intentar leer systemd desde el filesystem montado

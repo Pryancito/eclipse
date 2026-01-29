@@ -1104,9 +1104,10 @@ impl FileSystem for EclipseFSWrapper {
             // Buscar el nombre en los hijos del directorio
             if node.kind == eclipsefs_lib::NodeKind::Directory {
                 let mut found = false;
-                for child in &node.children {
-                    if child.name == *part {
-                        current_inode = child.inode as u32;
+                // node.children es un FnvIndexMap<String, u32> que se itera como (key, value)
+                for (child_name, child_inode) in node.children.iter() {
+                    if child_name.as_str() == *part {
+                        current_inode = *child_inode;
                         found = true;
                         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Encontrado '{}' -> inodo {}\n", part, current_inode));
                         break;

@@ -407,11 +407,10 @@ fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
     // Primero intentar cargar desde el sistema de archivos montado (EclipseFS)
     crate::debug::serial_write_str("ELF_LOADER: Intentando cargar systemd desde el sistema de archivos montado...\n");
     
-    if let Some(vfs_system) = get_vfs_system() {
-        let vfs_lock = vfs_system.lock();
-        
+    let mut vfs_guard = get_vfs_system();
+    if let Some(vfs_system) = &*vfs_guard {
         // Intentar cargar desde el filesystem montado en /
-        if let Some(root_fs) = vfs_lock.get_mount("/") {
+        if let Some(root_fs) = vfs_system.get_mount("/") {
             let fs_lock = root_fs.lock();
             
             let paths = ["/sbin/eclipse-systemd", "/usr/sbin/eclipse-systemd", "/sbin/init"];
