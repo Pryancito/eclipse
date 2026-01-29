@@ -159,7 +159,12 @@ impl ProcessMemoryManager {
         let page_count = (size + self.page_size - 1) / self.page_size;
 
         for i in 0..page_count {
-            let page_vaddr = vaddr + (i * self.page_size);
+            // Usar checked_mul para prevenir desbordamiento en cálculo de offset
+            let offset = i.checked_mul(self.page_size)
+                .ok_or("Desbordamiento al calcular offset de página")?;
+            
+            let page_vaddr = vaddr.checked_add(offset)
+                .ok_or("Desbordamiento al calcular dirección de página")?;
 
             // Simular configuración de página
             self.setup_page_entry(page_vaddr, flags)?;
@@ -260,6 +265,12 @@ impl ProcessMemoryManager {
     }
 
     /// Configurar argumentos del proceso
+    /// 
+    /// # Errores
+    /// 
+    /// Retorna un error si:
+    /// - Los argumentos o variables de entorno causarían underflow del stack pointer
+    /// - El resultado final no está alineado correctamente
     pub fn setup_process_args(
         &self,
         stack_ptr: u64,
@@ -271,16 +282,22 @@ impl ProcessMemoryManager {
 
         let mut current_ptr = stack_ptr;
 
-        // Simular colocación de argumentos
+        // Simular colocación de argumentos con verificación de underflow
         for arg in args {
-            // Simular almacenamiento de argumento
-            current_ptr -= arg.len() as u64 + 1; // +1 para null terminator
+            let arg_size = (arg.len() as u64).checked_add(1) // +1 para null terminator
+                .ok_or("Argumento demasiado largo")?;
+            
+            current_ptr = current_ptr.checked_sub(arg_size)
+                .ok_or("Stack underflow al colocar argumentos")?;
         }
 
-        // Simular colocación de variables de entorno
+        // Simular colocación de variables de entorno con verificación de underflow
         for env_var in env {
-            // Simular almacenamiento de variable de entorno
-            current_ptr -= env_var.len() as u64 + 1; // +1 para null terminator
+            let env_size = (env_var.len() as u64).checked_add(1) // +1 para null terminator
+                .ok_or("Variable de entorno demasiado larga")?;
+            
+            current_ptr = current_ptr.checked_sub(env_size)
+                .ok_or("Stack underflow al colocar variables de entorno")?;
         }
 
         // Alinear a 16 bytes (requisito de ABI x86_64)
