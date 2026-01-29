@@ -293,8 +293,10 @@ pub fn init_ps2_system() -> Result<(), &'static str> {
     // IRQ 1 = Teclado PS/2
     // IRQ 12 = Ratón PS/2
     if let Err(e) = enable_ps2_irqs() {
-        // No es crítico, el sistema puede funcionar sin interrupciones
-        // (por ejemplo, con polling)
+        // Registrar el error pero no es crítico - el sistema puede funcionar sin interrupciones
+        // usando polling como fallback
+        #[cfg(feature = "logging")]
+        crate::logging::log_error!("PS/2", "No se pudieron habilitar IRQs: {}", e);
     }
 
     *PS2_SYSTEM.lock() = Some(system);
@@ -305,14 +307,19 @@ pub fn init_ps2_system() -> Result<(), &'static str> {
 fn enable_ps2_irqs() -> Result<(), &'static str> {
     use crate::interrupts::pic::PicManager;
     
+    // Nota: El PIC debe ser inicializado solo una vez globalmente.
+    // Aquí solo habilitamos las IRQs específicas.
     let pic = PicManager::new();
-    pic.initialize()?;
     
-    // Habilitar IRQ 1 (teclado)
-    pic.enable_irq(1)?;
+    // Habilitar IRQ 1 (teclado) - está en el PIC primario
+    if let Err(e) = pic.enable_irq(1) {
+        return Err("No se pudo habilitar IRQ 1 del teclado");
+    }
     
-    // Habilitar IRQ 12 (ratón) - esto está en el PIC secundario
-    pic.enable_irq(12)?;
+    // Habilitar IRQ 12 (ratón) - está en el PIC secundario
+    if let Err(e) = pic.enable_irq(12) {
+        return Err("No se pudo habilitar IRQ 12 del ratón");
+    }
     
     Ok(())
 }

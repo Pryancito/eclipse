@@ -267,8 +267,12 @@ impl PS2MouseDriver {
     }
 
     /// Esperar hasta que el buffer de entrada esté lleno
+    /// Nota: Este timeout es un contador de iteraciones, no basado en tiempo real.
+    /// El valor de 100,000 iteraciones proporciona aproximadamente 1-10ms en CPUs modernas.
+    /// Para sistemas de producción, considerar usar un timer hardware.
     unsafe fn wait_for_input(&self) {
-        for _ in 0..100000 {
+        const TIMEOUT_ITERATIONS: u32 = 100_000;
+        for _ in 0..TIMEOUT_ITERATIONS {
             if (self.status_port.read() & 0x01) != 0 {
                 return;
             }
@@ -277,8 +281,10 @@ impl PS2MouseDriver {
     }
 
     /// Esperar hasta que el buffer de salida esté vacío
+    /// Nota: Este timeout es un contador de iteraciones, no basado en tiempo real.
     unsafe fn wait_for_output(&self) {
-        for _ in 0..100000 {
+        const TIMEOUT_ITERATIONS: u32 = 100_000;
+        for _ in 0..TIMEOUT_ITERATIONS {
             if (self.status_port.read() & 0x02) == 0 {
                 return;
             }
@@ -379,8 +385,11 @@ impl PS2MouseDriver {
         let y_movement = self.packet_buffer[2] as i8;
         
         // Verificar bit de overflow y validez del paquete
-        if (flags & 0xC0) != 0 {
-            // Overflow o bit reservado activado, descartar paquete
+        // Bits 6-7 del byte de flags deben ser 0 en un paquete válido
+        // Bit 6: X overflow, Bit 7: Y overflow
+        const OVERFLOW_MASK: u8 = 0xC0;
+        if (flags & OVERFLOW_MASK) != 0 {
+            // Overflow detectado o bits reservados activados, descartar paquete
             return None;
         }
 
@@ -390,14 +399,23 @@ impl PS2MouseDriver {
         let new_middle = (flags & 0x04) != 0;
 
         // Aplicar signo extendido si es necesario
+        // Los movimientos son de 9 bits (8 bits de datos + 1 bit de signo)
+        // El bit de signo está en las flags (bit 4 para X, bit 5 para Y)
         let mut dx = x_movement as i32;
         let mut dy = -(y_movement as i32); // Invertir Y para coordenadas de pantalla
 
-        if (flags & 0x10) != 0 {
-            dx |= !0xFF; // Extender signo para X
+        // Extender signo para movimiento X (bit 4 de flags es el bit de signo)
+        const X_SIGN_BIT: u8 = 0x10;
+        if (flags & X_SIGN_BIT) != 0 {
+            // Valor negativo: extender con 1s en los bits superiores
+            dx |= !0xFF;
         }
-        if (flags & 0x20) != 0 {
-            dy |= !0xFF; // Extender signo para Y
+        
+        // Extender signo para movimiento Y (bit 5 de flags es el bit de signo)
+        const Y_SIGN_BIT: u8 = 0x20;
+        if (flags & Y_SIGN_BIT) != 0 {
+            // Valor negativo: extender con 1s en los bits superiores
+            dy |= !0xFF;
         }
 
         // Actualizar posición
