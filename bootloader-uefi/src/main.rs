@@ -241,8 +241,21 @@ fn flush_log_to_file(bs: &BootServices, image_handle: Handle) {
     }
 }
 
-// Mapear el framebuffer en direcciones altas con identidad (2MiB pages) en nuestras tablas
+/// Mapear el framebuffer en direcciones altas con identidad (2MiB pages) en nuestras tablas
+/// 
+/// # Safety
+/// 
+/// Esta función manipula directamente las tablas de páginas de x86_64. Es unsafe porque:
+/// - Asume que pml4_phys apunta a una tabla PML4 válida y alineada a 4KB
+/// - Modifica estructuras de memoria críticas del sistema
+/// - Usa aritmética de punteros sin límites explícitos
+/// 
+/// El llamador debe asegurar que:
+/// - pml4_phys es una dirección física válida de una tabla PML4
+/// - fb_base y fb_size son válidos y no causan desbordamiento
+/// - Esta función se llama en contexto apropiado del bootloader antes de ExitBootServices
 fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_size: u64) {
+    // SAFETY: serial_write_str solo escribe a puertos serie, es seguro en contexto bootloader
     unsafe {
         serial_write_str("BL: mapeando framebuffer en page tables...\r\n");
     }
@@ -250,48 +263,77 @@ fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_
     let ps: u64 = 0x080;   // Page Size (2MiB)
     let addr_mask: u64 = 0x000F_FFFF_FFFF_F000u64;
 
+    // Calcular límites alineados a 2MiB para evitar mapeos parciales
     let phys_start = fb_base & !0x1F_FFFFu64; // 2MiB aligned down
-    let phys_end = (fb_base + fb_size + 0x1F_FFFFu64) & !0x1F_FFFFu64; // 2MiB aligned up
+    let phys_end = (fb_base.saturating_add(fb_size).saturating_add(0x1F_FFFFu64)) & !0x1F_FFFFu64; // 2MiB aligned up
 
+    // SAFETY: Asumimos que pml4_phys apunta a memoria válida alineada a 4KB
+    // Esta es una precondición de la función
     let pml4_ptr = pml4_phys as *mut u64;
 
     let mut addr = phys_start;
     while addr < phys_end {
+        // Calcular índice PML4 (bits 39-47)
         let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+        
+        // SAFETY: pml4_idx está limitado a 0-511 por el mask 0x1FF, por lo que
+        // pml4_ptr.add(pml4_idx) siempre está dentro de los límites de la tabla PML4 (512 entradas)
         let pdpt_entry = unsafe { pml4_ptr.add(pml4_idx) };
+        
+        // SAFETY: pdpt_entry apunta a una entrada válida de la tabla PML4
         let mut pdpt_phys: u64 = unsafe { *pdpt_entry } & addr_mask;
+        
         if pdpt_phys == 0 {
+            // Necesitamos crear una nueva tabla PDPT
             if let Ok(new_pdpt) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+                // SAFETY: new_pdpt es memoria recién asignada de 4096 bytes por UEFI
                 unsafe { core::ptr::write_bytes(new_pdpt as *mut u8, 0, 4096); }
                 pdpt_phys = new_pdpt & addr_mask;
+                // SAFETY: pdpt_entry apunta a entrada válida en PML4
                 unsafe { *pdpt_entry = pdpt_phys | p_w; }
             } else {
+                // SAFETY: solo escribe a puerto serie
                 unsafe { serial_write_str("BL: ERROR alloc PDPT\r\n"); }
                 break;
             }
         }
 
+        // SAFETY: pdpt_phys ahora contiene una dirección válida de tabla PDPT
         let pdpt_ptr = pdpt_phys as *mut u64;
         let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+        
+        // SAFETY: pdpt_idx está limitado a 0-511, dentro de límites de PDPT
         let pd_entry = unsafe { pdpt_ptr.add(pdpt_idx) };
+        
+        // SAFETY: pd_entry apunta a entrada válida de PDPT
         let mut pd_phys: u64 = unsafe { *pd_entry } & addr_mask;
+        
         if pd_phys == 0 {
+            // Necesitamos crear una nueva tabla PD
             if let Ok(new_pd) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+                // SAFETY: new_pd es memoria recién asignada de 4096 bytes por UEFI
                 unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
                 pd_phys = new_pd & addr_mask;
+                // SAFETY: pd_entry apunta a entrada válida en PDPT
                 unsafe { *pd_entry = pd_phys | p_w; }
             } else {
+                // SAFETY: solo escribe a puerto serie
                 unsafe { serial_write_str("BL: ERROR alloc PD\r\n"); }
                 break;
             }
         }
 
+        // SAFETY: pd_phys ahora contiene una dirección válida de tabla PD
         let pd_ptr = pd_phys as *mut u64;
         let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+        
+        // SAFETY: pd_idx está limitado a 0-511, dentro de límites de PD
+        // Escribimos una entrada de página de 2MiB con mapeo de identidad
         unsafe {
             *pd_ptr.add(pd_idx) = (addr & addr_mask) | p_w | ps;
         }
 
+        // Avanzar al siguiente bloque de 2MiB, usando saturating_add para prevenir overflow
         addr = addr.saturating_add(0x20_0000u64); // next 2MiB
     }
 }
