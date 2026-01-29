@@ -296,13 +296,27 @@ impl InitSystem {
         &self,
         path: &str,
     ) -> Result<crate::elf_loader::LoadedProcess, &'static str> {
-        // En un sistema real, esto:
-        // 1. Abriría el archivo desde el sistema de archivos
-        // 2. Leería el header ELF
-        // 3. Verificaría la arquitectura y formato
-        // 4. Cargaría los segmentos en memoria
+        // En un sistema real con VFS, leemos el archivo del sistema de archivos
+        // Intentar leer desde VFS primero
+        if let Some(vfs_guard) = crate::vfs_global::get_vfs().try_lock() {
+            if let Ok(elf_data) = vfs_guard.read_file(path) {
+                crate::debug::serial_write_str(&alloc::format!(
+                    "INIT_SYSTEM: Cargando ELF desde VFS: {} ({} bytes)\n",
+                    path, elf_data.len()
+                ));
+                
+                let mut elf_loader = crate::elf_loader::ElfLoader::new();
+                return elf_loader.load_elf(&elf_data[..]);
+            }
+        }
+        
+        // Fallback a datos simulados si VFS no está disponible
+        crate::debug::serial_write_str(&alloc::format!(
+            "INIT_SYSTEM: VFS no disponible, usando datos ELF simulados para {}\n",
+            path
+        ));
 
-        // Simular carga del ELF
+        // Simular carga del ELF con datos ficticios
         let mut elf_loader = crate::elf_loader::ElfLoader::new();
 
         // Simular lectura del archivo

@@ -912,6 +912,68 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
             serial_write_str(&alloc::format!("KERNEL_MAIN: stdin init FAIL: {}\n", e));
         }
     }
+    
+    // 14.5: Inicializar VFS (Virtual File System)
+    serial_write_str("KERNEL_MAIN: Inicializando VFS...\n");
+    fb.write_text_kernel("Inicializando VFS (Virtual File System)...", Color::WHITE);
+    
+    match crate::vfs_global::init_vfs() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ VFS inicializado (10MB RAM FS)", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: VFS initialized - filesystem ready\n");
+            
+            // Preparar binario de systemd en VFS
+            match crate::vfs_global::prepare_systemd_binary() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ Binario systemd preparado en /sbin/init", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: systemd binary prepared in VFS\n");
+                }
+                Err(e) => {
+                    fb.write_text_kernel(&alloc::format!("⚠ systemd binary: {:?}", e), Color::YELLOW);
+                }
+            }
+            
+            // Crear archivos de servicio por defecto
+            match crate::vfs_global::create_default_service_files() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ Archivos de servicio creados", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: Default service files created\n");
+                }
+                Err(e) => {
+                    fb.write_text_kernel(&alloc::format!("⚠ service files: {:?}", e), Color::YELLOW);
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ VFS: {:?}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: VFS init FAIL: {:?}\n", e));
+        }
+    }
+    
+    // 14.6: Inicializar /proc filesystem
+    serial_write_str("KERNEL_MAIN: Inicializando /proc...\n");
+    fb.write_text_kernel("Inicializando /proc filesystem...", Color::WHITE);
+    
+    match crate::procfs::init_procfs() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ /proc inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: /proc initialized - process info available\n");
+            
+            // Crear entrada para PID 1
+            match crate::procfs::update_process_info(1) {
+                Ok(_) => {
+                    serial_write_str("KERNEL_MAIN: /proc/1/ created\n");
+                }
+                Err(_) => {
+                    serial_write_str("KERNEL_MAIN: Warning: Could not create /proc/1/\n");
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ /proc: {:?}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: /proc init FAIL: {:?}\n", e));
+        }
+    }
 
     // Mensaje final antes de entrar al loop principal
     fb.write_text_kernel("", Color::WHITE);
