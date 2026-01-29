@@ -24,6 +24,12 @@ use crate::resource_manager::ResourceManager;
 use eclipse_ipc::{UnixBus, IpcMessage, socket_path_from_env};
 use std::time::Duration as StdDuration;
 
+/// Límite máximo de intentos de reinicio para un servicio
+const MAX_SERVICE_RESTART_ATTEMPTS: u32 = 5;
+
+/// Tiempo de espera por defecto antes de reiniciar un servicio (en segundos)
+const DEFAULT_RESTART_SEC: u64 = 5;
+
 /// Estado de un servicio
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServiceState {
@@ -71,6 +77,8 @@ pub struct SystemdDaemon {
     is_running: Arc<RwLock<bool>>,
     /// Directorio de servicios
     service_dir: String,
+    /// Tiempo de inicio del sistema (boot time)
+    boot_time: Instant,
 }
 
 impl SystemdDaemon {
@@ -93,6 +101,7 @@ impl SystemdDaemon {
             resource_manager,
             is_running: Arc::new(RwLock::new(false)),
             service_dir: service_dir.to_string(),
+            boot_time: Instant::now(),
         })
     }
 
@@ -336,6 +345,12 @@ impl SystemdDaemon {
 
     /// Ejecuta un servicio
     async fn execute_service(&self, service_name: &str, service_file: &ServiceFile) -> Result<()> {
+        self.start_service_internal(service_name, service_file, 0).await
+    }
+
+    /// Inicia un servicio internamente (usado por execute_service y restart)
+    /// restart_count: número de veces que este servicio ha sido reiniciado
+    async fn start_service_internal(&self, service_name: &str, service_file: &ServiceFile, restart_count: u32) -> Result<()> {
         // Obtener configuración del servicio
         let exec_start = ServiceParser::get_entry(service_file, "Service", "ExecStart")
             .ok_or_else(|| anyhow::anyhow!("ExecStart no encontrado"))?;
@@ -381,7 +396,7 @@ impl SystemdDaemon {
                     state: ServiceState::Active,
                     pid: Some(pid),
                     start_time: Instant::now(),
-                    restart_count: 0,
+                    restart_count,  // Preservar el contador de reintentos
                     last_error: None,
                     service_file: service_file.clone(),
                 };
@@ -451,7 +466,7 @@ impl SystemdDaemon {
             total_services: services.len(),
             running_services: running.len(),
             failed_services: running.values().filter(|s| s.state == ServiceState::Failed).count(),
-            uptime: Instant::now(), // En una implementación real, esto sería el tiempo de inicio del sistema
+            uptime: self.boot_time,
         }
     }
 
@@ -513,6 +528,7 @@ impl SystemdDaemon {
     /// Monitorea servicios en ejecución
     async fn monitor_services(&self) -> Result<()> {
         let mut running = self.running_services.write().await;
+        let mut to_restart = Vec::new();
         let mut to_remove = Vec::new();
         
         for (name, service) in running.iter_mut() {
@@ -522,12 +538,78 @@ impl SystemdDaemon {
                     warn!("Advertencia  Proceso terminado inesperadamente: {} (PID: {})", name, pid);
                     self.journal_manager.log_warning("systemd", &format!("Proceso terminado inesperadamente: {} (PID: {})", name, pid))?;
                     service.state = ServiceState::Failed;
-                    to_remove.push(name.clone());
+                    
+                    // Verificar política de reinicio
+                    let restart_policy = crate::service_parser::ServiceParser::get_entry(
+                        &service.service_file, 
+                        "Service", 
+                        "Restart"
+                    ).map(|s| s.as_str()).unwrap_or("no");
+                    
+                    let should_restart = match restart_policy {
+                        "always" => true,
+                        "on-failure" => true,  // El servicio falló inesperadamente
+                        "on-abnormal" => true, // Terminación inesperada es anormal
+                        _ => false,
+                    };
+                    
+                    if should_restart {
+                        // Verificar límite de reintentos
+                        if service.restart_count < MAX_SERVICE_RESTART_ATTEMPTS {
+                            info!("Reiniciando servicio {} (intento {})", name, service.restart_count + 1);
+                            self.journal_manager.log_info(
+                                "systemd", 
+                                &format!("Reiniciando servicio {} (intento {})", name, service.restart_count + 1)
+                            )?;
+                            to_restart.push(name.clone());
+                        } else {
+                            warn!("Servicio {} alcanzó límite de reintentos, marcando como fallido", name);
+                            self.journal_manager.log_error(
+                                "systemd",
+                                &format!("Servicio {} alcanzó límite de reintentos", name)
+                            )?;
+                            to_remove.push(name.clone());
+                        }
+                    } else {
+                        to_remove.push(name.clone());
+                    }
                 }
             }
         }
         
-        // Remover servicios fallidos
+        // Soltar el lock antes de reiniciar servicios para evitar deadlock
+        drop(running);
+        
+        // Reiniciar servicios que lo necesitan
+        for name in to_restart {
+            // Obtener información del servicio antes de reiniciar
+            let mut running = self.running_services.write().await;
+            if let Some(service) = running.get_mut(&name) {
+                let restart_sec = crate::service_parser::ServiceParser::get_entry(
+                    &service.service_file,
+                    "Service",
+                    "RestartSec"
+                ).and_then(|s| s.parse::<u64>().ok()).unwrap_or(DEFAULT_RESTART_SEC);
+                
+                let new_restart_count = service.restart_count + 1;
+                let service_file = service.service_file.clone();
+                
+                // Remover el servicio fallido antes de reiniciar
+                running.remove(&name);
+                drop(running);
+                
+                // Esperar antes de reiniciar
+                sleep(Duration::from_secs(restart_sec)).await;
+                
+                // Reiniciar el servicio con el contador actualizado
+                if let Err(e) = self.start_service_internal(&name, &service_file, new_restart_count).await {
+                    warn!("Error reiniciando servicio {}: {}", name, e);
+                }
+            }
+        }
+        
+        // Remover servicios que no se reinician
+        let mut running = self.running_services.write().await;
         for name in to_remove {
             running.remove(&name);
         }
@@ -536,10 +618,47 @@ impl SystemdDaemon {
     }
 
     /// Verifica si un proceso está ejecutándose
-    fn is_process_running(&self, _pid: u32) -> bool {
-        // En una implementación real, aquí se verificaría el estado del proceso
-        // Por ahora, simulamos que siempre está ejecutándose
-        true
+    fn is_process_running(&self, pid: u32) -> bool {
+        // Verificar si el proceso existe leyendo /proc/<pid>/stat
+        use std::fs;
+        use std::path::Path;
+        
+        let proc_path = format!("/proc/{}/stat", pid);
+        let path = Path::new(&proc_path);
+        
+        // Si el archivo existe, el proceso está vivo
+        if !path.exists() {
+            return false;
+        }
+        
+        // Intentar leer el archivo para verificar que es accesible
+        match fs::read_to_string(&proc_path) {
+            Ok(content) => {
+                // El formato de /proc/pid/stat es: pid (comm) state ...
+                // donde comm puede contener espacios y paréntesis
+                // Necesitamos encontrar el último ')' para obtener el estado correctamente
+                if let Some(last_paren) = content.rfind(')') {
+                    // El estado está después de ') ' (paréntesis y espacio)
+                    let after_comm = &content[last_paren + 1..].trim();
+                    if let Some(state_char) = after_comm.chars().next() {
+                        match state_char {
+                            'Z' | 'X' => false, // Zombie o muerto
+                            _ => true,          // Cualquier otro estado significa que está vivo
+                        }
+                    } else {
+                        // Si no podemos parsear, asumimos que está vivo por seguridad
+                        true
+                    }
+                } else {
+                    // Formato inesperado, asumimos que está vivo por seguridad
+                    true
+                }
+            }
+            Err(_) => {
+                // Si no podemos leer el archivo, probablemente el proceso murió
+                false
+            }
+        }
     }
 
     /// Procesa la cola de eventos

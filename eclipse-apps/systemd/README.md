@@ -7,9 +7,10 @@ Sistema de inicialización moderno y completo para Eclipse OS que implementa fun
 ### Arquitectura del Sistema
 - Sistema modular: Arquitectura completamente modular con separación de responsabilidades
 - Integración completa: Integración nativa con el kernel Eclipse OS
-- Gestión de procesos: Monitoreo avanzado de procesos usando `/proc`
+- **Monitoreo de procesos real**: Monitoreo de salud de procesos usando `/proc/<pid>/stat`
 - Gestión de recursos: Control de CPU, memoria e I/O por servicio
 - Sistema de notificaciones: Notificaciones en tiempo real entre servicios
+- **Uptime tracking**: Seguimiento preciso del tiempo de actividad del sistema desde el arranque
 
 ### Gestión de Servicios
 - Parser completo: Parser robusto de archivos `.service` estándar
@@ -17,6 +18,9 @@ Sistema de inicialización moderno y completo para Eclipse OS que implementa fun
 - Estados del servicio: Estados completos (inactive, activating, active, deactivating, failed)
 - Control de ciclo de vida: Inicio, parada, reinicio y recarga de servicios
 - Manejo de señales: SIGTERM graceful shutdown con fallback a SIGKILL
+- **Restart Policy**: Implementación completa de políticas de reinicio (`always`, `on-failure`, `on-abnormal`)
+- **Auto-restart**: Reinicio automático de servicios fallidos con límite de reintentos (máximo 5)
+- **RestartSec**: Soporte para tiempo de espera configurable antes de reiniciar
 
 ### Sistema de Dependencias
 - Resolución inteligente: Resolución automática de dependencias con detección de ciclos
@@ -225,15 +229,32 @@ Eclipse SystemD está diseñado para integrarse con el kernel Eclipse:
 
 ## Estado del proyecto
 
-- Completado Parser de archivos .service
-- Completado Validador de sintaxis
-- Completado Gestión básica de servicios
-- Completado Sistema de logging
-- Completado Script de instalación
-- 🚧 Integración con kernel (en progreso)
-- ⏳ Gestión avanzada de dependencias
-- ⏳ Sistema de notificaciones
-- ⏳ Gestión de recursos
+### ✅ Completado
+- Parser de archivos .service
+- Validador de sintaxis
+- Gestión básica de servicios
+- Sistema de logging (journal)
+- Script de instalación
+- **Monitoreo de procesos real** (usando /proc filesystem)
+- **Restart Policy** (always, on-failure, on-abnormal)
+- **Auto-restart de servicios** con límite de reintentos
+- **Uptime tracking** desde boot
+- Gestión avanzada de dependencias
+- Sistema de notificaciones
+- Gestión de recursos (monitoreo)
+
+### 🚧 En Progreso
+- Integración completa con kernel
+- Privilege dropping (User/Group directives)
+- inotify para detección de cambios en archivos .service
+- Aplicación de límites usando cgroups
+
+### ⏳ Planificado
+- Soporte para sockets systemd
+- Timer units (.timer files)
+- Path units (.path files)
+- Soporte completo para D-Bus
+- Mejor manejo de SIGTERM/SIGKILL
 
 ## Contribuir
 
