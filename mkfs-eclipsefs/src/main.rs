@@ -63,7 +63,7 @@ struct EclipseFSHeader {
 }
 
 impl EclipseFSHeader {
-    fn new(label: &str, block_size: u32, total_blocks: u64, total_inodes: u64) -> Self {
+    fn new(label: &str, _block_size: u32, _total_blocks: u64, total_inodes: u64) -> Self {
         let mut header_label = [0u8; 100];
         let label_bytes = label.as_bytes();
         let copy_len = label_bytes.len().min(99);

@@ -1227,11 +1227,43 @@ build_mkfs_eclipsefs() {
     cd ..
 }
 
+# Función para compilar eclipsefs-cli
+build_eclipsefs_cli() {
+    print_step "Compilando eclipsefs-cli..."
+    
+    if [ ! -d "eclipsefs-cli" ]; then
+        print_status "Directorio eclipsefs-cli no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipsefs-cli
+    
+    print_status "Compilando eclipsefs CLI tool..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "eclipsefs-cli compilado exitosamente"
+        
+        local cli_path="target/release/eclipsefs"
+        if [ -f "$cli_path" ]; then
+            local cli_size=$(du -h "$cli_path" | cut -f1)
+            print_status "eclipsefs CLI generado: $cli_path ($cli_size)"
+        fi
+    else
+        print_error "Error al compilar eclipsefs-cli"
+        cd ..
+        return 1
+    fi
+    
+    cd ..
+}
+
 # Función principal
 main() {
     # Ejecutar pasos de construcción
     build_eclipsefs_lib
     build_mkfs_eclipsefs
+    build_eclipsefs_cli
     build_kernel
     build_bootloader
     build_installer
