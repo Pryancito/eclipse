@@ -19,6 +19,9 @@ use crate::filesystem::eclipsefs::{EclipseFSDeviceInfo, EclipseFSWrapper};
 use crate::init_system::{InitProcess, InitSystem};
 use crate::wayland::{get_wayland_state, init_wayland, is_wayland_initialized};
 
+// Variable global para habilitar systemd
+static ENABLE_SYSTEMD_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 use crate::ai::{ModelLoader, ModelType};
 use crate::ai_pretrained_models::{PretrainedModelManager, PretrainedModelType};
 use crate::ai_typing_system::{
@@ -909,6 +912,68 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
             serial_write_str(&alloc::format!("KERNEL_MAIN: stdin init FAIL: {}\n", e));
         }
     }
+    
+    // 14.5: Inicializar VFS (Virtual File System)
+    serial_write_str("KERNEL_MAIN: Inicializando VFS...\n");
+    fb.write_text_kernel("Inicializando VFS (Virtual File System)...", Color::WHITE);
+    
+    match crate::vfs_global::init_vfs() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ VFS inicializado (10MB RAM FS)", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: VFS initialized - filesystem ready\n");
+            
+            // Preparar binario de systemd en VFS
+            match crate::vfs_global::prepare_systemd_binary() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ Binario systemd preparado en /sbin/init", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: systemd binary prepared in VFS\n");
+                }
+                Err(e) => {
+                    fb.write_text_kernel(&alloc::format!("⚠ systemd binary: {:?}", e), Color::YELLOW);
+                }
+            }
+            
+            // Crear archivos de servicio por defecto
+            match crate::vfs_global::create_default_service_files() {
+                Ok(_) => {
+                    fb.write_text_kernel("✓ Archivos de servicio creados", Color::GREEN);
+                    serial_write_str("KERNEL_MAIN: Default service files created\n");
+                }
+                Err(e) => {
+                    fb.write_text_kernel(&alloc::format!("⚠ service files: {:?}", e), Color::YELLOW);
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ VFS: {:?}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: VFS init FAIL: {:?}\n", e));
+        }
+    }
+    
+    // 14.6: Inicializar /proc filesystem
+    serial_write_str("KERNEL_MAIN: Inicializando /proc...\n");
+    fb.write_text_kernel("Inicializando /proc filesystem...", Color::WHITE);
+    
+    match crate::procfs::init_procfs() {
+        Ok(_) => {
+            fb.write_text_kernel("✓ /proc inicializado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: /proc initialized - process info available\n");
+            
+            // Crear entrada para PID 1
+            match crate::procfs::update_process_info(1) {
+                Ok(_) => {
+                    serial_write_str("KERNEL_MAIN: /proc/1/ created\n");
+                }
+                Err(_) => {
+                    serial_write_str("KERNEL_MAIN: Warning: Could not create /proc/1/\n");
+                }
+            }
+        }
+        Err(e) => {
+            fb.write_text_kernel(&alloc::format!("⚠ /proc: {:?}", e), Color::YELLOW);
+            serial_write_str(&alloc::format!("KERNEL_MAIN: /proc init FAIL: {:?}\n", e));
+        }
+    }
 
     // Mensaje final antes de entrar al loop principal
     fb.write_text_kernel("", Color::WHITE);
@@ -916,15 +981,91 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     fb.write_text_kernel("  ✅ ECLIPSE OS - Sistema completamente inicializado", Color::GREEN);
     fb.write_text_kernel("═══════════════════════════════════════════════════════", Color::CYAN);
     fb.write_text_kernel("", Color::WHITE);
+    
+    // ═══════════════════════════════════════════════════════════════
+    // INTEGRACIÓN ECLIPSE-SYSTEMD: Transferencia de control a PID 1
+    // ═══════════════════════════════════════════════════════════════
+    
+    // Verificar si systemd está habilitado (puede ser configurado via kernel params)
+    let systemd_enabled = ENABLE_SYSTEMD_INIT.load(core::sync::atomic::Ordering::Relaxed) || 
+                          check_systemd_kernel_param();
+    
+    if systemd_enabled {
+        fb.write_text_kernel("", Color::WHITE);
+        fb.write_text_kernel("🔄 Transferencia de control a eclipse-systemd...", Color::YELLOW);
+        serial_write_str("KERNEL_MAIN: Iniciando transferencia de control a systemd\n");
+        
+        match init_and_execute_systemd(fb) {
+            Ok(_) => {
+                // Si llegamos aquí, systemd ejecutó exitosamente pero retornó
+                fb.write_text_kernel("⚠ eclipse-systemd retornó al kernel", Color::YELLOW);
+                serial_write_str("KERNEL_MAIN: systemd returned - continuing with kernel loop\n");
+            }
+            Err(e) => {
+                // Error al inicializar systemd - continuar con kernel loop
+                fb.write_text_kernel(&alloc::format!("⚠ Error systemd: {} - usando kernel loop", e), Color::YELLOW);
+                serial_write_str(&alloc::format!("KERNEL_MAIN: systemd init failed: {} - fallback to kernel loop\n", e));
+            }
+        }
+    } else {
+        fb.write_text_kernel("ℹ eclipse-systemd deshabilitado - usando kernel loop", Color::CYAN);
+        serial_write_str("KERNEL_MAIN: systemd disabled - using kernel main loop\n");
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    
+    fb.write_text_kernel("", Color::WHITE);
     fb.write_text_kernel("🚀 Iniciando loop principal mejorado...", Color::GREEN);
     fb.write_text_kernel("   Procesando eventos del sistema...", Color::WHITE);
     serial_write_str("KERNEL_MAIN: ========================================\n");
-    serial_write_str("KERNEL_MAIN: Sistema completamente inicializado\n");
     serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado\n");
     serial_write_str("KERNEL_MAIN: ========================================\n");
     
     // Llamar al loop principal mejorado (nunca retorna - loop infinito)
     crate::main_loop::main_loop(fb, xhci_initialized)
+}
+
+/// Verificar si systemd está habilitado via parámetros del kernel
+fn check_systemd_kernel_param() -> bool {
+    // TODO: En un sistema real, esto verificaría los parámetros de la línea de comando
+    // Por ejemplo, parseando el comando del bootloader para buscar "init=/sbin/init"
+    // 
+    // Por ahora, retornar true para habilitar systemd por defecto.
+    // Cambiar a false para deshabilitar systemd y usar solo el kernel loop.
+    true
+}
+
+/// Inicializar y ejecutar eclipse-systemd como PID 1
+fn init_and_execute_systemd(fb: &mut FramebufferDriver) -> Result<(), &'static str> {
+    serial_write_str("SYSTEMD_INIT: Iniciando sistema de inicialización\n");
+    
+    // Crear instancia del sistema de inicialización
+    let mut init_system = InitSystem::new();
+    
+    // Inicializar el sistema
+    init_system.initialize()?;
+    
+    serial_write_str("SYSTEMD_INIT: Sistema de inicialización configurado\n");
+    fb.write_text_kernel("✓ Sistema de inicialización configurado", Color::GREEN);
+    
+    // Mostrar mensaje de transferencia
+    fb.write_text_kernel("", Color::WHITE);
+    fb.write_text_kernel("🔄 Transfiriendo control a PID 1 (eclipse-systemd)...", Color::CYAN);
+    serial_write_str("SYSTEMD_INIT: Ejecutando eclipse-systemd como PID 1\n");
+    
+    // Ejecutar eclipse-systemd
+    // NOTA: En un sistema real, esto transferiría completamente el control
+    // Por ahora, ejecutamos la simulación y retornamos
+    match init_system.execute_init() {
+        Ok(_) => {
+            serial_write_str("SYSTEMD_INIT: eclipse-systemd ejecutado exitosamente\n");
+            Ok(())
+        }
+        Err(e) => {
+            serial_write_str(&alloc::format!("SYSTEMD_INIT: Error: {}\n", e));
+            Err(e)
+        }
+    }
 }
 
 /// Inicializa los sistemas críticos que no pueden fallar

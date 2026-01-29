@@ -89,12 +89,20 @@ sudo service eclipse-systemd status
 
 ### Integración con kernel
 ```bash
-# Compilar kernel con integración systemd
-cd ../..
-./eclipse_kernel/build_with_systemd.sh
+# El kernel Eclipse OS incluye soporte de integración systemd
+# Ubicado en: eclipse_kernel/src/init_system.rs
 
-# Ejecutar pruebas de integración
-./test_systemd_integration.sh
+# Estado de la integración kernel-systemd:
+# ✅ Módulo init_system.rs implementado
+# ✅ Hook de inicialización en kernel_main()
+# ✅ Configuración de PID 1 y variables de entorno
+# ⚠️ Carga de ELF (simulada - requiere VFS real)
+# ⚠️ Memoria virtual (simulada - requiere paginación completa)
+# ⚠️ Transferencia de control (pendiente - requiere implementación completa)
+
+# Para habilitar systemd en el kernel:
+# El kernel verifica automáticamente si systemd debe iniciarse
+# Actualmente retorna al kernel loop si falla la transferencia
 ```
 
 ## Uso
@@ -242,12 +250,38 @@ Eclipse SystemD está diseñado para integrarse con el kernel Eclipse:
 - Gestión avanzada de dependencias
 - Sistema de notificaciones
 - Gestión de recursos (monitoreo)
+- **Integración con kernel Eclipse OS** (módulo init_system.rs)
 
 ### 🚧 En Progreso
-- Integración completa con kernel
+- Integración completa con kernel (requiere VFS y paginación)
+- Carga real de ejecutables ELF desde filesystem
+- Transferencia de control kernel→userland
+- Implementación de syscalls críticas (fork, exec, wait)
 - Privilege dropping (User/Group directives)
 - inotify para detección de cambios en archivos .service
 - Aplicación de límites usando cgroups
+
+### 🔧 Limitaciones Actuales de la Integración Kernel
+
+El kernel Eclipse OS tiene un módulo `init_system.rs` que proporciona la
+infraestructura para ejecutar eclipse-systemd como PID 1, pero actualmente
+tiene las siguientes limitaciones:
+
+1. **Filesystem**: No hay VFS funcional, por lo que la carga de ejecutables
+   usa datos ELF ficticios en lugar de leer `/sbin/init` del disco.
+
+2. **Memoria Virtual**: El mapeo de memoria es simulado y no configura
+   tablas de páginas reales para el espacio de usuario.
+
+3. **Transferencia de Control**: La función `iretq` está documentada pero
+   no se ejecuta realmente porque requiere paginación completa.
+
+4. **Syscalls**: Las syscalls críticas (fork, exec, wait, signal) no están
+   implementadas, lo que impide que systemd cree y gestione procesos.
+
+Cuando estas limitaciones se resuelvan, el kernel podrá transferir
+completamente el control a eclipse-systemd y el sistema operativo
+funcionará con un init system completo.
 
 ### ⏳ Planificado
 - Soporte para sockets systemd

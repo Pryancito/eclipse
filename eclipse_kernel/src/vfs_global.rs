@@ -1,0 +1,178 @@
+//! Global VFS Instance and Integration
+//!
+//! This module provides a global virtual filesystem instance that can be
+//! accessed throughout the kernel.
+
+use crate::virtual_fs::{VirtualFileSystem, FsResult};
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Global VFS instance
+    pub static ref GLOBAL_VFS: Mutex<VirtualFileSystem> = {
+        let mut vfs = VirtualFileSystem::new(10 * 1024 * 1024); // 10MB RAM FS
+        
+        // Create standard directories
+        vfs.create_directory("/proc").ok();
+        vfs.create_directory("/dev").ok();
+        vfs.create_directory("/sys").ok();
+        vfs.create_directory("/sbin").ok();
+        vfs.create_directory("/bin").ok();
+        vfs.create_directory("/usr").ok();
+        vfs.create_directory("/usr/bin").ok();
+        vfs.create_directory("/etc").ok();
+        vfs.create_directory("/etc/eclipse").ok();
+        vfs.create_directory("/etc/eclipse/systemd").ok();
+        vfs.create_directory("/etc/eclipse/systemd/system").ok();
+        vfs.create_directory("/var").ok();
+        vfs.create_directory("/var/log").ok();
+        vfs.create_directory("/tmp").ok();
+        vfs.create_directory("/home").ok();
+        
+        Mutex::new(vfs)
+    };
+}
+
+/// Get reference to global VFS
+pub fn get_vfs() -> &'static Mutex<VirtualFileSystem> {
+    &GLOBAL_VFS
+}
+
+/// Initialize VFS with default structure
+pub fn init_vfs() -> FsResult<()> {
+    let vfs = get_vfs();
+    let mut vfs_lock = vfs.lock();
+    
+    // Create default files
+    vfs_lock.create_file("/etc/hostname", b"eclipse-os\n")?;
+    vfs_lock.create_file("/etc/os-release", b"NAME=\"Eclipse OS\"\nVERSION=\"0.1.0\"\n")?;
+    
+    Ok(())
+}
+
+/// Create minimal systemd stub in VFS for testing
+pub fn prepare_systemd_binary() -> FsResult<()> {
+    let vfs = get_vfs();
+    let mut vfs_lock = vfs.lock();
+    
+    // Create a minimal ELF header stub
+    // In a real system, this would be loaded from disk
+    let minimal_elf = create_minimal_elf_stub();
+    
+    vfs_lock.create_file("/sbin/eclipse-systemd", &minimal_elf)?;
+    vfs_lock.create_file("/sbin/init", &minimal_elf)?;
+    
+    Ok(())
+}
+
+/// Create minimal ELF stub for testing
+fn create_minimal_elf_stub() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    
+    // ELF64 header (minimal valid ELF)
+    let mut elf = Vec::new();
+    
+    // ELF magic
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    
+    // 64-bit, little-endian, version 1
+    elf.push(2); // ELFCLASS64
+    elf.push(1); // ELFDATA2LSB  
+    elf.push(1); // EV_CURRENT
+    elf.push(0); // ELFOSABI_SYSV
+    elf.extend_from_slice(&[0; 8]); // Padding
+    
+    // e_type = ET_EXEC (2), e_machine = EM_X86_64 (0x3E)
+    elf.extend_from_slice(&[2, 0, 0x3E, 0]);
+    
+    // e_version = 1
+    elf.extend_from_slice(&[1, 0, 0, 0]);
+    
+    // e_entry = 0x400000 (entry point)
+    elf.extend_from_slice(&[0, 0, 0x40, 0, 0, 0, 0, 0]);
+    
+    // e_phoff = 64 (program header offset)
+    elf.extend_from_slice(&[64, 0, 0, 0, 0, 0, 0, 0]);
+    
+    // e_shoff = 0 (no section headers for now)
+    elf.extend_from_slice(&[0; 8]);
+    
+    // e_flags = 0
+    elf.extend_from_slice(&[0; 4]);
+    
+    // e_ehsize = 64
+    elf.extend_from_slice(&[64, 0]);
+    
+    // e_phentsize = 56
+    elf.extend_from_slice(&[56, 0]);
+    
+    // e_phnum = 1
+    elf.extend_from_slice(&[1, 0]);
+    
+    // e_shentsize = 0
+    elf.extend_from_slice(&[0, 0]);
+    
+    // e_shnum = 0
+    elf.extend_from_slice(&[0, 0]);
+    
+    // e_shstrndx = 0
+    elf.extend_from_slice(&[0, 0]);
+    
+    // Program header
+    // p_type = PT_LOAD (1)
+    elf.extend_from_slice(&[1, 0, 0, 0]);
+    
+    // p_flags = PF_R | PF_X (5)
+    elf.extend_from_slice(&[5, 0, 0, 0]);
+    
+    // p_offset = 0
+    elf.extend_from_slice(&[0; 8]);
+    
+    // p_vaddr = 0x400000
+    elf.extend_from_slice(&[0, 0, 0x40, 0, 0, 0, 0, 0]);
+    
+    // p_paddr = 0x400000
+    elf.extend_from_slice(&[0, 0, 0x40, 0, 0, 0, 0, 0]);
+    
+    // p_filesz = 4096
+    elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
+    
+    // p_memsz = 4096
+    elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
+    
+    // p_align = 4096
+    elf.extend_from_slice(&[0, 0x10, 0, 0, 0, 0, 0, 0]);
+    
+    // Pad to minimum size
+    while elf.len() < 4096 {
+        elf.push(0x90); // NOP instruction
+    }
+    
+    elf
+}
+
+/// Create default service files for systemd
+pub fn create_default_service_files() -> FsResult<()> {
+    let vfs = get_vfs();
+    let mut vfs_lock = vfs.lock();
+    
+    // Create basic.target
+    let basic_target = b"\
+[Unit]
+Description=Basic System
+Documentation=man:systemd.special(7)
+";
+    vfs_lock.create_file("/etc/eclipse/systemd/system/basic.target", basic_target)?;
+    
+    // Create multi-user.target
+    let multi_user = b"\
+[Unit]
+Description=Multi-User System
+Documentation=man:systemd.special(7)
+Requires=basic.target
+After=basic.target
+";
+    vfs_lock.create_file("/etc/eclipse/systemd/system/multi-user.target", multi_user)?;
+    
+    Ok(())
+}
