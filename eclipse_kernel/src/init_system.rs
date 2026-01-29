@@ -298,7 +298,7 @@ impl InitSystem {
     ) -> Result<crate::elf_loader::LoadedProcess, &'static str> {
         // En un sistema real con VFS, leemos el archivo del sistema de archivos
         // Intentar leer desde VFS primero
-        if let Some(vfs_guard) = crate::vfs_global::get_vfs().try_lock() {
+        if let Some(mut vfs_guard) = crate::vfs_global::get_vfs().try_lock() {
             if let Ok(elf_data) = vfs_guard.read_file(path) {
                 crate::debug::serial_write_str(&alloc::format!(
                     "INIT_SYSTEM: Cargando ELF desde VFS: {} ({} bytes)\n",

@@ -3,7 +3,7 @@
 //! This module provides a global virtual filesystem instance that can be
 //! accessed throughout the kernel.
 
-use crate::virtual_fs::{VirtualFileSystem, FsResult};
+use crate::virtual_fs::{VirtualFileSystem, FsResult, FilePermissions};
 use spin::Mutex;
 use lazy_static::lazy_static;
 
@@ -13,21 +13,22 @@ lazy_static! {
         let mut vfs = VirtualFileSystem::new(10 * 1024 * 1024); // 10MB RAM FS
         
         // Create standard directories
-        vfs.create_directory("/proc").ok();
-        vfs.create_directory("/dev").ok();
-        vfs.create_directory("/sys").ok();
-        vfs.create_directory("/sbin").ok();
-        vfs.create_directory("/bin").ok();
-        vfs.create_directory("/usr").ok();
-        vfs.create_directory("/usr/bin").ok();
-        vfs.create_directory("/etc").ok();
-        vfs.create_directory("/etc/eclipse").ok();
-        vfs.create_directory("/etc/eclipse/systemd").ok();
-        vfs.create_directory("/etc/eclipse/systemd/system").ok();
-        vfs.create_directory("/var").ok();
-        vfs.create_directory("/var/log").ok();
-        vfs.create_directory("/tmp").ok();
-        vfs.create_directory("/home").ok();
+        // Create standard directories
+        vfs.create_directory("/proc", FilePermissions::default()).ok();
+        vfs.create_directory("/dev", FilePermissions::default()).ok();
+        vfs.create_directory("/sys", FilePermissions::default()).ok();
+        vfs.create_directory("/sbin", FilePermissions::default()).ok();
+        vfs.create_directory("/bin", FilePermissions::default()).ok();
+        vfs.create_directory("/usr", FilePermissions::default()).ok();
+        vfs.create_directory("/usr/bin", FilePermissions::default()).ok();
+        vfs.create_directory("/etc", FilePermissions::default()).ok();
+        vfs.create_directory("/etc/eclipse", FilePermissions::default()).ok();
+        vfs.create_directory("/etc/eclipse/systemd", FilePermissions::default()).ok();
+        vfs.create_directory("/etc/eclipse/systemd/system", FilePermissions::default()).ok();
+        vfs.create_directory("/var", FilePermissions::default()).ok();
+        vfs.create_directory("/var/log", FilePermissions::default()).ok();
+        vfs.create_directory("/tmp", FilePermissions::default()).ok();
+        vfs.create_directory("/home", FilePermissions::default()).ok();
         
         Mutex::new(vfs)
     };
@@ -44,8 +45,12 @@ pub fn init_vfs() -> FsResult<()> {
     let mut vfs_lock = vfs.lock();
     
     // Create default files
-    vfs_lock.create_file("/etc/hostname", b"eclipse-os\n")?;
-    vfs_lock.create_file("/etc/os-release", b"NAME=\"Eclipse OS\"\nVERSION=\"0.1.0\"\n")?;
+    // Create default files
+    vfs_lock.create_file("/etc/hostname", FilePermissions::default())?;
+    vfs_lock.write_file("/etc/hostname", b"eclipse-os\n")?;
+
+    vfs_lock.create_file("/etc/os-release", FilePermissions::default())?;
+    vfs_lock.write_file("/etc/os-release", b"NAME=\"Eclipse OS\"\nVERSION=\"0.1.0\"\n")?;
     
     Ok(())
 }
@@ -59,8 +64,11 @@ pub fn prepare_systemd_binary() -> FsResult<()> {
     // In a real system, this would be loaded from disk
     let minimal_elf = create_minimal_elf_stub();
     
-    vfs_lock.create_file("/sbin/eclipse-systemd", &minimal_elf)?;
-    vfs_lock.create_file("/sbin/init", &minimal_elf)?;
+    vfs_lock.create_file("/sbin/eclipse-systemd", FilePermissions::default())?;
+    vfs_lock.write_file("/sbin/eclipse-systemd", &minimal_elf)?;
+
+    vfs_lock.create_file("/sbin/init", FilePermissions::default())?;
+    vfs_lock.write_file("/sbin/init", &minimal_elf)?;
     
     Ok(())
 }
@@ -162,7 +170,8 @@ pub fn create_default_service_files() -> FsResult<()> {
 Description=Basic System
 Documentation=man:systemd.special(7)
 ";
-    vfs_lock.create_file("/etc/eclipse/systemd/system/basic.target", basic_target)?;
+    vfs_lock.create_file("/etc/eclipse/systemd/system/basic.target", FilePermissions::default())?;
+    vfs_lock.write_file("/etc/eclipse/systemd/system/basic.target", basic_target)?;
     
     // Create multi-user.target
     let multi_user = b"\
@@ -172,7 +181,8 @@ Documentation=man:systemd.special(7)
 Requires=basic.target
 After=basic.target
 ";
-    vfs_lock.create_file("/etc/eclipse/systemd/system/multi-user.target", multi_user)?;
+    vfs_lock.create_file("/etc/eclipse/systemd/system/multi-user.target", FilePermissions::default())?;
+    vfs_lock.write_file("/etc/eclipse/systemd/system/multi-user.target", multi_user)?;
     
     Ok(())
 }

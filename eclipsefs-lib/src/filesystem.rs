@@ -14,6 +14,7 @@ use crate::defragmentation::{DefragmentationConfig, IntelligentDefragmenter};
 use crate::load_balancing::{LoadBalancingConfig, IntelligentLoadBalancer};
 #[cfg(feature = "std")]
 use crate::journal::{Journal, JournalConfig, JournalEntry, TransactionType};
+use crate::format::{EclipseFSHeader, InodeTableEntry};
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;

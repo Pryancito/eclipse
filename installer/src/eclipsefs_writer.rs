@@ -214,7 +214,7 @@ impl EclipseFSInstaller {
         println!("📊 Escribiendo {} nodos al sistema de archivos", total_inodes);
         
         // Crear el escritor EclipseFS
-        let mut writer = EclipseFSWriter::new(&self.image_path)
+        let mut writer = EclipseFSWriter::from_path(&self.image_path)
             .map_err(|e| format!("Error creando EclipseFSWriter: {:?}", e))?;
         
         // Agregar todos los nodos del sistema de archivos al writer
