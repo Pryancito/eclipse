@@ -10,6 +10,7 @@ pub mod wayland_client;
 pub mod panel;
 pub mod launcher;
 pub mod window_manager;
+pub mod mem;
 
 pub use wayland_client::*;
 pub use panel::*;

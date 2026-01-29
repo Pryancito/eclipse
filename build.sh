@@ -589,14 +589,22 @@ create_basic_distribution() {
         fi
 
         # Copiar Wayland Server (Rust) si existe
-        if [ -f "userland/wayland_server/target/release/wayland_server" ]; then
+        if [ -f "userland/wayland_server/target/x86_64-unknown-linux-gnu/release/wayland_server" ]; then
+            cp "userland/wayland_server/target/x86_64-unknown-linux-gnu/release/wayland_server" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/wayland_server"
+            print_status "Wayland Server (Rust) copiado"
+        elif [ -f "userland/wayland_server/target/release/wayland_server" ]; then
             cp "userland/wayland_server/target/release/wayland_server" "$BUILD_DIR/userland/bin/"
             chmod +x "$BUILD_DIR/userland/bin/wayland_server"
             print_status "Wayland Server (Rust) copiado"
         fi
 
         # Copiar COSMIC Client (Rust) si existe
-        if [ -f "userland/cosmic_client/target/release/cosmic_client" ]; then
+        if [ -f "userland/cosmic_client/target/x86_64-unknown-linux-gnu/release/cosmic_client" ]; then
+            cp "userland/cosmic_client/target/x86_64-unknown-linux-gnu/release/cosmic_client" "$BUILD_DIR/userland/bin/"
+            chmod +x "$BUILD_DIR/userland/bin/cosmic_client"
+            print_status "COSMIC Client (Rust) copiado"
+        elif [ -f "userland/cosmic_client/target/release/cosmic_client" ]; then
             cp "userland/cosmic_client/target/release/cosmic_client" "$BUILD_DIR/userland/bin/"
             chmod +x "$BUILD_DIR/userland/bin/cosmic_client"
             print_status "COSMIC Client (Rust) copiado"
