@@ -702,3 +702,82 @@ pub fn translate_virtual_address(virtual_addr: u64) -> Option<(u64, u64)> {
     let manager = get_virtual_manager();
     manager.translate_address(virtual_addr)
 }
+
+/// Configurar paginación para userland
+/// 
+/// Configura las tablas de páginas necesarias para ejecutar código en modo usuario.
+/// Retorna la dirección física de la tabla PML4 configurada.
+/// 
+/// # WARNING
+/// Esta es una implementación stub que retorna error porque no hay código userland real.
+/// Cuando se implemente completamente, debe:
+/// 1. Crear una nueva PML4 para el proceso userland
+/// 2. Crear y configurar PDPTs, PDs, y PTs necesarios
+/// 3. Mapear el código, datos, heap y stack del userland
+/// 4. Configurar permisos apropiados (USER, WRITABLE, etc.)
+pub fn setup_userland_paging() -> Result<u64, &'static str> {
+    serial_write_str("PAGING: Setting up userland paging tables\n");
+    
+    // Por ahora, retornamos un error porque no hay código userland real para ejecutar.
+    // Cuando haya un binario real de eclipse-systemd en memoria, esta función deberá
+    // crear las tablas de páginas apropiadas.
+    
+    Err("setup_userland_paging: No hay código userland real para mapear")
+}
+
+/// Mapear memoria para userland
+///
+/// Mapea un rango de memoria virtual en el espacio de direcciones del userland.
+///
+/// # Argumentos
+/// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
+/// - `virtual_addr`: Dirección virtual base a mapear
+/// - `size`: Tamaño del rango a mapear en bytes
+/// 
+/// # WARNING - STUB IMPLEMENTATION
+/// Esta función actualmente es un stub que solo registra la operación.
+/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
+/// habilitar la ejecución de código userland real.
+pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Result<(), &'static str> {
+    serial_write_str(&alloc::format!(
+        "PAGING: map_userland_memory(pml4=0x{:x}, vaddr=0x{:x}, size=0x{:x})\n",
+        pml4_addr, virtual_addr, size
+    ));
+    
+    // En un sistema completo, esto:
+    // 1. Accedería a la tabla PML4 en pml4_addr
+    // 2. Crearía/navegaría por PDPTs, PDs, PTs según sea necesario
+    // 3. Asignaría páginas físicas para el rango virtual_addr..virtual_addr+size
+    // 4. Configuraría las entradas de página con los permisos apropiados
+    //
+    // Por ahora, solo simulamos éxito
+    Ok(())
+}
+
+/// Mapear memoria con mapeo identidad (virtual == física)
+///
+/// Crea un mapeo donde las direcciones virtuales son iguales a las físicas.
+/// Útil para hardware memory-mapped y código que necesita conocer sus direcciones físicas.
+///
+/// # Argumentos
+/// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
+/// - `physical_addr`: Dirección física/virtual base a mapear
+/// - `size`: Tamaño del rango a mapear en bytes
+/// 
+/// # WARNING - STUB IMPLEMENTATION
+/// Esta función actualmente es un stub que solo registra la operación.
+/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
+/// habilitar la ejecución de código userland real.
+pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u64) -> Result<(), &'static str> {
+    serial_write_str(&alloc::format!(
+        "PAGING: identity_map_userland_memory(pml4=0x{:x}, paddr=0x{:x}, size=0x{:x})\n",
+        pml4_addr, physical_addr, size
+    ));
+    
+    // En un sistema completo, esto mapearía physical_addr -> physical_addr
+    // de forma que al acceder a la dirección virtual physical_addr se acceda
+    // a la dirección física physical_addr.
+    //
+    // Por ahora, solo simulamos éxito
+    Ok(())
+}

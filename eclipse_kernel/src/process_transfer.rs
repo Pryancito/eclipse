@@ -98,39 +98,39 @@ impl ProcessTransfer {
             context.rip, context.rsp
         ));
         
-<<<<<<< HEAD
-        // NOTA: La transferencia completa al userland requiere:
-        // 1. Código ejecutable real cargado en memoria en entry_point
-        // 2. Memoria mapeada correctamente (código, datos, heap, stack)
-        // 3. GDT/IDT configurados para soportar cambio de privilegio
-        // 
-        // Sin código real en 0x400000, saltar allí causaría un #UD o #GP fault
-        // que podría llevar a un triple fault si los handlers no están configurados.
-        
-        crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
-        crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
-        
-        // Retornar error indicando que la transferencia fue diferida
-        Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria.")
-=======
-        let pml4_addr = self.setup_userland_environment()?;
-        
-        // Map userland code (Identity map around entry point)
-        if context.rip < 0x800000000000 {
-             identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
+        // Intentar configurar el entorno de userland
+        match self.setup_userland_environment() {
+            Ok(pml4_addr) => {
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
+                
+                // Map userland code (Identity map around entry point)
+                if context.rip < 0x800000000000 {
+                    identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
+                }
+                
+                // Map stack memory
+                // Stack is at 0x1000000 (16MB) with size 0x800000 (8MB)
+                // So stack range is 0x800000 - 0x1000000
+                let stack_base = context.rsp.saturating_sub(0x100000); // 1MB below stack pointer
+                map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?;
+                
+                // Execute process
+                self.execute_userland_process(context, pml4_addr)?;
+                
+                Ok(())
+            }
+            Err(e) => {
+                // La configuración del entorno falló, probablemente porque no hay código userland real
+                crate::debug::serial_write_str(&alloc::format!(
+                    "PROCESS_TRANSFER: Userland environment setup failed: {}\n", e
+                ));
+                crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+                crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+                
+                // Retornar el error para que el sistema sepa que la transferencia fue diferida
+                Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria")
+            }
         }
-        
-        // Verify stack mapping if needed
-        if context.rsp > 0x100000000 {
-             let stack_base = context.rsp - 0x100000;
-             map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?; 
-        }
-        
-        // Execute process
-        self.execute_userland_process(context, pml4_addr)?;
-        
-        Ok(())
->>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     }
 
     /// Configurar el entorno de ejecución del userland
@@ -151,22 +151,6 @@ impl ProcessTransfer {
         setup_userland_idt(kernel_code_selector)
     }
 
-<<<<<<< HEAD
-    /// Configurar paginación
-    fn setup_paging(&self) -> Result<(), &'static str> {
-        // Crear y configurar el gestor de paginación
-        let mut paging_manager = PagingManager::new();
-        let _pml4_addr = paging_manager.setup_userland_paging()?;
-        
-        // Cambiar a la nueva tabla de páginas
-        paging_manager.switch_to_pml4();
-
-        Ok(())
-    }
-
-    /// Configurar interrupciones
-=======
->>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     fn setup_interrupts(&self) -> Result<(), &'static str> {
         initialize_interrupt_system(0x08)
     }
@@ -187,75 +171,6 @@ impl ProcessTransfer {
         Ok(())
     }
 
-<<<<<<< HEAD
-    /// Transferir control al userland usando iretq
-    fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
-        crate::debug::serial_write_str(&alloc::format!(
-            "PROCESS_TRANSFER: Executing iretq - entry=0x{:x} stack=0x{:x}\n",
-            context.rip, context.rsp
-        ));
-        
-        unsafe {
-            // Preparar el stack del kernel para iretq
-            // iretq espera (de tope a fondo del stack):
-            // RIP, CS, RFLAGS, RSP, SS
-            
-            asm!(
-                // Primero guardamos el stack pointer actual en un registro temporal
-                "mov r11, rsp",
-                
-                // Apilar valores para iretq (en orden inverso porque el stack crece hacia abajo)
-                "push {ss}",              // Stack Segment (USER_DS = 0x23)
-                "push {user_rsp}",        // User Stack Pointer
-                "push {rflags}",          // RFLAGS
-                "push {cs}",              // Code Segment (USER_CS = 0x2B)
-                "push {rip}",             // Instruction Pointer
-                
-                // Cargar registros de propósito general del contexto
-                "mov rax, {rax}",
-                "mov rbx, {rbx}",
-                "mov rcx, {rcx}",
-                "mov rdx, {rdx}",
-                "mov rsi, {rsi}",
-                "mov rdi, {rdi}",
-                "mov rbp, {rbp}",
-                "mov r8, {r8}",
-                "mov r9, {r9}",
-                "mov r10, {r10}",
-                // r11 se usó temporalmente, lo cargamos ahora
-                "mov r11, {r11}",
-                "mov r12, {r12}",
-                "mov r13, {r13}",
-                "mov r14, {r14}",
-                "mov r15, {r15}",
-                
-                // Ejecutar iretq para transferir al userland (NUNCA RETORNA)
-                "iretq",
-                
-                ss = in(reg) context.ss,
-                user_rsp = in(reg) context.rsp,
-                rflags = in(reg) context.rflags,
-                cs = in(reg) context.cs,
-                rip = in(reg) context.rip,
-                rax = in(reg) context.rax,
-                rbx = in(reg) context.rbx,
-                rcx = in(reg) context.rcx,
-                rdx = in(reg) context.rdx,
-                rsi = in(reg) context.rsi,
-                rdi = in(reg) context.rdi,
-                rbp = in(reg) context.rbp,
-                r8 = in(reg) context.r8,
-                r9 = in(reg) context.r9,
-                r10 = in(reg) context.r10,
-                r11 = in(reg) context.r11,
-                r12 = in(reg) context.r12,
-                r13 = in(reg) context.r13,
-                r14 = in(reg) context.r14,
-                r15 = in(reg) context.r15,
-                options(noreturn)
-            );
-        }
-=======
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
         crate::debug::serial_write_str("PROCESS_TRANSFER: Switching CR3 and executing iretq...\n");
         
@@ -305,7 +220,6 @@ impl ProcessTransfer {
         }
 
         Err("Critical: iretq failed or returned")
->>>>>>> ed6658f3 (correcion de bugs de compilacion en el kernel)
     }
 
     pub fn get_current_pid(&self) -> u32 {
