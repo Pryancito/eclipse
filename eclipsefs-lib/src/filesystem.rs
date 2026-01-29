@@ -12,6 +12,8 @@ use crate::cache::{CacheConfig, IntelligentCache};
 use crate::defragmentation::{DefragmentationConfig, IntelligentDefragmenter};
 #[cfg(feature = "std")]
 use crate::load_balancing::{LoadBalancingConfig, IntelligentLoadBalancer};
+#[cfg(feature = "std")]
+use crate::journal::{Journal, JournalConfig, JournalEntry, TransactionType};
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -45,6 +47,7 @@ pub struct EclipseFS {
     cache: Option<IntelligentCache>,             // Sistema de caché inteligente
     defragmenter: Option<IntelligentDefragmenter>, // Sistema de defragmentación
     load_balancer: Option<IntelligentLoadBalancer>, // Sistema de balanceo de carga
+    journal: Option<Journal>,                     // Sistema de journaling para crash recovery
 }
 
 #[cfg(not(feature = "std"))]
@@ -70,7 +73,7 @@ impl EclipseFS {
             nodes: HashMap::new(),
             #[cfg(not(feature = "std"))]
             nodes: FnvIndexMap::new(),
-            next_inode: 1,
+            next_inode: 2,  // Start at 2 since root is 1
             root_inode: 1,
             umask: 0o022,
             // Inicializar nuevos campos RedoxFS
@@ -91,6 +94,8 @@ impl EclipseFS {
             defragmenter: None,
             #[cfg(feature = "std")]
             load_balancer: None,
+            #[cfg(feature = "std")]
+            journal: None,
         };
         
         // Crear el directorio raíz
@@ -222,6 +227,91 @@ impl EclipseFS {
     pub fn enable_intelligent_load_balancing(&mut self, config: LoadBalancingConfig) -> EclipseFSResult<()> {
         self.load_balancer = Some(IntelligentLoadBalancer::new(config));
         Ok(())
+    }
+    
+    /// Habilitar sistema de journaling para crash recovery (inspirado en ext4)
+    #[cfg(feature = "std")]
+    pub fn enable_journaling(&mut self, config: JournalConfig) -> EclipseFSResult<()> {
+        self.journal = Some(Journal::new(config));
+        Ok(())
+    }
+    
+    /// Deshabilitar journaling
+    #[cfg(feature = "std")]
+    pub fn disable_journaling(&mut self) -> EclipseFSResult<()> {
+        if let Some(ref mut journal) = self.journal {
+            journal.commit()?;
+        }
+        self.journal = None;
+        Ok(())
+    }
+    
+    /// Commit journal transactions
+    #[cfg(feature = "std")]
+    pub fn commit_journal(&mut self) -> EclipseFSResult<()> {
+        if let Some(ref mut journal) = self.journal {
+            journal.commit()?;
+        }
+        Ok(())
+    }
+    
+    /// Rollback journal transactions
+    #[cfg(feature = "std")]
+    pub fn rollback_journal(&mut self) -> EclipseFSResult<()> {
+        if let Some(ref mut journal) = self.journal {
+            journal.rollback()?;
+        }
+        Ok(())
+    }
+    
+    /// Log a transaction to the journal
+    #[cfg(feature = "std")]
+    fn log_transaction(&mut self, transaction_type: TransactionType, inode: u32, parent_inode: u32, data: &[u8]) -> EclipseFSResult<()> {
+        if let Some(ref mut journal) = self.journal {
+            let entry = JournalEntry::new(transaction_type, inode, parent_inode)
+                .with_data(data)?;
+            journal.log_transaction(entry)?;
+        }
+        Ok(())
+    }
+    
+    /// Recover from journal after crash
+    #[cfg(feature = "std")]
+    pub fn recover_from_journal(&mut self) -> EclipseFSResult<u32> {
+        if let Some(ref journal) = self.journal {
+            let entries = journal.replay()?;
+            let recovered_count = entries.len() as u32;
+            
+            // Apply recovered transactions
+            for entry in entries {
+                match entry.transaction_type {
+                    TransactionType::CreateFile | TransactionType::CreateDirectory => {
+                        // Transaction was logged but may not have completed
+                        // Check if node exists, if not recreate it
+                        if !self.nodes.contains_key(&entry.inode) {
+                            let node = if entry.transaction_type == TransactionType::CreateFile {
+                                EclipseFSNode::new_file()
+                            } else {
+                                EclipseFSNode::new_dir()
+                            };
+                            self.add_node(entry.inode, node)?;
+                        }
+                    }
+                    TransactionType::WriteData => {
+                        // Restore file data
+                        if let Some(node) = self.nodes.get_mut(&entry.inode) {
+                            node.set_data(&entry.data)?;
+                        }
+                    }
+                    _ => {
+                        // Other transaction types handled similarly
+                    }
+                }
+            }
+            
+            return Ok(recovered_count);
+        }
+        Ok(0)
     }
     
     /// Ejecutar optimizaciones avanzadas (inspirado en RedoxFS)
@@ -422,6 +512,10 @@ impl EclipseFS {
         let inode = self.allocate_inode();
         let file_node = EclipseFSNode::new_file();
         
+        // Log transaction to journal before making changes
+        #[cfg(feature = "std")]
+        self.log_transaction(TransactionType::CreateFile, inode, parent_inode, name.as_bytes())?;
+        
         self.add_node(inode, file_node)?;
         
         // Agregar el hijo al padre
@@ -452,6 +546,10 @@ impl EclipseFS {
         
         let inode = self.allocate_inode();
         let dir_node = EclipseFSNode::new_dir();
+        
+        // Log transaction to journal before making changes
+        #[cfg(feature = "std")]
+        self.log_transaction(TransactionType::CreateDirectory, inode, parent_inode, name.as_bytes())?;
         
         self.add_node(inode, dir_node)?;
         
@@ -547,6 +645,10 @@ impl EclipseFS {
     
     /// Escribir en un archivo
     pub fn write_file(&mut self, inode: u32, data: &[u8]) -> EclipseFSResult<()> {
+        // Log transaction to journal before making changes
+        #[cfg(feature = "std")]
+        self.log_transaction(TransactionType::WriteData, inode, 0, data)?;
+        
         let node = self.get_node_mut(inode).ok_or(EclipseFSError::NotFound)?;
         
         if node.kind != NodeKind::File {

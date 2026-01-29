@@ -35,10 +35,14 @@ pub mod cache;
 pub mod defragmentation;
 #[cfg(feature = "std")]
 pub mod load_balancing;
+#[cfg(feature = "std")]
+pub mod journal;
 
 #[cfg(feature = "std")]
 pub use reader::EclipseFSReader;
 #[cfg(feature = "std")]
 pub use writer::EclipseFSWriter;
+#[cfg(feature = "std")]
+pub use journal::{Journal, JournalConfig, JournalEntry, JournalStats, TransactionType};
 
 pub const ECLIPSEFS_VERSION: u32 = 0x00020000; // v0.2.0
