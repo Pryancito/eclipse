@@ -1,0 +1,47 @@
+[package]
+name = "cosmic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core utilities
+heapless = "0.8"
+
+# COSMIC Desktop crates from System76/Pop!_OS
+cosmic-text = "0.16"       # Pure Rust text handling with advanced layout and shaping
+# libcosmic = "0.1"        # Main COSMIC GUI toolkit (requires std, disabled for now)
+
+# Wayland compositor framework
+smithay = { version = "0.7", optional = true }  # Wayland compositor building blocks
+wayland-server = { version = "0.31", optional = true }  # Wayland server protocol
+wayland-protocols = { version = "0.32", optional = true }  # Wayland protocol extensions
+calloop = { version = "0.14", optional = true }  # Event loop for compositor
+
+# Wayland client support
+wayland-client = { version = "0.31", optional = true }  # Wayland client protocol
+
+# Additional useful crates
+serde = { version = "1.0", default-features = false, optional = true }
+serde_json = { version = "1.0", default-features = false, optional = true }
+
+[features]
+default = []
+compositor = ["smithay", "wayland-server", "wayland-protocols", "calloop"]
+client = ["wayland-client"]
+serialization = ["serde", "serde_json"]
+
+[lib]
+name = "cosmic"
+path = "mod.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"

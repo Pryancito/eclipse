@@ -160,7 +160,7 @@ pub mod ai_services; // Servicios de IA integrados
 pub mod ai_shell; // Shell integrado con comandos de IA
 pub mod ai_simple_demo; // Demostración simple de IA
 pub mod ai_typing_system; // Sistema de escritura inteligente con IA
-pub mod cosmic;
+// pub mod cosmic; // MIGRATED TO USERLAND: Moved to userland/cosmic
 pub mod hotplug; // Sistema de hotplug para dispositivos USB
 pub mod ipc; // Sistema de comunicación inter-proceso
 pub mod kernel_utils;
