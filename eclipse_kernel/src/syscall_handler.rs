@@ -58,6 +58,11 @@ const KERNEL_DS: u64 = 0x10;
 const USER_CS: u64 = 0x2B;      // RPL=3, index=5 (0x28 + 3)
 const USER_DS: u64 = 0x23;      // RPL=3, index=4 (0x20 + 3)
 
+/// User segment base for SYSRET calculation
+/// SYSRET sets: CS = USER_SEGMENT_BASE + 16, SS = USER_SEGMENT_BASE + 8
+/// This value (0x1B) results in CS=0x2B and SS=0x23 when SYSRET executes
+const USER_SEGMENT_BASE: u64 = 0x1B;
+
 /// Per-CPU kernel data
 #[repr(C)]
 pub struct KernelCpuData {
@@ -135,8 +140,7 @@ pub fn init_syscall() -> Result<(), &'static str> {
         // 
         // SYSRET sets: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
         // We want: CS = 0x2B (USER_CS), SS = 0x23 (USER_DS)
-        // Therefore: STAR[63:48] = 0x2B - 16 = 0x1B
-        const USER_SEGMENT_BASE: u64 = 0x1B;  // Base for SYSRET (will become 0x2B for CS, 0x23 for SS)
+        // Therefore: STAR[63:48] = 0x2B - 16 = 0x1B (USER_SEGMENT_BASE)
         let star = (USER_SEGMENT_BASE << 48) | (KERNEL_CS << 32);
         wrmsr(IA32_STAR, star);
         
