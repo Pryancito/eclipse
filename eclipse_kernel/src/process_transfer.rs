@@ -319,11 +319,12 @@ impl ProcessTransfer {
         let context_ptr = &context as *const ProcessContext;
         
         unsafe {
-            // 1. Switch CR3
-             asm!("mov cr3, {}", in(reg) pml4_addr, options(nostack));
-            
-            // 2. Execute iretq
+            // CRITICAL FIX: Build the iretq stack frame BEFORE switching CR3
+            // The temporary kernel stack at 0x500000 is only mapped in the kernel page tables,
+            // not in the userland page tables. If we switch CR3 first, the stack becomes
+            // unmapped and any push operations will trigger a page fault -> triple fault -> reset.
             asm!(
+                // 1. Setup temporary kernel stack and build iretq frame BEFORE CR3 switch
                 "mov rsp, {tmp_stack}",  
                 
                 // Push stack frame for iretq: SS, RSP, RFLAGS, CS, RIP
@@ -334,7 +335,11 @@ impl ProcessTransfer {
                 "push qword ptr [rax + 144]", // CS
                 "push qword ptr [rax + 128]", // RIP
                 
-                // Restore GPRs
+                // 2. NOW switch CR3 to userland page tables
+                //    Stack frame is already built, so we don't need to access 0x500000 anymore
+                "mov cr3, {new_pml4}",
+                
+                // 3. Restore GPRs from context
                 "mov rbx, [rax + 8]",
                 "mov rcx, [rax + 16]",
                 "mov rdx, [rax + 24]",
@@ -353,9 +358,12 @@ impl ProcessTransfer {
                 // Restore RAX last (it currently holds context_ptr)
                 "mov rax, [rax]",
                 
+                // 4. Execute iretq to transfer to userland
+                //    This pops: RIP, CS, RFLAGS, RSP, SS and jumps to userland
                 "iretq",
                 
                 in("rax") context_ptr,
+                new_pml4 = in(reg) pml4_addr,
                 tmp_stack = in(reg) 0x500000u64,
                 options(noreturn)
             );
