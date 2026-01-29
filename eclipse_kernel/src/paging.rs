@@ -311,10 +311,11 @@ impl PagingManager {
 
     /// Mapear memoria del userland
     fn map_userland_memory(&mut self) -> Result<(), &'static str> {
-        // Mapear solo un rango pequeño de memoria del userland para eclipse-systemd
-        // Esto evita problemas de alineación y asignación excesiva de memoria
+        // Mapear memoria del userland para eclipse-systemd
+        // Rango: 0x400000 - 0x1000000 (16MB total)
+        // Incluye: código, datos, heap y stack
         let userland_start = 0x400000;
-        let userland_end = 0x500000; // Solo 1MB de memoria del userland
+        let userland_end = 0x1000000; // 16MB para abarcar código + stack
 
         let mut current_addr = userland_start;
         while current_addr < userland_end {
