@@ -23,6 +23,9 @@ pub mod window_system;
 pub mod widgets;
 pub mod real_graphics_manager;
 
+// Ejemplos de integración
+pub mod examples;
+
 use phases::{init_graphics_phase_manager, GraphicsPhase, GraphicsPhaseManager};
 
 /// Inicializar el sistema de gráficos
