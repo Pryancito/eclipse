@@ -45,7 +45,7 @@ pub struct JournalEntry {
 impl JournalEntry {
     /// Create a new journal entry
     pub fn new(transaction_type: TransactionType, inode: u32, parent_inode: u32) -> Self {
-        Self {
+        let mut entry = Self {
             transaction_id: 0, // Will be assigned by journal
             transaction_type,
             inode,
@@ -57,7 +57,10 @@ impl JournalEntry {
             #[cfg(not(feature = "std"))]
             data: HeaplessVec::new(),
             checksum: 0,
-        }
+        };
+        // Set correct checksum for empty data
+        entry.checksum = Self::calculate_checksum(&[]);
+        entry
     }
 
     /// Add data to the journal entry

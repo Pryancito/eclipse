@@ -547,6 +547,10 @@ impl EclipseFS {
         let inode = self.allocate_inode();
         let dir_node = EclipseFSNode::new_dir();
         
+        // Log transaction to journal before making changes
+        #[cfg(feature = "std")]
+        self.log_transaction(TransactionType::CreateDirectory, inode, parent_inode, name.as_bytes())?;
+        
         self.add_node(inode, dir_node)?;
         
         // Agregar el hijo al padre
