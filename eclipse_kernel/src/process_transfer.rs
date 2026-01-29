@@ -95,25 +95,25 @@ impl ProcessTransfer {
     /// NOTA: Esta función actualmente solo valida requisitos previos.
     /// La transferencia real requiere soporte completo de memoria virtual.
     pub fn transfer_to_userland(&mut self, context: ProcessContext) -> Result<(), &'static str> {
-        // NOTA: La transferencia completa al userland requiere:
-        // 1. Soporte completo de memoria virtual y paginación
-        // 2. Configuración adecuada de GDT/IDT para userland
-        // 3. Sistema de archivos funcional para cargar el ejecutable
-        // 
-        // Por ahora, validamos requisitos sin ejecutar operaciones
-        // que puedan causar un triple fault y reinicio del sistema
-        
-        crate::debug::serial_write_str("PROCESS_TRANSFER: Validando requisitos para transferencia a userland\n");
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Starting userland transfer sequence\n");
         crate::debug::serial_write_str(&alloc::format!(
-            "PROCESS_TRANSFER: entry_point=0x{:x} stack=0x{:x}\n",
+            "PROCESS_TRANSFER: context rip=0x{:x} rsp=0x{:x}\n",
             context.rip, context.rsp
         ));
         
-        // No configurar PID hasta que la transferencia sea exitosa
-        // (actualmente siempre falla por falta de soporte de VM)
+        // NOTA: La transferencia completa al userland requiere:
+        // 1. Código ejecutable real cargado en memoria en entry_point
+        // 2. Memoria mapeada correctamente (código, datos, heap, stack)
+        // 3. GDT/IDT configurados para soportar cambio de privilegio
+        // 
+        // Sin código real en 0x400000, saltar allí causaría un #UD o #GP fault
+        // que podría llevar a un triple fault si los handlers no están configurados.
         
-        // Retornar error indicando que falta soporte de VM
-        Err("Transferencia al userland requiere soporte completo de memoria virtual.")
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+        crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+        
+        // Retornar error indicando que la transferencia fue diferida
+        Err("Transferencia al userland diferida: requiere código ejecutable cargado en memoria.")
     }
 
     /// Configurar el entorno de ejecución del userland
@@ -148,12 +148,11 @@ impl ProcessTransfer {
 
     /// Configurar paginación
     fn setup_paging(&self) -> Result<(), &'static str> {
-        // Configurar paginación real para userland
-        let _pml4_addr = setup_userland_paging()?;
-
-        // Cambiar a la nueva tabla de páginas
+        // Crear y configurar el gestor de paginación
         let mut paging_manager = PagingManager::new();
-        paging_manager.setup_userland_paging()?;
+        let _pml4_addr = paging_manager.setup_userland_paging()?;
+        
+        // Cambiar a la nueva tabla de páginas
         paging_manager.switch_to_pml4();
 
         Ok(())
@@ -191,32 +190,28 @@ impl ProcessTransfer {
 
     /// Transferir control al userland usando iretq
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext) -> Result<(), &'static str> {
-        // NOTA: Esta función debería transferir completamente el control al userland
-        // y NUNCA retornar. Sin embargo, sin soporte real de memoria virtual y paginación,
-        // no podemos ejecutar código en userland.
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: Executing iretq - entry=0x{:x} stack=0x{:x}\n",
+            context.rip, context.rsp
+        ));
         
         unsafe {
-            // En un sistema real con paginación completa:
-            // 1. Configurar CR3 con la tabla de páginas del proceso
-            // 2. Preparar el stack del kernel con los valores para iretq
-            // 3. Cargar todos los registros
-            // 4. Ejecutar iretq para saltar al código userland
+            // Preparar el stack del kernel para iretq
+            // iretq espera (de tope a fondo del stack):
+            // RIP, CS, RFLAGS, RSP, SS
             
-            // Por ahora, simulamos la transición mostrando que está configurado
-            // En un kernel funcional, este código configuraría el stack y ejecutaría:
-            /*
-            // Preparar el stack del kernel para iretq (crece hacia abajo)
             asm!(
-                // Apilar los valores en el orden correcto para iretq:
-                // SS, RSP, RFLAGS, CS, RIP
-                "mov rsp, {tmp_stack}",  // Usar stack temporal del kernel
-                "push {ss}",              // Stack Segment
-                "push {rsp}",             // Stack Pointer
-                "push {rflags}",          // Flags
-                "push {cs}",              // Code Segment  
+                // Primero guardamos el stack pointer actual en un registro temporal
+                "mov r11, rsp",
+                
+                // Apilar valores para iretq (en orden inverso porque el stack crece hacia abajo)
+                "push {ss}",              // Stack Segment (USER_DS = 0x23)
+                "push {user_rsp}",        // User Stack Pointer
+                "push {rflags}",          // RFLAGS
+                "push {cs}",              // Code Segment (USER_CS = 0x2B)
                 "push {rip}",             // Instruction Pointer
                 
-                // Cargar registros del contexto
+                // Cargar registros de propósito general del contexto
                 "mov rax, {rax}",
                 "mov rbx, {rbx}",
                 "mov rcx, {rcx}",
@@ -227,18 +222,18 @@ impl ProcessTransfer {
                 "mov r8, {r8}",
                 "mov r9, {r9}",
                 "mov r10, {r10}",
+                // r11 se usó temporalmente, lo cargamos ahora
                 "mov r11, {r11}",
                 "mov r12, {r12}",
                 "mov r13, {r13}",
                 "mov r14, {r14}",
                 "mov r15, {r15}",
                 
-                // Transferir control (NUNCA RETORNA)
+                // Ejecutar iretq para transferir al userland (NUNCA RETORNA)
                 "iretq",
                 
-                tmp_stack = in(reg) 0x500000u64,  // Stack temporal del kernel
                 ss = in(reg) context.ss,
-                rsp = in(reg) context.rsp,
+                user_rsp = in(reg) context.rsp,
                 rflags = in(reg) context.rflags,
                 cs = in(reg) context.cs,
                 rip = in(reg) context.rip,
@@ -259,17 +254,7 @@ impl ProcessTransfer {
                 r15 = in(reg) context.r15,
                 options(noreturn)
             );
-            */
-            
-            // Por ahora, solo registramos que la transferencia fue intentada
-            crate::debug::serial_write_str(&alloc::format!(
-                "PROCESS_TRANSFER: Transferencia simulada - entry=0x{:x} stack=0x{:x}\n",
-                context.rip, context.rsp
-            ));
         }
-
-        // En un sistema real, esta línea nunca se ejecutaría porque iretq nunca retorna
-        Err("Transferencia al userland no soportada sin memoria virtual completa")
     }
 
     /// Registrar inicio del proceso
