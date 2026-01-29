@@ -251,3 +251,46 @@ pub fn example_check_system_state() -> Result<(), &'static str> {
     })
     .ok_or("Manager de fases no inicializado")?
 }
+
+/// Ejemplo 6: Usar los gestores globales con las funciones helper
+pub fn example_use_global_managers() -> Result<(), &'static str> {
+    use super::{with_multi_gpu_manager, with_window_compositor, with_widget_manager};
+    use alloc::string::String;
+    
+    // Usar el gestor Multi-GPU si está disponible
+    if can_use_advanced_multi_gpu() {
+        with_multi_gpu_manager(|_gpu_mgr| {
+            // Gestionar GPUs
+            // En una implementación real, usar métodos del gestor
+        });
+    }
+    
+    // Usar el compositor de ventanas si está disponible
+    if can_use_window_system() {
+        with_window_compositor(|compositor| {
+            // Crear una ventana de ejemplo
+            use super::window_system::{Position, Size};
+            let _window_id = compositor.create_window(
+                String::from("Ejemplo"),
+                Position { x: 100, y: 100 },
+                Size { width: 800, height: 600 }
+            );
+        });
+    }
+    
+    // Usar el gestor de widgets si está disponible
+    if can_use_widget_system() {
+        with_widget_manager(|widget_mgr| {
+            // Crear widgets de ejemplo
+            use super::widgets::WidgetType;
+            use super::window_system::{Position, Size};
+            let _button_id = widget_mgr.create_widget(
+                WidgetType::Button,
+                Position { x: 10, y: 10 },
+                Size { width: 100, height: 30 }
+            );
+        });
+    }
+    
+    Ok(())
+}
