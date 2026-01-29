@@ -69,8 +69,12 @@ pub struct GraphicsCapabilities {
 /// Inicializar gráficos UEFI para detección
 pub fn init_uefi_graphics() -> Result<(), &'static str> {
     // Transicionar a fase de detección UEFI
+    // Transicionar a fase de detección UEFI
     if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_uefi_detection()?;
+        let mut guard = manager.lock();
+        if let Some(mgr) = guard.as_mut() {
+            mgr.init_uefi_detection()?;
+        }
     }
 
     // Detectar hardware gráfico

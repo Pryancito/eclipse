@@ -722,6 +722,9 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
                 eclipsefs_lib::EclipseFSError::InvalidOperation => {
                     crate::debug::serial_write_str("InvalidOperation - operación inválida\n");
                 }
+                eclipsefs_lib::EclipseFSError::UnsupportedOperation => {
+                    crate::debug::serial_write_str("UnsupportedOperation - operación no soportada\n");
+                }
                 eclipsefs_lib::EclipseFSError::UnsupportedVersion => {
                     crate::debug::serial_write_str("UnsupportedVersion - versión no soportada\n");
                 }

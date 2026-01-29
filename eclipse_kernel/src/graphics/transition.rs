@@ -221,11 +221,11 @@ fn execute_multi_gpu_transition() -> Result<(), &'static str> {
     // Ejecutando transición a Multi-GPU
     
     // Transicionar en el manager de fases
-    if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_advanced_multi_gpu()?;
-    } else {
-        return Err("Manager de fases no disponible");
-    }
+    // Transicionar en el manager de fases
+    with_graphics_phase_manager(|manager| {
+        manager.init_advanced_multi_gpu()
+    })
+    .ok_or("Manager de fases no disponible")??;
     
     Ok(())
 }
@@ -260,11 +260,11 @@ fn execute_window_system_transition() -> Result<(), &'static str> {
     // Ejecutando transición a Window System
     
     // Transicionar en el manager de fases
-    if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_window_system()?;
-    } else {
-        return Err("Manager de fases no disponible");
-    }
+    // Transicionar en el manager de fases
+    with_graphics_phase_manager(|manager| {
+        manager.init_window_system()
+    })
+    .ok_or("Manager de fases no disponible")??;
     
     Ok(())
 }
@@ -299,11 +299,11 @@ fn execute_widget_system_transition() -> Result<(), &'static str> {
     // Ejecutando transición a Widget System
     
     // Transicionar en el manager de fases
-    if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_widget_system()?;
-    } else {
-        return Err("Manager de fases no disponible");
-    }
+    // Transicionar en el manager de fases
+    with_graphics_phase_manager(|manager| {
+        manager.init_widget_system()
+    })
+    .ok_or("Manager de fases no disponible")??;
     
     Ok(())
 }

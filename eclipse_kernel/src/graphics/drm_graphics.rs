@@ -79,9 +79,13 @@ pub struct DrmPerformanceStats {
 /// Inicializar sistema DRM
 pub fn init_drm_graphics() -> Result<(), &'static str> {
     // Verificar que estamos en fase correcta
+    // Verificar que estamos en fase correcta
     if let Some(manager) = get_graphics_phase_manager() {
-        if !manager.can_use_drm() {
-            return Err("DRM no disponible en la fase actual");
+        let guard = manager.lock();
+        if let Some(mgr) = guard.as_ref() {
+            if !mgr.can_use_drm() {
+                return Err("DRM no disponible en la fase actual");
+            }
         }
     }
 
@@ -103,8 +107,12 @@ pub fn init_drm_graphics() -> Result<(), &'static str> {
     // Log("[DRM Graphics] Framebuffer DRM configurado");
 
     // Marcar como inicializado
+    // Marcar como inicializado
     if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_drm_runtime(framebuffer_info)?;
+        let mut guard = manager.lock();
+        if let Some(mgr) = guard.as_mut() {
+            mgr.init_drm_runtime(framebuffer_info)?;
+        }
     }
 
     // Log("[DRM Graphics] Sistema DRM inicializado exitosamente");
@@ -222,7 +230,12 @@ pub fn get_drm_system_state() -> Option<&'static DrmSystemState> {
 /// Verificar si DRM está disponible
 pub fn is_drm_available() -> bool {
     if let Some(manager) = get_graphics_phase_manager() {
-        manager.can_use_drm()
+        let guard = manager.lock();
+        if let Some(mgr) = guard.as_ref() {
+            mgr.can_use_drm()
+        } else {
+            false
+        }
     } else {
         false
     }

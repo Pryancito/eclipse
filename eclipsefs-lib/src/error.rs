@@ -22,6 +22,8 @@ pub enum EclipseFSError {
     DuplicateEntry,
     /// Operación inválida
     InvalidOperation,
+    /// Operación no soportada
+    UnsupportedOperation,
     /// Error de I/O
     IoError,
     /// Permisos insuficientes
@@ -68,6 +70,7 @@ impl fmt::Display for EclipseFSError {
             EclipseFSError::NotFound => write!(f, "Archivo no encontrado"),
             EclipseFSError::DuplicateEntry => write!(f, "Entrada duplicada"),
             EclipseFSError::InvalidOperation => write!(f, "Operación inválida"),
+            EclipseFSError::UnsupportedOperation => write!(f, "Operación no soportada"),
             EclipseFSError::IoError => write!(f, "Error de I/O"),
             EclipseFSError::PermissionDenied => write!(f, "Permisos insuficientes"),
             EclipseFSError::DeviceFull => write!(f, "Dispositivo lleno"),

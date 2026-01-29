@@ -140,7 +140,7 @@ pub fn check_permissions(token: &SecurityToken, resource: &str, access: AccessLe
 /// Establecer permisos
 pub fn set_permissions(resource: &str, user: &str, access: AccessLevel) -> bool {
     let manager = get_security_manager();
-    if let Ok(mut mgr) = manager.lock() {
+    let result = if let Ok(mut mgr) = manager.lock() {
         mgr.resource_permissions
             .entry(resource.to_string())
             .or_insert_with(HashMap::new)
@@ -150,7 +150,9 @@ pub fn set_permissions(resource: &str, user: &str, access: AccessLevel) -> bool 
         true
     } else {
         false
-    }
+    };
+    
+    result
 }
 
 /// Autenticar usuario
@@ -168,36 +170,40 @@ pub fn authenticate_user(username: &str, password: &str) -> bool {
 /// Crear nuevo usuario
 pub fn create_user(username: &str, password: &str) -> bool {
     let manager = get_security_manager();
-    if let Ok(mut mgr) = manager.lock() {
+    let result = if let Ok(mut mgr) = manager.lock() {
         if mgr.users.contains_key(username) {
             eprintln!("❌ Usuario ya existe: {}", username);
-            return false;
+            false
+        } else {
+            let user = User {
+                username: username.to_string(),
+                password_hash: simple_hash(password),
+                permissions: HashMap::new(),
+            };
+            
+            mgr.users.insert(username.to_string(), user);
+            println!("✅ Usuario creado: {}", username);
+            true
         }
-        
-        let user = User {
-            username: username.to_string(),
-            password_hash: simple_hash(password),
-            permissions: HashMap::new(),
-        };
-        
-        mgr.users.insert(username.to_string(), user);
-        println!("✅ Usuario creado: {}", username);
-        true
     } else {
         false
-    }
+    };
+    
+    result
 }
 
 /// Cerrar sesión
 pub fn logout_user(token: &SecurityToken) -> bool {
     let manager = get_security_manager();
-    if let Ok(mut mgr) = manager.lock() {
+    let result = if let Ok(mut mgr) = manager.lock() {
         mgr.active_tokens.remove(&token.session_id);
         println!("🔓 Sesión cerrada para: {}", token.user);
         true
     } else {
         false
-    }
+    };
+    
+    result
 }
 
 /// Encriptar datos (XOR simple - en producción usar AES)
@@ -225,13 +231,15 @@ pub fn generate_key(size: usize) -> Vec<u8> {
 /// Listar usuarios activos
 pub fn list_active_users() -> Vec<String> {
     let manager = get_security_manager();
-    if let Ok(mgr) = manager.lock() {
+    let result = if let Ok(mgr) = manager.lock() {
         mgr.active_tokens.values()
             .map(|token| token.user.clone())
             .collect()
     } else {
         vec![]
-    }
+    };
+    
+    result
 }
 
 /// Inicializar sistema de seguridad

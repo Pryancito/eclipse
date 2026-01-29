@@ -768,7 +768,14 @@ impl EclipseFS {
         let node = self.get_node_mut(inode).ok_or(EclipseFSError::NotFound)?;
         
         // Simple XOR encryption (en producción usar AES-256 real)
-        let encrypted_data: Vec<_> = node.data.iter()
+        #[cfg(feature = "std")]
+        let encrypted_data: Vec<u8> = node.data.iter()
+            .enumerate()
+            .map(|(i, &byte)| byte ^ key[i % key.len()])
+            .collect();
+
+        #[cfg(not(feature = "std"))]
+        let encrypted_data: Vec<u8, MAX_DATA_SIZE> = node.data.iter()
             .enumerate()
             .map(|(i, &byte)| byte ^ key[i % key.len()])
             .collect();
