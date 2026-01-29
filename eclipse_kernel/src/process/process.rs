@@ -243,6 +243,11 @@ impl ProcessControlBlock {
     pub fn set_state(&mut self, new_state: ProcessState) {
         self.state = new_state;
     }
+    
+    /// Obtener estado del proceso
+    pub fn get_state(&self) -> ProcessState {
+        self.state
+    }
 
     /// Actualizar contexto de CPU
     pub fn update_cpu_context(&mut self, context: CpuContext) {

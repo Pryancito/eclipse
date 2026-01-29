@@ -5,6 +5,43 @@
 use crate::debug::serial_write_str;
 use crate::syscalls::{SyscallArgs, SyscallResult};
 use core::arch::asm;
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Global process manager for syscalls
+    static ref SYSCALL_PROCESS_MANAGER: Mutex<Option<crate::process::manager::ProcessManager>> = {
+        Mutex::new(None)
+    };
+    
+    /// Current process ID (simulated for now)
+    static ref CURRENT_PID: Mutex<u32> = Mutex::new(1);
+}
+
+/// Initialize the process manager for syscalls
+fn init_process_manager_if_needed() {
+    let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
+    if manager_guard.is_none() {
+        serial_write_str("SYSCALL: Initializing process manager\n");
+        let mut manager = crate::process::manager::ProcessManager::new();
+        if let Err(e) = manager.init() {
+            serial_write_str(&alloc::format!("SYSCALL: Failed to init manager: {}\n", e));
+        } else {
+            serial_write_str("SYSCALL: Process manager initialized\n");
+        }
+        *manager_guard = Some(manager);
+    }
+}
+
+/// Get current process ID
+fn get_current_pid() -> u32 {
+    *CURRENT_PID.lock()
+}
+
+/// Set current process ID
+fn set_current_pid(pid: u32) {
+    *CURRENT_PID.lock() = pid;
+}
 
 /// MSR addresses for syscall setup
 const IA32_STAR: u32 = 0xC0000081;
@@ -206,8 +243,46 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
 fn sys_exit(code: i32) -> SyscallResult {
     serial_write_str(&alloc::format!("SYSCALL: exit(code={})\n", code));
     
-    // TODO: Actually terminate the process
-    // For now, just halt the system
+    // Initialize process manager if needed
+    init_process_manager_if_needed();
+    
+    let current_pid = get_current_pid();
+    
+    // Mark process as zombie and store exit code
+    let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
+    if let Some(ref mut manager) = *manager_guard {
+        if let Some(ref mut process) = manager.processes[current_pid as usize] {
+            process.set_state(crate::process::process::ProcessState::Zombie);
+            process.exit_code = Some(code as u32);
+            
+            serial_write_str(&alloc::format!(
+                "SYSCALL: Process {} marked as zombie with code {}\n",
+                current_pid, code
+            ));
+            
+            // Get parent PID for SIGCHLD
+            if let Some(parent_pid) = process.parent_pid {
+                serial_write_str(&alloc::format!(
+                    "SYSCALL: Sending SIGCHLD to parent PID {}\n",
+                    parent_pid
+                ));
+                
+                // Set SIGCHLD pending for parent
+                if let Some(ref mut parent) = manager.processes[parent_pid as usize] {
+                    parent.pending_signals |= 1 << 17; // SIGCHLD = 17
+                    serial_write_str("SYSCALL: SIGCHLD set for parent\n");
+                }
+            }
+        } else {
+            serial_write_str(&alloc::format!(
+                "SYSCALL: Process {} not found in table\n",
+                current_pid
+            ));
+        }
+    }
+    
+    // In real implementation, this would switch to another process
+    // For now, just halt
     serial_write_str("SYSCALL: Process exited, halting system\n");
     
     loop {
@@ -221,18 +296,45 @@ fn sys_exit(code: i32) -> SyscallResult {
 fn sys_fork() -> SyscallResult {
     serial_write_str("SYSCALL: fork() - creating child process\n");
     
-    // For minimal implementation, just return simulated PID
-    // In real implementation, this would:
-    // 1. Copy parent's memory space
-    // 2. Copy parent's page tables
-    // 3. Create new process structure
-    // 4. Return 0 to child, child PID to parent
+    // Initialize process manager if needed
+    init_process_manager_if_needed();
     
-    // For now, simulate fork by returning a fake child PID
-    let child_pid = 2; // Simulated child PID
+    // Get current process ID
+    let parent_pid = get_current_pid();
     
-    serial_write_str(&alloc::format!("SYSCALL: fork() returning child PID {}\n", child_pid));
-    SyscallResult::Success(child_pid)
+    // Create child process using process manager
+    let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
+    if let Some(ref mut manager) = *manager_guard {
+        match manager.create_process("child", crate::process::process::ProcessPriority::Normal) {
+            Ok(child_pid) => {
+                serial_write_str(&alloc::format!(
+                    "SYSCALL: fork() - parent PID {}, created child PID {}\n",
+                    parent_pid, child_pid
+                ));
+                
+                // Set parent-child relationship
+                if let Some(ref mut child) = manager.processes[child_pid as usize] {
+                    child.parent_pid = Some(parent_pid);
+                }
+                
+                // In real fork:
+                // 1. Copy parent's memory space (COW)
+                // 2. Duplicate page tables
+                // 3. Copy file descriptors
+                // 4. Return 0 to child, child PID to parent
+                
+                // For now, we're always the parent
+                SyscallResult::Success(child_pid as u64)
+            }
+            Err(e) => {
+                serial_write_str(&alloc::format!("SYSCALL: fork() failed: {}\n", e));
+                SyscallResult::Error(crate::syscalls::SyscallError::OutOfMemory)
+            }
+        }
+    } else {
+        serial_write_str("SYSCALL: fork() - process manager not initialized\n");
+        SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+    }
 }
 
 /// sys_execve - Execute program
@@ -273,16 +375,81 @@ fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u
 fn sys_wait4(pid: i32, wstatus: *mut i32, options: i32, rusage: *mut u8) -> SyscallResult {
     serial_write_str(&alloc::format!("SYSCALL: wait4(pid={}, options=0x{:x})\n", pid, options));
     
-    // For minimal implementation, just return immediately
-    // In real implementation, this would:
-    // 1. Check if child with given PID exists
-    // 2. If not exited, block until it exits
-    // 3. Return child PID and exit status
-    // 4. Clean up zombie process
+    // Initialize process manager if needed
+    init_process_manager_if_needed();
     
-    // Simulate no children
-    serial_write_str("SYSCALL: wait4() - no children to wait for\n");
+    let current_pid = get_current_pid();
     
-    // Return -ECHILD (no child processes)
-    SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+    // Check for zombie children
+    let mut manager_guard = SYSCALL_PROCESS_MANAGER.lock();
+    if let Some(ref mut manager) = *manager_guard {
+        // Find zombie child
+        for i in 0..crate::process::MAX_PROCESSES {
+            if let Some(ref mut child) = manager.processes[i] {
+                // Check if this is a zombie child of current process
+                let is_zombie = child.get_state() == crate::process::process::ProcessState::Zombie;
+                let is_child = child.parent_pid == Some(current_pid);
+                let matches_pid = pid == -1 || pid == child.pid as i32;
+                
+                if is_zombie && is_child && matches_pid {
+                    let child_pid = child.pid;
+                    let exit_code = child.exit_code.unwrap_or(0) as i32;
+                    
+                    serial_write_str(&alloc::format!(
+                        "SYSCALL: wait4() - found zombie child PID {}, exit code {}\n",
+                        child_pid, exit_code
+                    ));
+                    
+                    // Write exit status to userland if pointer provided
+                    if !wstatus.is_null() {
+                        unsafe {
+                            // Status encoding: exit code in high byte
+                            *wstatus = (exit_code & 0xFF) << 8;
+                        }
+                    }
+                    
+                    // Reap the zombie - remove from process table
+                    manager.processes[i] = None;
+                    manager.active_processes = manager.active_processes.saturating_sub(1);
+                    
+                    serial_write_str(&alloc::format!(
+                        "SYSCALL: Reaped zombie child {}\n",
+                        child_pid
+                    ));
+                    
+                    // Return child PID
+                    return SyscallResult::Success(child_pid as u64);
+                }
+            }
+        }
+        
+        // No zombie children found
+        serial_write_str("SYSCALL: wait4() - no zombie children\n");
+        
+        // Check if we have any children at all
+        let mut has_children = false;
+        for i in 0..crate::process::MAX_PROCESSES {
+            if let Some(ref child) = manager.processes[i] {
+                if child.parent_pid == Some(current_pid) {
+                    has_children = true;
+                    break;
+                }
+            }
+        }
+        
+        if has_children {
+            // Have children but none are zombies yet
+            serial_write_str("SYSCALL: wait4() - children exist but not zombies yet\n");
+            // In real implementation, would block here
+            // For now, return error
+            SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+        } else {
+            // No children at all
+            serial_write_str("SYSCALL: wait4() - no children (ECHILD)\n");
+            SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+        }
+    } else {
+        serial_write_str("SYSCALL: wait4() - process manager not initialized\n");
+        SyscallResult::Error(crate::syscalls::SyscallError::InvalidOperation)
+    }
 }
