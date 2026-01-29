@@ -108,11 +108,11 @@ impl ProcessTransfer {
                     identity_map_userland_memory(pml4_addr, context.rip & !0xFFF, 0x200000)?;
                 }
                 
-                // Verify stack mapping if needed  
-                if context.rsp > 0x100000000 {
-                    let stack_base = context.rsp - 0x100000;
-                    map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?; 
-                }
+                // Map stack memory
+                // Stack is at 0x1000000 (16MB) with size 0x800000 (8MB)
+                // So stack range is 0x800000 - 0x1000000
+                let stack_base = context.rsp.saturating_sub(0x100000); // 1MB below stack pointer
+                map_userland_memory(pml4_addr, stack_base, 0x100000 + 4096)?;
                 
                 // Execute process
                 self.execute_userland_process(context, pml4_addr)?;

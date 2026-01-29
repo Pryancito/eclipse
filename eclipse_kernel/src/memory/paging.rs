@@ -707,14 +707,17 @@ pub fn translate_virtual_address(virtual_addr: u64) -> Option<(u64, u64)> {
 /// 
 /// Configura las tablas de páginas necesarias para ejecutar código en modo usuario.
 /// Retorna la dirección física de la tabla PML4 configurada.
+/// 
+/// # WARNING
+/// Esta es una implementación stub que retorna error porque no hay código userland real.
+/// Cuando se implemente completamente, debe:
+/// 1. Crear una nueva PML4 para el proceso userland
+/// 2. Crear y configurar PDPTs, PDs, y PTs necesarios
+/// 3. Mapear el código, datos, heap y stack del userland
+/// 4. Configurar permisos apropiados (USER, WRITABLE, etc.)
 pub fn setup_userland_paging() -> Result<u64, &'static str> {
     serial_write_str("PAGING: Setting up userland paging tables\n");
     
-    // En un sistema completo, esto crearía y configuraría:
-    // - Una nueva PML4 para el proceso userland
-    // - PDPTs, PDs, y PTs necesarios
-    // - Mapeo del código, datos, heap y stack del userland
-    //
     // Por ahora, retornamos un error porque no hay código userland real para ejecutar.
     // Cuando haya un binario real de eclipse-systemd en memoria, esta función deberá
     // crear las tablas de páginas apropiadas.
@@ -730,8 +733,13 @@ pub fn setup_userland_paging() -> Result<u64, &'static str> {
 /// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
 /// - `virtual_addr`: Dirección virtual base a mapear
 /// - `size`: Tamaño del rango a mapear en bytes
+/// 
+/// # WARNING - STUB IMPLEMENTATION
+/// Esta función actualmente es un stub que solo registra la operación.
+/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
+/// habilitar la ejecución de código userland real.
 pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Result<(), &'static str> {
-    serial_write_str(&format!(
+    serial_write_str(&alloc::format!(
         "PAGING: map_userland_memory(pml4=0x{:x}, vaddr=0x{:x}, size=0x{:x})\n",
         pml4_addr, virtual_addr, size
     ));
@@ -755,8 +763,13 @@ pub fn map_userland_memory(pml4_addr: u64, virtual_addr: u64, size: u64) -> Resu
 /// - `pml4_addr`: Dirección física de la tabla PML4 del proceso
 /// - `physical_addr`: Dirección física/virtual base a mapear
 /// - `size`: Tamaño del rango a mapear en bytes
+/// 
+/// # WARNING - STUB IMPLEMENTATION
+/// Esta función actualmente es un stub que solo registra la operación.
+/// NO REALIZA MAPEO REAL DE MEMORIA. Debe ser implementada completamente antes de
+/// habilitar la ejecución de código userland real.
 pub fn identity_map_userland_memory(pml4_addr: u64, physical_addr: u64, size: u64) -> Result<(), &'static str> {
-    serial_write_str(&format!(
+    serial_write_str(&alloc::format!(
         "PAGING: identity_map_userland_memory(pml4=0x{:x}, paddr=0x{:x}, size=0x{:x})\n",
         pml4_addr, physical_addr, size
     ));
