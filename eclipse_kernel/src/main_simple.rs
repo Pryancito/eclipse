@@ -993,19 +993,20 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     if systemd_enabled {
         fb.write_text_kernel("", Color::WHITE);
         fb.write_text_kernel("🔄 Inicializando eclipse-systemd...", Color::YELLOW);
-        serial_write_str("KERNEL_MAIN: Iniciando transferencia de control a systemd\n");
+        serial_write_str("KERNEL_MAIN: Iniciando preparación de systemd\n");
         
         match init_and_execute_systemd(fb) {
             Ok(_) => {
-                // Si llegamos aquí, systemd ejecutó exitosamente pero retornó
-                fb.write_text_kernel("✓ eclipse-systemd configurado", Color::GREEN);
-                serial_write_str("KERNEL_MAIN: systemd configured - continuing with kernel loop\n");
+                // Este caso actualmente no ocurre porque transfer_to_userland siempre falla
+                // sin soporte completo de VM. Se mantiene para compatibilidad futura.
+                fb.write_text_kernel("✓ eclipse-systemd ejecutándose como PID 1", Color::GREEN);
+                serial_write_str("KERNEL_MAIN: systemd transferred successfully\n");
             }
-            Err(e) => {
-                // Error al inicializar systemd - continuar con kernel loop
-                // Esto es esperado hasta que se implemente soporte completo de memoria virtual
-                fb.write_text_kernel("✓ Usando kernel loop (VM pendiente)", Color::GREEN);
-                serial_write_str(&alloc::format!("KERNEL_MAIN: systemd init deferred: {} - using kernel loop\n", e));
+            Err(_e) => {
+                // La transferencia falla porque falta soporte de memoria virtual
+                // Esto es comportamiento esperado actualmente - no es un error crítico
+                fb.write_text_kernel("⚠ Usando kernel loop (VM pendiente)", Color::YELLOW);
+                serial_write_str("KERNEL_MAIN: systemd transfer deferred - using kernel loop\n");
             }
         }
     } else {

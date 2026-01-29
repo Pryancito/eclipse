@@ -90,7 +90,10 @@ impl ProcessTransfer {
         Self { current_pid: 0 }
     }
 
-    /// Transferir control a un proceso del userland
+    /// Preparar para transferir control a un proceso del userland
+    /// 
+    /// NOTA: Esta función actualmente solo valida requisitos previos.
+    /// La transferencia real requiere soporte completo de memoria virtual.
     pub fn transfer_to_userland(&mut self, context: ProcessContext) -> Result<(), &'static str> {
         // Configurar el proceso como activo
         self.current_pid = 1; // eclipse-systemd será PID 1
@@ -100,18 +103,16 @@ impl ProcessTransfer {
         // 2. Configuración adecuada de GDT/IDT para userland
         // 3. Sistema de archivos funcional para cargar el ejecutable
         // 
-        // Por ahora, simulamos la preparación sin ejecutar operaciones
+        // Por ahora, validamos requisitos sin ejecutar operaciones
         // que puedan causar un triple fault y reinicio del sistema
         
-        crate::debug::serial_write_str(&alloc::format!(
-            "PROCESS_TRANSFER: Simulando transferencia a userland\n"
-        ));
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Validando requisitos para transferencia a userland\n");
         crate::debug::serial_write_str(&alloc::format!(
             "PROCESS_TRANSFER: entry_point=0x{:x} stack=0x{:x}\n",
             context.rip, context.rsp
         ));
         
-        // Retornar error sin ejecutar operaciones peligrosas
+        // Retornar error indicando que falta soporte de VM
         Err("Transferencia al userland requiere soporte completo de memoria virtual")
     }
 

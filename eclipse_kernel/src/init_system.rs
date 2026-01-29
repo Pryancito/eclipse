@@ -680,7 +680,7 @@ impl InitSystem {
 
     /// Enviar mensaje de inicio de eclipse-systemd a la interfaz serial
     fn send_systemd_startup_message(&self, init_process: &InitProcess) {
-        // Escribir mensajes al framebuffer cuando systemd tome el control
+        // Escribir mensajes al framebuffer
         if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
             fb.write_text_kernel(
                 "=== PREPARANDO ECLIPSE-SYSTEMD ===",
@@ -688,22 +688,22 @@ impl InitSystem {
             );
             fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
             fb.write_text_kernel(
-                "PID 1: eclipse-systemd preparado",
+                "PID 1: Configuración de eclipse-systemd iniciada",
                 crate::drivers::framebuffer::Color::CYAN,
             );
             fb.write_text_kernel(
-                "⚠ Nota: Transferencia completa requiere memoria virtual",
+                "⚠ Pendiente: Soporte completo de memoria virtual",
                 crate::drivers::framebuffer::Color::YELLOW,
             );
             fb.write_text_kernel(
-                "Sistema continuará con kernel loop principal",
+                "El sistema continuará con el kernel loop",
                 crate::drivers::framebuffer::Color::WHITE,
             );
         }
 
         // Log serial para debugging
         crate::debug::serial_write_str(
-            "INIT_SYSTEM: eclipse-systemd configurado pero no transferido (requiere VM completa)\n"
+            "INIT_SYSTEM: eclipse-systemd configurado (transferencia pendiente de VM completa)\n"
         );
     }
 }
