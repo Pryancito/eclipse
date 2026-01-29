@@ -106,9 +106,21 @@ impl JournalEntry {
         Self::calculate_checksum(&self.data) == self.checksum
     }
 
-    /// Get current timestamp (stub for now)
+    /// Get current timestamp
     fn current_time() -> u64 {
-        1640995200 // 2022-01-01 00:00:00 UTC
+        #[cfg(feature = "std")]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // En no_std sin reloj del sistema, usar un valor fijo
+            1640995200 // 2022-01-01 00:00:00 UTC
+        }
     }
 }
 
