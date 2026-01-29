@@ -1,11 +1,39 @@
+# Build artifacts
 eclipse-os-complete/
-test_disk.img
 eclipse-os-build/
 eclipse-os.img
+test_disk.img
+test_eclipsefs.img
+
+# Rust build artifacts
 */target/
 target/
 Cargo.lock
-# Build artifacts
+*.rlib
+*.pdb
+
+# Userland binaries
 userland/wayland_compositor/wayland_compositor
 userland/cosmic_desktop/cosmic_desktop
-test_eclipsefs.img
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Debug files
+*.log
+*.out
+
+# OS generated files
+.Trash-*
+Thumbs.db
+

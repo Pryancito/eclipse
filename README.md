@@ -1,5 +1,10 @@
 # Eclipse OS - Sistema Operativo en Rust
 
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/platform-x86__64-lightgrey.svg)]()
+
 Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser eficiente, seguro y fácil de usar. Combina un kernel híbrido con un sistema de userland robusto y un sistema de display avanzado usando DRM (Direct Rendering Manager).
 
 ## Características Principales
@@ -59,6 +64,35 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 │  │ (x86_64)    │ │   (RAM)     │ │  Devices    │          │
 │  └─────────────┘ └─────────────┘ └─────────────┘          │
 └─────────────────────────────────────────────────────────────┘
+```
+
+## 🚀 Inicio Rápido
+
+### Para Nuevos Usuarios
+
+Si eres nuevo en Eclipse OS, sigue estos pasos para comenzar rápidamente:
+
+```bash
+# 1. Clonar el repositorio
+git clone https://github.com/Pryancito/eclipse.git
+cd eclipse
+
+# 2. Instalar dependencias del sistema (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install build-essential qemu-system-x86 ovmf
+
+# 3. Instalar Rust (si no lo tienes)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+rustup toolchain install nightly
+rustup target add x86_64-unknown-none --toolchain nightly
+rustup target add x86_64-unknown-uefi --toolchain nightly
+
+# 4. Compilar el proyecto
+./build.sh
+
+# 5. Probar en QEMU (opcional, si la compilación fue exitosa)
+./qemu.sh
 ```
 
 ## Instalación y Uso
