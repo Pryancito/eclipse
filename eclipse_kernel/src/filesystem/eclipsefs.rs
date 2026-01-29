@@ -1567,6 +1567,40 @@ impl FileSystem for EclipseFSWrapper {
                     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
                     return Err(VfsError::FileNotFound);
                 }
+                
+                // Después de encontrar el componente, verificar si es un symlink y seguirlo
+                let found_node = self.load_node_lazy(current_inode, &mut storage)?;
+                if found_node.kind == eclipsefs_lib::NodeKind::Symlink {
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' es un symlink, siguiendo...\n", part));
+                    
+                    // Obtener el target del symlink desde los datos del nodo
+                    let target_bytes = found_node.get_data();
+                    let target = alloc::string::String::from_utf8_lossy(target_bytes).to_string();
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Symlink apunta a '{}'\n", target));
+                    
+                    // Resolver el target del symlink de forma recursiva
+                    // Si el target es relativo, lo resolvemos desde el directorio padre actual
+                    let target_path = if target.starts_with('/') {
+                        // Ruta absoluta
+                        target.clone()
+                    } else {
+                        // Ruta relativa - necesitamos construir el path completo
+                        // Reconstruir el path del directorio padre
+                        let parent_path = if idx > 0 {
+                            alloc::format!("/{}", path_parts[..idx].join("/"))
+                        } else {
+                            "/".to_string()
+                        };
+                        alloc::format!("{}/{}", parent_path.trim_end_matches('/'), target)
+                    };
+                    
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Resolviendo symlink a '{}'\n", target_path));
+                    
+                    // Resolver recursivamente el target del symlink
+                    // Prevenir loops infinitos limitando la profundidad
+                    current_inode = self.resolve_path(&target_path)?;
+                    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Symlink resuelto a inodo {}\n", current_inode));
+                }
             } else {
                 // Es un archivo y no es el último componente - error
                 if idx < path_parts.len() - 1 {
@@ -1587,7 +1621,7 @@ impl FileSystem for EclipseFSWrapper {
     fn read_file_path(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo archivo '{}' (lazy)\n", path));
         
-        // Resolver la ruta a un inode
+        // Resolver la ruta a un inode (esto ya sigue symlinks automáticamente)
         let inode = self.resolve_path(path)?;
         
         // Crear un storage manager para la operación de lectura
@@ -1596,9 +1630,9 @@ impl FileSystem for EclipseFSWrapper {
         // Cargar el nodo
         let node = self.load_node_lazy(inode, &mut storage)?;
         
-        // Verificar que sea un archivo
+        // Verificar que sea un archivo (después de seguir symlinks, debería serlo)
         if node.kind != eclipsefs_lib::NodeKind::File {
-            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' no es un archivo\n", path));
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' no es un archivo (tipo: {:?})\n", path, node.kind));
             return Err(VfsError::NotAFile);
         }
         
