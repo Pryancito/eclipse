@@ -49,4 +49,4 @@ pub use writer::EclipseFSWriter;
 #[cfg(feature = "std")]
 pub use journal::{Journal, JournalConfig, JournalEntry, JournalStats, TransactionType};
 
-pub const ECLIPSEFS_VERSION: u32 = 0x00020000; // v0.2.0
+pub const ECLIPSEFS_VERSION: u32 = 0x00030000; // v0.3.0
