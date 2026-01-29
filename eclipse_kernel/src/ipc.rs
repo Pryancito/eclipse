@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -15,6 +16,22 @@ pub type IpcMessageId = u32;
 
 /// Contador global para generar IDs únicos de mensajes
 static NEXT_MESSAGE_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Límites de seguridad para mensajes IPC
+pub const MAX_MESSAGE_QUEUE_SIZE: usize = 1024;
+pub const MAX_RESPONSE_QUEUE_SIZE: usize = 1024;
+pub const MAX_DRIVER_DATA_SIZE: usize = 16 * 1024 * 1024; // 16MB
+pub const MAX_COMMAND_ARGS_SIZE: usize = 4096;
+pub const IPC_TIMEOUT_ITERATIONS: usize = 10000;
+
+/// Prioridad de mensajes IPC
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MessagePriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
 
 /// Tipos de mensajes IPC entre kernel y userland
 #[derive(Debug, Clone)]
@@ -196,42 +213,185 @@ pub enum DriverCommandType {
 
 /// Manager IPC para comunicación entre kernel y userland
 pub struct IpcManager {
-    message_queue: Vec<(IpcMessageId, IpcMessage)>,
-    response_queue: Vec<(IpcMessageId, IpcMessage)>,
+    message_queue: VecDeque<(IpcMessageId, MessagePriority, IpcMessage)>,
+    response_queue: VecDeque<(IpcMessageId, IpcMessage)>,
+    response_map: BTreeMap<IpcMessageId, IpcMessage>,
     registered_drivers: BTreeMap<u32, DriverInfo>,
     next_driver_id: u32,
+    stats: IpcStatistics,
+}
+
+/// Estadísticas de IPC para monitoreo
+#[derive(Debug, Clone, Default)]
+pub struct IpcStatistics {
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub messages_dropped: u64,
+    pub responses_sent: u64,
+    pub responses_received: u64,
+    pub validation_errors: u64,
+    pub timeout_errors: u64,
 }
 
 impl IpcManager {
     pub fn new() -> Self {
         Self {
-            message_queue: Vec::new(),
-            response_queue: Vec::new(),
+            message_queue: VecDeque::new(),
+            response_queue: VecDeque::new(),
+            response_map: BTreeMap::new(),
             registered_drivers: BTreeMap::new(),
             next_driver_id: 1,
+            stats: IpcStatistics::default(),
         }
     }
 
-    /// Enviar mensaje al userland
+    /// Validar mensaje IPC antes de procesarlo
+    pub fn validate_message(&self, message: &IpcMessage) -> Result<(), &'static str> {
+        match message {
+            IpcMessage::LoadDriver { driver_data, .. } => {
+                if driver_data.len() > MAX_DRIVER_DATA_SIZE {
+                    return Err("Driver data size exceeds limit");
+                }
+            }
+            IpcMessage::DriverCommand { args, .. } => {
+                if args.len() > MAX_COMMAND_ARGS_SIZE {
+                    return Err("Command args size exceeds limit");
+                }
+            }
+            IpcMessage::Command { args, .. } => {
+                if args.len() > 256 {
+                    return Err("Too many command arguments");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Enviar mensaje al userland con prioridad
     pub fn send_message(&mut self, message: IpcMessage) -> IpcMessageId {
+        self.send_message_with_priority(message, MessagePriority::Normal)
+    }
+
+    /// Enviar mensaje con prioridad específica
+    pub fn send_message_with_priority(
+        &mut self,
+        message: IpcMessage,
+        priority: MessagePriority,
+    ) -> IpcMessageId {
+        // Validar mensaje antes de enviarlo
+        if let Err(_) = self.validate_message(&message) {
+            self.stats.validation_errors += 1;
+            return 0; // ID inválido
+        }
+
+        // Verificar límites de cola
+        if self.message_queue.len() >= MAX_MESSAGE_QUEUE_SIZE {
+            self.stats.messages_dropped += 1;
+            return 0; // Cola llena
+        }
+
         let message_id = NEXT_MESSAGE_ID.fetch_add(1, Ordering::SeqCst);
-        self.message_queue.push((message_id, message));
+        
+        // Insertar mensaje manteniendo orden de prioridad
+        let mut inserted = false;
+        for i in 0..self.message_queue.len() {
+            if let Some((_, msg_priority, _)) = self.message_queue.get(i) {
+                if priority > *msg_priority {
+                    self.message_queue.insert(i, (message_id, priority, message));
+                    inserted = true;
+                    break;
+                }
+            }
+        }
+        
+        if !inserted {
+            self.message_queue.push_back((message_id, priority, message));
+        }
+        
+        self.stats.messages_sent += 1;
         message_id
     }
 
-    /// Obtener mensaje del userland
+    /// Obtener mensaje del userland (respeta prioridades)
     pub fn receive_message(&mut self) -> Option<(IpcMessageId, IpcMessage)> {
-        self.message_queue.pop()
+        if let Some((msg_id, _priority, message)) = self.message_queue.pop_front() {
+            self.stats.messages_received += 1;
+            Some((msg_id, message))
+        } else {
+            None
+        }
     }
 
     /// Enviar respuesta al userland
     pub fn send_response(&mut self, message_id: IpcMessageId, response: IpcMessage) {
-        self.response_queue.push((message_id, response));
+        // Verificar límites de cola
+        if self.response_queue.len() >= MAX_RESPONSE_QUEUE_SIZE {
+            self.stats.messages_dropped += 1;
+            return;
+        }
+
+        // Guardar en mapa para búsqueda rápida
+        self.response_map.insert(message_id, response.clone());
+        self.response_queue.push_back((message_id, response));
+        self.stats.responses_sent += 1;
     }
 
     /// Obtener respuesta para el userland
     pub fn get_response(&mut self) -> Option<(IpcMessageId, IpcMessage)> {
-        self.response_queue.pop()
+        if let Some((msg_id, response)) = self.response_queue.pop_front() {
+            self.response_map.remove(&msg_id);
+            self.stats.responses_received += 1;
+            Some((msg_id, response))
+        } else {
+            None
+        }
+    }
+
+    /// Obtener respuesta específica por ID (con timeout)
+    pub fn get_response_by_id(
+        &mut self,
+        message_id: IpcMessageId,
+        timeout_iterations: usize,
+    ) -> Option<IpcMessage> {
+        // Buscar primero en el mapa (más rápido)
+        if let Some(response) = self.response_map.remove(&message_id) {
+            // Remover también de la cola
+            self.response_queue.retain(|(id, _)| *id != message_id);
+            return Some(response);
+        }
+
+        // Si no está en el mapa, esperar con timeout
+        for _ in 0..timeout_iterations {
+            if let Some(response) = self.response_map.remove(&message_id) {
+                self.response_queue.retain(|(id, _)| *id != message_id);
+                return Some(response);
+            }
+        }
+
+        self.stats.timeout_errors += 1;
+        None
+    }
+
+    /// Limpiar respuestas antiguas (garbage collection)
+    pub fn cleanup_old_responses(&mut self, max_age_iterations: usize) {
+        // En una implementación real, esto usaría timestamps
+        // Por ahora, limitamos el tamaño de la cola
+        while self.response_queue.len() > MAX_RESPONSE_QUEUE_SIZE / 2 {
+            if let Some((msg_id, _)) = self.response_queue.pop_front() {
+                self.response_map.remove(&msg_id);
+            }
+        }
+    }
+
+    /// Obtener estadísticas de IPC
+    pub fn get_statistics(&self) -> &IpcStatistics {
+        &self.stats
+    }
+
+    /// Reiniciar estadísticas
+    pub fn reset_statistics(&mut self) {
+        self.stats = IpcStatistics::default();
     }
 
     /// Procesar mensaje IPC
@@ -561,17 +721,17 @@ impl<'a> IpcFsClient<'a> {
         Self { ipc, mount_id }
     }
 
-    /// Enviar solicitud y obtener respuesta (bloqueante simple)
+    /// Enviar solicitud y obtener respuesta (con timeout mejorado)
     pub fn call(&mut self, mut req: FsRequest) -> Option<FsResponse> {
         req.request_id = NEXT_MESSAGE_ID.fetch_add(1, Ordering::SeqCst);
         let id = self.ipc.send_message(IpcMessage::FsRequest(req.clone()));
 
-        // Bucle simple: en una implementación real, habría colas por ID y espera con timeout
-        for _ in 0..1024 {
-            if let Some((_rid, IpcMessage::FsResponse(resp))) = self.ipc.get_response() {
-                if resp.request_id == id {
-                    return Some(resp);
-                }
+        // Usar nueva función con timeout configurable
+        if let Some(IpcMessage::FsResponse(resp)) = 
+            self.ipc.get_response_by_id(id, IPC_TIMEOUT_ITERATIONS) 
+        {
+            if resp.request_id == id {
+                return Some(resp);
             }
         }
         None
