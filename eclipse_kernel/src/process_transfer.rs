@@ -333,21 +333,27 @@ impl ProcessTransfer {
 
     fn transfer_to_userland_with_iretq(&self, context: ProcessContext, pml4_addr: u64) -> Result<(), &'static str> {
         crate::debug::serial_write_str("PROCESS_TRANSFER: Switching CR3 and executing iretq...\n");
+        crate::debug::serial_write_str(&alloc::format!(
+            "PROCESS_TRANSFER: Transferring to RIP=0x{:x}, RSP=0x{:x}, PML4=0x{:x}\n",
+            context.rip, context.rsp, pml4_addr
+        ));
         
         let context_ptr = &context as *const ProcessContext;
         
         unsafe {
-            // CRITICAL FIX: Build the iretq stack frame AND restore registers BEFORE switching CR3
+            // CRITICAL: Build the iretq stack frame AND restore registers BEFORE switching CR3
             // 
-            // UPDATE: The temporary kernel stack at 0x500000 is now identity-mapped in both
-            // kernel and userland page tables to enable safe CR3 switching. However, the
-            // context structure is still on the kernel stack which is not accessible after
-            // CR3 switch.
+            // The temporary kernel stack at 0x500000 is identity-mapped in both
+            // kernel and userland page tables to enable safe CR3 switching.
             // 
-            // Solution: Do ALL context memory accesses BEFORE CR3 switch. We restore registers
-            // from the context into actual CPU registers, build the iretq frame on the mapped
-            // temporary stack, then switch CR3, then execute iretq. The temporary stack at
-            // 0x500000 remains accessible after CR3 switch because it's identity-mapped.
+            // Process:
+            // 1. Build iretq frame on temporary stack (accessible after CR3 switch)
+            // 2. Restore all GPRs from context
+            // 3. Switch CR3 to userland page tables
+            // 4. Execute iretq to transfer to userland
+            //
+            // If this causes a fault (e.g., #GP, #PF), the system will triple fault
+            // and reset since we don't have proper exception handlers in userland yet.
             asm!(
                 // 1. Setup temporary kernel stack and build iretq frame BEFORE CR3 switch
                 "mov rsp, {tmp_stack}",  
@@ -402,6 +408,7 @@ impl ProcessTransfer {
             );
         }
 
+        // This line should never be reached due to options(noreturn)
         Err("Critical: iretq failed or returned")
     }
 
