@@ -135,10 +135,6 @@ impl Taskbar {
             start_button_pressed: false,
         }
     }
-            background_animation: 0.0,
-            blur_effect: 0.0,
-        }
-    }
 
     /// Actualiza la barra de tareas
     pub fn update(&mut self, delta_time: f32) {
