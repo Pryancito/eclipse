@@ -112,23 +112,22 @@ impl ProcessTransfer {
             return Err("Stack pointer fuera del espacio de direcciones canónico");
         }
         
-        // Verificar si hay código ejecutable real en el punto de entrada
-        // Si el código en entry_point es ceros o inválido, no intentar la transferencia
-        let entry_code = unsafe {
-            core::slice::from_raw_parts(context.rip as *const u8, 16)
-        };
+        // NOTA: No podemos verificar si hay código en entry_point sin antes mapear
+        // esa dirección en las tablas de páginas actuales. Intentar leer de 0x400000
+        // sin que esté mapeado causaría un triple fault.
+        // 
+        // En su lugar, asumimos que no hay código cargado hasta que el sistema
+        // de carga de ELF se implemente completamente.
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Userland code loading not yet implemented\n");
+        crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
+        crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
+        return Err("Transferencia al userland diferida: carga de código no implementada");
         
-        // Verificar si hay al menos algunos bytes no-cero (indicando código potencialmente válido)
-        let has_code = entry_code.iter().any(|&b| b != 0);
+        // TODO: El código siguiente está deshabilitado hasta que se implemente
+        // la carga real de binarios ELF en memoria física y el mapeo correspondiente.
+        // Cuando se implemente, eliminar el return anterior y descomentar este bloque.
         
-        if !has_code {
-            crate::debug::serial_write_str("PROCESS_TRANSFER: No executable code found at entry point\n");
-            crate::debug::serial_write_str("PROCESS_TRANSFER: Deferring transfer - no userland code loaded yet\n");
-            crate::debug::serial_write_str("PROCESS_TRANSFER: System will continue with kernel loop\n");
-            return Err("Transferencia al userland diferida: no hay código ejecutable en el punto de entrada");
-        }
-        
-        // Intentar configurar el entorno de userland
+        /* Código para implementación futura:
         match self.setup_userland_environment() {
             Ok(pml4_addr) => {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
@@ -161,6 +160,7 @@ impl ProcessTransfer {
                 Err("Transferencia al userland diferida: fallo en configuración del entorno")
             }
         }
+        */
     }
 
     /// Configurar el entorno de ejecución del userland
