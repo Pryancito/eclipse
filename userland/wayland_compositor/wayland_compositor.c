@@ -16,6 +16,7 @@
 // #include <unistd.h>
 
 // Definiciones de syscalls
+#define SYS_EXIT 0
 #define SYS_WRITE 1
 #define SYS_READ 2
 #define SYS_OPEN 3
@@ -92,8 +93,8 @@ static inline long sys_ioctl(int fd, unsigned long request, void *arg) {
 }
 
 static inline void sys_exit(int code) {
-    syscall1(0, code);
-    // No debería llegar aquí
+    syscall1(SYS_EXIT, code);
+    // Should not reach here
     while(1) {}
 }
 
@@ -350,7 +351,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-// Entry point para freestanding binary
+// Entry point for freestanding binary
 void _start(void) {
     int result = main(0, NULL);
     sys_exit(result);

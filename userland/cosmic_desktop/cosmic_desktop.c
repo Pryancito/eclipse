@@ -362,7 +362,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-// Entry point para freestanding binary
+// Entry point for freestanding binary
 void _start(void) {
     int result = main(0, NULL);
     sys_exit(result);
