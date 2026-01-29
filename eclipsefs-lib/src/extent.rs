@@ -133,7 +133,8 @@ impl ExtentTree {
         // Try to merge with existing extents first
         for existing in &mut self.extents {
             if existing.try_merge(&extent) {
-                self.total_blocks += extent.length as u64;
+                // Don't increment total_blocks here - try_merge already updated the extent length
+                // total_blocks will be correctly calculated in get_stats()
                 return Ok(());
             }
         }
@@ -204,17 +205,18 @@ impl ExtentTree {
     }
 
     /// Calculate fragmentation score (lower is better)
-    /// Returns percentage: 0 = perfect (1 extent), 100 = worst case
+    /// Returns percentage: 0 = perfect (1 extent), approaches 100 = highly fragmented
     pub fn fragmentation_score(&self) -> f32 {
         if self.extents.is_empty() {
             return 0.0;
         }
         
         // Ideal: 1 extent per file
-        // Worst: many small extents
+        // As extent count increases, fragmentation increases
         let ideal_extents = 1.0;
         let actual_extents = self.extents.len() as f32;
         
+        // This formula approaches 100% as extent count increases
         ((actual_extents - ideal_extents) / actual_extents) * 100.0
     }
 

@@ -152,6 +152,12 @@ impl AllocationGroup {
             return Err(EclipseFSError::InvalidOperation);
         }
 
+        // Check if block is already free (prevent double-free)
+        if (self.bitmap[word_idx] & (1u64 << bit_idx)) != 0 {
+            // Block is already free
+            return Err(EclipseFSError::InvalidOperation);
+        }
+
         // Mark as free
         self.bitmap[word_idx] |= 1u64 << bit_idx;
         self.free_blocks += 1;
@@ -272,10 +278,18 @@ impl BlockAllocator {
 
     /// Free an extent
     pub fn free_extent(&mut self, extent: &Extent) -> EclipseFSResult<()> {
+        // Validate extent is fully contained within a single allocation group
+        let extent_end = extent.physical_block + extent.length as u64;
+        
         // Find the group containing this extent
         for group in &mut self.groups {
             if extent.physical_block >= group.start_block &&
                extent.physical_block < group.start_block + group.block_count {
+                // Validate extent doesn't span multiple groups
+                if extent_end > group.start_block + group.block_count {
+                    return Err(EclipseFSError::InvalidOperation);
+                }
+                
                 group.free_blocks(extent.physical_block, extent.length)?;
                 self.free_blocks += extent.length as u64;
                 return Ok(());
@@ -287,15 +301,23 @@ impl BlockAllocator {
 
     /// Register a delayed allocation
     /// Delays actual block allocation until flush/commit
+    /// Note: Registering the same logical_block twice will overwrite the previous count
     pub fn delay_allocation(&mut self, logical_block: u64, count: u32) -> EclipseFSResult<()> {
         #[cfg(feature = "std")]
         {
+            if self.delayed_allocs.contains_key(&logical_block) {
+                // Warn about overwrite - could indicate a bug
+                return Err(EclipseFSError::InvalidOperation);
+            }
             self.delayed_allocs.insert(logical_block, count);
             Ok(())
         }
 
         #[cfg(not(feature = "std"))]
         {
+            if self.delayed_allocs.contains_key(&logical_block) {
+                return Err(EclipseFSError::InvalidOperation);
+            }
             self.delayed_allocs.insert(logical_block, count)
                 .map_err(|_| EclipseFSError::DeviceFull)?;
             Ok(())

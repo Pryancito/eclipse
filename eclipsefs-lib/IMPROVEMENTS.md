@@ -457,22 +457,24 @@ Inspired by:
 | Deduplication | 🚧 | ❌ | ❌ | ❌ | ✅ |
 | ACLs | ✅ | ✅ | ✅ | ❌ | ✅ |
 | **Scalability** |
-| Max file size | 16 EB | 16 TB | 8 EB | 256 GB | 16 EB |
-| Max filesystem size | Unlimited | 1 EB | 16 EB | 256 GB | 256 ZB |
+| Max file size | 16 EB (2^64 blocks) | 16 TB | 8 EB | 256 GB | 16 EB |
+| Max filesystem size | 64 ZB (theoretical) | 1 EB | 16 EB | 256 GB | 256 ZB |
 
 Legend: ✅ Implemented | 🚧 Partial/Planned | ❌ Not available
 
 ## Performance Metrics
 
-Compared to previous version (v0.2.0):
+Theoretical improvements compared to previous version (v0.2.0):
 
-| Operation | v0.2.0 | v0.3.0 | Improvement |
+| Operation | v0.2.0 | v0.3.0 (Expected) | Improvement |
 |-----------|--------|--------|-------------|
-| Large file writes | Baseline | 50-100x faster | Extent-based allocation |
-| Sequential reads | Baseline | 20-40% faster | Better locality |
-| Fragmentation (after 1000 ops) | 45% | 8% | 82% reduction |
-| Allocation overhead | Baseline | 30% lower | Allocation groups |
+| Large file writes | Baseline | 50-100x faster | Extent-based allocation (theoretical) |
+| Sequential reads | Baseline | 20-40% faster | Better locality (expected) |
+| Fragmentation (after 1000 ops) | Baseline | 70-80% reduction | Delayed allocation + extent merging |
+| Allocation overhead | Baseline | 30% lower | Allocation groups (expected) |
 | Memory usage | Baseline | Similar | Efficient extent trees |
+
+*Note: Performance numbers are theoretical/expected improvements based on similar features in ext4/XFS. Actual benchmarks pending.*
 
 ## Implementation Status
 
