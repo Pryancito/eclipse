@@ -189,31 +189,41 @@ pub fn example_capability_based_usage() -> Result<(), &'static str> {
 
 // Funciones auxiliares simuladas (implementar según necesidad)
 
+/// TODO: Implementar uso completo del sistema de widgets
+/// Esta función debería inicializar y mostrar widgets de UI
 fn use_widget_system() {
     // Implementar uso de widgets
 }
 
+/// TODO: Implementar uso del sistema de ventanas sin widgets
+/// Esta función debería crear y gestionar ventanas básicas
 fn use_window_system_only() {
     // Implementar uso de ventanas sin widgets
 }
 
+/// TODO: Implementar uso de Multi-GPU sin sistema de ventanas
+/// Esta función debería configurar y usar múltiples GPUs
 fn use_multi_gpu_only() {
     // Implementar uso de Multi-GPU sin sistema de ventanas
 }
 
+/// TODO: Implementar uso de DRM básico
+/// Esta función debería usar operaciones DRM básicas
 fn use_drm_only() {
     // Implementar uso de DRM básico
 }
 
+/// TODO: Implementar fallback a UEFI
+/// Esta función debería usar gráficos UEFI básicos
 fn use_uefi_fallback() {
     // Implementar fallback a UEFI
 }
 
 /// Ejemplo 5: Verificar estado del sistema
 pub fn example_check_system_state() -> Result<(), &'static str> {
-    use super::get_graphics_phase_manager;
+    use super::with_graphics_phase_manager;
     
-    if let Some(manager) = get_graphics_phase_manager() {
+    with_graphics_phase_manager(|manager| {
         let state = manager.get_state();
         
         // Verificar fase actual
@@ -238,7 +248,6 @@ pub fn example_check_system_state() -> Result<(), &'static str> {
         let _is_widget_phase = state.is_widget_system_phase();
         
         Ok(())
-    } else {
-        Err("Manager de fases no inicializado")
-    }
+    })
+    .ok_or("Manager de fases no inicializado")?
 }

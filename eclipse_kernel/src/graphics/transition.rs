@@ -4,7 +4,7 @@
 //! - UEFI Bootloader -> UEFI Kernel Detection
 //! - UEFI Kernel Detection -> DRM Kernel Runtime
 
-use super::phases::{get_graphics_phase_manager, GraphicsPhase};
+use super::phases::{with_graphics_phase_manager, GraphicsPhase};
 use crate::drivers::framebuffer::FramebufferInfo;
 
 /// Estado de transición
@@ -78,12 +78,10 @@ impl TransitionManager {
 
     /// Obtener timestamp
     fn get_timestamp() -> u64 {
-        // Simulación simple de timestamp
-        unsafe {
-            static mut COUNTER: u64 = 0;
-            COUNTER += 1;
-            COUNTER
-        }
+        // Simulación simple de timestamp con contador atómico
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -136,12 +134,11 @@ fn prepare_drm_transition(framebuffer_info: &FramebufferInfo) -> Result<(), &'st
 fn execute_drm_transition(framebuffer_info: FramebufferInfo) -> Result<(), &'static str> {
     // Ejecutando transición
 
-    // Transicionar en el manager de fases
-    if let Some(manager) = get_graphics_phase_manager() {
-        manager.init_drm_runtime(framebuffer_info)?;
-    } else {
-        return Err("Manager de fases no disponible");
-    }
+    // Transicionar en el manager de fases usando API thread-safe
+    with_graphics_phase_manager(|manager| {
+        manager.init_drm_runtime(framebuffer_info)
+    })
+    .ok_or("Manager de fases no disponible")??;
 
     // Inicializar sistema DRM
     crate::graphics::drm_graphics::init_drm_graphics()?;
