@@ -289,7 +289,31 @@ pub fn init_ps2_system() -> Result<(), &'static str> {
     let mut system = PS2System::new();
     system.initialize()?;
 
+    // Habilitar IRQs del PIC para dispositivos PS/2
+    // IRQ 1 = Teclado PS/2
+    // IRQ 12 = Ratón PS/2
+    if let Err(e) = enable_ps2_irqs() {
+        // No es crítico, el sistema puede funcionar sin interrupciones
+        // (por ejemplo, con polling)
+    }
+
     *PS2_SYSTEM.lock() = Some(system);
+    Ok(())
+}
+
+/// Habilitar las IRQs del PIC para dispositivos PS/2
+fn enable_ps2_irqs() -> Result<(), &'static str> {
+    use crate::interrupts::pic::PicManager;
+    
+    let pic = PicManager::new();
+    pic.initialize()?;
+    
+    // Habilitar IRQ 1 (teclado)
+    pic.enable_irq(1)?;
+    
+    // Habilitar IRQ 12 (ratón) - esto está en el PIC secundario
+    pic.enable_irq(12)?;
+    
     Ok(())
 }
 
