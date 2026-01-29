@@ -328,3 +328,23 @@ pub fn send_apic_eoi() {
         }
     }
 }
+
+/// Obtener el LAPIC ID del procesador actual usando CPUID
+/// Esta función lee el LAPIC ID directamente del procesador,
+/// útil para identificar el BSP (Bootstrap Processor)
+pub fn get_current_lapic_id() -> u8 {
+    unsafe {
+        let mut ebx: u32;
+        core::arch::asm!(
+            "mov eax, 1",
+            "cpuid",
+            out("ebx") ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags)
+        );
+        // LAPIC ID está en bits 24-31 de EBX
+        ((ebx >> 24) & 0xFF) as u8
+    }
+}
