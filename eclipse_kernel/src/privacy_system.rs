@@ -9,16 +9,16 @@ use alloc::string::String;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// Obtener timestamp actual del sistema en milisegundos
+/// Get current system timestamp in milliseconds
 fn get_timestamp() -> u64 {
-    // Usar el timer del sistema si está disponible
+    // Use system timer if available
     #[cfg(feature = "timer")]
     {
         crate::interrupts::timer::get_uptime_ms()
     }
     #[cfg(not(feature = "timer"))]
     {
-        // Si el timer no está disponible, usar un contador global
+        // If timer is not available, use a global counter
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         COUNTER.fetch_add(1, Ordering::Relaxed)
     }

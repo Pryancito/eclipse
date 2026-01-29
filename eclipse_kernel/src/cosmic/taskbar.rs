@@ -671,22 +671,22 @@ impl Taskbar {
         &self.items
     }
 
-    /// Presionar botón de inicio
+    /// Press start button
     pub fn press_start_button(&mut self) {
         self.start_button_pressed = true;
     }
 
-    /// Soltar botón de inicio
+    /// Release start button
     pub fn release_start_button(&mut self) {
         self.start_button_pressed = false;
     }
 
-    /// Toggle botón de inicio
+    /// Toggle start button
     pub fn toggle_start_button(&mut self) {
         self.start_button_pressed = !self.start_button_pressed;
     }
 
-    /// Verificar si el botón de inicio está presionado
+    /// Check if start button is pressed
     pub fn is_start_button_pressed(&self) -> bool {
         self.start_button_pressed
     }

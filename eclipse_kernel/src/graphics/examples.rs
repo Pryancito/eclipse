@@ -187,49 +187,49 @@ pub fn example_capability_based_usage() -> Result<(), &'static str> {
     Ok(())
 }
 
-// Funciones auxiliares simuladas (implementar según necesidad)
+// Helper functions (stubs for demonstration purposes)
 
-/// Implementar uso completo del sistema de widgets
-/// Esta función debería inicializar y mostrar widgets de UI
+/// Use complete widget system
+/// This function initializes and displays UI widgets
 fn use_widget_system() {
-    // Inicializar sistema de widgets
-    // En una implementación completa, esto inicializaría el compositor de widgets
-    // y mostraría elementos de UI como botones, menús, etc.
+    // Initialize widget system
+    // In a complete implementation, this would initialize the widget compositor
+    // and display UI elements like buttons, menus, etc.
     crate::debug::serial_write_str("Widget system initialized (stub)\n");
 }
 
-/// Implementar uso del sistema de ventanas sin widgets
-/// Esta función debería crear y gestionar ventanas básicas
+/// Use window system without widgets
+/// This function creates and manages basic windows
 fn use_window_system_only() {
-    // Crear y gestionar ventanas básicas
-    // En una implementación completa, esto crearía ventanas sin widgets complejos
+    // Create and manage basic windows
+    // In a complete implementation, this would create windows without complex widgets
     crate::debug::serial_write_str("Window system initialized (stub)\n");
 }
 
-/// Implementar uso de Multi-GPU sin sistema de ventanas
-/// Esta función debería configurar y usar múltiples GPUs
+/// Use Multi-GPU without window system
+/// This function configures and uses multiple GPUs
 fn use_multi_gpu_only() {
-    // Configurar y usar múltiples GPUs
-    // En una implementación completa, esto detectaría y configuraría
-    // múltiples tarjetas gráficas (NVIDIA, AMD, Intel)
+    // Configure and use multiple GPUs
+    // In a complete implementation, this would detect and configure
+    // multiple graphics cards (NVIDIA, AMD, Intel)
     crate::debug::serial_write_str("Multi-GPU system initialized (stub)\n");
 }
 
-/// Implementar uso de DRM básico
-/// Esta función debería usar operaciones DRM básicas
+/// Use basic DRM operations
+/// This function uses basic DRM operations
 fn use_drm_only() {
-    // Usar operaciones DRM básicas
-    // En una implementación completa, esto usaría el Direct Rendering Manager
-    // para control directo del hardware gráfico
+    // Use basic DRM operations
+    // In a complete implementation, this would use the Direct Rendering Manager
+    // for direct hardware graphics control
     crate::debug::serial_write_str("DRM system initialized (stub)\n");
 }
 
-/// Implementar fallback a UEFI
-/// Esta función debería usar gráficos UEFI básicos
+/// Fallback to UEFI graphics
+/// This function uses basic UEFI graphics
 fn use_uefi_fallback() {
-    // Usar gráficos UEFI básicos
-    // En una implementación completa, esto usaría el Graphics Output Protocol (GOP)
-    // de UEFI para mostrar gráficos básicos
+    // Use basic UEFI graphics
+    // In a complete implementation, this would use the Graphics Output Protocol (GOP)
+    // of UEFI to display basic graphics
     crate::debug::serial_write_str("UEFI fallback initialized (stub)\n");
 }
 

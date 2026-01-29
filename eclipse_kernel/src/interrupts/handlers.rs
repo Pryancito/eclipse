@@ -255,9 +255,9 @@ fn process_keyboard_scancode(scancode: u8) {
         _ => None,
     };
     
-    // Procesar el evento si tenemos un keycode válido
+    // Process the event if we have a valid keycode
     if let Some(key) = keycode {
-        // Rastrear estado de teclas modificadoras
+        // Track modifier key states
         match key {
             KeyCode::LeftShift | KeyCode::RightShift | KeyCode::Shift => {
                 SHIFT_PRESSED.store(pressed, Ordering::Relaxed);
@@ -271,7 +271,7 @@ fn process_keyboard_scancode(scancode: u8) {
             _ => {}
         }
         
-        // Obtener estado actual de Shift para procesamiento de caracteres
+        // Get current Shift state for character processing
         let shift = SHIFT_PRESSED.load(Ordering::Relaxed);
         process_key_event(key, pressed, shift);
     }
