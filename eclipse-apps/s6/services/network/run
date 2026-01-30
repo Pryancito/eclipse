@@ -1,0 +1,6 @@
+#!/bin/sh
+# Network Service - S6 run script
+# Replaces: network.service
+
+exec 2>&1
+exec /sbin/eclipse-network

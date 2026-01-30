@@ -1,0 +1,4 @@
+#!/bin/sh
+# Eclipse Shell Logger - S6 log script
+
+exec s6-log -d3 -b n20 s1000000 T /var/log/s6/eclipse-shell

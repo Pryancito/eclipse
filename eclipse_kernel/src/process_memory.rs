@@ -376,8 +376,8 @@ impl core::ops::BitOr for MemoryFlags {
     }
 }
 
-/// Función de utilidad para configurar memoria de eclipse-systemd
-pub fn setup_eclipse_systemd_memory() -> Result<ProcessMemory, &'static str> {
+/// Función de utilidad para configurar memoria de eclipse-s6
+pub fn setup_eclipse_s6_memory() -> Result<ProcessMemory, &'static str> {
     let mut manager = ProcessMemoryManager::new();
 
     // Asignar memoria para el proceso

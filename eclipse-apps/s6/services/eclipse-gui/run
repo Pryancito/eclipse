@@ -1,0 +1,6 @@
+#!/bin/sh
+# Eclipse GUI Service - S6 run script
+# Replaces: eclipse-gui.service
+
+exec 2>&1
+exec /sbin/eclipse-gui

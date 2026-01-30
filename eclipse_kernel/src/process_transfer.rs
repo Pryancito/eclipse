@@ -1,6 +1,6 @@
 //! Transferencia de control del kernel al userland
 //!
-//! Este módulo maneja la transición del kernel al userland ejecutando eclipse-systemd
+//! Este módulo maneja la transición del kernel al userland ejecutando eclipse-s6
 
 extern crate alloc;
 
@@ -420,7 +420,7 @@ impl Default for ProcessTransfer {
     }
 }
 
-pub fn transfer_to_eclipse_systemd(
+pub fn transfer_to_eclipse_s6(
     loaded_process: &crate::elf_loader::LoadedProcess,
     stack_pointer: u64,
     argc: u64,
@@ -434,6 +434,6 @@ pub fn transfer_to_eclipse_systemd(
     Ok(())
 }
 
-pub fn simulate_eclipse_systemd_execution() -> Result<(), &'static str> {
+pub fn simulate_eclipse_s6_execution() -> Result<(), &'static str> {
     Ok(())
 }

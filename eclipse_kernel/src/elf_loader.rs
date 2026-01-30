@@ -362,31 +362,15 @@ impl Default for ElfLoader {
     }
 }
 
-/// Función de utilidad para cargar eclipse-systemd
-pub fn load_eclipse_systemd() -> LoadResult {
-    // Try embedded mini-systemd first
-    if crate::embedded_systemd::has_embedded_systemd() {
-        crate::debug::serial_write_str("ELF_LOADER: Loading embedded mini-systemd\n");
-        let embedded_data = crate::embedded_systemd::get_embedded_systemd();
-        
-        let mut loader = ElfLoader::new();
-        match loader.load_elf(embedded_data) {
-            Ok(process) => {
-                crate::debug::serial_write_str("ELF_LOADER: Successfully loaded embedded mini-systemd\n");
-                return Ok(process);
-            }
-            Err(e) => {
-                crate::debug::serial_write_str(&alloc::format!(
-                    "ELF_LOADER: Failed to load embedded systemd: {}\n", e
-                ));
-            }
-        }
-    }
+/// Función de utilidad para cargar eclipse-s6
+pub fn load_eclipse_s6() -> LoadResult {
+    // Try embedded mini-s6 first (if we create one)
+    // For now, we'll use the VFS or fake data
     
     // Fallback to VFS
-    let elf_data = match load_systemd_from_vfs() {
+    let elf_data = match load_s6_from_vfs() {
         Ok(data) => {
-            crate::debug::serial_write_str("ELF_LOADER: Loaded eclipse-systemd from VFS\n");
+            crate::debug::serial_write_str("ELF_LOADER: Loaded eclipse-s6 from VFS\n");
             data
         }
         Err(_) => {
@@ -399,13 +383,13 @@ pub fn load_eclipse_systemd() -> LoadResult {
     loader.load_elf(&elf_data)
 }
 
-/// Cargar systemd desde el VFS o el sistema de archivos montado
-fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
+/// Cargar s6 desde el VFS o el sistema de archivos montado
+fn load_s6_from_vfs() -> Result<Vec<u8>, &'static str> {
     use crate::vfs_global::get_vfs;
     use crate::filesystem::vfs::get_vfs as get_vfs_system;
     
     // Primero intentar cargar desde el sistema de archivos montado (EclipseFS)
-    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar systemd desde el sistema de archivos montado...\n");
+    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar s6 desde el sistema de archivos montado...\n");
     
     let mut vfs_guard = get_vfs_system();
     if let Some(vfs_system) = &*vfs_guard {
@@ -413,7 +397,7 @@ fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
         if let Some(root_fs) = vfs_system.get_mount("/") {
             let fs_lock = root_fs.lock();
             
-            let paths = ["/sbin/eclipse-systemd", "/usr/sbin/eclipse-systemd", "/sbin/init"];
+            let paths = ["/sbin/eclipse-s6", "/usr/sbin/eclipse-s6", "/sbin/init"];
             
             for path in &paths {
                 crate::debug::serial_write_str(&alloc::format!("ELF_LOADER: Intentando leer {} desde filesystem montado...\n", path));
@@ -435,12 +419,12 @@ fn load_systemd_from_vfs() -> Result<Vec<u8>, &'static str> {
     }
     
     // Si no se pudo cargar desde el filesystem montado, intentar desde el VFS en memoria
-    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar systemd desde VFS en memoria...\n");
+    crate::debug::serial_write_str("ELF_LOADER: Intentando cargar s6 desde VFS en memoria...\n");
     let vfs = get_vfs();
     let mut vfs_lock = vfs.lock();
     
-    // Intentar cargar /sbin/eclipse-systemd o /sbin/init
-    let paths = ["/sbin/eclipse-systemd", "/sbin/init"];
+    // Intentar cargar /sbin/eclipse-s6 o /sbin/init
+    let paths = ["/sbin/eclipse-s6", "/sbin/init"];
     
     for path in &paths {
         match vfs_lock.read_file(path) {

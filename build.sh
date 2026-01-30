@@ -175,32 +175,32 @@ build_installer() {
     cd ..
 }
 
-# Función para compilar systemd
-build_systemd() {
-    print_step "Compilando sistema systemd..."
+# Función para compilar S6
+build_s6() {
+    print_step "Compilando sistema S6..."
     
-    if [ ! -d "eclipse-apps/systemd" ]; then
-        print_status "Directorio systemd no encontrado, saltando..."
+    if [ ! -d "eclipse-apps/s6" ]; then
+        print_status "Directorio s6 no encontrado, saltando..."
         return 0
     fi
     
-    cd eclipse-apps/systemd
+    cd eclipse-apps/s6
     
-    # Compilar systemd
-    print_status "Compilando systemd..."
+    # Compilar S6
+    print_status "Compilando S6..."
     cargo build --release
     
     if [ $? -eq 0 ]; then
-        print_success "Systemd compilado exitosamente"
+        print_success "S6 compilado exitosamente"
         
-        # Mostrar información del systemd compilado
-        local systemd_path="target/release/eclipse-systemd"
-        if [ -f "$systemd_path" ]; then
-            local systemd_size=$(du -h "$systemd_path" | cut -f1)
-            print_status "Systemd generado: $systemd_path ($systemd_size)"
+        # Mostrar información del S6 compilado
+        local s6_path="target/release/eclipse-s6"
+        if [ -f "$s6_path" ]; then
+            local s6_size=$(du -h "$s6_path" | cut -f1)
+            print_status "S6 generado: $s6_path ($s6_size)"
         fi
     else
-        print_error "Error al compilar systemd"
+        print_error "Error al compilar S6"
         return 1
     fi
     
@@ -1379,7 +1379,7 @@ main() {
     build_kernel
     build_bootloader
     build_installer
-    build_systemd
+    build_s6
     build_eclipse_apps
     build_userland
     

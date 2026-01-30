@@ -1,12 +1,12 @@
 //! Sistema de Inicialización Eclipse OS
 //!
 //! Este módulo maneja la transición del kernel al userland,
-//! ejecutando eclipse-systemd como PID 1
+//! ejecutando eclipse-s6 como PID 1
 //!
 //! # Estado Actual de la Implementación
 //!
 //! ## ✅ Implementado
-//! - Estructura InitProcess con configuración completa de eclipse-systemd
+//! - Estructura InitProcess con configuración completa de eclipse-s6
 //! - Configuración de variables de entorno estándar
 //! - Verificación de ejecutables (simulada)
 //! - Integración con módulos elf_loader, process_memory y process_transfer
@@ -31,14 +31,14 @@
 //!
 //! let mut init_system = InitSystem::new();
 //! init_system.initialize()?;
-//! init_system.execute_init()?;  // Transfiere control a systemd
+//! init_system.execute_init()?;  // Transfiere control a S6
 //! ```
 
 use core::fmt::Write;
 // use crate::main_simple::SerialWriter;
-use crate::elf_loader::{load_eclipse_systemd, ElfLoader};
-use crate::process_memory::{setup_eclipse_systemd_memory, ProcessMemoryManager};
-use crate::process_transfer::{transfer_to_eclipse_systemd, ProcessContext, ProcessTransfer};
+use crate::elf_loader::{load_eclipse_s6, ElfLoader};
+use crate::process_memory::{setup_eclipse_s6_memory, ProcessMemoryManager};
+use crate::process_transfer::{transfer_to_eclipse_s6, ProcessContext, ProcessTransfer};
 use heapless::{String, Vec};
 
 // Instancia global del escritor serial
@@ -57,7 +57,7 @@ pub struct InitProcess {
 /// Gestor del sistema de inicialización
 pub struct InitSystem {
     init_process: Option<InitProcess>,
-    systemd_path: &'static str,
+    s6_path: &'static str,
     is_initialized: bool,
 }
 
@@ -66,7 +66,7 @@ impl InitSystem {
     pub fn new() -> Self {
         Self {
             init_process: None,
-            systemd_path: "/sbin/init",
+            s6_path: "/sbin/init",
             is_initialized: false,
         }
     }
@@ -79,9 +79,9 @@ impl InitSystem {
         // Crear proceso init
         self.init_process = Some(InitProcess {
             pid: 1,
-            name: "eclipse-systemd",
+            name: "eclipse-s6",
             executable_path: "/sbin/init",
-            arguments: &["eclipse-systemd"],
+            arguments: &["eclipse-s6"],
             environment: &[
                 "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
                 "HOME=/root",
@@ -99,15 +99,15 @@ impl InitSystem {
         Ok(())
     }
 
-    /// Verificar que eclipse-systemd existe
-    fn check_systemd_exists(&self) -> bool {
+    /// Verificar que eclipse-s6 existe
+    fn check_s6_exists(&self) -> bool {
         // En un sistema real, esto verificaría la existencia del archivo
         // Por ahora, simulamos la verificación con diferentes rutas posibles
 
         let possible_paths = [
             "/sbin/init",
-            "/sbin/eclipse-systemd",
-            "/usr/sbin/eclipse-systemd",
+            "/sbin/eclipse-s6",
+            "/usr/sbin/eclipse-s6",
         ];
 
         // Simular verificación de existencia
@@ -159,7 +159,7 @@ impl InitSystem {
         // En un sistema real, esto verificaría los permisos del archivo
         // Por ahora, simulamos que tiene permisos de ejecución
 
-        path.ends_with("eclipse-systemd")
+        path.ends_with("eclipse-s6")
     }
 
     /// Verificar formato ELF
@@ -195,9 +195,9 @@ impl InitSystem {
         true
     }
 
-    /// Ejecutar eclipse-systemd como PID 1
+    /// Ejecutar eclipse-s6 como PID 1
     ///
-    /// Este método intenta transferir el control del kernel a eclipse-systemd.
+    /// Este método intenta transferir el control del kernel a eclipse-s6.
     ///
     /// # Estado Actual
     ///
@@ -208,7 +208,7 @@ impl InitSystem {
     ///
     /// # Flujo de Ejecución
     ///
-    /// 1. Verifica que eclipse-systemd existe
+    /// 1. Verifica que eclipse-s6 existe
     /// 2. Muestra mensaje de inicio en framebuffer
     /// 3. Carga el ejecutable (simulado)
     /// 4. Configura memoria del proceso (simulado)
@@ -228,16 +228,16 @@ impl InitSystem {
 
         let init_process = self.init_process.as_ref().unwrap();
 
-        // Verificar que eclipse-systemd existe y es válido
-        if !self.check_systemd_exists() {
-            return Err("eclipse-systemd no encontrado o no es válido");
+        // Verificar que eclipse-s6 existe y es válido
+        if !self.check_s6_exists() {
+            return Err("eclipse-s6 no encontrado o no es válido");
         }
 
         // Enviar mensaje de inicio a la interfaz serial
-        self.send_systemd_startup_message(init_process);
+        self.send_s6_startup_message(init_process);
 
-        // 1. Cargar el ejecutable eclipse-systemd
-        let loaded_process = self.load_eclipse_systemd_executable()?;
+        // 1. Cargar el ejecutable eclipse-s6
+        let loaded_process = self.load_eclipse_s6_executable()?;
 
         // 2. Configurar el espacio de direcciones del proceso
         let process_memory = self.setup_process_memory(&loaded_process)?;
@@ -331,7 +331,7 @@ impl InitSystem {
         // En un sistema real, esto usaría el sistema de archivos
         // Por ahora, simulamos la lectura del archivo
 
-        // Simular datos del ejecutable eclipse-systemd
+        // Simular datos del ejecutable eclipse-s6
         let mut file_data = heapless::Vec::<u8, 4096>::new();
 
         // Simular header ELF
@@ -463,7 +463,7 @@ impl InitSystem {
         InitSystemStats {
             is_initialized: self.is_initialized,
             init_pid: self.init_process.as_ref().map(|p| p.pid).unwrap_or(0),
-            systemd_path: self.systemd_path,
+            s6_path: self.s6_path,
             total_processes: 1, // Solo el init por ahora
         }
     }
@@ -474,7 +474,7 @@ impl InitSystem {
 pub struct InitSystemStats {
     pub is_initialized: bool,
     pub init_pid: u32,
-    pub systemd_path: &'static str,
+    pub s6_path: &'static str,
     pub total_processes: u32,
 }
 
@@ -491,9 +491,9 @@ pub fn create_init_symlink() -> Result<(), &'static str> {
 
     let init_system = InitSystem::new();
 
-    // Verificar que eclipse-systemd existe
-    if !init_system.check_systemd_exists() {
-        return Err("eclipse-systemd no encontrado, no se puede crear enlace simbólico");
+    // Verificar que eclipse-s6 existe
+    if !init_system.check_s6_exists() {
+        return Err("eclipse-s6 no encontrado, no se puede crear enlace simbólico");
     }
 
     // Simular creación del enlace simbólico
@@ -516,9 +516,9 @@ pub fn verify_init_configuration() -> Result<(), &'static str> {
         return Err("Proceso init no configurado");
     }
 
-    // Verificar que eclipse-systemd existe
-    if !init_system.check_systemd_exists() {
-        return Err("eclipse-systemd no encontrado");
+    // Verificar que eclipse-s6 existe
+    if !init_system.check_s6_exists() {
+        return Err("eclipse-s6 no encontrado");
     }
 
     // Verificar estadísticas del sistema
@@ -533,7 +533,7 @@ pub fn verify_init_configuration() -> Result<(), &'static str> {
 /// Función de utilidad para obtener información del sistema de inicialización
 pub fn get_init_system_info() -> InitSystemInfo {
     InitSystemInfo {
-        systemd_path: "/sbin/init",
+        s6_path: "/sbin/init",
         init_pid: 1,
         is_ready: true,
         supported_features: &[
@@ -550,7 +550,7 @@ pub fn get_init_system_info() -> InitSystemInfo {
 /// Información del sistema de inicialización
 #[derive(Debug, Clone)]
 pub struct InitSystemInfo {
-    pub systemd_path: &'static str,
+    pub s6_path: &'static str,
     pub init_pid: u32,
     pub is_ready: bool,
     pub supported_features: &'static [&'static str],
@@ -572,8 +572,8 @@ pub fn diagnose_init_system() -> InitSystemDiagnostic {
 
     // Verificar sistema de archivos
     let init_system = InitSystem::new();
-    if !init_system.check_systemd_exists() {
-        diagnostic.add_error("Sistema de archivos", "eclipse-systemd no encontrado");
+    if !init_system.check_s6_exists() {
+        diagnostic.add_error("Sistema de archivos", "eclipse-s6 no encontrado");
     }
 
     diagnostic
@@ -631,7 +631,7 @@ impl InitSystem {
         loaded_process: &crate::elf_loader::LoadedProcess,
     ) -> Result<crate::process_memory::ProcessMemory, &'static str> {
         // Configurar la memoria del proceso
-        setup_eclipse_systemd_memory()
+        setup_eclipse_s6_memory()
     }
 
     /// Configurar argumentos del proceso
@@ -670,12 +670,12 @@ impl InitSystem {
         argv: u64,
         envp: u64,
     ) -> Result<(), &'static str> {
-        // Transferir control al proceso eclipse-systemd
-        transfer_to_eclipse_systemd(loaded_process, stack_pointer, argc, argv, envp)
+        // Transferir control al proceso eclipse-s6
+        transfer_to_eclipse_s6(loaded_process, stack_pointer, argc, argv, envp)
     }
 
-    /// Enviar mensaje de inicio de eclipse-systemd a la interfaz serial
-    fn send_systemd_startup_message(&self, init_process: &InitProcess) {
+    /// Enviar mensaje de inicio de eclipse-s6 a la interfaz serial
+    fn send_s6_startup_message(&self, init_process: &InitProcess) {
         // Escribir mensajes al framebuffer
         if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
             fb.write_text_kernel(
@@ -684,7 +684,7 @@ impl InitSystem {
             );
             fb.write_text_kernel("", crate::drivers::framebuffer::Color::WHITE);
             fb.write_text_kernel(
-                "PID 1: Configuración de eclipse-systemd iniciada.",
+                "PID 1: Configuración de eclipse-s6 iniciada.",
                 crate::drivers::framebuffer::Color::CYAN,
             );
             fb.write_text_kernel(
@@ -699,7 +699,7 @@ impl InitSystem {
 
         // Log serial para debugging
         crate::debug::serial_write_str(
-            "INIT_SYSTEM: eclipse-systemd configurado (transferencia pendiente de VM completa)\n"
+            "INIT_SYSTEM: eclipse-s6 configurado (transferencia pendiente de VM completa)\n"
         );
     }
 }

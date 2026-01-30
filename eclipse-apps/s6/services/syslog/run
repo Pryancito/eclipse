@@ -1,0 +1,6 @@
+#!/bin/sh
+# Syslog Service - S6 run script
+# Replaces: syslog.service
+
+exec 2>&1
+exec /sbin/eclipse-syslog

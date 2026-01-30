@@ -1,0 +1,6 @@
+#!/bin/sh
+# Eclipse Shell Service - S6 run script
+# Replaces: eclipse-shell.service
+
+exec 2>&1
+exec /sbin/eclipse-shell
