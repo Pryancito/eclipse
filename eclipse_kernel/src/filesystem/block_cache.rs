@@ -208,7 +208,8 @@ pub fn read_data_from_offset(
     let mut iteration_count = 0;
     
     // PROTECCIÓN: Calcular el bloque final esperado para detener la lectura
-    let end_block = start_block + expected_blocks as u64;
+    // El último bloque válido es start_block + expected_blocks - 1
+    let end_block = start_block + expected_blocks as u64 - 1;
     
     while remaining > 0 && bytes_read < buffer.len() {
         // PROTECCIÓN: Verificar si se alcanzó el bloque final esperado
@@ -239,13 +240,13 @@ pub fn read_data_from_offset(
         let to_copy = remaining.min(available);
         
         // PROTECCIÓN: Detener si no hay progreso (to_copy == 0)
-        // Esto previene loops infinitos cuando se lee más allá del final de datos válidos
+        // Esto indica un bug en la lógica de lectura de bloques y debe retornar error
         if to_copy == 0 {
             crate::debug::serial_write_str(&alloc::format!(
-                "BLOCK_CACHE: Sin progreso en bloque {} (to_copy=0), deteniendo lectura. bytes_read={}, remaining={}\n",
+                "BLOCK_CACHE: ERROR - Sin progreso en bloque {} (to_copy=0). bytes_read={}, remaining={}\n",
                 current_block, bytes_read, remaining
             ));
-            break;
+            return Err("Sin progreso en lectura de bloques - posible bug en lógica de lectura");
         }
         
         // Log de progreso cada 100 bloques para archivos grandes

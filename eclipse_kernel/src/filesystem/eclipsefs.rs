@@ -173,17 +173,6 @@ impl EclipseFSWrapper {
         // Calcular el tamaño de los datos TLV (excluyendo la cabecera ya leída)
         let tlv_size = record_size - ecfs_constants::NODE_RECORD_HEADER_SIZE;
         
-        // PROTECCIÓN: Validar que el tamaño TLV sea razonable
-        // Esto previene lecturas excesivas más allá de los datos válidos
-        const MAX_TLV_SIZE: usize = 16 * 1024 * 1024 - ecfs_constants::NODE_RECORD_HEADER_SIZE; // Max - header
-        if tlv_size > MAX_TLV_SIZE {
-            crate::debug::serial_write_str(&alloc::format!(
-                "ECLIPSEFS: ERROR - Tamaño TLV excesivo: {} bytes (máximo permitido: {} bytes)\n",
-                tlv_size, MAX_TLV_SIZE
-            ));
-            return Err(VfsError::InvalidFs("Tamaño TLV excesivo - posible corrupción".into()));
-        }
-        
         // Crear buffer completo: cabecera + datos TLV
         let mut node_buffer = alloc::vec![0u8; record_size];
         
