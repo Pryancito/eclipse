@@ -89,7 +89,7 @@ impl IdtRegister {
     /// Cargar IDT en el procesador
     pub fn load(&self) {
         unsafe {
-            asm!("lidt [{}]", in(reg) self as *const Self as u64, options(nomem, nostack));
+            asm!("lidt [{}]", in(reg) self, options(readonly, nostack));
         }
     }
 }
