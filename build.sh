@@ -1186,13 +1186,15 @@ EOF
         UNMOUNT_RETRIES=5
         UNMOUNT_SUCCESS=0
         for i in $(seq 1 $UNMOUNT_RETRIES); do
+            if [ $i -gt 1 ]; then
+                print_status "Reintentando desmontaje (intento $i/$UNMOUNT_RETRIES)..."
+                sleep 1
+                sync
+            fi
             if sudo umount "$MOUNT_POINT" 2>/dev/null; then
                 UNMOUNT_SUCCESS=1
                 break
             fi
-            print_status "Reintentando desmontaje (intento $i/$UNMOUNT_RETRIES)..."
-            sleep 1
-            sync
         done
         
         if [ $UNMOUNT_SUCCESS -eq 1 ]; then
