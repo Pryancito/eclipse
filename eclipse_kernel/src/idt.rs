@@ -416,8 +416,8 @@ fn log_interrupt(interrupt_type: &str, details: &str) {
 // HANDLERS DE EXCEPCIONES IMPLEMENTADOS
 // ============================================================================
 
-/// Handler de división por cero
-extern "C" fn divide_by_zero_handler() {
+// Handlers internos (llamados por las funciones naked)
+fn divide_by_zero_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("DIVIDE_BY_ZERO", "División por cero detectada");
     
@@ -432,8 +432,49 @@ extern "C" fn divide_by_zero_handler() {
     }
 }
 
-/// Handler de debug
-extern "C" fn debug_handler() {
+/// Handler de división por cero (assembly wrapper)
+#[unsafe(naked)]
+extern "C" fn divide_by_zero_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym divide_by_zero_handler_inner,
+        );
+    }
+}
+
+fn debug_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("DEBUG", "Debug exception");
     
@@ -446,8 +487,49 @@ extern "C" fn debug_handler() {
     }
 }
 
-/// Handler de NMI (Non-Maskable Interrupt)
-extern "C" fn nmi_handler() {
+/// Handler de debug (assembly wrapper)
+#[unsafe(naked)]
+extern "C" fn debug_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym debug_handler_inner,
+        );
+    }
+}
+
+fn nmi_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("NMI", "Non-maskable interrupt");
     
@@ -460,8 +542,49 @@ extern "C" fn nmi_handler() {
     }
 }
 
-/// Handler de breakpoint
-extern "C" fn breakpoint_handler() {
+/// Handler de NMI (Non-Maskable Interrupt)
+#[unsafe(naked)]
+extern "C" fn nmi_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym nmi_handler_inner,
+        );
+    }
+}
+
+fn breakpoint_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("BREAKPOINT", "Breakpoint exception");
     
@@ -474,8 +597,49 @@ extern "C" fn breakpoint_handler() {
     }
 }
 
-/// Handler de overflow
-extern "C" fn overflow_handler() {
+/// Handler de breakpoint
+#[unsafe(naked)]
+extern "C" fn breakpoint_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym breakpoint_handler_inner,
+        );
+    }
+}
+
+fn overflow_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("OVERFLOW", "Integer overflow");
     
@@ -487,8 +651,49 @@ extern "C" fn overflow_handler() {
     }
 }
 
-/// Handler de bounds check
-extern "C" fn bounds_check_handler() {
+/// Handler de overflow
+#[unsafe(naked)]
+extern "C" fn overflow_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym overflow_handler_inner,
+        );
+    }
+}
+
+fn bounds_check_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("BOUNDS_CHECK", "Bounds check violation");
     
@@ -500,8 +705,49 @@ extern "C" fn bounds_check_handler() {
     }
 }
 
-/// Handler de opcode inválido
-extern "C" fn invalid_opcode_handler() {
+/// Handler de bounds check
+#[unsafe(naked)]
+extern "C" fn bounds_check_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym bounds_check_handler_inner,
+        );
+    }
+}
+
+fn invalid_opcode_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("INVALID_OPCODE", "Invalid opcode executed");
     
@@ -513,8 +759,49 @@ extern "C" fn invalid_opcode_handler() {
     }
 }
 
-/// Handler de dispositivo no disponible
-extern "C" fn device_not_available_handler() {
+/// Handler de opcode inválido
+#[unsafe(naked)]
+extern "C" fn invalid_opcode_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym invalid_opcode_handler_inner,
+        );
+    }
+}
+
+fn device_not_available_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("DEVICE_NOT_AVAILABLE", "Device not available");
     
@@ -526,8 +813,49 @@ extern "C" fn device_not_available_handler() {
     }
 }
 
-/// Handler de double fault
-extern "C" fn double_fault_handler() {
+/// Handler de dispositivo no disponible
+#[unsafe(naked)]
+extern "C" fn device_not_available_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym device_not_available_handler_inner,
+        );
+    }
+}
+
+fn double_fault_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("DOUBLE_FAULT", "Double fault - system may be unstable");
     
@@ -543,8 +871,50 @@ extern "C" fn double_fault_handler() {
     }
 }
 
-/// Handler de coprocessor segment overrun
-extern "C" fn coprocessor_segment_overrun_handler() {
+/// Handler de double fault
+#[unsafe(naked)]
+extern "C" fn double_fault_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym double_fault_handler_inner,
+        );
+    }
+}
+
+fn coprocessor_segment_overrun_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("COPROCESSOR_OVERRUN", "Coprocessor segment overrun");
     
@@ -556,8 +926,49 @@ extern "C" fn coprocessor_segment_overrun_handler() {
     }
 }
 
-/// Handler de TSS inválido
-extern "C" fn invalid_tss_handler() {
+/// Handler de coprocessor segment overrun
+#[unsafe(naked)]
+extern "C" fn coprocessor_segment_overrun_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym coprocessor_segment_overrun_handler_inner,
+        );
+    }
+}
+
+fn invalid_tss_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("INVALID_TSS", "Invalid TSS");
     
@@ -569,8 +980,50 @@ extern "C" fn invalid_tss_handler() {
     }
 }
 
-/// Handler de segmento no presente
-extern "C" fn segment_not_present_handler() {
+/// Handler de TSS inválido
+#[unsafe(naked)]
+extern "C" fn invalid_tss_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym invalid_tss_handler_inner,
+        );
+    }
+}
+
+fn segment_not_present_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("SEGMENT_NOT_PRESENT", "Segment not present");
     
@@ -582,8 +1035,50 @@ extern "C" fn segment_not_present_handler() {
     }
 }
 
-/// Handler de stack segment fault
-extern "C" fn stack_segment_fault_handler() {
+/// Handler de segmento no presente
+#[unsafe(naked)]
+extern "C" fn segment_not_present_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym segment_not_present_handler_inner,
+        );
+    }
+}
+
+fn stack_segment_fault_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("STACK_SEGMENT_FAULT", "Stack segment fault");
     
@@ -595,8 +1090,50 @@ extern "C" fn stack_segment_fault_handler() {
     }
 }
 
-/// Handler de general protection fault
-extern "C" fn general_protection_fault_handler() {
+/// Handler de stack segment fault
+#[unsafe(naked)]
+extern "C" fn stack_segment_fault_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym stack_segment_fault_handler_inner,
+        );
+    }
+}
+
+fn general_protection_fault_handler_inner() {
     GP_FAULTS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("GENERAL_PROTECTION_FAULT", "General protection fault");
     
@@ -608,8 +1145,50 @@ extern "C" fn general_protection_fault_handler() {
     }
 }
 
-/// Handler de page fault
-extern "C" fn page_fault_handler() {
+/// Handler de general protection fault
+#[unsafe(naked)]
+extern "C" fn general_protection_fault_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym general_protection_fault_handler_inner,
+        );
+    }
+}
+
+fn page_fault_handler_inner() {
     PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("PAGE_FAULT", "Page fault");
     
@@ -622,8 +1201,50 @@ extern "C" fn page_fault_handler() {
     }
 }
 
-/// Handler de floating point error
-extern "C" fn floating_point_error_handler() {
+/// Handler de page fault
+#[unsafe(naked)]
+extern "C" fn page_fault_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym page_fault_handler_inner,
+        );
+    }
+}
+
+fn floating_point_error_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("FLOATING_POINT_ERROR", "Floating point error");
     
@@ -635,8 +1256,49 @@ extern "C" fn floating_point_error_handler() {
     }
 }
 
-/// Handler de alignment check
-extern "C" fn alignment_check_handler() {
+/// Handler de floating point error
+#[unsafe(naked)]
+extern "C" fn floating_point_error_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym floating_point_error_handler_inner,
+        );
+    }
+}
+
+fn alignment_check_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("ALIGNMENT_CHECK", "Alignment check failed");
     
@@ -648,8 +1310,50 @@ extern "C" fn alignment_check_handler() {
     }
 }
 
-/// Handler de machine check
-extern "C" fn machine_check_handler() {
+/// Handler de alignment check
+#[unsafe(naked)]
+extern "C" fn alignment_check_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "add rsp, 8",  // Skip error code pushed by CPU
+            "iretq",
+            inner = sym alignment_check_handler_inner,
+        );
+    }
+}
+
+fn machine_check_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("MACHINE_CHECK", "Machine check error");
     
@@ -662,8 +1366,49 @@ extern "C" fn machine_check_handler() {
     }
 }
 
-/// Handler de SIMD floating point exception
-extern "C" fn simd_floating_point_exception_handler() {
+/// Handler de machine check
+#[unsafe(naked)]
+extern "C" fn machine_check_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym machine_check_handler_inner,
+        );
+    }
+}
+
+fn simd_floating_point_exception_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("SIMD_FP_EXCEPTION", "SIMD floating point exception");
     
@@ -675,8 +1420,49 @@ extern "C" fn simd_floating_point_exception_handler() {
     }
 }
 
-/// Handler de virtualization exception
-extern "C" fn virtualization_exception_handler() {
+/// Handler de SIMD floating point exception
+#[unsafe(naked)]
+extern "C" fn simd_floating_point_exception_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym simd_floating_point_exception_handler_inner,
+        );
+    }
+}
+
+fn virtualization_exception_handler_inner() {
     EXCEPTIONS.fetch_add(1, Ordering::Relaxed);
     log_interrupt("VIRTUALIZATION_EXCEPTION", "Virtualization exception");
     
@@ -688,12 +1474,53 @@ extern "C" fn virtualization_exception_handler() {
     }
 }
 
+/// Handler de virtualization exception
+#[unsafe(naked)]
+extern "C" fn virtualization_exception_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym virtualization_exception_handler_inner,
+        );
+    }
+}
+
 // ============================================================================
 // HANDLERS DE INTERRUPCIONES IMPLEMENTADOS
 // ============================================================================
 
-/// Handler de timer
-extern "C" fn timer_handler() {
+fn timer_handler_inner() {
     TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     
     // Timer interrupt - usado para scheduling
@@ -704,8 +1531,49 @@ extern "C" fn timer_handler() {
     }
 }
 
-/// Handler de teclado
-extern "C" fn keyboard_handler() {
+/// Handler de timer
+#[unsafe(naked)]
+extern "C" fn timer_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym timer_handler_inner,
+        );
+    }
+}
+
+fn keyboard_handler_inner() {
     KEYBOARD_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     
     // Llamar al manejador PS/2 del teclado
@@ -717,8 +1585,49 @@ extern "C" fn keyboard_handler() {
     }
 }
 
-/// Handler de ratón
-extern "C" fn mouse_handler() {
+/// Handler de teclado
+#[unsafe(naked)]
+extern "C" fn keyboard_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym keyboard_handler_inner,
+        );
+    }
+}
+
+fn mouse_handler_inner() {
     MOUSE_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     
     // Llamar al manejador PS/2 del ratón
@@ -731,8 +1640,49 @@ extern "C" fn mouse_handler() {
     }
 }
 
-/// Handler de serial
-extern "C" fn serial_handler() {
+/// Handler de ratón
+#[unsafe(naked)]
+extern "C" fn mouse_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym mouse_handler_inner,
+        );
+    }
+}
+
+fn serial_handler_inner() {
     SERIAL_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     
     // Serial interrupt - leer datos del puerto serial
@@ -744,8 +1694,49 @@ extern "C" fn serial_handler() {
     }
 }
 
-/// Handler de syscall
-extern "C" fn syscall_handler() {
+/// Handler de serial
+#[unsafe(naked)]
+extern "C" fn serial_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym serial_handler_inner,
+        );
+    }
+}
+
+fn syscall_handler_inner() {
     SYSCALLS.fetch_add(1, Ordering::Relaxed);
     
     // System call handler
@@ -755,5 +1746,47 @@ extern "C" fn syscall_handler() {
         for &byte in msg {
             asm!("out dx, al", in("dx") 0x3F8u16, in("al") byte, options(nostack, nomem));
         }
+    }
+}
+
+/// Handler de syscall
+#[unsafe(naked)]
+extern "C" fn syscall_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rbx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "call {inner}",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rbx",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+            "iretq",
+            inner = sym syscall_handler_inner,
+        );
     }
 }
