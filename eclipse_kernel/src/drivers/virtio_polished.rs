@@ -603,10 +603,45 @@ impl VirtioPolishedDriver {
     fn create_real_virtio_driver(&self, pci_device: &PciDevice) -> Result<Box<dyn BlockDevice>, String> {
         serial_write_str("VIRTIO_POLISHED: Creando driver VirtIO real...\n");
         
-        // Por ahora, usar el simulador ya que la API de VirtIO es compleja
-        // TODO: Implementar driver VirtIO real cuando sea necesario
-        serial_write_str("VIRTIO_POLISHED: Usando simulador como fallback para driver real\n");
-        Err("Driver VirtIO real no implementado aún".to_string())
+        // Convertir PciDevice de polished_pci a PciDevice del kernel
+        let kernel_pci_device = crate::drivers::pci::PciDevice {
+            vendor_id: pci_device.vendor_id,
+            device_id: pci_device.device_id,
+            class_code: pci_device.class,
+            subclass_code: pci_device.subclass,
+            prog_if: pci_device.prog_if,
+            bus: pci_device.bus,
+            device: pci_device.device,
+            function: pci_device.function,
+            revision_id: 0, // No disponible en polished_pci
+            header_type: 0, // No disponible en polished_pci
+            status: 0, // No disponible en polished_pci
+            command: 0, // No disponible en polished_pci
+        };
+        
+        // Intentar crear el driver VirtIO real usando virtio_blk
+        serial_write_str("VIRTIO_POLISHED: Intentando inicializar VirtioBlkDriver...\n");
+        
+        // Obtener framebuffer para el driver
+        match crate::drivers::framebuffer::get_framebuffer() {
+            Some(fb) => {
+                match crate::drivers::virtio_blk::VirtioBlkDriver::new(kernel_pci_device, fb) {
+                    Ok(driver) => {
+                        serial_write_str("VIRTIO_POLISHED: VirtioBlkDriver creado exitosamente!\n");
+                        Ok(Box::new(driver))
+                    }
+                    Err(e) => {
+                        serial_write_str(&format!("VIRTIO_POLISHED: Error creando VirtioBlkDriver: {}\n", e));
+                        serial_write_str("VIRTIO_POLISHED: Cayendo al simulador como fallback\n");
+                        Err(format!("No se pudo crear driver VirtIO real: {}", e))
+                    }
+                }
+            }
+            None => {
+                serial_write_str("VIRTIO_POLISHED: No se pudo obtener framebuffer, cayendo al simulador\n");
+                Err("No se pudo obtener framebuffer".to_string())
+            }
+        }
     }
 
     fn read_from_pci_device(&self, device: &PciDevice, start_block: u64, buffer: &mut [u8]) -> Result<(), String> {
