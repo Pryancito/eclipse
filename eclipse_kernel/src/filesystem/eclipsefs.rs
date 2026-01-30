@@ -129,12 +129,25 @@ impl EclipseFSWrapper {
             self.partition_index,
             absolute_offset,
             &mut node_buffer
-        ).map_err(|_| VfsError::InvalidOperation)?;
+        ).map_err(|e| {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error en read_data_from_offset: {}\n", e));
+            VfsError::IoError(alloc::format!("Error leyendo nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
+        })?;
+
+        if bytes_read == 0 {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: ERROR - Se leyeron 0 bytes para el nodo {}\n", inode_num));
+            return Err(VfsError::InvalidFs("No se pudieron leer datos del nodo".into()));
+        }
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
 
         // Parsear el nodo desde el buffer usando formato TLV
-        self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)
+        let node = self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)?;
+        
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} parseado exitosamente (tipo: {:?}, tamaño: {})\n", 
+            inode_num, node.kind, node.size));
+        
+        Ok(node)
     }
 
     /// Parsear un nodo desde un buffer TLV
@@ -329,6 +342,12 @@ impl EclipseFSWrapper {
                     crate::debug::serial_write_str(&alloc::format!(
                         "ECLIPSEFS: Directorio con {} entradas\n", children.len()
                     ));
+                    // Log all children for debugging
+                    for (child_name, child_inode) in children.iter() {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ECLIPSEFS:   - '{}' -> inodo {}\n", child_name, child_inode
+                        ));
+                    }
                 }
                 _ => {
                     // Ignorar tags desconocidos
@@ -534,6 +553,8 @@ impl EclipseFSWrapper {
             
             // Buscar el nombre en los hijos del directorio
             if node.kind == eclipsefs_lib::NodeKind::Directory {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Directorio inodo {} tiene {} hijos\n", current_inode, node.children.len()));
+                
                 let mut found_inode = None;
                 // node.children es un FnvIndexMap<String, u32> que se itera como (key, value)
                 for (child_name, child_inode) in node.children.iter() {
@@ -547,7 +568,10 @@ impl EclipseFSWrapper {
                 let found_inode = match found_inode {
                     Some(inode) => inode,
                     None => {
-                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio inodo {}. Hijos disponibles:\n", part, current_inode));
+                        for (child_name, child_inode) in node.children.iter() {
+                            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS:   - '{}' -> inodo {}\n", child_name, child_inode));
+                        }
                         return Err(VfsError::FileNotFound);
                     }
                 };
@@ -727,34 +751,21 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     
     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) 📋 Leyendo EclipseFS desde {} (sector 0 de la partición)\n", partition.name));
     
-    // Leer el superblock de EclipseFS directamente desde /dev/sda2
-    // Como el driver ATA directo falla, vamos a leer directamente desde el sector donde está EclipseFS
-    // Determinar sector offset según el dispositivo
-    // Particiones 2 típicamente empiezan después de la partición 1 (boot)
-    let is_second_partition = partition.name.ends_with("2") || partition.name.ends_with("p2");
-    let sector_offset = if is_second_partition {
-        // EclipseFS está instalado en /dev/sda2, que empieza en el sector 20973568 (según el instalador)
-        // Pero vamos a leer directamente desde el inicio de la partición
-        20973568
-    } else {
-        partition.start_lba
-    };
-    
-    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Leyendo desde sector {} de {} (offset de partición: {})\n", 
-                                                   sector_offset, partition.name, partition.start_lba));
-    
     // Leer realmente desde el disco usando el storage manager
     crate::debug::serial_write_str("ECLIPSEFS: (root) Leyendo realmente desde el disco\n");
     
-    // Leer el boot sector desde la partición usando el storage manager
-    // CORRECCIÓN: Usar el índice correcto de la partición (/dev/sda2 = índice 1)
-    // Determinar índice de partición (0=primera, 1=segunda, etc.)
-    let partition_index = if partition.name.ends_with("2") || partition.name.ends_with("p2") {
-        1
-    } else {
-        0
-    };
-    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Usando índice de partición {} para {}\n", partition_index, partition.name));
+    // CORRECCIÓN CRÍTICA: Encontrar el índice correcto de la partición en el vector de particiones
+    // No podemos asumir que partition 2 = index 1, debemos buscar la partición por sus propiedades
+    let partition_position = storage.partitions.iter()
+        .position(|p| p.name == partition.name && p.start_lba == partition.start_lba)
+        .ok_or(VfsError::DeviceError("Partición no encontrada en storage manager".into()))?;
+    
+    // Verificar que el índice cabe en u32
+    let partition_index = u32::try_from(partition_position)
+        .map_err(|_| VfsError::DeviceError("Índice de partición demasiado grande".into()))?;
+        
+    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Partición '{}' encontrada en índice {} del vector de particiones\n", 
+        partition.name, partition_index));
     
     // NUEVA ESTRATEGIA: Buscar EclipseFS en diferentes sectores dentro de la partición
     let mut eclipsefs_found = false;
@@ -1631,13 +1642,31 @@ impl FileSystem for EclipseFSWrapper {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo archivo '{}' (lazy)\n", path));
         
         // Resolver la ruta a un inode (esto ya sigue symlinks automáticamente)
-        let inode = self.resolve_path(path)?;
+        let inode = match self.resolve_path(path) {
+            Ok(inode) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta '{}' resuelta a inodo {}\n", path, inode));
+                inode
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error resolviendo ruta '{}': {:?}\n", path, e));
+                return Err(e);
+            }
+        };
         
         // Crear un storage manager para la operación de lectura
         let mut storage = StorageManager::new();
         
         // Cargar el nodo
-        let node = self.load_node_lazy(inode, &mut storage)?;
+        let node = match self.load_node_lazy(inode, &mut storage) {
+            Ok(node) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} cargado exitosamente\n", inode));
+                node
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error cargando nodo {}: {:?}\n", inode, e));
+                return Err(e);
+            }
+        };
         
         // Verificar que sea un archivo (después de seguir symlinks, debería serlo)
         if node.kind != eclipsefs_lib::NodeKind::File {
