@@ -17,14 +17,6 @@ use crate::EclipseFSNode;
 /// Tamaño máximo total del cache ARC (debe ser par)
 const ARC_CACHE_SIZE: usize = 1024;
 
-/// Entrada en el cache ARC
-#[derive(Clone)]
-struct ARCEntry {
-    inode: u32,
-    node: EclipseFSNode,
-    access_count: u32,
-}
-
 /// Implementación del cache ARC (Adaptive Replacement Cache)
 /// Este es el algoritmo "arquera" que optimiza dinámicamente entre
 /// datos recientes y datos frecuentes
@@ -74,6 +66,11 @@ impl AdaptiveReplacementCache {
             t1_to_t2_promotions: 0,
             adaptations: 0,
         }
+    }
+    
+    /// Verificar si un inode está en cache (sin modificar estado)
+    pub fn contains(&self, inode: u32) -> bool {
+        self.cache_data.contains_key(&inode)
     }
     
     /// Obtener un nodo del cache
@@ -273,6 +270,12 @@ impl AdaptiveReplacementCache {
         self.misses = 0;
         self.t1_to_t2_promotions = 0;
         self.adaptations = 0;
+    }
+}
+
+impl Default for AdaptiveReplacementCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

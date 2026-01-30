@@ -6,7 +6,7 @@ use crate::{
 };
 use crate::arc_cache::AdaptiveReplacementCache;
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -21,7 +21,8 @@ const MAX_CACHED_NODES: usize = 1024;
 pub enum CacheType {
     /// LRU simple (Least Recently Used)
     LRU,
-    /// ARC (Adaptive Replacement Cache) - Algoritmo "Arquera"
+    /// ARC (Adaptive Replacement Cache) - También conocido como "Arquera" (nombre coloquial)
+    /// Este es el algoritmo estándar ARC usado en ZFS
     ARC,
 }
 
@@ -34,8 +35,8 @@ pub struct EclipseFSReader {
     cache_type: CacheType,
     /// Simple LRU cache for recently accessed nodes (usado cuando cache_type == LRU)
     lru_cache: HashMap<u32, EclipseFSNode>,
-    /// Track access order for LRU eviction
-    lru_access_order: Vec<u32>,
+    /// Track access order for LRU eviction (VecDeque for O(1) pop_front)
+    lru_access_order: VecDeque<u32>,
     /// ARC cache (usado cuando cache_type == ARC)
     arc_cache: Option<AdaptiveReplacementCache>,
 }
@@ -69,7 +70,7 @@ impl EclipseFSReader {
             inode_table,
             cache_type,
             lru_cache: HashMap::new(),
-            lru_access_order: Vec::new(),
+            lru_access_order: VecDeque::new(),
             arc_cache: if cache_type == CacheType::ARC {
                 Some(AdaptiveReplacementCache::new())
             } else {
@@ -96,7 +97,7 @@ impl EclipseFSReader {
             inode_table,
             cache_type,
             lru_cache: HashMap::new(),
-            lru_access_order: Vec::new(),
+            lru_access_order: VecDeque::new(),
             arc_cache: if cache_type == CacheType::ARC {
                 Some(AdaptiveReplacementCache::new())
             } else {
@@ -165,9 +166,10 @@ impl EclipseFSReader {
             }
             CacheType::LRU => {
                 if let Some(cached_node) = self.lru_cache.get(&inode) {
-                    // Update LRU access order
+                    // Update LRU access order - O(n) due to retain, but necessary
+                    // TODO: Consider using a more efficient data structure for true O(1)
                     self.lru_access_order.retain(|&i| i != inode);
-                    self.lru_access_order.push(inode);
+                    self.lru_access_order.push_back(inode);
                     return Ok(cached_node.clone());
                 }
             }
@@ -347,17 +349,16 @@ impl EclipseFSReader {
                 }
             }
             CacheType::LRU => {
-                // Evict oldest entry if cache is full
+                // Evict oldest entry if cache is full - O(1) with VecDeque
                 if self.lru_cache.len() >= MAX_CACHED_NODES {
-                    if let Some(oldest_inode) = self.lru_access_order.first().copied() {
+                    if let Some(oldest_inode) = self.lru_access_order.pop_front() {
                         self.lru_cache.remove(&oldest_inode);
-                        self.lru_access_order.remove(0);
                     }
                 }
 
                 // Add to cache
                 self.lru_cache.insert(inode, node);
-                self.lru_access_order.push(inode);
+                self.lru_access_order.push_back(inode);
             }
         }
     }
@@ -482,9 +483,9 @@ impl EclipseFSReader {
             // Only prefetch if not already cached
             let already_cached = match self.cache_type {
                 CacheType::ARC => {
-                    // For ARC, we check by attempting a get (which updates internal state anyway)
-                    // If it's cached, we'll get a hit; if not, we'll load it below
-                    false // Always try to load, ARC will handle efficiently
+                    self.arc_cache.as_ref()
+                        .map(|arc| arc.contains(inode))
+                        .unwrap_or(false)
                 }
                 CacheType::LRU => self.lru_cache.contains_key(&inode),
             };
