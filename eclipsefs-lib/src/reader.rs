@@ -298,6 +298,12 @@ impl EclipseFSReader {
                 .map_err(|_| EclipseFSError::InvalidFormat)?;
             offset += name_len;
 
+            // Deduplicate: Only insert if not already present
+            // HashMap::insert would overwrite, but we explicitly check to detect issues
+            if entries.contains_key(&name) {
+                eprintln!("WARNING: Duplicate directory entry '{}' found during deserialization, skipping", name);
+                continue;
+            }
             entries.insert(name, child_inode);
         }
 
