@@ -9,9 +9,11 @@ use crate::drivers::storage_device_wrapper::{StorageDeviceWrapper, EclipseFSDevi
 use crate::drivers::framebuffer::{FramebufferDriver, Color};
 use crate::drivers::intel_raid::IntelRaidDriver;
 use crate::drivers::intel_ahci_raid::IntelAhciRaidDriver;
+use crate::drivers::virtio_blk::VirtioBlkDriver;
 use alloc::{format, vec::Vec, string::{String, ToString}, boxed::Box};
 use crate::drivers::block::BlockDevice as LegacyBlockDevice;
 use core::cmp;
+use spin::Mutex;
 
 /// Tipos de controladoras de almacenamiento
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -573,9 +575,6 @@ impl StorageManager {
                 if device.vendor_id == 0x1AF4 && device.device_id == 0x1001 {
                     serial_write_str("STORAGE_MANAGER: ✅ VirtIO Block Device encontrado - inicializando driver VirtIO\n");
                     
-                    // Inicializar el driver VirtIO real
-                    use crate::drivers::virtio_blk::VirtioBlkDriver;
-                    
                     // Necesitamos un framebuffer para la inicialización
                     if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
                         match VirtioBlkDriver::new(device.clone(), fb) {
@@ -605,9 +604,7 @@ impl StorageManager {
                                 });
                                 
                                 // Guardar el driver VirtIO globalmente
-                                unsafe {
-                                    VIRTIO_BLK_DRIVER = Some(virtio_driver);
-                                }
+                                *VIRTIO_BLK_DRIVER.lock() = Some(virtio_driver);
                                 
                                 serial_write_str(&format!("STORAGE_MANAGER: VirtIO Block agregado: {:04X}:{:04X}\n", 
                                                          device.vendor_id, device.device_id));
@@ -4159,20 +4156,19 @@ impl StorageManager {
         serial_write_str(&format!("STORAGE_MANAGER: Leyendo sector {} con driver VirtIO\n", sector));
         
         // Usar el driver VirtIO real si está disponible
-        unsafe {
-            if let Some(ref virtio_driver) = VIRTIO_BLK_DRIVER {
-                serial_write_str("STORAGE_MANAGER: Usando driver VirtIO real para lectura\n");
-                
-                // Leer usando el driver VirtIO
-                match virtio_driver.read_blocks(sector, buffer) {
-                    Ok(()) => {
-                        serial_write_str(&format!("STORAGE_MANAGER: ✅ Sector {} leído exitosamente con driver VirtIO\n", sector));
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        serial_write_str(&format!("STORAGE_MANAGER: ❌ Error leyendo sector {} con driver VirtIO: {}\n", sector, e));
-                        return Err(e);
-                    }
+        let driver_lock = VIRTIO_BLK_DRIVER.lock();
+        if let Some(ref virtio_driver) = *driver_lock {
+            serial_write_str("STORAGE_MANAGER: Usando driver VirtIO real para lectura\n");
+            
+            // Leer usando el driver VirtIO
+            match virtio_driver.read_blocks(sector, buffer) {
+                Ok(()) => {
+                    serial_write_str(&format!("STORAGE_MANAGER: ✅ Sector {} leído exitosamente con driver VirtIO\n", sector));
+                    return Ok(());
+                }
+                Err(e) => {
+                    serial_write_str(&format!("STORAGE_MANAGER: ❌ Error leyendo sector {} con driver VirtIO: {}\n", sector, e));
+                    return Err(e);
                 }
             }
         }
@@ -4194,7 +4190,9 @@ pub enum StorageSectorType {
 static mut STORAGE_MANAGER: Option<StorageManager> = None;
 
 // Instancia global del driver VirtIO Block
-static mut VIRTIO_BLK_DRIVER: Option<crate::drivers::virtio_blk::VirtioBlkDriver> = None;
+// NOTA: Solo se soporta un dispositivo VirtIO a la vez. Si se detectan múltiples
+// dispositivos VirtIO, solo el último se almacenará aquí.
+static VIRTIO_BLK_DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 
 /// Inicializar gestor de almacenamiento global
 pub fn init_storage_manager() -> Result<(), &'static str> {
