@@ -304,6 +304,21 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         // crate::allocator::init_allocator(); 
     }
 
+    // Initialize syscall system (after heap is initialized)
+    serial_write_str("KERNEL: Initializing syscall system...\n");
+    let _syscall_handler = crate::syscalls::handler::init_syscall_system();
+    serial_write_str("KERNEL: Syscall system initialized.\n");
+
+    // Initialize interrupt system (after heap is initialized)
+    serial_write_str("KERNEL: Initializing interrupt system...\n");
+    let kernel_code_selector = 0x08; // Kernel code selector
+    if let Err(e) = crate::interrupts::manager::initialize_interrupt_system(kernel_code_selector) {
+        use alloc::format;
+        serial_write_str(&format!("KERNEL: FATAL - Failed to initialize interrupt system: {}\n", e));
+        loop {}
+    }
+    serial_write_str("KERNEL: Interrupt system initialized.\n");
+
     fb.clear_screen(Color::BLACK);
     fb.write_text_kernel("Eclipse OS Kernel v0.1.0", Color::WHITE);
 

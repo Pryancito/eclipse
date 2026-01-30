@@ -6,14 +6,11 @@
 extern crate alloc;
 use eclipse_kernel::{
     drivers::framebuffer::{
-        get_framebuffer, init_framebuffer, Color, FramebufferDriver, FramebufferInfo,
+        get_framebuffer, init_framebuffer, FramebufferInfo,
     },
     main_simple::kernel_main,
     debug::serial_write_str,
-    interrupts::manager::initialize_interrupt_system,
-    syscalls::handler::init_syscall_system,
 };
-use core::panic::PanicInfo;
 
 // --- Funciones de depuración serie movidas a debug.rs ---
 
@@ -68,7 +65,7 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     unsafe {
         let gdt_ptr = GdtPointer {
             limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
-            base: &KERNEL_GDT as *const _ as u64,
+            base: &raw const KERNEL_GDT as *const _ as u64,
         };
         
         core::arch::asm!(
@@ -123,19 +120,9 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
         serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
     }
 
-    // Initialize syscall system
-    serial_write_str("KERNEL: Initializing syscall system...\n");
-    let _syscall_handler = init_syscall_system();
-    serial_write_str("KERNEL: Syscall system initialized.\n");
-
-    // Initialize interrupt system
-    serial_write_str("KERNEL: Initializing interrupt system...\n");
-    let kernel_code_selector = 0x08; // Kernel code selector
-    if let Err(e) = initialize_interrupt_system(kernel_code_selector) {
-        panic!("Failed to initialize interrupt system: {}", e);
-    }
-    serial_write_str("KERNEL: Interrupt system initialized.\n");
-
+    // NOTE: Syscall and interrupt initialization moved to kernel_main in main_simple.rs
+    // because they require heap allocation which is initialized there
+    
     serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");
     kernel_main_wrapper();
 }
