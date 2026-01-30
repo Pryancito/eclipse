@@ -201,10 +201,38 @@ pub fn read_data_from_offset(
     let mut current_offset = block_offset;
     let mut current_block = start_block;
     
+    // PROTECCIÓN: Calcular número máximo de bloques a leer
+    // Esto previene loops infinitos en caso de corrupción de datos
+    let expected_blocks = (buffer.len() + block_offset + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let max_iterations = expected_blocks + 10; // +10 como margen de seguridad
+    let mut iteration_count = 0;
+    
     while remaining > 0 && bytes_read < buffer.len() {
+        // Verificar límite de iteraciones para prevenir loop infinito
+        iteration_count += 1;
+        if iteration_count > max_iterations {
+            crate::debug::serial_write_str(&alloc::format!(
+                "BLOCK_CACHE: ERROR - Excedido límite de iteraciones ({}) leyendo {} bytes desde offset {}\n",
+                max_iterations, buffer.len(), offset
+            ));
+            crate::debug::serial_write_str(&alloc::format!(
+                "BLOCK_CACHE: Estado: bytes_read={}, remaining={}, current_block={}\n",
+                bytes_read, remaining, current_block
+            ));
+            return Err("Excedido límite de iteraciones en lectura de bloques");
+        }
+        
         let block_data = cache.get_or_load_block(current_block, storage, partition_index)?;
         let available = block_data.len() - current_offset;
         let to_copy = remaining.min(available);
+        
+        // Log de progreso cada 100 bloques para archivos grandes
+        if iteration_count % 100 == 0 {
+            crate::debug::serial_write_str(&alloc::format!(
+                "BLOCK_CACHE: Progreso de lectura: {} bloques leídos, {} bytes de {}\n",
+                iteration_count, bytes_read, buffer.len()
+            ));
+        }
         
         buffer[bytes_read..bytes_read + to_copy]
             .copy_from_slice(&block_data[current_offset..current_offset + to_copy]);

@@ -156,6 +156,16 @@ impl EclipseFSWrapper {
             return Err(VfsError::InvalidFs("Tamaño de registro inválido".into()));
         }
 
+        // PROTECCIÓN: Validar que el tamaño del registro sea razonable (max 16MB)
+        const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024; // 16MB
+        if record_size > MAX_RECORD_SIZE {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Tamaño de registro excesivo: {} bytes (máximo permitido: {} bytes)\n",
+                record_size, MAX_RECORD_SIZE
+            ));
+            return Err(VfsError::InvalidFs("Tamaño de registro excesivo - posible corrupción".into()));
+        }
+
         crate::debug::serial_write_str(&alloc::format!(
             "ECLIPSEFS: Nodo {} - tamaño del registro: {} bytes\n", inode_num, record_size
         ));
