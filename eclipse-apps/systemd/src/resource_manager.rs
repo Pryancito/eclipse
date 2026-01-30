@@ -313,7 +313,7 @@ impl ResourceManager {
     /// Inicia el monitoreo continuo de recursos
     #[allow(dead_code)]
     pub async fn start_monitoring(&self) -> Result<()> {
-        info!("Buscando Iniciando monitoreo de recursos del sistema");
+        info!("Iniciando monitoreo de recursos del sistema");
 
         loop {
             // Actualizar estadísticas de todos los servicios

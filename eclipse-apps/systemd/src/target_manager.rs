@@ -156,16 +156,16 @@ impl TargetManager {
                             .unwrap_or("unknown")
                             .to_string();
                         
-                        debug!("Buscando Cargando target: {}", target_name);
+                        debug!("Cargando target: {}", target_name);
                         
                         match self.parse_target_file(&path) {
                             Ok(target) => {
                                 let target_name_clone = target_name.clone();
                                 self.targets.insert(target_name, target);
-                                debug!("  Servicio Target cargado: {}", target_name_clone);
+                                debug!("Target cargado: {}", target_name_clone);
                             }
                             Err(e) => {
-                                warn!("  Error Error cargando target {}: {}", target_name, e);
+                                warn!("Error cargando target {}: {}", target_name, e);
                             }
                         }
                     }
@@ -179,12 +179,16 @@ impl TargetManager {
     /// Parsea un archivo .target
     fn parse_target_file(&self, path: &Path) -> Result<Target> {
         let content = fs::read_to_string(path)?;
-        self.parse_target_content(&content)
+        let name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        self.parse_target_content(&content, &name)
     }
 
     /// Parsea el contenido de un archivo .target
-    fn parse_target_content(&self, content: &str) -> Result<Target> {
-        let name = String::new();
+    fn parse_target_content(&self, content: &str, name: &str) -> Result<Target> {
+        let name = name.to_string();
         let mut description = String::new();
         let mut services = Vec::new();
         let mut dependencies = Vec::new();

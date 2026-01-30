@@ -189,7 +189,7 @@ impl DependencyResolver {
     /// Resuelve el orden de inicio de una lista de servicios
     #[allow(dead_code)]
     pub fn resolve_startup_order(&self, services: &[String]) -> Result<Vec<String>> {
-        debug!("Reiniciando Resolviendo orden de inicio para: {:?}", services);
+        debug!("Resolviendo orden de inicio para: {:?}", services);
         
         let mut graph = HashMap::new();
         let mut in_degree = HashMap::new();

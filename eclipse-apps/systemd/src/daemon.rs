@@ -331,7 +331,7 @@ impl SystemdDaemon {
     /// Reinicia un servicio
     #[allow(dead_code)]
     pub async fn restart_service(&self, service_name: &str) -> Result<()> {
-        info!("Reiniciando Reiniciando servicio: {}", service_name);
+        info!("Reiniciando servicio: {}", service_name);
         
         // Detener si está ejecutándose
         if self.is_service_running(service_name).await {
@@ -341,7 +341,7 @@ impl SystemdDaemon {
         // Iniciar nuevamente
         self.start_service(service_name).await?;
         
-        info!("Servicio Servicio reiniciado: {}", service_name);
+        info!("Servicio reiniciado: {}", service_name);
         Ok(())
     }
 

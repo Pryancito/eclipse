@@ -98,7 +98,7 @@ impl ServiceManager {
     /// Inicia un servicio
     #[allow(dead_code)]
     pub fn start_service(&self, name: &str) -> Result<()> {
-        info!("Iniciando Iniciando servicio: {}", name);
+        info!("Iniciando servicio: {}", name);
         
         // Verificar si ya está ejecutándose
         if self.is_service_running(name) {
@@ -124,14 +124,14 @@ impl ServiceManager {
         // Ejecutar el servicio
         self.execute_service(name, &service_file)?;
         
-        info!("Servicio Servicio iniciado: {}", name);
+        info!("Servicio iniciado: {}", name);
         Ok(())
     }
 
     /// Detiene un servicio
     #[allow(dead_code)]
     pub fn stop_service(&self, name: &str) -> Result<()> {
-        info!("Deteniendo Deteniendo servicio: {}", name);
+        info!("Deteniendo servicio: {}", name);
         
         let mut running = match self.running_services.lock() {
             Ok(guard) => guard,
@@ -150,7 +150,7 @@ impl ServiceManager {
             
             service_info.state = ServiceState::Inactive;
             running.remove(name);
-            info!("Servicio Servicio detenido: {}", name);
+            info!("Servicio detenido: {}", name);
         } else {
             return Err(anyhow::anyhow!("Servicio no está ejecutándose: {}", name));
         }
@@ -161,7 +161,7 @@ impl ServiceManager {
     /// Reinicia un servicio
     #[allow(dead_code)]
     pub fn restart_service(&self, name: &str) -> Result<()> {
-        info!("Reiniciando Reiniciando servicio: {}", name);
+        info!("Reiniciando servicio: {}", name);
         
         // Detener si está ejecutándose
         if self.is_service_running(name) {
@@ -174,14 +174,14 @@ impl ServiceManager {
         // Iniciar nuevamente
         self.start_service(name)?;
         
-        info!("Servicio Servicio reiniciado: {}", name);
+        info!("Servicio reiniciado: {}", name);
         Ok(())
     }
 
     /// Recarga un servicio
     #[allow(dead_code)]
     pub fn reload_service(&self, name: &str) -> Result<()> {
-        info!("Reiniciando Recargando servicio: {}", name);
+        info!("Recargando servicio: {}", name);
         
         let mut running = match self.running_services.lock() {
             Ok(guard) => guard,
