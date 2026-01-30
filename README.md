@@ -4,10 +4,19 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Platform](https://img.shields.io/badge/platform-x86__64-lightgrey.svg)]()
+[![Init System](https://img.shields.io/badge/init-S6-blue.svg)]()
 
-Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser eficiente, seguro y fácil de usar. Combina un kernel híbrido con un sistema de userland robusto y un sistema de display avanzado usando DRM (Direct Rendering Manager).
+Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser eficiente, seguro y fácil de usar. Combina un kernel híbrido con un sistema de userland robusto, un sistema de display avanzado usando DRM (Direct Rendering Manager) y **S6 como sistema de inicialización** para una ingeniería de sistemas perfecta y modular.
 
 ## Características Principales
+
+### 🔧 Sistema de Inicialización S6
+- **Supervision Suite**: Sistema de supervisión modular y eficiente
+- **Proceso Supervision**: Reinicio automático de servicios fallidos
+- **Logging**: Sistema de logging con s6-log y rotación automática
+- **Minimal Footprint**: ~200KB vs systemd ~10MB
+- **Perfect Engineering**: Diseñado siguiendo la filosofía Unix
+- **Service Management**: Gestión simple con scripts shell
 
 ### 🚀 Kernel Híbrido
 - **Arquitectura x86_64**: Soporte completo para procesadores de 64 bits
@@ -41,16 +50,22 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Eclipse OS v0.1.0                        │
+│                      Init: S6 Supervision                    │
 ├─────────────────────────────────────────────────────────────┤
 │  Userland Applications                                      │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
 │  │   GUI Apps  │ │  Shell Apps │ │ System Apps │          │
 │  └─────────────┘ └─────────────┘ └─────────────┘          │
 ├─────────────────────────────────────────────────────────────┤
-│  System Services                                            │
+│  System Services (S6 Supervised)                            │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
 │  │ DRM Display │ │ File System │ │   Network   │          │
 │  └─────────────┘ └─────────────┘ └─────────────┘          │
+│  ┌─────────────┐                                            │
+│  │ S6 Init (PID 1)                                          │
+│  │ - s6-svscan: Process supervision                         │
+│  │ - s6-log: Logging & rotation                            │
+│  └─────────────┘                                            │
 ├─────────────────────────────────────────────────────────────┤
 │  Eclipse Kernel (Hybrid)                                    │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
@@ -219,10 +234,17 @@ eclipse-os/
 ├── eclipse_kernel/          # Kernel principal
 │   ├── src/
 │   │   ├── main.rs         # Punto de entrada del kernel
+│   │   ├── init_system.rs  # Sistema de inicialización (S6)
 │   │   ├── vga_centered_display.rs  # Sistema VGA
 │   │   ├── boot_messages.rs        # Mensajes de arranque
 │   │   └── ...             # Otros módulos del kernel
 │   └── Cargo.toml
+├── eclipse-apps/            # Aplicaciones del sistema
+│   ├── s6/                 # S6 init system
+│   │   ├── src/main.rs    # Implementación S6
+│   │   ├── services/      # Service run scripts
+│   │   └── README.md      # Documentación S6
+│   └── ...                # Otras aplicaciones
 ├── userland/                # Sistema userland
 │   ├── src/
 │   │   ├── drm_display.rs  # Sistema DRM
@@ -232,7 +254,6 @@ eclipse-os/
 │   └── Cargo.toml
 ├── bootloader-uefi/         # Bootloader UEFI personalizado
 ├── installer/               # Instalador del sistema
-├── eclipse-apps/            # Aplicaciones del sistema
 ├── build.sh                 # Script de construcción principal
 └── README.md               # Este archivo
 ```
@@ -333,6 +354,7 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 - **Versión**: 0.1.0
 - **Estado**: En desarrollo activo
 - **Kernel**: Funcional con VGA y UEFI
+- **Init System**: S6 supervision suite (modular y eficiente)
 - **Userland**: Sistema DRM implementado
 - **Gráficos**: Sistema de 6 fases con soporte Multi-GPU
 - **Sistema de Ventanas**: En integración
@@ -343,6 +365,7 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ### Características Planificadas
 
+- ✅ **Sistema S6**: Migración completa a S6 supervision suite
 - ✅ **Soporte Wayland**: Integración completa con libwayland y wlroots
 - **Sistema de ventanas**: GUI completa con compositor avanzado
 - **Multi-GPU avanzado**: Soporte completo para NVIDIA, AMD e Intel
@@ -351,6 +374,35 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 - **Soporte de red**: TCP/IP completo
 - **Sistema de paquetes**: Gestor de paquetes nativo
 - **Multiusuario**: Soporte para múltiples usuarios
+
+## Sistema S6
+
+Eclipse OS usa **S6** como sistema de inicialización, reemplazando systemd para lograr:
+
+### Ventajas de S6
+- **Modularidad perfecta**: Cada componente hace una cosa bien
+- **Footprint mínimo**: ~200KB vs systemd ~10MB
+- **Confiabilidad**: Diseñado para operación 24/7
+- **Supervisión**: Reinicio automático de servicios fallidos
+- **Simplicidad**: Scripts shell simples en lugar de archivos complejos
+
+### Uso de S6
+
+```bash
+# Control de servicios
+eclipse-s6 start network
+eclipse-s6 stop network
+eclipse-s6 restart network
+eclipse-s6 status network
+
+# Directorio de servicios
+ls /run/service/
+
+# Ver logs
+tail -f /var/log/s6/network/current
+```
+
+Para más información, ver [eclipse-apps/s6/README.md](eclipse-apps/s6/README.md)
 
 ## Soporte Wayland
 
