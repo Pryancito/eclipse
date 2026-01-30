@@ -1948,9 +1948,13 @@ impl EclipseFS {
                             name.push_str(core::str::from_utf8(name_slice).map_err(|_| EclipseFSError::InvalidFormat)?)
                                 .map_err(|_| EclipseFSError::InvalidOperation)?;
 
-                            children
-                                .push((name, child_inode))
-                                .map_err(|_| EclipseFSError::InvalidOperation)?;
+                            // Deduplicate: Check if this name already exists in children vec
+                            let already_exists = children.iter().any(|(existing_name, _)| existing_name == &name);
+                            if !already_exists {
+                                children
+                                    .push((name, child_inode))
+                                    .map_err(|_| EclipseFSError::InvalidOperation)?;
+                            }
                         }
                     }
                     tlv_tags::CONTENT => {
