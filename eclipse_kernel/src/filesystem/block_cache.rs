@@ -81,7 +81,10 @@ impl StaticBlockCache {
         // Leer del disco usando el storage manager
         let buffer = self.blocks[slot].as_mut().unwrap();
         storage.read_from_partition(partition_index, block_num, buffer)
-            .map_err(|_| "Error leyendo bloque del disco")?;
+            .map_err(|e| {
+                crate::debug::serial_write_str(&alloc::format!("BLOCK_CACHE: Error leyendo bloque {} del disco: {}\n", block_num, e));
+                e
+            })?;
 
         crate::debug::serial_write_str(&alloc::format!("BLOCK_CACHE: Bloque {} cargado exitosamente en slot {}\n", block_num, slot));
         Ok(buffer)
