@@ -1,0 +1,11 @@
+[Unit]
+Description=Network Service
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/network-daemon
+Restart=on-failure
+
+[Install]
+WantedBy=basic.target multi-user.target

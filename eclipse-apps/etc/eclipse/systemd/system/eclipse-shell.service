@@ -1,0 +1,11 @@
+[Unit]
+Description=Eclipse Shell Service
+After=basic.target network.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/eclipse-shell
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
