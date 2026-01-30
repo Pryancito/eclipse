@@ -567,7 +567,7 @@ pub fn init_paging(config: &crate::memory::MemoryConfig) -> Result<(), &'static 
     
     // Mapear el kernel (ahora pasamos el manager explícitamente)
     serial_write_str("PAGING CHECKPOINT B: Map Kernel Start\n");
-    map_kernel_memory(&mut physical_manager, &mut virtual_manager, kernel_base, kernel_limit)?;
+    map_kernel_memory(&mut physical_manager, &mut virtual_manager, kernel_base, kernel_limit, total_memory)?;
     serial_write_str("PAGING CHECKPOINT C: Map Kernel Done\n");
     
     // Establecer la tabla PML4
@@ -595,6 +595,7 @@ fn map_kernel_memory(
     virtual_manager: &mut VirtualMemoryManager,
     kernel_base: u64,
     kernel_limit: u64,
+    total_physical_memory: u64,
 ) -> Result<(), &'static str> {
     let mut current_addr = kernel_base;
     let mut physical_addr = 0x100000; // 1MB
@@ -609,27 +610,22 @@ fn map_kernel_memory(
         physical_addr += PAGE_SIZE as u64;
     }
 
-    // 2. Identity Mapping CRÍTICO (0GB - 4GB)
-    // RSP está en 0x3FFB8000 (~1GB), así que necesitamos mapear más que 128MB.
-    // Mapeamos los primeros 4GB para estar seguros (Stack, Framebuffer, DMA, MMIO).
-    serial_write_str("PAGING CHECKPOINT B2: Identity Loop (4GB)\n");
-    // Usamos u64 para evitar overflow en 32-bit (aunque estamos en 64-bit)
-    let identity_limit = 4u64 * 1024 * 1024 * 1024; 
+    // 2. Identity Mapping CRÍTICO
+    // RSP está en 0x3FFB8000 (~1GB), así que necesitamos mapear suficiente memoria.
+    // FIX: Usar el tamaño de memoria física real en vez de 4GB hardcodeado.
+    // Esto evita consumir páginas físicas mapeando memoria que no existe.
+    serial_write_str("PAGING CHECKPOINT B2: Identity Loop\n");
+    // Usar el mínimo entre la memoria física total y 4GB para seguridad
+    // (en caso de que haya más de 4GB de RAM en el futuro)
+    let identity_limit = core::cmp::min(total_physical_memory, 4u64 * 1024 * 1024 * 1024);
     let mut id_addr = 0;
     while id_addr < identity_limit {
         let flags = PAGE_PRESENT | PAGE_WRITABLE;
-        // Check if we exceed total physical memory to save space?
-        // Actually, internal fragmentation of page tables is small. 
-        // Mapping holes is fine (just useless PTs).
-        // But better constraint it to actual RAM size if possible, BUT stack might be in MMIO hole?
-        // Safe to map 4GB for now.
-        
-        // Optimización: Solo mapear si tenemos memoria física o es zona baja (<4GB usualmente seguro)
         virtual_manager.map_page(id_addr, id_addr, flags, physical_manager)?;
         id_addr += PAGE_SIZE as u64;
         
-        // Logging de progreso cada 512MB para no colgar la serial console
-        if id_addr % (512 * 1024 * 1024) == 0 {
+        // Logging de progreso cada 10MB para no colgar la serial console
+        if id_addr % (10 * 1024 * 1024) == 0 {
              crate::debug::serial_write_str("."); 
         }
     }
