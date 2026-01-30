@@ -1,0 +1,11 @@
+[Unit]
+Description=DRM Display Initialization Service
+After=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/drm-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=hardware.target

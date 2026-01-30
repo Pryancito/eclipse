@@ -1,0 +1,12 @@
+[Unit]
+Description=Eclipse Wayland Compositor Service
+After=hardware.target wayland.target
+Requires=hardware.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/eclipse-wayland
+Restart=on-failure
+
+[Install]
+WantedBy=wayland.target graphical.target

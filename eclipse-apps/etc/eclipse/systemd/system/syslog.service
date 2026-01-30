@@ -1,0 +1,11 @@
+[Unit]
+Description=System Logging Service
+DefaultDependencies=no
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/syslogd
+Restart=always
+
+[Install]
+WantedBy=basic.target multi-user.target

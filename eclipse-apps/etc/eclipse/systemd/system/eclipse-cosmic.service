@@ -1,0 +1,12 @@
+[Unit]
+Description=Eclipse Cosmic Desktop Service
+After=eclipse-wayland.service
+Requires=eclipse-wayland.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/eclipse-cosmic
+Restart=on-failure
+
+[Install]
+WantedBy=graphical.target

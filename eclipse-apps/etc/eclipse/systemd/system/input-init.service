@@ -1,0 +1,11 @@
+[Unit]
+Description=Input Device Initialization Service
+After=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/input-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=hardware.target
