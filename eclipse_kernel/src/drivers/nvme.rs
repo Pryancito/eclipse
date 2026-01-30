@@ -25,7 +25,7 @@ const NVME_CSTS_RDY: u32 = 0x01;
 const NVME_CSTS_CFS: u32 = 0x02;
 
 /// Información del dispositivo NVMe
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NvmeDeviceInfo {
     pub model: String,
     pub serial: String,
@@ -34,6 +34,16 @@ pub struct NvmeDeviceInfo {
     pub max_lba: u64,
     pub block_size: u32,
     pub capacity: u64,
+}
+
+/// Información de namespace NVMe
+#[derive(Debug, Clone)]
+pub struct NvmeNamespaceInfo {
+    pub nsid: u32,         // Namespace ID
+    pub size: u64,         // Tamaño en bloques
+    pub capacity: u64,     // Capacidad en bloques
+    pub block_size: u32,   // Tamaño de bloque en bytes
+    pub formatted_lba_size: u8, // Índice del formato LBA actual
 }
 
 /// Estructura de comando NVMe
@@ -74,6 +84,8 @@ pub struct NvmeDriver {
     admin_queue_tail: u16,
     submission_queue: Vec<NvmeCommand>,
     completion_queue: Vec<NvmeCompletion>,
+    doorbell_stride: u32, // Doorbell stride in 4-byte units
+    namespaces: Vec<NvmeNamespaceInfo>, // Lista de namespaces activos
 }
 
 impl NvmeDriver {
@@ -87,6 +99,8 @@ impl NvmeDriver {
             admin_queue_tail: 0,
             submission_queue: Vec::new(),
             completion_queue: Vec::new(),
+            doorbell_stride: 0,
+            namespaces: Vec::new(),
         }
     }
 
@@ -177,23 +191,56 @@ impl NvmeDriver {
     fn setup_admin_queues(&mut self) -> Result<(), &'static str> {
         serial_write_str("NVME: Configurando colas de administración...\n");
 
-        // Configurar tamaño de colas (64 entradas)
-        let queue_size = 64;
-        let queue_size_log = 6; // log2(64)
+        // Leer capacidades del controlador
+        let cap = self.read_register_64(NVME_CAP as u32);
+        let max_queue_entries = ((cap & 0xFFFF) + 1) as u32; // MQES (Maximum Queue Entries Supported)
+        let doorbell_stride = ((cap >> 32) & 0xF) as u32; // DSTRD (Doorbell Stride)
+        
+        // Guardar doorbell stride para uso posterior
+        self.doorbell_stride = doorbell_stride;
+        
+        serial_write_str(&format!("NVME: CAP = 0x{:016X}, Max Queue Entries = {}, Doorbell Stride = {}\n", 
+                                 cap, max_queue_entries, doorbell_stride));
 
-        // Configurar atributos de cola de administración
-        let aqa = (queue_size - 1) << 16 | (queue_size - 1);
+        // Configurar tamaño de colas (mínimo entre 64 y capacidad del controlador)
+        let queue_size = 64.min(max_queue_entries);
+        
+        serial_write_str(&format!("NVME: Configurando colas con {} entradas\n", queue_size));
+
+        // Configurar atributos de cola de administración (AQA)
+        // Bits [15:0] = ASQS (Admin Submission Queue Size) - 0-based value
+        // Bits [31:16] = ACQS (Admin Completion Queue Size) - 0-based value
+        let aqa = ((queue_size - 1) << 16) | (queue_size - 1);
         self.write_register(NVME_AQA, aqa);
 
-        // Asignar memoria para colas (simplificado - en implementación real usaría alloc)
+        // Asignar memoria para colas
         self.submission_queue = Vec::with_capacity(queue_size as usize);
         self.completion_queue = Vec::with_capacity(queue_size as usize);
 
-        // Configurar direcciones base de colas (simplificado)
-        self.write_register(NVME_ASQ, 0x1000); // Dirección física de SQ
-        self.write_register(NVME_ACQ, 0x2000); // Dirección física de CQ
+        // NOTA: En una implementación real, se usarían direcciones físicas de memoria DMA
+        // Por ahora usamos direcciones simuladas que deben ser mapeadas por el sistema de memoria
+        // TODO: Implementar asignación real de memoria física para DMA
+        let asq_addr: u64 = 0x10000; // Submission Queue Base Address (debe estar alineado a 4KB)
+        let acq_addr: u64 = 0x20000; // Completion Queue Base Address (debe estar alineado a 4KB)
+        
+        serial_write_str(&format!("NVME: ASQ Address = 0x{:016X}, ACQ Address = 0x{:016X}\n", 
+                                 asq_addr, acq_addr));
 
-        serial_write_str("NVME: Colas de administración configuradas\n");
+        // Configurar direcciones base de colas usando registros de 64 bits
+        self.write_register_64(NVME_ASQ, asq_addr);
+        self.write_register_64(NVME_ACQ, acq_addr);
+        
+        // Verificar que las direcciones se escribieron correctamente
+        let verify_asq = self.read_register_64(NVME_ASQ);
+        let verify_acq = self.read_register_64(NVME_ACQ);
+        
+        if verify_asq != asq_addr || verify_acq != acq_addr {
+            serial_write_str(&format!("NVME: ERROR - Verificación de direcciones falló: ASQ=0x{:016X}, ACQ=0x{:016X}\n", 
+                                     verify_asq, verify_acq));
+            return Err("Error configurando direcciones de colas de administración");
+        }
+
+        serial_write_str("NVME: Colas de administración configuradas correctamente\n");
         Ok(())
     }
 
@@ -241,20 +288,64 @@ impl NvmeDriver {
         };
 
         self.device_info = Some(device_info);
+        
+        // Enumerar namespaces
+        self.enumerate_namespaces()?;
+        
         serial_write_str("NVME: Dispositivo identificado exitosamente\n");
         Ok(())
     }
 
-    /// Enviar comando
+    /// Enumerar namespaces activos del dispositivo NVMe
+    fn enumerate_namespaces(&mut self) -> Result<(), &'static str> {
+        serial_write_str("NVME: Enumerando namespaces...\n");
+        
+        // TODO: Implementar enumeración real de namespaces usando comando IDENTIFY NAMESPACE
+        // Por ahora, crear un namespace simulado
+        let ns_info = NvmeNamespaceInfo {
+            nsid: 1,
+            size: 0x100000, // 512 MB en bloques de 512 bytes
+            capacity: 0x100000,
+            block_size: 512,
+            formatted_lba_size: 0,
+        };
+        
+        self.namespaces.push(ns_info);
+        
+        serial_write_str(&format!("NVME: {} namespace(s) enumerado(s)\n", self.namespaces.len()));
+        
+        Ok(())
+    }
+
+    /// Enviar comando a la cola de administración
     fn submit_command(&mut self, cmd: NvmeCommand) -> Result<(), &'static str> {
+        // Copiar los campos a variables locales para evitar referencias desalineadas
+        let opcode = cmd.opcode;
+        let command_id = cmd.command_id;
+        
+        serial_write_str(&format!("NVME: Enviando comando opcode=0x{:02X}, command_id={}\n", 
+                                 opcode, command_id));
+        
         // Agregar comando a la cola de envío
         self.submission_queue.push(cmd);
         
-        // Actualizar tail pointer
-        self.admin_queue_tail = (self.admin_queue_tail + 1) % 64;
+        // Actualizar tail pointer (wrap around basado en el tamaño de la cola)
+        let queue_size = 64; // Debe coincidir con el tamaño configurado en setup_admin_queues
+        self.admin_queue_tail = (self.admin_queue_tail + 1) % queue_size;
         
-        // Notificar al controlador
-        self.write_register(0x1000, self.admin_queue_tail as u32); // Doorbell register
+        // Calcular el offset del doorbell register de la Admin Submission Queue
+        // El doorbell base está en 0x1000
+        // Admin SQ Tail Doorbell (SQTDBL) está en offset 0x1000
+        // Cada doorbell está separado por (4 << DSTRD) bytes
+        let doorbell_offset = 0x1000u32; // Admin SQ doorbell
+        
+        serial_write_str(&format!("NVME: Escribiendo doorbell en offset 0x{:08X}, tail={}\n", 
+                                 doorbell_offset, self.admin_queue_tail));
+        
+        // Escribir el tail pointer al doorbell register para notificar al controlador
+        self.write_register(doorbell_offset, self.admin_queue_tail as u32);
+        
+        serial_write_str("NVME: Comando enviado exitosamente\n");
 
         Ok(())
     }
@@ -349,19 +440,35 @@ impl NvmeDriver {
         Ok(())
     }
 
-    /// Leer registro de 32 bits
+    /// Leer registro de 32 bits usando volatile
     fn read_register(&self, offset: u32) -> u32 {
         unsafe {
             let addr = (self.base_addr + offset) as *const u32;
-            *addr
+            core::ptr::read_volatile(addr)
         }
     }
 
-    /// Escribir registro de 32 bits
+    /// Escribir registro de 32 bits usando volatile
     fn write_register(&self, offset: u32, value: u32) {
         unsafe {
             let addr = (self.base_addr + offset) as *mut u32;
-            *addr = value;
+            core::ptr::write_volatile(addr, value);
+        }
+    }
+
+    /// Leer registro de 64 bits usando volatile
+    fn read_register_64(&self, offset: u32) -> u64 {
+        unsafe {
+            let addr = (self.base_addr + offset) as *const u64;
+            core::ptr::read_volatile(addr)
+        }
+    }
+
+    /// Escribir registro de 64 bits usando volatile
+    fn write_register_64(&self, offset: u32, value: u64) {
+        unsafe {
+            let addr = (self.base_addr + offset) as *mut u64;
+            core::ptr::write_volatile(addr, value);
         }
     }
 
