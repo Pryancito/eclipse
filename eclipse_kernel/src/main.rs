@@ -123,19 +123,9 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
         serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
     }
 
-    // Initialize syscall system
-    serial_write_str("KERNEL: Initializing syscall system...\n");
-    let _syscall_handler = init_syscall_system();
-    serial_write_str("KERNEL: Syscall system initialized.\n");
-
-    // Initialize interrupt system
-    serial_write_str("KERNEL: Initializing interrupt system...\n");
-    let kernel_code_selector = 0x08; // Kernel code selector
-    if let Err(e) = initialize_interrupt_system(kernel_code_selector) {
-        panic!("Failed to initialize interrupt system: {}", e);
-    }
-    serial_write_str("KERNEL: Interrupt system initialized.\n");
-
+    // NOTE: Syscall and interrupt initialization moved to kernel_main_wrapper
+    // because they require heap allocation which is initialized later
+    
     serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");
     kernel_main_wrapper();
 }
