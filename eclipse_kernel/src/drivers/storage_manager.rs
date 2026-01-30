@@ -2521,28 +2521,61 @@ impl StorageManager {
         serial_write_str(&format!("STORAGE_MANAGER: Leyendo desde partición {} ({}) bloque {} (offset {} -> LBA absoluto {}) ({} bytes = {} sectores)\n", 
                                  partition_index, partition.name, block, partition_offset, absolute_block, buffer.len(), num_sectors));
 
-        // OPTIMIZACIÓN: Para lecturas multi-sector, usar función optimizada de IDE
-        if num_sectors > 1 && matches!(device.info.controller_type, StorageControllerType::IntelRAID | StorageControllerType::AHCI) {
-            // Intentar lectura multi-sector directa con IDE
-            match self.read_ide_modern_sectors(absolute_block, num_sectors, buffer) {
-                Ok(_) => {
-                    serial_write_str(&format!("STORAGE_MANAGER: Lectura multi-sector exitosa ({} sectores)\n", num_sectors));
-                    return Ok(());
-                }
-                Err(e) => {
-                    serial_write_str(&format!("STORAGE_MANAGER: Lectura multi-sector IDE falló: {}, usando fallback\n", e));
-                    // Continuar con fallback
-                }
-            }
-        }
-
-        // Fallback: leer sector por sector si la lectura multi-sector no está disponible o falló
-        for i in 0..num_sectors {
-            let sector_offset = i * SECTOR_SIZE;
-            let bytes_to_read = core::cmp::min(SECTOR_SIZE, buffer.len() - sector_offset);
-            let sector_buffer = &mut buffer[sector_offset..sector_offset + bytes_to_read];
+        // OPTIMIZACIÓN: Lectura integral con batches (transferencia de datos)
+        // En lugar de leer sector por sector, leer en batches
+        // AJUSTADO PARA QEMU: usa batches de 8 sectores (4KB) que QEMU maneja bien
+        // Los batches pueden ejecutarse como comandos multi-sector reales en hardware compatible
+        const BATCH_SIZE_SECTORS: usize = 8; // 8 sectores = 4KB por batch (QEMU-safe)
+        
+        let mut sectors_read = 0;
+        while sectors_read < num_sectors {
+            // Calcular cuántos sectores leer en este batch (máximo 8 para QEMU)
+            let sectors_in_batch = core::cmp::min(BATCH_SIZE_SECTORS, num_sectors - sectors_read);
+            let batch_offset = sectors_read * SECTOR_SIZE;
+            let batch_size_bytes = sectors_in_batch * SECTOR_SIZE;
+            let bytes_to_read = core::cmp::min(batch_size_bytes, buffer.len() - batch_offset);
             
-            self.read_device_sector_with_type(&device.info, absolute_block + i as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+            // Buffer para este batch - asegurar que está alineado al tamaño de sector
+            let batch_buffer = &mut buffer[batch_offset..batch_offset + bytes_to_read];
+            
+            // Intentar lectura batch multi-sector solo para controladores compatibles
+            // Evitar overhead innecesario para VirtIO que no soporta batches
+            if sectors_in_batch > 1 && matches!(device.info.controller_type, 
+                                               StorageControllerType::ATA |
+                                               StorageControllerType::IntelRAID | 
+                                               StorageControllerType::AHCI) {
+                match self.read_sectors_batch(absolute_block + sectors_read as u64, sectors_in_batch, batch_buffer) {
+                    Ok(_) => {
+                        // Lectura batch exitosa
+                        sectors_read += sectors_in_batch;
+                        continue;
+                    }
+                    Err(batch_error) => {
+                        // Log del error del batch para diagnóstico
+                        serial_write_str(&format!("STORAGE_MANAGER: Lectura batch falló ({}), usando fallback sector-por-sector\n", batch_error));
+                        
+                        // Si falla el batch, leer sector por sector solo para este batch
+                        for i in 0..sectors_in_batch {
+                            let sector_offset = i * SECTOR_SIZE;
+                            let bytes_to_read_sector = core::cmp::min(SECTOR_SIZE, batch_buffer.len() - sector_offset);
+                            let sector_buffer = &mut batch_buffer[sector_offset..sector_offset + bytes_to_read_sector];
+                            
+                            self.read_device_sector_with_type(&device.info, absolute_block + (sectors_read + i) as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+                        }
+                        sectors_read += sectors_in_batch;
+                    }
+                }
+            } else {
+                // Para VirtIO o lecturas de 1 sector, leer sector por sector
+                for i in 0..sectors_in_batch {
+                    let sector_offset = i * SECTOR_SIZE;
+                    let bytes_to_read_sector = core::cmp::min(SECTOR_SIZE, batch_buffer.len() - sector_offset);
+                    let sector_buffer = &mut batch_buffer[sector_offset..sector_offset + bytes_to_read_sector];
+                    
+                    self.read_device_sector_with_type(&device.info, absolute_block + (sectors_read + i) as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+                }
+                sectors_read += sectors_in_batch;
+            }
         }
         Ok(())
     }
@@ -3797,6 +3830,45 @@ impl StorageManager {
         
         serial_write_str("STORAGE_MANAGER: Sector leído exitosamente con driver IDE moderno\n");
         Ok(())
+    }
+    
+    /// Lectura batch de múltiples sectores consecutivos para controladores compatibles
+    /// Implementa la estrategia de "lectura integral" para reducir operaciones de I/O
+    /// OPTIMIZADO PARA QEMU: usa el driver IDE multi-sector cuando es posible
+    /// Solo funciona para ATA/IDE, IntelRAID y AHCI - falla para otros tipos
+    fn read_sectors_batch(&self, start_sector: u64, num_sectors: usize, buffer: &mut [u8]) -> Result<(), &'static str> {
+        const SECTOR_SIZE: usize = 512;
+        
+        if buffer.len() < num_sectors * SECTOR_SIZE {
+            return Err("Buffer too small for batch read");
+        }
+        
+        // Obtener el dispositivo (asumiendo dispositivo 0)
+        // TODO: Pasar device info como parámetro en lugar de asumir dispositivo 0
+        if self.devices.is_empty() {
+            return Err("No devices available");
+        }
+        let device = &self.devices[0];
+        
+        // Intentar lectura multi-sector nativa del driver IDE
+        // Esto es un batch REAL, no un loop - lee múltiples sectores en UN comando
+        if matches!(device.info.controller_type, 
+                   StorageControllerType::ATA |
+                   StorageControllerType::IntelRAID | 
+                   StorageControllerType::AHCI) {
+            // read_ide_modern_sectors implementa batch real usando comandos IDE multi-sector
+            // Puede leer hasta 256 sectores en un solo comando de hardware
+            match self.read_ide_modern_sectors(start_sector, num_sectors, buffer) {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    // Si falla, retornar error para que el caller use fallback
+                }
+            }
+        }
+        
+        // Para otros controladores (VirtIO, etc), no hay soporte de batch
+        // Retornar error para que el caller use lectura sector-por-sector
+        Err("Batch read not supported for this controller")
     }
     
     /// Escribir sector usando driver IDE moderno para controladoras Intel IDE
