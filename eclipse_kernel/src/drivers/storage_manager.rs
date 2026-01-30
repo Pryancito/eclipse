@@ -2514,12 +2514,28 @@ impl StorageManager {
         let partition_offset = partition.start_lba;
         let absolute_block = block + partition_offset;
         
+        const SECTOR_SIZE: usize = 512;
+        let num_sectors = (buffer.len() + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        
         // Leer desde el dispositivo usando el offset absoluto
-        serial_write_str(&format!("STORAGE_MANAGER: Leyendo desde partición {} ({}) bloque {} (offset {} -> LBA absoluto {}) ({} bytes)\n", 
-                                 partition_index, partition.name, block, partition_offset, absolute_block, buffer.len()));
+        serial_write_str(&format!("STORAGE_MANAGER: Leyendo desde partición {} ({}) bloque {} (offset {} -> LBA absoluto {}) ({} bytes = {} sectores)\n", 
+                                 partition_index, partition.name, block, partition_offset, absolute_block, buffer.len(), num_sectors));
 
-        // Usar read_device_sector para leer el bloque absoluto
-        self.read_device_sector_with_type(&device.info, absolute_block, buffer, StorageSectorType::EclipseFS)
+        // Leer múltiples sectores consecutivos en una sola operación
+        if buffer.len() > SECTOR_SIZE {
+            // Buffer grande: leer múltiples sectores
+            for i in 0..num_sectors {
+                let sector_offset = i * SECTOR_SIZE;
+                let bytes_to_read = core::cmp::min(SECTOR_SIZE, buffer.len() - sector_offset);
+                let sector_buffer = &mut buffer[sector_offset..sector_offset + bytes_to_read];
+                
+                self.read_device_sector_with_type(&device.info, absolute_block + i as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+            }
+            Ok(())
+        } else {
+            // Buffer de un solo sector: lectura directa
+            self.read_device_sector_with_type(&device.info, absolute_block, buffer, StorageSectorType::EclipseFS)
+        }
     }
 
     /// Escribir a una partición específica
