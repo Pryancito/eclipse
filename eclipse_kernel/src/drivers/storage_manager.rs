@@ -577,7 +577,7 @@ impl StorageManager {
                     use crate::drivers::virtio_blk::VirtioBlkDriver;
                     
                     // Necesitamos un framebuffer para la inicialización
-                    if let Some(fb) = crate::drivers::framebuffer::get_framebuffer_mut() {
+                    if let Some(fb) = crate::drivers::framebuffer::get_framebuffer() {
                         match VirtioBlkDriver::new(device.clone(), fb) {
                             Ok(virtio_driver) => {
                                 serial_write_str("STORAGE_MANAGER: ✅ Driver VirtIO inicializado exitosamente\n");
