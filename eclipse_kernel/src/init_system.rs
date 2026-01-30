@@ -615,14 +615,14 @@ impl InitSystemDiagnostic {
 }
 
 impl InitSystem {
-    /// Cargar el ejecutable eclipse-systemd
-    fn load_eclipse_systemd_executable(
+    /// Cargar el ejecutable eclipse-s6
+    fn load_eclipse_s6_executable(
         &self,
     ) -> Result<crate::elf_loader::LoadedProcess, &'static str> {
         // En un sistema real, aquí cargaríamos el archivo desde el sistema de archivos
         // Por ahora, usamos la función de simulación
 
-        load_eclipse_systemd()
+        load_eclipse_s6()
     }
 
     /// Configurar memoria del proceso

@@ -439,7 +439,7 @@ fn load_s6_from_vfs() -> Result<Vec<u8>, &'static str> {
         }
     }
     
-    Err("No se encontró systemd en VFS ni en filesystem montado")
+    Err("No se encontró init system (S6) en VFS ni en filesystem montado")
 }
 
 /// Crear datos ELF ficticios para simulación
@@ -595,8 +595,8 @@ pub fn load_elf_from_vfs_to_new_page_table(path: &str) -> LoadResult {
         ));
         data
     } else {
-        // Fallback to embedded if path matches systemd
-        if path.contains("systemd") || path.contains("init") {
+        // Fallback to embedded if path matches init system
+        if path.contains("s6") || path.contains("init") {
             serial_write_str("ELF_LOADER: VFS failed, trying embedded binary\n");
             if crate::embedded_systemd::has_embedded_systemd() {
                 crate::embedded_systemd::get_embedded_systemd().to_vec()
