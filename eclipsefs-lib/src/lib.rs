@@ -46,6 +46,18 @@ pub mod defragmentation;
 pub mod load_balancing;
 #[cfg(feature = "std")]
 pub mod journal;
+#[cfg(feature = "std")]
+pub mod write_optimization;
+#[cfg(feature = "std")]
+pub mod compression;
+#[cfg(feature = "std")]
+pub mod cow;
+#[cfg(feature = "std")]
+pub mod merkle;
+#[cfg(feature = "std")]
+pub mod btree;
+#[cfg(feature = "std")]
+pub mod dedup;
 
 #[cfg(feature = "std")]
 pub use reader::{EclipseFSReader, CacheType, CacheStats};

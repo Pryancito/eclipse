@@ -46,6 +46,8 @@ pub enum EclipseFSError {
     SnapshotError,
     /// Error de ACL
     AclError,
+    /// Invalid checksum (data corruption)
+    InvalidChecksum,
 }
 
 impl From<&str> for EclipseFSError {
@@ -82,6 +84,7 @@ impl fmt::Display for EclipseFSError {
             EclipseFSError::CompressionError => write!(f, "Error de compresión"),
             EclipseFSError::SnapshotError => write!(f, "Error de snapshot"),
             EclipseFSError::AclError => write!(f, "Error de ACL"),
+            EclipseFSError::InvalidChecksum => write!(f, "Checksum inválido - datos corruptos"),
         }
     }
 }

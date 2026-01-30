@@ -2580,6 +2580,104 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Leer múltiples bloques consecutivos desde una partición en una sola operación
+    /// Esta función optimiza la lectura de archivos grandes al reducir el número de llamadas
+    /// desde potencialmente 100,000+ a unas pocas llamadas para archivos grandes.
+    ///
+    /// # Argumentos
+    /// * `partition_index` - Índice de la partición a leer
+    /// * `start_block` - Primer bloque a leer
+    /// * `num_blocks` - Número de bloques consecutivos a leer
+    /// * `buffer` - Buffer donde se almacenarán los datos (debe ser >= num_blocks * 512 bytes)
+    ///
+    /// # Retorna
+    /// Ok(()) si la lectura fue exitosa, o un error si falló
+    pub fn read_multiple_blocks_from_partition(
+        &self,
+        partition_index: u32,
+        start_block: u64,
+        num_blocks: usize,
+        buffer: &mut [u8]
+    ) -> Result<(), &'static str> {
+        if self.devices.is_empty() {
+            return Err("No hay dispositivos de almacenamiento disponibles");
+        }
+
+        const SECTOR_SIZE: usize = 512;
+        let required_size = num_blocks * SECTOR_SIZE;
+        
+        if buffer.len() < required_size {
+            return Err("Buffer demasiado pequeño para la lectura solicitada");
+        }
+
+        let partition_idx = partition_index as usize;
+        if partition_idx >= self.partitions.len() {
+            return Err("Índice de partición fuera de rango");
+        }
+
+        let partition = &self.partitions[partition_idx];
+        let device = &self.devices[0];
+        let partition_offset = partition.start_lba;
+        let absolute_block = start_block + partition_offset;
+        
+        serial_write_str(&format!(
+            "STORAGE_MANAGER: Lectura optimizada de {} bloques desde partición {} ({}) bloque {} (LBA absoluto {})\n", 
+            num_blocks, partition_index, partition.name, start_block, absolute_block
+        ));
+
+        // Usar la lectura batch existente que ya maneja la optimización
+        // Esta función ya lee en bloques de 8 sectores cuando es posible
+        const BATCH_SIZE_SECTORS: usize = 8;
+        
+        let mut sectors_read = 0;
+        let total_sectors = num_blocks;
+        
+        while sectors_read < total_sectors {
+            let sectors_in_batch = core::cmp::min(BATCH_SIZE_SECTORS, total_sectors - sectors_read);
+            let batch_offset = sectors_read * SECTOR_SIZE;
+            let batch_size_bytes = sectors_in_batch * SECTOR_SIZE;
+            let bytes_to_read = core::cmp::min(batch_size_bytes, buffer.len() - batch_offset);
+            
+            let batch_buffer = &mut buffer[batch_offset..batch_offset + bytes_to_read];
+            
+            // Usar lectura batch para controladores compatibles
+            if sectors_in_batch > 1 && matches!(device.info.controller_type, 
+                                               StorageControllerType::ATA |
+                                               StorageControllerType::IntelRAID | 
+                                               StorageControllerType::AHCI) {
+                match self.read_sectors_batch(absolute_block + sectors_read as u64, sectors_in_batch, batch_buffer) {
+                    Ok(_) => {
+                        sectors_read += sectors_in_batch;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Fallback a lectura sector por sector
+                        for i in 0..sectors_in_batch {
+                            let sector_offset = i * SECTOR_SIZE;
+                            let bytes_to_read_sector = core::cmp::min(SECTOR_SIZE, batch_buffer.len() - sector_offset);
+                            let sector_buffer = &mut batch_buffer[sector_offset..sector_offset + bytes_to_read_sector];
+                            
+                            self.read_device_sector_with_type(&device.info, absolute_block + (sectors_read + i) as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+                        }
+                        sectors_read += sectors_in_batch;
+                    }
+                }
+            } else {
+                // Para VirtIO o lecturas de 1 sector
+                for i in 0..sectors_in_batch {
+                    let sector_offset = i * SECTOR_SIZE;
+                    let bytes_to_read_sector = core::cmp::min(SECTOR_SIZE, batch_buffer.len() - sector_offset);
+                    let sector_buffer = &mut batch_buffer[sector_offset..sector_offset + bytes_to_read_sector];
+                    
+                    self.read_device_sector_with_type(&device.info, absolute_block + (sectors_read + i) as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+                }
+                sectors_read += sectors_in_batch;
+            }
+        }
+        
+        Ok(())
+    }
+
     /// Escribir a una partición específica
     pub fn write_to_partition(&self, partition_index: u32, block: u64, data: &[u8]) -> Result<(), &'static str> {
         if self.devices.is_empty() {

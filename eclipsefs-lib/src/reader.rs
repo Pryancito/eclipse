@@ -39,6 +39,11 @@ pub struct EclipseFSReader {
     lru_access_order: VecDeque<u32>,
     /// ARC cache (usado cuando cache_type == ARC)
     arc_cache: Option<AdaptiveReplacementCache>,
+    /// Sequential access detection (ext4-inspired readahead)
+    last_accessed_inode: Option<u32>,
+    sequential_access_count: u32,
+    /// Readahead window size (number of nodes to prefetch)
+    readahead_window: usize,
 }
 
 impl EclipseFSReader {
@@ -76,6 +81,9 @@ impl EclipseFSReader {
             } else {
                 None
             },
+            last_accessed_inode: None,
+            sequential_access_count: 0,
+            readahead_window: 8,
         })
     }
 
@@ -103,6 +111,9 @@ impl EclipseFSReader {
             } else {
                 None
             },
+            last_accessed_inode: None,
+            sequential_access_count: 0,
+            readahead_window: 8,
         })
     }
 
@@ -337,7 +348,44 @@ impl EclipseFSReader {
         // Cache the node for future reads
         self.cache_node(inode, node.clone());
 
+        // Detect sequential access and trigger readahead (ext4-inspired)
+        self.detect_and_readahead(inode);
+
         Ok(node)
+    }
+
+    /// Detect sequential access patterns and trigger intelligent readahead
+    /// Similar to ext4's readahead heuristics
+    fn detect_and_readahead(&mut self, current_inode: u32) {
+        // Check if this is sequential access
+        if let Some(last_inode) = self.last_accessed_inode {
+            // Sequential if current is last + 1
+            if current_inode == last_inode + 1 {
+                self.sequential_access_count += 1;
+                
+                // Increase readahead window on continued sequential access
+                // Max out at 32 nodes (adaptive like ext4)
+                if self.sequential_access_count >= 4 && self.readahead_window < 32 {
+                    self.readahead_window = (self.readahead_window * 2).min(32);
+                }
+                
+                // Trigger readahead if we've detected a pattern
+                if self.sequential_access_count >= 2 {
+                    let readahead_inodes: Vec<u32> = ((current_inode + 1)..=(current_inode + self.readahead_window as u32))
+                        .filter(|&inode| inode < self.inode_table.len() as u32)
+                        .collect();
+                    
+                    // Best-effort prefetch (ignore errors)
+                    let _ = self.prefetch_nodes(&readahead_inodes);
+                }
+            } else {
+                // Non-sequential access, reset
+                self.sequential_access_count = 0;
+                self.readahead_window = 8; // Reset to default
+            }
+        }
+        
+        self.last_accessed_inode = Some(current_inode);
     }
 
     /// Cache a node and manage eviction based on cache type

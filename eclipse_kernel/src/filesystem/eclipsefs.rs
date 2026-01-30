@@ -1433,6 +1433,9 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
                 eclipsefs_lib::EclipseFSError::AclError => {
                     crate::debug::serial_write_str("AclError - error de ACL\n");
                 }
+                eclipsefs_lib::EclipseFSError::InvalidChecksum => {
+                    crate::debug::serial_write_str("InvalidChecksum - checksum inválido\n");
+                }
             }
             return Err(VfsError::InvalidFs("EclipseFS load_from_stream error".into()));
         }
