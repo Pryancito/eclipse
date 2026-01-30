@@ -277,7 +277,7 @@ impl SystemdDaemon {
         // Orquestación simple: no bloquear por clientes.
         // Wayland puede arrancar solo; COSMIC reconectará por su cuenta.
         // Dejamos el pequeño retraso, pero no exigimos dependencia fuerte.
-        if service_name == "eclipse-wayland.service" {
+        if normalized_name == "eclipse-wayland" {
             self.serial_logger.write_info("systemd", "⏳ Esperando estabilización de Wayland...").await?;
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
