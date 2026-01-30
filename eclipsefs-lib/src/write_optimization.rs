@@ -115,7 +115,8 @@ impl SequentialWriteOptimizer {
     /// Check if write is sequential
     pub fn is_sequential(&self, inode: u32) -> bool {
         if let Some(last) = self.last_inode {
-            inode == last + 1 || inode == last - 1
+            // Only forward sequential pattern to avoid oscillation issues
+            inode == last + 1
         } else {
             false
         }
@@ -128,9 +129,13 @@ impl SequentialWriteOptimizer {
         if is_sequential {
             self.sequential_count += 1;
             
-            // Add data to buffer if there's space
+            // Add data to buffer if there's space, otherwise flush will be triggered
             if self.sequential_buffer.len() + data.len() <= self.max_buffer_size {
                 self.sequential_buffer.extend_from_slice(data);
+            } else {
+                // Buffer is full, caller should flush
+                self.last_inode = Some(inode);
+                return true;
             }
         } else {
             self.sequential_count = 0;

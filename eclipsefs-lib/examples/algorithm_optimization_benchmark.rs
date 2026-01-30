@@ -75,7 +75,9 @@ fn benchmark_sequential_reads(path: &str) -> Result<(), Box<dyn std::error::Erro
     let cached_duration = start.elapsed();
     
     println!("✅ Cached sequential read: {:.2}ms", cached_duration.as_secs_f64() * 1000.0);
-    println!("   Speedup: {:.1}x faster", duration.as_secs_f64() / cached_duration.as_secs_f64());
+    if cached_duration.as_secs_f64() > 0.0 {
+        println!("   Speedup: {:.1}x faster", duration.as_secs_f64() / cached_duration.as_secs_f64());
+    }
     
     Ok(())
 }
@@ -128,7 +130,9 @@ fn benchmark_directory_prefetch(path: &str) -> Result<(), Box<dyn std::error::Er
     let prefetch_duration = start.elapsed();
     
     println!("✅ Prefetched {} children: {:.2}ms", prefetch_count, prefetch_duration.as_secs_f64() * 1000.0);
-    println!("   Avg per prefetch: {:.2}µs", prefetch_duration.as_secs_f64() * 1_000_000.0 / prefetch_count as f64);
+    if prefetch_count > 0 {
+        println!("   Avg per prefetch: {:.2}µs", prefetch_duration.as_secs_f64() * 1_000_000.0 / prefetch_count as f64);
+    }
     
     // Now read them - should all be cached
     let start = Instant::now();
@@ -138,7 +142,9 @@ fn benchmark_directory_prefetch(path: &str) -> Result<(), Box<dyn std::error::Er
     let cached_read_duration = start.elapsed();
     
     println!("✅ Cached reads of prefetched children: {:.2}ms", cached_read_duration.as_secs_f64() * 1000.0);
-    println!("   Speedup: {:.1}x faster than prefetch", prefetch_duration.as_secs_f64() / cached_read_duration.as_secs_f64());
+    if prefetch_count > 0 && cached_read_duration.as_secs_f64() > 0.0 {
+        println!("   Speedup: {:.1}x faster than prefetch", prefetch_duration.as_secs_f64() / cached_read_duration.as_secs_f64());
+    }
     
     Ok(())
 }

@@ -73,13 +73,14 @@ impl SimpleCompressor {
             if count >= 3 {
                 compressed.push(count);
                 compressed.push(current_byte);
-                i += count as usize;
             } else {
                 // Store single byte with count 0 to indicate literal
                 compressed.push(0);
                 compressed.push(current_byte);
-                i += 1;
             }
+            
+            // Always advance by the count to avoid reprocessing
+            i += count as usize;
         }
 
         // Only return compressed if it's actually smaller
@@ -94,6 +95,11 @@ impl SimpleCompressor {
     fn decompress_rle(data: &[u8]) -> EclipseFSResult<Vec<u8>> {
         if data.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Validate data has even number of bytes
+        if data.len() % 2 != 0 {
+            return Ok(data.to_vec()); // Return original if malformed
         }
 
         let mut decompressed = Vec::new();
