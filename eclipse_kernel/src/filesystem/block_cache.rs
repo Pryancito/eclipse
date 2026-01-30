@@ -207,7 +207,20 @@ pub fn read_data_from_offset(
     let max_iterations = expected_blocks + 10; // +10 como margen de seguridad
     let mut iteration_count = 0;
     
+    // PROTECCIÓN: Calcular el bloque final esperado para detener la lectura
+    // El último bloque válido es start_block + expected_blocks - 1
+    let end_block = start_block + expected_blocks as u64 - 1;
+    
     while remaining > 0 && bytes_read < buffer.len() {
+        // PROTECCIÓN: Verificar si se alcanzó el bloque final esperado
+        if current_block > end_block {
+            crate::debug::serial_write_str(&alloc::format!(
+                "BLOCK_CACHE: Alcanzado bloque final esperado ({}), deteniendo lectura\n",
+                end_block
+            ));
+            break; // Condición para detener la lectura
+        }
+        
         // Verificar límite de iteraciones para prevenir loop infinito
         iteration_count += 1;
         if iteration_count > max_iterations {
@@ -225,6 +238,16 @@ pub fn read_data_from_offset(
         let block_data = cache.get_or_load_block(current_block, storage, partition_index)?;
         let available = block_data.len() - current_offset;
         let to_copy = remaining.min(available);
+        
+        // PROTECCIÓN: Detener si no hay progreso (to_copy == 0)
+        // Esto indica un bug en la lógica de lectura de bloques y debe retornar error
+        if to_copy == 0 {
+            crate::debug::serial_write_str(&alloc::format!(
+                "BLOCK_CACHE: ERROR - Sin progreso en bloque {} (to_copy=0). bytes_read={}, remaining={}\n",
+                current_block, bytes_read, remaining
+            ));
+            return Err("Sin progreso en lectura de bloques - posible bug en lógica de lectura");
+        }
         
         // Log de progreso cada 100 bloques para archivos grandes
         if iteration_count % 100 == 0 {
