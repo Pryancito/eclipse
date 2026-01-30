@@ -107,6 +107,52 @@ impl EclipseFSWrapper {
         self
     }
 
+    /// Intentar recuperar un nodo desde snapshot cuando se detecta corrupción
+    /// Esta es una función de ayuda que sugiere acciones de recuperación
+    fn handle_corruption(&self, inode_num: u32, error_details: &str) -> VfsError {
+        crate::debug::serial_write_str(&alloc::format!(
+            "\n╔════════════════════════════════════════════════════════════╗\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ CORRUPCIÓN DE ARCHIVO DETECTADA                          ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "╠════════════════════════════════════════════════════════════╣\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ Inode:   {}                                             ║\n", inode_num
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ Error:   {}║\n", error_details
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "╠════════════════════════════════════════════════════════════╣\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ ACCIONES RECOMENDADAS:                                    ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ 1. Verificar integridad del sistema de archivos          ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ 2. Intentar recuperar desde snapshot si está disponible  ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ 3. Ejecutar fsck en el sistema de archivos               ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "║ 4. Restaurar desde backup externo si es necesario        ║\n"
+        ));
+        crate::debug::serial_write_str(&alloc::format!(
+            "╚════════════════════════════════════════════════════════════╝\n\n"
+        ));
+        
+        VfsError::IoError(alloc::format!(
+            "Archivo corrupto (inode {}): {}. Error de lectura - tamaño del archivo incorrecto.",
+            inode_num, error_details
+        ))
+    }
+
     /// Cargar un nodo específico bajo demanda
     pub fn load_node_lazy(&self, inode_num: u32, storage: &mut StorageManager) -> Result<eclipsefs_lib::EclipseFSNode, VfsError> {
         // Buscar la entrada en la tabla de inodos
@@ -133,8 +179,11 @@ impl EclipseFSWrapper {
         })?;
 
         if header_bytes_read < ecfs_constants::NODE_RECORD_HEADER_SIZE {
-            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: ERROR - Cabecera truncada: {} bytes\n", header_bytes_read));
-            return Err(VfsError::InvalidFs("Cabecera de nodo truncada".into()));
+            let error_msg = alloc::format!(
+                "Cabecera truncada: esperados {} bytes, leídos {}", 
+                ecfs_constants::NODE_RECORD_HEADER_SIZE, header_bytes_read
+            );
+            return Err(self.handle_corruption(inode_num, &error_msg));
         }
 
         // Parsear la cabecera para obtener el tamaño del registro
@@ -192,11 +241,11 @@ impl EclipseFSWrapper {
         })?;
 
         if tlv_bytes_read < tlv_size {
-            crate::debug::serial_write_str(&alloc::format!(
-                "ECLIPSEFS: ERROR - Datos TLV incompletos: se esperaban {} bytes, se leyeron {}\n",
+            let error_msg = alloc::format!(
+                "Datos TLV incompletos: esperados {} bytes, leídos {}", 
                 tlv_size, tlv_bytes_read
-            ));
-            return Err(VfsError::InvalidFs("Datos TLV de nodo incompletos".into()));
+            );
+            return Err(self.handle_corruption(inode_num, &error_msg));
         }
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes totales: {} cabecera + {} TLV)\n", 
@@ -1628,15 +1677,41 @@ impl FileSystem for EclipseFSWrapper {
         // Si es un archivo, obtener los datos
         if node.kind == eclipsefs_lib::NodeKind::File {
             let data = node.get_data();
-        let start = offset as usize;
+            let file_size = data.len();
+            let start = offset as usize;
             let end = (start + buffer.len()).min(data.len());
             
             if start < data.len() {
                 let len = end - start;
                 buffer[..len].copy_from_slice(&data[start..end]);
-                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leídos {} bytes del inodo {}\n", len, inode));
+                
+                // VALIDACIÓN DE INTEGRIDAD: Verificar EOF cuando se lee hasta el final
+                if start + len == file_size {
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: EOF alcanzado correctamente para inodo {} (tamaño del archivo: {} bytes)\n", 
+                        inode, file_size
+                    ));
+                }
+                
+                // VALIDACIÓN: Si se solicitaron más bytes de los que tiene el archivo
+                if buffer.len() > len && start + buffer.len() > file_size {
+                    crate::debug::serial_write_str(&alloc::format!(
+                        "ECLIPSEFS: ADVERTENCIA - Se solicitaron {} bytes pero solo hay {} bytes disponibles desde offset {} (tamaño del archivo: {})\n",
+                        buffer.len(), len, offset, file_size
+                    ));
+                }
+                
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: Leídos {} bytes del inodo {} (offset: {}, tamaño archivo: {})\n", 
+                    len, inode, offset, file_size
+                ));
                 Ok(len)
             } else {
+                // Offset más allá del final del archivo
+                crate::debug::serial_write_str(&alloc::format!(
+                    "ECLIPSEFS: EOF - offset {} más allá del tamaño del archivo {} bytes\n",
+                    offset, file_size
+                ));
                 Ok(0)
             }
         } else {
