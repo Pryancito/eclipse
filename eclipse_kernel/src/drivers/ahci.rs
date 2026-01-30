@@ -658,4 +658,90 @@ impl AhciDriver {
             core::arch::asm!("nop", options(nomem, nostack));
         }
     }
+
+    /// Construir un FIS de tipo Register H2D para comandos ATA
+    fn build_fis_reg_h2d(&self, command: u8, lba: u64, count: u16, is_lba48: bool) -> FisRegH2D {
+        FisRegH2D {
+            fis_type: FIS_TYPE_REG_H2D,
+            flags: 0x80, // Bit 7 = 1 indica comando (no control)
+            command,
+            features_low: 0,
+            
+            // LBA bits 0-23
+            lba_low: (lba & 0xFF) as u8,
+            lba_mid: ((lba >> 8) & 0xFF) as u8,
+            lba_high: ((lba >> 16) & 0xFF) as u8,
+            device: 0xE0 | (if is_lba48 { 0x40 } else { 0x00 }), // LBA mode, bit 6 = LBA48
+            
+            // LBA bits 24-47 (solo para LBA48)
+            lba_low_exp: if is_lba48 { ((lba >> 24) & 0xFF) as u8 } else { 0 },
+            lba_mid_exp: if is_lba48 { ((lba >> 32) & 0xFF) as u8 } else { 0 },
+            lba_high_exp: if is_lba48 { ((lba >> 40) & 0xFF) as u8 } else { 0 },
+            features_high: 0,
+            
+            // Sector count
+            count_low: (count & 0xFF) as u8,
+            count_high: if is_lba48 { ((count >> 8) & 0xFF) as u8 } else { 0 },
+            icc: 0,
+            control: 0,
+            
+            reserved: [0; 4],
+        }
+    }
+
+    /// Buscar un slot de comando libre en el puerto
+    fn find_free_command_slot(&self, port: u32) -> Option<u32> {
+        // Leer los slots ocupados
+        let sact = self.read_port_register(port, AHCI_PxSACT);
+        let ci = self.read_port_register(port, AHCI_PxCI);
+        
+        // Buscar un slot libre (tanto en SACT como en CI deben ser 0)
+        for slot in 0..32 {
+            if (sact & (1 << slot)) == 0 && (ci & (1 << slot)) == 0 {
+                return Some(slot);
+            }
+        }
+        
+        None
+    }
+
+    /// Esperar a que un comando se complete
+    fn wait_for_command_completion(&self, port: u32, slot: u32, timeout_ms: u32) -> Result<(), &'static str> {
+        let mut timeout = timeout_ms * 100; // Aproximadamente 10us por iteración
+        
+        while timeout > 0 {
+            // Verificar si el comando completó (bit en PxCI se limpia)
+            let ci = self.read_port_register(port, AHCI_PxCI);
+            if (ci & (1 << slot)) == 0 {
+                // Verificar errores
+                let is_reg = self.read_port_register(port, AHCI_PxIS);
+                if is_reg & 0x7FFF0000 != 0 { // Bits de error
+                    serial_write_str(&format!("AHCI: Error en comando - PxIS = 0x{:08X}\n", is_reg));
+                    // Limpiar errores
+                    self.write_port_register(port, AHCI_PxIS, is_reg);
+                    return Err("Error ejecutando comando AHCI");
+                }
+                
+                // Limpiar interrupciones
+                if is_reg != 0 {
+                    self.write_port_register(port, AHCI_PxIS, is_reg);
+                }
+                
+                return Ok(());
+            }
+            
+            // Verificar errores incluso si el comando aún está en ejecución
+            let is_reg = self.read_port_register(port, AHCI_PxIS);
+            if is_reg & 0x7FFF0000 != 0 { // Bits de error
+                serial_write_str(&format!("AHCI: Error durante ejecución - PxIS = 0x{:08X}\n", is_reg));
+                self.write_port_register(port, AHCI_PxIS, is_reg);
+                return Err("Error durante ejecución de comando AHCI");
+            }
+            
+            self.io_delay();
+            timeout -= 1;
+        }
+        
+        Err("Timeout esperando completación de comando AHCI")
+    }
 }

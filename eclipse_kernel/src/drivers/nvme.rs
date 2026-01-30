@@ -25,7 +25,7 @@ const NVME_CSTS_RDY: u32 = 0x01;
 const NVME_CSTS_CFS: u32 = 0x02;
 
 /// Información del dispositivo NVMe
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NvmeDeviceInfo {
     pub model: String,
     pub serial: String,
@@ -34,6 +34,16 @@ pub struct NvmeDeviceInfo {
     pub max_lba: u64,
     pub block_size: u32,
     pub capacity: u64,
+}
+
+/// Información de namespace NVMe
+#[derive(Debug, Clone)]
+pub struct NvmeNamespaceInfo {
+    pub nsid: u32,         // Namespace ID
+    pub size: u64,         // Tamaño en bloques
+    pub capacity: u64,     // Capacidad en bloques
+    pub block_size: u32,   // Tamaño de bloque en bytes
+    pub formatted_lba_size: u8, // Índice del formato LBA actual
 }
 
 /// Estructura de comando NVMe
@@ -75,6 +85,7 @@ pub struct NvmeDriver {
     submission_queue: Vec<NvmeCommand>,
     completion_queue: Vec<NvmeCompletion>,
     doorbell_stride: u32, // Doorbell stride in 4-byte units
+    namespaces: Vec<NvmeNamespaceInfo>, // Lista de namespaces activos
 }
 
 impl NvmeDriver {
@@ -89,6 +100,7 @@ impl NvmeDriver {
             submission_queue: Vec::new(),
             completion_queue: Vec::new(),
             doorbell_stride: 0,
+            namespaces: Vec::new(),
         }
     }
 
@@ -276,7 +288,32 @@ impl NvmeDriver {
         };
 
         self.device_info = Some(device_info);
+        
+        // Enumerar namespaces
+        self.enumerate_namespaces()?;
+        
         serial_write_str("NVME: Dispositivo identificado exitosamente\n");
+        Ok(())
+    }
+
+    /// Enumerar namespaces activos del dispositivo NVMe
+    fn enumerate_namespaces(&mut self) -> Result<(), &'static str> {
+        serial_write_str("NVME: Enumerando namespaces...\n");
+        
+        // TODO: Implementar enumeración real de namespaces usando comando IDENTIFY NAMESPACE
+        // Por ahora, crear un namespace simulado
+        let ns_info = NvmeNamespaceInfo {
+            nsid: 1,
+            size: 0x100000, // 512 MB en bloques de 512 bytes
+            capacity: 0x100000,
+            block_size: 512,
+            formatted_lba_size: 0,
+        };
+        
+        self.namespaces.push(ns_info);
+        
+        serial_write_str(&format!("NVME: {} namespace(s) enumerado(s)\n", self.namespaces.len()));
+        
         Ok(())
     }
 
