@@ -120,8 +120,8 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
         serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
     }
 
-    // NOTE: Syscall and interrupt initialization moved to kernel_main_wrapper
-    // because they require heap allocation which is initialized later
+    // NOTE: Syscall and interrupt initialization moved to kernel_main in main_simple.rs
+    // because they require heap allocation which is initialized there
     
     serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");
     kernel_main_wrapper();
