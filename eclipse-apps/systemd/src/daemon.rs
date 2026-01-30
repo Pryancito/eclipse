@@ -225,10 +225,13 @@ impl SystemdDaemon {
         // Escribir a serial que estamos iniciando el servicio
         self.serial_logger.write_info("systemd", &format!("🔧 Preparando servicio: {}", service_name)).await?;
         
+        // Normalizar nombre del servicio (quitar .service si está presente)
+        let normalized_name = service_name.strip_suffix(".service").unwrap_or(service_name);
+        
         // Verificar si el servicio existe
         let service_file = {
             let services = self.services.read().await;
-            services.get(service_name).cloned()
+            services.get(normalized_name).cloned()
         };
         
         let service_file = match service_file {
@@ -242,7 +245,7 @@ impl SystemdDaemon {
         // Verificar si ya está ejecutándose
         {
             let running = self.running_services.read().await;
-            if running.contains_key(service_name) {
+            if running.contains_key(normalized_name) {
                 self.serial_logger.write_info("systemd", &format!("✅ Servicio ya ejecutándose: {}", service_name)).await?;
                 return Ok(());
             }
@@ -255,6 +258,11 @@ impl SystemdDaemon {
         }
         
         for dep in &dependencies {
+            // Saltar targets, solo procesar servicios
+            if dep.ends_with(".target") {
+                continue;
+            }
+            
             if !self.is_service_running(dep).await {
                 self.serial_logger.write_info("systemd", &format!("📦 Iniciando dependencia: {} -> {}", dep, service_name)).await?;
                 info!("Dependencia Iniciando dependencia: {}", dep);
@@ -264,7 +272,7 @@ impl SystemdDaemon {
 
         // Ejecutar el servicio
         self.serial_logger.write_info("systemd", &format!("🚀 Ejecutando servicio: {}", service_name)).await?;
-        self.execute_service(service_name, &service_file).await?;
+        self.execute_service(normalized_name, &service_file).await?;
 
         // Orquestación simple: no bloquear por clientes.
         // Wayland puede arrancar solo; COSMIC reconectará por su cuenta.
@@ -284,8 +292,10 @@ impl SystemdDaemon {
     pub async fn stop_service(&self, service_name: &str) -> Result<()> {
         info!("Deteniendo Deteniendo servicio: {}", service_name);
         
+        let normalized_name = service_name.strip_suffix(".service").unwrap_or(service_name);
+        
         let mut running = self.running_services.write().await;
-        if let Some(running_service) = running.get_mut(service_name) {
+        if let Some(running_service) = running.get_mut(normalized_name) {
             running_service.state = ServiceState::Deactivating;
             
             // Terminar proceso si existe
@@ -300,7 +310,7 @@ impl SystemdDaemon {
             
             let pid = running_service.pid;
             running_service.state = ServiceState::Inactive;
-            running.remove(service_name);
+            running.remove(normalized_name);
 
             // Enviar notificación de servicio detenido
             if let Err(e) = self.notification_manager.notify_service_stopping(service_name, pid) {
@@ -333,14 +343,16 @@ impl SystemdDaemon {
 
     /// Obtiene el estado de un servicio
     pub async fn get_service_status(&self, service_name: &str) -> Option<ServiceState> {
+        let normalized_name = service_name.strip_suffix(".service").unwrap_or(service_name);
         let running = self.running_services.read().await;
-        running.get(service_name).map(|s| s.state.clone())
+        running.get(normalized_name).map(|s| s.state.clone())
     }
 
     /// Verifica si un servicio está ejecutándose
     pub async fn is_service_running(&self, service_name: &str) -> bool {
+        let normalized_name = service_name.strip_suffix(".service").unwrap_or(service_name);
         let running = self.running_services.read().await;
-        running.contains_key(service_name)
+        running.contains_key(normalized_name)
     }
 
     /// Ejecuta un servicio
