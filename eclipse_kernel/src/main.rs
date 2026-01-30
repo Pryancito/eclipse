@@ -6,14 +6,11 @@
 extern crate alloc;
 use eclipse_kernel::{
     drivers::framebuffer::{
-        get_framebuffer, init_framebuffer, Color, FramebufferDriver, FramebufferInfo,
+        get_framebuffer, init_framebuffer, FramebufferInfo,
     },
     main_simple::kernel_main,
     debug::serial_write_str,
-    interrupts::manager::initialize_interrupt_system,
-    syscalls::handler::init_syscall_system,
 };
-use core::panic::PanicInfo;
 
 // --- Funciones de depuración serie movidas a debug.rs ---
 
@@ -68,7 +65,7 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     unsafe {
         let gdt_ptr = GdtPointer {
             limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
-            base: &KERNEL_GDT as *const _ as u64,
+            base: &raw const KERNEL_GDT as *const _ as u64,
         };
         
         core::arch::asm!(
