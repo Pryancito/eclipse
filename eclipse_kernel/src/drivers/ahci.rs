@@ -70,6 +70,62 @@ const FIS_TYPE_SET_DEVICE: u8 = 0xA1; // Set Device Bits FIS
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_DMA: u8 = 0xC8;
 const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+const ATA_CMD_READ_DMA_EXT: u8 = 0x25; // Read DMA EXT (LBA48)
+const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35; // Write DMA EXT (LBA48)
+
+/// Estructura de Command Header (32 bytes)
+/// Esta estructura está en la Command List y apunta a la Command Table
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct AhciCommandHeader {
+    // DW0
+    flags: u16,        // Command flags (CFL, A, W, P, R, B, C, etc.)
+    prdtl: u16,        // Physical Region Descriptor Table Length
+    // DW1
+    prdbc: u32,        // Physical Region Descriptor Byte Count
+    // DW2-3
+    ctba: u64,         // Command Table Base Address (debe estar alineado a 128 bytes)
+    // DW4-7
+    reserved: [u32; 4], // Reservado
+}
+
+/// Estructura de Physical Region Descriptor (PRD) - 16 bytes
+/// Describe una región de memoria física para DMA
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct AhciPrd {
+    dba: u64,          // Data Base Address (debe estar alineado a 2 bytes)
+    reserved: u32,     // Reservado
+    dbc: u32,          // Data Byte Count (bit 31 = interrupt, bits 21-0 = byte count - 1)
+}
+
+/// Estructura de Register FIS - Host to Device (20 bytes)
+/// Se usa para enviar comandos ATA al dispositivo
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct FisRegH2D {
+    fis_type: u8,      // FIS_TYPE_REG_H2D = 0x27
+    flags: u8,         // Bit 7 = Command/Control, bit 6-4 = Port Multiplier Port
+    command: u8,       // Comando ATA
+    features_low: u8,  // Features (7:0)
+    
+    lba_low: u8,       // LBA (7:0)
+    lba_mid: u8,       // LBA (15:8)
+    lba_high: u8,      // LBA (23:16)
+    device: u8,        // Device register
+    
+    lba_low_exp: u8,   // LBA (31:24) - para LBA48
+    lba_mid_exp: u8,   // LBA (39:32) - para LBA48
+    lba_high_exp: u8,  // LBA (47:40) - para LBA48
+    features_high: u8, // Features (15:8)
+    
+    count_low: u8,     // Sector count (7:0)
+    count_high: u8,    // Sector count (15:8) - para LBA48
+    icc: u8,           // Isochronous Command Completion
+    control: u8,       // Control register
+    
+    reserved: [u8; 4], // Reservado
+}
 
 /// Información del dispositivo AHCI
 #[derive(Debug)]
@@ -88,6 +144,11 @@ pub struct AhciDriver {
     is_initialized: bool,
     device_info: Option<AhciDeviceInfo>,
     active_port: Option<u32>,
+    // Direcciones de memoria para estructuras AHCI (simuladas por ahora)
+    // En una implementación real, se asignarían con el allocador de memoria física
+    command_list_base: u64,    // Base de Command List (1KB, alineado a 1KB)
+    fis_base: u64,             // Base de Received FIS (256 bytes, alineado a 256 bytes)
+    command_table_base: u64,   // Base de Command Table (256 bytes + PRDs, alineado a 128 bytes)
 }
 
 impl AhciDriver {
@@ -98,6 +159,10 @@ impl AhciDriver {
             is_initialized: false,
             device_info: None,
             active_port: None,
+            // TODO: Estas direcciones deben ser asignadas por el allocador de memoria física
+            command_list_base: 0x40000,    // Dirección física simulada
+            fis_base: 0x40400,             // Dirección física simulada
+            command_table_base: 0x40500,   // Dirección física simulada
         }
     }
 
@@ -111,6 +176,10 @@ impl AhciDriver {
             is_initialized: false,
             device_info: None,
             active_port: None,
+            // TODO: Estas direcciones deben ser asignadas por el allocador de memoria física
+            command_list_base: 0x40000,    // Dirección física simulada
+            fis_base: 0x40400,             // Dirección física simulada
+            command_table_base: 0x40500,   // Dirección física simulada
         }
     }
 
@@ -207,8 +276,95 @@ impl AhciDriver {
             }
         }
         
+        // Configurar el puerto activo con las estructuras de memoria necesarias
+        if let Some(port) = self.active_port {
+            self.setup_port_structures(port)?;
+        }
+        
         self.is_initialized = true;
         serial_write_str("AHCI: ✅ Driver AHCI robusto inicializado correctamente\n");
+        Ok(())
+    }
+
+    /// Configurar estructuras de memoria para un puerto AHCI
+    fn setup_port_structures(&self, port: u32) -> Result<(), &'static str> {
+        serial_write_str(&format!("AHCI: Configurando estructuras de memoria para puerto {}...\n", port));
+        
+        // Verificar que el puerto esté detenido antes de configurar
+        let cmd = self.read_port_register(port, AHCI_PxCMD);
+        if cmd & (AHCI_PxCMD_ST | AHCI_PxCMD_CR | AHCI_PxCMD_FRE | AHCI_PxCMD_FR) != 0 {
+            serial_write_str("AHCI: Puerto debe estar detenido antes de configurar estructuras\n");
+            // El puerto ya debería estar detenido por identify_device
+        }
+        
+        // Configurar Command List Base Address (CLB)
+        // La Command List debe estar alineada a 1KB
+        let clb_lower = (self.command_list_base & 0xFFFFFFFF) as u32;
+        let clb_upper = ((self.command_list_base >> 32) & 0xFFFFFFFF) as u32;
+        
+        self.write_port_register(port, AHCI_PxCLB, clb_lower);
+        self.write_port_register(port, AHCI_PxCLBU, clb_upper);
+        
+        serial_write_str(&format!("AHCI: CLB configurado en 0x{:016X}\n", self.command_list_base));
+        
+        // Configurar FIS Base Address (FB)
+        // El Received FIS debe estar alineado a 256 bytes
+        let fb_lower = (self.fis_base & 0xFFFFFFFF) as u32;
+        let fb_upper = ((self.fis_base >> 32) & 0xFFFFFFFF) as u32;
+        
+        self.write_port_register(port, AHCI_PxFB, fb_lower);
+        self.write_port_register(port, AHCI_PxFBU, fb_upper);
+        
+        serial_write_str(&format!("AHCI: FB configurado en 0x{:016X}\n", self.fis_base));
+        
+        // Limpiar interrupciones pendientes
+        let is = self.read_port_register(port, AHCI_PxIS);
+        if is != 0 {
+            self.write_port_register(port, AHCI_PxIS, is);
+            serial_write_str(&format!("AHCI: Interrupciones limpiadas: 0x{:08X}\n", is));
+        }
+        
+        // Habilitar FIS Receive Enable (FRE)
+        let mut cmd = self.read_port_register(port, AHCI_PxCMD);
+        cmd |= AHCI_PxCMD_FRE;
+        self.write_port_register(port, AHCI_PxCMD, cmd);
+        
+        // Esperar a que FIS Receive Running (FR) se active
+        let mut timeout = 10000;
+        while timeout > 0 {
+            let cmd = self.read_port_register(port, AHCI_PxCMD);
+            if cmd & AHCI_PxCMD_FR != 0 {
+                break;
+            }
+            self.io_delay();
+            timeout -= 1;
+        }
+        
+        if timeout == 0 {
+            return Err("Timeout esperando FIS Receive Running");
+        }
+        
+        // Habilitar Start (ST) para permitir que el puerto procese comandos
+        let mut cmd = self.read_port_register(port, AHCI_PxCMD);
+        cmd |= AHCI_PxCMD_ST;
+        self.write_port_register(port, AHCI_PxCMD, cmd);
+        
+        // Esperar a que Command List Running (CR) se active
+        timeout = 10000;
+        while timeout > 0 {
+            let cmd = self.read_port_register(port, AHCI_PxCMD);
+            if cmd & AHCI_PxCMD_CR != 0 {
+                break;
+            }
+            self.io_delay();
+            timeout -= 1;
+        }
+        
+        if timeout == 0 {
+            return Err("Timeout esperando Command List Running");
+        }
+        
+        serial_write_str("AHCI: ✅ Estructuras de puerto configuradas correctamente\n");
         Ok(())
     }
 
