@@ -62,10 +62,10 @@ pub extern "C" fn multiboot2_entry(framebuffer_info_ptr: *const FramebufferInfo)
         // Inicializar sistema de syscalls
         let _syscall_handler = init_syscall_system();
 
-        // Inicializar sistema de interrupciones
-        let kernel_code_selector = 0x08; // Selector de código del kernel
+        // Initialize interrupt system
+        let kernel_code_selector = 0x08; // Kernel code selector
         if let Err(e) = initialize_interrupt_system(kernel_code_selector) {
-            panic!("Error al inicializar sistema de interrupciones: {}", e);
+            panic!("Failed to initialize interrupt system: {}", e);
         }
 
         // Obtener el framebuffer mutable
