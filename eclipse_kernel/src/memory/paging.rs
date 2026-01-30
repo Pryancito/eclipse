@@ -612,12 +612,12 @@ fn map_kernel_memory(
 
     // 2. Identity Mapping CRÍTICO
     // RSP está en 0x3FFB8000 (~1GB), así que necesitamos mapear suficiente memoria.
-    // FIX: Usar el tamaño de memoria física real en vez de 4GB hardcodeado.
-    // Esto evita consumir páginas físicas mapeando memoria que no existe.
+    // FIXED: Limit identity mapping to 1.5GB to conserve physical pages for userland setup.
+    // This covers: kernel code (1MB+), stack (up to 1GB), physical allocator (32MB+),
+    // and provides buffer. Userland gets separate page tables via setup_userland_paging().
     serial_write_str("PAGING CHECKPOINT B2: Identity Loop\n");
-    // Usar el mínimo entre la memoria física total y 4GB para seguridad
-    // (en caso de que haya más de 4GB de RAM en el futuro)
-    let identity_limit = core::cmp::min(total_physical_memory, 4u64 * 1024 * 1024 * 1024);
+    // Use 1.5GB limit instead of full 4GB to conserve physical pages
+    let identity_limit = core::cmp::min(total_physical_memory, (1536u64 * 1024 * 1024));
     let mut id_addr = 0;
     while id_addr < identity_limit {
         let flags = PAGE_PRESENT | PAGE_WRITABLE;
@@ -631,6 +631,13 @@ fn map_kernel_memory(
     }
     crate::debug::serial_write_str("\n");
     serial_write_str("PAGING CHECKPOINT B3: Identity Done\n");
+    
+    // Log remaining free pages after identity mapping
+    crate::debug::serial_write_str("PAGING: Free pages after identity mapping: ");
+    print_hex(physical_manager.free_pages as u64);
+    crate::debug::serial_write_str(" (");
+    print_hex((physical_manager.free_pages as u64 * PAGE_SIZE as u64) / (1024 * 1024));
+    crate::debug::serial_write_str(" MB)\n");
     
     Ok(())
 }
