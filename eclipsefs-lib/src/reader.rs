@@ -5,17 +5,25 @@ use crate::{
     EclipseFSResult, InodeTableEntry, NodeKind,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 /// Buffer size for I/O operations (256KB for better performance)
 const BUFFER_SIZE: usize = 256 * 1024;
 
+/// Maximum number of cached nodes (adjust based on memory constraints)
+const MAX_CACHED_NODES: usize = 1024;
+
 /// Lector de imágenes EclipseFS
 pub struct EclipseFSReader {
     file: BufReader<File>,
     header: EclipseFSHeader,
     inode_table: Vec<InodeTableEntry>,
+    /// Simple LRU cache for recently accessed nodes
+    node_cache: HashMap<u32, EclipseFSNode>,
+    /// Track access order for LRU eviction
+    access_order: Vec<u32>,
 }
 
 impl EclipseFSReader {
@@ -40,6 +48,8 @@ impl EclipseFSReader {
             file: buffered_file,
             header,
             inode_table,
+            node_cache: HashMap::new(),
+            access_order: Vec::new(),
         })
     }
 
@@ -54,6 +64,8 @@ impl EclipseFSReader {
             file: buffered_file,
             header,
             inode_table,
+            node_cache: HashMap::new(),
+            access_order: Vec::new(),
         })
     }
 
@@ -106,6 +118,14 @@ impl EclipseFSReader {
 
     /// Leer un nodo por su inode
     pub fn read_node(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
+        // Check cache first
+        if let Some(cached_node) = self.node_cache.get(&inode) {
+            // Update LRU access order
+            self.access_order.retain(|&i| i != inode);
+            self.access_order.push(inode);
+            return Ok(cached_node.clone());
+        }
+
         let entry = self
             .inode_table
             .get(inode as usize - 1)
@@ -242,7 +262,7 @@ impl EclipseFSReader {
             }
         }
 
-        Ok(EclipseFSNode {
+        let node = EclipseFSNode {
             kind: node_type,
             data,
             children,
@@ -263,7 +283,27 @@ impl EclipseFSReader {
             // Extent-based allocation
             extent_tree: crate::extent::ExtentTree::new(),
             use_extents: false,
-        })
+        };
+
+        // Cache the node for future reads
+        self.cache_node(inode, node.clone());
+
+        Ok(node)
+    }
+
+    /// Cache a node and manage LRU eviction
+    fn cache_node(&mut self, inode: u32, node: EclipseFSNode) {
+        // Evict oldest entry if cache is full
+        if self.node_cache.len() >= MAX_CACHED_NODES {
+            if let Some(oldest_inode) = self.access_order.first().copied() {
+                self.node_cache.remove(&oldest_inode);
+                self.access_order.remove(0);
+            }
+        }
+
+        // Add to cache
+        self.node_cache.insert(inode, node);
+        self.access_order.push(inode);
     }
 
     /// Deserializar entradas de directorio
@@ -378,4 +418,31 @@ impl EclipseFSReader {
     pub fn get_node(&mut self, inode: u64) -> EclipseFSResult<EclipseFSNode> {
         self.read_node(inode as u32)
     }
+
+    /// Prefetch multiple nodes at once for better performance
+    /// This is especially useful for directory listings
+    pub fn prefetch_nodes(&mut self, inodes: &[u32]) -> EclipseFSResult<()> {
+        for &inode in inodes {
+            // Only prefetch if not already cached
+            if !self.node_cache.contains_key(&inode) {
+                // Ignore errors during prefetch - best effort
+                let _ = self.read_node(inode);
+            }
+        }
+        Ok(())
+    }
+
+    /// Get cache statistics
+    pub fn get_cache_stats(&self) -> CacheStats {
+        CacheStats {
+            cached_nodes: self.node_cache.len(),
+            cache_capacity: MAX_CACHED_NODES,
+        }
+    }
+}
+
+/// Cache statistics for monitoring
+pub struct CacheStats {
+    pub cached_nodes: usize,
+    pub cache_capacity: usize,
 }

@@ -112,13 +112,17 @@ impl Filesystem for EclipseFSFuse {
                     return;
                 }
                 
+                // Prefetch all child nodes at once for much better performance
+                let child_inodes: Vec<u32> = node.get_children().values().copied().collect();
+                let _ = reader.prefetch_nodes(&child_inodes);
+                
                 let mut entries = Vec::new();
                 
                 // Agregar entradas especiales
                 entries.push((".", ino, fuse::FileType::Directory));
                 entries.push(("..", if ino == constants::ROOT_INODE as u64 { ino } else { 1 }, fuse::FileType::Directory));
                 
-                // Agregar entradas del directorio
+                // Agregar entradas del directorio (now much faster due to cache)
                 for (name, child_inode) in node.get_children().iter() {
                     let file_type = match reader.read_node(*child_inode) {
                         Ok(child_node) => match child_node.kind {
