@@ -6,11 +6,14 @@ use crate::{
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
+
+/// Buffer size for I/O operations (256KB for better performance)
+const BUFFER_SIZE: usize = 256 * 1024;
 
 /// Lector de imágenes EclipseFS
 pub struct EclipseFSReader {
-    file: File,
+    file: BufReader<File>,
     header: EclipseFSHeader,
     inode_table: Vec<InodeTableEntry>,
 }
@@ -18,7 +21,7 @@ pub struct EclipseFSReader {
 impl EclipseFSReader {
     /// Crear un nuevo lector desde un archivo
     pub fn new(file_path: &str) -> EclipseFSResult<Self> {
-        let mut file = File::open(file_path).map_err(|e| {
+        let file = File::open(file_path).map_err(|e| {
             // Proporcionar contexto adicional sobre el error
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 eprintln!("Error: Permiso denegado al abrir '{}'. Intenta ejecutar con 'sudo'", file_path);
@@ -27,30 +30,35 @@ impl EclipseFSReader {
                 EclipseFSError::IoError
             }
         })?;
-        let header = Self::read_header(&mut file)?;
-        let inode_table = Self::read_inode_table(&mut file, &header)?;
+        
+        // Wrap file with BufReader for much better performance
+        let mut buffered_file = BufReader::with_capacity(BUFFER_SIZE, file);
+        let header = Self::read_header(&mut buffered_file)?;
+        let inode_table = Self::read_inode_table(&mut buffered_file, &header)?;
 
         Ok(Self {
-            file,
+            file: buffered_file,
             header,
             inode_table,
         })
     }
 
     /// Crear un nuevo lector desde un File existente
-    pub fn from_file(mut file: File) -> EclipseFSResult<Self> {
-        let header = Self::read_header(&mut file)?;
-        let inode_table = Self::read_inode_table(&mut file, &header)?;
+    pub fn from_file(file: File) -> EclipseFSResult<Self> {
+        // Wrap file with BufReader for much better performance
+        let mut buffered_file = BufReader::with_capacity(BUFFER_SIZE, file);
+        let header = Self::read_header(&mut buffered_file)?;
+        let inode_table = Self::read_inode_table(&mut buffered_file, &header)?;
 
         Ok(Self {
-            file,
+            file: buffered_file,
             header,
             inode_table,
         })
     }
 
     /// Leer el header del sistema de archivos
-    fn read_header(file: &mut File) -> EclipseFSResult<EclipseFSHeader> {
+    fn read_header(file: &mut BufReader<File>) -> EclipseFSResult<EclipseFSHeader> {
         let mut magic = [0u8; 9];
         file.read_exact(&mut magic)?;
 
@@ -80,7 +88,7 @@ impl EclipseFSReader {
 
     /// Leer la tabla de inodos
     fn read_inode_table(
-        file: &mut File,
+        file: &mut BufReader<File>,
         header: &EclipseFSHeader,
     ) -> EclipseFSResult<Vec<InodeTableEntry>> {
         file.seek(SeekFrom::Start(header.inode_table_offset))?;
