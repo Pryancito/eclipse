@@ -6,11 +6,12 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 /// Logger serial para systemd
 pub struct SerialLogger {
     /// Puerto serial (simulado)
+    #[allow(dead_code)]
     serial_port: Arc<Mutex<u16>>,
     /// Habilitado
     enabled: bool,
@@ -26,11 +27,13 @@ impl SerialLogger {
     }
 
     /// Habilita o deshabilita el logging serial
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
     /// Verifica si está habilitado
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -72,6 +75,7 @@ impl SerialLogger {
     }
 
     /// Escribe un mensaje de debug
+    #[allow(dead_code)]
     pub async fn write_debug(&self, service: &str, message: &str) -> Result<()> {
         self.write_message("DEBUG", service, message).await
     }
@@ -113,6 +117,7 @@ Estado: Iniciando servicios del sistema...
     }
 
     /// Escribe información de un servicio
+    #[allow(dead_code)]
     pub async fn write_service_info(&self, service_name: &str, state: &str, pid: Option<u32>) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -136,6 +141,7 @@ Estado: Iniciando servicios del sistema...
     }
 
     /// Escribe un mensaje de error del sistema
+    #[allow(dead_code)]
     pub async fn write_system_error(&self, error: &str) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -151,6 +157,7 @@ Estado: Iniciando servicios del sistema...
     }
 
     /// Escribe un mensaje de advertencia del sistema
+    #[allow(dead_code)]
     pub async fn write_system_warning(&self, warning: &str) -> Result<()> {
         if !self.enabled {
             return Ok(());

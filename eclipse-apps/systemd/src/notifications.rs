@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 
 /// Tipo de notificación
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum NotificationType {
     /// Servicio listo
     Ready,
@@ -27,6 +28,7 @@ pub enum NotificationType {
 
 /// Notificación de servicio
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ServiceNotification {
     pub service_name: String,
     pub notification_type: NotificationType,
@@ -39,6 +41,7 @@ pub struct ServiceNotification {
 
 /// Canal de notificaciones
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct NotificationChannel {
     /// Nombre del canal
     name: String,
@@ -117,6 +120,7 @@ impl NotificationManager {
     }
 
     /// Suscribe a un canal de notificaciones
+    #[allow(dead_code)]
     pub fn subscribe(&self, channel_name: &str, subscriber_id: &str) -> Result<broadcast::Receiver<ServiceNotification>> {
         let channels = match self.channels.lock() {
             Ok(guard) => guard,
@@ -145,6 +149,7 @@ impl NotificationManager {
     }
 
     /// Cancela la suscripción de un canal
+    #[allow(dead_code)]
     pub fn unsubscribe(&self, channel_name: &str, subscriber_id: &str) -> Result<()> {
         let channels = match self.channels.lock() {
             Ok(guard) => guard,
@@ -187,6 +192,7 @@ impl NotificationManager {
     }
 
     /// Notifica que un servicio se está recargando
+    #[allow(dead_code)]
     pub fn notify_service_reloading(&self, service_name: &str, pid: u32) -> Result<()> {
         let notification = ServiceNotification {
             service_name: service_name.to_string(),
@@ -235,6 +241,7 @@ impl NotificationManager {
     }
 
     /// Obtiene el historial de notificaciones
+    #[allow(dead_code)]
     pub fn get_notification_history(&self, limit: Option<usize>) -> Vec<ServiceNotification> {
         let history = match self.history.lock() {
             Ok(guard) => guard,
@@ -248,6 +255,7 @@ impl NotificationManager {
     }
 
     /// Obtiene estadísticas de notificaciones
+    #[allow(dead_code)]
     pub fn get_notification_stats(&self) -> NotificationStats {
         let history = match self.history.lock() {
             Ok(guard) => guard,
@@ -294,6 +302,7 @@ impl NotificationManager {
 
 /// Estadísticas de notificaciones
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NotificationStats {
     pub total_notifications: usize,
     pub type_counts: HashMap<NotificationType, usize>,
@@ -301,6 +310,7 @@ pub struct NotificationStats {
 }
 
 impl NotificationStats {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "Notificaciones: {} total, {} tipos, {} servicios",

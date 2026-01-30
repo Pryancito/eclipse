@@ -112,6 +112,7 @@ impl ServiceParser {
     }
 
     /// Lista todas las secciones
+    #[allow(dead_code)]
     pub fn list_sections(service_file: &ServiceFile) -> Vec<&str> {
         service_file.sections
             .iter()

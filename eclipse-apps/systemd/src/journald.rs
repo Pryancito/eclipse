@@ -81,6 +81,7 @@ pub struct JournalManager {
 
 /// Configuración del journal
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct JournalConfig {
     pub max_file_size: u64,
     pub max_files: u32,
@@ -291,6 +292,7 @@ impl JournalManager {
     }
 
     /// Registra un mensaje estructurado con campos adicionales
+    #[allow(dead_code)]
     pub fn log_structured(&self, service: &str, priority: Priority, message: &str, fields: HashMap<String, String>) -> Result<()> {
         let entry = JournalEntry {
             timestamp: Utc::now(),
@@ -308,6 +310,7 @@ impl JournalManager {
     }
 
     /// Registra evento de inicio de servicio
+    #[allow(dead_code)]
     pub fn log_service_start(&self, service_name: &str, pid: u32) -> Result<()> {
         let mut fields = HashMap::new();
         fields.insert("EVENT".to_string(), "SERVICE_START".to_string());
@@ -317,6 +320,7 @@ impl JournalManager {
     }
 
     /// Registra evento de parada de servicio
+    #[allow(dead_code)]
     pub fn log_service_stop(&self, service_name: &str, pid: Option<u32>, exit_code: Option<i32>) -> Result<()> {
         let mut fields = HashMap::new();
         fields.insert("EVENT".to_string(), "SERVICE_STOP".to_string());
@@ -339,6 +343,7 @@ impl JournalManager {
     }
 
     /// Registra evento de fallo de servicio
+    #[allow(dead_code)]
     pub fn log_service_failure(&self, service_name: &str, error: &str) -> Result<()> {
         let mut fields = HashMap::new();
         fields.insert("EVENT".to_string(), "SERVICE_FAILURE".to_string());
@@ -348,6 +353,7 @@ impl JournalManager {
     }
 
     /// Lee entradas del journal
+    #[allow(dead_code)]
     pub fn read_entries(&self, service: Option<&str>, limit: Option<usize>) -> Result<Vec<JournalEntry>> {
         let content = std::fs::read_to_string(&self.journal_file)?;
         let mut entries = Vec::new();
@@ -388,6 +394,7 @@ impl JournalManager {
     }
 
     /// Busca entradas en el journal
+    #[allow(dead_code)]
     pub fn search_entries(&self, query: &str, service: Option<&str>) -> Result<Vec<JournalEntry>> {
         let entries = self.read_entries(service, None)?;
         let mut results = Vec::new();
@@ -402,6 +409,7 @@ impl JournalManager {
     }
 
     /// Obtiene estadísticas del journal
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> Result<JournalStats> {
         let entries = self.read_entries(None, None)?;
         
@@ -555,6 +563,7 @@ impl JournalManager {
 
 /// Estadísticas del journal
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct JournalStats {
     pub total_entries: usize,
     pub service_counts: HashMap<String, usize>,
@@ -564,6 +573,7 @@ pub struct JournalStats {
 }
 
 impl JournalStats {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "Journal: {} entradas, {} servicios, {} errores, {} advertencias",

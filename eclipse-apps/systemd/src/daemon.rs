@@ -32,6 +32,7 @@ const DEFAULT_RESTART_SEC: u64 = 5;
 
 /// Estado de un servicio
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ServiceState {
     Inactive,
     Activating,
@@ -43,6 +44,7 @@ pub enum ServiceState {
 
 /// Información de un servicio en ejecución
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RunningService {
     pub name: String,
     pub state: ServiceState,
@@ -54,6 +56,7 @@ pub struct RunningService {
 }
 
 /// Daemon principal de systemd
+#[allow(dead_code)]
 pub struct SystemdDaemon {
     /// Servicios cargados
     services: Arc<RwLock<HashMap<String, ServiceFile>>>,
@@ -326,6 +329,7 @@ impl SystemdDaemon {
     }
 
     /// Reinicia un servicio
+    #[allow(dead_code)]
     pub async fn restart_service(&self, service_name: &str) -> Result<()> {
         info!("Reiniciando Reiniciando servicio: {}", service_name);
         
@@ -342,6 +346,7 @@ impl SystemdDaemon {
     }
 
     /// Obtiene el estado de un servicio
+    #[allow(dead_code)]
     pub async fn get_service_status(&self, service_name: &str) -> Option<ServiceState> {
         let normalized_name = service_name.strip_suffix(".service").unwrap_or(service_name);
         let running = self.running_services.read().await;
@@ -708,6 +713,7 @@ impl SystemdDaemon {
 
 /// Estado del sistema
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SystemStatus {
     pub total_services: usize,
     pub running_services: usize,

@@ -4,14 +4,13 @@
 //! como start, stop, restart, status, etc.
 
 use anyhow::Result;
-use log::{info, warn, error};
-use std::process::{Command, Stdio};
-use std::collections::HashMap;
-use serde_json;
+use log::info;
+use std::process::Command;
 
 /// Control de systemd
 pub struct SystemdControl {
     /// Socket de comunicación con el daemon
+    #[allow(dead_code)]
     daemon_socket: String,
 }
 

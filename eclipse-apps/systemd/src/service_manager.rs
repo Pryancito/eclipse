@@ -15,6 +15,7 @@ use crate::service_parser::{ServiceFile, ServiceParser};
 
 /// Estado de un servicio
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ServiceState {
     Inactive,
     Activating,
@@ -26,6 +27,7 @@ pub enum ServiceState {
 
 /// Información de un servicio en ejecución
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ServiceInfo {
     pub name: String,
     pub state: ServiceState,
@@ -39,6 +41,7 @@ pub struct ServiceInfo {
 
 /// Información detallada de un proceso
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub state: String,
@@ -50,6 +53,7 @@ pub struct ProcessInfo {
 
 /// Estadísticas del manager de servicios
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ServiceManagerStats {
     pub total_services: usize,
     pub running_services: usize,
@@ -58,6 +62,7 @@ pub struct ServiceManagerStats {
 }
 
 /// Manager de servicios
+#[allow(dead_code)]
 pub struct ServiceManager {
     /// Servicios en ejecución
     running_services: Arc<Mutex<HashMap<String, ServiceInfo>>>,
@@ -75,6 +80,7 @@ impl ServiceManager {
     }
 
     /// Registra un servicio
+    #[allow(dead_code)]
     pub fn register_service(&self, name: &str, service_file: ServiceFile) {
         match self.service_configs.lock() {
             Ok(mut configs) => {
@@ -90,6 +96,7 @@ impl ServiceManager {
     }
 
     /// Inicia un servicio
+    #[allow(dead_code)]
     pub fn start_service(&self, name: &str) -> Result<()> {
         info!("Iniciando Iniciando servicio: {}", name);
         
@@ -122,6 +129,7 @@ impl ServiceManager {
     }
 
     /// Detiene un servicio
+    #[allow(dead_code)]
     pub fn stop_service(&self, name: &str) -> Result<()> {
         info!("Deteniendo Deteniendo servicio: {}", name);
         
@@ -151,6 +159,7 @@ impl ServiceManager {
     }
 
     /// Reinicia un servicio
+    #[allow(dead_code)]
     pub fn restart_service(&self, name: &str) -> Result<()> {
         info!("Reiniciando Reiniciando servicio: {}", name);
         
@@ -170,6 +179,7 @@ impl ServiceManager {
     }
 
     /// Recarga un servicio
+    #[allow(dead_code)]
     pub fn reload_service(&self, name: &str) -> Result<()> {
         info!("Reiniciando Recargando servicio: {}", name);
         
@@ -203,6 +213,7 @@ impl ServiceManager {
     }
 
     /// Verifica si un servicio está ejecutándose
+    #[allow(dead_code)]
     pub fn is_service_running(&self, name: &str) -> bool {
         match self.running_services.lock() {
             Ok(running) => running.contains_key(name),
@@ -214,6 +225,7 @@ impl ServiceManager {
     }
 
     /// Obtiene el estado de un servicio
+    #[allow(dead_code)]
     pub fn get_service_state(&self, name: &str) -> Option<ServiceState> {
         match self.running_services.lock() {
             Ok(running) => running.get(name).map(|s| s.state.clone()),
@@ -225,6 +237,7 @@ impl ServiceManager {
     }
 
     /// Obtiene información de un servicio
+    #[allow(dead_code)]
     pub fn get_service_info(&self, name: &str) -> Option<ServiceInfo> {
         match self.running_services.lock() {
             Ok(running) => running.get(name).cloned(),
@@ -236,6 +249,7 @@ impl ServiceManager {
     }
 
     /// Lista todos los servicios en ejecución
+    #[allow(dead_code)]
     pub fn list_running_services(&self) -> Vec<String> {
         match self.running_services.lock() {
             Ok(running) => running.keys().cloned().collect(),
@@ -247,12 +261,13 @@ impl ServiceManager {
     }
 
     /// Ejecuta un servicio
+    #[allow(dead_code)]
     fn execute_service(&self, name: &str, service_file: &ServiceFile) -> Result<()> {
         // Obtener configuración del servicio
         let exec_start = ServiceParser::get_entry(service_file, "Service", "ExecStart")
             .ok_or_else(|| anyhow::anyhow!("ExecStart no encontrado"))?;
         
-        let service_type = ServiceParser::get_entry(service_file, "Service", "Type")
+        let _service_type = ServiceParser::get_entry(service_file, "Service", "Type")
             .unwrap_or(&"simple".to_string());
         
         let root_user = "root".to_string();
@@ -328,6 +343,7 @@ impl ServiceManager {
     }
 
     /// Obtiene variables de entorno del servicio
+    #[allow(dead_code)]
     fn get_environment_variables(&self, service_file: &ServiceFile) -> Option<Vec<(String, String)>> {
         let mut env_vars = Vec::new();
         
@@ -350,6 +366,7 @@ impl ServiceManager {
     }
 
     /// Parsea una entrada de variable de entorno
+    #[allow(dead_code)]
     fn parse_environment_entry(&self, entry: &str) -> Option<(String, String)> {
         if let Some(eq_pos) = entry.find('=') {
             let key = entry[..eq_pos].trim().to_string();
@@ -361,6 +378,7 @@ impl ServiceManager {
     }
 
     /// Inicia el monitoreo de un proceso
+    #[allow(dead_code)]
     fn start_process_monitoring(&self, service_name: &str, pid: u32) {
         let service_name = service_name.to_string();
         let running_services = Arc::clone(&self.running_services);
@@ -392,6 +410,7 @@ impl ServiceManager {
     }
 
     /// Verifica si un proceso está ejecutándose
+    #[allow(dead_code)]
     fn is_process_running(pid: u32) -> bool {
         // En Linux, verificar si el proceso existe leyendo /proc/<pid>/stat
         let proc_path = format!("/proc/{}/stat", pid);
@@ -402,6 +421,7 @@ impl ServiceManager {
     }
 
     /// Termina un proceso con manejo mejorado de señales
+    #[allow(dead_code)]
     fn terminate_process(&self, pid: u32) -> Result<()> {
         // Verificar que el proceso existe antes de intentar terminarlo
         if !Self::is_process_running(pid) {
@@ -456,6 +476,7 @@ impl ServiceManager {
     }
 
     /// Obtiene información detallada de un proceso
+    #[allow(dead_code)]
     pub fn get_process_info(&self, pid: u32) -> Option<ProcessInfo> {
         if !Self::is_process_running(pid) {
             return None;
@@ -498,6 +519,7 @@ impl ServiceManager {
     }
 
     /// Obtiene el uso de memoria de un proceso
+    #[allow(dead_code)]
     fn get_memory_usage(&self, pid: u32) -> u64 {
         let statm_path = format!("/proc/{}/statm", pid);
         if let Ok(content) = std::fs::read_to_string(&statm_path) {
@@ -513,6 +535,7 @@ impl ServiceManager {
     }
 
     /// Obtiene estadísticas del manager
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> ServiceManagerStats {
         let running = self.running_services.lock().unwrap();
         let configs = self.service_configs.lock().unwrap();
@@ -527,6 +550,7 @@ impl ServiceManager {
 }
 
 impl ServiceManagerStats {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "Servicios: {}/{} ejecutándose ({} activos, {} fallidos)",

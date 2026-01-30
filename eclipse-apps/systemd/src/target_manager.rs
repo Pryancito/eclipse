@@ -11,6 +11,7 @@ use std::path::Path;
 
 /// Target de systemd
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Target {
     pub name: String,
     pub description: String,
@@ -183,7 +184,7 @@ impl TargetManager {
 
     /// Parsea el contenido de un archivo .target
     fn parse_target_content(&self, content: &str) -> Result<Target> {
-        let mut name = String::new();
+        let name = String::new();
         let mut description = String::new();
         let mut services = Vec::new();
         let mut dependencies = Vec::new();
@@ -277,21 +278,25 @@ impl TargetManager {
     }
 
     /// Obtiene un target por nombre
+    #[allow(dead_code)]
     pub fn get_target(&self, target_name: &str) -> Option<&Target> {
         self.targets.get(target_name)
     }
 
     /// Lista todos los targets disponibles
+    #[allow(dead_code)]
     pub fn list_targets(&self) -> Vec<&str> {
         self.targets.keys().map(|s| s.as_str()).collect()
     }
 
     /// Verifica si un target existe
+    #[allow(dead_code)]
     pub fn target_exists(&self, target_name: &str) -> bool {
         self.targets.contains_key(target_name)
     }
 
     /// Obtiene información de un target
+    #[allow(dead_code)]
     pub fn get_target_info(&self, target_name: &str) -> Option<TargetInfo> {
         if let Some(target) = self.targets.get(target_name) {
             Some(TargetInfo {
@@ -309,6 +314,7 @@ impl TargetManager {
 
 /// Información de un target
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TargetInfo {
     pub name: String,
     pub description: String,
@@ -318,6 +324,7 @@ pub struct TargetInfo {
 }
 
 impl TargetInfo {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "{}: {} ({} servicios, {} dependencias, {} conflictos)",

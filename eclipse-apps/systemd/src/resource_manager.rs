@@ -12,6 +12,7 @@ use tokio::time::sleep;
 
 /// Información de uso de CPU
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CpuUsage {
     pub user_time: u64,
     pub system_time: u64,
@@ -21,6 +22,7 @@ pub struct CpuUsage {
 
 /// Información de uso de memoria
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MemoryUsage {
     pub total: u64,
     pub used: u64,
@@ -32,6 +34,7 @@ pub struct MemoryUsage {
 
 /// Información de uso de I/O
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct IoUsage {
     pub read_bytes: u64,
     pub write_bytes: u64,
@@ -42,6 +45,7 @@ pub struct IoUsage {
 
 /// Límites de recursos para un servicio
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ResourceLimits {
     pub cpu_quota: u32,        // Porcentaje de CPU (0-100)
     pub memory_limit: u64,     // Límite de memoria en bytes (0 = ilimitado)
@@ -52,6 +56,7 @@ pub struct ResourceLimits {
 
 /// Estadísticas de recursos de un servicio
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ServiceResourceStats {
     pub service_name: String,
     pub cpu_usage: CpuUsage,
@@ -62,6 +67,7 @@ pub struct ServiceResourceStats {
 }
 
 /// Manager de recursos del sistema
+#[allow(dead_code)]
 pub struct ResourceManager {
     /// Estadísticas de servicios
     service_stats: Arc<Mutex<HashMap<String, ServiceResourceStats>>>,
@@ -94,7 +100,7 @@ impl ResourceManager {
     }
 
     /// Registra un servicio para monitoreo de recursos
-    pub fn register_service(&self, service_name: &str, pid: Option<u32>) -> Result<()> {
+    pub fn register_service(&self, service_name: &str, _pid: Option<u32>) -> Result<()> {
         let mut stats = match self.service_stats.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -136,6 +142,7 @@ impl ResourceManager {
     }
 
     /// Actualiza las estadísticas de un servicio
+    #[allow(dead_code)]
     pub fn update_service_stats(&self, service_name: &str, pid: Option<u32>) -> Result<()> {
         let mut stats = match self.service_stats.lock() {
             Ok(guard) => guard,
@@ -180,6 +187,7 @@ impl ResourceManager {
     }
 
     /// Establece límites de recursos para un servicio
+    #[allow(dead_code)]
     pub fn set_service_limits(&self, service_name: &str, limits: ResourceLimits) -> Result<()> {
         let mut stats = match self.service_stats.lock() {
             Ok(guard) => guard,
@@ -204,6 +212,7 @@ impl ResourceManager {
     }
 
     /// Obtiene estadísticas de recursos de un servicio
+    #[allow(dead_code)]
     pub fn get_service_stats(&self, service_name: &str) -> Option<ServiceResourceStats> {
         let stats = match self.service_stats.lock() {
             Ok(guard) => guard,
@@ -216,6 +225,7 @@ impl ResourceManager {
     }
 
     /// Obtiene estadísticas de todos los servicios
+    #[allow(dead_code)]
     pub fn get_all_service_stats(&self) -> Vec<ServiceResourceStats> {
         let stats = match self.service_stats.lock() {
             Ok(guard) => guard,
@@ -228,6 +238,7 @@ impl ResourceManager {
     }
 
     /// Obtiene el historial de uso de un servicio
+    #[allow(dead_code)]
     pub fn get_service_history(&self, service_name: &str, limit: Option<usize>) -> Vec<(Instant, CpuUsage, MemoryUsage)> {
         let history = match self.usage_history.lock() {
             Ok(guard) => guard,
@@ -245,6 +256,7 @@ impl ResourceManager {
     }
 
     /// Verifica si un servicio excede sus límites
+    #[allow(dead_code)]
     pub fn check_resource_limits(&self, service_name: &str) -> Result<Vec<String>> {
         let mut violations = Vec::new();
         let stats = match self.service_stats.lock() {
@@ -284,6 +296,7 @@ impl ResourceManager {
     }
 
     /// Obtiene estadísticas del sistema
+    #[allow(dead_code)]
     pub fn get_system_stats(&self) -> Result<SystemStats> {
         let cpu_usage = self.get_system_cpu_usage()?;
         let memory_usage = self.get_system_memory_usage()?;
@@ -298,6 +311,7 @@ impl ResourceManager {
     }
 
     /// Inicia el monitoreo continuo de recursos
+    #[allow(dead_code)]
     pub async fn start_monitoring(&self) -> Result<()> {
         info!("Buscando Iniciando monitoreo de recursos del sistema");
 
@@ -333,6 +347,7 @@ impl ResourceManager {
     }
 
     /// Obtiene uso de CPU de un proceso
+    #[allow(dead_code)]
     fn get_process_cpu_usage(&self, pid: u32) -> Result<CpuUsage> {
         let stat_path = format!("/proc/{}/stat", pid);
         let stat_content = std::fs::read_to_string(&stat_path)?;
@@ -362,6 +377,7 @@ impl ResourceManager {
     }
 
     /// Obtiene uso de memoria de un proceso
+    #[allow(dead_code)]
     fn get_process_memory_usage(&self, pid: u32) -> Result<MemoryUsage> {
         let statm_path = format!("/proc/{}/statm", pid);
         let statm_content = std::fs::read_to_string(&statm_path)?;
@@ -389,6 +405,7 @@ impl ResourceManager {
     }
 
     /// Obtiene uso de I/O de un proceso
+    #[allow(dead_code)]
     fn get_process_io_usage(&self, pid: u32) -> Result<IoUsage> {
         let io_path = format!("/proc/{}/io", pid);
         if let Ok(io_content) = std::fs::read_to_string(&io_path) {
@@ -430,6 +447,7 @@ impl ResourceManager {
     }
 
     /// Obtiene uso de CPU del sistema
+    #[allow(dead_code)]
     fn get_system_cpu_usage(&self) -> Result<CpuUsage> {
         let stat_content = std::fs::read_to_string("/proc/stat")?;
         let first_line = stat_content.lines().next()
@@ -462,6 +480,7 @@ impl ResourceManager {
     }
 
     /// Obtiene uso de memoria del sistema
+    #[allow(dead_code)]
     fn get_system_memory_usage(&self) -> Result<MemoryUsage> {
         let meminfo_content = std::fs::read_to_string("/proc/meminfo")?;
         let mut total = 0u64;
@@ -501,6 +520,7 @@ impl ResourceManager {
     }
 
     /// Obtiene promedio de carga del sistema
+    #[allow(dead_code)]
     fn get_system_load_average(&self) -> Result<(f32, f32, f32)> {
         let loadavg_content = std::fs::read_to_string("/proc/loadavg")?;
         let parts: Vec<&str> = loadavg_content.split_whitespace().collect();
@@ -517,6 +537,7 @@ impl ResourceManager {
     }
 
     /// Obtiene tiempo de actividad del sistema
+    #[allow(dead_code)]
     fn get_system_uptime(&self) -> Duration {
         if let Ok(uptime_content) = std::fs::read_to_string("/proc/uptime") {
             let parts: Vec<&str> = uptime_content.split_whitespace().collect();
@@ -530,6 +551,7 @@ impl ResourceManager {
     }
 
     /// Aplica límites de recursos a un servicio
+    #[allow(dead_code)]
     fn apply_resource_limits(&self, service_name: &str, limits: &ResourceLimits) -> Result<()> {
         // Nota: En una implementación real, aquí se aplicarían límites usando:
         // - cgroups para CPU, memoria e I/O
@@ -541,6 +563,7 @@ impl ResourceManager {
     }
 
     /// Agrega entrada al historial de uso
+    #[allow(dead_code)]
     fn add_to_history(&self, service_name: &str, cpu: &CpuUsage, memory: &MemoryUsage) {
         let mut history = match self.usage_history.lock() {
             Ok(guard) => guard,
@@ -565,6 +588,7 @@ impl ResourceManager {
 
 /// Estadísticas del sistema
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SystemStats {
     pub cpu_usage: CpuUsage,
     pub memory_usage: MemoryUsage,
@@ -573,6 +597,7 @@ pub struct SystemStats {
 }
 
 impl SystemStats {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "Sistema - CPU: {:.1}%, Memoria: {:.1}%, Load: {:.2} {:.2} {:.2}, Uptime: {:.0}s",

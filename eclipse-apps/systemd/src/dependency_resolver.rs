@@ -11,6 +11,7 @@ use crate::service_parser::{ServiceFile, ServiceParser};
 
 /// Tipo de dependencia
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum DependencyType {
     Requires,    // Requerido (si falla, este también falla)
     Wants,       // Deseado (si falla, este continúa)
@@ -21,6 +22,7 @@ pub enum DependencyType {
 
 /// Dependencia entre servicios
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Dependency {
     pub from: String,
     pub to: String,
@@ -28,6 +30,7 @@ pub struct Dependency {
 }
 
 /// Resolvedor de dependencias
+#[allow(dead_code)]
 pub struct DependencyResolver {
     /// Grafo de dependencias
     dependencies: HashMap<String, Vec<Dependency>>,
@@ -177,13 +180,14 @@ impl DependencyResolver {
     }
 
     /// Extrae el nombre del servicio del archivo
-    fn extract_service_name(&self, service_file: &ServiceFile) -> String {
+    fn extract_service_name(&self, _service_file: &ServiceFile) -> String {
         // En una implementación real, esto se obtendría del nombre del archivo
         // o de una entrada específica en el archivo .service
         "unknown.service".to_string()
     }
 
     /// Resuelve el orden de inicio de una lista de servicios
+    #[allow(dead_code)]
     pub fn resolve_startup_order(&self, services: &[String]) -> Result<Vec<String>> {
         debug!("Reiniciando Resolviendo orden de inicio para: {:?}", services);
         
@@ -251,6 +255,7 @@ impl DependencyResolver {
     }
 
     /// Verifica si hay conflictos entre servicios
+    #[allow(dead_code)]
     pub fn check_conflicts(&self, services: &[String]) -> Result<Vec<(String, String)>> {
         let mut conflicts = Vec::new();
         
@@ -270,6 +275,7 @@ impl DependencyResolver {
     }
 
     /// Verifica si dos servicios entran en conflicto
+    #[allow(dead_code)]
     fn services_conflict(&self, service1: &str, service2: &str) -> bool {
         // En una implementación real, aquí se verificarían las entradas
         // Conflicts en los archivos .service
@@ -285,6 +291,7 @@ impl DependencyResolver {
     }
 
     /// Valida las dependencias de un servicio
+    #[allow(dead_code)]
     pub fn validate_dependencies(&self, service_name: &str, available_services: &[String]) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
 
@@ -307,6 +314,7 @@ impl DependencyResolver {
     }
 
     /// Obtiene el grafo completo de dependencias
+    #[allow(dead_code)]
     pub fn build_dependency_graph(&self, services: &[String]) -> Result<HashMap<String, Vec<String>>> {
         let mut graph = HashMap::new();
 
@@ -319,6 +327,7 @@ impl DependencyResolver {
     }
 
     /// Encuentra servicios huérfanos (sin dependencias)
+    #[allow(dead_code)]
     pub fn find_orphan_services(&self, services: &[String]) -> Vec<String> {
         let mut orphans = Vec::new();
 
@@ -334,6 +343,7 @@ impl DependencyResolver {
     }
 
     /// Obtiene información de dependencias
+    #[allow(dead_code)]
     pub fn get_dependency_info(&self, service_name: &str) -> DependencyInfo {
         let mut info = DependencyInfo {
             service_name: service_name.to_string(),
@@ -368,6 +378,7 @@ impl DependencyResolver {
 
 /// Información de dependencias de un servicio
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DependencyInfo {
     pub service_name: String,
     pub requires: Vec<String>,
@@ -378,6 +389,7 @@ pub struct DependencyInfo {
 }
 
 impl DependencyInfo {
+    #[allow(dead_code)]
     pub fn get_summary(&self) -> String {
         format!(
             "{}: {} requires, {} wants, {} after, {} before, {} conflicts",
