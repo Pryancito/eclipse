@@ -134,8 +134,8 @@ if [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ]; then
 fi
 
 # Configuración básica
-# Usar IDE en lugar de VirtIO porque el driver VirtIO está simulando lecturas
-QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=ide"
+# Usar VirtIO para estandarizar el manejo de discos entre hardware real y emulado
+QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=virtio"
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
 QEMU_CMD="$QEMU_CMD -enable-kvm"

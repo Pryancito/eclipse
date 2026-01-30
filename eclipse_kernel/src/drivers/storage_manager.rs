@@ -571,25 +571,85 @@ impl StorageManager {
 
                 // DETECCIÓN ESPECIAL: VirtIO Block Device
                 if device.vendor_id == 0x1AF4 && device.device_id == 0x1001 {
-                    serial_write_str("STORAGE_MANAGER: ✅ VirtIO Block Device encontrado - usando driver VirtIO específico\n");
+                    serial_write_str("STORAGE_MANAGER: ✅ VirtIO Block Device encontrado - inicializando driver VirtIO\n");
                     
-                    let device_info = StorageDeviceInfo {
-                        controller_type: StorageControllerType::VirtIO,
-                        model: format!("VirtIO Block {:04X}:{:04X}", device.vendor_id, device.device_id),
-                        serial: String::from("VIRTIO-SERIAL"),
-                        firmware: String::from("VirtIO"),
-                        capacity: 0, // Se detectará después
-                        block_size: 512,
-                        max_lba: 0,
-                        device_name: String::new(), // Se asignará después
-                    };
+                    // Inicializar el driver VirtIO real
+                    use crate::drivers::virtio_blk::VirtioBlkDriver;
                     
-                    self.devices.push(StorageDevice {
-                        info: device_info,
-                    });
+                    // Necesitamos un framebuffer para la inicialización
+                    if let Some(fb) = crate::drivers::framebuffer::get_framebuffer_mut() {
+                        match VirtioBlkDriver::new(device.clone(), fb) {
+                            Ok(virtio_driver) => {
+                                serial_write_str("STORAGE_MANAGER: ✅ Driver VirtIO inicializado exitosamente\n");
+                                
+                                // Obtener capacidad del dispositivo
+                                let capacity_blocks = virtio_driver.block_count();
+                                let capacity_bytes = capacity_blocks * (virtio_driver.block_size() as u64);
+                                
+                                serial_write_str(&format!("STORAGE_MANAGER: VirtIO capacidad: {} bloques ({} bytes)\n", 
+                                    capacity_blocks, capacity_bytes));
+                                
+                                let device_info = StorageDeviceInfo {
+                                    controller_type: StorageControllerType::VirtIO,
+                                    model: format!("VirtIO Block {:04X}:{:04X}", device.vendor_id, device.device_id),
+                                    serial: String::from("VIRTIO-SERIAL"),
+                                    firmware: String::from("VirtIO"),
+                                    capacity: capacity_bytes,
+                                    block_size: virtio_driver.block_size(),
+                                    max_lba: capacity_blocks,
+                                    device_name: String::new(), // Se asignará después
+                                };
+                                
+                                self.devices.push(StorageDevice {
+                                    info: device_info,
+                                });
+                                
+                                // Guardar el driver VirtIO globalmente
+                                unsafe {
+                                    VIRTIO_BLK_DRIVER = Some(virtio_driver);
+                                }
+                                
+                                serial_write_str(&format!("STORAGE_MANAGER: VirtIO Block agregado: {:04X}:{:04X}\n", 
+                                                         device.vendor_id, device.device_id));
+                            }
+                            Err(e) => {
+                                serial_write_str(&format!("STORAGE_MANAGER: ❌ Error inicializando driver VirtIO: {}\n", e));
+                                // Agregar el dispositivo de todas formas, pero con capacidad 0
+                                let device_info = StorageDeviceInfo {
+                                    controller_type: StorageControllerType::VirtIO,
+                                    model: format!("VirtIO Block {:04X}:{:04X} (error)", device.vendor_id, device.device_id),
+                                    serial: String::from("VIRTIO-ERROR"),
+                                    firmware: String::from("VirtIO"),
+                                    capacity: 0,
+                                    block_size: 512,
+                                    max_lba: 0,
+                                    device_name: String::new(),
+                                };
+                                
+                                self.devices.push(StorageDevice {
+                                    info: device_info,
+                                });
+                            }
+                        }
+                    } else {
+                        serial_write_str("STORAGE_MANAGER: ❌ No hay framebuffer disponible para inicializar VirtIO\n");
+                        // Agregar dispositivo sin inicializar driver
+                        let device_info = StorageDeviceInfo {
+                            controller_type: StorageControllerType::VirtIO,
+                            model: format!("VirtIO Block {:04X}:{:04X} (no fb)", device.vendor_id, device.device_id),
+                            serial: String::from("VIRTIO-NO-FB"),
+                            firmware: String::from("VirtIO"),
+                            capacity: 0,
+                            block_size: 512,
+                            max_lba: 0,
+                            device_name: String::new(),
+                        };
+                        
+                        self.devices.push(StorageDevice {
+                            info: device_info,
+                        });
+                    }
                     
-                    serial_write_str(&format!("STORAGE_MANAGER: VirtIO Block agregado: {:04X}:{:04X}\n", 
-                                             device.vendor_id, device.device_id));
                     continue; // Saltar al siguiente dispositivo
                 }
 
@@ -4098,33 +4158,27 @@ impl StorageManager {
     fn read_virtio_sector(&self, sector: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
         serial_write_str(&format!("STORAGE_MANAGER: Leyendo sector {} con driver VirtIO\n", sector));
         
-        // VirtIO usa memoria mapeada en lugar de puertos I/O
-        // Para simplificar, vamos a simular una lectura exitosa con datos de prueba
-        // En una implementación real, esto accedería a la memoria mapeada del dispositivo VirtIO
-        
-        // Simular datos de prueba para verificar que el sistema funciona
-        if sector == 0 {
-            // Simular un MBR básico
-            buffer[0..512].fill(0);
-            buffer[510] = 0x55;
-            buffer[511] = 0xAA;
-            serial_write_str("STORAGE_MANAGER: Sector 0 simulado con MBR básico\n");
-        } else if sector == 2048 {
-            // Simular un GPT básico
-            buffer[0..512].fill(0);
-            buffer[8..16].copy_from_slice(b"EFI PART");
-            serial_write_str("STORAGE_MANAGER: Sector 2048 simulado con GPT básico\n");
-        } else {
-            // Para otros sectores, llenar con datos de prueba
-            buffer[0..512].fill(0);
-            // Escribir el número de sector en los primeros 8 bytes para verificación
-            let sector_bytes = sector.to_le_bytes();
-            buffer[0..8].copy_from_slice(&sector_bytes);
-            serial_write_str(&format!("STORAGE_MANAGER: Sector {} simulado con datos de prueba\n", sector));
+        // Usar el driver VirtIO real si está disponible
+        unsafe {
+            if let Some(ref virtio_driver) = VIRTIO_BLK_DRIVER {
+                serial_write_str("STORAGE_MANAGER: Usando driver VirtIO real para lectura\n");
+                
+                // Leer usando el driver VirtIO
+                match virtio_driver.read_blocks(sector, buffer) {
+                    Ok(()) => {
+                        serial_write_str(&format!("STORAGE_MANAGER: ✅ Sector {} leído exitosamente con driver VirtIO\n", sector));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        serial_write_str(&format!("STORAGE_MANAGER: ❌ Error leyendo sector {} con driver VirtIO: {}\n", sector, e));
+                        return Err(e);
+                    }
+                }
+            }
         }
         
-        serial_write_str("STORAGE_MANAGER: Sector leído exitosamente con driver VirtIO (simulado)\n");
-        Ok(())
+        serial_write_str("STORAGE_MANAGER: ❌ Driver VirtIO no disponible, no se puede leer\n");
+        Err("Driver VirtIO no inicializado")
     }
 }
 
@@ -4138,6 +4192,9 @@ pub enum StorageSectorType {
 
 // Instancia global del gestor de almacenamiento
 static mut STORAGE_MANAGER: Option<StorageManager> = None;
+
+// Instancia global del driver VirtIO Block
+static mut VIRTIO_BLK_DRIVER: Option<crate::drivers::virtio_blk::VirtioBlkDriver> = None;
 
 /// Inicializar gestor de almacenamiento global
 pub fn init_storage_manager() -> Result<(), &'static str> {
