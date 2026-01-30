@@ -313,7 +313,8 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL: Initializing interrupt system...\n");
     let kernel_code_selector = 0x08; // Kernel code selector
     if let Err(e) = crate::interrupts::manager::initialize_interrupt_system(kernel_code_selector) {
-        serial_write_str("KERNEL: FATAL - Failed to initialize interrupt system!\n");
+        use alloc::format;
+        serial_write_str(&format!("KERNEL: FATAL - Failed to initialize interrupt system: {}\n", e));
         loop {}
     }
     serial_write_str("KERNEL: Interrupt system initialized.\n");
