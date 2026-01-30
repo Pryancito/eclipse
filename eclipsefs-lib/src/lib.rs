@@ -39,6 +39,8 @@ pub mod writer;
 #[cfg(feature = "std")]
 pub mod cache;
 #[cfg(feature = "std")]
+pub mod arc_cache;
+#[cfg(feature = "std")]
 pub mod defragmentation;
 #[cfg(feature = "std")]
 pub mod load_balancing;
@@ -46,9 +48,11 @@ pub mod load_balancing;
 pub mod journal;
 
 #[cfg(feature = "std")]
-pub use reader::EclipseFSReader;
+pub use reader::{EclipseFSReader, CacheType, CacheStats};
 #[cfg(feature = "std")]
 pub use writer::EclipseFSWriter;
+#[cfg(feature = "std")]
+pub use arc_cache::{AdaptiveReplacementCache, ARCStats};
 #[cfg(feature = "std")]
 pub use journal::{Journal, JournalConfig, JournalEntry, JournalStats, TransactionType};
 
