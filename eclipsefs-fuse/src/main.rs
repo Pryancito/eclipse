@@ -135,7 +135,7 @@ impl Filesystem for EclipseFSFuse {
                 // Enviar entradas desde el offset
                 for (i, (name, inode, file_type)) in entries.iter().enumerate() {
                     if i as i64 >= offset {
-                        if reply.add(*inode, offset + i as i64, *file_type, name) {
+                        if reply.add(*inode, (i + 1) as i64, *file_type, name) {
                             break;
                         }
                     }
