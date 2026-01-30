@@ -4,11 +4,11 @@
 use crate::drivers::storage_manager::StorageManager;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Tamaño de bloque estándar (128KB para mejor rendimiento)
-pub const BLOCK_SIZE: usize = 131072; // 128KB
+/// Tamaño de bloque estándar (512 bytes)
+pub const BLOCK_SIZE: usize = 512;
 
 /// Número máximo de bloques en cache
-const CACHE_SIZE: usize = 4; // 4 bloques = 512KB de cache
+const CACHE_SIZE: usize = 64; // 64 bloques = 32KB de cache
 
 /// Cache de bloques estático para el kernel
 pub struct StaticBlockCache {
