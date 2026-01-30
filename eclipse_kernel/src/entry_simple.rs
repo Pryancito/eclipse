@@ -59,21 +59,23 @@ pub extern "C" fn multiboot2_entry(framebuffer_info_ptr: *const FramebufferInfo)
             fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask
         );
 
-        // Inicializar sistema de syscalls
+        // Initialize syscall system
         let _syscall_handler = init_syscall_system();
 
-        // Inicializar sistema de interrupciones
-        let kernel_code_selector = 0x08; // Selector de código del kernel
-        let _ = initialize_interrupt_system(kernel_code_selector);
+        // Initialize interrupt system
+        let kernel_code_selector = 0x08; // Kernel code selector
+        if let Err(e) = initialize_interrupt_system(kernel_code_selector) {
+            panic!("Failed to initialize interrupt system: {}", e);
+        }
 
-        // Obtener el framebuffer mutable
+        // Get mutable framebuffer
         if let Some(fb) = get_framebuffer() {
             kernel_main(fb);
         } else {
-            panic!("No se pudo obtener el framebuffer");
+            panic!("Failed to obtain framebuffer");
         }
 
-        // El kernel nunca debería llegar aquí, pero por seguridad
+        // Kernel should never reach here, but as a safety measure
         loop {
             core::hint::spin_loop();
         }
