@@ -251,9 +251,7 @@ pub fn initialize_interrupt_system(kernel_code_selector: u16) -> Result<(), &'st
         
         // CRÍTICO: Cargar la IDT DESPUÉS de mover el manager a su ubicación final
         // Si se carga antes, IDTR apuntaría a la dirección del stack (ahora inválida)
-        if let Some(ref mgr) = INTERRUPT_MANAGER {
-            mgr.load_idt();
-        }
+        INTERRUPT_MANAGER.as_ref().unwrap().load_idt();
     }
 
     Ok(())
