@@ -29,7 +29,7 @@
 //!
 
 use crate::bootloader_data;
-use crate::drivers::storage_manager::{StorageManager, StorageSectorType};
+use crate::drivers::storage_manager::{StorageManager, StorageSectorType, get_storage_manager_mut};
 use crate::filesystem::vfs::{get_vfs, init_vfs, FileSystem, StatInfo, VfsError};
 use crate::filesystem::block_cache::{get_block_cache, read_data_from_offset, BLOCK_SIZE};
 use eclipsefs_lib::{format::constants as ecfs_constants, EclipseFSError, EclipseFSHeader, InodeTableEntry};
@@ -490,9 +490,13 @@ impl EclipseFSWrapper {
     pub fn sync_to_disk(&mut self) -> Result<(), VfsError> {
         crate::debug::serial_write_str("ECLIPSEFS: Sincronizando cambios al disco...\n");
         
+        // Obtener referencia al storage manager global
+        let storage = get_storage_manager_mut()
+            .ok_or(VfsError::DeviceError("Storage manager no disponible".into()))?;
+        
         // Sincronizar cache de bloques
         get_block_cache().sync(
-            &mut StorageManager::new(),
+            storage,
             self.partition_index
         ).map_err(|_| VfsError::InvalidOperation)?;
         
@@ -531,8 +535,9 @@ impl EclipseFSWrapper {
             return Ok(1);
         }
         
-        // Buscar en la tabla de inodos
-        let mut storage = StorageManager::new();
+        // Obtener referencia al storage manager global
+        let storage = get_storage_manager_mut()
+            .ok_or(VfsError::DeviceError("Storage manager no disponible".into()))?;
         
         // Empezar desde la raíz (inode 1) y navegar por cada componente de la ruta
         let path_parts: Vec<&str> = normalized.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
@@ -542,7 +547,7 @@ impl EclipseFSWrapper {
             crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Buscando '{}' en inodo {}\n", part, current_inode));
             
             // Cargar el nodo actual
-            let node = self.load_node_lazy(current_inode, &mut storage)?;
+            let node = self.load_node_lazy(current_inode, storage)?;
             
             // Si es el último componente de la ruta, podríamos estar buscando un archivo
             // De lo contrario, debe ser un directorio
@@ -577,7 +582,7 @@ impl EclipseFSWrapper {
                 };
                 
                 // Cargar el nodo encontrado para verificar si es un symlink
-                let found_node = self.load_node_lazy(found_inode, &mut storage)?;
+                let found_node = self.load_node_lazy(found_inode, storage)?;
                 
                 if found_node.kind == eclipsefs_lib::NodeKind::Symlink {
                     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: '{}' es un symlink, siguiendo...\n", part));
@@ -1552,11 +1557,12 @@ impl FileSystem for EclipseFSWrapper {
     fn read(&self, inode: u32, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo inodo {} offset {} ({} bytes)\n", inode, offset, buffer.len()));
         
-        // Crear un storage manager temporal para la operación de lectura
-        let mut storage = StorageManager::new();
+        // Obtener referencia al storage manager global
+        let storage = get_storage_manager_mut()
+            .ok_or(VfsError::DeviceError("Storage manager no disponible".into()))?;
         
         // Cargar el nodo bajo demanda
-        let node = self.load_node_lazy(inode, &mut storage)?;
+        let node = self.load_node_lazy(inode, storage)?;
         
         // Si es un archivo, obtener los datos
         if node.kind == eclipsefs_lib::NodeKind::File {
@@ -1590,11 +1596,12 @@ impl FileSystem for EclipseFSWrapper {
     fn stat(&self, inode: u32) -> Result<StatInfo, VfsError> {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Stat inodo {} (lazy)\n", inode));
         
-        // Crear un storage manager temporal para la operación de lectura
-        let mut storage = StorageManager::new();
+        // Obtener referencia al storage manager global
+        let storage = get_storage_manager_mut()
+            .ok_or(VfsError::DeviceError("Storage manager no disponible".into()))?;
         
         // Cargar el nodo bajo demanda
-        let node = self.load_node_lazy(inode, &mut storage)?;
+        let node = self.load_node_lazy(inode, storage)?;
         
     Ok(StatInfo {
             inode,
@@ -1653,11 +1660,12 @@ impl FileSystem for EclipseFSWrapper {
             }
         };
         
-        // Crear un storage manager para la operación de lectura
-        let mut storage = StorageManager::new();
+        // Obtener referencia al storage manager global
+        let storage = get_storage_manager_mut()
+            .ok_or(VfsError::DeviceError("Storage manager no disponible".into()))?;
         
         // Cargar el nodo
-        let node = match self.load_node_lazy(inode, &mut storage) {
+        let node = match self.load_node_lazy(inode, storage) {
             Ok(node) => {
                 crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} cargado exitosamente\n", inode));
                 node
