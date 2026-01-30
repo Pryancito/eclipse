@@ -160,31 +160,40 @@ impl EclipseFSWrapper {
             "ECLIPSEFS: Nodo {} - tamaño del registro: {} bytes\n", inode_num, record_size
         ));
 
-        // Ahora leer el registro completo usando un Vec con el tamaño correcto
+        // Calcular el tamaño de los datos TLV (excluyendo la cabecera ya leída)
+        let tlv_size = record_size - ecfs_constants::NODE_RECORD_HEADER_SIZE;
+        
+        // Crear buffer completo: cabecera + datos TLV
         let mut node_buffer = alloc::vec![0u8; record_size];
-        let bytes_read = read_data_from_offset(
+        
+        // Copiar la cabecera ya leída al inicio del buffer
+        node_buffer[..ecfs_constants::NODE_RECORD_HEADER_SIZE].copy_from_slice(&header_buffer);
+        
+        // Leer solo los datos TLV (sin releer la cabecera)
+        let tlv_bytes_read = read_data_from_offset(
             get_block_cache(),
             storage,
             self.partition_index,
-            absolute_offset,
-            &mut node_buffer
+            absolute_offset + ecfs_constants::NODE_RECORD_HEADER_SIZE as u64,
+            &mut node_buffer[ecfs_constants::NODE_RECORD_HEADER_SIZE..]
         ).map_err(|e| {
-            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error en read_data_from_offset: {}\n", e));
-            VfsError::IoError(alloc::format!("Error leyendo nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error leyendo datos TLV del nodo: {}\n", e));
+            VfsError::IoError(alloc::format!("Error leyendo datos TLV del nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
         })?;
 
-        if bytes_read < record_size {
+        if tlv_bytes_read < tlv_size {
             crate::debug::serial_write_str(&alloc::format!(
-                "ECLIPSEFS: ERROR - Registro incompleto: se esperaban {} bytes, se leyeron {}\n",
-                record_size, bytes_read
+                "ECLIPSEFS: ERROR - Datos TLV incompletos: se esperaban {} bytes, se leyeron {}\n",
+                tlv_size, tlv_bytes_read
             ));
-            return Err(VfsError::InvalidFs("Registro de nodo incompleto".into()));
+            return Err(VfsError::InvalidFs("Datos TLV de nodo incompletos".into()));
         }
 
-        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes totales: {} cabecera + {} TLV)\n", 
+            inode_num, record_size, ecfs_constants::NODE_RECORD_HEADER_SIZE, tlv_bytes_read));
 
         // Parsear el nodo desde el buffer usando formato TLV
-        let node = self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)?;
+        let node = self.parse_node_from_buffer(&node_buffer, inode_num)?;
         
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} parseado exitosamente (tipo: {:?}, tamaño: {})\n", 
             inode_num, node.kind, node.size));
