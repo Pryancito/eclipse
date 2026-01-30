@@ -129,7 +129,10 @@ impl EclipseFSWrapper {
             self.partition_index,
             absolute_offset,
             &mut node_buffer
-        ).map_err(|_| VfsError::InvalidOperation)?;
+        ).map_err(|e| {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error en read_data_from_offset: {}\n", e));
+            VfsError::InvalidOperation
+        })?;
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
 
@@ -329,6 +332,12 @@ impl EclipseFSWrapper {
                     crate::debug::serial_write_str(&alloc::format!(
                         "ECLIPSEFS: Directorio con {} entradas\n", children.len()
                     ));
+                    // Log all children for debugging
+                    for (child_name, child_inode) in children.iter() {
+                        crate::debug::serial_write_str(&alloc::format!(
+                            "ECLIPSEFS:   - '{}' -> inodo {}\n", child_name, child_inode
+                        ));
+                    }
                 }
                 _ => {
                     // Ignorar tags desconocidos
@@ -534,6 +543,8 @@ impl EclipseFSWrapper {
             
             // Buscar el nombre en los hijos del directorio
             if node.kind == eclipsefs_lib::NodeKind::Directory {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Directorio inodo {} tiene {} hijos\n", current_inode, node.children.len()));
+                
                 let mut found_inode = None;
                 // node.children es un FnvIndexMap<String, u32> que se itera como (key, value)
                 for (child_name, child_inode) in node.children.iter() {
@@ -547,7 +558,10 @@ impl EclipseFSWrapper {
                 let found_inode = match found_inode {
                     Some(inode) => inode,
                     None => {
-                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio\n", part));
+                        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: No se encontró '{}' en el directorio inodo {}. Hijos disponibles:\n", part, current_inode));
+                        for (child_name, child_inode) in node.children.iter() {
+                            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS:   - '{}' -> inodo {}\n", child_name, child_inode));
+                        }
                         return Err(VfsError::FileNotFound);
                     }
                 };
@@ -1631,13 +1645,31 @@ impl FileSystem for EclipseFSWrapper {
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Leyendo archivo '{}' (lazy)\n", path));
         
         // Resolver la ruta a un inode (esto ya sigue symlinks automáticamente)
-        let inode = self.resolve_path(path)?;
+        let inode = match self.resolve_path(path) {
+            Ok(inode) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Ruta '{}' resuelta a inodo {}\n", path, inode));
+                inode
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error resolviendo ruta '{}': {:?}\n", path, e));
+                return Err(e);
+            }
+        };
         
         // Crear un storage manager para la operación de lectura
         let mut storage = StorageManager::new();
         
         // Cargar el nodo
-        let node = self.load_node_lazy(inode, &mut storage)?;
+        let node = match self.load_node_lazy(inode, &mut storage) {
+            Ok(node) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} cargado exitosamente\n", inode));
+                node
+            }
+            Err(e) => {
+                crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error cargando nodo {}: {:?}\n", inode, e));
+                return Err(e);
+            }
+        };
         
         // Verificar que sea un archivo (después de seguir symlinks, debería serlo)
         if node.kind != eclipsefs_lib::NodeKind::File {
