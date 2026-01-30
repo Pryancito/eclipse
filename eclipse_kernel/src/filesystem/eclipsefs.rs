@@ -134,10 +134,20 @@ impl EclipseFSWrapper {
             VfsError::InvalidOperation
         })?;
 
+        if bytes_read == 0 {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: ERROR - Se leyeron 0 bytes para el nodo {}\n", inode_num));
+            return Err(VfsError::InvalidFs("No se pudieron leer datos del nodo".into()));
+        }
+
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
 
         // Parsear el nodo desde el buffer usando formato TLV
-        self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)
+        let node = self.parse_node_from_buffer(&node_buffer[..bytes_read], inode_num)?;
+        
+        crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} parseado exitosamente (tipo: {:?}, tamaño: {})\n", 
+            inode_num, node.kind, node.size));
+        
+        Ok(node)
     }
 
     /// Parsear un nodo desde un buffer TLV
