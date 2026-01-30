@@ -2536,7 +2536,7 @@ impl StorageManager {
             }
         }
 
-        // OPTIMIZACIÓN: Lectura integral con batches (trasbase de datos)
+        // OPTIMIZACIÓN: Lectura integral con batches (transferencia de datos)
         // En lugar de leer sector por sector, leer en batches
         // AJUSTADO PARA QEMU: usa batches de 8 sectores (4KB) que QEMU maneja bien
         // Esto reduce 100,000 lecturas a ~12,500 para un archivo de 51.2MB (8x mejora)
@@ -2561,7 +2561,10 @@ impl StorageManager {
                         sectors_read += sectors_in_batch;
                         continue;
                     }
-                    Err(_) => {
+                    Err(batch_error) => {
+                        // Log del error del batch para diagnóstico
+                        serial_write_str(&format!("STORAGE_MANAGER: Lectura batch falló ({}), usando fallback sector-por-sector\n", batch_error));
+                        
                         // Si falla el batch, leer sector por sector solo para este batch
                         for i in 0..sectors_in_batch {
                             let sector_offset = i * SECTOR_SIZE;
@@ -3836,67 +3839,39 @@ impl StorageManager {
     
     /// Lectura batch genérica de múltiples sectores consecutivos
     /// Implementa la estrategia de "lectura integral" para reducir operaciones de I/O
-    /// OPTIMIZADO PARA QEMU: usa batches pequeños que QEMU maneja bien
+    /// OPTIMIZADO PARA QEMU: usa el driver IDE multi-sector cuando es posible
     fn read_sectors_batch(&self, start_sector: u64, num_sectors: usize, buffer: &mut [u8]) -> Result<(), &'static str> {
-        if buffer.len() < num_sectors * 512 {
-            return Err("Buffer demasiado pequeño para lectura batch");
+        const SECTOR_SIZE: usize = 512;
+        
+        if buffer.len() < num_sectors * SECTOR_SIZE {
+            return Err("Buffer too small for batch read");
         }
         
         // Obtener el dispositivo (asumiendo dispositivo 0)
         if self.devices.is_empty() {
-            return Err("No hay dispositivos disponibles");
+            return Err("No devices available");
         }
         let device = &self.devices[0];
         
-        // OPTIMIZACIÓN QEMU: En QEMU, los comandos multi-sector grandes pueden fallar
-        // En su lugar, usamos batches pequeños de 8 sectores (4KB) que son más confiables
-        // Esto aún reduce significativamente las operaciones vs sector-por-sector
-        
-        // Para VirtIO (común en QEMU), intentar lectura batch optimizada
-        if matches!(device.info.controller_type, StorageControllerType::VirtIO) {
-            // VirtIO en QEMU maneja bien lecturas medianas
-            const VIRTIO_BATCH_SIZE: usize = 32; // 16KB - tamaño óptimo para VirtIO en QEMU
-            let mut sectors_read = 0;
-            
-            while sectors_read < num_sectors {
-                let batch_size = core::cmp::min(VIRTIO_BATCH_SIZE, num_sectors - sectors_read);
-                let offset = sectors_read * 512;
-                let batch_buffer_size = batch_size * 512;
-                let batch_buffer = &mut buffer[offset..offset + batch_buffer_size];
-                
-                // VirtIO puede leer batches directamente
-                for i in 0..batch_size {
-                    let sector_buf = &mut batch_buffer[i * 512..(i + 1) * 512];
-                    self.read_device_sector_with_type(&device.info, start_sector + (sectors_read + i) as u64, sector_buf, StorageSectorType::EclipseFS)?;
+        // ESTRATEGIA 1: Intentar lectura multi-sector nativa del driver IDE
+        // Esto es un batch real, no un loop - lee múltiples sectores en un comando
+        if matches!(device.info.controller_type, 
+                   StorageControllerType::ATA |
+                   StorageControllerType::IntelRAID | 
+                   StorageControllerType::AHCI) {
+            // read_ide_modern_sectors implementa batch real usando comandos IDE multi-sector
+            match self.read_ide_modern_sectors(start_sector, num_sectors, buffer) {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    // Si falla, intentar con VirtIO o continuar con fallback
                 }
-                
-                sectors_read += batch_size;
             }
-            return Ok(());
         }
         
-        // Para ATA/IDE en QEMU, usar batches muy pequeños (8 sectores = 4KB)
-        // QEMU emula IDE de manera conservadora y batches grandes pueden fallar
-        const QEMU_SAFE_BATCH_SIZE: usize = 8; // 4KB - muy confiable en QEMU
-        let mut sectors_read = 0;
-        
-        while sectors_read < num_sectors {
-            let batch_size = core::cmp::min(QEMU_SAFE_BATCH_SIZE, num_sectors - sectors_read);
-            let offset = sectors_read * 512;
-            let batch_buffer_size = batch_size * 512;
-            let batch_buffer = &mut buffer[offset..offset + batch_buffer_size];
-            
-            // Leer este batch sector por sector (pero agrupado lógicamente)
-            // Esto permite mejor manejo de caché y reduce overhead de llamadas
-            for i in 0..batch_size {
-                let sector_buf = &mut batch_buffer[i * 512..(i + 1) * 512];
-                self.read_device_sector_with_type(&device.info, start_sector + (sectors_read + i) as u64, sector_buf, StorageSectorType::EclipseFS)?;
-            }
-            
-            sectors_read += batch_size;
-        }
-        
-        Ok(())
+        // ESTRATEGIA 2: Para VirtIO en QEMU, el driver puede no soportar multi-sector
+        // En este caso, fallar y dejar que el caller haga sector-por-sector
+        // No hacemos loop aquí para evitar duplicar la lógica del caller
+        Err("Batch read not supported for this controller")
     }
     
     /// Escribir sector usando driver IDE moderno para controladoras Intel IDE
