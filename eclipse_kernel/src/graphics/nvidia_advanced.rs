@@ -133,6 +133,9 @@ impl NvidiaAdvancedDriver {
         // Detectar límite de potencia
         let power_limit = self.detect_power_limit(device);
         
+        // Detectar versión CUDA según arquitectura
+        let (cuda_version, architecture) = self.detect_cuda_architecture(device);
+        
         Ok(NvidiaGpuInfo {
             pci_device: device.clone(),
             gpu_name,
@@ -149,12 +152,53 @@ impl NvidiaAdvancedDriver {
             power_limit,
             temperature: 0, // Se actualizará en tiempo real
             fan_speed: 0,   // Se actualizará en tiempo real
-            driver_version: String::from("2.0.0"),
-            cuda_version: String::from("12.0"),
+            driver_version: String::from("2.5.0"),
+            cuda_version,
             vulkan_support: true,
             opengl_support: true,
             directx_support: true,
         })
+    }
+
+    /// Detectar arquitectura CUDA y versión según GPU
+    fn detect_cuda_architecture(&self, device: &PciDevice) -> (String, String) {
+        match (device.vendor_id, device.device_id) {
+            // RTX 50 Series - Blackwell - CUDA 12.7+ (Compute 10.0)
+            (0x10DE, 0x2D00..=0x2DFF) => (
+                String::from("12.7"),
+                String::from("Blackwell (sm_100)")
+            ),
+            
+            // RTX 40 Series - Ada Lovelace - CUDA 12.0+ (Compute 8.9)
+            (0x10DE, 0x2600..=0x28FF) => (
+                String::from("12.3"),
+                String::from("Ada Lovelace (sm_89)")
+            ),
+            
+            // RTX 30 Series - Ampere - CUDA 11.1+ (Compute 8.6)
+            (0x10DE, 0x2200..=0x25FF) => (
+                String::from("12.0"),
+                String::from("Ampere (sm_86)")
+            ),
+            
+            // RTX 20 Series - Turing - CUDA 10.0+ (Compute 7.5)
+            (0x10DE, 0x1F00..=0x1FFF) => (
+                String::from("11.8"),
+                String::from("Turing (sm_75)")
+            ),
+            
+            // Hopper (Data Center) - CUDA 12.0+ (Compute 9.0)
+            (0x10DE, 0x2330..=0x233F) => (
+                String::from("12.6"),
+                String::from("Hopper (sm_90)")
+            ),
+            
+            // Default
+            _ => (
+                String::from("11.0"),
+                String::from("Unknown")
+            ),
+        }
     }
 
     /// Detectar modelo específico de GPU NVIDIA
@@ -368,18 +412,55 @@ impl NvidiaAdvancedDriver {
         }
     }
 
-    /// Calcular ancho de banda de memoria
+    /// Calcular ancho de banda de memoria con configuraciones específicas por GPU
     fn calculate_memory_bandwidth(&self, memory_clock: u32, total_memory: u64) -> u64 {
-        // Fórmula simplificada: (memory_clock * bus_width * 2) / 8
-        // Asumiendo bus de 256 bits para la mayoría de GPUs modernas
-        let bus_width = 256;
-        ((memory_clock as u64 * bus_width * 2) / 8) / 1000000 // Convertir a GB/s
+        // Determinar ancho de bus según la GPU
+        // RTX 50 series usa GDDR7 con buses más anchos
+        // Hopper usa HBM3/HBM3e con buses ultra anchos
+        let bus_width = if total_memory >= 80 * 1024 * 1024 * 1024 {
+            // Hopper (H100/H200) - HBM3/HBM3e con bus de 5120 bits
+            5120
+        } else if total_memory >= 24 * 1024 * 1024 * 1024 {
+            // GPUs de gama alta (RTX 3090, 4090, 5090) - 384 bits
+            384
+        } else if total_memory >= 16 * 1024 * 1024 * 1024 {
+            // GPUs de gama media-alta - 256 bits
+            256
+        } else if total_memory >= 8 * 1024 * 1024 * 1024 {
+            // GPUs de gama media - 256 bits
+            256
+        } else {
+            // GPUs entry-level - 128/192 bits
+            192
+        };
+        
+        // Fórmula: (memory_clock * bus_width * 2) / 8 / 1000 para GB/s
+        // El *2 es por DDR (Double Data Rate)
+        ((memory_clock as u64 * bus_width * 2) / 8) / 1000
     }
 
-    /// Detectar información PCIe
+    /// Detectar información PCIe real según generación de GPU
     fn detect_pcie_info(&self, device: &PciDevice) -> (u8, u8) {
-        // Por ahora, asumir PCIe 4.0 x16
-        (4, 16)
+        // Detectar versión PCIe y lanes según la generación de GPU
+        match (device.vendor_id, device.device_id) {
+            // RTX 50 Series - PCIe 5.0 x16
+            (0x10DE, 0x2D01..=0x2D0F) => (5, 16),
+            
+            // RTX 40 Series - PCIe 4.0 x16
+            (0x10DE, 0x2600..=0x28FF) => (4, 16),
+            
+            // RTX 30 Series - PCIe 4.0 x16
+            (0x10DE, 0x2200..=0x25FF) => (4, 16),
+            
+            // RTX 20 Series - PCIe 3.0 x16
+            (0x10DE, 0x1F00..=0x1FFF) => (3, 16),
+            
+            // Hopper (Data Center) - PCIe 5.0 x16
+            (0x10DE, 0x2330..=0x233F) => (5, 16),
+            
+            // Por defecto PCIe 3.0 x16
+            _ => (3, 16),
+        }
     }
 
     /// Detectar límite de potencia
