@@ -131,7 +131,7 @@ impl EclipseFSWrapper {
             &mut node_buffer
         ).map_err(|e| {
             crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error en read_data_from_offset: {}\n", e));
-            VfsError::InvalidOperation
+            VfsError::IoError(alloc::format!("Error leyendo nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
         })?;
 
         if bytes_read == 0 {
@@ -751,30 +751,18 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     
     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) 📋 Leyendo EclipseFS desde {} (sector 0 de la partición)\n", partition.name));
     
-    // Leer el superblock de EclipseFS directamente desde /dev/sda2
-    // Como el driver ATA directo falla, vamos a leer directamente desde el sector donde está EclipseFS
-    // Determinar sector offset según el dispositivo
-    // Particiones 2 típicamente empiezan después de la partición 1 (boot)
-    let is_second_partition = partition.name.ends_with("2") || partition.name.ends_with("p2");
-    let sector_offset = if is_second_partition {
-        // EclipseFS está instalado en /dev/sda2, que empieza en el sector 20973568 (según el instalador)
-        // Pero vamos a leer directamente desde el inicio de la partición
-        20973568
-    } else {
-        partition.start_lba
-    };
-    
-    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Leyendo desde sector {} de {} (offset de partición: {})\n", 
-                                                   sector_offset, partition.name, partition.start_lba));
-    
     // Leer realmente desde el disco usando el storage manager
     crate::debug::serial_write_str("ECLIPSEFS: (root) Leyendo realmente desde el disco\n");
     
     // CORRECCIÓN CRÍTICA: Encontrar el índice correcto de la partición en el vector de particiones
     // No podemos asumir que partition 2 = index 1, debemos buscar la partición por sus propiedades
-    let partition_index = storage.partitions.iter()
+    let partition_position = storage.partitions.iter()
         .position(|p| p.name == partition.name && p.start_lba == partition.start_lba)
-        .ok_or(VfsError::DeviceError("Partición no encontrada en storage manager".into()))? as u32;
+        .ok_or(VfsError::DeviceError("Partición no encontrada en storage manager".into()))?;
+    
+    // Verificar que el índice cabe en u32
+    let partition_index = u32::try_from(partition_position)
+        .map_err(|_| VfsError::DeviceError("Índice de partición demasiado grande".into()))?;
         
     crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Partición '{}' encontrada en índice {} del vector de particiones\n", 
         partition.name, partition_index));
