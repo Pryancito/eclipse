@@ -770,15 +770,14 @@ pub fn mount_root_fs_from_storage(storage: &StorageManager) -> Result<(), VfsErr
     // Leer realmente desde el disco usando el storage manager
     crate::debug::serial_write_str("ECLIPSEFS: (root) Leyendo realmente desde el disco\n");
     
-    // Leer el boot sector desde la partición usando el storage manager
-    // CORRECCIÓN: Usar el índice correcto de la partición (/dev/sda2 = índice 1)
-    // Determinar índice de partición (0=primera, 1=segunda, etc.)
-    let partition_index = if partition.name.ends_with("2") || partition.name.ends_with("p2") {
-        1
-    } else {
-        0
-    };
-    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Usando índice de partición {} para {}\n", partition_index, partition.name));
+    // CORRECCIÓN CRÍTICA: Encontrar el índice correcto de la partición en el vector de particiones
+    // No podemos asumir que partition 2 = index 1, debemos buscar la partición por sus propiedades
+    let partition_index = storage.partitions.iter()
+        .position(|p| p.name == partition.name && p.start_lba == partition.start_lba)
+        .ok_or(VfsError::DeviceError("Partición no encontrada en storage manager".into()))? as u32;
+        
+    crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: (root) Partición '{}' encontrada en índice {} del vector de particiones\n", 
+        partition.name, partition_index));
     
     // NUEVA ESTRATEGIA: Buscar EclipseFS en diferentes sectores dentro de la partición
     let mut eclipsefs_found = false;
