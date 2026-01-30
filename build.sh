@@ -127,9 +127,9 @@ build_bootloader() {
     
     cd bootloader-uefi
     
-    # Compilar el bootloader directamente con cargo
+    # Compilar el bootloader directamente con cargo usando nightly
     print_status "Compilando bootloader para target $UEFI_TARGET..."
-    cargo build --release --target "$UEFI_TARGET"
+    cargo +nightly build --release --target "$UEFI_TARGET"
     
     if [ $? -eq 0 ]; then
         print_success "Bootloader UEFI compilado exitosamente"

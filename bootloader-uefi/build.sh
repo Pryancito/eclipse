@@ -18,18 +18,18 @@ fi
 
 # Instalar dependencias si es necesario
 echo "📦 Verificando dependencias..."
-cargo check --target x86_64-unknown-uefi
+cargo +nightly check --target x86_64-unknown-uefi
 
 if [ $? -ne 0 ]; then
     echo "🔧 Instalando dependencias UEFI..."
-    rustup target add x86_64-unknown-uefi
+    rustup target add x86_64-unknown-uefi --toolchain nightly
     cargo install cargo-xbuild
 fi
 
 # Compilar el bootloader simplificado
 echo ""
 echo "🔨 Compilando bootloader UEFI simplificado..."
-cargo build --release --target x86_64-unknown-uefi
+cargo +nightly build --release --target x86_64-unknown-uefi
 
 if [ $? -eq 0 ]; then
     echo ""
