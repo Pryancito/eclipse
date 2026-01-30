@@ -2514,12 +2514,37 @@ impl StorageManager {
         let partition_offset = partition.start_lba;
         let absolute_block = block + partition_offset;
         
+        const SECTOR_SIZE: usize = 512;
+        let num_sectors = (buffer.len() + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        
         // Leer desde el dispositivo usando el offset absoluto
-        serial_write_str(&format!("STORAGE_MANAGER: Leyendo desde partición {} ({}) bloque {} (offset {} -> LBA absoluto {}) ({} bytes)\n", 
-                                 partition_index, partition.name, block, partition_offset, absolute_block, buffer.len()));
+        serial_write_str(&format!("STORAGE_MANAGER: Leyendo desde partición {} ({}) bloque {} (offset {} -> LBA absoluto {}) ({} bytes = {} sectores)\n", 
+                                 partition_index, partition.name, block, partition_offset, absolute_block, buffer.len(), num_sectors));
 
-        // Usar read_device_sector para leer el bloque absoluto
-        self.read_device_sector_with_type(&device.info, absolute_block, buffer, StorageSectorType::EclipseFS)
+        // OPTIMIZACIÓN: Para lecturas multi-sector, usar función optimizada de IDE
+        if num_sectors > 1 && matches!(device.info.controller_type, StorageControllerType::IntelRAID | StorageControllerType::AHCI) {
+            // Intentar lectura multi-sector directa con IDE
+            match self.read_ide_modern_sectors(absolute_block, num_sectors, buffer) {
+                Ok(_) => {
+                    serial_write_str(&format!("STORAGE_MANAGER: Lectura multi-sector exitosa ({} sectores)\n", num_sectors));
+                    return Ok(());
+                }
+                Err(e) => {
+                    serial_write_str(&format!("STORAGE_MANAGER: Lectura multi-sector IDE falló: {}, usando fallback\n", e));
+                    // Continuar con fallback
+                }
+            }
+        }
+
+        // Fallback: leer sector por sector si la lectura multi-sector no está disponible o falló
+        for i in 0..num_sectors {
+            let sector_offset = i * SECTOR_SIZE;
+            let bytes_to_read = core::cmp::min(SECTOR_SIZE, buffer.len() - sector_offset);
+            let sector_buffer = &mut buffer[sector_offset..sector_offset + bytes_to_read];
+            
+            self.read_device_sector_with_type(&device.info, absolute_block + i as u64, sector_buffer, StorageSectorType::EclipseFS)?;
+        }
+        Ok(())
     }
 
     /// Escribir a una partición específica
@@ -3542,6 +3567,129 @@ impl StorageManager {
         } else {
             Err("Partición no encontrada")
         }
+    }
+    
+    /// Leer múltiples sectores usando driver IDE moderno para controladoras Intel IDE
+    fn read_ide_modern_sectors(&self, start_sector: u64, num_sectors: usize, buffer: &mut [u8]) -> Result<(), &'static str> {
+        serial_write_str(&format!("STORAGE_MANAGER: Leyendo {} sectores desde sector {} con driver IDE moderno\n", num_sectors, start_sector));
+        
+        if buffer.len() < num_sectors * 512 {
+            return Err("Buffer demasiado pequeño para la cantidad de sectores solicitados");
+        }
+        
+        // Intel IDE Primary Master (puerto 0x1F0)
+        const IDE_DATA_PORT: u16 = 0x1F0;
+        const IDE_SECTOR_COUNT: u16 = 0x1F2;
+        const IDE_SECTOR_NUMBER: u16 = 0x1F3;
+        const IDE_CYLINDER_LOW: u16 = 0x1F4;
+        const IDE_CYLINDER_HIGH: u16 = 0x1F5;
+        const IDE_DRIVE_HEAD: u16 = 0x1F6;
+        const IDE_COMMAND: u16 = 0x1F7;
+        const IDE_STATUS: u16 = 0x1F7;
+        
+        // Comando READ SECTORS
+        const CMD_READ_SECTORS: u8 = 0x20;
+        
+        // Estado del controlador
+        const STATUS_BSY: u8 = 0x80;  // Busy
+        const STATUS_DRDY: u8 = 0x40; // Drive Ready
+        const STATUS_DF: u8 = 0x20;   // Drive Fault
+        const STATUS_DRQ: u8 = 0x08;  // Data Request
+        const STATUS_ERR: u8 = 0x01;  // Error
+        
+        // Leer sectores en bloques (máximo 256 sectores por comando)
+        let mut sectors_read = 0;
+        while sectors_read < num_sectors {
+            let sectors_to_read = core::cmp::min(256, num_sectors - sectors_read);
+            let current_sector = start_sector + sectors_read as u64;
+            let buffer_offset = sectors_read * 512;
+            
+            // Esperar que el controlador no esté ocupado
+            unsafe {
+                for _ in 0..1000 {
+                    let status: u8;
+                    core::arch::asm!("in al, dx", out("al") status, in("dx") IDE_STATUS, options(nostack, preserves_flags));
+                    if (status & STATUS_BSY) == 0 {
+                        break;
+                    }
+                    for _ in 0..1000 {
+                        core::arch::asm!("nop", options(nostack, preserves_flags));
+                    }
+                }
+            }
+            
+            // Configurar parámetros del comando
+            unsafe {
+                // Número de sectores a leer (0 = 256 sectores)
+                let sector_count = if sectors_to_read == 256 { 0 } else { sectors_to_read as u8 };
+                core::arch::asm!("out dx, al", in("al") sector_count, in("dx") IDE_SECTOR_COUNT, options(nostack, preserves_flags));
+                
+                // Número de sector (LBA 28-bit)
+                let sector_low = (current_sector & 0xFF) as u8;
+                core::arch::asm!("out dx, al", in("al") sector_low, in("dx") IDE_SECTOR_NUMBER, options(nostack, preserves_flags));
+                
+                let sector_mid = ((current_sector >> 8) & 0xFF) as u8;
+                core::arch::asm!("out dx, al", in("al") sector_mid, in("dx") IDE_CYLINDER_LOW, options(nostack, preserves_flags));
+                
+                let sector_high = ((current_sector >> 16) & 0xFF) as u8;
+                core::arch::asm!("out dx, al", in("al") sector_high, in("dx") IDE_CYLINDER_HIGH, options(nostack, preserves_flags));
+                
+                // Drive/Head register (LBA mode, Master drive)
+                let drive_head = 0xE0 | (((current_sector >> 24) & 0x0F) as u8);
+                core::arch::asm!("out dx, al", in("al") drive_head, in("dx") IDE_DRIVE_HEAD, options(nostack, preserves_flags));
+                
+                // Enviar comando READ SECTORS
+                core::arch::asm!("out dx, al", in("al") CMD_READ_SECTORS, in("dx") IDE_COMMAND, options(nostack, preserves_flags));
+            }
+            
+            // Leer cada sector del bloque
+            for sector_idx in 0..sectors_to_read {
+                // Esperar a que los datos estén listos
+                unsafe {
+                    for _ in 0..10000 {
+                        let status: u8;
+                        core::arch::asm!("in al, dx", out("al") status, in("dx") IDE_STATUS, options(nostack, preserves_flags));
+                        
+                        if (status & STATUS_ERR) != 0 {
+                            serial_write_str("STORAGE_MANAGER: Error en estado del controlador IDE\n");
+                            return Err("Error en controlador IDE");
+                        }
+                        
+                        if (status & STATUS_DRQ) != 0 {
+                            break; // Datos listos
+                        }
+                        
+                        if (status & STATUS_BSY) != 0 {
+                            continue; // Aún ocupado
+                        }
+                        
+                        for _ in 0..1000 {
+                            core::arch::asm!("nop", options(nostack, preserves_flags));
+                        }
+                    }
+                }
+                
+                // Leer datos del sector (512 bytes)
+                let sector_buffer_offset = buffer_offset + sector_idx * 512;
+                unsafe {
+                    for i in 0..256 { // 256 palabras de 16 bits = 512 bytes
+                        let word: u16;
+                        core::arch::asm!("in ax, dx", out("ax") word, in("dx") IDE_DATA_PORT, options(nostack, preserves_flags));
+                        
+                        let byte1 = (word & 0xFF) as u8;
+                        let byte2 = ((word >> 8) & 0xFF) as u8;
+                        
+                        buffer[sector_buffer_offset + i * 2] = byte1;
+                        buffer[sector_buffer_offset + i * 2 + 1] = byte2;
+                    }
+                }
+            }
+            
+            sectors_read += sectors_to_read;
+        }
+        
+        serial_write_str(&format!("STORAGE_MANAGER: {} sectores leídos exitosamente con driver IDE moderno\n", num_sectors));
+        Ok(())
     }
     
     /// Leer sector usando driver IDE moderno para controladoras Intel IDE

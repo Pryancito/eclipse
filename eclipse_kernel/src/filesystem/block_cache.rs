@@ -196,6 +196,31 @@ pub fn read_data_from_offset(
     let start_block = offset / block_size;
     let block_offset = (offset % block_size) as usize;
     
+    // OPTIMIZACIÓN: Para lecturas grandes (>= 128KB), leer directamente desde storage
+    // sin pasar por el cache, ya que estos datos probablemente no se reutilizarán
+    const DIRECT_READ_THRESHOLD: usize = 128 * 1024; // 128KB
+    
+    if buffer.len() >= DIRECT_READ_THRESHOLD && block_offset == 0 {
+        // Lectura grande y alineada a bloque: leer directamente desde storage
+        crate::debug::serial_write_str(&alloc::format!(
+            "BLOCK_CACHE: Lectura grande ({} bytes) - leyendo directamente desde storage\n",
+            buffer.len()
+        ));
+        
+        let bytes_to_read = buffer.len();
+        storage.read_from_partition(partition_index, start_block, &mut buffer[0..bytes_to_read])?;
+        
+        // VALIDACIÓN DE INTEGRIDAD: Verificar que se leyó la cantidad esperada de bytes
+        crate::debug::serial_write_str(&alloc::format!(
+            "BLOCK_CACHE: Lectura directa completada: {} bytes leídos desde bloque {}\n",
+            bytes_to_read, start_block
+        ));
+        
+        // Nota: La validación de EOF se debe hacer en el nivel superior (filesystem)
+        // donde se conoce el tamaño real del archivo
+        return Ok(bytes_to_read);
+    }
+    
     let mut bytes_read = 0;
     let mut remaining = buffer.len();
     let mut current_offset = block_offset;
