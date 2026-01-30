@@ -114,13 +114,18 @@ impl ProcessTransfer {
             Ok(pml4_addr) => {
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Userland environment setup successful\n");
                 
-                // CRITICAL FIX: Mapear el stack temporal del kernel (0x500000) en las tablas de usuario
+                // CRITICAL FIX: Mapear el stack temporal del kernel para la transferencia iretq
                 // Este stack se usa durante la transferencia (iretq) y DEBE estar accesible
                 // después del cambio de CR3, de lo contrario ocurre un triple fault.
-                const TEMP_KERNEL_STACK: u64 = 0x500000;
-                const TEMP_STACK_SIZE: u64 = 0x1000; // 4KB es suficiente para el frame de iretq
+                // 
+                // IMPORTANTE: El stack crece hacia abajo. Si ponemos RSP en 0x500000 y hacemos
+                // push, el stack irá hacia 0x4FFFFF, 0x4FFFFE, etc. Necesitamos mapear
+                // una página que cubra el rango donde el stack crecerá.
+                const TEMP_KERNEL_STACK_TOP: u64 = 0x500000;  // Tope del stack (donde empieza RSP)
+                const TEMP_STACK_SIZE: u64 = 0x1000;           // 4KB para el frame de iretq
+                const TEMP_KERNEL_STACK_BASE: u64 = TEMP_KERNEL_STACK_TOP - TEMP_STACK_SIZE; // 0x4FF000
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Mapping temporary kernel stack for CR3 switch...\n");
-                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK, TEMP_STACK_SIZE)?;
+                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK_BASE, TEMP_STACK_SIZE)?;
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Temporary kernel stack mapped successfully\n");
                 
                 // Mapear el stack del userland
@@ -255,13 +260,18 @@ impl ProcessTransfer {
                 
                 crate::debug::serial_write_str("PROCESS_TRANSFER: All ELF segments mapped successfully\n");
                 
-                // CRITICAL FIX: Mapear el stack temporal del kernel (0x500000) en las tablas de usuario
+                // CRITICAL FIX: Mapear el stack temporal del kernel para la transferencia iretq
                 // Este stack se usa durante la transferencia (iretq) y DEBE estar accesible
                 // después del cambio de CR3, de lo contrario ocurre un triple fault.
-                const TEMP_KERNEL_STACK: u64 = 0x500000;
-                const TEMP_STACK_SIZE: u64 = 0x1000; // 4KB es suficiente para el frame de iretq
+                // 
+                // IMPORTANTE: El stack crece hacia abajo. Si ponemos RSP en 0x500000 y hacemos
+                // push, el stack irá hacia 0x4FFFFF, 0x4FFFFE, etc. Necesitamos mapear
+                // una página que cubra el rango donde el stack crecerá.
+                const TEMP_KERNEL_STACK_TOP: u64 = 0x500000;  // Tope del stack (donde empieza RSP)
+                const TEMP_STACK_SIZE: u64 = 0x1000;           // 4KB para el frame de iretq
+                const TEMP_KERNEL_STACK_BASE: u64 = TEMP_KERNEL_STACK_TOP - TEMP_STACK_SIZE; // 0x4FF000
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Mapping temporary kernel stack for CR3 switch...\n");
-                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK, TEMP_STACK_SIZE)?;
+                identity_map_userland_writable(pml4_addr, TEMP_KERNEL_STACK_BASE, TEMP_STACK_SIZE)?;
                 crate::debug::serial_write_str("PROCESS_TRANSFER: Temporary kernel stack mapped successfully\n");
                 
                 // Mapear el stack del userland
