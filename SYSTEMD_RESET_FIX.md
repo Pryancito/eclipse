@@ -1,6 +1,9 @@
-# SystemD Reset Fix
+# Init System Reset Fix (Historical - Now Using S6)
 
-## Problem
+> **Note**: This document describes a historical issue with the systemd implementation.  
+> Eclipse OS now uses **S6** as its init system. See [eclipse-apps/s6/README.md](eclipse-apps/s6/README.md)
+
+## Problem (Historical - systemd)
 The system was resetting (triple fault) when attempting to transfer control to systemd in userland.
 
 ## Root Cause
@@ -33,7 +36,9 @@ jmp -4      ; 0xEB 0xFC
 - `eclipse_kernel/src/vfs_global.rs` - Fixed stub generation
 - `eclipse_kernel/src/process_transfer.rs` - Re-enabled userland transfer
 
-## Result
-✅ System no longer resets when transferring to systemd
-✅ Systemd stub runs safely in userland
-✅ System remains operational
+## Result (Historical)
+✅ System no longer resets when transferring to init system  
+✅ Init stub runs safely in userland  
+✅ System remains operational  
+
+**Current Status**: Eclipse OS now uses S6 supervision suite instead of systemd.

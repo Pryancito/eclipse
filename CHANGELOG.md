@@ -8,6 +8,12 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 ## [No Publicado]
 
 ### Añadido
+- **Sistema S6**: Migración completa a S6 supervision suite como init system
+  - Supervision automática de servicios
+  - Logging con s6-log y rotación automática
+  - Scripts shell simples en lugar de archivos .service complejos
+  - Footprint mínimo (~200KB vs systemd ~10MB)
+  - Documentación completa en eclipse-apps/s6/README.md
 - Validación de nombres de archivo para prevenir path traversal
 - Validación de tamaño de datos para prevenir overflow de memoria
 - Archivo SECURITY.md con guías de seguridad
@@ -22,8 +28,15 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 - Mejoras en .gitignore para excluir más archivos temporales
 
 ### Cambiado
-- Mejorada la documentación del README con ejemplos más claros
+- **Sistema de inicialización**: Reemplazado systemd por S6 para mejor modularidad
+- Actualizado build.sh para compilar S6 en lugar de systemd
+- Actualizado kernel init_system.rs para cargar eclipse-s6
+- Mejorada la documentación del README con ejemplos más claros y sección S6
 - Optimizadas las condiciones de compilación para reducir warnings
+
+### Deprecado
+- eclipse-apps/systemd/ - Reemplazado por eclipse-apps/s6/
+- userland/mini-systemd/ - Ya no se usa (S6 maneja la supervisión)
 
 ### Corregido
 - Eliminados imports no utilizados en eclipsefs-lib
