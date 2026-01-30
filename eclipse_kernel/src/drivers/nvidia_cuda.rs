@@ -71,18 +71,18 @@ impl CudaIntegration {
         // - cuDeviceGetCount() para obtener número de dispositivos
         // - cuDeviceGet() para obtener información de cada dispositivo
 
-        let cuda_version = "12.2".to_string();
+        let cuda_version = "12.7".to_string(); // Soporta hasta Blackwell
         let device_count = 1;
 
         let mut devices = Vec::new();
         for i in 0..device_count {
             devices.push(CudaDevice {
                 device_id: i,
-                name: "GeForce RTX 3060".to_string(),
-                compute_capability: (8, 6), // RTX 3060 es compute capability 8.6
-                memory_total: 8 * 1024 * 1024 * 1024, // 8GB
-                memory_free: 7 * 1024 * 1024 * 1024, // 7GB libre
-                multiprocessor_count: 28,   // RTX 3060 tiene 28 SMs
+                name: "NVIDIA GPU".to_string(), // Se detectará dinámicamente
+                compute_capability: (8, 6), // Se detectará según GPU
+                memory_total: 8 * 1024 * 1024 * 1024, // 8GB por defecto
+                memory_free: 7 * 1024 * 1024 * 1024,
+                multiprocessor_count: 28,
                 max_threads_per_block: 1024,
                 max_threads_per_multiprocessor: 1536,
                 warp_size: 32,
@@ -212,5 +212,127 @@ impl CudaIntegration {
     /// Obtener versión de CUDA
     pub fn get_cuda_version(&self) -> &str {
         &self.cuda_version
+    }
+}
+
+/// Obtener compute capability según device ID de PCI
+/// 
+/// Esta función mapea device IDs de NVIDIA a compute capabilities
+/// para soportar las últimas arquitecturas.
+pub fn get_compute_capability_for_device(device_id: u16) -> (u32, u32) {
+    match device_id {
+        // RTX 50 Series (Blackwell) - Compute Capability 10.0
+        0x2D00..=0x2DFF => (10, 0),
+        
+        // RTX 40 Series (Ada Lovelace) - Compute Capability 8.9
+        0x2600..=0x28FF => (8, 9),
+        
+        // RTX 30 Series (Ampere) - Compute Capability 8.6
+        0x2200..=0x25FF => (8, 6),
+        
+        // RTX 20 Series (Turing) - Compute Capability 7.5
+        0x1F00..=0x1FFF => (7, 5),
+        
+        // GTX 16 Series (Turing) - Compute Capability 7.5
+        0x1E00..=0x1EFF => (7, 5),
+        
+        // GTX 10 Series (Pascal) - Compute Capability 6.1
+        0x1B00..=0x1BFF => (6, 1),
+        
+        // Hopper (Data Center) - Compute Capability 9.0
+        0x2330..=0x233F => (9, 0),
+        
+        // Default (assume modern GPU)
+        _ => (7, 0),
+    }
+}
+
+/// Obtener CUDA version mínima requerida según compute capability
+pub fn get_min_cuda_version_for_cc(compute_capability: (u32, u32)) -> &'static str {
+    match compute_capability {
+        (10, 0) => "12.7", // Blackwell
+        (9, 0) => "12.0",  // Hopper
+        (8, 9) => "12.0",  // Ada Lovelace
+        (8, 6) => "11.1",  // Ampere
+        (7, 5) => "10.0",  // Turing
+        (6, 1) => "8.0",   // Pascal
+        _ => "11.0",
+    }
+}
+
+/// Obtener nombre de arquitectura según compute capability
+pub fn get_architecture_name(compute_capability: (u32, u32)) -> &'static str {
+    match compute_capability {
+        (10, 0) => "Blackwell",
+        (9, 0) => "Hopper",
+        (8, 9) => "Ada Lovelace",
+        (8, 6) => "Ampere",
+        (7, 5) => "Turing",
+        (6, 1) => "Pascal",
+        (5, 2) => "Maxwell",
+        _ => "Unknown",
+    }
+}
+
+/// Obtener capacidades específicas de arquitectura
+pub struct ArchitectureCapabilities {
+    pub has_rt_cores: bool,
+    pub has_tensor_cores: bool,
+    pub supports_dlss: bool,
+    pub supports_ray_tracing: bool,
+    pub supports_mesh_shaders: bool,
+    pub max_cuda_version: &'static str,
+}
+
+pub fn get_architecture_capabilities(compute_capability: (u32, u32)) -> ArchitectureCapabilities {
+    match compute_capability {
+        (10, 0) => ArchitectureCapabilities {
+            has_rt_cores: true,
+            has_tensor_cores: true,
+            supports_dlss: true,
+            supports_ray_tracing: true,
+            supports_mesh_shaders: true,
+            max_cuda_version: "12.7",
+        },
+        (9, 0) => ArchitectureCapabilities {
+            has_rt_cores: false, // Hopper es para compute, no gaming
+            has_tensor_cores: true,
+            supports_dlss: false,
+            supports_ray_tracing: false,
+            supports_mesh_shaders: false,
+            max_cuda_version: "12.6",
+        },
+        (8, 9) => ArchitectureCapabilities {
+            has_rt_cores: true,
+            has_tensor_cores: true,
+            supports_dlss: true,
+            supports_ray_tracing: true,
+            supports_mesh_shaders: true,
+            max_cuda_version: "12.3",
+        },
+        (8, 6) => ArchitectureCapabilities {
+            has_rt_cores: true,
+            has_tensor_cores: true,
+            supports_dlss: true,
+            supports_ray_tracing: true,
+            supports_mesh_shaders: true,
+            max_cuda_version: "12.0",
+        },
+        (7, 5) => ArchitectureCapabilities {
+            has_rt_cores: true,
+            has_tensor_cores: true,
+            supports_dlss: true,
+            supports_ray_tracing: true,
+            supports_mesh_shaders: false,
+            max_cuda_version: "11.8",
+        },
+        _ => ArchitectureCapabilities {
+            has_rt_cores: false,
+            has_tensor_cores: false,
+            supports_dlss: false,
+            supports_ray_tracing: false,
+            supports_mesh_shaders: false,
+            max_cuda_version: "11.0",
+        },
     }
 }
