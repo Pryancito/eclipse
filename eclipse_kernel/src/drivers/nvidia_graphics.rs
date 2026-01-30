@@ -18,9 +18,11 @@ const NVIDIA_VENDOR_ID: u16 = 0x10DE;
 // IDs de dispositivos NVIDIA por generación
 const NVIDIA_GTX_900_SERIES: u16 = 0x13C0; // GTX 960
 const NVIDIA_GTX_1000_SERIES: u16 = 0x1B80; // GTX 1060
-const NVIDIA_GTX_2000_SERIES: u16 = 0x1F08; // RTX 2060
-const NVIDIA_GTX_3000_SERIES: u16 = 0x2504; // RTX 3060
-const NVIDIA_GTX_4000_SERIES: u16 = 0x2684; // RTX 4060
+const NVIDIA_RTX_2000_SERIES: u16 = 0x1F08; // RTX 2060
+const NVIDIA_RTX_3000_SERIES: u16 = 0x2204; // RTX 3060
+const NVIDIA_RTX_4000_SERIES: u16 = 0x2684; // RTX 4060
+const NVIDIA_RTX_5000_SERIES: u16 = 0x2D01; // RTX 5060
+const NVIDIA_HOPPER_SERIES: u16 = 0x2330; // H100
 
 /// Estado del driver NVIDIA
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,9 +39,11 @@ pub enum NvidiaDriverState {
 pub enum NvidiaGeneration {
     GTX900,
     GTX1000,
-    GTX2000,
-    GTX3000,
-    GTX4000,
+    RTX2000,
+    RTX3000,
+    RTX4000,
+    RTX5000,
+    Hopper,
     Unknown,
 }
 
@@ -49,9 +53,11 @@ impl NvidiaGeneration {
         match device_id {
             0x13C0..=0x13FF => NvidiaGeneration::GTX900,
             0x1B80..=0x1BFF => NvidiaGeneration::GTX1000,
-            0x1F08..=0x1FFF => NvidiaGeneration::GTX2000,
-            0x2504..=0x25FF => NvidiaGeneration::GTX3000,
-            0x2684..=0x26FF => NvidiaGeneration::GTX4000,
+            0x1F00..=0x1FFF => NvidiaGeneration::RTX2000,
+            0x2200..=0x25FF => NvidiaGeneration::RTX3000,
+            0x2600..=0x2CFF => NvidiaGeneration::RTX4000,
+            0x2D00..=0x2DFF => NvidiaGeneration::RTX5000,
+            0x2330..=0x233F => NvidiaGeneration::Hopper,
             _ => NvidiaGeneration::Unknown,
         }
     }
@@ -61,9 +67,11 @@ impl NvidiaGeneration {
         match self {
             NvidiaGeneration::GTX900 => "GTX 900 Series",
             NvidiaGeneration::GTX1000 => "GTX 1000 Series",
-            NvidiaGeneration::GTX2000 => "RTX 2000 Series",
-            NvidiaGeneration::GTX3000 => "RTX 3000 Series",
-            NvidiaGeneration::GTX4000 => "RTX 4000 Series",
+            NvidiaGeneration::RTX2000 => "RTX 2000 Series",
+            NvidiaGeneration::RTX3000 => "RTX 3000 Series",
+            NvidiaGeneration::RTX4000 => "RTX 4000 Series",
+            NvidiaGeneration::RTX5000 => "RTX 5000 Series (Blackwell)",
+            NvidiaGeneration::Hopper => "Hopper Architecture (Data Center)",
             NvidiaGeneration::Unknown => "Unknown",
         }
     }
