@@ -34,13 +34,13 @@ impl InterruptManager {
         }
     }
 
-    /// Inicializar el sistema de interrupciones
+    /// Inicializar el sistema de interrupciones (sin cargar IDT)
     pub fn initialize(&mut self, kernel_code_selector: u16) -> Result<(), &'static str> {
         if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        // Configurar IDT
+        // Configurar IDT (pero NO cargarla todavía)
         self.idt_manager.setup_userland(kernel_code_selector)?;
 
         // Verificar si APIC está disponible
@@ -61,6 +61,9 @@ impl InterruptManager {
         // Las interrupciones deben permanecer deshabilitadas hasta que el kernel
         // esté completamente inicializado para evitar cuelgues en hardware real
         // El kernel debe llamar explícitamente a enable_interrupts() cuando esté listo
+        
+        // NOTA: La IDT debe cargarse DESPUÉS de que el manager esté en su ubicación
+        // final, para evitar que IDTR apunte a memoria inválida
         
         self.initialized.store(true, Ordering::Release);
         Ok(())
@@ -245,6 +248,12 @@ pub fn initialize_interrupt_system(kernel_code_selector: u16) -> Result<(), &'st
         let mut manager = InterruptManager::new();
         manager.initialize(kernel_code_selector)?;
         INTERRUPT_MANAGER = Some(manager);
+        
+        // CRÍTICO: Cargar la IDT DESPUÉS de mover el manager a su ubicación final
+        // Si se carga antes, IDTR apuntaría a la dirección del stack (ahora inválida)
+        if let Some(ref mgr) = INTERRUPT_MANAGER {
+            mgr.load_idt();
+        }
     }
 
     Ok(())

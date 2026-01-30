@@ -307,11 +307,17 @@ impl IdtManager {
         Self { idt: Idt::new() }
     }
 
-    /// Configurar IDT para userland
+    /// Configurar IDT para userland (sin cargar)
     pub fn setup_userland(&mut self, kernel_code_selector: u16) -> Result<(), &'static str> {
         self.idt.setup_userland(kernel_code_selector)?;
-        self.idt.load();
+        // NO cargar la IDT aquí - debe cargarse después de que el manager
+        // esté en su ubicación final para evitar que IDTR apunte a memoria inválida
         Ok(())
+    }
+
+    /// Cargar IDT en el procesador
+    pub fn load_idt(&self) {
+        self.idt.load();
     }
 
     /// Obtener IDT
