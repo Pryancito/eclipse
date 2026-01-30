@@ -128,7 +128,14 @@ fn benchmark_ls_operation(path: &str) -> Result<f64, Box<dyn std::error::Error>>
     
     println!("   Listed {} files", count);
     let stats = reader.get_cache_stats();
-    println!("   Cache: {}/{} nodes", stats.cached_nodes, stats.cache_capacity);
+    match stats {
+        eclipsefs_lib::CacheStats::LRU { cached_nodes, cache_capacity } => {
+            println!("   Cache: {}/{} nodes", cached_nodes, cache_capacity);
+        }
+        eclipsefs_lib::CacheStats::ARC(arc_stats) => {
+            println!("   Cache: {}/{} nodes (ARC)", arc_stats.t1_size + arc_stats.t2_size, arc_stats.total_capacity);
+        }
+    }
     
     Ok(elapsed.as_secs_f64())
 }
@@ -159,7 +166,14 @@ fn benchmark_find_operation(path: &str) -> Result<f64, Box<dyn std::error::Error
     
     println!("   Traversed {} inodes", total_files);
     let stats = reader.get_cache_stats();
-    println!("   Cache: {}/{} nodes", stats.cached_nodes, stats.cache_capacity);
+    match stats {
+        eclipsefs_lib::CacheStats::LRU { cached_nodes, cache_capacity } => {
+            println!("   Cache: {}/{} nodes", cached_nodes, cache_capacity);
+        }
+        eclipsefs_lib::CacheStats::ARC(arc_stats) => {
+            println!("   Cache: {}/{} nodes (ARC)", arc_stats.t1_size + arc_stats.t2_size, arc_stats.total_capacity);
+        }
+    }
     
     Ok(elapsed.as_secs_f64())
 }
@@ -197,7 +211,14 @@ fn benchmark_stat_operations(path: &str) -> Result<f64, Box<dyn std::error::Erro
     
     println!("   Stat'd {} files", files.len());
     let stats = reader.get_cache_stats();
-    println!("   Cache: {}/{} nodes", stats.cached_nodes, stats.cache_capacity);
+    match stats {
+        eclipsefs_lib::CacheStats::LRU { cached_nodes, cache_capacity } => {
+            println!("   Cache: {}/{} nodes", cached_nodes, cache_capacity);
+        }
+        eclipsefs_lib::CacheStats::ARC(arc_stats) => {
+            println!("   Cache: {}/{} nodes (ARC)", arc_stats.t1_size + arc_stats.t2_size, arc_stats.total_capacity);
+        }
+    }
     
     Ok(elapsed.as_secs_f64())
 }

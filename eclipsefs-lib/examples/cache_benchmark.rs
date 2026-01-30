@@ -99,8 +99,14 @@ fn benchmark_directory_read(path: &str, reuse_reader: bool) -> Result<f64, Box<d
     
     // Print cache stats
     let stats = reader.get_cache_stats();
-    println!("   Cache: {} nodes cached (capacity: {})", 
-             stats.cached_nodes, stats.cache_capacity);
+    match stats {
+        eclipsefs_lib::CacheStats::LRU { cached_nodes, cache_capacity } => {
+            println!("   Cache: {} nodes cached (capacity: {})", cached_nodes, cache_capacity);
+        }
+        eclipsefs_lib::CacheStats::ARC(_) => {
+            println!("   Cache: ARC enabled");
+        }
+    }
     
     Ok(elapsed.as_secs_f64())
 }

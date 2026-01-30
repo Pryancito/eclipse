@@ -4,6 +4,7 @@ use crate::{
     format::constants, format::tlv_tags, EclipseFSError, EclipseFSHeader, EclipseFSNode,
     EclipseFSResult, InodeTableEntry, NodeKind,
 };
+use crate::arc_cache::AdaptiveReplacementCache;
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,20 +16,38 @@ const BUFFER_SIZE: usize = 512 * 1024;
 /// Maximum number of cached nodes (adjust based on memory constraints)
 const MAX_CACHED_NODES: usize = 1024;
 
+/// Tipo de cache a utilizar
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CacheType {
+    /// LRU simple (Least Recently Used)
+    LRU,
+    /// ARC (Adaptive Replacement Cache) - Algoritmo "Arquera"
+    ARC,
+}
+
 /// Lector de imágenes EclipseFS
 pub struct EclipseFSReader {
     file: BufReader<File>,
     header: EclipseFSHeader,
     inode_table: Vec<InodeTableEntry>,
-    /// Simple LRU cache for recently accessed nodes
-    node_cache: HashMap<u32, EclipseFSNode>,
+    /// Tipo de cache en uso
+    cache_type: CacheType,
+    /// Simple LRU cache for recently accessed nodes (usado cuando cache_type == LRU)
+    lru_cache: HashMap<u32, EclipseFSNode>,
     /// Track access order for LRU eviction
-    access_order: Vec<u32>,
+    lru_access_order: Vec<u32>,
+    /// ARC cache (usado cuando cache_type == ARC)
+    arc_cache: Option<AdaptiveReplacementCache>,
 }
 
 impl EclipseFSReader {
     /// Crear un nuevo lector desde un archivo
     pub fn new(file_path: &str) -> EclipseFSResult<Self> {
+        Self::new_with_cache(file_path, CacheType::LRU)
+    }
+
+    /// Crear un nuevo lector con tipo de cache específico
+    pub fn new_with_cache(file_path: &str, cache_type: CacheType) -> EclipseFSResult<Self> {
         let file = File::open(file_path).map_err(|e| {
             // Proporcionar contexto adicional sobre el error
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -48,13 +67,24 @@ impl EclipseFSReader {
             file: buffered_file,
             header,
             inode_table,
-            node_cache: HashMap::new(),
-            access_order: Vec::new(),
+            cache_type,
+            lru_cache: HashMap::new(),
+            lru_access_order: Vec::new(),
+            arc_cache: if cache_type == CacheType::ARC {
+                Some(AdaptiveReplacementCache::new())
+            } else {
+                None
+            },
         })
     }
 
     /// Crear un nuevo lector desde un File existente
     pub fn from_file(file: File) -> EclipseFSResult<Self> {
+        Self::from_file_with_cache(file, CacheType::LRU)
+    }
+
+    /// Crear un nuevo lector desde un File con tipo de cache específico
+    pub fn from_file_with_cache(file: File, cache_type: CacheType) -> EclipseFSResult<Self> {
         // Wrap file with BufReader for much better performance
         let mut buffered_file = BufReader::with_capacity(BUFFER_SIZE, file);
         let header = Self::read_header(&mut buffered_file)?;
@@ -64,8 +94,14 @@ impl EclipseFSReader {
             file: buffered_file,
             header,
             inode_table,
-            node_cache: HashMap::new(),
-            access_order: Vec::new(),
+            cache_type,
+            lru_cache: HashMap::new(),
+            lru_access_order: Vec::new(),
+            arc_cache: if cache_type == CacheType::ARC {
+                Some(AdaptiveReplacementCache::new())
+            } else {
+                None
+            },
         })
     }
 
@@ -118,12 +154,23 @@ impl EclipseFSReader {
 
     /// Leer un nodo por su inode
     pub fn read_node(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
-        // Check cache first
-        if let Some(cached_node) = self.node_cache.get(&inode) {
-            // Update LRU access order
-            self.access_order.retain(|&i| i != inode);
-            self.access_order.push(inode);
-            return Ok(cached_node.clone());
+        // Check cache first based on cache type
+        match self.cache_type {
+            CacheType::ARC => {
+                if let Some(ref mut arc) = self.arc_cache {
+                    if let Some(node) = arc.get(inode) {
+                        return Ok(node);
+                    }
+                }
+            }
+            CacheType::LRU => {
+                if let Some(cached_node) = self.lru_cache.get(&inode) {
+                    // Update LRU access order
+                    self.lru_access_order.retain(|&i| i != inode);
+                    self.lru_access_order.push(inode);
+                    return Ok(cached_node.clone());
+                }
+            }
         }
 
         let entry = self
@@ -291,19 +338,28 @@ impl EclipseFSReader {
         Ok(node)
     }
 
-    /// Cache a node and manage LRU eviction
+    /// Cache a node and manage eviction based on cache type
     fn cache_node(&mut self, inode: u32, node: EclipseFSNode) {
-        // Evict oldest entry if cache is full
-        if self.node_cache.len() >= MAX_CACHED_NODES {
-            if let Some(oldest_inode) = self.access_order.first().copied() {
-                self.node_cache.remove(&oldest_inode);
-                self.access_order.remove(0);
+        match self.cache_type {
+            CacheType::ARC => {
+                if let Some(ref mut arc) = self.arc_cache {
+                    arc.put(inode, node);
+                }
+            }
+            CacheType::LRU => {
+                // Evict oldest entry if cache is full
+                if self.lru_cache.len() >= MAX_CACHED_NODES {
+                    if let Some(oldest_inode) = self.lru_access_order.first().copied() {
+                        self.lru_cache.remove(&oldest_inode);
+                        self.lru_access_order.remove(0);
+                    }
+                }
+
+                // Add to cache
+                self.lru_cache.insert(inode, node);
+                self.lru_access_order.push(inode);
             }
         }
-
-        // Add to cache
-        self.node_cache.insert(inode, node);
-        self.access_order.push(inode);
     }
 
     /// Deserializar entradas de directorio
@@ -424,7 +480,16 @@ impl EclipseFSReader {
     pub fn prefetch_nodes(&mut self, inodes: &[u32]) -> EclipseFSResult<()> {
         for &inode in inodes {
             // Only prefetch if not already cached
-            if !self.node_cache.contains_key(&inode) {
+            let already_cached = match self.cache_type {
+                CacheType::ARC => {
+                    // For ARC, we check by attempting a get (which updates internal state anyway)
+                    // If it's cached, we'll get a hit; if not, we'll load it below
+                    false // Always try to load, ARC will handle efficiently
+                }
+                CacheType::LRU => self.lru_cache.contains_key(&inode),
+            };
+            
+            if !already_cached {
                 // Ignore errors during prefetch - best effort
                 let _ = self.read_node(inode);
             }
@@ -434,10 +499,27 @@ impl EclipseFSReader {
 
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> CacheStats {
-        CacheStats {
-            cached_nodes: self.node_cache.len(),
-            cache_capacity: MAX_CACHED_NODES,
+        match self.cache_type {
+            CacheType::LRU => CacheStats::LRU {
+                cached_nodes: self.lru_cache.len(),
+                cache_capacity: MAX_CACHED_NODES,
+            },
+            CacheType::ARC => {
+                if let Some(ref arc) = self.arc_cache {
+                    CacheStats::ARC(arc.stats())
+                } else {
+                    CacheStats::LRU {
+                        cached_nodes: 0,
+                        cache_capacity: MAX_CACHED_NODES,
+                    }
+                }
+            }
         }
+    }
+
+    /// Get current cache type
+    pub fn get_cache_type(&self) -> CacheType {
+        self.cache_type
     }
 
     /// Read a directory node and automatically prefetch all its children
@@ -456,7 +538,25 @@ impl EclipseFSReader {
 }
 
 /// Cache statistics for monitoring
-pub struct CacheStats {
-    pub cached_nodes: usize,
-    pub cache_capacity: usize,
+#[derive(Debug, Clone)]
+pub enum CacheStats {
+    LRU {
+        cached_nodes: usize,
+        cache_capacity: usize,
+    },
+    ARC(crate::arc_cache::ARCStats),
+}
+
+impl CacheStats {
+    pub fn print(&self) {
+        match self {
+            CacheStats::LRU { cached_nodes, cache_capacity } => {
+                println!("=== LRU Cache Statistics ===");
+                println!("Cached nodes: {}/{}", cached_nodes, cache_capacity);
+            }
+            CacheStats::ARC(stats) => {
+                stats.print();
+            }
+        }
+    }
 }
