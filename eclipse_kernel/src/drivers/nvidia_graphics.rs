@@ -108,8 +108,8 @@ impl NvidiaGraphicsInfo {
             supports_3d: true,
             supports_vulkan: generation >= NvidiaGeneration::GTX1000,
             supports_opengl: true,
-            supports_raytracing: generation >= NvidiaGeneration::GTX2000,
-            supports_dlss: generation >= NvidiaGeneration::GTX2000,
+            supports_raytracing: generation >= NvidiaGeneration::RTX2000,
+            supports_dlss: generation >= NvidiaGeneration::RTX2000,
             supports_hdmi: true,
             supports_dp: true,
             driver_version: "NVIDIA Driver v1.0.0",
@@ -635,7 +635,7 @@ pub fn detect_nvidia_gpu() -> Option<NvidiaGraphicsDriver> {
         device: 1,
         function: 0,
         vendor_id: NVIDIA_VENDOR_ID,
-        device_id: NVIDIA_GTX_3000_SERIES, // RTX 3060 como ejemplo
+        device_id: NVIDIA_RTX_3000_SERIES, // RTX 3060 como ejemplo
         class_code: 0x03,                  // VGA controller
         subclass_code: 0x00,
         prog_if: 0x00,

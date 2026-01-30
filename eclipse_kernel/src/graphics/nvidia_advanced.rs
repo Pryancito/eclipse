@@ -113,28 +113,28 @@ impl NvidiaAdvancedDriver {
         let device = &gpu.pci_device;
         
         // Detectar modelo específico de GPU
-        let gpu_name = self.detect_gpu_model(device);
+        let gpu_name = Self::detect_gpu_model(device);
         
         // Detectar memoria real usando BARs
-        let total_memory = self.detect_real_memory(device)?;
+        let total_memory = Self::detect_real_memory(device)?;
         
         // Detectar características específicas
-        let (cuda_cores, rt_cores, tensor_cores) = self.detect_gpu_cores(device);
+        let (cuda_cores, rt_cores, tensor_cores) = Self::detect_gpu_cores(device);
         
         // Detectar relojes
-        let (memory_clock, core_clock) = self.detect_clocks(device);
+        let (memory_clock, core_clock) = Self::detect_clocks(device);
         
         // Detectar ancho de banda de memoria
-        let memory_bandwidth = self.calculate_memory_bandwidth(memory_clock, total_memory);
+        let memory_bandwidth = Self::calculate_memory_bandwidth(memory_clock, total_memory);
         
         // Detectar versión PCIe
-        let (pcie_version, pcie_lanes) = self.detect_pcie_info(device);
+        let (pcie_version, pcie_lanes) = Self::detect_pcie_info(device);
         
         // Detectar límite de potencia
-        let power_limit = self.detect_power_limit(device);
+        let power_limit = Self::detect_power_limit(device);
         
         // Detectar versión CUDA según arquitectura
-        let (cuda_version, architecture) = self.detect_cuda_architecture(device);
+        let (cuda_version, architecture) = Self::detect_cuda_architecture(device);
         
         Ok(NvidiaGpuInfo {
             pci_device: device.clone(),
@@ -161,7 +161,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar arquitectura CUDA y versión según GPU
-    fn detect_cuda_architecture(&self, device: &PciDevice) -> (String, String) {
+    fn detect_cuda_architecture(device: &PciDevice) -> (String, String) {
         match (device.vendor_id, device.device_id) {
             // RTX 50 Series - Blackwell - CUDA 12.7+ (Compute 10.0)
             (0x10DE, 0x2D00..=0x2DFF) => (
@@ -202,7 +202,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar modelo específico de GPU NVIDIA
-    fn detect_gpu_model(&self, device: &PciDevice) -> String {
+    fn detect_gpu_model(device: &PciDevice) -> String {
         match (device.vendor_id, device.device_id) {
             // RTX 20 Series (Turing)
             (0x10DE, 0x1F06) => "GeForce RTX 2060 SUPER".to_string(),
@@ -247,7 +247,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar memoria real usando BARs
-    fn detect_real_memory(&self, device: &PciDevice) -> Result<u64, String> {
+    fn detect_real_memory(device: &PciDevice) -> Result<u64, String> {
         // Leer todos los BARs
         let bars = device.read_all_bars();
         
@@ -270,7 +270,7 @@ impl NvidiaAdvancedDriver {
         
         // Si no se detectó memoria en BARs, usar estimación por modelo
         if total_memory == 0 {
-            total_memory = self.estimate_memory_by_model(device);
+            total_memory = Self::estimate_memory_by_model(device);
         }
         
         
@@ -278,7 +278,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Estimar memoria por modelo de GPU
-    fn estimate_memory_by_model(&self, device: &PciDevice) -> u64 {
+    fn estimate_memory_by_model(device: &PciDevice) -> u64 {
         match (device.vendor_id, device.device_id) {
             // RTX 20 Series (Turing)
             (0x10DE, 0x1F06) => 8 * 1024 * 1024 * 1024,  // RTX 2060 SUPER - 8GB
@@ -323,7 +323,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar número de cores
-    fn detect_gpu_cores(&self, device: &PciDevice) -> (u32, u32, u32) {
+    fn detect_gpu_cores(device: &PciDevice) -> (u32, u32, u32) {
         match (device.vendor_id, device.device_id) {
             // RTX 20 Series (Turing) - (CUDA cores, RT cores, Tensor cores)
             (0x10DE, 0x1F06) => (2176, 34, 136),  // RTX 2060 SUPER
@@ -368,7 +368,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar relojes de memoria y core
-    fn detect_clocks(&self, device: &PciDevice) -> (u32, u32) {
+    fn detect_clocks(device: &PciDevice) -> (u32, u32) {
         match (device.vendor_id, device.device_id) {
             // RTX 20 Series (Turing) - (Memory MHz, Core MHz)
             (0x10DE, 0x1F06) => (14000, 1650),  // RTX 2060 SUPER
@@ -413,7 +413,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Calcular ancho de banda de memoria con configuraciones específicas por GPU
-    fn calculate_memory_bandwidth(&self, memory_clock: u32, total_memory: u64) -> u64 {
+    fn calculate_memory_bandwidth(memory_clock: u32, total_memory: u64) -> u64 {
         // Determinar ancho de bus según la GPU
         // RTX 50 series usa GDDR7 con buses más anchos
         // Hopper usa HBM3/HBM3e con buses ultra anchos
@@ -440,7 +440,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar información PCIe real según generación de GPU
-    fn detect_pcie_info(&self, device: &PciDevice) -> (u8, u8) {
+    fn detect_pcie_info(device: &PciDevice) -> (u8, u8) {
         // Detectar versión PCIe y lanes según la generación de GPU
         match (device.vendor_id, device.device_id) {
             // RTX 50 Series - PCIe 5.0 x16
@@ -464,7 +464,7 @@ impl NvidiaAdvancedDriver {
     }
 
     /// Detectar límite de potencia
-    fn detect_power_limit(&self, device: &PciDevice) -> u32 {
+    fn detect_power_limit(device: &PciDevice) -> u32 {
         match (device.vendor_id, device.device_id) {
             // RTX 20 Series (Turing)
             (0x10DE, 0x1F06) => 175,  // RTX 2060 SUPER
@@ -548,7 +548,7 @@ impl NvidiaAdvancedDriver {
         }
 
         let gpu = &mut self.nvidia_gpus[gpu_index];
-        let max_limit = self.detect_power_limit(&gpu.pci_device);
+        let max_limit = Self::detect_power_limit(&gpu.pci_device);
 
         if limit_watts > max_limit {
             return Err(format!(
@@ -570,7 +570,7 @@ impl NvidiaAdvancedDriver {
         let gpu = &mut self.nvidia_gpus[gpu_index];
         
         // Validar rangos seguros (no permitir overclock extremo)
-        let (default_mem, default_core) = self.detect_clocks(&gpu.pci_device);
+        let (default_mem, default_core) = Self::detect_clocks(&gpu.pci_device);
         
         if core_mhz > default_core * 2 {
             return Err(String::from("Frecuencia de núcleo demasiado alta"));
@@ -584,7 +584,7 @@ impl NvidiaAdvancedDriver {
         gpu.memory_clock = memory_mhz;
         
         // Recalcular ancho de banda
-        gpu.memory_bandwidth = self.calculate_memory_bandwidth(memory_mhz, gpu.total_memory);
+        gpu.memory_bandwidth = Self::calculate_memory_bandwidth(memory_mhz, gpu.total_memory);
         
         Ok(())
     }
@@ -606,12 +606,12 @@ impl NvidiaAdvancedDriver {
             } else if temp >= TEMP_CRITICAL {
                 // Throttling agresivo: reducir frecuencias al 50%
                 let gpu = &self.nvidia_gpus[idx];
-                let (mem_clock, core_clock) = self.detect_clocks(&gpu.pci_device);
+                let (mem_clock, core_clock) = Self::detect_clocks(&gpu.pci_device);
                 self.set_clock_speeds(idx, core_clock / 2, mem_clock / 2)?;
             } else if temp >= TEMP_WARNING {
                 // Throttling moderado: reducir frecuencias al 75%
                 let gpu = &self.nvidia_gpus[idx];
-                let (mem_clock, core_clock) = self.detect_clocks(&gpu.pci_device);
+                let (mem_clock, core_clock) = Self::detect_clocks(&gpu.pci_device);
                 self.set_clock_speeds(idx, (core_clock * 3) / 4, (mem_clock * 3) / 4)?;
             }
         }
@@ -645,7 +645,7 @@ impl NvidiaAdvancedDriver {
         gpu.pci_device.reset_device();
 
         // Reinicializar parámetros
-        let (mem_clock, core_clock) = self.detect_clocks(&gpu.pci_device);
+        let (mem_clock, core_clock) = Self::detect_clocks(&gpu.pci_device);
         self.set_clock_speeds(gpu_index, core_clock, mem_clock)?;
 
         Ok(())

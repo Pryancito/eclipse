@@ -230,6 +230,15 @@ impl PciDevice {
         }
         None
     }
+    pub fn reset_device(&self) {
+        // Placeholder implementation for device reset
+        // In a real scenario, this would trigger FLR or similar mechanism
+        // For now, we just ensure Bus Master is disabled strictly speaking
+        let command = self.read_config(0x04);
+        self.write_config(0x04, command & !0x04); // Disable Bus Master
+        
+        // Re-enable happens in initialization or explicit enable calls
+    }
 }
 
 /// Información específica de GPU
