@@ -198,8 +198,16 @@ impl EclipseFSWriter {
         children: &std::collections::HashMap<String, u32>,
     ) -> EclipseFSResult<Vec<u8>> {
         let mut data = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
 
         for (name, inode) in children {
+            // Validación adicional: verificar que no haya duplicados
+            if !seen_names.insert(name.clone()) {
+                eprintln!("WARNING: Duplicate entry detected during serialization: {}", name);
+                // Continuar pero registrar el problema
+                continue;
+            }
+            
             let name_bytes = name.as_bytes();
             data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(&inode.to_le_bytes());
