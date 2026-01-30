@@ -57,19 +57,20 @@ impl InterruptManager {
         // Inicializar gestor de IRQs
         self.irq_manager.initialize()?;
 
-        // Habilitar interrupciones
-        self.enable_interrupts()?;
-
+        // CRÍTICO: NO habilitar interrupciones automáticamente
+        // Las interrupciones deben permanecer deshabilitadas hasta que el kernel
+        // esté completamente inicializado para evitar cuelgues en hardware real
+        // El kernel debe llamar explícitamente a enable_interrupts() cuando esté listo
+        
         self.initialized.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Habilitar interrupciones del sistema
     pub fn enable_interrupts(&self) -> Result<(), &'static str> {
-        if !self.initialized.load(Ordering::Acquire) {
-            return Err("Sistema de interrupciones no inicializado");
-        }
-
+        // NOTA: No verificar si está inicializado para permitir habilitar
+        // interrupciones después de la inicialización completa del kernel
+        
         unsafe {
             core::arch::asm!("sti", options(nostack, nomem));
         }

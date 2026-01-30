@@ -1052,6 +1052,20 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado\n");
     serial_write_str("KERNEL_MAIN: ========================================\n");
     
+    // CRÍTICO: Habilitar interrupciones SOLO DESPUÉS de que todo esté inicializado
+    // Esto previene cuelgues en hardware real causados por interrupciones tempranas
+    serial_write_str("KERNEL_MAIN: Habilitando interrupciones del sistema...\n");
+    match crate::interrupts::manager::enable_interrupts() {
+        Ok(_) => {
+            serial_write_str("KERNEL_MAIN: Interrupciones habilitadas correctamente\n");
+            fb.write_text_kernel("✓ Interrupciones habilitadas", Color::GREEN);
+        }
+        Err(e) => {
+            serial_write_str(&alloc::format!("KERNEL_MAIN: ADVERTENCIA - Error habilitando interrupciones: {}\n", e));
+            fb.write_text_kernel("⚠ Interrupciones no habilitadas", Color::YELLOW);
+        }
+    }
+    
     // Llamar al loop principal mejorado (nunca retorna - loop infinito)
     crate::main_loop::main_loop(fb, xhci_initialized)
 }
