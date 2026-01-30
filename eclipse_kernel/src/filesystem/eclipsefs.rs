@@ -119,10 +119,49 @@ impl EclipseFSWrapper {
         // Calcular el offset absoluto en el disco
         let absolute_offset = entry.offset;
         
-        // Buffer para leer el nodo (asumimos tamaño máximo de 4KB por nodo)
-        let mut node_buffer = [0u8; 4096];
-        
-        // Leer datos del nodo usando el cache de bloques
+        // Primero, leer solo la cabecera para determinar el tamaño del registro
+        let mut header_buffer = [0u8; ecfs_constants::NODE_RECORD_HEADER_SIZE];
+        let header_bytes_read = read_data_from_offset(
+            get_block_cache(),
+            storage,
+            self.partition_index,
+            absolute_offset,
+            &mut header_buffer
+        ).map_err(|e| {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Error leyendo cabecera del nodo: {}\n", e));
+            VfsError::IoError(alloc::format!("Error leyendo cabecera del nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
+        })?;
+
+        if header_bytes_read < ecfs_constants::NODE_RECORD_HEADER_SIZE {
+            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: ERROR - Cabecera truncada: {} bytes\n", header_bytes_read));
+            return Err(VfsError::InvalidFs("Cabecera de nodo truncada".into()));
+        }
+
+        // Parsear la cabecera para obtener el tamaño del registro
+        let recorded_inode = u32::from_le_bytes([header_buffer[0], header_buffer[1], header_buffer[2], header_buffer[3]]);
+        let record_size = u32::from_le_bytes([header_buffer[4], header_buffer[5], header_buffer[6], header_buffer[7]]) as usize;
+
+        if recorded_inode != inode_num {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Inode no coincide en cabecera (esperado {}, encontrado {})\n",
+                inode_num, recorded_inode
+            ));
+            return Err(VfsError::InvalidFs("Inode no coincide en cabecera".into()));
+        }
+
+        if record_size < ecfs_constants::NODE_RECORD_HEADER_SIZE {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Tamaño de registro inválido en cabecera: {}\n", record_size
+            ));
+            return Err(VfsError::InvalidFs("Tamaño de registro inválido".into()));
+        }
+
+        crate::debug::serial_write_str(&alloc::format!(
+            "ECLIPSEFS: Nodo {} - tamaño del registro: {} bytes\n", inode_num, record_size
+        ));
+
+        // Ahora leer el registro completo usando un Vec con el tamaño correcto
+        let mut node_buffer = alloc::vec![0u8; record_size];
         let bytes_read = read_data_from_offset(
             get_block_cache(),
             storage,
@@ -134,9 +173,12 @@ impl EclipseFSWrapper {
             VfsError::IoError(alloc::format!("Error leyendo nodo {} desde offset {}: {}", inode_num, absolute_offset, e))
         })?;
 
-        if bytes_read == 0 {
-            crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: ERROR - Se leyeron 0 bytes para el nodo {}\n", inode_num));
-            return Err(VfsError::InvalidFs("No se pudieron leer datos del nodo".into()));
+        if bytes_read < record_size {
+            crate::debug::serial_write_str(&alloc::format!(
+                "ECLIPSEFS: ERROR - Registro incompleto: se esperaban {} bytes, se leyeron {}\n",
+                record_size, bytes_read
+            ));
+            return Err(VfsError::InvalidFs("Registro de nodo incompleto".into()));
         }
 
         crate::debug::serial_write_str(&alloc::format!("ECLIPSEFS: Nodo {} leído exitosamente ({} bytes)\n", inode_num, bytes_read));
