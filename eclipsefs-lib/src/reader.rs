@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-/// Buffer size for I/O operations (256KB for better performance)
-const BUFFER_SIZE: usize = 256 * 1024;
+/// Buffer size for I/O operations (512KB for better performance)
+const BUFFER_SIZE: usize = 512 * 1024;
 
 /// Maximum number of cached nodes (adjust based on memory constraints)
 const MAX_CACHED_NODES: usize = 1024;
@@ -438,6 +438,20 @@ impl EclipseFSReader {
             cached_nodes: self.node_cache.len(),
             cache_capacity: MAX_CACHED_NODES,
         }
+    }
+
+    /// Read a directory node and automatically prefetch all its children
+    /// This is optimized for directory listing operations
+    pub fn read_directory_with_children(&mut self, inode: u32) -> EclipseFSResult<EclipseFSNode> {
+        let dir_node = self.read_node(inode)?;
+        
+        // Only prefetch for directories
+        if dir_node.kind == NodeKind::Directory {
+            let child_inodes: Vec<u32> = dir_node.get_children().values().copied().collect();
+            let _ = self.prefetch_nodes(&child_inodes);
+        }
+        
+        Ok(dir_node)
     }
 }
 

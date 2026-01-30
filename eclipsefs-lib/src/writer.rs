@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 
-/// Buffer size for I/O operations (256KB for better performance)
-const BUFFER_SIZE: usize = 256 * 1024;
+/// Buffer size for I/O operations (512KB for better performance on large writes)
+const BUFFER_SIZE: usize = 512 * 1024;
 
 /// Escritor de imágenes EclipseFS
 pub struct EclipseFSWriter {
