@@ -42,7 +42,8 @@ fn main() -> EclipseFSResult<()> {
     }
     let write_duration = write_start.elapsed();
     println!("✅ Write completed in {:.2?}", write_duration);
-    println!("   Speed: {:.2} MB/s\n", 10.0 / write_duration.as_secs_f64());
+    let write_speed = 10.0 / write_duration.as_secs_f64().max(0.000001);
+    println!("   Speed: {:.2} MB/s\n", write_speed);
 
     // Test 2: Read the 10MB file
     println!("Test 2: Reading 10MB file from filesystem...");
@@ -73,7 +74,8 @@ fn main() -> EclipseFSResult<()> {
     }
     let read_duration = read_start.elapsed();
     println!("✅ Read completed in {:.2?}", read_duration);
-    println!("   Speed: {:.2} MB/s\n", 10.0 / read_duration.as_secs_f64());
+    let read_speed = 10.0 / read_duration.as_secs_f64().max(0.000001);
+    println!("   Speed: {:.2} MB/s\n", read_speed);
 
     // Test 3: Multiple small reads (simulating kernel startup)
     println!("Test 3: Multiple small file reads (100 files)...");
@@ -124,8 +126,10 @@ fn main() -> EclipseFSResult<()> {
 
     // Summary
     println!("=== Performance Summary ===");
-    println!("10MB write: {:.2?} ({:.2} MB/s)", write_duration, 10.0 / write_duration.as_secs_f64());
-    println!("10MB read:  {:.2?} ({:.2} MB/s)", read_duration, 10.0 / read_duration.as_secs_f64());
+    let write_speed = 10.0 / write_duration.as_secs_f64().max(0.000001);
+    let read_speed = 10.0 / read_duration.as_secs_f64().max(0.000001);
+    println!("10MB write: {:.2?} ({:.2} MB/s)", write_duration, write_speed);
+    println!("10MB read:  {:.2?} ({:.2} MB/s)", read_duration, read_speed);
     println!("100 x 10KB reads: {:.2?} ({:.2?} per file)", multi_duration, multi_duration / 100);
     
     if read_duration.as_secs_f64() < 5.0 {
@@ -134,9 +138,9 @@ fn main() -> EclipseFSResult<()> {
         println!("\n⚠️  WARNING: Read time exceeds 5 second target");
     }
 
-    // Cleanup
-    std::fs::remove_file(test_file)?;
-    std::fs::remove_file("benchmark_multi.img")?;
+    // Cleanup (use RAII pattern for better cleanup on error)
+    let _ = std::fs::remove_file(test_file);
+    let _ = std::fs::remove_file("benchmark_multi.img");
 
     Ok(())
 }
