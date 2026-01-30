@@ -1175,8 +1175,38 @@ EOF
         
         # Desmontar FAT32
         print_status "Desmontando partición FAT32..."
-        sudo umount "$MOUNT_POINT"
-        sudo rmdir "$MOUNT_POINT"
+        
+        # Asegurar que no estamos en el directorio del punto de montaje
+        cd "$(dirname "$0")"
+        
+        # Sincronizar para vaciar todas las escrituras pendientes al disco
+        sync
+        
+        # Intentar desmontar con reintentos
+        UNMOUNT_RETRIES=5
+        UNMOUNT_SUCCESS=0
+        for i in $(seq 1 $UNMOUNT_RETRIES); do
+            if [ $i -gt 1 ]; then
+                print_status "Reintentando desmontaje (intento $i/$UNMOUNT_RETRIES)..."
+                sleep 1
+                sync
+            fi
+            if sudo umount "$MOUNT_POINT" 2>/dev/null; then
+                UNMOUNT_SUCCESS=1
+                break
+            fi
+        done
+        
+        if [ $UNMOUNT_SUCCESS -eq 1 ]; then
+            print_success "✓ Partición FAT32 desmontada correctamente"
+            sudo rmdir "$MOUNT_POINT" 2>/dev/null || true
+        else
+            print_error "Error al desmontar $MOUNT_POINT"
+            print_status "Intentando limpieza forzada..."
+            sudo umount -l "$MOUNT_POINT" 2>/dev/null || true
+            sleep 1
+            sudo rmdir "$MOUNT_POINT" 2>/dev/null || true
+        fi
         
         # Partición EclipseFS ya fue poblada con populate-eclipsefs
         print_success "Partición EclipseFS lista con archivos del sistema"
