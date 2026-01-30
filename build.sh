@@ -1176,13 +1176,13 @@ EOF
         # Desmontar FAT32
         print_status "Desmontando partición FAT32..."
         
-        # Ensure we're not in the mount point directory
+        # Asegurar que no estamos en el directorio del punto de montaje
         cd "$(dirname "$0")"
         
-        # Sync to flush all pending writes to disk
+        # Sincronizar para vaciar todas las escrituras pendientes al disco
         sync
         
-        # Try to unmount with retries
+        # Intentar desmontar con reintentos
         UNMOUNT_RETRIES=5
         UNMOUNT_SUCCESS=0
         for i in $(seq 1 $UNMOUNT_RETRIES); do
