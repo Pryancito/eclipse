@@ -10,6 +10,8 @@ use eclipse_kernel::{
     },
     main_simple::kernel_main,
     debug::serial_write_str,
+    interrupts::manager::initialize_interrupt_system,
+    syscalls::handler::init_syscall_system,
 };
 use core::panic::PanicInfo;
 
@@ -120,6 +122,20 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     } else {
         serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
     }
+
+    // Inicializar sistema de syscalls
+    serial_write_str("KERNEL: Initializing syscall system...\n");
+    let _syscall_handler = init_syscall_system();
+    serial_write_str("KERNEL: Syscall system initialized.\n");
+
+    // Inicializar sistema de interrupciones
+    serial_write_str("KERNEL: Initializing interrupt system...\n");
+    let kernel_code_selector = 0x08; // Selector de código del kernel
+    if let Err(e) = initialize_interrupt_system(kernel_code_selector) {
+        serial_write_str(&alloc::format!("KERNEL: FATAL - Failed to initialize interrupt system: {}\n", e));
+        panic!("Error al inicializar sistema de interrupciones: {}", e);
+    }
+    serial_write_str("KERNEL: Interrupt system initialized.\n");
 
     serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");
     kernel_main_wrapper();
