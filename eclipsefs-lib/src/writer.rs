@@ -7,11 +7,14 @@ use crate::{
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+
+/// Buffer size for I/O operations (256KB for better performance)
+const BUFFER_SIZE: usize = 256 * 1024;
 
 /// Escritor de imágenes EclipseFS
 pub struct EclipseFSWriter {
-    file: File,
+    file: BufWriter<File>,
     nodes: BTreeMap<u32, EclipseFSNode>,
     next_inode: u32,
 }
@@ -20,7 +23,7 @@ impl EclipseFSWriter {
     /// Crear un nuevo escritor
     pub fn new(file: File) -> Self {
         Self {
-            file,
+            file: BufWriter::with_capacity(BUFFER_SIZE, file),
             nodes: BTreeMap::new(),
             next_inode: constants::ROOT_INODE + 1,
         }
@@ -62,6 +65,9 @@ impl EclipseFSWriter {
 
         // Escribir nodos
         self.write_nodes(&header)?;
+
+        // Flush buffer to ensure all data is written
+        self.file.flush()?;
 
         Ok(())
     }
