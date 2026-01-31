@@ -183,6 +183,7 @@ pub mod debug;
 pub mod error_recovery; // Sistema de recuperación de errores durante el boot
 pub mod vfs_global; // VFS global instance
 pub mod procfs; // /proc filesystem implementation
+pub mod microkernel; // Microkernel architecture implementation
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {

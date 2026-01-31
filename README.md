@@ -9,13 +9,15 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 
 ## Características Principales
 
-### 🚀 Kernel Híbrido
+### 🚀 Microkernel Moderno
 - **Arquitectura x86_64**: Soporte completo para procesadores de 64 bits
+- **Arquitectura Microkernel**: Servicios del sistema ejecutándose en espacio de usuario
+- **Sistema de Mensajes**: Comunicación IPC eficiente entre servidores
 - **Multiboot2**: Compatible con bootloaders estándar
 - **UEFI**: Soporte nativo para firmware UEFI moderno
 - **Gestión de memoria**: Sistema de memoria avanzado con paginación
 - **Interrupciones**: Manejo completo de interrupciones del sistema
-- **Drivers**: Drivers para VGA, teclado, mouse y más
+- **Servidores del Sistema**: FileSystem, Graphics, Network, Input, Audio, AI, Security
 
 ### 🖥️ Sistema de Display Avanzado
 - **DRM (Direct Rendering Manager)**: Control total de la pantalla en userland
@@ -52,10 +54,10 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 │  │ DRM Display │ │ File System │ │   Network   │          │
 │  └─────────────┘ └─────────────┘ └─────────────┘          │
 ├─────────────────────────────────────────────────────────────┤
-│  Eclipse Kernel (Hybrid)                                    │
+│  Eclipse Kernel (Microkernel)                               │
 │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐          │
-│  │   Memory    │ │ Interrupts  │ │   Drivers   │          │
-│  │ Management  │ │   Handler   │ │   (VGA,etc) │          │
+│  │   Memory    │ │ Interrupts  │ │     IPC     │          │
+│  │ Management  │ │   Handler   │ │  Messaging  │          │
 │  └─────────────┘ └─────────────┘ └─────────────┘          │
 ├─────────────────────────────────────────────────────────────┤
 │  Hardware Layer                                             │
