@@ -1,0 +1,40 @@
+[package]
+name = "eclipse_microkernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Eclipse OS Team"]
+description = "Microkernel nativo de Eclipse OS escrito desde cero en Rust"
+
+[lib]
+name = "eclipse_microkernel"
+crate-type = ["staticlib"]
+
+[[bin]]
+name = "eclipse_microkernel"
+path = "src/main.rs"
+
+[dependencies]
+# Dependencias básicas para bare metal
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+x86_64 = { version = "0.14", default-features = false, features = ["abi_x86_interrupt", "inline_asm"] }
+volatile = { version = "0.2", default-features = false }
+bitflags = { version = "2.4", default-features = false }
+
+[build-dependencies]
+cc = "1.0"
+
+[features]
+default = []
+
+[profile.dev]
+panic = "abort"
+lto = false
+opt-level = "z"
+overflow-checks = false
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+overflow-checks = false
+codegen-units = 1
