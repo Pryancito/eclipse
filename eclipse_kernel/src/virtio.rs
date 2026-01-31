@@ -200,53 +200,68 @@ impl VirtIOBlockDevice {
         use crate::serial;
         
         // Create a minimal EclipseFS header at block 0 (which maps to partition offset)
-        // EclipseFS header structure (from eclipsefs-lib):
+        // EclipseFS header structure (from eclipsefs-lib format.rs):
         // Magic: "ECLIPSEFS" (9 bytes)
-        // Version: u32 (4 bytes) 
-        // Block size: u32 (4 bytes)
-        // Total blocks: u64 (8 bytes)
-        // Root inode: u32 (4 bytes)
+        // Version: u32 (4 bytes) - little endian
+        // Inode table offset: u64 (8 bytes) - little endian
+        // Inode table size: u64 (8 bytes) - little endian
+        // Total inodes: u32 (4 bytes) - little endian
         // And more fields...
         
-        // For now, create a simple valid header
+        let mut offset = 0;
+        
         // Magic number: "ECLIPSEFS"
-        SIMULATED_DISK[0] = b'E';
-        SIMULATED_DISK[1] = b'C';
-        SIMULATED_DISK[2] = b'L';
-        SIMULATED_DISK[3] = b'I';
-        SIMULATED_DISK[4] = b'P';
-        SIMULATED_DISK[5] = b'S';
-        SIMULATED_DISK[6] = b'E';
-        SIMULATED_DISK[7] = b'F';
-        SIMULATED_DISK[8] = b'S';
+        SIMULATED_DISK[offset..offset+9].copy_from_slice(b"ECLIPSEFS");
+        offset += 9;
         
-        // Version: 1.0 (0x00010000)
-        SIMULATED_DISK[9] = 0x00;
-        SIMULATED_DISK[10] = 0x00;
-        SIMULATED_DISK[11] = 0x01;
-        SIMULATED_DISK[12] = 0x00;
+        // Version: 1.0 (0x00010000) - little endian
+        let version: u32 = 0x00010000; // Major 1, Minor 0
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&version.to_le_bytes());
+        offset += 4;
         
-        // Block size: 4096 (0x1000)
-        SIMULATED_DISK[13] = 0x00;
-        SIMULATED_DISK[14] = 0x10;
-        SIMULATED_DISK[15] = 0x00;
-        SIMULATED_DISK[16] = 0x00;
+        // Inode table offset: 4096 (after header) - little endian
+        let inode_table_offset: u64 = 4096;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_offset.to_le_bytes());
+        offset += 8;
         
-        // Total blocks: 128 (simulated disk size / 4096)
-        SIMULATED_DISK[17] = 128;
-        SIMULATED_DISK[18] = 0x00;
-        SIMULATED_DISK[19] = 0x00;
-        SIMULATED_DISK[20] = 0x00;
-        SIMULATED_DISK[21] = 0x00;
-        SIMULATED_DISK[22] = 0x00;
-        SIMULATED_DISK[23] = 0x00;
-        SIMULATED_DISK[24] = 0x00;
+        // Inode table size: 4096 (minimal) - little endian
+        let inode_table_size: u64 = 4096;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_size.to_le_bytes());
+        offset += 8;
         
-        // Root inode: 1
-        SIMULATED_DISK[25] = 0x01;
-        SIMULATED_DISK[26] = 0x00;
-        SIMULATED_DISK[27] = 0x00;
-        SIMULATED_DISK[28] = 0x00;
+        // Total inodes: 1 (just root) - little endian
+        let total_inodes: u32 = 1;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&total_inodes.to_le_bytes());
+        offset += 4;
+        
+        // Header checksum: 0 (skip for now)
+        let header_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&header_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Metadata checksum: 0
+        let metadata_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&metadata_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Data checksum: 0
+        let data_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&data_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Creation time: 0
+        let creation_time: u64 = 0;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&creation_time.to_le_bytes());
+        offset += 8;
+        
+        // Last check: 0
+        let last_check: u64 = 0;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&last_check.to_le_bytes());
+        offset += 8;
+        
+        // Flags: 0
+        let flags: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&flags.to_le_bytes());
         
         serial::serial_print("[VirtIO] Simulated disk initialized with EclipseFS header\n");
     }
