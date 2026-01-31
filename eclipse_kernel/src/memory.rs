@@ -36,7 +36,7 @@ pub fn init() {
     unsafe {
         // Inicializar el heap con un bloque libre grande
         let heap_start = HEAP.memory.as_mut_ptr();
-        crate::serial::serial_print("[MEM] Heap start: 0x");
+        crate::serial::serial_print("[MEM] Heap start: ");
         crate::serial::serial_print_hex(heap_start as u64);
         crate::serial::serial_print("\n");
         
@@ -59,7 +59,7 @@ pub fn init() {
         crate::serial::serial_print("[MEM] Generic spinlock passed\n");
 
         crate::serial::serial_print("[MEM] Locking allocator...\n");
-        crate::serial::serial_print("[MEM] Allocator addr: 0x");
+        crate::serial::serial_print("[MEM] Allocator addr: ");
         crate::serial::serial_print_hex(&raw const ALLOCATOR as u64);
         crate::serial::serial_print("\n");
         let mut allocator = ALLOCATOR.lock();
@@ -136,9 +136,9 @@ pub fn init_paging(kernel_phys_base: u64) {
     
     // DEBUG
     unsafe {
-        crate::serial::serial_print("Init Paging. Phys Base: 0x");
+        crate::serial::serial_print("Init Paging. Phys Base: ");
         crate::serial::serial_print_hex(kernel_phys_base);
-        crate::serial::serial_print("\nOffset: 0x");
+        crate::serial::serial_print("\nOffset: ");
         crate::serial::serial_print_hex(phys_offset);
         crate::serial::serial_print("\n");
     }
@@ -149,7 +149,7 @@ pub fn init_paging(kernel_phys_base: u64) {
         let pd_phys = (&PD as *const _ as u64).wrapping_add(phys_offset);
         let pml4_phys = (&PML4 as *const _ as u64).wrapping_add(phys_offset);
 
-        crate::serial::serial_print("PML4 Phys: 0x");
+        crate::serial::serial_print("PML4 Phys: ");
         crate::serial::serial_print_hex(pml4_phys);
         crate::serial::serial_print("\n");
 

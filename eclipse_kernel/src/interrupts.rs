@@ -198,9 +198,9 @@ extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
     
     crate::serial::serial_print("EXCEPTION: ");
     crate::serial::serial_print_dec(num);
-    crate::serial::serial_print(" Error: 0x");
+    crate::serial::serial_print(" Error: ");
     crate::serial::serial_print_hex(error_code);
-    crate::serial::serial_print(" RIP: 0x");
+    crate::serial::serial_print(" RIP: ");
     crate::serial::serial_print_hex(rip);
     crate::serial::serial_print("\n");
     
@@ -208,7 +208,7 @@ extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
     if num == 14 { // Page Fault
         let cr2: u64;
         unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
-        crate::serial::serial_print("CR2: 0x");
+        crate::serial::serial_print("CR2: ");
         crate::serial::serial_print_hex(cr2);
         crate::serial::serial_print("\n");
     }

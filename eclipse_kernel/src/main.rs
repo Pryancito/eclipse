@@ -73,7 +73,7 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     // Inicializar serial para debugging
     serial::init();
     serial::serial_print("DEBUG: Entered _start\n");
-    serial::serial_print("Phys Base: 0x");
+    serial::serial_print("Phys Base: ");
     serial::serial_print_hex(kernel_phys_base);
     serial::serial_print("\n");
     
@@ -107,7 +107,7 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     // Test heap allocation early to verify allocator
     serial::serial_print("Testing early heap allocation...\n");
     let test_vec = vec![0u8; 128];
-    serial::serial_print("Early heap allocation successful, ptr: 0x");
+    serial::serial_print("Early heap allocation successful, ptr: ");
     serial::serial_print_hex(test_vec.as_ptr() as u64);
     serial::serial_print("\n");
     core::mem::drop(test_vec); // Free it

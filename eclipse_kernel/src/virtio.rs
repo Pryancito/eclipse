@@ -306,16 +306,19 @@ impl Virtqueue {
         let idx = avail.idx as usize % self.queue_size as usize;
         avail.ring[idx] = head;
         
-        // Memory barrier
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        
+        // Update index - this tells the device there's work to do
         avail.idx = avail.idx.wrapping_add(1);
+        
+        // Memory barrier to ensure all writes (ring and idx) are visible before notification
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         
         Some(head)
     }
     
     /// Check if there are used buffers
     unsafe fn has_used(&self) -> bool {
+        // Memory barrier to ensure we see device updates
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = &*self.used;
         self.last_used_idx != used.idx
     }
@@ -444,7 +447,7 @@ impl VirtIOBlockDevice {
         
         // Read device features
         let features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
-        serial::serial_print("[VirtIO] Device features: 0x");
+        serial::serial_print("[VirtIO] Device features: ");
         serial::serial_print_hex(features as u64);
         serial::serial_print("\n");
         
@@ -476,7 +479,7 @@ impl VirtIOBlockDevice {
             Some(queue) => {
                 // Set queue address (physical address / 4096)
                 let queue_pfn = (queue.desc_phys / 4096) as u32;
-                serial::serial_print("[VirtIO] Queue PFN: 0x");
+                serial::serial_print("[VirtIO] Queue PFN: ");
                 serial::serial_print_hex(queue_pfn as u64);
                 serial::serial_print("\n");
                 
@@ -496,7 +499,7 @@ impl VirtIOBlockDevice {
                 
                 // Verify status was set correctly
                 let final_status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
-                serial::serial_print("[VirtIO] Final device status: 0x");
+                serial::serial_print("[VirtIO] Final device status: ");
                 serial::serial_print_hex(final_status as u64);
                 serial::serial_print("\n");
                 
@@ -516,7 +519,7 @@ impl VirtIOBlockDevice {
         
         // Debug: Check if this is actually MMIO or PCI
         let magic = read_volatile(&(*regs).magic_value);
-        crate::serial::serial_print("[VirtIO] Magic value: 0x");
+        crate::serial::serial_print("[VirtIO] Magic value: ");
         crate::serial::serial_print_hex(magic as u64);
         crate::serial::serial_print("\n");
         
@@ -748,6 +751,9 @@ impl VirtIOBlockDevice {
             
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
+            // Memory barrier before notifying device to ensure all writes are visible
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
@@ -863,6 +869,9 @@ impl VirtIOBlockDevice {
             
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
+            // Memory barrier before notifying device to ensure all writes are visible
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
@@ -937,7 +946,7 @@ pub fn init() {
             
             // Get BAR0 for VirtIO registers
             let bar0 = crate::pci::get_bar(&pci_dev, 0);
-            serial::serial_print("[VirtIO]   BAR0 raw=0x");
+            serial::serial_print("[VirtIO]   BAR0 raw=");
             serial::serial_print_hex(bar0 as u64);
             serial::serial_print(" (bit0=");
             serial::serial_print_dec((bar0 & 1) as u64);
@@ -945,7 +954,7 @@ pub fn init() {
             
             let bar_addr = (bar0 & !0xF) as u64;
             
-            serial::serial_print("[VirtIO]   BAR0 masked=0x");
+            serial::serial_print("[VirtIO]   BAR0 masked=");
             serial::serial_print_hex(bar_addr);
             serial::serial_print("\n");
             
@@ -953,7 +962,7 @@ pub fn init() {
             if (bar0 & 1) != 0 {
                 // I/O port BAR - VirtIO legacy PCI
                 let io_base = (bar0 & !0x3) as u16;
-                serial::serial_print("[VirtIO]   I/O port BAR detected at base=0x");
+                serial::serial_print("[VirtIO]   I/O port BAR detected at base=");
                 serial::serial_print_hex(io_base as u64);
                 serial::serial_print("\n");
                 

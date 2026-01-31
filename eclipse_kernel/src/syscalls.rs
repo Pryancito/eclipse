@@ -261,7 +261,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     stats.exec_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] exec() called with buffer at 0x");
+    serial::serial_print("[SYSCALL] exec() called with buffer at ");
     serial::serial_print_hex(elf_ptr);
     serial::serial_print(", size: ");
     serial::serial_print_dec(elf_size);
@@ -279,7 +279,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     
     // Replace current process with ELF binary
     if let Some(entry_point) = crate::elf_loader::replace_process_image(elf_data) {
-        serial::serial_print("[SYSCALL] exec() replacing process image, entry: 0x");
+        serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
         serial::serial_print_hex(entry_point);
         serial::serial_print("\n");
         
@@ -376,7 +376,7 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         *(out_size as *mut u64) = bin_size;
     }
     
-    serial::serial_print("[SYSCALL] Service binary: ptr=0x");
+    serial::serial_print("[SYSCALL] Service binary: ptr=");
     serial::serial_print_hex(bin_ptr);
     serial::serial_print(", size=");
     serial::serial_print_dec(bin_size);

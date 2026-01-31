@@ -67,7 +67,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     }
     
     serial::serial_print("ELF: Valid header found\n");
-    serial::serial_print("ELF: Entry point: 0x");
+    serial::serial_print("ELF: Entry point: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
     
@@ -86,9 +86,9 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
         
         if ph.p_type == PT_LOAD {
-            serial::serial_print("ELF: Loading segment at 0x");
+            serial::serial_print("ELF: Loading segment at ");
             serial::serial_print_hex(ph.p_vaddr);
-            serial::serial_print(" size: 0x");
+            serial::serial_print(" size: ");
             serial::serial_print_hex(ph.p_memsz);
             serial::serial_print("\n");
             
@@ -114,9 +114,9 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
                 let bss_size = (ph.p_memsz - ph.p_filesz) as usize;
                 let bss_start = ph.p_vaddr + ph.p_filesz;
                 
-                serial::serial_print("ELF: Zeroing BSS at 0x");
+                serial::serial_print("ELF: Zeroing BSS at ");
                 serial::serial_print_hex(bss_start);
-                serial::serial_print(" size: 0x");
+                serial::serial_print(" size: ");
                 serial::serial_print_hex(bss_size as u64);
                 serial::serial_print("\n");
                 
@@ -164,7 +164,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
         return None;
     }
     
-    serial::serial_print("ELF: Valid exec binary, entry: 0x");
+    serial::serial_print("ELF: Valid exec binary, entry: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
     
@@ -183,7 +183,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
 /// Jump to entry point in userspace (Ring 3)
 /// This function never returns
 pub unsafe fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
-    serial::serial_print("ELF: Jumping to entry point in userspace: 0x");
+    serial::serial_print("ELF: Jumping to entry point in userspace: ");
     serial::serial_print_hex(entry_point);
     serial::serial_print("\n");
     
