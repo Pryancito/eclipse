@@ -139,6 +139,94 @@ pub struct MicrokernelStatistics {
 - **Optimización Granular**: Cada servicio puede optimizarse individualmente
 - **Recursos Dinámicos**: Asignación de recursos según demanda
 
+## Migración a Userspace
+
+### Servicios Migrados a Userspace
+Los siguientes servicios ahora se ejecutan completamente en espacio de usuario:
+
+✅ **FileSystem Server** (`userland/src/services/servers/filesystem_server.rs`)
+- Maneja todas las operaciones de I/O de archivos
+- Comandos: Open, Read, Write, Close, Delete, Create, List, Stat
+- Prioridad: 10 (Alta)
+
+✅ **Graphics Server** (`userland/src/services/servers/graphics_server.rs`)
+- Gestiona operaciones de display y renderizado
+- Comandos: InitDisplay, DrawPixel, DrawRect, DrawLine, Clear, Swap, SetMode
+- Prioridad: 9 (Alta)
+
+✅ **Network Server** (`userland/src/services/servers/network_server.rs`)
+- Implementa stack TCP/IP y gestión de red
+- Comandos: SocketCreate, Bind, Send, Recv
+- Prioridad: 8 (Media-Alta)
+
+✅ **Input Server** (`userland/src/services/servers/input_server.rs`)
+- Maneja eventos de teclado, mouse y otros dispositivos
+- Comandos: KeyboardEvent, MouseEvent, GetKeyboardState, GetMouseState
+- Prioridad: 9 (Alta)
+
+✅ **Audio Server** (`userland/src/services/servers/audio_server.rs`)
+- Gestiona reproducción y captura de audio
+- Comandos: Play, Capture, SetVolume, GetVolume
+- Prioridad: 7 (Media)
+
+✅ **AI Server** (`userland/src/services/servers/ai_server.rs`)
+- Ejecuta inferencia de modelos de IA
+- Comandos: Inference, LoadModel, UnloadModel, AnomalyDetection, Prediction
+- Prioridad: 6 (Baja)
+
+✅ **Security Server** (`userland/src/services/servers/security_server.rs`)
+- Maneja autenticación, autorización y encriptación
+- Comandos: Authenticate, Authorize, Encrypt, Decrypt, Hash, Audit, CheckPermission
+- Prioridad: 10 (Máxima)
+
+### Arquitectura de Servidores Userspace
+
+Todos los servidores implementan el trait `MicrokernelServer`:
+
+```rust
+pub trait MicrokernelServer {
+    fn name(&self) -> &str;
+    fn message_type(&self) -> MessageType;
+    fn priority(&self) -> u8;
+    fn initialize(&mut self) -> Result<()>;
+    fn process_message(&mut self, message: &Message) -> Result<Vec<u8>>;
+    fn shutdown(&mut self) -> Result<()>;
+    fn get_stats(&self) -> ServerStats;
+}
+```
+
+### Gestor de Servidores
+
+El `MicrokernelServerManager` gestiona todos los servidores:
+- Registro de servidores
+- Inicialización secuencial
+- Enrutamiento de mensajes
+- Recolección de estadísticas
+- Apagado ordenado
+
+### Integración con SystemServiceManager
+
+Los servidores del microkernel se integran con el `SystemServiceManager` de userland:
+
+```rust
+// En userland/src/services/system_services.rs
+pub fn initialize_microkernel_servers(&mut self) -> Result<()> {
+    let mut manager = MicrokernelServerManager::new();
+    
+    // Registrar servidores en orden de prioridad
+    manager.register_server(Box::new(SecurityServer::new()))?;
+    manager.register_server(Box::new(FileSystemServer::new()))?;
+    manager.register_server(Box::new(GraphicsServer::new()))?;
+    manager.register_server(Box::new(NetworkServer::new()))?;
+    manager.register_server(Box::new(InputServer::new()))?;
+    manager.register_server(Box::new(AudioServer::new()))?;
+    manager.register_server(Box::new(AIServer::new()))?;
+    
+    manager.initialize_all()?;
+    Ok(())
+}
+```
+
 ## Migración Futura
 
 ### Servicios Pendientes de Migración
@@ -150,10 +238,12 @@ Los siguientes componentes aún están en el kernel y deben migrarse a servidore
 
 ### Plan de Migración
 1. **Fase 1** (Completada): Inicializar infraestructura de microkernel
-2. **Fase 2**: Mover drivers a servidores userland
-3. **Fase 3**: Migrar sistema de archivos a FileSystem Server
-4. **Fase 4**: Migrar stack de red a Network Server
-5. **Fase 5**: Migrar sistema gráfico a Graphics Server
+2. **Fase 2** (Completada): Crear servidores userspace con trait común
+3. **Fase 3** (Completada): Implementar 7 servidores principales en userspace
+4. **Fase 4** (Pendiente): Conectar servidores userspace con kernel vía IPC real
+5. **Fase 5** (Pendiente): Mover drivers específicos a servidores userland
+6. **Fase 6** (Pendiente): Migrar stack de red completo a Network Server
+7. **Fase 7** (Pendiente): Migrar sistema gráfico completo a Graphics Server
 
 ## Referencia de API
 
