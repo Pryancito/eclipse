@@ -141,10 +141,11 @@ unsafe impl Hal for KernelHal {
         let layout = Layout::from_size_align(size, 4096).expect("layout DMA");
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
-            serial_write_str("VIRTIO_HAL: dma_alloc retornó null\n");
-            return (0, NonNull::dangling());
+            serial_write_str("VIRTIO_HAL: ERROR CRÍTICO - dma_alloc falló, sin memoria\n");
+            panic!("VirtIO: No se puede asignar {} páginas DMA", pages);
         }
         let vaddr = ptr as usize;
+        serial_write_str(&format!("VIRTIO_HAL: dma_alloc exitoso - {} páginas en vaddr={:#x}\n", pages, vaddr));
         (vaddr, unsafe { NonNull::new_unchecked(ptr) })
     }
 
@@ -156,14 +157,33 @@ unsafe impl Hal for KernelHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: usize, size: usize) -> NonNull<u8> {
+        serial_write_str(&format!("VIRTIO_HAL: mmio_phys_to_virt - paddr={:#x} size={:#x}\n", paddr, size));
+        
         let virt = pci_helper::map_mmio_region(paddr as u64, size as u64)
-            .expect("map_mmio_region falló");
-        NonNull::new(virt as *mut u8).unwrap()
+            .unwrap_or_else(|e| {
+                serial_write_str(&format!("VIRTIO_HAL: ERROR - map_mmio_region falló: {}\n", e));
+                panic!("VirtIO: No se puede mapear región MMIO en {:#x}", paddr);
+            });
+        
+        if virt == 0 {
+            panic!("VirtIO: map_mmio_region retornó dirección 0 para paddr={:#x}", paddr);
+        }
+        
+        serial_write_str(&format!("VIRTIO_HAL: mmio_phys_to_virt exitoso - virt={:#x}\n", virt));
+        NonNull::new(virt as *mut u8).expect("MMIO virt address is null")
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> usize {
-        buffer.as_ptr() as *const u8 as usize
+        let paddr = buffer.as_ptr() as *const u8 as usize;
+        // En un sistema con IOMMU, aquí se configuraría el mapeo DMA
+        // Por ahora usamos identidad (paddr == vaddr) ya que el kernel usa mapeo directo
+        serial_write_str(&format!("VIRTIO_HAL: share buffer at {:#x}\n", paddr));
+        paddr
     }
 
-    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {}
+    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+        // En un sistema con cache coherency explícito, aquí se haría flush/invalidate
+        // Por ahora asumimos cache coherente (x86-64 MESI protocol)
+        serial_write_str(&format!("VIRTIO_HAL: unshare buffer at {:#x}\n", _paddr));
+    }
 }

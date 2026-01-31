@@ -32,16 +32,41 @@ pub fn device_function(device: PciDevice) -> DeviceFunction {
 }
 
 pub fn map_mmio_region(paddr: u64, size: u64) -> Result<usize, String> {
-    serial_write_str(&format!("VIRTIO: map_mmio_region identidad {:#x} tamaño {:#x}\n", paddr, size));
+    serial_write_str(&format!("VIRTIO: map_mmio_region paddr={:#x} tamaño={:#x}\n", paddr, size));
+    
+    // Validar que paddr no sea 0 (dirección inválida)
+    if paddr == 0 {
+        serial_write_str("VIRTIO: ERROR - paddr es 0 (dirección inválida)\n");
+        return Err("paddr inválido (0)".to_string());
+    }
+    
+    // Validar que size no sea 0
+    if size == 0 {
+        serial_write_str("VIRTIO: ERROR - size es 0\n");
+        return Err("size inválido (0)".to_string());
+    }
     
     // Usar mapeo de identidad directo - el kernel tiene mapeo de identidad habilitado
     // Esto significa que la dirección física es la misma que la virtual
+    // En Eclipse OS, las primeras 64 GiB de RAM física están mapeadas 1:1
     serial_write_str(&format!("VIRTIO: Usando mapeo de identidad {:#x}\n", paddr));
     
     // Verificar que la región esté en el rango mapeado (0-64 GiB)
+    // QEMU típicamente asigna BARs de dispositivos en rangos bajos (< 4 GiB)
     if paddr >= 0x1000000000 { // 64 GiB
-        serial_write_str("VIRTIO: ADVERTENCIA - región fuera del rango mapeado (64 GiB)\n");
-        return Err("Región fuera del rango mapeado".to_string());
+        serial_write_str(&format!("VIRTIO: ADVERTENCIA - región fuera del rango mapeado (64 GiB): {:#x}\n", paddr));
+        return Err(format!("Región fuera del rango mapeado: {:#x}", paddr));
+    }
+    
+    // Verificar que la región completa esté en el rango
+    let end_addr = paddr.checked_add(size).ok_or_else(|| {
+        serial_write_str("VIRTIO: ERROR - overflow en cálculo de end_addr\n");
+        "Overflow en cálculo de dirección final".to_string()
+    })?;
+    
+    if end_addr > 0x1000000000 {
+        serial_write_str(&format!("VIRTIO: ADVERTENCIA - región se extiende fuera del rango: {:#x}-{:#x}\n", paddr, end_addr));
+        return Err(format!("Región se extiende fuera del rango: {:#x}-{:#x}", paddr, end_addr));
     }
     
     serial_write_str(&format!("VIRTIO: map_mmio_region exitoso - retornando {:#x}\n", paddr));
