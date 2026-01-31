@@ -198,22 +198,53 @@ unsafe impl Send for Virtqueue {}
 impl Virtqueue {
     /// Create a new virtqueue with DMA-allocated memory
     unsafe fn new(queue_size: u16) -> Option<Self> {
-        // Calculate sizes for each component
+        // Calculate sizes according to VirtIO Legacy spec
+        // The Used Ring must be aligned to 4096 bytes boundary
+        
         let desc_size = core::mem::size_of::<VirtQDescriptor>() * queue_size as usize;
         let avail_size = 6 + 2 * queue_size as usize + 2; // flags + idx + ring + used_event
         let used_size = 6 + 8 * queue_size as usize + 2; // flags + idx + ring + avail_event
         
-        // Allocate descriptors (16-byte aligned)
-        let (desc_ptr, desc_phys) = crate::memory::alloc_dma_buffer(desc_size, 16)?;
-        let descriptors = desc_ptr as *mut VirtQDescriptor;
+        // Calculate offsets
+        let avail_offset = desc_size;
         
-        // Allocate available ring (2-byte aligned)
-        let (avail_ptr, avail_phys) = crate::memory::alloc_dma_buffer(avail_size, 2)?;
-        let avail = avail_ptr as *mut VirtQAvail;
+        // Used ring must be 4096-byte aligned
+        let mut used_offset = avail_offset + avail_size;
+        if used_offset % 4096 != 0 {
+            used_offset = (used_offset + 4095) & !4095;
+        }
         
-        // Allocate used ring (4-byte aligned) 
-        let (used_ptr, used_phys) = crate::memory::alloc_dma_buffer(used_size, 4)?;
-        let used = used_ptr as *mut VirtQUsed;
+        let total_size = used_offset + used_size;
+        
+        crate::serial::serial_print("[VirtIO] Allocating contiguous queue memory: ");
+        crate::serial::serial_print_dec(total_size as u64);
+        crate::serial::serial_print(" bytes (aligned to 4096)\n");
+        
+        // Allocate single contiguous buffer (4096-byte aligned)
+        let (mem_ptr, mem_phys) = crate::memory::alloc_dma_buffer(total_size, 4096)?;
+        
+        // Zero out memory
+        core::ptr::write_bytes(mem_ptr, 0, total_size);
+        
+        // Calculate pointers and physical addresses
+        let descriptors = mem_ptr as *mut VirtQDescriptor;
+        let desc_phys = mem_phys;
+        
+        let avail = mem_ptr.add(avail_offset) as *mut VirtQAvail;
+        let avail_phys = mem_phys + avail_offset as u64;
+        
+        let used = mem_ptr.add(used_offset) as *mut VirtQUsed;
+        let used_phys = mem_phys + used_offset as u64;
+        
+        crate::serial::serial_print("[VirtIO]   Desc phys: ");
+        crate::serial::serial_print_hex(desc_phys);
+        crate::serial::serial_print("\n");
+        crate::serial::serial_print("[VirtIO]   Avail phys: ");
+        crate::serial::serial_print_hex(avail_phys);
+        crate::serial::serial_print("\n");
+        crate::serial::serial_print("[VirtIO]   Used phys: ");
+        crate::serial::serial_print_hex(used_phys);
+        crate::serial::serial_print("\n");
         
         // Initialize descriptors as a free list
         for i in 0..queue_size {
@@ -464,12 +495,13 @@ impl VirtIOBlockDevice {
         serial::serial_print("\n");
         
         if queue_size == 0 || queue_size > 256 {
-            serial::serial_print("[VirtIO] Invalid queue size\n");
+            serial::serial_print("[VirtIO] Invalid queue size (must be 1-256): ");
+            serial::serial_print_dec(queue_size as u64);
+            serial::serial_print("\n");
             return false;
         }
         
-        // Use a reasonable queue size
-        let actual_queue_size = if queue_size > 128 { 128 } else { queue_size };
+        let actual_queue_size = queue_size;
         serial::serial_print("[VirtIO] Using queue size: ");
         serial::serial_print_dec(actual_queue_size as u64);
         serial::serial_print("\n");
@@ -770,16 +802,30 @@ impl VirtIOBlockDevice {
             }
             
             // Wait for completion (polling for now)
-            let mut timeout = 1000000;
+            // Increase timeout significantly for QEMU emulation (approx 100M cycles)
+            let mut timeout = 100000000;
+            
+            // crate::serial::serial_print("[VirtIO] Waiting for device... ");
+            
             while !queue.has_used() && timeout > 0 {
                 timeout -= 1;
                 core::hint::spin_loop();
+                
+                if timeout % 10000000 == 0 {
+                    // crate::serial::serial_print(".");
+                }
             }
+            // crate::serial::serial_print("\n");
             
             if timeout == 0 {
                 crate::serial::serial_print("[VirtIO] read_block failed: Device timeout (block ");
                 crate::serial::serial_print_dec(block_num);
-                crate::serial::serial_print(")\n");
+                crate::serial::serial_print(") - Queue params: used_idx=");
+                crate::serial::serial_print_dec(unsafe { (*queue.used).idx as u64 });
+                crate::serial::serial_print(", last_used=");
+                crate::serial::serial_print_dec(queue.last_used_idx as u64);
+                crate::serial::serial_print("\n");
+                
                 // Cleanup
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
@@ -888,13 +934,17 @@ impl VirtIOBlockDevice {
             }
             
             // Wait for completion
-            let mut timeout = 1000000;
+            let mut timeout = 100000000;
             while !queue.has_used() && timeout > 0 {
                 timeout -= 1;
                 core::hint::spin_loop();
             }
             
             if timeout == 0 {
+                crate::serial::serial_print("[VirtIO] write_block failed: Device timeout (block ");
+                crate::serial::serial_print_dec(block_num);
+                crate::serial::serial_print(")\n");
+                
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 return Err("VirtIO write timeout");
@@ -927,6 +977,18 @@ pub fn init() {
     use crate::serial;
     
     serial::serial_print("[VirtIO] Initializing VirtIO devices...\n");
+    
+    // Self-test virt_to_phys
+    unsafe {
+        let test_ptr = &BLOCK_DEVICE as *const _ as u64;
+        let phys = crate::memory::virt_to_phys(test_ptr);
+        serial::serial_print("[VirtIO] Memory test: Virt=");
+        serial::serial_print_hex(test_ptr);
+        serial::serial_print(" Phys=");
+        serial::serial_print_hex(phys);
+        serial::serial_print("\n");
+    }
+    
     serial::serial_print("[VirtIO] Searching for VirtIO block devices on PCI bus...\n");
     
     // Try to find VirtIO block device on PCI bus first

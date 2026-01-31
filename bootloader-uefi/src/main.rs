@@ -1352,7 +1352,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     {
         let bs = system_table.boot_services();
-        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-eclipse-microkernel/release/eclipse_kernel");
+        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
 
         match load_kernel_from_data(bs, kernel_data) {
             Ok((entry_point_phys, entry_point_virt, kernel_phys_base, total_len)) => {
