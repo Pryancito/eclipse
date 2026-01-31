@@ -723,10 +723,15 @@ impl VirtIOBlockDevice {
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
-            } else {
+            } else if self.mmio_base != 0 {
                 // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
                 write_volatile(&mut (*regs).queue_notify, 0);
+            } else {
+                // This should never happen due to early return for simulated disk
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("Invalid device configuration");
             }
             
             // Wait for completion (polling for now)
@@ -827,10 +832,15 @@ impl VirtIOBlockDevice {
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
-            } else {
+            } else if self.mmio_base != 0 {
                 // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
                 write_volatile(&mut (*regs).queue_notify, 0);
+            } else {
+                // This should never happen due to early return for simulated disk
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("Invalid device configuration");
             }
             
             // Wait for completion
