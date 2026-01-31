@@ -158,10 +158,7 @@ impl MicrokernelServer for FileSystemServer {
             3 => self.handle_write(command_data),
             4 => self.handle_close(command_data),
             7 => self.handle_list(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {

@@ -125,10 +125,7 @@ impl MicrokernelServer for NetworkServer {
             2 => self.handle_bind(command_data),
             3 => self.handle_send(command_data),
             4 => self.handle_recv(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {

@@ -144,10 +144,7 @@ impl MicrokernelServer for GraphicsServer {
             3 => self.handle_draw_rect(command_data),
             5 => self.handle_clear(command_data),
             6 => self.handle_swap(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {

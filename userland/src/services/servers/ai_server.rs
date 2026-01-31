@@ -124,10 +124,7 @@ impl MicrokernelServer for AIServer {
             3 => self.handle_unload_model(command_data),
             4 => self.handle_anomaly_detection(command_data),
             5 => self.handle_prediction(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {

@@ -112,10 +112,7 @@ impl MicrokernelServer for AudioServer {
             2 => self.handle_capture(command_data),
             3 => self.handle_set_volume(command_data),
             4 => self.handle_get_volume(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {

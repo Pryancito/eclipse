@@ -157,10 +157,7 @@ impl MicrokernelServer for SecurityServer {
             5 => self.handle_hash(command_data),
             6 => self.handle_audit(command_data),
             7 => self.handle_check_permission(command_data),
-            _ => {
-                self.stats.messages_failed += 1;
-                Err(anyhow::anyhow!("Comando desconocido: {}", command))
-            }
+            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
         };
         
         if result.is_err() {
