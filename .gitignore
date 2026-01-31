@@ -37,3 +37,5 @@ userland/cosmic_desktop/cosmic_desktop
 .Trash-*
 Thumbs.db
 
+test_eclipse.img
+*.img
