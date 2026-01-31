@@ -463,6 +463,9 @@ pub fn main_loop(fb: &mut FramebufferDriver, xhci_initialized: bool) -> ! {
         // Ejecutar tareas programadas (input, terminal, procesos)
         run_scheduled_tasks(fb);
         
+        // Procesar mensajes del microkernel cada iteración
+        crate::microkernel::process_messages();
+        
         // Polling USB HID cada 100,000 iteraciones (~cada ~10ms dependiendo de la CPU)
         // Solo si XHCI está inicializado
         if xhci_initialized && counter.wrapping_sub(last_hid_poll) > 100_000 {

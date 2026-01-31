@@ -305,7 +305,130 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     }
 
     fb.clear_screen(Color::BLACK);
-    fb.write_text_kernel("Eclipse OS Kernel v0.1.0", Color::WHITE);
+    fb.write_text_kernel("Eclipse OS Kernel v0.1.0 - Microkernel", Color::WHITE);
+
+    // === MICROKERNEL INITIALIZATION ===
+    serial_write_str("KERNEL_MAIN: Initializing Microkernel Architecture...\n");
+    fb.write_text_kernel("Inicializando arquitectura microkernel...", Color::CYAN);
+    
+    if crate::microkernel::init_microkernel() {
+        fb.write_text_kernel("✓ Microkernel inicializado", Color::GREEN);
+        serial_write_str("KERNEL_MAIN: Microkernel initialized successfully\n");
+        
+        // Register core system servers
+        serial_write_str("KERNEL_MAIN: Registering system servers...\n");
+        
+        // Security Server - MUST be registered first for authentication
+        if let Some(_sec_server_id) = crate::microkernel::register_server(
+            b"Security",
+            crate::microkernel::MessageType::Security,
+            10  // Highest priority
+        ) {
+            fb.write_text_kernel("  ✓ Security Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Security server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Security Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Security server registration failed\n");
+        }
+        
+        // File System Server
+        if let Some(_fs_server_id) = crate::microkernel::register_server(
+            b"FileSystem",
+            crate::microkernel::MessageType::FileSystem,
+            10  // High priority
+        ) {
+            fb.write_text_kernel("  ✓ FileSystem Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: FileSystem server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando FileSystem Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - FileSystem server registration failed\n");
+        }
+        
+        // Graphics Server
+        if let Some(_gfx_server_id) = crate::microkernel::register_server(
+            b"Graphics",
+            crate::microkernel::MessageType::Graphics,
+            9  // High priority
+        ) {
+            fb.write_text_kernel("  ✓ Graphics Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Graphics server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Graphics Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Graphics server registration failed\n");
+        }
+        
+        // Network Server
+        if let Some(_net_server_id) = crate::microkernel::register_server(
+            b"Network",
+            crate::microkernel::MessageType::Network,
+            8  // Medium-high priority
+        ) {
+            fb.write_text_kernel("  ✓ Network Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Network server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Network Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Network server registration failed\n");
+        }
+        
+        // Input Server (keyboard, mouse)
+        if let Some(_input_server_id) = crate::microkernel::register_server(
+            b"Input",
+            crate::microkernel::MessageType::Input,
+            9  // High priority
+        ) {
+            fb.write_text_kernel("  ✓ Input Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Input server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Input Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Input server registration failed\n");
+        }
+        
+        // Audio Server
+        if let Some(_audio_server_id) = crate::microkernel::register_server(
+            b"Audio",
+            crate::microkernel::MessageType::Audio,
+            7  // Medium priority
+        ) {
+            fb.write_text_kernel("  ✓ Audio Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Audio server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Audio Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Audio server registration failed\n");
+        }
+        
+        // AI Server
+        if let Some(_ai_server_id) = crate::microkernel::register_server(
+            b"AI",
+            crate::microkernel::MessageType::AI,
+            6  // Lower priority
+        ) {
+            fb.write_text_kernel("  ✓ AI Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: AI server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando AI Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - AI server registration failed\n");
+        }
+        
+        fb.write_text_kernel("✓ Arquitectura microkernel activa", Color::CYAN);
+        serial_write_str("KERNEL_MAIN: Microkernel architecture fully initialized\n");
+        
+        // Display microkernel statistics
+        if let Some(stats) = crate::microkernel::get_microkernel_statistics() {
+            fb.write_text_kernel(
+                &alloc::format!("  Servidores activos: {}", stats.active_servers),
+                Color::WHITE
+            );
+            serial_write_str(&alloc::format!(
+                "KERNEL_MAIN: Microkernel stats - {} servers, {} clients\n",
+                stats.active_servers, stats.active_clients
+            ));
+        }
+    } else {
+        fb.write_text_kernel("⚠ Error inicializando microkernel", Color::RED);
+        serial_write_str("KERNEL_MAIN: ERROR - Microkernel initialization failed\n");
+    }
+    
+    fb.write_text_kernel("", Color::WHITE);
 
     // --- Inicialización del Gestor de Paginación ---
     // ELIMINADO: No usar el gestor de paginación antiguo (crate::paging)

@@ -175,7 +175,7 @@ impl EclipseShell {
         let mut info = String::new();
         writeln!(&mut info, "Info Información del sistema Eclipse OS:").unwrap();
         writeln!(&mut info, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").unwrap();
-        writeln!(&mut info, "  Arquitectura: x86_64 microkernel híbrido").unwrap();
+        writeln!(&mut info, "  Arquitectura: x86_64 microkernel puro").unwrap();
         writeln!(&mut info, "  Lenguaje: 100% Rust con #![no_std]").unwrap();
         writeln!(&mut info, "  Memoria: Gestión avanzada con paginación").unwrap();
         writeln!(&mut info, "  Procesos: PCB completo con 7 estados").unwrap();
