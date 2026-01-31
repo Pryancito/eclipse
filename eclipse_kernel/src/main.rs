@@ -20,6 +20,7 @@ mod syscalls;
 mod servers;
 mod elf_loader;
 mod virtio;
+mod filesystem;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -94,6 +95,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Initializing VirtIO devices...\n");
     virtio::init();
     
+    // Inicializar filesystem
+    serial::serial_print("Initializing filesystem subsystem...\n");
+    filesystem::init();
+    
     serial::serial_print("Microkernel initialized successfully!\n");
     
     // Llamar a kernel_main
@@ -108,10 +113,23 @@ static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unkn
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Entering kernel main loop...\n");
     
-    // TODO: Montar sistema de archivos eclipsefs
-    serial::serial_print("[KERNEL] TODO: Mount eclipsefs filesystem\n");
-    serial::serial_print("[KERNEL] This will be implemented with VirtIO block driver\n");
-    serial::serial_print("[KERNEL] For now, loading embedded init process...\n\n");
+    // Intentar montar el sistema de archivos
+    serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
+    match filesystem::mount_root() {
+        Ok(_) => {
+            serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
+            
+            // TODO: Try to load init from /sbin/init
+            serial::serial_print("[KERNEL] TODO: Load init from /sbin/init\n");
+            serial::serial_print("[KERNEL] For now, loading embedded init process...\n\n");
+        }
+        Err(e) => {
+            serial::serial_print("[KERNEL] Failed to mount filesystem: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            serial::serial_print("[KERNEL] Falling back to embedded init...\n\n");
+        }
+    }
     
     // Cargar proceso init desde binario embebido
     serial::serial_print("Loading init process from embedded binary...\n");
