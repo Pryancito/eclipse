@@ -19,6 +19,7 @@ mod scheduler;
 mod syscalls;
 mod servers;
 mod elf_loader;
+mod virtio;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -88,6 +89,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     // Inicializar servidores del sistema
     serial::serial_print("Initializing system servers...\n");
     servers::init_servers();
+    
+    // Inicializar dispositivos VirtIO
+    serial::serial_print("Initializing VirtIO devices...\n");
+    virtio::init();
     
     serial::serial_print("Microkernel initialized successfully!\n");
     
