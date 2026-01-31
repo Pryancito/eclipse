@@ -95,22 +95,41 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     kernel_main(framebuffer_info_ptr);
 }
 
+/// Init process binary embedded in kernel
+/// This will be loaded instead of the test process
+static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
+
 /// Función principal del kernel
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Entering kernel main loop...\n");
     
-    // Crear un proceso de prueba
-    serial::serial_print("Creating test process...\n");
-    let stack_base = 0x400000; // 4MB mark
-    let stack_size = 0x10000;  // 64KB
+    // TODO: Montar sistema de archivos eclipsefs
+    serial::serial_print("[KERNEL] TODO: Mount eclipsefs filesystem\n");
+    serial::serial_print("[KERNEL] This will be implemented with VirtIO block driver\n");
+    serial::serial_print("[KERNEL] For now, loading embedded init process...\n");
+    serial::serial_print("\n");
     
-    if let Some(pid) = process::create_process(test_process as u64, stack_base, stack_size) {
-        serial::serial_print("Test process created with PID: ");
+    // Cargar proceso init desde binario embebido
+    serial::serial_print("Loading init process from embedded binary...\n");
+    serial::serial_print("Init binary size: ");
+    serial::serial_print_dec(INIT_BINARY.len() as u64);
+    serial::serial_print(" bytes\n");
+    
+    // Usar el ELF loader para cargar el binario init
+    if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
+        serial::serial_print("Init process loaded with PID: ");
         serial::serial_print_dec(pid as u64);
         serial::serial_print("\n");
         
         // Agregar a la cola del scheduler
         scheduler::enqueue_process(pid);
+        
+        serial::serial_print("Init process scheduled for execution\n");
+        serial::serial_print("System initialization complete!\n");
+        serial::serial_print("\n");
+    } else {
+        serial::serial_print("ERROR: Failed to load init process!\n");
+        serial::serial_print("System cannot continue without init\n");
     }
     
     loop {
@@ -120,13 +139,5 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
         
         // Yield CPU
         unsafe { core::arch::asm!("hlt") };
-    }
-}
-
-/// Proceso de prueba simple
-extern "C" fn test_process() -> ! {
-    loop {
-        // Proceso de prueba - simplemente yield
-        scheduler::yield_cpu();
     }
 }
