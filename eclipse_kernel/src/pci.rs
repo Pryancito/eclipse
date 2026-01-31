@@ -236,7 +236,13 @@ pub fn init() {
             serial::serial_print(" Type=");
             serial::serial_print(dev.device_type());
             if dev.is_virtio() {
-                serial::serial_print(" [VirtIO]");
+                serial::serial_print(" [VirtIO");
+                // Identify specific VirtIO device types
+                if dev.device_id == 0x1001 || dev.device_id == 0x1042 {
+                    serial::serial_print(" Block]");
+                } else {
+                    serial::serial_print("]");
+                }
             }
             serial::serial_print("\n");
         }
@@ -247,7 +253,10 @@ pub fn init() {
 pub fn find_virtio_block_device() -> Option<PciDevice> {
     let devices = PCI_DEVICES.lock();
     devices.iter().find(|dev| {
-        dev.is_virtio() && dev.device_id == 0x1001 // VirtIO block device
+        // VirtIO block device IDs:
+        // 0x1001 = Legacy VirtIO block device
+        // 0x1042 = Modern/transitional VirtIO block device  
+        dev.is_virtio() && (dev.device_id == 0x1001 || dev.device_id == 0x1042)
     }).copied()
 }
 

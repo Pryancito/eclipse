@@ -959,23 +959,8 @@ pub fn init() {
         serial::serial_print("[VirtIO] No VirtIO block device found on PCI bus\n");
     }
     
-    // Fall back to simulated device
-    serial::serial_print("[VirtIO] Falling back to simulated block device\n");
-    unsafe {
-        let mut device = VirtIOBlockDevice {
-            mmio_base: 0,
-            io_base: 0,
-            queue_size: 8,
-            queue: None,
-        };
-        
-        if device.init() {
-            serial::serial_print("[VirtIO] Simulated device initialized successfully\n");
-            *BLOCK_DEVICE.lock() = Some(device);
-        } else {
-            serial::serial_print("[VirtIO] Failed to initialize simulated device\n");
-        }
-    }
+    // Don't fall back to simulated device - let ATA driver handle real hardware
+    serial::serial_print("[VirtIO] No VirtIO device available, ATA will be used if present\n");
 }
 
 /// Get a reference to the block device
