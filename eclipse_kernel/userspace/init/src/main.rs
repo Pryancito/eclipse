@@ -15,26 +15,26 @@ pub extern "C" fn _start() -> ! {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║              ECLIPSE OS INIT SYSTEM v0.1.0                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("");
+    println!();
     println!("Init process started with PID: {}", pid);
-    println!("");
+    println!();
     
     // TODO: Montar sistema de archivos eclipsefs
     println!("[INIT] Mounting eclipsefs root filesystem...");
     println!("[TODO] EclipseFS mounting not yet implemented in microkernel");
     println!("[INFO] This will be implemented when filesystem server is ready");
-    println!("");
+    println!();
     
     // TODO: Lanzar servicios del sistema
     println!("[INIT] Starting system services...");
     println!("[TODO] Service management not yet implemented");
     println!("[INFO] Future: will launch eclipse-systemd or equivalent");
-    println!("");
+    println!();
     
     // Loop principal del init
     println!("[INIT] Entering main loop...");
     println!("[INFO] Init process running. Kernel is operational.");
-    println!("");
+    println!();
     
     let mut counter = 0;
     loop {

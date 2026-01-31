@@ -106,8 +106,7 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     // TODO: Montar sistema de archivos eclipsefs
     serial::serial_print("[KERNEL] TODO: Mount eclipsefs filesystem\n");
     serial::serial_print("[KERNEL] This will be implemented with VirtIO block driver\n");
-    serial::serial_print("[KERNEL] For now, loading embedded init process...\n");
-    serial::serial_print("\n");
+    serial::serial_print("[KERNEL] For now, loading embedded init process...\n\n");
     
     // Cargar proceso init desde binario embebido
     serial::serial_print("Loading init process from embedded binary...\n");
@@ -125,8 +124,7 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
         scheduler::enqueue_process(pid);
         
         serial::serial_print("Init process scheduled for execution\n");
-        serial::serial_print("System initialization complete!\n");
-        serial::serial_print("\n");
+        serial::serial_print("System initialization complete!\n\n");
     } else {
         serial::serial_print("ERROR: Failed to load init process!\n");
         serial::serial_print("System cannot continue without init\n");
