@@ -5,6 +5,49 @@
 
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
+use core::arch::asm;
+
+/// Read from I/O port (8-bit)
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    value
+}
+
+/// Write to I/O port (8-bit)
+#[inline]
+unsafe fn outb(port: u16, value: u8) {
+    asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+}
+
+/// Read from I/O port (16-bit)
+#[inline]
+unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    value
+}
+
+/// Write to I/O port (16-bit)
+#[inline]
+unsafe fn outw(port: u16, value: u16) {
+    asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+}
+
+/// Read from I/O port (32-bit)
+#[inline]
+unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    value
+}
+
+/// Write to I/O port (32-bit)
+#[inline]
+unsafe fn outl(port: u16, value: u32) {
+    asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+}
 
 /// VirtIO MMIO base address (typical for QEMU)
 const VIRTIO_MMIO_BASE: u64 = 0x0A000000;
@@ -21,6 +64,16 @@ const VIRTIO_STATUS_DRIVER: u32 = 2;
 const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
 const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
 const VIRTIO_STATUS_FAILED: u32 = 128;
+
+/// VirtIO Legacy PCI register offsets (I/O port based)
+const VIRTIO_PCI_DEVICE_FEATURES: u16 = 0x00;  // 32-bit r/o
+const VIRTIO_PCI_DRIVER_FEATURES: u16 = 0x04;  // 32-bit r/w
+const VIRTIO_PCI_QUEUE_ADDR: u16 = 0x08;       // 32-bit r/w
+const VIRTIO_PCI_QUEUE_SIZE: u16 = 0x0C;       // 16-bit r/o
+const VIRTIO_PCI_QUEUE_SEL: u16 = 0x0E;        // 16-bit r/w
+const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 0x10;     // 16-bit r/w
+const VIRTIO_PCI_DEVICE_STATUS: u16 = 0x12;    // 8-bit r/w
+const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 
 /// VirtIO MMIO register offsets
 #[repr(C)]
@@ -276,7 +329,8 @@ impl Virtqueue {
 
 /// VirtIO block device driver
 pub struct VirtIOBlockDevice {
-    mmio_base: u64,
+    mmio_base: u64,       // MMIO base address (0 if using I/O ports)
+    io_base: u16,         // I/O port base (0 if using MMIO)
     queue_size: u16,
     queue: Option<Virtqueue>,
 }
@@ -298,6 +352,7 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print("[VirtIO] No real device found, using simulated disk\n");
             return Some(VirtIOBlockDevice {
                 mmio_base: 0,
+                io_base: 0,
                 queue_size: 8,
                 queue: None,
             });
@@ -317,6 +372,7 @@ impl VirtIOBlockDevice {
         
         Some(VirtIOBlockDevice {
             mmio_base,
+            io_base: 0,
             queue_size: 8,
             queue: None,
         })
@@ -328,6 +384,17 @@ impl VirtIOBlockDevice {
         // Create device structure  
         Some(VirtIOBlockDevice {
             mmio_base: bar_addr,
+            io_base: 0,
+            queue_size: 8,
+            queue: None,
+        })
+    }
+    
+    /// Create a new VirtIO block device from PCI I/O ports
+    unsafe fn new_from_pci_io(io_base: u16) -> Option<Self> {
+        Some(VirtIOBlockDevice {
+            mmio_base: 0,
+            io_base,
             queue_size: 8,
             queue: None,
         })
@@ -335,12 +402,96 @@ impl VirtIOBlockDevice {
     
     /// Initialize the VirtIO block device
     unsafe fn init(&mut self) -> bool {
-        if self.mmio_base == 0 {
+        if self.mmio_base == 0 && self.io_base == 0 {
             // Simulated device - initialize test data
             self.init_simulated_disk();
             return true;
         }
         
+        if self.io_base != 0 {
+            // I/O port based (legacy PCI)
+            return self.init_legacy_pci();
+        }
+        
+        // MMIO based
+        self.init_mmio()
+    }
+    
+    /// Initialize legacy PCI VirtIO device (I/O ports)
+    unsafe fn init_legacy_pci(&mut self) -> bool {
+        use crate::serial;
+        
+        serial::serial_print("[VirtIO] Initializing legacy PCI device\n");
+        
+        // Reset device
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, 0);
+        
+        // Set ACKNOWLEDGE
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+        
+        // Set DRIVER
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER as u8));
+        
+        // Read device features
+        let features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
+        serial::serial_print("[VirtIO] Device features: 0x");
+        serial::serial_print_hex(features as u64);
+        serial::serial_print("\n");
+        
+        // Write driver features (accept all for now)
+        outl(self.io_base + VIRTIO_PCI_DRIVER_FEATURES, 0);
+        
+        // Select queue 0
+        outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+        
+        // Get queue size
+        let queue_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        serial::serial_print("[VirtIO] Queue size: ");
+        serial::serial_print_dec(queue_size as u64);
+        serial::serial_print("\n");
+        
+        if queue_size == 0 || queue_size > 256 {
+            serial::serial_print("[VirtIO] Invalid queue size\n");
+            return false;
+        }
+        
+        // Use a reasonable queue size
+        let actual_queue_size = if queue_size > 128 { 128 } else { queue_size };
+        serial::serial_print("[VirtIO] Using queue size: ");
+        serial::serial_print_dec(actual_queue_size as u64);
+        serial::serial_print("\n");
+        
+        // Create virtqueue
+        match Virtqueue::new(actual_queue_size) {
+            Some(queue) => {
+                // Set queue address (physical address / 4096)
+                let queue_pfn = (queue.desc_phys / 4096) as u32;
+                serial::serial_print("[VirtIO] Queue PFN: 0x");
+                serial::serial_print_hex(queue_pfn as u64);
+                serial::serial_print("\n");
+                
+                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, queue_pfn);
+                
+                self.queue = Some(queue);
+                self.queue_size = actual_queue_size;
+                
+                // Set DRIVER_OK
+                let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+                outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
+                
+                serial::serial_print("[VirtIO] Legacy PCI device initialized successfully\n");
+                true
+            }
+            None => {
+                serial::serial_print("[VirtIO] Failed to allocate virtqueue\n");
+                false
+            }
+        }
+    }
+    
+    /// Initialize MMIO VirtIO device
+    unsafe fn init_mmio(&mut self) -> bool {
         let regs = self.mmio_base as *mut VirtIOMMIORegs;
         
         // Debug: Check if this is actually MMIO or PCI
@@ -729,24 +880,56 @@ pub fn init() {
             
             // Get BAR0 for VirtIO registers
             let bar0 = crate::pci::get_bar(&pci_dev, 0);
+            serial::serial_print("[VirtIO]   BAR0 raw=0x");
+            serial::serial_print_hex(bar0 as u64);
+            serial::serial_print(" (bit0=");
+            serial::serial_print_dec((bar0 & 1) as u64);
+            serial::serial_print(")\n");
+            
             let bar_addr = (bar0 & !0xF) as u64;
             
-            serial::serial_print("[VirtIO]   BAR0=0x");
+            serial::serial_print("[VirtIO]   BAR0 masked=0x");
             serial::serial_print_hex(bar_addr);
             serial::serial_print("\n");
             
-            // Try to create a real VirtIO device from PCI
-            if bar_addr != 0 {
-                match VirtIOBlockDevice::new_from_pci(bar_addr) {
+            // Check if this is I/O port or MMIO BAR
+            if (bar0 & 1) != 0 {
+                // I/O port BAR - VirtIO legacy PCI
+                let io_base = (bar0 & !0x3) as u16;
+                serial::serial_print("[VirtIO]   I/O port BAR detected at 0x");
+                serial::serial_print_hex(io_base as u64);
+                serial::serial_print("\n");
+                
+                // Try to initialize I/O port based device
+                match VirtIOBlockDevice::new_from_pci_io(io_base) {
                     Some(mut device) => {
                         if device.init() {
-                            serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
+                            serial::serial_print("[VirtIO] I/O port device initialized successfully\n");
                             *BLOCK_DEVICE.lock() = Some(device);
                             return;
                         }
                     }
                     None => {
-                        serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
+                        serial::serial_print("[VirtIO] Failed to create I/O port device\n");
+                    }
+                }
+            } else {
+                // Memory BAR - Try MMIO
+                serial::serial_print("[VirtIO]   Memory BAR - trying MMIO\n");
+                
+                // Try to create a real VirtIO device from PCI
+                if bar_addr != 0 {
+                    match VirtIOBlockDevice::new_from_pci(bar_addr) {
+                        Some(mut device) => {
+                            if device.init() {
+                                serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
+                                *BLOCK_DEVICE.lock() = Some(device);
+                                return;
+                            }
+                        }
+                        None => {
+                            serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
+                        }
                     }
                 }
             }
@@ -760,6 +943,7 @@ pub fn init() {
     unsafe {
         let mut device = VirtIOBlockDevice {
             mmio_base: 0,
+            io_base: 0,
             queue_size: 8,
             queue: None,
         };
