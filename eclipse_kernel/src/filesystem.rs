@@ -9,6 +9,21 @@ use eclipsefs_lib::NodeKind;
 /// Block size for filesystem operations
 pub const BLOCK_SIZE: usize = 4096;
 
+/// Read a block from the underlying block device
+/// Tries VirtIO first, falls back to ATA
+fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+    // Try VirtIO first (preferred for QEMU)
+    match crate::virtio::read_block(block_num, buffer) {
+        Ok(_) => {
+            return Ok(());
+        }
+        Err(_) => {
+            // Fall back to ATA
+            crate::ata::read_block(block_num, buffer)
+        }
+    }
+}
+
 /// Filesystem state
 pub struct Filesystem {
     mounted: bool,
@@ -36,7 +51,7 @@ pub fn mount() -> Result<(), &'static str> {
             return Err("Filesystem already mounted");
         }
         
-        serial::serial_print("[FS] Attempting to mount eclipsefs via ATA...\n");
+        serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
         
         serial::serial_print("[FS] Allocating superblock buffer...\n");
         // Use heap to avoid stack overflow
@@ -45,8 +60,8 @@ pub fn mount() -> Result<(), &'static str> {
         serial::serial_print_hex(superblock.as_ptr() as u64);
         serial::serial_print("\n");
         
-        serial::serial_print("[FS] Reading superblock from ATA...\n");
-        crate::ata::read_block(Self::PARTITION_OFFSET_BLOCKS, &mut superblock)?;
+        serial::serial_print("[FS] Reading superblock from block device...\n");
+        read_block_from_device(Self::PARTITION_OFFSET_BLOCKS, &mut superblock)?;
         serial::serial_print("[FS] Superblock read successfully\n");
         
         // Parse header using library
@@ -94,7 +109,7 @@ pub fn mount() -> Result<(), &'static str> {
             let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
             
             let mut buffer = vec![0u8; 4096];
-            crate::ata::read_block(block_num, &mut buffer)?;
+            read_block_from_device(block_num, &mut buffer)?;
             
             let inode_num = u32::from_le_bytes([
                 buffer[offset_in_block], buffer[offset_in_block+1], 
@@ -161,7 +176,7 @@ pub fn mount() -> Result<(), &'static str> {
         // If the record crosses boundary, we failed. Optimistic assumption for bootloader.
         
         let mut block_buffer = vec![0u8; 4096];
-        crate::ata::read_block(block_num, &mut block_buffer)?;
+        read_block_from_device(block_num, &mut block_buffer)?;
         
         if offset_in_block + 8 > 4096 {
              // Basic boundary cross handling would load next block
@@ -210,7 +225,7 @@ pub fn mount() -> Result<(), &'static str> {
         
         while bytes_read < record_size {
              let chunk_size = min(4096, record_size - bytes_read);
-             crate::ata::read_block(current_block, &mut block_buffer)?;
+             read_block_from_device(current_block, &mut block_buffer)?;
              record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
              bytes_read += chunk_size;
              current_block += 1;
@@ -293,7 +308,7 @@ pub fn mount() -> Result<(), &'static str> {
              let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
              
              let mut block_buffer = vec![0u8; 4096];
-             crate::ata::read_block(block_num, &mut block_buffer)?;
+             read_block_from_device(block_num, &mut block_buffer)?;
              
              let record_size = u32::from_le_bytes([
                 block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
@@ -309,7 +324,7 @@ pub fn mount() -> Result<(), &'static str> {
             let mut current_block = block_num + 1;
             while bytes_read < record_size {
                  let chunk_size = min(4096, record_size - bytes_read);
-                 crate::ata::read_block(current_block, &mut block_buffer)?;
+                 read_block_from_device(current_block, &mut block_buffer)?;
                  record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
                  bytes_read += chunk_size;
                  current_block += 1;

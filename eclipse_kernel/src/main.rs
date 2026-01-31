@@ -128,7 +128,11 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     serial::serial_print("Initializing system servers...\n");
     servers::init_servers();
     
-    // Inicializar driver ATA
+    // Inicializar driver VirtIO (preferred for QEMU)
+    serial::serial_print("Initializing VirtIO driver...\n");
+    virtio::init();
+    
+    // Inicializar driver ATA (fallback for real hardware)
     serial::serial_print("Initializing ATA driver...\n");
     ata::init();
     

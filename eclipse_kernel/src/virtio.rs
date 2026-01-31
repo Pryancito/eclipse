@@ -199,13 +199,56 @@ impl VirtIOBlockDevice {
     unsafe fn init_simulated_disk(&mut self) {
         use crate::serial;
         
-        // Block 0: Simple "superblock" marker
-        SIMULATED_DISK[0] = 0xEC; // 'E'
-        SIMULATED_DISK[1] = 0x4C; // 'L'
-        SIMULATED_DISK[2] = 0x49; // 'I'
-        SIMULATED_DISK[3] = 0x50; // 'P'
+        // Create a minimal EclipseFS header at block 0 (which maps to partition offset)
+        // EclipseFS header structure (from eclipsefs-lib):
+        // Magic: "ECLIPSEFS" (9 bytes)
+        // Version: u32 (4 bytes) 
+        // Block size: u32 (4 bytes)
+        // Total blocks: u64 (8 bytes)
+        // Root inode: u32 (4 bytes)
+        // And more fields...
         
-        serial::serial_print("[VirtIO] Simulated disk initialized with test data\n");
+        // For now, create a simple valid header
+        // Magic number: "ECLIPSEFS"
+        SIMULATED_DISK[0] = b'E';
+        SIMULATED_DISK[1] = b'C';
+        SIMULATED_DISK[2] = b'L';
+        SIMULATED_DISK[3] = b'I';
+        SIMULATED_DISK[4] = b'P';
+        SIMULATED_DISK[5] = b'S';
+        SIMULATED_DISK[6] = b'E';
+        SIMULATED_DISK[7] = b'F';
+        SIMULATED_DISK[8] = b'S';
+        
+        // Version: 1.0 (0x00010000)
+        SIMULATED_DISK[9] = 0x00;
+        SIMULATED_DISK[10] = 0x00;
+        SIMULATED_DISK[11] = 0x01;
+        SIMULATED_DISK[12] = 0x00;
+        
+        // Block size: 4096 (0x1000)
+        SIMULATED_DISK[13] = 0x00;
+        SIMULATED_DISK[14] = 0x10;
+        SIMULATED_DISK[15] = 0x00;
+        SIMULATED_DISK[16] = 0x00;
+        
+        // Total blocks: 128 (simulated disk size / 4096)
+        SIMULATED_DISK[17] = 128;
+        SIMULATED_DISK[18] = 0x00;
+        SIMULATED_DISK[19] = 0x00;
+        SIMULATED_DISK[20] = 0x00;
+        SIMULATED_DISK[21] = 0x00;
+        SIMULATED_DISK[22] = 0x00;
+        SIMULATED_DISK[23] = 0x00;
+        SIMULATED_DISK[24] = 0x00;
+        
+        // Root inode: 1
+        SIMULATED_DISK[25] = 0x01;
+        SIMULATED_DISK[26] = 0x00;
+        SIMULATED_DISK[27] = 0x00;
+        SIMULATED_DISK[28] = 0x00;
+        
+        serial::serial_print("[VirtIO] Simulated disk initialized with EclipseFS header\n");
     }
     
     /// Read a block from the device
@@ -216,8 +259,20 @@ impl VirtIOBlockDevice {
         
         if self.mmio_base == 0 {
             // Simulated read
+            // The filesystem expects blocks starting at 131328 (partition offset)
+            // So we map that to the start of our simulated disk
+            const PARTITION_OFFSET: u64 = 131328;
+            
             unsafe {
-                let offset = (block_num as usize) * 4096;
+                if block_num < PARTITION_OFFSET {
+                    // Block is before the partition, return zeros
+                    buffer[..4096].fill(0);
+                    return Ok(());
+                }
+                
+                let relative_block = block_num - PARTITION_OFFSET;
+                let offset = (relative_block as usize) * 4096;
+                
                 if offset + 4096 > SIMULATED_DISK.len() {
                     return Err("Block number out of range");
                 }
@@ -245,8 +300,17 @@ impl VirtIOBlockDevice {
         
         if self.mmio_base == 0 {
             // Simulated write
+            const PARTITION_OFFSET: u64 = 131328;
+            
             unsafe {
-                let offset = (block_num as usize) * 4096;
+                if block_num < PARTITION_OFFSET {
+                    // Block is before the partition, ignore write
+                    return Ok(());
+                }
+                
+                let relative_block = block_num - PARTITION_OFFSET;
+                let offset = (relative_block as usize) * 4096;
+                
                 if offset + 4096 > SIMULATED_DISK.len() {
                     return Err("Block number out of range");
                 }
