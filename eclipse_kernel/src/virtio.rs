@@ -75,6 +75,10 @@ const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 0x10;     // 16-bit r/w
 const VIRTIO_PCI_DEVICE_STATUS: u16 = 0x12;    // 8-bit r/w
 const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 
+/// Delay cycles after setting DRIVER_OK status
+/// Gives device time to process status change before first operation
+const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
+
 /// VirtIO MMIO register offsets
 #[repr(C)]
 struct VirtIOMMIORegs {
@@ -481,7 +485,7 @@ impl VirtIOBlockDevice {
                 outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
                 
                 // Small delay to let device process the status change
-                for _ in 0..1000 {
+                for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
                     core::hint::spin_loop();
                 }
                 

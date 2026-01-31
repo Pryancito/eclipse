@@ -6,10 +6,14 @@
 //! - Gestión de memoria física
 
 use linked_list_allocator::LockedHeap;
-use spin::Mutex;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Physical offset for virtual-to-physical address translation
-static PHYS_OFFSET: Mutex<u64> = Mutex::new(0);
+/// Written once during init_paging(), then read-only
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Size of the kernel region with offset-based mapping (128MB = 64 * 2MB pages)
+const KERNEL_REGION_SIZE: u64 = 0x8000000;
 
 /// Tamaño del heap del kernel (2 MB)
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
@@ -127,7 +131,8 @@ pub fn init_paging(kernel_phys_base: u64) {
     let phys_offset = kernel_phys_base.wrapping_sub(0x200000);
     
     // Store phys_offset for later use by virt_to_phys
-    *PHYS_OFFSET.lock() = phys_offset;
+    // Using Relaxed ordering is safe here because this runs during single-threaded init
+    PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
     
     // DEBUG
     unsafe {
@@ -225,11 +230,12 @@ pub fn get_cr3() -> u64 {
 /// Translate virtual address to physical address
 /// Handles both offset-mapped kernel region and identity-mapped regions
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
-    let phys_offset = *PHYS_OFFSET.lock();
+    // Using Relaxed ordering is safe because PHYS_OFFSET is written once during init
+    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
     // Check if address is in the kernel region (first 128MB = 64 * 2MB pages)
     // These are mapped with phys_offset
-    if virt_addr < 0x8000000 {
+    if virt_addr < KERNEL_REGION_SIZE {
         // Kernel region: virt + phys_offset = phys
         virt_addr.wrapping_add(phys_offset)
     } else {
