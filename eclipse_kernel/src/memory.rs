@@ -6,6 +6,14 @@
 //! - Gestión de memoria física
 
 use linked_list_allocator::LockedHeap;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Physical offset for virtual-to-physical address translation
+/// Written once during init_paging(), then read-only
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Size of the kernel region with offset-based mapping (128MB = 64 * 2MB pages)
+const KERNEL_REGION_SIZE: u64 = 0x8000000;
 
 /// Tamaño del heap del kernel (2 MB)
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
@@ -122,6 +130,10 @@ static mut PD: PageTable = PageTable::new();
 pub fn init_paging(kernel_phys_base: u64) {
     let phys_offset = kernel_phys_base.wrapping_sub(0x200000);
     
+    // Store phys_offset for later use by virt_to_phys
+    // Using Relaxed ordering is safe here because this runs during single-threaded init
+    PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
+    
     // DEBUG
     unsafe {
         crate::serial::serial_print("Init Paging. Phys Base: 0x");
@@ -216,17 +228,34 @@ pub fn get_cr3() -> u64 {
 }
 
 /// Translate virtual address to physical address
-/// This is a simplified version that works for identity-mapped regions
+/// 
+/// The kernel uses two different virtual-to-physical mapping schemes:
+/// 
+/// 1. **Kernel region (0x0 - 0x8000000 / 128MB)**: Offset-based mapping
+///    - Contains: .text, .rodata, .data, .bss (including heap), page tables
+///    - Mapping: `physical = virtual + phys_offset`
+///    - The phys_offset is determined during boot based on where bootloader loaded the kernel
+///    - Example: If kernel loaded at physical 0x200000, offset = 0
+///
+/// 2. **Higher memory (>= 128MB)**: Identity mapping  
+///    - Contains: Stack, user space, MMIO regions
+///    - Mapping: `physical = virtual`
+///
+/// This dual scheme allows the kernel to be position-independent while keeping
+/// higher memory simple for userspace and hardware access.
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
-    // For our simple paging setup:
-    // - Addresses in first 128MB are offset by phys_offset  
-    // - Higher addresses are identity mapped
-    // Since DMA buffers will be in heap (which is identity mapped in our setup),
-    // we can use a simple approach
+    // Using Relaxed ordering is safe because PHYS_OFFSET is written once during init
+    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
-    // For now, we assume heap addresses are in the identity-mapped region
-    // This works because our heap is allocated from BSS which is identity-mapped
-    virt_addr
+    // Check if address is in the kernel region (first 128MB = 64 * 2MB pages)
+    // These are mapped with phys_offset
+    if virt_addr < KERNEL_REGION_SIZE {
+        // Kernel region: virt + phys_offset = phys
+        virt_addr.wrapping_add(phys_offset)
+    } else {
+        // Higher memory: identity mapped (virt = phys)
+        virt_addr
+    }
 }
 
 /// Allocate DMA-safe buffer

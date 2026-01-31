@@ -75,6 +75,15 @@ const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 0x10;     // 16-bit r/w
 const VIRTIO_PCI_DEVICE_STATUS: u16 = 0x12;    // 8-bit r/w
 const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 
+/// Delay cycles after setting DRIVER_OK status
+/// Gives device time to process status change before first operation
+/// 
+/// This is a conservative delay (~1000-2000 CPU cycles) that works across different
+/// QEMU/KVM configurations and CPU speeds. While VirtIO devices typically respond
+/// quickly in virtualized environments, this ensures status change is processed
+/// before we attempt first I/O operation.
+const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
+
 /// VirtIO MMIO register offsets
 #[repr(C)]
 struct VirtIOMMIORegs {
@@ -480,6 +489,17 @@ impl VirtIOBlockDevice {
                 let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
                 outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
                 
+                // Small delay to let device process the status change
+                for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
+                    core::hint::spin_loop();
+                }
+                
+                // Verify status was set correctly
+                let final_status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+                serial::serial_print("[VirtIO] Final device status: 0x");
+                serial::serial_print_hex(final_status as u64);
+                serial::serial_print("\n");
+                
                 serial::serial_print("[VirtIO] Legacy PCI device initialized successfully\n");
                 true
             }
@@ -692,15 +712,24 @@ impl VirtIOBlockDevice {
         
         // Real VirtIO block read
         unsafe {
-            let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
+            let queue = self.queue.as_mut().ok_or_else(|| {
+                crate::serial::serial_print("[VirtIO] read_block failed: No virtqueue available\n");
+                "No virtqueue available"
+            })?;
             
             // Allocate DMA buffers for request
             let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(
                 core::mem::size_of::<VirtIOBlockReq>(), 16
-            ).ok_or("Failed to allocate request buffer")?;
+            ).ok_or_else(|| {
+                crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate request buffer\n");
+                "Failed to allocate request buffer"
+            })?;
             
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
-                .ok_or("Failed to allocate status buffer")?;
+                .ok_or_else(|| {
+                    crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate status buffer\n");
+                    "Failed to allocate status buffer"
+                })?;
             
             let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
             
@@ -742,6 +771,9 @@ impl VirtIOBlockDevice {
             }
             
             if timeout == 0 {
+                crate::serial::serial_print("[VirtIO] read_block failed: Device timeout (block ");
+                crate::serial::serial_print_dec(block_num);
+                crate::serial::serial_print(")\n");
                 // Cleanup
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
@@ -759,6 +791,9 @@ impl VirtIOBlockDevice {
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 
                 if status != VIRTIO_BLK_S_OK {
+                    crate::serial::serial_print("[VirtIO] read_block failed: Bad status ");
+                    crate::serial::serial_print_dec(status as u64);
+                    crate::serial::serial_print("\n");
                     return Err("VirtIO read failed");
                 }
                 
@@ -883,10 +918,11 @@ pub fn init() {
     use crate::serial;
     
     serial::serial_print("[VirtIO] Initializing VirtIO devices...\n");
+    serial::serial_print("[VirtIO] Searching for VirtIO block devices on PCI bus...\n");
     
     // Try to find VirtIO block device on PCI bus first
     if let Some(pci_dev) = crate::pci::find_virtio_block_device() {
-        serial::serial_print("[VirtIO] Found VirtIO block device on PCI\n");
+        serial::serial_print("[VirtIO] Found VirtIO block device on PCI!\n");
         serial::serial_print("[VirtIO]   Bus=");
         serial::serial_print_dec(pci_dev.bus as u64);
         serial::serial_print(" Device=");
@@ -917,17 +953,20 @@ pub fn init() {
             if (bar0 & 1) != 0 {
                 // I/O port BAR - VirtIO legacy PCI
                 let io_base = (bar0 & !0x3) as u16;
-                serial::serial_print("[VirtIO]   I/O port BAR detected at 0x");
+                serial::serial_print("[VirtIO]   I/O port BAR detected at base=0x");
                 serial::serial_print_hex(io_base as u64);
                 serial::serial_print("\n");
                 
                 // Try to initialize I/O port based device
                 match VirtIOBlockDevice::new_from_pci_io(io_base) {
                     Some(mut device) => {
+                        serial::serial_print("[VirtIO]   Attempting to initialize I/O port device...\n");
                         if device.init() {
                             serial::serial_print("[VirtIO] I/O port device initialized successfully\n");
                             *BLOCK_DEVICE.lock() = Some(device);
                             return;
+                        } else {
+                            serial::serial_print("[VirtIO]   I/O port device initialization failed\n");
                         }
                     }
                     None => {
@@ -942,16 +981,21 @@ pub fn init() {
                 if bar_addr != 0 {
                     match VirtIOBlockDevice::new_from_pci(bar_addr) {
                         Some(mut device) => {
+                            serial::serial_print("[VirtIO]   Attempting to initialize MMIO device...\n");
                             if device.init() {
                                 serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
                                 *BLOCK_DEVICE.lock() = Some(device);
                                 return;
+                            } else {
+                                serial::serial_print("[VirtIO]   MMIO device initialization failed\n");
                             }
                         }
                         None => {
                             serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
                         }
                     }
+                } else {
+                    serial::serial_print("[VirtIO]   BAR0 address is 0, cannot initialize\n");
                 }
             }
         }
