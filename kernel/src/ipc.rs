@@ -306,3 +306,26 @@ pub fn get_stats() -> (u32, u32, u64) {
     
     (active_servers, active_clients, ipc.total_messages)
 }
+
+/// Recibir mensaje para un cliente
+pub fn receive_message(client_id: ClientId) -> Option<Message> {
+    let mut ipc = IPC_SYSTEM.lock();
+    
+    // Buscar mensajes en la cola global para este cliente
+    for i in 0..1024 {
+        let idx = (ipc.global_queue_head + i) % 1024;
+        if idx == ipc.global_queue_tail {
+            break;
+        }
+        
+        if let Some(ref msg) = ipc.global_message_queue[idx] {
+            if msg.from == client_id {
+                // Tomar el mensaje
+                let message = ipc.global_message_queue[idx].take();
+                return message;
+            }
+        }
+    }
+    
+    None
+}

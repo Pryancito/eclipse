@@ -16,6 +16,7 @@ pub mod process;
 pub mod scheduler;
 pub mod syscalls;
 pub mod servers;
+mod elf_loader;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};

@@ -18,6 +18,7 @@ mod process;
 mod scheduler;
 mod syscalls;
 mod servers;
+mod elf_loader;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]

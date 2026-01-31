@@ -271,3 +271,8 @@ pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
     
     result
 }
+
+/// Obtener PID del proceso actual  
+pub fn current_process_id() -> Option<ProcessId> {
+    Some(1) // TODO: Track current PID properly
+}
