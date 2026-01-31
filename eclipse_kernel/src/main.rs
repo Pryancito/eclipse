@@ -19,6 +19,9 @@ mod scheduler;
 mod syscalls;
 mod servers;
 mod elf_loader;
+mod virtio;
+mod filesystem;
+mod binaries;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -89,28 +92,66 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Initializing system servers...\n");
     servers::init_servers();
     
+    // Inicializar dispositivos VirtIO
+    serial::serial_print("Initializing VirtIO devices...\n");
+    virtio::init();
+    
+    // Inicializar filesystem
+    serial::serial_print("Initializing filesystem subsystem...\n");
+    filesystem::init();
+    
     serial::serial_print("Microkernel initialized successfully!\n");
     
     // Llamar a kernel_main
     kernel_main(framebuffer_info_ptr);
 }
 
+/// Init process binary embedded in kernel
+/// This will be loaded instead of the test process
+pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
+
 /// Función principal del kernel
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Entering kernel main loop...\n");
     
-    // Crear un proceso de prueba
-    serial::serial_print("Creating test process...\n");
-    let stack_base = 0x400000; // 4MB mark
-    let stack_size = 0x10000;  // 64KB
+    // Intentar montar el sistema de archivos
+    serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
+    match filesystem::mount_root() {
+        Ok(_) => {
+            serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
+            
+            // TODO: Try to load init from /sbin/init
+            serial::serial_print("[KERNEL] TODO: Load init from /sbin/init\n");
+            serial::serial_print("[KERNEL] For now, loading embedded init process...\n\n");
+        }
+        Err(e) => {
+            serial::serial_print("[KERNEL] Failed to mount filesystem: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            serial::serial_print("[KERNEL] Falling back to embedded init...\n\n");
+        }
+    }
     
-    if let Some(pid) = process::create_process(test_process as u64, stack_base, stack_size) {
-        serial::serial_print("Test process created with PID: ");
+    // Cargar proceso init desde binario embebido
+    serial::serial_print("Loading init process from embedded binary...\n");
+    serial::serial_print("Init binary size: ");
+    serial::serial_print_dec(INIT_BINARY.len() as u64);
+    serial::serial_print(" bytes\n");
+    
+    // Usar el ELF loader para cargar el binario init
+    if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
+        serial::serial_print("Init process loaded with PID: ");
         serial::serial_print_dec(pid as u64);
         serial::serial_print("\n");
         
         // Agregar a la cola del scheduler
         scheduler::enqueue_process(pid);
+        
+        serial::serial_print("Init process scheduled for execution\n");
+        serial::serial_print("System initialization complete!\n\n");
+    } else {
+        serial::serial_print("ERROR: Failed to load init process!\n");
+        serial::serial_print("System cannot continue without init\n");
     }
     
     loop {
@@ -120,13 +161,5 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
         
         // Yield CPU
         unsafe { core::arch::asm!("hlt") };
-    }
-}
-
-/// Proceso de prueba simple
-extern "C" fn test_process() -> ! {
-    loop {
-        // Proceso de prueba - simplemente yield
-        scheduler::yield_cpu();
     }
 }

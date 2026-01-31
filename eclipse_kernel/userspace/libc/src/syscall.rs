@@ -8,6 +8,10 @@ pub const SYS_SEND: u64 = 3;
 pub const SYS_RECEIVE: u64 = 4;
 pub const SYS_YIELD: u64 = 5;
 pub const SYS_GETPID: u64 = 6;
+pub const SYS_FORK: u64 = 7;
+pub const SYS_EXEC: u64 = 8;
+pub const SYS_WAIT: u64 = 9;
+pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> u64 {
@@ -20,6 +24,13 @@ unsafe fn syscall0(n: u64) -> u64 {
 unsafe fn syscall1(n: u64, arg1: u64) -> u64 {
     let ret: u64;
     asm!("int 0x80", in("rax") n, in("rdi") arg1, lateout("rax") ret, options(nostack));
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall2(n: u64, arg1: u64, arg2: u64) -> u64 {
+    let ret: u64;
+    asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, lateout("rax") ret, options(nostack));
     ret
 }
 
@@ -49,4 +60,42 @@ pub fn yield_cpu() {
 
 pub fn getpid() -> u32 {
     unsafe { syscall0(SYS_GETPID) as u32 }
+}
+
+pub fn fork() -> i32 {
+    unsafe { syscall0(SYS_FORK) as i32 }
+}
+
+pub fn exec(elf_buffer: &[u8]) -> i32 {
+    unsafe { syscall2(SYS_EXEC, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
+}
+
+pub fn wait(status: Option<&mut i32>) -> i32 {
+    let status_ptr = match status {
+        Some(s) => s as *mut i32 as u64,
+        None => 0,
+    };
+    unsafe { syscall1(SYS_WAIT, status_ptr) as i32 }
+}
+
+/// Get service binary by ID
+/// Returns (pointer, size) or (0, 0) on error
+pub fn get_service_binary(service_id: u32) -> (*const u8, usize) {
+    let mut ptr: u64 = 0;
+    let mut size: u64 = 0;
+    
+    let result = unsafe {
+        syscall3(
+            SYS_GET_SERVICE_BINARY,
+            service_id as u64,
+            &mut ptr as *mut u64 as u64,
+            &mut size as *mut u64 as u64
+        )
+    };
+    
+    if result == 0 {
+        (ptr as *const u8, size as usize)
+    } else {
+        (core::ptr::null(), 0)
+    }
 }

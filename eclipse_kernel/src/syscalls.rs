@@ -19,6 +19,10 @@ pub enum SyscallNumber {
     Receive = 4,
     Yield = 5,
     GetPid = 6,
+    Fork = 7,
+    Exec = 8,
+    Wait = 9,
+    GetServiceBinary = 10,
 }
 
 /// Estadísticas de syscalls
@@ -30,6 +34,9 @@ pub struct SyscallStats {
     pub send_calls: u64,
     pub receive_calls: u64,
     pub yield_calls: u64,
+    pub fork_calls: u64,
+    pub exec_calls: u64,
+    pub wait_calls: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
@@ -40,6 +47,9 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     send_calls: 0,
     receive_calls: 0,
     yield_calls: 0,
+    fork_calls: 0,
+    exec_calls: 0,
+    wait_calls: 0,
 });
 
 /// Handler principal de syscalls
@@ -63,6 +73,10 @@ pub extern "C" fn syscall_handler(
         4 => sys_receive(arg1, arg2),
         5 => sys_yield(),
         6 => sys_getpid(),
+        7 => sys_fork(),
+        8 => sys_exec(arg1, arg2),
+        9 => sys_wait(arg1),
+        10 => sys_get_service_binary(arg1, arg2, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -207,6 +221,168 @@ fn sys_getpid() -> u64 {
     }
 }
 
+/// sys_fork - Create a new process (child)
+/// Returns: Child PID in parent, 0 in child, -1 on error
+fn sys_fork() -> u64 {
+    use crate::process;
+    
+    let mut stats = SYSCALL_STATS.lock();
+    stats.fork_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] fork() called\n");
+    
+    // Create child process
+    match process::fork_process() {
+        Some(child_pid) => {
+            serial::serial_print("[SYSCALL] fork() created child process with PID: ");
+            serial::serial_print_dec(child_pid as u64);
+            serial::serial_print("\n");
+            
+            // Add child to scheduler
+            crate::scheduler::enqueue_process(child_pid);
+            
+            // Return child PID to parent
+            child_pid as u64
+        }
+        None => {
+            serial::serial_print("[SYSCALL] fork() failed - could not create child\n");
+            u64::MAX // -1 indicates error
+        }
+    }
+}
+
+/// sys_exec - Replace current process with new program
+/// arg1: pointer to ELF buffer
+/// arg2: size of ELF buffer
+/// Returns: 0 on success (doesn't return on success), -1 on error
+fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.exec_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] exec() called with buffer at 0x");
+    serial::serial_print_hex(elf_ptr);
+    serial::serial_print(", size: ");
+    serial::serial_print_dec(elf_size);
+    serial::serial_print("\n");
+    
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+        serial::serial_print("[SYSCALL] exec() invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    // Create slice from buffer
+    let elf_data = unsafe {
+        core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize)
+    };
+    
+    // Replace current process with ELF binary
+    if let Some(entry_point) = crate::elf_loader::replace_process_image(elf_data) {
+        serial::serial_print("[SYSCALL] exec() replacing process image, entry: 0x");
+        serial::serial_print_hex(entry_point);
+        serial::serial_print("\n");
+        
+        // This doesn't return - we jump to the new process entry point
+        unsafe {
+            crate::elf_loader::jump_to_entry(entry_point);
+        }
+    } else {
+        serial::serial_print("[SYSCALL] exec() failed to load ELF\n");
+        return u64::MAX;
+    }
+}
+
+/// sys_wait - Wait for child process to terminate
+/// arg1: pointer to status variable (or 0 to ignore)
+/// Returns: PID of terminated child, or -1 on error
+fn sys_wait(_status_ptr: u64) -> u64 {
+    use crate::process;
+    
+    let mut stats = SYSCALL_STATS.lock();
+    stats.wait_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] wait() called\n");
+    
+    // Get current process ID
+    let current_pid = match process::current_process_id() {
+        Some(pid) => pid,
+        None => {
+            serial::serial_print("[SYSCALL] wait() failed - no current process\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Look for terminated child processes
+    let processes = process::list_processes();
+    for (pid, state) in processes.iter() {
+        if *pid == 0 {
+            continue;
+        }
+        
+        if state == &process::ProcessState::Terminated {
+            if let Some(proc) = process::get_process(*pid) {
+                if proc.parent_pid == Some(current_pid) {
+                    serial::serial_print("[SYSCALL] wait() found terminated child PID: ");
+                    serial::serial_print_dec(*pid as u64);
+                    serial::serial_print("\n");
+                    
+                    // TODO: Clean up child process resources
+                    // TODO: Write exit status to status_ptr if non-zero
+                    
+                    return *pid as u64;
+                }
+            }
+        }
+    }
+    
+    // No terminated children found
+    serial::serial_print("[SYSCALL] wait() - no terminated children\n");
+    u64::MAX // -1 indicates no children or error
+}
+
+/// sys_get_service_binary - Get pointer and size of embedded service binary
+/// Args: service_id (0-4), out_ptr (pointer to store binary pointer), out_size (pointer to store size)
+/// Returns: 0 on success, -1 on error
+fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
+    serial::serial_print("[SYSCALL] get_service_binary(");
+    serial::serial_print_dec(service_id);
+    serial::serial_print(")\n");
+    
+    // Validate pointers
+    if out_ptr == 0 || out_size == 0 {
+        return u64::MAX;
+    }
+    
+    // Get service binary based on ID
+    let (bin_ptr, bin_size) = match service_id {
+        0 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
+        1 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
+        2 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
+        3 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
+        4 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        _ => {
+            serial::serial_print("[SYSCALL] Invalid service ID\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Write pointer and size to user-provided addresses
+    unsafe {
+        *(out_ptr as *mut u64) = bin_ptr;
+        *(out_size as *mut u64) = bin_size;
+    }
+    
+    serial::serial_print("[SYSCALL] Service binary: ptr=0x");
+    serial::serial_print_hex(bin_ptr);
+    serial::serial_print(", size=");
+    serial::serial_print_dec(bin_size);
+    serial::serial_print("\n");
+    
+    0 // Success
+}
+
 /// Obtener estadísticas de syscalls
 pub fn get_stats() -> SyscallStats {
     let stats = SYSCALL_STATS.lock();
@@ -218,6 +394,9 @@ pub fn get_stats() -> SyscallStats {
         send_calls: stats.send_calls,
         receive_calls: stats.receive_calls,
         yield_calls: stats.yield_calls,
+        fork_calls: stats.fork_calls,
+        exec_calls: stats.exec_calls,
+        wait_calls: stats.wait_calls,
     }
 }
 
