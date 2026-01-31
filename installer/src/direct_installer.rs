@@ -424,7 +424,7 @@ impl DirectInstaller {
 
     fn install_eclipse_systemd(&self, _disk: &DiskInfo) -> Result<(), String> {
         println!("   Instalando eclipse-systemd...");
-        let systemd_source = "eclipse-apps/systemd/target/release/eclipse-systemd";
+        let systemd_source = "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd";
 
         if Path::new(systemd_source).exists() {
             // Crear directorios del sistema

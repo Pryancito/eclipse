@@ -1,136 +1,329 @@
-//! Minimal filesystem support for Eclipse microkernel
-//! 
-//! This module provides a basic interface for mounting and accessing
-//! the eclipsefs filesystem. For full implementation, this should be
-//! moved to userspace according to microkernel principles.
-
 use crate::serial;
+use core::cmp::min;
+use alloc::vec::Vec;
+use alloc::vec;
+use alloc::string::String;
+use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags, constants};
+use eclipsefs_lib::NodeKind;
 
 /// Block size for filesystem operations
 pub const BLOCK_SIZE: usize = 4096;
 
-/// Maximum number of open files
-const MAX_OPEN_FILES: usize = 16;
-
-/// File handle
-#[derive(Clone, Copy)]
-pub struct FileHandle {
-    pub inode: u32,
-    pub offset: u64,
-    pub flags: u32,
-}
-
 /// Filesystem state
 pub struct Filesystem {
     mounted: bool,
-    root_inode: u32,
-    // In a full implementation, this would include:
-    // - Inode table
-    // - Block allocation bitmap
-    // - Directory cache
-    // - File descriptor table
+    header: Option<EclipseFSHeader>,
+    inode_table_offset: u64,
 }
 
 static mut FS: Filesystem = Filesystem {
     mounted: false,
-    root_inode: 1,
+    header: None,
+    inode_table_offset: 0,
 };
 
 impl Filesystem {
     /// Mount the root filesystem
-    pub fn mount() -> Result<(), &'static str> {
-        unsafe {
-            if FS.mounted {
-                return Err("Filesystem already mounted");
-            }
-            
-            serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
-            
-            // Read superblock from block 0
-            let mut superblock = [0u8; 4096];
-            if let Err(e) = crate::virtio::read_block(0, &mut superblock) {
-                serial::serial_print("[FS] Failed to read superblock: ");
-                serial::serial_print(e);
-                serial::serial_print("\n");
-                return Err("Failed to read superblock");
-            }
-            
-            // Check magic number (ELIP = EclipseFS)
-            if superblock[0] == 0xEC && superblock[1] == 0x4C && 
-               superblock[2] == 0x49 && superblock[3] == 0x50 {
+// Hardcoded partition offset for now (513 MiB / 4096 bytes = 131328 blocks)
+const PARTITION_OFFSET_BLOCKS: u64 = 131328;
+
+pub fn mount() -> Result<(), &'static str> {
+    // Enforce ATA initialization before mounting
+    // This is handled in main.rs but good to be sure
+    
+    unsafe {
+        if FS.mounted {
+            return Err("Filesystem already mounted");
+        }
+        
+        serial::serial_print("[FS] Attempting to mount eclipsefs via ATA...\n");
+        
+        serial::serial_print("[FS] Allocating superblock buffer...\n");
+        // Use heap to avoid stack overflow
+        let mut superblock = vec![0u8; 4096];
+        serial::serial_print("[FS] Buffer allocated at: 0x");
+        serial::serial_print_hex(superblock.as_ptr() as u64);
+        serial::serial_print("\n");
+        
+        serial::serial_print("[FS] Reading superblock from ATA...\n");
+        crate::ata::read_block(Self::PARTITION_OFFSET_BLOCKS, &mut superblock)?;
+        serial::serial_print("[FS] Superblock read successfully\n");
+        
+        // Parse header using library
+        match EclipseFSHeader::from_bytes(&superblock) {
+            Ok(header) => {
                 serial::serial_print("[FS] EclipseFS signature found\n");
+                serial::serial_print("[FS] Version: ");
+                serial::serial_print_dec((header.version >> 16) as u64);
+                serial::serial_print(".");
+                serial::serial_print_dec((header.version & 0xFFFF) as u64);
+                serial::serial_print("\n");
+                
+                FS.inode_table_offset = header.inode_table_offset;
+                FS.header = Some(header);
+                FS.mounted = true;
+                
+                serial::serial_print("[FS] Filesystem mounted successfully\n");
+                Ok(())
+            },
+            Err(_) => {
+                serial::serial_print("[FS] Invalid EclipseFS header\n");
+                Err("Invalid EclipseFS header")
+            }
+        }
+    }
+}
+    
+    /// Read an inode entry
+    fn read_inode_entry(inode: u32) -> Result<InodeTableEntry, &'static str> {
+        unsafe {
+            let header = FS.header.as_ref().ok_or("FS not mounted")?;
+            
+            if inode < 1 || inode > header.total_inodes {
+                return Err("Inode out of range");
+            }
+            
+            // Calculate sector for inode entry
+            // Inode table starts at inode_table_offset
+            // Each entry is 8 bytes.
+            // inode indices are 1-based, table is 0-indexed (inode 1 is at index 0)
+            let index = (inode - 1) as u64;
+            let entry_offset = FS.inode_table_offset + (index * 8);
+            
+            let block_num = (entry_offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+            let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
+            
+            let mut buffer = vec![0u8; 4096];
+            crate::ata::read_block(block_num, &mut buffer)?;
+            
+            let inode_num = u32::from_le_bytes([
+                buffer[offset_in_block], buffer[offset_in_block+1], 
+                buffer[offset_in_block+2], buffer[offset_in_block+3]
+            ]) as u64;
+            
+            let rel_offset = u32::from_le_bytes([
+                buffer[offset_in_block+4], buffer[offset_in_block+5], 
+                buffer[offset_in_block+6], buffer[offset_in_block+7]
+            ]) as u64;
+             
+            let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
+            
+            Ok(InodeTableEntry::new(inode_num, absolute_offset))
+        }
+    }
+    
+    /// Parse TLV data from a node record
+    fn parse_tlv_content(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let mut offset = 0;
+        while offset + 6 <= data.len() {
+            let tag = u16::from_le_bytes([data[offset], data[offset+1]]);
+            let length = u32::from_le_bytes([
+                data[offset+2], data[offset+3], data[offset+4], data[offset+5]
+            ]) as usize;
+            
+            offset += 6;
+            
+            if offset + length > data.len() {
+                break;
+            }
+            
+            if tag == tlv_tags::CONTENT {
+                let mut content = vec![0u8; length];
+                content.copy_from_slice(&data[offset..offset+length]);
+                return Ok(content);
+            }
+            
+            // Directories logic handled separately in lookup
+            
+            offset += length;
+        }
+        
+        Ok(Vec::new()) // Empty content if not found
+    }
+
+    /// Read file content by inode
+    pub fn read_file_by_inode(inode: u32, buffer: &mut [u8]) -> Result<usize, &'static str> {
+        let entry = Self::read_inode_entry(inode)?;
+        
+        // Read node record
+        let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        
+        // Node Header: Inode (4) + Size (4) + Header Size (4) ? NO.
+        // Node format: 
+        // 4 bytes: inode
+        // 4 bytes: record size
+        // TLV data...
+        
+        // If record spans blocks, we need logic for that. 
+        // For simplicity, assumed nodes fit in one block for initialization phase.
+        // But `read_block` reads 4096 bytes.
+        // If the record crosses boundary, we failed. Optimistic assumption for bootloader.
+        
+        let mut block_buffer = vec![0u8; 4096];
+        crate::ata::read_block(block_num, &mut block_buffer)?;
+        
+        if offset_in_block + 8 > 4096 {
+             // Basic boundary cross handling would load next block
+             return Err("Node header crosses block boundary (unsupported in simple driver)");
+        }
+
+        let _read_inode = u32::from_le_bytes([
+            block_buffer[offset_in_block], block_buffer[offset_in_block+1],
+            block_buffer[offset_in_block+2], block_buffer[offset_in_block+3]
+        ]);
+        
+        let record_size = u32::from_le_bytes([
+            block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
+            block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
+        ]) as usize;
+        
+        if offset_in_block + record_size > 4096 {
+             // For now, assume small nodes. /sbin/init is small but binary might be ~100KB+ stored in content?
+             // Actually, file content is inside CONTENT TLV.
+             // If content is large, it WILL cross block boundaries.
+             // We need a proper loop reading blocks.
+             // OR, more likely for an OS, the CONTENT TLV points to extents?
+             // EclipseFS simple format puts data INLINE in CONTENT tag.
+             // This means /sbin/init (1.2MB) is huge record!
+             // So `block_buffer` is not enough.
+             
+             // WE MUST IMPLEMENT MULTI-BLOCK READ.
+             
+             // Let's implement reading the full record into a temporary buffer?
+             // No, kernel heap is smallish? 
+             // We can read directly to destination buffer if we parse TLV correctly.
+        }
+
+        // Simpler approach:
+        // Read the full record size.
+        // If it spans blocks, read multiple blocks.
+        
+        let mut record_data = vec![0u8; record_size];
+        
+        // Read first chunk
+        let first_chunk_size = min(record_size, 4096 - offset_in_block);
+        record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block+first_chunk_size]);
+        
+        let mut bytes_read = first_chunk_size;
+        let mut current_block = block_num + 1;
+        
+        while bytes_read < record_size {
+             let chunk_size = min(4096, record_size - bytes_read);
+             crate::ata::read_block(current_block, &mut block_buffer)?;
+             record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
+             bytes_read += chunk_size;
+             current_block += 1;
+        }
+        
+        // Now parse TLV from record_data (skipping 8 byte header)
+        let content = Self::parse_tlv_content(&record_data[8..])?;
+        
+        let copy_len = min(buffer.len(), content.len());
+        buffer[..copy_len].copy_from_slice(&content[..copy_len]);
+        
+        Ok(copy_len)
+    }
+
+    /// Helper to find child inode in directory data
+    fn find_child_in_dir(data: &[u8], target_name: &str) -> Option<u32> {
+        let mut offset = 0;
+        // Skip header 8 bytes if passing raw record, but here we pass TLV value
+        while offset + 6 <= data.len() {
+             let tag = u16::from_le_bytes([data[offset], data[offset+1]]);
+             let length = u32::from_le_bytes([
+                data[offset+2], data[offset+3], data[offset+4], data[offset+5]
+            ]) as usize;
+            offset += 6;
+            
+            if tag == tlv_tags::DIRECTORY_ENTRIES {
+                // Parse dir entries
+                // Format: NameLen(4) + Inode(4) + Name(Len)
+                let dir_data = &data[offset..offset+length];
+                let mut dir_offset = 0;
+                while dir_offset + 8 <= dir_data.len() {
+                    let name_len = u32::from_le_bytes([
+                        dir_data[dir_offset], dir_data[dir_offset+1],
+                        dir_data[dir_offset+2], dir_data[dir_offset+3]
+                    ]) as usize;
+                    
+                    let child_inode = u32::from_le_bytes([
+                        dir_data[dir_offset+4], dir_data[dir_offset+5],
+                        dir_data[dir_offset+6], dir_data[dir_offset+7]
+                    ]);
+                    
+                    if dir_offset + 8 + name_len > dir_data.len() { break; }
+                    
+                    let name_bytes = &dir_data[dir_offset+8..dir_offset+8+name_len];
+                    if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        if name == target_name {
+                            return Some(child_inode);
+                        }
+                    }
+                    
+                    dir_offset += 8 + name_len;
+                }
+            }
+            offset += length;
+        }
+        None
+    }
+
+    /// Lookup functionality
+    pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
+        unsafe {
+            let _ = FS.header.as_ref().ok_or("FS not mounted")?;
+        }
+        
+        if path == "/" {
+            return Ok(1); // Root
+        }
+        
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current_inode = 1;
+        
+        for part in parts {
+            // Read directory inode
+             // Reuse read logic but we need the raw record to find children
+             let entry = Self::read_inode_entry(current_inode)?;
+             
+             // Load whole record (same logic as read_file_by_inode basically)
+             // TODO: Refactor duplication
+             let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+             let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+             
+             let mut block_buffer = vec![0u8; 4096];
+             crate::ata::read_block(block_num, &mut block_buffer)?;
+             
+             let record_size = u32::from_le_bytes([
+                block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
+                block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
+            ]) as usize;
+            
+            let mut record_data = vec![0u8; record_size];
+            // Read first chunk
+            let first_chunk_size = min(record_size, 4096 - offset_in_block);
+            record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block+first_chunk_size]);
+            
+            let mut bytes_read = first_chunk_size;
+            let mut current_block = block_num + 1;
+            while bytes_read < record_size {
+                 let chunk_size = min(4096, record_size - bytes_read);
+                 crate::ata::read_block(current_block, &mut block_buffer)?;
+                 record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
+                 bytes_read += chunk_size;
+                 current_block += 1;
+            }
+            
+            // Search in record
+            if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
+                current_inode = inode;
             } else {
-                serial::serial_print("[FS] Warning: No EclipseFS signature, continuing anyway\n");
+                return Err("File not found");
             }
-            
-            FS.mounted = true;
-            FS.root_inode = 1;
-            
-            serial::serial_print("[FS] Filesystem mounted successfully\n");
-            Ok(())
         }
-    }
-    
-    /// Check if filesystem is mounted
-    pub fn is_mounted() -> bool {
-        unsafe { FS.mounted }
-    }
-    
-    /// Open a file
-    pub fn open(_path: &str) -> Result<FileHandle, &'static str> {
-        unsafe {
-            if !FS.mounted {
-                return Err("Filesystem not mounted");
-            }
-            
-            // TODO: Implement path resolution
-            // For now, return a placeholder handle
-            Ok(FileHandle {
-                inode: 2, // Assume init is inode 2
-                offset: 0,
-                flags: 0,
-            })
-        }
-    }
-    
-    /// Read from a file
-    pub fn read(handle: FileHandle, buffer: &mut [u8]) -> Result<usize, &'static str> {
-        unsafe {
-            if !FS.mounted {
-                return Err("Filesystem not mounted");
-            }
-            
-            // TODO: Read from inode's data blocks
-            // For now, read from block 1 (simulated)
-            let mut block_buffer = [0u8; 4096];
-            crate::virtio::read_block(1, &mut block_buffer)?;
-            
-            let copy_len = buffer.len().min(4096);
-            buffer[..copy_len].copy_from_slice(&block_buffer[..copy_len]);
-            
-            Ok(copy_len)
-        }
-    }
-    
-    /// Close a file
-    pub fn close(_handle: FileHandle) -> Result<(), &'static str> {
-        unsafe {
-            if !FS.mounted {
-                return Err("Filesystem not mounted");
-            }
-            
-            // Nothing to do for now
-            Ok(())
-        }
-    }
-    
-    /// Read entire file into buffer (helper function)
-    pub fn read_file(path: &str, buffer: &mut [u8]) -> Result<usize, &'static str> {
-        // Open, read, close pattern
-        let handle = Self::open(path)?;
-        let bytes_read = Self::read(handle, buffer)?;
-        Self::close(handle)?;
-        Ok(bytes_read)
+        
+        Ok(current_inode)
     }
 }
 
@@ -138,9 +331,6 @@ impl Filesystem {
 /// Initialize the filesystem subsystem
 pub fn init() {
     serial::serial_print("Initializing filesystem subsystem...\n");
-    
-    // The actual mounting will happen after VirtIO is initialized
-    // and we have a working block device
 }
 
 /// Mount the root filesystem
@@ -150,10 +340,14 @@ pub fn mount_root() -> Result<(), &'static str> {
 
 /// Read a file from the filesystem
 pub fn read_file(path: &str, buffer: &mut [u8]) -> Result<usize, &'static str> {
-    Filesystem::read_file(path, buffer)
+    // 1. Lookup inode
+    let inode = Filesystem::lookup_path(path)?;
+    // 2. Read file
+    Filesystem::read_file_by_inode(inode, buffer)
 }
 
 /// Check if filesystem is mounted
 pub fn is_mounted() -> bool {
-    Filesystem::is_mounted()
+    // Safe because we just read bool
+    unsafe { FS.mounted }
 }

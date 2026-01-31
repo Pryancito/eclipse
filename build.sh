@@ -100,9 +100,9 @@ build_kernel() {
     cd eclipse_kernel
     if [ "${KERNEL_MINIMAL:-0}" = "1" ]; then
         print_status "Modo MINIMAL: compilando kernel sin características opcionales"
-        rustup run nightly cargo build --target x86_64-unknown-none --release
+        RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --target x86_64-unknown-none --release
     else
-        rustup run nightly cargo build --target x86_64-unknown-none --release
+        RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --target x86_64-unknown-none --release
     fi
 
     if [ $? -eq 0 ]; then
@@ -186,15 +186,15 @@ build_systemd() {
     
     cd eclipse-apps/systemd
     
-    # Compilar systemd
+    # Compilar systemd para el target correcto
     print_status "Compilando systemd..."
-    cargo build --release
+    cargo build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
         print_success "Systemd compilado exitosamente"
         
-        # Mostrar información del systemd compilado
-        local systemd_path="target/release/eclipse-systemd"
+        # Mostrar información del sistema compilado
+        local systemd_path="target/x86_64-unknown-none/release/eclipse-systemd"
         if [ -f "$systemd_path" ]; then
             local systemd_size=$(du -h "$systemd_path" | cut -f1)
             print_status "Systemd generado: $systemd_path ($systemd_size)"
@@ -665,10 +665,10 @@ create_basic_distribution() {
         mkdir -p "$BUILD_DIR/usr/sbin"
         
         # Copiar systemd si existe
-        if [ -f "eclipse-apps/systemd/target/release/eclipse-systemd" ]; then
-            cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/userland/bin/"
+        if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
+            cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/userland/bin/"
             # También instalar en /usr/bin/ para que el kernel lo encuentre
-            cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/"
+            cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/"
             chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
             print_status "Systemd copiado e instalado en /usr/sbin/"
         fi
@@ -1067,11 +1067,11 @@ create_bootable_image() {
                 mkdir -p "$BUILD_DIR"/{bin,sbin,usr/{bin,sbin,lib},etc,var,tmp,home,root,dev,proc,sys}
                 
                 # Copiar eclipse-systemd a las ubicaciones estándar si existe
-                if [ -f "eclipse-apps/systemd/target/release/eclipse-systemd" ]; then
+                if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
                     mkdir -p "$BUILD_DIR/sbin"
                     mkdir -p "$BUILD_DIR/usr/sbin"
-                    cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/sbin/eclipse-systemd"
-                    cp "eclipse-apps/systemd/target/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/eclipse-systemd"
+                    cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/sbin/eclipse-systemd"
+                    cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/eclipse-systemd"
                     chmod +x "$BUILD_DIR/sbin/eclipse-systemd"
                     chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
                     print_status "eclipse-systemd copiado a /sbin/ y /usr/sbin/"
@@ -1299,7 +1299,7 @@ build_eclipse_apps() {
     cd ../..
 
     print_status "Compilando eclipse-systemd..."
-    cd systemd && cargo build --release || { cd ..; print_error "Fallo compilando eclipse-systemd"; return 1; }
+    cd systemd && cargo build --release --target x86_64-unknown-none || { cd ..; print_error "Fallo compilando eclipse-systemd"; return 1; }
     cd ..
 
     print_success "eclipse-apps compilado completamente"

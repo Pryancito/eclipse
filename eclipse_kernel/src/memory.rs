@@ -5,12 +5,10 @@
 //! - Heap allocator
 //! - Gestión de memoria física
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::null_mut;
-use spin::Mutex;
+use linked_list_allocator::LockedHeap;
 
 /// Tamaño del heap del kernel (2 MB)
-const HEAP_SIZE: usize = 2 * 1024 * 1024;
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 /// Heap estático del kernel
 #[repr(align(4096))]
@@ -22,78 +20,46 @@ static mut HEAP: KernelHeap = KernelHeap {
     memory: [0; HEAP_SIZE],
 };
 
-/// Información de bloques libres
-struct FreeBlock {
-    size: usize,
-    next: *mut FreeBlock,
-}
-
-/// Allocator simple basado en lista enlazada
-pub struct SimpleAllocator {
-    free_list: Mutex<*mut FreeBlock>,
-}
-
-unsafe impl Send for SimpleAllocator {}
-unsafe impl Sync for SimpleAllocator {}
-
-unsafe impl GlobalAlloc for SimpleAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(layout.align());
-        let aligned_size = (size + 15) & !15; // Alinear a 16 bytes
-        
-        let mut free_list = self.free_list.lock();
-        let mut current = *free_list;
-        let mut prev: *mut *mut FreeBlock = &mut *free_list;
-        
-        // Buscar bloque libre
-        while !current.is_null() {
-            let block = &mut *current;
-            if block.size >= aligned_size {
-                // Dividir bloque si es demasiado grande
-                if block.size > aligned_size + core::mem::size_of::<FreeBlock>() {
-                    let new_block = (current as usize + aligned_size) as *mut FreeBlock;
-                    (*new_block).size = block.size - aligned_size;
-                    (*new_block).next = block.next;
-                    *prev = new_block;
-                } else {
-                    *prev = block.next;
-                }
-                return current as *mut u8;
-            }
-            prev = &mut block.next;
-            current = block.next;
-        }
-        
-        null_mut()
-    }
-    
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size().max(layout.align());
-        let aligned_size = (size + 15) & !15;
-        
-        let block = ptr as *mut FreeBlock;
-        (*block).size = aligned_size;
-        
-        let mut free_list = self.free_list.lock();
-        (*block).next = *free_list;
-        *free_list = block;
-    }
-}
-
 #[global_allocator]
-static ALLOCATOR: SimpleAllocator = SimpleAllocator {
-    free_list: Mutex::new(null_mut()),
-};
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Inicializar el sistema de memoria
 pub fn init() {
     unsafe {
         // Inicializar el heap con un bloque libre grande
-        let heap_start = HEAP.memory.as_mut_ptr() as *mut FreeBlock;
-        (*heap_start).size = HEAP_SIZE;
-        (*heap_start).next = null_mut();
+        let heap_start = HEAP.memory.as_mut_ptr();
+        crate::serial::serial_print("[MEM] Heap start: 0x");
+        crate::serial::serial_print_hex(heap_start as u64);
+        crate::serial::serial_print("\n");
         
-        *ALLOCATOR.free_list.lock() = heap_start;
+        // Manual write test
+        crate::serial::serial_print("[MEM] Testing write to heap start...\n");
+        *heap_start = 0xAA;
+        if *heap_start == 0xAA {
+             crate::serial::serial_print("[MEM] Write test passed\n");
+        } else {
+             crate::serial::serial_print("[MEM] Write test FAILED\n");
+        }
+        
+        // Test Generic Spinlock
+        crate::serial::serial_print("[MEM] Testing generic spinlock...\n");
+        let lock = spin::Mutex::new(0);
+        {
+            let mut data = lock.lock();
+            *data = 1;
+        }
+        crate::serial::serial_print("[MEM] Generic spinlock passed\n");
+
+        crate::serial::serial_print("[MEM] Locking allocator...\n");
+        crate::serial::serial_print("[MEM] Allocator addr: 0x");
+        crate::serial::serial_print_hex(&raw const ALLOCATOR as u64);
+        crate::serial::serial_print("\n");
+        let mut allocator = ALLOCATOR.lock();
+        crate::serial::serial_print("[MEM] Allocator locked. Initializing...\n");
+        
+        allocator.init(heap_start, HEAP_SIZE);
+        
+        crate::serial::serial_print("[MEM] Allocator initialized\n");
     }
 }
 
@@ -153,40 +119,77 @@ static mut PDPT: PageTable = PageTable::new();
 static mut PD: PageTable = PageTable::new();
 
 /// Inicializar paginación
-pub fn init_paging() {
+pub fn init_paging(kernel_phys_base: u64) {
+    let phys_offset = kernel_phys_base.wrapping_sub(0x200000);
+    
+    // DEBUG
     unsafe {
-        // Configurar identity mapping para los primeros 2GB
+        crate::serial::serial_print("Init Paging. Phys Base: 0x");
+        crate::serial::serial_print_hex(kernel_phys_base);
+        crate::serial::serial_print("\nOffset: 0x");
+        crate::serial::serial_print_hex(phys_offset);
+        crate::serial::serial_print("\n");
+    }
+
+    unsafe {
+        // Calcular direcciones físicas de las tablas (que están en BSS virtual)
+        let pdpt_phys = (&PDPT as *const _ as u64).wrapping_add(phys_offset);
+        let pd_phys = (&PD as *const _ as u64).wrapping_add(phys_offset);
+        let pml4_phys = (&PML4 as *const _ as u64).wrapping_add(phys_offset);
+
+        crate::serial::serial_print("PML4 Phys: 0x");
+        crate::serial::serial_print_hex(pml4_phys);
+        crate::serial::serial_print("\n");
+
+        // Configurar identity mapping SHIFTED para los primeros 2GB
+        // Esto mapea Virtual X -> Physical X + Offset
+        
         // PML4[0] -> PDPT
         PML4.entries[0].set_addr(
-            &PDPT as *const _ as u64,
+            pdpt_phys,
             PAGE_PRESENT | PAGE_WRITABLE
         );
         
         // PML4[511] -> PDPT (higher half)
         PML4.entries[511].set_addr(
-            &PDPT as *const _ as u64,
+            pdpt_phys,
             PAGE_PRESENT | PAGE_WRITABLE
         );
         
         // PDPT[0] -> PD
         PDPT.entries[0].set_addr(
-            &PD as *const _ as u64,
+            pd_phys,
             PAGE_PRESENT | PAGE_WRITABLE
         );
         
         // PD: Mapear 1GB con páginas de 2MB (huge pages)
+        // Aplicando el offset SOLO al rango del kernel (64MB aprox)
+        // El resto (Stack, Hardware) se mantiene Identity 1:1
         for i in 0..512 {
+            let virt_addr = (i as u64) * 0x200000;
+            
+            // Skip page 0 (offset) if needed
+            if i == 0 {
+                PD.entries[i].set_addr(0, 0); // Not present
+                continue;
+            }
+
+            let phys_addr = if i < 64 { // Map first 128MB (Kernel) with offset
+                virt_addr.wrapping_add(phys_offset)
+            } else { // Map Rest (Stack at i=511) with Identity
+                virt_addr
+            };
+
             PD.entries[i].set_addr(
-                (i as u64) * 0x200000, // 2MB per entry
-                PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE
+                phys_addr,
+                PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE | PAGE_USER
             );
         }
-        
-        // Cargar CR3 con PML4
-        let pml4_addr = &PML4 as *const _ as u64;
+
+        // Cargar CR3 con PML4 Físico
         core::arch::asm!(
             "mov cr3, {}",
-            in(reg) pml4_addr,
+            in(reg) pml4_phys,
             options(nostack, preserves_flags)
         );
     }

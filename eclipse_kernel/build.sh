@@ -10,4 +10,4 @@ echo "Compiling kernel..."
 cargo +nightly build --target x86_64-unknown-none --release
 
 echo "=== Build complete ==="
-echo "Kernel binary: target/x86_64-unknown-none/release/eclipse_microkernel"
+echo "Kernel binary: target/x86_64-unknown-none/release/eclipse_kernel"

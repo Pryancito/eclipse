@@ -285,7 +285,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         
         // This doesn't return - we jump to the new process entry point
         unsafe {
-            crate::elf_loader::jump_to_entry(entry_point);
+            // Use standard userspace stack top
+            let stack_top: u64 = 0x800000;
+            crate::elf_loader::jump_to_userspace(entry_point, stack_top);
         }
     } else {
         serial::serial_print("[SYSCALL] exec() failed to load ELF\n");

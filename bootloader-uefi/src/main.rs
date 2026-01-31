@@ -657,7 +657,7 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
     Ok((entry, kernel_phys_base, total_len, segmap))
 }
 
-fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, u64, u64), BootError> {
+fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, u64, u64, u64), BootError> {
     // Leer cabecera ELF
     if kernel_data.len() < core::mem::size_of::<Elf64Ehdr>() {
         return Err(BootError::LoadElf(Status::LOAD_ERROR));
@@ -742,35 +742,35 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
     }
 
     // Reservar memoria física (usar AnyPages para evitar conflictos de dirección)
-    let mut allocated_addr = kernel_phys_base;
-
-    match bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
+    // Reservar memoria física para el kernel
+    // IMPORTANTE: Necesitamos alineación de 2MB para Huge Pages.
+    // AllocatePages(AnyPages) solo garantiza 4KB.
+    // Estrategia: Reservar size + 2MB extra y alinear manualmente.
+    
+    let extra_pages_for_alignment = 512; // 2MB / 4KB
+    let allocation_pages = total_pages + extra_pages_for_alignment;
+    
+    let mut allocated_addr;
+    
+    match bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_CODE, allocation_pages) {
         Ok(addr) => {
-            allocated_addr = addr;
+            // Calcular dirección alineada a 2MB
+            let addr_u64 = addr;
+            let alignment = 0x200000;
+            let aligned_addr = (addr_u64 + (alignment - 1)) & !(alignment - 1);
+            
+            allocated_addr = aligned_addr;
+            
             unsafe {
-                serial_write_str("DEBUG: memoria asignada en 0x");
+                serial_write_str("DEBUG: Kernel alloc raw: 0x");
                 serial_write_hex64(addr);
-                serial_write_str(" (Address request)\r\n");
+                serial_write_str(" aligned: 0x");
+                serial_write_hex64(allocated_addr);
+                serial_write_str("\r\n");
             }
-        }
-        Err(st_addr) => {
-            unsafe {
-                serial_write_str("DEBUG: allocate_address fallo, usando AnyPages\r\n");
-            }
-            // Usar AnyPages para que UEFI elija una dirección disponible
-            match bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_CODE, total_pages) {
-                Ok(addr) => {
-                    allocated_addr = addr;
-                    unsafe {
-                        serial_write_str("DEBUG: memoria asignada en 0x");
-                        serial_write_hex64(addr);
-                        serial_write_str(" (AnyPages)\r\n");
-                    }
-                }
-                Err(st_any) => {
-                    return Err(BootError::LoadSegment { status: st_any.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
-                }
-            }
+        },
+        Err(st_any) => {
+             return Err(BootError::LoadSegment { status: st_any.status(), seg_index: 0, addr: kernel_phys_base, pages: allocation_pages });
         }
     }
 
@@ -919,7 +919,7 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         }
     };
 
-    Ok((entry_point_phys, allocated_addr, total_size))
+    Ok((entry_point_phys, ehdr.e_entry, allocated_addr, total_size))
 }
 
 enum BootError {
@@ -1355,12 +1355,14 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
 
         match load_kernel_from_data(bs, kernel_data) {
-            Ok((entry_point, kernel_phys_base, total_len)) => {
+            Ok((entry_point_phys, entry_point_virt, kernel_phys_base, total_len)) => {
                 unsafe {
                     serial_write_str("BL: kernel ELF cargado exitosamente\r\n");
                     log_append_bytes(b"[BL] kernel loaded\r\n");
-                    serial_write_str("BL: entry_point=0x");
-                    serial_write_hex64(entry_point);
+                    serial_write_str("BL: entry_point_phys=0x");
+                    serial_write_hex64(entry_point_phys);
+                    serial_write_str(" entry_point_virt=0x");
+                    serial_write_hex64(entry_point_virt);
                     serial_write_str(" kernel_phys_base=0x");
                     serial_write_hex64(kernel_phys_base);
                     serial_write_str(" total_len=0x");
@@ -1368,25 +1370,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str("\r\n");
                 }
                 
+                // La función load_kernel_from_data ya devuelve la dirección física del entry point
                 // Mapear la dirección virtual del kernel (0x200000) a su dirección física real
                 map_kernel_virtual_to_physical(pml4_phys, 0x200000, kernel_phys_base, total_len);
                 
-                // Calcular el entry point físico sumando el offset al base físico
-                let entry_offset = entry_point.saturating_sub(KERNEL_VIRT_BASE);
-                let entry_phys_calc = kernel_phys_base + entry_offset;
-                
-                unsafe {
-                    serial_write_str("DEBUG PRE-ASIGNACION: entry_phys_calc = 0x");
-                    serial_write_hex64(entry_phys_calc);
-                    serial_write_str(", kernel_phys_base = 0x");
-                    serial_write_hex64(kernel_phys_base);
-                    serial_write_str(", entry_offset = 0x");
-                    serial_write_hex64(entry_offset);
-                    serial_write_str("\r\n");
-                }
-                
-                // Asignar a variables fuera del scope para evitar corrupción
-                kernel_entry_phys = entry_phys_calc;
+                // Asignar direcamente el Virtual Entry Point para el salto
+                kernel_entry_phys = entry_point_virt;
                 kernel_base = kernel_phys_base;
                 kernel_size = total_len;
                 
@@ -1791,13 +1780,15 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::arch::asm!(
             "mov cr3, {cr3}",           // Configurar paginación
             "mov rsp, {rsp}",           // Configurar stack
-            "mov rdi, {fbinfo}",        // Pasar framebuffer_info_ptr en RDI
-            "mov rax, {entry}",         // Usar dirección física calculada del entry point
-            "jmp rax",                  // Saltar directamente al kernel
+            "sub rsp, 8",               // Alinear stack a 16 bytes
+            
+            "jmp rax",                  // Saltar al entry point (RAX)
+            
             cr3 = in(reg) cr3_value,
             rsp = in(reg) rsp_alineado,
-            fbinfo = in(reg) framebuffer_info_ptr,
-            entry = in(reg) kernel_entry_phys
+            in("rdi") framebuffer_info_ptr, // ARG1
+            in("rsi") kernel_base,          // ARG2
+            in("rax") kernel_entry_phys,    // Entry Point
         );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)

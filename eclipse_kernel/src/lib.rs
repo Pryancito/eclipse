@@ -7,6 +7,8 @@
 
 use core::panic::PanicInfo;
 
+extern crate alloc;
+
 pub mod boot;
 pub mod memory;
 pub mod interrupts;
@@ -19,6 +21,7 @@ pub mod servers;
 pub mod binaries;
 pub mod virtio;
 pub mod filesystem;
+pub mod ata;
 mod elf_loader;
 
 // Re-exportar tipos importantes

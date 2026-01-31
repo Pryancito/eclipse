@@ -97,3 +97,22 @@ pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const USER_CODE_SELECTOR: u16 = 0x18 | 3; // Ring 3
 pub const USER_DATA_SELECTOR: u16 = 0x20 | 3; // Ring 3
+
+/// Habilitar instrucciones SSE
+pub fn enable_sse() {
+    unsafe {
+        // Habilitar SSE bit en CR0 (Monitor Coprocessor) y limpiar Emulation
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1 << 2); // LIMPIAR EM (bit 2)
+        cr0 |= (1 << 1);  // SET MP (bit 1)
+        asm!("mov cr0, {}", in(reg) cr0);
+
+        // Habilitar SSE en CR4 (OSFXSR y OSXMMEXCPT)
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4);
+        cr4 |= (1 << 9);  // OSFXSR
+        cr4 |= (1 << 10); // OSXMMEXCPT
+        asm!("mov cr4, {}", in(reg) cr4);
+    }
+}

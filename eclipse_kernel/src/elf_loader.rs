@@ -71,8 +71,62 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
     
-    // TODO: Cargar segmentos PT_LOAD en memoria
-    // Por ahora, simplemente crear proceso con entry point
+    // Iterate over program headers and load segments
+    let ph_offset = header.e_phoff as usize;
+    let ph_count = header.e_phnum as usize;
+    let ph_size = header.e_phentsize as usize;
+    
+    if elf_data.len() < ph_offset + (ph_count * ph_size) {
+        serial::serial_print("ELF: Program headers out of bounds\n");
+        return None;
+    }
+    
+    for i in 0..ph_count {
+        let offset = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        
+        if ph.p_type == PT_LOAD {
+            serial::serial_print("ELF: Loading segment at 0x");
+            serial::serial_print_hex(ph.p_vaddr);
+            serial::serial_print(" size: 0x");
+            serial::serial_print_hex(ph.p_memsz);
+            serial::serial_print("\n");
+            
+            // Check if we can copy (filesz > 0)
+            if ph.p_filesz > 0 {
+                let file_offset = ph.p_offset as usize;
+                
+                if file_offset + (ph.p_filesz as usize) > elf_data.len() {
+                    serial::serial_print("ELF: Segment file content out of bounds\n");
+                    return None;
+                }
+                
+                // Copy data to memory
+                unsafe {
+                    let src = elf_data.as_ptr().add(file_offset);
+                    let dst = ph.p_vaddr as *mut u8;
+                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                }
+            }
+            
+            // Zero out BSS (memsz > filesz)
+            if ph.p_memsz > ph.p_filesz {
+                let bss_size = (ph.p_memsz - ph.p_filesz) as usize;
+                let bss_start = ph.p_vaddr + ph.p_filesz;
+                
+                serial::serial_print("ELF: Zeroing BSS at 0x");
+                serial::serial_print_hex(bss_start);
+                serial::serial_print(" size: 0x");
+                serial::serial_print_hex(bss_size as u64);
+                serial::serial_print("\n");
+                
+                unsafe {
+                    let dst = bss_start as *mut u8;
+                    core::ptr::write_bytes(dst, 0, bss_size);
+                }
+            }
+        }
+    }
     
     let stack_base = 0x700000; // 7MB
     let stack_size = 0x10000;  // 64KB
@@ -126,45 +180,34 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     Some(header.e_entry)
 }
 
-/// Jump to entry point (for exec())
+/// Jump to entry point in userspace (Ring 3)
 /// This function never returns
-pub unsafe fn jump_to_entry(entry_point: u64) -> ! {
-    serial::serial_print("ELF: Jumping to entry point: 0x");
+pub unsafe fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
+    serial::serial_print("ELF: Jumping to entry point in userspace: 0x");
     serial::serial_print_hex(entry_point);
     serial::serial_print("\n");
     
-    // Set up a clean stack for the new process
-    // Use a fixed stack location for userspace
-    let stack_top: u64 = 0x800000; // 8MB - 64KB = stack top
-    
-    // Clear all general-purpose registers and jump to entry point
-    // This simulates a clean process start
+    let user_cs: u64 = 0x1b; // Selector de datos/código usuario (GDT) + RPL 3
+    let user_ds: u64 = 0x23;
+    let rflags: u64 = 0x202; // Interrupciones habilitadas
+
     asm!(
-        // Clear all general-purpose registers
-        "xor rax, rax",
-        "xor rbx, rbx",
-        "xor rcx, rcx",
-        "xor rdx, rdx",
-        "xor rsi, rsi",
-        "xor rdi, rdi",
-        "xor r8, r8",
-        "xor r9, r9",
-        "xor r10, r10",
-        "xor r11, r11",
-        "xor r12, r12",
-        "xor r13, r13",
-        "xor r14, r14",
-        "xor r15, r15",
-        
-        // Set up stack pointer
-        "mov rsp, {stack}",
-        "mov rbp, rsp",
-        
-        // Jump to entry point
-        "jmp {entry}",
-        
-        stack = in(reg) stack_top,
-        entry = in(reg) entry_point,
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        "push {ss}",     // SS
+        "push {rsp}",    // RSP
+        "push {rflags}", // RFLAGS
+        "push {cs}",     // CS
+        "push {rip}",    // RIP
+        "iretq",
+        ss = in(reg) user_ds,
+        rsp = in(reg) stack_top,
+        rflags = in(reg) rflags,
+        cs = in(reg) user_cs,
+        rip = in(reg) entry_point,
+        in("ax") user_ds,
         options(noreturn)
     );
 }

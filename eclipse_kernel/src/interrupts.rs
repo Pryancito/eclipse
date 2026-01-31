@@ -88,26 +88,26 @@ const IDT_INTERRUPT_GATE: u8 = 0b00001110;
 pub fn init() {
     unsafe {
         // Configurar handlers de excepciones (0-31)
-        KERNEL_IDT.entries[0].set_handler(exception_0 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[1].set_handler(exception_1 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[3].set_handler(exception_3 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[4].set_handler(exception_4 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[6].set_handler(exception_6 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[8].set_handler(exception_8 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[13].set_handler(exception_13 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[14].set_handler(exception_14 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[0].set_handler(exception_0 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[1].set_handler(exception_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[3].set_handler(exception_3 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[4].set_handler(exception_4 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[6].set_handler(exception_6 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[8].set_handler(exception_8 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[13].set_handler(exception_13 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[14].set_handler(exception_14 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
         // Configurar handlers de IRQ (32-47)
-        KERNEL_IDT.entries[32].set_handler(irq_0 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
-        KERNEL_IDT.entries[33].set_handler(irq_1 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[32].set_handler(irq_0 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[33].set_handler(irq_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
         // Configurar syscall handler (int 0x80)
-        KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
         // Cargar IDT
         let idt_descriptor = IdtDescriptor {
             limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base: &KERNEL_IDT as *const _ as u64,
+            base: &raw const KERNEL_IDT as *const _ as u64,
         };
         
         asm!(
@@ -122,7 +122,8 @@ pub fn init() {
     
     // Habilitar interrupciones
     unsafe {
-        asm!("sti", options(nomem, nostack));
+        // asm!("sti", options(nomem, nostack));
+        crate::serial::serial_print("[INT] Interrupts DISABLED for debugging\n");
     }
 }
 
@@ -190,29 +191,54 @@ unsafe fn inb(port: u16) -> u8 {
 // Exception Handlers
 // ============================================================================
 
-extern "C" fn exception_handler(_num: u64, error_code: u64) {
+extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
     let mut stats = INTERRUPT_STATS.lock();
     stats.exceptions += 1;
     drop(stats);
     
-    crate::serial::serial_print("Exception occurred! Error code: ");
+    crate::serial::serial_print("EXCEPTION: ");
+    crate::serial::serial_print_dec(num);
+    crate::serial::serial_print(" Error: 0x");
     crate::serial::serial_print_hex(error_code);
+    crate::serial::serial_print(" RIP: 0x");
+    crate::serial::serial_print_hex(rip);
     crate::serial::serial_print("\n");
+    
+    // Halt to avoid loop
+    if num == 14 { // Page Fault
+        let cr2: u64;
+        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
+        crate::serial::serial_print("CR2: 0x");
+        crate::serial::serial_print_hex(cr2);
+        crate::serial::serial_print("\n");
+    }
+    
+    loop { 
+        if num == 3 { return; } // Breakpoint should return
+        unsafe { asm!("hlt") } 
+    }
 }
 
 // Division by zero (#DE)
 #[unsafe(naked)]
 unsafe extern "C" fn exception_0() {
     core::arch::naked_asm!(
-        // Alineación de stack (16 bytes según x86-64 ABI)
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
         // Push dummy error code
         "push 0",
         "push 0",
+        
+        // Pass arguments in registers (System V AMD64 ABI)
+        // RDI = Exception Number (0)
+        // RSI = Error Code (0)
+        "pop rdi", // Exception Number (Top of Stack)
+        "pop rsi", // Error Code (Next)
+        "mov rdx, [rsp]", // Peek RIP
+        
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+
         "call {}",
-        // Restaurar stack
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -224,11 +250,18 @@ unsafe extern "C" fn exception_0() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_1() {
     core::arch::naked_asm!(
+        "push 0",
+        "push 1",
+        
+        // Arguments: RDI=Num, RSI=Error, RDX=RIP
+        "pop rdi", // Exception Number
+        "pop rsi", // Error Code
+        "mov rdx, [rsp]", // Peek RIP
+        
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 0",
-        "push 1",
+
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -241,11 +274,17 @@ unsafe extern "C" fn exception_1() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_3() {
     core::arch::naked_asm!(
+        "push 0",
+        "push 3",
+        
+        "pop rdi", // Exception Number
+        "pop rsi", // Error Code
+        "mov rdx, [rsp]", // Peek RIP
+
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 0",
-        "push 3",
+
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -258,11 +297,17 @@ unsafe extern "C" fn exception_3() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_4() {
     core::arch::naked_asm!(
+        "push 0",
+        "push 4",
+        
+        "pop rdi", // Exception Number
+        "pop rsi", // Error Code
+        "mov rdx, [rsp]", // Peek RIP
+
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 0",
-        "push 4",
+
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -275,11 +320,17 @@ unsafe extern "C" fn exception_4() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_6() {
     core::arch::naked_asm!(
+        "push 0",
+        "push 6",
+        
+        "pop rdi", // Exception Number
+        "pop rsi", // Error Code
+        "mov rdx, [rsp]", // Peek RIP
+
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 0",
-        "push 6",
+
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -295,12 +346,18 @@ unsafe extern "C" fn exception_8() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        // Error code ya está en el stack
-        "push 8",
+        // Error code ya está en el stack (pusheado por CPU)
+        "pop rsi", // Pop error code into RSI
+        "mov rdi, 8", // Exception number into RDI
+        "mov rdx, [rsp]", // Peek RIP
+        
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
-        "add rsp, 8", // Pop error code
         "iretq",
         sym exception_handler,
     );
@@ -310,14 +367,17 @@ unsafe extern "C" fn exception_8() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_13() {
     core::arch::naked_asm!(
+        "pop rsi", // Error Code
+        "mov rdi, 13", // Exception Number
+        "mov rdx, [rsp]", // Peek RIP
+
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 13",
+        
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
-        "add rsp, 8",
         "iretq",
         sym exception_handler,
     );
@@ -327,14 +387,17 @@ unsafe extern "C" fn exception_13() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_14() {
     core::arch::naked_asm!(
+        "pop rsi", // Error Code
+        "mov rdi, 14", // Exception Number
+        "mov rdx, [rsp]", // Peek RIP
+
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "push 14",
+        
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
-        "add rsp, 8",
         "iretq",
         sym exception_handler,
     );
