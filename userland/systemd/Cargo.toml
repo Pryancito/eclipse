@@ -1,0 +1,20 @@
+[package]
+name = "eclipse-systemd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# eclipse-libc provides syscall wrappers for the Eclipse microkernel
+# Path dependency is intentional: both are built as part of Eclipse OS
+# and eclipse-libc is specific to this kernel implementation
+eclipse-libc = { path = "../../eclipse_kernel/userspace/libc" }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = "s"     # Optimize for size even in dev
