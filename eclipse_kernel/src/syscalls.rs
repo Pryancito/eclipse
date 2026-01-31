@@ -19,6 +19,9 @@ pub enum SyscallNumber {
     Receive = 4,
     Yield = 5,
     GetPid = 6,
+    Fork = 7,
+    Exec = 8,
+    Wait = 9,
 }
 
 /// Estadísticas de syscalls
@@ -30,6 +33,9 @@ pub struct SyscallStats {
     pub send_calls: u64,
     pub receive_calls: u64,
     pub yield_calls: u64,
+    pub fork_calls: u64,
+    pub exec_calls: u64,
+    pub wait_calls: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
@@ -40,6 +46,9 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     send_calls: 0,
     receive_calls: 0,
     yield_calls: 0,
+    fork_calls: 0,
+    exec_calls: 0,
+    wait_calls: 0,
 });
 
 /// Handler principal de syscalls
@@ -63,6 +72,9 @@ pub extern "C" fn syscall_handler(
         4 => sys_receive(arg1, arg2),
         5 => sys_yield(),
         6 => sys_getpid(),
+        7 => sys_fork(),
+        8 => sys_exec(arg1, arg2),
+        9 => sys_wait(arg1),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -207,6 +219,92 @@ fn sys_getpid() -> u64 {
     }
 }
 
+/// sys_fork - Create a new process (child)
+/// Returns: Child PID in parent, 0 in child, -1 on error
+fn sys_fork() -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.fork_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] fork() called\n");
+    
+    // TODO: Full implementation would:
+    // 1. Copy parent's address space (page tables)
+    // 2. Copy parent's stack
+    // 3. Clone file descriptors
+    // 4. Set up parent-child relationship
+    // 5. Return 0 in child, child PID in parent
+    
+    // For now, return error (not implemented)
+    serial::serial_print("[SYSCALL] fork() not fully implemented yet\n");
+    u64::MAX // -1 indicates error
+}
+
+/// sys_exec - Replace current process with new program
+/// arg1: pointer to ELF buffer
+/// arg2: size of ELF buffer
+/// Returns: 0 on success (doesn't return on success), -1 on error
+fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.exec_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] exec() called with buffer at 0x");
+    serial::serial_print_hex(elf_ptr);
+    serial::serial_print(", size: ");
+    serial::serial_print_dec(elf_size);
+    serial::serial_print("\n");
+    
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+        serial::serial_print("[SYSCALL] exec() invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    // Create slice from buffer
+    let elf_data = unsafe {
+        core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize)
+    };
+    
+    // Try to load ELF
+    if let Some(_pid) = crate::elf_loader::load_elf(elf_data) {
+        serial::serial_print("[SYSCALL] exec() loaded ELF successfully\n");
+        
+        // TODO: Full implementation would:
+        // 1. Unmap old address space
+        // 2. Map new ELF sections
+        // 3. Set up new stack
+        // 4. Jump to entry point
+        
+        // For now, just acknowledge success
+        serial::serial_print("[SYSCALL] exec() framework ready, but not jumping to new code\n");
+        return 0;
+    } else {
+        serial::serial_print("[SYSCALL] exec() failed to load ELF\n");
+        return u64::MAX;
+    }
+}
+
+/// sys_wait - Wait for child process to terminate
+/// arg1: pointer to status variable (or 0 to ignore)
+/// Returns: PID of terminated child, or -1 on error
+fn sys_wait(status_ptr: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.wait_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] wait() called\n");
+    
+    // TODO: Full implementation would:
+    // 1. Find terminated child processes
+    // 2. Clean up zombie processes
+    // 3. Return child's exit status
+    // 4. Block if no children have terminated yet
+    
+    // For now, return -1 (no children)
+    serial::serial_print("[SYSCALL] wait() not fully implemented yet\n");
+    u64::MAX
+}
+
 /// Obtener estadísticas de syscalls
 pub fn get_stats() -> SyscallStats {
     let stats = SYSCALL_STATS.lock();
@@ -218,6 +316,9 @@ pub fn get_stats() -> SyscallStats {
         send_calls: stats.send_calls,
         receive_calls: stats.receive_calls,
         yield_calls: stats.yield_calls,
+        fork_calls: stats.fork_calls,
+        exec_calls: stats.exec_calls,
+        wait_calls: stats.wait_calls,
     }
 }
 

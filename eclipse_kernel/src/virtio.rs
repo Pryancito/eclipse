@@ -100,10 +100,16 @@ struct VirtQUsed {
 pub struct VirtIOBlockDevice {
     mmio_base: u64,
     queue_size: u16,
-    // Virtqueues would be allocated here
+    // In a full implementation, these would be allocated:
+    // descriptors: *mut VirtQDescriptor,
+    // avail_ring: *mut VirtQAvail,
+    // used_ring: *mut VirtQUsed,
 }
 
 static BLOCK_DEVICE: Mutex<Option<VirtIOBlockDevice>> = Mutex::new(None);
+
+// Simulated block storage for testing (512 KB = 128 blocks of 4KB each)
+static mut SIMULATED_DISK: [u8; 512 * 1024] = [0; 512 * 1024];
 
 impl VirtIOBlockDevice {
     /// Create a new VirtIO block device
@@ -113,7 +119,12 @@ impl VirtIOBlockDevice {
         // Check magic value
         let magic = read_volatile(&(*regs).magic_value);
         if magic != VIRTIO_MAGIC {
-            return None;
+            // No real VirtIO device, return simulated one
+            crate::serial::serial_print("[VirtIO] No real device found, using simulated disk\n");
+            return Some(VirtIOBlockDevice {
+                mmio_base: 0,
+                queue_size: 8,
+            });
         }
         
         // Check version (should be 2 for VirtIO 1.0)
@@ -136,6 +147,12 @@ impl VirtIOBlockDevice {
     
     /// Initialize the VirtIO block device
     unsafe fn init(&mut self) -> bool {
+        if self.mmio_base == 0 {
+            // Simulated device - initialize test data
+            self.init_simulated_disk();
+            return true;
+        }
+        
         let regs = self.mmio_base as *mut VirtIOMMIORegs;
         
         // Reset device
@@ -165,8 +182,11 @@ impl VirtIOBlockDevice {
             return false;
         }
         
-        // TODO: Setup virtqueue
-        // For now, we'll implement a minimal queue setup
+        // TODO: Setup real virtqueue
+        // This would involve:
+        // 1. Allocate descriptor table, avail ring, used ring
+        // 2. Write physical addresses to MMIO registers
+        // 3. Set queue size and mark ready
         
         // Set DRIVER_OK status bit
         let status = read_volatile(&(*regs).status);
@@ -175,18 +195,68 @@ impl VirtIOBlockDevice {
         true
     }
     
+    /// Initialize simulated disk with test data
+    unsafe fn init_simulated_disk(&mut self) {
+        use crate::serial;
+        
+        // Block 0: Simple "superblock" marker
+        SIMULATED_DISK[0] = 0xEC; // 'E'
+        SIMULATED_DISK[1] = 0x4C; // 'L'
+        SIMULATED_DISK[2] = 0x49; // 'I'
+        SIMULATED_DISK[3] = 0x50; // 'P'
+        
+        serial::serial_print("[VirtIO] Simulated disk initialized with test data\n");
+    }
+    
     /// Read a block from the device
-    pub fn read_block(&mut self, _block_num: u64, _buffer: &mut [u8]) -> Result<(), &'static str> {
-        // TODO: Implement actual block reading using virtqueues
-        // This is a placeholder
-        Err("Not yet implemented")
+    pub fn read_block(&mut self, block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+        if buffer.len() < 4096 {
+            return Err("Buffer too small (need 4096 bytes)");
+        }
+        
+        if self.mmio_base == 0 {
+            // Simulated read
+            unsafe {
+                let offset = (block_num as usize) * 4096;
+                if offset + 4096 > SIMULATED_DISK.len() {
+                    return Err("Block number out of range");
+                }
+                buffer[..4096].copy_from_slice(&SIMULATED_DISK[offset..offset + 4096]);
+            }
+            return Ok(());
+        }
+        
+        // TODO: Real VirtIO block read would:
+        // 1. Allocate descriptors for request header, data buffer, status
+        // 2. Chain them together
+        // 3. Add to available ring
+        // 4. Notify device via MMIO write
+        // 5. Poll used ring for completion
+        // 6. Check status byte
+        
+        Err("Real VirtIO read not yet implemented")
     }
     
     /// Write a block to the device
-    pub fn write_block(&mut self, _block_num: u64, _buffer: &[u8]) -> Result<(), &'static str> {
-        // TODO: Implement actual block writing using virtqueues
-        // This is a placeholder
-        Err("Not yet implemented")
+    pub fn write_block(&mut self, block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+        if buffer.len() < 4096 {
+            return Err("Buffer too small (need 4096 bytes)");
+        }
+        
+        if self.mmio_base == 0 {
+            // Simulated write
+            unsafe {
+                let offset = (block_num as usize) * 4096;
+                if offset + 4096 > SIMULATED_DISK.len() {
+                    return Err("Block number out of range");
+                }
+                SIMULATED_DISK[offset..offset + 4096].copy_from_slice(&buffer[..4096]);
+            }
+            return Ok(());
+        }
+        
+        // TODO: Real VirtIO block write
+        Err("Real VirtIO write not yet implemented")
     }
 }
 
@@ -198,19 +268,30 @@ pub fn init() {
     
     unsafe {
         // Try to detect VirtIO block device at standard MMIO address
-        if let Some(mut device) = VirtIOBlockDevice::new(VIRTIO_MMIO_BASE) {
-            serial::serial_print("VirtIO block device detected at 0x");
-            serial::serial_print_hex(VIRTIO_MMIO_BASE);
-            serial::serial_print("\n");
-            
-            if device.init() {
-                serial::serial_print("VirtIO block device initialized successfully\n");
-                *BLOCK_DEVICE.lock() = Some(device);
-            } else {
-                serial::serial_print("Failed to initialize VirtIO block device\n");
+        // If not found, use simulated device
+        let mut device = match VirtIOBlockDevice::new(VIRTIO_MMIO_BASE) {
+            Some(dev) => {
+                if dev.mmio_base != 0 {
+                    serial::serial_print("VirtIO block device detected at 0x");
+                    serial::serial_print_hex(VIRTIO_MMIO_BASE);
+                    serial::serial_print("\n");
+                }
+                dev
             }
+            None => {
+                serial::serial_print("Creating simulated block device\n");
+                VirtIOBlockDevice {
+                    mmio_base: 0,
+                    queue_size: 8,
+                }
+            }
+        };
+        
+        if device.init() {
+            serial::serial_print("Block device initialized successfully\n");
+            *BLOCK_DEVICE.lock() = Some(device);
         } else {
-            serial::serial_print("No VirtIO block device found at standard MMIO address\n");
+            serial::serial_print("Failed to initialize block device\n");
         }
     }
 }
