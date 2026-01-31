@@ -669,7 +669,7 @@ impl VirtIOBlockDevice {
             return Err("Buffer too small (need 4096 bytes)");
         }
         
-        if self.mmio_base == 0 {
+        if self.mmio_base == 0 && self.io_base == 0 {
             // Simulated read
             const PARTITION_OFFSET: u64 = 131328;
             
@@ -720,8 +720,19 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Notify device
-            let regs = self.mmio_base as *mut VirtIOMMIORegs;
-            write_volatile(&mut (*regs).queue_notify, 0);
+            if self.io_base != 0 && self.mmio_base == 0 {
+                // Legacy PCI - use I/O port notification
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            } else if self.mmio_base != 0 {
+                // MMIO - use MMIO register notification
+                let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                write_volatile(&mut (*regs).queue_notify, 0);
+            } else {
+                // This should never happen due to early return for simulated disk
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("Invalid device configuration");
+            }
             
             // Wait for completion (polling for now)
             let mut timeout = 1000000;
@@ -767,7 +778,7 @@ impl VirtIOBlockDevice {
             return Err("Buffer too small (need 4096 bytes)");
         }
         
-        if self.mmio_base == 0 {
+        if self.mmio_base == 0 && self.io_base == 0 {
             // Simulated write
             const PARTITION_OFFSET: u64 = 131328;
             
@@ -788,7 +799,6 @@ impl VirtIOBlockDevice {
             return Ok(());
         }
         
-        // TODO: Real VirtIO block write
         // Real VirtIO block write
         unsafe {
             let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
@@ -819,8 +829,19 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Notify device
-            let regs = self.mmio_base as *mut VirtIOMMIORegs;
-            write_volatile(&mut (*regs).queue_notify, 0);
+            if self.io_base != 0 && self.mmio_base == 0 {
+                // Legacy PCI - use I/O port notification
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            } else if self.mmio_base != 0 {
+                // MMIO - use MMIO register notification
+                let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                write_volatile(&mut (*regs).queue_notify, 0);
+            } else {
+                // This should never happen due to early return for simulated disk
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("Invalid device configuration");
+            }
             
             // Wait for completion
             let mut timeout = 1000000;
