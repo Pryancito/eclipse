@@ -1175,12 +1175,12 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado\n");
     serial_write_str("KERNEL_MAIN: ========================================\n");
     
-    // NOTA: Las interrupciones ya fueron habilitadas en init_main_components()
-    // antes de la inicialización de VirtIO para permitir la comunicación con el dispositivo
-    serial_write_str("KERNEL_MAIN: Interrupciones ya habilitadas (antes de VirtIO init)\n");
-    fb.write_text_kernel("Interrupciones: Ya configuradas", Color::CYAN);
+    // NOTE: Interrupts have already been enabled in init_main_components()
+    // before VirtIO initialization to allow device communication
+    serial_write_str("KERNEL_MAIN: Interrupts already enabled (before VirtIO init)\n");
+    fb.write_text_kernel("Interrupts: Already configured", Color::CYAN);
     
-    // Llamar al loop principal mejorado (nunca retorna - loop infinito)
+    // Call the improved main loop (never returns - infinite loop)
     crate::main_loop::main_loop(fb, xhci_initialized)
 }
 
@@ -1291,30 +1291,30 @@ fn init_critical_systems(fb: &mut FramebufferDriver) -> Result<(), RecoveryActio
 /// Inicializa los componentes principales con posibilidad de recuperación
 fn init_main_components(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
     // Sistema de interrupciones - CRITICAL: Must be enabled before VirtIO initialization
-    serial_write_str("INIT_MAIN: Inicializando sistema de interrupciones...\n");
+    serial_write_str("INIT_MAIN: Initializing interrupt system...\n");
     fb.write_text_kernel("Inicializando sistema de interrupciones...", Color::CYAN);
     
-    // Setup IDT with kernel code selector (0x08)
+    // Setup IDT with kernel code selector (0x08) - serves both kernel and userland
     match setup_userland_idt(0x08) {
         Ok(_) => {
-            serial_write_str("INIT_MAIN: IDT configurada exitosamente\n");
+            serial_write_str("INIT_MAIN: IDT configured successfully\n");
             fb.write_text_kernel("✓ IDT configurada", Color::GREEN);
         }
         Err(e) => {
-            serial_write_str(&alloc::format!("INIT_MAIN: ERROR configurando IDT: {}\n", e));
+            serial_write_str(&alloc::format!("INIT_MAIN: ERROR configuring IDT: {}\n", e));
             fb.write_text_kernel(&alloc::format!("⚠ Error en IDT: {}", e), Color::YELLOW);
         }
     }
     
     // Enable interrupts early for VirtIO device initialization
-    serial_write_str("INIT_MAIN: Habilitando interrupciones para dispositivos VirtIO...\n");
+    serial_write_str("INIT_MAIN: Enabling interrupts for VirtIO devices...\n");
     match crate::interrupts::manager::enable_interrupts() {
         Ok(_) => {
-            serial_write_str("INIT_MAIN: Interrupciones habilitadas (para VirtIO)\n");
+            serial_write_str("INIT_MAIN: Interrupts enabled (for VirtIO)\n");
             fb.write_text_kernel("✓ Interrupciones habilitadas", Color::GREEN);
         }
         Err(e) => {
-            serial_write_str(&alloc::format!("INIT_MAIN: ADVERTENCIA - Error habilitando interrupciones: {}\n", e));
+            serial_write_str(&alloc::format!("INIT_MAIN: WARNING - Error enabling interrupts: {}\n", e));
             fb.write_text_kernel(&alloc::format!("⚠ Interrupciones: {}", e), Color::YELLOW);
         }
     }
