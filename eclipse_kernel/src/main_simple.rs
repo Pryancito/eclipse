@@ -1175,19 +1175,10 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
     serial_write_str("KERNEL_MAIN: Entrando al loop principal mejorado\n");
     serial_write_str("KERNEL_MAIN: ========================================\n");
     
-    // CRÍTICO: Habilitar interrupciones SOLO DESPUÉS de que todo esté inicializado
-    // Esto previene cuelgues en hardware real causados por interrupciones tempranas
-    serial_write_str("KERNEL_MAIN: Habilitando interrupciones del sistema...\n");
-    match crate::interrupts::manager::enable_interrupts() {
-        Ok(_) => {
-            serial_write_str("KERNEL_MAIN: Interrupciones habilitadas correctamente\n");
-            fb.write_text_kernel("✓ Interrupciones habilitadas", Color::GREEN);
-        }
-        Err(e) => {
-            serial_write_str(&alloc::format!("KERNEL_MAIN: ADVERTENCIA - Error habilitando interrupciones: {}\n", e));
-            fb.write_text_kernel("⚠ Interrupciones no habilitadas", Color::YELLOW);
-        }
-    }
+    // NOTA: Las interrupciones ya fueron habilitadas en init_main_components()
+    // antes de la inicialización de VirtIO para permitir la comunicación con el dispositivo
+    serial_write_str("KERNEL_MAIN: Interrupciones ya habilitadas (antes de VirtIO init)\n");
+    fb.write_text_kernel("Interrupciones: Ya configuradas", Color::CYAN);
     
     // Llamar al loop principal mejorado (nunca retorna - loop infinito)
     crate::main_loop::main_loop(fb, xhci_initialized)
@@ -1299,9 +1290,34 @@ fn init_critical_systems(fb: &mut FramebufferDriver) -> Result<(), RecoveryActio
 
 /// Inicializa los componentes principales con posibilidad de recuperación
 fn init_main_components(fb: &mut FramebufferDriver) -> Result<(), RecoveryAction> {
-    // Sistema de interrupciones (deshabilitado por compatibilidad)
-    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad.", Color::YELLOW);
-    fb.write_text_kernel("Sistema de interrupciones omitido por compatibilidad", Color::YELLOW);
+    // Sistema de interrupciones - CRITICAL: Must be enabled before VirtIO initialization
+    serial_write_str("INIT_MAIN: Inicializando sistema de interrupciones...\n");
+    fb.write_text_kernel("Inicializando sistema de interrupciones...", Color::CYAN);
+    
+    // Setup IDT with kernel code selector (0x08)
+    match setup_userland_idt(0x08) {
+        Ok(_) => {
+            serial_write_str("INIT_MAIN: IDT configurada exitosamente\n");
+            fb.write_text_kernel("✓ IDT configurada", Color::GREEN);
+        }
+        Err(e) => {
+            serial_write_str(&alloc::format!("INIT_MAIN: ERROR configurando IDT: {}\n", e));
+            fb.write_text_kernel(&alloc::format!("⚠ Error en IDT: {}", e), Color::YELLOW);
+        }
+    }
+    
+    // Enable interrupts early for VirtIO device initialization
+    serial_write_str("INIT_MAIN: Habilitando interrupciones para dispositivos VirtIO...\n");
+    match crate::interrupts::manager::enable_interrupts() {
+        Ok(_) => {
+            serial_write_str("INIT_MAIN: Interrupciones habilitadas (para VirtIO)\n");
+            fb.write_text_kernel("✓ Interrupciones habilitadas", Color::GREEN);
+        }
+        Err(e) => {
+            serial_write_str(&alloc::format!("INIT_MAIN: ADVERTENCIA - Error habilitando interrupciones: {}\n", e));
+            fb.write_text_kernel(&alloc::format!("⚠ Interrupciones: {}", e), Color::YELLOW);
+        }
+    }
 
     // Inicializar gestor de paginación
     let paging_manager = try_init_with_fallback!("paging_system",
