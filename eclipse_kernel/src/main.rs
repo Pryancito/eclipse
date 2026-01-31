@@ -26,6 +26,7 @@ mod scheduler;
 mod syscalls;
 mod servers;
 mod elf_loader;
+mod pci;
 mod virtio;
 mod filesystem;
 mod binaries;
@@ -127,6 +128,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     // Inicializar servidores del sistema
     serial::serial_print("Initializing system servers...\n");
     servers::init_servers();
+    
+    // Inicializar subsistema PCI
+    serial::serial_print("Initializing PCI subsystem...\n");
+    pci::init();
     
     // Inicializar driver VirtIO (preferred for QEMU)
     serial::serial_print("Initializing VirtIO driver...\n");

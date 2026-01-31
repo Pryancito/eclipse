@@ -19,6 +19,7 @@ pub mod scheduler;
 pub mod syscalls;
 pub mod servers;
 pub mod binaries;
+pub mod pci;
 pub mod virtio;
 pub mod filesystem;
 pub mod ata;
