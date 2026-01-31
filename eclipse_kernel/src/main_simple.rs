@@ -326,6 +326,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ FileSystem Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: FileSystem server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando FileSystem Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - FileSystem server registration failed\n");
         }
         
         // Graphics Server
@@ -336,6 +339,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ Graphics Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: Graphics server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Graphics Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Graphics server registration failed\n");
         }
         
         // Network Server
@@ -346,6 +352,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ Network Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: Network server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Network Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Network server registration failed\n");
         }
         
         // Input Server (keyboard, mouse)
@@ -356,6 +365,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ Input Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: Input server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Input Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Input server registration failed\n");
         }
         
         // Audio Server
@@ -366,6 +378,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ Audio Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: Audio server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Audio Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Audio server registration failed\n");
         }
         
         // AI Server
@@ -376,6 +391,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ AI Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: AI server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando AI Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - AI server registration failed\n");
         }
         
         // Security Server
@@ -386,6 +404,9 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         ) {
             fb.write_text_kernel("  ✓ Security Server registrado", Color::GREEN);
             serial_write_str("KERNEL_MAIN: Security server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Security Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Security server registration failed\n");
         }
         
         fb.write_text_kernel("✓ Arquitectura microkernel activa", Color::CYAN);
