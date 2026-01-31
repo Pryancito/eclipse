@@ -74,6 +74,23 @@ impl GraphicsServer {
         Ok(vec![1])
     }
     
+    /// Procesar comando de dibujo de línea
+    fn handle_draw_line(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 20 {
+            return Err(anyhow::anyhow!("Datos insuficientes para DRAW_LINE"));
+        }
+        
+        let x1 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let y1 = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let x2 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let y2 = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let color = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        
+        println!("   [GFX] Dibujando línea de ({},{}) a ({},{}) con color 0x{:06X}", 
+                 x1, y1, x2, y2, color);
+        Ok(vec![1])
+    }
+    
     /// Procesar comando de limpieza de pantalla
     fn handle_clear(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let color = if data.len() >= 4 {
@@ -142,6 +159,7 @@ impl MicrokernelServer for GraphicsServer {
             1 => self.handle_init_display(command_data),
             2 => self.handle_draw_pixel(command_data),
             3 => self.handle_draw_rect(command_data),
+            4 => self.handle_draw_line(command_data),
             5 => self.handle_clear(command_data),
             6 => self.handle_swap(command_data),
             _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
