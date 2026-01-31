@@ -112,7 +112,7 @@ static BLOCK_DEVICE: Mutex<Option<VirtIOBlockDevice>> = Mutex::new(None);
 static mut SIMULATED_DISK: [u8; 512 * 1024] = [0; 512 * 1024];
 
 impl VirtIOBlockDevice {
-    /// Create a new VirtIO block device
+    /// Create a new VirtIO block device from MMIO base
     unsafe fn new(mmio_base: u64) -> Option<Self> {
         let regs = mmio_base as *mut VirtIOMMIORegs;
         
@@ -141,6 +141,25 @@ impl VirtIOBlockDevice {
         
         Some(VirtIOBlockDevice {
             mmio_base,
+            queue_size: 8,
+        })
+    }
+    
+    /// Create a new VirtIO block device from PCI BAR address
+    unsafe fn new_from_pci(bar_addr: u64) -> Option<Self> {
+        // For PCI devices, the BAR points to VirtIO registers
+        // Try to detect if this is a valid VirtIO device
+        // Note: PCI VirtIO devices use I/O or Memory-mapped I/O
+        
+        // For now, create a device with the PCI BAR as the base
+        // The actual implementation would need to:
+        // 1. Parse PCI capabilities to find VirtIO structures
+        // 2. Setup virtqueues
+        // 3. Enable DMA
+        
+        // Create device structure  
+        Some(VirtIOBlockDevice {
+            mmio_base: bar_addr,
             queue_size: 8,
         })
     }
@@ -343,34 +362,64 @@ impl VirtIOBlockDevice {
 pub fn init() {
     use crate::serial;
     
-    serial::serial_print("Initializing VirtIO devices...\n");
+    serial::serial_print("[VirtIO] Initializing VirtIO devices...\n");
     
+    // Try to find VirtIO block device on PCI bus first
+    if let Some(pci_dev) = crate::pci::find_virtio_block_device() {
+        serial::serial_print("[VirtIO] Found VirtIO block device on PCI\n");
+        serial::serial_print("[VirtIO]   Bus=");
+        serial::serial_print_dec(pci_dev.bus as u64);
+        serial::serial_print(" Device=");
+        serial::serial_print_dec(pci_dev.device as u64);
+        serial::serial_print(" Function=");
+        serial::serial_print_dec(pci_dev.function as u64);
+        serial::serial_print("\n");
+        
+        unsafe {
+            // Enable the PCI device for DMA and I/O
+            crate::pci::enable_device(&pci_dev, true);
+            
+            // Get BAR0 for VirtIO registers
+            let bar0 = crate::pci::get_bar(&pci_dev, 0);
+            let bar_addr = (bar0 & !0xF) as u64;
+            
+            serial::serial_print("[VirtIO]   BAR0=0x");
+            serial::serial_print_hex(bar_addr);
+            serial::serial_print("\n");
+            
+            // Try to create a real VirtIO device from PCI
+            if bar_addr != 0 {
+                match VirtIOBlockDevice::new_from_pci(bar_addr) {
+                    Some(mut device) => {
+                        if device.init() {
+                            serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
+                            *BLOCK_DEVICE.lock() = Some(device);
+                            return;
+                        }
+                    }
+                    None => {
+                        serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
+                    }
+                }
+            }
+        }
+    } else {
+        serial::serial_print("[VirtIO] No VirtIO block device found on PCI bus\n");
+    }
+    
+    // Fall back to simulated device
+    serial::serial_print("[VirtIO] Falling back to simulated block device\n");
     unsafe {
-        // Try to detect VirtIO block device at standard MMIO address
-        // If not found, use simulated device
-        let mut device = match VirtIOBlockDevice::new(VIRTIO_MMIO_BASE) {
-            Some(dev) => {
-                if dev.mmio_base != 0 {
-                    serial::serial_print("VirtIO block device detected at 0x");
-                    serial::serial_print_hex(VIRTIO_MMIO_BASE);
-                    serial::serial_print("\n");
-                }
-                dev
-            }
-            None => {
-                serial::serial_print("Creating simulated block device\n");
-                VirtIOBlockDevice {
-                    mmio_base: 0,
-                    queue_size: 8,
-                }
-            }
+        let mut device = VirtIOBlockDevice {
+            mmio_base: 0,
+            queue_size: 8,
         };
         
         if device.init() {
-            serial::serial_print("Block device initialized successfully\n");
+            serial::serial_print("[VirtIO] Simulated device initialized successfully\n");
             *BLOCK_DEVICE.lock() = Some(device);
         } else {
-            serial::serial_print("Failed to initialize block device\n");
+            serial::serial_print("[VirtIO] Failed to initialize simulated device\n");
         }
     }
 }

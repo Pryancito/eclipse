@@ -209,3 +209,48 @@ pub fn get_cr3() -> u64 {
     }
     cr3
 }
+
+/// Translate virtual address to physical address
+/// This is a simplified version that works for identity-mapped regions
+pub fn virt_to_phys(virt_addr: u64) -> u64 {
+    // For our simple paging setup:
+    // - Addresses in first 128MB are offset by phys_offset  
+    // - Higher addresses are identity mapped
+    // Since DMA buffers will be in heap (which is identity mapped in our setup),
+    // we can use a simple approach
+    
+    // For now, we assume heap addresses are in the identity-mapped region
+    // This works because our heap is allocated from BSS which is identity-mapped
+    virt_addr
+}
+
+/// Allocate DMA-safe buffer
+/// Returns (virtual address, physical address)
+pub fn alloc_dma_buffer(size: usize, align: usize) -> Option<(*mut u8, u64)> {
+    use alloc::alloc::{alloc, Layout};
+    
+    unsafe {
+        // Allocate aligned buffer
+        let layout = Layout::from_size_align(size, align).ok()?;
+        let ptr = alloc(layout);
+        
+        if ptr.is_null() {
+            return None;
+        }
+        
+        // Calculate physical address
+        let virt = ptr as u64;
+        let phys = virt_to_phys(virt);
+        
+        Some((ptr, phys))
+    }
+}
+
+/// Free DMA buffer
+pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
+    use alloc::alloc::{dealloc, Layout};
+    
+    if let Ok(layout) = Layout::from_size_align(size, align) {
+        dealloc(ptr, layout);
+    }
+}
