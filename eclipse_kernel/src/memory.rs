@@ -6,6 +6,10 @@
 //! - Gestión de memoria física
 
 use linked_list_allocator::LockedHeap;
+use spin::Mutex;
+
+/// Physical offset for virtual-to-physical address translation
+static PHYS_OFFSET: Mutex<u64> = Mutex::new(0);
 
 /// Tamaño del heap del kernel (2 MB)
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
@@ -122,6 +126,9 @@ static mut PD: PageTable = PageTable::new();
 pub fn init_paging(kernel_phys_base: u64) {
     let phys_offset = kernel_phys_base.wrapping_sub(0x200000);
     
+    // Store phys_offset for later use by virt_to_phys
+    *PHYS_OFFSET.lock() = phys_offset;
+    
     // DEBUG
     unsafe {
         crate::serial::serial_print("Init Paging. Phys Base: 0x");
@@ -216,17 +223,19 @@ pub fn get_cr3() -> u64 {
 }
 
 /// Translate virtual address to physical address
-/// This is a simplified version that works for identity-mapped regions
+/// Handles both offset-mapped kernel region and identity-mapped regions
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
-    // For our simple paging setup:
-    // - Addresses in first 128MB are offset by phys_offset  
-    // - Higher addresses are identity mapped
-    // Since DMA buffers will be in heap (which is identity mapped in our setup),
-    // we can use a simple approach
+    let phys_offset = *PHYS_OFFSET.lock();
     
-    // For now, we assume heap addresses are in the identity-mapped region
-    // This works because our heap is allocated from BSS which is identity-mapped
-    virt_addr
+    // Check if address is in the kernel region (first 128MB = 64 * 2MB pages)
+    // These are mapped with phys_offset
+    if virt_addr < 0x8000000 {
+        // Kernel region: virt + phys_offset = phys
+        virt_addr.wrapping_add(phys_offset)
+    } else {
+        // Higher memory: identity mapped (virt = phys)
+        virt_addr
+    }
 }
 
 /// Allocate DMA-safe buffer
