@@ -248,9 +248,7 @@ impl Filesystem {
                     // For simplicity, we'll handle this case by reading continuous data
                     let next_block_num = block_num + 1;
                     let mut next_block = [0u8; 4096];
-                    if let Err(_) = crate::virtio::read_block(next_block_num as u64, &mut next_block) {
-                        return Err("Failed to read continuation block");
-                    }
+                    crate::virtio::read_block(next_block_num as u64, &mut next_block)?;
                     
                     // Copy remaining data from current block and continuation from next
                     let remaining_in_current = BLOCK_SIZE - pos;
@@ -352,7 +350,9 @@ impl Filesystem {
                         entries_pos += 1;
                         
                         if entries_pos + name_len + 4 > BLOCK_SIZE {
-                            break;  // Entry spans boundary, skip for now
+                            // Entry spans boundary - this is a limitation of the current simple implementation
+                            serial::serial_print("[FS] Warning: directory entry spans block boundary, skipping\n");
+                            break;
                         }
                         
                         // Extract entry name
@@ -363,17 +363,8 @@ impl Filesystem {
                         entries_pos += 4;
                         
                         // Compare names
-                        if name.len() == name_len {
-                            let mut matches = true;
-                            for i in 0..name_len {
-                                if name.as_bytes()[i] != entry_name[i] {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-                            if matches {
-                                return Ok(Some(child_inode));
-                            }
+                        if name.as_bytes() == entry_name {
+                            return Ok(Some(child_inode));
                         }
                     }
                     
@@ -405,7 +396,7 @@ impl Filesystem {
             let path_bytes = path.as_bytes();
             
             // Skip leading slash
-            if path_bytes.len() > 0 && path_bytes[0] == b'/' {
+            if !path_bytes.is_empty() && path_bytes[0] == b'/' {
                 start = 1;
             }
             
