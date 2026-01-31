@@ -77,10 +77,10 @@ pub fn load_gdt() {
         // Recargar segmentos
         asm!(
             "push 0x08",
-            "lea rax, [rip + 1f]",
+            "lea rax, [rip + 2f]",
             "push rax",
             "retfq",
-            "1:",
+            "2:",
             "mov ax, 0x10",
             "mov ds, ax",
             "mov es, ax",
@@ -88,7 +88,6 @@ pub fn load_gdt() {
             "mov gs, ax",
             "mov ss, ax",
             out("rax") _,
-            options(att_syntax)
         );
     }
 }
