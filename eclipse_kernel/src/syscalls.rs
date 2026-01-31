@@ -277,19 +277,16 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize)
     };
     
-    // Try to load ELF
-    if let Some(_pid) = crate::elf_loader::load_elf(elf_data) {
-        serial::serial_print("[SYSCALL] exec() loaded ELF successfully\n");
+    // Replace current process with ELF binary
+    if let Some(entry_point) = crate::elf_loader::replace_process_image(elf_data) {
+        serial::serial_print("[SYSCALL] exec() replacing process image, entry: 0x");
+        serial::serial_print_hex(entry_point);
+        serial::serial_print("\n");
         
-        // TODO: Full implementation would:
-        // 1. Unmap old address space
-        // 2. Map new ELF sections
-        // 3. Set up new stack
-        // 4. Jump to entry point
-        
-        // For now, just acknowledge success
-        serial::serial_print("[SYSCALL] exec() framework ready, but not jumping to new code\n");
-        return 0;
+        // This doesn't return - we jump to the new process entry point
+        unsafe {
+            crate::elf_loader::jump_to_entry(entry_point);
+        }
     } else {
         serial::serial_print("[SYSCALL] exec() failed to load ELF\n");
         return u64::MAX;
