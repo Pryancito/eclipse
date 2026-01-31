@@ -1,51 +1,64 @@
+/* Linker script para el microkernel Eclipse OS */
+OUTPUT_FORMAT(elf64-x86-64)
+OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
-PHDRS
-{
-    text PT_LOAD FLAGS(5);
-    rodata PT_LOAD FLAGS(4);
-    data PT_LOAD FLAGS(6);
-    note PT_NOTE FLAGS(4);
-}
+/* Dirección de carga del kernel (después del bootloader) */
+/* Enlazamos en 2MB para coincidir con la dirección de carga física del bootloader */
+KERNEL_BASE = 0x0000000000000000;
+KERNEL_PHYS_BASE = 0x200000;
 
 SECTIONS
 {
-    /* Dirección fija en 2MB - kernel NO relocatable (non-PIE)
-     * TODO: Investigar soporte PIE cuando el bootloader esté más maduro
-     * Intentamos PIE pero el bootloader tiene problemas con la relocación.
-     */
-    . = 0x200000;
-    
-    .init : {
-        *(.init)
-    } :text
+    . = KERNEL_BASE + KERNEL_PHYS_BASE;
 
-    .text : {
-        *(.text .text.*)
-    } :text
-    
-    .rodata : {
-        *(.rodata .rodata.*)
-    } :rodata
-    
-    .data : {
-        *(.data .data.*)
-    } :data
-    
-    .bss : {
-        *(.bss .bss.*)
+    /* Sección de inicio - debe ser la primera */
+    .init : AT(ADDR(.init) - KERNEL_BASE)
+    {
+        KEEP(*(.init))
+    }
+
+    /* Código ejecutable */
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_BASE)
+    {
+        *(.text*)
+    }
+
+    /* Datos de solo lectura */
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_BASE)
+    {
+        *(.rodata*)
+    }
+
+    /* Datos inicializados */
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_BASE)
+    {
+        *(.data*)
+    }
+
+    /* Datos no inicializados (BSS) */
+    .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_BASE)
+    {
         *(COMMON)
-    } :data
-    
-    /* Nota PVH para QEMU */
-    .note : {
-        *(.note)
-        *(.note.*)
-    } :note
-    
-    /DISCARD/ : {
-        *(.eh_frame)
-        *(.debug_*)
+        *(.bss*)
+    }
+
+    /* Sección de tablas de páginas */
+    .page_tables ALIGN(4K) : AT(ADDR(.page_tables) - KERNEL_BASE)
+    {
+        *(.page_tables*)
+    }
+
+    /* Símbolos de fin de kernel */
+    . = ALIGN(4K);
+    _kernel_end = .;
+    _kernel_phys_end = . - KERNEL_BASE;
+
+    /* Descartar secciones innecesarias */
+    /DISCARD/ :
+    {
         *(.comment)
+        *(.eh_frame)
+        *(.note*)
     }
 }

@@ -1,1 +1,13 @@
-build_unified.sh
+#!/bin/bash
+# Script de construcción para el microkernel Eclipse OS
+
+set -e
+
+echo "=== Building Eclipse Microkernel ==="
+
+# Compilar con nightly Rust
+echo "Compiling kernel..."
+cargo +nightly build --target x86_64-unknown-none --release
+
+echo "=== Build complete ==="
+echo "Kernel binary: target/x86_64-unknown-none/release/eclipse_microkernel"

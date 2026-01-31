@@ -1,147 +1,132 @@
-//! Punto de entrada principal del binario del kernel Eclipse OS
+//! Eclipse Microkernel - Punto de entrada principal
+//! 
+//! Este es el punto de entrada del microkernel compatible con el bootloader UEFI.
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
-extern crate alloc;
-use eclipse_kernel::{
-    drivers::framebuffer::{
-        get_framebuffer, init_framebuffer, Color, FramebufferDriver, FramebufferInfo,
-    },
-    main_simple::kernel_main,
-    debug::serial_write_str,
-};
 use core::panic::PanicInfo;
 
-// --- Funciones de depuración serie movidas a debug.rs ---
+// Módulos del microkernel
+mod boot;
+mod memory;
+mod interrupts;
+mod ipc;
+mod serial;
+mod process;
+mod scheduler;
+mod syscalls;
+mod servers;
+mod elf_loader;
 
-/*
+/// Información del framebuffer recibida del bootloader UEFI
+#[repr(C)]
+pub struct FramebufferInfo {
+    pub base_address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels_per_scan_line: u32,
+    pub pixel_format: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+}
+
+/// Panic handler del kernel
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    if let Some(mut fb) = get_framebuffer() {
-        fb.clear_screen(Color::RED);
-        fb.write_text_kernel("KERNEL PANIC", Color::WHITE);
-        if let Some(location) = info.location() {
-            let msg = alloc::format!(
-                "Panic in {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            );
-            fb.write_text_kernel(&msg, Color::WHITE);
-        }
+    serial::serial_print("KERNEL PANIC: ");
+    if let Some(location) = info.location() {
+        serial::serial_print("at ");
+        serial::serial_print(location.file());
+        serial::serial_print(":");
+        // Note: Can't easily print numbers without format! macro
     }
-    loop {}
-}
-*/
-
-/// GDT mínima para el kernel
-#[repr(C, align(16))]
-struct GdtTable {
-    entries: [u64; 5],
+    serial::serial_print("\n");
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
 }
 
-static mut KERNEL_GDT: GdtTable = GdtTable {
-    entries: [
-        0x0000000000000000, // Null descriptor
-        0x00AF9A000000FFFF, // Code segment (64-bit)
-        0x00CF92000000FFFF, // Data segment
-        0x0000000000000000, // Reservado
-        0x0000000000000000, // Reservado
-    ],
-};
-
-#[repr(C, packed)]
-struct GdtPointer {
-    limit: u16,
-    base: u64,
-}
-
-/// Punto de entrada del kernel, llamado desde el bootloader.
+/// Punto de entrada del kernel, llamado desde el bootloader UEFI
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
-    // CRÍTICO: Cargar GDT nuevo PRIMERO antes de hacer CUALQUIER otra cosa
-    // La GDT de UEFI no está mapeada en nuestras page tables
-    unsafe {
-        let gdt_ptr = GdtPointer {
-            limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
-            base: &KERNEL_GDT as *const _ as u64,
-        };
-        
-        core::arch::asm!(
-            "lgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack, preserves_flags)
-        );
-        
-        // Recargar segmentos de código y datos
-        core::arch::asm!(
-            "push 0x08",            // Code segment selector
-            "lea rax, [rip + 2f]",
-            "push rax",
-            "retfq",                // Far return para recargar CS
-            "2:",
-            "mov ax, 0x10",         // Data segment selector
-            "mov ds, ax",
-            "mov es, ax",
-            "mov fs, ax",
-            "mov gs, ax",
-            "mov ss, ax",
-            out("rax") _,
-            options(nostack)
-        );
-    }
+    // Inicializar serial para debugging
+    serial::init();
+    serial::serial_print("Eclipse Microkernel v0.1.0 starting...\n");
     
-    // Ahora SÍ podemos usar serial_write_str de forma segura
-    serial_write_str("KERNEL: _start entry (GDT loaded)\n");
+    // Cargar GDT
+    serial::serial_print("Loading GDT...\n");
+    boot::load_gdt();
     
-    if framebuffer_info_ptr != 0 {
-        serial_write_str("KERNEL: Framebuffer info found.\n");
-        unsafe {
-            let fb_info = core::ptr::read_volatile(framebuffer_info_ptr as *const FramebufferInfo);
-            serial_write_str("KERNEL: Calling init_framebuffer...\n");
-            match init_framebuffer(
-                fb_info.base_address,
-                fb_info.width,
-                fb_info.height,
-                fb_info.pixels_per_scan_line,
-                fb_info.pixel_format,
-                fb_info.red_mask | fb_info.green_mask | fb_info.blue_mask,
-            ) {
-                Ok(()) => {
-                    serial_write_str("KERNEL: Framebuffer initialized OK.\n");
-                }
-                Err(_e) => {
-                    serial_write_str("KERNEL: ERROR - Framebuffer init failed.\n");
-                }
-            }
-        }
-    } else {
-        serial_write_str("KERNEL: WARNING - No framebuffer info.\n");
-    }
-
-    serial_write_str("KERNEL: Calling kernel_main_wrapper...\n");
-    kernel_main_wrapper();
+    // Inicializar memoria
+    serial::serial_print("Initializing memory system...\n");
+    memory::init();
+    
+    // Configurar paginación
+    serial::serial_print("Enabling paging...\n");
+    memory::init_paging();
+    
+    // Inicializar IDT e interrupciones
+    serial::serial_print("Initializing IDT and interrupts...\n");
+    interrupts::init();
+    
+    // Inicializar sistema IPC
+    serial::serial_print("Initializing IPC system...\n");
+    ipc::init();
+    
+    // Inicializar scheduler
+    serial::serial_print("Initializing scheduler...\n");
+    scheduler::init();
+    
+    // Inicializar syscalls
+    serial::serial_print("Initializing syscalls...\n");
+    syscalls::init();
+    
+    // Inicializar servidores del sistema
+    serial::serial_print("Initializing system servers...\n");
+    servers::init_servers();
+    
+    serial::serial_print("Microkernel initialized successfully!\n");
+    
+    // Llamar a kernel_main
+    kernel_main(framebuffer_info_ptr);
 }
 
-/// Wrapper para llamar a kernel_main con el framebuffer.
-fn kernel_main_wrapper() -> ! {
-    serial_write_str("KERNEL: kernel_main_wrapper called.\n");
+/// Función principal del kernel
+fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
+    serial::serial_print("Entering kernel main loop...\n");
     
-    if let Some(fb) = get_framebuffer() {
-        serial_write_str("KERNEL: Framebuffer available, calling kernel_main.\n");
-        kernel_main(fb);
-    } else {
-        serial_write_str("KERNEL: ERROR - No framebuffer available, cannot proceed.\n");
-        // Crear un framebuffer de emergencia o continuar sin él
-        // Por ahora, entramos en un bucle infinito
+    // Crear un proceso de prueba
+    serial::serial_print("Creating test process...\n");
+    let stack_base = 0x400000; // 4MB mark
+    let stack_size = 0x10000;  // 64KB
+    
+    if let Some(pid) = process::create_process(test_process as u64, stack_base, stack_size) {
+        serial::serial_print("Test process created with PID: ");
+        serial::serial_print_dec(pid as u64);
+        serial::serial_print("\n");
+        
+        // Agregar a la cola del scheduler
+        scheduler::enqueue_process(pid);
     }
     
-    // Si kernel_main retorna (no debería), entramos en un bucle infinito.
     loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
+        // Main loop del microkernel
+        // Procesar mensajes IPC
+        ipc::process_messages();
+        
+        // Yield CPU
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
+/// Proceso de prueba simple
+extern "C" fn test_process() -> ! {
+    loop {
+        // Proceso de prueba - simplemente yield
+        scheduler::yield_cpu();
     }
 }

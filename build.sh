@@ -102,7 +102,7 @@ build_kernel() {
         print_status "Modo MINIMAL: compilando kernel sin características opcionales"
         rustup run nightly cargo build --target x86_64-unknown-none --release
     else
-        rustup run nightly cargo build --target x86_64-unknown-none --release --features cosmic-desktop,ai-models
+        rustup run nightly cargo build --target x86_64-unknown-none --release
     fi
 
     if [ $? -eq 0 ]; then
