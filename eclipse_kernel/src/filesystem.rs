@@ -56,7 +56,7 @@ pub fn mount() -> Result<(), &'static str> {
         serial::serial_print("[FS] Allocating superblock buffer...\n");
         // Use heap to avoid stack overflow
         let mut superblock = vec![0u8; 4096];
-        serial::serial_print("[FS] Buffer allocated at: 0x");
+        serial::serial_print("[FS] Buffer allocated at: ");
         serial::serial_print_hex(superblock.as_ptr() as u64);
         serial::serial_print("\n");
         

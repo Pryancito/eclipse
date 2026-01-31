@@ -227,11 +227,11 @@ pub fn init() {
             serial::serial_print_dec(dev.device as u64);
             serial::serial_print(" Func ");
             serial::serial_print_dec(dev.function as u64);
-            serial::serial_print(": Vendor=0x");
+            serial::serial_print(": Vendor=");
             serial::serial_print_hex(dev.vendor_id as u64);
-            serial::serial_print(" Device=0x");
+            serial::serial_print(" Device=");
             serial::serial_print_hex(dev.device_id as u64);
-            serial::serial_print(" Class=0x");
+            serial::serial_print(" Class=");
             serial::serial_print_hex(dev.class_code as u64);
             serial::serial_print(" Type=");
             serial::serial_print(dev.device_type());
