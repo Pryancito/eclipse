@@ -6,7 +6,10 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
+use alloc::boxed::Box;
 
 // Módulos del microkernel
 mod boot;
@@ -125,11 +128,11 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
             // Try to load init from /sbin/init
             serial::serial_print("[KERNEL] Attempting to load init from /sbin/init...\n");
             
-            // Allocate buffer for reading init binary (max 512KB)
+            // Allocate buffer on heap for reading init binary (max 512KB)
             const MAX_INIT_SIZE: usize = 512 * 1024;
-            let mut init_buffer = [0u8; MAX_INIT_SIZE];
+            let mut init_buffer = Box::new([0u8; MAX_INIT_SIZE]);
             
-            match filesystem::read_file("/sbin/init", &mut init_buffer) {
+            match filesystem::read_file("/sbin/init", &mut init_buffer[..]) {
                 Ok(bytes_read) => {
                     serial::serial_print("[KERNEL] Read /sbin/init: ");
                     serial::serial_print_dec(bytes_read as u64);
