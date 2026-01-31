@@ -8,10 +8,23 @@
 //! - Servicio de gestión de red
 //! - Servicio de gestión de hardware
 //! - Servicio de logging del sistema
+//! 
+//! También integra los servidores del microkernel que se ejecutan en userspace.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+use super::servers::{
+    MicrokernelServerManager,
+    filesystem_server::FileSystemServer,
+    graphics_server::GraphicsServer,
+    network_server::NetworkServer,
+    input_server::InputServer,
+    audio_server::AudioServer,
+    ai_server::AIServer,
+    security_server::SecurityServer,
+};
 
 /// Estado de un servicio del sistema
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +72,7 @@ pub struct SystemService {
 pub struct SystemServiceManager {
     services: BTreeMap<String, SystemService>,
     running_services: Vec<String>,
+    microkernel_servers: Option<MicrokernelServerManager>,
 }
 
 impl SystemServiceManager {
@@ -67,6 +81,7 @@ impl SystemServiceManager {
         Self {
             services: BTreeMap::new(),
             running_services: Vec::new(),
+            microkernel_servers: None,
         }
     }
 
@@ -140,9 +155,57 @@ impl SystemServiceManager {
         self.services.get(service_name).map(|s| &s.stats)
     }
 
+    /// Inicializar servidores del microkernel en userspace
+    pub fn initialize_microkernel_servers(&mut self) -> anyhow::Result<()> {
+        println!("\n═══════════════════════════════════════════════════════");
+        println!("  Inicializando Servidores del Microkernel (Userspace)");
+        println!("═══════════════════════════════════════════════════════\n");
+        
+        let mut manager = MicrokernelServerManager::new();
+        
+        // Registrar todos los servidores del microkernel
+        println!("Registrando servidores del microkernel...");
+        
+        // 1. Security Server (máxima prioridad)
+        manager.register_server(Box::new(SecurityServer::new()))?;
+        
+        // 2. FileSystem Server
+        manager.register_server(Box::new(FileSystemServer::new()))?;
+        
+        // 3. Graphics Server
+        manager.register_server(Box::new(GraphicsServer::new()))?;
+        
+        // 4. Network Server
+        manager.register_server(Box::new(NetworkServer::new()))?;
+        
+        // 5. Input Server
+        manager.register_server(Box::new(InputServer::new()))?;
+        
+        // 6. Audio Server
+        manager.register_server(Box::new(AudioServer::new()))?;
+        
+        // 7. AI Server
+        manager.register_server(Box::new(AIServer::new()))?;
+        
+        // Inicializar todos los servidores
+        println!("\nInicializando servidores registrados...");
+        manager.initialize_all()?;
+        
+        self.microkernel_servers = Some(manager);
+        
+        println!("\n═══════════════════════════════════════════════════════");
+        println!("  ✅ Servidores del Microkernel Activos en Userspace");
+        println!("═══════════════════════════════════════════════════════\n");
+        
+        Ok(())
+    }
+    
     /// Inicializar todos los servicios
     pub fn initialize_all_services(&mut self) -> anyhow::Result<()> {
         println!("Inicializando servicios del sistema Eclipse OS...");
+        
+        // Primero inicializar servidores del microkernel
+        self.initialize_microkernel_servers()?;
         
         // Crear servicios básicos
         let basic_services = vec![
@@ -252,6 +315,37 @@ impl SystemServiceManager {
         }
 
         println!("✅ Todos los servicios del sistema inicializados correctamente");
+        
+        // Mostrar estadísticas de servidores del microkernel
+        self.show_microkernel_stats();
+        
+        Ok(())
+    }
+    
+    /// Mostrar estadísticas de servidores del microkernel
+    pub fn show_microkernel_stats(&self) {
+        if let Some(ref manager) = self.microkernel_servers {
+            println!("\n═══════════════════════════════════════════════════════");
+            println!("  Estadísticas de Servidores del Microkernel");
+            println!("═══════════════════════════════════════════════════════");
+            
+            let stats = manager.get_all_stats();
+            for (name, stat) in stats {
+                println!("  • {}: {} mensajes procesados, {} errores",
+                         name, stat.messages_processed, stat.messages_failed);
+            }
+            
+            println!("═══════════════════════════════════════════════════════\n");
+        }
+    }
+    
+    /// Detener servidores del microkernel
+    pub fn shutdown_microkernel_servers(&mut self) -> anyhow::Result<()> {
+        if let Some(ref mut manager) = self.microkernel_servers {
+            println!("\nDeteniendo servidores del microkernel...");
+            manager.shutdown_all()?;
+            println!("✅ Servidores del microkernel detenidos");
+        }
         Ok(())
     }
 
