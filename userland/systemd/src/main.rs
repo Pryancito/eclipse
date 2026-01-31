@@ -7,9 +7,12 @@
 //! - Service dependency management
 //! - Parallel service startup
 //! - Service restart policies
-//! - Socket activation support
-//! - Integration with microkernel IPC
 //! - Service monitoring and health checks
+//! - Zombie process reaping
+//! 
+//! Future enhancements:
+//! - Socket activation support
+//! - Full microkernel IPC integration
 
 #![no_std]
 #![no_main]
@@ -18,6 +21,15 @@ use eclipse_libc::{println, getpid, yield_cpu, fork, wait, exit};
 
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
+
+/// Service initialization delay (in yield iterations)
+const SERVICE_INIT_DELAY: u32 = 10000;
+
+/// Service health check interval (in loop ticks)
+const MONITOR_INTERVAL: u64 = 100000;
+
+/// Heartbeat print interval (in loop ticks)
+const HEARTBEAT_INTERVAL: u64 = 1000000;
 
 /// Service state
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -244,10 +256,10 @@ fn start_system_services() {
         println!("  [START] Starting services with no dependencies...");
         for i in 0..SERVICE_COUNT {
             if let Some(ref mut service) = SERVICES[i] {
-                if service.dependencies.len() == 0 {
+                if service.dependencies.is_empty() {
                     start_service(service, i);
                     // Allow service to initialize
-                    for _ in 0..10000 {
+                    for _ in 0..SERVICE_INIT_DELAY {
                         yield_cpu();
                     }
                 }
@@ -260,12 +272,12 @@ fn start_system_services() {
         println!("  [START] Starting dependent services...");
         for i in 0..SERVICE_COUNT {
             if let Some(ref mut service) = SERVICES[i] {
-                if service.dependencies.len() > 0 && service.state == ServiceState::Inactive {
+                if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
                     // Check if dependencies are met
                     if check_dependencies(service) {
                         start_service(service, i);
                         // Allow service to initialize
-                        for _ in 0..10000 {
+                        for _ in 0..SERVICE_INIT_DELAY {
                             yield_cpu();
                         }
                     } else {
@@ -352,13 +364,13 @@ fn main_loop() -> ! {
     loop {
         tick += 1;
         
-        // Every 100K ticks, check service health
-        if tick % 100000 == 0 {
+        // Every MONITOR_INTERVAL ticks, check service health
+        if tick % MONITOR_INTERVAL == 0 {
             monitor_services();
         }
         
-        // Every 1M ticks, print status
-        if tick % 1000000 == 0 {
+        // Every HEARTBEAT_INTERVAL ticks, print status
+        if tick % HEARTBEAT_INTERVAL == 0 {
             heartbeat_counter += 1;
             println!();
             println!("[HEARTBEAT #{}] SystemD operational", heartbeat_counter);
