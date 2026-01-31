@@ -101,6 +101,9 @@ pub fn init() {
         KERNEL_IDT.entries[32].set_handler(irq_0 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[33].set_handler(irq_1 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
+        // Configurar syscall handler (int 0x80)
+        KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        
         // Cargar IDT
         let idt_descriptor = IdtDescriptor {
             limit: (core::mem::size_of::<Idt>() - 1) as u16,
@@ -426,4 +429,71 @@ pub fn get_stats() -> InterruptStats {
         irqs: stats.irqs,
         timer_ticks: stats.timer_ticks,
     }
+}
+
+// ============================================================================
+// Syscall Handler (int 0x80)
+// ============================================================================
+
+extern "C" fn syscall_handler_rust(
+    syscall_num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> u64 {
+    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5)
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_int80() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        // Guardar registros
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        // Parámetros de syscall:
+        // rax = syscall number
+        // rdi = arg1
+        // rsi = arg2
+        // rdx = arg3
+        // r10 = arg4
+        // r8 = arg5
+        // r9 = arg6
+        "mov rdi, rax",  // syscall_num
+        "mov rsi, rdi",  // arg1 (original rdi)
+        "mov rdx, rsi",  // arg2 (original rsi)
+        "mov rcx, rdx",  // arg3 (original rdx)
+        "mov r8, r10",   // arg4
+        "mov r9, r8",    // arg5
+        "call {}",
+        // Resultado en rax
+        "mov [rsp + 80], rax",  // Guardar resultado en rax guardado
+        // Restaurar registros
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",  // Ahora rax tiene el valor de retorno
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym syscall_handler_rust,
+    );
 }

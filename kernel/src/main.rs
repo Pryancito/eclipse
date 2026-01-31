@@ -16,6 +16,8 @@ mod ipc;
 mod serial;
 mod process;
 mod scheduler;
+mod syscalls;
+mod servers;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -77,6 +79,14 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     // Inicializar scheduler
     serial::serial_print("Initializing scheduler...\n");
     scheduler::init();
+    
+    // Inicializar syscalls
+    serial::serial_print("Initializing syscalls...\n");
+    syscalls::init();
+    
+    // Inicializar servidores del sistema
+    serial::serial_print("Initializing system servers...\n");
+    servers::init_servers();
     
     serial::serial_print("Microkernel initialized successfully!\n");
     

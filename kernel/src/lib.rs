@@ -14,6 +14,8 @@ pub mod ipc;
 pub mod serial;
 pub mod process;
 pub mod scheduler;
+pub mod syscalls;
+pub mod servers;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};
@@ -21,6 +23,7 @@ pub use memory::{PageTable, PageTableEntry};
 pub use interrupts::InterruptStats;
 pub use process::{Process, ProcessId, ProcessState, Context};
 pub use scheduler::SchedulerStats;
+pub use syscalls::SyscallStats;
 
 #[cfg(not(test))]
 #[panic_handler]

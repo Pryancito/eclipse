@@ -77,8 +77,14 @@ fn open_root_fs(bs: &BootServices, image_handle: Handle) -> uefi::Result<Directo
 
 fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
     // Ampliar rutas candidatas para localizar el kernel en la ESP
+    // NOTA: Agregamos eclipse_microkernel como primera opción
     let candidates = [
-        // Nombres base
+        // Nuevo microkernel
+        uefi::cstr16!("eclipse_microkernel"),
+        uefi::cstr16!("\\eclipse_microkernel"),
+        uefi::cstr16!("\\EFI\\BOOT\\eclipse_microkernel"),
+        uefi::cstr16!("\\boot\\eclipse_microkernel"),
+        // Kernel anterior (compatibilidad)
         uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
     ];
