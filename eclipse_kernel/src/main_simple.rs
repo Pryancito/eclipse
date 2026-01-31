@@ -318,6 +318,19 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         // Register core system servers
         serial_write_str("KERNEL_MAIN: Registering system servers...\n");
         
+        // Security Server - MUST be registered first for authentication
+        if let Some(_sec_server_id) = crate::microkernel::register_server(
+            b"Security",
+            crate::microkernel::MessageType::Security,
+            10  // Highest priority
+        ) {
+            fb.write_text_kernel("  ✓ Security Server registrado", Color::GREEN);
+            serial_write_str("KERNEL_MAIN: Security server registered\n");
+        } else {
+            fb.write_text_kernel("  ⚠ Error registrando Security Server", Color::YELLOW);
+            serial_write_str("KERNEL_MAIN: WARNING - Security server registration failed\n");
+        }
+        
         // File System Server
         if let Some(_fs_server_id) = crate::microkernel::register_server(
             b"FileSystem",
@@ -394,19 +407,6 @@ pub fn kernel_main(fb: &mut FramebufferDriver) -> ! {
         } else {
             fb.write_text_kernel("  ⚠ Error registrando AI Server", Color::YELLOW);
             serial_write_str("KERNEL_MAIN: WARNING - AI server registration failed\n");
-        }
-        
-        // Security Server
-        if let Some(_sec_server_id) = crate::microkernel::register_server(
-            b"Security",
-            crate::microkernel::MessageType::Security,
-            10  // Highest priority
-        ) {
-            fb.write_text_kernel("  ✓ Security Server registrado", Color::GREEN);
-            serial_write_str("KERNEL_MAIN: Security server registered\n");
-        } else {
-            fb.write_text_kernel("  ⚠ Error registrando Security Server", Color::YELLOW);
-            serial_write_str("KERNEL_MAIN: WARNING - Security server registration failed\n");
         }
         
         fb.write_text_kernel("✓ Arquitectura microkernel activa", Color::CYAN);
