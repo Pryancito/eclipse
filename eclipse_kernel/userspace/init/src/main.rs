@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit};
+use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -136,20 +136,43 @@ fn start_service(service: &mut Service) {
     
     if pid == 0 {
         // Child process - execute the service
-        println!("  [CHILD] Running as child process for service: {}", service.name);
+        println!("  [CHILD] Child process for service: {}", service.name);
         
-        // TODO: Load actual service binary from filesystem
-        // For now, we'll just simulate a service that runs and exits
-        // In a real implementation, we would:
-        // exec(&service_binary);
+        // Determine which service binary to load
+        let service_id = match service.name {
+            "filesystem" => 0,
+            "network" => 1,
+            "display" => 2,
+            "audio" => 3,
+            "input" => 4,
+            _ => {
+                println!("  [CHILD] Unknown service: {}", service.name);
+                exit(1);
+            }
+        };
         
-        // Simulate service work
-        println!("  [CHILD] Service {} doing work...", service.name);
-        for _ in 0..10000 {
-            yield_cpu();
+        // Get service binary from kernel
+        let (bin_ptr, bin_size) = get_service_binary(service_id);
+        
+        if bin_ptr.is_null() || bin_size == 0 {
+            println!("  [CHILD] Failed to get service binary for: {}", service.name);
+            exit(1);
         }
-        println!("  [CHILD] Service {} exiting normally", service.name);
-        exit(0);
+        
+        println!("  [CHILD] Got service binary: {} bytes", bin_size);
+        
+        // Create slice from pointer
+        let service_binary = unsafe {
+            core::slice::from_raw_parts(bin_ptr, bin_size)
+        };
+        
+        // Execute the service binary
+        println!("  [CHILD] Executing service binary via exec()...");
+        let result = exec(service_binary);
+        
+        // If exec succeeds, it should not return
+        println!("  [CHILD] exec() returned with error: {}", result);
+        exit(1);
     } else if pid > 0 {
         // Parent process - track the service
         service.pid = pid;

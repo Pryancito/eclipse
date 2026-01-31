@@ -21,6 +21,7 @@ mod servers;
 mod elf_loader;
 mod virtio;
 mod filesystem;
+mod binaries;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -107,7 +108,7 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
 
 /// Init process binary embedded in kernel
 /// This will be loaded instead of the test process
-static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
+pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
 
 /// Función principal del kernel
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {

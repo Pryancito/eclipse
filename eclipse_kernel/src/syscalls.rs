@@ -22,6 +22,7 @@ pub enum SyscallNumber {
     Fork = 7,
     Exec = 8,
     Wait = 9,
+    GetServiceBinary = 10,
 }
 
 /// Estadísticas de syscalls
@@ -75,6 +76,7 @@ pub extern "C" fn syscall_handler(
         7 => sys_fork(),
         8 => sys_exec(arg1, arg2),
         9 => sys_wait(arg1),
+        10 => sys_get_service_binary(arg1, arg2, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -341,6 +343,47 @@ fn sys_wait(_status_ptr: u64) -> u64 {
     // No terminated children found
     serial::serial_print("[SYSCALL] wait() - no terminated children\n");
     u64::MAX // -1 indicates no children or error
+}
+
+/// sys_get_service_binary - Get pointer and size of embedded service binary
+/// Args: service_id (0-4), out_ptr (pointer to store binary pointer), out_size (pointer to store size)
+/// Returns: 0 on success, -1 on error
+fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
+    serial::serial_print("[SYSCALL] get_service_binary(");
+    serial::serial_print_dec(service_id);
+    serial::serial_print(")\n");
+    
+    // Validate pointers
+    if out_ptr == 0 || out_size == 0 {
+        return u64::MAX;
+    }
+    
+    // Get service binary based on ID
+    let (bin_ptr, bin_size) = match service_id {
+        0 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
+        1 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
+        2 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
+        3 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
+        4 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        _ => {
+            serial::serial_print("[SYSCALL] Invalid service ID\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Write pointer and size to user-provided addresses
+    unsafe {
+        *(out_ptr as *mut u64) = bin_ptr;
+        *(out_size as *mut u64) = bin_size;
+    }
+    
+    serial::serial_print("[SYSCALL] Service binary: ptr=0x");
+    serial::serial_print_hex(bin_ptr);
+    serial::serial_print(", size=");
+    serial::serial_print_dec(bin_size);
+    serial::serial_print("\n");
+    
+    0 // Success
 }
 
 /// Obtener estadísticas de syscalls

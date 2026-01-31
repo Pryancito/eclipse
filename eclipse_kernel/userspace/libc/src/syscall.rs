@@ -11,6 +11,7 @@ pub const SYS_GETPID: u64 = 6;
 pub const SYS_FORK: u64 = 7;
 pub const SYS_EXEC: u64 = 8;
 pub const SYS_WAIT: u64 = 9;
+pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> u64 {
@@ -75,4 +76,26 @@ pub fn wait(status: Option<&mut i32>) -> i32 {
         None => 0,
     };
     unsafe { syscall1(SYS_WAIT, status_ptr) as i32 }
+}
+
+/// Get service binary by ID
+/// Returns (pointer, size) or (0, 0) on error
+pub fn get_service_binary(service_id: u32) -> (*const u8, usize) {
+    let mut ptr: u64 = 0;
+    let mut size: u64 = 0;
+    
+    let result = unsafe {
+        syscall3(
+            SYS_GET_SERVICE_BINARY,
+            service_id as u64,
+            &mut ptr as *mut u64 as u64,
+            &mut size as *mut u64 as u64
+        )
+    };
+    
+    if result == 0 {
+        (ptr as *const u8, size as usize)
+    } else {
+        (core::ptr::null(), 0)
+    }
 }

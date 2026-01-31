@@ -133,54 +133,7 @@ impl Filesystem {
         Ok(bytes_read)
     }
 }
-            // TODO: Look up inode
-            // TODO: Allocate file descriptor
-            
-            // Placeholder
-            Err("File open not yet implemented")
-        }
-    }
-    
-    /// Read from a file
-    pub fn read(_handle: FileHandle, _buffer: &mut [u8]) -> Result<usize, &'static str> {
-        unsafe {
-            if !FS.mounted {
-                return Err("Filesystem not mounted");
-            }
-            
-            // TODO: Read from inode's data blocks
-            // TODO: Handle indirect blocks
-            // TODO: Update file offset
-            
-            Err("File read not yet implemented")
-        }
-    }
-    
-    /// Close a file
-    pub fn close(_handle: FileHandle) -> Result<(), &'static str> {
-        unsafe {
-            if !FS.mounted {
-                return Err("Filesystem not mounted");
-            }
-            
-            // TODO: Free file descriptor
-            // TODO: Flush any cached data
-            
-            Ok(())
-        }
-    }
-    
-    /// Read entire file into buffer (helper function)
-    pub fn read_file(_path: &str, _buffer: &mut [u8]) -> Result<usize, &'static str> {
-        // This is a convenience function for loading init
-        // In a real implementation:
-        // 1. open(path)
-        // 2. read(handle, buffer)
-        // 3. close(handle)
-        
-        Err("read_file not yet implemented")
-    }
-}
+
 
 /// Initialize the filesystem subsystem
 pub fn init() {
