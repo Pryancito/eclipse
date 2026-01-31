@@ -228,7 +228,21 @@ pub fn get_cr3() -> u64 {
 }
 
 /// Translate virtual address to physical address
-/// Handles both offset-mapped kernel region and identity-mapped regions
+/// 
+/// The kernel uses two different virtual-to-physical mapping schemes:
+/// 
+/// 1. **Kernel region (0x0 - 0x8000000 / 128MB)**: Offset-based mapping
+///    - Contains: .text, .rodata, .data, .bss (including heap), page tables
+///    - Mapping: `physical = virtual + phys_offset`
+///    - The phys_offset is determined during boot based on where bootloader loaded the kernel
+///    - Example: If kernel loaded at physical 0x200000, offset = 0
+///
+/// 2. **Higher memory (>= 128MB)**: Identity mapping  
+///    - Contains: Stack, user space, MMIO regions
+///    - Mapping: `physical = virtual`
+///
+/// This dual scheme allows the kernel to be position-independent while keeping
+/// higher memory simple for userspace and hardware access.
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
     // Using Relaxed ordering is safe because PHYS_OFFSET is written once during init
     let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);

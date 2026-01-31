@@ -77,6 +77,11 @@ const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 
 /// Delay cycles after setting DRIVER_OK status
 /// Gives device time to process status change before first operation
+/// 
+/// This is a conservative delay (~1000-2000 CPU cycles) that works across different
+/// QEMU/KVM configurations and CPU speeds. While VirtIO devices typically respond
+/// quickly in virtualized environments, this ensures status change is processed
+/// before we attempt first I/O operation.
 const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
 
 /// VirtIO MMIO register offsets
