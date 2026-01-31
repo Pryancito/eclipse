@@ -755,7 +755,7 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Memory barrier before notifying device to ensure all writes are visible
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
@@ -873,7 +873,7 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Memory barrier before notifying device to ensure all writes are visible
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
