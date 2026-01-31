@@ -306,13 +306,10 @@ impl Virtqueue {
         let idx = avail.idx as usize % self.queue_size as usize;
         avail.ring[idx] = head;
         
-        // Memory barrier to ensure ring write is visible before updating idx
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        
         // Update index - this tells the device there's work to do
         avail.idx = avail.idx.wrapping_add(1);
         
-        // Memory barrier to ensure idx write is visible to device
+        // Memory barrier to ensure all writes (ring and idx) are visible before notification
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         
         Some(head)
