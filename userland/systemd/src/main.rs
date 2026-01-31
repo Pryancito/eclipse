@@ -3,14 +3,19 @@
 //! This is a full-featured init system (PID 1) for Eclipse OS that manages
 //! system services, tracks dependencies, and integrates with the microkernel.
 //!
-//! Features:
+//! ## Bare Metal Execution
+//! This code runs in a bare metal environment (no OS, no standard library).
+//! - `#![no_std]` - No standard library (no heap, no file I/O, etc.)
+//! - `#![no_main]` - No standard entry point; we define our own `_start`
+//!
+//! ## Features:
 //! - Service dependency management
 //! - Parallel service startup
 //! - Service restart policies
 //! - Service monitoring and health checks
 //! - Zombie process reaping
 //! 
-//! Future enhancements:
+//! ## Future enhancements:
 //! - Socket activation support
 //! - Full microkernel IPC integration
 
@@ -103,6 +108,14 @@ impl Service {
 }
 
 /// System services registry
+/// 
+/// # Safety
+/// These static mut variables are safe because:
+/// - Init process (PID 1) is single-threaded
+/// - No concurrent access to these variables
+/// - All access is sequential within the main loop
+/// 
+/// If threading is added in the future, these should be wrapped in a Mutex.
 static mut SERVICES: [Option<Service>; MAX_SERVICES] = [const { None }; MAX_SERVICES];
 static mut SERVICE_COUNT: usize = 0;
 

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# We'll use eclipse-libc from the kernel userspace
+# eclipse-libc provides syscall wrappers for the Eclipse microkernel
+# Path dependency is intentional: both are built as part of Eclipse OS
+# and eclipse-libc is specific to this kernel implementation
 eclipse-libc = { path = "../../eclipse_kernel/userspace/libc" }
 
 [profile.release]
