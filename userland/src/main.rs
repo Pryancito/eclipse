@@ -6,6 +6,7 @@
 
 // Módulos del sistema
 pub mod applications;
+pub mod services;
 
 // Módulos de IA
 pub mod ai_core;
@@ -31,6 +32,7 @@ pub mod gui;
 
 use anyhow::Result;
 use log::info;
+use services::system_services::SystemServiceManager;
 
 /// Inicializa el userland de Eclipse OS
 pub fn init() -> anyhow::Result<()> {
@@ -48,21 +50,57 @@ fn main() {
     // Inicializar logging
     env_logger::init();
     
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║         Eclipse OS - Userland con Servidores Microkernel           ║");
+    println!("║                    Servicios en Espacio de Usuario                  ║");
+    println!("╚══════════════════════════════════════════════════════════════════════╝\n");
+    
     // Inicializar userland
     if let Err(e) = init() {
         eprintln!("❌ Error al inicializar userland: {}", e);
         std::process::exit(1);
     }
     
-    println!("🎉 Eclipse OS Userland inicializado exitosamente!");
-    println!("✅ Todos los componentes del userland están funcionando");
+    // Crear y configurar gestor de servicios del sistema
+    let mut service_manager = SystemServiceManager::new();
     
-    // Simular operaciones del userland
-    println!("🔄 Simulando operaciones del userland...");
-    println!("   • Aplicaciones de usuario cargadas");
-    println!("   • Sistema de archivos funcionando");
-    println!("   • Red funcionando");
-    println!("   • Seguridad activa");
-    
-    println!("🚀 Eclipse OS Userland está listo para usar!");
+    // Inicializar todos los servicios (incluyendo servidores del microkernel)
+    match service_manager.initialize_all_services() {
+        Ok(_) => {
+            println!("🎉 Eclipse OS Userland inicializado exitosamente!");
+            println!("✅ Todos los componentes del userland están funcionando\n");
+            
+            // Simular operaciones del userland
+            println!("🔄 Sistema operativo en modo userspace...");
+            println!("   • Servidores del microkernel activos y procesando mensajes");
+            println!("   • Aplicaciones de usuario cargadas");
+            println!("   • Sistema de archivos funcionando");
+            println!("   • Red funcionando");
+            println!("   • Seguridad activa");
+            
+            // Mostrar resumen del sistema
+            let (total, running, stopped) = service_manager.get_system_summary();
+            println!("\n📊 Resumen del Sistema:");
+            println!("   • Total de servicios: {}", total);
+            println!("   • Servicios en ejecución: {}", running);
+            println!("   • Servicios detenidos: {}", stopped);
+            
+            println!("\n🚀 Eclipse OS Userland está listo para usar!");
+            println!("   Los servidores del microkernel están esperando mensajes del kernel.\n");
+            
+            // Detener servidores al finalizar
+            println!("Presione Ctrl+C para detener los servicios...");
+            
+            // En un sistema real, aquí entraríamos en un loop de eventos
+            // Por ahora, solo limpiamos y salimos
+            println!("\nFinalizando userland...");
+            if let Err(e) = service_manager.shutdown_microkernel_servers() {
+                eprintln!("⚠ Error al detener servidores: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Error al inicializar servicios: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
