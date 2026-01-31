@@ -168,8 +168,9 @@ pub fn init_paging(kernel_phys_base: u64) {
         for i in 0..512 {
             let virt_addr = (i as u64) * 0x200000;
             
-            // Map page 0 with identity mapping and cache-disabled for MMIO
-            // This allows access to low memory regions like PCI BARs at 0xC000
+            // Map page 0 with identity mapping and cache-disabled for MMIO access
+            // This enables access to memory-mapped I/O regions in low memory (0x0-0x200000)
+            // such as PCI device BARs, VGA memory, and other hardware MMIO regions
             if i == 0 {
                 PD.entries[i].set_addr(
                     0,
