@@ -77,7 +77,7 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 struct VirtQAvail {
     flags: u16,
     idx: u16,
-    ring: [u16; 8], // Small queue for now
+    ring: [u16; 256], // Support up to 256 queue entries
     used_event: u16, // Used event (only if VIRTIO_F_EVENT_IDX)
 }
 
@@ -94,7 +94,7 @@ struct VirtQUsedElem {
 struct VirtQUsed {
     flags: u16,
     idx: u16,
-    ring: [VirtQUsedElem; 8],
+    ring: [VirtQUsedElem; 256],
     avail_event: u16, // Available event (only if VIRTIO_F_EVENT_IDX)
 }
 
@@ -343,6 +343,12 @@ impl VirtIOBlockDevice {
         
         let regs = self.mmio_base as *mut VirtIOMMIORegs;
         
+        // Debug: Check if this is actually MMIO or PCI
+        let magic = read_volatile(&(*regs).magic_value);
+        crate::serial::serial_print("[VirtIO] Magic value: 0x");
+        crate::serial::serial_print_hex(magic as u64);
+        crate::serial::serial_print("\n");
+        
         // Reset device
         write_volatile(&mut (*regs).status, 0);
         
@@ -374,16 +380,27 @@ impl VirtIOBlockDevice {
         write_volatile(&mut (*regs).queue_sel, 0); // Select queue 0
         
         let queue_size = read_volatile(&(*regs).queue_num_max);
-        if queue_size == 0 || queue_size > 8 {
-            crate::serial::serial_print("[VirtIO] Invalid queue size\n");
+        crate::serial::serial_print("[VirtIO] Queue size read: ");
+        crate::serial::serial_print_hex(queue_size as u64);
+        crate::serial::serial_print("\n");
+        
+        // VirtIO spec allows queue sizes up to 32768, but we'll use a reasonable limit
+        if queue_size == 0 || queue_size > 256 {
+            crate::serial::serial_print("[VirtIO] Invalid queue size (must be 1-256)\n");
             return false;
         }
         
+        // Use a smaller queue size that we can handle (power of 2, <=128)
+        let actual_queue_size = if queue_size > 128 { 128 } else { queue_size };
+        crate::serial::serial_print("[VirtIO] Using queue size: ");
+        crate::serial::serial_print_dec(actual_queue_size as u64);
+        crate::serial::serial_print("\n");
+        
         // Create virtqueue
-        match Virtqueue::new(queue_size as u16) {
+        match Virtqueue::new(actual_queue_size as u16) {
             Some(queue) => {
                 // Set queue size
-                write_volatile(&mut (*regs).queue_num, queue_size as u32);
+                write_volatile(&mut (*regs).queue_num, actual_queue_size as u32);
                 
                 // Set descriptor table address
                 let desc_low = (queue.desc_phys & 0xFFFFFFFF) as u32;
