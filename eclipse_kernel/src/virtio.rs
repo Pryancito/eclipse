@@ -924,10 +924,13 @@ pub fn init() {
                 // Try to initialize I/O port based device
                 match VirtIOBlockDevice::new_from_pci_io(io_base) {
                     Some(mut device) => {
+                        serial::serial_print("[VirtIO]   Attempting to initialize I/O port device...\n");
                         if device.init() {
                             serial::serial_print("[VirtIO] I/O port device initialized successfully\n");
                             *BLOCK_DEVICE.lock() = Some(device);
                             return;
+                        } else {
+                            serial::serial_print("[VirtIO]   I/O port device initialization failed\n");
                         }
                     }
                     None => {
@@ -942,16 +945,21 @@ pub fn init() {
                 if bar_addr != 0 {
                     match VirtIOBlockDevice::new_from_pci(bar_addr) {
                         Some(mut device) => {
+                            serial::serial_print("[VirtIO]   Attempting to initialize MMIO device...\n");
                             if device.init() {
                                 serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
                                 *BLOCK_DEVICE.lock() = Some(device);
                                 return;
+                            } else {
+                                serial::serial_print("[VirtIO]   MMIO device initialization failed\n");
                             }
                         }
                         None => {
                             serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
                         }
                     }
+                } else {
+                    serial::serial_print("[VirtIO]   BAR0 address is 0, cannot initialize\n");
                 }
             }
         }
