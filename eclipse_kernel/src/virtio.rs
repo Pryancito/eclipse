@@ -313,7 +313,7 @@ impl Virtqueue {
         avail.idx = avail.idx.wrapping_add(1);
         
         // Memory barrier to ensure idx write is visible to device
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         
         Some(head)
     }
