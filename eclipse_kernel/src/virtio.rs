@@ -720,7 +720,7 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Notify device
-            if self.io_base != 0 {
+            if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
             } else {
@@ -824,7 +824,7 @@ impl VirtIOBlockDevice {
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
             // Notify device
-            if self.io_base != 0 {
+            if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
             } else {
