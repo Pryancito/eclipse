@@ -81,6 +81,7 @@ pub struct Process {
     pub stack_size: usize,
     pub priority: u8,
     pub time_slice: u32,
+    pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
 }
 
 impl Process {
@@ -93,6 +94,7 @@ impl Process {
             stack_size: 0,
             priority: 0,
             time_slice: 0,
+            parent_pid: None,
         }
     }
 }
@@ -102,6 +104,37 @@ const MAX_PROCESSES: usize = 64;
 static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([None; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
+
+// Stack pool for forked processes (simple static allocation)
+const STACK_POOL_SIZE: usize = 8; // Support up to 8 concurrent child processes
+const CHILD_STACK_SIZE: usize = 4096;
+#[repr(align(16))]
+struct StackPool {
+    stacks: [[u8; CHILD_STACK_SIZE]; STACK_POOL_SIZE],
+    used: [bool; STACK_POOL_SIZE],
+}
+
+static mut STACK_POOL: StackPool = StackPool {
+    stacks: [[0; CHILD_STACK_SIZE]; STACK_POOL_SIZE],
+    used: [false; STACK_POOL_SIZE],
+};
+
+static STACK_POOL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Allocate a stack from the pool
+fn allocate_stack() -> Option<u64> {
+    let _lock = STACK_POOL_LOCK.lock();
+    unsafe {
+        for i in 0..STACK_POOL_SIZE {
+            if !STACK_POOL.used[i] {
+                STACK_POOL.used[i] = true;
+                return Some(STACK_POOL.stacks[i].as_mut_ptr() as u64);
+            }
+        }
+    }
+    None
+}
+
 
 /// Crear un nuevo proceso
 pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> Option<ProcessId> {
@@ -270,4 +303,58 @@ pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
     }
     
     result
+}
+
+/// Fork current process - create child process
+/// Returns: Some(child_pid) on success, None on error
+pub fn fork_process() -> Option<ProcessId> {
+    // Get current process
+    let current_pid = current_process_id()?;
+    let parent = get_process(current_pid)?;
+    
+    // Allocate new stack for child from pool
+    let child_stack = allocate_stack()?;
+    
+    // Copy parent's stack to child
+    unsafe {
+        let parent_stack_ptr = parent.stack_base as *const u8;
+        let child_stack_ptr = child_stack as *mut u8;
+        core::ptr::copy_nonoverlapping(
+            parent_stack_ptr,
+            child_stack_ptr,
+            parent.stack_size.min(CHILD_STACK_SIZE)
+        );
+    }
+    
+    // Create child process
+    let mut table = PROCESS_TABLE.lock();
+    let mut next_pid = NEXT_PID.lock();
+    
+    for slot in table.iter_mut() {
+        if slot.is_none() {
+            let child_pid = *next_pid;
+            *next_pid += 1;
+            
+            let mut child = parent; // Copy parent's state
+            child.id = child_pid;
+            child.state = ProcessState::Ready;
+            child.stack_base = child_stack;
+            child.stack_size = CHILD_STACK_SIZE;
+            child.parent_pid = Some(current_pid);
+            
+            // Adjust stack pointer for child
+            let stack_offset = parent.context.rsp - parent.stack_base;
+            child.context.rsp = child_stack + stack_offset;
+            
+            // Child returns 0 from fork
+            child.context.rax = 0;
+            
+            *slot = Some(child);
+            
+            // Parent returns child PID
+            return Some(child_pid);
+        }
+    }
+    
+    None
 }

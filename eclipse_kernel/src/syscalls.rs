@@ -222,22 +222,32 @@ fn sys_getpid() -> u64 {
 /// sys_fork - Create a new process (child)
 /// Returns: Child PID in parent, 0 in child, -1 on error
 fn sys_fork() -> u64 {
+    use crate::process;
+    
     let mut stats = SYSCALL_STATS.lock();
     stats.fork_calls += 1;
     drop(stats);
     
     serial::serial_print("[SYSCALL] fork() called\n");
     
-    // TODO: Full implementation would:
-    // 1. Copy parent's address space (page tables)
-    // 2. Copy parent's stack
-    // 3. Clone file descriptors
-    // 4. Set up parent-child relationship
-    // 5. Return 0 in child, child PID in parent
-    
-    // For now, return error (not implemented)
-    serial::serial_print("[SYSCALL] fork() not fully implemented yet\n");
-    u64::MAX // -1 indicates error
+    // Create child process
+    match process::fork_process() {
+        Some(child_pid) => {
+            serial::serial_print("[SYSCALL] fork() created child process with PID: ");
+            serial::serial_print_dec(child_pid as u64);
+            serial::serial_print("\n");
+            
+            // Add child to scheduler
+            crate::scheduler::enqueue_process(child_pid);
+            
+            // Return child PID to parent
+            child_pid as u64
+        }
+        None => {
+            serial::serial_print("[SYSCALL] fork() failed - could not create child\n");
+            u64::MAX // -1 indicates error
+        }
+    }
 }
 
 /// sys_exec - Replace current process with new program
@@ -287,22 +297,50 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// sys_wait - Wait for child process to terminate
 /// arg1: pointer to status variable (or 0 to ignore)
 /// Returns: PID of terminated child, or -1 on error
-fn sys_wait(status_ptr: u64) -> u64 {
+fn sys_wait(_status_ptr: u64) -> u64 {
+    use crate::process;
+    
     let mut stats = SYSCALL_STATS.lock();
     stats.wait_calls += 1;
     drop(stats);
     
     serial::serial_print("[SYSCALL] wait() called\n");
     
-    // TODO: Full implementation would:
-    // 1. Find terminated child processes
-    // 2. Clean up zombie processes
-    // 3. Return child's exit status
-    // 4. Block if no children have terminated yet
+    // Get current process ID
+    let current_pid = match process::current_process_id() {
+        Some(pid) => pid,
+        None => {
+            serial::serial_print("[SYSCALL] wait() failed - no current process\n");
+            return u64::MAX;
+        }
+    };
     
-    // For now, return -1 (no children)
-    serial::serial_print("[SYSCALL] wait() not fully implemented yet\n");
-    u64::MAX
+    // Look for terminated child processes
+    let processes = process::list_processes();
+    for (pid, state) in processes.iter() {
+        if *pid == 0 {
+            continue;
+        }
+        
+        if state == &process::ProcessState::Terminated {
+            if let Some(proc) = process::get_process(*pid) {
+                if proc.parent_pid == Some(current_pid) {
+                    serial::serial_print("[SYSCALL] wait() found terminated child PID: ");
+                    serial::serial_print_dec(*pid as u64);
+                    serial::serial_print("\n");
+                    
+                    // TODO: Clean up child process resources
+                    // TODO: Write exit status to status_ptr if non-zero
+                    
+                    return *pid as u64;
+                }
+            }
+        }
+    }
+    
+    // No terminated children found
+    serial::serial_print("[SYSCALL] wait() - no terminated children\n");
+    u64::MAX // -1 indicates no children or error
 }
 
 /// Obtener estadísticas de syscalls
