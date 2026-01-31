@@ -306,16 +306,22 @@ impl Virtqueue {
         let idx = avail.idx as usize % self.queue_size as usize;
         avail.ring[idx] = head;
         
-        // Memory barrier
+        // Memory barrier to ensure ring write is visible before updating idx
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         
+        // Update index - this tells the device there's work to do
         avail.idx = avail.idx.wrapping_add(1);
+        
+        // Memory barrier to ensure idx write is visible to device
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         
         Some(head)
     }
     
     /// Check if there are used buffers
     unsafe fn has_used(&self) -> bool {
+        // Memory barrier to ensure we see device updates
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = &*self.used;
         self.last_used_idx != used.idx
     }
@@ -748,6 +754,9 @@ impl VirtIOBlockDevice {
             
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
+            // Memory barrier before notifying device to ensure all writes are visible
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
@@ -862,6 +871,9 @@ impl VirtIOBlockDevice {
             ];
             
             let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            
+            // Memory barrier before notifying device to ensure all writes are visible
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
