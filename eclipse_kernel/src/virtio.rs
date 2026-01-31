@@ -78,6 +78,7 @@ struct VirtQAvail {
     flags: u16,
     idx: u16,
     ring: [u16; 8], // Small queue for now
+    used_event: u16, // Used event (only if VIRTIO_F_EVENT_IDX)
 }
 
 /// VirtIO used ring element
@@ -94,16 +95,190 @@ struct VirtQUsed {
     flags: u16,
     idx: u16,
     ring: [VirtQUsedElem; 8],
+    avail_event: u16, // Available event (only if VIRTIO_F_EVENT_IDX)
+}
+
+/// VirtIO block request header
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VirtIOBlockReq {
+    req_type: u32,
+    reserved: u32,
+    sector: u64,
+}
+
+/// VirtIO block request types
+const VIRTIO_BLK_T_IN: u32 = 0;   // Read
+const VIRTIO_BLK_T_OUT: u32 = 1;  // Write
+
+/// VirtIO block status codes
+const VIRTIO_BLK_S_OK: u8 = 0;
+const VIRTIO_BLK_S_IOERR: u8 = 1;
+const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
+/// Virtqueue structure
+struct Virtqueue {
+    queue_size: u16,
+    descriptors: *mut VirtQDescriptor,
+    avail: *mut VirtQAvail,
+    used: *mut VirtQUsed,
+    desc_phys: u64,
+    avail_phys: u64,
+    used_phys: u64,
+    free_head: u16,
+    num_used: u16,
+    last_used_idx: u16,
+}
+
+// Safety: Virtqueue uses raw pointers but manages them correctly
+unsafe impl Send for Virtqueue {}
+
+impl Virtqueue {
+    /// Create a new virtqueue with DMA-allocated memory
+    unsafe fn new(queue_size: u16) -> Option<Self> {
+        // Calculate sizes for each component
+        let desc_size = core::mem::size_of::<VirtQDescriptor>() * queue_size as usize;
+        let avail_size = 6 + 2 * queue_size as usize + 2; // flags + idx + ring + used_event
+        let used_size = 6 + 8 * queue_size as usize + 2; // flags + idx + ring + avail_event
+        
+        // Allocate descriptors (16-byte aligned)
+        let (desc_ptr, desc_phys) = crate::memory::alloc_dma_buffer(desc_size, 16)?;
+        let descriptors = desc_ptr as *mut VirtQDescriptor;
+        
+        // Allocate available ring (2-byte aligned)
+        let (avail_ptr, avail_phys) = crate::memory::alloc_dma_buffer(avail_size, 2)?;
+        let avail = avail_ptr as *mut VirtQAvail;
+        
+        // Allocate used ring (4-byte aligned) 
+        let (used_ptr, used_phys) = crate::memory::alloc_dma_buffer(used_size, 4)?;
+        let used = used_ptr as *mut VirtQUsed;
+        
+        // Initialize descriptors as a free list
+        for i in 0..queue_size {
+            (*descriptors.add(i as usize)).next = if i + 1 < queue_size { i + 1 } else { 0 };
+            (*descriptors.add(i as usize)).flags = 0;
+        }
+        
+        // Initialize available ring
+        (*avail).flags = 0;
+        (*avail).idx = 0;
+        
+        // Initialize used ring
+        (*used).flags = 0;
+        (*used).idx = 0;
+        
+        Some(Virtqueue {
+            queue_size,
+            descriptors,
+            avail,
+            used,
+            desc_phys,
+            avail_phys,
+            used_phys,
+            free_head: 0,
+            num_used: 0,
+            last_used_idx: 0,
+        })
+    }
+    
+    /// Allocate a descriptor chain
+    unsafe fn alloc_desc(&mut self) -> Option<u16> {
+        if self.num_used >= self.queue_size {
+            return None;
+        }
+        
+        let desc = self.free_head;
+        self.free_head = (*self.descriptors.add(desc as usize)).next;
+        self.num_used += 1;
+        
+        Some(desc)
+    }
+    
+    /// Free a descriptor chain
+    unsafe fn free_desc(&mut self, desc_idx: u16) {
+        let mut idx = desc_idx;
+        loop {
+            let desc = &mut *self.descriptors.add(idx as usize);
+            let next = desc.next;
+            let has_next = (desc.flags & VIRTQ_DESC_F_NEXT) != 0;
+            
+            // Add to free list
+            desc.flags = 0;
+            desc.next = self.free_head;
+            self.free_head = idx;
+            self.num_used -= 1;
+            
+            if !has_next {
+                break;
+            }
+            idx = next;
+        }
+    }
+    
+    /// Add buffers to the queue
+    unsafe fn add_buf(&mut self, buffers: &[(u64, u32, u16)]) -> Option<u16> {
+        if buffers.is_empty() || buffers.len() > self.queue_size as usize {
+            return None;
+        }
+        
+        // Allocate descriptor chain
+        let head = self.alloc_desc()?;
+        let mut desc_idx = head;
+        
+        for (i, &(addr, len, flags)) in buffers.iter().enumerate() {
+            let desc = &mut *self.descriptors.add(desc_idx as usize);
+            desc.addr = addr;
+            desc.len = len;
+            desc.flags = flags;
+            
+            if i + 1 < buffers.len() {
+                let next = self.alloc_desc()?;
+                desc.flags |= VIRTQ_DESC_F_NEXT;
+                desc.next = next;
+                desc_idx = next;
+            }
+        }
+        
+        // Add to available ring
+        let avail = &mut *self.avail;
+        let idx = avail.idx as usize % self.queue_size as usize;
+        avail.ring[idx] = head;
+        
+        // Memory barrier
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        
+        avail.idx = avail.idx.wrapping_add(1);
+        
+        Some(head)
+    }
+    
+    /// Check if there are used buffers
+    unsafe fn has_used(&self) -> bool {
+        let used = &*self.used;
+        self.last_used_idx != used.idx
+    }
+    
+    /// Get next used buffer
+    unsafe fn get_used(&mut self) -> Option<(u16, u32)> {
+        if !self.has_used() {
+            return None;
+        }
+        
+        let used = &*self.used;
+        let idx = self.last_used_idx as usize % self.queue_size as usize;
+        let elem = used.ring[idx];
+        
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        
+        Some((elem.id as u16, elem.len))
+    }
 }
 
 /// VirtIO block device driver
 pub struct VirtIOBlockDevice {
     mmio_base: u64,
     queue_size: u16,
-    // In a full implementation, these would be allocated:
-    // descriptors: *mut VirtQDescriptor,
-    // avail_ring: *mut VirtQAvail,
-    // used_ring: *mut VirtQUsed,
+    queue: Option<Virtqueue>,
 }
 
 static BLOCK_DEVICE: Mutex<Option<VirtIOBlockDevice>> = Mutex::new(None);
@@ -112,7 +287,7 @@ static BLOCK_DEVICE: Mutex<Option<VirtIOBlockDevice>> = Mutex::new(None);
 static mut SIMULATED_DISK: [u8; 512 * 1024] = [0; 512 * 1024];
 
 impl VirtIOBlockDevice {
-    /// Create a new VirtIO block device
+    /// Create a new VirtIO block device from MMIO base
     unsafe fn new(mmio_base: u64) -> Option<Self> {
         let regs = mmio_base as *mut VirtIOMMIORegs;
         
@@ -124,6 +299,7 @@ impl VirtIOBlockDevice {
             return Some(VirtIOBlockDevice {
                 mmio_base: 0,
                 queue_size: 8,
+                queue: None,
             });
         }
         
@@ -142,6 +318,18 @@ impl VirtIOBlockDevice {
         Some(VirtIOBlockDevice {
             mmio_base,
             queue_size: 8,
+            queue: None,
+        })
+    }
+    
+    /// Create a new VirtIO block device from PCI BAR address
+    unsafe fn new_from_pci(bar_addr: u64) -> Option<Self> {
+        // For PCI devices, the BAR points to VirtIO registers
+        // Create device structure  
+        Some(VirtIOBlockDevice {
+            mmio_base: bar_addr,
+            queue_size: 8,
+            queue: None,
         })
     }
     
@@ -182,16 +370,57 @@ impl VirtIOBlockDevice {
             return false;
         }
         
-        // TODO: Setup real virtqueue
-        // This would involve:
-        // 1. Allocate descriptor table, avail ring, used ring
-        // 2. Write physical addresses to MMIO registers
-        // 3. Set queue size and mark ready
+        // Setup virtqueue
+        write_volatile(&mut (*regs).queue_sel, 0); // Select queue 0
+        
+        let queue_size = read_volatile(&(*regs).queue_num_max);
+        if queue_size == 0 || queue_size > 8 {
+            crate::serial::serial_print("[VirtIO] Invalid queue size\n");
+            return false;
+        }
+        
+        // Create virtqueue
+        match Virtqueue::new(queue_size as u16) {
+            Some(queue) => {
+                // Set queue size
+                write_volatile(&mut (*regs).queue_num, queue_size as u32);
+                
+                // Set descriptor table address
+                let desc_low = (queue.desc_phys & 0xFFFFFFFF) as u32;
+                let desc_high = (queue.desc_phys >> 32) as u32;
+                write_volatile(&mut (*regs).queue_desc_low, desc_low);
+                write_volatile(&mut (*regs).queue_desc_high, desc_high);
+                
+                // Set available ring address
+                let avail_low = (queue.avail_phys & 0xFFFFFFFF) as u32;
+                let avail_high = (queue.avail_phys >> 32) as u32;
+                write_volatile(&mut (*regs).queue_driver_low, avail_low);
+                write_volatile(&mut (*regs).queue_driver_high, avail_high);
+                
+                // Set used ring address
+                let used_low = (queue.used_phys & 0xFFFFFFFF) as u32;
+                let used_high = (queue.used_phys >> 32) as u32;
+                write_volatile(&mut (*regs).queue_device_low, used_low);
+                write_volatile(&mut (*regs).queue_device_high, used_high);
+                
+                // Mark queue as ready
+                write_volatile(&mut (*regs).queue_ready, 1);
+                
+                self.queue = Some(queue);
+                
+                crate::serial::serial_print("[VirtIO] Virtqueue initialized successfully\n");
+            }
+            None => {
+                crate::serial::serial_print("[VirtIO] Failed to allocate virtqueue\n");
+                return false;
+            }
+        }
         
         // Set DRIVER_OK status bit
         let status = read_volatile(&(*regs).status);
         write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_DRIVER_OK);
         
+        crate::serial::serial_print("[VirtIO] Device initialized with real virtqueue\n");
         true
     }
     
@@ -199,13 +428,71 @@ impl VirtIOBlockDevice {
     unsafe fn init_simulated_disk(&mut self) {
         use crate::serial;
         
-        // Block 0: Simple "superblock" marker
-        SIMULATED_DISK[0] = 0xEC; // 'E'
-        SIMULATED_DISK[1] = 0x4C; // 'L'
-        SIMULATED_DISK[2] = 0x49; // 'I'
-        SIMULATED_DISK[3] = 0x50; // 'P'
+        // Create a minimal EclipseFS header at block 0 (which maps to partition offset)
+        // EclipseFS header structure (from eclipsefs-lib format.rs):
+        // Magic: "ECLIPSEFS" (9 bytes)
+        // Version: u32 (4 bytes) - little endian
+        // Inode table offset: u64 (8 bytes) - little endian
+        // Inode table size: u64 (8 bytes) - little endian
+        // Total inodes: u32 (4 bytes) - little endian
+        // And more fields...
         
-        serial::serial_print("[VirtIO] Simulated disk initialized with test data\n");
+        let mut offset = 0;
+        
+        // Magic number: "ECLIPSEFS"
+        SIMULATED_DISK[offset..offset+9].copy_from_slice(b"ECLIPSEFS");
+        offset += 9;
+        
+        // Version: 1.0 (0x00010000) - little endian
+        let version: u32 = 0x00010000; // Major 1, Minor 0
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&version.to_le_bytes());
+        offset += 4;
+        
+        // Inode table offset: 4096 (after header) - little endian
+        let inode_table_offset: u64 = 4096;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_offset.to_le_bytes());
+        offset += 8;
+        
+        // Inode table size: 4096 (minimal) - little endian
+        let inode_table_size: u64 = 4096;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_size.to_le_bytes());
+        offset += 8;
+        
+        // Total inodes: 1 (just root) - little endian
+        let total_inodes: u32 = 1;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&total_inodes.to_le_bytes());
+        offset += 4;
+        
+        // Header checksum: 0 (skip for now)
+        let header_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&header_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Metadata checksum: 0
+        let metadata_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&metadata_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Data checksum: 0
+        let data_checksum: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&data_checksum.to_le_bytes());
+        offset += 4;
+        
+        // Creation time: 0
+        let creation_time: u64 = 0;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&creation_time.to_le_bytes());
+        offset += 8;
+        
+        // Last check: 0
+        let last_check: u64 = 0;
+        SIMULATED_DISK[offset..offset+8].copy_from_slice(&last_check.to_le_bytes());
+        offset += 8;
+        
+        // Flags: 0
+        let flags: u32 = 0;
+        SIMULATED_DISK[offset..offset+4].copy_from_slice(&flags.to_le_bytes());
+        
+        serial::serial_print("[VirtIO] Simulated disk initialized with EclipseFS header\n");
     }
     
     /// Read a block from the device
@@ -216,8 +503,17 @@ impl VirtIOBlockDevice {
         
         if self.mmio_base == 0 {
             // Simulated read
+            const PARTITION_OFFSET: u64 = 131328;
+            
             unsafe {
-                let offset = (block_num as usize) * 4096;
+                if block_num < PARTITION_OFFSET {
+                    buffer[..4096].fill(0);
+                    return Ok(());
+                }
+                
+                let relative_block = block_num - PARTITION_OFFSET;
+                let offset = (relative_block as usize) * 4096;
+                
                 if offset + 4096 > SIMULATED_DISK.len() {
                     return Err("Block number out of range");
                 }
@@ -226,15 +522,75 @@ impl VirtIOBlockDevice {
             return Ok(());
         }
         
-        // TODO: Real VirtIO block read would:
-        // 1. Allocate descriptors for request header, data buffer, status
-        // 2. Chain them together
-        // 3. Add to available ring
-        // 4. Notify device via MMIO write
-        // 5. Poll used ring for completion
-        // 6. Check status byte
-        
-        Err("Real VirtIO read not yet implemented")
+        // Real VirtIO block read
+        unsafe {
+            let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
+            
+            // Allocate DMA buffers for request
+            let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(
+                core::mem::size_of::<VirtIOBlockReq>(), 16
+            ).ok_or("Failed to allocate request buffer")?;
+            
+            let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
+                .ok_or("Failed to allocate status buffer")?;
+            
+            let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
+            
+            // Build request header
+            let req = &mut *(req_ptr as *mut VirtIOBlockReq);
+            req.req_type = VIRTIO_BLK_T_IN; // Read
+            req.reserved = 0;
+            req.sector = block_num * 8; // 4KB block = 8 * 512-byte sectors
+            
+            // Build descriptor chain: request -> data -> status
+            let buffers = [
+                (req_phys, core::mem::size_of::<VirtIOBlockReq>() as u32, 0),
+                (buffer_phys, 4096, VIRTQ_DESC_F_WRITE),
+                (status_phys, 1, VIRTQ_DESC_F_WRITE),
+            ];
+            
+            let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            
+            // Notify device
+            let regs = self.mmio_base as *mut VirtIOMMIORegs;
+            write_volatile(&mut (*regs).queue_notify, 0);
+            
+            // Wait for completion (polling for now)
+            let mut timeout = 1000000;
+            while !queue.has_used() && timeout > 0 {
+                timeout -= 1;
+                core::hint::spin_loop();
+            }
+            
+            if timeout == 0 {
+                // Cleanup
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("VirtIO read timeout");
+            }
+            
+            // Get used buffer
+            if let Some((used_idx, _len)) = queue.get_used() {
+                // Check status
+                let status = *status_ptr;
+                
+                // Free buffers
+                queue.free_desc(used_idx);
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                
+                if status != VIRTIO_BLK_S_OK {
+                    return Err("VirtIO read failed");
+                }
+                
+                return Ok(());
+            }
+            
+            // Cleanup on failure
+            crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+            crate::memory::free_dma_buffer(status_ptr, 1, 1);
+            Err("No used buffer returned")
+        }
     }
     
     /// Write a block to the device
@@ -245,8 +601,17 @@ impl VirtIOBlockDevice {
         
         if self.mmio_base == 0 {
             // Simulated write
+            const PARTITION_OFFSET: u64 = 131328;
+            
             unsafe {
-                let offset = (block_num as usize) * 4096;
+                if block_num < PARTITION_OFFSET {
+                    // Block is before the partition, ignore write
+                    return Ok(());
+                }
+                
+                let relative_block = block_num - PARTITION_OFFSET;
+                let offset = (relative_block as usize) * 4096;
+                
                 if offset + 4096 > SIMULATED_DISK.len() {
                     return Err("Block number out of range");
                 }
@@ -256,7 +621,71 @@ impl VirtIOBlockDevice {
         }
         
         // TODO: Real VirtIO block write
-        Err("Real VirtIO write not yet implemented")
+        // Real VirtIO block write
+        unsafe {
+            let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
+            
+            // Allocate DMA buffers
+            let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(
+                core::mem::size_of::<VirtIOBlockReq>(), 16
+            ).ok_or("Failed to allocate request buffer")?;
+            
+            let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
+                .ok_or("Failed to allocate status buffer")?;
+            
+            let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
+            
+            // Build request header
+            let req = &mut *(req_ptr as *mut VirtIOBlockReq);
+            req.req_type = VIRTIO_BLK_T_OUT; // Write
+            req.reserved = 0;
+            req.sector = block_num * 8;
+            
+            // Build descriptor chain: request -> data -> status
+            let buffers = [
+                (req_phys, core::mem::size_of::<VirtIOBlockReq>() as u32, 0),
+                (buffer_phys, 4096, 0), // Data is read by device
+                (status_phys, 1, VIRTQ_DESC_F_WRITE),
+            ];
+            
+            let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            
+            // Notify device
+            let regs = self.mmio_base as *mut VirtIOMMIORegs;
+            write_volatile(&mut (*regs).queue_notify, 0);
+            
+            // Wait for completion
+            let mut timeout = 1000000;
+            while !queue.has_used() && timeout > 0 {
+                timeout -= 1;
+                core::hint::spin_loop();
+            }
+            
+            if timeout == 0 {
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                return Err("VirtIO write timeout");
+            }
+            
+            // Get used buffer
+            if let Some((used_idx, _len)) = queue.get_used() {
+                let status = *status_ptr;
+                
+                queue.free_desc(used_idx);
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                
+                if status != VIRTIO_BLK_S_OK {
+                    return Err("VirtIO write failed");
+                }
+                
+                return Ok(());
+            }
+            
+            crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+            crate::memory::free_dma_buffer(status_ptr, 1, 1);
+            Err("No used buffer returned")
+        }
     }
 }
 
@@ -264,34 +693,65 @@ impl VirtIOBlockDevice {
 pub fn init() {
     use crate::serial;
     
-    serial::serial_print("Initializing VirtIO devices...\n");
+    serial::serial_print("[VirtIO] Initializing VirtIO devices...\n");
     
+    // Try to find VirtIO block device on PCI bus first
+    if let Some(pci_dev) = crate::pci::find_virtio_block_device() {
+        serial::serial_print("[VirtIO] Found VirtIO block device on PCI\n");
+        serial::serial_print("[VirtIO]   Bus=");
+        serial::serial_print_dec(pci_dev.bus as u64);
+        serial::serial_print(" Device=");
+        serial::serial_print_dec(pci_dev.device as u64);
+        serial::serial_print(" Function=");
+        serial::serial_print_dec(pci_dev.function as u64);
+        serial::serial_print("\n");
+        
+        unsafe {
+            // Enable the PCI device for DMA and I/O
+            crate::pci::enable_device(&pci_dev, true);
+            
+            // Get BAR0 for VirtIO registers
+            let bar0 = crate::pci::get_bar(&pci_dev, 0);
+            let bar_addr = (bar0 & !0xF) as u64;
+            
+            serial::serial_print("[VirtIO]   BAR0=0x");
+            serial::serial_print_hex(bar_addr);
+            serial::serial_print("\n");
+            
+            // Try to create a real VirtIO device from PCI
+            if bar_addr != 0 {
+                match VirtIOBlockDevice::new_from_pci(bar_addr) {
+                    Some(mut device) => {
+                        if device.init() {
+                            serial::serial_print("[VirtIO] Real PCI device initialized successfully\n");
+                            *BLOCK_DEVICE.lock() = Some(device);
+                            return;
+                        }
+                    }
+                    None => {
+                        serial::serial_print("[VirtIO] Failed to create device from PCI BAR\n");
+                    }
+                }
+            }
+        }
+    } else {
+        serial::serial_print("[VirtIO] No VirtIO block device found on PCI bus\n");
+    }
+    
+    // Fall back to simulated device
+    serial::serial_print("[VirtIO] Falling back to simulated block device\n");
     unsafe {
-        // Try to detect VirtIO block device at standard MMIO address
-        // If not found, use simulated device
-        let mut device = match VirtIOBlockDevice::new(VIRTIO_MMIO_BASE) {
-            Some(dev) => {
-                if dev.mmio_base != 0 {
-                    serial::serial_print("VirtIO block device detected at 0x");
-                    serial::serial_print_hex(VIRTIO_MMIO_BASE);
-                    serial::serial_print("\n");
-                }
-                dev
-            }
-            None => {
-                serial::serial_print("Creating simulated block device\n");
-                VirtIOBlockDevice {
-                    mmio_base: 0,
-                    queue_size: 8,
-                }
-            }
+        let mut device = VirtIOBlockDevice {
+            mmio_base: 0,
+            queue_size: 8,
+            queue: None,
         };
         
         if device.init() {
-            serial::serial_print("Block device initialized successfully\n");
+            serial::serial_print("[VirtIO] Simulated device initialized successfully\n");
             *BLOCK_DEVICE.lock() = Some(device);
         } else {
-            serial::serial_print("Failed to initialize block device\n");
+            serial::serial_print("[VirtIO] Failed to initialize simulated device\n");
         }
     }
 }
