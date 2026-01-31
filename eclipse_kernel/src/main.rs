@@ -6,7 +6,10 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
+use alloc::boxed::Box;
 
 // Módulos del microkernel
 mod boot;
@@ -116,43 +119,81 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     
     // Intentar montar el sistema de archivos
     serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
+    let mut init_loaded = false;
+    
     match filesystem::mount_root() {
         Ok(_) => {
             serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
             
-            // TODO: Try to load init from /sbin/init
-            serial::serial_print("[KERNEL] TODO: Load init from /sbin/init\n");
-            serial::serial_print("[KERNEL] For now, loading embedded init process...\n\n");
+            // Try to load init from /sbin/init
+            serial::serial_print("[KERNEL] Attempting to load init from /sbin/init...\n");
+            
+            // Allocate buffer on heap for reading init binary (max 512KB)
+            const MAX_INIT_SIZE: usize = 512 * 1024;
+            let mut init_buffer = Box::new([0u8; MAX_INIT_SIZE]);
+            
+            match filesystem::read_file("/sbin/init", &mut init_buffer[..]) {
+                Ok(bytes_read) => {
+                    serial::serial_print("[KERNEL] Read /sbin/init: ");
+                    serial::serial_print_dec(bytes_read as u64);
+                    serial::serial_print(" bytes\n");
+                    
+                    // Load the ELF binary
+                    if let Some(pid) = elf_loader::load_elf(&init_buffer[..bytes_read]) {
+                        serial::serial_print("[KERNEL] Init process loaded from /sbin/init with PID: ");
+                        serial::serial_print_dec(pid as u64);
+                        serial::serial_print("\n");
+                        
+                        // Add to scheduler queue
+                        scheduler::enqueue_process(pid);
+                        
+                        serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+                        init_loaded = true;
+                    } else {
+                        serial::serial_print("[KERNEL] Failed to load ELF from /sbin/init\n");
+                        serial::serial_print("[KERNEL] Falling back to embedded init...\n");
+                    }
+                }
+                Err(e) => {
+                    serial::serial_print("[KERNEL] Failed to read /sbin/init: ");
+                    serial::serial_print(e);
+                    serial::serial_print("\n");
+                    serial::serial_print("[KERNEL] Falling back to embedded init...\n");
+                }
+            }
         }
         Err(e) => {
             serial::serial_print("[KERNEL] Failed to mount filesystem: ");
             serial::serial_print(e);
             serial::serial_print("\n");
-            serial::serial_print("[KERNEL] Falling back to embedded init...\n\n");
+            serial::serial_print("[KERNEL] Falling back to embedded init...\n");
         }
     }
     
-    // Cargar proceso init desde binario embebido
-    serial::serial_print("Loading init process from embedded binary...\n");
-    serial::serial_print("Init binary size: ");
-    serial::serial_print_dec(INIT_BINARY.len() as u64);
-    serial::serial_print(" bytes\n");
-    
-    // Usar el ELF loader para cargar el binario init
-    if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
-        serial::serial_print("Init process loaded with PID: ");
-        serial::serial_print_dec(pid as u64);
-        serial::serial_print("\n");
+    // If init was not loaded from /sbin/init, load embedded binary
+    if !init_loaded {
+        serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
+        serial::serial_print("[KERNEL] Init binary size: ");
+        serial::serial_print_dec(INIT_BINARY.len() as u64);
+        serial::serial_print(" bytes\n");
         
-        // Agregar a la cola del scheduler
-        scheduler::enqueue_process(pid);
-        
-        serial::serial_print("Init process scheduled for execution\n");
-        serial::serial_print("System initialization complete!\n\n");
-    } else {
-        serial::serial_print("ERROR: Failed to load init process!\n");
-        serial::serial_print("System cannot continue without init\n");
+        // Use the ELF loader to load the init binary
+        if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
+            serial::serial_print("[KERNEL] Init process loaded with PID: ");
+            serial::serial_print_dec(pid as u64);
+            serial::serial_print("\n");
+            
+            // Add to scheduler queue
+            scheduler::enqueue_process(pid);
+            
+            serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+        } else {
+            serial::serial_print("[KERNEL] ERROR: Failed to load init process!\n");
+            serial::serial_print("[KERNEL] System cannot continue without init\n");
+        }
     }
+    
+    serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
     
     loop {
         // Main loop del microkernel
