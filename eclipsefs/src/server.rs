@@ -7,6 +7,9 @@ use anyhow::Result;
 use crate::messages::{Message, MessageType, EclipseFSCommand};
 use crate::operations::FileSystemOperations;
 
+/// Prioridad del servidor de filesystem (alta prioridad como otros servidores del sistema)
+const FILESYSTEM_SERVER_PRIORITY: u8 = 10;
+
 /// Trait común para servidores del microkernel
 pub trait MicrokernelServer {
     fn name(&self) -> &str;
@@ -197,7 +200,7 @@ impl MicrokernelServer for EclipseFSServer {
     }
 
     fn priority(&self) -> u8 {
-        10 // Alta prioridad (igual que el FileSystem Server)
+        FILESYSTEM_SERVER_PRIORITY
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -250,7 +253,14 @@ impl MicrokernelServer for EclipseFSServer {
             EclipseFSCommand::List => self.handle_list(command_data),
             EclipseFSCommand::Stat => self.handle_stat(command_data),
             EclipseFSCommand::Sync => self.handle_sync(),
-            _ => Err(anyhow::anyhow!("Comando no implementado: {:?}", command)),
+            // Comandos no implementados aún
+            EclipseFSCommand::Mkdir | 
+            EclipseFSCommand::Rmdir | 
+            EclipseFSCommand::Rename | 
+            EclipseFSCommand::Chmod | 
+            EclipseFSCommand::StatFS => {
+                Err(anyhow::anyhow!("Comando no implementado: {:?}", command))
+            }
         };
 
         if result.is_err() {

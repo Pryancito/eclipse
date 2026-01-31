@@ -5,6 +5,22 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use eclipsefs_lib::{EclipseFSReader, NodeKind};
 
+/// Primer file descriptor disponible (0,1,2 son stdin/stdout/stderr)
+const FIRST_AVAILABLE_FD: u32 = 3;
+
+/// Datos de ejemplo para archivos cuando no se puede leer del filesystem
+const EXAMPLE_FILE_DATA: &[u8] = b"EclipseFS file content\n";
+
+/// Listado de ejemplo para directorios cuando no se puede leer del filesystem
+const EXAMPLE_DIR_LISTING: &[&str] = &[
+    "boot/",
+    "home/",
+    "etc/",
+    "usr/",
+    "var/",
+    "tmp/",
+];
+
 /// Descriptor de archivo abierto
 #[derive(Debug, Clone)]
 pub struct FileDescriptor {
@@ -31,7 +47,7 @@ impl FileSystemOperations {
     pub fn new() -> Self {
         Self {
             open_files: Arc::new(Mutex::new(HashMap::new())),
-            next_fd: Arc::new(Mutex::new(3)), // Empieza en 3 (0,1,2 son stdin/stdout/stderr)
+            next_fd: Arc::new(Mutex::new(FIRST_AVAILABLE_FD)),
             fs_mounted: Arc::new(Mutex::new(false)),
             fs_image_path: Arc::new(Mutex::new(None)),
         }
@@ -105,6 +121,19 @@ impl FileSystemOperations {
         Ok(fd)
     }
 
+    /// Obtener datos de ejemplo para fallback
+    fn get_example_file_data(buffer: &mut [u8], position: &mut u64) -> usize {
+        let bytes_to_copy = std::cmp::min(buffer.len(), EXAMPLE_FILE_DATA.len());
+        buffer[..bytes_to_copy].copy_from_slice(&EXAMPLE_FILE_DATA[..bytes_to_copy]);
+        *position += bytes_to_copy as u64;
+        bytes_to_copy
+    }
+
+    /// Obtener listado de ejemplo para directorios
+    fn get_example_dir_listing() -> Vec<String> {
+        EXAMPLE_DIR_LISTING.iter().map(|s| s.to_string()).collect()
+    }
+
     /// Leer datos de un archivo
     pub fn read(&self, fd: u32, buffer: &mut [u8]) -> Result<usize> {
         let mut open_files = self.open_files.lock().unwrap();
@@ -144,31 +173,22 @@ impl FileSystemOperations {
                             }
                             Err(_) => {
                                 // Archivo no encontrado, usar datos de ejemplo
-                                let example_data = b"EclipseFS file content\n";
-                                let bytes_to_copy = std::cmp::min(buffer.len(), example_data.len());
-                                buffer[..bytes_to_copy].copy_from_slice(&example_data[..bytes_to_copy]);
-                                descriptor.position += bytes_to_copy as u64;
-                                Ok(bytes_to_copy)
+                                let bytes = Self::get_example_file_data(buffer, &mut descriptor.position);
+                                Ok(bytes)
                             }
                         }
                     }
                     Err(_) => {
                         // Ruta no encontrada, usar datos de ejemplo
-                        let example_data = b"EclipseFS file content\n";
-                        let bytes_to_copy = std::cmp::min(buffer.len(), example_data.len());
-                        buffer[..bytes_to_copy].copy_from_slice(&example_data[..bytes_to_copy]);
-                        descriptor.position += bytes_to_copy as u64;
-                        Ok(bytes_to_copy)
+                        let bytes = Self::get_example_file_data(buffer, &mut descriptor.position);
+                        Ok(bytes)
                     }
                 }
             }
             Err(_) => {
                 // Fallback a datos de ejemplo
-                let example_data = b"EclipseFS simulated content\n";
-                let bytes_to_copy = std::cmp::min(buffer.len(), example_data.len());
-                buffer[..bytes_to_copy].copy_from_slice(&example_data[..bytes_to_copy]);
-                descriptor.position += bytes_to_copy as u64;
-                Ok(bytes_to_copy)
+                let bytes = Self::get_example_file_data(buffer, &mut descriptor.position);
+                Ok(bytes)
             }
         }
     }
@@ -269,42 +289,21 @@ impl FileSystemOperations {
                             Err(_) => {
                                 // Error leyendo nodo, retornar listado de ejemplo
                                 println!("   [EclipseFS] Listado simulado de {}", path);
-                                Ok(vec![
-                                    "boot/".to_string(),
-                                    "home/".to_string(),
-                                    "etc/".to_string(),
-                                    "usr/".to_string(),
-                                    "var/".to_string(),
-                                    "tmp/".to_string(),
-                                ])
+                                Ok(Self::get_example_dir_listing())
                             }
                         }
                     }
                     Err(_) => {
                         // Ruta no encontrada, retornar listado de ejemplo
                         println!("   [EclipseFS] Listado simulado de {}", path);
-                        Ok(vec![
-                            "boot/".to_string(),
-                            "home/".to_string(),
-                            "etc/".to_string(),
-                            "usr/".to_string(),
-                            "var/".to_string(),
-                            "tmp/".to_string(),
-                        ])
+                        Ok(Self::get_example_dir_listing())
                     }
                 }
             }
             Err(_) => {
                 // Retornar listado de ejemplo
                 println!("   [EclipseFS] Listado simulado de {}", path);
-                Ok(vec![
-                    "boot/".to_string(),
-                    "home/".to_string(),
-                    "etc/".to_string(),
-                    "usr/".to_string(),
-                    "var/".to_string(),
-                    "tmp/".to_string(),
-                ])
+                Ok(Self::get_example_dir_listing())
             }
         }
     }
