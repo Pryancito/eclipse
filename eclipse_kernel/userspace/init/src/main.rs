@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -22,6 +22,7 @@ struct Service {
     name: &'static str,
     state: ServiceState,
     restart_count: u32,
+    pid: i32,  // Process ID of the service (0 if not running)
 }
 
 impl Service {
@@ -30,6 +31,7 @@ impl Service {
             name,
             state: ServiceState::Stopped,
             restart_count: 0,
+            pid: 0,
         }
     }
 }
@@ -129,17 +131,36 @@ fn start_service(service: &mut Service) {
     
     service.state = ServiceState::Starting;
     
-    // TODO: Implement actual service spawning
-    // This would:
-    // 1. Fork a new process
-    // 2. Load service executable
-    // 3. Set up IPC channels
-    // 4. Wait for ready signal
+    // Fork a new process for the service
+    let pid = fork();
     
-    // For now, mark as running
-    service.state = ServiceState::Running;
-    
-    println!("  [SERVICE] {} started", service.name);
+    if pid == 0 {
+        // Child process - execute the service
+        println!("  [CHILD] Running as child process for service: {}", service.name);
+        
+        // TODO: Load actual service binary from filesystem
+        // For now, we'll just simulate a service that runs and exits
+        // In a real implementation, we would:
+        // exec(&service_binary);
+        
+        // Simulate service work
+        println!("  [CHILD] Service {} doing work...", service.name);
+        for _ in 0..10000 {
+            yield_cpu();
+        }
+        println!("  [CHILD] Service {} exiting normally", service.name);
+        exit(0);
+    } else if pid > 0 {
+        // Parent process - track the service
+        service.pid = pid;
+        service.state = ServiceState::Running;
+        println!("  [SERVICE] {} started with PID: {}", service.name, pid);
+    } else {
+        // Fork failed
+        println!("  [ERROR] Failed to fork service: {}", service.name);
+        service.state = ServiceState::Failed;
+        service.pid = 0;
+    }
 }
 
 /// Main loop - monitor services and handle system events
@@ -162,8 +183,8 @@ fn main_loop() -> ! {
             print_service_status();
         }
         
-        // Handle zombie processes
-        // TODO: Implement wait() syscall and reap zombies
+        // Handle zombie processes - reap terminated children
+        reap_zombies();
         
         // Yield CPU to other processes
         yield_cpu();
@@ -175,14 +196,40 @@ fn check_services() {
     unsafe {
         for service in SERVICES.iter_mut() {
             if service.state == ServiceState::Running {
-                // TODO: Check if process is still alive
-                // TODO: Restart if crashed
+                // Process is tracked via PID, wait() will detect if it terminates
             } else if service.state == ServiceState::Failed {
-                // TODO: Implement restart policy
+                // Implement restart policy
                 if service.restart_count < 3 {
-                    println!("[INIT] Restarting failed service: {}", service.name);
+                    println!("[INIT] Restarting failed service: {} (attempt {})", 
+                             service.name, service.restart_count + 1);
                     start_service(service);
                     service.restart_count += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Reap zombie processes and update service states
+fn reap_zombies() {
+    loop {
+        // Non-blocking wait for any terminated child
+        let terminated_pid = wait(None);
+        
+        if terminated_pid < 0 {
+            // No more terminated children
+            break;
+        }
+        
+        // Find which service this PID belonged to
+        unsafe {
+            for service in SERVICES.iter_mut() {
+                if service.pid == terminated_pid && service.state == ServiceState::Running {
+                    println!("[INIT] Service {} (PID {}) has terminated", 
+                             service.name, terminated_pid);
+                    service.state = ServiceState::Failed;
+                    service.pid = 0;
+                    break;
                 }
             }
         }
@@ -200,7 +247,13 @@ fn print_service_status() {
                 ServiceState::Running => "running",
                 ServiceState::Failed => "failed",
             };
-            println!("  - {}: {} (restarts: {})", service.name, status, service.restart_count);
+            if service.pid > 0 {
+                println!("  - {}: {} (PID: {}, restarts: {})", 
+                         service.name, status, service.pid, service.restart_count);
+            } else {
+                println!("  - {}: {} (restarts: {})", 
+                         service.name, status, service.restart_count);
+            }
         }
     }
 }
