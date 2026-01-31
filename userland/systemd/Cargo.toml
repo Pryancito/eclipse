@@ -1,0 +1,18 @@
+[package]
+name = "eclipse-systemd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# We'll use eclipse-libc from the kernel userspace
+eclipse-libc = { path = "../../eclipse_kernel/userspace/libc" }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = "s"     # Optimize for size even in dev
