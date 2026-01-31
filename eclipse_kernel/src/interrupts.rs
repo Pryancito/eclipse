@@ -190,27 +190,14 @@ unsafe fn inb(port: u16) -> u8 {
 // Exception Handlers
 // ============================================================================
 
-extern "C" fn exception_handler(num: u64, error_code: u64) {
+extern "C" fn exception_handler(_num: u64, error_code: u64) {
     let mut stats = INTERRUPT_STATS.lock();
     stats.exceptions += 1;
     drop(stats);
     
-    crate::serial::serial_print("Exception ");
-    crate::serial::serial_print_dec(num);
-    crate::serial::serial_print(" occurred! Error code: ");
+    crate::serial::serial_print("Exception occurred! Error code: ");
     crate::serial::serial_print_hex(error_code);
     crate::serial::serial_print("\n");
-    
-    // For page faults, print CR2 (faulting address)
-    if num == 14 {
-        let cr2: u64;
-        unsafe {
-            asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
-        }
-        crate::serial::serial_print("Page fault at address: ");
-        crate::serial::serial_print_hex(cr2);
-        crate::serial::serial_print("\n");
-    }
 }
 
 // Division by zero (#DE)
@@ -221,9 +208,9 @@ unsafe extern "C" fn exception_0() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        // Set parameters in registers (x86-64 calling convention)
-        "mov rdi, 0",      // Exception number
-        "mov rsi, 0",      // Error code (none for this exception)
+        // Push dummy error code
+        "push 0",
+        "push 0",
         "call {}",
         // Restaurar stack
         "mov rsp, rbp",
@@ -240,8 +227,8 @@ unsafe extern "C" fn exception_1() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 1",
-        "mov rsi, 0",
+        "push 0",
+        "push 1",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -257,8 +244,8 @@ unsafe extern "C" fn exception_3() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 3",
-        "mov rsi, 0",
+        "push 0",
+        "push 3",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -274,8 +261,8 @@ unsafe extern "C" fn exception_4() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 4",
-        "mov rsi, 0",
+        "push 0",
+        "push 4",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -291,8 +278,8 @@ unsafe extern "C" fn exception_6() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 6",
-        "mov rsi, 0",
+        "push 0",
+        "push 6",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -308,13 +295,12 @@ unsafe extern "C" fn exception_8() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        // Error code is at [rbp + 8] (pushed by CPU before return address)
-        "mov rdi, 8",           // Exception number
-        "mov rsi, [rbp + 8]",   // Error code from stack
+        // Error code ya está en el stack
+        "push 8",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
-        "add rsp, 8",  // Pop error code
+        "add rsp, 8", // Pop error code
         "iretq",
         sym exception_handler,
     );
@@ -327,8 +313,7 @@ unsafe extern "C" fn exception_13() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 13",
-        "mov rsi, [rbp + 8]",  // Error code from stack
+        "push 13",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
@@ -345,8 +330,7 @@ unsafe extern "C" fn exception_14() {
         "push rbp",
         "mov rbp, rsp",
         "and rsp, -16",
-        "mov rdi, 14",
-        "mov rsi, [rbp + 8]",  // Error code from stack
+        "push 14",
         "call {}",
         "mov rsp, rbp",
         "pop rbp",
