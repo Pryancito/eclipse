@@ -12,11 +12,15 @@ pub mod memory;
 pub mod interrupts;
 pub mod ipc;
 pub mod serial;
+pub mod process;
+pub mod scheduler;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};
 pub use memory::{PageTable, PageTableEntry};
 pub use interrupts::InterruptStats;
+pub use process::{Process, ProcessId, ProcessState, Context};
+pub use scheduler::SchedulerStats;
 
 #[cfg(not(test))]
 #[panic_handler]

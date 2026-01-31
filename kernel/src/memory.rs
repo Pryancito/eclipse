@@ -99,7 +99,7 @@ pub fn init() {
 
 /// Estructura de entrada de tabla de páginas
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PageTableEntry {
     entry: u64,
 }
@@ -115,6 +115,10 @@ impl PageTableEntry {
     
     pub fn present(&self) -> bool {
         self.entry & 0x1 != 0
+    }
+    
+    pub fn get_addr(&self) -> u64 {
+        self.entry & 0x000F_FFFF_FFFF_F000
     }
 }
 
@@ -142,3 +146,63 @@ pub const PAGE_ACCESSED: u64 = 1 << 5;
 pub const PAGE_DIRTY: u64 = 1 << 6;
 pub const PAGE_HUGE: u64 = 1 << 7;
 pub const PAGE_GLOBAL: u64 = 1 << 8;
+
+/// Tablas de páginas estáticas para el kernel
+static mut PML4: PageTable = PageTable::new();
+static mut PDPT: PageTable = PageTable::new();
+static mut PD: PageTable = PageTable::new();
+
+/// Inicializar paginación
+pub fn init_paging() {
+    unsafe {
+        // Configurar identity mapping para los primeros 2GB
+        // PML4[0] -> PDPT
+        PML4.entries[0].set_addr(
+            &PDPT as *const _ as u64,
+            PAGE_PRESENT | PAGE_WRITABLE
+        );
+        
+        // PML4[511] -> PDPT (higher half)
+        PML4.entries[511].set_addr(
+            &PDPT as *const _ as u64,
+            PAGE_PRESENT | PAGE_WRITABLE
+        );
+        
+        // PDPT[0] -> PD
+        PDPT.entries[0].set_addr(
+            &PD as *const _ as u64,
+            PAGE_PRESENT | PAGE_WRITABLE
+        );
+        
+        // PD: Mapear 1GB con páginas de 2MB (huge pages)
+        for i in 0..512 {
+            PD.entries[i].set_addr(
+                (i as u64) * 0x200000, // 2MB per entry
+                PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE
+            );
+        }
+        
+        // Cargar CR3 con PML4
+        let pml4_addr = &PML4 as *const _ as u64;
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) pml4_addr,
+            options(nostack, preserves_flags)
+        );
+    }
+    
+    crate::serial::serial_print("Paging enabled\n");
+}
+
+/// Obtener dirección física de CR3
+pub fn get_cr3() -> u64 {
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr3",
+            out(reg) cr3,
+            options(nostack, preserves_flags)
+        );
+    }
+    cr3
+}

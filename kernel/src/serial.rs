@@ -88,6 +88,33 @@ pub fn serial_print_hex(num: u64) {
     }
 }
 
+/// Escribir un número decimal
+pub fn serial_print_dec(num: u64) {
+    if !*SERIAL_INITIALIZED.lock() {
+        return;
+    }
+    
+    if num == 0 {
+        write_byte(b'0');
+        return;
+    }
+    
+    let mut n = num;
+    let mut digits = [0u8; 20];
+    let mut i = 0;
+    
+    while n > 0 {
+        digits[i] = (b'0' + (n % 10) as u8);
+        n /= 10;
+        i += 1;
+    }
+    
+    while i > 0 {
+        i -= 1;
+        write_byte(digits[i]);
+    }
+}
+
 /// Escribir a un puerto de I/O
 #[inline]
 unsafe fn outb(port: u16, value: u8) {

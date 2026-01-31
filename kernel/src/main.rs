@@ -14,6 +14,8 @@ mod memory;
 mod interrupts;
 mod ipc;
 mod serial;
+mod process;
+mod scheduler;
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -60,6 +62,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Initializing memory system...\n");
     memory::init();
     
+    // Configurar paginación
+    serial::serial_print("Enabling paging...\n");
+    memory::init_paging();
+    
     // Inicializar IDT e interrupciones
     serial::serial_print("Initializing IDT and interrupts...\n");
     interrupts::init();
@@ -67,6 +73,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
     // Inicializar sistema IPC
     serial::serial_print("Initializing IPC system...\n");
     ipc::init();
+    
+    // Inicializar scheduler
+    serial::serial_print("Initializing scheduler...\n");
+    scheduler::init();
     
     serial::serial_print("Microkernel initialized successfully!\n");
     
@@ -78,9 +88,19 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64) -> ! {
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("Entering kernel main loop...\n");
     
-    // TODO: Iniciar servidores del sistema
-    // TODO: Configurar scheduler
-    // TODO: Cargar proceso init
+    // Crear un proceso de prueba
+    serial::serial_print("Creating test process...\n");
+    let stack_base = 0x400000; // 4MB mark
+    let stack_size = 0x10000;  // 64KB
+    
+    if let Some(pid) = process::create_process(test_process as u64, stack_base, stack_size) {
+        serial::serial_print("Test process created with PID: ");
+        serial::serial_print_dec(pid as u64);
+        serial::serial_print("\n");
+        
+        // Agregar a la cola del scheduler
+        scheduler::enqueue_process(pid);
+    }
     
     loop {
         // Main loop del microkernel
@@ -89,5 +109,13 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
         
         // Yield CPU
         unsafe { core::arch::asm!("hlt") };
+    }
+}
+
+/// Proceso de prueba simple
+extern "C" fn test_process() -> ! {
+    loop {
+        // Proceso de prueba - simplemente yield
+        scheduler::yield_cpu();
     }
 }
