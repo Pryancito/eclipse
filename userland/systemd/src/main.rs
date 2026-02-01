@@ -290,22 +290,42 @@ fn start_system_services() {
         
         println!();
         
-        // Then start services with dependencies (in priority order)
+        // Multi-pass dependency resolution for cascading dependencies
         println!("  [START] Starting dependent services...");
-        for i in 0..SERVICE_COUNT {
-            if let Some(ref mut service) = SERVICES[i] {
-                if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
-                    // Check if dependencies are met
-                    if check_dependencies(service) {
-                        start_service(service, i);
-                        // Allow service to initialize
-                        for _ in 0..SERVICE_INIT_DELAY {
-                            yield_cpu();
+        let max_passes = 10;  // Prevent infinite loops
+        let mut pass = 0;
+        let mut services_started_this_pass;
+        
+        loop {
+            pass += 1;
+            services_started_this_pass = 0;
+            
+            println!("  [PASS {}] Checking service dependencies...", pass);
+            
+            for i in 0..SERVICE_COUNT {
+                if let Some(ref mut service) = SERVICES[i] {
+                    if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
+                        // Check if dependencies are met
+                        if check_dependencies(service) {
+                            start_service(service, i);
+                            services_started_this_pass += 1;
+                            // Allow service to initialize
+                            for _ in 0..SERVICE_INIT_DELAY {
+                                yield_cpu();
+                            }
                         }
-                    } else {
-                        println!("  [SKIP] {} - dependencies not met", service.name);
                     }
                 }
+            }
+            
+            if services_started_this_pass == 0 {
+                println!("  [COMPLETE] No more services to start");
+                break;
+            }
+            
+            if pass >= max_passes {
+                println!("  [WARNING] Maximum passes reached, some services may not have started");
+                break;
             }
         }
     }
