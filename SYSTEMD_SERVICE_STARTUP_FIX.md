@@ -179,8 +179,15 @@ Once the fix is confirmed working, disable debug output for production:
 
 1. Edit `eclipse-apps/systemd/src/main.rs`
 2. Change `const DEBUG_SERVICE_STARTUP: bool = true;` to `const DEBUG_SERVICE_STARTUP: bool = false;`
-3. Rebuild systemd: `cd eclipse-apps/systemd && cargo +nightly build --release --target x86_64-unknown-none`
+3. Rebuild the system: `./build.sh`
 4. Test again to ensure production build works without debug output
+
+Note: For a quick rebuild of just systemd, you can also use:
+```bash
+cd eclipse-apps/systemd
+cargo +nightly build --release --target x86_64-unknown-none
+cd ../..
+```
 
 ## Technical Details
 
