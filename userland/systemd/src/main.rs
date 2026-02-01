@@ -189,7 +189,7 @@ fn init_services() {
         const NO_DEPS: &[usize] = &[];
         const LOG_DEPS: &[usize] = &[0];      // Depends on log service
         const DEVFS_DEPS: &[usize] = &[0, 1]; // Depends on log + devfs
-        const INPUT_DEPS: &[usize] = &[0, 1, 2]; // Depends on log + devfs + input
+        const INPUT_DEPS: &[usize] = &[0, 1, 2]; // Depends on log + devfs + input (for Display/Network)
         
         // Service 0: Log Server / Console (no dependencies - MUST BE FIRST)
         add_service(Service::new(
