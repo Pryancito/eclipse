@@ -38,7 +38,7 @@ done
 echo "Building eclipse-systemd..."
 if [ -d "eclipse-apps/systemd" ]; then
     cd eclipse-apps/systemd
-    cargo build --release --target x86_64-unknown-none
+    cargo +nightly build --release --target x86_64-unknown-none
     if [ $? -ne 0 ]; then
         echo "Failed to build eclipse-systemd"
         exit 1
