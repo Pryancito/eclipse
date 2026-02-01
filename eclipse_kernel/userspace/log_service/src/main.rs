@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, yield_cpu, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
 
 /// Log buffer for storing messages before filesystem is ready
 /// 
@@ -42,18 +42,39 @@ fn log_message(msg: &str) {
     // 1. Write to serial port (immediate output for debugging)
     println!("{}", msg);
     
-    // 2. Buffer the message for later file write
+    // 2. Buffer the message for batched file writes
     log_to_buffer(msg);
     log_to_buffer("\n");
     
-    // 3. TODO: When filesystem syscalls (open, write, close) are available,
-    //    write buffered logs to /var/log/system.log
-    //    Example:
-    //    let fd = open("/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND);
-    //    if fd >= 0 {
-    //        write(fd, LOG_BUFFER.as_ptr(), LOG_BUFFER_POS);
-    //        close(fd);
-    //    }
+    // 3. Write buffered logs to /var/log/system.log
+    // Flush buffer when it reaches a threshold or periodically
+    unsafe {
+        if LOG_BUFFER_POS > 3072 {  // Flush when 75% full
+            flush_log_buffer();
+        }
+    }
+}
+
+/// Flush the log buffer to /var/log/system.log
+fn flush_log_buffer() {
+    unsafe {
+        if LOG_BUFFER_POS == 0 {
+            return; // Nothing to flush
+        }
+        
+        // Open the log file
+        let fd = open("/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
+        if fd >= 0 {
+            // Write buffered data to file
+            let written = write(fd as u32, &LOG_BUFFER[..LOG_BUFFER_POS]);
+            if written > 0 {
+                // Successfully written
+                LOG_BUFFER_POS = 0; // Reset buffer
+            }
+            // Close the file
+            close(fd);
+        }
+    }
 }
 
 #[no_mangle]
@@ -77,9 +98,16 @@ pub extern "C" fn _start() -> ! {
     // Main loop - handle log messages
     let mut heartbeat_counter = 0u64;
     let mut log_stats_counter = 0u64;
+    let mut flush_counter = 0u64;
     
     loop {
         heartbeat_counter += 1;
+        flush_counter += 1;
+        
+        // Periodically flush log buffer to file (every 1 million iterations)
+        if flush_counter % 1000000 == 0 {
+            flush_log_buffer();
+        }
         
         // Process log messages (simulated IPC reception)
         if heartbeat_counter % 500000 == 0 {
