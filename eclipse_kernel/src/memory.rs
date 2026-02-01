@@ -159,19 +159,19 @@ pub fn init_paging(kernel_phys_base: u64) {
         // PML4[0] -> PDPT
         PML4.entries[0].set_addr(
             pdpt_phys,
-            PAGE_PRESENT | PAGE_WRITABLE
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
         );
         
         // PML4[511] -> PDPT (higher half)
         PML4.entries[511].set_addr(
             pdpt_phys,
-            PAGE_PRESENT | PAGE_WRITABLE
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
         );
         
         // PDPT[0] -> PD
         PDPT.entries[0].set_addr(
             pd_phys,
-            PAGE_PRESENT | PAGE_WRITABLE
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
         );
         
         // PD: Mapear 1GB con páginas de 2MB (huge pages)

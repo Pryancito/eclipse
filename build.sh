@@ -91,6 +91,32 @@ build_eclipsefs_lib() {
     cd ..
 }
 
+# Función para compilar el proceso init (embedded)
+build_eclipse_init() {
+    print_step "Compilando init process (embedded)..."
+    
+    cd eclipse_kernel/userspace/init
+    
+    print_status "Compilando eclipse-init..."
+    RUSTFLAGS="-C link-arg=-Tlinker.ld -C relocation-model=static" cargo build --release --target x86_64-unknown-none
+    
+    if [ $? -eq 0 ]; then
+        print_success "eclipse-init compilado exitosamente"
+        
+        local init_path="target/x86_64-unknown-none/release/eclipse-init"
+        if [ -f "$init_path" ]; then
+            local init_size=$(du -h "$init_path" | cut -f1)
+            print_status "Init process generado: $init_path ($init_size)"
+        fi
+    else
+        print_error "Error al compilar eclipse-init"
+        cd ../../..
+        return 1
+    fi
+    
+    cd ../../..
+}
+
 # Función para compilar el kernel
 build_kernel() {
     print_step "Compilando kernel Eclipse OS v0.1.0..."
@@ -1238,6 +1264,7 @@ show_build_summary() {
     echo "Binarios compilados:"
     echo "Componentes compilados:"
     echo "  Librería EclipseFS: eclipsefs-lib/target/debug/libeclipsefs_lib.rlib"
+    echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init"
     echo "  Kernel Eclipse OS: target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
     echo "  Instalador: installer/target/release/eclipse-installer"
@@ -1406,6 +1433,7 @@ main() {
     build_mkfs_eclipsefs
     build_populate_eclipsefs
     build_eclipsefs_cli
+    build_eclipse_init
     build_kernel
     build_bootloader
     build_installer

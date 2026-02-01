@@ -128,7 +128,8 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         }
     }
     
-    let stack_base = 0x700000; // 7MB
+    // Default user stack at 96MB
+    let stack_base = 0x6000000; // 512MB
     let stack_size = 0x10000;  // 64KB
     
     create_process(header.e_entry, stack_base, stack_size)
@@ -182,13 +183,24 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
 
 /// Jump to entry point in userspace (Ring 3)
 /// This function never returns
-pub unsafe fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
-    serial::serial_print("ELF: Jumping to entry point in userspace: ");
+/// 
+/// # Safety
+/// This function constructs a stack frame and executes `iretq` to switch privilege levels.
+/// It MUST be called with a valid userspace entry point and stack top.
+pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
+    // FORCE PRINT to ensure we reached this point
+    serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
+    serial::serial_print("  Entry: ");
     serial::serial_print_hex(entry_point);
+    serial::serial_print("\n  Stack: ");
+    serial::serial_print_hex(stack_top);
     serial::serial_print("\n");
     
-    let user_cs: u64 = 0x1b; // Selector de datos/código usuario (GDT) + RPL 3
-    let user_ds: u64 = 0x23;
+    // Selectors from boot.rs:
+    // USER_CODE_SELECTOR: u16 = 0x18 | 3;
+    // USER_DATA_SELECTOR: u16 = 0x20 | 3;
+    let user_cs: u64 = 0x1b; // 0x18 | 3
+    let user_ds: u64 = 0x23; // 0x20 | 3
     let rflags: u64 = 0x202; // Interrupciones habilitadas
 
     asm!(

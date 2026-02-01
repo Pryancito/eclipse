@@ -4,8 +4,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Userspace programs load at 0x400000 (4MB) */
-    . = 0x400000;
+    /* Userspace programs load    /* Load at 64MB to avoid kernel compatibility issues */
+    . = 0x4000000;
 
     .text : ALIGN(4K)
     {

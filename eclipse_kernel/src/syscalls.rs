@@ -65,6 +65,11 @@ pub extern "C" fn syscall_handler(
     stats.total_calls += 1;
     drop(stats);
     
+    // DEBUG: Trace all syscalls
+    // serial::serial_print("SYSCALL: ");
+    // serial::serial_print_dec(syscall_num);
+    // serial::serial_print("\n");
+
     match syscall_num {
         0 => sys_exit(arg1),
         1 => sys_write(arg1, arg2, arg3),
@@ -111,9 +116,16 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         if buf_ptr != 0 && len > 0 && len < 4096 {
             unsafe {
                 let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                for &byte in slice {
-                    if byte != 0 {
-                        serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("?"));
+                if let Ok(s) = core::str::from_utf8(slice) {
+                    serial::serial_print(s);
+                } else {
+                    // Fallback for non-utf8 (print safe chars)
+                    for &byte in slice {
+                        if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
+                             serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
+                        } else {
+                            serial::serial_print(".");
+                        }
                     }
                 }
             }
@@ -285,8 +297,8 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         
         // This doesn't return - we jump to the new process entry point
         unsafe {
-            // Use standard userspace stack top
-            let stack_top: u64 = 0x800000;
+            // Use standard userspace stack top (96MB + 64KB)
+            let stack_top: u64 = 0x6010000;
             crate::elf_loader::jump_to_userspace(entry_point, stack_top);
         }
     } else {

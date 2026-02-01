@@ -102,7 +102,9 @@ pub fn init() {
         KERNEL_IDT.entries[33].set_handler(irq_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
         // Configurar syscall handler (int 0x80)
-        KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        // Must be callable from Ring 3 (DPL 3) or it will cause #GP
+        const IDT_RING_3: u8 = 0b01100000;
+        KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_3 | IDT_INTERRUPT_GATE);
         
         // Cargar IDT
         let idt_descriptor = IdtDescriptor {
@@ -122,8 +124,8 @@ pub fn init() {
     
     // Habilitar interrupciones
     unsafe {
-        // asm!("sti", options(nomem, nostack));
-        crate::serial::serial_print("[INT] Interrupts DISABLED for debugging\n");
+        asm!("sti", options(nomem, nostack));
+        crate::serial::serial_print("[INT] Interrupts ENABLED\n");
     }
 }
 
@@ -413,11 +415,11 @@ extern "C" fn timer_handler() {
     stats.irqs += 1;
     drop(stats);
     
-    // Llamar al scheduler si está disponible
-    #[cfg(feature = "scheduler")]
-    crate::scheduler::tick();
-    
+    // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
+    
+    // Llamar al scheduler si está disponible
+    crate::scheduler::tick();
 }
 
 #[unsafe(naked)]
@@ -534,15 +536,15 @@ unsafe extern "C" fn syscall_int80() {
         // r10 = arg4
         // r8 = arg5
         // r9 = arg6
-        "mov rdi, rax",  // syscall_num
-        "mov rsi, rdi",  // arg1 (original rdi)
-        "mov rdx, rsi",  // arg2 (original rsi)
-        "mov rcx, rdx",  // arg3 (original rdx)
-        "mov r8, r10",   // arg4
-        "mov r9, r8",    // arg5
+        "mov r9, r8",    // arg5 (from r8)
+        "mov r8, r10",   // arg4 (from r10)
+        "mov rcx, rdx",  // arg3 (from rdx)
+        "mov rdx, rsi",  // arg2 (from rsi)
+        "mov rsi, rdi",  // arg1 (from rdi)
+        "mov rdi, rax",  // syscall_num (from rax)
         "call {}",
         // Resultado en rax
-        "mov [rsp + 80], rax",  // Guardar resultado en rax guardado
+        "mov [rsp + 72], rax",  // Guardar resultado en rax guardado
         // Restaurar registros
         "pop r11",
         "pop r10",

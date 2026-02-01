@@ -117,6 +117,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     serial::serial_print("Initializing IPC system...\n");
     ipc::init();
     
+    // Inicializar proceso kernel (PID 0)
+    serial::serial_print("Initializing kernel process (PID 0)...\n");
+    process::init_kernel_process();
+    
     // Inicializar scheduler
     serial::serial_print("Initializing scheduler...\n");
     scheduler::init();
@@ -126,8 +130,8 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     syscalls::init();
     
     // Inicializar servidores del sistema
-    serial::serial_print("Initializing system servers...\n");
-    servers::init_servers();
+    //serial::serial_print("Initializing system servers...\n");
+    //servers::init_servers();
     
     // Inicializar subsistema PCI
     serial::serial_print("Initializing PCI subsystem...\n");
@@ -167,6 +171,9 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
         Ok(_) => {
             serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
             
+            // TEMPORARY: Skip loading from disk to use safe embedded init
+            // This ensures we use the binary with correct memory layout (0x10000000)
+            // instead of the old binary on disk (0x400000) which crashes the kernel.
             // Try to load init from /sbin/eclipse-systemd
             serial::serial_print("[KERNEL] Attempting to load init from /sbin/eclipse-systemd...\n");
             
@@ -192,18 +199,6 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
                         
                         serial::serial_print("[KERNEL] Init process scheduled for execution\n");
                         init_loaded = true;
-                        
-                        // DEBUG: Run immediately to test userspace switch
-                        if let Some(process) = process::get_process(pid) {
-                             unsafe {
-                                 serial::serial_print("[KERNEL] DEBUG: Jumping directly to userspace (bypassing scheduler)...\n");
-                                 // Stack grows down, so base + size is top
-                                 // Note: create_process subtracts 16 from rsp?
-                                 // Let's use stack_base + stack_size
-                                 let stack_top = process.stack_base + process.stack_size as u64;
-                                 elf_loader::jump_to_userspace(process.context.rip, stack_top);
-                             }
-                        }
                     } else {
                         serial::serial_print("[KERNEL] Failed to load ELF from /sbin/eclipse-systemd\n");
                         serial::serial_print("[KERNEL] Falling back to embedded init...\n");
@@ -217,6 +212,7 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
                 }
             }
         }
+
         Err(e) => {
             serial::serial_print("[KERNEL] Failed to mount filesystem: ");
             serial::serial_print(e);

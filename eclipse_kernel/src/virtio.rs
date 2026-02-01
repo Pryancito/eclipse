@@ -977,18 +977,6 @@ pub fn init() {
     use crate::serial;
     
     serial::serial_print("[VirtIO] Initializing VirtIO devices...\n");
-    
-    // Self-test virt_to_phys
-    unsafe {
-        let test_ptr = &BLOCK_DEVICE as *const _ as u64;
-        let phys = crate::memory::virt_to_phys(test_ptr);
-        serial::serial_print("[VirtIO] Memory test: Virt=");
-        serial::serial_print_hex(test_ptr);
-        serial::serial_print(" Phys=");
-        serial::serial_print_hex(phys);
-        serial::serial_print("\n");
-    }
-    
     serial::serial_print("[VirtIO] Searching for VirtIO block devices on PCI bus...\n");
     
     // Try to find VirtIO block device on PCI bus first

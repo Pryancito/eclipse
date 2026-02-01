@@ -9,6 +9,50 @@ struct GdtDescriptor {
     offset: u64,
 }
 
+/// Task State Segment (64-bit)
+#[repr(C, packed)]
+pub struct TaskStateSegment {
+    reserved1: u32,
+    pub rsp0: u64,
+    pub rsp1: u64,
+    pub rsp2: u64,
+    reserved2: u64,
+    pub ist1: u64,
+    pub ist2: u64,
+    pub ist3: u64,
+    pub ist4: u64,
+    pub ist5: u64,
+    pub ist6: u64,
+    pub ist7: u64,
+    reserved3: u64,
+    reserved4: u16,
+    pub iomap_base: u16,
+}
+
+impl TaskStateSegment {
+    pub const fn new() -> Self {
+        Self {
+            reserved1: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            reserved2: 0,
+            ist1: 0,
+            ist2: 0,
+            ist3: 0,
+            ist4: 0,
+            ist5: 0,
+            ist6: 0,
+            ist7: 0,
+            reserved3: 0,
+            reserved4: 0,
+            iomap_base: 0xFFFF,
+        }
+    }
+}
+
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
+
 /// Entrada de la GDT
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -38,6 +82,8 @@ impl GdtEntry {
 #[repr(C, align(16))]
 struct Gdt {
     entries: [GdtEntry; 8],
+    tss_system: GdtEntry, // User system segment (TSS low)
+    tss_ignore: GdtEntry, // User system segment (TSS high)
 }
 
 /// GDT estática
@@ -58,11 +104,47 @@ static mut GDT: Gdt = Gdt {
         GdtEntry::new(0, 0, 0, 0),
         GdtEntry::new(0, 0, 0, 0),
     ],
+    tss_system: GdtEntry::new(0, 0, 0, 0),
+    tss_ignore: GdtEntry::new(0, 0, 0, 0),
 };
 
-/// Cargar la GDT
+/// Cargar la GDT y TSS
 pub fn load_gdt() {
     unsafe {
+        // Setup TSS entry in GDT
+        let tss_base = &TSS as *const _ as u64;
+        let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u32;
+        
+        // 0x40: TSS Descriptor (16 bytes)
+        // System Segment (0), Type 9 (Available TSS), DPL 0, P 1
+        // Access byte: 0b10001001 = 0x89
+        GDT.tss_system = GdtEntry::new(tss_base as u32, tss_limit, 0x89, 0x00);
+        
+        // Upper 32 bits of base address
+        let upper_base = (tss_base >> 32) as u32;
+        // In 64-bit mode, the upper 8 bytes of the system descriptor contain the upper 32 bits of base
+        // GdtEntry struct layout: limit_low(2), base_low(2), base_mid(1), access(1), gran(1), base_high(1)
+        // We reuse GdtEntry structure but the fields mean different things for the second half of system descriptor
+        // The upper 32 bits of base go into the first 32 bits of the second entry (reserved in struct)
+        // We need to be careful with GdtEntry structure packing
+        
+        // Let's construct it raw to be safe or map it.
+        // limit_low (2) + base_low (2) = 4 bytes
+        // base_mid (1) + access (1) + gran (1) + base_high (1) = 4 bytes
+        
+        // For the high part of 64-bit descriptor:
+        // Bytes 0-3: Base 32-63
+        // Bytes 4-7: Reserved (zero)
+        
+        GDT.tss_ignore = GdtEntry {
+            limit_low: (upper_base & 0xFFFF) as u16,
+            base_low: ((upper_base >> 16) & 0xFFFF) as u16,
+            base_middle: 0,
+            access: 0,
+            granularity: 0,
+            base_high: 0,
+        };
+
         let descriptor = GdtDescriptor {
             size: (core::mem::size_of::<Gdt>() - 1) as u16,
             offset: &GDT as *const _ as u64,
@@ -89,6 +171,20 @@ pub fn load_gdt() {
             "mov ss, ax",
             out("rax") _,
         );
+        
+        // Load TSS
+        asm!(
+            "mov ax, 0x40",
+            "ltr ax",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Set the kernel stack pointer in the TSS (RSP0)
+pub fn set_tss_stack(stack_top: u64) {
+    unsafe {
+        TSS.rsp0 = stack_top;
     }
 }
 
@@ -97,6 +193,7 @@ pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const USER_CODE_SELECTOR: u16 = 0x18 | 3; // Ring 3
 pub const USER_DATA_SELECTOR: u16 = 0x20 | 3; // Ring 3
+pub const TSS_SELECTOR: u16 = 0x40;
 
 /// Habilitar instrucciones SSE
 pub fn enable_sse() {

@@ -97,15 +97,31 @@ pub fn schedule() {
 
 /// Realizar context switch entre dos procesos
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
+    let dbg_from_pid = Some(from_pid);
     let mut stats = SCHEDULER_STATS.lock();
     stats.context_switches += 1;
     drop(stats);
     
     set_current_process(Some(to_pid));
     
+    // DEBUG: Print context switch
+    crate::serial::serial_print("Context switch: ");
+    if let Some(fid) = dbg_from_pid {
+         crate::serial::serial_print_dec(fid as u64);
+    } else {
+         crate::serial::serial_print("None");
+    }
+    crate::serial::serial_print(" -> ");
+    crate::serial::serial_print_dec(to_pid as u64);
+    crate::serial::serial_print("\n");
+    
     // Obtener contextos
     let mut from_process = get_process(from_pid).unwrap();
     let to_process = get_process(to_pid).unwrap();
+    
+    // Update TSS RSP0 for the next process
+    // This ensures that interrupts happening in userspace will switch to this process's kernel stack
+    crate::boot::set_tss_stack(to_process.kernel_stack_top);
     
     // Realizar switch
     unsafe {

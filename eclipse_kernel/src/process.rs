@@ -66,7 +66,7 @@ impl Context {
             r15: 0,
             rsp: 0,
             rip: 0,
-            rflags: 0x202, // IF (interrupts enabled)
+            rflags: 0x002, // IF disabled by default
         }
     }
 }
@@ -82,6 +82,7 @@ pub struct Process {
     pub priority: u8,
     pub time_slice: u32,
     pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
+    pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
 }
 
 impl Process {
@@ -95,6 +96,7 @@ impl Process {
             priority: 0,
             time_slice: 0,
             parent_pid: None,
+            kernel_stack_top: 0,
         }
     }
 }
@@ -136,8 +138,42 @@ fn allocate_stack() -> Option<u64> {
 }
 
 
+/// Inicializar el proceso kernel (PID 0)
+pub fn init_kernel_process() {
+    let mut table = PROCESS_TABLE.lock();
+    // No tocamos NEXT_PID, dejamos que empiece en 1
+    
+    // Crear proceso kernel
+    let mut process = Process::new();
+    process.id = 0;
+    process.state = ProcessState::Running;
+    process.priority = 0; // Prioridad más baja
+    process.time_slice = 10;
+    
+    // No necesitamos configurar el contexto ya que se guardará
+    // en el primer switch.
+    
+    // Insertar en la tabla (slot 0)
+    table[0] = Some(process);
+    
+    // Establecer como actual
+    *CURRENT_PROCESS.lock() = Some(0);
+}
+
 /// Crear un nuevo proceso
 pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> Option<ProcessId> {
+    // Allocate kernel stack for this process
+    // For now, we use a fixed size buffer from heap or a pool could be better.
+    // Let's alloc from heap using vec!
+    // 8KB kernel stack should be enough
+    let kernel_stack_size = 8192;
+    let kernel_stack = alloc::vec![0u8; kernel_stack_size];
+    let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
+    
+    // Leak the memory so it persists for the process lifetime (simplification for now)
+    // Ideally we should store the Vec in the Process struct to drop it later
+    core::mem::forget(kernel_stack);
+
     let mut table = PROCESS_TABLE.lock();
     let mut next_pid = NEXT_PID.lock();
     
@@ -155,10 +191,26 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
             process.priority = 5; // Prioridad media por defecto
             process.time_slice = 10; // 10 ticks
             
+            // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
+            let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+
             // Configurar contexto inicial
-            process.context.rip = entry_point;
-            process.context.rsp = stack_base + stack_size as u64 - 16; // Dejar espacio
-            process.context.rflags = 0x202; // IF enabled
+            // En vez de saltar directo al userspace (que mantendría Ring 0),
+            // saltamos a una función trampolín que hace `iretq` para cambiar a Ring 3
+            process.context.rip = crate::elf_loader::jump_to_userspace as u64;
+            process.context.rdi = entry_point;                            // arg1 para jump_to_userspace
+            process.context.rsi = stack_base + stack_size as u64;         // arg2 para jump_to_userspace
+            process.context.rsp = kernel_stack_top_aligned;               // Stack del kernel para el trampolín
+            process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
+            process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
+            
+            crate::serial::serial_print("[PROCESS] Created PID ");
+            crate::serial::serial_print_dec(pid as u64);
+            crate::serial::serial_print(" | RIP (Trampoline): ");
+            crate::serial::serial_print_hex(process.context.rip);
+            crate::serial::serial_print(" | RSP (Kernel): ");
+            crate::serial::serial_print_hex(process.context.rsp);
+            crate::serial::serial_print("\n");
             
             *slot = Some(process);
             return Some(pid);
@@ -212,66 +264,89 @@ pub fn update_process(pid: ProcessId, process: Process) {
 /// Esta función es unsafe porque manipula directamente registros de CPU
 pub unsafe fn switch_context(from: &mut Context, to: &Context) {
     asm!(
-        // Guardar contexto actual
-        "mov [{from} + 0x00], rax",
-        "mov [{from} + 0x08], rbx",
-        "mov [{from} + 0x10], rcx",
-        "mov [{from} + 0x18], rdx",
-        "mov [{from} + 0x20], rsi",
-        "mov [{from} + 0x28], rdi",
-        "mov [{from} + 0x30], rbp",
-        "mov [{from} + 0x38], r8",
-        "mov [{from} + 0x40], r9",
-        "mov [{from} + 0x48], r10",
-        "mov [{from} + 0x50], r11",
-        "mov [{from} + 0x58], r12",
-        "mov [{from} + 0x60], r13",
-        "mov [{from} + 0x68], r14",
-        "mov [{from} + 0x70], r15",
+        // Guardar contexto actual (usando rdi = from)
+        "mov [rdi + 0x00], rax",
+        "mov [rdi + 0x08], rbx",
+        "mov [rdi + 0x10], rcx",
+        "mov [rdi + 0x18], rdx",
+        "mov [rdi + 0x20], rsi",
+        // rdi está en uso, pero guarda su valor original (que recibimos)
+        // No, el valor de rdi NO está en rdi ahora mismo? 
+        // Sí, porque 'from' está pinneado a rdi. 
+        // PERO rdi caller-saved/callee-saved issues? 
+        // No, 'from' es un puntero. El valor del registro RDI del proceso 'actual' 
+        // antes de llamar a esta funcion es lo que queremos guardar?
+        // No, queremos guardar el estado de los registros general purpose.
+        // El rdi que usamos es el puntero 'from'. Si queremos guardar el rdi del proceso,
+        // tendríamos que haberlo pusheado o algo?
+        // En System V ABI, RDI es el primer argumento.
+        // Así que RDI tiene el puntero 'from'. EL valor RDI del proceso es 'from'.
+        // Eso está bien para 'from'.
+        "mov [rdi + 0x28], rdi", 
+        "mov [rdi + 0x30], rbp",
+        "mov [rdi + 0x38], r8",
+        "mov [rdi + 0x40], r9",
+        "mov [rdi + 0x48], r10",
+        "mov [rdi + 0x50], r11",
+        "mov [rdi + 0x58], r12",
+        "mov [rdi + 0x60], r13",
+        "mov [rdi + 0x68], r14",
+        "mov [rdi + 0x70], r15",
         
         // Guardar RSP actual
         "mov rax, rsp",
-        "mov [{from} + 0x78], rax",
+        "mov [rdi + 0x78], rax",
         
         // Guardar RIP (dirección de retorno)
         "lea rax, [rip + 2f]",
-        "mov [{from} + 0x80], rax",
+        "mov [rdi + 0x80], rax",
         
         // Guardar RFLAGS
         "pushfq",
         "pop rax",
-        "mov [{from} + 0x88], rax",
+        "mov [rdi + 0x88], rax",
         
-        // Restaurar contexto nuevo
-        "mov rax, [{to} + 0x00]",
-        "mov rbx, [{to} + 0x08]",
-        "mov rcx, [{to} + 0x10]",
-        "mov rdx, [{to} + 0x18]",
-        "mov rsi, [{to} + 0x20]",
-        "mov rdi, [{to} + 0x28]",
-        "mov rbp, [{to} + 0x30]",
-        "mov r8,  [{to} + 0x38]",
-        "mov r9,  [{to} + 0x40]",
-        "mov r10, [{to} + 0x48]",
-        "mov r11, [{to} + 0x50]",
-        "mov r12, [{to} + 0x58]",
-        "mov r13, [{to} + 0x60]",
-        "mov r14, [{to} + 0x68]",
-        "mov r15, [{to} + 0x70]",
+        // ==========================================
+        // Restaurar contexto nuevo (usando rsi = to)
+        // ==========================================
         
-        // Restaurar RSP
-        "mov rsp, [{to} + 0x78]",
+        // 1. Cambiar Stack
+        "mov rsp, [rsi + 0x78]",
         
-        // Restaurar RFLAGS
-        "push qword ptr [{to} + 0x88]",
-        "popfq",
+        // 2. Preparar stack para iretq/ret simulado
+        // Orden inverso al pop: Queremos que popfq saque RFLAGS y ret saque RIP.
+        // Stack crece hacia abajo.
+        // Push RIP (queda más "abajo" en memoria alta)
+        "push qword ptr [rsi + 0x80]", // RIP
+        // Push RFLAGS (queda más "arriba" en memoria baja, tope del stack)
+        "push qword ptr [rsi + 0x88]", // RFLAGS
         
-        // Saltar a RIP
-        "jmp [{to} + 0x80]",
+        // 3. Restaurar GP registers (EXCEPTO RSI que tiene el puntero 'to')
+        "mov rax, [rsi + 0x00]",
+        "mov rbx, [rsi + 0x08]",
+        "mov rcx, [rsi + 0x10]",
+        "mov rdx, [rsi + 0x18]",
+        "mov rdi, [rsi + 0x28]",
+        "mov rbp, [rsi + 0x30]",
+        "mov r8,  [rsi + 0x38]",
+        "mov r9,  [rsi + 0x40]",
+        "mov r10, [rsi + 0x48]",
+        "mov r11, [rsi + 0x50]",
+        "mov r12, [rsi + 0x58]",
+        "mov r13, [rsi + 0x60]",
+        "mov r14, [rsi + 0x68]",
+        "mov r15, [rsi + 0x70]",
+        
+        // 4. Restaurar RSI (Ultimo, porque usabamos rsi como puntero 'to')
+        "mov rsi, [rsi + 0x20]",
+        
+        // 5. Restaurar RFLAGS y RIP
+        "popfq", // Restaura RFLAGS
+        "ret",   // Restaura RIP (pop rip; jmp rip)
         
         "2:",
-        from = in(reg) from,
-        to = in(reg) to,
+        in("rdi") from,
+        in("rsi") to,
         options(noreturn)
     );
 }
