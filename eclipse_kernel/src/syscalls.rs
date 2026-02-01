@@ -503,6 +503,8 @@ pub fn get_stats() -> SyscallStats {
         fork_calls: stats.fork_calls,
         exec_calls: stats.exec_calls,
         wait_calls: stats.wait_calls,
+        open_calls: stats.open_calls,
+        close_calls: stats.close_calls,
     }
 }
 
