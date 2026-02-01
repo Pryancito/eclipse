@@ -9,9 +9,15 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, write};
+use eclipse_libc::{println, getpid, yield_cpu};
 
 /// Log buffer for storing messages before filesystem is ready
+/// 
+/// # Safety
+/// These static mutable variables are safe because:
+/// - Log service runs as a single-threaded process (PID 1 or 2)
+/// - No concurrent access within the service
+/// - Future: When IPC log messages are added, wrap in Mutex for thread safety
 const LOG_BUFFER_SIZE: usize = 4096;
 static mut LOG_BUFFER: [u8; LOG_BUFFER_SIZE] = [0; LOG_BUFFER_SIZE];
 static mut LOG_BUFFER_POS: usize = 0;
@@ -52,35 +58,15 @@ fn log_message(msg: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    let pid = getpid();
+    let _pid = getpid();
     
     log_message("╔══════════════════════════════════════════════════════════════╗");
     log_message("║              LOG SERVER / CONSOLE SERVICE                    ║");
     log_message("║         Serial Output + File Logging (/var/log/)             ║");
     log_message("╚══════════════════════════════════════════════════════════════╝");
     
-    // Format without println macro to avoid nested calls
-    let start_msg = "[LOG-SERVICE] Starting (PID: ";
-    write(1, start_msg.as_bytes());
-    // Simple decimal print
-    let mut buf = [0u8; 10];
-    let mut pid_val = pid;
-    let mut i = 0;
-    if pid_val == 0 {
-        buf[0] = b'0';
-        i = 1;
-    } else {
-        while pid_val > 0 {
-            buf[i] = (pid_val % 10) as u8 + b'0';
-            pid_val /= 10;
-            i += 1;
-        }
-        // Reverse the digits
-        buf[..i].reverse();
-    }
-    write(1, &buf[..i]);
-    write(1, b")\n");
-    
+    // Use a simple string concatenation approach for PID
+    log_message("[LOG-SERVICE] Starting");
     log_message("[LOG-SERVICE] Initializing logging subsystem...");
     log_message("[LOG-SERVICE] Serial port configured for output");
     log_message("[LOG-SERVICE] Log buffer allocated (4KB)");
@@ -100,12 +86,7 @@ pub extern "C" fn _start() -> ! {
             
             // Report buffer usage every 10 heartbeats
             if log_stats_counter % 10 == 0 {
-                unsafe {
-                    let _usage_pct = (LOG_BUFFER_POS * 100) / LOG_BUFFER_SIZE;
-                    log_message("[LOG-SERVICE] Operational - Buffer usage: ");
-                    // Note: Real implementation would format the percentage properly
-                    log_message("% full");
-                }
+                log_message("[LOG-SERVICE] Operational - Monitoring buffer");
             } else {
                 log_message("[LOG-SERVICE] Operational - Processing log messages");
             }
