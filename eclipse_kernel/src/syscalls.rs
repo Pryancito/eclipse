@@ -390,6 +390,13 @@ fn sys_wait(_status_ptr: u64) -> u64 {
 /// sys_get_service_binary - Get pointer and size of embedded service binary
 /// Args: service_id (0-4), out_ptr (pointer to store binary pointer), out_size (pointer to store size)
 /// Returns: 0 on success, -1 on error
+/// 
+/// Service IDs (matching init startup order):
+/// 0 = log_service (Log Server / Console)
+/// 1 = devfs_service (Device Manager)
+/// 2 = input_service (Input Server)
+/// 3 = display_service (Graphics Server)
+/// 4 = network_service (Network Server)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     serial::serial_print("[SYSCALL] get_service_binary(");
     serial::serial_print_dec(service_id);
@@ -400,13 +407,13 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         return u64::MAX;
     }
     
-    // Get service binary based on ID
+    // Get service binary based on ID (new init startup order)
     let (bin_ptr, bin_size) = match service_id {
-        0 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
-        1 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
-        2 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
-        3 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
-        4 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        0 => (crate::binaries::LOG_SERVICE_BINARY.as_ptr() as u64, crate::binaries::LOG_SERVICE_BINARY.len() as u64),
+        1 => (crate::binaries::DEVFS_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DEVFS_SERVICE_BINARY.len() as u64),
+        2 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        3 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
+        4 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
         _ => {
             serial::serial_print("[SYSCALL] Invalid service ID\n");
             return u64::MAX;
