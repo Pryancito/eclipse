@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, exit, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, yield_cpu};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
