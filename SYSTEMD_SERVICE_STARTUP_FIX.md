@@ -175,11 +175,12 @@ Check that all 7 services show `[active]` status in the heartbeat output.
 
 ## Cleanup After Verification
 
-Once the fix is confirmed working, remove debug output:
+Once the fix is confirmed working, disable debug output for production:
 
-1. Remove all lines containing `[DEBUG]` from `eclipse-apps/systemd/src/main.rs`
-2. Rebuild systemd
-3. Test again to ensure production build works
+1. Edit `eclipse-apps/systemd/src/main.rs`
+2. Change `const DEBUG_SERVICE_STARTUP: bool = true;` to `const DEBUG_SERVICE_STARTUP: bool = false;`
+3. Rebuild systemd: `cd eclipse-apps/systemd && cargo +nightly build --release --target x86_64-unknown-none`
+4. Test again to ensure production build works without debug output
 
 ## Technical Details
 
