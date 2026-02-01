@@ -28,7 +28,7 @@ use eclipse_libc::{println, getpid, yield_cpu, fork, wait, exit};
 const MAX_SERVICES: usize = 32;
 
 /// Service initialization delay (in yield iterations)
-const SERVICE_INIT_DELAY: u32 = 10000;
+const SERVICE_INIT_DELAY: u32 = 100;
 
 /// Service health check interval (in loop ticks)
 const MONITOR_INTERVAL: u64 = 100000;
@@ -188,8 +188,9 @@ fn init_services() {
         // Define service dependencies
         const NO_DEPS: &[usize] = &[];
         const LOG_DEPS: &[usize] = &[0];      // Depends on log service
-        const DEVFS_DEPS: &[usize] = &[0, 1]; // Depends on log + devfs
-        const INPUT_DEPS: &[usize] = &[0, 1, 2]; // Depends on log + devfs + input (for Display/Network)
+        const DEVFS_DEPS: &[usize] = &[0];    // Depends on log
+        const FILESYSTEM_DEPS: &[usize] = &[0, 1]; // Depends on log+devfs
+        const INPUT_DEPS: &[usize] = &[0, 1, 2]; // Depends on log+devfs+fs
         
         // Service 0: Log Server / Console (no dependencies - MUST BE FIRST)
         add_service(Service::new(
@@ -210,18 +211,28 @@ fn init_services() {
             9,   // Very high priority
             LOG_DEPS,
         ));
+
+        // Service 2: Filesystem Server (depends on devfs)
+        add_service(Service::new(
+            "filesystem.service",
+            "Filesystem Server - VFS and Mounts",
+            ServiceType::Simple,
+            RestartPolicy::OnFailure,
+            9,
+            DEVFS_DEPS,
+        ));
         
-        // Service 2: Input Server (depends on log + devfs)
+        // Service 3: Input Server (depends on filesystem)
         add_service(Service::new(
             "input.service",
             "Input Server - Keyboard and Mouse Management",
             ServiceType::Simple,
             RestartPolicy::OnFailure,
             8,
-            DEVFS_DEPS,
+            FILESYSTEM_DEPS,
         ));
         
-        // Service 3: Display/Graphics Server (depends on log + devfs + input)
+        // Service 4: Display/Graphics Server (depends on input)
         add_service(Service::new(
             "display.service",
             "Graphics Server - Display and Video Buffer",
@@ -230,8 +241,18 @@ fn init_services() {
             7,
             INPUT_DEPS,
         ));
+
+        // Service 5: Audio Server (depends on filesystem)
+        add_service(Service::new(
+            "audio.service",
+            "Audio Server - Sound System",
+            ServiceType::Simple,
+            RestartPolicy::OnFailure,
+            6,
+            FILESYSTEM_DEPS,
+        ));
         
-        // Service 4: Network Server (depends on log + devfs + input - MOST COMPLEX, LAST)
+        // Service 6: Network Server (depends on input)
         add_service(Service::new(
             "network.service",
             "Network Server - Network Stack Service",
@@ -294,20 +315,25 @@ fn start_system_services() {
         println!("  [START] Starting dependent services...");
         for i in 0..SERVICE_COUNT {
             if let Some(ref mut service) = SERVICES[i] {
+                // DEBUG: Trace service check
+                // println!("  [DEBUG] Checking service: {}", service.name);
+                
                 if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
                     // Check if dependencies are met
                     if check_dependencies(service) {
+                        println!("  [DEP-OK] Dependencies met for {}", service.name);
                         start_service(service, i);
                         // Allow service to initialize
                         for _ in 0..SERVICE_INIT_DELAY {
                             yield_cpu();
                         }
                     } else {
-                        println!("  [SKIP] {} - dependencies not met", service.name);
+                        // println!("  [SKIP] {} - dependencies not met", service.name);
                     }
                 }
             }
         }
+        println!("  [START] Single pass of start loop complete");
     }
 }
 
@@ -344,28 +370,39 @@ fn start_service(service: &mut Service, _service_idx: usize) {
         let service_id = match service.name {
             "log.service" => 0,
             "devfs.service" => 1,
-            "input.service" => 2,
-            "display.service" => 3,
-            "network.service" => 4,
+            "filesystem.service" => 2,
+            "input.service" => 3,
+            "display.service" => 4,
+            "audio.service" => 5,
+            "network.service" => 6,
             _ => {
                 println!("    [ERROR] Unknown service: {}", service.name);
                 exit(1);
             }
         };
         
-        // For now, we'll just simulate the service
-        // In a real implementation, we'd load the service binary
-        println!("    [INFO] Service {} would execute with ID {}", service.name, service_id);
+        // Get service binary from kernel
+        // Note: This returns a pointer to kernel memory (RODATA). 
+        // We cannot read it in userspace, but we can pass it back to sys_exec.
+        let (bin_ptr, bin_size) = eclipse_libc::get_service_binary(service_id as u32);
         
-        // Simulate service running
-        let mut counter = 0u64;
-        loop {
-            counter += 1;
-            if counter % 1000000 == 0 {
-                // Service heartbeat (would use IPC in real system)
-            }
-            yield_cpu();
+        if bin_ptr.is_null() || bin_size == 0 {
+             println!("    [CHILD] ERROR: Failed to get binary for service {}", service.name);
+             exit(1);
         }
+        
+        println!("    [CHILD] Got binary for {} at {:p}, size: {}", service.name, bin_ptr, bin_size);
+        
+        // Create slice from raw parts (we won't read it, just pass to exec)
+        let binary_slice = unsafe { core::slice::from_raw_parts(bin_ptr, bin_size) };
+        
+        // Exec the new service
+        // This replaces the current process image
+        let ret = eclipse_libc::exec(binary_slice);
+        
+        // If we are here, exec failed
+        println!("    [CHILD] ERROR: exec() failed with code {}", ret);
+        exit(1);
     } else if pid > 0 {
         // Parent process - track the service
         service.pid = pid;

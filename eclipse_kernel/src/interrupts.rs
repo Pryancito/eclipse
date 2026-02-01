@@ -507,8 +507,9 @@ extern "C" fn syscall_handler_rust(
     arg3: u64,
     arg4: u64,
     arg5: u64,
+    frame_ptr: u64,
 ) -> u64 {
-    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5)
+    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, frame_ptr)
 }
 
 #[unsafe(naked)]
@@ -528,6 +529,10 @@ unsafe extern "C" fn syscall_int80() {
         "push r9",
         "push r10",
         "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
         // Parámetros de syscall:
         // rax = syscall number
         // rdi = arg1
@@ -542,10 +547,40 @@ unsafe extern "C" fn syscall_int80() {
         "mov rdx, rsi",  // arg2 (from rsi)
         "mov rsi, rdi",  // arg1 (from rdi)
         "mov rdi, rax",  // syscall_num (from rax)
+        
+        // Pass RBP (frame pointer) as 7th argument (on stack)
+        "push rbp",
+        
         "call {}",
+        
+        // Clean up stack argument
+        "add rsp, 8",
+        
         // Resultado en rax
-        "mov [rsp + 72], rax",  // Guardar resultado en rax guardado
+        // UPDATE OFFSET: previously +72 (9*8).
+        // Now we have pushed 4 more regs (32 bytes).
+        // Stack layout relative to CURRENT RSP (after add rsp,8):
+        // R15 (0)
+        // R14 (8)
+        // R13 (16)
+        // R12 (24)
+        // R11 (32)
+        // R10 (40)
+        // R9  (48)
+        // R8  (56)
+        // RDI (64)
+        // RSI (72)
+        // RDX (80)
+        // RCX (88)
+        // RBX (96)
+        // RAX (104) <-- TARGET
+        "mov [rsp + 104], rax",  // Guardar resultado en rax guardado
+        
         // Restaurar registros
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
         "pop r11",
         "pop r10",
         "pop r9",

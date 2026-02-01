@@ -103,13 +103,13 @@ impl Process {
 
 /// Tabla de procesos
 const MAX_PROCESSES: usize = 64;
-static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([None; MAX_PROCESSES]);
+pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([None; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
 
 // Stack pool for forked processes (simple static allocation)
 const STACK_POOL_SIZE: usize = 8; // Support up to 8 concurrent child processes
-const CHILD_STACK_SIZE: usize = 4096;
+const CHILD_STACK_SIZE: usize = 262144; // 256KB
 #[repr(align(16))]
 struct StackPool {
     stacks: [[u8; CHILD_STACK_SIZE]; STACK_POOL_SIZE],
@@ -143,15 +143,28 @@ pub fn init_kernel_process() {
     let mut table = PROCESS_TABLE.lock();
     // No tocamos NEXT_PID, dejamos que empiece en 1
     
-    // Crear proceso kernel
+    // Allocate kernel stack for PID 0 (Idle/Kernel task)
+    // Even though it runs on the boot stack initially, we need a valid TSS RSP0 
+    // for when it's scheduled back in, just in case.
+    let kernel_stack_size = 8192;
+    let kernel_stack = alloc::vec![0u8; kernel_stack_size];
+    let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
+    core::mem::forget(kernel_stack); // Leak
+    
+    let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+
     let mut process = Process::new();
     process.id = 0;
     process.state = ProcessState::Running;
     process.priority = 0; // Prioridad más baja
     process.time_slice = 10;
+    process.kernel_stack_top = kernel_stack_top_aligned;
     
-    // No necesitamos configurar el contexto ya que se guardará
-    // en el primer switch.
+    // Configurar contexto inicial
+    // Cuando el scheduler cambie a PID 0, necesita saber el RSP.
+    // PERO, PID 0 ya está "corriendo". Su contexto real se guarda
+    // cuando llamamos a switch_context(0, X).
+    // Así que solo necesitamos kernel_stack_top para el TSS.
     
     // Insertar en la tabla (slot 0)
     table[0] = Some(process);
@@ -347,7 +360,6 @@ pub unsafe fn switch_context(from: &mut Context, to: &Context) {
         "2:",
         in("rdi") from,
         in("rsi") to,
-        options(noreturn)
     );
 }
 
@@ -391,14 +403,38 @@ pub fn fork_process() -> Option<ProcessId> {
     let child_stack = allocate_stack()?;
     
     // Copy parent's stack to child
+    // Calculate used stack size
+    let parent_stack_top = parent.stack_base + parent.stack_size as u64;
+    let used_stack_size = parent_stack_top - parent.context.rsp;
+    
+    // DEBUG: Print stack details
+    crate::serial::serial_print("[PROCESS] Fork debug: PID ");
+    crate::serial::serial_print_dec(parent.id as u64);
+    crate::serial::serial_print("\n  Stack Base: ");
+    crate::serial::serial_print_hex(parent.stack_base);
+    crate::serial::serial_print("\n  Stack Top:  ");
+    crate::serial::serial_print_hex(parent_stack_top);
+    crate::serial::serial_print("\n  RSP:        ");
+    crate::serial::serial_print_hex(parent.context.rsp);
+    crate::serial::serial_print("\n  Used Size:  ");
+    crate::serial::serial_print_dec(used_stack_size);
+    crate::serial::serial_print("\n  Max Child:  ");
+    crate::serial::serial_print_dec(CHILD_STACK_SIZE as u64);
+    crate::serial::serial_print("\n");
+    
+    if used_stack_size as usize > CHILD_STACK_SIZE {
+        crate::serial::serial_print("[PROCESS] Fork failed: Stack too large for child\n");
+        return None; 
+    }
+    
+    // Copy parent's stack to child (Top-aligned)
+    let child_stack_top = child_stack + CHILD_STACK_SIZE as u64;
+    let child_rsp = child_stack_top - used_stack_size;
+    
     unsafe {
-        let parent_stack_ptr = parent.stack_base as *const u8;
-        let child_stack_ptr = child_stack as *mut u8;
-        core::ptr::copy_nonoverlapping(
-            parent_stack_ptr,
-            child_stack_ptr,
-            parent.stack_size.min(CHILD_STACK_SIZE)
-        );
+        let src = parent.context.rsp as *const u8;
+        let dst = child_rsp as *mut u8;
+        core::ptr::copy_nonoverlapping(src, dst, used_stack_size as usize);
     }
     
     // Create child process
@@ -418,8 +454,7 @@ pub fn fork_process() -> Option<ProcessId> {
             child.parent_pid = Some(current_pid);
             
             // Adjust stack pointer for child
-            let stack_offset = parent.context.rsp - parent.stack_base;
-            child.context.rsp = child_stack + stack_offset;
+            child.context.rsp = child_rsp;
             
             // Child returns 0 from fork
             child.context.rax = 0;

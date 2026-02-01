@@ -138,7 +138,7 @@ fi
 QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=virtio"
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
-QEMU_CMD="$QEMU_CMD -enable-kvm"
+QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"
 
 # Configuración de display
 QEMU_CMD="$QEMU_CMD -vga virtio"

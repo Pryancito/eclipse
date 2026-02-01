@@ -128,9 +128,9 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         }
     }
     
-    // Default user stack at 96MB
-    let stack_base = 0x6000000; // 512MB
-    let stack_size = 0x10000;  // 64KB
+    // Default user stack at 512MB
+    let stack_base = 0x20000000; // 512MB
+    let stack_size = 0x40000;  // 256KB
     
     create_process(header.e_entry, stack_base, stack_size)
 }
@@ -169,15 +169,59 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
     
-    // TODO: In a real implementation, we would:
-    // 1. Parse and load PT_LOAD segments into memory
-    // 2. Set up proper memory mappings
-    // 3. Zero BSS sections
-    // 4. Set up heap
-    //
-    // For now, we just validate the ELF and return the entry point
-    // The binary is already in memory (passed as a slice)
+    // Iterate over program headers and load segments
+    let ph_offset = header.e_phoff as usize;
+    let ph_count = header.e_phnum as usize;
+    let ph_size = header.e_phentsize as usize;
     
+    if elf_data.len() < ph_offset + (ph_count * ph_size) {
+        serial::serial_print("ELF: Program headers out of bounds for exec\n");
+        return None;
+    }
+    
+    for i in 0..ph_count {
+        let offset = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        
+        if ph.p_type == PT_LOAD {
+            serial::serial_print("ELF: Loading segment for exec at ");
+            serial::serial_print_hex(ph.p_vaddr);
+            serial::serial_print(" size: ");
+            serial::serial_print_hex(ph.p_memsz);
+            serial::serial_print("\n");
+            
+            // Check if we can copy (filesz > 0)
+            if ph.p_filesz > 0 {
+                let file_offset = ph.p_offset as usize;
+                
+                if file_offset + (ph.p_filesz as usize) > elf_data.len() {
+                    serial::serial_print("ELF: Segment file content out of bounds\n");
+                    return None;
+                }
+                
+                // Copy data to memory
+                // Note: We are overwriting the current process memory.
+                // This assumes the new binary maps to addresses that are valid and writable.
+                unsafe {
+                    let src = elf_data.as_ptr().add(file_offset);
+                    let dst = ph.p_vaddr as *mut u8;
+                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                }
+            }
+            
+            // Zero out BSS (memsz > filesz)
+            if ph.p_memsz > ph.p_filesz {
+                let bss_size = (ph.p_memsz - ph.p_filesz) as usize;
+                let bss_start = ph.p_vaddr + ph.p_filesz;
+                
+                unsafe {
+                    let dst = bss_start as *mut u8;
+                    core::ptr::write_bytes(dst, 0, bss_size);
+                }
+            }
+        }
+    }
+
     Some(header.e_entry)
 }
 

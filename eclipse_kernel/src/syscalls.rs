@@ -66,7 +66,84 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     _arg4: u64,
     _arg5: u64,
+    frame_ptr: u64,
 ) -> u64 {
+    // CAPTURE USER CONTEXT
+    // Update the current process context with the User register state from the interrupt frame
+    // Frame structure relative to frame_ptr (RBP):
+    // [32] RSP
+    // [8]  RIP
+    // [-8]  RAX
+    // [-16] RBX
+    // [-24] RCX
+    // [-32] RDX
+    // [-40] RSI
+    // [-48] RDI
+    // [-56] R8
+    // [-64] R9
+    // [-72] R10
+    // [-80] R11
+    // [-88] R12
+    // [-96] R13
+    // [-104] R14
+    // [-112] R15
+    unsafe {
+        unsafe fn read_stack(rbp: u64, offset: isize) -> u64 {
+            let ptr = (rbp as isize + offset) as *const u64;
+            *ptr
+        }
+    
+        // Read registers
+        let user_rsp = read_stack(frame_ptr, 32);
+        let user_rip = read_stack(frame_ptr, 8);
+        
+        let user_rax = read_stack(frame_ptr, -8);
+        let user_rbx = read_stack(frame_ptr, -16);
+        let user_rcx = read_stack(frame_ptr, -24);
+        let user_rdx = read_stack(frame_ptr, -32);
+        let user_rsi = read_stack(frame_ptr, -40);
+        let user_rdi = read_stack(frame_ptr, -48);
+        let user_r8  = read_stack(frame_ptr, -56);
+        let user_r9  = read_stack(frame_ptr, -64);
+        let user_r10 = read_stack(frame_ptr, -72);
+        let user_r11 = read_stack(frame_ptr, -80);
+        let user_r12 = read_stack(frame_ptr, -88);
+        let user_r13 = read_stack(frame_ptr, -96);
+        let user_r14 = read_stack(frame_ptr, -104);
+        let user_r15 = read_stack(frame_ptr, -112);
+        
+        // Note: RBP is frame_ptr itself (value at [rbp] is saved RBP)
+        let user_rbp = read_stack(frame_ptr, 0); 
+        
+        let stats = SYSCALL_STATS.lock();
+        drop(stats);
+
+        if let Some(pid) = current_process_id() {
+             use crate::process::{update_process, get_process};
+             if let Some(mut process) = get_process(pid) {
+                 process.context.rsp = user_rsp;
+                 process.context.rip = user_rip;
+                 process.context.rax = user_rax;
+                 process.context.rbx = user_rbx;
+                 process.context.rcx = user_rcx;
+                 process.context.rdx = user_rdx;
+                 process.context.rsi = user_rsi;
+                 process.context.rdi = user_rdi;
+                 process.context.rbp = user_rbp;
+                 process.context.r8  = user_r8;
+                 process.context.r9  = user_r9;
+                 process.context.r10 = user_r10;
+                 process.context.r11 = user_r11;
+                 process.context.r12 = user_r12;
+                 process.context.r13 = user_r13;
+                 process.context.r14 = user_r14;
+                 process.context.r15 = user_r15;
+                 
+                 update_process(pid, process);
+             }
+        }
+    }
+
     let mut stats = SYSCALL_STATS.lock();
     stats.total_calls += 1;
     drop(stats);
@@ -328,8 +405,8 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         
         // This doesn't return - we jump to the new process entry point
         unsafe {
-            // Use standard userspace stack top (96MB + 64KB)
-            let stack_top: u64 = 0x6010000;
+            // Use standard userspace stack top (512MB + 256KB)
+            let stack_top: u64 = 0x20040000;
             crate::elf_loader::jump_to_userspace(entry_point, stack_top);
         }
     } else {
@@ -394,9 +471,11 @@ fn sys_wait(_status_ptr: u64) -> u64 {
 /// Service IDs (matching init startup order):
 /// 0 = log_service (Log Server / Console)
 /// 1 = devfs_service (Device Manager)
-/// 2 = input_service (Input Server)
-/// 3 = display_service (Graphics Server)
-/// 4 = network_service (Network Server)
+/// 2 = filesystem_service (Filesystem Server)
+/// 3 = input_service (Input Server)
+/// 4 = display_service (Graphics Server)
+/// 5 = audio_service (Audio Server)
+/// 6 = network_service (Network Server)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     serial::serial_print("[SYSCALL] get_service_binary(");
     serial::serial_print_dec(service_id);
@@ -411,9 +490,11 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     let (bin_ptr, bin_size) = match service_id {
         0 => (crate::binaries::LOG_SERVICE_BINARY.as_ptr() as u64, crate::binaries::LOG_SERVICE_BINARY.len() as u64),
         1 => (crate::binaries::DEVFS_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DEVFS_SERVICE_BINARY.len() as u64),
-        2 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
-        3 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
-        4 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
+        2 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
+        3 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        4 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
+        5 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
+        6 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
         _ => {
             serial::serial_print("[SYSCALL] Invalid service ID\n");
             return u64::MAX;

@@ -64,13 +64,15 @@ fn write_byte(byte: u8) {
 
 /// Escribir una cadena al puerto serial
 pub fn serial_print(s: &str) {
-    if !*SERIAL_INITIALIZED.lock() {
-        return;
-    }
-    
-    for byte in s.bytes() {
-        write_byte(byte);
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if !*SERIAL_INITIALIZED.lock() {
+            return;
+        }
+        
+        for byte in s.bytes() {
+            write_byte(byte);
+        }
+    });
 }
 
 /// Escribir un número en hexadecimal

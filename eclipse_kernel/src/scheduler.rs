@@ -96,6 +96,7 @@ pub fn schedule() {
 }
 
 /// Realizar context switch entre dos procesos
+#[inline(never)]
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     let dbg_from_pid = Some(from_pid);
     let mut stats = SCHEDULER_STATS.lock();
@@ -105,6 +106,7 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     set_current_process(Some(to_pid));
     
     // DEBUG: Print context switch
+    /*
     crate::serial::serial_print("Context switch: ");
     if let Some(fid) = dbg_from_pid {
          crate::serial::serial_print_dec(fid as u64);
@@ -114,22 +116,46 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     crate::serial::serial_print(" -> ");
     crate::serial::serial_print_dec(to_pid as u64);
     crate::serial::serial_print("\n");
+    */
     
-    // Obtener contextos
-    let mut from_process = get_process(from_pid).unwrap();
-    let to_process = get_process(to_pid).unwrap();
+    // Get raw pointers to contexts in the global table
+    let (from_ctx_ptr, to_ctx_ptr, to_kernel_stack) = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        
+        let from_process = table[from_pid as usize].as_mut().expect("From process not found");
+        let from_ptr = &mut from_process.context as *mut crate::process::Context;
+        
+        let to_process = table[to_pid as usize].as_mut().expect("To process not found");
+        let to_ptr = &to_process.context as *const crate::process::Context;
+        
+        // Capture properties needed for debug/setup
+        let kstack = to_process.kernel_stack_top;
+        
+        /* DEBUG: Print target context (Commented out to reduce noise)
+        crate::serial::serial_print("Switching to PID ");
+        crate::serial::serial_print_dec(to_pid as u64);
+        crate::serial::serial_print("\n  Target RIP: ");
+        crate::serial::serial_print_hex(to_process.context.rip);
+        crate::serial::serial_print("\n  Target RSP: ");
+        crate::serial::serial_print_hex(to_process.context.rsp);
+        crate::serial::serial_print("\n");
+        */
+        
+        (from_ptr, to_ptr, kstack)
+    };
     
     // Update TSS RSP0 for the next process
-    // This ensures that interrupts happening in userspace will switch to this process's kernel stack
-    crate::boot::set_tss_stack(to_process.kernel_stack_top);
+    crate::boot::set_tss_stack(to_kernel_stack);
     
-    // Realizar switch
+    // Perform raw context switch
     unsafe {
-        crate::process::switch_context(&mut from_process.context, &to_process.context);
+        crate::process::switch_context(&mut *from_ctx_ptr, &*to_ctx_ptr);
     }
     
-    // Actualizar proceso from después del switch
-    update_process(from_pid, from_process);
+    // Force compilation of return path
+    // This prevents LLVM from optimizing away the return or inserting ud2
+    // if it mistakenly thinks the function diverges.
+    // crate::serial::serial_print("Resumed from switch\n");
 }
 
 /// Yield - ceder CPU voluntariamente

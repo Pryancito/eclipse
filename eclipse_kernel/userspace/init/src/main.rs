@@ -38,25 +38,31 @@ impl Service {
 
 /// System services
 /// Launch order (as per requirements):
-/// 1. Log Server / Console - for debugging
-/// 2. Device Manager (devfs) - creates /dev nodes
-/// 3. Input Server - manages keyboard/mouse interrupts
-/// 4. Graphics Server (Display Server) - depends on Input Server
-/// 5. Network Server - most complex, launched last
-static mut SERVICES: [Service; 5] = [
+/// 1. Log Server / Console (0)
+/// 2. Device Manager (devfs) (1)
+/// 3. Filesystem Server (2)
+/// 4. Input Server (3)
+/// 5. Graphics Server (Display) (4)
+/// 6. Audio Server (5)
+/// 7. Network Server (6)
+static mut SERVICES: [Service; 7] = [
     Service::new("log"),
     Service::new("devfs"),
+    Service::new("filesystem"),
     Service::new("input"),
     Service::new("display"),
+    Service::new("audio"),
     Service::new("network"),
 ];
+
+
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              ECLIPSE OS INIT SYSTEM v0.2.0                   ║");
+    println!("║              ECLIPSE OS INIT SYSTEM v0.1.0                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("Init process started with PID: {}", pid);
@@ -125,24 +131,28 @@ fn start_essential_services() {
 /// Start system services
 fn start_system_services() {
     unsafe {
-        // Start input service (depends on log + devfs)
+        // Start filesystem service (depends on devfs)
         start_service(&mut SERVICES[2]);
         
-        // Give it time to initialize
-        for _ in 0..1000 {
-            yield_cpu();
-        }
-        
-        // Start display service (depends on input)
+        for _ in 0..1000 { yield_cpu(); }
+
+        // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);
         
-        // Give it time to initialize
-        for _ in 0..1000 {
-            yield_cpu();
-        }
+        for _ in 0..1000 { yield_cpu(); }
+        
+        // Start display service (depends on input)
+        start_service(&mut SERVICES[4]);
+        
+        for _ in 0..1000 { yield_cpu(); }
+
+        // Start audio service (depends on filesystem)
+        start_service(&mut SERVICES[5]);
+        
+        for _ in 0..1000 { yield_cpu(); }
         
         // Start network service last (most complex)
-        start_service(&mut SERVICES[4]);
+        start_service(&mut SERVICES[6]);
     }
 }
 
@@ -160,12 +170,15 @@ fn start_service(service: &mut Service) {
         println!("  [CHILD] Child process for service: {}", service.name);
         
         // Determine which service binary to load
+        // Determine which service binary to load
         let service_id = match service.name {
             "log" => 0,
             "devfs" => 1,
-            "input" => 2,
-            "display" => 3,
-            "network" => 4,
+            "filesystem" => 2,
+            "input" => 3,
+            "display" => 4,
+            "audio" => 5,
+            "network" => 6,
             _ => {
                 println!("  [CHILD] Unknown service: {}", service.name);
                 exit(1);

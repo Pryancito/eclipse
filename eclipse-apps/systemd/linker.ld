@@ -4,8 +4,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Load at 64MB to avoid kernel compatibility issues */
-    . = 0x4000000;
+    /* Load at 256MB (0x10000000) to avoid kernel compatibility issues */
+    . = 0x10000000;
 
     .text : ALIGN(4K)
     {
