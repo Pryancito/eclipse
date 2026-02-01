@@ -27,8 +27,11 @@ use eclipse_libc::{println, getpid, yield_cpu, fork, wait, exit};
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
 
+/// Enable debug output for service startup (set to false for production)
+const DEBUG_SERVICE_STARTUP: bool = true;
+
 /// Service initialization delay (in yield iterations)
-const SERVICE_INIT_DELAY: u32 = 100;
+const SERVICE_INIT_DELAY: u32 = 10000;
 
 /// Service health check interval (in loop ticks)
 const MONITOR_INTERVAL: u64 = 100000;
@@ -294,6 +297,9 @@ fn system_init() {
 
 /// Start system services based on dependencies
 fn start_system_services() {
+    if DEBUG_SERVICE_STARTUP {
+        println!("  [DEBUG] Entering start_system_services");
+    }
     unsafe {
         // First, start services with no dependencies
         println!("  [START] Starting services with no dependencies...");
@@ -302,13 +308,22 @@ fn start_system_services() {
                 if service.dependencies.is_empty() {
                     start_service(service, i);
                     // Allow service to initialize
+                    if DEBUG_SERVICE_STARTUP {
+                        println!("  [DEBUG] Yielding {} times for service initialization", SERVICE_INIT_DELAY);
+                    }
                     for _ in 0..SERVICE_INIT_DELAY {
                         yield_cpu();
+                    }
+                    if DEBUG_SERVICE_STARTUP {
+                        println!("  [DEBUG] Done yielding for service {}", service.name);
                     }
                 }
             }
         }
         
+        if DEBUG_SERVICE_STARTUP {
+            println!("  [DEBUG] Completed starting services with no dependencies");
+        }
         println!();
         
         // Multi-pass dependency resolution for cascading dependencies
@@ -325,18 +340,36 @@ fn start_system_services() {
             
             for i in 0..SERVICE_COUNT {
                 if let Some(ref mut service) = SERVICES[i] {
+                    if DEBUG_SERVICE_STARTUP {
+                        println!("  [DEBUG] Checking service {} state={:?} has_deps={}", 
+                                 service.name, service.state, !service.dependencies.is_empty());
+                    }
                     if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
                         // Check if dependencies are met
                         if check_dependencies(service) {
+                            if DEBUG_SERVICE_STARTUP {
+                                println!("  [DEBUG] Dependencies met for {}, starting...", service.name);
+                            }
                             start_service(service, i);
                             services_started_this_pass += 1;
                             // Allow service to initialize
                             for _ in 0..SERVICE_INIT_DELAY {
                                 yield_cpu();
                             }
+                            if DEBUG_SERVICE_STARTUP {
+                                println!("  [DEBUG] Service {} started and initialized", service.name);
+                            }
+                        } else {
+                            if DEBUG_SERVICE_STARTUP {
+                                println!("  [DEBUG] Dependencies NOT met for {}", service.name);
+                            }
                         }
                     }
                 }
+            }
+            
+            if DEBUG_SERVICE_STARTUP {
+                println!("  [DEBUG] Pass {} complete, started {} services", pass, services_started_this_pass);
             }
             
             if services_started_this_pass == 0 {

@@ -214,7 +214,7 @@ build_systemd() {
     
     # Compilar systemd para el target correcto
     print_status "Compilando systemd..."
-    cargo build --release --target x86_64-unknown-none
+    cargo +nightly build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
         print_success "Systemd compilado exitosamente"
