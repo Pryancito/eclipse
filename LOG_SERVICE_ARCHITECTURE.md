@@ -97,6 +97,11 @@ static mut LOG_BUFFER_POS: usize = 0;
 3. **Integration Code**:
 ```rust
 // When filesystem syscalls are available:
+// Note: These constants would need to be defined in eclipse_libc
+// const O_WRONLY: i32 = 0x0001;
+// const O_CREAT: i32 = 0x0100;
+// const O_APPEND: i32 = 0x0400;
+
 let fd = open("/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
 if fd >= 0 {
     write(fd as u32, &LOG_BUFFER[..LOG_BUFFER_POS]);

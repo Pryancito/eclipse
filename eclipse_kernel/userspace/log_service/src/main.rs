@@ -27,7 +27,7 @@ fn log_to_buffer(msg: &str) {
     unsafe {
         let bytes = msg.as_bytes();
         let available = LOG_BUFFER_SIZE - LOG_BUFFER_POS;
-        let to_copy = if bytes.len() < available { bytes.len() } else { available };
+        let to_copy = bytes.len().min(available);
         
         if to_copy > 0 {
             LOG_BUFFER[LOG_BUFFER_POS..LOG_BUFFER_POS + to_copy]
@@ -58,6 +58,7 @@ fn log_message(msg: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // TODO: Use PID in log messages when string formatting is available
     let _pid = getpid();
     
     log_message("╔══════════════════════════════════════════════════════════════╗");
