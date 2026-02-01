@@ -12,6 +12,16 @@ pub const SYS_FORK: u64 = 7;
 pub const SYS_EXEC: u64 = 8;
 pub const SYS_WAIT: u64 = 9;
 pub const SYS_GET_SERVICE_BINARY: u64 = 10;
+pub const SYS_OPEN: u64 = 11;
+pub const SYS_CLOSE: u64 = 12;
+
+// File open flags
+pub const O_RDONLY: i32 = 0x0000;
+pub const O_WRONLY: i32 = 0x0001;
+pub const O_RDWR: i32 = 0x0002;
+pub const O_CREAT: i32 = 0x0040;
+pub const O_TRUNC: i32 = 0x0200;
+pub const O_APPEND: i32 = 0x0400;
 
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> u64 {
@@ -97,5 +107,26 @@ pub fn get_service_binary(service_id: u32) -> (*const u8, usize) {
         (ptr as *const u8, size as usize)
     } else {
         (core::ptr::null(), 0)
+    }
+}
+
+/// Open a file
+/// Returns file descriptor on success, -1 on error
+pub fn open(path: &str, flags: i32, _mode: i32) -> i32 {
+    unsafe {
+        syscall3(
+            SYS_OPEN,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            flags as u64
+        ) as i32
+    }
+}
+
+/// Close a file descriptor
+/// Returns 0 on success, -1 on error
+pub fn close(fd: i32) -> i32 {
+    unsafe {
+        syscall1(SYS_CLOSE, fd as u64) as i32
     }
 }

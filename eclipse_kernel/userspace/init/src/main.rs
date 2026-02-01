@@ -37,12 +37,18 @@ impl Service {
 }
 
 /// System services
+/// Launch order (as per requirements):
+/// 1. Log Server / Console - for debugging
+/// 2. Device Manager (devfs) - creates /dev nodes
+/// 3. Input Server - manages keyboard/mouse interrupts
+/// 4. Graphics Server (Display Server) - depends on Input Server
+/// 5. Network Server - most complex, launched last
 static mut SERVICES: [Service; 5] = [
-    Service::new("filesystem"),
-    Service::new("network"),
-    Service::new("display"),
-    Service::new("audio"),
+    Service::new("log"),
+    Service::new("devfs"),
     Service::new("input"),
+    Service::new("display"),
+    Service::new("network"),
 ];
 
 #[no_mangle]
@@ -98,8 +104,16 @@ fn mount_filesystems() {
 /// Start essential services
 fn start_essential_services() {
     unsafe {
-        // Start filesystem server
+        // Start log server first - critical for debugging
         start_service(&mut SERVICES[0]);
+        
+        // Give it time to initialize
+        for _ in 0..1000 {
+            yield_cpu();
+        }
+        
+        // Start device manager (devfs) - creates /dev nodes
+        start_service(&mut SERVICES[1]);
         
         // Give it time to initialize
         for _ in 0..1000 {
@@ -111,16 +125,23 @@ fn start_essential_services() {
 /// Start system services
 fn start_system_services() {
     unsafe {
-        // Start network service
-        start_service(&mut SERVICES[1]);
-        
-        // Start display service
+        // Start input service (depends on log + devfs)
         start_service(&mut SERVICES[2]);
         
-        // Start audio service
+        // Give it time to initialize
+        for _ in 0..1000 {
+            yield_cpu();
+        }
+        
+        // Start display service (depends on input)
         start_service(&mut SERVICES[3]);
         
-        // Start input service
+        // Give it time to initialize
+        for _ in 0..1000 {
+            yield_cpu();
+        }
+        
+        // Start network service last (most complex)
         start_service(&mut SERVICES[4]);
     }
 }
@@ -140,11 +161,11 @@ fn start_service(service: &mut Service) {
         
         // Determine which service binary to load
         let service_id = match service.name {
-            "filesystem" => 0,
-            "network" => 1,
-            "display" => 2,
-            "audio" => 3,
-            "input" => 4,
+            "log" => 0,
+            "devfs" => 1,
+            "input" => 2,
+            "display" => 3,
+            "network" => 4,
             _ => {
                 println!("  [CHILD] Unknown service: {}", service.name);
                 exit(1);

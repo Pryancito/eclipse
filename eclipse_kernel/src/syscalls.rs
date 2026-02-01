@@ -23,6 +23,8 @@ pub enum SyscallNumber {
     Exec = 8,
     Wait = 9,
     GetServiceBinary = 10,
+    Open = 11,
+    Close = 12,
 }
 
 /// Estadísticas de syscalls
@@ -37,6 +39,8 @@ pub struct SyscallStats {
     pub fork_calls: u64,
     pub exec_calls: u64,
     pub wait_calls: u64,
+    pub open_calls: u64,
+    pub close_calls: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
@@ -50,6 +54,8 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     fork_calls: 0,
     exec_calls: 0,
     wait_calls: 0,
+    open_calls: 0,
+    close_calls: 0,
 });
 
 /// Handler principal de syscalls
@@ -82,6 +88,8 @@ pub extern "C" fn syscall_handler(
         8 => sys_exec(arg1, arg2),
         9 => sys_wait(arg1),
         10 => sys_get_service_binary(arg1, arg2, arg3),
+        11 => sys_open(arg1, arg2, arg3),
+        12 => sys_close(arg1),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -112,6 +120,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     stats.write_calls += 1;
     drop(stats);
     
+    // Handle stdout/stderr (1, 2) - write to serial
     if fd == 1 || fd == 2 {
         if buf_ptr != 0 && len > 0 && len < 4096 {
             unsafe {
@@ -120,6 +129,28 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                     serial::serial_print(s);
                 } else {
                     // Fallback for non-utf8 (print safe chars)
+                    for &byte in slice {
+                        if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
+                             serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
+                        } else {
+                            serial::serial_print(".");
+                        }
+                    }
+                }
+            }
+            return len;
+        }
+    }
+    // Handle file descriptor 3 (/var/log/system.log) - write to in-kernel buffer
+    else if fd == 3 {
+        if buf_ptr != 0 && len > 0 && len < 4096 {
+            unsafe {
+                let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
+                // For now, also write to serial to show it's working
+                serial::serial_print("[LOGFILE] ");
+                if let Ok(s) = core::str::from_utf8(slice) {
+                    serial::serial_print(s);
+                } else {
                     for &byte in slice {
                         if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
                              serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
@@ -359,6 +390,13 @@ fn sys_wait(_status_ptr: u64) -> u64 {
 /// sys_get_service_binary - Get pointer and size of embedded service binary
 /// Args: service_id (0-4), out_ptr (pointer to store binary pointer), out_size (pointer to store size)
 /// Returns: 0 on success, -1 on error
+/// 
+/// Service IDs (matching init startup order):
+/// 0 = log_service (Log Server / Console)
+/// 1 = devfs_service (Device Manager)
+/// 2 = input_service (Input Server)
+/// 3 = display_service (Graphics Server)
+/// 4 = network_service (Network Server)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     serial::serial_print("[SYSCALL] get_service_binary(");
     serial::serial_print_dec(service_id);
@@ -369,13 +407,13 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         return u64::MAX;
     }
     
-    // Get service binary based on ID
+    // Get service binary based on ID (new init startup order)
     let (bin_ptr, bin_size) = match service_id {
-        0 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
-        1 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
-        2 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
-        3 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
-        4 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        0 => (crate::binaries::LOG_SERVICE_BINARY.as_ptr() as u64, crate::binaries::LOG_SERVICE_BINARY.len() as u64),
+        1 => (crate::binaries::DEVFS_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DEVFS_SERVICE_BINARY.len() as u64),
+        2 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
+        3 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
+        4 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
         _ => {
             serial::serial_print("[SYSCALL] Invalid service ID\n");
             return u64::MAX;
@@ -397,6 +435,67 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     0 // Success
 }
 
+/// sys_open - Open a file
+/// Args: path_ptr (pointer to path string), path_len (length of path), flags (open flags)
+/// Returns: file descriptor on success, -1 on error
+fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.open_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] open() called\n");
+    
+    // Validate parameters
+    if path_ptr == 0 || path_len == 0 || path_len > 4096 {
+        serial::serial_print("[SYSCALL] open() - invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    // Extract path string
+    let path = unsafe {
+        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        core::str::from_utf8(slice).unwrap_or("")
+    };
+    
+    serial::serial_print("[SYSCALL] open(\"");
+    serial::serial_print(path);
+    serial::serial_print("\", flags=");
+    serial::serial_print_hex(flags);
+    serial::serial_print(")\n");
+    
+    // For now, we support a very simple file system simulation
+    // Return a fake file descriptor for /var/log/system.log
+    if path == "/var/log/system.log" {
+        serial::serial_print("[SYSCALL] open() - returning FD 3 for log file\n");
+        3 // Return FD 3 for log file
+    } else {
+        serial::serial_print("[SYSCALL] open() - file not found\n");
+        u64::MAX // File not found
+    }
+}
+
+/// sys_close - Close a file descriptor
+/// Args: fd (file descriptor)
+/// Returns: 0 on success, -1 on error
+fn sys_close(fd: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.close_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] close(");
+    serial::serial_print_dec(fd);
+    serial::serial_print(")\n");
+    
+    // For now, just validate the FD
+    if fd >= 3 && fd < 1024 {
+        serial::serial_print("[SYSCALL] close() - success\n");
+        0 // Success
+    } else {
+        serial::serial_print("[SYSCALL] close() - invalid FD\n");
+        u64::MAX // Error
+    }
+}
+
 /// Obtener estadísticas de syscalls
 pub fn get_stats() -> SyscallStats {
     let stats = SYSCALL_STATS.lock();
@@ -411,6 +510,8 @@ pub fn get_stats() -> SyscallStats {
         fork_calls: stats.fork_calls,
         exec_calls: stats.exec_calls,
         wait_calls: stats.wait_calls,
+        open_calls: stats.open_calls,
+        close_calls: stats.close_calls,
     }
 }
 
