@@ -174,62 +174,71 @@ fn print_banner() {
 }
 
 /// Initialize service registry with system services
+/// 
+/// Launch order (as per requirements):
+/// 1. Log Server / Console - for debugging
+/// 2. Device Manager (devfs) - creates /dev nodes
+/// 3. Input Server - manages keyboard/mouse interrupts
+/// 4. Graphics Server (Display Server) - depends on Input Server
+/// 5. Network Server - most complex, launched last
 fn init_services() {
     unsafe {
         SERVICE_COUNT = 0;
         
         // Define service dependencies
         const NO_DEPS: &[usize] = &[];
-        const FS_DEPS: &[usize] = &[0];  // Depends on filesystem
+        const LOG_DEPS: &[usize] = &[0];      // Depends on log service
+        const DEVFS_DEPS: &[usize] = &[0, 1]; // Depends on log + devfs
+        const INPUT_DEPS: &[usize] = &[0, 1, 2]; // Depends on log + devfs + input
         
-        // Service 0: Filesystem Server (no dependencies)
+        // Service 0: Log Server / Console (no dependencies - MUST BE FIRST)
         add_service(Service::new(
-            "filesystem.service",
-            "EclipseFS Filesystem Server",
+            "log.service",
+            "Log Server / Console - Central Logging Service",
             ServiceType::Simple,
             RestartPolicy::OnFailure,
-            10,  // High priority
+            10,  // Highest priority
             NO_DEPS,
         ));
         
-        // Service 1: Network Server (depends on filesystem)
+        // Service 1: Device Manager (devfs) (depends on log)
         add_service(Service::new(
-            "network.service",
-            "Network Stack Service",
+            "devfs.service",
+            "Device Manager - Creates /dev nodes",
+            ServiceType::Simple,
+            RestartPolicy::OnFailure,
+            9,   // Very high priority
+            LOG_DEPS,
+        ));
+        
+        // Service 2: Input Server (depends on log + devfs)
+        add_service(Service::new(
+            "input.service",
+            "Input Server - Keyboard and Mouse Management",
             ServiceType::Simple,
             RestartPolicy::OnFailure,
             8,
-            FS_DEPS,
+            DEVFS_DEPS,
         ));
         
-        // Service 2: Display Server (depends on filesystem)
+        // Service 3: Display/Graphics Server (depends on log + devfs + input)
         add_service(Service::new(
             "display.service",
-            "Display and Graphics Server",
-            ServiceType::Simple,
-            RestartPolicy::OnFailure,
-            9,
-            FS_DEPS,
-        ));
-        
-        // Service 3: Audio Server (depends on filesystem)
-        add_service(Service::new(
-            "audio.service",
-            "Audio Playback and Capture Service",
+            "Graphics Server - Display and Video Buffer",
             ServiceType::Simple,
             RestartPolicy::OnFailure,
             7,
-            FS_DEPS,
+            INPUT_DEPS,
         ));
         
-        // Service 4: Input Server (depends on filesystem)
+        // Service 4: Network Server (depends on log + devfs + input - MOST COMPLEX, LAST)
         add_service(Service::new(
-            "input.service",
-            "Input Device Management Service",
+            "network.service",
+            "Network Server - Network Stack Service",
             ServiceType::Simple,
             RestartPolicy::OnFailure,
-            9,
-            FS_DEPS,
+            6,   // Lower priority, starts last
+            INPUT_DEPS,
         ));
         
         println!("  [OK] Registered {} services", SERVICE_COUNT);
@@ -333,11 +342,11 @@ fn start_service(service: &mut Service, _service_idx: usize) {
         
         // Map service name to service ID for get_service_binary syscall
         let service_id = match service.name {
-            "filesystem.service" => 0,
-            "network.service" => 1,
-            "display.service" => 2,
-            "audio.service" => 3,
-            "input.service" => 4,
+            "log.service" => 0,
+            "devfs.service" => 1,
+            "input.service" => 2,
+            "display.service" => 3,
+            "network.service" => 4,
             _ => {
                 println!("    [ERROR] Unknown service: {}", service.name);
                 exit(1);
