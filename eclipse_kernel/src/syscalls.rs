@@ -219,6 +219,39 @@ pub extern "C" fn syscall_handler(
         if let Some(mut process) = get_process(pid) {
             process.context.rax = ret;
             update_process(pid, process);
+            
+            // CRITICAL FIX FOR CONTEXT SWITCH BUG:
+            // If a context switch occurred during this syscall (e.g., in yield_cpu or send/receive),
+            // the GP registers were restored from the PCB by switch_context().
+            // However, the values on the kernel stack (pushed by syscall_int80) are STALE.
+            // We MUST write the updated PCB register values back to the stack frame
+            // so that when syscall_int80 pops them, it restores the correct context.
+            unsafe {
+                unsafe fn write_stack(rbp: u64, offset: isize, value: u64) {
+                    let ptr = (rbp as isize + offset) as *mut u64;
+                    *ptr = value;
+                }
+                
+                // Write updated register values back to the stack frame
+                // This ensures syscall_int80's pop instructions restore the correct values
+                write_stack(frame_ptr, -8, process.context.rax);   // RAX
+                write_stack(frame_ptr, -16, process.context.rbx);  // RBX
+                write_stack(frame_ptr, -24, process.context.rcx);  // RCX
+                write_stack(frame_ptr, -32, process.context.rdx);  // RDX
+                write_stack(frame_ptr, -40, process.context.rsi);  // RSI
+                write_stack(frame_ptr, -48, process.context.rdi);  // RDI
+                write_stack(frame_ptr, -56, process.context.r8);   // R8
+                write_stack(frame_ptr, -64, process.context.r9);   // R9
+                write_stack(frame_ptr, -72, process.context.r10);  // R10
+                write_stack(frame_ptr, -80, process.context.r11);  // R11
+                write_stack(frame_ptr, -88, process.context.r12);  // R12
+                write_stack(frame_ptr, -96, process.context.r13);  // R13
+                write_stack(frame_ptr, -104, process.context.r14); // R14
+                write_stack(frame_ptr, -112, process.context.r15); // R15
+                write_stack(frame_ptr, 0, process.context.rbp);    // RBP
+                // Note: RSP and RIP are in the IRETQ frame and will be restored by IRETQ
+                // They don't need to be written back to the GP register save area
+            }
         }
     }
     
