@@ -412,19 +412,27 @@ fn sys_fork() -> u64 {
     stats.fork_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] fork() called\n");
+    let current_pid = process::current_process_id().unwrap_or(0);
+    serial::serial_print("[SYSCALL] fork() called from PID ");
+    serial::serial_print_dec(current_pid as u64);
+    serial::serial_print("\n");
     
     // Create child process
     match process::fork_process() {
         Some(child_pid) => {
             serial::serial_print("[SYSCALL] fork() created child process with PID: ");
             serial::serial_print_dec(child_pid as u64);
+            serial::serial_print(", returning to parent PID ");
+            serial::serial_print_dec(current_pid as u64);
             serial::serial_print("\n");
             
             // Add child to scheduler
             crate::scheduler::enqueue_process(child_pid);
             
             // Return child PID to parent
+            serial::serial_print("[SYSCALL] fork() returning ");
+            serial::serial_print_dec(child_pid as u64);
+            serial::serial_print(" to parent\n");
             child_pid as u64
         }
         None => {

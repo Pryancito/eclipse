@@ -98,7 +98,7 @@ build_eclipse_init() {
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    RUSTFLAGS="-C link-arg=-Tlinker.ld -C relocation-model=static" cargo build --release --target x86_64-unknown-none
+    RUSTFLAGS="-C link-arg=-Tlinker.ld -C relocation-model=static" rustup run nightly cargo build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"

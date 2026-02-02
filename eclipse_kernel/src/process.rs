@@ -259,6 +259,15 @@ pub fn update_process(pid: ProcessId, process: Process) {
 /// # Safety
 /// Esta función es unsafe porque manipula directamente registros de CPU
 pub unsafe fn switch_context(from: &mut Context, to: &Context) {
+    // DEBUG: Print what RAX we're about to restore
+    let to_rax = to.rax;
+    let to_rip = to.rip;
+    crate::serial::serial_print("[SWITCH_CTX] Restoring RAX=");
+    crate::serial::serial_print_hex(to_rax);
+    crate::serial::serial_print(" RIP=");
+    crate::serial::serial_print_hex(to_rip);
+    crate::serial::serial_print("\n");
+    
     asm!(
         // Guardar contexto actual (usando rdi = from)
         "mov [rdi + 0x00], rax",
