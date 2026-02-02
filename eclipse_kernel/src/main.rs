@@ -157,65 +157,27 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
 
 /// Init process binary embedded in kernel
 /// This will be loaded instead of the test process
-// TEMPORARY: Using fork_test to debug fork() behavior
-pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/fork_test/target/x86_64-unknown-none/release/fork_test");
+pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
 
 /// Función principal del kernel
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
+    serial::serial_print("===== FORK FIX VERSION - TESTING =====\n");
     serial::serial_print("Entering kernel main loop...\n");
     
     // Intentar montar el sistema de archivos
     serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
     let mut init_loaded = false;
     
-    // TEMPORARY: Skip disk loading to test fork() with embedded binary
-    let _skip_disk = true;
-    
-    if !_skip_disk {
     match filesystem::mount_root() {
         Ok(_) => {
             serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
             
-            // TEMPORARY: Skip loading from disk to use safe embedded init
-            // This ensures we use the binary with correct memory layout (0x10000000)
-            // instead of the old binary on disk (0x400000) which crashes the kernel.
-            // Try to load init from /sbin/eclipse-systemd
-            serial::serial_print("[KERNEL] Attempting to load init from /sbin/eclipse-systemd...\n");
-            
-            // Allocate buffer on heap for reading init binary (max 512KB)
-            // Use vec! to avoid stack overflow with Box::new([0u8; ...])
-            const MAX_INIT_SIZE: usize = 8 * 1024 * 1024;
-            let mut init_buffer = vec![0u8; MAX_INIT_SIZE];
-            
-            match filesystem::read_file("/sbin/eclipse-systemd", &mut init_buffer[..]) {
-                Ok(bytes_read) => {
-                    serial::serial_print("[KERNEL] Read /sbin/eclipse-systemd: ");
-                    serial::serial_print_dec(bytes_read as u64);
-                    serial::serial_print(" bytes\n");
-                    
-                    // Load the ELF binary
-                    if let Some(pid) = elf_loader::load_elf(&init_buffer[..bytes_read]) {
-                        serial::serial_print("[KERNEL] Init process loaded from /sbin/eclipse-systemd with PID: ");
-                        serial::serial_print_dec(pid as u64);
-                        serial::serial_print("\n");
-                        
-                        // Add to scheduler queue
-                        scheduler::enqueue_process(pid);
-                        
-                        serial::serial_print("[KERNEL] Init process scheduled for execution\n");
-                        init_loaded = true;
-                    } else {
-                        serial::serial_print("[KERNEL] Failed to load ELF from /sbin/eclipse-systemd\n");
-                        serial::serial_print("[KERNEL] Falling back to embedded init...\n");
-                    }
-                }
-                Err(e) => {
-                    serial::serial_print("[KERNEL] Failed to read /sbin/eclipse-systemd: ");
-                    serial::serial_print(e);
-                    serial::serial_print("\n");
-                    serial::serial_print("[KERNEL] Falling back to embedded init...\n");
-                }
-            }
+            // TEMPORARY: Skip loading from disk to test embedded init with fork() fix
+            // The eclipse-systemd on disk crashes immediately (exit code 10)
+            // For now, test with the simpler embedded init
+            serial::serial_print("[KERNEL] Skipping disk systemd (crashes), using embedded init...\n");
+            // Don't load from disk - use embedded binary
+            // init_loaded stays false
         }
 
         Err(e) => {
@@ -224,7 +186,6 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
             serial::serial_print("\n");
             serial::serial_print("[KERNEL] Falling back to embedded init...\n");
         }
-    }
     }
     
     // If init was not loaded from /sbin/init, load embedded binary
