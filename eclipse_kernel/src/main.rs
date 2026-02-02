@@ -157,7 +157,8 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
 
 /// Init process binary embedded in kernel
 /// This will be loaded instead of the test process
-pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
+// TEMPORARY: Using fork_test to debug fork() behavior
+pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/fork_test/target/x86_64-unknown-none/release/fork_test");
 
 /// Función principal del kernel
 fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
@@ -167,6 +168,10 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
     let mut init_loaded = false;
     
+    // TEMPORARY: Skip disk loading to test fork() with embedded binary
+    let _skip_disk = true;
+    
+    if !_skip_disk {
     match filesystem::mount_root() {
         Ok(_) => {
             serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
@@ -219,6 +224,7 @@ fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
             serial::serial_print("\n");
             serial::serial_print("[KERNEL] Falling back to embedded init...\n");
         }
+    }
     }
     
     // If init was not loaded from /sbin/init, load embedded binary
