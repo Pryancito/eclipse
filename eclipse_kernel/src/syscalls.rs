@@ -133,7 +133,8 @@ pub extern "C" fn syscall_handler(
              if let Some(mut process) = get_process(pid) {
                  process.context.rsp = user_rsp;
                  process.context.rip = user_rip;
-                 process.context.rax = user_rax;
+                 // DON'T update RAX here - it will be updated after the syscall completes
+                 // process.context.rax = user_rax;
                  process.context.rbx = user_rbx;
                  process.context.rcx = user_rcx;
                  process.context.rdx = user_rdx;
@@ -208,6 +209,18 @@ pub extern "C" fn syscall_handler(
     }
     */
     // if syscall_num == 4 { crate::serial::serial_print("RRet "); }
+    
+    // CRITICAL FIX: Update the calling process's RAX with the return value
+    // This must happen AFTER the syscall executes, not before
+    // Otherwise, if the process gets context-switched during the syscall,
+    // it will be restored with the wrong RAX value
+    if let Some(pid) = current_process_id() {
+        use crate::process::{update_process, get_process};
+        if let Some(mut process) = get_process(pid) {
+            process.context.rax = ret;
+            update_process(pid, process);
+        }
+    }
     
     ret
 }
@@ -412,19 +425,27 @@ fn sys_fork() -> u64 {
     stats.fork_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] fork() called\n");
+    let current_pid = process::current_process_id().unwrap_or(0);
+    serial::serial_print("[SYSCALL] fork() called from PID ");
+    serial::serial_print_dec(current_pid as u64);
+    serial::serial_print("\n");
     
     // Create child process
     match process::fork_process() {
         Some(child_pid) => {
             serial::serial_print("[SYSCALL] fork() created child process with PID: ");
             serial::serial_print_dec(child_pid as u64);
+            serial::serial_print(", returning to parent PID ");
+            serial::serial_print_dec(current_pid as u64);
             serial::serial_print("\n");
             
             // Add child to scheduler
             crate::scheduler::enqueue_process(child_pid);
             
             // Return child PID to parent
+            serial::serial_print("[SYSCALL] fork() returning ");
+            serial::serial_print_dec(child_pid as u64);
+            serial::serial_print(" to parent\n");
             child_pid as u64
         }
         None => {

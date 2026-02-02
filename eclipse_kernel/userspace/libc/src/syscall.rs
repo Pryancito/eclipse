@@ -78,7 +78,47 @@ pub fn getppid() -> u32 {
 }
 
 pub fn fork() -> i32 {
-    unsafe { syscall0(SYS_FORK) as i32 }
+    let pid = unsafe { syscall0(SYS_FORK) as i32 };
+    // DEBUG: Print what fork() returned
+    unsafe {
+        let msg = if pid == 0 {
+            "[LIBC] fork() returned 0 (child)\n"
+        } else if pid > 0 {
+            "[LIBC] fork() returned positive (parent)\n"
+        } else {
+            "[LIBC] fork() returned negative (error)\n"
+        };
+        syscall3(SYS_WRITE, 1, msg.as_ptr() as u64, msg.len() as u64);
+        
+        // Also print the actual PID value
+        let prefix = "[LIBC] fork() return value: ";
+        syscall3(SYS_WRITE, 1, prefix.as_ptr() as u64, prefix.len() as u64);
+        
+        // Convert PID to string and print (simple approach)
+        let mut buf = [0u8; 20];
+        let mut n = if pid < 0 { -pid } else { pid };
+        let mut i = 0;
+        if n == 0 {
+            buf[0] = b'0';
+            i = 1;
+        } else {
+            while n > 0 {
+                buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                i += 1;
+            }
+        }
+        // Reverse
+        for j in 0..i/2 {
+            buf.swap(j, i-1-j);
+        }
+        if pid < 0 {
+            syscall3(SYS_WRITE, 1, b"-".as_ptr() as u64, 1);
+        }
+        syscall3(SYS_WRITE, 1, buf.as_ptr() as u64, i as u64);
+        syscall3(SYS_WRITE, 1, b"\n".as_ptr() as u64, 1);
+    }
+    pid
 }
 
 pub fn exec(elf_buffer: &[u8]) -> i32 {
