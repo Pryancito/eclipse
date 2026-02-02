@@ -210,6 +210,37 @@ pub extern "C" fn syscall_handler(
     */
     // if syscall_num == 4 { crate::serial::serial_print("RRet "); }
     
+    // Stack frame offsets for GP registers saved by syscall_int80
+    // These must match the push order in the naked assembly function
+    const RAX_OFFSET: isize = -8;
+    const RBX_OFFSET: isize = -16;
+    const RCX_OFFSET: isize = -24;
+    const RDX_OFFSET: isize = -32;
+    const RSI_OFFSET: isize = -40;
+    const RDI_OFFSET: isize = -48;
+    const R8_OFFSET: isize = -56;
+    const R9_OFFSET: isize = -64;
+    const R10_OFFSET: isize = -72;
+    const R11_OFFSET: isize = -80;
+    const R12_OFFSET: isize = -88;
+    const R13_OFFSET: isize = -96;
+    const R14_OFFSET: isize = -104;
+    const R15_OFFSET: isize = -112;
+    const RBP_OFFSET: isize = 0;
+    
+    /// Write a value to a specific offset in the syscall stack frame
+    /// 
+    /// # Safety
+    /// This function is unsafe because:
+    /// - It performs raw pointer dereferencing
+    /// - Caller must ensure rbp points to a valid stack frame
+    /// - Caller must use correct offsets matching the syscall_int80 stack layout
+    /// - Writing to incorrect offsets will corrupt the stack
+    unsafe fn write_stack(rbp: u64, offset: isize, value: u64) {
+        let ptr = (rbp as isize + offset) as *mut u64;
+        *ptr = value;
+    }
+    
     // CRITICAL FIX: Update the calling process's RAX with the return value
     // This must happen AFTER the syscall executes, not before
     // Otherwise, if the process gets context-switched during the syscall,
@@ -218,6 +249,39 @@ pub extern "C" fn syscall_handler(
         use crate::process::{update_process, get_process};
         if let Some(mut process) = get_process(pid) {
             process.context.rax = ret;
+            
+            // CRITICAL FIX FOR CONTEXT SWITCH BUG:
+            // If a context switch occurred during this syscall (e.g., in yield_cpu or send/receive),
+            // the GP registers were restored from the PCB by switch_context().
+            // However, the values on the kernel stack (pushed by syscall_int80) are STALE.
+            // We MUST write the updated PCB register values back to the stack frame
+            // so that when syscall_int80 pops them, it restores the correct context.
+            
+            // Write all register values (including the newly updated RAX) to the stack frame.
+            // This must happen BEFORE the final update_process() call because process is moved there.
+            // RAX was just set to the return value above, and now we write all registers
+            // (including RAX) to the stack so syscall_int80 will pop the correct values.
+            unsafe {
+                write_stack(frame_ptr, RAX_OFFSET, process.context.rax);
+                write_stack(frame_ptr, RBX_OFFSET, process.context.rbx);
+                write_stack(frame_ptr, RCX_OFFSET, process.context.rcx);
+                write_stack(frame_ptr, RDX_OFFSET, process.context.rdx);
+                write_stack(frame_ptr, RSI_OFFSET, process.context.rsi);
+                write_stack(frame_ptr, RDI_OFFSET, process.context.rdi);
+                write_stack(frame_ptr, R8_OFFSET, process.context.r8);
+                write_stack(frame_ptr, R9_OFFSET, process.context.r9);
+                write_stack(frame_ptr, R10_OFFSET, process.context.r10);
+                write_stack(frame_ptr, R11_OFFSET, process.context.r11);
+                write_stack(frame_ptr, R12_OFFSET, process.context.r12);
+                write_stack(frame_ptr, R13_OFFSET, process.context.r13);
+                write_stack(frame_ptr, R14_OFFSET, process.context.r14);
+                write_stack(frame_ptr, R15_OFFSET, process.context.r15);
+                write_stack(frame_ptr, RBP_OFFSET, process.context.rbp);
+                // Note: RSP and RIP are in the IRETQ frame and will be restored by IRETQ
+                // They don't need to be written back to the GP register save area
+            }
+            
+            // Now update the PCB with the new RAX value
             update_process(pid, process);
         }
     }
