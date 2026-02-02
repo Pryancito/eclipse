@@ -31,6 +31,7 @@ pub enum MessageType {
     AI = 0x00000080,
     Security = 0x00000100,
     User = 0x00000200,
+    Signal = 0x00000400, // Process-to-Process signal (not for Kernel Servers)
 }
 
 /// Mensaje del microkernel
@@ -158,7 +159,14 @@ impl IpcSystem {
     }
 }
 
+use alloc::collections::VecDeque;
+
 static IPC_SYSTEM: Mutex<IpcSystem> = Mutex::new(IpcSystem::new());
+
+/// Buzones de mensajes por proceso (Process Mailboxes)
+/// Mapea PID -> Cola de mensajes (FIFO)
+/// Limitado a MAX_PROCESSES (64) definidos en process.rs
+static PROCESS_MAILBOXES: Mutex<[Option<VecDeque<Message>>; 64]> = Mutex::new([const { None }; 64]);
 
 /// Inicializar el sistema IPC
 pub fn init() {
@@ -168,6 +176,12 @@ pub fn init() {
     ipc.server_id_counter.store(1, Ordering::SeqCst);
     ipc.client_id_counter.store(1, Ordering::SeqCst);
     ipc.total_messages = 0;
+    
+    // Reset mailboxes
+    let mut mailboxes = PROCESS_MAILBOXES.lock();
+    for slot in mailboxes.iter_mut() {
+        *slot = None;
+    }
 }
 
 /// Registrar un servidor
@@ -256,34 +270,107 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
 
 /// Procesar mensajes pendientes
 pub fn process_messages() {
-    let mut ipc = IPC_SYSTEM.lock();
-    
-    // Procesar hasta 10 mensajes por llamada para no bloquear
-    for _ in 0..10 {
-        if ipc.global_queue_head == ipc.global_queue_tail {
-            break; // Cola vacía
-        }
+    // CRITICAL: We must disable interrupts while processing messages because
+    // this function runs in the kernel task (interrupts enabled).
+    // If an interrupt (like a syscall) occurs while we hold IPC_SYSTEM,
+    // and that syscall tries to access IPC_SYSTEM (e.g. sys_send/sys_receive),
+    // we will DEADLOCK.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut ipc = IPC_SYSTEM.lock();
         
-        let head = ipc.global_queue_head;
-        if let Some(msg) = ipc.global_message_queue[head].take() {
-            // Entregar mensaje al servidor correspondiente
-            for i in 0..32 {
-                if let Some(ref mut server) = ipc.servers[i] {
-                    if server.id == msg.to {
-                        let tail = server.queue_tail;
-                        let next_tail = (tail + 1) % 64;
-                        if next_tail != server.queue_head {
-                            server.message_queue[tail] = Some(msg);
-                            server.queue_tail = next_tail;
+        // Procesar hasta 10 mensajes por llamada para no bloquear
+        for _ in 0..10 {
+            if ipc.global_queue_head == ipc.global_queue_tail {
+                break; // Cola vacía
+            }
+            
+            let head = ipc.global_queue_head;
+            if let Some(msg) = ipc.global_message_queue[head] {
+                // DEBUG: Print all messages processed
+                 crate::serial::serial_print("KERNEL IPC: Processing msg type ");
+                 crate::serial::serial_print_hex(msg.msg_type as u64);
+                 crate::serial::serial_print(" from ");
+                 crate::serial::serial_print_dec(msg.from as u64);
+                 crate::serial::serial_print(" to ");
+                 crate::serial::serial_print_dec(msg.to as u64);
+                 crate::serial::serial_print("\n");
+
+                // Check if it's a Signal message - route to Process Mailbox
+                if msg.msg_type == MessageType::Signal {
+                    let pid = msg.to as usize;
+                    
+                    // If PID is within range (0..64)
+                    if pid < 64 {
+                        // Remove from global queue
+                        if let Some(signal_msg) = ipc.global_message_queue[head].take() {
+                             ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                             
+                             let mut mailboxes = PROCESS_MAILBOXES.lock();
+                             if mailboxes[pid].is_none() {
+                                 mailboxes[pid] = Some(VecDeque::new());
+                             }
+                             
+                             if let Some(queue) = &mut mailboxes[pid] {
+                             // Limit queue size to avoid kernel memory exhaustion
+                             if queue.len() < 32 {
+                                 queue.push_back(signal_msg);
+                                 crate::serial::serial_print("KERNEL IPC: Pushed Signal to Mailbox ");
+                                 crate::serial::serial_print_dec(pid as u64);
+                                 crate::serial::serial_print("\n");
+                             } else {
+                                 crate::serial::serial_print("KERNEL IPC: Mailbox full for PID ");
+                                 crate::serial::serial_print_dec(pid as u64);
+                                 crate::serial::serial_print("\n");
+                             }
+                         }
+                    }
+                    } else {
+                        // Invalid PID, just consume/discard
+                        ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                    }
+                    
+                    continue;
+                }
+                
+                // For other messages, check if they are for a registered kernel server
+                // Only if we find a destination server do we take it out of the global queue
+                let mut found_server_idx = None;
+                
+                // First pass: find the server index without mutable borrow
+                for i in 0..32 {
+                    if let Some(ref server) = ipc.servers[i] {
+                        if server.id == msg.to {
+                            found_server_idx = Some(i);
+                            break;
                         }
-                        break;
                     }
                 }
+                
+                if let Some(idx) = found_server_idx {
+                    // Found destination server - take message and deliver
+                    if let Some(taken_msg) = ipc.global_message_queue[head].take() {
+                        if let Some(ref mut server) = ipc.servers[idx] {
+                            let tail = server.queue_tail;
+                            let next_tail = (tail + 1) % 64;
+                            if next_tail != server.queue_head {
+                                server.message_queue[tail] = Some(taken_msg);
+                                server.queue_tail = next_tail;
+                            }
+                        }
+                    }
+                }
+                
+                // Advance head (if delivered or not handled/dropped)
+                ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+            } else {
+                // Slot empty but head points to it? Should not happen if logic is correct
+                ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
             }
         }
         
-        ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
-    }
+        // DEBUG
+        // crate::serial::serial_print("Done loop\n");
+    });
 }
 
 /// Obtener estadísticas del sistema IPC
@@ -309,6 +396,27 @@ pub fn get_stats() -> (u32, u32, u64) {
 
 /// Recibir mensaje para un cliente
 pub fn receive_message(client_id: ClientId) -> Option<Message> {
+    // 1. Check Process Mailbox first
+    let client_pid = client_id as usize;
+    if client_pid < 64 {
+        // We lock mailboxes first
+        let mut mailboxes = PROCESS_MAILBOXES.lock();
+        if let Some(queue) = &mut mailboxes[client_pid] {
+            if let Some(msg) = queue.pop_front() {
+                 crate::serial::serial_print("KERNEL IPC: Popped message from Mailbox ");
+                 crate::serial::serial_print_dec(client_pid as u64);
+                 crate::serial::serial_print("\n");
+                return Some(msg);
+            }
+        } else {
+             // DEBUG
+             // crate::serial::serial_print("IPC DEBUG: Mailbox ");
+             // crate::serial::serial_print_dec(client_pid as u64);
+             // crate::serial::serial_print(" is None\n");
+        }
+    }
+    
+    // 2. Check Global Queue (Legacy / Fallback)
     let mut ipc = IPC_SYSTEM.lock();
     
     // Buscar mensajes en la cola global para este cliente
@@ -319,7 +427,7 @@ pub fn receive_message(client_id: ClientId) -> Option<Message> {
         }
         
         if let Some(ref msg) = ipc.global_message_queue[idx] {
-            if msg.from == client_id {
+            if msg.to == client_id {
                 // Tomar el mensaje
                 let message = ipc.global_message_queue[idx].take();
                 return message;

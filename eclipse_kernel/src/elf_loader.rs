@@ -106,6 +106,21 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
                     let src = elf_data.as_ptr().add(file_offset);
                     let dst = ph.p_vaddr as *mut u8;
                     core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                    
+                    // DEBUG: Verify content at 0x100004EF
+                    if ph.p_vaddr <= 0x100004EF && (ph.p_vaddr + ph.p_filesz) > 0x100004EF {
+                         let check_ptr = 0x100004EF as *const u8;
+                         let b1 = *check_ptr;
+                         let b2 = *(check_ptr.add(1));
+                         let b3 = *(check_ptr.add(2));
+                         serial::serial_print("ELF DEBUG: At 0x100004EF: ");
+                         serial::serial_print_hex(b1 as u64);
+                         serial::serial_print(" ");
+                         serial::serial_print_hex(b2 as u64);
+                         serial::serial_print(" ");
+                         serial::serial_print_hex(b3 as u64);
+                         serial::serial_print("\n");
+                    }
                 }
             }
             

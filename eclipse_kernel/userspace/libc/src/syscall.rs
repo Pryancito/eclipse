@@ -14,6 +14,7 @@ pub const SYS_WAIT: u64 = 9;
 pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 pub const SYS_OPEN: u64 = 11;
 pub const SYS_CLOSE: u64 = 12;
+pub const SYS_GETPPID: u64 = 13;
 
 // File open flags
 pub const O_RDONLY: i32 = 0x0000;
@@ -72,6 +73,10 @@ pub fn getpid() -> u32 {
     unsafe { syscall0(SYS_GETPID) as u32 }
 }
 
+pub fn getppid() -> u32 {
+    unsafe { syscall0(SYS_GETPPID) as u32 }
+}
+
 pub fn fork() -> i32 {
     unsafe { syscall0(SYS_FORK) as i32 }
 }
@@ -128,5 +133,38 @@ pub fn open(path: &str, flags: i32, _mode: i32) -> i32 {
 pub fn close(fd: i32) -> i32 {
     unsafe {
         syscall1(SYS_CLOSE, fd as u64) as i32
+    }
+}
+/// Send a message to a server
+/// Returns 0 on success, -1 on error
+pub fn send(server_id: u32, msg_type: u32, data: &[u8]) -> i32 {
+    unsafe {
+        syscall3(
+            SYS_SEND,
+            server_id as u64,
+            msg_type as u64,
+            data.as_ptr() as u64
+        ) as i32
+    }
+}
+
+/// Receive a message
+/// Returns (length, sender_pid) or (0, 0) if no message
+pub fn receive(buffer: &mut [u8]) -> (usize, u32) {
+    let mut sender_pid: u64 = 0;
+    
+    let result = unsafe {
+        syscall3(
+            SYS_RECEIVE,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+            &mut sender_pid as *mut u64 as u64
+        )
+    };
+    
+    if result > 0 {
+        (result as usize, sender_pid as u32)
+    } else {
+        (0, 0)
     }
 }

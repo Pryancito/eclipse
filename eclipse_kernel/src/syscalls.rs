@@ -98,6 +98,16 @@ pub extern "C" fn syscall_handler(
         let user_rip = read_stack(frame_ptr, 8);
         
         let user_rax = read_stack(frame_ptr, -8);
+        
+        /* 
+        crate::serial::serial_print("SYSCALL: frame_ptr=");
+        crate::serial::serial_print_hex(frame_ptr);
+        crate::serial::serial_print(" user_rax=");
+        crate::serial::serial_print_hex(user_rax);
+        crate::serial::serial_print(" user_rip=");
+        crate::serial::serial_print_hex(user_rip);
+        crate::serial::serial_print("\n");
+        */
         let user_rbx = read_stack(frame_ptr, -16);
         let user_rcx = read_stack(frame_ptr, -24);
         let user_rdx = read_stack(frame_ptr, -32);
@@ -153,12 +163,12 @@ pub extern "C" fn syscall_handler(
     // serial::serial_print_dec(syscall_num);
     // serial::serial_print("\n");
 
-    match syscall_num {
+    let ret = match syscall_num {
         0 => sys_exit(arg1),
         1 => sys_write(arg1, arg2, arg3),
         2 => sys_read(arg1, arg2, arg3),
         3 => sys_send(arg1, arg2, arg3),
-        4 => sys_receive(arg1, arg2),
+        4 => sys_receive(arg1, arg2, arg3),
         5 => sys_yield(),
         6 => sys_getpid(),
         7 => sys_fork(),
@@ -167,13 +177,39 @@ pub extern "C" fn syscall_handler(
         10 => sys_get_service_binary(arg1, arg2, arg3),
         11 => sys_open(arg1, arg2, arg3),
         12 => sys_close(arg1),
+        13 => sys_getppid(),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
             serial::serial_print("\n");
             u64::MAX
         }
+    };
+
+    // DEBUG Trace return
+    /* 
+    if syscall_num == 5 { 
+        if let Some(pid) = crate::process::current_process_id() {
+            crate::serial::serial_print("YRet[PID=");
+            crate::serial::serial_print_dec(pid as u64);
+            crate::serial::serial_print(" RIP=");
+            unsafe {
+                 let rip_val = *( (frame_ptr + 8) as *const u64 );
+                 let cs_val = *( (frame_ptr + 16) as *const u64 );
+                 let rflags_val = *( (frame_ptr + 24) as *const u64 );
+                 crate::serial::serial_print_hex(rip_val);
+                 crate::serial::serial_print(" CS=");
+                 crate::serial::serial_print_hex(cs_val);
+                 crate::serial::serial_print(" FL=");
+                 crate::serial::serial_print_hex(rflags_val);
+            }
+            crate::serial::serial_print("] ");
+        }
     }
+    */
+    // if syscall_num == 4 { crate::serial::serial_print("RRet "); }
+    
+    ret
 }
 
 /// sys_exit - Terminar proceso actual
@@ -273,6 +309,7 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64) -> u64 {
     if let Some(client_id) = current_process_id() {
         let message_type = match msg_type {
             1 => MessageType::System,
+            255 => MessageType::Signal, // Special signal type for P2P
             2 => MessageType::Memory,
             4 => MessageType::FileSystem,
             8 => MessageType::Network,
@@ -293,8 +330,8 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64) -> u64 {
     u64::MAX // Error
 }
 
-/// sys_receive - Recibir mensaje IPC (IMPLEMENTADO)
-fn sys_receive(buffer_ptr: u64, size: u64) -> u64 {
+/// sys_receive - Recibir mensaje IPC
+fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.receive_calls += 1;
     drop(stats);
@@ -304,9 +341,14 @@ fn sys_receive(buffer_ptr: u64, size: u64) -> u64 {
         return u64::MAX; // Error
     }
     
+    // DEBUG: Print entry
+    crate::serial::serial_print("R"); // R = syscall receive called
+    
     if let Some(client_id) = current_process_id() {
         // Intentar recibir mensaje
         if let Some(msg) = receive_message(client_id) {
+            crate::serial::serial_print("!"); // ! = Message found
+            
             // Copiar mensaje a buffer de usuario
             unsafe {
                 let user_buf = core::slice::from_raw_parts_mut(
@@ -314,11 +356,17 @@ fn sys_receive(buffer_ptr: u64, size: u64) -> u64 {
                     core::cmp::min(size as usize, 32)
                 );
                 user_buf.copy_from_slice(&msg.data[..core::cmp::min(size as usize, 32)]);
+                
+                // Si se proporcionó un puntero para el PID del remitente, escribirlo
+                if sender_pid_ptr != 0 {
+                    *(sender_pid_ptr as *mut u64) = msg.from as u64;
+                }
             }
-            return msg.data.len() as u64;
+            return msg.data_size as u64;
         }
     }
     
+    // crate::serial::serial_print("0"); // 0 = Only print if debugging spam needed
     0 // No hay mensajes
 }
 
@@ -339,6 +387,20 @@ fn sys_getpid() -> u64 {
     } else {
         0
     }
+}
+
+/// sys_getppid - Obtener PID del proceso padre
+fn sys_getppid() -> u64 {
+    use crate::process::{current_process_id, get_process};
+    
+    if let Some(pid) = current_process_id() {
+        if let Some(proc) = get_process(pid) {
+            if let Some(ppid) = proc.parent_pid {
+                return ppid as u64;
+            }
+        }
+    }
+    0
 }
 
 /// sys_fork - Create a new process (child)

@@ -22,7 +22,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, wait, exit};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive};
 
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
@@ -307,15 +307,23 @@ fn start_system_services() {
             if let Some(ref mut service) = SERVICES[i] {
                 if service.dependencies.is_empty() {
                     start_service(service, i);
-                    // Allow service to initialize
-                    if DEBUG_SERVICE_STARTUP {
-                        println!("  [DEBUG] Yielding {} times for service initialization", SERVICE_INIT_DELAY);
-                    }
-                    for _ in 0..SERVICE_INIT_DELAY {
-                        yield_cpu();
-                    }
-                    if DEBUG_SERVICE_STARTUP {
-                        println!("  [DEBUG] Done yielding for service {}", service.name);
+                    
+                    // Wait for service to signal READY via IPC
+                    if service.pid > 0 {
+                        if DEBUG_SERVICE_STARTUP {
+                            println!("  [DEBUG] Waiting for service {} to signal READY...", service.name);
+                        }
+                        
+                        // Wait up to 20000 cycles for readiness
+                        if wait_for_service_ready(service.pid, 20000) {
+                            if DEBUG_SERVICE_STARTUP {
+                                println!("  [DEBUG] Service {} signalled READY", service.name);
+                            }
+                        } else {
+                            println!("  [WARNING] Timeout waiting for service {} to initialize", service.name);
+                        }
+                    } else {
+                        // Fork failed, nothing to wait for
                     }
                 }
             }
@@ -352,12 +360,17 @@ fn start_system_services() {
                             }
                             start_service(service, i);
                             services_started_this_pass += 1;
-                            // Allow service to initialize
-                            for _ in 0..SERVICE_INIT_DELAY {
-                                yield_cpu();
-                            }
-                            if DEBUG_SERVICE_STARTUP {
-                                println!("  [DEBUG] Service {} started and initialized", service.name);
+                            
+                            // Wait for service to signal READY via IPC
+                            if service.pid > 0 {
+                                // Wait up to 20000 cycles for readiness
+                                if wait_for_service_ready(service.pid, 20000) {
+                                    if DEBUG_SERVICE_STARTUP {
+                                        println!("  [DEBUG] Service {} signalled READY", service.name);
+                                    }
+                                } else {
+                                     println!("  [WARNING] Timeout waiting for service {} to initialize", service.name);
+                                }
                             }
                         } else {
                             if DEBUG_SERVICE_STARTUP {
@@ -399,6 +412,55 @@ fn check_dependencies(service: &Service) -> bool {
         }
     }
     true
+}
+
+/// Wait for a specific service to signal it is ready via IPC
+/// Returns true if ready, false if timeout
+fn wait_for_service_ready(pid: i32, timeout_cycles: u32) -> bool {
+    // Buffer for receiving IPC messages
+    let mut buffer = [0u8; 32];
+    
+    // We poll for messages in a loop with yield
+    for cycle in 0..timeout_cycles {
+        if DEBUG_SERVICE_STARTUP {
+             println!("    [IPC] Cycle {}", cycle);
+        }
+
+        // Check for messages
+        let (len, sender) = receive(&mut buffer);
+        
+        if len > 0 {
+             if DEBUG_SERVICE_STARTUP {
+                  println!("    [IPC] Got msg len={} from {}", len, sender);
+             }
+            // Check if message is from the expected service PID
+            // and contains "READY" payload (or just any message for now)
+            if sender == pid as u32 {
+                // Determine if it's a READY message
+                // For now any message is considered READY
+                if DEBUG_SERVICE_STARTUP {
+                     println!("    [IPC] Received signal from PID {}", sender);
+                }
+                return true;
+            } else {
+                // Message from someone else - ignore or log?
+                 if DEBUG_SERVICE_STARTUP {
+                     println!("    [IPC] Ignored signal from PID {} (waiting for {})", sender, pid);
+                }
+            }
+        }
+        
+        // No message or wrong sender, yield and retry
+        println!("    [IPC] Yielding...");
+        yield_cpu();
+        println!("    [IPC] Back from yield");
+        
+        if DEBUG_SERVICE_STARTUP && (cycle % 100 == 0) {
+            println!("    [IPC] Still waiting for PID {}... (cycle {})", pid, cycle);
+        }
+    }
+    
+    false // Timeout
 }
 
 /// Start a specific service
@@ -466,6 +528,7 @@ fn start_service(service: &mut Service, _service_idx: usize) {
 /// Main service manager loop
 fn main_loop() -> ! {
     let mut tick: u64 = 0;
+    
     let mut heartbeat_counter: u64 = 0;
     
     loop {

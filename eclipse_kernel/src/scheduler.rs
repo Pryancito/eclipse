@@ -106,7 +106,6 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     set_current_process(Some(to_pid));
     
     // DEBUG: Print context switch
-    /*
     crate::serial::serial_print("Context switch: ");
     if let Some(fid) = dbg_from_pid {
          crate::serial::serial_print_dec(fid as u64);
@@ -116,7 +115,6 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     crate::serial::serial_print(" -> ");
     crate::serial::serial_print_dec(to_pid as u64);
     crate::serial::serial_print("\n");
-    */
     
     // Get raw pointers to contexts in the global table
     let (from_ctx_ptr, to_ctx_ptr, to_kernel_stack) = {

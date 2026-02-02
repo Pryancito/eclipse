@@ -20,50 +20,33 @@ pub enum ProcessState {
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
     // Registros de propósito general
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
+    pub rax: u64, // 0x00
+    pub rbx: u64, // 0x08
+    pub rcx: u64, // 0x10
+    pub rdx: u64, // 0x18
+    pub rsi: u64, // 0x20
+    pub rdi: u64, // 0x28
+    pub rbp: u64, // 0x30
+    pub r8: u64,  // 0x38
+    pub r9: u64,  // 0x40
+    pub r10: u64, // 0x48
+    pub r11: u64, // 0x50
+    pub r12: u64, // 0x58
+    pub r13: u64, // 0x60
+    pub r14: u64, // 0x68
+    pub r15: u64, // 0x70
     
-    // Stack pointer
-    pub rsp: u64,
-    
-    // Instruction pointer
-    pub rip: u64,
-    
-    // Flags
-    pub rflags: u64,
+    // Punteros y estado
+    pub rsp: u64,    // 0x78
+    pub rip: u64,    // 0x80
+    pub rflags: u64, // 0x88
 }
 
 impl Context {
     pub const fn new() -> Self {
         Self {
-            rax: 0,
-            rbx: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: 0,
-            rbp: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
+            rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
+            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
             rsp: 0,
             rip: 0,
             rflags: 0x002, // IF disabled by default
@@ -327,12 +310,8 @@ pub unsafe fn switch_context(from: &mut Context, to: &Context) {
         "mov rsp, [rsi + 0x78]",
         
         // 2. Preparar stack para iretq/ret simulado
-        // Orden inverso al pop: Queremos que popfq saque RFLAGS y ret saque RIP.
-        // Stack crece hacia abajo.
-        // Push RIP (queda más "abajo" en memoria alta)
-        "push qword ptr [rsi + 0x80]", // RIP
-        // Push RFLAGS (queda más "arriba" en memoria baja, tope del stack)
-        "push qword ptr [rsi + 0x88]", // RFLAGS
+        "push qword ptr [rsi + 0x80]", // RIP (at 0x80)
+        "push qword ptr [rsi + 0x88]", // RFLAGS (at 0x88)
         
         // 3. Restaurar GP registers (EXCEPTO RSI que tiene el puntero 'to')
         "mov rax, [rsi + 0x00]",
@@ -453,8 +432,46 @@ pub fn fork_process() -> Option<ProcessId> {
             child.stack_size = CHILD_STACK_SIZE;
             child.parent_pid = Some(current_pid);
             
-            // Adjust stack pointer for child
-            child.context.rsp = child_rsp;
+            // Allocate NEW kernel stack for child
+            // This is critical: if they share the same kstack, they corrupt each other
+            let kernel_stack_size = 8192;
+            let kernel_stack = alloc::vec![0u8; kernel_stack_size];
+            let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
+            let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+            core::mem::forget(kernel_stack); // Leak for now
+            
+            child.kernel_stack_top = kernel_stack_top_aligned;
+            
+            // PUSH IRETQ frame onto child's kernel stack
+            // Frame: [SS] [RSP] [RFLAGS] [CS] [RIP]
+            let mut kstack_ptr = kernel_stack_top_aligned as *mut u64;
+            unsafe {
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x23; // SS
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = child_rsp; // RSP
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent.context.rflags; // RFLAGS
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x1b; // CS
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent.context.rip; // RIP
+            }
+            
+            // Set up context for child to start via trampoline
+            child.context.rip = crate::interrupts::fork_child_trampoline as u64;
+            child.context.rsp = kstack_ptr as u64; // RSP points to the iframe
+            
+            // Copy all parent GP registers to child
+            child.context.rbx = parent.context.rbx;
+            child.context.rcx = parent.context.rcx;
+            child.context.rdx = parent.context.rdx;
+            child.context.rsi = parent.context.rsi;
+            child.context.rdi = parent.context.rdi;
+            child.context.rbp = parent.context.rbp;
+            child.context.r8 = parent.context.r8;
+            child.context.r9 = parent.context.r9;
+            child.context.r10 = parent.context.r10;
+            child.context.r11 = parent.context.r11;
+            child.context.r12 = parent.context.r12;
+            child.context.r13 = parent.context.r13;
+            child.context.r14 = parent.context.r14;
+            child.context.r15 = parent.context.r15;
             
             // Child returns 0 from fork
             child.context.rax = 0;

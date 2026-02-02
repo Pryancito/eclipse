@@ -14,7 +14,7 @@ opt-level = "z"     # Optimize for size
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = false
 
 [profile.dev]
 opt-level = "s"     # Optimize for size even in dev

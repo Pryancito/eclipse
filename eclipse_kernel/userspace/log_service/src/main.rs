@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
+use eclipse_libc::{println, getpid, getppid, send, yield_cpu, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
 
 /// Log buffer for storing messages before filesystem is ready
 /// 
@@ -94,6 +94,16 @@ pub extern "C" fn _start() -> ! {
     log_message("[LOG-SERVICE] Log buffer allocated (4KB)");
     log_message("[LOG-SERVICE] Target log file: /var/log/system.log");
     log_message("[LOG-SERVICE] Ready to accept log messages from other services");
+    
+    // Notify init (parent) that we are ready
+    let ppid = getppid();
+    if ppid > 0 {
+        // Send READY message (Type 255 = Signal/Process)
+        // This avoids collision with Network Server (ID 3)
+        let ready_msg = b"READY";
+        send(ppid as u32, 255, ready_msg);
+        log_message("[LOG-SERVICE] Sent READY signal to init");
+    }
     
     // Main loop - handle log messages
     let mut heartbeat_counter = 0u64;

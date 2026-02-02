@@ -517,66 +517,59 @@ unsafe extern "C" fn syscall_int80() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
-        "and rsp, -16",
-        // Guardar registros
-        "push rax",
-        "push rbx",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        // Parámetros de syscall:
-        // rax = syscall number
-        // rdi = arg1
-        // rsi = arg2
-        // rdx = arg3
-        // r10 = arg4
-        // r8 = arg5
-        // r9 = arg6
+        
+        // Guardar registros GP (antes de alinear stack para tener offsets fijos desde RBP)
+        "push rax", // [rbp - 8]
+        "push rbx", // [rbp - 16]
+        "push rcx", // [rbp - 24]
+        "push rdx", // [rbp - 32]
+        "push rsi", // [rbp - 40]
+        "push rdi", // [rbp - 48]
+        "push r8",  // [rbp - 56]
+        "push r9",  // [rbp - 64]
+        "push r10", // [rbp - 72]
+        "push r11", // [rbp - 80]
+        "push r12", // [rbp - 88]
+        "push r13", // [rbp - 96]
+        "push r14", // [rbp - 104]
+        "push r15", // [rbp - 112]
+        
+        "and rsp, -16", // Alinear stack para SysV ABI
+        
+        // Los argumentos de syscall de x86_64 suelen ser:
+        // rax = num
+        // rdi, rsi, rdx, r10, r8, r9
+        
+        // Mapear argumentos para la función Rust
+        // RDI (arg 0) = syscall_num (RAX)
+        // RSI (arg 1) = arg1 (RDI)
+        // RDX (arg 2) = arg2 (RSI)
+        // RCX (arg 3) = arg3 (RDX)
+        // R8  (arg 4) = arg4 (R10)
+        // R9  (arg 5) = arg5 (R8)
+        
         "mov r9, r8",    // arg5 (from r8)
         "mov r8, r10",   // arg4 (from r10)
         "mov rcx, rdx",  // arg3 (from rdx)
         "mov rdx, rsi",  // arg2 (from rsi)
         "mov rsi, rdi",  // arg1 (from rdi)
-        "mov rdi, rax",  // syscall_num (from rax)
+        "mov rdi, rax",  // syscall_num
         
-        // Pass RBP (frame pointer) as 7th argument (on stack)
+        // Pasar RBP (puntero al frame) como 7º argumento
         "push rbp",
         
         "call {}",
         
-        // Clean up stack argument
-        "add rsp, 8",
+        "add rsp, 8", // Limpiar 7º arg
         
-        // Resultado en rax
-        // UPDATE OFFSET: previously +72 (9*8).
-        // Now we have pushed 4 more regs (32 bytes).
-        // Stack layout relative to CURRENT RSP (after add rsp,8):
-        // R15 (0)
-        // R14 (8)
-        // R13 (16)
-        // R12 (24)
-        // R11 (32)
-        // R10 (40)
-        // R9  (48)
-        // R8  (56)
-        // RDI (64)
-        // RSI (72)
-        // RDX (80)
-        // RCX (88)
-        // RBX (96)
-        // RAX (104) <-- TARGET
-        "mov [rsp + 104], rax",  // Guardar resultado en rax guardado
+        // Restaurar registros GP (ojo: RSP original está en RBP)
+        "mov rsp, rbp",
+        "sub rsp, 112", // Mover RSP al inicio de los regs pusheados (r15)
         
-        // Restaurar registros
+        // El resultado está en RAX. Queremos que el RAX pusheado sea este resultado
+        // Offset de RAX desde RBP es -8.
+        "mov [rbp - 8], rax",
+        
         "pop r15",
         "pop r14",
         "pop r13",
@@ -591,9 +584,34 @@ unsafe extern "C" fn syscall_int80() {
         "pop rcx",
         "pop rbx",
         "pop rax",  // Ahora rax tiene el valor de retorno
-        "mov rsp, rbp",
+        
         "pop rbp",
         "iretq",
         sym syscall_handler_rust,
+    );
+}
+
+/// Trampolín para procesos hijos recién creados vía fork
+/// 
+/// Esta función se encarga de restaurar el contexto de usuario y saltar 
+/// a Ring 3 usando los valores guardados en el PCB durante el fork.
+#[unsafe(naked)]
+pub unsafe extern "C" fn fork_child_trampoline() -> ! {
+    core::arch::naked_asm!(
+        // Bloquear interrupciones mientras preparamos el salto
+        "cli",
+        
+        // Restaurar selectores de datos
+        "mov ax, 0x23", // USER_DATA_SELECTOR
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        
+        // El scheduler ya restauró los registros GP (rax, rbx, rsi, etc.)
+        // El stack (RSP) ya apunta al frame IRETQ pushgeado por fork_process.
+        
+        // ¡Salto a Userspace!
+        "iretq",
     );
 }
