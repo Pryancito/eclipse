@@ -1,9 +1,9 @@
-//! Sistema de gestión de memoria del microkernel
+//! Microkernel memory management system
 //! 
-//! Implementa:
-//! - Paginación básica
+//! Implements:
+//! - Basic paging
 //! - Heap allocator
-//! - Gestión de memoria física
+//! - Physical memory management
 
 use linked_list_allocator::LockedHeap;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,10 +15,12 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// Size of the kernel region with offset-based mapping (128MB = 64 * 2MB pages)
 const KERNEL_REGION_SIZE: u64 = 0x8000000;
 
-/// Tamaño del heap del kernel (2 MB)
-const HEAP_SIZE: usize = 32 * 1024 * 1024;
+/// Kernel heap size (128 MB)
+/// Sized to accommodate multiple 2MB page allocations for userspace processes.
+/// Each process needs ~6-8MB (stack + code pages), supporting 15+ concurrent processes.
+const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
-/// Heap estático del kernel
+/// Static kernel heap
 #[repr(align(4096))]
 struct KernelHeap {
     memory: [u8; HEAP_SIZE],
