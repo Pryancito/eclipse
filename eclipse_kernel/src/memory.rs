@@ -94,6 +94,10 @@ impl PageTableEntry {
     pub fn get_addr(&self) -> u64 {
         self.entry & 0x000F_FFFF_FFFF_F000
     }
+
+    pub fn get_flags(&self) -> u64 {
+        self.entry & 0xFFF
+    }
 }
 
 /// Tabla de páginas
@@ -107,6 +111,10 @@ impl PageTable {
         Self {
             entries: [PageTableEntry::new(); 512],
         }
+    }
+
+    pub fn entries_mut(&mut self) -> &mut [PageTableEntry; 512] {
+        &mut self.entries
     }
 }
 
@@ -225,6 +233,136 @@ pub fn get_cr3() -> u64 {
         );
     }
     cr3
+}
+
+/// Create a new isolated page table for a process
+/// Returns the physical address of the PML4
+/// Create a new isolated page table for a process
+/// Returns the physical address of the PML4
+pub fn create_process_paging() -> u64 {
+    unsafe {
+        // Use alloc_dma_buffer to avoid stack overflow with Box::new(PageTable::new())
+        let (pml4_ptr, pml4_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PML4");
+        let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PDPT");
+        let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PD");
+        
+        let pml4 = &mut *(pml4_ptr as *mut PageTable);
+        let pdpt = &mut *(pdpt_ptr as *mut PageTable);
+        let pd   = &mut *(pd_ptr as *mut PageTable);
+        
+        // Zero out the new tables
+        core::ptr::write_bytes(pml4_ptr, 0, 4096);
+        core::ptr::write_bytes(pdpt_ptr, 0, 4096);
+        core::ptr::write_bytes(pd_ptr, 0, 4096);
+        
+        // Clone kernel mappings (entire first 1GB provided by PD[0])
+        // This includes kernel code, heap, boot stack (at i=511), and MMIO (at i=0)
+        for i in 0..512 {
+            pd.entries[i] = PD.entries[i];
+        }
+        
+        pdpt.entries[0].set_addr(pd_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        pml4.entries[0].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        
+        // Also map kernel into higher half
+        pml4.entries[511].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        
+        pml4_phys
+    }
+}
+
+/// Clone an existing process's page table (deep copy of user-space mappings)
+/// Returns the physical address of the child's PML4
+pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
+    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
+    
+    // Parent tables (virtual access)
+    let p_pml4_virt = parent_pml4_phys.wrapping_sub(phys_offset);
+    let p_pml4 = unsafe { &*(p_pml4_virt as *const PageTable) };
+
+    // Parent PDPT and PD
+    let p_pdpt_phys = p_pml4.entries[0].get_addr();
+    let p_pdpt = unsafe { &*(p_pdpt_phys.wrapping_sub(phys_offset) as *const PageTable) };
+    let p_pd_phys = p_pdpt.entries[0].get_addr();
+    let p_pd = unsafe { &*(p_pd_phys.wrapping_sub(phys_offset) as *const PageTable) };
+
+    // Create a new table structure for the child
+    // This clones the kernel mappings automatically
+    let c_pml4_phys = create_process_paging();
+    let c_pml4_virt = c_pml4_phys.wrapping_sub(phys_offset);
+    let c_pml4 = unsafe { &mut *(c_pml4_virt as *mut PageTable) };
+
+    // Child PDPT and PD
+    let c_pdpt_phys = c_pml4.entries[0].get_addr();
+    let c_pdpt = unsafe { &mut *(c_pdpt_phys.wrapping_sub(phys_offset) as *mut PageTable) };
+    let c_pd_phys = c_pdpt.entries[0].get_addr();
+    let c_pd = unsafe { &mut *(c_pd_phys.wrapping_sub(phys_offset) as *mut PageTable) };
+
+    // Deep copy user regions (>= 128MB, entries 64-511 in PD)
+    for i in 64..512 {
+        let entry = p_pd.entries[i];
+        if !entry.present() {
+            continue;
+        }
+
+        let p_paddr = entry.get_addr();
+        let vaddr = (i as u64) * 0x200000;
+
+        // Clone if it's a "custom" mapping (phys != virt-identity)
+        // or just clone everything user-mode for safety.
+        // In our system, if it's a process mapping, it's a Huge page in user space.
+        if entry.get_flags() & PAGE_USER != 0 {
+            // Check if it's an identity mapping (Hardware/Identity region)
+            // If it's not identity, it's an ELF segment or stack
+            if p_paddr != vaddr {
+                if let Some((child_kptr, child_paddr)) = alloc_dma_buffer(0x200000, 0x200000) {
+                    let parent_kptr = p_paddr.wrapping_sub(phys_offset) as *const u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(parent_kptr, child_kptr, 0x200000);
+                    }
+                    c_pd.entries[i].set_addr(child_paddr, entry.get_flags());
+                }
+            } else {
+                // Identity mapping, keep as is
+                c_pd.entries[i] = entry;
+            }
+        }
+    }
+
+    c_pml4_phys
+}
+
+/// Map a 2MB page in a process's page table
+/// This is a simplified version using 2MB pages for everything for now
+pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
+    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
+    
+    // Convert PML4 phys to virt to access it
+    let pml4_virt = pml4_phys.wrapping_sub(phys_offset);
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+    
+    // We assume the PDPT and PD already exist for the process (created in create_process_paging)
+    // but only for the first entry. If mapping beyond 1GB, we'd need to allocate more.
+    // For init and log service, they are well within the first 1GB (0x10000000 is 256MB).
+    
+    let pdpt_phys = pml4.entries[pml4_idx].get_addr();
+    let pdpt_virt = pdpt_phys.wrapping_sub(phys_offset);
+    let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
+    
+    let pd_phys = pdpt.entries[pdpt_idx].get_addr();
+    let pd_virt = pd_phys.wrapping_sub(phys_offset);
+    let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
+    
+    pd.entries[pd_idx].set_addr(paddr, flags | PAGE_HUGE | PAGE_PRESENT | PAGE_USER);
+    
+    // Flush TLB (expensive, but safe)
+    unsafe {
+        core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
+    }
 }
 
 /// Translate virtual address to physical address

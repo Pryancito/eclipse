@@ -66,6 +66,7 @@ pub struct Process {
     pub time_slice: u32,
     pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
     pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
+    pub page_table_phys: u64,          // Physical address of the PML4
 }
 
 impl Process {
@@ -80,6 +81,7 @@ impl Process {
             time_slice: 0,
             parent_pid: None,
             kernel_stack_top: 0,
+            page_table_phys: 0,
         }
     }
 }
@@ -90,38 +92,8 @@ pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
 
-// Stack pool for forked processes (simple static allocation)
-const STACK_POOL_SIZE: usize = 8; // Support up to 8 concurrent child processes
-const CHILD_STACK_SIZE: usize = 262144; // 256KB
-#[repr(align(16))]
-struct StackPool {
-    stacks: [[u8; CHILD_STACK_SIZE]; STACK_POOL_SIZE],
-    used: [bool; STACK_POOL_SIZE],
-}
 
-static mut STACK_POOL: StackPool = StackPool {
-    stacks: [[0; CHILD_STACK_SIZE]; STACK_POOL_SIZE],
-    used: [false; STACK_POOL_SIZE],
-};
-
-static STACK_POOL_LOCK: Mutex<()> = Mutex::new(());
-
-/// Allocate a stack from the pool
-fn allocate_stack() -> Option<u64> {
-    let _lock = STACK_POOL_LOCK.lock();
-    unsafe {
-        for i in 0..STACK_POOL_SIZE {
-            if !STACK_POOL.used[i] {
-                STACK_POOL.used[i] = true;
-                return Some(STACK_POOL.stacks[i].as_mut_ptr() as u64);
-            }
-        }
-    }
-    None
-}
-
-
-/// Inicializar el proceso kernel (PID 0)
+// Inicializar el proceso kernel (PID 0)
 pub fn init_kernel_process() {
     let mut table = PROCESS_TABLE.lock();
     // No tocamos NEXT_PID, dejamos que empiece en 1
@@ -142,6 +114,7 @@ pub fn init_kernel_process() {
     process.priority = 0; // Prioridad más baja
     process.time_slice = 10;
     process.kernel_stack_top = kernel_stack_top_aligned;
+    process.page_table_phys = crate::memory::get_cr3();
     
     // Configurar contexto inicial
     // Cuando el scheduler cambie a PID 0, necesita saber el RSP.
@@ -186,6 +159,7 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
             process.stack_size = stack_size;
             process.priority = 5; // Prioridad media por defecto
             process.time_slice = 10; // 10 ticks
+            process.page_table_phys = crate::memory::create_process_paging();
             
             // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
             let kernel_stack_top_aligned = kernel_stack_top & !0xF;
@@ -373,48 +347,10 @@ pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
 
 /// Fork current process - create child process
 /// Returns: Some(child_pid) on success, None on error
-pub fn fork_process() -> Option<ProcessId> {
+pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     // Get current process
     let current_pid = current_process_id()?;
     let parent = get_process(current_pid)?;
-    
-    // Allocate new stack for child from pool
-    let child_stack = allocate_stack()?;
-    
-    // Copy parent's stack to child
-    // Calculate used stack size
-    let parent_stack_top = parent.stack_base + parent.stack_size as u64;
-    let used_stack_size = parent_stack_top - parent.context.rsp;
-    
-    // DEBUG: Print stack details
-    crate::serial::serial_print("[PROCESS] Fork debug: PID ");
-    crate::serial::serial_print_dec(parent.id as u64);
-    crate::serial::serial_print("\n  Stack Base: ");
-    crate::serial::serial_print_hex(parent.stack_base);
-    crate::serial::serial_print("\n  Stack Top:  ");
-    crate::serial::serial_print_hex(parent_stack_top);
-    crate::serial::serial_print("\n  RSP:        ");
-    crate::serial::serial_print_hex(parent.context.rsp);
-    crate::serial::serial_print("\n  Used Size:  ");
-    crate::serial::serial_print_dec(used_stack_size);
-    crate::serial::serial_print("\n  Max Child:  ");
-    crate::serial::serial_print_dec(CHILD_STACK_SIZE as u64);
-    crate::serial::serial_print("\n");
-    
-    if used_stack_size as usize > CHILD_STACK_SIZE {
-        crate::serial::serial_print("[PROCESS] Fork failed: Stack too large for child\n");
-        return None; 
-    }
-    
-    // Copy parent's stack to child (Top-aligned)
-    let child_stack_top = child_stack + CHILD_STACK_SIZE as u64;
-    let child_rsp = child_stack_top - used_stack_size;
-    
-    unsafe {
-        let src = parent.context.rsp as *const u8;
-        let dst = child_rsp as *mut u8;
-        core::ptr::copy_nonoverlapping(src, dst, used_stack_size as usize);
-    }
     
     // Create child process
     let mut table = PROCESS_TABLE.lock();
@@ -428,12 +364,12 @@ pub fn fork_process() -> Option<ProcessId> {
             let mut child = parent; // Copy parent's state
             child.id = child_pid;
             child.state = ProcessState::Ready;
-            child.stack_base = child_stack;
-            child.stack_size = CHILD_STACK_SIZE;
             child.parent_pid = Some(current_pid);
             
+            // DEEP COPY of parent's address space (code, stack, data)
+            child.page_table_phys = crate::memory::clone_process_paging(parent.page_table_phys);
+            
             // Allocate NEW kernel stack for child
-            // This is critical: if they share the same kstack, they corrupt each other
             let kernel_stack_size = 8192;
             let kernel_stack = alloc::vec![0u8; kernel_stack_size];
             let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
@@ -443,42 +379,38 @@ pub fn fork_process() -> Option<ProcessId> {
             child.kernel_stack_top = kernel_stack_top_aligned;
             
             // PUSH IRETQ frame onto child's kernel stack
-            // Frame: [SS] [RSP] [RFLAGS] [CS] [RIP]
+            // We use the same user-space stack address as the parent
             let mut kstack_ptr = kernel_stack_top_aligned as *mut u64;
             unsafe {
                 kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x23; // SS
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = child_rsp; // RSP
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent.context.rflags; // RFLAGS
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rsp; // Same RSP
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rflags;
                 kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x1b; // CS
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent.context.rip; // RIP
+                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rip;
             }
             
             // Set up context for child to start via trampoline
             child.context.rip = crate::interrupts::fork_child_trampoline as u64;
-            child.context.rsp = kstack_ptr as u64; // RSP points to the iframe
+            child.context.rsp = kstack_ptr as u64;
+            child.context.rax = 0; // Return value for child
             
-            // Copy all parent GP registers to child
-            child.context.rbx = parent.context.rbx;
-            child.context.rcx = parent.context.rcx;
-            child.context.rdx = parent.context.rdx;
-            child.context.rsi = parent.context.rsi;
-            child.context.rdi = parent.context.rdi;
-            child.context.rbp = parent.context.rbp;
-            child.context.r8 = parent.context.r8;
-            child.context.r9 = parent.context.r9;
-            child.context.r10 = parent.context.r10;
-            child.context.r11 = parent.context.r11;
-            child.context.r12 = parent.context.r12;
-            child.context.r13 = parent.context.r13;
-            child.context.r14 = parent.context.r14;
-            child.context.r15 = parent.context.r15;
-            
-            // Child returns 0 from fork
-            child.context.rax = 0;
+            // Copy all GP registers from parent_context
+            child.context.rbx = parent_context.rbx;
+            child.context.rcx = parent_context.rcx;
+            child.context.rdx = parent_context.rdx;
+            child.context.rsi = parent_context.rsi;
+            child.context.rdi = parent_context.rdi;
+            child.context.rbp = parent_context.rbp;
+            child.context.r8 = parent_context.r8;
+            child.context.r9 = parent_context.r9;
+            child.context.r10 = parent_context.r10;
+            child.context.r11 = parent_context.r11;
+            child.context.r12 = parent_context.r12;
+            child.context.r13 = parent_context.r13;
+            child.context.r14 = parent_context.r14;
+            child.context.r15 = parent_context.r15;
             
             *slot = Some(child);
-            
-            // Parent returns child PID
             return Some(child_pid);
         }
     }

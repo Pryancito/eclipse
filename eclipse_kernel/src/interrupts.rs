@@ -602,11 +602,13 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         "cli",
         
         // Restaurar selectores de datos
+        "push rax",
         "mov ax, 0x23", // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
         "mov fs, ax",
         "mov gs, ax",
+        "pop rax",
         
         // El scheduler ya restauró los registros GP (rax, rbx, rsi, etc.)
         // El stack (RSP) ya apunta al frame IRETQ pushgeado por fork_process.

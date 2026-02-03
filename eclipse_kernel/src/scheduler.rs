@@ -117,7 +117,7 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     crate::serial::serial_print("\n");
     
     // Get raw pointers to contexts in the global table
-    let (from_ctx_ptr, to_ctx_ptr, to_kernel_stack) = {
+    let (from_ctx_ptr, to_ctx_ptr, to_kernel_stack, to_page_table) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         
         let from_process = table[from_pid as usize].as_mut().expect("From process not found");
@@ -128,22 +128,21 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
         
         // Capture properties needed for debug/setup
         let kstack = to_process.kernel_stack_top;
+        let pt = to_process.page_table_phys;
         
-        /* DEBUG: Print target context (Commented out to reduce noise)
-        crate::serial::serial_print("Switching to PID ");
-        crate::serial::serial_print_dec(to_pid as u64);
-        crate::serial::serial_print("\n  Target RIP: ");
-        crate::serial::serial_print_hex(to_process.context.rip);
-        crate::serial::serial_print("\n  Target RSP: ");
-        crate::serial::serial_print_hex(to_process.context.rsp);
-        crate::serial::serial_print("\n");
-        */
-        
-        (from_ptr, to_ptr, kstack)
+        (from_ptr, to_ptr, kstack, pt)
     };
     
     // Update TSS RSP0 for the next process
     crate::boot::set_tss_stack(to_kernel_stack);
+    
+    // Switch address space if necessary
+    unsafe {
+        let current_cr3 = crate::memory::get_cr3();
+        if to_page_table != 0 && to_page_table != current_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) to_page_table);
+        }
+    }
     
     // Perform raw context switch
     unsafe {

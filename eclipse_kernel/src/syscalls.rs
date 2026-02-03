@@ -68,91 +68,37 @@ pub extern "C" fn syscall_handler(
     _arg5: u64,
     frame_ptr: u64,
 ) -> u64 {
-    // CAPTURE USER CONTEXT
-    // Update the current process context with the User register state from the interrupt frame
+    // Read user context from the interrupt frame
     // Frame structure relative to frame_ptr (RBP):
-    // [32] RSP
-    // [8]  RIP
-    // [-8]  RAX
-    // [-16] RBX
-    // [-24] RCX
-    // [-32] RDX
-    // [-40] RSI
-    // [-48] RDI
-    // [-56] R8
-    // [-64] R9
-    // [-72] R10
-    // [-80] R11
-    // [-88] R12
-    // [-96] R13
-    // [-104] R14
-    // [-112] R15
+    // [32] RSP, [24] RFLAGS, [16] CS, [8] RIP, [0] RBP
+    // Pushed registers: [-8] RAX, [-16] RBX, [-24] RCX, [-32] RDX, [-40] RSI, [-48] RDI, 
+    // [-56] R8, [-64] R9, [-72] R10, [-80] R11, [-88] R12, [-96] R13, [-104] R14, [-112] R15
+    let mut context = crate::process::Context::new();
     unsafe {
         unsafe fn read_stack(rbp: u64, offset: isize) -> u64 {
             let ptr = (rbp as isize + offset) as *const u64;
             *ptr
         }
     
-        // Read registers
-        let user_rsp = read_stack(frame_ptr, 32);
-        let user_rip = read_stack(frame_ptr, 8);
+        context.rsp = read_stack(frame_ptr, 32);
+        context.rip = read_stack(frame_ptr, 8);
+        context.rflags = read_stack(frame_ptr, 24);
+        context.rbp = read_stack(frame_ptr, 0);
         
-        let user_rax = read_stack(frame_ptr, -8);
-        
-        /* 
-        crate::serial::serial_print("SYSCALL: frame_ptr=");
-        crate::serial::serial_print_hex(frame_ptr);
-        crate::serial::serial_print(" user_rax=");
-        crate::serial::serial_print_hex(user_rax);
-        crate::serial::serial_print(" user_rip=");
-        crate::serial::serial_print_hex(user_rip);
-        crate::serial::serial_print("\n");
-        */
-        let user_rbx = read_stack(frame_ptr, -16);
-        let user_rcx = read_stack(frame_ptr, -24);
-        let user_rdx = read_stack(frame_ptr, -32);
-        let user_rsi = read_stack(frame_ptr, -40);
-        let user_rdi = read_stack(frame_ptr, -48);
-        let user_r8  = read_stack(frame_ptr, -56);
-        let user_r9  = read_stack(frame_ptr, -64);
-        let user_r10 = read_stack(frame_ptr, -72);
-        let user_r11 = read_stack(frame_ptr, -80);
-        let user_r12 = read_stack(frame_ptr, -88);
-        let user_r13 = read_stack(frame_ptr, -96);
-        let user_r14 = read_stack(frame_ptr, -104);
-        let user_r15 = read_stack(frame_ptr, -112);
-        
-        // Note: RBP is frame_ptr itself (value at [rbp] is saved RBP)
-        let user_rbp = read_stack(frame_ptr, 0); 
-        
-        let stats = SYSCALL_STATS.lock();
-        drop(stats);
-
-        if let Some(pid) = current_process_id() {
-             use crate::process::{update_process, get_process};
-             if let Some(mut process) = get_process(pid) {
-                 process.context.rsp = user_rsp;
-                 process.context.rip = user_rip;
-                 // DON'T update RAX here - it will be updated after the syscall completes
-                 // process.context.rax = user_rax;
-                 process.context.rbx = user_rbx;
-                 process.context.rcx = user_rcx;
-                 process.context.rdx = user_rdx;
-                 process.context.rsi = user_rsi;
-                 process.context.rdi = user_rdi;
-                 process.context.rbp = user_rbp;
-                 process.context.r8  = user_r8;
-                 process.context.r9  = user_r9;
-                 process.context.r10 = user_r10;
-                 process.context.r11 = user_r11;
-                 process.context.r12 = user_r12;
-                 process.context.r13 = user_r13;
-                 process.context.r14 = user_r14;
-                 process.context.r15 = user_r15;
-                 
-                 update_process(pid, process);
-             }
-        }
+        context.rax = read_stack(frame_ptr, -8);
+        context.rbx = read_stack(frame_ptr, -16);
+        context.rcx = read_stack(frame_ptr, -24);
+        context.rdx = read_stack(frame_ptr, -32);
+        context.rsi = read_stack(frame_ptr, -40);
+        context.rdi = read_stack(frame_ptr, -48);
+        context.r8  = read_stack(frame_ptr, -56);
+        context.r9  = read_stack(frame_ptr, -64);
+        context.r10 = read_stack(frame_ptr, -72);
+        context.r11 = read_stack(frame_ptr, -80);
+        context.r12 = read_stack(frame_ptr, -88);
+        context.r13 = read_stack(frame_ptr, -96);
+        context.r14 = read_stack(frame_ptr, -104);
+        context.r15 = read_stack(frame_ptr, -112);
     }
 
     let mut stats = SYSCALL_STATS.lock();
@@ -172,7 +118,7 @@ pub extern "C" fn syscall_handler(
         4 => sys_receive(arg1, arg2, arg3),
         5 => sys_yield(),
         6 => sys_getpid(),
-        7 => sys_fork(),
+        7 => sys_fork(&context),
         8 => sys_exec(arg1, arg2),
         9 => sys_wait(arg1),
         10 => sys_get_service_binary(arg1, arg2, arg3),
@@ -187,105 +133,6 @@ pub extern "C" fn syscall_handler(
         }
     };
 
-    // DEBUG Trace return
-    /* 
-    if syscall_num == 5 { 
-        if let Some(pid) = crate::process::current_process_id() {
-            crate::serial::serial_print("YRet[PID=");
-            crate::serial::serial_print_dec(pid as u64);
-            crate::serial::serial_print(" RIP=");
-            unsafe {
-                 let rip_val = *( (frame_ptr + 8) as *const u64 );
-                 let cs_val = *( (frame_ptr + 16) as *const u64 );
-                 let rflags_val = *( (frame_ptr + 24) as *const u64 );
-                 crate::serial::serial_print_hex(rip_val);
-                 crate::serial::serial_print(" CS=");
-                 crate::serial::serial_print_hex(cs_val);
-                 crate::serial::serial_print(" FL=");
-                 crate::serial::serial_print_hex(rflags_val);
-            }
-            crate::serial::serial_print("] ");
-        }
-    }
-    */
-    // if syscall_num == 4 { crate::serial::serial_print("RRet "); }
-    
-    // Stack frame offsets for GP registers saved by syscall_int80
-    // These must match the push order in the naked assembly function
-    const RAX_OFFSET: isize = -8;
-    const RBX_OFFSET: isize = -16;
-    const RCX_OFFSET: isize = -24;
-    const RDX_OFFSET: isize = -32;
-    const RSI_OFFSET: isize = -40;
-    const RDI_OFFSET: isize = -48;
-    const R8_OFFSET: isize = -56;
-    const R9_OFFSET: isize = -64;
-    const R10_OFFSET: isize = -72;
-    const R11_OFFSET: isize = -80;
-    const R12_OFFSET: isize = -88;
-    const R13_OFFSET: isize = -96;
-    const R14_OFFSET: isize = -104;
-    const R15_OFFSET: isize = -112;
-    const RBP_OFFSET: isize = 0;
-    
-    /// Write a value to a specific offset in the syscall stack frame
-    /// 
-    /// # Safety
-    /// This function is unsafe because:
-    /// - It performs raw pointer dereferencing
-    /// - Caller must ensure rbp points to a valid stack frame
-    /// - Caller must use correct offsets matching the syscall_int80 stack layout
-    /// - Writing to incorrect offsets will corrupt the stack
-    unsafe fn write_stack(rbp: u64, offset: isize, value: u64) {
-        let ptr = (rbp as isize + offset) as *mut u64;
-        *ptr = value;
-    }
-    
-    // CRITICAL FIX: Update the calling process's RAX with the return value
-    // This must happen AFTER the syscall executes, not before
-    // Otherwise, if the process gets context-switched during the syscall,
-    // it will be restored with the wrong RAX value
-    if let Some(pid) = current_process_id() {
-        use crate::process::{update_process, get_process};
-        if let Some(mut process) = get_process(pid) {
-            process.context.rax = ret;
-            
-            // CRITICAL FIX FOR CONTEXT SWITCH BUG:
-            // If a context switch occurred during this syscall (e.g., in yield_cpu or send/receive),
-            // the GP registers were restored from the PCB by switch_context().
-            // However, the values on the kernel stack (pushed by syscall_int80) are STALE.
-            // We MUST write the updated PCB register values back to the stack frame
-            // so that when syscall_int80 pops them, it restores the correct context.
-            
-            // Write all register values (including the newly updated RAX) to the stack frame.
-            // This must happen BEFORE the final update_process() call because process is moved there.
-            // RAX was just set to the return value above, and now we write all registers
-            // (including RAX) to the stack so syscall_int80 will pop the correct values.
-            unsafe {
-                write_stack(frame_ptr, RAX_OFFSET, process.context.rax);
-                write_stack(frame_ptr, RBX_OFFSET, process.context.rbx);
-                write_stack(frame_ptr, RCX_OFFSET, process.context.rcx);
-                write_stack(frame_ptr, RDX_OFFSET, process.context.rdx);
-                write_stack(frame_ptr, RSI_OFFSET, process.context.rsi);
-                write_stack(frame_ptr, RDI_OFFSET, process.context.rdi);
-                write_stack(frame_ptr, R8_OFFSET, process.context.r8);
-                write_stack(frame_ptr, R9_OFFSET, process.context.r9);
-                write_stack(frame_ptr, R10_OFFSET, process.context.r10);
-                write_stack(frame_ptr, R11_OFFSET, process.context.r11);
-                write_stack(frame_ptr, R12_OFFSET, process.context.r12);
-                write_stack(frame_ptr, R13_OFFSET, process.context.r13);
-                write_stack(frame_ptr, R14_OFFSET, process.context.r14);
-                write_stack(frame_ptr, R15_OFFSET, process.context.r15);
-                write_stack(frame_ptr, RBP_OFFSET, process.context.rbp);
-                // Note: RSP and RIP are in the IRETQ frame and will be restored by IRETQ
-                // They don't need to be written back to the GP register save area
-            }
-            
-            // Now update the PCB with the new RAX value
-            update_process(pid, process);
-        }
-    }
-    
     ret
 }
 
@@ -482,7 +329,7 @@ fn sys_getppid() -> u64 {
 
 /// sys_fork - Create a new process (child)
 /// Returns: Child PID in parent, 0 in child, -1 on error
-fn sys_fork() -> u64 {
+fn sys_fork(context: &crate::process::Context) -> u64 {
     use crate::process;
     
     let mut stats = SYSCALL_STATS.lock();
@@ -495,7 +342,7 @@ fn sys_fork() -> u64 {
     serial::serial_print("\n");
     
     // Create child process
-    match process::fork_process() {
+    match process::fork_process(context) {
         Some(child_pid) => {
             serial::serial_print("[SYSCALL] fork() created child process with PID: ");
             serial::serial_print_dec(child_pid as u64);
