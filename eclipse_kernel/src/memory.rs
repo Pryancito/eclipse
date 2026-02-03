@@ -15,7 +15,9 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// Size of the kernel region with offset-based mapping (128MB = 64 * 2MB pages)
 const KERNEL_REGION_SIZE: u64 = 0x8000000;
 
-/// Tamaño del heap del kernel (128 MB)
+/// Kernel heap size (128 MB)
+/// Sized to accommodate multiple 2MB page allocations for userspace processes.
+/// Each process needs ~6-8MB (stack + code pages), supporting 15+ concurrent processes.
 const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 /// Heap estático del kernel
