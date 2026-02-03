@@ -15,8 +15,8 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// Size of the kernel region with offset-based mapping (128MB = 64 * 2MB pages)
 const KERNEL_REGION_SIZE: u64 = 0x8000000;
 
-/// Tamaño del heap del kernel (2 MB)
-const HEAP_SIZE: usize = 32 * 1024 * 1024;
+/// Tamaño del heap del kernel (128 MB)
+const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 /// Heap estático del kernel
 #[repr(align(4096))]
