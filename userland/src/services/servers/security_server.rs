@@ -3,18 +3,34 @@
 //! Implementa el servidor de seguridad que maneja autenticación, autorización,
 //! encriptación y auditoría de seguridad del sistema.
 //!
-//! **STATUS**: STUB IMPLEMENTATION - CRITICAL SECURITY ISSUE
-//! - Authentication: STUB (always succeeds)
-//! - Authorization: STUB (always allows)
-//! - Encryption/Decryption: STUB (no-op, just copies data) - SECURITY RISK!
-//! - Hashing: STUB (returns zeros) - SECURITY RISK!
-//! - Audit logging: STUB (only prints, no persistence)
-//! TODO: Implement real cryptography (e.g., using ring or RustCrypto crates)
-//! TODO: Implement real authentication and authorization
-//! TODO: Add secure key management
+//! **STATUS**: REAL CRYPTOGRAPHY IMPLEMENTATION ✅
+//! - Encryption/Decryption: AES-256-GCM with authentication
+//! - Hashing: SHA-256 cryptographic hash function
+//! - Authentication: STUB (always succeeds) - TODO
+//! - Authorization: STUB (always allows) - TODO
+//! - Audit logging: STUB (only prints, no persistence) - TODO
+//! 
+//! ## Encryption Format
+//! Encrypted data format: [12-byte nonce][ciphertext][16-byte auth tag]
+//! - Nonce: Random 96-bit value (unique per encryption)
+//! - Ciphertext: AES-256-GCM encrypted data
+//! - Auth Tag: 128-bit authentication tag for integrity
+//!
+//! ## Security Notes
+//! - AES-256-GCM provides confidentiality and authenticity
+//! - Each encryption uses a unique random nonce
+//! - SHA-256 provides 256-bit cryptographic hash
+//! - TODO: Implement secure key management (currently using hardcoded key)
+//! - TODO: Implement key rotation and derivation
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
+use sha2::{Sha256, Digest};
+use aes_gcm::{
+    aead::{Aead, KeyInit, OsRng},
+    Aes256Gcm, Nonce, Key
+};
+use rand::RngCore;
 
 /// Comandos de seguridad
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,15 +67,28 @@ pub struct SecurityServer {
     name: String,
     stats: ServerStats,
     initialized: bool,
+    /// Master encryption key (AES-256)
+    /// TODO: Implement secure key storage and rotation
+    encryption_key: [u8; 32],
 }
 
 impl SecurityServer {
     /// Crear un nuevo servidor de seguridad
     pub fn new() -> Self {
+        // TODO: Replace with secure key derivation/storage
+        // For now, using a hardcoded key (NOT SECURE for production!)
+        let encryption_key = [
+            0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+            0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+            0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+            0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4,
+        ];
+        
         Self {
             name: "Security".to_string(),
             stats: ServerStats::default(),
             initialized: false,
+            encryption_key,
         }
     }
     
@@ -93,35 +122,74 @@ impl SecurityServer {
     
     /// Procesar comando de encriptación
     fn handle_encrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        println!("   [SEC] Encriptando {} bytes", data.len());
+        println!("   [SEC] Encriptando {} bytes con AES-256-GCM", data.len());
         
-        // WARNING: This is a STUB implementation - NO ACTUAL ENCRYPTION!
-        // TODO: Implement real encryption (e.g., AES-256-GCM via ring crate)
-        // For now, just copy data (INSECURE!)
-        let encrypted = data.to_vec();
-        Ok(encrypted)
+        // Create cipher with our key
+        let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
+        let cipher = Aes256Gcm::new(key);
+        
+        // Generate a random nonce (12 bytes for GCM)
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        // Encrypt the data
+        let ciphertext = cipher.encrypt(nonce, data)
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
+        
+        // Format: [nonce (12 bytes)][ciphertext + auth tag]
+        let mut result = Vec::with_capacity(12 + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+        
+        println!("   [SEC] Encrypted: {} bytes -> {} bytes (includes nonce and auth tag)", 
+                 data.len(), result.len());
+        
+        Ok(result)
     }
     
     /// Procesar comando de desencriptación
     fn handle_decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        println!("   [SEC] Desencriptando {} bytes", data.len());
+        println!("   [SEC] Desencriptando {} bytes con AES-256-GCM", data.len());
         
-        // WARNING: This is a STUB implementation - NO ACTUAL DECRYPTION!
-        // TODO: Implement real decryption (e.g., AES-256-GCM via ring crate)
-        // For now, just copy data (INSECURE!)
-        let decrypted = data.to_vec();
-        Ok(decrypted)
+        // Format: [nonce (12 bytes)][ciphertext + auth tag]
+        if data.len() < 12 {
+            return Err(anyhow::anyhow!("Datos insuficientes: se requiere al menos nonce (12 bytes)"));
+        }
+        
+        // Extract nonce
+        let nonce = Nonce::from_slice(&data[0..12]);
+        let ciphertext = &data[12..];
+        
+        // Create cipher with our key
+        let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
+        let cipher = Aes256Gcm::new(key);
+        
+        // Decrypt the data
+        let plaintext = cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| anyhow::anyhow!("Decryption failed (invalid key or corrupted data): {:?}", e))?;
+        
+        println!("   [SEC] Decrypted: {} bytes -> {} bytes", data.len(), plaintext.len());
+        
+        Ok(plaintext)
     }
     
     /// Procesar comando de generación de hash
     fn handle_hash(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        println!("   [SEC] Generando hash de {} bytes", data.len());
+        println!("   [SEC] Generando hash SHA-256 de {} bytes", data.len());
         
-        // WARNING: This is a STUB implementation - NO ACTUAL HASHING!
-        // TODO: Implement real hashing (e.g., SHA-256 via ring or sha2 crate)
-        // For now, return zeros (INSECURE!)
-        let hash = vec![0u8; 32];
-        Ok(hash)
+        // Create SHA-256 hasher
+        let mut hasher = Sha256::new();
+        
+        // Feed data to hasher
+        hasher.update(data);
+        
+        // Get the hash result (32 bytes)
+        let hash = hasher.finalize();
+        
+        println!("   [SEC] Hash generado: {} bytes", hash.len());
+        
+        Ok(hash.to_vec())
     }
     
     /// Procesar comando de auditoría
