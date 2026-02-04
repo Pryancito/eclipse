@@ -22,6 +22,7 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 ### 🖥️ Sistema de Display Avanzado
 - **DRM (Direct Rendering Manager)**: Control total de la pantalla en userland
 - **VGA Text Mode**: Modo de texto tradicional para compatibilidad
+- **NVIDIA GPU Support**: Drivers nativos para GPUs modernas (Turing+) mediante open-gpu-kernel-modules
 - **Aceleración por hardware**: Rendimiento optimizado
 - **Múltiples monitores**: Soporte para configuraciones multi-pantalla
 - **Resoluciones modernas**: Soporte para resoluciones hasta 4K
@@ -213,6 +214,54 @@ primary_device = "/dev/dri/card0"  # Dispositivo DRM principal
 multi_gpu = true            # Habilitar soporte multi-GPU
 compositor = true           # Habilitar compositor de ventanas
 ```
+
+## 🎮 Soporte para GPUs NVIDIA
+
+Eclipse OS incluye soporte nativo para GPUs NVIDIA modernas a través de la integración con los [NVIDIA open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules).
+
+### GPUs Compatibles
+
+El soporte está disponible para las siguientes arquitecturas:
+
+- **Turing** (2018): RTX 2080 Ti, RTX 2080, RTX 2070, RTX 2060
+- **Ampere** (2020): RTX 3090, RTX 3080, RTX 3070, RTX 3060
+- **Ada Lovelace** (2022): RTX 4090, RTX 4080, RTX 4070, RTX 4060
+- **Hopper** (2022): H100 y GPUs de datacenter
+
+> **Nota:** Se requiere arquitectura Turing o superior. GPUs más antiguas (Pascal, Maxwell, etc.) no son compatibles con los módulos de código abierto de NVIDIA.
+
+### Características
+
+- ✅ **Detección Automática**: Identificación automática de GPUs NVIDIA via PCI
+- ✅ **Identificación de Arquitectura**: Reconoce Turing, Ampere, Ada Lovelace y Hopper
+- ✅ **Especificaciones de Hardware**: Reporta núcleos CUDA, SM count y VRAM
+- ✅ **Multi-GPU**: Soporte para múltiples GPUs NVIDIA
+- ✅ **Habilitación de Dispositivos**: Configura I/O, memoria y bus master
+- 🔄 **CUDA** (Planeado): Soporte para cargas de trabajo de computación
+- 🔄 **Ray Tracing** (Planeado): Soporte para RT cores
+- 🔄 **Display Output** (Planeado): Salida directa via DisplayPort/HDMI
+
+### Mensajes de Arranque
+
+Cuando se detecta una GPU NVIDIA, el kernel mostrará:
+
+```
+[NVIDIA] Initializing NVIDIA GPU subsystem...
+[NVIDIA] Compatible with open-gpu-kernel-modules
+[NVIDIA] Found 1 NVIDIA GPU(s)
+[NVIDIA] GPU 0: GeForce RTX 3080
+[NVIDIA]   Device ID: 0x2206
+[NVIDIA]   Architecture: Ampere
+[NVIDIA]   Memory: 10240 MB
+[NVIDIA]   CUDA Cores: 8704
+[NVIDIA]   SM Count: 68
+[NVIDIA]   ✓ Supported by open-gpu-kernel-modules
+[NVIDIA]   Device enabled (I/O, Memory, Bus Master)
+```
+
+### Documentación Adicional
+
+Para más información sobre el soporte NVIDIA, consulta [docs/NVIDIA_SUPPORT.md](docs/NVIDIA_SUPPORT.md).
 
 ## Estructura del Proyecto
 
