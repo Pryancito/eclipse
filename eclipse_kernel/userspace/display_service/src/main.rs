@@ -216,6 +216,11 @@ fn select_best_vesa_mode(modes: &[Option<VesaModeInfo>; 16]) -> Option<VesaModeI
     let mut best_mode: Option<VesaModeInfo> = None;
     let mut best_score = 0u32;
     
+    // Scoring weights for mode selection
+    const RESOLUTION_DIVISOR: u32 = 1000;  // Normalize resolution to reasonable range
+    const BPP_WEIGHT: u32 = 100;            // Weight for color depth
+    const DOUBLE_BUFFER_BONUS: u32 = 5000;  // Bonus for double buffering support
+    
     for mode_opt in modes.iter() {
         if let Some(mode) = mode_opt {
             // Skip non-linear modes (bank-switched, slower)
@@ -225,9 +230,9 @@ fn select_best_vesa_mode(modes: &[Option<VesaModeInfo>; 16]) -> Option<VesaModeI
             
             // Calculate mode score
             // Priority: resolution (80%) > color depth (15%) > double buffer (5%)
-            let resolution_score = (mode.width * mode.height) / 1000;
-            let bpp_score = mode.bpp * 100;
-            let buffer_score = if mode.supports_double_buffer { 5000 } else { 0 };
+            let resolution_score = (mode.width * mode.height) / RESOLUTION_DIVISOR;
+            let bpp_score = mode.bpp * BPP_WEIGHT;
+            let buffer_score = if mode.supports_double_buffer { DOUBLE_BUFFER_BONUS } else { 0 };
             
             let total_score = resolution_score + bpp_score + buffer_score;
             
@@ -593,21 +598,39 @@ pub extern "C" fn _start() -> ! {
             println!("[DISPLAY-SERVICE] Testing 2D acceleration...");
             
             // Test screen clear
-            if let Ok(_) = clear_screen(fb, colors::BLACK) {
-                println!("[DISPLAY-SERVICE]   ✓ Screen clear successful");
-                stats.fill_operations += 1;
+            match clear_screen(fb, colors::BLACK) {
+                Ok(_) => {
+                    println!("[DISPLAY-SERVICE]   ✓ Screen clear successful");
+                    stats.fill_operations += 1;
+                }
+                Err(e) => {
+                    println!("[DISPLAY-SERVICE]   ✗ Screen clear failed: {}", e);
+                    stats.driver_errors += 1;
+                }
             }
             
             // Test rectangle fill
-            if let Ok(_) = accel_fill_rect(fb, 100, 100, 200, 150, colors::BLUE) {
-                println!("[DISPLAY-SERVICE]   ✓ Rectangle fill successful");
-                stats.fill_operations += 1;
+            match accel_fill_rect(fb, 100, 100, 200, 150, colors::BLUE) {
+                Ok(_) => {
+                    println!("[DISPLAY-SERVICE]   ✓ Rectangle fill successful");
+                    stats.fill_operations += 1;
+                }
+                Err(e) => {
+                    println!("[DISPLAY-SERVICE]   ✗ Rectangle fill failed: {}", e);
+                    stats.driver_errors += 1;
+                }
             }
             
             // Test blit operation
-            if let Ok(_) = accel_blit(fb, 0, 0, 10, 10, 100, 100) {
-                println!("[DISPLAY-SERVICE]   ✓ BitBLT operation successful");
-                stats.blit_operations += 1;
+            match accel_blit(fb, 0, 0, 10, 10, 100, 100) {
+                Ok(_) => {
+                    println!("[DISPLAY-SERVICE]   ✓ BitBLT operation successful");
+                    stats.blit_operations += 1;
+                }
+                Err(e) => {
+                    println!("[DISPLAY-SERVICE]   ✗ BitBLT operation failed: {}", e);
+                    stats.driver_errors += 1;
+                }
             }
             
             println!("[DISPLAY-SERVICE] 2D acceleration tests completed");
