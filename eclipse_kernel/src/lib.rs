@@ -23,6 +23,7 @@ pub mod pci;
 pub mod virtio;
 pub mod filesystem;
 pub mod ata;
+pub mod fd;  // File descriptor management
 mod elf_loader;
 
 // Re-exportar tipos importantes

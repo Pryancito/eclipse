@@ -31,6 +31,7 @@ mod virtio;
 mod filesystem;
 mod binaries;
 mod ata;
+mod fd;  // File descriptor management
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -128,6 +129,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     // Inicializar syscalls
     serial::serial_print("Initializing syscalls...\n");
     syscalls::init();
+    
+    // Initialize file descriptor system
+    serial::serial_print("Initializing file descriptor system...\n");
+    fd::init();
     
     // Inicializar servidores del sistema
     serial::serial_print("Initializing system servers...\n");

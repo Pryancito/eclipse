@@ -203,7 +203,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     0
 }
 
-/// sys_read - Leer de un file descriptor (IMPLEMENTADO)
+/// sys_read - Leer de un file descriptor (IMPLEMENTED)
 fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.read_calls += 1;
@@ -214,14 +214,68 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         return u64::MAX; // Error
     }
     
-    // Por ahora, solo soportamos lectura desde stdin (fd=0)
+    // Handle stdin (fd=0) specially
     if fd == 0 {
         // TODO: Implementar buffer de input real
         // Por ahora retornar 0 (EOF)
         return 0;
     }
     
-    u64::MAX // Error - fd no soportado
+    // Get current process ID
+    if let Some(pid) = current_process_id() {
+        // Look up file descriptor
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            serial::serial_print("[SYSCALL] read(FD=");
+            serial::serial_print_dec(fd);
+            serial::serial_print(", len=");
+            serial::serial_print_dec(len);
+            serial::serial_print(", inode=");
+            serial::serial_print_dec(fd_entry.inode as u64);
+            serial::serial_print(")\n");
+            
+            // Read from file using filesystem
+            // We need to use read_file_by_inode or similar
+            // For now, let's skip offset handling and read from beginning
+            let mut temp_buffer = [0u8; 4096];
+            let read_len = core::cmp::min(len as usize, 4096);
+            
+            // TODO: Implement read_file_by_inode_with_offset in filesystem
+            // For now, this is a limitation - we can't read with offset
+            match crate::filesystem::Filesystem::read_file_by_inode(fd_entry.inode, &mut temp_buffer[..read_len]) {
+                Ok(bytes_read) => {
+                    // Copy to user buffer
+                    unsafe {
+                        let user_buf = core::slice::from_raw_parts_mut(
+                            buf_ptr as *mut u8,
+                            bytes_read
+                        );
+                        user_buf.copy_from_slice(&temp_buffer[..bytes_read]);
+                    }
+                    
+                    // Update file offset
+                    let new_offset = fd_entry.offset + bytes_read as u64;
+                    crate::fd::fd_update_offset(pid, fd as usize, new_offset);
+                    
+                    serial::serial_print("[SYSCALL] read() - success, ");
+                    serial::serial_print_dec(bytes_read as u64);
+                    serial::serial_print(" bytes\n");
+                    
+                    bytes_read as u64
+                },
+                Err(e) => {
+                    serial::serial_print("[SYSCALL] read() - error: ");
+                    serial::serial_print(e);
+                    serial::serial_print("\n");
+                    u64::MAX
+                }
+            }
+        } else {
+            serial::serial_print("[SYSCALL] read() - invalid FD\n");
+            u64::MAX
+        }
+    } else {
+        u64::MAX
+    }
 }
 
 /// sys_send - Enviar mensaje IPC
@@ -534,14 +588,43 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     serial::serial_print_hex(flags);
     serial::serial_print(")\n");
     
-    // For now, we support a very simple file system simulation
-    // Return a fake file descriptor for /var/log/system.log
-    if path == "/var/log/system.log" {
-        serial::serial_print("[SYSCALL] open() - returning FD 3 for log file\n");
-        3 // Return FD 3 for log file
-    } else {
-        serial::serial_print("[SYSCALL] open() - file not found\n");
-        u64::MAX // File not found
+    // Check if filesystem is mounted
+    if !crate::filesystem::is_mounted() {
+        serial::serial_print("[SYSCALL] open() - filesystem not mounted\n");
+        return u64::MAX;
+    }
+    
+    // Try to look up the file in the filesystem
+    // For now, we'll use a simplified approach - if the file exists,
+    // we can open it for reading
+    match crate::filesystem::Filesystem::lookup_path(path) {
+        Ok(inode) => {
+            // Get current process ID
+            if let Some(pid) = current_process_id() {
+                // Allocate file descriptor
+                match crate::fd::fd_open(pid, inode, flags as u32) {
+                    Some(fd) => {
+                        serial::serial_print("[SYSCALL] open() - success, FD=");
+                        serial::serial_print_dec(fd as u64);
+                        serial::serial_print("\n");
+                        fd as u64
+                    },
+                    None => {
+                        serial::serial_print("[SYSCALL] open() - FD table full\n");
+                        u64::MAX
+                    }
+                }
+            } else {
+                serial::serial_print("[SYSCALL] open() - no current process\n");
+                u64::MAX
+            }
+        },
+        Err(_) => {
+            serial::serial_print("[SYSCALL] open() - file not found: ");
+            serial::serial_print(path);
+            serial::serial_print("\n");
+            u64::MAX
+        }
     }
 }
 
@@ -557,13 +640,24 @@ fn sys_close(fd: u64) -> u64 {
     serial::serial_print_dec(fd);
     serial::serial_print(")\n");
     
-    // For now, just validate the FD
-    if fd >= 3 && fd < 1024 {
-        serial::serial_print("[SYSCALL] close() - success\n");
-        0 // Success
+    // Don't allow closing stdio descriptors
+    if fd < 3 {
+        serial::serial_print("[SYSCALL] close() - cannot close stdio\n");
+        return u64::MAX;
+    }
+    
+    // Get current process ID
+    if let Some(pid) = current_process_id() {
+        // Close the file descriptor
+        if crate::fd::fd_close(pid, fd as usize) {
+            serial::serial_print("[SYSCALL] close() - success\n");
+            0
+        } else {
+            serial::serial_print("[SYSCALL] close() - invalid FD\n");
+            u64::MAX
+        }
     } else {
-        serial::serial_print("[SYSCALL] close() - invalid FD\n");
-        u64::MAX // Error
+        u64::MAX
     }
 }
 
