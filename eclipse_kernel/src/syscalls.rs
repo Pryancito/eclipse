@@ -25,7 +25,13 @@ pub enum SyscallNumber {
     GetServiceBinary = 10,
     Open = 11,
     Close = 12,
+    Lseek = 14,
 }
+
+/// lseek whence values (POSIX standard)
+pub const SEEK_SET: u64 = 0; // Absolute position
+pub const SEEK_CUR: u64 = 1; // Relative to current position  
+pub const SEEK_END: u64 = 2; // Relative to end of file
 
 /// Estadísticas de syscalls
 pub struct SyscallStats {
@@ -41,6 +47,7 @@ pub struct SyscallStats {
     pub wait_calls: u64,
     pub open_calls: u64,
     pub close_calls: u64,
+    pub lseek_calls: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
@@ -56,6 +63,7 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     wait_calls: 0,
     open_calls: 0,
     close_calls: 0,
+    lseek_calls: 0,
 });
 
 /// Handler principal de syscalls
@@ -125,6 +133,7 @@ pub extern "C" fn syscall_handler(
         11 => sys_open(arg1, arg2, arg3),
         12 => sys_close(arg1),
         13 => sys_getppid(),
+        14 => sys_lseek(arg1, arg2 as i64, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -728,6 +737,108 @@ fn sys_close(fd: u64) -> u64 {
     }
 }
 
+/// sys_lseek - Reposition file offset
+///
+/// Changes the file offset for the specified file descriptor.
+/// Returns the new offset from the beginning of the file, or u64::MAX on error.
+///
+/// Parameters:
+/// - fd: File descriptor
+/// - offset: Offset value (interpretation depends on whence)
+/// - whence: How to interpret offset:
+///   - SEEK_SET (0): Set to offset bytes
+///   - SEEK_CUR (1): Set to current + offset bytes  
+///   - SEEK_END (2): Set to size + offset bytes
+///
+/// Implementation notes:
+/// - For simplicity, we allow seeking beyond file size (needed for future writes)
+/// - Negative offsets are converted from i64 and validated
+/// - File size is estimated as u32::MAX for simplicity (actual size requires
+///   parsing filesystem metadata which is complex)
+fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
+    let mut stats = SYSCALL_STATS.lock();
+    stats.lseek_calls += 1;
+    drop(stats);
+    
+    serial::serial_print("[SYSCALL] lseek(FD=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(", offset=");
+    serial::serial_print_dec(offset as u64);
+    serial::serial_print(", whence=");
+    serial::serial_print_dec(whence);
+    serial::serial_print(")\n");
+    
+    // Don't allow seeking on stdio
+    if fd < 3 {
+        serial::serial_print("[SYSCALL] lseek() - cannot seek on stdio\n");
+        return u64::MAX;
+    }
+    
+    // Get current process ID
+    let pid = match current_process_id() {
+        Some(p) => p,
+        None => {
+            serial::serial_print("[SYSCALL] lseek() - no current process\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Get file descriptor entry (just to check it's current offset)
+    let current_offset = match crate::fd::fd_get(pid, fd as usize) {
+        Some(entry) => entry.offset,
+        None => {
+            serial::serial_print("[SYSCALL] lseek() - invalid FD\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Calculate new offset based on whence
+    let new_offset = match whence {
+        SEEK_SET => {
+            // Absolute positioning
+            if offset < 0 {
+                serial::serial_print("[SYSCALL] lseek() - negative offset with SEEK_SET\n");
+                return u64::MAX;
+            }
+            offset as u64
+        }
+        SEEK_CUR => {
+            // Relative to current position
+            let current = current_offset as i64;
+            let result = current + offset;
+            if result < 0 {
+                serial::serial_print("[SYSCALL] lseek() - result offset is negative\n");
+                return u64::MAX;
+            }
+            result as u64
+        }
+        SEEK_END => {
+            // Relative to end of file
+            // For simplicity, we don't have an easy way to get file size
+            // without reading the full inode metadata. For now, we'll
+            // treat SEEK_END as an error.
+            // TODO: Implement file size retrieval from inode
+            serial::serial_print("[SYSCALL] lseek() - SEEK_END not yet implemented\n");
+            return u64::MAX;
+        }
+        _ => {
+            serial::serial_print("[SYSCALL] lseek() - invalid whence value\n");
+            return u64::MAX;
+        }
+    };
+    
+    // Update the file offset
+    if crate::fd::fd_update_offset(pid, fd as usize, new_offset) {
+        serial::serial_print("[SYSCALL] lseek() - new offset: ");
+        serial::serial_print_dec(new_offset);
+        serial::serial_print("\n");
+        new_offset
+    } else {
+        serial::serial_print("[SYSCALL] lseek() - failed to update offset\n");
+        u64::MAX
+    }
+}
+
 /// Obtener estadísticas de syscalls
 pub fn get_stats() -> SyscallStats {
     let stats = SYSCALL_STATS.lock();
@@ -744,6 +855,7 @@ pub fn get_stats() -> SyscallStats {
         wait_calls: stats.wait_calls,
         open_calls: stats.open_calls,
         close_calls: stats.close_calls,
+        lseek_calls: stats.lseek_calls,
     }
 }
 
