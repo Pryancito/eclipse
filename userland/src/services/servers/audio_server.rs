@@ -2,9 +2,40 @@
 //! 
 //! Implementa el servidor de audio que maneja reproducción, captura y procesamiento
 //! de audio desde el espacio de usuario.
+//!
+//! **STATUS**: STUB IMPLEMENTATION
+//! - Audio playback: STUB (no actual device output)
+//! - Audio capture: STUB (returns zero-filled buffer)
+//! - Volume control: STUB (no hardware control)
+//! TODO: Integrate with kernel audio drivers (e.g., AC97, HDA)
+//! TODO: Implement actual audio device I/O
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
+
+/// Comandos de audio
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AudioCommand {
+    Play = 1,
+    Capture = 2,
+    SetVolume = 3,
+    GetVolume = 4,
+}
+
+impl TryFrom<u8> for AudioCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(AudioCommand::Play),
+            2 => Ok(AudioCommand::Capture),
+            3 => Ok(AudioCommand::SetVolume),
+            4 => Ok(AudioCommand::GetVolume),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Servidor de audio
 pub struct AudioServer {
@@ -38,7 +69,8 @@ impl AudioServer {
         let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         println!("   [AUDIO] Capturando {} bytes de audio", size);
         
-        // Simular datos de audio capturados
+        // TODO: Read from actual audio input device
+        // For now, return zero-filled buffer (STUB)
         let captured = vec![0u8; size as usize];
         Ok(captured)
     }
@@ -104,15 +136,17 @@ impl MicrokernelServer for AudioServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = AudioCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_play(command_data),
-            2 => self.handle_capture(command_data),
-            3 => self.handle_set_volume(command_data),
-            4 => self.handle_get_volume(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            AudioCommand::Play => self.handle_play(command_data),
+            AudioCommand::Capture => self.handle_capture(command_data),
+            AudioCommand::SetVolume => self.handle_set_volume(command_data),
+            AudioCommand::GetVolume => self.handle_get_volume(command_data),
         };
         
         if result.is_err() {

@@ -24,6 +24,21 @@ fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'sta
     }
 }
 
+/// Write a block to the underlying block device
+/// Tries VirtIO first, falls back to ATA
+fn write_block_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+    // Try VirtIO first (preferred for QEMU)
+    match crate::virtio::write_block(block_num, buffer) {
+        Ok(_) => {
+            return Ok(());
+        }
+        Err(_) => {
+            // ATA write not implemented yet
+            Err("ATA write not implemented")
+        }
+    }
+}
+
 /// Filesystem state
 pub struct Filesystem {
     mounted: bool,
@@ -240,6 +255,138 @@ pub fn mount() -> Result<(), &'static str> {
         Ok(copy_len)
     }
 
+    /// Write data to file by inode
+    /// 
+    /// This is a simplified implementation that writes data to an existing file
+    /// without extending it. It modifies the file content in-place.
+    /// 
+    /// Limitations:
+    /// - Cannot extend file beyond current size
+    /// - Cannot allocate new blocks
+    /// - Writes are limited to existing file content
+    /// 
+    /// Parameters:
+    /// - inode: The inode number of the file
+    /// - data: The data to write
+    /// - offset: Offset within the file content (not block offset)
+    /// 
+    /// Returns: Number of bytes written
+    pub fn write_file_by_inode(inode: u32, data: &[u8], offset: u64) -> Result<usize, &'static str> {
+        let entry = Self::read_inode_entry(inode)?;
+        
+        // Read the full node record first
+        let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        
+        let mut block_buffer = vec![0u8; 4096];
+        read_block_from_device(block_num, &mut block_buffer)?;
+        
+        if offset_in_block + 8 > 4096 {
+            return Err("Node header crosses block boundary");
+        }
+        
+        let record_size = u32::from_le_bytes([
+            block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
+            block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
+        ]) as usize;
+        
+        // Read full record
+        let mut record_data = vec![0u8; record_size];
+        let first_chunk_size = min(record_size, 4096 - offset_in_block);
+        record_data[0..first_chunk_size].copy_from_slice(
+            &block_buffer[offset_in_block..offset_in_block+first_chunk_size]
+        );
+        
+        let mut bytes_read = first_chunk_size;
+        let mut current_block = block_num + 1;
+        
+        while bytes_read < record_size {
+            let chunk_size = min(4096, record_size - bytes_read);
+            read_block_from_device(current_block, &mut block_buffer)?;
+            record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
+            bytes_read += chunk_size;
+            current_block += 1;
+        }
+        
+        // Find CONTENT TLV and modify it
+        let mut tlv_offset = 8; // Skip 8-byte header
+        let mut content_found = false;
+        let mut content_tlv_offset = 0;
+        let mut content_length = 0;
+        
+        while tlv_offset + 6 <= record_data.len() {
+            let tag = u16::from_le_bytes([record_data[tlv_offset], record_data[tlv_offset+1]]);
+            let length = u32::from_le_bytes([
+                record_data[tlv_offset+2], record_data[tlv_offset+3], 
+                record_data[tlv_offset+4], record_data[tlv_offset+5]
+            ]) as usize;
+            
+            if tag == tlv_tags::CONTENT {
+                content_found = true;
+                content_tlv_offset = tlv_offset + 6; // Offset to actual content data
+                content_length = length;
+                break;
+            }
+            
+            tlv_offset += 6 + length;
+        }
+        
+        if !content_found {
+            return Err("No CONTENT TLV found in file");
+        }
+        
+        // Check bounds
+        if offset as usize >= content_length {
+            return Err("Write offset beyond file content");
+        }
+        
+        let write_start = content_tlv_offset + offset as usize;
+        let max_write = min(data.len(), content_length - offset as usize);
+        
+        if max_write == 0 {
+            return Ok(0);
+        }
+        
+        // Modify the record data
+        record_data[write_start..write_start+max_write].copy_from_slice(&data[..max_write]);
+        
+        // Write the modified record back to disk
+        // We need to write all blocks that the record spans
+        let start_block = block_num;
+        let start_offset = offset_in_block;
+        
+        // Prepare first block with modified data
+        let mut write_buffer = vec![0u8; 4096];
+        read_block_from_device(start_block, &mut write_buffer)?;
+        
+        let first_write_size = min(record_size, 4096 - start_offset);
+        write_buffer[start_offset..start_offset+first_write_size].copy_from_slice(&record_data[0..first_write_size]);
+        
+        write_block_to_device(start_block, &write_buffer)?;
+        
+        // Write remaining blocks if record spans multiple blocks
+        let mut bytes_written = first_write_size;
+        let mut write_block_num = start_block + 1;
+        
+        while bytes_written < record_size {
+            let chunk_size = min(4096, record_size - bytes_written);
+            
+            // Read existing block (to preserve data we're not modifying)
+            read_block_from_device(write_block_num, &mut write_buffer)?;
+            
+            // Overwrite with our new data
+            write_buffer[0..chunk_size].copy_from_slice(&record_data[bytes_written..bytes_written+chunk_size]);
+            
+            // Write back to disk
+            write_block_to_device(write_block_num, &write_buffer)?;
+            
+            bytes_written += chunk_size;
+            write_block_num += 1;
+        }
+        
+        Ok(max_write)
+    }
+
     /// Helper to find child inode in directory data
     fn find_child_in_dir(data: &[u8], target_name: &str) -> Option<u32> {
         let mut offset = 0;
@@ -282,6 +429,58 @@ pub fn mount() -> Result<(), &'static str> {
             offset += length;
         }
         None
+    }
+
+    /// Get the size of a file by inode number
+    /// Returns the content length from the CONTENT TLV
+    pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
+        unsafe {
+            let _ = FS.header.as_ref().ok_or("FS not mounted")?;
+        }
+        
+        // Read the inode entry from the inode table
+        let entry = Self::read_inode_entry(inode)?;
+        
+        // Calculate which block the node record starts at
+        let record_block = unsafe {
+            Self::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
+        };
+        
+        // Read the first block of the node record
+        let mut block_buffer = vec![0u8; BLOCK_SIZE];
+        read_block_from_device(record_block, &mut block_buffer)?;
+        
+        // Parse TLV structure to find CONTENT tag
+        let mut offset = 0;
+        while offset + 8 <= block_buffer.len() {
+            // Read tag (4 bytes) and length (4 bytes)
+            let tag = u32::from_le_bytes([
+                block_buffer[offset], block_buffer[offset+1],
+                block_buffer[offset+2], block_buffer[offset+3]
+            ]);
+            
+            let length = u32::from_le_bytes([
+                block_buffer[offset+4], block_buffer[offset+5],
+                block_buffer[offset+6], block_buffer[offset+7]
+            ]) as usize;
+            
+            if tag == tlv_tags::CONTENT as u32 {
+                // Found CONTENT tag, return its length as file size
+                return Ok(length as u64);
+            }
+            
+            // Move to next TLV entry
+            offset += 8 + length;
+            
+            // If we've gone past the first block, we need to handle multi-block records
+            // For simplicity, assume CONTENT is in first block (reasonable for most files)
+            if offset >= BLOCK_SIZE {
+                break;
+            }
+        }
+        
+        // If we didn't find CONTENT tag, the file is empty or this is a directory
+        Ok(0)
     }
 
     /// Lookup functionality

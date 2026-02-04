@@ -1,7 +1,25 @@
-//! ATA/PIANO PIO Mode Driver
+//! ATA/PATA PIO Mode Driver
 //!
-//! Provides basic support for reading and writing to ATA hard drives using
-//! Programmed I/O (PIO) mode. Only supports the Primary Bus, Master Drive for now.
+//! Provides support for reading and writing to ATA hard drives using
+//! Programmed I/O (PIO) mode.
+//!
+//! ## Current Features
+//! - LBA28 mode (supports drives up to 137GB / 2^28 sectors)
+//! - LBA48 mode (supports drives up to 128PB / 2^48 sectors)
+//! - Primary bus support (Master and Slave drives)
+//! - PIO mode (polling-based, no DMA)
+//!
+//! ## Limitations
+//! - No DMA support (would improve performance significantly)
+//! - No interrupt-driven I/O (uses polling)
+//! - No ATAPI/CD-ROM support
+//! - No secondary bus support (would need ports 0x170-0x177)
+//!
+//! ## Future Enhancements
+//! - DMA mode for better performance
+//! - Interrupt-driven I/O instead of polling
+//! - Secondary bus support
+//! - SMART monitoring
 
 use core::arch::asm;
 use spin::Mutex;
@@ -18,9 +36,12 @@ const ATA_COMMAND_PORT: u16 = 0x1F7; // Write
 const ATA_STATUS_PORT: u16 = 0x1F7;  // Read
 
 /// ATA Commands
-const ATA_CMD_READ_SECTORS: u8 = 0x20;
-const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+const ATA_CMD_READ_SECTORS: u8 = 0x20;      // Read sectors (LBA28)
+const ATA_CMD_READ_SECTORS_EXT: u8 = 0x24;  // Read sectors (LBA48)
+const ATA_CMD_WRITE_SECTORS: u8 = 0x30;     // Write sectors (LBA28)
+const ATA_CMD_WRITE_SECTORS_EXT: u8 = 0x34; // Write sectors (LBA48)
 const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;   // Flush cache (LBA48)
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 
 /// Status Register Bits
@@ -36,6 +57,10 @@ pub static ATA_DRIVE: Mutex<Option<AtaDrive>> = Mutex::new(None);
 pub struct AtaDrive {
     /// Is this the master drive?
     master: bool,
+    /// Does the drive support LBA48?
+    lba48_supported: bool,
+    /// Maximum addressable LBA (for capacity detection)
+    max_lba: u64,
 }
 
 impl AtaDrive {
@@ -43,7 +68,11 @@ impl AtaDrive {
     /// 
     /// Note: This does not initialize the hardware. Call `init()` for that.
     pub const fn new(master: bool) -> Self {
-        Self { master }
+        Self { 
+            master,
+            lba48_supported: false,
+            max_lba: 0,
+        }
     }
 
     /// Read data from a port
@@ -120,20 +149,46 @@ impl AtaDrive {
                 }
             }
             
-            // Read identification data (256 words) to clear buffer
-            for _ in 0..256 {
-                Self::inw(ATA_DATA_PORT);
+            // Read identification data (256 words = 512 bytes)
+            let mut identify_data = [0u16; 256];
+            for i in 0..256 {
+                identify_data[i] = Self::inw(ATA_DATA_PORT);
+            }
+            
+            // Check for LBA48 support (word 83, bit 10)
+            self.lba48_supported = (identify_data[83] & (1 << 10)) != 0;
+            
+            // Get maximum LBA
+            if self.lba48_supported {
+                // LBA48: words 100-103 (64-bit value)
+                self.max_lba = identify_data[100] as u64
+                    | ((identify_data[101] as u64) << 16)
+                    | ((identify_data[102] as u64) << 32)
+                    | ((identify_data[103] as u64) << 48);
+            } else {
+                // LBA28: words 60-61 (32-bit value)
+                self.max_lba = identify_data[60] as u64
+                    | ((identify_data[61] as u64) << 16);
             }
             
             crate::serial::serial_print("[ATA] Drive initialized successfully\n");
+            crate::serial::serial_print("[ATA]   LBA48 support: ");
+            crate::serial::serial_print(if self.lba48_supported { "Yes" } else { "No" });
+            crate::serial::serial_print("\n[ATA]   Max LBA: ");
+            crate::serial::serial_print_dec(self.max_lba);
+            crate::serial::serial_print("\n[ATA]   Capacity: ~");
+            crate::serial::serial_print_dec((self.max_lba * 512) / (1024 * 1024)); // MB
+            crate::serial::serial_print(" MB\n");
             true
         }
     }
     
-    /// Read sectors from the drive (LBA28)
+    /// Read sectors from the drive (supports both LBA28 and LBA48)
     /// 
     /// - `lba`: Logical Block Address (Sector index)
     /// - `buffer`: Buffer to store data. Must be a multiple of 512 bytes.
+    /// 
+    /// Automatically uses LBA48 mode for LBAs > 0x0FFFFFFF if supported.
     pub fn read_sectors(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
         if buffer.len() % 512 != 0 {
             return Err("Buffer length must be a multiple of 512 bytes");
@@ -144,14 +199,27 @@ impl AtaDrive {
             return Ok(());
         }
         
-        // Limited to 255 sectors per read in LBA28
-        // For simplicity, we read 1 sector at a time loop if needed, 
-        // effectively implementing a simple loop.
+        // Check if LBA is within drive capacity
+        if lba >= self.max_lba {
+            return Err("LBA out of range for this drive");
+        }
+        
+        // Read sectors one at a time
         for i in 0..sectors {
             let offset = i * 512;
             let current_lba = lba + i as u64;
             
-            match self.read_sector_lba28(current_lba, &mut buffer[offset..offset + 512]) {
+            // Choose LBA28 or LBA48 based on LBA value and drive support
+            let result = if current_lba > 0x0FFFFFFF {
+                if !self.lba48_supported {
+                    return Err("LBA48 required but not supported by drive");
+                }
+                self.read_sector_lba48(current_lba, &mut buffer[offset..offset + 512])
+            } else {
+                self.read_sector_lba28(current_lba, &mut buffer[offset..offset + 512])
+            };
+            
+            match result {
                 Ok(_) => {},
                 Err(e) => return Err(e),
             }
@@ -214,16 +282,84 @@ impl AtaDrive {
         
         Ok(())
     }
+    
+    /// Read a single sector using LBA48
+    fn read_sector_lba48(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+        if lba > 0x0000FFFFFFFFFFFF {
+            return Err("LBA48 out of range (max 48-bit)");
+        }
+        
+        unsafe {
+            // Wait for drive to be ready
+            while Self::inb(ATA_STATUS_PORT) & STATUS_BSY != 0 {}
+            
+            // Select drive
+            let drive_select = if self.master { 0x40 } else { 0x50 }; // LBA mode bit 6
+            Self::outb(ATA_DRIVE_HEAD_PORT, drive_select);
+            
+            // LBA48 uses a special sequence: write high bytes, then low bytes
+            
+            // Sector count high byte (we're reading 1 sector, so 0)
+            Self::outb(ATA_SECTOR_COUNT_PORT, 0);
+            
+            // LBA high bytes (bits 24-47)
+            Self::outb(ATA_LBA_LOW_PORT, (lba >> 24) as u8);
+            Self::outb(ATA_LBA_MID_PORT, (lba >> 32) as u8);
+            Self::outb(ATA_LBA_HIGH_PORT, (lba >> 40) as u8);
+            
+            // Sector count low byte (1 sector)
+            Self::outb(ATA_SECTOR_COUNT_PORT, 1);
+            
+            // LBA low bytes (bits 0-23)
+            Self::outb(ATA_LBA_LOW_PORT, lba as u8);
+            Self::outb(ATA_LBA_MID_PORT, (lba >> 8) as u8);
+            Self::outb(ATA_LBA_HIGH_PORT, (lba >> 16) as u8);
+            
+            // Send Read Command (LBA48 extended)
+            Self::outb(ATA_COMMAND_PORT, ATA_CMD_READ_SECTORS_EXT);
+            
+            // Wait for data
+            loop {
+                let status = Self::inb(ATA_STATUS_PORT);
+                if status & STATUS_ERR != 0 {
+                    return Err("ATA Read Error (LBA48)");
+                }
+                if status & STATUS_DRQ != 0 {
+                    break;
+                }
+            }
+            
+            // Read 256 words (512 bytes)
+            for i in 0..256 {
+                let data = Self::inw(ATA_DATA_PORT);
+                buffer[i * 2] = data as u8;
+                buffer[i * 2 + 1] = (data >> 8) as u8;
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 /// Initialize the ATA system
+/// Tries to initialize both master and slave drives on the primary bus
 pub fn init() {
-    let mut drive = AtaDrive::new(true); // Master
+    crate::serial::serial_print("[ATA] Initializing ATA subsystem...\n");
     
-    if drive.init() {
-        *ATA_DRIVE.lock() = Some(drive);
+    // Try master drive first
+    let mut master = AtaDrive::new(true);
+    if master.init() {
+        *ATA_DRIVE.lock() = Some(master);
+        return; // Master drive found and initialized
+    }
+    
+    // Try slave drive if master failed
+    crate::serial::serial_print("[ATA] Master drive not found, trying slave...\n");
+    let mut slave = AtaDrive::new(false);
+    if slave.init() {
+        *ATA_DRIVE.lock() = Some(slave);
     } else {
-        crate::serial::serial_print("[ATA] Failed to initialize primary master drive\n");
+        crate::serial::serial_print("[ATA] No ATA drives found on primary bus\n");
     }
 }
 

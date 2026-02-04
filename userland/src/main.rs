@@ -8,15 +8,15 @@
 pub mod applications;
 pub mod services;
 
-// Módulos de IA
+// Módulos de IA (experimental/optional - implementations are stubs for now)
 pub mod ai_core;
 pub mod ai_assistant;
-pub mod ai_anomaly;
-pub mod ai_hardware;
 pub mod ai_performance;
-pub mod ai_predictor;
 pub mod ai_multi_gpu;
 pub mod ai_gpu_failover;
+
+// Note: ai_anomaly, ai_hardware, and ai_predictor were stub modules and have been removed
+// Future implementations should use real ML libraries or mark as optional features
 
 // Módulos del sistema
 pub mod file_system;
@@ -27,8 +27,8 @@ pub mod security;
 pub mod fat32;
 pub mod ntfs;
 
-// Módulos de GUI
-pub mod gui;
+// Note: GUI module removed - use Wayland integration instead (wayland_integration, wayland_terminal)
+// Real GUI functionality is provided through Wayland compositor and clients
 
 use anyhow::Result;
 use log::info;

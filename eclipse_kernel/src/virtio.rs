@@ -380,9 +380,6 @@ pub struct VirtIOBlockDevice {
 
 static BLOCK_DEVICE: Mutex<Option<VirtIOBlockDevice>> = Mutex::new(None);
 
-// Simulated block storage for testing (512 KB = 128 blocks of 4KB each)
-static mut SIMULATED_DISK: [u8; 512 * 1024] = [0; 512 * 1024];
-
 impl VirtIOBlockDevice {
     /// Create a new VirtIO block device from MMIO base
     unsafe fn new(mmio_base: u64) -> Option<Self> {
@@ -391,14 +388,8 @@ impl VirtIOBlockDevice {
         // Check magic value
         let magic = read_volatile(&(*regs).magic_value);
         if magic != VIRTIO_MAGIC {
-            // No real VirtIO device, return simulated one
-            crate::serial::serial_print("[VirtIO] No real device found, using simulated disk\n");
-            return Some(VirtIOBlockDevice {
-                mmio_base: 0,
-                io_base: 0,
-                queue_size: 8,
-                queue: None,
-            });
+            // No VirtIO device found
+            return None;
         }
         
         // Check version (should be 2 for VirtIO 1.0)
@@ -445,12 +436,6 @@ impl VirtIOBlockDevice {
     
     /// Initialize the VirtIO block device
     unsafe fn init(&mut self) -> bool {
-        if self.mmio_base == 0 && self.io_base == 0 {
-            // Simulated device - initialize test data
-            self.init_simulated_disk();
-            return true;
-        }
-        
         if self.io_base != 0 {
             // I/O port based (legacy PCI)
             return self.init_legacy_pci();
@@ -647,105 +632,14 @@ impl VirtIOBlockDevice {
         true
     }
     
-    /// Initialize simulated disk with test data
-    unsafe fn init_simulated_disk(&mut self) {
-        use crate::serial;
-        
-        // Create a minimal EclipseFS header at block 0 (which maps to partition offset)
-        // EclipseFS header structure (from eclipsefs-lib format.rs):
-        // Magic: "ECLIPSEFS" (9 bytes)
-        // Version: u32 (4 bytes) - little endian
-        // Inode table offset: u64 (8 bytes) - little endian
-        // Inode table size: u64 (8 bytes) - little endian
-        // Total inodes: u32 (4 bytes) - little endian
-        // And more fields...
-        
-        let mut offset = 0;
-        
-        // Magic number: "ECLIPSEFS"
-        SIMULATED_DISK[offset..offset+9].copy_from_slice(b"ECLIPSEFS");
-        offset += 9;
-        
-        // Version: 1.0 (0x00010000) - little endian
-        let version: u32 = 0x00010000; // Major 1, Minor 0
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&version.to_le_bytes());
-        offset += 4;
-        
-        // Inode table offset: 4096 (after header) - little endian
-        let inode_table_offset: u64 = 4096;
-        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_offset.to_le_bytes());
-        offset += 8;
-        
-        // Inode table size: 4096 (minimal) - little endian
-        let inode_table_size: u64 = 4096;
-        SIMULATED_DISK[offset..offset+8].copy_from_slice(&inode_table_size.to_le_bytes());
-        offset += 8;
-        
-        // Total inodes: 1 (just root) - little endian
-        let total_inodes: u32 = 1;
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&total_inodes.to_le_bytes());
-        offset += 4;
-        
-        // Header checksum: 0 (skip for now)
-        let header_checksum: u32 = 0;
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&header_checksum.to_le_bytes());
-        offset += 4;
-        
-        // Metadata checksum: 0
-        let metadata_checksum: u32 = 0;
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&metadata_checksum.to_le_bytes());
-        offset += 4;
-        
-        // Data checksum: 0
-        let data_checksum: u32 = 0;
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&data_checksum.to_le_bytes());
-        offset += 4;
-        
-        // Creation time: 0
-        let creation_time: u64 = 0;
-        SIMULATED_DISK[offset..offset+8].copy_from_slice(&creation_time.to_le_bytes());
-        offset += 8;
-        
-        // Last check: 0
-        let last_check: u64 = 0;
-        SIMULATED_DISK[offset..offset+8].copy_from_slice(&last_check.to_le_bytes());
-        offset += 8;
-        
-        // Flags: 0
-        let flags: u32 = 0;
-        SIMULATED_DISK[offset..offset+4].copy_from_slice(&flags.to_le_bytes());
-        
-        serial::serial_print("[VirtIO] Simulated disk initialized with EclipseFS header\n");
-    }
-    
+
     /// Read a block from the device
     pub fn read_block(&mut self, block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
         if buffer.len() < 4096 {
             return Err("Buffer too small (need 4096 bytes)");
         }
         
-        if self.mmio_base == 0 && self.io_base == 0 {
-            // Simulated read
-            const PARTITION_OFFSET: u64 = 131328;
-            
-            unsafe {
-                if block_num < PARTITION_OFFSET {
-                    buffer[..4096].fill(0);
-                    return Ok(());
-                }
-                
-                let relative_block = block_num - PARTITION_OFFSET;
-                let offset = (relative_block as usize) * 4096;
-                
-                if offset + 4096 > SIMULATED_DISK.len() {
-                    return Err("Block number out of range");
-                }
-                buffer[..4096].copy_from_slice(&SIMULATED_DISK[offset..offset + 4096]);
-            }
-            return Ok(());
-        }
-        
-        // Real VirtIO block read
+        // VirtIO block read
         unsafe {
             let queue = self.queue.as_mut().ok_or_else(|| {
                 crate::serial::serial_print("[VirtIO] read_block failed: No virtqueue available\n");
@@ -865,28 +759,7 @@ impl VirtIOBlockDevice {
             return Err("Buffer too small (need 4096 bytes)");
         }
         
-        if self.mmio_base == 0 && self.io_base == 0 {
-            // Simulated write
-            const PARTITION_OFFSET: u64 = 131328;
-            
-            unsafe {
-                if block_num < PARTITION_OFFSET {
-                    // Block is before the partition, ignore write
-                    return Ok(());
-                }
-                
-                let relative_block = block_num - PARTITION_OFFSET;
-                let offset = (relative_block as usize) * 4096;
-                
-                if offset + 4096 > SIMULATED_DISK.len() {
-                    return Err("Block number out of range");
-                }
-                SIMULATED_DISK[offset..offset + 4096].copy_from_slice(&buffer[..4096]);
-            }
-            return Ok(());
-        }
-        
-        // Real VirtIO block write
+        // VirtIO block write
         unsafe {
             let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
             
@@ -927,7 +800,7 @@ impl VirtIOBlockDevice {
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
                 write_volatile(&mut (*regs).queue_notify, 0);
             } else {
-                // This should never happen due to early return for simulated disk
+                // Invalid device configuration
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 return Err("Invalid device configuration");

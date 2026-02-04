@@ -2,12 +2,21 @@
 //! 
 //! Implementa el servidor de gráficos que maneja todas las operaciones de display,
 //! renderizado y aceleración por hardware desde el espacio de usuario.
+//!
+//! **STATUS**: STUB IMPLEMENTATION
+//! - Display initialization: STUB (no framebuffer access)
+//! - Pixel/Rect/Line drawing: STUB (no actual rendering)
+//! - Buffer swapping: STUB (no double buffering)
+//! TODO: Integrate with kernel framebuffer or DRM/KMS
+//! TODO: Implement actual rendering via framebuffer writes
+//! TODO: Add hardware acceleration support
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
 
 /// Comandos de gráficos
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum GraphicsCommand {
     InitDisplay = 1,
     DrawPixel = 2,
@@ -15,7 +24,22 @@ pub enum GraphicsCommand {
     DrawLine = 4,
     Clear = 5,
     Swap = 6,
-    SetMode = 7,
+}
+
+impl TryFrom<u8> for GraphicsCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(GraphicsCommand::InitDisplay),
+            2 => Ok(GraphicsCommand::DrawPixel),
+            3 => Ok(GraphicsCommand::DrawRect),
+            4 => Ok(GraphicsCommand::DrawLine),
+            5 => Ok(GraphicsCommand::Clear),
+            6 => Ok(GraphicsCommand::Swap),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Servidor de gráficos
@@ -60,7 +84,8 @@ impl GraphicsServer {
         let y = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let color = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         
-        // Simular dibujo de pixel
+        // TODO: Access actual framebuffer and draw pixel at (x, y) with color
+        // For now, stub implementation (no actual rendering)
         Ok(vec![1])
     }
     
@@ -152,17 +177,19 @@ impl MicrokernelServer for GraphicsServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = GraphicsCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_init_display(command_data),
-            2 => self.handle_draw_pixel(command_data),
-            3 => self.handle_draw_rect(command_data),
-            4 => self.handle_draw_line(command_data),
-            5 => self.handle_clear(command_data),
-            6 => self.handle_swap(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            GraphicsCommand::InitDisplay => self.handle_init_display(command_data),
+            GraphicsCommand::DrawPixel => self.handle_draw_pixel(command_data),
+            GraphicsCommand::DrawRect => self.handle_draw_rect(command_data),
+            GraphicsCommand::DrawLine => self.handle_draw_line(command_data),
+            GraphicsCommand::Clear => self.handle_clear(command_data),
+            GraphicsCommand::Swap => self.handle_swap(command_data),
         };
         
         if result.is_err() {
