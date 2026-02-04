@@ -36,6 +36,8 @@ struct Framebuffer {
 }
 
 /// Color constants (ARGB format)
+/// These will be used for future rendering operations
+#[allow(dead_code)]
 mod colors {
     pub const BLACK: u32 = 0xFF000000;
     pub const WHITE: u32 = 0xFFFFFFFF;
@@ -64,6 +66,7 @@ fn detect_nvidia_gpu() -> bool {
 }
 
 /// Initialize NVIDIA graphics driver
+/// Note: Current stub implementation always succeeds
 fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE] Initializing NVIDIA driver...");
     println!("[DISPLAY-SERVICE]   - Loading NVIDIA kernel module");
@@ -85,6 +88,7 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
 }
 
 /// Initialize VESA graphics driver
+/// Note: Current stub implementation always succeeds
 fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE] Initializing VESA/VBE driver...");
     println!("[DISPLAY-SERVICE]   - Querying VESA BIOS Extensions");
