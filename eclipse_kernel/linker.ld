@@ -18,6 +18,12 @@ SECTIONS
         KEEP(*(.init))
     }
 
+    /* Sección de tablas de páginas */
+    .page_tables ALIGN(4096) : AT(ADDR(.page_tables) - KERNEL_BASE)
+    {
+        *(.page_tables*)
+    }
+
     /* Código ejecutable */
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_BASE)
     {
@@ -41,12 +47,6 @@ SECTIONS
     {
         *(COMMON)
         *(.bss*)
-    }
-
-    /* Sección de tablas de páginas */
-    .page_tables ALIGN(4K) : AT(ADDR(.page_tables) - KERNEL_BASE)
-    {
-        *(.page_tables*)
     }
 
     /* Símbolos de fin de kernel */
