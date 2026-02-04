@@ -14,6 +14,67 @@
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
 
+/// Syscall number for getting framebuffer info
+const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
+/// Syscall number for mapping framebuffer into virtual memory
+const SYS_MAP_FRAMEBUFFER: u64 = 16;
+
+/// Framebuffer information from kernel/bootloader
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub address: u64,      // Physical address of framebuffer
+    pub width: u32,        // Width in pixels
+    pub height: u32,       // Height in pixels
+    pub pitch: u32,        // Bytes per scanline
+    pub bpp: u16,          // Bits per pixel
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+}
+
+/// Get framebuffer info from kernel via syscall
+fn get_framebuffer_info() -> Option<FramebufferInfo> {
+    let ptr: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_GET_FRAMEBUFFER_INFO => ptr,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    
+    if ptr == 0 {
+        None
+    } else {
+        unsafe { Some(*(ptr as *const FramebufferInfo)) }
+    }
+}
+
+/// Map framebuffer into process virtual memory
+/// Returns virtual address where framebuffer is mapped, or None on failure
+fn map_framebuffer() -> Option<*mut u8> {
+    let addr: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MAP_FRAMEBUFFER => addr,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    
+    if addr == 0 {
+        None
+    } else {
+        Some(addr as *mut u8)
+    }
+}
+
 /// Comandos de gráficos
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,17 +110,30 @@ pub struct GraphicsServer {
     initialized: bool,
     width: u32,
     height: u32,
+    framebuffer_info: Option<FramebufferInfo>,
+    framebuffer_ptr: Option<*mut u8>,  // Mapped virtual address
 }
 
 impl GraphicsServer {
     /// Crear un nuevo servidor de gráficos
     pub fn new() -> Self {
+        // Get framebuffer info from kernel
+        let fb_info = get_framebuffer_info();
+        
+        let (width, height) = if let Some(ref info) = fb_info {
+            (info.width, info.height)
+        } else {
+            (1920, 1080) // Default fallback
+        };
+        
         Self {
             name: "Graphics".to_string(),
             stats: ServerStats::default(),
             initialized: false,
-            width: 1920,
-            height: 1080,
+            width,
+            height,
+            framebuffer_info: fb_info,
+            framebuffer_ptr: None,
         }
     }
     
@@ -156,7 +230,41 @@ impl MicrokernelServer for GraphicsServer {
     
     fn initialize(&mut self) -> Result<()> {
         println!("   [GFX] Inicializando servidor de gráficos...");
-        println!("   [GFX] Detectando hardware de video...");
+        
+        if let Some(ref fb_info) = self.framebuffer_info {
+            println!("   [GFX] Framebuffer detectado:");
+            println!("   [GFX]   Dirección: 0x{:016X}", fb_info.address);
+            println!("   [GFX]   Resolución: {}x{}", fb_info.width, fb_info.height);
+            println!("   [GFX]   Pitch: {} bytes", fb_info.pitch);
+            println!("   [GFX]   BPP: {} bits", fb_info.bpp);
+            
+            self.width = fb_info.width;
+            self.height = fb_info.height;
+            
+            // Map framebuffer into our virtual address space
+            println!("   [GFX] Mapeando framebuffer...");
+            if let Some(fb_ptr) = map_framebuffer() {
+                self.framebuffer_ptr = Some(fb_ptr);
+                println!("   [GFX] Framebuffer mapeado en: 0x{:016X}", fb_ptr as u64);
+                
+                // Clear screen to black
+                println!("   [GFX] Limpiando pantalla (negro)...");
+                unsafe {
+                    core::ptr::write_bytes(
+                        fb_ptr,
+                        0,  // Black
+                        (fb_info.pitch * fb_info.height) as usize,
+                    );
+                }
+                println!("   [GFX] Pantalla limpiada");
+            } else {
+                println!("   [GFX] ERROR: No se pudo mapear el framebuffer");
+            }
+        } else {
+            println!("   [GFX] ADVERTENCIA: No se pudo obtener info del framebuffer");
+            println!("   [GFX] Usando configuración por defecto: {}x{}", self.width, self.height);
+        }
+        
         println!("   [GFX] Configurando modo de video {}x{}", self.width, self.height);
         println!("   [GFX] Inicializando aceleración por hardware...");
         

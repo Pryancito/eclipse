@@ -170,7 +170,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
 pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
 
 /// Función principal del kernel
-pub fn kernel_main(_framebuffer_info_ptr: u64) -> ! {
+pub fn kernel_main(framebuffer_info_ptr: u64) -> ! {
+    // Store framebuffer info for graphics server
+    boot::set_framebuffer_info(framebuffer_info_ptr);
+    
     serial::serial_print("===== FORK FIX VERSION - TESTING =====\n");
     serial::serial_print("Entering kernel main loop...\n");
     

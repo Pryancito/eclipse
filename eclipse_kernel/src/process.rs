@@ -213,6 +213,16 @@ pub fn get_process(pid: ProcessId) -> Option<Process> {
     None
 }
 
+/// Get process page table physical address
+pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
+    if let Some(pid) = pid {
+        if let Some(process) = get_process(pid) {
+            return process.page_table_phys;
+        }
+    }
+    0
+}
+
 /// Actualizar proceso
 pub fn update_process(pid: ProcessId, process: Process) {
     let mut table = PROCESS_TABLE.lock();

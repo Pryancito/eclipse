@@ -19,6 +19,80 @@
 
 use eclipse_libc::{println, getpid, yield_cpu};
 
+/// Syscall numbers
+const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
+const SYS_MAP_FRAMEBUFFER: u64 = 16;
+
+/// Framebuffer information from kernel/bootloader
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct FramebufferInfoFromKernel {
+    address: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u16,
+    red_mask_size: u8,
+    red_mask_shift: u8,
+    green_mask_size: u8,
+    green_mask_shift: u8,
+    blue_mask_size: u8,
+    blue_mask_shift: u8,
+}
+
+/// Get framebuffer info from kernel
+fn get_framebuffer_info_from_kernel() -> Option<FramebufferInfoFromKernel> {
+    let mut fb_info = FramebufferInfoFromKernel {
+        address: 0,
+        width: 0,
+        height: 0,
+        pitch: 0,
+        bpp: 0,
+        red_mask_size: 0,
+        red_mask_shift: 0,
+        green_mask_size: 0,
+        green_mask_shift: 0,
+        blue_mask_size: 0,
+        blue_mask_shift: 0,
+    };
+    
+    let result: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_GET_FRAMEBUFFER_INFO,
+            in("rdi") &mut fb_info as *mut _ as u64,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    
+    if result == 0 {
+        Some(fb_info)
+    } else {
+        None
+    }
+}
+
+/// Map framebuffer into process virtual memory
+fn map_framebuffer_memory() -> Option<usize> {
+    let addr: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_MAP_FRAMEBUFFER,
+            lateout("rax") addr,
+            options(nostack)
+        );
+    }
+    
+    if addr == 0 {
+        None
+    } else {
+        Some(addr as usize)
+    }
+}
+
 /// Graphics driver types
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum GraphicsDriver {
@@ -289,57 +363,31 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]   ║  VESA BIOS Extensions (VBE) 2.0/3.0  ║");
     println!("[DISPLAY-SERVICE]   ╚════════════════════════════════════════╝");
     
-    // Step 1: Query VBE controller information
-    println!("[DISPLAY-SERVICE]   - Querying VBE controller information...");
-    println!("[DISPLAY-SERVICE]     * VBE Version: 3.0");
-    println!("[DISPLAY-SERVICE]     * OEM String: Eclipse VESA Driver");
-    println!("[DISPLAY-SERVICE]     * Total Memory: 16 MB");
-    println!("[DISPLAY-SERVICE]     * Capabilities: Linear framebuffer, Hardware cursor");
+    // Step 1: Get real framebuffer info from kernel
+    println!("[DISPLAY-SERVICE]   - Querying kernel for framebuffer information...");
+    let kernel_fb_info = get_framebuffer_info_from_kernel()
+        .ok_or("Failed to get framebuffer info from kernel")?;
     
-    // Step 2: Enumerate all available VESA modes
-    println!("[DISPLAY-SERVICE]   - Enumerating available video modes...");
-    let available_modes = enumerate_vesa_modes();
+    println!("[DISPLAY-SERVICE]     * Framebuffer detected via bootloader");
+    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
+    println!("[DISPLAY-SERVICE]     * Resolution: {}x{}", kernel_fb_info.width, kernel_fb_info.height);
+    println!("[DISPLAY-SERVICE]     * Pitch: {} bytes", kernel_fb_info.pitch);
+    println!("[DISPLAY-SERVICE]     * BPP: {} bits", kernel_fb_info.bpp);
     
-    let mut mode_count = 0;
-    for (_i, mode_opt) in available_modes.iter().enumerate() {
-        if let Some(mode) = mode_opt {
-            mode_count += 1;
-            let buffer_support = if mode.supports_double_buffer { "✓" } else { "✗" };
-            let linear_support = if mode.is_linear { "✓" } else { "✗" };
-            println!("[DISPLAY-SERVICE]     * Mode {}: {}x{}x{} (Linear: {}, DBuf: {})", 
-                     mode.mode_number, mode.width, mode.height, mode.bpp, 
-                     linear_support, buffer_support);
-        }
-    }
-    println!("[DISPLAY-SERVICE]   - Found {} compatible modes", mode_count);
-    
-    // Step 3: Select best mode
-    println!("[DISPLAY-SERVICE]   - Selecting optimal video mode...");
-    let selected_mode = select_best_vesa_mode(&available_modes)
-        .ok_or("No suitable VESA mode found")?;
-    
-    println!("[DISPLAY-SERVICE]     ✓ Selected: {}x{}@{}bpp (Mode 0x{:X})", 
-             selected_mode.width, selected_mode.height, 
-             selected_mode.bpp, selected_mode.mode_number);
-    
-    // Step 4: Set video mode
-    println!("[DISPLAY-SERVICE]   - Setting video mode 0x{:X}...", selected_mode.mode_number);
-    // In real implementation: INT 10h, AX=4F02h, BX=mode_number | 0x4000 (LFB)
-    println!("[DISPLAY-SERVICE]     * Enabling Linear Frame Buffer (LFB)");
-    println!("[DISPLAY-SERVICE]     * Disabling VGA text mode");
-    println!("[DISPLAY-SERVICE]     * Clearing display memory");
-    
-    // Step 5: Map framebuffer to memory
+    // Step 2: Map framebuffer to virtual memory
     println!("[DISPLAY-SERVICE]   - Mapping framebuffer to virtual memory...");
-    let fb_base = 0xFD000000;  // Common VESA LFB base address
-    let fb_size = (selected_mode.width * selected_mode.height * (selected_mode.bpp / 8)) as usize;
-    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", fb_base);
+    let fb_base = map_framebuffer_memory()
+        .ok_or("Failed to map framebuffer into virtual memory")?;
+    
+    let fb_size = (kernel_fb_info.pitch * kernel_fb_info.height) as usize;
+    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
     println!("[DISPLAY-SERVICE]     * Device node: /dev/fb0");
     
-    // Step 6: Setup double buffering if supported
-    let back_buffer = if selected_mode.supports_double_buffer {
+    // Step 3: Setup double buffering if supported
+    let supports_double_buffer = kernel_fb_info.bpp == 32;
+    let back_buffer = if supports_double_buffer {
         println!("[DISPLAY-SERVICE]   - Allocating back buffer for double buffering...");
         let back_buf_addr = fb_base + fb_size;
         println!("[DISPLAY-SERVICE]     ✓ Back buffer at: 0x{:X}", back_buf_addr);
@@ -349,9 +397,9 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
         None
     };
     
-    // Step 7: Initialize 2D acceleration
+    // Step 4: Initialize 2D acceleration
     println!("[DISPLAY-SERVICE]   - Initializing 2D acceleration engine...");
-    let supports_accel = selected_mode.bpp == 32 && selected_mode.is_linear;
+    let supports_accel = kernel_fb_info.bpp == 32;
     if supports_accel {
         println!("[DISPLAY-SERVICE]     ✓ Hardware-accelerated operations enabled:");
         println!("[DISPLAY-SERVICE]       - Fast block transfers (BitBLT)");
@@ -363,7 +411,7 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
         println!("[DISPLAY-SERVICE]     ! Software rendering only (mode limitations)");
     }
     
-    // Step 8: Configure V-Sync
+    // Step 5: Configure V-Sync
     println!("[DISPLAY-SERVICE]   - Configuring vertical sync (V-Sync)...");
     println!("[DISPLAY-SERVICE]     * V-Sync enabled for tear-free rendering");
     println!("[DISPLAY-SERVICE]     * Target refresh rate: 60 Hz");
@@ -376,14 +424,14 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
         base_address: fb_base,
         size: fb_size,
         mode: DisplayMode {
-            width: selected_mode.width,
-            height: selected_mode.height,
-            bpp: selected_mode.bpp,
-            mode_number: selected_mode.mode_number,
+            width: kernel_fb_info.width,
+            height: kernel_fb_info.height,
+            bpp: kernel_fb_info.bpp as u32,
+            mode_number: 0, // Not applicable for bootloader framebuffer
             refresh_rate: 60,
         },
         back_buffer,
-        pitch: selected_mode.pitch,
+        pitch: kernel_fb_info.pitch,
         supports_hw_accel: supports_accel,
     })
 }
@@ -487,13 +535,17 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
 
 /// Perform optimized screen clear
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
-    // Use hardware acceleration if available
-    if fb.supports_hw_accel {
-        accel_fill_rect(fb, 0, 0, fb.mode.width, fb.mode.height, color)?;
-    } else {
-        // Software fallback
-        yield_cpu();
+    // Clear screen by writing to framebuffer memory
+    let fb_ptr = fb.base_address as *mut u32;
+    let pixel_count = (fb.size / 4) as usize; // 4 bytes per pixel for 32bpp
+    
+    unsafe {
+        // Write color to every pixel
+        for i in 0..pixel_count {
+            core::ptr::write_volatile(fb_ptr.add(i), color);
+        }
     }
+    
     Ok(())
 }
 

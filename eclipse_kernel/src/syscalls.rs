@@ -26,6 +26,8 @@ pub enum SyscallNumber {
     Open = 11,
     Close = 12,
     Lseek = 14,
+    GetFramebufferInfo = 15,
+    MapFramebuffer = 16,
 }
 
 /// lseek whence values (POSIX standard)
@@ -134,6 +136,8 @@ pub extern "C" fn syscall_handler(
         12 => sys_close(arg1),
         13 => sys_getppid(),
         14 => sys_lseek(arg1, arg2 as i64, arg3),
+        15 => sys_get_framebuffer_info(arg1),
+        16 => sys_map_framebuffer(),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -568,10 +572,6 @@ fn sys_wait(_status_ptr: u64) -> u64 {
         if state == &process::ProcessState::Terminated {
             if let Some(proc) = process::get_process(*pid) {
                 if proc.parent_pid == Some(current_pid) {
-                    serial::serial_print("[SYSCALL] wait() found terminated child PID: ");
-                    serial::serial_print_dec(*pid as u64);
-                    serial::serial_print("\n");
-                    
                     // TODO: Clean up child process resources
                     // TODO: Write exit status to status_ptr if non-zero
                     
@@ -883,6 +883,120 @@ pub fn get_stats() -> SyscallStats {
         close_calls: stats.close_calls,
         lseek_calls: stats.lseek_calls,
     }
+}
+
+/// sys_get_framebuffer_info - Get framebuffer information from bootloader
+/// Accepts a pointer to userspace buffer and copies framebuffer info into it
+/// Returns 0 on success, -1 on failure
+fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
+    use crate::servers::FramebufferInfo;
+    
+    if user_buffer == 0 {
+        return u64::MAX; // -1 as u64
+    }
+    
+    let fb_info_ptr = crate::boot::get_framebuffer_info();
+    if fb_info_ptr == 0 {
+        return u64::MAX; // -1 as u64
+    }
+    
+    // The bootloader passes a different FramebufferInfo structure
+    // We need to convert it to our syscall structure
+    unsafe {
+        // Read bootloader structure (from main.rs)
+        #[repr(C)]
+        struct BootloaderFramebufferInfo {
+            base_address: u64,
+            width: u32,
+            height: u32,
+            pixels_per_scan_line: u32,
+            pixel_format: u32,
+            red_mask: u32,
+            green_mask: u32,
+            blue_mask: u32,
+        }
+        
+        let bootloader_fb = &*(fb_info_ptr as *const BootloaderFramebufferInfo);
+        
+        // Calculate BPP from pixel format
+        // Pixel format 1 = RGB, typically 32bpp
+        // For now, assume 32bpp for RGB formats
+        let bpp: u16 = 32;
+        let bytes_per_pixel = bpp / 8;
+        
+        // Calculate pitch (bytes per scanline)
+        let pitch = bootloader_fb.pixels_per_scan_line * bytes_per_pixel as u32;
+        
+        // Create syscall structure
+        let syscall_fb = FramebufferInfo {
+            address: bootloader_fb.base_address,
+            width: bootloader_fb.width,
+            height: bootloader_fb.height,
+            pitch,
+            bpp,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        };
+        
+        // Copy to userspace buffer
+        let user_fb_info = user_buffer as *mut FramebufferInfo;
+        core::ptr::write(user_fb_info, syscall_fb);
+    }
+    
+    0 // Success
+}
+
+/// sys_map_framebuffer - Map framebuffer physical memory into process virtual space
+/// Returns the virtual address where framebuffer is mapped, or 0 on failure
+fn sys_map_framebuffer() -> u64 {
+    // Get framebuffer info
+    let fb_info_ptr = crate::boot::get_framebuffer_info();
+    if fb_info_ptr == 0 {
+        serial::serial_print("MAP_FB: No framebuffer info available\n");
+        return 0;
+    }
+    
+    // Read bootloader structure
+    #[repr(C)]
+    struct BootloaderFramebufferInfo {
+        base_address: u64,
+        width: u32,
+        height: u32,
+        pixels_per_scan_line: u32,
+        pixel_format: u32,
+        red_mask: u32,
+        green_mask: u32,
+        blue_mask: u32,
+    }
+    
+    let bootloader_fb = unsafe { &*(fb_info_ptr as *const BootloaderFramebufferInfo) };
+    
+    // Calculate framebuffer size correctly
+    // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
+    let fb_size = (bootloader_fb.pixels_per_scan_line * bootloader_fb.height * 4) as u64;
+    
+    serial::serial_print("MAP_FB: Framebuffer mapping request\n");
+    serial::serial_print("  Phys addr: ");
+    serial::serial_print_hex(bootloader_fb.base_address);
+    serial::serial_print("\n  Size: ");
+    serial::serial_print_hex(fb_size);
+    serial::serial_print("\n");
+    
+    // Get current process page table
+    let current_pid = crate::process::current_process_id();
+    let page_table_phys = crate::process::get_process_page_table(current_pid);
+    
+    if page_table_phys == 0 {
+        serial::serial_print("MAP_FB: ERROR - Could not get process page table\n");
+        return 0;
+    }
+    
+    // Map framebuffer into process address space
+    crate::memory::map_framebuffer_for_process(page_table_phys, bootloader_fb.base_address, fb_size)
 }
 
 /// Inicializar sistema de syscalls

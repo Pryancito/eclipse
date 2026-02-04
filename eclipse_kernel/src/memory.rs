@@ -617,3 +617,92 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
         dealloc(ptr, layout);
     }
 }
+
+/// Map framebuffer physical memory into process page tables
+/// Returns virtual address where framebuffer is mapped, or 0 on failure
+pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_size: u64) -> u64 {
+    // For identity mapping, we'll map the framebuffer at its physical address
+    // This is simpler than choosing a high virtual address
+    let virtual_addr = fb_phys_addr;
+    
+    // Round size up to 2MB pages
+    let num_pages = (fb_size + 0x1FFFFF) / 0x200000;
+    
+    crate::serial::serial_print("MAP_FB: Identity mapping ");
+    crate::serial::serial_print_dec(num_pages);
+    crate::serial::serial_print(" pages\n");
+    crate::serial::serial_print("  Virt = Phys = ");
+    crate::serial::serial_print_hex(fb_phys_addr);
+    crate::serial::serial_print("\n");
+    
+    // Get physical offset to convert virtual addresses to physical
+    let phys_offset = PHYS_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    
+    // Access the process's PML4 (convert physical to virtual)
+    let pml4_virt = page_table_phys.wrapping_sub(phys_offset);
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    
+    // For each 2MB page of the framebuffer
+    for page_idx in 0..num_pages {
+        let page_phys = fb_phys_addr + (page_idx * 0x200000);
+        let page_virt = page_phys; // Identity mapping
+        
+        // Calculate indices for page table walk
+        let pml4_idx = ((page_virt >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((page_virt >> 30) & 0x1FF) as usize;
+        let pd_idx = ((page_virt >> 21) & 0x1FF) as usize;
+        
+        // Get or create PDPT
+        if !pml4.entries[pml4_idx].present() {
+            // Allocate new PDPT
+            if let Some((pdpt_ptr, pdpt_phys)) = alloc_dma_buffer(4096, 4096) {
+                unsafe { core::ptr::write_bytes(pdpt_ptr, 0, 4096); }
+                pml4.entries[pml4_idx].set_addr(
+                    pdpt_phys,
+                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                );
+            } else {
+                crate::serial::serial_print("MAP_FB: Failed to allocate PDPT\n");
+                return 0;
+            }
+        }
+        
+        let pdpt_phys = pml4.entries[pml4_idx].get_addr();
+        let pdpt_virt = pdpt_phys.wrapping_sub(phys_offset);
+        let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
+        
+        // Get or create PD
+        if !pdpt.entries[pdpt_idx].present() {
+            // Allocate new PD
+            if let Some((pd_ptr, pd_phys)) = alloc_dma_buffer(4096, 4096) {
+                unsafe { core::ptr::write_bytes(pd_ptr, 0, 4096); }
+                pdpt.entries[pdpt_idx].set_addr(
+                    pd_phys,
+                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                );
+            } else {
+                crate::serial::serial_print("MAP_FB: Failed to allocate PD\n");
+                return 0;
+            }
+        }
+        
+        let pd_phys = pdpt.entries[pdpt_idx].get_addr();
+        let pd_virt = pd_phys.wrapping_sub(phys_offset);
+        let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
+        
+        // Map the 2MB page with USER flag
+        pd.entries[pd_idx].set_addr(
+            page_phys,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_HUGE
+        );
+    }
+    
+    crate::serial::serial_print("MAP_FB: Successfully mapped framebuffer\n");
+    
+    // Flush TLB for the mapped pages
+    unsafe {
+        core::arch::asm!("mov rax, cr3; mov cr3, rax", out("rax") _);
+    }
+    
+    virtual_addr
+}

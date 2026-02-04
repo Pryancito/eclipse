@@ -5,6 +5,23 @@ use crate::process::{create_process, ProcessId};
 use crate::serial;
 use crate::scheduler::yield_cpu;
 
+/// Framebuffer information from bootloader
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub address: u64,      // Physical address of framebuffer
+    pub width: u32,        // Width in pixels
+    pub height: u32,       // Height in pixels
+    pub pitch: u32,        // Bytes per scanline
+    pub bpp: u16,          // Bits per pixel
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+}
+
 /// IDs de los servidores del sistema
 pub struct SystemServers {
     pub filesystem: Option<ServerId>,
@@ -115,7 +132,41 @@ fn handle_filesystem_message(msg: &crate::ipc::Message) {
 extern "C" fn graphics_server() -> ! {
     serial::serial_print("Graphics server started\n");
     
-    // TODO: Obtener framebuffer info del kernel
+    // Get framebuffer info from kernel (syscall 15)
+    let fb_info_ptr = unsafe {
+        let result: u64;
+        core::arch::asm!(
+            "mov rax, 15",  // SYS_GET_FRAMEBUFFER_INFO
+            "syscall",
+            out("rax") result,
+            out("rcx") _,
+            out("r11") _,
+        );
+        result
+    };
+    
+    if fb_info_ptr != 0 {
+        // Parse framebuffer info structure
+        let fb_info = unsafe { &*(fb_info_ptr as *const FramebufferInfo) };
+        
+        serial::serial_print("Graphics: Framebuffer initialized\n");
+        serial::serial_print("  Address: ");
+        serial::serial_print_hex(fb_info.address);
+        serial::serial_print("\n  Resolution: ");
+        serial::serial_print_dec(fb_info.width as u64);
+        serial::serial_print("x");
+        serial::serial_print_dec(fb_info.height as u64);
+        serial::serial_print("\n  Pitch: ");
+        serial::serial_print_dec(fb_info.pitch as u64);
+        serial::serial_print("\n  BPP: ");
+        serial::serial_print_dec(fb_info.bpp as u64);
+        serial::serial_print("\n");
+        
+        // TODO: Map framebuffer into process address space
+        // TODO: Initialize graphics operations
+    } else {
+        serial::serial_print("Graphics: No framebuffer available\n");
+    }
     
     loop {
         if let Some(server_id) = get_graphics_server() {

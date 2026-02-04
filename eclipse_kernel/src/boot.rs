@@ -1,6 +1,20 @@
 //! Inicialización del sistema y GDT
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Framebuffer information from bootloader
+static FRAMEBUFFER_INFO: AtomicU64 = AtomicU64::new(0);
+
+/// Store framebuffer info from bootloader
+pub fn set_framebuffer_info(ptr: u64) {
+    FRAMEBUFFER_INFO.store(ptr, Ordering::Relaxed);
+}
+
+/// Get framebuffer info pointer (for graphics server)
+pub fn get_framebuffer_info() -> u64 {
+    FRAMEBUFFER_INFO.load(Ordering::Relaxed)
+}
 
 /// Descriptor de la GDT
 #[repr(C, packed)]
