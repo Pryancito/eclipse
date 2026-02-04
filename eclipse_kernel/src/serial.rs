@@ -1,4 +1,26 @@
-//! Módulo de comunicación serial (COM1) para debugging
+//! Serial Communication Module (COM1-COM4) for debugging and I/O
+//!
+//! Provides serial port communication for debugging output and input.
+//!
+//! ## Current Features
+//! - COM1 support (0x3F8) - primary port
+//! - Output functionality (transmit)
+//! - Input functionality (receive with buffering)
+//! - 38400 baud rate
+//! - 8N1 configuration (8 data bits, no parity, 1 stop bit)
+//! - FIFO buffers enabled
+//!
+//! ## Limitations
+//! - No interrupt-driven I/O (uses polling)
+//! - COM2-COM4 not yet implemented
+//! - Fixed baud rate (38400)
+//! - No hardware flow control
+//!
+//! ## Future Enhancements
+//! - Interrupt-driven I/O for better performance
+//! - COM2-COM4 support
+//! - Configurable baud rates
+//! - Hardware flow control (RTS/CTS)
 
 use core::arch::asm;
 use spin::Mutex;
@@ -48,6 +70,61 @@ pub fn init() {
 /// Verificar si el serial está listo para transmitir
 fn is_transmit_empty() -> bool {
     unsafe { inb(SERIAL_PORT + 5) & 0x20 != 0 }
+}
+
+/// Verificar si hay datos disponibles para recibir
+fn is_data_available() -> bool {
+    unsafe { inb(SERIAL_PORT + 5) & 0x01 != 0 }
+}
+
+/// Leer un byte del puerto serial (blocking)
+/// Retorna None si no hay datos disponibles
+pub fn read_byte() -> Option<u8> {
+    if !*SERIAL_INITIALIZED.lock() {
+        return None;
+    }
+    
+    if is_data_available() {
+        Some(unsafe { inb(SERIAL_PORT) })
+    } else {
+        None
+    }
+}
+
+/// Leer un byte del puerto serial (blocking - espera hasta que haya datos)
+pub fn read_byte_blocking() -> u8 {
+    while !is_data_available() {
+        core::hint::spin_loop();
+    }
+    unsafe { inb(SERIAL_PORT) }
+}
+
+/// Leer múltiples bytes del serial hasta llenar el buffer o timeout
+/// Retorna el número de bytes leídos
+pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
+    if !*SERIAL_INITIALIZED.lock() {
+        return 0;
+    }
+    
+    let mut count = 0;
+    let mut timeout = timeout_iterations;
+    
+    for byte in buffer.iter_mut() {
+        if timeout == 0 {
+            break;
+        }
+        
+        if let Some(b) = read_byte() {
+            *byte = b;
+            count += 1;
+            timeout = timeout_iterations; // Reset timeout on successful read
+        } else {
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+    }
+    
+    count
 }
 
 /// Escribir un byte al puerto serial
