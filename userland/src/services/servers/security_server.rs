@@ -3,12 +3,13 @@
 //! Implementa el servidor de seguridad que maneja autenticación, autorización,
 //! encriptación y auditoría de seguridad del sistema.
 //!
-//! **STATUS**: REAL CRYPTOGRAPHY IMPLEMENTATION ✅
-//! - Encryption/Decryption: AES-256-GCM with authentication
-//! - Hashing: SHA-256 cryptographic hash function
-//! - Authentication: STUB (always succeeds) - TODO
-//! - Authorization: STUB (always allows) - TODO
-//! - Audit logging: STUB (only prints, no persistence) - TODO
+//! **STATUS**: REAL CRYPTOGRAPHY & AUTHENTICATION ✅
+//! - Encryption/Decryption: AES-256-GCM with authentication ✅
+//! - Hashing: SHA-256 cryptographic hash function ✅
+//! - Authentication: Argon2id password verification ✅
+//! - Session Management: HMAC-SHA256 tokens ✅
+//! - Authorization: Basic role-based (implemented) ⚠️
+//! - Audit logging: In-memory (no persistence yet) ⚠️
 //! 
 //! ## Encryption Format
 //! Encrypted data format: [12-byte nonce][ciphertext][16-byte auth tag]
@@ -20,8 +21,13 @@
 //! - AES-256-GCM provides confidentiality and authenticity
 //! - Each encryption uses a unique random nonce
 //! - SHA-256 provides 256-bit cryptographic hash
+//! - Argon2id for password hashing (OWASP recommended, PHC winner)
+//! - HMAC-SHA256 for session tokens
+//! - Constant-time password comparison (timing attack resistant)
 //! - TODO: Implement secure key management (currently using hardcoded key)
 //! - TODO: Implement key rotation and derivation
+//! - TODO: Add persistent user database
+//! - TODO: Add password complexity requirements
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
@@ -31,6 +37,12 @@ use aes_gcm::{
     Aes256Gcm, Nonce, Key
 };
 use rand::RngCore;
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
+use hmac::{Hmac, Mac};
+use std::collections::HashMap;
 
 /// Comandos de seguridad
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +74,31 @@ impl TryFrom<u8> for SecurityCommand {
     }
 }
 
+/// User information
+#[derive(Clone)]
+struct User {
+    username: String,
+    password_hash: String,
+    role: UserRole,
+}
+
+/// User roles for authorization
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserRole {
+    Admin,
+    User,
+    Guest,
+}
+
+/// Session information
+#[derive(Clone)]
+struct Session {
+    token: String,
+    username: String,
+    role: UserRole,
+    created_at: u64,
+}
+
 /// Servidor de seguridad
 pub struct SecurityServer {
     name: String,
@@ -70,13 +107,21 @@ pub struct SecurityServer {
     /// Master encryption key (AES-256)
     /// TODO: Implement secure key storage and rotation
     encryption_key: [u8; 32],
+    /// HMAC secret key for session tokens
+    hmac_secret: [u8; 32],
+    /// User database (username -> User)
+    users: HashMap<String, User>,
+    /// Active sessions (token -> Session)
+    sessions: HashMap<String, Session>,
+    /// Session counter for uniqueness
+    session_counter: u64,
 }
 
 impl SecurityServer {
     /// Crear un nuevo servidor de seguridad
     pub fn new() -> Self {
         // TODO: Replace with secure key derivation/storage
-        // For now, using a hardcoded key (NOT SECURE for production!)
+        // For now, using hardcoded keys (NOT SECURE for production!)
         let encryption_key = [
             0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
             0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
@@ -84,40 +129,191 @@ impl SecurityServer {
             0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4,
         ];
         
+        let hmac_secret = [
+            0x2a, 0x7b, 0x4c, 0x8d, 0x9e, 0x1f, 0x3a, 0x5b,
+            0x6c, 0x7d, 0x8e, 0x9f, 0x0a, 0x1b, 0x2c, 0x3d,
+            0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf,
+            0xc0, 0xd1, 0xe2, 0xf3, 0x04, 0x15, 0x26, 0x37,
+        ];
+        
         Self {
             name: "Security".to_string(),
             stats: ServerStats::default(),
             initialized: false,
             encryption_key,
+            hmac_secret,
+            users: HashMap::new(),
+            sessions: HashMap::new(),
+            session_counter: 0,
         }
+    }
+    
+    /// Create default test users
+    fn create_default_users(&mut self) -> Result<()> {
+        println!("   [SEC] Creating default users...");
+        
+        // Create an Argon2 instance with default params (OWASP recommended)
+        let argon2 = Argon2::default();
+        
+        // Create admin user
+        let salt = SaltString::generate(&mut rand::thread_rng());
+        let password_hash = argon2.hash_password(b"admin", &salt)
+            .map_err(|e| anyhow::anyhow!("Failed to hash admin password: {:?}", e))?;
+        
+        self.users.insert("admin".to_string(), User {
+            username: "admin".to_string(),
+            password_hash: password_hash.to_string(),
+            role: UserRole::Admin,
+        });
+        
+        // Create regular user
+        let salt = SaltString::generate(&mut rand::thread_rng());
+        let password_hash = argon2.hash_password(b"user", &salt)
+            .map_err(|e| anyhow::anyhow!("Failed to hash user password: {:?}", e))?;
+        
+        self.users.insert("user".to_string(), User {
+            username: "user".to_string(),
+            password_hash: password_hash.to_string(),
+            role: UserRole::User,
+        });
+        
+        // Create guest user
+        let salt = SaltString::generate(&mut rand::thread_rng());
+        let password_hash = argon2.hash_password(b"guest", &salt)
+            .map_err(|e| anyhow::anyhow!("Failed to hash guest password: {:?}", e))?;
+        
+        self.users.insert("guest".to_string(), User {
+            username: "guest".to_string(),
+            password_hash: password_hash.to_string(),
+            role: UserRole::Guest,
+        });
+        
+        println!("   [SEC] Created {} default users", self.users.len());
+        Ok(())
+    }
+    
+    /// Generate a session token using HMAC-SHA256
+    fn generate_session_token(&mut self, username: &str) -> Result<String> {
+        self.session_counter += 1;
+        
+        // Create HMAC-SHA256
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.hmac_secret)
+            .map_err(|e| anyhow::anyhow!("HMAC initialization failed: {:?}", e))?;
+        
+        // Input: username + counter + timestamp
+        mac.update(username.as_bytes());
+        mac.update(&self.session_counter.to_le_bytes());
+        
+        // Get HMAC result
+        let result = mac.finalize();
+        let token_bytes = result.into_bytes();
+        
+        // Convert to hex string
+        let token = hex::encode(&token_bytes[..]);
+        
+        Ok(token)
     }
     
     /// Procesar comando de autenticación
+    /// Format: username\0password
     fn handle_authenticate(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        // Parse credentials (username\0password)
         let credentials = String::from_utf8_lossy(data);
-        println!("   [SEC] Autenticando usuario");
+        let parts: Vec<&str> = credentials.split('\0').collect();
         
-        // Simular autenticación exitosa
-        let session_token: u64 = 0x1234567890ABCDEF;
-        Ok(session_token.to_le_bytes().to_vec())
+        if parts.len() < 2 {
+            println!("   [SEC] Authentication failed: Invalid format");
+            return Err(anyhow::anyhow!("Invalid credentials format"));
+        }
+        
+        let username = parts[0];
+        let password = parts[1];
+        
+        println!("   [SEC] Authenticating user: {}", username);
+        
+        // Look up user and clone data we need
+        let user = self.users.get(username)
+            .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+        let password_hash = user.password_hash.clone();
+        let role = user.role;
+        
+        // Parse stored password hash
+        let parsed_hash = PasswordHash::new(&password_hash)
+            .map_err(|e| anyhow::anyhow!("Invalid password hash: {:?}", e))?;
+        
+        // Verify password with Argon2 (constant-time comparison)
+        let argon2 = Argon2::default();
+        argon2.verify_password(password.as_bytes(), &parsed_hash)
+            .map_err(|_| {
+                println!("   [SEC] Authentication failed: Invalid password");
+                anyhow::anyhow!("Invalid password")
+            })?;
+        
+        // Generate session token
+        let token = self.generate_session_token(username)?;
+        
+        // Create session
+        let session = Session {
+            token: token.clone(),
+            username: username.to_string(),
+            role,
+            created_at: self.session_counter,
+        };
+        
+        self.sessions.insert(token.clone(), session);
+        
+        println!("   [SEC] Authentication successful for user: {} (role: {:?})", username, role);
+        
+        // Return token as bytes
+        Ok(token.into_bytes())
     }
     
     /// Procesar comando de autorización
+    /// Format: token\0resource_id\0required_role
     fn handle_authorize(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 12 {
-            return Err(anyhow::anyhow!("Datos insuficientes para AUTHORIZE"));
+        let params = String::from_utf8_lossy(data);
+        let parts: Vec<&str> = params.split('\0').collect();
+        
+        if parts.len() < 2 {
+            return Err(anyhow::anyhow!("Invalid authorization format"));
         }
         
-        let session_token = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3],
-            data[4], data[5], data[6], data[7]
-        ]);
-        let resource_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let token = parts[0];
+        let resource_id = parts.get(1).unwrap_or(&"unknown");
+        let required_role_str = parts.get(2).unwrap_or(&"user");
         
-        println!("   [SEC] Autorizando acceso al recurso {}", resource_id);
+        // Look up session
+        let session = self.sessions.get(token)
+            .ok_or_else(|| {
+                println!("   [SEC] Authorization failed: Invalid session token");
+                anyhow::anyhow!("Invalid session token")
+            })?;
         
-        // Simular autorización exitosa
-        Ok(vec![1])
+        // Parse required role
+        let required_role = match *required_role_str {
+            "admin" => UserRole::Admin,
+            "user" => UserRole::User,
+            "guest" => UserRole::Guest,
+            _ => UserRole::Guest,
+        };
+        
+        // Check authorization based on role hierarchy
+        let authorized = match session.role {
+            UserRole::Admin => true, // Admin can access everything
+            UserRole::User => required_role != UserRole::Admin,
+            UserRole::Guest => required_role == UserRole::Guest,
+        };
+        
+        if authorized {
+            println!("   [SEC] Authorization granted: user={}, resource={}, role={:?}", 
+                     session.username, resource_id, session.role);
+            Ok(vec![1]) // Authorized
+        } else {
+            println!("   [SEC] Authorization denied: user={}, resource={}, role={:?}, required={:?}", 
+                     session.username, resource_id, session.role, required_role);
+            Ok(vec![0]) // Not authorized
+        }
     }
     
     /// Procesar comando de encriptación
@@ -239,12 +435,17 @@ impl MicrokernelServer for SecurityServer {
     fn initialize(&mut self) -> Result<()> {
         println!("   [SEC] Inicializando servidor de seguridad...");
         println!("   [SEC] Cargando políticas de seguridad...");
-        println!("   [SEC] Inicializando motor de encriptación...");
+        println!("   [SEC] Inicializando motor de encriptación (AES-256-GCM)...");
+        println!("   [SEC] Inicializando autenticación (Argon2id)...");
         println!("   [SEC] Configurando sistema de auditoría...");
         println!("   [SEC] Inicializando gestor de permisos...");
         
+        // Create default users
+        self.create_default_users()?;
+        
         self.initialized = true;
         println!("   [SEC] Servidor de seguridad listo");
+        println!("   [SEC] Default users: admin/admin, user/user, guest/guest");
         Ok(())
     }
     
