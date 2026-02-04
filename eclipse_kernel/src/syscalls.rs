@@ -419,8 +419,6 @@ fn sys_wait(_status_ptr: u64) -> u64 {
     stats.wait_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] wait() called\n");
-    
     // Get current process ID
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
@@ -453,8 +451,6 @@ fn sys_wait(_status_ptr: u64) -> u64 {
         }
     }
     
-    // No terminated children found
-    serial::serial_print("[SYSCALL] wait() - no terminated children\n");
     u64::MAX // -1 indicates no children or error
 }
 
