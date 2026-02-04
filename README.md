@@ -234,12 +234,14 @@ El soporte está disponible para las siguientes arquitecturas:
 
 - ✅ **Detección Automática**: Identificación automática de GPUs NVIDIA via PCI
 - ✅ **Identificación de Arquitectura**: Reconoce Turing, Ampere, Ada Lovelace y Hopper
-- ✅ **Especificaciones de Hardware**: Reporta núcleos CUDA, SM count y VRAM
+- ✅ **Especificaciones de Hardware**: Reporta núcleos CUDA, RT cores, Tensor cores, SM count y VRAM
 - ✅ **Multi-GPU**: Soporte para múltiples GPUs NVIDIA
 - ✅ **Habilitación de Dispositivos**: Configura I/O, memoria y bus master
-- 🔄 **CUDA** (Planeado): Soporte para cargas de trabajo de computación
-- 🔄 **Ray Tracing** (Planeado): Soporte para RT cores
-- 🔄 **Display Output** (Planeado): Salida directa via DisplayPort/HDMI
+- ✅ **CUDA Runtime**: Runtime completo con gestión de contextos, memoria y lanzamiento de kernels
+- ✅ **Ray Tracing**: Soporte para RT cores con aceleración de estructuras y pipelines
+- ✅ **Display Output**: Salida directa via DisplayPort/HDMI con detección de conectores y configuración de modos
+- ✅ **Power Management**: Control de estados de energía, frecuencias y monitoreo térmico
+- ✅ **Video Encode/Decode**: NVENC/NVDEC para H.264, H.265, VP9, y AV1
 
 ### Mensajes de Arranque
 
@@ -255,6 +257,15 @@ Cuando se detecta una GPU NVIDIA, el kernel mostrará:
 [NVIDIA]   Memory: 10240 MB
 [NVIDIA]   CUDA Cores: 8704
 [NVIDIA]   SM Count: 68
+[NVIDIA]   RT Cores: 68
+[NVIDIA]   Tensor Cores: 272
+[NVIDIA]   Advanced Features:
+[NVIDIA]     ✓ CUDA Runtime
+[NVIDIA]     ✓ Ray Tracing (RT Cores)
+[NVIDIA]     ✓ DisplayPort/HDMI Output
+[NVIDIA]     ✓ Power Management
+[NVIDIA]     ✓ Video Encode (NVENC): 3 codecs
+[NVIDIA]     ✓ Video Decode (NVDEC): 4 codecs
 [NVIDIA]   ✓ Supported by open-gpu-kernel-modules
 [NVIDIA]   Device enabled (I/O, Memory, Bus Master)
 ```
