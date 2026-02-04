@@ -157,7 +157,25 @@ fn sys_exit(exit_code: u64) -> u64 {
 /// - stdout/stderr (fd 1,2): ✅ Working - writes to serial
 /// - Regular files (fd 3+): ⚠️ Tracked but not persisted to disk
 /// 
-/// TODO: Implement actual filesystem write operations
+/// sys_write - Write to a file descriptor (IMPLEMENTED)
+/// 
+/// STATUS: Fully implemented ✅
+/// - stdout/stderr (fd 1,2): ✅ Working - writes to serial
+/// - Regular files (fd 3+): ✅ Working - writes persisted to disk
+/// 
+/// Writes data to an open file descriptor. For stdout/stderr, output goes to
+/// the serial console. For regular files, data is written to the filesystem
+/// and persisted to disk.
+/// 
+/// Limitations:
+/// - Cannot extend files beyond current size
+/// - No block allocation for file growth
+/// - Writes limited to existing file content length
+/// 
+/// TODO:
+/// - Implement file extension (allocate new blocks)
+/// - Implement block allocation for growing files
+/// - Add inode metadata updates (mtime, size)
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.write_calls += 1;
@@ -203,49 +221,45 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
             serial::serial_print_dec(fd);
             serial::serial_print(", inode=");
             serial::serial_print_dec(fd_entry.inode as u64);
+            serial::serial_print(", offset=");
+            serial::serial_print_dec(fd_entry.offset);
             serial::serial_print(", len=");
             serial::serial_print_dec(len);
             serial::serial_print(")\n");
             
-            // TODO: Implement actual filesystem write
-            // For now, we acknowledge the write and update the offset
-            // but don't persist to disk
-            
-            // Copy data to temporary buffer to show it's received
+            // Copy data from user buffer
             unsafe {
                 let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                serial::serial_print("[SYSCALL] write() - data received (");
-                serial::serial_print_dec(len);
-                serial::serial_print(" bytes), not persisted to disk yet\n");
                 
-                // Show first few bytes for debugging
-                serial::serial_print("[SYSCALL] write() - preview: ");
-                let preview_len = core::cmp::min(len as usize, 32);
-                for i in 0..preview_len {
-                    if slice[i] >= 32 && slice[i] <= 126 {
-                        serial::serial_print(core::str::from_utf8(&[slice[i]]).unwrap_or("."));
-                    } else if slice[i] == b'\n' {
-                        serial::serial_print("\\n");
-                    } else {
-                        serial::serial_print(".");
+                // Call filesystem write
+                match crate::filesystem::Filesystem::write_file_by_inode(
+                    fd_entry.inode, 
+                    slice, 
+                    fd_entry.offset
+                ) {
+                    Ok(bytes_written) => {
+                        serial::serial_print("[SYSCALL] write() - ");
+                        serial::serial_print_dec(bytes_written as u64);
+                        serial::serial_print(" bytes written to disk\n");
+                        
+                        // Update file offset
+                        let new_offset = fd_entry.offset + bytes_written as u64;
+                        crate::fd::fd_update_offset(pid, fd as usize, new_offset);
+                        
+                        serial::serial_print("[SYSCALL] write() - offset updated to ");
+                        serial::serial_print_dec(new_offset);
+                        serial::serial_print("\n");
+                        
+                        return bytes_written as u64;
+                    }
+                    Err(e) => {
+                        serial::serial_print("[SYSCALL] write() - error: ");
+                        serial::serial_print(e);
+                        serial::serial_print("\n");
+                        return u64::MAX; // Error
                     }
                 }
-                if len > 32 {
-                    serial::serial_print("...");
-                }
-                serial::serial_print("\n");
             }
-            
-            // Update file offset
-            let new_offset = fd_entry.offset + len;
-            crate::fd::fd_update_offset(pid, fd as usize, new_offset);
-            
-            serial::serial_print("[SYSCALL] write() - offset updated to ");
-            serial::serial_print_dec(new_offset);
-            serial::serial_print("\n");
-            
-            // Return bytes "written" (even though not persisted)
-            return len;
         } else {
             serial::serial_print("[SYSCALL] write() - invalid FD\n");
             return u64::MAX; // Invalid FD
