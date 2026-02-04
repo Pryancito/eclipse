@@ -16,6 +16,36 @@
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
 
+/// Comandos de seguridad
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SecurityCommand {
+    Authenticate = 1,
+    Authorize = 2,
+    Encrypt = 3,
+    Decrypt = 4,
+    Hash = 5,
+    Audit = 6,
+    CheckPermission = 7,
+}
+
+impl TryFrom<u8> for SecurityCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(SecurityCommand::Authenticate),
+            2 => Ok(SecurityCommand::Authorize),
+            3 => Ok(SecurityCommand::Encrypt),
+            4 => Ok(SecurityCommand::Decrypt),
+            5 => Ok(SecurityCommand::Hash),
+            6 => Ok(SecurityCommand::Audit),
+            7 => Ok(SecurityCommand::CheckPermission),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Servidor de seguridad
 pub struct SecurityServer {
     name: String,
@@ -162,18 +192,20 @@ impl MicrokernelServer for SecurityServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = SecurityCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_authenticate(command_data),
-            2 => self.handle_authorize(command_data),
-            3 => self.handle_encrypt(command_data),
-            4 => self.handle_decrypt(command_data),
-            5 => self.handle_hash(command_data),
-            6 => self.handle_audit(command_data),
-            7 => self.handle_check_permission(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            SecurityCommand::Authenticate => self.handle_authenticate(command_data),
+            SecurityCommand::Authorize => self.handle_authorize(command_data),
+            SecurityCommand::Encrypt => self.handle_encrypt(command_data),
+            SecurityCommand::Decrypt => self.handle_decrypt(command_data),
+            SecurityCommand::Hash => self.handle_hash(command_data),
+            SecurityCommand::Audit => self.handle_audit(command_data),
+            SecurityCommand::CheckPermission => self.handle_check_permission(command_data),
         };
         
         if result.is_err() {

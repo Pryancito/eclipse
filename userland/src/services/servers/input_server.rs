@@ -2,9 +2,40 @@
 //! 
 //! Implementa el servidor de entrada que maneja todos los eventos de teclado, mouse
 //! y otros dispositivos de entrada.
+//!
+//! **STATUS**: STUB IMPLEMENTATION
+//! - Keyboard events: STUB (no actual PS/2 or USB keyboard handling)
+//! - Mouse events: STUB (no actual PS/2 or USB mouse handling)
+//! - Device state: STUB (returns zero-filled state)
+//! TODO: Integrate with kernel input drivers (PS/2, USB HID)
+//! TODO: Add support for gamepads and other input devices
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
+
+/// Comandos de entrada
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InputCommand {
+    KeyboardEvent = 1,
+    MouseEvent = 2,
+    GetKeyboardState = 3,
+    GetMouseState = 4,
+}
+
+impl TryFrom<u8> for InputCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(InputCommand::KeyboardEvent),
+            2 => Ok(InputCommand::MouseEvent),
+            3 => Ok(InputCommand::GetKeyboardState),
+            4 => Ok(InputCommand::GetMouseState),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Servidor de entrada
 pub struct InputServer {
@@ -49,7 +80,8 @@ impl InputServer {
         let y = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let buttons = data[8];
         
-        // Simular procesamiento de evento de mouse
+        // TODO: Process actual mouse event from hardware
+        // For now, stub implementation
         Ok(vec![1])
     }
     
@@ -57,7 +89,8 @@ impl InputServer {
     fn handle_get_keyboard_state(&mut self, _data: &[u8]) -> Result<Vec<u8>> {
         println!("   [INPUT] Obteniendo estado del teclado");
         
-        // Simular estado del teclado (256 bytes, uno por tecla)
+        // TODO: Read actual keyboard state from hardware
+        // For now, return zeros (stub implementation)
         let state = vec![0u8; 256];
         Ok(state)
     }
@@ -66,7 +99,8 @@ impl InputServer {
     fn handle_get_mouse_state(&mut self, _data: &[u8]) -> Result<Vec<u8>> {
         println!("   [INPUT] Obteniendo estado del mouse");
         
-        // Simular estado del mouse: x (4 bytes), y (4 bytes), botones (1 byte)
+        // TODO: Read actual mouse position and button state from hardware
+        // For now, return zeros (stub implementation)
         let mut state = Vec::new();
         state.extend_from_slice(&0i32.to_le_bytes()); // x
         state.extend_from_slice(&0i32.to_le_bytes()); // y
@@ -117,15 +151,17 @@ impl MicrokernelServer for InputServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = InputCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_keyboard_event(command_data),
-            2 => self.handle_mouse_event(command_data),
-            3 => self.handle_get_keyboard_state(command_data),
-            4 => self.handle_get_mouse_state(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            InputCommand::KeyboardEvent => self.handle_keyboard_event(command_data),
+            InputCommand::MouseEvent => self.handle_mouse_event(command_data),
+            InputCommand::GetKeyboardState => self.handle_get_keyboard_state(command_data),
+            InputCommand::GetMouseState => self.handle_get_mouse_state(command_data),
         };
         
         if result.is_err() {

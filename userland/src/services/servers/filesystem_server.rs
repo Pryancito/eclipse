@@ -14,6 +14,7 @@ use anyhow::Result;
 
 /// Comandos de sistema de archivos
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FileSystemCommand {
     Open = 1,
     Read = 2,
@@ -23,6 +24,24 @@ pub enum FileSystemCommand {
     Create = 6,
     List = 7,
     Stat = 8,
+}
+
+impl TryFrom<u8> for FileSystemCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(FileSystemCommand::Open),
+            2 => Ok(FileSystemCommand::Read),
+            3 => Ok(FileSystemCommand::Write),
+            4 => Ok(FileSystemCommand::Close),
+            5 => Ok(FileSystemCommand::Delete),
+            6 => Ok(FileSystemCommand::Create),
+            7 => Ok(FileSystemCommand::List),
+            8 => Ok(FileSystemCommand::Stat),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Servidor de sistema de archivos
@@ -160,16 +179,21 @@ impl MicrokernelServer for FileSystemServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = FileSystemCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_open(command_data),
-            2 => self.handle_read(command_data),
-            3 => self.handle_write(command_data),
-            4 => self.handle_close(command_data),
-            7 => self.handle_list(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            FileSystemCommand::Open => self.handle_open(command_data),
+            FileSystemCommand::Read => self.handle_read(command_data),
+            FileSystemCommand::Write => self.handle_write(command_data),
+            FileSystemCommand::Close => self.handle_close(command_data),
+            FileSystemCommand::List => self.handle_list(command_data),
+            FileSystemCommand::Delete | FileSystemCommand::Create | FileSystemCommand::Stat => {
+                Err(anyhow::anyhow!("Comando no implementado: {:?}", command))
+            }
         };
         
         if result.is_err() {

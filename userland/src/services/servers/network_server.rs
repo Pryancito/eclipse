@@ -2,9 +2,41 @@
 //! 
 //! Implementa el servidor de red que maneja todas las operaciones de networking,
 //! incluyendo TCP/IP, UDP, y gestión de interfaces de red.
+//!
+//! **STATUS**: STUB IMPLEMENTATION
+//! - Socket creation: STUB (returns hardcoded FD)
+//! - Bind operations: STUB (no actual port binding)
+//! - Send/Receive: STUB (no actual network I/O)
+//! TODO: Integrate with kernel network stack (TCP/IP, UDP)
+//! TODO: Implement actual socket operations via syscalls
+//! TODO: Add support for network interfaces and routing
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
+
+/// Comandos de red
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NetworkCommand {
+    SocketCreate = 1,
+    Bind = 2,
+    Send = 3,
+    Recv = 4,
+}
+
+impl TryFrom<u8> for NetworkCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(NetworkCommand::SocketCreate),
+            2 => Ok(NetworkCommand::Bind),
+            3 => Ok(NetworkCommand::Send),
+            4 => Ok(NetworkCommand::Recv),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Servidor de red
 pub struct NetworkServer {
@@ -26,6 +58,8 @@ impl NetworkServer {
     /// Procesar comando de inicialización de socket
     fn handle_socket_create(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         println!("   [NET] Creando socket");
+        // TODO: Create real socket via kernel syscall
+        // For now, return hardcoded FD (stub)
         let socket_fd: u32 = 100;
         Ok(socket_fd.to_le_bytes().to_vec())
     }
@@ -69,7 +103,8 @@ impl NetworkServer {
         
         println!("   [NET] Recibiendo hasta {} bytes del socket {}", max_size, socket_fd);
         
-        // Simular recepción de datos
+        // TODO: Receive actual network data from socket
+        // For now, return fake data (stub)
         let received_data = b"Network data from server";
         Ok(received_data.to_vec())
     }
@@ -117,15 +152,17 @@ impl MicrokernelServer for NetworkServer {
             return Err(anyhow::anyhow!("Mensaje vacío"));
         }
         
-        let command = message.data[0];
+        let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
+        let command = NetworkCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        
         let result = match command {
-            1 => self.handle_socket_create(command_data),
-            2 => self.handle_bind(command_data),
-            3 => self.handle_send(command_data),
-            4 => self.handle_recv(command_data),
-            _ => Err(anyhow::anyhow!("Comando desconocido: {}", command))
+            NetworkCommand::SocketCreate => self.handle_socket_create(command_data),
+            NetworkCommand::Bind => self.handle_bind(command_data),
+            NetworkCommand::Send => self.handle_send(command_data),
+            NetworkCommand::Recv => self.handle_recv(command_data),
         };
         
         if result.is_err() {
