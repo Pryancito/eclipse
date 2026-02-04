@@ -40,11 +40,18 @@ const PCI_CLASS_STORAGE: u8 = 0x01;
 const PCI_CLASS_NETWORK: u8 = 0x02;
 const PCI_CLASS_DISPLAY: u8 = 0x03;
 const PCI_CLASS_BRIDGE: u8 = 0x06;  // Bridge devices
+const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;  // Serial bus controllers (USB, etc.)
 
 /// PCI Bridge Subclasses
 const PCI_SUBCLASS_BRIDGE_HOST: u8 = 0x00;
 const PCI_SUBCLASS_BRIDGE_ISA: u8 = 0x01;
 const PCI_SUBCLASS_BRIDGE_PCI: u8 = 0x04;  // PCI-to-PCI bridge
+
+/// PCI Serial Bus Subclasses
+const PCI_SUBCLASS_USB_UHCI: u8 = 0x00;  // USB UHCI controller
+const PCI_SUBCLASS_USB_OHCI: u8 = 0x10;  // USB OHCI controller
+const PCI_SUBCLASS_USB_EHCI: u8 = 0x20;  // USB EHCI controller (USB 2.0)
+const PCI_SUBCLASS_USB_XHCI: u8 = 0x30;  // USB XHCI controller (USB 3.0+)
 
 /// PCI Configuration Space Registers
 const PCI_REG_VENDOR_ID: u8 = 0x00;
@@ -106,6 +113,10 @@ impl PciDevice {
             (0x06, 0x00) => "Host Bridge",
             (0x06, 0x01) => "ISA Bridge",
             (0x06, 0x04) => "PCI-to-PCI Bridge",
+            (0x0C, 0x00) => "USB UHCI Controller",
+            (0x0C, 0x10) => "USB OHCI Controller",
+            (0x0C, 0x20) => "USB EHCI Controller",
+            (0x0C, 0x30) => "USB XHCI Controller",
             _ => "Unknown Device",
         }
     }
@@ -113,6 +124,29 @@ impl PciDevice {
     /// Check if this is a PCI-to-PCI bridge
     pub fn is_pci_bridge(&self) -> bool {
         self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI
+    }
+
+    /// Check if this is a USB controller
+    pub fn is_usb_controller(&self) -> bool {
+        self.class_code == PCI_CLASS_SERIAL_BUS && 
+        (self.subclass == PCI_SUBCLASS_USB_UHCI || 
+         self.subclass == PCI_SUBCLASS_USB_OHCI ||
+         self.subclass == PCI_SUBCLASS_USB_EHCI ||
+         self.subclass == PCI_SUBCLASS_USB_XHCI)
+    }
+
+    /// Get USB controller type
+    pub fn usb_controller_type(&self) -> Option<&'static str> {
+        if !self.is_usb_controller() {
+            return None;
+        }
+        match self.subclass {
+            PCI_SUBCLASS_USB_UHCI => Some("UHCI (USB 1.1)"),
+            PCI_SUBCLASS_USB_OHCI => Some("OHCI (USB 1.1)"),
+            PCI_SUBCLASS_USB_EHCI => Some("EHCI (USB 2.0)"),
+            PCI_SUBCLASS_USB_XHCI => Some("XHCI (USB 3.0+)"),
+            _ => None,
+        }
     }
 }
 
