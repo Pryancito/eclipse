@@ -151,56 +151,109 @@ fn sys_exit(exit_code: u64) -> u64 {
     0
 }
 
-/// sys_write - Escribir a un file descriptor
+/// sys_write - Write to a file descriptor
+/// 
+/// STATUS: Partially implemented
+/// - stdout/stderr (fd 1,2): ✅ Working - writes to serial
+/// - Regular files (fd 3+): ⚠️ Tracked but not persisted to disk
+/// 
+/// TODO: Implement actual filesystem write operations
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.write_calls += 1;
     drop(stats);
     
+    // Validate parameters
+    if buf_ptr == 0 || len == 0 || len > 4096 {
+        serial::serial_print("[SYSCALL] write() - invalid parameters\n");
+        return u64::MAX; // Error
+    }
+    
+    // Handle stdin (0) - error, can't write to stdin
+    if fd == 0 {
+        serial::serial_print("[SYSCALL] write() - cannot write to stdin\n");
+        return u64::MAX;
+    }
+    
     // Handle stdout/stderr (1, 2) - write to serial
     if fd == 1 || fd == 2 {
-        if buf_ptr != 0 && len > 0 && len < 4096 {
-            unsafe {
-                let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                if let Ok(s) = core::str::from_utf8(slice) {
-                    serial::serial_print(s);
-                } else {
-                    // Fallback for non-utf8 (print safe chars)
-                    for &byte in slice {
-                        if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
-                             serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
-                        } else {
-                            serial::serial_print(".");
-                        }
+        unsafe {
+            let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
+            if let Ok(s) = core::str::from_utf8(slice) {
+                serial::serial_print(s);
+            } else {
+                // Fallback for non-utf8 (print safe chars)
+                for &byte in slice {
+                    if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
+                         serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
+                    } else {
+                        serial::serial_print(".");
                     }
                 }
             }
-            return len;
         }
+        return len;
     }
-    // Handle file descriptor 3 (/var/log/system.log) - write to in-kernel buffer
-    else if fd == 3 {
-        if buf_ptr != 0 && len > 0 && len < 4096 {
+    
+    // Handle regular files (fd 3+)
+    if let Some(pid) = current_process_id() {
+        // Look up file descriptor
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            serial::serial_print("[SYSCALL] write(FD=");
+            serial::serial_print_dec(fd);
+            serial::serial_print(", inode=");
+            serial::serial_print_dec(fd_entry.inode as u64);
+            serial::serial_print(", len=");
+            serial::serial_print_dec(len);
+            serial::serial_print(")\n");
+            
+            // TODO: Implement actual filesystem write
+            // For now, we acknowledge the write and update the offset
+            // but don't persist to disk
+            
+            // Copy data to temporary buffer to show it's received
             unsafe {
                 let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                // For now, also write to serial to show it's working
-                serial::serial_print("[LOGFILE] ");
-                if let Ok(s) = core::str::from_utf8(slice) {
-                    serial::serial_print(s);
-                } else {
-                    for &byte in slice {
-                        if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
-                             serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
-                        } else {
-                            serial::serial_print(".");
-                        }
+                serial::serial_print("[SYSCALL] write() - data received (");
+                serial::serial_print_dec(len);
+                serial::serial_print(" bytes), not persisted to disk yet\n");
+                
+                // Show first few bytes for debugging
+                serial::serial_print("[SYSCALL] write() - preview: ");
+                let preview_len = core::cmp::min(len as usize, 32);
+                for i in 0..preview_len {
+                    if slice[i] >= 32 && slice[i] <= 126 {
+                        serial::serial_print(core::str::from_utf8(&[slice[i]]).unwrap_or("."));
+                    } else if slice[i] == b'\n' {
+                        serial::serial_print("\\n");
+                    } else {
+                        serial::serial_print(".");
                     }
                 }
+                if len > 32 {
+                    serial::serial_print("...");
+                }
+                serial::serial_print("\n");
             }
+            
+            // Update file offset
+            let new_offset = fd_entry.offset + len;
+            crate::fd::fd_update_offset(pid, fd as usize, new_offset);
+            
+            serial::serial_print("[SYSCALL] write() - offset updated to ");
+            serial::serial_print_dec(new_offset);
+            serial::serial_print("\n");
+            
+            // Return bytes "written" (even though not persisted)
             return len;
+        } else {
+            serial::serial_print("[SYSCALL] write() - invalid FD\n");
+            return u64::MAX; // Invalid FD
         }
     }
-    0
+    
+    serial::serial_print("[SYSCALL] write() - no current process\n");
+    u64::MAX // Error
 }
 
 /// sys_read - Leer de un file descriptor (IMPLEMENTED)
