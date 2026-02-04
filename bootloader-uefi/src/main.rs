@@ -1314,6 +1314,21 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
                 buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
                 for i in 0..n { serial_write_byte(buf[i]); }
+                
+                // Limpiar pantalla con negro y mostrar mensaje de inicio
+                serial_write_str("BL: Limpiando pantalla y mostrando mensaje...\r\n");
+                let fb_ptr = framebuffer_info.base_address as *mut u32;
+                let stride = framebuffer_info.pixels_per_scan_line;
+                
+                // Limpiar pantalla con negro (0x00000000)
+                for y in 0..framebuffer_info.height {
+                    for x in 0..framebuffer_info.width {
+                        let offset = (y * stride + x) as isize;
+                        core::ptr::write_volatile(fb_ptr.offset(offset), 0x00000000);
+                    }
+                }
+                
+                serial_write_str("BL: Pantalla limpiada y mensaje mostrado\r\n");
             }
         } else {
             unsafe { 
@@ -1322,24 +1337,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
         }
     }
-
-    // Escribir información del framebuffer a la consola
-    {
-        use core::fmt::Write as _;
-        let out = system_table.stdout();
-        let _ = out.write_str("Framebuffer info: width=");
-        let _ = out.write_fmt(format_args!("{}", framebuffer_info.width));
-        let _ = out.write_str(" height=");
-        let _ = out.write_fmt(format_args!("{}", framebuffer_info.height));
-        let _ = out.write_str("\r\n");
-    }
     // Logs de depuración ANTES de salir de Boot Services
     {
         use core::fmt::Write as _;
         let out = system_table.stdout();
-        let _ = out.write_str("Preparando para cargar kernel después de ExitBootServices...\n");
+        let _ = out.write_str("Iniciando Sistema Operativo Eclipse v0.1.0\n");
         let _ = out.write_str("\n");
-        let _ = out.write_str("Saliendo de Boot Services...\n");
         let _ = out.write_str("Pasando el control al kernel...\n");
         unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
     }
@@ -1504,203 +1507,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 let fb_ptr = fb_info.base_address as *mut u32;
                 let stride = fb_info.pixels_per_scan_line; // Usar stride en lugar de width
                 
-                // Limpiar pantalla con VERDE para el bootloader
-                for y in 0..fb_info.height {
-                    for x in 0..fb_info.width {
-                        let offset = (y * stride + x) as isize;
-                        unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), 0x0000FF00); } // VERDE
-                    }
-                }
-                
-                // DEBUG VISUAL REAL CON COMPROBACIONES CONDICIONALES
-                
-                // RECTÁNGULO 1: BOOTLOADER INICIADO - VERDE si OK, ROJO si ERROR
-                let bootloader_ok = framebuffer_info_ptr != 0 && fb_info.base_address != 0;
-                let color1 = if bootloader_ok { 0x0000FF00 } else { 0x00FF0000 }; // Verde o Rojo
-                {
-                    let y_start: u32 = 0;
-                    let y_end: u32 = core::cmp::min(y_start + 80, fb_info.height);
-                    let x_end: u32 = core::cmp::min(600u32, fb_info.width);
-                    for y in y_start..y_end {
-                        for x in 0..x_end {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color1); }
-                        }
-                    }
-                }
-                
-                // RECTÁNGULO 2: KERNEL CARGADO - VERDE si OK, ROJO si ERROR
-                let kernel_loaded = kernel_entry_phys != 0 && kernel_size > 0;
-                let color2 = if kernel_loaded { 0x0000FF00 } else { 0x00FF0000 }; // Verde o Rojo
-                {
-                    let y_start: u32 = 100;
-                    let y_end: u32 = core::cmp::min(y_start + 80, fb_info.height);
-                    let x_end: u32 = core::cmp::min(600u32, fb_info.width);
-                    for y in y_start..y_end {
-                        for x in 0..x_end {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color2); }
-                        }
-                    }
-                }
-                
-                // RECTÁNGULO 3: FRAMEBUFFER OK - AZUL si OK, ROJO si ERROR
-                let framebuffer_ok = fb_info.base_address != 0 && fb_info.width > 0 && fb_info.height > 0;
-                let color3 = if framebuffer_ok { 0x000000FF } else { 0x00FF0000 }; // Azul o Rojo
-                {
-                    let y_start: u32 = 200;
-                    let y_end: u32 = core::cmp::min(y_start + 80, fb_info.height);
-                    let x_end: u32 = core::cmp::min(600u32, fb_info.width);
-                    for y in y_start..y_end {
-                        for x in 0..x_end {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color3); }
-                        }
-                    }
-                }
-                
-                // RECTÁNGULO 4: PAGINACIÓN OK - AMARILLO si OK, ROJO si ERROR
-                let pagination_ok = cr3_value != 0 && rsp_alineado != 0;
-                let color4 = if pagination_ok { 0x00FFFF00 } else { 0x00FF0000 }; // Amarillo o Rojo
-                {
-                    let y_start: u32 = 300;
-                    let y_end: u32 = core::cmp::min(y_start + 80, fb_info.height);
-                    let x_end: u32 = core::cmp::min(600u32, fb_info.width);
-                    for y in y_start..y_end {
-                        for x in 0..x_end {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color4); }
-                        }
-                    }
-                }
-                
-                // RECTÁNGULO 5: LISTO PARA SALTAR - MAGENTA si OK, ROJO si ERROR
-                let ready_to_jump = bootloader_ok && kernel_loaded && framebuffer_ok && pagination_ok;
-                let color5 = if ready_to_jump { 0x00FF00FF } else { 0x00FF0000 }; // Magenta o Rojo
-                {
-                    let y_start: u32 = 400;
-                    let y_end: u32 = core::cmp::min(y_start + 80, fb_info.height);
-                    let x_end: u32 = core::cmp::min(600u32, fb_info.width);
-                    for y in y_start..y_end {
-                        for x in 0..x_end {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color5); }
-                        }
-                    }
-                }
-                
-                // RECTÁNGULOS PEQUEÑOS DE ESTADO EN LA ESQUINA DERECHA
-                // Estado 1: SERIAL OK - CYAN si OK, ROJO si ERROR
-                let serial_ok = true; // Asumimos que el serial está OK si llegamos aquí
-                let color_s1 = if serial_ok { 0x0000FFFF } else { 0x00FF0000 }; // Cyan o Rojo
-                {
-                    let y_start: u32 = 500;
-                    let y_end: u32 = core::cmp::min(y_start + 40, fb_info.height);
-                    let right_start: u32 = fb_info.width.saturating_sub(220);
-                    let right_width: u32 = core::cmp::min(200u32, fb_info.width.saturating_sub(right_start));
-                    for y in y_start..y_end {
-                        for x in 0..right_width {
-                            let offset = (y * stride + (right_start + x)) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_s1); }
-                        }
-                    }
-                }
-                
-                // Estado 2: MEMORIA OK - BLANCO si OK, ROJO si ERROR
-                let memory_ok = kernel_size > 0 && kernel_size < 0x10000000; // Verificar tamaño razonable
-                let color_s2 = if memory_ok { 0x00FFFFFF } else { 0x00FF0000 }; // Blanco o Rojo
-                {
-                    let y_start: u32 = 550;
-                    let y_end: u32 = core::cmp::min(y_start + 40, fb_info.height);
-                    let right_start: u32 = fb_info.width.saturating_sub(220);
-                    let right_width: u32 = core::cmp::min(200u32, fb_info.width.saturating_sub(right_start));
-                    for y in y_start..y_end {
-                        for x in 0..right_width {
-                            let offset = (y * stride + (right_start + x)) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_s2); }
-                        }
-                    }
-                }
-                
-                // Estado 3: ENTRY POINT OK - GRIS si OK, ROJO si ERROR
-                let entry_ok = kernel_entry_phys != 0 && (kernel_entry_phys & 0xFFF) == 0; // Verificar alineación
-                let color_s3 = if entry_ok { 0x00808080 } else { 0x00FF0000 }; // Gris o Rojo
-                {
-                    let y_start: u32 = 600;
-                    let y_end: u32 = core::cmp::min(y_start + 40, fb_info.height);
-                    let right_start: u32 = fb_info.width.saturating_sub(220);
-                    let right_width: u32 = core::cmp::min(200u32, fb_info.width.saturating_sub(right_start));
-                    for y in y_start..y_end {
-                        for x in 0..right_width {
-                            let offset = (y * stride + (right_start + x)) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_s3); }
-                        }
-                    }
-                }
-                
-                // Sin bucle de espera - ir directamente
-                
-                // DEBUG SERIAL: Antes del rectángulo naranja
-                serial_write_str("BL: Pintando rectangulo NARANJA...\r\n");
-                
-                // ÚLTIMO BLOQUE (3 rectángulos) REPOSICIONADO A LA ZONA INFERIOR VISIBLE
-                let rect_h: u32 = 80;
-                let rect_w: u32 = core::cmp::min(600u32, fb_info.width);
-                let total_h: u32 = rect_h.saturating_mul(3);
-                let base_y: u32 = fb_info.height.saturating_sub(total_h + 10);
-
-                // RECT 1: INTENTANDO SALTAR AL KERNEL - NARANJA
-                let color_final = 0x00FF8000; // Naranja
-                {
-                    let y_start: u32 = base_y;
-                    let y_end: u32 = core::cmp::min(y_start + rect_h, fb_info.height);
-                    for y in y_start..y_end {
-                        for x in 0..rect_w {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_final); }
-                        }
-                    }
-                }
-                
-                serial_write_str("BL: Rectangulo NARANJA completado\r\n");
-                
-                // DEBUG SERIAL: Antes del rectángulo blanco
-                serial_write_str("BL: Pintando rectangulo BLANCO...\r\n");
-                
-                // RECTÁNGULO DEBUG INMEDIATO: BLANCO después del naranja
-                let color_blanco = 0x00FFFFFF; // BLANCO
-                {
-                    let y_start: u32 = base_y.saturating_add(rect_h);
-                    let y_end: u32 = core::cmp::min(y_start + rect_h, fb_info.height);
-                    for y in y_start..y_end {
-                        for x in 0..rect_w {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_blanco); }
-                        }
-                    }
-                }
-                
-                serial_write_str("BL: Rectangulo BLANCO completado\r\n");
-                
-                // DEBUG SERIAL: Antes del rectángulo verde
-                serial_write_str("BL: Pintando rectangulo VERDE...\r\n");
-                
-                // RECTÁNGULO DEBUG FINAL: VERDE antes del salto al kernel
-                let color_verde = 0x0000FF00; // VERDE
-                {
-                    let y_start: u32 = base_y.saturating_add(rect_h * 2);
-                    let y_end: u32 = core::cmp::min(y_start + rect_h, fb_info.height);
-                    for y in y_start..y_end {
-                        for x in 0..rect_w {
-                            let offset = (y * stride + x) as isize;
-                            unsafe { core::ptr::write_volatile(fb_ptr.add(offset as usize), color_verde); }
-                        }
-                    }
-                }
-                
-                serial_write_str("BL: Rectangulo VERDE completado\r\n");
-                
-                // DEBUG SERIAL DETALLADO: Valores críticos antes del salto
+                // DEBUG SERIAL: Valores críticos antes del salto
                 serial_write_str("BL: DEBUG CRITICO - Valores antes del salto:\r\n");
                 serial_write_str("BL: CR3 (PML4): ");
                 serial_write_hex64(cr3_value);
