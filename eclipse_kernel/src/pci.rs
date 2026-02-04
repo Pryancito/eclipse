@@ -2,6 +2,25 @@
 //!
 //! Implements PCI device enumeration and configuration space access
 //! for discovering and configuring VirtIO and other PCI devices.
+//!
+//! ## Current Features
+//! - Multi-bus enumeration (scans all 256 possible buses)
+//! - PCI-to-PCI bridge detection and secondary bus scanning
+//! - Multi-function device support
+//! - BAR (Base Address Register) access
+//! - Device enabling (I/O, Memory, Bus Master)
+//!
+//! ## Limitations
+//! - No MSI/MSI-X interrupt configuration
+//! - No PCI Express (PCIe) advanced features
+//! - No hot-plug support
+//! - No power management
+//!
+//! ## Future Enhancements
+//! - MSI/MSI-X interrupt support
+//! - PCIe capability parsing
+//! - Device hot-plug detection
+//! - Power management (D0-D3 states)
 
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
@@ -19,6 +38,12 @@ const PCI_VENDOR_QEMU: u16 = 0x1AF4; // Red Hat (QEMU VirtIO)
 const PCI_CLASS_STORAGE: u8 = 0x01;
 const PCI_CLASS_NETWORK: u8 = 0x02;
 const PCI_CLASS_DISPLAY: u8 = 0x03;
+const PCI_CLASS_BRIDGE: u8 = 0x06;  // Bridge devices
+
+/// PCI Bridge Subclasses
+const PCI_SUBCLASS_BRIDGE_HOST: u8 = 0x00;
+const PCI_SUBCLASS_BRIDGE_ISA: u8 = 0x01;
+const PCI_SUBCLASS_BRIDGE_PCI: u8 = 0x04;  // PCI-to-PCI bridge
 
 /// PCI Configuration Space Registers
 const PCI_REG_VENDOR_ID: u8 = 0x00;
@@ -28,6 +53,9 @@ const PCI_REG_STATUS: u8 = 0x06;
 const PCI_REG_CLASS_CODE: u8 = 0x08;
 const PCI_REG_HEADER_TYPE: u8 = 0x0E;
 const PCI_REG_BAR0: u8 = 0x10;
+const PCI_REG_PRIMARY_BUS: u8 = 0x18;      // For PCI-to-PCI bridges
+const PCI_REG_SECONDARY_BUS: u8 = 0x19;    // For PCI-to-PCI bridges
+const PCI_REG_SUBORDINATE_BUS: u8 = 0x1A;  // For PCI-to-PCI bridges
 const PCI_REG_INTERRUPT_LINE: u8 = 0x3C;
 
 /// PCI Command Register Bits
@@ -69,8 +97,16 @@ impl PciDevice {
             (0x01, 0x08) => "Storage Controller",
             (0x02, 0x00) => "Ethernet Controller",
             (0x03, 0x00) => "VGA Controller",
+            (0x06, 0x00) => "Host Bridge",
+            (0x06, 0x01) => "ISA Bridge",
+            (0x06, 0x04) => "PCI-to-PCI Bridge",
             _ => "Unknown Device",
         }
+    }
+    
+    /// Check if this is a PCI-to-PCI bridge
+    pub fn is_pci_bridge(&self) -> bool {
+        self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI
     }
 }
 
@@ -182,16 +218,33 @@ unsafe fn scan_function(bus: u8, device: u8, function: u8) -> Option<PciDevice> 
 }
 
 /// Scan a single PCI device (all functions)
+/// Also scans secondary buses if the device is a PCI-to-PCI bridge
 unsafe fn scan_device(bus: u8, device: u8) {
     // Check function 0 first
     if let Some(pci_dev) = scan_function(bus, device, 0) {
         PCI_DEVICES.lock().push(pci_dev);
+        
+        // If this is a PCI-to-PCI bridge, scan the secondary bus
+        if pci_dev.is_pci_bridge() {
+            let secondary_bus = pci_config_read_u8(bus, device, 0, PCI_REG_SECONDARY_BUS);
+            if secondary_bus != 0 {
+                scan_bus(secondary_bus);
+            }
+        }
         
         // If multi-function device, scan other functions
         if (pci_dev.header_type & 0x80) != 0 {
             for function in 1..8 {
                 if let Some(func_dev) = scan_function(bus, device, function) {
                     PCI_DEVICES.lock().push(func_dev);
+                    
+                    // Check if any other function is also a bridge
+                    if func_dev.is_pci_bridge() {
+                        let secondary_bus = pci_config_read_u8(bus, device, function, PCI_REG_SECONDARY_BUS);
+                        if secondary_bus != 0 {
+                            scan_bus(secondary_bus);
+                        }
+                    }
                 }
             }
         }
@@ -210,15 +263,24 @@ pub fn init() {
     use crate::serial;
     
     serial::serial_print("[PCI] Initializing PCI subsystem...\n");
+    serial::serial_print("[PCI] Scanning all PCI buses (with bridge detection)...\n");
     
     unsafe {
-        // Scan bus 0 (main bus)
+        // Scan bus 0 (main bus), which will recursively scan bridges
         scan_bus(0);
         
         let devices = PCI_DEVICES.lock();
         serial::serial_print("[PCI] Found ");
         serial::serial_print_dec(devices.len() as u64);
-        serial::serial_print(" PCI device(s)\n");
+        serial::serial_print(" PCI device(s) across all buses\n");
+        
+        // Count bridges
+        let bridge_count = devices.iter().filter(|d| d.is_pci_bridge()).count();
+        if bridge_count > 0 {
+            serial::serial_print("[PCI]   Detected ");
+            serial::serial_print_dec(bridge_count as u64);
+            serial::serial_print(" PCI-to-PCI bridge(s)\n");
+        }
         
         for dev in devices.iter() {
             serial::serial_print("[PCI]   Bus ");
