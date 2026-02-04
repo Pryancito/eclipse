@@ -431,6 +431,58 @@ pub fn mount() -> Result<(), &'static str> {
         None
     }
 
+    /// Get the size of a file by inode number
+    /// Returns the content length from the CONTENT TLV
+    pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
+        unsafe {
+            let _ = FS.header.as_ref().ok_or("FS not mounted")?;
+        }
+        
+        // Read the inode entry from the inode table
+        let entry = Self::read_inode_entry(inode)?;
+        
+        // Calculate which block the node record starts at
+        let record_block = unsafe {
+            Self::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
+        };
+        
+        // Read the first block of the node record
+        let mut block_buffer = vec![0u8; BLOCK_SIZE];
+        read_block_from_device(record_block, &mut block_buffer)?;
+        
+        // Parse TLV structure to find CONTENT tag
+        let mut offset = 0;
+        while offset + 8 <= block_buffer.len() {
+            // Read tag (4 bytes) and length (4 bytes)
+            let tag = u32::from_le_bytes([
+                block_buffer[offset], block_buffer[offset+1],
+                block_buffer[offset+2], block_buffer[offset+3]
+            ]);
+            
+            let length = u32::from_le_bytes([
+                block_buffer[offset+4], block_buffer[offset+5],
+                block_buffer[offset+6], block_buffer[offset+7]
+            ]) as usize;
+            
+            if tag == tlv_tags::CONTENT as u32 {
+                // Found CONTENT tag, return its length as file size
+                return Ok(length as u64);
+            }
+            
+            // Move to next TLV entry
+            offset += 8 + length;
+            
+            // If we've gone past the first block, we need to handle multi-block records
+            // For simplicity, assume CONTENT is in first block (reasonable for most files)
+            if offset >= BLOCK_SIZE {
+                break;
+            }
+        }
+        
+        // If we didn't find CONTENT tag, the file is empty or this is a directory
+        Ok(0)
+    }
+
     /// Lookup functionality
     pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
         unsafe {

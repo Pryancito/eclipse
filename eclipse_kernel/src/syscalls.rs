@@ -814,12 +814,38 @@ fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
         }
         SEEK_END => {
             // Relative to end of file
-            // For simplicity, we don't have an easy way to get file size
-            // without reading the full inode metadata. For now, we'll
-            // treat SEEK_END as an error.
-            // TODO: Implement file size retrieval from inode
-            serial::serial_print("[SYSCALL] lseek() - SEEK_END not yet implemented\n");
-            return u64::MAX;
+            // Get the FD entry to access the inode
+            let fd_entry = match crate::fd::fd_get(pid, fd as usize) {
+                Some(entry) => entry,
+                None => {
+                    serial::serial_print("[SYSCALL] lseek() - invalid FD for SEEK_END\n");
+                    return u64::MAX;
+                }
+            };
+            
+            // Get file size from filesystem
+            match crate::filesystem::Filesystem::get_file_size(fd_entry.inode) {
+                Ok(file_size) => {
+                    let size_i64 = file_size as i64;
+                    let result = size_i64 + offset;
+                    if result < 0 {
+                        serial::serial_print("[SYSCALL] lseek() - SEEK_END result is negative\n");
+                        return u64::MAX;
+                    }
+                    serial::serial_print("[SYSCALL] lseek() - file size: ");
+                    serial::serial_print_dec(file_size);
+                    serial::serial_print(", offset from end: ");
+                    serial::serial_print_dec(offset as u64);
+                    serial::serial_print("\n");
+                    result as u64
+                }
+                Err(e) => {
+                    serial::serial_print("[SYSCALL] lseek() - failed to get file size: ");
+                    serial::serial_print(e);
+                    serial::serial_print("\n");
+                    return u64::MAX;
+                }
+            }
         }
         _ => {
             serial::serial_print("[SYSCALL] lseek() - invalid whence value\n");
