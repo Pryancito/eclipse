@@ -26,6 +26,7 @@ pub extern "C" fn _start() -> ! {
     // Detect and initialize USB controllers
     println!("[INPUT-SERVICE] Detecting USB controllers...");
     println!("[INPUT-SERVICE]   - Scanning PCI bus for USB controllers");
+    // TODO: Dynamically detect USB controllers using actual PCI scanning
     println!("[INPUT-SERVICE]   - Found USB EHCI Controller (USB 2.0) at PCI 0:1D.7");
     println!("[INPUT-SERVICE]   - Found USB XHCI Controller (USB 3.0) at PCI 0:14.0");
     println!("[INPUT-SERVICE]   - USB controllers initialized successfully");
@@ -35,7 +36,8 @@ pub extern "C" fn _start() -> ! {
     println!("[INPUT-SERVICE]   - PS/2 Keyboard detected on /dev/input/kbd0");
     println!("[INPUT-SERVICE]   - Setting up keyboard interrupt handler (IRQ 1)");
     println!("[INPUT-SERVICE]   - USB Keyboard detected on /dev/input/kbd1");
-    println!("[INPUT-SERVICE]   - Gaming keyboard detected: Mechanical RGB (1000Hz polling)");
+    // TODO: Detect actual gaming keyboard capabilities from device
+    println!("[INPUT-SERVICE]   - Gaming keyboard detected: Mechanical RGB (up to 8000Hz polling)");
     println!("[INPUT-SERVICE]   - Keyboard initialized successfully");
     
     // Initialize mouse

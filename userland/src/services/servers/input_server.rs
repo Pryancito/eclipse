@@ -155,6 +155,11 @@ impl InputServer {
         let device_type = data[0]; // 1=keyboard, 2=mouse
         let polling_rate = u16::from_le_bytes([data[1], data[2]]);
         
+        // Validate polling rate (max 8000 Hz for gaming peripherals)
+        if polling_rate > 8000 {
+            return Err(anyhow::anyhow!("Polling rate exceeds maximum (8000 Hz): {}", polling_rate));
+        }
+        
         match device_type {
             1 => {
                 // Gaming keyboard (mechanical, RGB, etc.)
@@ -169,6 +174,12 @@ impl InputServer {
                 let buttons = data[5];
                 let delta_x = i16::from_le_bytes([data[6], data[7]]);
                 let delta_y = i16::from_le_bytes([data[8], data[9]]);
+                
+                // Validate DPI (max 32000 for gaming mice)
+                if dpi > 32000 {
+                    return Err(anyhow::anyhow!("DPI exceeds maximum (32000): {}", dpi));
+                }
+                
                 println!("   [INPUT] Gaming mouse event: DPI={}, buttons=0x{:02X}, dx={}, dy={}, poll_rate={}Hz", 
                          dpi, buttons, delta_x, delta_y, polling_rate);
             },
