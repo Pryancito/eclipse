@@ -24,7 +24,6 @@ pub enum GraphicsCommand {
     DrawLine = 4,
     Clear = 5,
     Swap = 6,
-    SetMode = 7,
 }
 
 impl TryFrom<u8> for GraphicsCommand {
@@ -38,7 +37,6 @@ impl TryFrom<u8> for GraphicsCommand {
             4 => Ok(GraphicsCommand::DrawLine),
             5 => Ok(GraphicsCommand::Clear),
             6 => Ok(GraphicsCommand::Swap),
-            7 => Ok(GraphicsCommand::SetMode),
             _ => Err(()),
         }
     }
@@ -192,7 +190,6 @@ impl MicrokernelServer for GraphicsServer {
             GraphicsCommand::DrawLine => self.handle_draw_line(command_data),
             GraphicsCommand::Clear => self.handle_clear(command_data),
             GraphicsCommand::Swap => self.handle_swap(command_data),
-            GraphicsCommand::SetMode => Err(anyhow::anyhow!("Comando no implementado: SetMode")),
         };
         
         if result.is_err() {

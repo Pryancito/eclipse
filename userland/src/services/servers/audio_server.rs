@@ -23,14 +23,16 @@ pub enum AudioCommand {
     GetVolume = 4,
 }
 
-impl AudioCommand {
-    fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for AudioCommand {
+    type Error = ();
+    
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Some(AudioCommand::Play),
-            2 => Some(AudioCommand::Capture),
-            3 => Some(AudioCommand::SetVolume),
-            4 => Some(AudioCommand::GetVolume),
-            _ => None,
+            1 => Ok(AudioCommand::Play),
+            2 => Ok(AudioCommand::Capture),
+            3 => Ok(AudioCommand::SetVolume),
+            4 => Ok(AudioCommand::GetVolume),
+            _ => Err(()),
         }
     }
 }
@@ -137,8 +139,8 @@ impl MicrokernelServer for AudioServer {
         let command_byte = message.data[0];
         let command_data = &message.data[1..message.data_size as usize];
         
-        let command = AudioCommand::from_u8(command_byte)
-            .ok_or_else(|| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
+        let command = AudioCommand::try_from(command_byte)
+            .map_err(|_| anyhow::anyhow!("Comando desconocido: {}", command_byte))?;
         
         let result = match command {
             AudioCommand::Play => self.handle_play(command_data),
