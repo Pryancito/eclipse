@@ -33,6 +33,7 @@ const PCI_CONFIG_DATA: u16 = 0xCFC;
 /// PCI Vendor IDs
 const PCI_VENDOR_INVALID: u16 = 0xFFFF;
 const PCI_VENDOR_QEMU: u16 = 0x1AF4; // Red Hat (QEMU VirtIO)
+const PCI_VENDOR_NVIDIA: u16 = 0x10DE; // NVIDIA Corporation
 
 /// PCI Device Classes
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -86,6 +87,11 @@ impl PciDevice {
         // VirtIO devices have vendor ID 0x1AF4 and device IDs in specific ranges
         self.vendor_id == PCI_VENDOR_QEMU && 
         (self.device_id >= 0x1000 && self.device_id <= 0x107F)
+    }
+
+    /// Check if this is an NVIDIA GPU
+    pub fn is_nvidia_gpu(&self) -> bool {
+        self.vendor_id == PCI_VENDOR_NVIDIA && self.class_code == PCI_CLASS_DISPLAY
     }
 
     /// Get the device type string
@@ -282,6 +288,14 @@ pub fn init() {
             serial::serial_print(" PCI-to-PCI bridge(s)\n");
         }
         
+        // Count NVIDIA GPUs
+        let nvidia_count = devices.iter().filter(|d| d.is_nvidia_gpu()).count();
+        if nvidia_count > 0 {
+            serial::serial_print("[PCI]   Detected ");
+            serial::serial_print_dec(nvidia_count as u64);
+            serial::serial_print(" NVIDIA GPU(s)\n");
+        }
+        
         for dev in devices.iter() {
             serial::serial_print("[PCI]   Bus ");
             serial::serial_print_dec(dev.bus as u64);
@@ -297,7 +311,9 @@ pub fn init() {
             serial::serial_print_hex(dev.class_code as u64);
             serial::serial_print(" Type=");
             serial::serial_print(dev.device_type());
-            if dev.is_virtio() {
+            if dev.is_nvidia_gpu() {
+                serial::serial_print(" [NVIDIA GPU]");
+            } else if dev.is_virtio() {
                 serial::serial_print(" [VirtIO");
                 // Identify specific VirtIO device types
                 if dev.device_id == 0x1001 || dev.device_id == 0x1042 {
@@ -320,6 +336,23 @@ pub fn find_virtio_block_device() -> Option<PciDevice> {
         // 0x1042 = Modern/transitional VirtIO block device  
         dev.is_virtio() && (dev.device_id == 0x1001 || dev.device_id == 0x1042)
     }).copied()
+}
+
+/// Find all NVIDIA GPUs
+pub fn find_nvidia_gpus() -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .filter(|dev| dev.is_nvidia_gpu())
+        .copied()
+        .collect()
+}
+
+/// Find first NVIDIA GPU
+pub fn find_nvidia_gpu() -> Option<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .find(|dev| dev.is_nvidia_gpu())
+        .copied()
 }
 
 /// Enable PCI device (set command register)

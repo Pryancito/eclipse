@@ -27,6 +27,7 @@ mod syscalls;
 mod servers;
 mod elf_loader;
 mod pci;
+mod nvidia;
 mod virtio;
 mod filesystem;
 mod binaries;
@@ -141,6 +142,10 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     // Inicializar subsistema PCI
     serial::serial_print("Initializing PCI subsystem...\n");
     pci::init();
+    
+    // Inicializar subsistema NVIDIA GPU
+    serial::serial_print("Initializing NVIDIA GPU subsystem...\n");
+    nvidia::init();
     
     // Inicializar driver VirtIO (preferred for QEMU)
     serial::serial_print("Initializing VirtIO driver...\n");

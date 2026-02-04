@@ -20,6 +20,7 @@ pub mod syscalls;
 pub mod servers;
 pub mod binaries;
 pub mod pci;
+pub mod nvidia;
 pub mod virtio;
 pub mod filesystem;
 pub mod ata;
