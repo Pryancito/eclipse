@@ -2,6 +2,16 @@
 //! 
 //! Implementa el servidor de seguridad que maneja autenticación, autorización,
 //! encriptación y auditoría de seguridad del sistema.
+//!
+//! **STATUS**: STUB IMPLEMENTATION - CRITICAL SECURITY ISSUE
+//! - Authentication: STUB (always succeeds)
+//! - Authorization: STUB (always allows)
+//! - Encryption/Decryption: STUB (no-op, just copies data) - SECURITY RISK!
+//! - Hashing: STUB (returns zeros) - SECURITY RISK!
+//! - Audit logging: STUB (only prints, no persistence)
+//! TODO: Implement real cryptography (e.g., using ring or RustCrypto crates)
+//! TODO: Implement real authentication and authorization
+//! TODO: Add secure key management
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
@@ -55,7 +65,9 @@ impl SecurityServer {
     fn handle_encrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         println!("   [SEC] Encriptando {} bytes", data.len());
         
-        // Simular encriptación (en realidad solo copia los datos)
+        // WARNING: This is a STUB implementation - NO ACTUAL ENCRYPTION!
+        // TODO: Implement real encryption (e.g., AES-256-GCM via ring crate)
+        // For now, just copy data (INSECURE!)
         let encrypted = data.to_vec();
         Ok(encrypted)
     }
@@ -64,7 +76,9 @@ impl SecurityServer {
     fn handle_decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         println!("   [SEC] Desencriptando {} bytes", data.len());
         
-        // Simular desencriptación (en realidad solo copia los datos)
+        // WARNING: This is a STUB implementation - NO ACTUAL DECRYPTION!
+        // TODO: Implement real decryption (e.g., AES-256-GCM via ring crate)
+        // For now, just copy data (INSECURE!)
         let decrypted = data.to_vec();
         Ok(decrypted)
     }
@@ -73,7 +87,9 @@ impl SecurityServer {
     fn handle_hash(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         println!("   [SEC] Generando hash de {} bytes", data.len());
         
-        // Simular hash SHA-256 (32 bytes)
+        // WARNING: This is a STUB implementation - NO ACTUAL HASHING!
+        // TODO: Implement real hashing (e.g., SHA-256 via ring or sha2 crate)
+        // For now, return zeros (INSECURE!)
         let hash = vec![0u8; 32];
         Ok(hash)
     }

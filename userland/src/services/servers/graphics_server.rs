@@ -2,6 +2,14 @@
 //! 
 //! Implementa el servidor de gráficos que maneja todas las operaciones de display,
 //! renderizado y aceleración por hardware desde el espacio de usuario.
+//!
+//! **STATUS**: STUB IMPLEMENTATION
+//! - Display initialization: STUB (no framebuffer access)
+//! - Pixel/Rect/Line drawing: STUB (no actual rendering)
+//! - Buffer swapping: STUB (no double buffering)
+//! TODO: Integrate with kernel framebuffer or DRM/KMS
+//! TODO: Implement actual rendering via framebuffer writes
+//! TODO: Add hardware acceleration support
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
@@ -60,7 +68,8 @@ impl GraphicsServer {
         let y = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let color = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         
-        // Simular dibujo de pixel
+        // TODO: Access actual framebuffer and draw pixel at (x, y) with color
+        // For now, stub implementation (no actual rendering)
         Ok(vec![1])
     }
     

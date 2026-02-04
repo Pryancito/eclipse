@@ -2,6 +2,12 @@
 //! 
 //! Implementa el servidor de archivos que maneja todas las operaciones de I/O de archivos
 //! desde el espacio de usuario, comunicándose con el kernel vía IPC.
+//!
+//! **STATUS**: PARTIAL IMPLEMENTATION
+//! - File descriptor management: STUB (hardcoded FDs)
+//! - File operations: Need kernel syscall integration
+//! - Directory listing: STUB (returns fake data)
+//! TODO: Integrate with kernel filesystem syscalls (sys_open, sys_read, sys_write, sys_close)
 
 use super::{Message, MessageType, MicrokernelServer, ServerStats};
 use anyhow::Result;
@@ -42,7 +48,8 @@ impl FileSystemServer {
         let filename = String::from_utf8_lossy(data);
         println!("   [FS] Abriendo archivo: {}", filename);
         
-        // Simular apertura exitosa - retornar file descriptor
+        // TODO: Call kernel syscall sys_open(filename) instead of returning hardcoded FD
+        // For now, return simulated file descriptor
         let fd: u32 = 42;
         Ok(fd.to_le_bytes().to_vec())
     }
@@ -58,7 +65,8 @@ impl FileSystemServer {
         
         println!("   [FS] Leyendo {} bytes del FD {}", size, fd);
         
-        // Simular lectura - retornar datos de ejemplo
+        // TODO: Call kernel syscall sys_read(fd, buffer, size) instead of returning fake data
+        // For now, return simulated data
         let mut result = Vec::new();
         result.extend_from_slice(b"Hello from FileSystem Server!");
         Ok(result)
@@ -75,7 +83,8 @@ impl FileSystemServer {
         
         println!("   [FS] Escribiendo {} bytes al FD {}", write_data.len(), fd);
         
-        // Simular escritura exitosa - retornar bytes escritos
+        // TODO: Call kernel syscall sys_write(fd, buffer, size) instead of simulating
+        // For now, simulate successful write
         let bytes_written = write_data.len() as u32;
         Ok(bytes_written.to_le_bytes().to_vec())
     }
@@ -89,7 +98,8 @@ impl FileSystemServer {
         let fd = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         println!("   [FS] Cerrando FD {}", fd);
         
-        // Simular cierre exitoso
+        // TODO: Call kernel syscall sys_close(fd) instead of simulating
+        // For now, simulate successful close
         Ok(vec![1])
     }
     
@@ -98,7 +108,8 @@ impl FileSystemServer {
         let path = String::from_utf8_lossy(data);
         println!("   [FS] Listando directorio: {}", path);
         
-        // Simular listado de archivos
+        // TODO: Implement real directory listing via kernel filesystem
+        // For now, return simulated file list
         let listing = "file1.txt\nfile2.txt\ndir1/\n";
         Ok(listing.as_bytes().to_vec())
     }
