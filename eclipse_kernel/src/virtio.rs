@@ -84,6 +84,10 @@ const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 /// before we attempt first I/O operation.
 const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
 
+/// Delay cycles after notifying device
+/// Gives device time to process notification before we start polling
+const DEVICE_NOTIFY_DELAY_CYCLES: u32 = 1000;
+
 /// VirtIO MMIO register offsets
 #[repr(C)]
 struct VirtIOMMIORegs {
@@ -516,6 +520,17 @@ impl VirtIOBlockDevice {
                 
                 outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, queue_pfn);
                 
+                // Verify queue address was set correctly
+                let readback_pfn = inl(self.io_base + VIRTIO_PCI_QUEUE_ADDR);
+                serial::serial_print("[VirtIO] Queue PFN readback: ");
+                serial::serial_print_hex(readback_pfn as u64);
+                serial::serial_print("\n");
+                
+                if readback_pfn != queue_pfn {
+                    serial::serial_print("[VirtIO] ERROR: Queue PFN readback mismatch!\n");
+                    return false;
+                }
+                
                 self.queue = Some(queue);
                 self.queue_size = actual_queue_size;
                 
@@ -668,16 +683,35 @@ impl VirtIOBlockDevice {
                 "Failed to allocate request buffer"
             })?;
             
+            crate::serial::serial_print("[VirtIO] Request buffer: virt=");
+            crate::serial::serial_print_hex(req_ptr as u64);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(req_phys);
+            crate::serial::serial_print("\n");
+            
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
                 .ok_or_else(|| {
                     crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate status buffer\n");
                     "Failed to allocate status buffer"
                 })?;
             
+            crate::serial::serial_print("[VirtIO] Status buffer: virt=");
+            crate::serial::serial_print_hex(status_ptr as u64);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(status_phys);
+            crate::serial::serial_print("\n");
+            
             // Initialize status to 0x55 to detect if device touches it
             *status_ptr = 0x55;
             
-            let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
+            let buffer_virt = buffer.as_ptr() as u64;
+            let buffer_phys = crate::memory::virt_to_phys(buffer_virt);
+            
+            crate::serial::serial_print("[VirtIO] Data buffer: virt=");
+            crate::serial::serial_print_hex(buffer_virt);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(buffer_phys);
+            crate::serial::serial_print("\n");
             
             // Build request header
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
@@ -692,15 +726,49 @@ impl VirtIOBlockDevice {
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
             
-            let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            
+            // Debug: Verify descriptor was added
+            crate::serial::serial_print("[VirtIO] Added descriptor chain starting at index: ");
+            crate::serial::serial_print_dec(desc_idx as u64);
+            crate::serial::serial_print("\n");
+            
+            // Debug: Check avail ring state
+            let avail_idx = read_volatile(&(*queue.avail).idx);
+            crate::serial::serial_print("[VirtIO] Avail idx after add_buf: ");
+            crate::serial::serial_print_dec(avail_idx as u64);
+            crate::serial::serial_print("\n");
             
             // Memory barrier before notifying device to ensure all writes are visible
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
-                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                crate::serial::serial_print("[VirtIO] Notifying device via I/O port ");
+                crate::serial::serial_print_hex(self.io_base as u64 + VIRTIO_PCI_QUEUE_NOTIFY as u64);
+                crate::serial::serial_print("\n");
+                
+                // Select queue 0 before notifying (VirtIO block uses single queue)
+                const VIRTIO_QUEUE_INDEX: u16 = 0;
+                outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, VIRTIO_QUEUE_INDEX);
+                
+                // Write to QUEUE_NOTIFY register
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
+                
+                // Memory barrier after notification to ensure device sees the write
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                
+                // Small delay to let device process notification
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
+                    core::hint::spin_loop();
+                }
+                
+                // Read back ISR status to confirm notification was received
+                let isr = inb(self.io_base + VIRTIO_PCI_ISR_STATUS);
+                crate::serial::serial_print("[VirtIO] ISR status after notify: ");
+                crate::serial::serial_print_hex(isr as u64);
+                crate::serial::serial_print("\n");
             } else if self.mmio_base != 0 {
                 // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
