@@ -516,6 +516,17 @@ impl VirtIOBlockDevice {
                 
                 outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, queue_pfn);
                 
+                // Verify queue address was set correctly
+                let readback_pfn = inl(self.io_base + VIRTIO_PCI_QUEUE_ADDR);
+                serial::serial_print("[VirtIO] Queue PFN readback: ");
+                serial::serial_print_hex(readback_pfn as u64);
+                serial::serial_print("\n");
+                
+                if readback_pfn != queue_pfn {
+                    serial::serial_print("[VirtIO] ERROR: Queue PFN readback mismatch!\n");
+                    return false;
+                }
+                
                 self.queue = Some(queue);
                 self.queue_size = actual_queue_size;
                 
@@ -692,15 +703,48 @@ impl VirtIOBlockDevice {
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
             
-            let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            
+            // Debug: Verify descriptor was added
+            crate::serial::serial_print("[VirtIO] Added descriptor chain starting at index: ");
+            crate::serial::serial_print_dec(desc_idx as u64);
+            crate::serial::serial_print("\n");
+            
+            // Debug: Check avail ring state
+            let avail_idx = read_volatile(&(*queue.avail).idx);
+            crate::serial::serial_print("[VirtIO] Avail idx after add_buf: ");
+            crate::serial::serial_print_dec(avail_idx as u64);
+            crate::serial::serial_print("\n");
             
             // Memory barrier before notifying device to ensure all writes are visible
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
+                crate::serial::serial_print("[VirtIO] Notifying device via I/O port ");
+                crate::serial::serial_print_hex(self.io_base as u64 + VIRTIO_PCI_QUEUE_NOTIFY as u64);
+                crate::serial::serial_print("\n");
+                
+                // Select queue 0 before notifying (ensure device knows which queue)
+                outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+                
+                // Write to QUEUE_NOTIFY register
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                
+                // Add memory fence after notification
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                
+                // Small delay to let device process notification
+                for _ in 0..1000 {
+                    core::hint::spin_loop();
+                }
+                
+                // Read back ISR status to confirm notification was received
+                let isr = inb(self.io_base + VIRTIO_PCI_ISR_STATUS);
+                crate::serial::serial_print("[VirtIO] ISR status after notify: ");
+                crate::serial::serial_print_hex(isr as u64);
+                crate::serial::serial_print("\n");
             } else if self.mmio_base != 0 {
                 // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
