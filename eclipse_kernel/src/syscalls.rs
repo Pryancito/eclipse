@@ -28,6 +28,9 @@ pub enum SyscallNumber {
     Lseek = 14,
     GetFramebufferInfo = 15,
     MapFramebuffer = 16,
+    PciEnumDevices = 17,
+    PciReadConfig = 18,
+    PciWriteConfig = 19,
 }
 
 /// lseek whence values (POSIX standard)
@@ -138,6 +141,9 @@ pub extern "C" fn syscall_handler(
         14 => sys_lseek(arg1, arg2 as i64, arg3),
         15 => sys_get_framebuffer_info(arg1),
         16 => sys_map_framebuffer(),
+        17 => sys_pci_enum_devices(arg1, arg2, arg3),
+        18 => sys_pci_read_config(arg1, arg2, arg3),
+        19 => sys_pci_write_config(arg1, arg2, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -997,6 +1003,129 @@ fn sys_map_framebuffer() -> u64 {
     
     // Map framebuffer into process address space
     crate::memory::map_framebuffer_for_process(page_table_phys, bootloader_fb.base_address, fb_size)
+}
+
+/// sys_pci_enum_devices - Enumerate PCI devices by class
+/// Args:
+///   arg1: class_code (0xFF = all devices, 0x04 = multimedia/audio)
+///   arg2: buffer pointer (array of PciDeviceInfo structs)
+///   arg3: buffer size (max number of devices)
+/// Returns: number of devices found, or u64::MAX on error
+fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u64 {
+    serial::serial_print("[SYSCALL] pci_enum_devices(class=");
+    serial::serial_print_hex(class_code);
+    serial::serial_print(")\n");
+    
+    // Validate parameters
+    if buffer_ptr == 0 || max_devices == 0 || max_devices > 256 {
+        serial::serial_print("[SYSCALL] pci_enum_devices - invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    // Get audio devices from PCI subsystem
+    let devices = if class_code == 0x04 {
+        // Multimedia/Audio devices
+        crate::pci::find_audio_devices()
+    } else if class_code == 0xFF {
+        // All devices - not implemented for now
+        serial::serial_print("[SYSCALL] pci_enum_devices - all devices not supported yet\n");
+        return 0;
+    } else {
+        serial::serial_print("[SYSCALL] pci_enum_devices - unsupported class\n");
+        return 0;
+    };
+    
+    let count = core::cmp::min(devices.len(), max_devices as usize);
+    
+    serial::serial_print("[SYSCALL] pci_enum_devices - found ");
+    serial::serial_print_dec(count as u64);
+    serial::serial_print(" device(s)\n");
+    
+    // Copy device info to userspace buffer
+    // Each device is represented as: bus, device, function, vendor_id, device_id, class, subclass, bar0
+    unsafe {
+        let user_buf = core::slice::from_raw_parts_mut(
+            buffer_ptr as *mut u64,
+            count * 8  // 8 u64 fields per device
+        );
+        
+        for (i, dev) in devices.iter().take(count).enumerate() {
+            let offset = i * 8;
+            user_buf[offset + 0] = dev.bus as u64;
+            user_buf[offset + 1] = dev.device as u64;
+            user_buf[offset + 2] = dev.function as u64;
+            user_buf[offset + 3] = dev.vendor_id as u64;
+            user_buf[offset + 4] = dev.device_id as u64;
+            user_buf[offset + 5] = dev.class_code as u64;
+            user_buf[offset + 6] = dev.subclass as u64;
+            user_buf[offset + 7] = dev.bar0 as u64;
+        }
+    }
+    
+    count as u64
+}
+
+/// sys_pci_read_config - Read PCI configuration space
+/// Args:
+///   arg1: device location (bus << 16 | device << 8 | function)
+///   arg2: offset in config space
+///   arg3: size (1, 2, or 4 bytes)
+/// Returns: value read, or u64::MAX on error
+fn sys_pci_read_config(device_location: u64, offset: u64, size: u64) -> u64 {
+    let bus = ((device_location >> 16) & 0xFF) as u8;
+    let device = ((device_location >> 8) & 0xFF) as u8;
+    let function = (device_location & 0xFF) as u8;
+    let offset = offset as u8;
+    
+    // Validate parameters
+    if device > 31 || function > 7 || offset > 252 {
+        serial::serial_print("[SYSCALL] pci_read_config - invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    unsafe {
+        match size {
+            1 => crate::pci::pci_config_read_u8(bus, device, function, offset) as u64,
+            2 => crate::pci::pci_config_read_u16(bus, device, function, offset) as u64,
+            4 => crate::pci::pci_config_read_u32(bus, device, function, offset) as u64,
+            _ => {
+                serial::serial_print("[SYSCALL] pci_read_config - invalid size\n");
+                u64::MAX
+            }
+        }
+    }
+}
+
+/// sys_pci_write_config - Write PCI configuration space
+/// Args:
+///   arg1: device location (bus << 16 | device << 8 | function)
+///   arg2: offset in config space
+///   arg3: value to write (size determined by offset alignment)
+/// Returns: 0 on success, u64::MAX on error
+fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
+    let bus = ((device_location >> 16) & 0xFF) as u8;
+    let device = ((device_location >> 8) & 0xFF) as u8;
+    let function = (device_location & 0xFF) as u8;
+    let offset = offset as u8;
+    
+    // Validate parameters
+    if device > 31 || function > 7 || offset > 252 {
+        serial::serial_print("[SYSCALL] pci_write_config - invalid parameters\n");
+        return u64::MAX;
+    }
+    
+    // For now, only allow writing to command register (offset 0x04)
+    // This is a security measure - we don't want userspace to mess with arbitrary PCI config
+    if offset != 0x04 {
+        serial::serial_print("[SYSCALL] pci_write_config - only command register writes allowed\n");
+        return u64::MAX;
+    }
+    
+    unsafe {
+        crate::pci::pci_config_write_u16(bus, device, function, offset, value as u16);
+    }
+    
+    0
 }
 
 /// Inicializar sistema de syscalls

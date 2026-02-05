@@ -8,8 +8,13 @@
 use linked_list_allocator::LockedHeap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Physical offset for virtual-to-physical address translation
-/// Written once during init_paging(), then read-only
+/// Higher Half offset for physical memory mapping
+/// All physical RAM is mapped at this virtual address
+/// Physical address X is accessible at (PHYS_MEM_OFFSET + X)
+pub const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
+
+/// Physical offset for virtual-to-physical address translation (legacy)
+/// This is now set to 0 since we use higher half mapping
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Size of the kernel region with offset-based mapping (256MB = 128 * 2MB pages)
@@ -100,7 +105,9 @@ impl PageTableEntry {
     }
     
     pub fn set_addr(&mut self, addr: u64, flags: u64) {
-        self.entry = (addr & 0x000F_FFFF_FFFF_F000) | flags;
+        // Clear bit 63 (NX) from address to ensure pages are executable by default
+        // The NX bit will only be set if explicitly included in flags
+        self.entry = (addr & 0x000F_FFFF_FFFF_F000) | (flags & 0x8000_0000_0000_0FFF);
     }
     
     pub fn present(&self) -> bool {
@@ -148,249 +155,40 @@ pub const PAGE_GLOBAL: u64 = 1 << 8;
 // Las tablas ahora están arriba para mayor seguridad
 
 /// Inicializar paginación
+/// 
+/// With Higher Half Kernel, the bootloader has already set up page tables:
+/// - PML4[0]: Identity mapping (0-4GB) for bootloader compatibility
+/// - PML4[256]: Higher half physical map (0xFFFF800000000000+)
+/// - PML4[511]: Recursive mapping for page table access
+/// 
+/// The kernel just needs to acknowledge this setup and continue using it.
+/// No need to create new page tables or switch CR3!
 pub fn init_paging(kernel_phys_base: u64) {
-    // Disable interrupts during paging initialization to avoid triple faults
-    // if an interrupt occurs before our transition is complete
-    unsafe {
-        core::arch::asm!("cli");
-    }
-
-    let phys_offset = kernel_phys_base.wrapping_sub(0x200000);
-    PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
-
-    unsafe {
-        let pml4_virt = &raw const PML4 as u64;
-        let pdpt_virt = &raw const PDPT as u64;
-        let pd0_virt = &raw const PD[0] as u64;
-
-        crate::serial::serial_print("Init Paging. Phys Base: ");
-        crate::serial::serial_print_hex(kernel_phys_base);
-        crate::serial::serial_print("\nOffset: ");
-        crate::serial::serial_print_hex(phys_offset);
-        crate::serial::serial_print("\nPML4 Virt: ");
-        crate::serial::serial_print_hex(pml4_virt);
-        crate::serial::serial_print("\n");
-        
-        // Zero all tables explicitly
-        core::ptr::write_bytes(pml4_virt as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pdpt_virt as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pd0_virt as *mut u8, 0, 16384);
-
-        // Calcular direcciones físicas
-        let pdpt_phys = pdpt_virt.wrapping_add(phys_offset);
-        let pml4_phys = pml4_virt.wrapping_add(phys_offset);
-        let pd0_phys = pd0_virt.wrapping_add(phys_offset);
-        let pd1_phys = pd0_phys + 4096;
-        let pd2_phys = pd0_phys + 8192;
-        let pd3_phys = pd0_phys + 12288;
-
-        crate::serial::serial_print("PML4 Phys: ");
-        crate::serial::serial_print_hex(pml4_phys);
-        crate::serial::serial_print("\n");
-
-        let rsp: u64;
-        core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        crate::serial::serial_print("Current RSP: ");
-        crate::serial::serial_print_hex(rsp);
-        crate::serial::serial_print("\n");
-
-        // PML4[0] -> PDPT
-        PML4.entries[0].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        
-        // PML4[511] -> PDPT (higher half mirror)
-        PML4.entries[511].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        
-        // PDPT: Link the 4 PDs to map 4GB
-        PDPT.entries[0].set_addr(pd0_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        PDPT.entries[1].set_addr(pd1_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        PDPT.entries[2].set_addr(pd2_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        PDPT.entries[3].set_addr(pd3_phys, PAGE_PRESENT | PAGE_WRITABLE);
-        
-        // PDs: Map 4GB with 2MB huge pages
-        for j in 0..4 {
-            for i in 0..512 {
-                let virt_addr = (j as u64) * 0x40000000 + (i as u64) * 0x200000;
-
-                let phys_addr = if virt_addr < KERNEL_REGION_SIZE {
-                    // Kernel region (linked range): virt + offset = phys
-                    virt_addr.wrapping_add(phys_offset)
-                } else {
-                    // Identity mapping (virt = phys)
-                    virt_addr
-                };
-
-                PD[j].entries[i].set_addr(phys_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE);
-            }
-        }
-        
-        // DEBUG: Verify mapping for RSP
-        let rsp_i = ((rsp & 0x3FFFFFFF) / 0x200000) as usize;
-        let rsp_j = (rsp / 0x40000000) as usize;
-        if rsp_j < 4 {
-             crate::serial::serial_print("RSP Mapping (PD[");
-             crate::serial::serial_print_dec(rsp_j as u64);
-             crate::serial::serial_print("].entries[");
-             crate::serial::serial_print_dec(rsp_i as u64);
-             crate::serial::serial_print("]): ");
-             crate::serial::serial_print_hex(PD[rsp_j].entries[rsp_i].get_addr());
-             crate::serial::serial_print("\n");
-        }
-        
-        // ===== PHYSICAL ADDRESS CHAIN DIAGNOSTICS =====
-        crate::serial::serial_print("\n=== PHYSICAL ADDRESS CHAIN ===\n");
-        crate::serial::serial_print("PML4 virt: ");
-        crate::serial::serial_print_hex(pml4_virt);
-        crate::serial::serial_print(" -> phys: ");
-        crate::serial::serial_print_hex(pml4_phys);
-        crate::serial::serial_print("\n");
-        
-        crate::serial::serial_print("PDPT virt: ");
-        crate::serial::serial_print_hex(pdpt_virt);
-        crate::serial::serial_print(" -> phys: ");
-        crate::serial::serial_print_hex(pdpt_phys);
-        crate::serial::serial_print("\n");
-        
-        crate::serial::serial_print("PD[0] virt: ");
-        crate::serial::serial_print_hex(pd0_virt);
-        crate::serial::serial_print(" -> phys: ");
-        crate::serial::serial_print_hex(pd0_phys);
-        crate::serial::serial_print("\n");
-        
-        crate::serial::serial_print("PD[1] phys: ");
-        crate::serial::serial_print_hex(pd1_phys);
-        crate::serial::serial_print("\n");
-        
-        crate::serial::serial_print("PD[2] phys: ");
-        crate::serial::serial_print_hex(pd2_phys);
-        crate::serial::serial_print("\n");
-        
-        crate::serial::serial_print("PD[3] phys: ");
-        crate::serial::serial_print_hex(pd3_phys);
-        crate::serial::serial_print("\n");
-        
-        // Verify PDPT points to correct PD addresses
-        crate::serial::serial_print("\nPDPT[0] points to: ");
-        crate::serial::serial_print_hex(PDPT.entries[0].get_addr());
-        crate::serial::serial_print(" (should be ");
-        crate::serial::serial_print_hex(pd0_phys);
-        crate::serial::serial_print(")\n");
-        
-        crate::serial::serial_print("PDPT[1] points to: ");
-        crate::serial::serial_print_hex(PDPT.entries[1].get_addr());
-        crate::serial::serial_print(" (should be ");
-        crate::serial::serial_print_hex(pd1_phys);
-        crate::serial::serial_print(")\n");
-        
-        // ===== SANITY CHECKS BEFORE CR3 SWITCH =====
-        crate::serial::serial_print("\n=== PRE-CR3 SANITY CHECKS ===\n");
-        
-        // 1. Verify alignment (must be 4KB aligned)
-        if pml4_phys & 0xFFF != 0 {
-            crate::serial::serial_print("FATAL: PML4 not 4KB aligned: ");
-            crate::serial::serial_print_hex(pml4_phys);
-            crate::serial::serial_print("\n");
-            loop { core::arch::asm!("hlt"); }
-        }
-        crate::serial::serial_print("✓ PML4 alignment OK (");
-        crate::serial::serial_print_hex(pml4_phys);
-        crate::serial::serial_print(")\n");
-        
-        // 2. Verify PML4[0] has PRESENT bit
-        if !PML4.entries[0].present() {
-            crate::serial::serial_print("FATAL: PML4[0] not present\n");
-            loop { core::arch::asm!("hlt"); }
-        }
-        crate::serial::serial_print("✓ PML4[0] present, points to: ");
-        crate::serial::serial_print_hex(PML4.entries[0].get_addr());
-        crate::serial::serial_print("\n");
-        
-        // 3. Verify PDPT entries have PRESENT bit
-        for i in 0..4 {
-            if !PDPT.entries[i].present() {
-                crate::serial::serial_print("FATAL: PDPT[");
-                crate::serial::serial_print_dec(i as u64);
-                crate::serial::serial_print("] not present\n");
-                loop { core::arch::asm!("hlt"); }
-            }
-        }
-        crate::serial::serial_print("✓ All 4 PDPT entries present\n");
-        
-        // 4. Verify current instruction page is mapped
-        let code_addr = init_paging as *const () as u64;
-        let code_page_idx = (code_addr / 0x200000) as usize;
-        let code_pd_idx = (code_addr / 0x40000000) as usize;
-        
-        crate::serial::serial_print("✓ Code address: ");
-        crate::serial::serial_print_hex(code_addr);
-        crate::serial::serial_print(" -> PD[");
-        crate::serial::serial_print_dec(code_pd_idx as u64);
-        crate::serial::serial_print("][");
-        crate::serial::serial_print_dec(code_page_idx as u64);
-        crate::serial::serial_print("]\n");
-        
-        if code_pd_idx < 4 && !PD[code_pd_idx].entries[code_page_idx].present() {
-            crate::serial::serial_print("FATAL: Code page not mapped!\n");
-            loop { core::arch::asm!("hlt"); }
-        }
-        crate::serial::serial_print("✓ Code page mapped to: ");
-        crate::serial::serial_print_hex(PD[code_pd_idx].entries[code_page_idx].get_addr());
-        crate::serial::serial_print("\n");
-        
-        // CRITICAL: Verify code page maps to where kernel actually is
-        let expected_code_phys = code_addr + phys_offset;
-        let actual_code_page_phys = PD[code_pd_idx].entries[code_page_idx].get_addr();
-        let expected_code_page_phys = (expected_code_phys & !0x1FFFFF);  // 2MB aligned
-        
-        crate::serial::serial_print("  Expected code phys: ");
-        crate::serial::serial_print_hex(expected_code_phys);
-        crate::serial::serial_print(" (page: ");
-        crate::serial::serial_print_hex(expected_code_page_phys);
-        crate::serial::serial_print(")\n");
-        
-        crate::serial::serial_print("  Actual page mapping: ");
-        crate::serial::serial_print_hex(actual_code_page_phys);
-        crate::serial::serial_print("\n");
-        
-        if actual_code_page_phys != expected_code_page_phys {
-            crate::serial::serial_print("WARNING: Code page mapping mismatch!\n");
-            crate::serial::serial_print("  This will cause instruction fetch fault after CR3 switch!\n");
-        }
-        
-        // 5. Verify stack page is mapped
-        if rsp_j < 4 && !PD[rsp_j].entries[rsp_i].present() {
-            crate::serial::serial_print("FATAL: Stack page not mapped!\n");
-            loop { core::arch::asm!("hlt"); }
-        }
-        crate::serial::serial_print("✓ Stack page mapped OK\n");
-        
-        crate::serial::serial_print("=== ALL SANITY CHECKS PASSED ===\n\n");
-
-        crate::serial::serial_print("Switching CR3 to ");
-        crate::serial::serial_print_hex(pml4_phys);
-        crate::serial::serial_print("...\n");
-
-         // Load CR3 and flush TLB
-        core::arch::asm!(
-            "mov cr3, {0}",
-            // Explicit TLB flush
-            "mov r8, cr3",
-            "mov cr3, r8",
-            // Re-enable interrupts
-            "sti",
-            in(reg) pml4_phys,
-            out("r8") _,
-            options(nostack, preserves_flags)
-        );
-    }
-    crate::serial::init();
+    crate::serial::serial_print("Init Paging (Higher Half mode)\n");
+    crate::serial::serial_print("Kernel phys base: ");
+    crate::serial::serial_print_hex(kernel_phys_base);
+    crate::serial::serial_print("\n");
     
-    // Try to call serial_print - this is where it fails
-    crate::serial::serial_print("Paging enabled and verified.\n");
+    // The bootloader has already set up page tables and loaded CR3
+    // We don't need to do anything here except verify it's working
     
-    // Re-enable interrupts AFTER Rust has restored the stack frame
-    unsafe {
-        core::arch::asm!("sti");
-    }
+    let cr3 = get_cr3();
+    crate::serial::serial_print("Current CR3: ");
+    crate::serial::serial_print_hex(cr3);
+    crate::serial::serial_print("\n");
+    
+    // Verify we can access physical memory via higher half
+    // Try to read from physical address 0 via higher half mapping
+    let test_virt = PHYS_MEM_OFFSET;
+    crate::serial::serial_print("Testing higher half access at: ");
+    crate::serial::serial_print_hex(test_virt);
+    crate::serial::serial_print("\n");
+    
+    // If we can read this without faulting, higher half mapping works
+    let _test_read = unsafe { core::ptr::read_volatile(test_virt as *const u8) };
+    
+    crate::serial::serial_print("✓ Higher half physical map verified\n");
+    crate::serial::serial_print("✓ Paging enabled and working\n");
 }
 
 /// Obtener dirección física de CR3
@@ -406,50 +204,49 @@ pub fn get_cr3() -> u64 {
     cr3
 }
 
-/// Create a new isolated page table for a process
-/// Returns the physical address of the PML4
+use x86_64::registers::control::Cr3;
+// use x86_64::structures::paging::PageTable; // Import removed to avoid conflict with local definition
+use x86_64::PhysAddr;
+
 /// Create a new isolated page table for a process
 /// Returns the physical address of the PML4
 pub fn create_process_paging() -> u64 {
     unsafe {
         // Use alloc_dma_buffer to avoid stack overflow with Box::new(PageTable::new())
         let (pml4_ptr, pml4_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PML4");
-        let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PDPT");
-        let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PD");
         
-        let pml4 = &mut *(pml4_ptr as *mut PageTable);
-        let pdpt = &mut *(pdpt_ptr as *mut PageTable);
-        let pd   = &mut *(pd_ptr as *mut PageTable);
-        
-        // Zero out the new tables
+        // Zero out the new PML4
         core::ptr::write_bytes(pml4_ptr, 0, 4096);
-        core::ptr::write_bytes(pdpt_ptr, 0, 4096);
-        core::ptr::write_bytes(pd_ptr, 0, 4096);
+        let pml4 = &mut *(pml4_ptr as *mut PageTable);
         
-        // Clone kernel mappings (entire first 1GB provided by PD[0])
-        // This includes kernel code, heap, boot stack (at i=511), and MMIO (at i=0)
-        for i in 0..512 {
-            pd.entries[i] = PD[0].entries[i];
-            // Remove PAGE_USER for kernel pages in PD[0] range
-            if (i as u64) * 0x200000 < KERNEL_REGION_SIZE {
-                let addr = pd.entries[i].get_addr();
-                let flags = pd.entries[i].get_flags();
-                pd.entries[i].set_addr(addr, flags & !PAGE_USER);
-            }
-        }
+        // Get current PML4 to copy kernel mappings
+        let (current_pml4_phys, _) = Cr3::read();
+        let current_pml4_virt = phys_to_virt(current_pml4_phys.start_address().as_u64());
+        let current_pml4 = &*(current_pml4_virt as *const PageTable);
         
-        // IMPORTANT: Link to other kernel tables (1GB-4GB)
-        // This allows processes to access the kernel even if it's loaded at high addresses (e.g. 2.8GB)
-        let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
-        pdpt.entries[0].set_addr(pd_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        pdpt.entries[1].set_addr((&raw const PD[1] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        pdpt.entries[2].set_addr((&raw const PD[2] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        pdpt.entries[3].set_addr((&raw const PD[3] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        // 1. Copy Higher Half Physical Map (PML4[256])
+        // This is CRITICAL for the kernel to access physical memory (allocator, etc.)
+        pml4.entries[256] = current_pml4.entries[256].clone();
         
-        pml4.entries[0].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        // 2. Map Kernel Code / Identity (PML4[0])
+        // For now, we share the 0-16GB identity map with the kernel.
+        // This includes the kernel code loaded at 0x200000.
+        // WARNING: This means processes share the lower 512GB (PML4[0])!
+        // This is necessary because the kernel code is currently linked at low addresses.
+        pml4.entries[0] = current_pml4.entries[0].clone();
         
-        // Also map kernel into higher half
-        pml4.entries[511].set_addr(pdpt_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        // 3. Setup Recursive Mapping
+        // Map the LAST entry (511) to point to the NEW PML4 itself
+        // This allows the kernel to access this page table structure at a known virtual address
+        // when this page table is active.
+        pml4.entries[511].set_addr(
+             pml4_phys, 
+             (x86_64::structures::paging::PageTableFlags::PRESENT | 
+             x86_64::structures::paging::PageTableFlags::WRITABLE).bits()
+        );
+        
+        // Note: usage of PDPT and PD generic buffers is removed as we reuse the upper level tables
+        // from the kernel for now. User space will be allocated dynamically later.
         
         pml4_phys
     }
@@ -458,133 +255,131 @@ pub fn create_process_paging() -> u64 {
 /// Clone an existing process's page table (deep copy of user-space mappings)
 /// Returns the physical address of the child's PML4
 pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
-    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
+    // 1. Create new skeleton page table
+    let child_pml4_phys = create_process_paging();
     
-    // Parent tables (virtual access)
-    let p_pml4_virt = parent_pml4_phys.wrapping_sub(phys_offset);
-    let p_pml4 = unsafe { &*(p_pml4_virt as *const PageTable) };
-
-    // Parent PDPT and PD
-    let p_pdpt_phys = p_pml4.entries[0].get_addr();
-    let p_pdpt = unsafe { &*(p_pdpt_phys.wrapping_sub(phys_offset) as *const PageTable) };
-    let p_pd_phys = p_pdpt.entries[0].get_addr();
-    let p_pd = unsafe { &*(p_pd_phys.wrapping_sub(phys_offset) as *const PageTable) };
-
-    // Create a new table structure for the child
-    // This clones the kernel mappings automatically
-    let c_pml4_phys = create_process_paging();
-    let c_pml4_virt = c_pml4_phys.wrapping_sub(phys_offset);
-    let c_pml4 = unsafe { &mut *(c_pml4_virt as *mut PageTable) };
-
-    // Child PDPT and PD
-    let c_pdpt_phys = c_pml4.entries[0].get_addr();
-    let c_pdpt = unsafe { &mut *(c_pdpt_phys.wrapping_sub(phys_offset) as *mut PageTable) };
-    let c_pd_phys = c_pdpt.entries[0].get_addr();
-    let c_pd = unsafe { &mut *(c_pd_phys.wrapping_sub(phys_offset) as *mut PageTable) };
-    
-    // Ensure child's PDPT also points to kernel's PD1-PD3
     unsafe {
-        c_pdpt.entries[1].set_addr((&raw const PD[1] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        c_pdpt.entries[2].set_addr((&raw const PD[2] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        c_pdpt.entries[3].set_addr((&raw const PD[3] as u64).wrapping_add(phys_offset), PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-    }
-
-    // Deep copy user regions (>= 128MB, entries 64-511 in PD)
-    for i in 64..512 {
-        let entry = p_pd.entries[i];
-        if !entry.present() {
-            continue;
-        }
-
-        let p_paddr = entry.get_addr();
-        let vaddr = (i as u64) * 0x200000;
-
-        // Clone if it's a "custom" mapping (phys != virt-identity)
-        // or just clone everything user-mode for safety.
-        // In our system, if it's a process mapping, it's a Huge page in user space.
-        if entry.get_flags() & PAGE_USER != 0 {
-            // Check if it's an identity mapping (Hardware/Identity region)
-            // If it's not identity, it's an ELF segment or stack
-            if p_paddr != vaddr {
-                if let Some((child_kptr, child_paddr)) = alloc_dma_buffer(0x200000, 0x200000) {
-                    let parent_kptr = p_paddr.wrapping_sub(phys_offset) as *const u8;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(parent_kptr, child_kptr, 0x200000);
-                    }
-                    c_pd.entries[i].set_addr(child_paddr, entry.get_flags());
-                }
-            } else {
-                // Identity mapping, keep as is
-                c_pd.entries[i] = entry;
+        // Access parent and child PML4s
+        let p_pml4 = &*(phys_to_virt(parent_pml4_phys) as *const PageTable);
+        let c_pml4 = &mut *(phys_to_virt(child_pml4_phys) as *mut PageTable);
+        
+        // We need to iterate over USER space (0 to 0x0000_7FFF_FFFF_FFFF)
+        // For efficiency in this simplistic kernel, we only scan the first PDP (512GB)
+        // because our processes (init) are small and live in 0-1GB range.
+        
+        // Iterate PML4 entries (Low half only)
+        for i in 0..256 {
+            let p_pml4_entry = &p_pml4.entries[i];
+            if !p_pml4_entry.present() || !x86_64::structures::paging::PageTableFlags::from_bits_truncate(p_pml4_entry.get_flags()).contains(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE) {
+                continue;
             }
+            
+            // If we are sharing the first entry with kernel mappings (identity map),
+            // we need to be careful.
+            // If i == 0, we already copied the Identity map in create_process_paging.
+            // But we might have user mappings mixed in there (e.g. at 256MB).
+            // We'll trust create_process_paging() did the initial copy.
+            // But for fork(), we want DEEP COPY of user pages.
+            // TODO: Implement proper deep copy for fork(). 
+            // For now, this is a placeholder that assumes shared kernel mappings are fine
+            // and doesn't fully implement CoW or deep copy for user pages mixed in identity map.
+            // This is enough to get services running (create_process) but NOT for fork() yet.
         }
     }
 
-    c_pml4_phys
+    child_pml4_phys
 }
 
 /// Map a 2MB page in a process's page table
-/// This is a simplified version using 2MB pages for everything for now
 pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
-    
-    // Convert PML4 phys to virt to access it
-    let pml4_virt = pml4_phys.wrapping_sub(phys_offset);
+    let pml4_virt = phys_to_virt(pml4_phys);
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
     
-    // We assume the PDPT and PD already exist for the process (created in create_process_paging)
-    // but only for the first entry. If mapping beyond 1GB, we'd need to allocate more.
-    // For init and log service, they are well within the first 1GB (0x10000000 is 256MB).
-    
-    let pdpt_phys = pml4.entries[pml4_idx].get_addr();
-    let pdpt_virt = pdpt_phys.wrapping_sub(phys_offset);
-    let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
-    
-    let pd_phys = pdpt.entries[pdpt_idx].get_addr();
-    let pd_virt = pd_phys.wrapping_sub(phys_offset);
-    let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
-    
-    pd.entries[pd_idx].set_addr(paddr, flags | PAGE_HUGE | PAGE_PRESENT | PAGE_USER);
-    
-    // Flush TLB (expensive, but safe)
     unsafe {
-        core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
+        // 1. Walk/Create PDPT
+        let pml4_entry = &mut pml4.entries[pml4_idx];
+        if !pml4_entry.present() {
+            let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
+            core::ptr::write_bytes(pdpt_ptr, 0, 4096);
+            pml4_entry.set_addr(
+                pdpt_phys, 
+                (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
+            );
+        }
+        
+        let pdpt_virt = phys_to_virt(pml4_entry.get_addr());
+        let pdpt = &mut *(pdpt_virt as *mut PageTable);
+        
+        // 2. Walk/Create PD
+        let pdpt_entry = &mut pdpt.entries[pdpt_idx];
+        if !pdpt_entry.present() {
+            let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
+            core::ptr::write_bytes(pd_ptr, 0, 4096);
+            pdpt_entry.set_addr(
+                pd_phys, 
+                (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
+            );
+        }
+        
+        let pd_virt = phys_to_virt(pdpt_entry.get_addr());
+        let pd = &mut *(pd_virt as *mut PageTable);
+        
+        // 3. Map Page (2MB)
+        pd.entries[pd_idx].set_addr(
+            paddr, 
+            (x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags) | 
+            x86_64::structures::paging::PageTableFlags::HUGE_PAGE |
+            x86_64::structures::paging::PageTableFlags::PRESENT | 
+            x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
+        );
     }
+    
+    // TLB Flush would be needed if this page table is active
+    // But usually we map before switching, or we should invalid entry.
 }
+
 
 /// Translate virtual address to physical address
 /// 
-/// The kernel uses two different virtual-to-physical mapping schemes:
+/// With Higher Half Kernel mapping:
 /// 
-/// 1. **Kernel region (0x0 - 0x8000000 / 128MB)**: Offset-based mapping
-///    - Contains: .text, .rodata, .data, .bss (including heap), page tables
-///    - Mapping: `physical = virtual + phys_offset`
-///    - The phys_offset is determined during boot based on where bootloader loaded the kernel
-///    - Example: If kernel loaded at physical 0x200000, offset = 0
+/// 1. **Higher Half Physical Map (0xFFFF800000000000+)**: Direct mapping
+///    - All physical RAM is mapped here
+///    - Mapping: `physical = virtual - PHYS_MEM_OFFSET`
+///    - Example: Virtual 0xFFFF800000001000 -> Physical 0x1000
 ///
-/// 2. **Higher memory (>= 128MB)**: Identity mapping  
-///    - Contains: Stack, user space, MMIO regions
+/// 2. **Low memory (< 4GB)**: Identity mapping (for compatibility)
+///    - Used during boot and for some legacy code
 ///    - Mapping: `physical = virtual`
 ///
-/// This dual scheme allows the kernel to be position-independent while keeping
-/// higher memory simple for userspace and hardware access.
+/// 3. **Kernel Higher Half (0xFFFF880000000000+)**: Not yet implemented
+///    - Will be used for kernel code/data in future
+///
+/// This is much simpler than the old offset-based approach!
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
-    // Using Relaxed ordering is safe because PHYS_OFFSET is written once during init
-    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
-    
-    // Check if address is in the kernel region (first 256MB = 128 * 2MB pages)
-    // These are mapped with phys_offset
-    if virt_addr < KERNEL_REGION_SIZE {
-        // Kernel region: virt + phys_offset = phys
-        virt_addr.wrapping_add(phys_offset)
+    // Check if address is in higher half physical memory map
+    if virt_addr >= PHYS_MEM_OFFSET {
+        // Higher half physical map: subtract offset to get physical address
+        virt_addr - PHYS_MEM_OFFSET
     } else {
-        // Higher memory: identity mapped (virt = phys)
+        // Low memory: identity mapped (virt = phys)
+        // This includes bootloader code, stack, and early kernel structures
         virt_addr
     }
+}
+
+/// Convert physical address to virtual address (inverse of virt_to_phys)
+/// Returns the higher half virtual address for accessing physical memory
+pub fn phys_to_virt(phys_addr: u64) -> u64 {
+    PHYS_MEM_OFFSET + phys_addr
 }
 
 /// Allocate DMA-safe buffer
@@ -621,8 +416,9 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
 /// Map framebuffer physical memory into process page tables
 /// Returns virtual address where framebuffer is mapped, or 0 on failure
 pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_size: u64) -> u64 {
+    use x86_64::structures::paging::PageTableFlags as Flags;
+    
     // For identity mapping, we'll map the framebuffer at its physical address
-    // This is simpler than choosing a high virtual address
     let virtual_addr = fb_phys_addr;
     
     // Round size up to 2MB pages
@@ -631,15 +427,9 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     crate::serial::serial_print("MAP_FB: Identity mapping ");
     crate::serial::serial_print_dec(num_pages);
     crate::serial::serial_print(" pages\n");
-    crate::serial::serial_print("  Virt = Phys = ");
-    crate::serial::serial_print_hex(fb_phys_addr);
-    crate::serial::serial_print("\n");
     
-    // Get physical offset to convert virtual addresses to physical
-    let phys_offset = PHYS_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
-    
-    // Access the process's PML4 (convert physical to virtual)
-    let pml4_virt = page_table_phys.wrapping_sub(phys_offset);
+    // Access the process's PML4
+    let pml4_virt = phys_to_virt(page_table_phys);
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     
     // For each 2MB page of the framebuffer
@@ -654,54 +444,48 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
         
         // Get or create PDPT
         if !pml4.entries[pml4_idx].present() {
-            // Allocate new PDPT
             if let Some((pdpt_ptr, pdpt_phys)) = alloc_dma_buffer(4096, 4096) {
                 unsafe { core::ptr::write_bytes(pdpt_ptr, 0, 4096); }
                 pml4.entries[pml4_idx].set_addr(
                     pdpt_phys,
-                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                    (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                crate::serial::serial_print("MAP_FB: Failed to allocate PDPT\n");
                 return 0;
             }
         }
         
+        // Get PDPT
         let pdpt_phys = pml4.entries[pml4_idx].get_addr();
-        let pdpt_virt = pdpt_phys.wrapping_sub(phys_offset);
+        let pdpt_virt = phys_to_virt(pdpt_phys);
         let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
         
         // Get or create PD
         if !pdpt.entries[pdpt_idx].present() {
-            // Allocate new PD
             if let Some((pd_ptr, pd_phys)) = alloc_dma_buffer(4096, 4096) {
                 unsafe { core::ptr::write_bytes(pd_ptr, 0, 4096); }
                 pdpt.entries[pdpt_idx].set_addr(
                     pd_phys,
-                    PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                    (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                crate::serial::serial_print("MAP_FB: Failed to allocate PD\n");
                 return 0;
             }
         }
         
+        // Get PD
         let pd_phys = pdpt.entries[pdpt_idx].get_addr();
-        let pd_virt = pd_phys.wrapping_sub(phys_offset);
+        let pd_virt = phys_to_virt(pd_phys);
         let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
         
-        // Map the 2MB page with USER flag
+        // Map Page (2MB) - Identity mapping for framebuffer
+        // Important: Huge Page bit + User Accessible + Write Through (for FB maybe?)
+        // Usually FB needs Write Combining but Write Through is safer than Write Back.
+        // For now, just standard flags.
         pd.entries[pd_idx].set_addr(
             page_phys,
-            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_HUGE
+            (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE | Flags::HUGE_PAGE).bits()
         );
-    }
-    
-    crate::serial::serial_print("MAP_FB: Successfully mapped framebuffer\n");
-    
-    // Flush TLB for the mapped pages
-    unsafe {
-        core::arch::asm!("mov rax, cr3; mov cr3, rax", out("rax") _);
     }
     
     virtual_addr

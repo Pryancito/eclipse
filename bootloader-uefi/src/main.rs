@@ -62,6 +62,15 @@ const PT_LOAD: u32 = 1;
 const KERNEL_VIRT_BASE: u64 = 0x200000; // Dirección fija del kernel (non-PIE)
 const MAX_KERNEL_ALLOCATION: u64 = 64 * 1024 * 1024; // 64 MiB como límite razonable para el kernel
 
+// Higher Half Kernel constants (Redox-style)
+/// Physical memory is mapped to this virtual address range
+/// All physical RAM from 0x0 to 4GB will be accessible at PHYS_MEM_OFFSET + phys_addr
+const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
+
+/// Kernel code and data will be mapped here
+/// This is separate from the physical memory map
+const KERNEL_HIGHER_HALF_BASE: u64 = 0xFFFF880000000000;
+
 /// Guardar entry point para evitar corrupción por llamadas a funciones
 static mut SAVED_ENTRY_REG: u64 = 0;
 
@@ -934,100 +943,106 @@ enum BootError {
 }
 
 fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::Result<(u64, u64), BootError> {
-    // Debug: confirmar que la función se está ejecutando
-    unsafe { serial_write_str("DEBUG: prepare_page_tables_only started\r\n"); }
+    unsafe { serial_write_str("DEBUG: prepare_page_tables_only started (Higher Half mode)\r\n"); }
 
-    // Reservar stack (64 KiB) por debajo de 1 GiB para que esté mapeada (identidad 0..1GiB)
+    // Reservar stack (64 KiB)
     let stack_pages: usize = 16;
-    let one_gib: u64 = 1u64 << 30;
-    let max_stack_addr: u64 = one_gib - 0x1000; // límite superior < 1GiB
     let stack_base = bs
-        .allocate_pages(AllocateType::MaxAddress(max_stack_addr), MemoryType::BOOT_SERVICES_DATA, stack_pages)
+        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, stack_pages)
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
-    // Configurar paginación identidad extendida (64 GiB, páginas de 2 MiB) para cubrir direcciones altas del kernel y VirtIO
-    // Allocate: 1 página para PML4, 2 para PDPT (para cubrir 512 GiB cada uno), 64 para PD (1 por GiB)
+    // Allocate page tables
+    // We need: 1 PML4, 1 PDPT for higher half physical map, 
+    // AND PDs for identity mapping. The bootloader is at ~5.3GB (0x140000000+).
+    // So we need to map at least 8GB to be safe. Let's do 16GB (16 PDs).
+    let num_pds = 16; // 16GB
+    
     let pml4_phys = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
 
-    // Necesitamos 2 PDPT para cubrir direcciones hasta ~1 TiB
-    let pdpt_phys = bs
+    // PDPT for higher half physical memory mapping (0xFFFF800000000000+)
+    let pdpt_phys_map = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
-    let pdpt_phys_high = bs
+        
+    // PDPT for low memory identity mapping
+    let pdpt_low = bs
         .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
 
-    // 64 PD para cubrir 64 GiB (incluyendo direcciones VirtIO altas)
-    let mut pd_phys_arr: [u64; 64] = [0; 64];
-    for gi_b in 0..64 {
-        pd_phys_arr[gi_b] = bs
+    // Use a vector/array for PDs. Since we don't have Vec easily, we'll allocate a contiguous block if possible
+    // or just an array of pointers.
+    // Let's allocate them individually to be safe.
+    let mut pd_phys_arr: [u64; 16] = [0; 16];
+    for i in 0..num_pds {
+        pd_phys_arr[i] = bs
             .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
     }
 
-        unsafe {
-        // Limpiar tablas
+    unsafe {
+        // Clear all tables
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pdpt_phys_high as *mut u8, 0, 4096);
-        for gi_b in 0..64 { core::ptr::write_bytes(pd_phys_arr[gi_b] as *mut u8, 0, 4096); }
+        core::ptr::write_bytes(pdpt_phys_map as *mut u8, 0, 4096);
+        core::ptr::write_bytes(pdpt_low as *mut u8, 0, 4096);
+        
+        for i in 0..num_pds {
+            core::ptr::write_bytes(pd_phys_arr[i] as *mut u8, 0, 4096);
+        }
 
         // Flags
         let p_w = 0x003u64; // Present | Write
-        let ps = 0x080u64; // Page Size (2 MiB) en PDE
+        let ps = 0x080u64;  // Page Size (2 MiB)
 
-        // PML4[0] -> PDPT
         let pml4 = pml4_phys as *mut u64;
-        *pml4.add(0) = (pdpt_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        let pdpt_map = pdpt_phys_map as *mut u64;
+        let pdpt_low_ptr = pdpt_low as *mut u64;
 
-        // PDPT[0..63] -> PDs (cada entrada mapea 1 GiB) - Primeros 64 GiB en el primer PDPT
-        let pdpt = pdpt_phys as *mut u64;
-        for gi_b in 0..64u64 {
-            *pdpt.add(gi_b as usize) = (pd_phys_arr[gi_b as usize] & 0x000F_FFFF_FFFF_F000u64) | p_w;
-            let pd = pd_phys_arr[gi_b as usize] as *mut u64;
-            for i in 0..512u64 {
-                // Identidad por defecto
-                let mut phys_base = gi_b * 0x4000_0000u64 + i * 0x20_0000u64;
-                // Alias fijo: VA [4GiB,5GiB) -> PA [0,1GiB)
-                if gi_b == 4 { phys_base = i * 0x20_0000u64; }
-                *pd.add(i as usize) = (phys_base & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+        // === HIGHER HALF PHYSICAL MEMORY MAP ===
+        // Map all physical RAM (0-16GB) to 0xFFFF800000000000+
+        *pml4.add(256) = (pdpt_phys_map & 0x000F_FFFF_FFFF_F000u64) | p_w;
+
+        // Link the PDs to the PDPT (each PD maps 1GB)
+        for i in 0..num_pds {
+            *pdpt_map.add(i) = (pd_phys_arr[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        }
+
+        // === IDENTITY MAPPING (0-16GB) ===
+        // PML4[0] -> PDPT for identity mapping
+        *pml4.add(0) = (pdpt_low & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        
+        // Link the same PDs to low memory PDPT for identity mapping
+        for i in 0..num_pds {
+            *pdpt_low_ptr.add(i) = (pd_phys_arr[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        }
+
+        // Fill each PD with 2MB pages mapping physical memory
+        // This populates both the higher half map AND the identity map since they share PDs
+        for pd_idx in 0..num_pds {
+            let pd = pd_phys_arr[pd_idx] as *mut u64;
+            for entry_idx in 0..512 {
+                // Physical address for this 2MB page
+                let phys_addr = (pd_idx as u64) * 0x40000000 + (entry_idx as u64) * 0x200000;
+                *pd.add(entry_idx) = (phys_addr & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
             }
         }
 
-        // El segundo PDPT no se usa ahora - todo está en el primero
-        serial_write_str("BL: DEBUG - Todo mapeado en primer PDPT (0-64 GiB)\r\n");
-        
-        // Debug específico para verificar mapeo de 32 GiB
-        let pdpt = pdpt_phys as *mut u64;
-        let entry_32 = unsafe { *pdpt.add(32) };
-        serial_write_str("BL: DEBUG - Verificando PDPT[32] (32 GiB)\r\n");
-        serial_write_hex64(entry_32);
-        serial_write_str("\r\n");
-        
-        if entry_32 != 0 {
-            let pd_addr = entry_32 & 0x000F_FFFF_FFFF_F000u64;
-            serial_write_str("BL: DEBUG - PD físico: ");
-            serial_write_hex64(pd_addr);
-            serial_write_str("\r\n");
-        } else {
-            serial_write_str("BL: ERROR - PDPT[32] está vacío!\r\n");
-        }
+        serial_write_str("BL: Higher half physical map: 0xFFFF800000000000 -> 0x0 (16GB)\r\n");
+        serial_write_str("BL: Identity mapping: 0x0 -> 0x0 (16GB) for bootloader\r\n");
 
-        // Conectar el segundo PDPT al PML4 en la entrada 1 (para direcciones >= 512 GiB)
-        *pml4.add(1) = (pdpt_phys_high & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        // === RECURSIVE PAGE TABLE MAPPING ===
+        // PML4[511] points to PML4 itself
+        *pml4.add(511) = (pml4_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
         
-        serial_write_str("BL: DEBUG - PML4[0] apunta a PDPT (0-64 GiB)\r\n");
-        serial_write_str("BL: DEBUG - VirtIO 0x800000000 (32 GiB) está en PDPT[32]\r\n");
+        serial_write_str("BL: Recursive mapping: PML4[511] -> PML4\r\n");
 
-        // Mapear framebuffer si es necesario (dirección típica 0x80000000+)
-        // Nota: framebuffer_info no está disponible aquí, se maneja después
-
-        // Nota: mantenemos mapeo identidad 0–64 GiB (incluyendo VirtIO en 0x800000000+)
-        serial_write_str("BL: DEBUG - Mapeo de identidad extendido configurado para 64 GiB\r\n");
-        serial_write_str("BL: DEBUG - VirtIO debería poder acceder a 0x800000000+\r\n");
+        // Debug output
+        serial_write_str("BL: Page tables configured:\r\n");
+        serial_write_str("  PML4[0]   -> Identity map (0-16GB)\r\n");
+        serial_write_str("  PML4[256] -> Higher half physical map (0xFFFF800000000000)\r\n");
+        serial_write_str("  PML4[511] -> Recursive (page table access)\r\n");
     }
 
     unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }
@@ -1367,8 +1382,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str(" entry_point_virt=0x");
                     serial_write_hex64(entry_point_virt);
                     serial_write_str(" kernel_phys_base=0x");
-                    serial_write_hex64(kernel_phys_base);
-                    serial_write_str(" total_len=0x");
                     serial_write_hex64(total_len);
                     serial_write_str("\r\n");
                 }
@@ -1377,14 +1390,16 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 // Mapear la dirección virtual del kernel (0x200000) a su dirección física real
                 map_kernel_virtual_to_physical(pml4_phys, 0x200000, kernel_phys_base, total_len);
                 
-                // Asignar direcamente el Virtual Entry Point para el salto
+                // BACK TO VIRTUAL ENTRY POINT
+                // We are switching page tables in the bootloader now, so we must jump to
+                // the VIRTUAL address which is mapped in the new page tables.
                 kernel_entry_phys = entry_point_virt;
                 kernel_base = kernel_phys_base;
                 kernel_size = total_len;
                 
                 // DEBUG INMEDIATO: verificar que se asignó correctamente
                 unsafe {
-                    serial_write_str("DEBUG: kernel_entry_phys ASIGNADO = 0x");
+                    serial_write_str("DEBUG: kernel_entry (VIRTUAL) = 0x");
                     serial_write_hex64(kernel_entry_phys);
                     serial_write_str("\r\n");
                 }
@@ -1565,7 +1580,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         unsafe {
             core::arch::asm!("mov {}, cr3", out(reg) cr3_current);
         }
-        serial_write_str("BL: CR3 actual: ");
+        serial_write_str("BL: CR3 actual (UEFI): ");
         serial_write_hex64(cr3_current);
         serial_write_str("\r\n");
         
@@ -1574,18 +1589,24 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         serial_write_hex64(kernel_entry_phys);
         serial_write_str("\r\n");
         serial_write_str("BL: Framebuffer info ptr: 0x");
-        serial_write_hex64(framebuffer_info_ptr);
+        serial_write_str("BL: PML4 address (for kernel): 0x");
+        serial_write_hex64(cr3_value);
         serial_write_str("\r\n");
         
         // Debug crítico: mostrar entry_reg exacto antes del salto
-        serial_write_str("BL: VALOR FINAL entry_phys antes del ASM: 0x");
+        serial_write_str("BL: Entry Virtual antes del salto: 0x");
         serial_write_hex64(kernel_entry_phys);
         serial_write_str("\r\n");
         
-        // Pasar el puntero a la estructura de framebuffer en rdi (primer argumento de la ABI x86_64)
-        // Usar la dirección física calculada del entry point del kernel
+        serial_write_str("BL: Loading new page tables (CR3)...\r\n");
+        
+        // Pasar parámetros al kernel:
+        // RDI = framebuffer_info_ptr (ARG1)
+        // RSI = kernel_base (ARG2)  
+        // RDX = pml4_phys (ARG3) - Kernel checks this
+        // RAX = entry point
         core::arch::asm!(
-            "mov cr3, {cr3}",           // Configurar paginación
+            "mov cr3, {cr3}",           // Configurar paginación - OK now with 16GB identity map
             "mov rsp, {rsp}",           // Configurar stack
             "sub rsp, 8",               // Alinear stack a 16 bytes
             
@@ -1595,6 +1616,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             rsp = in(reg) rsp_alineado,
             in("rdi") framebuffer_info_ptr, // ARG1
             in("rsi") kernel_base,          // ARG2
+            in("rdx") cr3_value,            // ARG3
             in("rax") kernel_entry_phys,    // Entry Point
         );
 

@@ -15,6 +15,9 @@ pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 pub const SYS_OPEN: u64 = 11;
 pub const SYS_CLOSE: u64 = 12;
 pub const SYS_GETPPID: u64 = 13;
+pub const SYS_PCI_ENUM_DEVICES: u64 = 17;
+pub const SYS_PCI_READ_CONFIG: u64 = 18;
+pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
 
 // File open flags
 pub const O_RDONLY: i32 = 0x0000;
@@ -206,5 +209,125 @@ pub fn receive(buffer: &mut [u8]) -> (usize, u32) {
         (result as usize, sender_pid as u32)
     } else {
         (0, 0)
+    }
+}
+
+/// PCI device information structure
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PciDeviceInfo {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub class_code: u8,
+    pub subclass: u8,
+    pub bar0: u32,
+}
+
+/// Enumerate PCI devices by class
+/// class_code: 0x04 for audio devices, 0xFF for all
+/// Returns number of devices found
+pub fn pci_enum_devices(class_code: u8, devices: &mut [PciDeviceInfo]) -> usize {
+    let buffer = devices.as_mut_ptr() as *mut u64;
+    let max_devices = devices.len();
+    
+    let count = unsafe {
+        syscall3(
+            SYS_PCI_ENUM_DEVICES,
+            class_code as u64,
+            buffer as u64,
+            max_devices as u64
+        )
+    };
+    
+    if count == u64::MAX {
+        return 0;
+    }
+    
+    // Parse the buffer into PciDeviceInfo structs
+    for i in 0..count as usize {
+        if i >= max_devices {
+            break;
+        }
+        
+        unsafe {
+            let offset = i * 8;
+            let buf_slice = core::slice::from_raw_parts(buffer, (count as usize) * 8);
+            
+            devices[i] = PciDeviceInfo {
+                bus: buf_slice[offset + 0] as u8,
+                device: buf_slice[offset + 1] as u8,
+                function: buf_slice[offset + 2] as u8,
+                vendor_id: buf_slice[offset + 3] as u16,
+                device_id: buf_slice[offset + 4] as u16,
+                class_code: buf_slice[offset + 5] as u8,
+                subclass: buf_slice[offset + 6] as u8,
+                bar0: buf_slice[offset + 7] as u32,
+            };
+        }
+    }
+    
+    count as usize
+}
+
+/// Read PCI configuration space (32-bit)
+pub fn pci_read_config_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    let device_location = ((bus as u64) << 16) | ((device as u64) << 8) | (function as u64);
+    
+    let result = unsafe {
+        syscall3(
+            SYS_PCI_READ_CONFIG,
+            device_location,
+            offset as u64,
+            4  // 4 bytes
+        )
+    };
+    
+    if result == u64::MAX {
+        0
+    } else {
+        result as u32
+    }
+}
+
+/// Read PCI configuration space (16-bit)
+pub fn pci_read_config_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
+    let device_location = ((bus as u64) << 16) | ((device as u64) << 8) | (function as u64);
+    
+    let result = unsafe {
+        syscall3(
+            SYS_PCI_READ_CONFIG,
+            device_location,
+            offset as u64,
+            2  // 2 bytes
+        )
+    };
+    
+    if result == u64::MAX {
+        0
+    } else {
+        result as u16
+    }
+}
+
+/// Read PCI configuration space (8-bit)
+pub fn pci_read_config_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
+    let device_location = ((bus as u64) << 16) | ((device as u64) << 8) | (function as u64);
+    
+    let result = unsafe {
+        syscall3(
+            SYS_PCI_READ_CONFIG,
+            device_location,
+            offset as u64,
+            1  // 1 byte
+        )
+    };
+    
+    if result == u64::MAX {
+        0
+    } else {
+        result as u8
     }
 }

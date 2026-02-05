@@ -69,14 +69,25 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 }
 
 /// Punto de entrada del kernel, llamado desde el bootloader UEFI
+/// 
+/// Parámetros (x86_64 calling convention):
+/// - RDI: framebuffer_info_ptr - Pointer to framebuffer information
+/// - RSI: kernel_phys_base - Physical base address where kernel is loaded
+/// - RDX: pml4_phys - Physical address of Higher Half page tables
 #[no_mangle]
 #[link_section = ".init"]
-pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! {
+pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64, pml4_phys: u64) -> ! {
     // Inicializar serial para debugging
     serial::init();
     serial::serial_print("DEBUG: Entered _start\n");
+    serial::serial_print("Framebuffer: ");
+    serial::serial_print_hex(framebuffer_info_ptr);
+    serial::serial_print("\n");
     serial::serial_print("Phys Base: ");
     serial::serial_print_hex(kernel_phys_base);
+    serial::serial_print("\n");
+    serial::serial_print("PML4 (Higher Half): ");
+    serial::serial_print_hex(pml4_phys);
     serial::serial_print("\n");
     
     serial::serial_print("Eclipse Microkernel v0.1.0 starting...\n");
@@ -89,8 +100,20 @@ pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64) -> ! 
     serial::serial_print("Enabling SSE...\n");
     boot::enable_sse();
 
-    // Configurar paginación
-    serial::serial_print("Enabling paging...\n");
+    // CRITICAL: Load Higher Half page tables BEFORE doing anything else
+    // This switches from UEFI identity mapping to our Higher Half mapping
+    serial::serial_print("Loading Higher Half page tables (CR3)...\n");
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) pml4_phys,
+            options(nostack, preserves_flags)
+        );
+    }
+    serial::serial_print("✓ Higher Half page tables loaded\n");
+
+    // Configurar paginación (now just verifies the Higher Half setup)
+    serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
     
     // Inicializar IDT e interrupciones

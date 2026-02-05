@@ -320,28 +320,34 @@ impl Virtqueue {
         
         for (i, &(addr, len, flags)) in buffers.iter().enumerate() {
             let desc = &mut *self.descriptors.add(desc_idx as usize);
-            desc.addr = addr;
-            desc.len = len;
-            desc.flags = flags;
+            // Use volatile writes for descriptors as device reads them
+            write_volatile(&mut desc.addr, addr);
+            write_volatile(&mut desc.len, len);
+            write_volatile(&mut desc.flags, flags);
             
             if i + 1 < buffers.len() {
                 let next = self.alloc_desc()?;
-                desc.flags |= VIRTQ_DESC_F_NEXT;
-                desc.next = next;
+                write_volatile(&mut desc.flags, flags | VIRTQ_DESC_F_NEXT);
+                write_volatile(&mut desc.next, next);
                 desc_idx = next;
+            } else {
+                write_volatile(&mut desc.next, 0);
             }
         }
         
         // Add to available ring
         let avail = &mut *self.avail;
-        let idx = avail.idx as usize % self.queue_size as usize;
-        avail.ring[idx] = head;
+        let idx = read_volatile(&avail.idx) as usize % self.queue_size as usize;
+        write_volatile(&mut avail.ring[idx], head);
         
         // Update index - this tells the device there's work to do
-        avail.idx = avail.idx.wrapping_add(1);
+        // IMPORTANT: Must perform wrapping add on the u16 index
+        let new_idx = read_volatile(&avail.idx).wrapping_add(1);
         
-        // Memory barrier to ensure all writes (ring and idx) are visible before notification
+        // Memory barrier to ensure all descriptor writes are visible before idx update
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        
+        write_volatile(&mut avail.idx, new_idx);
         
         Some(head)
     }
@@ -351,22 +357,30 @@ impl Virtqueue {
         // Memory barrier to ensure we see device updates
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = &*self.used;
-        self.last_used_idx != used.idx
+        // MUST use volatile read as device updates this asynchronously
+        let idx = read_volatile(&used.idx);
+        self.last_used_idx != idx
     }
     
     /// Get next used buffer
     unsafe fn get_used(&mut self) -> Option<(u16, u32)> {
-        if !self.has_used() {
+        // We can just call has_used() to check, but efficiency matters
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let used = &*self.used;
+        let current_idx = read_volatile(&used.idx);
+        
+        if self.last_used_idx == current_idx {
             return None;
         }
         
-        let used = &*self.used;
         let idx = self.last_used_idx as usize % self.queue_size as usize;
-        let elem = used.ring[idx];
+        // Volatile read of ring element
+        let elem_id = read_volatile(&used.ring[idx].id);
+        let elem_len = read_volatile(&used.ring[idx].len);
         
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         
-        Some((elem.id as u16, elem.len))
+        Some((elem_id as u16, elem_len))
     }
 }
 
@@ -660,6 +674,9 @@ impl VirtIOBlockDevice {
                     "Failed to allocate status buffer"
                 })?;
             
+            // Initialize status to 0x55 to detect if device touches it
+            *status_ptr = 0x55;
+            
             let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
             
             // Build request header
@@ -699,25 +716,24 @@ impl VirtIOBlockDevice {
             // Increase timeout significantly for QEMU emulation (approx 100M cycles)
             let mut timeout = 100000000;
             
-            // crate::serial::serial_print("[VirtIO] Waiting for device... ");
-            
             while !queue.has_used() && timeout > 0 {
                 timeout -= 1;
                 core::hint::spin_loop();
-                
-                if timeout % 10000000 == 0 {
-                    // crate::serial::serial_print(".");
-                }
             }
-            // crate::serial::serial_print("\n");
             
             if timeout == 0 {
                 crate::serial::serial_print("[VirtIO] read_block failed: Device timeout (block ");
                 crate::serial::serial_print_dec(block_num);
                 crate::serial::serial_print(") - Queue params: used_idx=");
-                crate::serial::serial_print_dec(unsafe { (*queue.used).idx as u64 });
+                crate::serial::serial_print_dec(unsafe { read_volatile(&(*queue.used).idx) as u64 });
                 crate::serial::serial_print(", last_used=");
                 crate::serial::serial_print_dec(queue.last_used_idx as u64);
+                crate::serial::serial_print("\n");
+                
+                // Debug: Check if status byte changed
+                let end_status = *status_ptr;
+                crate::serial::serial_print("[VirtIO] Debug: Status byte = 0x");
+                crate::serial::serial_print_hex(end_status as u64);
                 crate::serial::serial_print("\n");
                 
                 // Cleanup
@@ -737,8 +753,8 @@ impl VirtIOBlockDevice {
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 
                 if status != VIRTIO_BLK_S_OK {
-                    crate::serial::serial_print("[VirtIO] read_block failed: Bad status ");
-                    crate::serial::serial_print_dec(status as u64);
+                    crate::serial::serial_print("[VirtIO] read_block failed: Bad status 0x");
+                    crate::serial::serial_print_hex(status as u64);
                     crate::serial::serial_print("\n");
                     return Err("VirtIO read failed");
                 }
