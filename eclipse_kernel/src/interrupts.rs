@@ -122,6 +122,9 @@ pub fn init() {
     // Inicializar PIC
     init_pic();
     
+    // Inicializar PIT para generar timer interrupts
+    init_pit();
+    
     // Habilitar interrupciones
     unsafe {
         asm!("sti", options(nomem, nostack));
@@ -152,6 +155,26 @@ fn init_pic() {
         outb(0x21, 0xFC); // Mask: 11111100 (solo IRQ0 y IRQ1)
         outb(0xA1, 0xFF); // Mask todo el slave
     }
+}
+
+/// Inicializar PIT (Programmable Interval Timer)
+/// Configura el timer para generar interrupciones a ~100Hz
+fn init_pit() {
+    const PIT_FREQUENCY: u32 = 1193182; // Frecuencia base del PIT en Hz
+    const TARGET_FREQUENCY: u32 = 100;   // Interrupciones por segundo (100Hz)
+    
+    let divisor = PIT_FREQUENCY / TARGET_FREQUENCY;
+    
+    unsafe {
+        // Comando: Channel 0, lobyte/hibyte, rate generator
+        outb(0x43, 0x36);
+        
+        // Enviar divisor (low byte, high byte)
+        outb(0x40, (divisor & 0xFF) as u8);
+        outb(0x40, ((divisor >> 8) & 0xFF) as u8);
+    }
+    
+    crate::serial::serial_print("[INT] PIT initialized at ~100Hz\n");
 }
 
 /// Enviar End Of Interrupt al PIC

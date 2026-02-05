@@ -247,7 +247,11 @@ pub fn kernel_main(framebuffer_info_ptr: u64) -> ! {
         }
     }
     
-    serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
+    serial::serial_print("\n[KERNEL] System initialization complete!\n");
+    serial::serial_print("[KERNEL] Starting scheduler to run init process...\n\n");
+    
+    // Perform initial scheduling to start running the init process
+    scheduler::schedule();
     
     loop {
         // Main loop del microkernel
