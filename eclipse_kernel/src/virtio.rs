@@ -736,6 +736,8 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print("\n");
             
             // Memory barrier before notifying device to ensure all writes are visible
+            // Use compiler fence to prevent reordering, and also ensure caches are flushed
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Notify device
@@ -753,6 +755,7 @@ impl VirtIOBlockDevice {
                 
                 // Add memory fence after notification
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
                 
                 // Small delay to let device process notification
                 for _ in 0..1000 {
