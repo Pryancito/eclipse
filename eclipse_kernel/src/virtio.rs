@@ -679,16 +679,35 @@ impl VirtIOBlockDevice {
                 "Failed to allocate request buffer"
             })?;
             
+            crate::serial::serial_print("[VirtIO] Request buffer: virt=");
+            crate::serial::serial_print_hex(req_ptr as u64);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(req_phys);
+            crate::serial::serial_print("\n");
+            
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
                 .ok_or_else(|| {
                     crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate status buffer\n");
                     "Failed to allocate status buffer"
                 })?;
             
+            crate::serial::serial_print("[VirtIO] Status buffer: virt=");
+            crate::serial::serial_print_hex(status_ptr as u64);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(status_phys);
+            crate::serial::serial_print("\n");
+            
             // Initialize status to 0x55 to detect if device touches it
             *status_ptr = 0x55;
             
-            let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
+            let buffer_virt = buffer.as_ptr() as u64;
+            let buffer_phys = crate::memory::virt_to_phys(buffer_virt);
+            
+            crate::serial::serial_print("[VirtIO] Data buffer: virt=");
+            crate::serial::serial_print_hex(buffer_virt);
+            crate::serial::serial_print(" phys=");
+            crate::serial::serial_print_hex(buffer_phys);
+            crate::serial::serial_print("\n");
             
             // Build request header
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
