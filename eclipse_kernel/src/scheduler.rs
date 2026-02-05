@@ -2,6 +2,10 @@
 
 use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process};
 use spin::Mutex;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Flag to indicate if the scheduler is enabled
+static SCHEDULER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Cola de procesos ready
 const READY_QUEUE_SIZE: usize = 64;
@@ -63,6 +67,11 @@ pub fn tick() {
 
 /// Función principal de scheduling
 pub fn schedule() {
+    // Don't schedule if scheduler is not enabled yet
+    if !SCHEDULER_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    
     // Obtener proceso actual
     let current_pid = current_process_id();
     
@@ -180,6 +189,8 @@ fn perform_initial_context_switch(to_pid: ProcessId) -> ! {
     stats.context_switches += 1;
     drop(stats);
     
+    crate::serial::serial_print("[SCHEDULER] Getting process context...\n");
+    
     // Get process context and setup
     let (to_ctx_ptr, to_kernel_stack, to_page_table) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -190,16 +201,25 @@ fn perform_initial_context_switch(to_pid: ProcessId) -> ! {
         (to_ptr, kstack, pt)
     };
     
+    crate::serial::serial_print("[SCHEDULER] Context obtained, updating TSS...\n");
+    
     // Update TSS RSP0 for the next process
     crate::boot::set_tss_stack(to_kernel_stack);
     
-    // Switch address space
-    unsafe {
-        let current_cr3 = crate::memory::get_cr3();
-        if to_page_table != 0 && to_page_table != current_cr3 {
-            core::arch::asm!("mov cr3, {}", in(reg) to_page_table);
+    crate::serial::serial_print("[SCHEDULER] TSS updated, NOT switching address space (will switch in userspace trampoline)...\n");
+    
+    // DON'T switch address space here! The kernel code we're running is only mapped
+    // in the kernel page table. Switching now would cause a page fault.
+    // The address space switch will happen in jump_to_userspace via iretq.
+    // Just verify the page table is valid
+    if to_page_table == 0 {
+        crate::serial::serial_print("[SCHEDULER] ERROR: Process has no page table!\n");
+        loop {
+            unsafe { core::arch::asm!("hlt") };
         }
     }
+    
+    crate::serial::serial_print("[SCHEDULER] Address space switched, calling switch_context...\n");
     
     // Load the context and jump to the process
     // We use switch_context but with a dummy source context
@@ -219,6 +239,7 @@ fn perform_initial_context_switch(to_pid: ProcessId) -> ! {
     }
     
     // This should never be reached since switch_context jumps to the target process
+    crate::serial::serial_print("[SCHEDULER] ERROR: Returned from switch_context!\n");
     loop {
         unsafe { core::arch::asm!("hlt") };
     }
@@ -247,4 +268,17 @@ pub fn get_stats() -> SchedulerStats {
 /// Inicializar scheduler
 pub fn init() {
     crate::serial::serial_print("Scheduler initialized\n");
+}
+
+/// Enable the scheduler - allows schedule() to perform context switches
+pub fn enable() {
+    SCHEDULER_ENABLED.store(true, Ordering::SeqCst);
+    crate::serial::serial_print("[SCHEDULER] Enabled\n");
+}
+
+/// Disable the scheduler - schedule() will return immediately
+#[allow(dead_code)]
+pub fn disable() {
+    SCHEDULER_ENABLED.store(false, Ordering::SeqCst);
+    crate::serial::serial_print("[SCHEDULER] Disabled\n");
 }

@@ -250,6 +250,9 @@ pub fn kernel_main(framebuffer_info_ptr: u64) -> ! {
     serial::serial_print("\n[KERNEL] System initialization complete!\n");
     serial::serial_print("[KERNEL] Starting scheduler to run init process...\n\n");
     
+    // Enable scheduler now that initialization is complete
+    scheduler::enable();
+    
     // Perform initial scheduling to start running the init process
     scheduler::schedule();
     

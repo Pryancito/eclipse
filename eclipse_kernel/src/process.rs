@@ -159,7 +159,9 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
             process.stack_size = stack_size;
             process.priority = 5; // Prioridad media por defecto
             process.time_slice = 10; // 10 ticks
-            process.page_table_phys = crate::memory::create_process_paging();
+            // TEMPORARY: Use kernel page table for testing
+            // process.page_table_phys = crate::memory::create_process_paging();
+            process.page_table_phys = crate::memory::get_cr3();  // Use kernel page table
             
             // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
             let kernel_stack_top_aligned = kernel_stack_top & !0xF;
@@ -243,6 +245,12 @@ pub fn update_process(pid: ProcessId, process: Process) {
 /// # Safety
 /// Esta función es unsafe porque manipula directamente registros de CPU
 pub unsafe fn switch_context(from: &mut Context, to: &Context) {
+    crate::serial::serial_print("[SWITCH_CONTEXT] from RIP: ");
+    crate::serial::serial_print_hex(from.rip);
+    crate::serial::serial_print(" to RIP: ");
+    crate::serial::serial_print_hex(to.rip);
+    crate::serial::serial_print("\n");
+    
     asm!(
         // Guardar contexto actual (usando rdi = from)
         "mov [rdi + 0x00], rax",

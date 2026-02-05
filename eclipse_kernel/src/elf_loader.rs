@@ -314,12 +314,38 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
 /// It MUST be called with a valid userspace entry point and stack top.
 pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
     // FORCE PRINT to ensure we reached this point
-    serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
-    serial::serial_print("  Entry: ");
-    serial::serial_print_hex(entry_point);
-    serial::serial_print("\n  Stack: ");
-    serial::serial_print_hex(stack_top);
-    serial::serial_print("\n");
+    crate::serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
+    crate::serial::serial_print("  Entry: ");
+    crate::serial::serial_print_hex(entry_point);
+    crate::serial::serial_print("\n  Stack: ");
+    crate::serial::serial_print_hex(stack_top);
+    crate::serial::serial_print("\n");
+    
+    // Get the process page table and switch to it before iretq
+    let current_pid = crate::process::current_process_id().expect("No current process!");
+    let process_page_table = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        let process = table[current_pid as usize].as_ref().expect("Process not found");
+        process.page_table_phys
+    };
+    
+    crate::serial::serial_print("  Switching to process page table: ");
+    crate::serial::serial_print_hex(process_page_table);
+    crate::serial::serial_print("\n");
+    
+    // Switch to process page table
+    core::arch::asm!("mov cr3, {}", in(reg) process_page_table);
+    
+    // Flush TLB to ensure all mappings are visible
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+        );
+    }
+    
+    crate::serial::serial_print("  Page table switched and TLB flushed, executing iretq...\n");
     
     // Selectors from boot.rs:
     // USER_CODE_SELECTOR: u16 = 0x18 | 3;
