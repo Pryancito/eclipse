@@ -84,6 +84,10 @@ const VIRTIO_PCI_ISR_STATUS: u16 = 0x13;       // 8-bit r/o
 /// before we attempt first I/O operation.
 const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
 
+/// Delay cycles after notifying device
+/// Gives device time to process notification before we start polling
+const DEVICE_NOTIFY_DELAY_CYCLES: u32 = 1000;
+
 /// VirtIO MMIO register offsets
 #[repr(C)]
 struct VirtIOMMIORegs {
@@ -736,8 +740,6 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print("\n");
             
             // Memory barrier before notifying device to ensure all writes are visible
-            // Use compiler fence to prevent reordering, and also ensure caches are flushed
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Notify device
@@ -747,18 +749,18 @@ impl VirtIOBlockDevice {
                 crate::serial::serial_print_hex(self.io_base as u64 + VIRTIO_PCI_QUEUE_NOTIFY as u64);
                 crate::serial::serial_print("\n");
                 
-                // Select queue 0 before notifying (ensure device knows which queue)
-                outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+                // Select queue 0 before notifying (VirtIO block uses single queue)
+                const VIRTIO_QUEUE_INDEX: u16 = 0;
+                outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, VIRTIO_QUEUE_INDEX);
                 
                 // Write to QUEUE_NOTIFY register
-                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
                 
-                // Add memory fence after notification
+                // Memory barrier after notification to ensure device sees the write
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
                 
                 // Small delay to let device process notification
-                for _ in 0..1000 {
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
                     core::hint::spin_loop();
                 }
                 
