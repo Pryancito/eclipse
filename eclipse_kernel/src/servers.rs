@@ -48,9 +48,11 @@ pub fn init_servers() {
         serial::serial_print_dec(fs_id as u64);
         serial::serial_print("\n");
         
+        /*
         if let Some(_pid) = create_process(filesystem_server as *const () as u64, 0x500000, 0x10000) {
             serial::serial_print("FileSystem server process created\n");
         }
+        */
     }
     
     // Registrar servidor de Graphics
@@ -62,9 +64,11 @@ pub fn init_servers() {
         serial::serial_print_dec(gfx_id as u64);
         serial::serial_print("\n");
         
+        /*
         if let Some(_pid) = create_process(graphics_server as *const () as u64, 0x600000, 0x10000) {
             serial::serial_print("Graphics server process created\n");
         }
+        */
     }
     
     // Registrar servidor de Network

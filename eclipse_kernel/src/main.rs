@@ -11,7 +11,6 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
-use alloc::boxed::Box;
 use x86_64;
 
 // Módulos del microkernel
@@ -36,6 +35,7 @@ mod fd;  // File descriptor management
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct FramebufferInfo {
     pub base_address: u64,
     pub width: u32,
@@ -45,18 +45,44 @@ pub struct FramebufferInfo {
     pub red_mask: u32,
     pub green_mask: u32,
     pub blue_mask: u32,
+    pub reserved_mask: u32,
 }
+
+/// Información completa de arranque pasada por el bootloader
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootInfo {
+    pub framebuffer: FramebufferInfo,
+    pub pml4_addr: u64,
+    pub kernel_phys_base: u64,
+}
+
+/// Persistent storage for boot info once we move to Higher Half
+static mut PERSISTENT_BOOT_INFO: Option<BootInfo> = None;
+
+/// Stack de arranque (16KB)
+/// Used to ensure we run on a Higher Half stack immediately after boot
+#[repr(align(16))]
+// 64KB stack for kernel bootstrap
+#[repr(align(16))]
+struct BootStack {
+    stack: [u8; 65536],
+}
+
+static mut BOOT_STACK: BootStack = BootStack { stack: [0; 65536] };
 
 /// Panic handler del kernel
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial::serial_print("KERNEL PANIC: ");
+    serial::serial_print("at ");
     if let Some(location) = info.location() {
-        serial::serial_print("at ");
         serial::serial_print(location.file());
         serial::serial_print(":");
-        // Note: Can't easily print numbers without format! macro
+        serial::serial_print_dec(location.line() as u64);
     }
+    serial::serial_print("\n  Message: ");
+    let mut writer = crate::serial::SerialWriter;
+    let _ = core::fmt::write(&mut writer, format_args!("{}", info.message()));
     serial::serial_print("\n");
     loop {
         unsafe { core::arch::asm!("hlt") };
@@ -71,133 +97,108 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 /// Punto de entrada del kernel, llamado desde el bootloader UEFI
 /// 
 /// Parámetros (x86_64 calling convention):
-/// - RDI: framebuffer_info_ptr - Pointer to framebuffer information
-/// - RSI: kernel_phys_base - Physical base address where kernel is loaded
-/// - RDX: pml4_phys - Physical address of Higher Half page tables
+/// - RDI: boot_info_ptr - Pointer to BootInfo structure
 #[no_mangle]
 #[link_section = ".init"]
-pub extern "C" fn _start(framebuffer_info_ptr: u64, kernel_phys_base: u64, pml4_phys: u64) -> ! {
-    // Inicializar serial para debugging
+pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
+    // Initialize serial for debugging using early (bootloader provided) stack
     serial::init();
-    serial::serial_print("DEBUG: Entered _start\n");
-    serial::serial_print("Framebuffer: ");
-    serial::serial_print_hex(framebuffer_info_ptr);
-    serial::serial_print("\n");
-    serial::serial_print("Phys Base: ");
-    serial::serial_print_hex(kernel_phys_base);
-    serial::serial_print("\n");
-    serial::serial_print("PML4 (Higher Half): ");
-    serial::serial_print_hex(pml4_phys);
-    serial::serial_print("\n");
+    serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
     
-    serial::serial_print("Eclipse Microkernel v0.1.0 starting...\n");
-    
-    // Cargar GDT
-    serial::serial_print("Loading GDT...\n");
-    boot::load_gdt();
-    
-    // Habilitar SSE
-    serial::serial_print("Enabling SSE...\n");
-    boot::enable_sse();
+    if boot_info_ptr == 0 {
+        panic!("BootInfo pointer is null!");
+    }
 
-    // CRITICAL: Load Higher Half page tables BEFORE doing anything else
-    // This switches from UEFI identity mapping to our Higher Half mapping
-    serial::serial_print("Loading Higher Half page tables (CR3)...\n");
+    // Switch to Higher Half Boot Stack immediately to allow removing identity mapping later
+    // Ensure stack top is 16-byte aligned
+    let stack_top = (unsafe { &raw mut BOOT_STACK.stack } as u64) + 65536;
+    let stack_top_aligned = stack_top & !0xF;
+
     unsafe {
         core::arch::asm!(
-            "mov cr3, {}",
-            in(reg) pml4_phys,
-            options(nostack, preserves_flags)
+            "mov rsp, {0}",
+            "mov rbp, 0",
+            "jmp {1}",
+            in(reg) stack_top_aligned,
+            in(reg) kernel_bootstrap as u64,
+            in("rdi") boot_info_ptr, // Pass the original boot_info_ptr to kernel_bootstrap
+            options(noreturn)
         );
     }
-    serial::serial_print("✓ Higher Half page tables loaded\n");
+}
 
-    // Configurar paginación (now just verifies the Higher Half setup)
+/// Entry point in Higher Half with clean stack
+extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
+    // Stage 1: Copy BootInfo to Higher Half static before identity map is gone
+    let boot_info_raw = unsafe { &*(boot_info_ptr as *const BootInfo) };
+    unsafe { PERSISTENT_BOOT_INFO = Some(*boot_info_raw); }
+    let boot_info = unsafe { PERSISTENT_BOOT_INFO.as_ref().unwrap() };
+    
+    let pml4_phys = boot_info.pml4_addr;
+    let kernel_phys_base = boot_info.kernel_phys_base;
+
+    serial::serial_print("Switched to Higher Half Stack successfully\n");
+    serial::serial_print("BootInfo persistent storage initialized at: ");
+    serial::serial_print_hex(unsafe { &raw const PERSISTENT_BOOT_INFO } as u64);
+    serial::serial_print("\n");
+
+    // Stage 2: Basic hardware initialization
+    boot::load_gdt();
+    boot::enable_sse();
+
+    // Stage 3: Strict User/Kernel Separation
+    // Remove the 16GB identity mapping provided by the bootloader.
+    // After this, only Higher Half (Kernel) and explicitly mapped User locations are valid.
+    memory::remove_identity_mapping();
+    serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
+
+    // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
     
-    // Inicializar IDT e interrupciones
-    serial::serial_print("Initializing IDT and interrupts...\n");
     interrupts::init();
-
-    // TEST IDT
+    
     serial::serial_print("Testing IDT with breakpoint...\n");
     x86_64::instructions::interrupts::int3();
     serial::serial_print("IDT test passed\n");
     
-    // Inicializar memoria (Allocator)
     serial::serial_print("Initializing memory system...\n");
     memory::init();
     
-    // Test heap allocation early to verify allocator
     serial::serial_print("Testing early heap allocation...\n");
     let test_vec = vec![0u8; 128];
     serial::serial_print("Early heap allocation successful, ptr: ");
     serial::serial_print_hex(test_vec.as_ptr() as u64);
     serial::serial_print("\n");
-    core::mem::drop(test_vec); // Free it
+    core::mem::drop(test_vec);
      
-    
-    // Inicializar sistema IPC
-    serial::serial_print("Initializing IPC system...\n");
     ipc::init();
-    
-    // Inicializar proceso kernel (PID 0)
-    serial::serial_print("Initializing kernel process (PID 0)...\n");
     process::init_kernel_process();
-    
-    // Inicializar scheduler
-    serial::serial_print("Initializing scheduler...\n");
     scheduler::init();
-    
-    // Inicializar syscalls
-    serial::serial_print("Initializing syscalls...\n");
     syscalls::init();
-    
-    // Initialize file descriptor system
-    serial::serial_print("Initializing file descriptor system...\n");
     fd::init();
-    
-    // Inicializar servidores del sistema
-    serial::serial_print("Initializing system servers...\n");
-    servers::init_servers();
-    
-    // Inicializar subsistema PCI
-    serial::serial_print("Initializing PCI subsystem...\n");
-    pci::init();
-    
-    // Inicializar subsistema NVIDIA GPU
-    serial::serial_print("Initializing NVIDIA GPU subsystem...\n");
-    nvidia::init();
-    
-    // Inicializar driver VirtIO (preferred for QEMU)
-    serial::serial_print("Initializing VirtIO driver...\n");
-    virtio::init();
-    
-    // Inicializar driver ATA (fallback for real hardware)
-    serial::serial_print("Initializing ATA driver...\n");
-    ata::init();
-    
-    // Inicializar filesystem
-    serial::serial_print("Initializing filesystem subsystem...\n");
-    filesystem::init();
+    // servers::init_servers();
+    // pci::init();
+    // nvidia::init();
+    // virtio::init();
+    // ata::init();
+    // filesystem::init();
     
     serial::serial_print("Microkernel initialized successfully!\n");
     
-    // Llamar a kernel_main
-    kernel_main(framebuffer_info_ptr);
+    // Final Stage: Jump to main loop
+    kernel_main(&boot_info.framebuffer);
 }
 
 /// Init process binary embedded in kernel
-/// This will be loaded instead of the test process
 pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
 
 /// Función principal del kernel
-pub fn kernel_main(framebuffer_info_ptr: u64) -> ! {
+pub fn kernel_main(framebuffer_info: &FramebufferInfo) -> ! {
     // Store framebuffer info for graphics server
-    boot::set_framebuffer_info(framebuffer_info_ptr);
+    let fb_ptr = framebuffer_info as *const _ as u64;
+    boot::set_framebuffer_info(fb_ptr);
     
-    serial::serial_print("===== FORK FIX VERSION - TESTING =====\n");
     serial::serial_print("Entering kernel main loop...\n");
     
     // Intentar montar el sistema de archivos
@@ -207,54 +208,35 @@ pub fn kernel_main(framebuffer_info_ptr: u64) -> ! {
     match filesystem::mount_root() {
         Ok(_) => {
             serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
-            
-            // TEMPORARY: Skip loading from disk to test embedded init with fork() fix
-            // The eclipse-systemd on disk crashes immediately (exit code 10)
-            // For now, test with the simpler embedded init
             serial::serial_print("[KERNEL] Skipping disk systemd (crashes), using embedded init...\n");
-            // Don't load from disk - use embedded binary
-            // init_loaded stays false
         }
-
         Err(e) => {
             serial::serial_print("[KERNEL] Failed to mount filesystem: ");
             serial::serial_print(e);
             serial::serial_print("\n");
-            serial::serial_print("[KERNEL] Falling back to embedded init...\n");
         }
     }
     
-    // If init was not loaded from /sbin/init, load embedded binary
+    // Load embedded init
     if !init_loaded {
         serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
-        serial::serial_print("[KERNEL] Init binary size: ");
-        serial::serial_print_dec(INIT_BINARY.len() as u64);
-        serial::serial_print(" bytes\n");
-        
-        // Use the ELF loader to load the init binary
         if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
             serial::serial_print("[KERNEL] Init process loaded with PID: ");
             serial::serial_print_dec(pid as u64);
             serial::serial_print("\n");
-            
-            // Add to scheduler queue
             scheduler::enqueue_process(pid);
-            
             serial::serial_print("[KERNEL] Init process scheduled for execution\n");
-        } else {
-            serial::serial_print("[KERNEL] ERROR: Failed to load init process!\n");
-            serial::serial_print("[KERNEL] System cannot continue without init\n");
         }
     }
     
     serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
     
     loop {
-        // Main loop del microkernel
-        // Procesar mensajes IPC
         ipc::process_messages();
-        
-        // Yield CPU
-        unsafe { core::arch::asm!("hlt") };
+        crate::scheduler::tick();
+        crate::scheduler::schedule();
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
     }
 }

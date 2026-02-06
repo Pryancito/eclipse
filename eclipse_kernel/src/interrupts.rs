@@ -119,8 +119,14 @@ pub fn init() {
         );
     }
     
+    // Deshabilitar APIC (para volver a modo Legacy PIC)
+    disable_apic();
+
     // Inicializar PIC
     init_pic();
+    
+    // Inicializar PIT (Timer)
+    init_pit();
     
     // Habilitar interrupciones
     unsafe {
@@ -152,6 +158,30 @@ fn init_pic() {
         outb(0x21, 0xFC); // Mask: 11111100 (solo IRQ0 y IRQ1)
         outb(0xA1, 0xFF); // Mask todo el slave
     }
+}
+
+/// Inicializar PIT 8253/8254
+/// Configura el timer para disparar a ~1000Hz
+fn init_pit() {
+    // Frecuencia base del PIT: 1.193182 MHz
+    // Divisor = 1193182 / Frecuencia deseada
+    // Para 1000Hz: 1193182 / 1000 = 1193
+    let divisor: u16 = 1193;
+    
+    unsafe {
+        // Puerto 0x43: Command Register
+        // 00 (Channel 0) | 11 (Access mode: lo/hi byte) | 011 (Mode 3: Square Wave) | 0 (Binary)
+        // 0x36 = 00110110
+        outb(0x43, 0x36);
+        
+        // Puerto 0x40: Channel 0 Data
+        // Escribir byte bajo
+        outb(0x40, (divisor & 0xFF) as u8);
+        // Escribir byte alto
+        outb(0x40, ((divisor >> 8) & 0xFF) as u8);
+    }
+    
+    crate::serial::serial_print("[INT] PIT Initialized (1000Hz)\n");
 }
 
 /// Enviar End Of Interrupt al PIC
@@ -204,6 +234,11 @@ extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
     crate::serial::serial_print_hex(error_code);
     crate::serial::serial_print(" RIP: ");
     crate::serial::serial_print_hex(rip);
+    
+    let cr3: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+    crate::serial::serial_print(" Active CR3: ");
+    crate::serial::serial_print_hex(cr3);
     crate::serial::serial_print("\n");
     
     // Halt to avoid loop
@@ -616,4 +651,27 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         // ¡Salto a Userspace!
         "iretq",
     );
+}
+
+/// Deshabilitar APIC local vía MSR
+/// Esto es necesario si UEFI dejó el APIC habilitado, para forzar el uso del PIC legado
+fn disable_apic() {
+    unsafe {
+        use core::arch::asm;
+        let msr = 0x1B; // IA32_APIC_BASE
+        let low: u32;
+        let high: u32;
+
+        // Leer MSR actual
+        asm!("rdmsr", out("eax") low, out("edx") high, in("ecx") msr);
+
+        // Si el bit 11 (Enable) está activo, desactivarlo
+        if (low & (1 << 11)) != 0 {
+            let new_low = low & !(1 << 11);
+            asm!("wrmsr", in("ecx") msr, in("eax") new_low, in("edx") high);
+            crate::serial::serial_print("[INT] APIC disabled via MSR (Forced Legacy PIC)\n");
+        } else {
+             crate::serial::serial_print("[INT] APIC was already disabled\n");
+        }
+    }
 }

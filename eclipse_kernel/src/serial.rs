@@ -127,7 +127,17 @@ pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
     count
 }
 
-/// Escribir un byte al puerto serial
+/// Escribir un byte al puerto serial (versión pública)
+pub fn serial_print_byte(byte: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if !*SERIAL_INITIALIZED.lock() {
+            return;
+        }
+        write_byte(byte);
+    });
+}
+
+/// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
     // Esperar a que el buffer de transmisión esté vacío
     while !is_transmit_empty() {
@@ -150,6 +160,16 @@ pub fn serial_print(s: &str) {
             write_byte(byte);
         }
     });
+}
+
+/// Writer struct for formatted output support
+pub struct SerialWriter;
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        serial_print(s);
+        Ok(())
+    }
 }
 
 /// Escribir un número en hexadecimal

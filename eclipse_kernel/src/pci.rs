@@ -302,6 +302,9 @@ unsafe fn scan_function(bus: u8, device: u8, function: u8) -> Option<PciDevice> 
 unsafe fn scan_device(bus: u8, device: u8) {
     // Check function 0 first
     if let Some(pci_dev) = scan_function(bus, device, 0) {
+        // Enable device (Bus Master + memory/IO access)
+        enable_device(&pci_dev, true);
+        
         PCI_DEVICES.lock().push(pci_dev);
         
         // If this is a PCI-to-PCI bridge, scan the secondary bus
@@ -316,6 +319,9 @@ unsafe fn scan_device(bus: u8, device: u8) {
         if (pci_dev.header_type & 0x80) != 0 {
             for function in 1..8 {
                 if let Some(func_dev) = scan_function(bus, device, function) {
+                    // Enable device
+                    enable_device(&func_dev, true);
+                    
                     PCI_DEVICES.lock().push(func_dev);
                     
                     // Check if any other function is also a bridge
@@ -399,6 +405,10 @@ pub fn init() {
             serial::serial_print("\n");
         }
     }
+}
+/// Get a list of all discovered PCI devices
+pub fn get_all_devices() -> alloc::vec::Vec<PciDevice> {
+    PCI_DEVICES.lock().clone()
 }
 
 /// Find first VirtIO block device

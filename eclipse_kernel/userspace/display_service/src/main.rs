@@ -137,7 +137,7 @@ struct Framebuffer {
 /// These will be used for future rendering operations
 #[allow(dead_code)]
 mod colors {
-    pub const BLACK: u32 = 0xFF000000;
+    pub const BLACK: u32 = 0x00000000;
     pub const WHITE: u32 = 0xFFFFFFFF;
     pub const RED: u32 = 0xFFFF0000;
     pub const GREEN: u32 = 0xFF00FF00;
@@ -535,14 +535,23 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
 
 /// Perform optimized screen clear
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
-    // Clear screen by writing to framebuffer memory
+    // Clear primary framebuffer
     let fb_ptr = fb.base_address as *mut u32;
-    let pixel_count = (fb.size / 4) as usize; // 4 bytes per pixel for 32bpp
+    let pixel_count = (fb.size / 4) as usize;
     
     unsafe {
-        // Write color to every pixel
         for i in 0..pixel_count {
             core::ptr::write_volatile(fb_ptr.add(i), color);
+        }
+    }
+    
+    // Also clear back buffer if it exists
+    if let Some(back_buf_addr) = fb.back_buffer {
+        let back_ptr = back_buf_addr as *mut u32;
+        unsafe {
+            for i in 0..pixel_count {
+                core::ptr::write_volatile(back_ptr.add(i), color);
+            }
         }
     }
     
@@ -689,6 +698,11 @@ pub extern "C" fn _start() -> ! {
         }
     }
     
+    if let Some(ref fb) = framebuffer {
+        println!("[DISPLAY-SERVICE] Final screen clear before starting...");
+        let _ = clear_screen(fb, 0x00000000);
+    }
+
     println!("[DISPLAY-SERVICE] Display service ready");
     println!("[DISPLAY-SERVICE] Ready to accept rendering requests...");
     

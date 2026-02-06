@@ -41,6 +41,7 @@ struct Elf64ProgramHeader {
 
 const PT_LOAD: u32 = 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 /// Cargar binario ELF en memoria y crear proceso
 pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
@@ -70,6 +71,12 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     serial::serial_print("ELF: Entry point: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
+
+    // Validate Entry Point
+    if header.e_entry > USER_ADDR_MAX {
+         serial::serial_print("ELF: Entry point in kernel space (Security Violation)\n");
+         return None;
+    }
     
     // Iterate over program headers and load segments
     let ph_offset = header.e_phoff as usize;
@@ -79,6 +86,19 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
         serial::serial_print("ELF: Program headers out of bounds\n");
         return None;
+    }
+    
+    // Check segments for validity BEFORE creating process
+    for i in 0..ph_count {
+        let offset = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        
+        if ph.p_type == PT_LOAD {
+            if ph.p_vaddr > USER_ADDR_MAX || (ph.p_vaddr + ph.p_memsz) > USER_ADDR_MAX {
+                serial::serial_print("ELF: Segment overlaps kernel space (Security Violation)\n");
+                return None;
+            }
+        }
     }
     
     // Default user stack at 512MB
@@ -93,13 +113,24 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         let p = table[pid as usize].as_ref().unwrap();
         p.page_table_phys
     };
-
+    
     // Allocate and map user stack
     if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(stack_size, 0x200000) {
         serial::serial_print("ELF: Mapping stack at ");
         serial::serial_print_hex(stack_base);
         serial::serial_print("\n");
-        crate::memory::map_user_page_2mb(page_table_phys, stack_base, phys, crate::memory::PAGE_WRITABLE);
+        // We map the 2MB block using 4KB pages for consistency and safety
+        for i in 0..512 {
+            let offset = (i as u64) * 0x1000;
+            crate::memory::map_user_page_4kb(
+                page_table_phys, 
+                stack_base + offset, 
+                phys + offset, 
+                crate::memory::PAGE_WRITABLE
+            );
+        }
+        
+        crate::memory::walk_page_table(page_table_phys, stack_base);
     }
 
     // Keep track of mapped 2MB regions to handle segments sharing the same page
@@ -152,8 +183,21 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
                     mapped_pages[mapped_count] = Some(mp);
                     mapped_count += 1;
                     
-                    // Map it
-                    crate::memory::map_user_page_2mb(page_table_phys, vaddr_page_base, phys, crate::memory::PAGE_WRITABLE);
+                    // Map it (CRITICAL: must be done for the segment to be accessible in user space)
+                    // We map the 2MB block using 512 4KB pages to be absolutely safe and avoid PSE issues
+                    for i in 0..512 {
+                        let offset = (i as u64) * 0x1000;
+                        crate::memory::map_user_page_4kb(
+                            page_table_phys, 
+                            vaddr_page_base + offset, 
+                            phys + offset, 
+                            crate::memory::PAGE_WRITABLE
+                        );
+                    }
+                    
+                    // Diagnostic walk for the entry point specifically
+                    // crate::memory::walk_page_table(page_table_phys, vaddr_start);
+                    
                     kptr
                 } else {
                     return None;
@@ -215,6 +259,12 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     serial::serial_print("ELF: Valid exec binary, entry: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
+
+    // Validate Entry Point
+    if header.e_entry > USER_ADDR_MAX {
+         serial::serial_print("ELF: Entry point in kernel space (Security Violation)\n");
+         return None;
+    }
     
     // Iterate over program headers and load segments
     let ph_offset = header.e_phoff as usize;
@@ -224,6 +274,19 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
         serial::serial_print("ELF: Program headers out of bounds for exec\n");
         return None;
+    }
+
+    // Check segments for validity BEFORE loading
+    for i in 0..ph_count {
+        let offset = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        
+        if ph.p_type == PT_LOAD {
+            if ph.p_vaddr > USER_ADDR_MAX || (ph.p_vaddr + ph.p_memsz) > USER_ADDR_MAX {
+                serial::serial_print("ELF: Segment overlaps kernel space (Security Violation)\n");
+                return None;
+            }
+        }
     }
     
     let page_table_phys = crate::memory::get_cr3();
@@ -278,7 +341,18 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                     mapped_count += 1;
                     
                     // Map it
-                    crate::memory::map_user_page_2mb(page_table_phys, vaddr_page_base, phys, crate::memory::PAGE_WRITABLE);
+                    // We map the 2MB block using 4KB pages for consistency and safety
+                    for i in 0..512 {
+                        let offset = (i as u64) * 0x1000;
+                        crate::memory::map_user_page_4kb(
+                            page_table_phys, 
+                            vaddr_page_base + offset, 
+                            phys + offset, 
+                            crate::memory::PAGE_WRITABLE
+                        );
+                    }
+                    
+                    crate::memory::walk_page_table(page_table_phys, vaddr_page_base);
                     kptr
                 } else {
                     serial::serial_print("ELF: Failed to allocate 2MB block\n");
@@ -303,6 +377,13 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
         }
     }
 
+    // Finalize mappings
+    for j in 0..mapped_count {
+        if let Some(ref mp) = mapped_pages[j] {
+             crate::memory::map_user_page_2mb(page_table_phys, mp.vaddr_base, mp.phys_addr, crate::memory::PAGE_WRITABLE);
+        }
+    }
+
     Some(header.e_entry)
 }
 
@@ -320,6 +401,49 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     serial::serial_print("\n  Stack: ");
     serial::serial_print_hex(stack_top);
     serial::serial_print("\n");
+    
+    // 4. Perform direct physical read via Higher Half Direct Map
+    let direct_paddr = 0xB9E00000 + 0xB39; // Entry physical addr
+    let direct_vaddr = crate::memory::PHYS_MEM_OFFSET + direct_paddr;
+    /*
+    serial::serial_print("  SANITY: Reading from Direct Map (v=");
+    serial::serial_print_hex(direct_vaddr);
+    serial::serial_print(")... ");
+    let direct_byte = unsafe { core::ptr::read_volatile(direct_vaddr as *const u8) };
+    serial::serial_print("Done. Byte: ");
+    serial::serial_print_hex(direct_byte as u64);
+    serial::serial_print("\n");
+    */
+
+    // 5. Verify PML4[0] in hardware CR3 again
+    let pml4_phys: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) pml4_phys); }
+    let pml4_virt = crate::memory::PHYS_MEM_OFFSET + pml4_phys;
+    let pml4_ptr = pml4_virt as *const u64;
+    
+    /*
+    serial::serial_print("  SANITY: PML4 (v=");
+    serial::serial_print_hex(pml4_virt);
+    serial::serial_print(") RAW DUMP [0..7]:\n    ");
+    */
+    for i in 0..8 {
+        let val = unsafe { core::ptr::read_volatile(pml4_ptr.add(i)) };
+        serial::serial_print_hex(val);
+        serial::serial_print(" ");
+    }
+    serial::serial_print("\n");
+
+    let pml4 = unsafe { &*(pml4_virt as *const crate::memory::PageTable) };
+    serial::serial_print("  SANITY: PML4[0] at CR3: ");
+    serial::serial_print_hex(pml4.entries[0].get_flags());
+    serial::serial_print(" -> addr: ");
+    serial::serial_print_hex(pml4.entries[0].get_addr());
+    serial::serial_print("\n");
+
+    // SANITY CHECK: Is stack 16-byte aligned?
+    if stack_top % 16 != 0 {
+        serial::serial_print("  WARNING: User stack NOT 16-byte aligned!\n");
+    }
     
     // Selectors from boot.rs:
     // USER_CODE_SELECTOR: u16 = 0x18 | 3;

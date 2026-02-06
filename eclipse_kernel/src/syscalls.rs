@@ -119,9 +119,11 @@ pub extern "C" fn syscall_handler(
     drop(stats);
     
     // DEBUG: Trace all syscalls
-    // serial::serial_print("SYSCALL: ");
-    // serial::serial_print_dec(syscall_num);
-    // serial::serial_print("\n");
+    // Limit verbosity - maybe only print specific ones or all for now
+    // DEBUG: Trace all syscalls
+    // crate::serial::serial_print("SYSCALL: ");
+    // crate::serial::serial_print_dec(syscall_num);
+    // crate::serial::serial_print("\n");
 
     let ret = match syscall_num {
         0 => sys_exit(arg1),

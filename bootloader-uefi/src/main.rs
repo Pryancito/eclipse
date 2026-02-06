@@ -27,6 +27,14 @@ pub struct FramebufferInfo {
     pub reserved_mask: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootInfo {
+    pub framebuffer: FramebufferInfo,
+    pub pml4_addr: u64,
+    pub kernel_phys_base: u64,
+}
+
 // Global allocator simple
 struct SimpleAllocator;
 
@@ -59,7 +67,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
-const KERNEL_VIRT_BASE: u64 = 0x200000; // Dirección fija del kernel (non-PIE)
+const KERNEL_VIRT_BASE: u64 = 0xFFFF800000000000; // Dirección base del kernel (Higher Half)
 const MAX_KERNEL_ALLOCATION: u64 = 64 * 1024 * 1024; // 64 MiB como límite razonable para el kernel
 
 // Higher Half Kernel constants (Redox-style)
@@ -1208,7 +1216,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         blue_mask: 0,
         reserved_mask: 0,
     };
-    let mut framebuffer_info_ptr: u64 = 0;
+    let mut boot_info_ptr: u64 = 0;
     
     // Intentar obtener información del framebuffer usando Graphics Output Protocol
     {
@@ -1250,24 +1258,26 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 framebuffer_info.blue_mask = mask.blue;
                 framebuffer_info.reserved_mask = mask.reserved;
             }
-            // Reservar memoria persistente para pasar al kernel
+            // Reservar memoria persistente para pasar al kernel (BootInfo)
             if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
-                framebuffer_info_ptr = phys;
+                boot_info_ptr = phys;
                 unsafe {
-                    let dst = phys as *mut FramebufferInfo;
-                    core::ptr::write_volatile(dst, framebuffer_info);
+                    // Inicializar BootInfo
+                    let dst = phys as *mut BootInfo;
+                    (*dst).framebuffer = framebuffer_info;
+                    // PML4 y PhysBase se rellenarán después
                 }
             }
             
-            unsafe { 
+            unsafe {
                 serial_write_str("BL: GOP encontrado\r\n");
                 log_append_bytes(b"[BL] GOP ok\r\n");
-                // Log puntero de framebuffer_info reservado (si existe)
-                serial_write_str("BL: fbptr_pre=0x");
+                // Log puntero de boot_info reservado (si existe)
+                serial_write_str("BL: boot_info_ptr=0x");
                 let mut h = [0u8; 18];
                 let mut m = 0usize;
                 for i in (0..16).rev() {
-                    let nyb = ((framebuffer_info_ptr >> (i*4)) & 0xF) as u8;
+                    let nyb = ((boot_info_ptr >> (i*4)) & 0xF) as u8;
                     h[m] = if nyb < 10 { b'0'+nyb } else { b'a'+(nyb-10) }; m+=1;
                 }
                 h[m] = b'\r'; m+=1; h[m] = b'\n'; m+=1;
@@ -1386,9 +1396,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str("\r\n");
                 }
                 
-                // La función load_kernel_from_data ya devuelve la dirección física del entry point
-                // Mapear la dirección virtual del kernel (0x200000) a su dirección física real
-                map_kernel_virtual_to_physical(pml4_phys, 0x200000, kernel_phys_base, total_len);
+                // Mapear la dirección virtual del kernel a su dirección física real
+                // La dirección virtual base es KERNEL_VIRT_BASE
+                map_kernel_virtual_to_physical(pml4_phys, KERNEL_VIRT_BASE, kernel_phys_base, total_len);
                 
                 // BACK TO VIRTUAL ENTRY POINT
                 // We are switching page tables in the bootloader now, so we must jump to
@@ -1406,8 +1416,8 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             },
             Err(e) => {
                 unsafe {
-                    serial_write_str("BL: ERROR cargando kernel ELF: ");
-                    log_append_bytes(b"[BL] kernel load ERROR\r\n");
+                    serial_write_str("BL: ERROR CRITICO cargando kernel ELF: ");
+                    log_append_bytes(b"[BL] kernel load CRITICAL ERROR\r\n");
                     match e {
                         BootError::LoadElf(st) => {
                             serial_write_str("LoadElf status=");
@@ -1426,12 +1436,12 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                         _ => serial_write_str("Otro error"),
                     }
                     serial_write_str("\r\n");
+                    
+                    // PANIC: No intentar continuar si no hay kernel
+                    panic!("Error fatal cargando el kernel. El sistema no puede continuar.");
                 }
-                // Mantener valores por defecto si falla la carga
-                kernel_entry_phys = 0x200000;
-                kernel_base = KERNEL_PHYS_LOAD_ADDR;
-                kernel_size = 0;
             }
+
         }
     }
 
@@ -1516,8 +1526,15 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         );
 
         // DEBUG VISUAL DEL BOOTLOADER - RECTÁNGULOS DE COLORES PARA DIAGNÓSTICO
-        if framebuffer_info_ptr != 0 {
-            let fb_info = unsafe { core::ptr::read_volatile(framebuffer_info_ptr as *const FramebufferInfo) };
+        if boot_info_ptr != 0 {
+            // Actualizar BootInfo con valores finales
+            unsafe {
+                let dst = boot_info_ptr as *mut BootInfo;
+                (*dst).pml4_addr = cr3_value;
+                (*dst).kernel_phys_base = kernel_base;
+            };
+
+            let fb_info = unsafe { (*(boot_info_ptr as *const BootInfo)).framebuffer };
             if fb_info.base_address != 0 {
                 let fb_ptr = fb_info.base_address as *mut u32;
                 let stride = fb_info.pixels_per_scan_line; // Usar stride en lugar de width
@@ -1530,8 +1547,8 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 serial_write_hex64(rsp_alineado);
                 serial_write_str("\r\nBL: Entry Point: ");
                 serial_write_hex64(kernel_entry_phys);
-                serial_write_str("\r\nBL: Framebuffer Info: ");
-                serial_write_hex64(framebuffer_info_ptr);
+                serial_write_str("\r\nBL: Boot Info: ");
+                serial_write_hex64(boot_info_ptr);
                 
                 // DEBUG DETALLADO DEL FRAMEBUFFER
                 serial_write_str("\r\nBL: FRAMEBUFFER DETALLADO:\r\n");
@@ -1588,7 +1605,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         serial_write_str("BL: Entry point calculado: 0x");
         serial_write_hex64(kernel_entry_phys);
         serial_write_str("\r\n");
-        serial_write_str("BL: Framebuffer info ptr: 0x");
+        serial_write_str("BL: Boot info ptr: 0x");
+        serial_write_hex64(boot_info_ptr);
+        serial_write_str("\r\n");
         serial_write_str("BL: PML4 address (for kernel): 0x");
         serial_write_hex64(cr3_value);
         serial_write_str("\r\n");
@@ -1606,18 +1625,14 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // RDX = pml4_phys (ARG3) - Kernel checks this
         // RAX = entry point
         core::arch::asm!(
-            "mov cr3, {cr3}",           // Configurar paginación - OK now with 16GB identity map
-            "mov rsp, {rsp}",           // Configurar stack
-            "sub rsp, 8",               // Alinear stack a 16 bytes
-            
-            "jmp rax",                  // Saltar al entry point (RAX)
-            
-            cr3 = in(reg) cr3_value,
-            rsp = in(reg) rsp_alineado,
-            in("rdi") framebuffer_info_ptr, // ARG1
-            in("rsi") kernel_base,          // ARG2
-            in("rdx") cr3_value,            // ARG3
-            in("rax") kernel_entry_phys,    // Entry Point
+            "mov cr3, rax",      // Load new Page Tables (PML4) -> CR3
+            "xor rbp, rbp",      // Clear RBP
+            "mov rsp, rsi",      // Set RSP
+            "jmp rdx",           // Jump to kernel
+            in("rdi") boot_info_ptr, // Argument 1: BootInfo pointer
+            in("rsi") rsp_alineado,  // New Stack Pointer
+            in("rdx") kernel_entry_phys, // Kernel Entry Point
+            in("rax") pml4_phys      // PML4 Physical Address (loaded into CR3)
         );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)

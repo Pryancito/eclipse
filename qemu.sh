@@ -155,6 +155,8 @@ if [ "$USE_XHCI" = "1" ]; then
     QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
     QEMU_CMD="$QEMU_CMD -device usb-mouse,bus=xhci.0,port=2"
     QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=3"
+    QEMU_CMD="$QEMU_CMD -no-shutdown"
+    QEMU_CMD="$QEMU_CMD -d int"
 else
     print_warning "Usando controlador USB legacy (UHCI/EHCI)"
     QEMU_CMD="$QEMU_CMD -usb"
@@ -164,6 +166,11 @@ fi
 
 # Puerto de monitor QEMU (para debugging)
 QEMU_CMD="$QEMU_CMD -serial stdio"
+
+# Debugging flags (Unconditional)
+QEMU_CMD="$QEMU_CMD -no-reboot"
+QEMU_CMD="$QEMU_CMD -no-shutdown"
+QEMU_CMD="$QEMU_CMD -d int"
 
 # Ejecutar QEMU
 print_info "Comando QEMU:"

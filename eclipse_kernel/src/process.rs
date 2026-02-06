@@ -132,62 +132,54 @@ pub fn init_kernel_process() {
 /// Crear un nuevo proceso
 pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> Option<ProcessId> {
     // Allocate kernel stack for this process
-    // For now, we use a fixed size buffer from heap or a pool could be better.
-    // Let's alloc from heap using vec!
-    // 8KB kernel stack should be enough
     let kernel_stack_size = 8192;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
-    
-    // Leak the memory so it persists for the process lifetime (simplification for now)
-    // Ideally we should store the Vec in the Process struct to drop it later
     core::mem::forget(kernel_stack);
 
-    let mut table = PROCESS_TABLE.lock();
-    let mut next_pid = NEXT_PID.lock();
-    
-    // Buscar slot libre
-    for slot in table.iter_mut() {
-        if slot.is_none() {
-            let pid = *next_pid;
-            *next_pid += 1;
-            
-            let mut process = Process::new();
-            process.id = pid;
-            process.state = ProcessState::Ready;
-            process.stack_base = stack_base;
-            process.stack_size = stack_size;
-            process.priority = 5; // Prioridad media por defecto
-            process.time_slice = 10; // 10 ticks
-            process.page_table_phys = crate::memory::create_process_paging();
-            
-            // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
-            let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+    // CRITICAL: Disable interrupts to avoid deadlock with scheduler timer interrupt
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        let mut next_pid = NEXT_PID.lock();
+        
+        // Buscar slot libre
+        for slot in table.iter_mut() {
+            if slot.is_none() {
+                let pid = *next_pid;
+                *next_pid += 1;
+                
+                let mut process = Process::new();
+                process.id = pid;
+                process.state = ProcessState::Ready;
+                process.stack_base = stack_base;
+                process.stack_size = stack_size;
+                process.priority = 5; // Prioridad media por defecto
+                process.time_slice = 10; // 10 ticks
+                process.page_table_phys = crate::memory::create_process_paging();
+                
+                // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
+                let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-            // Configurar contexto inicial
-            // En vez de saltar directo al userspace (que mantendría Ring 0),
-            // saltamos a una función trampolín que hace `iretq` para cambiar a Ring 3
-            process.context.rip = crate::elf_loader::jump_to_userspace as u64;
-            process.context.rdi = entry_point;                            // arg1 para jump_to_userspace
-            process.context.rsi = stack_base + stack_size as u64;         // arg2 para jump_to_userspace
-            process.context.rsp = kernel_stack_top_aligned;               // Stack del kernel para el trampolín
-            process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
-            process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
-            
-            crate::serial::serial_print("[PROCESS] Created PID ");
-            crate::serial::serial_print_dec(pid as u64);
-            crate::serial::serial_print(" | RIP (Trampoline): ");
-            crate::serial::serial_print_hex(process.context.rip);
-            crate::serial::serial_print(" | RSP (Kernel): ");
-            crate::serial::serial_print_hex(process.context.rsp);
-            crate::serial::serial_print("\n");
-            
-            *slot = Some(process);
-            return Some(pid);
+                // Configurar contexto inicial
+                process.context.rip = crate::elf_loader::jump_to_userspace as *const () as u64;
+                process.context.rdi = entry_point;                            // arg1 para jump_to_userspace
+                process.context.rsi = stack_base + stack_size as u64;         // arg2 para jump_to_userspace
+                process.context.rsp = kernel_stack_top_aligned;               // Stack del kernel para el trampolín
+                process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
+                process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
+                
+                crate::serial::serial_print("[PROC] Created process PID: ");
+                crate::serial::serial_print_dec(pid as u64);
+                crate::serial::serial_print(" with CR3: ");
+                crate::serial::serial_print_hex(process.page_table_phys);
+                crate::serial::serial_print("\n");
+
+                *slot = Some(process);
+                return Some(pid);
+            }
         }
-    }
-    
-    None
+        None
+    })
 }
 
 /// Obtener proceso actual
@@ -202,15 +194,17 @@ pub fn set_current_process(pid: Option<ProcessId>) {
 
 /// Obtener proceso por ID
 pub fn get_process(pid: ProcessId) -> Option<Process> {
-    let table = PROCESS_TABLE.lock();
-    for process in table.iter() {
-        if let Some(p) = process {
-            if p.id == pid {
-                return Some(*p);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let table = PROCESS_TABLE.lock();
+        for process in table.iter() {
+            if let Some(p) = process {
+                if p.id == pid {
+                    return Some(*p);
+                }
             }
         }
-    }
-    None
+        None
+    })
 }
 
 /// Get process page table physical address
@@ -225,24 +219,28 @@ pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
 
 /// Actualizar proceso
 pub fn update_process(pid: ProcessId, process: Process) {
-    let mut table = PROCESS_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(p) = slot {
-            if p.id == pid {
-                *p = process;
-                return;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    *p = process;
+                    return;
+                }
             }
         }
-    }
+    });
 }
 
 /// Cambiar de contexto entre procesos
 /// 
 /// Esta función guarda el contexto del proceso actual y carga el contexto del siguiente proceso
+/// Optionally switches CR3 (Control Register 3) if next_cr3 is not 0.
 /// 
 /// # Safety
 /// Esta función es unsafe porque manipula directamente registros de CPU
-pub unsafe fn switch_context(from: &mut Context, to: &Context) {
+#[no_mangle]
+pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_cr3: u64) {
     asm!(
         // Guardar contexto actual (usando rdi = from)
         "mov [rdi + 0x00], rax",
@@ -251,17 +249,6 @@ pub unsafe fn switch_context(from: &mut Context, to: &Context) {
         "mov [rdi + 0x18], rdx",
         "mov [rdi + 0x20], rsi",
         // rdi está en uso, pero guarda su valor original (que recibimos)
-        // No, el valor de rdi NO está en rdi ahora mismo? 
-        // Sí, porque 'from' está pinneado a rdi. 
-        // PERO rdi caller-saved/callee-saved issues? 
-        // No, 'from' es un puntero. El valor del registro RDI del proceso 'actual' 
-        // antes de llamar a esta funcion es lo que queremos guardar?
-        // No, queremos guardar el estado de los registros general purpose.
-        // El rdi que usamos es el puntero 'from'. Si queremos guardar el rdi del proceso,
-        // tendríamos que haberlo pusheado o algo?
-        // En System V ABI, RDI es el primer argumento.
-        // Así que RDI tiene el puntero 'from'. EL valor RDI del proceso es 'from'.
-        // Eso está bien para 'from'.
         "mov [rdi + 0x28], rdi", 
         "mov [rdi + 0x30], rbp",
         "mov [rdi + 0x38], r8",
@@ -290,6 +277,13 @@ pub unsafe fn switch_context(from: &mut Context, to: &Context) {
         // Restaurar contexto nuevo (usando rsi = to)
         // ==========================================
         
+        // 0. Cambiar CR3 si es necesario (Atomic-ish switch with Stack)
+        // rdx holds next_cr3
+        "test rdx, rdx",
+        "jz 3f",
+        "mov cr3, rdx",
+        "3:",
+
         // 1. Cambiar Stack
         "mov rsp, [rsi + 0x78]",
         
@@ -323,6 +317,7 @@ pub unsafe fn switch_context(from: &mut Context, to: &Context) {
         "2:",
         in("rdi") from,
         in("rsi") to,
+        in("rdx") next_cr3,
     );
 }
 

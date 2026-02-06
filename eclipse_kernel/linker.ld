@@ -4,8 +4,8 @@ OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
 /* Dirección de carga del kernel (después del bootloader) */
-/* Enlazamos en 2MB para coincidir con la dirección de carga física del bootloader */
-KERNEL_BASE = 0x0000000000000000;
+/* Enlazamos en 2MB pero en HIGHER HALF para separar kernel/user */
+KERNEL_BASE = 0xFFFF800000000000;
 KERNEL_PHYS_BASE = 0x200000;
 
 SECTIONS

@@ -126,9 +126,9 @@ build_kernel() {
     cd eclipse_kernel
     if [ "${KERNEL_MINIMAL:-0}" = "1" ]; then
         print_status "Modo MINIMAL: compilando kernel sin características opcionales"
-        RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --target x86_64-unknown-none --release
+        rustup run nightly cargo build --target x86_64-unknown-none --release
     else
-        RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --target x86_64-unknown-none --release
+        rustup run nightly cargo build --target x86_64-unknown-none --release
     fi
 
     if [ $? -eq 0 ]; then
@@ -214,7 +214,6 @@ build_systemd() {
     
     # Compilar systemd para el target correcto
     print_status "Compilando systemd..."
-    cargo clean
     RUSTFLAGS="-C no-redzone -C link-arg=-Tlinker.ld -C relocation-model=static" cargo +nightly build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
