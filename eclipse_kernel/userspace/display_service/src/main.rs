@@ -97,11 +97,15 @@ fn map_framebuffer_memory() -> Option<usize> {
 }
 
 /// Clear framebuffer to black immediately after mapping
+/// Uses volatile writes to ensure visibility on memory-mapped framebuffer
 fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u8;
+    let fb_ptr = fb_base as *mut u32;
+    let pixel_count = fb_size / BYTES_PER_PIXEL;
     unsafe {
-        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
+        for i in 0..pixel_count {
+            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000);
+        }
     }
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
 }
@@ -605,32 +609,19 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     let fb_ptr = fb.base_address as *mut u32;
     let pixel_count = (fb.size / BYTES_PER_PIXEL) as usize;
     
-    // For black (0x00000000), use optimized write_bytes
-    if color == 0 {
-        unsafe {
-            core::ptr::write_bytes(fb_ptr as *mut u8, 0x00, fb.size);
-        }
-    } else {
-        // For other colors, need to write individual pixels
-        unsafe {
-            for i in 0..pixel_count {
-                core::ptr::write_volatile(fb_ptr.add(i), color);
-            }
+    // Use volatile writes for all colors to ensure visibility on memory-mapped framebuffer
+    unsafe {
+        for i in 0..pixel_count {
+            core::ptr::write_volatile(fb_ptr.add(i), color);
         }
     }
     
     // Also clear back buffer if it exists
     if let Some(back_buf_addr) = fb.back_buffer {
         let back_ptr = back_buf_addr as *mut u32;
-        if color == 0 {
-            unsafe {
-                core::ptr::write_bytes(back_ptr as *mut u8, 0x00, fb.size);
-            }
-        } else {
-            unsafe {
-                for i in 0..pixel_count {
-                    core::ptr::write_volatile(back_ptr.add(i), color);
-                }
+        unsafe {
+            for i in 0..pixel_count {
+                core::ptr::write_volatile(back_ptr.add(i), color);
             }
         }
     }
