@@ -23,6 +23,9 @@ use eclipse_libc::{println, getpid, yield_cpu};
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_MAP_FRAMEBUFFER: u64 = 16;
 
+/// Framebuffer constants
+const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
+
 /// Framebuffer information from kernel/bootloader
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -363,12 +366,9 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
     
     // Clear the screen immediately after mapping framebuffer
     println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u32;
-    let pixel_count = (fb_size / 4) as usize;
+    let fb_ptr = fb_base as *mut u8;
     unsafe {
-        for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000); // Black
-        }
+        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
     }
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
     
@@ -420,12 +420,9 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     
     // Step 2.5: Clear the screen immediately after mapping framebuffer
     println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u32;
-    let pixel_count = (fb_size / 4) as usize;
+    let fb_ptr = fb_base as *mut u8;
     unsafe {
-        for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000); // Black
-        }
+        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
     }
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
     
@@ -581,20 +578,34 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     // Clear primary framebuffer
     let fb_ptr = fb.base_address as *mut u32;
-    let pixel_count = (fb.size / 4) as usize;
+    let pixel_count = (fb.size / BYTES_PER_PIXEL) as usize;
     
-    unsafe {
-        for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), color);
+    // For black (0x00000000), use optimized write_bytes
+    if color == 0 {
+        unsafe {
+            core::ptr::write_bytes(fb_ptr as *mut u8, 0x00, fb.size);
+        }
+    } else {
+        // For other colors, need to write individual pixels
+        unsafe {
+            for i in 0..pixel_count {
+                core::ptr::write_volatile(fb_ptr.add(i), color);
+            }
         }
     }
     
     // Also clear back buffer if it exists
     if let Some(back_buf_addr) = fb.back_buffer {
         let back_ptr = back_buf_addr as *mut u32;
-        unsafe {
-            for i in 0..pixel_count {
-                core::ptr::write_volatile(back_ptr.add(i), color);
+        if color == 0 {
+            unsafe {
+                core::ptr::write_bytes(back_ptr as *mut u8, 0x00, fb.size);
+            }
+        } else {
+            unsafe {
+                for i in 0..pixel_count {
+                    core::ptr::write_volatile(back_ptr.add(i), color);
+                }
             }
         }
     }
