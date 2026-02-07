@@ -902,22 +902,12 @@ pub fn get_stats() -> SyscallStats {
 fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
     use crate::servers::FramebufferInfo;
     
-    // DEBUG LOGGING
-    serial::serial_print("[SYSCALL] sys_get_framebuffer_info called\n");
-    
     if user_buffer == 0 {
-        serial::serial_print("[SYSCALL] sys_get_framebuffer_info: user_buffer is null\n");
         return u64::MAX; // -1 as u64
     }
     
     let fb_info_ptr = crate::boot::get_framebuffer_info();
-    
-    serial::serial_print("[SYSCALL] sys_get_framebuffer_info: fb_info_ptr = ");
-    serial::serial_print_hex(fb_info_ptr);
-    serial::serial_print("\n");
-    
     if fb_info_ptr == 0 {
-        serial::serial_print("[SYSCALL] sys_get_framebuffer_info: fb_info_ptr is null (bootloader info missing)\n");
         return u64::MAX; // -1 as u64
     }
     
@@ -938,18 +928,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
             reserved_mask: u32, // Added to match kernel main.rs definition
         }
         
-        // Verify pointer validity before dereferencing (basic check)
-        if fb_info_ptr < 0xFFFF800000000000 {
-             serial::serial_print("[SYSCALL] WARNING: fb_info_ptr is in low memory? \n");
-        }
-        
         let bootloader_fb = &*(fb_info_ptr as *const BootloaderFramebufferInfo);
-        
-        serial::serial_print("[SYSCALL] FB Info from Bootloader:\n");
-        serial::serial_print("  Base: "); serial::serial_print_hex(bootloader_fb.base_address); serial::serial_print("\n");
-        serial::serial_print("  Res: "); serial::serial_print_dec(bootloader_fb.width as u64); 
-        serial::serial_print("x"); serial::serial_print_dec(bootloader_fb.height as u64); serial::serial_print("\n");
-        serial::serial_print("  Pitch (pixels): "); serial::serial_print_dec(bootloader_fb.pixels_per_scan_line as u64); serial::serial_print("\n");
         
         // Calculate BPP from pixel format
         // Pixel format 1 = RGB, typically 32bpp
@@ -978,8 +957,6 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         // Copy to userspace buffer
         let user_fb_info = user_buffer as *mut FramebufferInfo;
         core::ptr::write(user_fb_info, syscall_fb);
-        
-        serial::serial_print("[SYSCALL] sys_get_framebuffer_info: success, info copied to user buffer\n");
     }
     
     0 // Success
