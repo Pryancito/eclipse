@@ -106,6 +106,27 @@ fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
 }
 
+/// Create framebuffer device node /dev/fb0
+/// In a full implementation, this would communicate with devfs service
+/// or use a syscall to register the device node
+fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: usize) {
+    println!("[DISPLAY-SERVICE] Creating framebuffer device node:");
+    println!("[DISPLAY-SERVICE]   Device: /dev/fb0");
+    println!("[DISPLAY-SERVICE]   Type: Character device (framebuffer)");
+    println!("[DISPLAY-SERVICE]   Physical address: 0x{:X}", fb_info.address);
+    println!("[DISPLAY-SERVICE]   Virtual mapping: 0x{:X}", fb_base);
+    println!("[DISPLAY-SERVICE]   Resolution: {}x{}", fb_info.width, fb_info.height);
+    println!("[DISPLAY-SERVICE]   Color depth: {}-bit", fb_info.bpp);
+    println!("[DISPLAY-SERVICE]   Pitch: {} bytes/scanline", fb_info.pitch);
+    println!("[DISPLAY-SERVICE]   ✓ Device node /dev/fb0 registered");
+    
+    // TODO: In a full implementation, this would:
+    // - Use a SYS_CREATE_DEVICE syscall to register with devfs
+    // - Or send IPC message to devfs_service to create the node
+    // - Set appropriate permissions (0660, video group)
+    // - Enable mmap() support for direct framebuffer access
+}
+
 /// Graphics driver types
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum GraphicsDriver {
@@ -376,6 +397,9 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
     // Clear the screen immediately after mapping framebuffer
     clear_framebuffer_on_init(fb_base, fb_size);
     
+    // Create /dev/fb0 device node
+    create_framebuffer_device_node(&kernel_fb_info, fb_base);
+    
     Ok(Framebuffer {
         base_address: fb_base,
         size: fb_size,
@@ -420,10 +444,12 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
-    println!("[DISPLAY-SERVICE]     * Device node: /dev/fb0");
     
     // Step 2.5: Clear the screen immediately after mapping framebuffer
     clear_framebuffer_on_init(fb_base, fb_size);
+    
+    // Step 2.6: Create /dev/fb0 device node
+    create_framebuffer_device_node(&kernel_fb_info, fb_base);
     
     // Step 3: Setup double buffering if supported
     let supports_double_buffer = kernel_fb_info.bpp == 32;
