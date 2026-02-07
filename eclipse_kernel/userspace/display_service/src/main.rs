@@ -337,20 +337,53 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]   - Configuring GPU memory");
     println!("[DISPLAY-SERVICE]   - Setting up display modes");
     println!("[DISPLAY-SERVICE]   - Initializing CUDA cores (optional)");
+    
+    // Get framebuffer info from kernel via syscall
+    println!("[DISPLAY-SERVICE]   - Querying kernel for framebuffer information...");
+    let kernel_fb_info = get_framebuffer_info_from_kernel()
+        .ok_or("Failed to get framebuffer info from kernel")?;
+    
+    println!("[DISPLAY-SERVICE]     * Framebuffer detected via bootloader");
+    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
+    println!("[DISPLAY-SERVICE]     * Resolution: {}x{}", kernel_fb_info.width, kernel_fb_info.height);
+    println!("[DISPLAY-SERVICE]     * Pitch: {} bytes", kernel_fb_info.pitch);
+    println!("[DISPLAY-SERVICE]     * BPP: {} bits", kernel_fb_info.bpp);
+    
+    // Map framebuffer to virtual memory via syscall
+    println!("[DISPLAY-SERVICE]   - Mapping framebuffer to virtual memory...");
+    let fb_base = map_framebuffer_memory()
+        .ok_or("Failed to map framebuffer into virtual memory")?;
+    
+    let fb_size = (kernel_fb_info.pitch * kernel_fb_info.height) as usize;
+    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
+    println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
+    println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
+    
     println!("[DISPLAY-SERVICE]   - NVIDIA driver initialized successfully");
     
+    // Clear the screen immediately after mapping framebuffer
+    println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
+    let fb_ptr = fb_base as *mut u32;
+    let pixel_count = (fb_size / 4) as usize;
+    unsafe {
+        for i in 0..pixel_count {
+            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000); // Black
+        }
+    }
+    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
+    
     Ok(Framebuffer {
-        base_address: 0xE0000000,  // Example NVIDIA framebuffer base
-        size: 1920 * 1080 * 4,     // 1920x1080 @ 32bpp
+        base_address: fb_base,
+        size: fb_size,
         mode: DisplayMode {
-            width: 1920,
-            height: 1080,
-            bpp: 32,
+            width: kernel_fb_info.width,
+            height: kernel_fb_info.height,
+            bpp: kernel_fb_info.bpp as u32,
             mode_number: 0,  // NVIDIA-specific mode
             refresh_rate: 60,
         },
         back_buffer: None,
-        pitch: 1920 * 4,
+        pitch: kernel_fb_info.pitch,
         supports_hw_accel: true,
     })
 }
@@ -384,6 +417,17 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
     println!("[DISPLAY-SERVICE]     * Device node: /dev/fb0");
+    
+    // Step 2.5: Clear the screen immediately after mapping framebuffer
+    println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
+    let fb_ptr = fb_base as *mut u32;
+    let pixel_count = (fb_size / 4) as usize;
+    unsafe {
+        for i in 0..pixel_count {
+            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000); // Black
+        }
+    }
+    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
     
     // Step 3: Setup double buffering if supported
     let supports_double_buffer = kernel_fb_info.bpp == 32;
