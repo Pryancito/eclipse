@@ -607,7 +607,7 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     // Clear primary framebuffer
     let fb_ptr = fb.base_address as *mut u32;
-    let pixel_count = (fb.size / BYTES_PER_PIXEL) as usize;
+    let pixel_count = fb.size / BYTES_PER_PIXEL;
     
     // Use volatile writes for all colors to ensure visibility on memory-mapped framebuffer
     unsafe {
