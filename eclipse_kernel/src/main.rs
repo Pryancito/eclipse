@@ -197,7 +197,24 @@ pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-
 pub fn kernel_main(framebuffer_info: &FramebufferInfo) -> ! {
     // Store framebuffer info for graphics server
     let fb_ptr = framebuffer_info as *const _ as u64;
+    
+    serial::serial_print("DEBUG: Setting framebuffer info at 0x");
+    serial::serial_print_hex(fb_ptr);
+    serial::serial_print("\n");
+    serial::serial_print("DEBUG: FB Base: 0x");
+    serial::serial_print_hex(framebuffer_info.base_address);
+    serial::serial_print("\n");
+    
     boot::set_framebuffer_info(fb_ptr);
+    
+    // VERIFY READBACK
+    let check_ptr = boot::get_framebuffer_info();
+    serial::serial_print("DEBUG: Readback FB info from boot module: 0x");
+    serial::serial_print_hex(check_ptr);
+    serial::serial_print("\n");
+    if check_ptr != fb_ptr {
+         serial::serial_print("DEBUG: CRITICAL ERROR - Readback mismatch!\n");
+    }
     
     serial::serial_print("Entering kernel main loop...\n");
     

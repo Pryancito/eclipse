@@ -4,7 +4,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Framebuffer information from bootloader
-static FRAMEBUFFER_INFO: AtomicU64 = AtomicU64::new(0);
+static FRAMEBUFFER_INFO: AtomicU64 = AtomicU64::new(0xDEADBEEF);
 
 /// Store framebuffer info from bootloader
 pub fn set_framebuffer_info(ptr: u64) {
