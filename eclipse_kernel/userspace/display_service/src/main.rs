@@ -96,6 +96,16 @@ fn map_framebuffer_memory() -> Option<usize> {
     }
 }
 
+/// Clear framebuffer to black immediately after mapping
+fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
+    println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
+    let fb_ptr = fb_base as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
+    }
+    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
+}
+
 /// Graphics driver types
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum GraphicsDriver {
@@ -358,19 +368,13 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
         .ok_or("Failed to map framebuffer into virtual memory")?;
     
     let fb_size = (kernel_fb_info.pitch * kernel_fb_info.height) as usize;
-    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
     
     println!("[DISPLAY-SERVICE]   - NVIDIA driver initialized successfully");
     
     // Clear the screen immediately after mapping framebuffer
-    println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
-    }
-    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
+    clear_framebuffer_on_init(fb_base, fb_size);
     
     Ok(Framebuffer {
         base_address: fb_base,
@@ -419,12 +423,7 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]     * Device node: /dev/fb0");
     
     // Step 2.5: Clear the screen immediately after mapping framebuffer
-    println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(fb_ptr, 0x00, fb_size);
-    }
-    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
+    clear_framebuffer_on_init(fb_base, fb_size);
     
     // Step 3: Setup double buffering if supported
     let supports_double_buffer = kernel_fb_info.bpp == 32;
