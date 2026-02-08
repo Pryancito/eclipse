@@ -15,6 +15,7 @@ pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 pub const SYS_OPEN: u64 = 11;
 pub const SYS_CLOSE: u64 = 12;
 pub const SYS_GETPPID: u64 = 13;
+pub const SYS_LSEEK: u64 = 14;
 pub const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 pub const SYS_MAP_FRAMEBUFFER: u64 = 16;
 pub const SYS_PCI_ENUM_DEVICES: u64 = 17;
