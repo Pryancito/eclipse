@@ -719,6 +719,10 @@ impl VirtIOBlockDevice {
             req.reserved = 0;
             req.sector = block_num * 8; // 4KB block = 8 * 512-byte sectors
             
+            // Memory barrier to ensure request header is written to memory
+            // before we set up descriptors pointing to it
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            
             // Build descriptor chain: request -> data -> status
             let buffers = [
                 (req_phys, core::mem::size_of::<VirtIOBlockReq>() as u32, 0),
@@ -879,6 +883,10 @@ impl VirtIOBlockDevice {
             req.req_type = VIRTIO_BLK_T_OUT; // Write
             req.reserved = 0;
             req.sector = block_num * 8;
+            
+            // Memory barrier to ensure request header is written to memory
+            // before we set up descriptors pointing to it
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Build descriptor chain: request -> data -> status
             let buffers = [
