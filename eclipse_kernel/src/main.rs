@@ -151,11 +151,11 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     syscalls::init();
     fd::init();
     // servers::init_servers();
-    // pci::init();
-    // nvidia::init();
-    // virtio::init();
-    // ata::init();
-    // filesystem::init();
+    pci::init();
+    nvidia::init();
+    virtio::init();
+    ata::init();
+    filesystem::init();
     
     serial::serial_print("Microkernel initialized successfully!\n");
     
