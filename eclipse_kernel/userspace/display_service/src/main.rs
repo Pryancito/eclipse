@@ -98,7 +98,7 @@ fn map_framebuffer_memory() -> Option<usize> {
     }
 }
 
-/// Clear framebuffer to black immediately after mapping
+/// Clear framebuffer to white immediately after mapping
 /// Uses volatile writes to ensure visibility on memory-mapped framebuffer
 fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
@@ -106,7 +106,7 @@ fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     let pixel_count = fb_size / BYTES_PER_PIXEL;
     unsafe {
         for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), 0xFFFFFFFF);
+            core::ptr::write_volatile(fb_ptr.add(i), 0x00FFFFFF);
         }
     }
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to white");
