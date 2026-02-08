@@ -39,7 +39,7 @@ pub extern "C" fn _start() -> ! {
     // Launch Smithay App
     println!("[GUI-SERVICE] Launching Smithay Compositor (smithay_app)...");
     
-    let app_path = "/bin/smithay_app";
+    let app_path = "/usr/bin/smithay_app";
     
     unsafe {
         // Open application file
@@ -57,7 +57,25 @@ pub extern "C" fn _start() -> ! {
         // Read file into buffer
         // Note: In a real implementation we'd read in chunks or use mmap
         // Here we assume it fits in our static buffer
-        let bytes_read = read(fd as u32, &mut APP_BUFFER);
+        // Read file into buffer in chunks
+        let mut total_bytes_read = 0;
+        loop {
+             let chunk_size = read(fd as u32, &mut APP_BUFFER[total_bytes_read..]);
+             if chunk_size < 0 {
+                 println!("[GUI-SERVICE] ERROR: Failed to read (ret={})", chunk_size);
+                 break;
+             }
+             if chunk_size == 0 {
+                 break; // EOF
+             }
+             total_bytes_read += chunk_size as usize;
+             // print progress every ~100KB to avoid spam
+             if total_bytes_read % (100 * 1024) == 0 {
+                  println!("[GUI-SERVICE] Read {} bytes...", total_bytes_read);
+             }
+        }
+        
+        let bytes_read = total_bytes_read as isize;
         
         close(fd);
         

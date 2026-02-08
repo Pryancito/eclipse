@@ -60,8 +60,8 @@ if [ -d "eclipse-apps/smithay_app" ]; then
         exit 1
     fi
     # Copy to filesystem build directory
-    mkdir -p ../../eclipse-os-build/bin
-    cp target/x86_64-unknown-none/release/smithay_app ../../eclipse-os-build/bin/smithay_app
+    mkdir -p ../../eclipse-os-build/usr/bin
+    cp target/x86_64-unknown-none/release/smithay_app ../../eclipse-os-build/usr/bin/smithay_app
     cd ../..
 else
     echo "Directory eclipse-apps/smithay_app not found!"

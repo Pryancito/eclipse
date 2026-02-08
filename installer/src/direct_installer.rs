@@ -351,13 +351,13 @@ impl DirectInstaller {
 
         // Copiar kernel
         println!("   Instalando kernel...");
-        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_microkernel";
+        let kernel_source = "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel";
 
         if !Path::new(kernel_source).exists() {
             return Err("Kernel no encontrado. Ejecuta 'cd eclipse_kernel && cargo build --release' primero".to_string());
         }
 
-        fs::copy(kernel_source, format!("{}/eclipse_microkernel", self.efi_mount_point))
+        fs::copy(kernel_source, format!("{}/eclipse_kernel", self.efi_mount_point))
             .map_err(|e| format!("Error copiando kernel: {}", e))?;
 
         // Solución 1: Crear un script startup.nsh para QEMU y otros firmwares
@@ -529,6 +529,7 @@ impl DirectInstaller {
         // Instalar aplicaciones de eclipse-apps
         let apps_to_install = vec![
             ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
+            ("eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app", "/usr/bin/smithay_app"),
             ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
         ];
 

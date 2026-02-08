@@ -739,36 +739,21 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print_dec(avail_idx as u64);
             crate::serial::serial_print("\n");
             
-            // Memory barrier before notifying device to ensure all writes are visible
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 // Legacy PCI - use I/O port notification
-                crate::serial::serial_print("[VirtIO] Notifying device via I/O port ");
-                crate::serial::serial_print_hex(self.io_base as u64 + VIRTIO_PCI_QUEUE_NOTIFY as u64);
-                crate::serial::serial_print("\n");
                 
                 // Select queue 0 before notifying (VirtIO block uses single queue)
                 const VIRTIO_QUEUE_INDEX: u16 = 0;
                 outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, VIRTIO_QUEUE_INDEX);
                 
+                // Memory barrier strict ordering: ensure all memory writes are visible before notify
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
                 // Write to QUEUE_NOTIFY register
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
                 
-                // Memory barrier after notification to ensure device sees the write
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                
-                // Small delay to let device process notification
-                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
-                    core::hint::spin_loop();
-                }
-                
-                // Read back ISR status to confirm notification was received
-                let isr = inb(self.io_base + VIRTIO_PCI_ISR_STATUS);
-                crate::serial::serial_print("[VirtIO] ISR status after notify: ");
-                crate::serial::serial_print_hex(isr as u64);
-                crate::serial::serial_print("\n");
+                // No delay needed if synchronization is correct
             } else if self.mmio_base != 0 {
                 // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;

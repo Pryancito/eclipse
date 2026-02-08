@@ -171,88 +171,94 @@ pub fn mount() -> Result<(), &'static str> {
         Ok(Vec::new()) // Empty content if not found
     }
 
-    /// Read file content by inode
-    pub fn read_file_by_inode(inode: u32, buffer: &mut [u8]) -> Result<usize, &'static str> {
+    /// Read file content by inode with offset
+    /// Does NOT buffer the entire file. Reads directly for the requested range.
+    pub fn read_file_by_inode_at(inode: u32, buffer: &mut [u8], offset: u64) -> Result<usize, &'static str> {
         let entry = Self::read_inode_entry(inode)?;
         
-        // Read node record
+        // Read the first block of the node record to find CONTENT TLV
         let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
         let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
-        
-        // Node Header: Inode (4) + Size (4) + Header Size (4) ? NO.
-        // Node format: 
-        // 4 bytes: inode
-        // 4 bytes: record size
-        // TLV data...
-        
-        // If record spans blocks, we need logic for that. 
-        // For simplicity, assumed nodes fit in one block for initialization phase.
-        // But `read_block` reads 4096 bytes.
-        // If the record crosses boundary, we failed. Optimistic assumption for bootloader.
         
         let mut block_buffer = vec![0u8; 4096];
         read_block_from_device(block_num, &mut block_buffer)?;
         
         if offset_in_block + 8 > 4096 {
-             // Basic boundary cross handling would load next block
-             return Err("Node header crosses block boundary (unsupported in simple driver)");
+             return Err("Node header crosses block boundary");
         }
-
-        let _read_inode = u32::from_le_bytes([
-            block_buffer[offset_in_block], block_buffer[offset_in_block+1],
-            block_buffer[offset_in_block+2], block_buffer[offset_in_block+3]
-        ]);
         
         let record_size = u32::from_le_bytes([
             block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
             block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
         ]) as usize;
-        
-        if offset_in_block + record_size > 4096 {
-             // For now, assume small nodes. /sbin/init is small but binary might be ~100KB+ stored in content?
-             // Actually, file content is inside CONTENT TLV.
-             // If content is large, it WILL cross block boundaries.
-             // We need a proper loop reading blocks.
-             // OR, more likely for an OS, the CONTENT TLV points to extents?
-             // EclipseFS simple format puts data INLINE in CONTENT tag.
-             // This means /sbin/init (1.2MB) is huge record!
-             // So `block_buffer` is not enough.
-             
-             // WE MUST IMPLEMENT MULTI-BLOCK READ.
-             
-             // Let's implement reading the full record into a temporary buffer?
-             // No, kernel heap is smallish? 
-             // We can read directly to destination buffer if we parse TLV correctly.
-        }
 
-        // Simpler approach:
-        // Read the full record size.
-        // If it spans blocks, read multiple blocks.
+        // Parse TLVs in the first block to find CONTENT
+        // We assume headers structure (CONTENT tag) appears in the first block.
+        // If not, we'd need to scan more blocks, but population tool puts it early.
         
-        let mut record_data = vec![0u8; record_size];
+        let header_end = min(4096, offset_in_block + record_size);
+        let valid_data = &block_buffer[offset_in_block+8..header_end]; // Skip 8 byte node header
         
-        // Read first chunk
-        let first_chunk_size = min(record_size, 4096 - offset_in_block);
-        record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block+first_chunk_size]);
+        let mut tlv_cursor = 0;
+        let mut content_start_offset_rel = 0; // Relative to node data start (after 8 bytes)
+        let mut content_length = 0;
+        let mut found = false;
         
-        let mut bytes_read = first_chunk_size;
-        let mut current_block = block_num + 1;
-        
-        while bytes_read < record_size {
-             let chunk_size = min(4096, record_size - bytes_read);
-             read_block_from_device(current_block, &mut block_buffer)?;
-             record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
-             bytes_read += chunk_size;
-             current_block += 1;
+        while tlv_cursor + 6 <= valid_data.len() {
+            let tag = u16::from_le_bytes([valid_data[tlv_cursor], valid_data[tlv_cursor+1]]);
+            let length = u32::from_le_bytes([
+                valid_data[tlv_cursor+2], valid_data[tlv_cursor+3], 
+                valid_data[tlv_cursor+4], valid_data[tlv_cursor+5]
+            ]) as usize;
+            
+            if tag == tlv_tags::CONTENT {
+                content_start_offset_rel = tlv_cursor + 6;
+                content_length = length;
+                found = true;
+                break;
+            }
+            
+            tlv_cursor += 6 + length;
         }
         
-        // Now parse TLV from record_data (skipping 8 byte header)
-        let content = Self::parse_tlv_content(&record_data[8..])?;
+        if !found {
+            // Could be in next block if first block is filled with metadata?
+            // For now, assume it's in first block.
+             return Err("CONTENT TLV not found in first block");
+        }
         
-        let copy_len = min(buffer.len(), content.len());
-        buffer[..copy_len].copy_from_slice(&content[..copy_len]);
+        if offset >= content_length as u64 {
+            return Ok(0); // EOF
+        }
         
-        Ok(copy_len)
+        let read_len = min(buffer.len(), content_length - offset as usize);
+        
+        // precise byte offset on disk where requested data starts
+        let absolute_data_start = entry.offset + 8 + content_start_offset_rel as u64 + offset;
+        
+        // Read data from disk block by block
+        let mut bytes_read = 0;
+        let mut current_abs_pos = absolute_data_start;
+        
+        while bytes_read < read_len {
+            let current_block = (current_abs_pos / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+            let current_off = (current_abs_pos % BLOCK_SIZE as u64) as usize;
+            
+            read_block_from_device(current_block, &mut block_buffer)?;
+            
+            let chunk_size = min(read_len - bytes_read, 4096 - current_off);
+            buffer[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[current_off..current_off+chunk_size]);
+            
+            bytes_read += chunk_size;
+            current_abs_pos += chunk_size as u64;
+        }
+        
+        Ok(read_len)
+    }
+
+    /// Backwards compatibility wrapper
+    pub fn read_file_by_inode(inode: u32, buffer: &mut [u8]) -> Result<usize, &'static str> {
+        Self::read_file_by_inode_at(inode, buffer, 0)
     }
 
     /// Write data to file by inode

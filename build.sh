@@ -724,8 +724,6 @@ create_basic_distribution() {
         
         # Copiar systemd si existe
         if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
-            cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/userland/bin/"
-            # También instalar en /usr/bin/ para que el kernel lo encuentre
             cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/"
             chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
             print_status "Systemd copiado e instalado en /usr/sbin/"
@@ -733,8 +731,6 @@ create_basic_distribution() {
         
         # Copiar smithay_app si existe
         if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
-            cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/userland/bin/"
-            # También instalar en /usr/bin/ para que esté disponible
             cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/"
             chmod +x "$BUILD_DIR/usr/bin/smithay_app"
             print_status "smithay_app copiado e instalado en /usr/bin/"
@@ -790,7 +786,7 @@ wayland_text_editor = "/userland/bin/wayland_text_editor"
 
 [desktop_environment]
 # Nota: Algunos componentes del desktop environment no están implementados aún
-# wayland_server = "/userland/bin/eclipse_wayland"
+wayland_server = "/usr/bin/smithay_app"
 # cosmic_desktop = "/userland/bin/eclipse_cosmic"
 # rwaybar = "/userland/bin/rwaybar"
 # eclipse_taskbar = "/userland/bin/eclipse_taskbar"
@@ -987,11 +983,13 @@ EOF
     fi
     
     # Copiar binarios de eclipse-apps si existen
-    # Nota: Estos binarios no existen en la versión actual
-    # if [ -f "eclipse-apps/target/release/eclipse_wayland" ]; then
-    #     cp "eclipse-apps/target/release/eclipse_wayland" "$BUILD_DIR/userland/bin/"
-    #     print_status "eclipse_wayland copiado"
-    # fi
+        # Copiar binarios de Wayland y COSMIC a /usr/bin/
+        #mkdir -p "$BUILD_DIR/usr/bin"
+        #if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
+        #    cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/"
+        #    chmod +x "$BUILD_DIR/usr/bin/smithay_app"
+        #    print_status "smithay_app instalado en usr/bin/"
+        #fi
 
     # if [ -f "eclipse-apps/target/release/eclipse_cosmic" ]; then
     #     cp "eclipse-apps/target/release/eclipse_cosmic" "$BUILD_DIR/userland/bin/"
@@ -1144,6 +1142,14 @@ create_bootable_image() {
                     print_status "eclipse-systemd copiado a /sbin/ y /usr/sbin/"
                 fi
                 
+                # Copiar smithay_app a la ubicacion estándar si existe
+                if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
+                    mkdir -p "$BUILD_DIR/usr/bin"
+                    cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/smithay_app"
+                    chmod +x "$BUILD_DIR/usr/bin/smithay_app"
+                    print_status "smithay_app copiado a /usr/bin/"
+                fi
+
                 # Copiar otros binarios importantes si existen
                 if [ -d "userland/target/release" ]; then
                     mkdir -p "$BUILD_DIR/bin"

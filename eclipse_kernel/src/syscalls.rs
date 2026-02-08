@@ -298,9 +298,12 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     drop(stats);
     
     // Validar parámetros
-    if buf_ptr == 0 || len == 0 || len > 4096 {
+    if buf_ptr == 0 || len == 0 {
         return u64::MAX; // Error
     }
+    
+    // Clamp length to 4096 to avoid large buffer issues
+    let len = core::cmp::min(len, 4096);
     
     // Handle stdin (fd=0) specially
     if fd == 0 {
@@ -327,9 +330,8 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
             let mut temp_buffer = [0u8; 4096];
             let read_len = core::cmp::min(len as usize, 4096);
             
-            // TODO: Implement read_file_by_inode_with_offset in filesystem
-            // For now, this is a limitation - we can't read with offset
-            match crate::filesystem::Filesystem::read_file_by_inode(fd_entry.inode, &mut temp_buffer[..read_len]) {
+            // Read from file using filesystem with offset
+            match crate::filesystem::Filesystem::read_file_by_inode_at(fd_entry.inode, &mut temp_buffer[..read_len], fd_entry.offset) {
                 Ok(bytes_read) => {
                     // Copy to user buffer
                     unsafe {
