@@ -604,6 +604,7 @@ fn sys_wait(_status_ptr: u64) -> u64 {
 /// 4 = display_service (Graphics Server)
 /// 5 = audio_service (Audio Server)
 /// 6 = network_service (Network Server)
+/// 7 = gui_service (GUI Launcher)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     serial::serial_print("[SYSCALL] get_service_binary(");
     serial::serial_print_dec(service_id);
@@ -623,6 +624,7 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         4 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
         5 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
         6 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
+        7 => (crate::binaries::GUI_SERVICE_BINARY.as_ptr() as u64, crate::binaries::GUI_SERVICE_BINARY.len() as u64),
         _ => {
             serial::serial_print("[SYSCALL] Invalid service ID\n");
             return u64::MAX;

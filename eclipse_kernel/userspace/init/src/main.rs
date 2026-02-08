@@ -45,7 +45,7 @@ impl Service {
 /// 5. Graphics Server (Display) (4)
 /// 6. Audio Server (5)
 /// 7. Network Server (6)
-static mut SERVICES: [Service; 7] = [
+static mut SERVICES: [Service; 8] = [
     Service::new("log"),
     Service::new("devfs"),
     Service::new("filesystem"),
@@ -53,6 +53,7 @@ static mut SERVICES: [Service; 7] = [
     Service::new("display"),
     Service::new("audio"),
     Service::new("network"),
+    Service::new("gui"),
 ];
 
 
@@ -145,6 +146,10 @@ fn start_system_services() {
         
         // Start network service last (most complex)
         start_service(&mut SERVICES[6]);
+        yield_cpu();
+
+        // Start GUI service (depends on network)
+        start_service(&mut SERVICES[7]);
     }
 }
 
@@ -171,6 +176,7 @@ fn start_service(service: &mut Service) {
             "display" => 4,
             "audio" => 5,
             "network" => 6,
+            "gui" => 7,
             _ => {
                 println!("  [CHILD] Unknown service: {}", service.name);
                 exit(1);

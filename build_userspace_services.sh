@@ -7,7 +7,7 @@ echo "Building userspace services..."
 # cd userspace/libc && cargo build --release && cd ../..
 
 # List of services to build
-SERVICES="log_service devfs_service filesystem_service network_service display_service audio_service input_service init"
+SERVICES="log_service devfs_service filesystem_service network_service display_service audio_service input_service gui_service init"
 
 for service in $SERVICES; do
     echo "Building $service..."
@@ -47,6 +47,24 @@ if [ -d "eclipse-apps/systemd" ]; then
     cd ../..
 else
     echo "Directory eclipse-apps/systemd not found!"
+    exit 1
+fi
+
+echo "Building smithay_app..."
+if [ -d "eclipse-apps/smithay_app" ]; then
+    cd eclipse-apps/smithay_app
+    cargo clean
+    cargo +nightly build --release --target x86_64-unknown-none
+    if [ $? -ne 0 ]; then
+        echo "Failed to build smithay_app"
+        exit 1
+    fi
+    # Copy to filesystem build directory
+    mkdir -p ../../eclipse-os-build/bin
+    cp target/x86_64-unknown-none/release/smithay_app ../../eclipse-os-build/bin/smithay_app
+    cd ../..
+else
+    echo "Directory eclipse-apps/smithay_app not found!"
     exit 1
 fi
 

@@ -9,6 +9,7 @@ pub static DEVFS_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/devfs_serv
 pub static INPUT_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/input_service/target/x86_64-unknown-none/release/input_service");
 pub static DISPLAY_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/display_service/target/x86_64-unknown-none/release/display_service");
 pub static NETWORK_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/network_service/target/x86_64-unknown-none/release/network_service");
+pub static GUI_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/gui_service/target/x86_64-unknown-none/release/gui_service");
 
 // Legacy services (kept for compatibility)
 pub static FILESYSTEM_SERVICE_BINARY: &[u8] = include_bytes!("../userspace/filesystem_service/target/x86_64-unknown-none/release/filesystem_service");
