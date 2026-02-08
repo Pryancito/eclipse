@@ -233,6 +233,38 @@ build_systemd() {
     cd ../..
 }
 
+# Función para compilar smithay_app
+build_smithay_app() {
+    print_step "Compilando smithay_app..."
+    
+    if [ ! -d "eclipse-apps/smithay_app" ]; then
+        print_status "Directorio smithay_app no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-apps/smithay_app
+    
+    # Compilar smithay_app para el target correcto
+    print_status "Compilando smithay_app..."
+    cargo +nightly build --release --target x86_64-unknown-none
+    
+    if [ $? -eq 0 ]; then
+        print_success "smithay_app compilado exitosamente"
+        
+        # Mostrar información del sistema compilado
+        local smithay_path="target/x86_64-unknown-none/release/smithay_app"
+        if [ -f "$smithay_path" ]; then
+            local smithay_size=$(du -h "$smithay_path" | cut -f1)
+            print_status "smithay_app generado: $smithay_path ($smithay_size)"
+        fi
+    else
+        print_error "Error al compilar smithay_app"
+        return 1
+    fi
+    
+    cd ../..
+}
+
 # Función para compilar userland principal
 build_userland_main() {
     print_step "Compilando userland principal..."
@@ -697,6 +729,15 @@ create_basic_distribution() {
             cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/"
             chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
             print_status "Systemd copiado e instalado en /usr/sbin/"
+        fi
+        
+        # Copiar smithay_app si existe
+        if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
+            cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/userland/bin/"
+            # También instalar en /usr/bin/ para que esté disponible
+            cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/"
+            chmod +x "$BUILD_DIR/usr/bin/smithay_app"
+            print_status "smithay_app copiado e instalado en /usr/bin/"
         fi
         
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
@@ -1438,6 +1479,7 @@ main() {
     build_bootloader
     build_installer
     build_systemd
+    build_smithay_app
     # build_eclipse_apps
     # build_userland
     
