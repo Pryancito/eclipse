@@ -10,13 +10,18 @@ use eclipse_libc::{println, getpid, yield_cpu, get_framebuffer_info, map_framebu
 
 /// IPC Message Types for Xwayland protocol
 const MSG_TYPE_GRAPHICS: u32 = 0x00000010;  // Graphics messages
+
+#[allow(dead_code)]
 const MSG_TYPE_INPUT: u32 = 0x00000040;     // Input messages
+
+#[allow(dead_code)]
 const MSG_TYPE_SIGNAL: u32 = 0x00000400;    // Signal messages
 
 /// Framebuffer state
 struct FramebufferState {
     info: FramebufferInfo,
     base_addr: usize,
+    #[allow(dead_code)]
     size: usize,
 }
 
@@ -156,6 +161,7 @@ impl IpcHandler {
     }
     
     /// Send a status update message
+    #[allow(dead_code)]
     fn send_status(&self, target_pid: u32) {
         let status_msg = b"SMITHAY_READY";
         let _ = send(target_pid, MSG_TYPE_GRAPHICS, status_msg);
