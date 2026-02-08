@@ -702,7 +702,7 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print("\n");
             
             // Initialize status to 0x55 to detect if device touches it
-            *status_ptr = 0x55;
+            write_volatile(status_ptr, 0x55);
             
             let buffer_virt = buffer.as_ptr() as u64;
             let buffer_phys = crate::memory::virt_to_phys(buffer_virt);
@@ -715,9 +715,12 @@ impl VirtIOBlockDevice {
             
             // Build request header
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
-            req.req_type = VIRTIO_BLK_T_IN; // Read
-            req.reserved = 0;
-            req.sector = block_num * 8; // 4KB block = 8 * 512-byte sectors
+            write_volatile(&mut req.req_type, VIRTIO_BLK_T_IN); // Read
+            write_volatile(&mut req.reserved, 0);
+            write_volatile(&mut req.sector, block_num * 8); // 4KB block = 8 * 512-byte sectors
+            
+            // Memory barrier to ensure all DMA buffer writes are visible before adding to queue
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Build descriptor chain: request -> data -> status
             let buffers = [
@@ -876,9 +879,12 @@ impl VirtIOBlockDevice {
             
             // Build request header
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
-            req.req_type = VIRTIO_BLK_T_OUT; // Write
-            req.reserved = 0;
-            req.sector = block_num * 8;
+            write_volatile(&mut req.req_type, VIRTIO_BLK_T_OUT); // Write
+            write_volatile(&mut req.reserved, 0);
+            write_volatile(&mut req.sector, block_num * 8);
+            
+            // Memory barrier to ensure all DMA buffer writes are visible before adding to queue
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Build descriptor chain: request -> data -> status
             let buffers = [
