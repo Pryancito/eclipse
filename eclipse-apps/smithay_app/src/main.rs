@@ -17,6 +17,10 @@ const MSG_TYPE_INPUT: u32 = 0x00000040;     // Input messages
 #[allow(dead_code)]
 const MSG_TYPE_SIGNAL: u32 = 0x00000400;    // Signal messages
 
+/// Status update interval (iterations between status prints)
+/// Approximately 5 seconds assuming fast yield cycles
+const STATUS_UPDATE_INTERVAL: u64 = 5000000;
+
 /// Framebuffer state
 struct FramebufferState {
     info: FramebufferInfo,
@@ -156,7 +160,9 @@ impl IpcHandler {
             
             // Echo back a simple acknowledgment
             let response = b"ACK";
-            let _ = send(sender_pid, MSG_TYPE_GRAPHICS, response);
+            if send(sender_pid, MSG_TYPE_GRAPHICS, response) != 0 {
+                println!("[SMITHAY] WARNING: Failed to send ACK to PID {}", sender_pid);
+            }
         }
     }
     
@@ -164,7 +170,9 @@ impl IpcHandler {
     #[allow(dead_code)]
     fn send_status(&self, target_pid: u32) {
         let status_msg = b"SMITHAY_READY";
-        let _ = send(target_pid, MSG_TYPE_GRAPHICS, status_msg);
+        if send(target_pid, MSG_TYPE_GRAPHICS, status_msg) != 0 {
+            println!("[SMITHAY] WARNING: Failed to send status to PID {}", target_pid);
+        }
     }
 }
 
@@ -230,8 +238,8 @@ pub extern "C" fn _start() -> ! {
         // Process IPC messages every iteration
         ipc.process_messages();
         
-        // Print status update every ~5 seconds
-        if counter.wrapping_sub(last_status_counter) >= 5000000 {
+        // Print status update periodically
+        if counter.wrapping_sub(last_status_counter) >= STATUS_UPDATE_INTERVAL {
             println!("[SMITHAY] [Status] Active | Messages: {} | Wayland: 0 | X11: 0", 
                 ipc.message_count);
             last_status_counter = counter;

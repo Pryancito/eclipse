@@ -6,7 +6,7 @@ Smithay App is a Wayland compositor with Xwayland support designed specifically 
 
 ## Features
 
-- **Direct Framebuffer Access**: Uses `/dev/fb0` for hardware-accelerated graphics rendering
+- **Direct Framebuffer Access**: Uses `/dev/fb0` for direct memory-mapped graphics rendering
 - **Eclipse OS IPC Integration**: Native IPC communication for inter-process messaging
 - **Xwayland Support**: Provides X11 compatibility layer for legacy X applications
 - **X11 Socket Management**: Creates and manages X11 Unix domain socket at `/tmp/.X11-unix/X0`
