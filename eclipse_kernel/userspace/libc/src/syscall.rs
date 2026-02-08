@@ -15,6 +15,8 @@ pub const SYS_GET_SERVICE_BINARY: u64 = 10;
 pub const SYS_OPEN: u64 = 11;
 pub const SYS_CLOSE: u64 = 12;
 pub const SYS_GETPPID: u64 = 13;
+pub const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
+pub const SYS_MAP_FRAMEBUFFER: u64 = 16;
 pub const SYS_PCI_ENUM_DEVICES: u64 = 17;
 pub const SYS_PCI_READ_CONFIG: u64 = 18;
 pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
@@ -329,5 +331,62 @@ pub fn pci_read_config_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
         0
     } else {
         result as u8
+    }
+}
+
+/// Framebuffer information structure (matches kernel's FramebufferInfo in servers.rs)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u16,
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+}
+
+/// Get framebuffer information from the kernel
+/// Returns Some(FramebufferInfo) on success, None on failure
+pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
+    let mut fb_info = FramebufferInfo {
+        address: 0,
+        width: 0,
+        height: 0,
+        pitch: 0,
+        bpp: 0,
+        red_mask_size: 0,
+        red_mask_shift: 0,
+        green_mask_size: 0,
+        green_mask_shift: 0,
+        blue_mask_size: 0,
+        blue_mask_shift: 0,
+    };
+    
+    let result = unsafe {
+        syscall1(SYS_GET_FRAMEBUFFER_INFO, &mut fb_info as *mut _ as u64)
+    };
+    
+    if result == 0 {
+        Some(fb_info)
+    } else {
+        None
+    }
+}
+
+/// Map framebuffer into process address space
+/// Returns the virtual address of the mapped framebuffer on success, None on failure
+pub fn map_framebuffer() -> Option<usize> {
+    let result = unsafe { syscall0(SYS_MAP_FRAMEBUFFER) };
+    
+    if result != 0 {
+        Some(result as usize)
+    } else {
+        None
     }
 }
