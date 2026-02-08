@@ -1254,7 +1254,7 @@ Desarrollado con amor en Rust
         println!("       📦 Instalando binarios del sistema...");
         
         // Instalar eclipse-systemd
-        let systemd_path = "eclipse-apps/systemd/target/release/eclipse-systemd";
+        let systemd_path = "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd";
         if Path::new(systemd_path).exists() {
             eclipsefs.install_binary("/usr/sbin/eclipse-systemd", systemd_path)?;
             // También copiar a /sbin/eclipse-systemd para compatibilidad
@@ -1265,6 +1265,15 @@ Desarrollado con amor en Rust
             println!("         ✓ Enlace simbólico /sbin/init -> eclipse-systemd creado");
         } else {
             println!("         ⚠️  eclipse-systemd no encontrado en: {}", systemd_path);
+        }
+        
+        // Instalar smithay_app
+        let smithay_path = "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app";
+        if Path::new(smithay_path).exists() {
+            eclipsefs.install_binary("/usr/bin/smithay_app", smithay_path)?;
+            println!("         ✓ smithay_app instalado en /usr/bin/");
+        } else {
+            println!("         ⚠️  smithay_app no encontrado en: {}", smithay_path);
         }
         
         // Instalar otros binarios del sistema
