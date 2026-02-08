@@ -18,8 +18,11 @@ const MSG_TYPE_INPUT: u32 = 0x00000040;     // Input messages
 const MSG_TYPE_SIGNAL: u32 = 0x00000400;    // Signal messages
 
 /// Status update interval (iterations between status prints)
-/// Approximately 5 seconds assuming fast yield cycles
+/// Note: Actual time duration depends on yield_cpu() behavior and system load
 const STATUS_UPDATE_INTERVAL: u64 = 5000000;
+
+/// IPC message buffer size
+const IPC_BUFFER_SIZE: usize = 256;
 
 /// Framebuffer state
 struct FramebufferState {
@@ -148,7 +151,7 @@ impl IpcHandler {
     
     /// Process incoming IPC messages
     fn process_messages(&mut self) {
-        let mut buffer = [0u8; 256];
+        let mut buffer = [0u8; IPC_BUFFER_SIZE];
         
         // Try to receive messages
         let (len, sender_pid) = receive(&mut buffer);
