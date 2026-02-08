@@ -3,17 +3,88 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Framebuffer information from bootloader
-static FRAMEBUFFER_INFO: AtomicU64 = AtomicU64::new(0);
-
-/// Store framebuffer info from bootloader
-pub fn set_framebuffer_info(ptr: u64) {
-    FRAMEBUFFER_INFO.store(ptr, Ordering::Relaxed);
+/// Información del framebuffer recibida del bootloader UEFI
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    pub base_address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels_per_scan_line: u32,
+    pub pixel_format: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub reserved_mask: u32,
 }
 
-/// Get framebuffer info pointer (for graphics server)
+/// Información completa de arranque pasada por el bootloader
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootInfo {
+    pub framebuffer: FramebufferInfo,
+    pub pml4_addr: u64,
+    pub kernel_phys_base: u64,
+}
+
+/// Static storage for BootInfo
+/// We use a single Option<BootInfo> to store the copy of the boot info
+/// Initialized to Some(dummy) to force it into .data section instead of .bss
+/// This prevents it from being zeroed out if BSS initialization happens late or incorrectly
+static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
+    framebuffer: FramebufferInfo {
+        base_address: 0xDEADBEEF,
+        width: 0,
+        height: 0,
+        pixels_per_scan_line: 0,
+        pixel_format: 0,
+        red_mask: 0,
+        green_mask: 0,
+        blue_mask: 0,
+        reserved_mask: 0,
+    },
+    pml4_addr: 0,
+    kernel_phys_base: 0,
+});
+
+/// Initialize boot info from the pointer passed by the bootloader
+pub fn init(boot_info_ptr: u64) {
+    if boot_info_ptr == 0 {
+        panic!("BootInfo pointer is null in boot::init");
+    }
+    
+    unsafe {
+        crate::serial::serial_print("[BOOT] Initializing BootInfo storage...\n");
+        let boot_info_ref = &*(boot_info_ptr as *const BootInfo);
+        BOOT_INFO = Some(*boot_info_ref);
+        
+        crate::serial::serial_print("[BOOT] BootInfo stored at: ");
+        crate::serial::serial_print_hex(&raw const BOOT_INFO as u64);
+        crate::serial::serial_print("\n");
+        
+        if let Some(bi) = &BOOT_INFO {
+            crate::serial::serial_print("[BOOT] Framebuffer base: ");
+            crate::serial::serial_print_hex(bi.framebuffer.base_address);
+            crate::serial::serial_print("\n");
+        }
+    }
+}
+
+/// Get access to the global BootInfo
+pub fn get_boot_info() -> &'static BootInfo {
+    unsafe {
+        BOOT_INFO.as_ref().expect("BootInfo not initialized")
+    }
+}
+
+/// Get framebuffer info pointer (for graphics server/syscalls)
 pub fn get_framebuffer_info() -> u64 {
-    FRAMEBUFFER_INFO.load(Ordering::Relaxed)
+    unsafe {
+        if let Some(bi) = &BOOT_INFO {
+            return &bi.framebuffer as *const _ as u64;
+        }
+        0
+    }
 }
 
 /// Descriptor de la GDT

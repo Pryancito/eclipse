@@ -58,6 +58,9 @@ pub fn init() {
         // Inicializar el heap con un bloque libre grande
         // IMPORTANTE: Obtenemos la dirección del array estático en memoria baja
         let heap_ptr_low = HEAP.memory.as_mut_ptr();
+        crate::serial::serial_print("[MEM] HEAP static addr: ");
+        crate::serial::serial_print_hex(heap_ptr_low as u64);
+        crate::serial::serial_print("\n");
         
         // Convertimos a dirección física
         let heap_phys = virt_to_phys(heap_ptr_low as u64);

@@ -33,37 +33,8 @@ mod binaries;
 mod ata;
 mod fd;  // File descriptor management
 
-/// Información del framebuffer recibida del bootloader UEFI
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FramebufferInfo {
-    pub base_address: u64,
-    pub width: u32,
-    pub height: u32,
-    pub pixels_per_scan_line: u32,
-    pub pixel_format: u32,
-    pub red_mask: u32,
-    pub green_mask: u32,
-    pub blue_mask: u32,
-    pub reserved_mask: u32,
-}
-
-/// Información completa de arranque pasada por el bootloader
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BootInfo {
-    pub framebuffer: FramebufferInfo,
-    pub pml4_addr: u64,
-    pub kernel_phys_base: u64,
-}
-
-/// Persistent storage for boot info once we move to Higher Half
-static mut PERSISTENT_BOOT_INFO: Option<BootInfo> = None;
-
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
-#[repr(align(16))]
-// 64KB stack for kernel bootstrap
 #[repr(align(16))]
 struct BootStack {
     stack: [u8; 65536],
@@ -109,6 +80,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         panic!("BootInfo pointer is null!");
     }
 
+    unsafe {
+        serial::serial_print("[KERNEL] BOOT_STACK addr: ");
+        serial::serial_print_hex(&raw const BOOT_STACK as u64);
+        serial::serial_print("\n");
+    }
+
     // Switch to Higher Half Boot Stack immediately to allow removing identity mapping later
     // Ensure stack top is 16-byte aligned
     let stack_top = (unsafe { &raw mut BOOT_STACK.stack } as u64) + 65536;
@@ -129,18 +106,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 /// Entry point in Higher Half with clean stack
 extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
-    // Stage 1: Copy BootInfo to Higher Half static before identity map is gone
-    let boot_info_raw = unsafe { &*(boot_info_ptr as *const BootInfo) };
-    unsafe { PERSISTENT_BOOT_INFO = Some(*boot_info_raw); }
-    let boot_info = unsafe { PERSISTENT_BOOT_INFO.as_ref().unwrap() };
+    // Stage 1: Initialize BootInfo in centralized storage
+    boot::init(boot_info_ptr);
+    let boot_info = boot::get_boot_info();
     
     let pml4_phys = boot_info.pml4_addr;
     let kernel_phys_base = boot_info.kernel_phys_base;
 
     serial::serial_print("Switched to Higher Half Stack successfully\n");
-    serial::serial_print("BootInfo persistent storage initialized at: ");
-    serial::serial_print_hex(unsafe { &raw const PERSISTENT_BOOT_INFO } as u64);
-    serial::serial_print("\n");
 
     // Stage 2: Basic hardware initialization
     boot::load_gdt();
@@ -187,17 +160,16 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     serial::serial_print("Microkernel initialized successfully!\n");
     
     // Final Stage: Jump to main loop
-    kernel_main(&boot_info.framebuffer);
+    kernel_main(boot_info);
 }
 
 /// Init process binary embedded in kernel
 pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
 
 /// Función principal del kernel
-pub fn kernel_main(framebuffer_info: &FramebufferInfo) -> ! {
-    // Store framebuffer info for graphics server
-    let fb_ptr = framebuffer_info as *const _ as u64;
-    boot::set_framebuffer_info(fb_ptr);
+pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
+    // Framebuffer info is now handled centrally by boot::get_framebuffer_info()
+    // No need to store it manually
     
     serial::serial_print("Entering kernel main loop...\n");
     

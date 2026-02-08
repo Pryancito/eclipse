@@ -19,6 +19,8 @@
 
 use eclipse_libc::{println, getpid, yield_cpu};
 
+mod logo;
+
 /// Syscall numbers
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_MAP_FRAMEBUFFER: u64 = 16;
@@ -104,10 +106,10 @@ fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     let pixel_count = fb_size / BYTES_PER_PIXEL;
     unsafe {
         for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), 0x00000000);
+            core::ptr::write_volatile(fb_ptr.add(i), 0xFFFFFFFF);
         }
     }
-    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to black");
+    println!("[DISPLAY-SERVICE]     ✓ Screen cleared to white");
 }
 
 /// Create framebuffer device node /dev/fb0
@@ -730,7 +732,7 @@ pub extern "C" fn _start() -> ! {
             println!("[DISPLAY-SERVICE] Testing 2D acceleration...");
             
             // Test screen clear
-            match clear_screen(fb, colors::BLACK) {
+            match clear_screen(fb, colors::WHITE) {
                 Ok(_) => {
                     println!("[DISPLAY-SERVICE]   ✓ Screen clear successful");
                     stats.fill_operations += 1;
@@ -771,7 +773,10 @@ pub extern "C" fn _start() -> ! {
     
     if let Some(ref fb) = framebuffer {
         println!("[DISPLAY-SERVICE] Final screen clear before starting...");
-        let _ = clear_screen(fb, 0x00000000);
+        let _ = clear_screen(fb, 0xFFFFFFFF);
+
+        println!("[DISPLAY-SERVICE] Drawing startup logo...");
+        logo::draw(fb.base_address, fb.pitch, fb.mode.bpp, fb.mode.width, fb.mode.height);
     }
 
     println!("[DISPLAY-SERVICE] Display service ready");

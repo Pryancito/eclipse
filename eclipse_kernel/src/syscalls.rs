@@ -907,28 +907,28 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
     }
     
     let fb_info_ptr = crate::boot::get_framebuffer_info();
+    serial::serial_print("[SYSCALL] get_framebuffer_info ptr: ");
+    serial::serial_print_hex(fb_info_ptr);
+    serial::serial_print("\n");
+
     if fb_info_ptr == 0 {
+        serial::serial_print("[SYSCALL] ERROR: Framebuffer info pointer is NULL\n");
         return u64::MAX; // -1 as u64
     }
     
-    // The bootloader passes a different FramebufferInfo structure
-    // We need to convert it to our syscall structure
+    // The boot/kernel FramebufferInfo is what we want.
+    // We just need to make sure we copy it to the userspace buffer format.
+    
+    // NOTE: boot::get_framebuffer_info() returns a pointer to the FramebufferInfo struct inside BootInfo
+    let kernel_fb_ptr = crate::boot::get_framebuffer_info() as *const crate::boot::FramebufferInfo;
+
     unsafe {
-        // Read bootloader structure (from main.rs)
-        #[repr(C)]
-        struct BootloaderFramebufferInfo {
-            base_address: u64,
-            width: u32,
-            height: u32,
-            pixels_per_scan_line: u32,
-            pixel_format: u32,
-            red_mask: u32,
-            green_mask: u32,
-            blue_mask: u32,
-            reserved_mask: u32, // Added to match kernel main.rs definition
+        if kernel_fb_ptr.is_null() {
+             serial::serial_print("[SYSCALL] ERROR: Kernel framebuffer pointer is null\n");
+             return u64::MAX;
         }
-        
-        let bootloader_fb = &*(fb_info_ptr as *const BootloaderFramebufferInfo);
+
+        let kernel_fb = &*kernel_fb_ptr;
         
         // Calculate BPP from pixel format
         // Pixel format 1 = RGB, typically 32bpp
@@ -937,13 +937,13 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         let bytes_per_pixel = bpp / 8;
         
         // Calculate pitch (bytes per scanline)
-        let pitch = bootloader_fb.pixels_per_scan_line * bytes_per_pixel as u32;
+        let pitch = kernel_fb.pixels_per_scan_line * bytes_per_pixel as u32;
         
         // Create syscall structure
         let syscall_fb = FramebufferInfo {
-            address: bootloader_fb.base_address,
-            width: bootloader_fb.width,
-            height: bootloader_fb.height,
+            address: kernel_fb.base_address,
+            width: kernel_fb.width,
+            height: kernel_fb.height,
             pitch,
             bpp,
             red_mask_size: 8,
@@ -972,28 +972,20 @@ fn sys_map_framebuffer() -> u64 {
         return 0;
     }
     
-    // Read bootloader structure
-    #[repr(C)]
-    struct BootloaderFramebufferInfo {
-        base_address: u64,
-        width: u32,
-        height: u32,
-        pixels_per_scan_line: u32,
-        pixel_format: u32,
-        red_mask: u32,
-        green_mask: u32,
-        blue_mask: u32,
-    }
-    
-    let bootloader_fb = unsafe { &*(fb_info_ptr as *const BootloaderFramebufferInfo) };
+    let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
     
     // Calculate framebuffer size correctly
     // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
-    let fb_size = (bootloader_fb.pixels_per_scan_line * bootloader_fb.height * 4) as u64;
+    // Map 2x size to support double buffering in display_service
+    let single_frame_size = (kernel_fb.pixels_per_scan_line * kernel_fb.height * 4) as u64;
+    let fb_size = single_frame_size * 2;
     
-    serial::serial_print("MAP_FB: Framebuffer mapping request\n");
+    // Align to 4KB (page size)
+    let fb_size = (fb_size + 0xFFF) & !0xFFF;
+    
+    serial::serial_print("MAP_FB: Framebuffer mapping request (Double Buffered)\n");
     serial::serial_print("  Phys addr: ");
-    serial::serial_print_hex(bootloader_fb.base_address);
+    serial::serial_print_hex(kernel_fb.base_address);
     serial::serial_print("\n  Size: ");
     serial::serial_print_hex(fb_size);
     serial::serial_print("\n");
@@ -1008,7 +1000,8 @@ fn sys_map_framebuffer() -> u64 {
     }
     
     // Map framebuffer into process address space
-    crate::memory::map_framebuffer_for_process(page_table_phys, bootloader_fb.base_address, fb_size)
+    // Map framebuffer into process address space
+    crate::memory::map_framebuffer_for_process(page_table_phys, kernel_fb.base_address, fb_size)
 }
 
 /// sys_pci_enum_devices - Enumerate PCI devices by class
