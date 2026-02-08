@@ -719,8 +719,8 @@ impl VirtIOBlockDevice {
             req.reserved = 0;
             req.sector = block_num * 8; // 4KB block = 8 * 512-byte sectors
             
-            // Memory barrier to ensure request header is written to memory
-            // before we set up descriptors pointing to it
+            // Memory barrier to ensure request header writes are visible to the
+            // VirtIO device when it reads from DMA memory
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Build descriptor chain: request -> data -> status
@@ -884,8 +884,8 @@ impl VirtIOBlockDevice {
             req.reserved = 0;
             req.sector = block_num * 8;
             
-            // Memory barrier to ensure request header is written to memory
-            // before we set up descriptors pointing to it
+            // Memory barrier to ensure request header writes are visible to the
+            // VirtIO device when it reads from DMA memory
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Build descriptor chain: request -> data -> status
