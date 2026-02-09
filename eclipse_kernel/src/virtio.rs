@@ -768,7 +768,7 @@ impl VirtIOBlockDevice {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 
                 // Check status - MUST use volatile read as device writes this asynchronously
-                let status = read_volatile(status_ptr);
+                let status = unsafe { read_volatile(status_ptr) };
                 
                 queue.free_desc(used_idx);
                 
@@ -876,7 +876,7 @@ impl VirtIOBlockDevice {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 
                 // Check status - MUST use volatile read as device writes this asynchronously
-                let status = read_volatile(status_ptr);
+                let status = unsafe { read_volatile(status_ptr) };
                 
                 queue.free_desc(used_idx);
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
