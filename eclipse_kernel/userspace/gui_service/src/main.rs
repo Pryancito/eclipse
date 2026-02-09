@@ -3,7 +3,7 @@
 //! This service:
 //! 1. Starts after network_service.
 //! 2. Initializes Xwayland (simulated).
-//! 3. Launches the Smithay Compositor (smithay_app) from disk.
+//! 3. Launches the XFwl4 Compositor (xfwl4) from disk.
 
 #![no_std]
 #![no_main]
@@ -12,7 +12,7 @@ use eclipse_libc::{println, getpid, exit, yield_cpu, open, read, close, exec, O_
 
 /// Buffer for loading the application binary
 /// 2MB should be enough for our simulated app
-static mut APP_BUFFER: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
+static mut APP_BUFFER: [u8; 32 * 1024 * 1024] = [0; 32 * 1024 * 1024];
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -36,10 +36,10 @@ pub extern "C" fn _start() -> ! {
     println!("[GUI-SERVICE]   - Xwayland ready");
     println!("[GUI-SERVICE]   - DISPLAY=:0 configured");
 
-    // Launch Smithay App
-    println!("[GUI-SERVICE] Launching Smithay Compositor (smithay_app)...");
+    // Launch XFwl4 App
+    println!("[GUI-SERVICE] Launching XFwl4 Compositor (xfwl4)...");
     
-    let app_path = "/usr/bin/smithay_app";
+    let app_path = "/usr/bin/xfwl4";
     
     unsafe {
         // Open application file

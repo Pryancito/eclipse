@@ -50,22 +50,4 @@ else
     exit 1
 fi
 
-echo "Building smithay_app..."
-if [ -d "eclipse-apps/smithay_app" ]; then
-    cd eclipse-apps/smithay_app
-    cargo clean
-    cargo +nightly build --release --target x86_64-unknown-none
-    if [ $? -ne 0 ]; then
-        echo "Failed to build smithay_app"
-        exit 1
-    fi
-    # Copy to filesystem build directory
-    mkdir -p ../../eclipse-os-build/usr/bin
-    cp target/x86_64-unknown-none/release/smithay_app ../../eclipse-os-build/usr/bin/smithay_app
-    cd ../..
-else
-    echo "Directory eclipse-apps/smithay_app not found!"
-    exit 1
-fi
-
 echo "All userspace services built successfully."

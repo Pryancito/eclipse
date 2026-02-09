@@ -138,6 +138,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     serial::serial_print("Initializing memory system...\n");
     memory::init();
     
+    // Init DevFS before other subsystems
+    filesystem::init_devfs();
+    
     serial::serial_print("Testing early heap allocation...\n");
     let test_vec = vec![0u8; 128];
     serial::serial_print("Early heap allocation successful, ptr: ");

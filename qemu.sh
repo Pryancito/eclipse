@@ -135,7 +135,7 @@ fi
 
 # Configuración básica
 # Usar VirtIO para estandarizar el manejo de discos entre hardware real y emulado
-QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=ide"
+QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=virtio"
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
 QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"

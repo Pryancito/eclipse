@@ -499,6 +499,27 @@ pub fn mount() -> Result<(), &'static str> {
             return Ok(1); // Root
         }
         
+        // Handle /dev paths
+        if is_device_path(path) {
+            if path == "/dev" {
+                return Ok(2); // Mock directory inode for /dev
+            }
+            if let Some(dev_name) = parse_device_name(path) {
+                if let Some(_node) = lookup_device(dev_name) {
+                    // Return a "virtual" inode for the device
+                    // We hash the name to get a semi-stable ID or just use a high number
+                    // For now, let's use a simple hashing or just return a dummy high ID.
+                    // A proper implementation would map name -> stable ID.
+                    // hack: simple hash
+                    let mut hash: u32 = 0xF0000000;
+                    for b in dev_name.bytes() {
+                        hash = hash.wrapping_add(b as u32);
+                    }
+                    return Ok(hash);
+                }
+            }
+        }
+        
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut current_inode = 1;
         
@@ -570,4 +591,90 @@ pub fn read_file(path: &str, buffer: &mut [u8]) -> Result<usize, &'static str> {
 pub fn is_mounted() -> bool {
     // Safe because we just read bool
     unsafe { FS.mounted }
+}
+
+// ============================================================================
+// DEVICE FILESYSTEM (DevFS) SUPPORT
+// ============================================================================
+
+/// Device Type definition
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DeviceType {
+    Block,      // Block devices (disks)
+    Char,       // Character devices (console, tty)
+    Network,    // Network interfaces
+    Input,      // Input devices
+    Audio,      // Audio devices
+    Display,    // Display/framebuffer
+    USB,        // USB controllers
+    Unknown,
+}
+
+/// Device Node entry in registry
+#[derive(Clone)]
+pub struct DeviceNode {
+    pub name: String,
+    pub device_type: DeviceType,
+    pub driver_pid: u64,
+}
+
+use spin::Mutex;
+use alloc::collections::BTreeMap;
+
+/// Global Device Registry
+/// Maps path ("null", "sda", etc.) to DeviceNode
+static DEVICE_REGISTRY: Mutex<Option<BTreeMap<String, DeviceNode>>> = Mutex::new(None);
+
+/// Initialize the device registry
+pub fn init_devfs() {
+    let mut registry = DEVICE_REGISTRY.lock();
+    *registry = Some(BTreeMap::new());
+    serial::serial_print("[FS] Device registry initialized\n");
+}
+
+/// Register a new device
+pub fn register_device(name: &str, device_type: DeviceType, driver_pid: u64) -> bool {
+    // Ensure registry is initialized
+    let mut registry_lock = DEVICE_REGISTRY.lock();
+    if registry_lock.is_none() {
+        *registry_lock = Some(BTreeMap::new());
+    }
+    
+    if let Some(registry) = registry_lock.as_mut() {
+        registry.insert(String::from(name), DeviceNode {
+            name: String::from(name),
+            device_type,
+            driver_pid,
+        });
+        
+        serial::serial_print("[FS] Registered device: /dev/");
+        serial::serial_print(name);
+        serial::serial_print("\n");
+        return true;
+    }
+    false
+}
+
+/// Lookup a device by name (e.g., "null")
+pub fn lookup_device(name: &str) -> Option<DeviceNode> {
+    let registry_lock = DEVICE_REGISTRY.lock();
+    if let Some(registry) = registry_lock.as_ref() {
+        registry.get(name).cloned()
+    } else {
+        None
+    }
+}
+
+/// Check if a path is a device path
+pub fn is_device_path(path: &str) -> bool {
+    path.starts_with("/dev/") || path == "/dev"
+}
+
+/// Parse device name from path
+pub fn parse_device_name(path: &str) -> Option<&str> {
+    if path.starts_with("/dev/") {
+        Some(&path[5..])
+    } else {
+        None
+    }
 }

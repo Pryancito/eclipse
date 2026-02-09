@@ -160,6 +160,7 @@ pub extern "C" fn syscall_handler(
         24 => sys_futex(arg1, arg2, arg3, _arg4),
         25 => sys_nanosleep(arg1),
         26 => sys_brk(arg1),
+        27 => sys_register_device(arg1, arg2, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -662,6 +663,39 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
     0 // Success
 }
 
+/// sys_register_device - Register a new device node (Syscall 27)
+fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
+    serial::serial_print("[SYSCALL] register_device called\n");
+    
+    if name_ptr == 0 || name_len == 0 || name_len > 256 {
+        return u64::MAX;
+    }
+    
+    let name = unsafe {
+        let slice = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
+        core::str::from_utf8(slice).unwrap_or("")
+    };
+    
+    let device_type = match type_id {
+        0 => crate::filesystem::DeviceType::Block,
+        1 => crate::filesystem::DeviceType::Char,
+        2 => crate::filesystem::DeviceType::Network,
+        3 => crate::filesystem::DeviceType::Input,
+        4 => crate::filesystem::DeviceType::Audio,
+        5 => crate::filesystem::DeviceType::Display,
+        6 => crate::filesystem::DeviceType::USB,
+        _ => crate::filesystem::DeviceType::Unknown,
+    };
+    
+    let driver_pid = if let Some(pid) = current_process_id() { pid as u64 } else { 0 };
+    
+    if crate::filesystem::register_device(name, device_type, driver_pid) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
 /// sys_open - Open a file
 /// Args: path_ptr (pointer to path string), path_len (length of path), flags (open flags)
 /// Returns: file descriptor on success, -1 on error
@@ -696,6 +730,27 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         return u64::MAX;
     }
     
+    // Handle /dev paths
+    if crate::filesystem::is_device_path(path) {
+        if let Some(dev_name) = crate::filesystem::parse_device_name(path) {
+            if let Some(node) = crate::filesystem::lookup_device(dev_name) {
+                if let Some(pid) = current_process_id() {
+                    // Open device FD
+                    // We use a dummy inode 0 for devices, but track the driver PID
+                    match crate::fd::fd_open(pid, 0, flags as u32, crate::fd::FileType::Device, node.driver_pid) {
+                         Some(fd) => {
+                            serial::serial_print("[SYSCALL] open() - device opened, FD=");
+                            serial::serial_print_dec(fd as u64);
+                            serial::serial_print("\n");
+                            return fd as u64;
+                        },
+                        None => return u64::MAX,
+                    }
+                }
+            }
+        }
+    }
+    
     // Try to look up the file in the filesystem
     // For now, we'll use a simplified approach - if the file exists,
     // we can open it for reading
@@ -704,7 +759,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
             // Get current process ID
             if let Some(pid) = current_process_id() {
                 // Allocate file descriptor
-                match crate::fd::fd_open(pid, inode, flags as u32) {
+                match crate::fd::fd_open(pid, inode, flags as u32, crate::fd::FileType::File, 0) {
                     Some(fd) => {
                         serial::serial_print("[SYSCALL] open() - success, FD=");
                         serial::serial_print_dec(fd as u64);

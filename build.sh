@@ -91,6 +91,125 @@ build_eclipsefs_lib() {
     cd ..
 }
 
+# Función para compilar eclipse-syscall
+build_eclipse_syscall() {
+    print_step "Compilando eclipse-syscall..."
+    
+    if [ ! -d "eclipse-syscall" ]; then
+        print_status "Directorio eclipse-syscall no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-syscall
+    
+    print_status "Compilando eclipse-syscall..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "eclipse-syscall compilado exitosamente"
+    else
+        print_error "Error al compilar eclipse-syscall"
+        cd ..
+        return 1
+    fi
+    
+    cd ..
+}
+
+# Función para preparar el sysroot
+prepare_sysroot() {
+    print_step "Preparando sysroot..."
+    mkdir -p "$BUILD_DIR/sysroot/usr/lib"
+    mkdir -p "$BUILD_DIR/sysroot/usr/include"
+}
+
+# Función para compilar eclipse-libc
+build_eclipse_libc() {
+    print_step "Compilando eclipse-libc..."
+    
+    if [ ! -d "eclipse-libc" ]; then
+        print_status "Directorio eclipse-libc no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-libc
+    
+    print_status "Compilando eclipse-libc..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "eclipse-libc compilado exitosamente"
+        
+        # Instalar en sysroot como liblibc.a
+        mkdir -p "$BUILD_DIR/sysroot/usr/lib"
+        cp target/release/libeclipse_libc.a "$BUILD_DIR/sysroot/usr/lib/liblibc.a"
+        print_status "Instalado en sysroot: $BUILD_DIR/sysroot/usr/lib/liblibc.a"
+    else
+        print_error "Error al compilar eclipse-libc"
+        cd ..
+        return 1
+    fi
+    
+    cd ..
+}
+
+# Función para compilar eclipse_std
+build_eclipse_std() {
+    print_step "Compilando eclipse_std..."
+    
+    if [ ! -d "eclipse-apps/eclipse_std" ]; then
+        print_status "Directorio eclipse-apps/eclipse_std no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-apps/eclipse_std
+    
+    print_status "Compilando eclipse_std..."
+    cargo build --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "eclipse_std compilado exitosamente"
+    else
+        print_error "Error al compilar eclipse_std"
+        cd ../..
+        return 1
+    fi
+    
+    cd ../..
+}
+
+# Función para compilar xfwl4
+build_xfwl4() {
+    print_step "Compilando xfwl4..."
+    
+    if [ ! -d "eclipse-apps/xfwl4" ]; then
+        print_status "Directorio eclipse-apps/xfwl4 no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd eclipse-apps/xfwl4
+    
+    print_status "Compilando xfwl4..."
+    # Usamos target x86_64-unknown-none y relocation-model=pic como otras apps de userland
+    RUSTFLAGS="-C relocation-model=pic" cargo build --release --target x86_64-unknown-none
+    
+    if [ $? -eq 0 ]; then
+        print_success "xfwl4 compilado exitosamente"
+        
+        local xfwl4_path="target/release/xfwl4"
+        if [ -f "$xfwl4_path" ]; then
+            local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
+            print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
+        fi
+    else
+        print_error "Error al compilar xfwl4"
+        cd ../..
+        return 1
+    fi
+    
+    cd ../..
+}
+
 # Función para compilar el proceso init (embedded)
 build_eclipse_init() {
     print_step "Compilando init process (embedded)..."
@@ -233,32 +352,43 @@ build_systemd() {
     cd ../..
 }
 
-# Función para compilar smithay_app
-build_smithay_app() {
-    print_step "Compilando smithay_app..."
+# Función para compilar xfwl4
+build_xfwl4() {
+    print_step "Compilando xfwl4..."
     
-    if [ ! -d "eclipse-apps/smithay_app" ]; then
-        print_status "Directorio smithay_app no encontrado, saltando..."
+    if [ ! -d "eclipse-apps/xfwl4" ]; then
+        print_status "Directorio xfwl4 no encontrado, saltando..."
         return 0
     fi
     
-    cd eclipse-apps/smithay_app
+    cd eclipse-apps/xfwl4
     
-    # Compilar smithay_app para el target correcto
-    print_status "Compilando smithay_app..."
-    cargo +nightly build --release --target x86_64-unknown-none
+    print_status "Compilando xfwl4..."
+    
+    # Configurar flags para usar nuestro sysroot y libc
+    # Configurar flags para usar nuestro sysroot y libc
+    #export RUSTFLAGS="-L native=../../$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib -C link-arg=-static"
+    # Permitir cross-compilation para pkg-config (aunque fallará sin .pc files, evita el panic inmediato)
+    #export PKG_CONFIG_ALLOW_CROSS=1
+    #export PKG_CONFIG_SYSROOT_DIR="../../$BUILD_DIR/sysroot"
+    
+    # Usar target custom y build-std
+    # Importante: build-std debe incluir panic_abort si usamos panic=abort
+    cargo build --release \
+#        --target x86_64-unknown-none \
+#        -Z build-std=std,core,alloc,panic_abort \
+#        --features default
     
     if [ $? -eq 0 ]; then
-        print_success "smithay_app compilado exitosamente"
+        print_success "xfwl4 compilado exitosamente"
         
-        # Mostrar información del sistema compilado
-        local smithay_path="target/x86_64-unknown-none/release/smithay_app"
-        if [ -f "$smithay_path" ]; then
-            local smithay_size=$(du -h "$smithay_path" | cut -f1)
-            print_status "smithay_app generado: $smithay_path ($smithay_size)"
+        local xfwl4_path="target/release/xfwl4"
+        if [ -f "$xfwl4_path" ]; then
+            local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
+            print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
         fi
     else
-        print_error "Error al compilar smithay_app"
+        print_error "Error al compilar xfwl4"
         return 1
     fi
     
@@ -578,6 +708,15 @@ build_userland() {
     build_app_framework
     build_drm_system
     build_wayland_integration
+    
+    # Nuevos componentes base
+    build_eclipse_syscall
+    prepare_sysroot
+    build_eclipse_libc
+    build_eclipse_std
+    
+    # Aplicaciones
+    build_xfwl4
     build_wayland_apps
     build_wayland_server
     build_cosmic_client
@@ -729,11 +868,11 @@ create_basic_distribution() {
             print_status "Systemd copiado e instalado en /usr/sbin/"
         fi
         
-        # Copiar smithay_app si existe
-        if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
-            cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/smithay_app"
-            print_status "smithay_app copiado e instalado en /usr/bin/"
+        # Copiar xfwl4 si existe
+        if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
+            cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
+            chmod +x "$BUILD_DIR/usr/bin/xfwl4"
+            print_status "xfwl4 copiado e instalado en /usr/bin/"
         fi
         
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
@@ -756,11 +895,15 @@ create_basic_distribution() {
         #     print_status "rwaybar instalado en /usr/bin/"
         # fi
 
-        # if [ -f "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" ]; then
-        #     cp "eclipse-apps/apps/eclipse_taskbar/target/release/eclipse_taskbar" "$BUILD_DIR/usr/bin/"
-        #     chmod +x "$BUILD_DIR/usr/bin/eclipse_taskbar"
         #     print_status "eclipse_taskbar instalado en /usr/bin/"
         # fi
+        
+        # Copiar xfwl4 si existe
+        if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
+            cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
+            chmod +x "$BUILD_DIR/usr/bin/xfwl4"
+            print_status "xfwl4 instalado en /usr/bin/"
+        fi
         
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
@@ -786,7 +929,7 @@ wayland_text_editor = "/userland/bin/wayland_text_editor"
 
 [desktop_environment]
 # Nota: Algunos componentes del desktop environment no están implementados aún
-wayland_server = "/usr/bin/smithay_app"
+wayland_server = "/usr/bin/xfwl4"
 # cosmic_desktop = "/userland/bin/eclipse_cosmic"
 # rwaybar = "/userland/bin/rwaybar"
 # eclipse_taskbar = "/userland/bin/eclipse_taskbar"
@@ -985,10 +1128,10 @@ EOF
     # Copiar binarios de eclipse-apps si existen
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
         #mkdir -p "$BUILD_DIR/usr/bin"
-        #if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
-        #    cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/"
-        #    chmod +x "$BUILD_DIR/usr/bin/smithay_app"
-        #    print_status "smithay_app instalado en usr/bin/"
+        #if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
+        #    cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
+        #    chmod +x "$BUILD_DIR/usr/bin/xfwl4"
+        #    print_status "xfwl4 instalado en usr/bin/"
         #fi
 
     # if [ -f "eclipse-apps/target/release/eclipse_cosmic" ]; then
@@ -1142,12 +1285,12 @@ create_bootable_image() {
                     print_status "eclipse-systemd copiado a /sbin/ y /usr/sbin/"
                 fi
                 
-                # Copiar smithay_app a la ubicacion estándar si existe
-                if [ -f "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" ]; then
+                # Copiar xfwl4 a la ubicacion estándar si existe
+                if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
                     mkdir -p "$BUILD_DIR/usr/bin"
-                    cp "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app" "$BUILD_DIR/usr/bin/smithay_app"
-                    chmod +x "$BUILD_DIR/usr/bin/smithay_app"
-                    print_status "smithay_app copiado a /usr/bin/"
+                    cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/xfwl4"
+                    chmod +x "$BUILD_DIR/usr/bin/xfwl4"
+                    print_status "xfwl4 copiado a /usr/bin/"
                 fi
 
                 # Copiar otros binarios importantes si existen
@@ -1485,7 +1628,7 @@ main() {
     build_bootloader
     build_installer
     build_systemd
-    build_smithay_app
+    build_xfwl4
     # build_eclipse_apps
     # build_userland
     

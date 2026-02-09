@@ -30,6 +30,11 @@ pub const O_CREAT: i32 = 0x0040;
 pub const O_TRUNC: i32 = 0x0200;
 pub const O_APPEND: i32 = 0x0400;
 
+// Seek flags
+pub const SEEK_SET: i32 = 0;
+pub const SEEK_CUR: i32 = 1;
+pub const SEEK_END: i32 = 2;
+
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> u64 {
     let ret: u64;
@@ -52,7 +57,7 @@ unsafe fn syscall2(n: u64, arg1: u64, arg2: u64) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
     asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, lateout("rax") ret, options(nostack));
     ret
@@ -179,6 +184,14 @@ pub fn open(path: &str, flags: i32, _mode: i32) -> i32 {
 pub fn close(fd: i32) -> i32 {
     unsafe {
         syscall1(SYS_CLOSE, fd as u64) as i32
+    }
+}
+
+/// Reposition read/write file offset
+/// Returns new offset on success, -1 on error
+pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    unsafe {
+        syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) as i64
     }
 }
 /// Send a message to a server

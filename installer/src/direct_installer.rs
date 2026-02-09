@@ -529,7 +529,7 @@ impl DirectInstaller {
         // Instalar aplicaciones de eclipse-apps
         let apps_to_install = vec![
             ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
-            ("eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app", "/usr/bin/smithay_app"),
+            ("eclipse-apps/xfwl4/target/release/xfwl4", "/usr/bin/xfwl4"),
             ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
         ];
 
@@ -1268,13 +1268,13 @@ Desarrollado con amor en Rust
             println!("         ⚠️  eclipse-systemd no encontrado en: {}", systemd_path);
         }
         
-        // Instalar smithay_app
-        let smithay_path = "eclipse-apps/smithay_app/target/x86_64-unknown-none/release/smithay_app";
+        // Instalar xfwl4
+        let smithay_path = "eclipse-apps/xfwl4/target/release/xfwl4";
         if Path::new(smithay_path).exists() {
-            eclipsefs.install_binary("/usr/bin/smithay_app", smithay_path)?;
-            println!("         ✓ smithay_app instalado en /usr/bin/");
+            eclipsefs.install_binary("/usr/bin/xfwl4", smithay_path)?;
+            println!("         ✓ xfwl4 instalado en /usr/bin/");
         } else {
-            println!("         ⚠️  smithay_app no encontrado en: {}", smithay_path);
+            println!("         ⚠️  xfwl4 no encontrado en: {}", smithay_path);
         }
         
         // Instalar otros binarios del sistema
