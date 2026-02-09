@@ -1,0 +1,26 @@
+//! Syscall numbers
+pub const SYS_EXIT: usize = 0;
+pub const SYS_WRITE: usize = 1;
+pub const SYS_READ: usize = 2;
+pub const SYS_SEND: usize = 3;
+pub const SYS_RECEIVE: usize = 4;
+pub const SYS_YIELD: usize = 5;
+pub const SYS_GETPID: usize = 6;
+pub const SYS_FORK: usize = 7;
+pub const SYS_EXEC: usize = 8;
+pub const SYS_WAIT: usize = 9;
+pub const SYS_GET_SERVICE_BINARY: usize = 10;
+pub const SYS_OPEN: usize = 11;
+pub const SYS_CLOSE: usize = 12;
+pub const SYS_GETPPID: usize = 13;
+pub const SYS_LSEEK: usize = 14;
+pub const SYS_GET_FRAMEBUFFER_INFO: usize = 15;
+pub const SYS_MAP_FRAMEBUFFER: usize = 16;
+// New for std support
+pub const SYS_MMAP: usize = 20;
+pub const SYS_MUNMAP: usize = 21;
+pub const SYS_CLONE: usize = 22;
+pub const SYS_GETTID: usize = 23;
+pub const SYS_FUTEX: usize = 24;
+pub const SYS_NANOSLEEP: usize = 25;
+pub const SYS_BRK: usize = 26;
