@@ -689,29 +689,28 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print_hex(req_phys);
             crate::serial::serial_print("\n");
             
+            // Allocate status buffer
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
                 .ok_or_else(|| {
                     crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate status buffer\n");
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                     "Failed to allocate status buffer"
                 })?;
             
-            crate::serial::serial_print("[VirtIO] Status:  v=");
-            crate::serial::serial_print_hex(status_ptr as u64);
-            crate::serial::serial_print(" p=");
-            crate::serial::serial_print_hex(status_phys);
-            crate::serial::serial_print("\n");
-            
+            // Allocate BOUNCE BUFFER for data
+            // Accessing heap directly (Vec) via virt_to_phys is risky if the heap is large
+            // or if the Vec is not physically contiguous (which it isn't guaranteed to be).
+            // A dedicated DMA buffer guarantees we give the device a valid, contiguous physical region.
+            let (bounce_ptr, bounce_phys) = crate::memory::alloc_dma_buffer(4096, 4096)
+                .ok_or_else(|| {
+                    crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate bounce buffer\n");
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                    crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                    "Failed to allocate bounce buffer"
+                })?;
+
             // Initialize status to 0x55 to detect if device touches it
             *status_ptr = 0x55;
-            
-            let buffer_virt = buffer.as_ptr() as u64;
-            let buffer_phys = crate::memory::virt_to_phys(buffer_virt);
-            
-            crate::serial::serial_print("[VirtIO] Data:    v=");
-            crate::serial::serial_print_hex(buffer_virt);
-            crate::serial::serial_print(" p=");
-            crate::serial::serial_print_hex(buffer_phys);
-            crate::serial::serial_print("\n");
             
             // Build request header
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
@@ -719,96 +718,47 @@ impl VirtIOBlockDevice {
             req.reserved = 0;
             req.sector = block_num * 8; // 4KB block = 8 * 512-byte sectors
             
-            // Build descriptor chain: request -> data -> status
+            // Build descriptor chain: request -> bounce buffer -> status
             let buffers = [
                 (req_phys, core::mem::size_of::<VirtIOBlockReq>() as u32, 0),
-                (buffer_phys, 4096, VIRTQ_DESC_F_WRITE),
+                (bounce_phys, 4096, VIRTQ_DESC_F_WRITE),
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
             
             let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
             
-            // Debug: Verify descriptor was added
-            crate::serial::serial_print("[VirtIO] Added descriptor chain starting at index: ");
-            crate::serial::serial_print_dec(desc_idx as u64);
-            crate::serial::serial_print("\n");
-            
-            // Debug: Check avail ring state
-            let avail_idx = read_volatile(&(*queue.avail).idx);
-            crate::serial::serial_print("[VirtIO] Avail idx after add_buf: ");
-            crate::serial::serial_print_dec(avail_idx as u64);
-            crate::serial::serial_print("\n");
-            
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
-                // Legacy PCI - use I/O port notification
-                
-                // Select queue 0 before notifying (VirtIO block uses single queue)
                 const VIRTIO_QUEUE_INDEX: u16 = 0;
                 outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, VIRTIO_QUEUE_INDEX);
-                
-                // Memory barrier strict ordering: ensure all memory writes are visible before notify
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-
-                // Write to QUEUE_NOTIFY register
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
-                
-                // No delay needed if synchronization is correct
             } else if self.mmio_base != 0 {
-                // MMIO - use MMIO register notification
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
                 write_volatile(&mut (*regs).queue_notify, 0);
             } else {
-                // This should never happen due to early return for simulated disk
+                 // Cleanup
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 return Err("Invalid device configuration");
             }
             
-            // Wait for completion (polling for now)
-            // Increase timeout for QEMU emulation
+            // Wait for completion (polling)
             let mut timeout = 100_000_000;
-            
             while !queue.has_used() && timeout > 0 {
-                // For legacy PCI, reading ISR Status acknowledges/clears the interrupt.
-                // Even if we are polling, the device might assert the line.
                 if self.io_base != 0 {
                     let isr = unsafe { inb(self.io_base + VIRTIO_PCI_ISR_STATUS) };
-                    if (isr & 1) != 0 {
-                         // Interrupt confirmed
-                    }
                 }
-                
-                // Debug: Check if status byte changes proactively
-                if unsafe { *status_ptr } != 0x55 {
-                    crate::serial::serial_print("DEBUG: Status changed to: ");
-                    crate::serial::serial_print_hex(unsafe { *status_ptr } as u64);
-                    crate::serial::serial_print("\n");
-                    // If status changes but has_used is false, we might have an issue with used ring
-                }
-
                 timeout -= 1;
                 core::hint::spin_loop();
             }
             
             if timeout == 0 {
-                crate::serial::serial_print("[VirtIO] read_block failed: Device timeout (block ");
-                crate::serial::serial_print_dec(block_num);
-                crate::serial::serial_print(") - Queue params: used_idx=");
-                crate::serial::serial_print_dec(unsafe { read_volatile(&(*queue.used).idx) as u64 });
-                crate::serial::serial_print(", last_used=");
-                crate::serial::serial_print_dec(queue.last_used_idx as u64);
-                crate::serial::serial_print("\n");
-                
-                // Debug: Check if status byte changed
-                let end_status = *status_ptr;
-                crate::serial::serial_print("[VirtIO] Debug: Status byte = 0x");
-                crate::serial::serial_print_hex(end_status as u64);
-                crate::serial::serial_print("\n");
-                
-                // Cleanup
+                crate::serial::serial_print("[VirtIO] read_block failed: Device timeout\n");
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 return Err("VirtIO read timeout");
             }
             
@@ -817,24 +767,32 @@ impl VirtIOBlockDevice {
                 // Check status
                 let status = *status_ptr;
                 
-                // Free buffers
                 queue.free_desc(used_idx);
-                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 
                 if status != VIRTIO_BLK_S_OK {
                     crate::serial::serial_print("[VirtIO] read_block failed: Bad status 0x");
                     crate::serial::serial_print_hex(status as u64);
                     crate::serial::serial_print("\n");
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                    crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                    crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                     return Err("VirtIO read failed");
                 }
+                
+                // Copy data from bounce buffer to user buffer
+                core::ptr::copy_nonoverlapping(bounce_ptr, buffer.as_mut_ptr(), 4096);
+                
+                // Cleanup
+                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 
                 return Ok(());
             }
             
-            // Cleanup on failure
             crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
             crate::memory::free_dma_buffer(status_ptr, 1, 1);
+            crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
             Err("No used buffer returned")
         }
     }
