@@ -2,7 +2,6 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Pryancito/eclipse/total)]()
 [![Platform](https://img.shields.io/badge/platform-x86__64-lightgrey.svg)]()
 
