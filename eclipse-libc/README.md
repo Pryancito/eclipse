@@ -2,29 +2,13 @@
 
 POSIX-compatible C library for Eclipse OS, written in Rust. Inspired by Redox OS's relibc.
 
-## Overview
-
-eclipse-libc provides a C/POSIX interface for Eclipse OS, enabling full std library support and compatibility with C/C++ applications.
-
-## Architecture
-
-```
-Applications (C/C++ or Rust with std)
-    ↓
-eclipse-libc (POSIX C API)
-    ↓
-eclipse-syscall (type-safe syscalls)
-    ↓
-Eclipse Kernel
-```
-
-## Current Implementation Status
+## Current Implementation Status (Phase 2 - Week 3-4)
 
 ### ✅ Implemented
 
 **Memory Management** (stdlib.h):
-- `malloc()` - allocate memory
-- `free()` - free memory  
+- `malloc()` - allocate memory via mmap
+- `free()` - free memory
 - `calloc()` - allocate and zero
 - `realloc()` - resize allocation
 - `abort()` - abort program
@@ -34,20 +18,31 @@ Eclipse Kernel
 - `memset()` - set memory
 - `strlen()` - string length
 
-**I/O** (stdio.h, unistd.h):
-- `putchar()` - write character
-- `puts()` - write string
-- `write()` - write to fd
-- `read()` - read from fd
-- `close()` - close fd
+**File I/O** (stdio.h):
+- `FILE` - file stream structure
+- `stdin`, `stdout`, `stderr` - standard streams
+- `fopen()` - open file
+- `fclose()` - close file
+- `fread()` - read from file
+- `fwrite()` - write to file
+- `fflush()` - flush buffer
+- `fputc()` - write character to stream
+- `putchar()` - write character to stdout
+- `puts()` - write string to stdout
+- `fputs()` - write string to stream
+
+**POSIX** (unistd.h):
+- `write()` - write to file descriptor
+- `read()` - read from file descriptor
+- `close()` - close file descriptor
 
 ### ⏳ TODO
 
 **stdio.h**:
-- [ ] FILE streams
-- [ ] fopen/fclose/fread/fwrite
-- [ ] printf/scanf family
-- [ ] stdin/stdout/stderr globals
+- [ ] printf/scanf family (variadic functions - complex in no_std)
+- [ ] getc/fgetc
+- [ ] ungetc
+- [ ] ferror/feof/clearerr
 
 **stdlib.h**:
 - [ ] atoi/atof/strtol conversions
@@ -58,6 +53,7 @@ Eclipse Kernel
 - [ ] strcmp/strncmp
 - [ ] strcpy/strncpy
 - [ ] strcat/strncat
+- [ ] strstr/strchr
 
 **pthread.h**:
 - [ ] pthread_create/join
@@ -71,40 +67,42 @@ Eclipse Kernel
 
 ## Usage
 
-### From Rust
+### File I/O Example
 
 ```rust
 use eclipse_libc::*;
 
 unsafe {
-    // Allocate memory
-    let ptr = malloc(1024);
+    // Open file
+    let file = fopen(b"/path/to/file\0".as_ptr() as *const c_char, 
+                     b"w\0".as_ptr() as *const c_char);
     
-    // Use string functions
-    let s = b"Hello\0";
-    let len = strlen(s.as_ptr() as *const c_char);
+    if !file.is_null() {
+        // Write to file
+        let data = b"Hello, Eclipse OS!";
+        fwrite(data.as_ptr() as *const c_void, 1, data.len(), file);
+        
+        // Close file
+        fclose(file);
+    }
     
-    // I/O
-    puts(s.as_ptr() as *const c_char);
-    
-    // Clean up
-    free(ptr);
+    // Use stdout
+    puts(b"Written to file!\0".as_ptr() as *const c_char);
 }
 ```
 
-### From C (future)
+### Memory Management Example
 
-```c
-#include <stdio.h>
-#include <stdlib.h>
+```rust
+use eclipse_libc::*;
 
-int main() {
-    puts("Hello from Eclipse OS!");
+unsafe {
+    let ptr = malloc(1024);
     
-    void *ptr = malloc(1024);
+    // Use memory
+    memset(ptr, 0, 1024);
+    
     free(ptr);
-    
-    return 0;
 }
 ```
 
@@ -115,30 +113,36 @@ cargo build --release
 ```
 
 Produces:
-- `libeclipse_libc.a` - static library
-- `libeclipse_libc.rlib` - Rust library
+- `libeclipse_libc.a` - static library (7.3 MB)
+- `libeclipse_libc.rlib` - Rust library (35 KB)
 
-## Implementation Details
+## Architecture
 
-### Memory Allocator
+```
+Applications
+    ↓
+eclipse-libc (POSIX C API)
+    ↓
+eclipse-syscall (type-safe syscalls)
+    ↓
+Eclipse Kernel
+```
 
-Currently uses mmap-based allocator:
-- All allocations use `SYS_MMAP` syscall
-- TODO: Implement free list or dlmalloc integration
-- TODO: Implement `SYS_MUNMAP` for deallocation
+## Progress
 
-### Threading
+Phase 1 (eclipse-syscall): ✅ 100%
+Phase 2 (eclipse-libc): 🔄 40% (basic functions + FILE I/O)
+Phase 3 (kernel syscalls): ⏳ 0%
+Phase 4 (std backend): ⏳ 0%
 
-Threading support pending:
-- Requires `SYS_CLONE` implementation in kernel
-- Will use futex for synchronization
+**Overall Progress: ~45%**
 
 ## Next Steps
 
-1. **Week 3-4**: Complete stdio (FILE streams, printf/scanf)
-2. **Week 5-6**: Complete stdlib and string operations
-3. **Week 7-8**: Implement pthread support
-4. **Future**: Networking (socket API)
+1. **Week 5-6**: Complete stdlib and string operations
+2. **Week 7-8**: Implement pthread support (requires kernel SYS_CLONE)
+3. **Phase 3**: Expand kernel syscalls (mmap, munmap, clone, futex)
+4. **Phase 4**: Implement std/sys/eclipse backend
 
 ## References
 
