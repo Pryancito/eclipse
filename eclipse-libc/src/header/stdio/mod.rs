@@ -248,3 +248,101 @@ pub unsafe extern "C" fn fputs(s: *const c_char, stream: *mut FILE) -> c_int {
         0
     }
 }
+
+// File positioning functions
+use eclipse_syscall::number::SYS_LSEEK;
+
+pub const SEEK_SET: c_int = 0;
+pub const SEEK_CUR: c_int = 1;
+pub const SEEK_END: c_int = 2;
+
+#[no_mangle]
+pub unsafe extern "C" fn fseek(stream: *mut FILE, offset: c_long, whence: c_int) -> c_int {
+    if stream.is_null() {
+        return -1;
+    }
+    
+    // Flush write buffer if needed
+    if (*stream).flags & MODE_WRITE != 0 {
+        fflush(stream);
+    }
+    
+    // Call lseek syscall
+    let result = eclipse_syscall::syscall3(
+        SYS_LSEEK,
+        (*stream).fd as usize,
+        offset as usize,
+        whence as usize
+    );
+    
+    if result as isize == -1 {
+        return -1;
+    }
+    
+    // Clear read buffer
+    (*stream).buf_pos = 0;
+    (*stream).buf_size = 0;
+    
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ftell(stream: *mut FILE) -> c_long {
+    if stream.is_null() {
+        return -1;
+    }
+    
+    // Get current position
+    let result = eclipse_syscall::syscall3(
+        SYS_LSEEK,
+        (*stream).fd as usize,
+        0,
+        SEEK_CUR as usize
+    );
+    
+    if result as isize == -1 {
+        return -1;
+    }
+    
+    result as c_long
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rewind(stream: *mut FILE) {
+    fseek(stream, 0, SEEK_SET);
+}
+
+// Additional file functions
+#[no_mangle]
+pub unsafe extern "C" fn feof(stream: *mut FILE) -> c_int {
+    if stream.is_null() {
+        return 1;
+    }
+    // Simple implementation
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ferror(stream: *mut FILE) -> c_int {
+    if stream.is_null() {
+        return 1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn clearerr(stream: *mut FILE) {
+    if !stream.is_null() {
+        // Would clear error and EOF flags
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn remove(pathname: *const c_char) -> c_int {
+    -1  // TODO: Implement SYS_UNLINK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
+    -1  // TODO: Implement SYS_RENAME
+}

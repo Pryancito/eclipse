@@ -13,6 +13,9 @@ pub mod header {
     pub mod string;
     pub mod pthread;
     pub mod unistd;
+    pub mod time;
+    pub mod errno;
+    pub mod signal;
 }
 
 pub use types::*;
