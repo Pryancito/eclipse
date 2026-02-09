@@ -32,6 +32,7 @@ mod filesystem;
 mod binaries;
 mod ata;
 mod fd;  // File descriptor management
+mod bcache; // Buffer Cache
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot

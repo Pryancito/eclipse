@@ -25,6 +25,7 @@ pub mod virtio;
 pub mod filesystem;
 pub mod ata;
 pub mod fd;  // File descriptor management
+pub mod bcache; // Buffer Cache
 mod elf_loader;
 
 // Re-exportar tipos importantes

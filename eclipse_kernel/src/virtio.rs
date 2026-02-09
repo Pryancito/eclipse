@@ -352,6 +352,9 @@ impl Virtqueue {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         
         write_volatile(&mut avail.idx, new_idx);
+
+        // Ensure the index update is globally visible before we notify the device
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         
         Some(head)
     }
@@ -730,7 +733,7 @@ impl VirtIOBlockDevice {
             // Notify device
             if self.io_base != 0 && self.mmio_base == 0 {
                 const VIRTIO_QUEUE_INDEX: u16 = 0;
-                outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, VIRTIO_QUEUE_INDEX);
+                // Note: No need to select queue for notification in legacy PCI
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
             } else if self.mmio_base != 0 {
@@ -756,10 +759,13 @@ impl VirtIOBlockDevice {
             
             if timeout == 0 {
                 crate::serial::serial_print("[VirtIO] read_block failed: Device timeout\n");
-                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                return Err("VirtIO read timeout");
+                crate::serial::serial_print("[VirtIO] WARNING: Leaking DMA buffers to prevent potential memory corruption from late device writes\n");
+                // DO NOT free buffers here. If the device writes to them later, 
+                // we don't want it overwriting random kernel memory.
+                // crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                // crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                // crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
+                return Err("VirtIO read timeout (buffers leaked)");
             }
             
             // Get used buffer
@@ -769,6 +775,14 @@ impl VirtIOBlockDevice {
                 
                 // Check status - MUST use volatile read as device writes this asynchronously
                 let status = unsafe { read_volatile(status_ptr) };
+
+                if status == 0x55 {
+                    crate::serial::serial_print("[VirtIO] read_block failed: Status not updated (still 0x55)\n");
+                     crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                     crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                     crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
+                    return Err("VirtIO status not updated (IRQ lost?)");
+                }
                 
                 queue.free_desc(used_idx);
                 

@@ -11,32 +11,16 @@ pub const BLOCK_SIZE: usize = 4096;
 
 /// Read a block from the underlying block device
 /// Tries VirtIO first, falls back to ATA
+/// Read a block from the underlying block device (Cached)
 fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    // Try VirtIO first (preferred for QEMU)
-    match crate::virtio::read_block(block_num, buffer) {
-        Ok(_) => {
-            return Ok(());
-        }
-        Err(_) => {
-            // Fall back to ATA
-            crate::ata::read_block(block_num, buffer)
-        }
-    }
+    crate::bcache::read_block(block_num, buffer)
 }
 
 /// Write a block to the underlying block device
 /// Tries VirtIO first, falls back to ATA
+/// Write a block to the underlying block device (Cached)
 fn write_block_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    // Try VirtIO first (preferred for QEMU)
-    match crate::virtio::write_block(block_num, buffer) {
-        Ok(_) => {
-            return Ok(());
-        }
-        Err(_) => {
-            // ATA write not implemented yet
-            Err("ATA write not implemented")
-        }
-    }
+    crate::bcache::write_block(block_num, buffer)
 }
 
 /// Filesystem state
@@ -572,6 +556,7 @@ pub fn mount() -> Result<(), &'static str> {
 /// Initialize the filesystem subsystem
 pub fn init() {
     serial::serial_print("Initializing filesystem subsystem...\n");
+    crate::bcache::init();
 }
 
 /// Mount the root filesystem
