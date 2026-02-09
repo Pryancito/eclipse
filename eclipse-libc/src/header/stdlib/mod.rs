@@ -1,8 +1,11 @@
 //! stdlib.h - Standard library
-use eclipse_syscall::call::exit;
 use crate::types::*;
+use eclipse_syscall::call::exit as sys_exit;
 
 #[no_mangle]
 pub unsafe extern "C" fn abort() -> ! {
-    exit(1);
+    sys_exit(1);
 }
+
+// Re-export malloc/free/calloc/realloc from alloc module
+pub use crate::alloc::{malloc, free, calloc, realloc};
