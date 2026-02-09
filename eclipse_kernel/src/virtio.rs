@@ -764,8 +764,11 @@ impl VirtIOBlockDevice {
             
             // Get used buffer
             if let Some((used_idx, _len)) = queue.get_used() {
-                // Check status
-                let status = *status_ptr;
+                // Memory fence to ensure device writes are visible
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                
+                // Check status - MUST use volatile read as device writes this asynchronously
+                let status = read_volatile(status_ptr);
                 
                 queue.free_desc(used_idx);
                 
@@ -869,7 +872,11 @@ impl VirtIOBlockDevice {
             
             // Get used buffer
             if let Some((used_idx, _len)) = queue.get_used() {
-                let status = *status_ptr;
+                // Memory fence to ensure device writes are visible
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                
+                // Check status - MUST use volatile read as device writes this asynchronously
+                let status = read_volatile(status_ptr);
                 
                 queue.free_desc(used_idx);
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
