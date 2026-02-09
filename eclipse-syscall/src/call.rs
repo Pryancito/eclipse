@@ -79,3 +79,37 @@ pub fn mmap(
 pub fn munmap(addr: usize, length: usize) -> Result<()> {
     cvt_unit(unsafe { crate::syscall2(SYS_MUNMAP, addr, length) })
 }
+
+/// Create a new thread or process
+pub fn clone(flags: usize, stack: usize, parent_tid: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_CLONE, flags, stack, parent_tid)
+    })
+}
+
+/// Get thread ID
+pub fn gettid() -> usize {
+    unsafe { crate::syscall0(SYS_GETTID) }
+}
+
+/// Fast userspace mutex operation
+pub fn futex(uaddr: usize, op: i32, val: i32, timeout: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall4(SYS_FUTEX, uaddr, op as usize, val as usize, timeout)
+    })
+}
+
+/// Sleep for specified nanoseconds  
+pub fn nanosleep(req: usize) -> Result<()> {
+    cvt_unit(unsafe { crate::syscall1(SYS_NANOSLEEP, req) })
+}
+
+/// Change program break (heap end)
+pub fn brk(addr: usize) -> Result<usize> {
+    let result = unsafe { crate::syscall1(SYS_BRK, addr) };
+    if result == usize::MAX {
+        Err(Error::new(ENOMEM))
+    } else {
+        Ok(result)
+    }
+}

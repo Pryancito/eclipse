@@ -19,5 +19,8 @@ pub const SYS_MAP_FRAMEBUFFER: usize = 16;
 // New for std support
 pub const SYS_MMAP: usize = 20;
 pub const SYS_MUNMAP: usize = 21;
-pub const SYS_BRK: usize = 23;
-pub const SYS_CLONE: usize = 24;
+pub const SYS_CLONE: usize = 22;
+pub const SYS_GETTID: usize = 23;
+pub const SYS_FUTEX: usize = 24;
+pub const SYS_NANOSLEEP: usize = 25;
+pub const SYS_BRK: usize = 26;

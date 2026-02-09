@@ -31,6 +31,13 @@ pub enum SyscallNumber {
     PciEnumDevices = 17,
     PciReadConfig = 18,
     PciWriteConfig = 19,
+    Mmap = 20,
+    Munmap = 21,
+    Clone = 22,
+    GetTid = 23,
+    Futex = 24,
+    Nanosleep = 25,
+    Brk = 26,
 }
 
 /// lseek whence values (POSIX standard)
@@ -146,6 +153,13 @@ pub extern "C" fn syscall_handler(
         17 => sys_pci_enum_devices(arg1, arg2, arg3),
         18 => sys_pci_read_config(arg1, arg2, arg3),
         19 => sys_pci_write_config(arg1, arg2, arg3),
+        20 => sys_mmap(arg1, arg2, arg3, _arg4, _arg5),
+        21 => sys_munmap(arg1, arg2),
+        22 => sys_clone(arg1, arg2, arg3),
+        23 => sys_gettid(),
+        24 => sys_futex(arg1, arg2, arg3, _arg4),
+        25 => sys_nanosleep(arg1),
+        26 => sys_brk(arg1),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -1129,6 +1143,171 @@ fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
     }
     
     0
+}
+
+/// sys_mmap - Map memory into process address space
+/// 
+/// Arguments:
+///   addr: Suggested address (0 = kernel chooses)
+///   length: Number of bytes to map
+///   prot: Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+///   flags: MAP_PRIVATE | MAP_ANONYMOUS | MAP_SHARED
+///   fd: File descriptor (ignored for anonymous mappings)
+/// 
+/// Returns: Address of mapped region, or u64::MAX on error
+fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _fd: u64) -> u64 {
+    // For now, simple implementation using heap allocator
+    // Proper implementation would use page tables
+    
+    if length == 0 {
+        return u64::MAX; // Invalid size
+    }
+    
+    // MAP_ANONYMOUS (0x20) - not backed by a file
+    let is_anonymous = (flags & 0x20) != 0;
+    
+    if !is_anonymous {
+        // File-backed mappings not yet supported
+        return u64::MAX;
+    }
+    
+    // Allocate memory (simplified - should use page allocator)
+    // For now, return a fake address in user space
+    // Real implementation would allocate pages and map them
+    
+    // Use a simple bump allocator concept
+    static MMAP_NEXT_ADDR: Mutex<u64> = Mutex::new(0x40000000);
+    
+    let mut next_addr = MMAP_NEXT_ADDR.lock();
+    let result_addr = if addr == 0 {
+        *next_addr
+    } else {
+        addr
+    };
+    
+    // Align to page boundary (4KB)
+    let aligned_addr = (result_addr + 0xFFF) & !0xFFF;
+    let aligned_length = (length + 0xFFF) & !0xFFF;
+    
+    *next_addr = aligned_addr + aligned_length;
+    drop(next_addr);
+    
+    // TODO: Actually allocate and map pages
+    // For now, just return the address
+    aligned_addr
+}
+
+/// sys_munmap - Unmap memory from process address space
+/// 
+/// Arguments:
+///   addr: Start address to unmap
+///   length: Number of bytes to unmap
+/// 
+/// Returns: 0 on success, u64::MAX on error
+fn sys_munmap(_addr: u64, _length: u64) -> u64 {
+    // TODO: Actually unmap pages
+    // For now, just return success
+    0
+}
+
+/// sys_clone - Create a new thread or process
+/// 
+/// Arguments:
+///   flags: CLONE_* flags determining what is shared
+///   stack: Stack pointer for new thread (0 = kernel allocates)
+///   parent_tid: Where to store TID in parent (can be 0)
+/// 
+/// Returns: TID of new thread/process, or u64::MAX on error
+fn sys_clone(_flags: u64, _stack: u64, _parent_tid: u64) -> u64 {
+    // Thread creation not yet fully implemented
+    // Would need:
+    // - Thread local storage
+    // - Separate stack allocation
+    // - Thread scheduler support
+    // - Proper synchronization
+    
+    serial::serial_print("sys_clone: Thread creation not yet implemented\n");
+    u64::MAX // Not implemented yet
+}
+
+/// sys_gettid - Get thread ID
+/// 
+/// Returns: Current thread ID (for now, same as PID)
+fn sys_gettid() -> u64 {
+    // For now, threads not implemented, return PID
+    current_process_id().unwrap_or(0) as u64
+}
+
+/// sys_futex - Fast userspace mutex
+/// 
+/// Arguments:
+///   uaddr: Address of futex word in user space
+///   op: Operation (FUTEX_WAIT, FUTEX_WAKE, etc.)
+///   val: Value for operation
+///   timeout: Timeout for FUTEX_WAIT (can be 0)
+/// 
+/// Returns: Depends on operation, u64::MAX on error
+fn sys_futex(_uaddr: u64, op: u64, _val: u64, _timeout: u64) -> u64 {
+    // Futex operations:
+    // 0 = FUTEX_WAIT - wait if *uaddr == val
+    // 1 = FUTEX_WAKE - wake up to val waiters
+    // 2 = FUTEX_FD - deprecated
+    // 3 = FUTEX_REQUEUE - requeue waiters to another futex
+    
+    match op & 0x7F {
+        0 => {
+            // FUTEX_WAIT - for now, just yield
+            sys_yield();
+            0
+        }
+        1 => {
+            // FUTEX_WAKE - return number woken (0 for now)
+            0
+        }
+        _ => {
+            serial::serial_print("sys_futex: Unknown operation: ");
+            serial::serial_print_hex(op);
+            serial::serial_print("\n");
+            u64::MAX
+        }
+    }
+}
+
+/// sys_nanosleep - Sleep for specified time
+/// 
+/// Arguments:
+///   req: Pointer to timespec structure (seconds + nanoseconds)
+/// 
+/// Returns: 0 on success, u64::MAX on error
+fn sys_nanosleep(_req: u64) -> u64 {
+    // For now, just yield CPU a few times to simulate sleep
+    // Real implementation would use timer interrupts
+    for _ in 0..100 {
+        sys_yield();
+    }
+    0
+}
+
+/// sys_brk - Change program break (heap end)
+/// 
+/// Arguments:
+///   addr: New program break address (0 = query current)
+/// 
+/// Returns: New program break address
+fn sys_brk(addr: u64) -> u64 {
+    // Simple heap management
+    static PROGRAM_BREAK: Mutex<u64> = Mutex::new(0x50000000);
+    
+    let mut brk = PROGRAM_BREAK.lock();
+    
+    if addr == 0 {
+        // Query current break
+        return *brk;
+    }
+    
+    // Set new break (no validation for now)
+    *brk = addr;
+    addr
 }
 
 /// Inicializar sistema de syscalls

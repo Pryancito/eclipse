@@ -42,6 +42,20 @@ mod arch {
     }
 
     #[inline(always)]
+    pub unsafe fn syscall4(n: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> usize {
+        let ret: usize;
+        core::arch::asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, lateout("rax") ret);
+        ret
+    }
+
+    #[inline(always)]
+    pub unsafe fn syscall5(n: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> usize {
+        let ret: usize;
+        core::arch::asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, in("r8") arg5, lateout("rax") ret);
+        ret
+    }
+
+    #[inline(always)]
     pub unsafe fn syscall6(n: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize, arg6: usize) -> usize {
         let ret: usize;
         core::arch::asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, in("r8") arg5, in("r9") arg6, lateout("rax") ret);
