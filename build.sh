@@ -121,6 +121,12 @@ prepare_sysroot() {
     print_step "Preparando sysroot..."
     mkdir -p "$BUILD_DIR/sysroot/usr/lib"
     mkdir -p "$BUILD_DIR/sysroot/usr/include"
+
+    # Crear librerías dummy para xkbcommon y pixman para satisfacer al linker
+    # Los símbolos reales se proporcionan vía Rust stubs en xfwl4/src/stubs.rs
+    print_status "Creando librerías dummy en sysroot..."
+    ar cr "$BUILD_DIR/sysroot/usr/lib/libxkbcommon.a"
+    ar cr "$BUILD_DIR/sysroot/usr/lib/libpixman-1.a"
 }
 
 # Función para compilar eclipse-libc
@@ -178,35 +184,42 @@ build_eclipse_std() {
     cd ../..
 }
 
-# Función para compilar xfwl4
+# Función para compilar xfwl4 (Compositor Wayland)
 build_xfwl4() {
-    print_step "Compilando xfwl4..."
-    
+    print_step "Compilando xfwl4 (Compositor Wayland)..."
+
     if [ ! -d "eclipse-apps/xfwl4" ]; then
         print_status "Directorio eclipse-apps/xfwl4 no encontrado, saltando..."
         return 0
     fi
-    
+
     cd eclipse-apps/xfwl4
-    
-    print_status "Compilando xfwl4..."
-    # Usamos target x86_64-unknown-none y relocation-model=pic como otras apps de userland
-    RUSTFLAGS="-C relocation-model=pic" cargo build --release --target x86_64-unknown-none
-    
-    if [ $? -eq 0 ]; then
-        print_success "xfwl4 compilado exitosamente"
-        
-        local xfwl4_path="target/release/xfwl4"
-        if [ -f "$xfwl4_path" ]; then
-            local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
-            print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
-        fi
-    else
+
+    print_status "Compilando xfwl4 para Eclipse OS..."
+    # Usamos target custom, no default features para evitar GTK/Glib, y activamos udev/egl
+    # Usamos target linux-musl para tener soporte de std (syscalls habilitadas en kernel)
+    # Linkamos contra eclipse-libc en sysroot
+    RUSTFLAGS="-C relocation-model=static -C link-arg=-nostdlib -L native=../../$BUILD_DIR/sysroot/usr/lib" cargo +nightly build \
+        --target x86_64-unknown-linux-musl \
+        --release \
+        --no-default-features \
+        --features eclipse \
+        -Z build-std=std,panic_abort
+
+    if [ $? -ne 0 ]; then
         print_error "Error al compilar xfwl4"
         cd ../..
         return 1
     fi
+
+    print_success "xfwl4 compilado exitosamente"
     
+    local xfwl4_path="target/x86_64-unknown-linux-musl/release/xfwl4"
+    if [ -f "$xfwl4_path" ]; then
+        local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
+        print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
+    fi
+
     cd ../..
 }
 
@@ -352,48 +365,6 @@ build_systemd() {
     cd ../..
 }
 
-# Función para compilar xfwl4
-build_xfwl4() {
-    print_step "Compilando xfwl4..."
-    
-    if [ ! -d "eclipse-apps/xfwl4" ]; then
-        print_status "Directorio xfwl4 no encontrado, saltando..."
-        return 0
-    fi
-    
-    cd eclipse-apps/xfwl4
-    
-    print_status "Compilando xfwl4..."
-    
-    # Configurar flags para usar nuestro sysroot y libc
-    # Configurar flags para usar nuestro sysroot y libc
-    #export RUSTFLAGS="-L native=../../$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib -C link-arg=-static"
-    # Permitir cross-compilation para pkg-config (aunque fallará sin .pc files, evita el panic inmediato)
-    #export PKG_CONFIG_ALLOW_CROSS=1
-    #export PKG_CONFIG_SYSROOT_DIR="../../$BUILD_DIR/sysroot"
-    
-    # Usar target custom y build-std
-    # Importante: build-std debe incluir panic_abort si usamos panic=abort
-    cargo build --release \
-#        --target x86_64-unknown-none \
-#        -Z build-std=std,core,alloc,panic_abort \
-#        --features default
-    
-    if [ $? -eq 0 ]; then
-        print_success "xfwl4 compilado exitosamente"
-        
-        local xfwl4_path="target/release/xfwl4"
-        if [ -f "$xfwl4_path" ]; then
-            local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
-            print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
-        fi
-    else
-        print_error "Error al compilar xfwl4"
-        return 1
-    fi
-    
-    cd ../..
-}
 
 # Función para compilar userland principal
 build_userland_main() {
@@ -1286,9 +1257,9 @@ create_bootable_image() {
                 fi
                 
                 # Copiar xfwl4 a la ubicacion estándar si existe
-                if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
+                if [ -f "eclipse-apps/xfwl4/target/x86_64-unknown-linux-musl/release/xfwl4" ]; then
                     mkdir -p "$BUILD_DIR/usr/bin"
-                    cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/xfwl4"
+                    cp "eclipse-apps/xfwl4/target/x86_64-unknown-linux-musl/release/xfwl4" "$BUILD_DIR/usr/bin/xfwl4"
                     chmod +x "$BUILD_DIR/usr/bin/xfwl4"
                     print_status "xfwl4 copiado a /usr/bin/"
                 fi
@@ -1628,6 +1599,8 @@ main() {
     build_bootloader
     build_installer
     build_systemd
+    prepare_sysroot
+    build_eclipse_libc
     build_xfwl4
     # build_eclipse_apps
     # build_userland

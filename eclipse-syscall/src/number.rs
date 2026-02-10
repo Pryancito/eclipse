@@ -26,3 +26,4 @@ pub const SYS_NANOSLEEP: usize = 25;
 pub const SYS_BRK: usize = 26;
 pub const SYS_REGISTER_DEVICE: usize = 27;
 pub const SYS_FMAP: usize = 28;
+pub const SYS_MOUNT: usize = 29;

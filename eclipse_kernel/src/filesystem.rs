@@ -80,9 +80,9 @@ pub fn mount() -> Result<(), &'static str> {
         
         serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
 
-        // Open disk:1 (RootFS in our QEMU setup)
-        serial::serial_print("[FS] Opening disk:1 via scheme registry...\n");
-        match crate::scheme::open("disk:1", 0, 0) {
+        // Open disk:0 (RootFS in our QEMU setup)
+        serial::serial_print("[FS] Opening disk:0 via scheme registry...\n");
+        match crate::scheme::open("disk:0", 0, 0) {
             Ok((s_id, r_id)) => {
                 FS.disk_scheme_id = s_id;
                 FS.disk_resource_id = r_id;
@@ -135,12 +135,14 @@ pub fn mount() -> Result<(), &'static str> {
                 FS.header = Some(header);
                 FS.mounted = true;
                 
-                serial::serial_print("[FS] Filesystem mounted successfully\n");
+                serial::serial_print("[FS] Filesystem mounted successfully. FS.mounted set to true.\n");
 
                 Ok(())
             },
-            Err(_) => {
-                serial::serial_print("[FS] Invalid EclipseFS header\n");
+            Err(e) => {
+                serial::serial_print("[FS] Invalid EclipseFS header: ");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
                 Err("Invalid EclipseFS header")
             }
         }
@@ -684,8 +686,8 @@ pub fn mount() -> Result<(), &'static str> {
 pub fn init() {
     serial::serial_print("Initializing filesystem subsystem...\n");
     crate::bcache::init();
-    crate::scheme::register_scheme("file", Box::new(FileSystemScheme));
-    crate::scheme::register_scheme("dev", Box::new(DevScheme));
+    crate::scheme::register_scheme("file", alloc::sync::Arc::new(FileSystemScheme));
+    crate::scheme::register_scheme("dev", alloc::sync::Arc::new(DevScheme));
 }
 
 /// Mount the root filesystem
@@ -794,9 +796,15 @@ pub struct FileSystemScheme;
 
 impl Scheme for FileSystemScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
-        if !is_mounted() {
+        let mounted = is_mounted();
+        if !mounted {
+            serial::serial_print("[FS-SCHEME] open() failed: filesystem NOT mounted\n");
             return Err(scheme_error::EIO);
         }
+        
+        serial::serial_print("[FS-SCHEME] open(");
+        serial::serial_print(path);
+        serial::serial_print(")\n");
 
         // Clean path to remove leading slash if present
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };

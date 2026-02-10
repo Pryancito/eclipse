@@ -136,7 +136,8 @@ impl TaskStateSegment {
     }
 }
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+/// TSS estática
+pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 /// Entrada de la GDT
 #[repr(C, packed)]

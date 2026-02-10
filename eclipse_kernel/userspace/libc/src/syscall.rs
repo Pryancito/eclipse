@@ -21,6 +21,7 @@ pub const SYS_MAP_FRAMEBUFFER: u64 = 16;
 pub const SYS_PCI_ENUM_DEVICES: u64 = 17;
 pub const SYS_PCI_READ_CONFIG: u64 = 18;
 pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
+pub const SYS_MOUNT: u64 = 29;
 
 // File open flags
 pub const O_RDONLY: i32 = 0x0000;
@@ -403,4 +404,9 @@ pub fn map_framebuffer() -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Mount the root filesystem
+pub fn mount() -> i32 {
+    unsafe { syscall0(SYS_MOUNT) as i32 }
 }

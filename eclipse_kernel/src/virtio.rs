@@ -1028,7 +1028,7 @@ pub fn init() {
     serial::serial_print("\n");
 
     // Register as disk: scheme
-    crate::scheme::register_scheme("disk", alloc::boxed::Box::new(DiskScheme));
+    crate::scheme::register_scheme("disk", alloc::sync::Arc::new(DiskScheme));
     serial::serial_print("[VirtIO] Registered 'disk:' scheme\n");
 }
 
@@ -1089,6 +1089,7 @@ impl Scheme for DiskScheme {
     }
 
     fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let mut devices = BLOCK_DEVICES.lock();
         let mut open_disks = OPEN_DISKS.lock();
         let open_disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
@@ -1097,7 +1098,6 @@ impl Scheme for DiskScheme {
         let offset_in_block = (open_disk.offset % 4096) as usize;
         
         let mut temp_block = [0u8; 4096];
-        let mut devices = BLOCK_DEVICES.lock();
         let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
         
         device.read_block(block_num, &mut temp_block).map_err(|_| scheme_error::EIO)?;

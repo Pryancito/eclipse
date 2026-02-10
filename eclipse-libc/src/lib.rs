@@ -24,8 +24,3 @@ pub use types::*;
 #[global_allocator]
 static ALLOCATOR: alloc::Allocator = alloc::Allocator;
 
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}

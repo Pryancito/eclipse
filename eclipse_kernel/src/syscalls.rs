@@ -42,6 +42,7 @@ pub enum SyscallNumber {
     Brk = 26,
     RegisterDevice = 27,
     Fmap = 28,
+    Mount = 29,
 }
 
 /// lseek whence values (POSIX standard)
@@ -155,6 +156,7 @@ pub extern "C" fn syscall_handler(
         26 => sys_brk(arg1),
         27 => sys_register_device(arg1, arg2, arg3),
         28 => sys_fmap(arg1, arg2, arg3),
+        29 => sys_mount(),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -766,6 +768,20 @@ pub fn get_stats() -> SyscallStats {
         open_calls: stats.open_calls,
         close_calls: stats.close_calls,
         lseek_calls: stats.lseek_calls,
+    }
+}
+
+/// sys_mount - Mount the root filesystem
+fn sys_mount() -> u64 {
+    serial::serial_print("[SYSCALL] mount() called\n");
+    match crate::filesystem::mount_root() {
+        Ok(_) => 0,
+        Err(e) => {
+            serial::serial_print("[SYSCALL] mount() failed: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            u64::MAX
+        }
     }
 }
 

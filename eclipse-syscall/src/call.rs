@@ -127,3 +127,10 @@ pub fn register_device(name: &str, type_id: usize) -> Result<()> {
         crate::syscall3(SYS_REGISTER_DEVICE, name.as_ptr() as usize, name.len(), type_id)
     })
 }
+
+/// Mount the root filesystem
+pub fn mount() -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall0(SYS_MOUNT)
+    })
+}

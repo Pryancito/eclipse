@@ -179,21 +179,9 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     
     serial::serial_print("Entering kernel main loop...\n");
     
-    // Intentar montar el sistema de archivos
-    serial::serial_print("[KERNEL] Attempting to mount root filesystem...\n");
+    // Mount is now handled by userspace filesystem_service via SYS_MOUNT
+    serial::serial_print("[KERNEL] Waiting for userspace to mount root filesystem...\n");
     let mut init_loaded = false;
-    
-    match filesystem::mount_root() {
-        Ok(_) => {
-            serial::serial_print("[KERNEL] Root filesystem mounted successfully\n");
-            serial::serial_print("[KERNEL] Skipping disk systemd (crashes), using embedded init...\n");
-        }
-        Err(e) => {
-            serial::serial_print("[KERNEL] Failed to mount filesystem: ");
-            serial::serial_print(e);
-            serial::serial_print("\n");
-        }
-    }
     
     // Load embedded init
     if !init_loaded {

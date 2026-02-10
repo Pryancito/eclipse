@@ -9,7 +9,7 @@ eclipse-syscall = { path = "../eclipse-syscall" }
 [lib]
 name = "eclipse_libc"
 path = "src/lib.rs"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [profile.release]
 panic = "abort"

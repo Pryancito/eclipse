@@ -344,10 +344,12 @@ impl Scheme for NetworkScheme {
     }
 }
 
+use alloc::sync::Arc;
+
 pub fn init() {
     init_servers();
-    crate::scheme::register_scheme("display", Box::new(DisplayScheme));
-    crate::scheme::register_scheme("input", Box::new(InputScheme));
-    crate::scheme::register_scheme("snd", Box::new(AudioScheme));
-    crate::scheme::register_scheme("net", Box::new(NetworkScheme));
+    crate::scheme::register_scheme("display", Arc::new(DisplayScheme));
+    crate::scheme::register_scheme("input", Arc::new(InputScheme));
+    crate::scheme::register_scheme("snd", Arc::new(AudioScheme));
+    crate::scheme::register_scheme("net", Arc::new(NetworkScheme));
 }

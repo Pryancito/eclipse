@@ -18,6 +18,28 @@ static INTERRUPT_STATS: Mutex<InterruptStats> = Mutex::new(InterruptStats {
     timer_ticks: 0,
 });
 
+/// Scratch space para guardar RSP de usuario durante syscall entry
+static mut USER_RSP_SCRATCH: u64 = 0;
+
+/// MSR Constants
+const MSR_EFER: u32 = 0xC0000080;
+const MSR_STAR: u32 = 0xC0000081;
+const MSR_LSTAR: u32 = 0xC0000082;
+const MSR_SFMASK: u32 = 0xC0000084;
+
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    asm!("rdmsr", out("eax") low, out("edx") high, in("ecx") msr, options(nomem, nostack, preserves_flags));
+    ((high as u64) << 32) | (low as u64)
+}
+
+unsafe fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags));
+}
+
 /// Descriptor de interrupción en la IDT
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -105,6 +127,22 @@ pub fn init() {
         // Must be callable from Ring 3 (DPL 3) or it will cause #GP
         const IDT_RING_3: u8 = 0b01100000;
         KERNEL_IDT.entries[0x80].set_handler(syscall_int80 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_3 | IDT_INTERRUPT_GATE);
+        
+        // --- Habilitar Syscall Instruction ---
+        // 1. Enable SCE in EFER
+        let efer = rdmsr(MSR_EFER);
+        wrmsr(MSR_EFER, efer | 1);
+
+        // 2. Setup STAR
+        // 63:48 = Sysret CS (0x08) -> Not used due to GDT layout, we use iretq
+        // 47:32 = Syscall CS (0x08) -> Loads CS=0x08 (Kernel Code), SS=0x10 (Kernel Data)
+        wrmsr(MSR_STAR, (0x08 << 32) | (0x08 << 48));
+
+        // 3. Setup LSTAR (Entry point)
+        wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+
+        // 4. Setup SFMASK (Mask Interrupts 0x200)
+        wrmsr(MSR_SFMASK, 0x200);
         
         // Cargar IDT
         let idt_descriptor = IdtDescriptor {
@@ -658,6 +696,102 @@ unsafe extern "C" fn syscall_int80() {
         "pop rbp",
         "iretq",
         sym syscall_handler_rust,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_entry() {
+    core::arch::naked_asm!(
+        // Syscall entry point (via LSTAR)
+        // RCX = User RIP
+        // R11 = User RFLAGS
+        // RSP = User RSP
+        
+        // Save User RSP to global scratch
+        "mov [rip + {user_rsp}], rsp",
+        
+        // Load Kernel RSP from TSS (offset 4 is rsp0)
+        "mov rsp, [rip + {tss} + 4]",
+        
+        // Build IRETQ stack frame manually
+        // Layout: SS, RSP, RFLAGS, CS, RIP
+        
+        // 1. SS (User Data = 0x23)
+        "mov rax, 0x23",
+        "push rax",
+        
+        // 2. RSP (Saved User RSP)
+        "push [rip + {user_rsp}]",
+        
+        // 3. RFLAGS (Saved in R11)
+        "push r11",
+        
+        // 4. CS (User Code = 0x1B)
+        "mov rax, 0x1B",
+        "push rax",
+        
+        // 5. RIP (Saved in RCX)
+        "push rcx",
+        
+        // Now on Kernel Stack with IRETQ frame. Save GPs.
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        
+        "mov rbp, rsp",
+        "and rsp, -16", // Align
+        
+        // Map arguments (Linux Syscall ABI -> Rust Handler)
+        // Linux: RAX (num), RDI (1), RSI (2), RDX (3), R10 (4), R8 (5), R9 (6)
+        // Rust Handler: sys_num, arg1, arg2, arg3, arg4, arg5, context
+        
+        "mov r9, r8",    // arg5 (from r8)
+        "mov r8, r10",   // arg4 (from r10)
+        "mov rcx, rdx",  // arg3 (from rdx)
+        "mov rdx, rsi",  // arg2 (from rsi)
+        "mov rsi, rdi",  // arg1 (from rdi)
+        "mov rdi, rax",  // syscall_num
+        
+        "lea rax, [rbp - 112]", // Context Ptr (address of r15)
+        "push rax",      // 7th arg
+        
+        "call {handler}",
+        
+        "add rsp, 8", // Pop 7th arg
+        "mov rsp, rbp", // Restore stack
+        
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        
+        "pop rbp",
+        "iretq",
+        
+        user_rsp = sym USER_RSP_SCRATCH,
+        tss = sym crate::boot::TSS,
+        handler = sym syscall_handler_rust,
     );
 }
 

@@ -18,7 +18,8 @@ use core::alloc::Layout;
 use eclipse_libc::{
     println, getpid, yield_cpu, 
     open, close, read, lseek, 
-    O_RDONLY, SEEK_SET
+    O_RDONLY, SEEK_SET,
+    mount
 };
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags};
 use linked_list_allocator::LockedHeap;
@@ -219,6 +220,14 @@ pub extern "C" fn _start() -> ! {
                     println!("[FS-SERVICE] Filesystem mounted!");
                     println!("[FS-SERVICE] Version: {}.{}", 
                         fs.header.version >> 16, fs.header.version & 0xFFFF);
+                        
+                    // Notify kernel to mount root
+                    println!("[FS-SERVICE] Notifying kernel to mount root...");
+                    if mount() == 0 {
+                        println!("[FS-SERVICE] Kernel root mount successful!");
+                    } else {
+                        println!("[FS-SERVICE] Kernel root mount FAILED!");
+                    }
                         
                     // List root directory
                     if let Err(e) = fs.list_dir(1) {

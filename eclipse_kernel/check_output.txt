@@ -1,0 +1,224 @@
+warning: constant `MAX_BLOCKS` is never used
+  --> /home/moebius/eclipse/eclipsefs-lib/src/blocks.rs:20:7
+   |
+20 | const MAX_BLOCKS: usize = 4096;
+   |       ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipsefs-lib` (lib) generated 1 warning
+    Checking eclipse_kernel v0.1.0 (/home/moebius/eclipse/eclipse_kernel)
+warning: unused imports: `AtomicU64` and `Ordering`
+ --> src/boot.rs:4:26
+  |
+4 | ...tomic::{AtomicU64, Ordering};
+  |            ^^^^^^^^^  ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary parentheses around assigned value
+   --> src/boot.rs:290:16
+    |
+290 | ...   cr0 |= (1 << 1);  // SET MP (bi...
+    |              ^      ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+290 -         cr0 |= (1 << 1);  // SET MP (bit 1)
+290 +         cr0 |= 1 << 1;  // SET MP (bit 1)
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> src/boot.rs:296:16
+    |
+296 |         cr4 |= (1 << 9);  // OSFXSR
+    |                ^      ^
+    |
+help: remove these parentheses
+    |
+296 -         cr4 |= (1 << 9);  // OSFXSR
+296 +         cr4 |= 1 << 9;  // OSFXSR
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> src/boot.rs:297:16
+    |
+297 |         cr4 |= (1 << 10); // OSXMMEXCPT
+    |                ^       ^
+    |
+help: remove these parentheses
+    |
+297 -         cr4 |= (1 << 10); // OSXMMEXCPT
+297 +         cr4 |= 1 << 10; // OSXMMEXCPT
+    |
+
+warning: unused import: `x86_64::PhysAddr`
+   --> src/memory.rs:282:5
+    |
+282 | use x86_64::PhysAddr;
+    |     ^^^^^^^^^^^^^^^^
+
+warning: unnecessary parentheses around assigned value
+   --> src/serial.rs:206:21
+    |
+206 | ...i] = (b'0' + (n % 10) as u8);
+    |         ^                     ^
+    |
+help: remove these parentheses
+    |
+206 -         digits[i] = (b'0' + (n % 10) as u8);
+206 +         digits[i] = b'0' + (n % 10) as u8;
+    |
+
+warning: unused import: `ProcessId`
+ --> src/syscalls.rs:5:22
+  |
+5 | use crate::process::{ProcessId, exit_pr...
+  |                      ^^^^^^^^^
+
+warning: unused imports: `ProcessId` and `create_process`
+ --> src/servers.rs:4:22
+  |
+4 | ...ss::{create_process, ProcessId};
+  |         ^^^^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `read_volatile` and `write_volatile`
+  --> src/pci.rs:25:17
+   |
+25 | ...::{read_volatile, write_volatile};
+   |       ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+
+warning: unused import: `constants`
+ --> src/filesystem.rs:6:73
+  |
+6 | ...y, tlv_tags, constants};
+  |                 ^^^^^^^^^
+
+warning: unused import: `eclipsefs_lib::NodeKind`
+ --> src/filesystem.rs:7:5
+  |
+7 | use eclipsefs_lib::NodeKind;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `alloc::vec::Vec`
+ --> src/fd.rs:5:5
+  |
+5 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `alloc::string::String`
+ --> src/fd.rs:6:5
+  |
+6 | use alloc::string::String;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `alloc::vec`
+  --> src/bcache.rs:10:5
+   |
+10 | use alloc::vec;
+   |     ^^^^^^^^^^
+
+warning: unused import: `crate::memory`
+ --> src/elf_loader.rs:4:5
+  |
+4 | use crate::memory;
+  |     ^^^^^^^^^^^^^
+
+warning: unused import: `core::ptr`
+ --> src/memory_builtins.rs:2:5
+  |
+2 | use core::ptr;
+  |     ^^^^^^^^^
+
+warning: unnecessary `unsafe` block
+  --> src/memory.rs:75:29
+   |
+57 |     unsafe {
+   |     ------ because it's nested under this `unsafe` block
+...
+75 |         let allocator_ref = unsafe { &...
+   |                             ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `data_ptr`
+   --> src/syscalls.rs:391:44
+    |
+391 | ...type: u64, data_ptr: u64) -> u64 {
+    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_data_ptr`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `desc_idx`
+   --> src/virtio.rs:756:21
+    |
+756 | ...       let desc_idx = queue.add_bu...
+    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_desc_idx`
+
+warning: unnecessary `unsafe` block
+   --> src/virtio.rs:930:30
+    |
+861 | ...   unsafe {
+    |       ------ because it's nested under this `unsafe` block
+...
+930 | ...           let status = unsafe { r...
+    |                            ^^^^^^ unnecessary `unsafe` block
+
+error[E0382]: use of moved value: `header`
+  --> src/filesystem.rs:84:20
+   |
+71 | ...  Ok(header) => {
+   |         ------ move occurs because `header` has type `EclipseFSHeader`, which does not implement the `Copy` trait
+...
+80 | ...      FS.header = Some(header);
+   |                           ------ value moved here
+...
+84 | ...      if header.total_inodes >= 0xF...
+   |             ^^^^^^^^^^^^^^^^^^^ value used here after move
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+80 |                 FS.header = Some(header.clone());
+   |                                        ++++++++
+
+warning: unnecessary `unsafe` block
+   --> src/filesystem.rs:449:28
+    |
+449 |         let record_block = unsafe {
+    |                            ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `direct_vaddr`
+   --> src/elf_loader.rs:407:9
+    |
+407 |     let direct_vaddr = crate::memory:...
+    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_direct_vaddr`
+
+For more information about this error, try `rustc --explain E0382`.
+warning: `eclipse_kernel` (lib) generated 21 warnings
+error: could not compile `eclipse_kernel` (lib) due to 1 previous error; 21 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+warning: unnecessary `unsafe` block
+  --> src/main.rs:84:5
+   |
+84 |     unsafe {
+   |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `pml4_phys`
+   --> src/main.rs:114:9
+    |
+114 |     let pml4_phys = boot_info.pml4_addr;
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pml4_phys`
+
+warning: variable does not need to be mutable
+   --> src/main.rs:182:9
+    |
+182 |     let mut init_loaded = false;
+    |         ----^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse_kernel` (bin "eclipse_kernel") generated 25 warnings (21 duplicates)
+error: could not compile `eclipse_kernel` (bin "eclipse_kernel") due to 1 previous error; 25 warnings emitted
