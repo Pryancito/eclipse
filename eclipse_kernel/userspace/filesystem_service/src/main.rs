@@ -210,8 +210,8 @@ pub extern "C" fn _start() -> ! {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("[FS-SERVICE] Starting (PID: {})", pid);
     
-    println!("[FS-SERVICE] Opening disk:1 via scheme registry...");
-    match BlockDevice::new("disk:1") {
+    println!("[FS-SERVICE] Opening disk:0 via scheme registry...");
+    match BlockDevice::new("disk:0") {
         Ok(device) => {
             println!("[FS-SERVICE] Device opened successfully");
             
