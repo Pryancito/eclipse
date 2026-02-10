@@ -18,6 +18,8 @@ static mut APP_BUFFER: [u8; 32 * 1024 * 1024] = [0; 32 * 1024 * 1024];
 /// This prevents race conditions with filesystem_service startup
 fn wait_for_filesystem() {
     let mut attempts = 0;
+    // Max 100 attempts with ~1000 yields each = reasonable timeout for service startup
+    // This allows filesystem_service time to mount without blocking indefinitely
     const MAX_ATTEMPTS: u32 = 100;
     
     loop {
@@ -38,8 +40,9 @@ fn wait_for_filesystem() {
             return;
         }
         
-        // Small delay before retry
-        for _ in 0..1000 {
+        // Small delay before retry - yield to other processes
+        // Reduced from 1000 to 100 iterations for faster checking
+        for _ in 0..100 {
             yield_cpu();
         }
     }
