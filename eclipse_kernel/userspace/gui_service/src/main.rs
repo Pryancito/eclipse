@@ -8,11 +8,43 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, exit, yield_cpu, open, read, close, exec, O_RDONLY};
+use eclipse_libc::{println, getpid, yield_cpu, open, read, close, exec, O_RDONLY};
 
 /// Buffer for loading the application binary
 /// 2MB should be enough for our simulated app
 static mut APP_BUFFER: [u8; 32 * 1024 * 1024] = [0; 32 * 1024 * 1024];
+
+/// Wait for filesystem to be mounted by trying to open a test path
+/// This prevents race conditions with filesystem_service startup
+fn wait_for_filesystem() {
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u32 = 100;
+    
+    loop {
+        // Try to open a simple test path to check if filesystem is mounted
+        // We use a path that should exist on the filesystem
+        let test_fd = open("file:/", O_RDONLY, 0);
+        
+        if test_fd >= 0 {
+            // Filesystem is mounted! Close the test fd and return
+            close(test_fd);
+            return;
+        }
+        
+        attempts += 1;
+        if attempts >= MAX_ATTEMPTS {
+            println!("[GUI-SERVICE] WARNING: Filesystem still not mounted after {} attempts", attempts);
+            println!("[GUI-SERVICE] Continuing anyway...");
+            return;
+        }
+        
+        // Small delay before retry
+        for _ in 0..1000 {
+            yield_cpu();
+        }
+    }
+}
+
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -29,6 +61,11 @@ pub extern "C" fn _start() -> ! {
     println!("[GUI-SERVICE]   - Starting Xwayland server on :0");
     println!("[GUI-SERVICE]   - Xwayland ready");
     println!("[GUI-SERVICE]   - DISPLAY=:0 configured");
+
+    // Wait for filesystem to be mounted before trying to load xfwl4
+    println!("[GUI-SERVICE] Waiting for filesystem to be mounted...");
+    wait_for_filesystem();
+    println!("[GUI-SERVICE] Filesystem is ready!");
 
     // Launch XFwl4 App
     println!("[GUI-SERVICE] Launching XFwl4 Compositor (xfwl4)...");
