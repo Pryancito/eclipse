@@ -236,9 +236,16 @@ extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
     crate::serial::serial_print_hex(rip);
     
     let cr3: u64;
-    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
     crate::serial::serial_print(" Active CR3: ");
     crate::serial::serial_print_hex(cr3);
+    
+    if let Some(pid) = crate::process::current_process_id() {
+        crate::serial::serial_print(" PID: ");
+        crate::serial::serial_print_dec(pid as u64);
+        crate::serial::serial_print(" Expect CR3: ");
+        crate::serial::serial_print_hex(crate::process::get_process_page_table(Some(pid)));
+    }
     crate::serial::serial_print("\n");
     
     // Halt to avoid loop
@@ -535,6 +542,32 @@ pub fn get_stats() -> InterruptStats {
 // Syscall Handler (int 0x80)
 // ============================================================================
 
+/// Contexto de registros guardados en el stack durante una syscall
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SyscallContext {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rbp: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
 extern "C" fn syscall_handler_rust(
     syscall_num: u64,
     arg1: u64,
@@ -542,9 +575,9 @@ extern "C" fn syscall_handler_rust(
     arg3: u64,
     arg4: u64,
     arg5: u64,
-    frame_ptr: u64,
+    context: &mut SyscallContext,
 ) -> u64 {
-    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, frame_ptr)
+    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, context)
 }
 
 #[unsafe(naked)]
@@ -590,8 +623,10 @@ unsafe extern "C" fn syscall_int80() {
         "mov rsi, rdi",  // arg1 (from rdi)
         "mov rdi, rax",  // syscall_num
         
-        // Pasar RBP (puntero al frame) como 7º argumento
-        "push rbp",
+        // Pasar puntero al contexto (RSP apunta a r15, que es el inicio de la estructura)
+        // La estructura SyscallContext mapea exactamente el layout del stack desde r15 hasta ss
+        "lea rax, [rbp - 112]", // Dirección de r15
+        "push rax",      // 7º argumento en el stack
         
         "call {}",
         

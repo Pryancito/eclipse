@@ -6,12 +6,48 @@
 //! - TCP/IP stack initialization
 //! - Network packet processing
 //! 
-//! It must start after devfs to access network devices.
+//! It must start after the service registry is ready.
 
 #![no_std]
 #![no_main]
 
 use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo};
+
+/// Syscall numbers
+const SYS_OPEN: u64 = 11;
+const SYS_WRITE: u64 = 1;
+
+fn sys_open(path: &str) -> Option<usize> {
+    let mut fd: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+            in("rdx") 0u64,
+            lateout("rax") fd,
+            options(nostack)
+        );
+    }
+    if (fd as isize) < 0 { None } else { Some(fd) }
+}
+
+fn sys_write(fd: usize, buf: &[u8]) -> usize {
+    let mut written: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_WRITE,
+            in("rdi") fd as u64,
+            in("rsi") buf.as_ptr() as u64,
+            in("rdx") buf.len() as u64,
+            lateout("rax") written,
+            options(nostack)
+        );
+    }
+    written
+}
 
 /// Network interface types
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -242,6 +278,11 @@ pub extern "C" fn _start() -> ! {
     println!("[NETWORK-SERVICE] Starting (PID: {})", pid);
     println!("[NETWORK-SERVICE] Initializing network subsystem...");
     
+    // Register with net: scheme
+    println!("[NETWORK-SERVICE] Connecting to net: scheme proxy...");
+    let net_fd = sys_open("net:").expect("Failed to open net: scheme");
+    println!("[NETWORK-SERVICE]   Scheme handle: {}", net_fd);
+    
     // Detect available network interfaces via PCI
     let (ethernet_card, wifi_card) = detect_network_cards();
     
@@ -342,6 +383,10 @@ pub extern "C" fn _start() -> ! {
             if heartbeat_counter % 200000 == 0 {
                 connections += 1;
             }
+
+            // Simulate sending network packets to kernel scheme
+            let dummy_packet = [0u8; 64];
+            sys_write(net_fd, &dummy_packet);
         }
         
         // Periodic status updates

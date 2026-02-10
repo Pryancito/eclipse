@@ -711,6 +711,8 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
 /// Returns virtual address where framebuffer is mapped, or 0 on failure
 pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_size: u64) -> u64 {
     use x86_64::structures::paging::PageTableFlags as Flags;
+    use x86_64::instructions::tlb::flush_all;
+    use crate::serial;
     
     // For identity mapping, we'll map the framebuffer at its physical address
     let virtual_addr = fb_phys_addr;
@@ -718,9 +720,9 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     // Round size up to 2MB pages
     let num_pages = (fb_size + 0x1FFFFF) / 0x200000;
     
-    crate::serial::serial_print("MAP_FB: Identity mapping ");
-    crate::serial::serial_print_dec(num_pages);
-    crate::serial::serial_print(" pages\n");
+    serial::serial_print("MAP_FB: Identity mapping ");
+    serial::serial_print_dec(num_pages);
+    serial::serial_print(" pages (2MB each)\n");
     
     // Access the process's PML4
     let pml4_virt = phys_to_virt(page_table_phys);
@@ -747,6 +749,20 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
             } else {
                 return 0;
             }
+        } else {
+            // FORCE User access bit on existing entry
+            let mut ent = pml4.entries[pml4_idx];
+            let flags = (ent.get_flags() | Flags::USER_ACCESSIBLE.bits()) & !Flags::NO_EXECUTE.bits();
+            ent.set_addr(ent.get_addr(), flags);
+            pml4.entries[pml4_idx] = ent;
+            
+            if page_idx == 0 {
+                serial::serial_print("  PML4[");
+                serial::serial_print_dec(pml4_idx as u64);
+                serial::serial_print("] setup, Entry: ");
+                serial::serial_print_hex(pml4.entries[pml4_idx].entry);
+                serial::serial_print("\n");
+            }
         }
         
         // Get PDPT
@@ -765,6 +781,18 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
             } else {
                 return 0;
             }
+        } else {
+            // FORCE User access bit on existing entry
+            let mut ent = pdpt.entries[pdpt_idx];
+            if ent.is_huge() {
+                serial::serial_print("MAP_FB: ERROR - 1GB Huge Page conflict at PDPT index ");
+                serial::serial_print_dec(pdpt_idx as u64);
+                serial::serial_print("\n");
+                return 0;
+            }
+            let flags = (ent.get_flags() | Flags::USER_ACCESSIBLE.bits()) & !Flags::NO_EXECUTE.bits();
+            ent.set_addr(ent.get_addr(), flags);
+            pdpt.entries[pdpt_idx] = ent;
         }
         
         // Get PD
@@ -773,14 +801,30 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
         let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
         
         // Map Page (2MB) - Identity mapping for framebuffer
-        // Important: Huge Page bit + User Accessible + Write Through (for FB maybe?)
-        // Usually FB needs Write Combining but Write Through is safer than Write Back.
-        // For now, just standard flags.
-        pd.entries[pd_idx].set_addr(
-            page_phys,
-            (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE | Flags::HUGE_PAGE).bits()
-        );
+        // Important: Huge Page bit + User Accessible + Write Through
+        let final_flags = Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE | Flags::HUGE_PAGE | Flags::WRITE_THROUGH;
+        pd.entries[pd_idx].set_addr(page_phys, final_flags.bits());
+        
+        if true {
+            serial::serial_print("MAP_FB: Mapped v=");
+            serial::serial_print_hex(page_virt);
+            serial::serial_print(" (PML4=");
+            serial::serial_print_dec(pml4_idx as u64);
+            serial::serial_print(", PDPT=");
+            serial::serial_print_dec(pdpt_idx as u64);
+            serial::serial_print(", PD=");
+            serial::serial_print_dec(pd_idx as u64);
+            serial::serial_print(") Entry: ");
+            serial::serial_print_hex(pd.entries[pd_idx].entry);
+            serial::serial_print("\n");
+        }
     }
+    
+    // Flush TLB globally
+    flush_all();
+    
+    // VERIFY: Walk the table for the first address
+    walk_page_table(page_table_phys, virtual_addr);
     
     virtual_addr
 }

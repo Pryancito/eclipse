@@ -22,8 +22,9 @@ use eclipse_libc::{println, getpid, yield_cpu};
 mod logo;
 
 /// Syscall numbers
+const SYS_OPEN: u64 = 11;
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
-const SYS_MAP_FRAMEBUFFER: u64 = 16;
+const SYS_FMAP: u64 = 28;
 
 /// Framebuffer constants
 const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
@@ -45,9 +46,33 @@ struct FramebufferInfoFromKernel {
     blue_mask_shift: u8,
 }
 
-/// Get framebuffer info from kernel
-fn get_framebuffer_info_from_kernel() -> Option<FramebufferInfoFromKernel> {
-    let mut fb_info = FramebufferInfoFromKernel {
+/// Get framebuffer info from kernel using the display: scheme
+fn get_display_handle() -> Option<usize> {
+    let path = "display:";
+    let mut fd: usize;
+    
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+            in("rdx") 0u64, // flags
+            lateout("rax") fd,
+            options(nostack)
+        );
+    }
+    
+    if (fd as isize) < 0 {
+        None
+    } else {
+        Some(fd)
+    }
+}
+
+/// Get actual framebuffer info from kernel
+fn get_kernel_framebuffer_info() -> Option<FramebufferInfoFromKernel> {
+    let mut info = FramebufferInfoFromKernel {
         address: 0,
         width: 0,
         height: 0,
@@ -66,35 +91,38 @@ fn get_framebuffer_info_from_kernel() -> Option<FramebufferInfoFromKernel> {
         core::arch::asm!(
             "int 0x80",
             in("rax") SYS_GET_FRAMEBUFFER_INFO,
-            in("rdi") &mut fb_info as *mut _ as u64,
+            in("rdi") &mut info as *mut _ as u64,
             lateout("rax") result,
             options(nostack)
         );
     }
     
     if result == 0 {
-        Some(fb_info)
+        Some(info)
     } else {
         None
     }
 }
 
-/// Map framebuffer into process virtual memory
-fn map_framebuffer_memory() -> Option<usize> {
-    let addr: u64;
+/// Map framebuffer memory using the fmap syscall on the display handle
+fn map_framebuffer_via_scheme(fd: usize, size: usize) -> Option<usize> {
+    let addr: usize;
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("rax") SYS_MAP_FRAMEBUFFER,
+            in("rax") SYS_FMAP,
+            in("rdi") fd as u64,
+            in("rsi") 0u64, // offset
+            in("rdx") size as u64,
             lateout("rax") addr,
             options(nostack)
         );
     }
     
-    if addr == 0 {
+    if (addr as isize) < 0 || addr == 0 {
         None
     } else {
-        Some(addr as usize)
+        Some(addr)
     }
 }
 
@@ -142,6 +170,7 @@ enum GraphicsDriver {
 }
 
 /// Display mode configuration
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct DisplayMode {
     width: u32,
@@ -164,11 +193,12 @@ struct VesaModeInfo {
 }
 
 /// Framebuffer information
+#[repr(C)]
 struct Framebuffer {
     base_address: usize,
     size: usize,
     mode: DisplayMode,
-    back_buffer: Option<usize>,  // For double buffering
+    back_buffer: usize,  // 0 for None
     pitch: u32,  // bytes per scanline
     supports_hw_accel: bool,  // 2D hardware acceleration support
 }
@@ -378,30 +408,52 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]   - Setting up display modes");
     println!("[DISPLAY-SERVICE]   - Initializing CUDA cores (optional)");
     
-    // Get framebuffer info from kernel via syscall
-    println!("[DISPLAY-SERVICE]   - Querying kernel for framebuffer information...");
-    let kernel_fb_info = get_framebuffer_info_from_kernel()
-        .ok_or("Failed to get framebuffer info from kernel")?;
+    // Get display handle via scheme
+    println!("[DISPLAY-SERVICE]   - Opening display: handle via scheme registry...");
+    let fb_fd = get_display_handle()
+        .ok_or("Failed to open display: handle")?;
     
-    println!("[DISPLAY-SERVICE]     * Framebuffer detected via bootloader");
-    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
-    println!("[DISPLAY-SERVICE]     * Resolution: {}x{}", kernel_fb_info.width, kernel_fb_info.height);
-    println!("[DISPLAY-SERVICE]     * Pitch: {} bytes", kernel_fb_info.pitch);
-    println!("[DISPLAY-SERVICE]     * BPP: {} bits", kernel_fb_info.bpp);
+    // In a real implementation, we would use fstat to get sizes, 
+    // but here we know it's a 32bpp FB from the bootloader.
+    // For now, let's assume a standard resolution if fstat is not fully implemented for userspace yet.
+    // Actually, we can just use the legacy syscall for info if we must, 
+    // until we have a better way to get VBE info through the scheme.
     
-    // Map framebuffer to virtual memory via syscall
-    println!("[DISPLAY-SERVICE]   - Mapping framebuffer to virtual memory...");
-    let fb_base = map_framebuffer_memory()
-        .ok_or("Failed to map framebuffer into virtual memory")?;
+    // Use dynamic framebuffer info from kernel instead of hardcoded values
+    let kernel_fb_info = get_kernel_framebuffer_info()
+        .unwrap_or(FramebufferInfoFromKernel {
+            address: 0,
+            width: 1280,
+            height: 1024,
+            pitch: 1280 * 4,
+            bpp: 32,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        });
+
+    let width = kernel_fb_info.width;
+    let height = kernel_fb_info.height;
+    let bpp = kernel_fb_info.bpp;
+    let pitch = kernel_fb_info.pitch;
+    let fb_size = (pitch * height) as usize;
+
+    // Use kernel_fb_info directly for the rest of processing
+
+    println!("[DISPLAY-SERVICE]   - Mapping display memory via fmap (primary + back buffer)...");
+    let fb_base = map_framebuffer_via_scheme(fb_fd, fb_size * 2)
+        .ok_or("Failed to map display memory")?;
     
-    let fb_size = (kernel_fb_info.pitch * kernel_fb_info.height) as usize;
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
     
-    println!("[DISPLAY-SERVICE]   - NVIDIA driver initialized successfully");
+    println!("[DISPLAY-SERVICE]   - NVIDIA driver initialized successfully (via display: scheme proxy)");
     
-    // Clear the screen immediately after mapping framebuffer
-    clear_framebuffer_on_init(fb_base, fb_size);
+    // Clear the entire mapped region (primary + back buffer)
+    clear_framebuffer_on_init(fb_base, fb_size * 2);
     
     // Create /dev/fb0 device node
     create_framebuffer_device_node(&kernel_fb_info, fb_base);
@@ -416,7 +468,7 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
             mode_number: 0,  // NVIDIA-specific mode
             refresh_rate: 60,
         },
-        back_buffer: None,
+        back_buffer: 0,
         pitch: kernel_fb_info.pitch,
         supports_hw_accel: true,
     })
@@ -430,48 +482,64 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]   ║  VESA BIOS Extensions (VBE) 2.0/3.0  ║");
     println!("[DISPLAY-SERVICE]   ╚════════════════════════════════════════╝");
     
-    // Step 1: Get real framebuffer info from kernel
-    println!("[DISPLAY-SERVICE]   - Querying kernel for framebuffer information...");
-    let kernel_fb_info = get_framebuffer_info_from_kernel()
-        .ok_or("Failed to get framebuffer info from kernel")?;
+    // Step 1: Get display handle via scheme
+    println!("[DISPLAY-SERVICE]   - Opening display: handle via scheme registry...");
+    let fb_fd = get_display_handle()
+        .ok_or("Failed to open display: handle")?;
     
-    println!("[DISPLAY-SERVICE]     * Framebuffer detected via bootloader");
-    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
-    println!("[DISPLAY-SERVICE]     * Resolution: {}x{}", kernel_fb_info.width, kernel_fb_info.height);
-    println!("[DISPLAY-SERVICE]     * Pitch: {} bytes", kernel_fb_info.pitch);
-    println!("[DISPLAY-SERVICE]     * BPP: {} bits", kernel_fb_info.bpp);
+    // Step 2: Get display info and map framebuffer
+    let kernel_fb_info = get_kernel_framebuffer_info()
+        .unwrap_or(FramebufferInfoFromKernel {
+            address: 0,
+            width: 1280,
+            height: 1024,
+            pitch: 1280 * 4,
+            bpp: 32,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        });
+
+    let width = kernel_fb_info.width;
+    let height = kernel_fb_info.height;
+    let bpp = kernel_fb_info.bpp;
+    let pitch = kernel_fb_info.pitch;
+    let fb_size = (pitch * height) as usize;
+
+    // Use kernel_fb_info directly
+
+    println!("[DISPLAY-SERVICE]   - Mapping framebuffer via fmap (primary + back buffer)...");
+    let fb_base = map_framebuffer_via_scheme(fb_fd, fb_size * 2)
+        .ok_or("Failed to map display memory")?;
     
-    // Step 2: Map framebuffer to virtual memory
-    println!("[DISPLAY-SERVICE]   - Mapping framebuffer to virtual memory...");
-    let fb_base = map_framebuffer_memory()
-        .ok_or("Failed to map framebuffer into virtual memory")?;
-    
-    let fb_size = (kernel_fb_info.pitch * kernel_fb_info.height) as usize;
-    println!("[DISPLAY-SERVICE]     * Physical address: 0x{:X}", kernel_fb_info.address);
     println!("[DISPLAY-SERVICE]     * Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]     * Size: {} KB ({} MB)", fb_size / 1024, fb_size / (1024 * 1024));
     
-    // Step 2.5: Clear the screen immediately after mapping framebuffer
-    clear_framebuffer_on_init(fb_base, fb_size);
+    // Step 2.5: Clear the entire mapped region immediately
+    println!("[DISPLAY-SERVICE] DEBUG: fb_base=0x{:X}, fb_size=0x{:X}", fb_base, fb_size);
+    clear_framebuffer_on_init(fb_base, fb_size * 2);
     
     // Step 2.6: Create /dev/fb0 device node
     create_framebuffer_device_node(&kernel_fb_info, fb_base);
     
     // Step 3: Setup double buffering if supported
-    let supports_double_buffer = kernel_fb_info.bpp == 32;
+    let supports_double_buffer = bpp == 32;
     let back_buffer = if supports_double_buffer {
         println!("[DISPLAY-SERVICE]   - Allocating back buffer for double buffering...");
         let back_buf_addr = fb_base + fb_size;
         println!("[DISPLAY-SERVICE]     ✓ Back buffer at: 0x{:X}", back_buf_addr);
-        Some(back_buf_addr)
+        back_buf_addr
     } else {
         println!("[DISPLAY-SERVICE]   - Double buffering not supported in this mode");
-        None
+        0
     };
     
     // Step 4: Initialize 2D acceleration
     println!("[DISPLAY-SERVICE]   - Initializing 2D acceleration engine...");
-    let supports_accel = kernel_fb_info.bpp == 32;
+    let supports_accel = bpp == 32;
     if supports_accel {
         println!("[DISPLAY-SERVICE]     ✓ Hardware-accelerated operations enabled:");
         println!("[DISPLAY-SERVICE]       - Fast block transfers (BitBLT)");
@@ -496,14 +564,14 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
         base_address: fb_base,
         size: fb_size,
         mode: DisplayMode {
-            width: kernel_fb_info.width,
-            height: kernel_fb_info.height,
-            bpp: kernel_fb_info.bpp as u32,
+            width,
+            height,
+            bpp: bpp as u32,
             mode_number: 0, // Not applicable for bootloader framebuffer
             refresh_rate: 60,
         },
         back_buffer,
-        pitch: kernel_fb_info.pitch,
+        pitch,
         supports_hw_accel: supports_accel,
     })
 }
@@ -588,7 +656,7 @@ fn accel_mem_copy(fb: &Framebuffer, _src: usize, _dst: usize, _size: usize) -> R
 /// Double buffer swap - present back buffer to display
 /// Implements tear-free page flipping if hardware supports it
 fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
-    if let Some(_back_buffer_addr) = fb.back_buffer {
+    if fb.back_buffer != 0 {
         // In a real implementation, this would:
         // 1. Wait for V-Sync
         // 2. Update display start address register (VBE function 07h)
@@ -608,6 +676,7 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
 /// Perform optimized screen clear
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     // Clear primary framebuffer
+    println!("[DISPLAY-SERVICE] DEBUG: Clearing FB base=0x{:X}, size=0x{:X}", fb.base_address, fb.size);
     let fb_ptr = fb.base_address as *mut u32;
     let pixel_count = fb.size / BYTES_PER_PIXEL;
     
@@ -619,7 +688,9 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     }
     
     // Also clear back buffer if it exists
-    if let Some(back_buf_addr) = fb.back_buffer {
+    if fb.back_buffer != 0 {
+        let back_buf_addr = fb.back_buffer;
+        println!("[DISPLAY-SERVICE] DEBUG: Clearing BACK FB base=0x{:X}", back_buf_addr);
         let back_ptr = back_buf_addr as *mut u32;
         unsafe {
             for i in 0..pixel_count {
@@ -714,7 +785,7 @@ pub extern "C" fn _start() -> ! {
         println!("[DISPLAY-SERVICE]   - Base address: 0x{:X}", fb.base_address);
         println!("[DISPLAY-SERVICE]   - Device: /dev/fb0");
         
-        if fb.back_buffer.is_some() {
+        if fb.back_buffer != 0 {
             println!("[DISPLAY-SERVICE]   - Double buffering: ENABLED");
         }
         
@@ -812,7 +883,7 @@ pub extern "C" fn _start() -> ! {
                     }
                     
                     // Double buffer swap if supported
-                    if fb.back_buffer.is_some() {
+                    if fb.back_buffer != 0 {
                         let _ = swap_buffers(fb);
                     }
                 }

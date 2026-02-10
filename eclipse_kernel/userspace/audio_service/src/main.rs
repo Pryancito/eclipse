@@ -13,6 +13,42 @@
 
 use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
+/// Syscall numbers
+const SYS_OPEN: u64 = 11;
+const SYS_WRITE: u64 = 1;
+
+fn sys_open(path: &str) -> Option<usize> {
+    let mut fd: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+            in("rdx") 0u64,
+            lateout("rax") fd,
+            options(nostack)
+        );
+    }
+    if (fd as isize) < 0 { None } else { Some(fd) }
+}
+
+fn sys_write(fd: usize, buf: &[u8]) -> usize {
+    let mut written: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_WRITE,
+            in("rdi") fd as u64,
+            in("rsi") buf.as_ptr() as u64,
+            in("rdx") buf.len() as u64,
+            lateout("rax") written,
+            options(nostack)
+        );
+    }
+    written
+}
+
 /// Audio device types
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum AudioDeviceType {
@@ -248,6 +284,11 @@ pub extern "C" fn _start() -> ! {
         init_audio_mixer();
     }
     
+    // Register with snd: scheme
+    println!("[AUDIO-SERVICE] Connecting to snd: scheme proxy...");
+    let snd_fd = sys_open("snd:").expect("Failed to open snd: scheme");
+    println!("[AUDIO-SERVICE]   Scheme handle: {}", snd_fd);
+
     // Report final status
     println!("[AUDIO-SERVICE] Audio service ready");
     
@@ -256,13 +297,11 @@ pub extern "C" fn _start() -> ! {
         match device_type {
             AudioDeviceType::IntelHDA => {
                 println!("[AUDIO-SERVICE]   - Intel HDA (High Definition Audio)");
-                println!("[AUDIO-SERVICE]     * /dev/snd/pcmC0D0p (playback)");
-                println!("[AUDIO-SERVICE]     * /dev/snd/pcmC0D0c (capture)");
+                println!("[AUDIO-SERVICE]     * snd:0 (mixed output)");
             },
             AudioDeviceType::AC97 => {
                 println!("[AUDIO-SERVICE]   - AC97 Audio");
-                println!("[AUDIO-SERVICE]     * /dev/snd/pcmC0D0p (playback)");
-                println!("[AUDIO-SERVICE]     * /dev/snd/pcmC0D0c (capture)");
+                println!("[AUDIO-SERVICE]     * snd:0 (mixed output)");
             },
             AudioDeviceType::None => {}
         }
@@ -293,6 +332,10 @@ pub extern "C" fn _start() -> ! {
             if heartbeat_counter % 100000 == 0 {
                 streams_active = 2;  // e.g., music playback + notification
                 samples_processed += 48000;  // 1 second at 48 kHz
+                
+                // Simulate sending audio data to kernel scheme
+                let dummy_data = [0u8; 1024];
+                sys_write(snd_fd, &dummy_data);
             }
         }
         

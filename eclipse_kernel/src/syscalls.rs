@@ -2,6 +2,8 @@
 //! 
 //! Implementa la interfaz entre userspace y kernel
 
+use alloc::format;
+
 use crate::process::{ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
 use crate::ipc::{MessageType, send_message, receive_message};
@@ -38,6 +40,8 @@ pub enum SyscallNumber {
     Futex = 24,
     Nanosleep = 25,
     Brk = 26,
+    RegisterDevice = 27,
+    Fmap = 28,
 }
 
 /// lseek whence values (POSIX standard)
@@ -86,40 +90,29 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     _arg4: u64,
     _arg5: u64,
-    frame_ptr: u64,
+    context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
-    // Read user context from the interrupt frame
-    // Frame structure relative to frame_ptr (RBP):
-    // [32] RSP, [24] RFLAGS, [16] CS, [8] RIP, [0] RBP
-    // Pushed registers: [-8] RAX, [-16] RBX, [-24] RCX, [-32] RDX, [-40] RSI, [-48] RDI, 
-    // [-56] R8, [-64] R9, [-72] R10, [-80] R11, [-88] R12, [-96] R13, [-104] R14, [-112] R15
-    let mut context = crate::process::Context::new();
-    unsafe {
-        unsafe fn read_stack(rbp: u64, offset: isize) -> u64 {
-            let ptr = (rbp as isize + offset) as *const u64;
-            *ptr
-        }
-    
-        context.rsp = read_stack(frame_ptr, 32);
-        context.rip = read_stack(frame_ptr, 8);
-        context.rflags = read_stack(frame_ptr, 24);
-        context.rbp = read_stack(frame_ptr, 0);
-        
-        context.rax = read_stack(frame_ptr, -8);
-        context.rbx = read_stack(frame_ptr, -16);
-        context.rcx = read_stack(frame_ptr, -24);
-        context.rdx = read_stack(frame_ptr, -32);
-        context.rsi = read_stack(frame_ptr, -40);
-        context.rdi = read_stack(frame_ptr, -48);
-        context.r8  = read_stack(frame_ptr, -56);
-        context.r9  = read_stack(frame_ptr, -64);
-        context.r10 = read_stack(frame_ptr, -72);
-        context.r11 = read_stack(frame_ptr, -80);
-        context.r12 = read_stack(frame_ptr, -88);
-        context.r13 = read_stack(frame_ptr, -96);
-        context.r14 = read_stack(frame_ptr, -104);
-        context.r15 = read_stack(frame_ptr, -112);
-    }
+    // Read user context directly from the struct passed by assembly
+    let process_context = crate::process::Context {
+        rsp: context.rsp,
+        rip: context.rip,
+        rflags: context.rflags,
+        rbp: context.rbp,
+        rax: context.rax,
+        rbx: context.rbx,
+        rcx: context.rcx,
+        rdx: context.rdx,
+        rsi: context.rsi,
+        rdi: context.rdi,
+        r8: context.r8,
+        r9: context.r9,
+        r10: context.r10,
+        r11: context.r11,
+        r12: context.r12,
+        r13: context.r13,
+        r14: context.r14,
+        r15: context.r15,
+    };
 
     let mut stats = SYSCALL_STATS.lock();
     stats.total_calls += 1;
@@ -140,14 +133,14 @@ pub extern "C" fn syscall_handler(
         4 => sys_receive(arg1, arg2, arg3),
         5 => sys_yield(),
         6 => sys_getpid(),
-        7 => sys_fork(&context),
+        7 => sys_fork(&process_context),
         8 => sys_exec(arg1, arg2),
         9 => sys_wait(arg1),
         10 => sys_get_service_binary(arg1, arg2, arg3),
         11 => sys_open(arg1, arg2, arg3),
         12 => sys_close(arg1),
         13 => sys_getppid(),
-        14 => sys_lseek(arg1, arg2 as i64, arg3),
+        14 => sys_lseek(arg1, arg2 as i64, arg3 as usize),
         15 => sys_get_framebuffer_info(arg1),
         16 => sys_map_framebuffer(),
         17 => sys_pci_enum_devices(arg1, arg2, arg3),
@@ -161,6 +154,7 @@ pub extern "C" fn syscall_handler(
         25 => sys_nanosleep(arg1),
         26 => sys_brk(arg1),
         27 => sys_register_device(arg1, arg2, arg3),
+        28 => sys_fmap(arg1, arg2, arg3),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -170,6 +164,30 @@ pub extern "C" fn syscall_handler(
     };
 
     ret
+}
+
+/// Verify if a pointer range points to valid user memory
+/// User memory range: 0x0000_0000_0000_0000 to 0x0000_7FFF_FFFF_FFFF
+fn is_user_pointer(ptr: u64, len: u64) -> bool {
+    // Check for null pointer
+    if ptr == 0 {
+        return false;
+    }
+    
+    // Check for overflow
+    let end = match ptr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    
+    // Check upper bound (Canonical lower half)
+    if end > 0x0000_8000_0000_0000 {
+        return false;
+    }
+    
+    // Additional alignment checks could be added here
+    
+    true
 }
 
 /// sys_exit - Terminar proceso actual
@@ -218,92 +236,38 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     drop(stats);
     
     // Validate parameters
-    if buf_ptr == 0 || len == 0 || len > 4096 {
-        serial::serial_print("[SYSCALL] write() - invalid parameters\n");
-        return u64::MAX; // Error
+    if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
+        return u64::MAX;
     }
-    
-    // Handle stdin (0) - error, can't write to stdin
-    if fd == 0 {
-        serial::serial_print("[SYSCALL] write() - cannot write to stdin\n");
+
+    if !is_user_pointer(buf_ptr, len) {
         return u64::MAX;
     }
     
-    // Handle stdout/stderr (1, 2) - write to serial
+    // Handle stdout (1) and stderr (2) by writing to serial
     if fd == 1 || fd == 2 {
         unsafe {
             let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
             if let Ok(s) = core::str::from_utf8(slice) {
                 serial::serial_print(s);
-            } else {
-                // Fallback for non-utf8 (print safe chars)
-                for &byte in slice {
-                    if byte >= 32 && byte <= 126 || byte == b'\n' || byte == b'\r' {
-                         serial::serial_print(core::str::from_utf8(&[byte]).unwrap_or("."));
-                    } else {
-                        serial::serial_print(".");
-                    }
-                }
             }
         }
         return len;
     }
-    
-    // Handle regular files (fd 3+)
+
     if let Some(pid) = current_process_id() {
-        // Look up file descriptor
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_print("[SYSCALL] write(FD=");
-            serial::serial_print_dec(fd);
-            serial::serial_print(", inode=");
-            serial::serial_print_dec(fd_entry.inode as u64);
-            serial::serial_print(", offset=");
-            serial::serial_print_dec(fd_entry.offset);
-            serial::serial_print(", len=");
-            serial::serial_print_dec(len);
-            serial::serial_print(")\n");
-            
-            // Copy data from user buffer
             unsafe {
                 let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-                
-                // Call filesystem write
-                match crate::filesystem::Filesystem::write_file_by_inode(
-                    fd_entry.inode, 
-                    slice, 
-                    fd_entry.offset
-                ) {
-                    Ok(bytes_written) => {
-                        serial::serial_print("[SYSCALL] write() - ");
-                        serial::serial_print_dec(bytes_written as u64);
-                        serial::serial_print(" bytes written to disk\n");
-                        
-                        // Update file offset
-                        let new_offset = fd_entry.offset + bytes_written as u64;
-                        crate::fd::fd_update_offset(pid, fd as usize, new_offset);
-                        
-                        serial::serial_print("[SYSCALL] write() - offset updated to ");
-                        serial::serial_print_dec(new_offset);
-                        serial::serial_print("\n");
-                        
-                        return bytes_written as u64;
-                    }
-                    Err(e) => {
-                        serial::serial_print("[SYSCALL] write() - error: ");
-                        serial::serial_print(e);
-                        serial::serial_print("\n");
-                        return u64::MAX; // Error
-                    }
+                match crate::scheme::write(fd_entry.scheme_id, fd_entry.resource_id, slice) {
+                    Ok(written) => return written as u64,
+                    Err(_) => return u64::MAX,
                 }
             }
-        } else {
-            serial::serial_print("[SYSCALL] write() - invalid FD\n");
-            return u64::MAX; // Invalid FD
         }
     }
     
-    serial::serial_print("[SYSCALL] write() - no current process\n");
-    u64::MAX // Error
+    u64::MAX
 }
 
 /// sys_read - Leer de un file descriptor (IMPLEMENTED)
@@ -312,75 +276,27 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     stats.read_calls += 1;
     drop(stats);
     
-    // Validar parámetros
-    if buf_ptr == 0 || len == 0 {
-        return u64::MAX; // Error
+    if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
+        return u64::MAX;
     }
     
-    // Clamp length to 4096 to avoid large buffer issues
-    let len = core::cmp::min(len, 4096);
-    
-    // Handle stdin (fd=0) specially
-    if fd == 0 {
-        // TODO: Implementar buffer de input real
-        // Por ahora retornar 0 (EOF)
-        return 0;
+    if !is_user_pointer(buf_ptr, len) {
+        return u64::MAX;
     }
     
-    // Get current process ID
     if let Some(pid) = current_process_id() {
-        // Look up file descriptor
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_print("[SYSCALL] read(FD=");
-            serial::serial_print_dec(fd);
-            serial::serial_print(", len=");
-            serial::serial_print_dec(len);
-            serial::serial_print(", inode=");
-            serial::serial_print_dec(fd_entry.inode as u64);
-            serial::serial_print(")\n");
-            
-            // Read from file using filesystem
-            // We need to use read_file_by_inode or similar
-            // For now, let's skip offset handling and read from beginning
-            let mut temp_buffer = [0u8; 4096];
-            let read_len = core::cmp::min(len as usize, 4096);
-            
-            // Read from file using filesystem with offset
-            match crate::filesystem::Filesystem::read_file_by_inode_at(fd_entry.inode, &mut temp_buffer[..read_len], fd_entry.offset) {
-                Ok(bytes_read) => {
-                    // Copy to user buffer
-                    unsafe {
-                        let user_buf = core::slice::from_raw_parts_mut(
-                            buf_ptr as *mut u8,
-                            bytes_read
-                        );
-                        user_buf.copy_from_slice(&temp_buffer[..bytes_read]);
-                    }
-                    
-                    // Update file offset
-                    let new_offset = fd_entry.offset + bytes_read as u64;
-                    crate::fd::fd_update_offset(pid, fd as usize, new_offset);
-                    
-                    serial::serial_print("[SYSCALL] read() - success, ");
-                    serial::serial_print_dec(bytes_read as u64);
-                    serial::serial_print(" bytes\n");
-                    
-                    bytes_read as u64
-                },
-                Err(e) => {
-                    serial::serial_print("[SYSCALL] read() - error: ");
-                    serial::serial_print(e);
-                    serial::serial_print("\n");
-                    u64::MAX
+            unsafe {
+                let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
+                match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
+                    Ok(bytes_read) => return bytes_read as u64,
+                    Err(_) => return u64::MAX,
                 }
             }
-        } else {
-            serial::serial_print("[SYSCALL] read() - invalid FD\n");
-            u64::MAX
         }
-    } else {
-        u64::MAX
     }
+    
+    u64::MAX
 }
 
 /// sys_send - Enviar mensaje IPC
@@ -500,8 +416,13 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     serial::serial_print_dec(current_pid as u64);
     serial::serial_print("\n");
     
+    // Create child process with modified context
+    // The child needs to see RAX=0 (return value of fork)
+    let mut child_context = *context;
+    child_context.rax = 0;
+    
     // Create child process
-    match process::fork_process(context) {
+    match process::fork_process(&child_context) {
         Some(child_pid) => {
             serial::serial_print("[SYSCALL] fork() created child process with PID: ");
             serial::serial_print_dec(child_pid as u64);
@@ -632,6 +553,12 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         return u64::MAX;
     }
     
+    // Check user pointer validity
+    if !is_user_pointer(out_ptr, 8) || !is_user_pointer(out_size, 8) {
+         serial::serial_print("[SYSCALL] get_service_binary - invalid user pointers\n");
+         return u64::MAX;
+    }
+    
     // Get service binary based on ID (new init startup order)
     let (bin_ptr, bin_size) = match service_id {
         0 => (crate::binaries::LOG_SERVICE_BINARY.as_ptr() as u64, crate::binaries::LOG_SERVICE_BINARY.len() as u64),
@@ -696,19 +623,14 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     }
 }
 
-/// sys_open - Open a file
-/// Args: path_ptr (pointer to path string), path_len (length of path), flags (open flags)
-/// Returns: file descriptor on success, -1 on error
+/// sys_open - Open a file or scheme resource
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.open_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] open() called\n");
-    
     // Validate parameters
     if path_ptr == 0 || path_len == 0 || path_len > 4096 {
-        serial::serial_print("[SYSCALL] open() - invalid parameters\n");
         return u64::MAX;
     }
     
@@ -720,230 +642,111 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     
     serial::serial_print("[SYSCALL] open(\"");
     serial::serial_print(path);
-    serial::serial_print("\", flags=");
-    serial::serial_print_hex(flags);
-    serial::serial_print(")\n");
-    
-    // Check if filesystem is mounted
-    if !crate::filesystem::is_mounted() {
-        serial::serial_print("[SYSCALL] open() - filesystem not mounted\n");
-        return u64::MAX;
-    }
-    
-    // Handle /dev paths
-    if crate::filesystem::is_device_path(path) {
-        if let Some(dev_name) = crate::filesystem::parse_device_name(path) {
-            if let Some(node) = crate::filesystem::lookup_device(dev_name) {
-                if let Some(pid) = current_process_id() {
-                    // Open device FD
-                    // We use a dummy inode 0 for devices, but track the driver PID
-                    match crate::fd::fd_open(pid, 0, flags as u32, crate::fd::FileType::Device, node.driver_pid) {
-                         Some(fd) => {
-                            serial::serial_print("[SYSCALL] open() - device opened, FD=");
-                            serial::serial_print_dec(fd as u64);
-                            serial::serial_print("\n");
-                            return fd as u64;
-                        },
-                        None => return u64::MAX,
-                    }
-                }
+    serial::serial_print("\")\n");
+
+    // Route through scheme system
+    // Paths starting with '/' are routed to the 'file:' scheme for compatibility
+    let (scheme_id, resource_id) = if path.starts_with('/') {
+        match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
+            Ok(res) => res,
+            Err(e) => {
+                serial::serial_print("[SYSCALL] open() failed: error ");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
+                return u64::MAX;
             }
         }
-    }
-    
-    // Try to look up the file in the filesystem
-    // For now, we'll use a simplified approach - if the file exists,
-    // we can open it for reading
-    match crate::filesystem::Filesystem::lookup_path(path) {
-        Ok(inode) => {
-            // Get current process ID
-            if let Some(pid) = current_process_id() {
-                // Allocate file descriptor
-                match crate::fd::fd_open(pid, inode, flags as u32, crate::fd::FileType::File, 0) {
-                    Some(fd) => {
-                        serial::serial_print("[SYSCALL] open() - success, FD=");
-                        serial::serial_print_dec(fd as u64);
-                        serial::serial_print("\n");
-                        fd as u64
-                    },
-                    None => {
-                        serial::serial_print("[SYSCALL] open() - FD table full\n");
-                        u64::MAX
-                    }
-                }
-            } else {
-                serial::serial_print("[SYSCALL] open() - no current process\n");
-                u64::MAX
+    } else {
+        match crate::scheme::open(path, flags as usize, 0) {
+            Ok(res) => res,
+            Err(e) => {
+                serial::serial_print("[SYSCALL] open() failed: error ");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
+                return u64::MAX;
             }
-        },
-        Err(_) => {
-            serial::serial_print("[SYSCALL] open() - file not found: ");
-            serial::serial_print(path);
-            serial::serial_print("\n");
-            u64::MAX
         }
+    };
+
+    if let Some(pid) = current_process_id() {
+        match crate::fd::fd_open(pid, scheme_id, resource_id, flags as u32) {
+            Some(fd) => {
+                serial::serial_print("[SYSCALL] open() -> FD ");
+                serial::serial_print_dec(fd as u64);
+                serial::serial_print("\n");
+                fd as u64
+            }
+            None => u64::MAX,
+        }
+    } else {
+        u64::MAX
     }
 }
 
 /// sys_close - Close a file descriptor
-/// Args: fd (file descriptor)
-/// Returns: 0 on success, -1 on error
 fn sys_close(fd: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.close_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] close(");
-    serial::serial_print_dec(fd);
-    serial::serial_print(")\n");
-    
-    // Don't allow closing stdio descriptors
-    if fd < 3 {
-        serial::serial_print("[SYSCALL] close() - cannot close stdio\n");
-        return u64::MAX;
-    }
-    
-    // Get current process ID
     if let Some(pid) = current_process_id() {
-        // Close the file descriptor
-        if crate::fd::fd_close(pid, fd as usize) {
-            serial::serial_print("[SYSCALL] close() - success\n");
-            0
-        } else {
-            serial::serial_print("[SYSCALL] close() - invalid FD\n");
-            u64::MAX
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            // Close in scheme
+            let _ = crate::scheme::close(fd_entry.scheme_id, fd_entry.resource_id);
+            
+            // Close in FD table
+            if crate::fd::fd_close(pid, fd as usize) {
+                return 0;
+            }
         }
-    } else {
-        u64::MAX
     }
+    u64::MAX
 }
 
-/// sys_lseek - Reposition file offset
-///
-/// Changes the file offset for the specified file descriptor.
-/// Returns the new offset from the beginning of the file, or u64::MAX on error.
-///
-/// Parameters:
-/// - fd: File descriptor
-/// - offset: Offset value (interpretation depends on whence)
-/// - whence: How to interpret offset:
-///   - SEEK_SET (0): Set to offset bytes
-///   - SEEK_CUR (1): Set to current + offset bytes  
-///   - SEEK_END (2): Set to size + offset bytes
-///
-/// Implementation notes:
-/// - For simplicity, we allow seeking beyond file size (needed for future writes)
-/// - Negative offsets are converted from i64 and validated
-/// - File size is estimated as u32::MAX for simplicity (actual size requires
-///   parsing filesystem metadata which is complex)
-fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
+/// sys_lseek - Change file offset
+fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.lseek_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] lseek(FD=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(", offset=");
-    serial::serial_print_dec(offset as u64);
-    serial::serial_print(", whence=");
-    serial::serial_print_dec(whence);
-    serial::serial_print(")\n");
-    
-    // Don't allow seeking on stdio
-    if fd < 3 {
-        serial::serial_print("[SYSCALL] lseek() - cannot seek on stdio\n");
-        return u64::MAX;
-    }
-    
-    // Get current process ID
-    let pid = match current_process_id() {
-        Some(p) => p,
-        None => {
-            serial::serial_print("[SYSCALL] lseek() - no current process\n");
-            return u64::MAX;
-        }
-    };
-    
-    // Get file descriptor entry (just to check it's current offset)
-    let current_offset = match crate::fd::fd_get(pid, fd as usize) {
-        Some(entry) => entry.offset,
-        None => {
-            serial::serial_print("[SYSCALL] lseek() - invalid FD\n");
-            return u64::MAX;
-        }
-    };
-    
-    // Calculate new offset based on whence
-    let new_offset = match whence {
-        SEEK_SET => {
-            // Absolute positioning
-            if offset < 0 {
-                serial::serial_print("[SYSCALL] lseek() - negative offset with SEEK_SET\n");
-                return u64::MAX;
-            }
-            offset as u64
-        }
-        SEEK_CUR => {
-            // Relative to current position
-            let current = current_offset as i64;
-            let result = current + offset;
-            if result < 0 {
-                serial::serial_print("[SYSCALL] lseek() - result offset is negative\n");
-                return u64::MAX;
-            }
-            result as u64
-        }
-        SEEK_END => {
-            // Relative to end of file
-            // Get the FD entry to access the inode
-            let fd_entry = match crate::fd::fd_get(pid, fd as usize) {
-                Some(entry) => entry,
-                None => {
-                    serial::serial_print("[SYSCALL] lseek() - invalid FD for SEEK_END\n");
-                    return u64::MAX;
-                }
-            };
-            
-            // Get file size from filesystem
-            match crate::filesystem::Filesystem::get_file_size(fd_entry.inode) {
-                Ok(file_size) => {
-                    let size_i64 = file_size as i64;
-                    let result = size_i64 + offset;
-                    if result < 0 {
-                        serial::serial_print("[SYSCALL] lseek() - SEEK_END result is negative\n");
-                        return u64::MAX;
+    u64::MAX
+}
+
+/// sys_fmap - Map a resource into memory via its scheme
+fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            serial::serial_print("SYS_FMAP: PID ");
+            serial::serial_print_dec(pid as u64);
+            serial::serial_print(" FD ");
+            serial::serial_print_dec(fd);
+            serial::serial_print(" Scheme ");
+            serial::serial_print_dec(fd_entry.scheme_id as u64);
+            serial::serial_print("\n");
+
+            match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
+                Ok(phys_addr) => {
+                    // For now, we perform the mapping here.
+                    // Ideally, it would be a separate syscall or fmap would return something
+                    // that the kernel then maps into the process address space.
+                    
+                    // HACK: For display, we perform the actual mapping
+                    if fd_entry.scheme_id == 1 { // display: scheme
+                         return crate::memory::map_framebuffer_for_process(
+                             crate::process::get_process_page_table(crate::process::current_process_id()),
+                             phys_addr as u64,
+                             len as u64
+                         );
                     }
-                    serial::serial_print("[SYSCALL] lseek() - file size: ");
-                    serial::serial_print_dec(file_size);
-                    serial::serial_print(", offset from end: ");
-                    serial::serial_print_dec(offset as u64);
-                    serial::serial_print("\n");
-                    result as u64
+
+                    // Return physical address for others (not really a mapping yet)
+                    return phys_addr as u64;
                 }
-                Err(e) => {
-                    serial::serial_print("[SYSCALL] lseek() - failed to get file size: ");
-                    serial::serial_print(e);
-                    serial::serial_print("\n");
-                    return u64::MAX;
-                }
+                Err(_) => return u64::MAX,
             }
         }
-        _ => {
-            serial::serial_print("[SYSCALL] lseek() - invalid whence value\n");
-            return u64::MAX;
-        }
-    };
-    
-    // Update the file offset
-    if crate::fd::fd_update_offset(pid, fd as usize, new_offset) {
-        serial::serial_print("[SYSCALL] lseek() - new offset: ");
-        serial::serial_print_dec(new_offset);
-        serial::serial_print("\n");
-        new_offset
-    } else {
-        serial::serial_print("[SYSCALL] lseek() - failed to update offset\n");
-        u64::MAX
     }
+    u64::MAX
 }
 
 /// Obtener estadísticas de syscalls
@@ -1073,8 +876,11 @@ fn sys_map_framebuffer() -> u64 {
     }
     
     // Map framebuffer into process address space
-    // Map framebuffer into process address space
-    crate::memory::map_framebuffer_for_process(page_table_phys, kernel_fb.base_address, fb_size)
+    let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, kernel_fb.base_address, fb_size);
+    serial::serial_print("MAP_FB: Done. Returning v=");
+    serial::serial_print_hex(vaddr);
+    serial::serial_print("\n");
+    vaddr
 }
 
 /// sys_pci_enum_devices - Enumerate PCI devices by class

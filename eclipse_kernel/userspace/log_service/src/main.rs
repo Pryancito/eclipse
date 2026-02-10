@@ -62,8 +62,8 @@ fn flush_log_buffer() {
             return; // Nothing to flush
         }
         
-        // Open the log file
-        let fd = open("/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
+        // Open the log file using the file: scheme explicitly
+        let fd = open("file:/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
         if fd >= 0 {
             // Write buffered data to file
             let written = write(fd as u32, &LOG_BUFFER[..LOG_BUFFER_POS]);

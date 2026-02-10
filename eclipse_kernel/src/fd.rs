@@ -13,35 +13,24 @@ const MAX_FDS_PER_PROCESS: usize = 64;
 /// Maximum number of processes (matching scheduler limit)
 const MAX_PROCESSES: usize = 64;
 
-/// File Type
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum FileType {
-    File,
-    Device,
-    Pipe,
-    Socket,
-}
-
 /// File descriptor entry
 #[derive(Clone, Debug, Copy)]
 pub struct FileDescriptor {
     pub in_use: bool,
-    pub file_type: FileType,
-    pub inode: u32,     // For File: inode number. For Device: device ID hash? Or just unused?
+    pub scheme_id: usize,
+    pub resource_id: usize,
     pub offset: u64,
     pub flags: u32,
-    pub device_pid: u64, // For Device: PID of the driver
 }
 
 impl FileDescriptor {
     pub const fn new() -> Self {
         Self {
             in_use: false,
-            file_type: FileType::File,
-            inode: 0,
+            scheme_id: 0,
+            resource_id: 0,
             offset: 0,
             flags: 0,
-            device_pid: 0,
         }
     }
 }
@@ -63,17 +52,16 @@ impl FdTable {
     /// Allocate a new file descriptor
     /// Returns the FD number (3+) or None if table is full
     /// FDs 0-2 are reserved for stdio
-    pub fn allocate(&mut self, inode: u32, flags: u32, file_type: FileType, device_pid: u64) -> Option<usize> {
+    pub fn allocate(&mut self, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
         // Start from FD 3 (0=stdin, 1=stdout, 2=stderr)
         for fd in 3..MAX_FDS_PER_PROCESS {
             if !self.fds[fd].in_use {
                 self.fds[fd] = FileDescriptor {
                     in_use: true,
-                    file_type,
-                    inode,
+                    scheme_id,
+                    resource_id,
                     offset: 0,
                     flags,
-                    device_pid,
                 };
                 return Some(fd);
             }
@@ -101,7 +89,7 @@ impl FdTable {
     
     /// Close a file descriptor
     pub fn close(&mut self, fd: usize) -> bool {
-        if fd >= 3 && fd < MAX_FDS_PER_PROCESS && self.fds[fd].in_use {
+        if fd < MAX_FDS_PER_PROCESS && self.fds[fd].in_use {
             self.fds[fd].in_use = false;
             true
         } else {
@@ -122,12 +110,12 @@ pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable
     }
 }
 
-/// Open a file for a process
-pub fn fd_open(pid: ProcessId, inode: u32, flags: u32, file_type: FileType, device_pid: u64) -> Option<usize> {
+/// Open a file for a process using a scheme and resource
+pub fn fd_open(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
     let mut tables = FD_TABLES.lock();
     let pid_idx = pid as usize;
     if pid_idx < MAX_PROCESSES {
-        tables[pid_idx].allocate(inode, flags, file_type, device_pid)
+        tables[pid_idx].allocate(scheme_id, resource_id, flags)
     } else {
         None
     }
@@ -171,4 +159,30 @@ pub fn fd_close(pid: ProcessId, fd: usize) -> bool {
 /// Initialize FD system
 pub fn init() {
     crate::serial::serial_print("File descriptor system initialized\n");
+}
+
+/// Initialize standard I/O for a process
+pub fn fd_init_stdio(pid: ProcessId) {
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open("log:", 0, 0) {
+        let mut tables = FD_TABLES.lock();
+        let pid_idx = pid as usize;
+        if pid_idx < MAX_PROCESSES {
+            // FD 1: stdout
+            tables[pid_idx].fds[1] = FileDescriptor {
+                in_use: true,
+                scheme_id,
+                resource_id,
+                offset: 0,
+                flags: 0,
+            };
+            // FD 2: stderr
+            tables[pid_idx].fds[2] = FileDescriptor {
+                in_use: true,
+                scheme_id,
+                resource_id,
+                offset: 0,
+                flags: 0,
+            };
+        }
+    }
 }

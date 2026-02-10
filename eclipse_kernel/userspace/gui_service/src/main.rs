@@ -27,19 +27,13 @@ pub extern "C" fn _start() -> ! {
     println!("[GUI-SERVICE] Initializing Xwayland support...");
     println!("[GUI-SERVICE]   - Setting up X socket /tmp/.X11-unix/X0");
     println!("[GUI-SERVICE]   - Starting Xwayland server on :0");
-    
-    // Simulate some startup time
-    for _ in 0..5 {
-        yield_cpu();
-    }
-    
     println!("[GUI-SERVICE]   - Xwayland ready");
     println!("[GUI-SERVICE]   - DISPLAY=:0 configured");
 
     // Launch XFwl4 App
     println!("[GUI-SERVICE] Launching XFwl4 Compositor (xfwl4)...");
     
-    let app_path = "/usr/bin/xfwl4";
+    let app_path = "file:/usr/bin/xfwl4";
     
     unsafe {
         // Open application file

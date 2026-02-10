@@ -106,6 +106,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     let stack_size = 0x40000;  // 256KB
     
     let pid = create_process(header.e_entry, stack_base, stack_size)?;
+    crate::fd::fd_init_stdio(pid); // Initialize stdio (log:)
     
     // Get the process to access its page table
     let page_table_phys = {

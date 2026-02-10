@@ -7,6 +7,12 @@ use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 use core::arch::asm;
 
+/// Read time stamp counter
+#[inline]
+fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// Read from I/O port (8-bit)
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
@@ -48,6 +54,14 @@ unsafe fn inl(port: u16) -> u32 {
 unsafe fn outl(port: u16, value: u32) {
     asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
 }
+
+/// Flush cache line
+#[inline]
+unsafe fn clflush(addr: u64) {
+    asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+}
+
+
 
 /// VirtIO MMIO base address (typical for QEMU)
 const VIRTIO_MMIO_BASE: u64 = 0x0A000000;
@@ -337,6 +351,8 @@ impl Virtqueue {
             } else {
                 write_volatile(&mut desc.next, 0);
             }
+            // FLUSH descriptor to RAM
+            clflush(desc as *const _ as u64);
         }
         
         // Add to available ring
@@ -344,6 +360,9 @@ impl Virtqueue {
         let idx = read_volatile(&avail.idx) as usize % self.queue_size as usize;
         write_volatile(&mut avail.ring[idx], head);
         
+        // FLUSH ring entry
+        clflush(&avail.ring[idx] as *const _ as u64);
+
         // Update index - this tells the device there's work to do
         // IMPORTANT: Must perform wrapping add on the u16 index
         let new_idx = read_volatile(&avail.idx).wrapping_add(1);
@@ -353,6 +372,9 @@ impl Virtqueue {
         
         write_volatile(&mut avail.idx, new_idx);
 
+        // FLUSH avail index
+        clflush(&avail.idx as *const _ as u64);
+
         // Ensure the index update is globally visible before we notify the device
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         
@@ -361,6 +383,9 @@ impl Virtqueue {
     
     /// Check if there are used buffers
     unsafe fn has_used(&self) -> bool {
+        // INVALIDATE cache for used ring index
+        clflush(&((*self.used).idx) as *const _ as u64);
+        
         // Memory barrier to ensure we see device updates
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = &*self.used;
@@ -371,6 +396,10 @@ impl Virtqueue {
     
     /// Get next used buffer
     unsafe fn get_used(&mut self) -> Option<(u16, u32)> {
+        // INVALIDATE cache for used ring entry
+        let idx = self.last_used_idx as usize % self.queue_size as usize;
+        clflush(&((*self.used).ring[idx]) as *const _ as u64);
+
         // We can just call has_used() to check, but efficiency matters
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let used = &*self.used;
@@ -679,13 +708,20 @@ impl VirtIOBlockDevice {
             })?;
             
             // Allocate DMA buffers for request
+            // Align to 64 bytes to avoid false sharing with other cache lines
             let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(
-                core::mem::size_of::<VirtIOBlockReq>(), 16
+                core::mem::size_of::<VirtIOBlockReq>(), 64
             ).ok_or_else(|| {
                 crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate request buffer\n");
                 "Failed to allocate request buffer"
             })?;
             
+            crate::serial::serial_print("[VirtIO] READ block=");
+            crate::serial::serial_print_dec(block_num);
+            crate::serial::serial_print(" on device ");
+            crate::serial::serial_print_hex(self.mmio_base | self.io_base as u64);
+            crate::serial::serial_print("\n");
+
             crate::serial::serial_print("[VirtIO] Request: v=");
             crate::serial::serial_print_hex(req_ptr as u64);
             crate::serial::serial_print(" p=");
@@ -693,10 +729,11 @@ impl VirtIOBlockDevice {
             crate::serial::serial_print("\n");
             
             // Allocate status buffer
-            let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
+            // Align to 64 bytes to avoid false sharing
+            let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 64)
                 .ok_or_else(|| {
                     crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate status buffer\n");
-                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 64);
                     "Failed to allocate status buffer"
                 })?;
             
@@ -707,10 +744,19 @@ impl VirtIOBlockDevice {
             let (bounce_ptr, bounce_phys) = crate::memory::alloc_dma_buffer(4096, 4096)
                 .ok_or_else(|| {
                     crate::serial::serial_print("[VirtIO] read_block failed: Cannot allocate bounce buffer\n");
-                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                    crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 64);
+                    crate::memory::free_dma_buffer(status_ptr, 1, 64);
                     "Failed to allocate bounce buffer"
                 })?;
+
+            crate::serial::serial_print("[VirtIO] Bounce Buffer: v=");
+            crate::serial::serial_print_hex(bounce_ptr as u64);
+            crate::serial::serial_print(" p=");
+            crate::serial::serial_print_hex(bounce_phys);
+            crate::serial::serial_print("\n");
+
+            // Zero out bounce buffer to detect if device actually writes to it
+            core::ptr::write_bytes(bounce_ptr, 0, 4096);
 
             // Initialize status to 0x55 to detect if device touches it
             *status_ptr = 0x55;
@@ -728,89 +774,122 @@ impl VirtIOBlockDevice {
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
             
-            let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            // FLUSH CACHE (Ensure data reaches RAM before device reads it)
+            clflush(req_ptr as u64);
+            clflush(status_ptr as u64);
+            // Flush bounce buffer (4KB)
+            for i in (0..4096).step_by(64) {
+                clflush((bounce_ptr as u64) + i);
+            }
             
-            // Notify device
-            if self.io_base != 0 && self.mmio_base == 0 {
-                const VIRTIO_QUEUE_INDEX: u16 = 0;
-                // Note: No need to select queue for notification in legacy PCI
+            let result: Result<(), &'static str> = (|| {
+                let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+                
+                // FORCE MEMORY BARRIER before notification
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
-            } else if self.mmio_base != 0 {
-                let regs = self.mmio_base as *mut VirtIOMMIORegs;
-                write_volatile(&mut (*regs).queue_notify, 0);
-            } else {
-                 // Cleanup
-                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                return Err("Invalid device configuration");
-            }
-            
-            // Wait for completion (polling)
-            let mut timeout = 100_000_000;
-            while !queue.has_used() && timeout > 0 {
-                if self.io_base != 0 {
-                    let isr = unsafe { inb(self.io_base + VIRTIO_PCI_ISR_STATUS) };
-                }
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-            
-            if timeout == 0 {
-                crate::serial::serial_print("[VirtIO] read_block failed: Device timeout\n");
-                crate::serial::serial_print("[VirtIO] WARNING: Leaking DMA buffers to prevent potential memory corruption from late device writes\n");
-                // DO NOT free buffers here. If the device writes to them later, 
-                // we don't want it overwriting random kernel memory.
-                // crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                // crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                // crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                return Err("VirtIO read timeout (buffers leaked)");
-            }
-            
-            // Get used buffer
-            if let Some((used_idx, _len)) = queue.get_used() {
-                // Memory fence to ensure device writes are visible
-                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 
-                // Check status - MUST use volatile read as device writes this asynchronously
-                let status = unsafe { read_volatile(status_ptr) };
-
-                if status == 0x55 {
-                    crate::serial::serial_print("[VirtIO] read_block failed: Status not updated (still 0x55)\n");
-                     crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                     crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                     crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                    return Err("VirtIO status not updated (IRQ lost?)");
+                // Notify device
+                if self.io_base != 0 && self.mmio_base == 0 {
+                    const VIRTIO_QUEUE_INDEX: u16 = 0;
+                    outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_QUEUE_INDEX);
+                } else if self.mmio_base != 0 {
+                    let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                    write_volatile(&mut (*regs).queue_notify, 0);
+                } else {
+                    return Err("Invalid device configuration");
                 }
                 
-                queue.free_desc(used_idx);
+                // Check initial status
+                let initial_status = read_volatile(status_ptr);
+                crate::serial::serial_print("[VirtIO] Pre-wait Status: 0x");
+                crate::serial::serial_print_hex(initial_status as u64);
+                crate::serial::serial_print("\n");
                 
-                if status != VIRTIO_BLK_S_OK {
-                    crate::serial::serial_print("[VirtIO] read_block failed: Bad status 0x");
-                    crate::serial::serial_print_hex(status as u64);
+                // Wait for completion (Timeout using RDTSC)
+                // 2 GHz = 2 * 10^9 cycles/sec. 1ms = 2 * 10^6 cycles.
+                // Wait up to 1 second (approx 2*10^9 cycles) or more conservatively 3*10^9.
+                let start_time = rdtsc();
+                let timeout_cycles = 3_000_000_000; // ~1-2 seconds depending on CPU freq
+                
+                while !queue.has_used() {
+                    if rdtsc().wrapping_sub(start_time) > timeout_cycles {
+                        // Final status check before failing
+                        let final_timeout_status = read_volatile(status_ptr);
+                        crate::serial::serial_print("[VirtIO] Timeout Status: 0x");
+                        crate::serial::serial_print_hex(final_timeout_status as u64);
+                        crate::serial::serial_print("\n");
+                        
+                        crate::serial::serial_print("[VirtIO] read_block failed: Device timeout (RDTSC)\n");
+                        crate::serial::serial_print("[VirtIO] WARNING: Leaking DMA buffers to prevent memory corruption\n");
+                        return Err("VirtIO read timeout (buffers leaked)");
+                    }
+                     
+                    if self.io_base != 0 {
+                         // Ack interrupt if PCI (though we shouldn't need to in poll mode ideally, but for legacy cleanup)
+                         let _isr = inb(self.io_base + VIRTIO_PCI_ISR_STATUS);
+                    }
+                    core::hint::spin_loop();
+                }
+                
+                // Get used buffer
+                if let Some((used_idx, len)) = queue.get_used() {
+                    // Memory fence to ensure device writes are visible
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    
+                    crate::serial::serial_print("[VirtIO] Read completed: len=");
+                    crate::serial::serial_print_dec(len as u64);
                     crate::serial::serial_print("\n");
-                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                    crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                    crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                    return Err("VirtIO read failed");
+                    
+                    // Check status - MUST use volatile read as device writes this asynchronously
+                    let status = read_volatile(status_ptr);
+
+                    // INVALIDATE CACHE for bounce buffer after read
+                    // This ensures we see what the device wrote to RAM
+                    for i in (0..4096).step_by(64) {
+                        clflush((bounce_ptr as u64) + i);
+                    }
+                    // Memory barrier to ensure clflush is finished before we copy
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+                    // RELEASE DESCRIPTOR IMMEDIATELY (Safety: Freeing before return)
+                    // We must free the descriptor so it goes back to the free pool.
+                    queue.free_desc(used_idx);
+                    
+                    if status == 0x55 {
+                        crate::serial::serial_print("[VirtIO] read_block failed: Status not updated (still 0x55)\n");
+                        return Err("VirtIO status not updated (IRQ lost?)");
+                    }
+                    
+                    if status != VIRTIO_BLK_S_OK {
+                        crate::serial::serial_print("[VirtIO] read_block failed: Bad status 0x");
+                        crate::serial::serial_print_hex(status as u64);
+                        crate::serial::serial_print("\n");
+                        return Err("VirtIO read failed");
+                    }
+                    
+                    // Copy data from bounce buffer to user buffer
+                    core::ptr::copy_nonoverlapping(bounce_ptr, buffer.as_mut_ptr(), 4096);
+                    Ok(())
+                } else {
+                    // Should be unreachable if has_used() returned true
+                    Err("Spurious wakeup")
                 }
-                
-                // Copy data from bounce buffer to user buffer
-                core::ptr::copy_nonoverlapping(bounce_ptr, buffer.as_mut_ptr(), 4096);
-                
-                // Cleanup
-                crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-                crate::memory::free_dma_buffer(status_ptr, 1, 1);
-                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-                
-                return Ok(());
+            })();
+
+            // Clean up DMA buffers (RAII-style)
+            // Note: If result is "Buffers Leaked" timeout, we do NOT free them.
+            if let Err(e) = result {
+                if e == "VirtIO read timeout (buffers leaked)" {
+                    return Err(e);
+                }
             }
             
-            crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
-            crate::memory::free_dma_buffer(status_ptr, 1, 1);
+            // Standard cleanup
+            crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 64);
+            crate::memory::free_dma_buffer(status_ptr, 1, 64);
             crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
-            Err("No used buffer returned")
+            
+            result
         }
     }
     
@@ -947,38 +1026,120 @@ pub fn init() {
     serial::serial_print("[VirtIO] Total devices initialized: ");
     serial::serial_print_dec(BLOCK_DEVICES.lock().len() as u64);
     serial::serial_print("\n");
+
+    // Register as disk: scheme
+    crate::scheme::register_scheme("disk", alloc::boxed::Box::new(DiskScheme));
+    serial::serial_print("[VirtIO] Registered 'disk:' scheme\n");
 }
 
-
-/// Read a block from the block device
+/// Global wrapper to read a block from the first available VirtIO device
 pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
     let mut devices = BLOCK_DEVICES.lock();
-    if devices.is_empty() {
-        return Err("No VirtIO block devices initialized");
+    if let Some(dev) = devices.get_mut(0) {
+        dev.read_block(block_num, buffer)
+    } else {
+        Err("No VirtIO block device found")
     }
-    
-    // Try each device until one works (the RootFS is usually on one of them)
-    // In our QEMU setup, Disk 0 is Boot (FAT), Disk 1 is RootFS.
-    // We'll iterate and try. To avoid spamming, we could remember which one worked.
-    let count = devices.len();
-    for i in 0..count {
-        match devices[i].read_block(block_num, buffer) {
-            Ok(_) => return Ok(()),
-            Err(_) => continue,
-        }
-    }
-    
-    Err("Failed to read block from any VirtIO device")
 }
 
-/// Write a block to the block device
+/// Global wrapper to write a block to the first available VirtIO device
 pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
     let mut devices = BLOCK_DEVICES.lock();
-    for i in 0..devices.len() {
-        match devices[i].write_block(block_num, buffer) {
-            Ok(_) => return Ok(()),
-            Err(_) => continue,
+    if let Some(dev) = devices.get_mut(0) {
+        dev.write_block(block_num, buffer)
+    } else {
+        Err("No VirtIO block device found")
+    }
+}
+
+
+// --- Redox-style Scheme Implementation ---
+
+use crate::scheme::{Scheme, Stat, error as scheme_error};
+
+struct OpenDisk {
+    disk_idx: usize,
+    offset: u64, // offset in bytes
+}
+
+static OPEN_DISKS: Mutex<alloc::vec::Vec<Option<OpenDisk>>> = Mutex::new(alloc::vec::Vec::new());
+
+pub struct DiskScheme;
+
+impl Scheme for DiskScheme {
+    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        let disk_idx = path.parse::<usize>().map_err(|_| scheme_error::EINVAL)?;
+        
+        let devices = BLOCK_DEVICES.lock();
+        if disk_idx >= devices.len() {
+            return Err(scheme_error::ENOENT);
+        }
+
+        let mut open_disks = OPEN_DISKS.lock();
+        for (i, slot) in open_disks.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(OpenDisk { disk_idx, offset: 0 });
+                return Ok(i);
+            }
+        }
+        
+        let id = open_disks.len();
+        open_disks.push(Some(OpenDisk { disk_idx, offset: 0 }));
+        Ok(id)
+    }
+
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let mut open_disks = OPEN_DISKS.lock();
+        let open_disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        // Convert byte offset to block number
+        let block_num = open_disk.offset / 4096;
+        let offset_in_block = (open_disk.offset % 4096) as usize;
+        
+        let mut temp_block = [0u8; 4096];
+        let mut devices = BLOCK_DEVICES.lock();
+        let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
+        
+        device.read_block(block_num, &mut temp_block).map_err(|_| scheme_error::EIO)?;
+        
+        let available = 4096 - offset_in_block;
+        let to_copy = core::cmp::min(buffer.len(), available);
+        
+        buffer[..to_copy].copy_from_slice(&temp_block[offset_in_block..offset_in_block + to_copy]);
+        
+        open_disk.offset += to_copy as u64;
+        Ok(to_copy)
+    }
+
+    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
+        Err(scheme_error::EIO) // Read-only for now
+    }
+
+    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
+        let mut open_disks = OPEN_DISKS.lock();
+        let open_disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        let new_offset = match whence {
+            0 => offset as u64, // SEEK_SET
+            1 => (open_disk.offset as isize + offset) as u64, // SEEK_CUR
+            _ => return Err(scheme_error::EINVAL),
+        };
+        
+        open_disk.offset = new_offset;
+        Ok(new_offset as usize)
+    }
+
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut open_disks = OPEN_DISKS.lock();
+        if let Some(slot) = open_disks.get_mut(id) {
+            *slot = None;
+            Ok(0)
+        } else {
+            Err(scheme_error::EBADF)
         }
     }
-    Err("Failed to write block to any VirtIO device")
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        Ok(0)
+    }
 }

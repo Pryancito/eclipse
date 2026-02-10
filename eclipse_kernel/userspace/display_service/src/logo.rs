@@ -25,6 +25,9 @@ pub fn draw(fb_base: usize, fb_pitch: u32, fb_bpp: u32, screen_width: u32, scree
     let start_x = (screen_width.saturating_sub(LOGO_WIDTH)) / 2;
     let start_y = (screen_height.saturating_sub(LOGO_HEIGHT)) / 2;
     
+    crate::println!("[DISPLAY-SERVICE] Logo center debug: screen={}x{}, logo={}x{}, start={},{}", 
+        screen_width, screen_height, LOGO_WIDTH, LOGO_HEIGHT, start_x, start_y);
+    
     let fb_ptr = fb_base as *mut u32;
     
     // Safety: modifying raw memory at framebuffer address

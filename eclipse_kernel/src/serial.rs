@@ -137,6 +137,11 @@ pub fn serial_print_byte(byte: u8) {
     });
 }
 
+/// Escribir un caracter al puerto serial
+pub fn serial_print_char(c: char) {
+    serial_print_byte(c as u8);
+}
+
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
     // Esperar a que el buffer de transmisión esté vacío

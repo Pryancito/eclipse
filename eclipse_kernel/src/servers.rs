@@ -4,6 +4,8 @@ use crate::ipc::{MessageType, register_server, ServerId, receive_message};
 use crate::process::{create_process, ProcessId};
 use crate::serial;
 use crate::scheduler::yield_cpu;
+use crate::scheme::{Scheme, Stat, error as scheme_error};
+use alloc::boxed::Box;
 
 /// Framebuffer information from bootloader
 #[repr(C)]
@@ -195,4 +197,157 @@ fn handle_graphics_message(msg: &crate::ipc::Message) {
     // - DRAW_LINE: dibujar línea
     // - FILL: rellenar área
     // - BLIT: copiar buffer
+}
+
+// --- Display Scheme ---
+
+pub struct DisplayScheme;
+
+impl Scheme for DisplayScheme {
+    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        Ok(0) // Single display resource
+    }
+
+    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+        let fb_info = &crate::boot::get_boot_info().framebuffer;
+        if fb_info.base_address == 0 {
+            return Err(scheme_error::EIO);
+        }
+
+        // Direct write to framebuffer (not optimized, but consistent)
+        let fb_ptr = (crate::memory::PHYS_MEM_OFFSET + fb_info.base_address) as *mut u8;
+        let fb_size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as usize; // Assuming 32bpp
+        
+        let to_copy = buf.len().min(fb_size);
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), fb_ptr, to_copy);
+        }
+        
+        Ok(to_copy)
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        Err(scheme_error::EIO)
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Ok(0) // Simplified seeker
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        let fb_info = &crate::boot::get_boot_info().framebuffer;
+        _stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
+        Ok(0)
+    }
+
+    fn fmap(&self, _id: usize, _offset: usize, _len: usize) -> Result<usize, usize> {
+        let fb_info = &crate::boot::get_boot_info().framebuffer;
+        if fb_info.base_address == 0 {
+            return Err(scheme_error::EIO);
+        }
+        // Return physical address
+        Ok(fb_info.base_address as usize)
+    }
+}
+
+// --- Input Scheme ---
+
+pub struct InputScheme;
+
+impl Scheme for InputScheme {
+    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        Ok(0) // Will be populated with input events
+    }
+
+    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+        Ok(buf.len())
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        Ok(0)
+    }
+}
+
+// --- Audio Scheme ---
+
+pub struct AudioScheme;
+
+impl Scheme for AudioScheme {
+    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+        Ok(buf.len())
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        Ok(0)
+    }
+}
+
+// --- Network Scheme ---
+
+pub struct NetworkScheme;
+
+impl Scheme for NetworkScheme {
+    fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+        Ok(buf.len())
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        Ok(0)
+    }
+}
+
+pub fn init() {
+    init_servers();
+    crate::scheme::register_scheme("display", Box::new(DisplayScheme));
+    crate::scheme::register_scheme("input", Box::new(InputScheme));
+    crate::scheme::register_scheme("snd", Box::new(AudioScheme));
+    crate::scheme::register_scheme("net", Box::new(NetworkScheme));
 }

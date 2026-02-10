@@ -2,6 +2,7 @@ use crate::serial;
 use core::cmp::min;
 use alloc::vec::Vec;
 use alloc::vec;
+use alloc::boxed::Box;
 use alloc::string::String;
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags, constants};
 use eclipsefs_lib::NodeKind;
@@ -9,18 +10,41 @@ use eclipsefs_lib::NodeKind;
 /// Block size for filesystem operations
 pub const BLOCK_SIZE: usize = 4096;
 
-/// Read a block from the underlying block device
-/// Tries VirtIO first, falls back to ATA
-/// Read a block from the underlying block device (Cached)
+/// Maximum record size to prevent OOM (2 MiB)
+pub const MAX_RECORD_SIZE: usize = 2 * 1024 * 1024;
+
+/// Read a block from the underlying block device using the scheme system
 fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    crate::bcache::read_block(block_num, buffer)
+    unsafe {
+        if !FS.mounted && FS.disk_resource_id == 0 && FS.disk_scheme_id == 0 {
+            // During mount, we might not have a handle yet.
+            // For now, use the old way during early bootstrap or a dummy handle.
+            // Actually, we should open the handle IN mount().
+        }
+
+        let offset = block_num * 4096;
+        let _ = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0)
+            .map_err(|_| "Disk seek error")?;
+        
+        match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
+            Ok(_) => Ok(()),
+            Err(_) => Err("Disk read error"),
+        }
+    }
 }
 
-/// Write a block to the underlying block device
-/// Tries VirtIO first, falls back to ATA
-/// Write a block to the underlying block device (Cached)
+/// Write a block to the underlying block device using the scheme system
 fn write_block_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    crate::bcache::write_block(block_num, buffer)
+    unsafe {
+        let offset = block_num * 4096;
+        let _ = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0)
+            .map_err(|_| "Disk seek error")?;
+        
+        match crate::scheme::write(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
+            Ok(_) => Ok(()),
+            Err(_) => Err("Disk write error"),
+        }
+    }
 }
 
 /// Filesystem state
@@ -28,12 +52,16 @@ pub struct Filesystem {
     mounted: bool,
     header: Option<EclipseFSHeader>,
     inode_table_offset: u64,
+    disk_scheme_id: usize,
+    disk_resource_id: usize,
 }
 
 static mut FS: Filesystem = Filesystem {
     mounted: false,
     header: None,
     inode_table_offset: 0,
+    disk_scheme_id: 0,
+    disk_resource_id: 0,
 };
 
 impl Filesystem {
@@ -51,19 +79,42 @@ pub fn mount() -> Result<(), &'static str> {
         }
         
         serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
+
+        // Open disk:1 (RootFS in our QEMU setup)
+        serial::serial_print("[FS] Opening disk:1 via scheme registry...\n");
+        match crate::scheme::open("disk:1", 0, 0) {
+            Ok((s_id, r_id)) => {
+                FS.disk_scheme_id = s_id;
+                FS.disk_resource_id = r_id;
+                serial::serial_print("[FS] Disk handle opened successfully\n");
+            }
+            Err(e) => {
+                serial::serial_print("[FS] Failed to open disk:1 - error ");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
+                return Err("Failed to open storage device");
+            }
+        }
         
         serial::serial_print("[FS] Allocating superblock buffer...\n");
         // Use heap to avoid stack overflow
         let mut superblock = vec![0u8; 4096];
-        serial::serial_print("[FS] Buffer allocated at: ");
-        serial::serial_print_hex(superblock.as_ptr() as u64);
-        serial::serial_print("\n");
         
         serial::serial_print("[FS] Reading superblock from block device...\n");
         read_block_from_device(Self::PARTITION_OFFSET_BLOCKS, &mut superblock)?;
         serial::serial_print("[FS] Superblock read successfully\n");
         
         // Parse header using library
+        serial::serial_print("[FS] Raw superblock dump (64 bytes):\n");
+        for i in (0..64).step_by(8) {
+            serial::serial_print_hex(u64::from_le_bytes([
+                superblock[i], superblock[i+1], superblock[i+2], superblock[i+3],
+                superblock[i+4], superblock[i+5], superblock[i+6], superblock[i+7]
+            ]));
+            serial::serial_print(" ");
+        }
+        serial::serial_print("\n");
+
         match EclipseFSHeader::from_bytes(&superblock) {
             Ok(header) => {
                 serial::serial_print("[FS] EclipseFS signature found\n");
@@ -74,10 +125,18 @@ pub fn mount() -> Result<(), &'static str> {
                 serial::serial_print("\n");
                 
                 FS.inode_table_offset = header.inode_table_offset;
+                
+                // DevFS Safety: Ensure disk inodes don't collide with 0xF0000000+ range
+                if header.total_inodes >= 0xF0000000 {
+                    serial::serial_print("[FS] WARNING: Total inodes exceeds safe range! DevFS collisions possible.\n");
+                    return Err("Filesystem too large (inodes overlap with DevFS)");
+                }
+                
                 FS.header = Some(header);
                 FS.mounted = true;
                 
                 serial::serial_print("[FS] Filesystem mounted successfully\n");
+
                 Ok(())
             },
             Err(_) => {
@@ -104,6 +163,14 @@ pub fn mount() -> Result<(), &'static str> {
             let index = (inode - 1) as u64;
             let entry_offset = FS.inode_table_offset + (index * 8);
             
+            serial::serial_print("[FS] read_inode(");
+            serial::serial_print_dec(inode as u64);
+            serial::serial_print(") table_off=0x");
+            serial::serial_print_hex(FS.inode_table_offset);
+            serial::serial_print(" entry_off=0x");
+            serial::serial_print_hex(entry_offset);
+            serial::serial_print("\n");
+            
             let block_num = (entry_offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
             let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
             
@@ -119,6 +186,21 @@ pub fn mount() -> Result<(), &'static str> {
                 buffer[offset_in_block+4], buffer[offset_in_block+5], 
                 buffer[offset_in_block+6], buffer[offset_in_block+7]
             ]) as u64;
+            
+            serial::serial_print("[FS] INODE RAW: num=");
+            serial::serial_print_dec(inode_num);
+            serial::serial_print(" rel_off=");
+            serial::serial_print_dec(rel_offset);
+            serial::serial_print("\n");
+
+            serial::serial_print("[FS] Raw buffer dump (32 bytes at offset_in_block): ");
+            for i in 0..32 {
+                if offset_in_block + i < 4096 {
+                    serial::serial_print_hex(buffer[offset_in_block + i] as u64);
+                    serial::serial_print(" ");
+                }
+            }
+            serial::serial_print("\n");
              
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
             
@@ -279,6 +361,11 @@ pub fn mount() -> Result<(), &'static str> {
             block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
             block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
         ]) as usize;
+        
+        // OOM Protection
+        if record_size > MAX_RECORD_SIZE {
+            return Err("File record too large (exceeds MAX_RECORD_SIZE)");
+        }
         
         // Read full record
         let mut record_data = vec![0u8; record_size];
@@ -479,6 +566,10 @@ pub fn mount() -> Result<(), &'static str> {
             let _ = FS.header.as_ref().ok_or("FS not mounted")?;
         }
         
+        serial::serial_print("[FS] lookup_path('");
+        serial::serial_print(path);
+        serial::serial_print("')\n");
+
         if path == "/" {
             return Ok(1); // Root
         }
@@ -508,6 +599,12 @@ pub fn mount() -> Result<(), &'static str> {
         let mut current_inode = 1;
         
         for part in parts {
+            serial::serial_print("[FS] Looking up '");
+            serial::serial_print(part);
+            serial::serial_print("' in inode ");
+            serial::serial_print_dec(current_inode as u64);
+            serial::serial_print("\n");
+
             // Read directory inode
              // Reuse read logic but we need the raw record to find children
              let entry = Self::read_inode_entry(current_inode)?;
@@ -520,10 +617,31 @@ pub fn mount() -> Result<(), &'static str> {
              let mut block_buffer = vec![0u8; 4096];
              read_block_from_device(block_num, &mut block_buffer)?;
              
+             if offset_in_block + 8 > 4096 {
+                return Err("Node header crosses block boundary");
+             }
+             
              let record_size = u32::from_le_bytes([
                 block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
                 block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
-            ]) as usize;
+             ]) as usize;
+            
+            serial::serial_print("[FS] Dir record size: ");
+            serial::serial_print_dec(record_size as u64);
+            serial::serial_print("\n");
+
+            if record_size < 8 {
+                // This might be a padding byte or end of directory marker if 0, 
+                // but for now let's treat it as an error/not found to avoid panic
+                serial::serial_print("[FS] Error: Record too small (<8)\n");
+                return Err("Invalid directory record size (too small)");
+            }
+            
+            // OOM Protection
+            if record_size > MAX_RECORD_SIZE {
+                 serial::serial_print("[FS] Error: Record too large (>MAX)\n");
+                 return Err("Directory record too large (exceeds MAX_RECORD_SIZE)");
+            }
             
             let mut record_data = vec![0u8; record_size];
             // Read first chunk
@@ -541,9 +659,18 @@ pub fn mount() -> Result<(), &'static str> {
             }
             
             // Search in record
+            // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
             if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
+                serial::serial_print("[FS] Found '");
+                serial::serial_print(part);
+                serial::serial_print("' -> inode ");
+                serial::serial_print_dec(inode as u64);
+                serial::serial_print("\n");
                 current_inode = inode;
             } else {
+                serial::serial_print("[FS] Child '");
+                serial::serial_print(part);
+                serial::serial_print("' not found in directory\n");
                 return Err("File not found");
             }
         }
@@ -557,6 +684,8 @@ pub fn mount() -> Result<(), &'static str> {
 pub fn init() {
     serial::serial_print("Initializing filesystem subsystem...\n");
     crate::bcache::init();
+    crate::scheme::register_scheme("file", Box::new(FileSystemScheme));
+    crate::scheme::register_scheme("dev", Box::new(DevScheme));
 }
 
 /// Mount the root filesystem
@@ -650,15 +779,161 @@ pub fn lookup_device(name: &str) -> Option<DeviceNode> {
     }
 }
 
+// --- Redox-style Scheme Implementation ---
+
+use crate::scheme::{Scheme, Stat, error as scheme_error};
+
+struct OpenFile {
+    inode: u32,
+    offset: u64,
+}
+
+static OPEN_FILES_SCHEME: Mutex<alloc::vec::Vec<Option<OpenFile>>> = Mutex::new(alloc::vec::Vec::new());
+
+pub struct FileSystemScheme;
+
+impl Scheme for FileSystemScheme {
+    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        if !is_mounted() {
+            return Err(scheme_error::EIO);
+        }
+
+        // Clean path to remove leading slash if present
+        let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+
+        match Filesystem::lookup_path(clean_path) {
+            Ok(inode) => {
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                for (i, slot) in open_files.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        *slot = Some(OpenFile { inode, offset: 0 });
+                        return Ok(i);
+                    }
+                }
+                
+                let id = open_files.len();
+                open_files.push(Some(OpenFile { inode, offset: 0 }));
+                Ok(id)
+            }
+            Err(_) => Err(scheme_error::ENOENT),
+        }
+    }
+
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        match Filesystem::read_file_by_inode_at(open_file.inode, buffer, open_file.offset) {
+            Ok(bytes_read) => {
+                open_file.offset += bytes_read as u64;
+                Ok(bytes_read)
+            }
+            Err(_) => Err(scheme_error::EIO),
+        }
+    }
+
+    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        match Filesystem::write_file_by_inode(open_file.inode, buffer, open_file.offset) {
+            Ok(bytes_written) => {
+                open_file.offset += bytes_written as u64;
+                Ok(bytes_written)
+            }
+            Err(_) => Err(scheme_error::EIO),
+        }
+    }
+
+    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        let new_offset = match whence {
+            0 => offset as u64, // SEEK_SET
+            1 => (open_file.offset as isize + offset) as u64, // SEEK_CUR
+            _ => return Err(scheme_error::EINVAL),
+        };
+        
+        open_file.offset = new_offset;
+        Ok(new_offset as usize)
+    }
+
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        if let Some(slot) = open_files.get_mut(id) {
+            *slot = None;
+            Ok(0)
+        } else {
+            Err(scheme_error::EBADF)
+        }
+    }
+
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        let open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        
+        match Filesystem::get_file_size(open_file.inode) {
+            Ok(size) => {
+                stat.size = size;
+                Ok(0)
+            }
+            Err(_) => Err(scheme_error::EIO),
+        }
+    }
+}
+
+// --- Dev Scheme ---
+
+pub struct DevScheme;
+
+impl Scheme for DevScheme {
+    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        // Remove leading slash if present
+        let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+        
+        if lookup_device(clean_path).is_some() {
+            // For now, we return a virtual ID based on the order in the registry
+            // This is a placeholder since devfs is currently mostly for registration info
+            Ok(0) 
+        } else {
+            Err(scheme_error::ENOENT)
+        }
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        Ok(0) // Placeholder
+    }
+
+    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
+        Ok(_buffer.len()) // Placeholder
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+}
+
+
 /// Check if a path is a device path
 pub fn is_device_path(path: &str) -> bool {
-    path.starts_with("/dev/") || path == "/dev"
+    path.starts_with("/dev/") || path == "/dev" || path.starts_with("dev/") || path == "dev"
 }
 
 /// Parse device name from path
 pub fn parse_device_name(path: &str) -> Option<&str> {
     if path.starts_with("/dev/") {
         Some(&path[5..])
+    } else if path.starts_with("dev/") {
+        Some(&path[4..])
     } else {
         None
     }

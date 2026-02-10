@@ -32,6 +32,7 @@ mod filesystem;
 mod binaries;
 mod ata;
 mod fd;  // File descriptor management
+mod scheme; // Redox-style scheme system
 mod bcache; // Buffer Cache
 
 /// Stack de arranque (16KB)
@@ -153,8 +154,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     process::init_kernel_process();
     scheduler::init();
     syscalls::init();
+    crate::scheme::init(); // Initialize Redox-style scheme system
     fd::init();
-    // servers::init_servers();
+    servers::init();
     pci::init();
     nvidia::init();
     virtio::init();

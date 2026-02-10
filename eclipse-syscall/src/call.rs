@@ -113,3 +113,17 @@ pub fn brk(addr: usize) -> Result<usize> {
         Ok(result)
     }
 }
+
+/// Map a resource in a scheme
+pub fn fmap(fd: usize, offset: usize, len: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_FMAP, fd, offset, len)
+    })
+}
+
+/// Register a new device node
+pub fn register_device(name: &str, type_id: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall3(SYS_REGISTER_DEVICE, name.as_ptr() as usize, name.len(), type_id)
+    })
+}

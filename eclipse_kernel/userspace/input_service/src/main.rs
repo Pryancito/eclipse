@@ -14,6 +14,42 @@
 
 use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo};
 
+/// Syscall numbers
+const SYS_OPEN: u64 = 11;
+const SYS_WRITE: u64 = 1;
+
+fn sys_open(path: &str) -> Option<usize> {
+    let mut fd: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+            in("rdx") 0u64,
+            lateout("rax") fd,
+            options(nostack)
+        );
+    }
+    if (fd as isize) < 0 { None } else { Some(fd) }
+}
+
+fn sys_write(fd: usize, buf: &[u8]) -> usize {
+    let mut written: usize;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_WRITE,
+            in("rdi") fd as u64,
+            in("rsi") buf.as_ptr() as u64,
+            in("rdx") buf.len() as u64,
+            lateout("rax") written,
+            options(nostack)
+        );
+    }
+    written
+}
+
 /// Input device types
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum InputDeviceType {
@@ -272,13 +308,10 @@ pub extern "C" fn _start() -> ! {
     println!("[INPUT-SERVICE]   Event queue allocated (256 events, 4KB buffer)");
     println!("[INPUT-SERVICE]   Ready to process input events");
     
-    // Initialize USB HID protocol support
-    if usb_device_count > 0 {
-        println!("[INPUT-SERVICE] Initializing USB HID protocol...");
-        println!("[INPUT-SERVICE]   USB HID Boot Protocol enabled");
-        println!("[INPUT-SERVICE]   USB HID Report Protocol enabled");
-        println!("[INPUT-SERVICE]   Absolute pointer support enabled");
-    }
+    // Register with input: scheme
+    println!("[INPUT-SERVICE] Connecting to input: scheme proxy...");
+    let input_fd = sys_open("input:").expect("Failed to open input: scheme");
+    println!("[INPUT-SERVICE]   Scheme handle: {}", input_fd);
     
     // Report initialization status
     println!("[INPUT-SERVICE] Input service ready");
@@ -321,6 +354,9 @@ pub extern "C" fn _start() -> ! {
             if event_queue.push(kbd_event) {
                 keyboard_events += 1;
                 total_events += 1;
+                // Report via scheme
+                let buf = unsafe { core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
+                sys_write(input_fd, buf);
             }
         }
         
