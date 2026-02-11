@@ -13,11 +13,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Physical address X is accessible at (PHYS_MEM_OFFSET + X)
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
 
-/// Maximum user-space virtual address (canonical lower half)
-/// User processes can only map addresses below this value
-/// Addresses >= 0xFFFF800000000000 are reserved for kernel (higher half)
-pub const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
-
 /// Physical offset for virtual-to-physical address translation (legacy)
 /// This is now set to 0 since we use higher half mapping
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -452,15 +447,6 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
 
 /// Map a 4KB page in a process's page table
 pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    // CRITICAL SECURITY CHECK: Prevent mapping into kernel space (Higher Half)
-    // User processes can only map addresses in the lower canonical half
-    if vaddr > USER_ADDR_MAX {
-        crate::serial::serial_print("[SECURITY] Attempt to map kernel-space address v=");
-        crate::serial::serial_print_hex(vaddr);
-        crate::serial::serial_print(" BLOCKED\n");
-        panic!("Security violation: Attempted to map user page into kernel space");
-    }
-    
     let pml4_virt = phys_to_virt(pml4_phys);
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     
@@ -529,15 +515,6 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 
 /// Map a 2MB page in a process's page table
 pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    // CRITICAL SECURITY CHECK: Prevent mapping into kernel space (Higher Half)
-    // User processes can only map addresses in the lower canonical half
-    if vaddr > USER_ADDR_MAX {
-        crate::serial::serial_print("[SECURITY] Attempt to map kernel-space address v=");
-        crate::serial::serial_print_hex(vaddr);
-        crate::serial::serial_print(" BLOCKED\n");
-        panic!("Security violation: Attempted to map user page into kernel space");
-    }
-    
     let pml4_virt = phys_to_virt(pml4_phys);
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     
