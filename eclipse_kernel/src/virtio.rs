@@ -884,6 +884,9 @@ impl VirtIOBlockDevice {
                     return Err("Invalid device configuration");
                 }
                 
+                // Memory fence to ensure device writes are visible
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                
                 // Check initial status
                 let initial_status = read_volatile(status_ptr);
                 crate::serial::serial_print("[VirtIO] Pre-wait Status: 0x");
@@ -898,6 +901,9 @@ impl VirtIOBlockDevice {
                 
                 while !queue.has_used() {
                     if rdtsc().wrapping_sub(start_time) > timeout_cycles {
+                        // Memory fence to ensure device writes are visible
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                        
                         // Final status check before failing
                         let final_timeout_status = read_volatile(status_ptr);
                         crate::serial::serial_print("[VirtIO] Timeout Status: 0x");
