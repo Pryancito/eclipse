@@ -477,6 +477,11 @@ pub fn mount() -> Result<(), &'static str> {
             ]) as usize;
             offset += 6;
             
+            if offset + length > data.len() {
+                serial::serial_print("[FS] find_child_in_dir: TLV length exceeds data size\n");
+                break; 
+            }
+
             if tag == tlv_tags::DIRECTORY_ENTRIES {
                 // Parse dir entries
                 // Format: NameLen(4) + Inode(4) + Name(Len)
@@ -493,10 +498,21 @@ pub fn mount() -> Result<(), &'static str> {
                         dir_data[dir_offset+6], dir_data[dir_offset+7]
                     ]);
                     
-                    if dir_offset + 8 + name_len > dir_data.len() { break; }
+                    if dir_offset + 8 + name_len > dir_data.len() {
+                        serial::serial_print("[FS] find_child_in_dir: Entry name exceeds dir data size\n");
+                        break; 
+                    }
                     
                     let name_bytes = &dir_data[dir_offset+8..dir_offset+8+name_len];
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        /* 
+                        serial::serial_print("  [DIR] Entry: '");
+                        serial::serial_print(name);
+                        serial::serial_print("' -> Inode ");
+                        serial::serial_print_dec(child_inode as u64);
+                        serial::serial_print("\n");
+                        */
+
                         if name == target_name {
                             return Some(child_inode);
                         }

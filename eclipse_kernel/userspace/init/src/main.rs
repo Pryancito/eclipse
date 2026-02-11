@@ -151,13 +151,17 @@ fn start_essential_services() {
         start_service(&mut SERVICES[0]);
         
         // Give it time to initialize (minimal delay)
-        yield_cpu();
+        for _ in 0..5000{
+            yield_cpu();
+        }
         
         // Start device manager (devfs) - creates /dev nodes
         start_service(&mut SERVICES[1]);
         
         // Give it time to initialize (minimal delay)
-        yield_cpu();
+        for _ in 0..5000{
+            yield_cpu();
+        }
     }
 }
 
@@ -171,28 +175,34 @@ fn start_system_services() {
         // This prevents race conditions where other services try to access files
         // before the filesystem is ready
         println!("  [INIT] Waiting for filesystem service to mount...");
-        for _ in 0..10000{
+        for _ in 0..5000{
             yield_cpu();
         }
         println!("  [INIT] Filesystem should be ready, continuing...");
 
         // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);
-        yield_cpu();
+        for _ in 0..5000{
+            yield_cpu();
+        }
         
         // Start display service (depends on input)
         start_service(&mut SERVICES[4]);
-        for _ in 0..10000{
+        for _ in 0..5000{
             yield_cpu();
         }
 
         // Start audio service (depends on filesystem)
         start_service(&mut SERVICES[5]);
-        yield_cpu();
+        for _ in 0..5000{
+            yield_cpu();
+        }
         
         // Start network service last (most complex)
         start_service(&mut SERVICES[6]);
-        yield_cpu();
+        for _ in 0..5000{
+            yield_cpu();
+        }
 
         // Start GUI service (depends on network)
         start_service(&mut SERVICES[7]);

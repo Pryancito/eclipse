@@ -1182,7 +1182,7 @@ impl Scheme for DiskScheme {
         let block_num = open_disk.offset / 4096;
         let offset_in_block = (open_disk.offset % 4096) as usize;
         
-        let mut temp_block = [0u8; 4096];
+        let mut temp_block = alloc::vec![0u8; 4096];
         let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
         
         if let Err(e) = device.read_block(block_num, &mut temp_block) {

@@ -11,6 +11,20 @@ pub struct BumpFrameAllocator {
 
 impl BumpFrameAllocator {
     pub unsafe fn init(boot_info: &'static BootInfo) -> Self {
+        serial::serial_print("[FRAME] Initializing with memory map:\n");
+        for i in 0..boot_info.memory_map_count {
+            let region = &boot_info.memory_map[i];
+            serial::serial_print("  Region ");
+            serial::serial_print_dec(i as u64);
+            serial::serial_print(": ");
+            serial::serial_print_hex(region.start);
+            serial::serial_print(" - ");
+            serial::serial_print_hex(region.start + region.len);
+            serial::serial_print(" type=");
+            serial::serial_print_dec(region.kind as u64);
+            serial::serial_print("\n");
+        }
+        
         BumpFrameAllocator {
             next: 0,
             current_region: 0,

@@ -346,6 +346,25 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     }
     crate::serial::serial_print("\n");
     
+    // Stack dump (first 64 bytes)
+    crate::serial::serial_print("  Stack Dump at ");
+    crate::serial::serial_print_hex(context.rsp);
+    crate::serial::serial_print(":\n");
+    unsafe {
+        let stack_ptr = context.rsp as *const u64;
+        for i in 0..8 {
+            // Check if stack_ptr is in a safe range (simple heuristic)
+            if context.rsp >= 0xFFFF800000000000 {
+                let val = core::ptr::read_volatile(stack_ptr.add(i));
+                crate::serial::serial_print("    [+");
+                crate::serial::serial_print_dec((i * 8) as u64);
+                crate::serial::serial_print("]: ");
+                crate::serial::serial_print_hex(val);
+                crate::serial::serial_print("\n");
+            }
+        }
+    }
+    
     loop { 
         if context.num == 3 { return; } // Breakpoint
         unsafe { asm!("hlt") } 

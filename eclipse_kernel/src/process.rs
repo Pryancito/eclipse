@@ -5,6 +5,7 @@ use spin::Mutex;
 
 /// ID de proceso
 pub type ProcessId = u32;
+pub const KERNEL_STACK_SIZE: usize = 32768; // 32KB stack for kernel operations
 
 /// Estado de un proceso
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -114,7 +115,7 @@ pub fn init_kernel_process() {
     // Allocate kernel stack for PID 0 (Idle/Kernel task)
     // Even though it runs on the boot stack initially, we need a valid TSS RSP0 
     // for when it's scheduled back in, just in case.
-    let kernel_stack_size = 8192;
+    let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
     core::mem::forget(kernel_stack); // Leak
@@ -145,7 +146,7 @@ pub fn init_kernel_process() {
 /// Crear un nuevo proceso
 pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> Option<ProcessId> {
     // Allocate kernel stack for this process
-    let kernel_stack_size = 8192;
+    let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
     core::mem::forget(kernel_stack);
@@ -391,7 +392,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             child.vmas = parent.vmas.clone();
             
             // Allocate NEW kernel stack for child
-            let kernel_stack_size = 8192;
+            let kernel_stack_size = KERNEL_STACK_SIZE;
             let kernel_stack = alloc::vec![0u8; kernel_stack_size];
             let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
             let kernel_stack_top_aligned = kernel_stack_top & !0xF;
