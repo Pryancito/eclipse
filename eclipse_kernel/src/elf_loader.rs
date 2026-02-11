@@ -4,6 +4,7 @@ use crate::process::{create_process, ProcessId};
 use crate::memory;
 use crate::serial;
 use core::arch::asm;
+use alloc::vec::Vec;
 
 /// ELF Header (64-bit)
 #[repr(C)]
@@ -236,7 +237,20 @@ pub fn init() {
 
 /// Replace current process image with ELF binary (for exec())
 /// Returns entry point if successful
-pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
+/// 
+/// # Security Hardening
+/// - Copies ELF data to kernel heap to prevent user mmap invalidation during load
+/// - Properly zeros BSS segments (p_memsz > p_filesz)
+/// - Validates all addresses to prevent kernel space collisions
+pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
+    // 1. CRITICAL: Copy ELF data to kernel heap
+    // This prevents crashes if user mmap is invalidated during page table modifications
+    serial::serial_print("ELF: Copying ELF data to kernel heap (");
+    serial::serial_print_dec(elf_data_user.len() as u64);
+    serial::serial_print(" bytes)\n");
+    
+    let elf_data = elf_data_user.to_vec();
+    
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -306,6 +320,12 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                 serial::serial_print("ELF: Segment overlaps kernel space (Security Violation)\n");
                 return None;
             }
+            
+            // Additional validation: Check for reasonable segment sizes
+            if ph.p_memsz > 0x40000000 {  // 1GB max per segment
+                serial::serial_print("ELF: Segment too large (Security Violation)\n");
+                return None;
+            }
         }
     }
     
@@ -349,8 +369,16 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                 
                 // Allocate new 2MB block
                 if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                    // Zero the block
+                    // Zero the entire 2MB block to ensure clean BSS
                     unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
+                    
+                    // Validate physical address doesn't collide with kernel
+                    // Kernel typically runs above 0xFFFF800000000000
+                    if phys >= 0xFFFF800000000000 {
+                        serial::serial_print("ELF: Physical address collision with kernel (Security)\n");
+                        unsafe { crate::memory::free_dma_buffer(kptr, 0x200000, 0x200000); }
+                        return None;
+                    }
                     
                     let mp = MappedPage {
                         vaddr_base: vaddr_page_base,
@@ -372,7 +400,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                         );
                     }
                     
-                    serial::serial_print("ELF: Mapping page for exec at ");
+                    serial::serial_print("ELF: Mapped page at ");
                     serial::serial_print_hex(vaddr_page_base);
                     serial::serial_print(" to phys ");
                     serial::serial_print_hex(phys);
@@ -386,18 +414,61 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                 }
             };
 
-            // Copy segment data
+            // 2. CRITICAL: Copy segment data with bounds checking
             if ph.p_filesz > 0 {
-                serial::serial_print("ELF: Copying segment for exec to ");
+                serial::serial_print("ELF: Copying segment to ");
                 serial::serial_print_hex(vaddr_start);
-                serial::serial_print("\n");
+                serial::serial_print(" (filesz=");
+                serial::serial_print_dec(ph.p_filesz);
+                serial::serial_print(", memsz=");
+                serial::serial_print_dec(ph.p_memsz);
+                serial::serial_print(")\n");
                 
                 let file_offset = ph.p_offset as usize;
+                let filesz = ph.p_filesz as usize;
                 let in_page_offset = (vaddr_start - vaddr_page_base) as usize;
+                
+                // Verify bounds: source buffer
+                if file_offset + filesz > elf_data.len() {
+                    serial::serial_print("ELF: File offset out of bounds\n");
+                    return None;
+                }
+                
+                // Verify bounds: destination buffer
+                if in_page_offset + filesz > 0x200000 {
+                    serial::serial_print("ELF: Segment exceeds page boundary\n");
+                    return None;
+                }
+                
                 unsafe {
                     let src = elf_data.as_ptr().add(file_offset);
                     let dst = target_kernel_ptr.add(in_page_offset);
-                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                    core::ptr::copy_nonoverlapping(src, dst, filesz);
+                }
+            }
+            
+            // 3. CRITICAL: Zero BSS section (p_memsz > p_filesz)
+            // This is crucial for xfwl4 compositor global variables
+            if ph.p_memsz > ph.p_filesz {
+                let bss_size = (ph.p_memsz - ph.p_filesz) as usize;
+                let filesz = ph.p_filesz as usize;
+                let in_page_offset = (vaddr_start - vaddr_page_base) as usize;
+                
+                serial::serial_print("ELF: Zeroing BSS (");
+                serial::serial_print_dec(bss_size as u64);
+                serial::serial_print(" bytes) at offset ");
+                serial::serial_print_dec((in_page_offset + filesz) as u64);
+                serial::serial_print("\n");
+                
+                // Verify bounds
+                if in_page_offset + filesz + bss_size > 0x200000 {
+                    serial::serial_print("ELF: BSS exceeds page boundary\n");
+                    return None;
+                }
+                
+                unsafe {
+                    let bss_start = target_kernel_ptr.add(in_page_offset + filesz);
+                    core::ptr::write_bytes(bss_start, 0, bss_size);
                 }
             }
         }
@@ -406,6 +477,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     // Flush TLB to ensure new mappings are active
     unsafe { x86_64::instructions::tlb::flush_all(); }
 
+    serial::serial_print("ELF: Process image replaced successfully\n");
     Some(header.e_entry)
 }
 
