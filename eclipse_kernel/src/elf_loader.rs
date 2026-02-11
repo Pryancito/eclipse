@@ -44,6 +44,11 @@ const PT_LOAD: u32 = 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
 
+// ELF loader security limits
+const MAX_SEGMENT_SIZE: u64 = 0x40000000; // 1GB max per segment
+const MAX_PHYS_ADDR: u64 = (1u64 << 52) - 1; // x86_64 52-bit physical address limit (4 PB)
+
+
 /// Cargar binario ELF en memoria y crear proceso
 pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     // Verificar header ELF
@@ -326,7 +331,7 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
             }
             
             // Additional validation: Check for reasonable segment sizes
-            if ph.p_memsz > 0x40000000 {  // 1GB max per segment
+            if ph.p_memsz > MAX_SEGMENT_SIZE {
                 serial::serial_print("ELF: Segment too large (Security Violation)\n");
                 return None;
             }
@@ -376,10 +381,7 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
                     // Zero the entire 2MB block to ensure clean BSS
                     unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
                     
-                    // Validate physical address is within valid range
-                    // x86_64 physical addresses are limited to 52 bits (4 PB)
-                    // Physical addresses must be < 0x000FFFFFFFFFFFFF (52-bit limit)
-                    const MAX_PHYS_ADDR: u64 = (1u64 << 52) - 1;
+                    // Validate physical address is within valid range (52-bit limit on x86_64)
                     if phys > MAX_PHYS_ADDR {
                         serial::serial_print("ELF: Physical address exceeds 52-bit limit (Security)\n");
                         unsafe { crate::memory::free_dma_buffer(kptr, 0x200000, 0x200000); }
