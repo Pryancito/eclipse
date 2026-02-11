@@ -116,6 +116,12 @@ pub struct ExtentTree {
     total_blocks: u64,
 }
 
+impl Default for ExtentTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExtentTree {
     /// Create a new empty extent tree
     pub fn new() -> Self {

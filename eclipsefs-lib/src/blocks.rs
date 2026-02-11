@@ -55,7 +55,7 @@ pub struct AllocationGroup {
 impl AllocationGroup {
     /// Create a new allocation group
     pub fn new(id: u32, start_block: u64, block_count: u64) -> Self {
-        let bitmap_size = ((block_count + 63) / 64) as usize;
+        let bitmap_size = block_count.div_ceil(64) as usize;
         
         #[cfg(feature = "std")]
         let bitmap = vec![0xFFFFFFFFFFFFFFFF; bitmap_size];
@@ -228,7 +228,7 @@ pub struct BlockAllocator {
 impl BlockAllocator {
     /// Create a new block allocator
     pub fn new(total_blocks: u64, blocks_per_group: u64) -> Self {
-        let group_count = ((total_blocks + blocks_per_group - 1) / blocks_per_group) as usize;
+        let group_count = total_blocks.div_ceil(blocks_per_group) as usize;
         
         #[cfg(feature = "std")]
         let mut groups = Vec::new();

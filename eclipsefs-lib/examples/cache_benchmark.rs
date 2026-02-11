@@ -1,7 +1,7 @@
 //! Cache Performance Benchmark for EclipseFS
 //! Tests the effectiveness of the node caching system
 
-use eclipsefs_lib::{EclipseFSNode, EclipseFSReader, EclipseFSWriter, NodeKind};
+use eclipsefs_lib::{EclipseFSNode, EclipseFSReader, EclipseFSWriter};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

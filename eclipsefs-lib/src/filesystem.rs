@@ -76,6 +76,12 @@ pub struct EclipseFS {
     default_acls: FnvIndexMap<u32, Acl, 64>,          // ACLs por defecto
 }
 
+impl Default for EclipseFS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EclipseFS {
     /// Crear un nuevo sistema de archivos EclipseFS (inspirado en RedoxFS)
     pub fn new() -> Self {
@@ -231,31 +237,8 @@ impl EclipseFS {
     /// Validar nombre de archivo/directorio
     /// Previene nombres inválidos que podrían causar problemas de seguridad o compatibilidad
     fn validate_filename(name: &str) -> EclipseFSResult<()> {
-        // Verificar longitud
-        if name.is_empty() {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        #[cfg(feature = "std")]
-        const MAX_NAME_LENGTH: usize = 255;
-        #[cfg(not(feature = "std"))]
-        const MAX_NAME_LENGTH: usize = MAX_NAME_LEN;
-        
-        if name.len() > MAX_NAME_LENGTH {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        // Verificar caracteres inválidos (protección contra path traversal)
-        if name.contains('/') || name.contains('\0') {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        // Prevenir nombres especiales que podrían causar problemas
-        if name == "." || name == ".." {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        Ok(())
+        // Use the security module for validation
+        crate::security::validate_filename(name)
     }
     
     /// Habilitar sistema de caché inteligente (inspirado en RedoxFS)
@@ -453,7 +436,7 @@ impl EclipseFS {
     fn update_version_history(&mut self, inode: u32, version: u32) {
         #[cfg(feature = "std")]
         {
-            self.version_history.entry(inode).or_insert_with(Vec::new).push(version);
+            self.version_history.entry(inode).or_default().push(version);
         }
         
         #[cfg(not(feature = "std"))]
@@ -519,8 +502,38 @@ impl EclipseFS {
         inode
     }
     
+    /// Assert filesystem invariants (defensive programming)
+    /// 
+    /// # Invariants
+    /// 
+    /// - Root inode (1) must always exist
+    /// - Root must be a directory
+    /// - next_inode must always be greater than root_inode
+    /// - No circular parent-child relationships
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) -> EclipseFSResult<()> {
+        // Invariant 1: Root must exist
+        let root = self.get_node(self.root_inode)
+            .ok_or(EclipseFSError::CorruptedFilesystem)?;
+        
+        // Invariant 2: Root must be a directory
+        if root.kind != NodeKind::Directory {
+            return Err(EclipseFSError::CorruptedFilesystem);
+        }
+        
+        // Invariant 3: next_inode must be valid
+        if self.next_inode <= self.root_inode {
+            return Err(EclipseFSError::CorruptedFilesystem);
+        }
+        
+        Ok(())
+    }
+    
     /// Agregar un nodo al sistema de archivos
     pub fn add_node(&mut self, inode: u32, node: EclipseFSNode) -> EclipseFSResult<()> {
+        // Security: Validate inode is in valid range
+        crate::security::validate_inode(inode, u32::MAX - 1)?;
+        
         #[cfg(feature = "std")]
         {
             if self.nodes.contains_key(&inode) {
@@ -538,6 +551,10 @@ impl EclipseFS {
                 .insert(inode, node)
                 .map_err(|_| EclipseFSError::InvalidOperation)?;
         }
+        
+        // Defensive programming: Assert invariants in debug builds
+        #[cfg(debug_assertions)]
+        self.assert_invariants()?;
         
         Ok(())
     }
@@ -791,7 +808,7 @@ impl EclipseFS {
         }
         
         let mut entries = Vec::new();
-        for (name, _) in node.get_children() {
+        for name in node.get_children().keys() {
             entries.push(name.clone());
         }
         
@@ -999,10 +1016,9 @@ impl EclipseFS {
             let inodes: Vec<u32> = self.nodes.keys().copied().collect();
             for inode in inodes {
                 if let Some(node) = self.get_node(inode) {
-                    if node.size >= threshold && matches!(node.kind, NodeKind::File) {
-                        if self.compress_file(inode, CompressionType::LZ4).is_ok() {
-                            compressed_count += 1;
-                        }
+                    if node.size >= threshold && matches!(node.kind, NodeKind::File)
+                        && self.compress_file(inode, CompressionType::LZ4).is_ok() {
+                        compressed_count += 1;
                     }
                 }
             }
@@ -2105,6 +2121,13 @@ pub struct OptimizationReport {
 }
 
 #[cfg(feature = "std")]
+impl Default for OptimizationReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
 impl OptimizationReport {
     pub fn new() -> Self {
         Self {
@@ -2261,7 +2284,7 @@ mod tests {
             
             // Contar cuántas veces aparece cada nombre
             let mut name_counts = std::collections::HashMap::new();
-            for (name, _inode) in children {
+            for name in children.keys() {
                 *name_counts.entry(name.clone()).or_insert(0) += 1;
             }
             

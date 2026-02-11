@@ -61,6 +61,12 @@ pub struct DedupManager {
     bytes_saved: u64,
 }
 
+impl Default for DedupManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DedupManager {
     /// Create a new dedup manager
     pub fn new() -> Self {
@@ -128,9 +134,8 @@ impl DedupManager {
 
     /// Remove a block reference
     pub fn remove_block(&mut self, block_id: u64) -> EclipseFSResult<()> {
-        let hash = self.block_to_hash.get(&block_id)
-            .ok_or(EclipseFSError::NotFound)?
-            .clone();
+        let hash = *self.block_to_hash.get(&block_id)
+            .ok_or(EclipseFSError::NotFound)?;
         
         let should_free = {
             let block = self.hash_table.get_mut(&hash)
@@ -314,7 +319,7 @@ mod tests {
         dedup.add_block(&data, 1).unwrap();
         
         assert_eq!(dedup.is_duplicate(&data), Some(1));
-        assert_eq!(dedup.is_duplicate(&vec![9, 9, 9]), None);
+        assert_eq!(dedup.is_duplicate(&[9, 9, 9]), None);
     }
 
     #[test]

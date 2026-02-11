@@ -190,6 +190,9 @@ impl EclipseFSNode {
             return Err(EclipseFSError::InvalidOperation);
         }
 
+        // Security: Validate filename to prevent path traversal
+        crate::security::validate_filename(name)?;
+
         #[cfg(feature = "std")]
         {
             if self.children.contains_key(name) {
@@ -220,6 +223,7 @@ impl EclipseFSNode {
         }
 
         self.mtime = Self::now();
+        self.update_checksum();
         Ok(())
     }
 
@@ -262,6 +266,9 @@ impl EclipseFSNode {
         if self.kind != NodeKind::File && self.kind != NodeKind::Symlink {
             return Err(EclipseFSError::InvalidOperation);
         }
+
+        // Security: Validate file size to prevent overflow
+        crate::security::validate_file_size(data.len() as u64)?;
 
         #[cfg(feature = "std")]
         {
@@ -441,11 +448,12 @@ impl EclipseFSNode {
         data
     }
     
-    /// Verificar integridad del nodo
+    /// Verificar integridad del nodo con constant-time comparison
     pub fn verify_integrity(&self) -> EclipseFSResult<()> {
         let expected_checksum = Self::calculate_crc32(&self.serialize_for_checksum());
-        if self.checksum != expected_checksum {
-            return Err(EclipseFSError::InvalidFormat);
+        // Security: Use constant-time comparison to prevent timing attacks
+        if !crate::security::validate_checksum(self.checksum, expected_checksum) {
+            return Err(EclipseFSError::InvalidChecksum);
         }
         Ok(())
     }

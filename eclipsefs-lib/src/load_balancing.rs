@@ -240,7 +240,7 @@ impl IntelligentLoadBalancer {
             files_moved,
             nodes_affected,
             load_improvement,
-            time_taken_ms: (end_time - start_time) as u64,
+            time_taken_ms: end_time - start_time,
             errors,
         })
     }

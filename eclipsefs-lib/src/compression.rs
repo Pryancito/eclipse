@@ -2,7 +2,7 @@
 //! Inspired by ZFS and Btrfs compression algorithms
 //! Supports multiple compression algorithms for different use cases
 
-use crate::{EclipseFSError, EclipseFSResult};
+use crate::EclipseFSResult;
 
 /// Compression algorithm selection
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,7 +98,7 @@ impl SimpleCompressor {
         }
 
         // Validate data has even number of bytes
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             return Ok(data.to_vec()); // Return original if malformed
         }
 

@@ -3,7 +3,7 @@
 //! This example shows how to use the new journaling features for crash recovery
 
 use eclipsefs_lib::{
-    EclipseFS, Journal, JournalConfig, constants,
+    EclipseFS, JournalConfig, constants,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

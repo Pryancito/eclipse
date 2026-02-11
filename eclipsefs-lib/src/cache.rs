@@ -148,17 +148,17 @@ impl IntelligentCache {
         // Verificar límites de memoria
         if *total_memory + data.len() > self.config.max_memory_mb * 1024 * 1024 {
             #[cfg(feature = "std")]
-            self.evict_entries(&mut *entries, data.len())?;
+            self.evict_entries(&mut entries, data.len())?;
             #[cfg(not(feature = "std"))]
-            self.evict_entries(&mut *entries, data.len())?;
+            self.evict_entries(&mut entries, data.len())?;
         }
         
         // Verificar límite de entradas
         if entries.len() >= self.config.max_entries {
             #[cfg(feature = "std")]
-            self.evict_entries(&mut *entries, 0)?;
+            self.evict_entries(&mut entries, 0)?;
             #[cfg(not(feature = "std"))]
-            self.evict_entries(&mut *entries, 0)?;
+            self.evict_entries(&mut entries, 0)?;
         }
         
         let entry = CacheEntry::new(key, data);

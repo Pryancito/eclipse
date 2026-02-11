@@ -66,7 +66,7 @@ fn test_extent_fragmentation() {
 #[test]
 fn test_block_allocator_basic() {
     // Create allocator with 1000 blocks, 100 blocks per group
-    let mut allocator = BlockAllocator::new(1000, 100);
+    let allocator = BlockAllocator::new(1000, 100);
     
     let stats = allocator.get_stats();
     assert_eq!(stats.total_blocks, 1000);

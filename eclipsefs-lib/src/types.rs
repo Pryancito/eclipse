@@ -95,6 +95,12 @@ pub struct TransparentEncryptionConfig {
     pub algorithm: EncryptionType,
 }
 
+impl Default for TransparentEncryptionConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransparentEncryptionConfig {
     pub fn new() -> Self {
         Self {
@@ -129,6 +135,12 @@ pub struct FindResult {
     #[cfg(not(feature = "std"))]
     pub matches: Vec<String<256>, 64>,
     pub total_matches: u32,
+}
+
+impl Default for EncryptionInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // Implementaciones de new() para compatibilidad
@@ -207,6 +219,12 @@ impl EncryptionInfo {
     }
 }
 
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Snapshot {
     pub fn new() -> Self {
         Self {
@@ -220,6 +238,12 @@ impl Snapshot {
             #[cfg(not(feature = "std"))]
             description: String::new(),
         }
+    }
+}
+
+impl Default for FindResult {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
