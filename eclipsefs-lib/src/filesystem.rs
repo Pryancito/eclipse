@@ -76,6 +76,12 @@ pub struct EclipseFS {
     default_acls: FnvIndexMap<u32, Acl, 64>,          // ACLs por defecto
 }
 
+impl Default for EclipseFS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EclipseFS {
     /// Crear un nuevo sistema de archivos EclipseFS (inspirado en RedoxFS)
     pub fn new() -> Self {
@@ -453,7 +459,7 @@ impl EclipseFS {
     fn update_version_history(&mut self, inode: u32, version: u32) {
         #[cfg(feature = "std")]
         {
-            self.version_history.entry(inode).or_insert_with(Vec::new).push(version);
+            self.version_history.entry(inode).or_default().push(version);
         }
         
         #[cfg(not(feature = "std"))]
@@ -791,7 +797,7 @@ impl EclipseFS {
         }
         
         let mut entries = Vec::new();
-        for (name, _) in node.get_children() {
+        for name in node.get_children().keys() {
             entries.push(name.clone());
         }
         
@@ -999,10 +1005,9 @@ impl EclipseFS {
             let inodes: Vec<u32> = self.nodes.keys().copied().collect();
             for inode in inodes {
                 if let Some(node) = self.get_node(inode) {
-                    if node.size >= threshold && matches!(node.kind, NodeKind::File) {
-                        if self.compress_file(inode, CompressionType::LZ4).is_ok() {
-                            compressed_count += 1;
-                        }
+                    if node.size >= threshold && matches!(node.kind, NodeKind::File)
+                        && self.compress_file(inode, CompressionType::LZ4).is_ok() {
+                        compressed_count += 1;
                     }
                 }
             }
@@ -2105,6 +2110,13 @@ pub struct OptimizationReport {
 }
 
 #[cfg(feature = "std")]
+impl Default for OptimizationReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
 impl OptimizationReport {
     pub fn new() -> Self {
         Self {
@@ -2261,7 +2273,7 @@ mod tests {
             
             // Contar cuántas veces aparece cada nombre
             let mut name_counts = std::collections::HashMap::new();
-            for (name, _inode) in children {
+            for name in children.keys() {
                 *name_counts.entry(name.clone()).or_insert(0) += 1;
             }
             

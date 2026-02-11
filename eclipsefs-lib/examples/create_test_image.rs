@@ -1,6 +1,6 @@
 //! Create a test EclipseFS image for testing CLI tools
 
-use eclipsefs_lib::{EclipseFSNode, EclipseFSWriter, constants};
+use eclipsefs_lib::{EclipseFSNode, EclipseFSWriter};
 use std::fs::File;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

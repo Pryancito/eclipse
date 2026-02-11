@@ -2,7 +2,7 @@
 //! Provides O(log n) lookups for directories with millions of entries
 //! Inspired by Btrfs and XFS directory structures
 
-use crate::{EclipseFSError, EclipseFSResult};
+use crate::EclipseFSResult;
 use std::cmp::Ordering;
 
 /// B-Tree node order (max children = 2 * ORDER)
@@ -44,7 +44,8 @@ pub struct BTreeNode {
     children: Vec<u32>,
     /// Is this a leaf node?
     is_leaf: bool,
-    /// Node ID
+    /// Node ID for debugging and management
+    #[allow(dead_code)]
     node_id: u32,
 }
 
@@ -76,7 +77,7 @@ impl BTreeNode {
 
     /// Check if node is minimal (for deletion)
     pub fn is_minimal(&self) -> bool {
-        self.entries.len() <= ORDER - 1
+        self.entries.len() < ORDER
     }
 
     /// Insert entry into node (assumes not full)
@@ -111,6 +112,12 @@ pub struct BTree {
     next_node_id: u32,
     /// Total entries in tree
     entry_count: usize,
+}
+
+impl Default for BTree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BTree {

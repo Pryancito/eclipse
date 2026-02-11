@@ -31,11 +31,11 @@ fn main() -> EclipseFSResult<()> {
         let sh_inode = writer.create_node(sh_link)?;
 
         // Agregar hijos al directorio raíz
-        let mut root = writer.get_root()?;
+        let root = writer.get_root()?;
         root.add_child("bin", bin_inode)?;
 
         // Agregar hijos al directorio /bin
-        let mut bin_dir = writer.get_node(bin_inode)?;
+        let bin_dir = writer.get_node(bin_inode)?;
         bin_dir.add_child("hello", hello_inode)?;
         bin_dir.add_child("sh", sh_inode)?;
 
@@ -49,9 +49,8 @@ fn main() -> EclipseFSResult<()> {
         let mut reader = EclipseFSReader::from_file(File::open(test_file).map_err(|e| {
             eprintln!("Error abriendo archivo: {}", e);
             eclipsefs_lib::EclipseFSError::IoError
-        })?).map_err(|e| {
+        })?).inspect_err(|&e| {
             eprintln!("Error creando reader: {:?}", e);
-            e
         })?;
 
         println!("\n=== Verificando imagen ===");

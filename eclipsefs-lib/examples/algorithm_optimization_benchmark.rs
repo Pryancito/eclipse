@@ -40,7 +40,7 @@ fn create_test_filesystem(path: &str, num_files: usize) -> Result<(), Box<dyn st
     for i in 0..num_files {
         let mut file_node = EclipseFSNode::new_file();
         let data = format!("File {} content with some data", i).into_bytes();
-        file_node.set_data(&data);
+        let _ = file_node.set_data(&data);
         
         let inode = writer.allocate_inode();
         writer.add_node(inode, file_node)?;

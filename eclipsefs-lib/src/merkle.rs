@@ -2,7 +2,7 @@
 //! Provides hierarchical data verification and efficient integrity checking
 //! Inspired by ZFS's Merkle tree and Btrfs's checksumming
 
-use crate::{EclipseFSError, EclipseFSResult};
+use crate::EclipseFSResult;
 use std::collections::HashMap;
 
 /// Hash type for Merkle tree
@@ -312,8 +312,8 @@ mod tests {
         
         // Get and verify proof
         let proof = tree.get_proof(1).unwrap();
-        assert!(proof.verify(&vec![1, 2, 3]));
-        assert!(!proof.verify(&vec![99, 99, 99]));
+        assert!(proof.verify(&[1, 2, 3]));
+        assert!(!proof.verify(&[99, 99, 99]));
     }
 
     #[test]

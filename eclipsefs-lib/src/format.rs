@@ -132,7 +132,7 @@ impl EclipseFSHeader {
 
     /// Validar el header
     pub fn validate(&self) -> EclipseFSResult<()> {
-        if &self.magic != ECLIPSEFS_MAGIC {
+        if self.magic != ECLIPSEFS_MAGIC {
             return Err(crate::EclipseFSError::InvalidFormat);
         }
 

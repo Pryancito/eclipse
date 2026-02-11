@@ -314,7 +314,7 @@ impl EclipseFSReader {
                     data = value.to_vec();
                 }
                 tlv_tags::DIRECTORY_ENTRIES => {
-                    children = Self::deserialize_directory_entries(&value)?;
+                    children = Self::deserialize_directory_entries(value)?;
                 }
                 _ => {
                     // Ignorar tags desconocidos

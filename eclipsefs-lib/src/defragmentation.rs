@@ -212,7 +212,7 @@ impl IntelligentDefragmenter {
             files_processed,
             fragments_consolidated,
             space_freed,
-            time_taken_ms: (end_time - start_time) as u64,
+            time_taken_ms: end_time - start_time,
             errors,
         })
     }

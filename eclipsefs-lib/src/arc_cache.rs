@@ -111,8 +111,8 @@ impl AdaptiveReplacementCache {
     /// Insertar un nodo en el cache
     pub fn put(&mut self, inode: u32, node: EclipseFSNode) {
         // Caso 1: Ya está en cache (actualizar)
-        if self.cache_data.contains_key(&inode) {
-            self.cache_data.insert(inode, node);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.cache_data.entry(inode) {
+            e.insert(node);
             return;
         }
         

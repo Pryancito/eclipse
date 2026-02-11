@@ -77,6 +77,12 @@ pub struct CowManager {
     shared_blocks: u64,
 }
 
+impl Default for CowManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CowManager {
     /// Create a new CoW manager
     pub fn new() -> Self {
@@ -301,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_checksum_verification() {
-        let cow = CowManager::new();
+        let _cow = CowManager::new();
         
         let data = vec![1, 2, 3, 4, 5];
         let block = RefCountedBlock::new(1, data.clone());

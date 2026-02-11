@@ -2,7 +2,7 @@
 //! Implements delayed allocation, write batching, and parallel I/O
 //! Inspired by ext4's delayed allocation and XFS's parallel I/O
 
-use crate::{EclipseFSError, EclipseFSResult, EclipseFSNode};
+use crate::{EclipseFSResult, EclipseFSNode};
 use std::collections::HashMap;
 
 /// Write batch for collecting multiple writes before flushing
