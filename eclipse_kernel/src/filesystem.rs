@@ -603,25 +603,24 @@ pub fn mount() -> Result<(), &'static str> {
              8 // Skip 8 bytes (Standard Header)
         };
         
-        while scan_offset + 8 <= buffer_to_scan.len() - buffer_offset {
+        while scan_offset + 6 <= buffer_to_scan.len() - buffer_offset {
              let idx = buffer_offset + scan_offset;
-             if idx + 8 > buffer_to_scan.len() { break; }
+             if idx + 6 > buffer_to_scan.len() { break; }
 
-             let tag = u32::from_le_bytes([
-                 buffer_to_scan[idx], buffer_to_scan[idx+1],
-                 buffer_to_scan[idx+2], buffer_to_scan[idx+3]
+             let tag = u16::from_le_bytes([
+                 buffer_to_scan[idx], buffer_to_scan[idx+1]
              ]);
              
              let length = u32::from_le_bytes([
-                 buffer_to_scan[idx+4], buffer_to_scan[idx+5],
-                 buffer_to_scan[idx+6], buffer_to_scan[idx+7]
+                 buffer_to_scan[idx+2], buffer_to_scan[idx+3],
+                 buffer_to_scan[idx+4], buffer_to_scan[idx+5]
              ]) as usize;
              
-             if tag == tlv_tags::CONTENT as u32 {
+             if tag == tlv_tags::CONTENT {
                  return Ok(length as u64);
              }
              
-             scan_offset += 8 + length;
+             scan_offset += 6 + length;
         }
         
         // Not found / Empty file
