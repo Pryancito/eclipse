@@ -237,31 +237,8 @@ impl EclipseFS {
     /// Validar nombre de archivo/directorio
     /// Previene nombres inválidos que podrían causar problemas de seguridad o compatibilidad
     fn validate_filename(name: &str) -> EclipseFSResult<()> {
-        // Verificar longitud
-        if name.is_empty() {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        #[cfg(feature = "std")]
-        const MAX_NAME_LENGTH: usize = 255;
-        #[cfg(not(feature = "std"))]
-        const MAX_NAME_LENGTH: usize = MAX_NAME_LEN;
-        
-        if name.len() > MAX_NAME_LENGTH {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        // Verificar caracteres inválidos (protección contra path traversal)
-        if name.contains('/') || name.contains('\0') {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        // Prevenir nombres especiales que podrían causar problemas
-        if name == "." || name == ".." {
-            return Err(EclipseFSError::InvalidFormat);
-        }
-        
-        Ok(())
+        // Use the security module for validation
+        crate::security::validate_filename(name)
     }
     
     /// Habilitar sistema de caché inteligente (inspirado en RedoxFS)

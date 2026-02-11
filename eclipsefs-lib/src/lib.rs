@@ -10,6 +10,7 @@ pub mod node;
 pub mod types;
 pub mod extent;
 pub mod blocks;
+pub mod security;
 // pub mod ai_features;
 // pub mod quantum_crypto;
 
