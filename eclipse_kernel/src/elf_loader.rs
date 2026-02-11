@@ -243,7 +243,28 @@ pub fn init() {
 /// - Properly zeros BSS segments (p_memsz > p_filesz)
 /// - Validates all addresses to prevent kernel space collisions
 pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
-    // 1. CRITICAL: Copy ELF data to kernel heap
+    // Fast validation BEFORE copying to heap (fail fast on invalid input)
+    if elf_data_user.len() < core::mem::size_of::<Elf64Header>() {
+        serial::serial_print("ELF: File too small for exec\n");
+        return None;
+    }
+    
+    // Quick header validation before expensive heap copy
+    let temp_header = unsafe {
+        &*(elf_data_user.as_ptr() as *const Elf64Header)
+    };
+    
+    if &temp_header.e_ident[0..4] != &ELF_MAGIC {
+        serial::serial_print("ELF: Invalid magic number for exec\n");
+        return None;
+    }
+    
+    if temp_header.e_ident[4] != 2 {
+        serial::serial_print("ELF: Not 64-bit for exec\n");
+        return None;
+    }
+    
+    // 1. CRITICAL: Copy ELF data to kernel heap AFTER validation
     // This prevents crashes if user mmap is invalidated during page table modifications
     serial::serial_print("ELF: Copying ELF data to kernel heap (");
     serial::serial_print_dec(elf_data_user.len() as u64);
@@ -251,27 +272,10 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
     
     let elf_data = elf_data_user.to_vec();
     
-    // Verify ELF header
-    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        serial::serial_print("ELF: File too small for exec\n");
-        return None;
-    }
-    
+    // Re-get header from kernel copy
     let header = unsafe {
         &*(elf_data.as_ptr() as *const Elf64Header)
     };
-    
-    // Verify magic number
-    if &header.e_ident[0..4] != &ELF_MAGIC {
-        serial::serial_print("ELF: Invalid magic number for exec\n");
-        return None;
-    }
-    
-    // Verify 64-bit
-    if header.e_ident[4] != 2 {
-        serial::serial_print("ELF: Not 64-bit for exec\n");
-        return None;
-    }
     
     serial::serial_print("ELF: Valid exec binary, entry: ");
     serial::serial_print_hex(header.e_entry);
@@ -372,10 +376,12 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
                     // Zero the entire 2MB block to ensure clean BSS
                     unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
                     
-                    // Validate physical address doesn't collide with kernel
-                    // Kernel typically runs above 0xFFFF800000000000
-                    if phys >= 0xFFFF800000000000 {
-                        serial::serial_print("ELF: Physical address collision with kernel (Security)\n");
+                    // Validate physical address is within valid range
+                    // x86_64 physical addresses are limited to 52 bits (4 PB)
+                    // Physical addresses must be < 0x000FFFFFFFFFFFFF (52-bit limit)
+                    const MAX_PHYS_ADDR: u64 = (1u64 << 52) - 1;
+                    if phys > MAX_PHYS_ADDR {
+                        serial::serial_print("ELF: Physical address exceeds 52-bit limit (Security)\n");
                         unsafe { crate::memory::free_dma_buffer(kptr, 0x200000, 0x200000); }
                         return None;
                     }
