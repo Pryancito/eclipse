@@ -269,7 +269,7 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
         return None;
     }
     
-    // 1. CRITICAL: Copy ELF data to kernel heap AFTER validation
+    // 1. CRITICAL: Copy ELF data to kernel heap AFTER basic header validation
     // This prevents crashes if user mmap is invalidated during page table modifications
     serial::serial_print("ELF: Copying ELF data to kernel heap (");
     serial::serial_print_dec(elf_data_user.len() as u64);
@@ -378,7 +378,7 @@ pub fn replace_process_image(elf_data_user: &[u8]) -> Option<u64> {
                 
                 // Allocate new 2MB block
                 if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                    // Zero the entire 2MB block to ensure clean BSS
+                    // Zero the entire 2MB block to ensure clean memory allocation
                     unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
                     
                     // Validate physical address is within valid range (52-bit limit on x86_64)
