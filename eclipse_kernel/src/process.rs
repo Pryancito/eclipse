@@ -15,6 +15,15 @@ pub enum ProcessState {
     Terminated,
 }
 
+/// Virtual Memory Area (VMA) region
+#[derive(Clone, Copy, Debug)]
+pub struct VMARegion {
+    pub start: u64,
+    pub end: u64,
+    pub flags: u64,
+    pub file_backed: bool,
+}
+
 /// Estructura de contexto salvado de un proceso
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +64,7 @@ impl Context {
 }
 
 /// Process Control Block
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Process {
     pub id: ProcessId,
     pub state: ProcessState,
@@ -67,6 +76,7 @@ pub struct Process {
     pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
     pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
     pub page_table_phys: u64,          // Physical address of the PML4
+    pub vmas: alloc::vec::Vec<VMARegion>, // Memory mappings
 }
 
 impl Process {
@@ -82,13 +92,14 @@ impl Process {
             parent_pid: None,
             kernel_stack_top: 0,
             page_table_phys: 0,
+            vmas: alloc::vec::Vec::new(),
         }
     }
 }
 
 /// Tabla de procesos
 const MAX_PROCESSES: usize = 64;
-pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([None; MAX_PROCESSES]);
+pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
 
@@ -199,7 +210,7 @@ pub fn get_process(pid: ProcessId) -> Option<Process> {
         for process in table.iter() {
             if let Some(p) = process {
                 if p.id == pid {
-                    return Some(*p);
+                    return Some(p.clone());
                 }
             }
         }
@@ -366,13 +377,16 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             let child_pid = *next_pid;
             *next_pid += 1;
             
-            let mut child = parent; // Copy parent's state
+            let mut child = parent.clone(); // Copy parent's state
             child.id = child_pid;
             child.state = ProcessState::Ready;
             child.parent_pid = Some(current_pid);
             
             // DEEP COPY of parent's address space (code, stack, data)
             child.page_table_phys = crate::memory::clone_process_paging(parent.page_table_phys);
+            
+            // Deep copy of VMA list (Vec clone does deep copy of elements if they are Clone)
+            child.vmas = parent.vmas.clone();
             
             // Allocate NEW kernel stack for child
             let kernel_stack_size = 8192;

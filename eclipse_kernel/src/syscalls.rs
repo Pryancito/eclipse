@@ -1064,46 +1064,223 @@ fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
 ///   fd: File descriptor (ignored for anonymous mappings)
 /// 
 /// Returns: Address of mapped region, or u64::MAX on error
-fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _fd: u64) -> u64 {
-    // For now, simple implementation using heap allocator
-    // Proper implementation would use page tables
+fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
+    use crate::process::{self, VMARegion, ProcessId};
+    use crate::memory;
+    use crate::serial;
+    use alloc::vec;
+
+    // Constants (matching libc)
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
     
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANONYMOUS: u64 = 0x20;
+
+    serial::serial_print("[SYSCALL] sys_mmap(addr=");
+    serial::serial_print_hex(addr);
+    serial::serial_print(", len=");
+    serial::serial_print_dec(length);
+    serial::serial_print(", flags=");
+    serial::serial_print_hex(flags);
+    serial::serial_print(", fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(")\n");
+
     if length == 0 {
-        return u64::MAX; // Invalid size
+        return u64::MAX;
+    }
+
+    // Align length to page size (4KB)
+    let aligned_length = (length + 0xFFF) & !0xFFF;
+    let num_pages = aligned_length / 4096;
+
+    let current_pid = match process::current_process_id() {
+        Some(pid) => pid,
+        None => return u64::MAX,
+    };
+
+    // 1. Find a free virtual address range
+    // For now we use a simple bump allocator strategy starting at 0x40000000 (1GB)
+    // In a real OS, we'd search the VMA list for gaps.
+    
+    // We need to query existing VMAs to find a gap.
+    // This requires locking the process table, getting the process, and inspecting VMAs.
+    // Since we can't easily iterate and hold lock while modifying, we'll do:
+    // 1. Get existing VMAs (copy/clone relevant info or hold lock if possible)
+    // 2. Decide on address
+    // 3. Update process with new VMA
+    
+    let mut target_addr = addr;
+    
+    // Determine target address
+    if target_addr == 0 {
+        // Find a free spot
+        // Start search at 1GB (0x40000000) to avoid code/stack collisions
+        // Code is usually at 0x400000 (4MB) or similar low addresses.
+        // Heap is managed by brk, usually after code.
+        // Stack grows down from high memory.
+        
+        let mut candidate = 0x40000000;
+        
+        // Simple gap search (inefficient but works for now)
+        if let Some(mut proc) = process::get_process(current_pid) {
+             // Sort vmas by start address to find gaps? 
+             // Or just check if candidate overlaps.
+             // For simplicity: Max of (end of last VMA, 0x40000000)
+             
+             for vma in &proc.vmas {
+                 if vma.end > candidate {
+                     candidate = (vma.end + 0xFFF) & !0xFFF;
+                     // Add some padding/guard page
+                     candidate += 4096;
+                 }
+             }
+             target_addr = candidate;
+        } else {
+            return u64::MAX;
+        }
     }
     
-    // MAP_ANONYMOUS (0x20) - not backed by a file
-    let is_anonymous = (flags & 0x20) != 0;
-    
-    if !is_anonymous {
-        // File-backed mappings not yet supported
+    // Validate target address
+    if target_addr < 0x100000 || target_addr > 0x0000_7FFF_FFFF_F000 {
+        serial::serial_print("[SYSCALL] mmap: invalid target address\n");
         return u64::MAX;
     }
     
-    // Allocate memory (simplified - should use page allocator)
-    // For now, return a fake address in user space
-    // Real implementation would allocate pages and map them
+    let is_anonymous = (flags & MAP_ANONYMOUS) != 0;
+    let is_file_backed = !is_anonymous;
     
-    // Use a simple bump allocator concept
-    static MMAP_NEXT_ADDR: Mutex<u64> = Mutex::new(0x40000000);
+    // 2. Map pages
+    // We need the process's page table physical address
+    let page_table_phys = process::get_process_page_table(Some(current_pid));
     
-    let mut next_addr = MMAP_NEXT_ADDR.lock();
-    let result_addr = if addr == 0 {
-        *next_addr
+    // Calculate page table flags
+    let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT 
+                     | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+                     
+    if (prot & PROT_WRITE) != 0 {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+    }
+    if (prot & PROT_EXEC) == 0 {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+    }
+
+    if is_file_backed {
+        // EAGER LOADING for file-backed mapping
+        // 1. Read file content
+        // 2. Allocate pages
+        // 3. Copy content
+        // 4. Map pages
+        
+        // Get file size and content
+        // We'll use the existing read_file_by_inode_at functionality via schemes
+        // But we need to go through the FD to get the inode
+        
+        if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
+            
+            // To emulate read_at, we need to:
+            // 1. Save current offset (lseek CUR 0)
+            // 2. Seek to desired offset
+            // 3. Read
+            // 4. Restore offset
+            // Note: This is not atomic with respect to other threads sharing the FD, 
+            // but for now it's the best we can do without scheme read_at support.
+            
+            // 1. Save current offset
+            // SEEK_CUR = 1
+            let old_offset = match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, 0, 1) {
+                Ok(off) => off as u64,
+                Err(_) => 0, // Assume 0 if lseek fails or not supported (unlikely for file)
+            };
+            
+            for i in 0..num_pages {
+                let page_offset = i * 4096;
+                let file_offset = 0 + page_offset; // Assuming offset 0 for now in mmap arg (todo: add offset arg)
+                
+                // Allocate a physical frame
+                let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
+                    Some(res) => res,
+                    None => return u64::MAX, // OOM
+                };
+                
+                // Zero the frame first
+                unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                
+                // 2. Seek to chunk offset
+                // SEEK_SET = 0
+                let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, file_offset as isize, 0);
+                
+                // 3. Read from file into this frame
+                // We create a slice from the frame_ptr to read into
+                let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, 4096) };
+                
+                match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
+                    Ok(_) => {
+                        // Map the frame to user space
+                        let vaddr = target_addr + page_offset;
+                        memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
+                    },
+                    Err(_) => {
+                        // Failed to read, free frame and abort?
+                        // For now just map zeros or partial
+                        unsafe { memory::free_dma_buffer(frame_ptr, 4096, 4096) };
+                        return u64::MAX;
+                    }
+                }
+            }
+            
+            // 4. Restore offset
+            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
+            
+        } else {
+             serial::serial_print("[SYSCALL] mmap: invalid FD for file-backed mapping\n");
+             return u64::MAX;
+        }
+
     } else {
-        addr
-    };
+        // ANONYMOUS MAPPING
+        // Just allocate zeroed pages
+        
+        for i in 0..num_pages {
+            let page_offset = i * 4096;
+            
+            // Allocate physical frame
+            let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
+                Some(res) => res,
+                None => return u64::MAX,
+            };
+            
+            // Zero it
+            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+            
+            // Map it
+            let vaddr = target_addr + page_offset;
+            memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
+        }
+    }
     
-    // Align to page boundary (4KB)
-    let aligned_addr = (result_addr + 0xFFF) & !0xFFF;
-    let aligned_length = (length + 0xFFF) & !0xFFF;
-    
-    *next_addr = aligned_addr + aligned_length;
-    drop(next_addr);
-    
-    // TODO: Actually allocate and map pages
-    // For now, just return the address
-    aligned_addr
+    // 3. Record VMA in process
+    if let Some(mut proc) = process::get_process(current_pid) {
+        let vma = VMARegion {
+            start: target_addr,
+            end: target_addr + aligned_length,
+            flags: flags, // Store original flags
+            file_backed: is_file_backed,
+        };
+        proc.vmas.push(vma);
+        process::update_process(current_pid, proc);
+        
+        serial::serial_print("[SYSCALL] mmap successful: ");
+        serial::serial_print_hex(target_addr);
+        serial::serial_print("\n");
+        return target_addr;
+    }
+
+    u64::MAX
 }
 
 /// sys_munmap - Unmap memory from process address space
@@ -1113,9 +1290,54 @@ fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _fd: u64) -> u64 {
 ///   length: Number of bytes to unmap
 /// 
 /// Returns: 0 on success, u64::MAX on error
-fn sys_munmap(_addr: u64, _length: u64) -> u64 {
-    // TODO: Actually unmap pages
-    // For now, just return success
+fn sys_munmap(addr: u64, length: u64) -> u64 {
+    use crate::process;
+    use crate::memory;
+    
+    if length == 0 { return u64::MAX; }
+    
+    let current_pid = match process::current_process_id() {
+        Some(pid) => pid,
+        None => return u64::MAX,
+    };
+    
+    // 1. Find VMA containing this range
+    if let Some(mut proc) = process::get_process(current_pid) {
+        // Find index of VMA
+        // We only support unmapping entire VMAs or aligned chunks for now
+        // For simplicity, we only remove the VMA record if it matches exactly or is contained.
+        // Partial unmapping is hard without splitting VMAs.
+        
+        // Remove intersecting VMAs
+        // Note: vector swap_remove or retain might disrupt ordering if we cared (we might later)
+        // retain is safer.
+        
+        let map_end = addr + length;
+        
+        // We need to know which pages to physically free.
+        // In a real OS, page tables tell us. Here, we blindly traverse the range.
+        
+        // TODO: Actually free physical pages!
+        // This requires walking the page table, resolving phys addr, and freeing dma buffer.
+        // memory::unmap_user_range(...) helper needed.
+        
+        // For now, we leave physical pages leakes (bad!) or handled by process exit cleaner.
+        // But we technically "unmap" them from valid tracking struct.
+        
+        let initial_len = proc.vmas.len();
+        proc.vmas.retain(|vma| {
+            // Remove if there is overlap
+            let overlap = core::cmp::max(addr, vma.start) < core::cmp::min(map_end, vma.end);
+            !overlap
+        });
+        
+        if proc.vmas.len() < initial_len {
+             process::update_process(current_pid, proc);
+             return 0; // Success
+        }
+    }
+    
+    // Even if no VMA found, munmap usually succeeds on valid addresses
     0
 }
 

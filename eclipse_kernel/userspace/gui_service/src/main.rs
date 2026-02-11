@@ -8,11 +8,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, read, close, exec, O_RDONLY};
-
-/// Buffer for loading the application binary
-/// 2MB should be enough for our simulated app
-static mut APP_BUFFER: [u8; 32 * 1024 * 1024] = [0; 32 * 1024 * 1024];
+use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, O_RDONLY, mmap, munmap, lseek, SEEK_END, SEEK_SET, PROT_READ, PROT_EXEC, MAP_PRIVATE};
 
 /// Wait for filesystem to be mounted by trying to open a test path
 /// This prevents race conditions with filesystem_service startup
@@ -86,48 +82,40 @@ pub extern "C" fn _start() -> ! {
             loop { yield_cpu(); }
         }
         
-        println!("[GUI-SERVICE] Reading {}...", app_path);
-        
-        // Read file into buffer
-        // Note: In a real implementation we'd read in chunks or use mmap
-        // Here we assume it fits in our static buffer
-        // Read file into buffer in chunks
-        let mut total_bytes_read = 0;
-        loop {
-             let chunk_size = read(fd as u32, &mut APP_BUFFER[total_bytes_read..]);
-             if chunk_size < 0 {
-                 println!("[GUI-SERVICE] ERROR: Failed to read (ret={})", chunk_size);
-                 break;
-             }
-             if chunk_size == 0 {
-                 break; // EOF
-             }
-             total_bytes_read += chunk_size as usize;
-             // print progress every ~100KB to avoid spam
-             if total_bytes_read % (100 * 1024) == 0 {
-                  println!("[GUI-SERVICE] Read {} bytes...", total_bytes_read);
-             }
+        // Get file size using lseek
+        let size = lseek(fd, 0, SEEK_END);
+        if size <= 0 {
+             println!("[GUI-SERVICE] ERROR: Failed to get file size (or empty file)");
+             close(fd);
+             loop { yield_cpu(); }
         }
         
-        let bytes_read = total_bytes_read as isize;
+        println!("[GUI-SERVICE] Mapping {} (size={})...", app_path, size);
         
-        close(fd);
+        // Map file into memory
+        // addr=0 (kernel chooses), prot=READ|EXEC, flags=PRIVATE, fd, offset=0
+        let mapped_addr = mmap(0, size as u64, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
         
-        if bytes_read <= 0 {
-            println!("[GUI-SERVICE] ERROR: Failed to read {} (bytes_read={})", app_path, bytes_read);
-            loop { yield_cpu(); }
+        if mapped_addr == u64::MAX {
+             println!("[GUI-SERVICE] mmap failed!");
+             close(fd);
+             loop { yield_cpu(); }
         }
         
-        println!("[GUI-SERVICE] Loaded {} bytes. Executing...", bytes_read);
+        println!("[GUI-SERVICE] Mapped at {:x}. Executing...", mapped_addr);
         
         // Create slice for exec
-        let binary_slice = core::slice::from_raw_parts(APP_BUFFER.as_ptr(), bytes_read as usize);
+        let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
         
         // Replace current process with synthesis_app
         let ret = exec(binary_slice);
         
         // Exec should not return on success
         println!("[GUI-SERVICE] ERROR: exec() failed with code {}", ret);
+        
+        // Clean up
+        munmap(mapped_addr, size as u64);
+        close(fd);
     }
 
     // Fallback loop

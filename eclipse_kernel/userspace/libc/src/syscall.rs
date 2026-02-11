@@ -410,3 +410,69 @@ pub fn map_framebuffer() -> Option<usize> {
 pub fn mount() -> i32 {
     unsafe { syscall0(SYS_MOUNT) as i32 }
 }
+
+pub const PROT_READ: u64 = 0x1;
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64 = 0x4;
+
+pub const MAP_SHARED: u64 = 0x01;
+pub const MAP_PRIVATE: u64 = 0x02;
+pub const MAP_FIXED: u64 = 0x10;
+pub const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Map memory
+/// Returns: Address of mapped memory, or u64::MAX on error
+pub fn mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
+    // Note: offset is currently ignored by kernel sys_mmap signature but we should pass it if we update kernel
+    // For now, kernel only takes 5 args, and our syscall5 helper doesn't exist yet either.
+    // Wait, sys_mmap defined in kernel takes 5 args: addr, length, prot, flags, fd. Offset is missing!
+    // We should probably update kernel to take 6 args, but we only have registers for 6 args (rdi, rsi, rdx, r10, r8, r9)
+    // syscall_handler in kernel takes 6 args.
+    
+    // Let's check syscall_handler signature in kernel:
+    // fn syscall_handler(syscall_num, arg1, arg2, arg3, _arg4, _arg5, context)
+    // It only captures up to 5 args currently in the signature?
+    // "arg1: u64, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64" -> 5 arguments.
+    // So for now we can't pass offset easily unless we extend syscall handler.
+    // The kernel sys_mmap ignores offset anyway.
+    
+    // We need a syscall5 function
+    unsafe { 
+        let ret: u64;
+        let n = 20; // SYS_MMAP
+        let arg1 = addr;
+        let arg2 = length;
+        let arg3 = prot;
+        let arg4 = flags;
+        let arg5 = fd as u64;
+        
+        // Inline asm for 5 arguments
+        // System V AMD64 ABI: rdi, rsi, rdx, rcx, r8, r9
+        // Eclipse OS Syscall ABI (from syscall_handler):
+        // rdi=arg1, rsi=arg2, rdx=arg3, r10=arg4, r8=arg5
+        // (rcx is destroyed by syscall instruction, so Linux uses r10 for 4th arg)
+        
+        // Let's verify our syscall dispatcher in syscall.rs
+        // syscall3 uses rdi, rsi, rdx.
+        // We need to implement syscall5.
+        
+        asm!(
+            "int 0x80",
+            in("rax") n,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            in("r8") arg5,
+            lateout("rax") ret,
+            options(nostack)
+        );
+        ret
+    }
+}
+
+/// Unmap memory
+pub fn munmap(addr: u64, length: u64) -> i32 {
+    let n = 21; // SYS_MUNMAP
+    unsafe { syscall2(n, addr, length) as i32 }
+}
