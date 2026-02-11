@@ -308,10 +308,19 @@ pub extern "C" fn _start() -> ! {
     println!("[INPUT-SERVICE]   Event queue allocated (256 events, 4KB buffer)");
     println!("[INPUT-SERVICE]   Ready to process input events");
     
-    // Register with input: scheme
+    // Register with input: scheme (optional - may not exist yet)
     println!("[INPUT-SERVICE] Connecting to input: scheme proxy...");
-    let input_fd = sys_open("input:").expect("Failed to open input: scheme");
-    println!("[INPUT-SERVICE]   Scheme handle: {}", input_fd);
+    let input_fd = match sys_open("input:") {
+        Some(fd) => {
+            println!("[INPUT-SERVICE]   Scheme handle: {}", fd);
+            Some(fd)
+        }
+        None => {
+            println!("[INPUT-SERVICE]   WARNING: input: scheme not available");
+            println!("[INPUT-SERVICE]   Service will run in standalone mode");
+            None
+        }
+    };
     
     // Report initialization status
     println!("[INPUT-SERVICE] Input service ready");
@@ -354,9 +363,11 @@ pub extern "C" fn _start() -> ! {
             if event_queue.push(kbd_event) {
                 keyboard_events += 1;
                 total_events += 1;
-                // Report via scheme
-                let buf = unsafe { core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
-                sys_write(input_fd, buf);
+                // Report via scheme (if available)
+                if let Some(fd) = input_fd {
+                    let buf = unsafe { core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
+                    sys_write(fd, buf);
+                }
             }
         }
         

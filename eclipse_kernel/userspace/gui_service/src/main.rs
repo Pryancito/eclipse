@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, O_RDONLY, mmap, munmap, lseek, SEEK_END, SEEK_SET, PROT_READ, PROT_EXEC, MAP_PRIVATE};
+use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, O_RDONLY, mmap, munmap, lseek, SEEK_END, SEEK_SET, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat};
 
 /// Wait for filesystem to be mounted by trying to open a test path
 /// This prevents race conditions with filesystem_service startup
@@ -82,24 +82,30 @@ pub extern "C" fn _start() -> ! {
             loop { yield_cpu(); }
         }
         
-        // Get file size using lseek
-        let size = lseek(fd, 0, SEEK_END);
-        if size <= 0 {
-             println!("[GUI-SERVICE] ERROR: Failed to get file size (or empty file)");
-             close(fd);
-             loop { yield_cpu(); }
+        // Use fstat to get file size instead of lseek (more reliable for larger files)
+        let mut st: Stat = core::mem::zeroed();
+        if fstat(fd, &mut st) < 0 {
+            println!("[GUI-SERVICE] ERROR: fstat failed for {}", app_path);
+            close(fd);
+            loop { yield_cpu(); }
         }
         
-        println!("[GUI-SERVICE] Mapping {} (size={})...", app_path, size);
-        
+        let size = st.size;
+        if size <= 0 {
+            println!("[GUI-SERVICE] ERROR: Invalid file size: {}", size);
+            close(fd);
+            loop { yield_cpu(); }
+        }
+
+        println!("[GUI-SERVICE] Mapping {} (size={} bytes)...", app_path, size);
+
         // Map file into memory
-        // addr=0 (kernel chooses), prot=READ|EXEC, flags=PRIVATE, fd, offset=0
         let mapped_addr = mmap(0, size as u64, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
         
-        if mapped_addr == u64::MAX {
-             println!("[GUI-SERVICE] mmap failed!");
-             close(fd);
-             loop { yield_cpu(); }
+        if mapped_addr == u64::MAX || mapped_addr == 0 {
+            println!("[GUI-SERVICE] ERROR: mmap failed for {}", app_path);
+            close(fd);
+            loop { yield_cpu(); }
         }
         
         println!("[GUI-SERVICE] Mapped at {:x}. Executing...", mapped_addr);

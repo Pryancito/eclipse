@@ -10,8 +10,8 @@ use eclipsefs_lib::NodeKind;
 /// Block size for filesystem operations
 pub const BLOCK_SIZE: usize = 4096;
 
-/// Maximum record size to prevent OOM (2 MiB)
-pub const MAX_RECORD_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum record size to prevent OOM (16 MiB)
+pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Read a block from the underlying block device using the scheme system
 fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
@@ -520,45 +520,111 @@ pub fn mount() -> Result<(), &'static str> {
         // Read the inode entry from the inode table
         let entry = Self::read_inode_entry(inode)?;
         
-        // Calculate which block the node record starts at
-        let record_block = unsafe {
+        // Calculate record location
+        let record_block_start = unsafe {
             Self::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
         };
+        let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         
-        // Read the first block of the node record
+        // Read first block
         let mut block_buffer = vec![0u8; BLOCK_SIZE];
-        read_block_from_device(record_block, &mut block_buffer)?;
+        read_block_from_device(record_block_start, &mut block_buffer)?;
         
-        // Parse TLV structure to find CONTENT tag
-        let mut offset = 0;
-        while offset + 8 <= block_buffer.len() {
-            // Read tag (4 bytes) and length (4 bytes)
-            let tag = u32::from_le_bytes([
-                block_buffer[offset], block_buffer[offset+1],
-                block_buffer[offset+2], block_buffer[offset+3]
-            ]);
+        // Parse record size from header (first 4 bytes after offset)
+        // Note: The inode points to the start of the record. The first 4 bytes are undefined/padding?
+        // Actually, based on lookup_path:
+        // offset_in_block+4..8 is the record size.
+        // Let's verify this structure.
+        
+        if offset_in_first_block + 8 > BLOCK_SIZE {
+             return Err("Node header crosses block boundary");
+        }
+        
+        // Get record total size
+        let mut record_size = u32::from_le_bytes([
+            block_buffer[offset_in_first_block+4], block_buffer[offset_in_first_block+5],
+            block_buffer[offset_in_first_block+6], block_buffer[offset_in_first_block+7]
+        ]) as usize;
+        
+        let mut explicit_record_scan = false;
+
+        // Fallback: If record_size is 0 (seen in some file inodes that seem to start with [ID][Offset]),
+        // or very small, Use manual scan mode on the first block.
+        // Also if record_size is suspiciously large (> MAX), it's likely garbage/header mismatch.
+        // Dump showed header matches logical 16-byte [ID][Offset] pattern.
+        if record_size < 8 || record_size > MAX_RECORD_SIZE {
+             crate::serial::serial_print("[FS] get_file_size: Suspicious record size (");
+             crate::serial::serial_print_dec(record_size as u64);
+             crate::serial::serial_print("), enabling fallback scan\n");
+             // Force a scan of the first block size, minus header
+             record_size = BLOCK_SIZE; 
+             explicit_record_scan = true;
+        }
+        
+        // Removed the error check here since we handle > MAX by falling back to block scan
+        
+        // Read the record data
+        let mut record_data = if explicit_record_scan {
+            // Just use the block buffer we already have
+            vec![] 
+        } else {
+             vec![0u8; record_size]
+        };
+        
+        if !explicit_record_scan {
+            let first_chunk_size = min(record_size, BLOCK_SIZE - offset_in_first_block);
+            record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_first_block..offset_in_first_block+first_chunk_size]);
             
-            let length = u32::from_le_bytes([
-                block_buffer[offset+4], block_buffer[offset+5],
-                block_buffer[offset+6], block_buffer[offset+7]
-            ]) as usize;
+            let mut bytes_read = first_chunk_size;
+            let mut current_block = record_block_start + 1;
             
-            if tag == tlv_tags::CONTENT as u32 {
-                // Found CONTENT tag, return its length as file size
-                return Ok(length as u64);
-            }
-            
-            // Move to next TLV entry
-            offset += 8 + length;
-            
-            // If we've gone past the first block, we need to handle multi-block records
-            // For simplicity, assume CONTENT is in first block (reasonable for most files)
-            if offset >= BLOCK_SIZE {
-                break;
+            while bytes_read < record_size {
+                let chunk_size = min(BLOCK_SIZE, record_size - bytes_read);
+                read_block_from_device(current_block, &mut block_buffer)?;
+                record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
+                bytes_read += chunk_size;
+                current_block += 1;
             }
         }
         
-        // If we didn't find CONTENT tag, the file is empty or this is a directory
+        // Parse TLVs
+        // If explicit scan, use block_buffer directly, starting after 16 bytes (suspected header)
+        // If normal, use record_data, starting after 8 bytes (standard header)
+        
+        let (buffer_to_scan, buffer_offset) = if explicit_record_scan {
+            (&block_buffer, offset_in_first_block)
+        } else {
+            (&record_data, 0)
+        };
+        
+        let mut scan_offset = if explicit_record_scan {
+             16 // Skip 16 bytes (ID + Offset?)
+        } else {
+             8 // Skip 8 bytes (Standard Header)
+        };
+        
+        while scan_offset + 8 <= buffer_to_scan.len() - buffer_offset {
+             let idx = buffer_offset + scan_offset;
+             if idx + 8 > buffer_to_scan.len() { break; }
+
+             let tag = u32::from_le_bytes([
+                 buffer_to_scan[idx], buffer_to_scan[idx+1],
+                 buffer_to_scan[idx+2], buffer_to_scan[idx+3]
+             ]);
+             
+             let length = u32::from_le_bytes([
+                 buffer_to_scan[idx+4], buffer_to_scan[idx+5],
+                 buffer_to_scan[idx+6], buffer_to_scan[idx+7]
+             ]) as usize;
+             
+             if tag == tlv_tags::CONTENT as u32 {
+                 return Ok(length as u64);
+             }
+             
+             scan_offset += 8 + length;
+        }
+        
+        // Not found / Empty file
         Ok(0)
     }
 
@@ -860,6 +926,10 @@ impl Scheme for FileSystemScheme {
         let new_offset = match whence {
             0 => offset as u64, // SEEK_SET
             1 => (open_file.offset as isize + offset) as u64, // SEEK_CUR
+            2 => { // SEEK_END
+                let size = Filesystem::get_file_size(open_file.inode).map_err(|_| scheme_error::EIO)? as u64;
+                (size as isize + offset) as u64
+            },
             _ => return Err(scheme_error::EINVAL),
         };
         

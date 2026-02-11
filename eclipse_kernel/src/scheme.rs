@@ -22,7 +22,7 @@ pub mod error {
 
 /// Stat information for a resource
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Stat {
     pub dev: u64,
     pub ino: u64,
@@ -30,10 +30,23 @@ pub struct Stat {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
-    pub rdev: u64,
     pub size: u64,
     pub blksize: u32,
     pub blocks: u64,
+}
+
+
+/// Get file status in a specific scheme
+pub fn fstat(scheme_idx: usize, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        if let Some((_, s)) = reg.schemes.get(scheme_idx) {
+             Arc::clone(s)
+        } else {
+             return Err(error::EBADF);
+        }
+    };
+    scheme.fstat(id, stat)
 }
 
 /// The Scheme trait defines the interface for all resource providers.

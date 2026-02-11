@@ -116,6 +116,9 @@ pub fn init() {
         KERNEL_IDT.entries[4].set_handler(exception_4 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[6].set_handler(exception_6 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[8].set_handler(exception_8 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[10].set_handler(exception_10 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[11].set_handler(exception_11 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[12].set_handler(exception_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[13].set_handler(exception_13 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[14].set_handler(exception_14 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
@@ -261,70 +264,159 @@ unsafe fn inb(port: u16) -> u8 {
 // Exception Handlers
 // ============================================================================
 
-extern "C" fn exception_handler(num: u64, error_code: u64, rip: u64) {
+#[repr(C, packed)]
+pub struct ExceptionContext {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rbp: u64,
+    pub num: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+extern "C" fn exception_handler(context: &ExceptionContext) {
     let mut stats = INTERRUPT_STATS.lock();
     stats.exceptions += 1;
     drop(stats);
     
-    crate::serial::serial_print("EXCEPTION: ");
-    crate::serial::serial_print_dec(num);
+    crate::serial::serial_print("\n!!! EXCEPTION: ");
+    crate::serial::serial_print_dec(context.num);
     crate::serial::serial_print(" Error: ");
-    crate::serial::serial_print_hex(error_code);
+    crate::serial::serial_print_hex(context.error_code);
     crate::serial::serial_print(" RIP: ");
-    crate::serial::serial_print_hex(rip);
+    crate::serial::serial_print_hex(context.rip);
+    crate::serial::serial_print(" !!!\n");
+    
+    // Dump all registers
+    crate::serial::serial_print("  RAX: "); crate::serial::serial_print_hex(context.rax);
+    crate::serial::serial_print(" RBX: "); crate::serial::serial_print_hex(context.rbx);
+    crate::serial::serial_print(" RCX: "); crate::serial::serial_print_hex(context.rcx);
+    crate::serial::serial_print(" RDX: "); crate::serial::serial_print_hex(context.rdx);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("  RSI: "); crate::serial::serial_print_hex(context.rsi);
+    crate::serial::serial_print(" RDI: "); crate::serial::serial_print_hex(context.rdi);
+    crate::serial::serial_print(" RBP: "); crate::serial::serial_print_hex(context.rbp);
+    crate::serial::serial_print(" RSP: "); crate::serial::serial_print_hex(context.rsp);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("  R8:  "); crate::serial::serial_print_hex(context.r8);
+    crate::serial::serial_print(" R9:  "); crate::serial::serial_print_hex(context.r9);
+    crate::serial::serial_print(" R10: "); crate::serial::serial_print_hex(context.r10);
+    crate::serial::serial_print(" R11: "); crate::serial::serial_print_hex(context.r11);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("  R12: "); crate::serial::serial_print_hex(context.r12);
+    crate::serial::serial_print(" R13: "); crate::serial::serial_print_hex(context.r13);
+    crate::serial::serial_print(" R14: "); crate::serial::serial_print_hex(context.r14);
+    crate::serial::serial_print(" R15: "); crate::serial::serial_print_hex(context.r15);
+    crate::serial::serial_print("\n");
+    crate::serial::serial_print("  RFL: "); crate::serial::serial_print_hex(context.rflags);
+    crate::serial::serial_print(" CS:  "); crate::serial::serial_print_hex(context.cs);
+    crate::serial::serial_print(" SS:  "); crate::serial::serial_print_hex(context.ss);
+    crate::serial::serial_print("\n");
     
     let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
-    crate::serial::serial_print(" Active CR3: ");
+    let cr2: u64;
+    unsafe { 
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); 
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); 
+    }
+    crate::serial::serial_print("  Active CR3: ");
     crate::serial::serial_print_hex(cr3);
+    crate::serial::serial_print(" CR2: ");
+    crate::serial::serial_print_hex(cr2);
     
     if let Some(pid) = crate::process::current_process_id() {
         crate::serial::serial_print(" PID: ");
         crate::serial::serial_print_dec(pid as u64);
-        crate::serial::serial_print(" Expect CR3: ");
-        crate::serial::serial_print_hex(crate::process::get_process_page_table(Some(pid)));
     }
     crate::serial::serial_print("\n");
     
-    // Halt to avoid loop
-    if num == 14 { // Page Fault
-        let cr2: u64;
-        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
-        crate::serial::serial_print("CR2: ");
-        crate::serial::serial_print_hex(cr2);
-        crate::serial::serial_print("\n");
-    }
-    
     loop { 
-        if num == 3 { return; } // Breakpoint should return
+        if context.num == 3 { return; } // Breakpoint
         unsafe { asm!("hlt") } 
     }
 }
+
+#[unsafe(naked)]
+unsafe extern "C" fn common_exception_handler() {
+    core::arch::naked_asm!(
+        // Stack tiene: [num, error_code, iretq_frame...]
+        "push rbp",
+        "mov rbp, rsp",
+        
+        // Guardar GPRs
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        
+        // RSP apunta a r15. Offset 0.
+        "mov rdi, rsp", // Argumento 1: &ExceptionContext
+        
+        "and rsp, -16",
+        "call {}",
+        
+        "mov rsp, rbp",
+        "sub rsp, 112", // Offset de R15 (14 registros x 8 bytes)
+        
+        "pop r15",
+
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        
+        "pop rbp",
+        "add rsp, 16", // Limpiar num y error_code
+        "iretq",
+        sym exception_handler,
+    );
+}
+
+
 
 // Division by zero (#DE)
 #[unsafe(naked)]
 unsafe extern "C" fn exception_0() {
     core::arch::naked_asm!(
-        // Push dummy error code
-        "push 0",
-        "push 0",
-        
-        // Pass arguments in registers (System V AMD64 ABI)
-        // RDI = Exception Number (0)
-        // RSI = Error Code (0)
-        "pop rdi", // Exception Number (Top of Stack)
-        "pop rsi", // Error Code (Next)
-        "mov rdx, [rsp]", // Peek RIP
-        
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        "push 0", // Dummy error code
+        "push 0", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -332,23 +424,10 @@ unsafe extern "C" fn exception_0() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_1() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 1",
-        
-        // Arguments: RDI=Num, RSI=Error, RDX=RIP
-        "pop rdi", // Exception Number
-        "pop rsi", // Error Code
-        "mov rdx, [rsp]", // Peek RIP
-        
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        "push 0", // Dummy error code
+        "push 1", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -356,22 +435,10 @@ unsafe extern "C" fn exception_1() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_3() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 3",
-        
-        "pop rdi", // Exception Number
-        "pop rsi", // Error Code
-        "mov rdx, [rsp]", // Peek RIP
-
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        "push 0", // Dummy error code
+        "push 3", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -379,22 +446,10 @@ unsafe extern "C" fn exception_3() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_4() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 4",
-        
-        "pop rdi", // Exception Number
-        "pop rsi", // Error Code
-        "mov rdx, [rsp]", // Peek RIP
-
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        "push 0", // Dummy error code
+        "push 4", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -402,22 +457,10 @@ unsafe extern "C" fn exception_4() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_6() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 6",
-        
-        "pop rdi", // Exception Number
-        "pop rsi", // Error Code
-        "mov rdx, [rsp]", // Peek RIP
-
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        "push 0", // Dummy error code
+        "push 6", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -425,23 +468,10 @@ unsafe extern "C" fn exception_6() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_8() {
     core::arch::naked_asm!(
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-        // Error code ya está en el stack (pusheado por CPU)
-        "pop rsi", // Pop error code into RSI
-        "mov rdi, 8", // Exception number into RDI
-        "mov rdx, [rsp]", // Peek RIP
-        
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        // Error code ya está en el stack
+        "push 8", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -449,19 +479,10 @@ unsafe extern "C" fn exception_8() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_13() {
     core::arch::naked_asm!(
-        "pop rsi", // Error Code
-        "mov rdi, 13", // Exception Number
-        "mov rdx, [rsp]", // Peek RIP
-
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-        
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        // Error code ya está en el stack
+        "push 13", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
 
@@ -469,25 +490,49 @@ unsafe extern "C" fn exception_13() {
 #[unsafe(naked)]
 unsafe extern "C" fn exception_14() {
     core::arch::naked_asm!(
-        "pop rsi", // Error Code
-        "mov rdi, 14", // Exception Number
-        "mov rdx, [rsp]", // Peek RIP
-
-        "push rbp",
-        "mov rbp, rsp",
-        "and rsp, -16",
-        
-        "call {}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "iretq",
-        sym exception_handler,
+        // Error code ya está en el stack
+        "push 14", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
     );
 }
+
+// Invalid TSS (#TS) - con error code
+#[unsafe(naked)]
+unsafe extern "C" fn exception_10() {
+    core::arch::naked_asm!(
+        "push 10",
+        "jmp {}",
+        sym common_exception_handler,
+    );
+}
+
+// Segment Not Present (#NP) - con error code
+#[unsafe(naked)]
+unsafe extern "C" fn exception_11() {
+    core::arch::naked_asm!(
+        "push 11",
+        "jmp {}",
+        sym common_exception_handler,
+    );
+}
+
+// Stack Segment Fault (#SS) - con error code
+#[unsafe(naked)]
+unsafe extern "C" fn exception_12() {
+    core::arch::naked_asm!(
+        "push 12",
+        "jmp {}",
+        sym common_exception_handler,
+    );
+}
+
+
 
 // ============================================================================
 // IRQ Handlers
 // ============================================================================
+
 
 extern "C" fn timer_handler() {
     let mut stats = INTERRUPT_STATS.lock();
@@ -678,6 +723,14 @@ unsafe extern "C" fn syscall_int80() {
         // Offset de RAX desde RBP es -8.
         "mov [rbp - 8], rax",
         
+        // CRITICAL: Restore user data segments BEFORE popping registers
+        // We need to do this while RBP is still valid
+        "mov ax, 0x23",  // USER_DATA_SELECTOR
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        
         "pop r15",
         "pop r14",
         "pop r13",
@@ -694,6 +747,7 @@ unsafe extern "C" fn syscall_int80() {
         "pop rax",  // Ahora rax tiene el valor de retorno
         
         "pop rbp",
+        
         "iretq",
         sym syscall_handler_rust,
     );
@@ -771,6 +825,13 @@ unsafe extern "C" fn syscall_entry() {
         "add rsp, 8", // Pop 7th arg
         "mov rsp, rbp", // Restore stack
         
+        // CRITICAL: Restore user data segments BEFORE popping registers
+        "mov ax, 0x23",  // USER_DATA_SELECTOR
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        
         "pop r15",
         "pop r14",
         "pop r13",
@@ -787,6 +848,7 @@ unsafe extern "C" fn syscall_entry() {
         "pop rax",
         
         "pop rbp",
+        
         "iretq",
         
         user_rsp = sym USER_RSP_SCRATCH,

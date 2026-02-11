@@ -22,6 +22,30 @@ pub const SYS_PCI_ENUM_DEVICES: u64 = 17;
 pub const SYS_PCI_READ_CONFIG: u64 = 18;
 pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
 pub const SYS_MOUNT: u64 = 29;
+pub const SYS_FSTAT: u64 = 30;
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+pub fn fstat(fd: i32, stat: &mut Stat) -> i32 {
+    unsafe { syscall2(SYS_FSTAT, fd as u64, stat as *mut Stat as u64) as i32 }
+}
+
+pub fn brk(addr: u64) -> u64 {
+    unsafe { syscall1(26, addr) }
+}
 
 // File open flags
 pub const O_RDONLY: i32 = 0x0000;
@@ -247,47 +271,47 @@ pub struct PciDeviceInfo {
 /// class_code: 0x04 for audio devices, 0xFF for all
 /// Returns number of devices found
 pub fn pci_enum_devices(class_code: u8, devices: &mut [PciDeviceInfo]) -> usize {
-    let buffer = devices.as_mut_ptr() as *mut u64;
     let max_devices = devices.len();
+    if max_devices == 0 { return 0; }
+    
+    // El kernel escribe 8 u64 por dispositivo.
+    // Usamos un buffer temporal para evitar solapamientos y corrupción de memoria.
+    let count_cap = core::cmp::min(max_devices, 16);
+    let mut tmp_buffer = [0u64; 16 * 8]; 
     
     let count = unsafe {
         syscall3(
             SYS_PCI_ENUM_DEVICES,
             class_code as u64,
-            buffer as u64,
-            max_devices as u64
+            tmp_buffer.as_mut_ptr() as u64,
+            count_cap as u64
         )
     };
     
-    if count == u64::MAX {
+    if count == u64::MAX || count == 0 {
         return 0;
     }
     
-    // Parse the buffer into PciDeviceInfo structs
-    for i in 0..count as usize {
-        if i >= max_devices {
-            break;
-        }
-        
-        unsafe {
-            let offset = i * 8;
-            let buf_slice = core::slice::from_raw_parts(buffer, (count as usize) * 8);
-            
-            devices[i] = PciDeviceInfo {
-                bus: buf_slice[offset + 0] as u8,
-                device: buf_slice[offset + 1] as u8,
-                function: buf_slice[offset + 2] as u8,
-                vendor_id: buf_slice[offset + 3] as u16,
-                device_id: buf_slice[offset + 4] as u16,
-                class_code: buf_slice[offset + 5] as u8,
-                subclass: buf_slice[offset + 6] as u8,
-                bar0: buf_slice[offset + 7] as u32,
-            };
-        }
+    let actual_count = core::cmp::min(count as usize, count_cap);
+    
+    // Parsear el buffer temporal a PciDeviceInfo
+    for i in 0..actual_count {
+        let offset = i * 8;
+        devices[i] = PciDeviceInfo {
+            bus: tmp_buffer[offset + 0] as u8,
+            device: tmp_buffer[offset + 1] as u8,
+            function: tmp_buffer[offset + 2] as u8,
+            vendor_id: tmp_buffer[offset + 3] as u16,
+            device_id: tmp_buffer[offset + 4] as u16,
+            class_code: tmp_buffer[offset + 5] as u8,
+            subclass: tmp_buffer[offset + 6] as u8,
+            bar0: tmp_buffer[offset + 7] as u32,
+        };
     }
     
-    count as usize
+    actual_count
 }
+
 
 /// Read PCI configuration space (32-bit)
 pub fn pci_read_config_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {

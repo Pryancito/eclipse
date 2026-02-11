@@ -43,6 +43,7 @@ pub enum SyscallNumber {
     RegisterDevice = 27,
     Fmap = 28,
     Mount = 29,
+    Fstat = 30,
 }
 
 /// lseek whence values (POSIX standard)
@@ -157,6 +158,7 @@ pub extern "C" fn syscall_handler(
         27 => sys_register_device(arg1, arg2, arg3),
         28 => sys_fmap(arg1, arg2, arg3),
         29 => sys_mount(),
+        30 => sys_fstat(arg1, arg2),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -493,6 +495,17 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         serial::serial_print_hex(entry_point);
         serial::serial_print("\n");
         
+        // Initialize heap (brk) for the new process
+        if let Some(pid) = current_process_id() {
+            if let Some(mut proc) = crate::process::get_process(pid) {
+                // Set initial brk at 1GB if not already set
+                if proc.brk_current == 0 {
+                    proc.brk_current = 0x40000000;
+                    crate::process::update_process(pid, proc);
+                }
+            }
+        }
+        
         // This doesn't return - we jump to the new process entry point
         unsafe {
             // Use standard userspace stack top (512MB + 256KB)
@@ -748,38 +761,76 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
 
 /// sys_fmap - Map a resource into memory via its scheme
 fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
+    serial::serial_print("SYS_FMAP: Called with FD ");
+    serial::serial_print_dec(fd);
+    serial::serial_print(", offset ");
+    serial::serial_print_dec(offset);
+    serial::serial_print(", len ");
+    serial::serial_print_dec(len);
+    serial::serial_print("\n");
+    
     if let Some(pid) = current_process_id() {
+        serial::serial_print("SYS_FMAP: PID ");
+        serial::serial_print_dec(pid as u64);
+        serial::serial_print("\n");
+        
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_print("SYS_FMAP: PID ");
-            serial::serial_print_dec(pid as u64);
-            serial::serial_print(" FD ");
-            serial::serial_print_dec(fd);
-            serial::serial_print(" Scheme ");
+            serial::serial_print("SYS_FMAP: FD entry found, scheme_id=");
             serial::serial_print_dec(fd_entry.scheme_id as u64);
+            serial::serial_print(", resource_id=");
+            serial::serial_print_dec(fd_entry.resource_id as u64);
             serial::serial_print("\n");
 
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(phys_addr) => {
+                    serial::serial_print("SYS_FMAP: scheme::fmap returned phys_addr=");
+                    serial::serial_print_hex(phys_addr as u64);
+                    serial::serial_print("\n");
+                    
                     // For now, we perform the mapping here.
                     // Ideally, it would be a separate syscall or fmap would return something
                     // that the kernel then maps into the process address space.
                     
                     // HACK: For display, we perform the actual mapping
                     if fd_entry.scheme_id == 1 { // display: scheme
-                         return crate::memory::map_framebuffer_for_process(
-                             crate::process::get_process_page_table(crate::process::current_process_id()),
-                             phys_addr as u64,
-                             len as u64
-                         );
+                        serial::serial_print("SYS_FMAP: Mapping framebuffer for display scheme\n");
+                        let page_table = crate::process::get_process_page_table(crate::process::current_process_id());
+                        serial::serial_print("SYS_FMAP: Page table phys=");
+                        serial::serial_print_hex(page_table);
+                        serial::serial_print("\n");
+                        
+                        let vaddr = crate::memory::map_framebuffer_for_process(
+                            page_table,
+                            phys_addr as u64,
+                            len as u64
+                        );
+                        
+                        serial::serial_print("SYS_FMAP: map_framebuffer_for_process returned vaddr=");
+                        serial::serial_print_hex(vaddr);
+                        serial::serial_print("\n");
+                        
+                        return vaddr;
                     }
 
                     // Return physical address for others (not really a mapping yet)
+                    serial::serial_print("SYS_FMAP: Returning phys_addr for non-display scheme\n");
                     return phys_addr as u64;
                 }
-                Err(_) => return u64::MAX,
+                Err(e) => {
+                    serial::serial_print("SYS_FMAP: scheme::fmap failed with error ");
+                    serial::serial_print_dec(e as u64);
+                    serial::serial_print("\n");
+                    return u64::MAX;
+                }
             }
+        } else {
+            serial::serial_print("SYS_FMAP: FD entry not found\n");
         }
+    } else {
+        serial::serial_print("SYS_FMAP: No current process\n");
     }
+    
+    serial::serial_print("SYS_FMAP: Returning error\n");
     u64::MAX
 }
 
@@ -1219,7 +1270,17 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, 4096) };
                 
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
-                    Ok(_) => {
+                    Ok(bytes_read) => {
+                        // DIAGNOSTIC: For first page, verify ELF magic
+                        if i == 0 && bytes_read >= 4 {
+                            serial::serial_print("[SYSCALL] mmap: First 4 bytes: ");
+                            for j in 0..4 {
+                                serial::serial_print_hex(frame_slice[j] as u64);
+                                serial::serial_print(" ");
+                            }
+                            serial::serial_print("\n");
+                        }
+                        
                         // Map the frame to user space
                         let vaddr = target_addr + page_offset;
                         memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
@@ -1419,26 +1480,98 @@ fn sys_nanosleep(_req: u64) -> u64 {
     0
 }
 
-/// sys_brk - Change program break (heap end)
+
+/// sys_fstat - Get file status
 /// 
 /// Arguments:
-///   addr: New program break address (0 = query current)
+///   fd: File descriptor
+///   stat_ptr: Pointer to Stat struct
 /// 
-/// Returns: New program break address
+/// Returns: 0 on success, u64::MAX on error
+/// sys_brk - Set program break (heap end)
+/// arg1: new break address (0 to query current)
+/// Returns: current/new break on success, u64::MAX on error
 fn sys_brk(addr: u64) -> u64 {
-    // Simple heap management
-    static PROGRAM_BREAK: Mutex<u64> = Mutex::new(0x50000000);
+    use crate::process;
+    use crate::memory;
     
-    let mut brk = PROGRAM_BREAK.lock();
-    
-    if addr == 0 {
-        // Query current break
-        return *brk;
+    if let Some(pid) = process::current_process_id() {
+        if let Some(mut proc) = process::get_process(pid) {
+            // If addr is 0, just return current brk
+            if addr == 0 {
+                return proc.brk_current;
+            }
+            
+            // Initialize brk if not set (first call)
+            if proc.brk_current == 0 {
+                // Set initial brk at 1GB (above mmap region)
+                proc.brk_current = 0x40000000;
+            }
+            
+            let old_brk = proc.brk_current;
+            let new_brk = addr;
+            
+            // Align to page boundaries
+            let old_brk_page = (old_brk + 4095) & !4095;
+            let new_brk_page = (new_brk + 4095) & !4095;
+            
+            if new_brk > old_brk {
+                // Growing heap - map new pages
+                let page_table_phys = proc.page_table_phys;
+                let mut current_page = old_brk_page;
+                
+                while current_page < new_brk_page {
+                    // Allocate and map a page
+                    if let Some((frame_ptr, frame_phys)) = memory::alloc_dma_buffer(4096, 4096) {
+                        // Zero the page
+                        unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                        
+                        // Map it as user writable
+                        let flags = memory::PAGE_USER | memory::PAGE_WRITABLE;
+                        memory::map_user_page_4kb(page_table_phys, current_page, frame_phys, flags);
+                        
+                        current_page += 4096;
+                    } else {
+                        // Out of memory - restore old brk
+                        process::update_process(pid, proc);
+                        return u64::MAX;
+                    }
+                }
+            } else if new_brk < old_brk {
+                // Shrinking heap - unmap pages
+                // TODO: Actually free the physical pages
+                // For now just update brk_current
+            }
+            
+            // Update brk_current
+            proc.brk_current = new_brk;
+            process::update_process(pid, proc);
+            
+            return new_brk;
+        }
     }
     
-    // Set new break (no validation for now)
-    *brk = addr;
-    addr
+    u64::MAX
+}
+
+fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
+    if stat_ptr == 0 { return u64::MAX; }
+    
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            let mut stat = crate::scheme::Stat::default();
+            
+            // Call scheme fstat
+            if crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat).is_ok() {
+                // Copy to user memory
+                unsafe {
+                    *(stat_ptr as *mut crate::scheme::Stat) = stat;
+                }
+                return 0;
+            }
+        }
+    }
+    u64::MAX
 }
 
 /// Inicializar sistema de syscalls

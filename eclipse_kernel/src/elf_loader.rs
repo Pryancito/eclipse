@@ -262,6 +262,23 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     serial::serial_print("ELF: Valid exec binary, entry: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
+    
+    // DIAGNOSTIC: Print first 16 bytes of ELF buffer
+    serial::serial_print("ELF: First 16 bytes: ");
+    for i in 0..16 {
+        serial::serial_print_hex(elf_data[i] as u64);
+        serial::serial_print(" ");
+    }
+    serial::serial_print("\n");
+    
+    // DIAGNOSTIC: Print e_entry raw bytes
+    serial::serial_print("ELF: e_entry bytes: ");
+    let entry_bytes = unsafe { core::slice::from_raw_parts(&header.e_entry as *const u64 as *const u8, 8) };
+    for i in 0..8 {
+        serial::serial_print_hex(entry_bytes[i] as u64);
+        serial::serial_print(" ");
+    }
+    serial::serial_print("\n");
 
     // Validate Entry Point
     if header.e_entry > USER_ADDR_MAX {
@@ -351,9 +368,15 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                             page_table_phys, 
                             vaddr_page_base + offset, 
                             phys + offset, 
-                            crate::memory::PAGE_WRITABLE
+                            crate::memory::PAGE_USER | crate::memory::PAGE_WRITABLE
                         );
                     }
+                    
+                    serial::serial_print("ELF: Mapping page for exec at ");
+                    serial::serial_print_hex(vaddr_page_base);
+                    serial::serial_print(" to phys ");
+                    serial::serial_print_hex(phys);
+                    serial::serial_print("\n");
                     
                     crate::memory::walk_page_table(page_table_phys, vaddr_page_base);
                     kptr
@@ -380,12 +403,8 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
         }
     }
 
-    // Finalize mappings
-    for j in 0..mapped_count {
-        if let Some(ref mp) = mapped_pages[j] {
-             crate::memory::map_user_page_2mb(page_table_phys, mp.vaddr_base, mp.phys_addr, crate::memory::PAGE_WRITABLE);
-        }
-    }
+    // Flush TLB to ensure new mappings are active
+    unsafe { x86_64::instructions::tlb::flush_all(); }
 
     Some(header.e_entry)
 }
@@ -404,52 +423,75 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     serial::serial_print_hex(entry_point);
     serial::serial_print("\n  Stack: ");
     serial::serial_print_hex(stack_top);
+    serial::serial_print("\n");
+
     // Verify entry point is in user space
     if entry_point >= USER_ADDR_MAX {
         serial::serial_print("ERROR: Entry point in kernel space!\n");
         loop { core::arch::asm!("hlt"); }
     }
     
-    // Read current CR3 and PML4 for verification
-    let (pml4_phys_frame, _) = x86_64::registers::control::Cr3::read();
-    let pml4_phys = pml4_phys_frame.start_address().as_u64();
+    // Aligned stack for System V ABI
+    let adjusted_stack = (stack_top - 24) & !0xF;
     
-    // Verify PML4[0] is mapped (user space)
-    let pml4_virt = crate::memory::PHYS_MEM_OFFSET + pml4_phys;
-    let pml4 = unsafe { &*(pml4_virt as *const crate::memory::PageTable) };
-    
-    // SANITY CHECK: Is stack 16-byte aligned?
-    if stack_top % 16 != 0 {
-        serial::serial_print("  WARNING: User stack NOT 16-byte aligned!\n");
+    // Set up argc/argv on user stack
+    unsafe {
+        let stack_ptr = stack_top as *mut u64;
+        *stack_ptr.offset(-1) = 0; // envp[0] = NULL
+        *stack_ptr.offset(-2) = 0; // argv[0] = NULL  
+        *stack_ptr.offset(-3) = 0; // argc = 0
     }
-    
-    // Selectors from boot.rs:
-    // USER_CODE_SELECTOR: u16 = 0x18 | 3;
-    // USER_DATA_SELECTOR: u16 = 0x20 | 3;
+
     let user_cs: u64 = 0x1b; // 0x18 | 3
     let user_ds: u64 = 0x23; // 0x20 | 3
     let rflags: u64 = 0x202; // Interrupciones habilitadas
-
+    
     asm!(
-        // Set up data segments
+        "cli",              // Disable interrupts during transition
+        
+        // Build iretq frame manually on kernel stack
+        "push {u_ss}",
+        "push {u_rsp}",
+        "push {u_flags}",
+        "push {u_cs}",
+        "push {u_rip}",
+        
+        // Set up user data segments
+        "mov ax, {ds_sel:x}",
         "mov ds, ax",
         "mov es, ax",
+        
+        // Zero FS and GS segments
+        "xor ax, ax",
         "mov fs, ax",
         "mov gs, ax",
         
-        // Build iretq frame
-        "push {ss}",     // SS
-        "push {rsp}",    // RSP
-        "push {rflags}", // RFLAGS
-        "push {cs}",     // CS
-        "push {rip}",    // RIP
+        // COMPLETE REGISTER HYGIENE
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rcx, rcx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor rbp, rbp",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        
         "iretq",
-        ss = in(reg) user_ds,
-        rsp = in(reg) stack_top,
-        rflags = in(reg) rflags,
-        cs = in(reg) user_cs,
-        rip = in(reg) entry_point,
-        in("ax") user_ds,
+        
+        u_ss = in(reg) user_ds,
+        u_rsp = in(reg) adjusted_stack,
+        u_flags = in(reg) rflags,
+        u_cs = in(reg) user_cs,
+        u_rip = in(reg) entry_point,
+        ds_sel = in(reg) user_ds,
         options(noreturn)
     );
 }
+

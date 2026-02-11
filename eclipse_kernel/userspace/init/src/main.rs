@@ -182,7 +182,9 @@ fn start_system_services() {
         
         // Start display service (depends on input)
         start_service(&mut SERVICES[4]);
-        yield_cpu();
+        for _ in 0..10000{
+            yield_cpu();
+        }
 
         // Start audio service (depends on filesystem)
         start_service(&mut SERVICES[5]);

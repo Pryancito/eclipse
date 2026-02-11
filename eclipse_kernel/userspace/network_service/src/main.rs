@@ -278,10 +278,19 @@ pub extern "C" fn _start() -> ! {
     println!("[NETWORK-SERVICE] Starting (PID: {})", pid);
     println!("[NETWORK-SERVICE] Initializing network subsystem...");
     
-    // Register with net: scheme
+    // Register with net: scheme (optional - may not exist yet)
     println!("[NETWORK-SERVICE] Connecting to net: scheme proxy...");
-    let net_fd = sys_open("net:").expect("Failed to open net: scheme");
-    println!("[NETWORK-SERVICE]   Scheme handle: {}", net_fd);
+    let net_fd = match sys_open("net:") {
+        Some(fd) => {
+            println!("[NETWORK-SERVICE]   Scheme handle: {}", fd);
+            Some(fd)
+        }
+        None => {
+            println!("[NETWORK-SERVICE]   WARNING: net: scheme not available");
+            println!("[NETWORK-SERVICE]   Service will run in standalone mode");
+            None
+        }
+    };
     
     // Detect available network interfaces via PCI
     let (ethernet_card, wifi_card) = detect_network_cards();
@@ -384,9 +393,11 @@ pub extern "C" fn _start() -> ! {
                 connections += 1;
             }
 
-            // Simulate sending network packets to kernel scheme
-            let dummy_packet = [0u8; 64];
-            sys_write(net_fd, &dummy_packet);
+            // Simulate sending network packets to kernel scheme (if available)
+            if let Some(fd) = net_fd {
+                let dummy_packet = [0u8; 64];
+                sys_write(fd, &dummy_packet);
+            }
         }
         
         // Periodic status updates

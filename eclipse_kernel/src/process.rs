@@ -77,6 +77,7 @@ pub struct Process {
     pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
     pub page_table_phys: u64,          // Physical address of the PML4
     pub vmas: alloc::vec::Vec<VMARegion>, // Memory mappings
+    pub brk_current: u64,                  // Current program break (heap end)
 }
 
 impl Process {
@@ -93,6 +94,7 @@ impl Process {
             kernel_stack_top: 0,
             page_table_phys: 0,
             vmas: alloc::vec::Vec::new(),
+            brk_current: 0,
         }
     }
 }
