@@ -184,6 +184,13 @@ fn is_user_pointer(ptr: u64, len: u64) -> bool {
     
     // Check upper bound (Canonical lower half)
     if end > 0x0000_8000_0000_0000 {
+        serial::serial_print("[SYSCALL] is_user_pointer failed: ");
+        serial::serial_print_hex(ptr);
+        serial::serial_print(" len ");
+        serial::serial_print_dec(len);
+        serial::serial_print(" end ");
+        serial::serial_print_hex(end);
+        serial::serial_print("\n");
         return false;
     }
     
@@ -292,9 +299,16 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                 let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
                     Ok(bytes_read) => return bytes_read as u64,
-                    Err(_) => return u64::MAX,
+                    Err(e) => {
+                        serial::serial_print("[SYSCALL] read() scheme error: ");
+                        serial::serial_print_dec(e as u64);
+                        serial::serial_print("\n");
+                        return u64::MAX;
+                    }
                 }
             }
+        } else {
+            serial::serial_print("[SYSCALL] read() failed: FD not found\n");
         }
     }
     
@@ -483,6 +497,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         unsafe {
             // Use standard userspace stack top (512MB + 256KB)
             let stack_top: u64 = 0x20040000;
+            // CR3 should already be set to the current process's address space
             crate::elf_loader::jump_to_userspace(entry_point, stack_top);
         }
     } else {
@@ -710,6 +725,23 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.lseek_calls += 1;
     drop(stats);
+    
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            serial::serial_print("[SYSCALL] lseek(fd=");
+            serial::serial_print_dec(fd);
+            serial::serial_print(", offset=");
+            serial::serial_print_dec(offset as u64);
+            serial::serial_print(", whence=");
+            serial::serial_print_dec(whence as u64);
+            serial::serial_print(")\n");
+
+            match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, offset as isize, whence) {
+                Ok(new_offset) => return new_offset as u64,
+                Err(_) => return u64::MAX,
+            }
+        }
+    }
     
     u64::MAX
 }

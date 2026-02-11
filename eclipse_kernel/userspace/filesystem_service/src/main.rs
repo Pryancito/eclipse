@@ -237,7 +237,7 @@ pub extern "C" fn _start() -> ! {
                 Err(e) => println!("[FS-SERVICE] Mount failed: {}", e),
             }
         },
-        Err(e) => println!("[FS-SERVICE] Failed to open /dev/vda: {}", e),
+        Err(e) => println!("[FS-SERVICE] Failed to open disk:0: {}", e),
     }
 
     println!("[FS-SERVICE] Entering main loop...");

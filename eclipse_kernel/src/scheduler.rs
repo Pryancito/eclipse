@@ -149,6 +149,7 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     crate::boot::set_tss_stack(to_kernel_stack);
     
     // Switch address space if necessary
+    // The kernel is mapped identically in all address spaces, so CR3 switching is safe
     let next_cr3 = {
         let current_cr3 = crate::memory::get_cr3();
         if to_page_table != 0 && to_page_table != current_cr3 {

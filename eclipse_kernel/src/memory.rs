@@ -64,11 +64,15 @@ pub fn init() {
         
         // Convertimos a dirección física
         let heap_phys = virt_to_phys(heap_ptr_low as u64);
+        crate::serial::serial_print("[MEM] HEAP physical addr: ");
+        crate::serial::serial_print_hex(heap_phys);
+        crate::serial::serial_print("\n");
         
         // Convertimos a dirección Higher Half (0xFFFF8000...) de forma EXPLICITA
-        // phys_to_virt intenta ser inteligente y devuelve direcciones bajas si caen en el rango estático,
-        // lo cual NO QUEREMOS porque necesitamos que el Heap sobreviva al cambio de CR3.
         let heap_start_high = PHYS_MEM_OFFSET + heap_phys;
+        crate::serial::serial_print("[MEM] HEAP higher-half base: ");
+        crate::serial::serial_print_hex(heap_start_high);
+        crate::serial::serial_print("\n");
         
         // Get raw pointer to ALLOCATOR and dereference explicitly
         let allocator_ptr = &raw const ALLOCATOR;
@@ -187,9 +191,9 @@ pub fn init_paging(kernel_phys_base: u64) {
     // If we can read this without faulting, higher half mapping works
     let _test_read = unsafe { core::ptr::read_volatile(test_virt as *const u8) };
     
-    // Our bootloader maps KERNEL_VIRT_BASE (0xFFFF800000000000) to kernel_phys_base.
-    // So there is NO 0x200000 shift in the mapping itself.
-    // Virtual X maps to Physical (X - 0xFFFF800000000000) + kernel_phys_base.
+    // The bootloader maps the kernel at PHYS_MEM_OFFSET -> kernel_phys_base.
+    // This creates an overlap where the first 256MB of the Higher Half
+    // is shifted by kernel_phys_base.
     PHYS_OFFSET.store(kernel_phys_base, Ordering::Relaxed);
     
     crate::serial::serial_print("✓ Higher half physical map verified\n");
@@ -221,7 +225,7 @@ pub fn walk_page_table(pml4_phys: u64, vaddr: u64) {
     
     if !pml4_entry.present() { return; }
     
-    let pdpt_virt = PHYS_MEM_OFFSET + pml4_entry.get_addr();
+    let pdpt_virt = phys_to_virt(pml4_entry.get_addr());
     let pdpt = unsafe { &*(pdpt_virt as *const PageTable) };
     let pdpt_entry = &pdpt.entries[pdpt_idx];
     
@@ -237,7 +241,7 @@ pub fn walk_page_table(pml4_phys: u64, vaddr: u64) {
         return;
     }
     
-    let pd_virt = PHYS_MEM_OFFSET + pdpt_entry.get_addr();
+    let pd_virt = phys_to_virt(pdpt_entry.get_addr());
     let pd = unsafe { &*(pd_virt as *const PageTable) };
     let pd_entry = &pd.entries[pd_idx];
     
@@ -304,7 +308,6 @@ pub fn remove_identity_mapping() {
 
 /// Returns the physical address of the PML4
 pub fn create_process_paging() -> u64 {
-    crate::serial::serial_print("[MEM] create_process_paging starting...\n");
     unsafe {
         // Use alloc_dma_buffer to avoid stack overflow with Box::new(PageTable::new())
         let (pml4_ptr, pml4_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PML4");
@@ -315,16 +318,12 @@ pub fn create_process_paging() -> u64 {
         
         // Get current PML4 to copy kernel mappings
         let (current_pml4_phys, _) = Cr3::read();
+        let current_pml4_phys_u64 = current_pml4_phys.start_address().as_u64();
         
-        // CRITICAL FIX: Do NOT use phys_to_virt() for CR3!
-        // phys_to_virt might confuse the CR3 address (e.g. 0xBE...) with the Kernel Static Region/Offset
-        // and return a Low Identity address (e.g. 0x6...) which is WRONG if we want to access the Physical Page.
-        // We MUST use the Higher Half Direct Map to guarantee we are reading the physical memory at CR3.
-        let current_pml4_virt = PHYS_MEM_OFFSET + current_pml4_phys.start_address().as_u64();
-        
-        // crate::serial::serial_print("PAGING: Reading P4 from: ");
-        // crate::serial::serial_print_hex(current_pml4_virt);
-        // crate::serial::serial_print("\n");
+        // CRITICAL: Use direct PHYS_MEM_OFFSET mapping, NOT phys_to_virt
+        // phys_to_virt applies kernel_phys_base offset which is WRONG for CR3
+        // CR3 points to a page table that's in the direct physical map
+        let current_pml4_virt = PHYS_MEM_OFFSET + current_pml4_phys_u64;
         
         let current_pml4 = &*(current_pml4_virt as *const PageTable);
 
@@ -348,12 +347,6 @@ pub fn create_process_paging() -> u64 {
              x86_64::structures::paging::PageTableFlags::WRITABLE).bits()
         );
         
-        // Note: usage of PDPT and PD generic buffers is removed as we reuse the upper level tables
-        // from the kernel for now. User space will be allocated dynamically later.
-        
-        crate::serial::serial_print("[MEM] create_process_paging finished. PML4 phys: ");
-        crate::serial::serial_print_hex(pml4_phys);
-        crate::serial::serial_print("\n");
         pml4_phys
     }
 }
@@ -642,23 +635,18 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
     let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
-    // 1. Check if the address is in the relocated kernel image range
-    // The kernel is linked at 0xFFFF800000200000 and the heap is part of it.
-    // We use KERNEL_REGION_SIZE to cover the entire potential image + early heap.
+    // 1. Check if the address is in the kernel/heap shifted range (first 256MB)
     if virt_addr >= PHYS_MEM_OFFSET && virt_addr < PHYS_MEM_OFFSET + KERNEL_REGION_SIZE {
-        // For the relocated kernel range: physical = (virtual - PHYS_MEM_OFFSET) + PHYS_OFFSET
-        // Where PHYS_OFFSET = kernel_phys_base - 0x200000
         return (virt_addr - PHYS_MEM_OFFSET) + phys_offset;
     }
     
-    // 2. Standard higher half physical map
-    // (For pages allocated outside the static kernel image/heap region)
+    // 2. Default higher half physical map (Virt = Base + Phys)
     if virt_addr >= PHYS_MEM_OFFSET {
         return virt_addr - PHYS_MEM_OFFSET;
     }
     
-    // 3. Low memory identity map (fallback/bootloader compatibility)
-    virt_addr + phys_offset
+    // 3. Low memory identity map (fallback/early boot)
+    virt_addr
 }
 
 /// Convert physical address to virtual address (inverse of virt_to_phys)
@@ -666,13 +654,12 @@ pub fn virt_to_phys(virt_addr: u64) -> u64 {
 pub fn phys_to_virt(phys_addr: u64) -> u64 {
     let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
-    // Check if address belongs to the relocated kernel image physical range
+    // Check if the physical address is in the range where the kernel is mapped
     if phys_addr >= phys_offset && phys_addr < phys_offset + KERNEL_REGION_SIZE {
-        // Map back to Higher Half virtual address (0xFFFF8000...)
         return (phys_addr - phys_offset) + PHYS_MEM_OFFSET;
     }
     
-    // Default higher half mapping for all other physical memory
+    // Otherwise it's standard direct mapping
     PHYS_MEM_OFFSET + phys_addr
 }
 

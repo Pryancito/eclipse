@@ -7,6 +7,8 @@ use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 use core::arch::asm;
 
+use crate::serial;
+
 /// Read time stamp counter
 #[inline]
 fn rdtsc() -> u64 {
@@ -58,7 +60,11 @@ unsafe fn outl(port: u16, value: u32) {
 /// Flush cache line
 #[inline]
 unsafe fn clflush(addr: u64) {
-    asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+    core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+}
+
+unsafe fn sfence() {
+    core::arch::asm!("sfence", options(nostack, preserves_flags));
 }
 
 
@@ -138,7 +144,6 @@ struct VirtIOMMIORegs {
     queue_device_high: u32,     // 0x0a4
 }
 
-/// VirtIO queue descriptor
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct VirtQDescriptor {
@@ -178,7 +183,6 @@ struct VirtQUsed {
     avail_event: u16, // Available event (only if VIRTIO_F_EVENT_IDX)
 }
 
-/// VirtIO block request header
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VirtIOBlockReq {
@@ -264,11 +268,30 @@ impl Virtqueue {
         crate::serial::serial_print_hex(used_phys);
         crate::serial::serial_print("\n");
         
-        // Initialize descriptors as a free list
+        // Initialize descriptors with free list
         for i in 0..queue_size {
-            (*descriptors.add(i as usize)).next = if i + 1 < queue_size { i + 1 } else { 0 };
-            (*descriptors.add(i as usize)).flags = 0;
+            let desc = &mut *descriptors.add(i as usize);
+            write_volatile(&mut desc.addr, 0);
+            write_volatile(&mut desc.len, 0);
+            write_volatile(&mut desc.flags, 0);
+            let next_val = if i + 1 < queue_size { i + 1 } else { 0 };
+            write_volatile(&mut desc.next, next_val);
+            clflush(desc as *const _ as u64);
         }
+        sfence();
+
+        // Verification log - check first 4 descriptors
+        crate::serial::serial_print("[VirtIO-VQ] Init verify (v=");
+        crate::serial::serial_print_hex(descriptors as u64);
+        crate::serial::serial_print(" p=");
+        crate::serial::serial_print_hex(desc_phys);
+        crate::serial::serial_print("): ");
+        for i in 0..4 {
+            let next = read_volatile(&raw const (*descriptors.add(i)).next);
+            crate::serial::serial_print_dec(next as u64);
+            crate::serial::serial_print(", ");
+        }
+        crate::serial::serial_print("\n");
         
         // Initialize available ring
         (*avail).flags = 0;
@@ -298,11 +321,34 @@ impl Virtqueue {
             return None;
         }
         
-        let desc = self.free_head;
-        self.free_head = (*self.descriptors.add(desc as usize)).next;
+        let desc_idx = self.free_head;
+        let desc_ptr = self.descriptors.add(desc_idx as usize);
+        
+        // Read next free from the descriptor itself
+        let next_free = read_volatile(&raw const (*desc_ptr).next);
+        
+        // LOOP DETECTION: If we are about to set free_head back to an already allocated index (or 0 if we already returned 0)
+        if self.num_used > 0 && desc_idx == next_free {
+             crate::serial::serial_print("[VirtIO-VQ] FATAL: Free list loop detected at index ");
+             crate::serial::serial_print_dec(desc_idx as u64);
+             crate::serial::serial_print("\n");
+             return None;
+        }
+
+        self.free_head = next_free;
         self.num_used += 1;
         
-        Some(desc)
+        /*
+        crate::serial::serial_print("[VirtIO-VQ] alloc_desc(");
+        crate::serial::serial_print_dec(self.num_used as u64);
+        crate::serial::serial_print("): ret=");
+        crate::serial::serial_print_dec(desc_idx as u64);
+        crate::serial::serial_print(" next=");
+        crate::serial::serial_print_dec(self.free_head as u64);
+        crate::serial::serial_print("\n");
+        */
+        
+        Some(desc_idx)
     }
     
     /// Free a descriptor chain
@@ -310,12 +356,18 @@ impl Virtqueue {
         let mut idx = desc_idx;
         loop {
             let desc = &mut *self.descriptors.add(idx as usize);
-            let next = desc.next;
-            let has_next = (desc.flags & VIRTQ_DESC_F_NEXT) != 0;
+            let next = read_volatile(&raw const desc.next);
+            let flags = read_volatile(&raw const desc.flags);
+            let has_next = (flags & VIRTQ_DESC_F_NEXT) != 0;
             
             // Add to free list
-            desc.flags = 0;
-            desc.next = self.free_head;
+            write_volatile(&mut desc.addr, 0);
+            write_volatile(&mut desc.len, 0);
+            write_volatile(&mut desc.flags, 0);
+            write_volatile(&mut desc.next, self.free_head);
+            
+            clflush(desc as *const _ as u64);
+            
             self.free_head = idx;
             self.num_used -= 1;
             
@@ -324,6 +376,7 @@ impl Virtqueue {
             }
             idx = next;
         }
+        sfence();
     }
     
     /// Add buffers to the queue
@@ -332,51 +385,84 @@ impl Virtqueue {
             return None;
         }
         
-        // Allocate descriptor chain
+        // Allocate descriptors and build chain
         let head = self.alloc_desc()?;
-        let mut desc_idx = head;
+        let mut curr_idx = head;
         
         for (i, &(addr, len, flags)) in buffers.iter().enumerate() {
-            let desc = &mut *self.descriptors.add(desc_idx as usize);
-            // Use volatile writes for descriptors as device reads them
+            let desc = &mut *self.descriptors.add(curr_idx as usize);
+            
+            // Write base fields
             write_volatile(&mut desc.addr, addr);
             write_volatile(&mut desc.len, len);
-            write_volatile(&mut desc.flags, flags);
             
             if i + 1 < buffers.len() {
-                let next = self.alloc_desc()?;
+                // Not the last buffer, link to next
+                let next_idx = self.alloc_desc()?;
                 write_volatile(&mut desc.flags, flags | VIRTQ_DESC_F_NEXT);
-                write_volatile(&mut desc.next, next);
-                desc_idx = next;
+                write_volatile(&mut desc.next, next_idx);
+                
+                // Debug log (using volatile reads for accuracy)
+                crate::serial::serial_print("[VirtIO-VQ] Desc ");
+                crate::serial::serial_print_dec(i as u64);
+                crate::serial::serial_print(" (idx=");
+                crate::serial::serial_print_dec(curr_idx as u64);
+                crate::serial::serial_print("): addr=");
+                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.addr) });
+                crate::serial::serial_print(" len=");
+                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.len) } as u64);
+                crate::serial::serial_print(" flags=");
+                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.flags) } as u64);
+                crate::serial::serial_print(" next=");
+                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.next) } as u64);
+                crate::serial::serial_print("\n");
+                
+                clflush(desc as *const _ as u64);
+                curr_idx = next_idx;
             } else {
+                // Last buffer in chain
+                write_volatile(&mut desc.flags, flags);
                 write_volatile(&mut desc.next, 0);
+                
+                // Debug log
+                crate::serial::serial_print("[VirtIO-VQ] Desc ");
+                crate::serial::serial_print_dec(i as u64);
+                crate::serial::serial_print(" (idx=");
+                crate::serial::serial_print_dec(curr_idx as u64);
+                crate::serial::serial_print("): addr=");
+                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.addr) });
+                crate::serial::serial_print(" len=");
+                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.len) } as u64);
+                crate::serial::serial_print(" flags=");
+                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.flags) } as u64);
+                crate::serial::serial_print(" (last)\n");
+                
+                clflush(desc as *const _ as u64);
             }
-            // FLUSH descriptor to RAM
-            clflush(desc as *const _ as u64);
         }
         
         // Add to available ring
         let avail = &mut *self.avail;
-        let idx = read_volatile(&avail.idx) as usize % self.queue_size as usize;
-        write_volatile(&mut avail.ring[idx], head);
+        let ring_idx = read_volatile(&avail.idx) as usize % self.queue_size as usize;
+        write_volatile(&mut avail.ring[ring_idx], head);
         
         // FLUSH ring entry
-        clflush(&avail.ring[idx] as *const _ as u64);
+        clflush(&avail.ring[ring_idx] as *const _ as u64);
 
         // Update index - this tells the device there's work to do
-        // IMPORTANT: Must perform wrapping add on the u16 index
         let new_idx = read_volatile(&avail.idx).wrapping_add(1);
         
-        // Memory barrier to ensure all descriptor writes are visible before idx update
+        // Memory barriers to ensure all descriptor writes are visible before idx update
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        sfence(); 
         
         write_volatile(&mut avail.idx, new_idx);
-
-        // FLUSH avail index
         clflush(&avail.idx as *const _ as u64);
+        sfence();
 
-        // Ensure the index update is globally visible before we notify the device
+        // Ensure update is visible before notification
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        sfence();
         
         Some(head)
     }
@@ -773,6 +859,21 @@ impl VirtIOBlockDevice {
                 (bounce_phys, 4096, VIRTQ_DESC_F_WRITE),
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
+
+            // Debug log request content AFTER build
+            crate::serial::serial_print("[VirtIO] Header (p=");
+            crate::serial::serial_print_hex(req_phys);
+            crate::serial::serial_print("): type=");
+            crate::serial::serial_print_dec(req.req_type as u64);
+            crate::serial::serial_print(" sector=");
+            crate::serial::serial_print_dec(req.sector);
+            crate::serial::serial_print(" (raw: ");
+            for i in 0..16 {
+                let b = unsafe { core::ptr::read_volatile((req_ptr as *const u8).add(i)) };
+                crate::serial::serial_print_hex(b as u64);
+                crate::serial::serial_print(" ");
+            }
+            crate::serial::serial_print(")\n");
             
             // FLUSH CACHE (Ensure data reaches RAM before device reads it)
             clflush(req_ptr as u64);
@@ -781,6 +882,7 @@ impl VirtIOBlockDevice {
             for i in (0..4096).step_by(64) {
                 clflush((bounce_ptr as u64) + i);
             }
+            sfence();
             
             let result: Result<(), &'static str> = (|| {
                 let desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
@@ -1100,7 +1202,14 @@ impl Scheme for DiskScheme {
         let mut temp_block = [0u8; 4096];
         let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
         
-        device.read_block(block_num, &mut temp_block).map_err(|_| scheme_error::EIO)?;
+        if let Err(e) = device.read_block(block_num, &mut temp_block) {
+            serial::serial_print("[DISK-SCHEME] read_block failed for disk ");
+            serial::serial_print_dec(open_disk.disk_idx as u64);
+            serial::serial_print(" block ");
+            serial::serial_print_dec(block_num);
+            serial::serial_print("\n");
+            return Err(scheme_error::EIO);
+        }
         
         let available = 4096 - offset_in_block;
         let to_copy = core::cmp::min(buffer.len(), available);

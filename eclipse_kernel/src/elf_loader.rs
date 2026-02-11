@@ -121,13 +121,14 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         serial::serial_print_hex(stack_base);
         serial::serial_print("\n");
         // We map the 2MB block using 4KB pages for consistency and safety
+        // CRITICAL: Must include PAGE_USER flag so Ring 3 can access the stack
         for i in 0..512 {
             let offset = (i as u64) * 0x1000;
             crate::memory::map_user_page_4kb(
                 page_table_phys, 
                 stack_base + offset, 
                 phys + offset, 
-                crate::memory::PAGE_WRITABLE
+                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
             );
         }
         
@@ -186,13 +187,14 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
                     
                     // Map it (CRITICAL: must be done for the segment to be accessible in user space)
                     // We map the 2MB block using 512 4KB pages to be absolutely safe and avoid PSE issues
+                    // CRITICAL: Must include PAGE_USER flag so Ring 3 can access these pages
                     for i in 0..512 {
                         let offset = (i as u64) * 0x1000;
                         crate::memory::map_user_page_4kb(
                             page_table_phys, 
                             vaddr_page_base + offset, 
                             phys + offset, 
-                            crate::memory::PAGE_WRITABLE
+                            crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
                         );
                     }
                     
@@ -394,6 +396,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
 /// # Safety
 /// This function constructs a stack frame and executes `iretq` to switch privilege levels.
 /// It MUST be called with a valid userspace entry point and stack top.
+/// CR3 should already be set to the correct process address space before calling this.
 pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
     // FORCE PRINT to ensure we reached this point
     serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
@@ -401,46 +404,20 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     serial::serial_print_hex(entry_point);
     serial::serial_print("\n  Stack: ");
     serial::serial_print_hex(stack_top);
-    serial::serial_print("\n");
-    
-    // 4. Perform direct physical read via Higher Half Direct Map
-    let direct_paddr = 0xB9E00000 + 0xB39; // Entry physical addr
-    let direct_vaddr = crate::memory::PHYS_MEM_OFFSET + direct_paddr;
-    /*
-    serial::serial_print("  SANITY: Reading from Direct Map (v=");
-    serial::serial_print_hex(direct_vaddr);
-    serial::serial_print(")... ");
-    let direct_byte = unsafe { core::ptr::read_volatile(direct_vaddr as *const u8) };
-    serial::serial_print("Done. Byte: ");
-    serial::serial_print_hex(direct_byte as u64);
-    serial::serial_print("\n");
-    */
-
-    // 5. Verify PML4[0] in hardware CR3 again
-    let pml4_phys: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) pml4_phys); }
-    let pml4_virt = crate::memory::PHYS_MEM_OFFSET + pml4_phys;
-    let pml4_ptr = pml4_virt as *const u64;
-    
-    /*
-    serial::serial_print("  SANITY: PML4 (v=");
-    serial::serial_print_hex(pml4_virt);
-    serial::serial_print(") RAW DUMP [0..7]:\n    ");
-    */
-    for i in 0..8 {
-        let val = unsafe { core::ptr::read_volatile(pml4_ptr.add(i)) };
-        serial::serial_print_hex(val);
-        serial::serial_print(" ");
+    // Verify entry point is in user space
+    if entry_point >= USER_ADDR_MAX {
+        serial::serial_print("ERROR: Entry point in kernel space!\n");
+        loop { core::arch::asm!("hlt"); }
     }
-    serial::serial_print("\n");
-
+    
+    // Read current CR3 and PML4 for verification
+    let (pml4_phys_frame, _) = x86_64::registers::control::Cr3::read();
+    let pml4_phys = pml4_phys_frame.start_address().as_u64();
+    
+    // Verify PML4[0] is mapped (user space)
+    let pml4_virt = crate::memory::PHYS_MEM_OFFSET + pml4_phys;
     let pml4 = unsafe { &*(pml4_virt as *const crate::memory::PageTable) };
-    serial::serial_print("  SANITY: PML4[0] at CR3: ");
-    serial::serial_print_hex(pml4.entries[0].get_flags());
-    serial::serial_print(" -> addr: ");
-    serial::serial_print_hex(pml4.entries[0].get_addr());
-    serial::serial_print("\n");
-
+    
     // SANITY CHECK: Is stack 16-byte aligned?
     if stack_top % 16 != 0 {
         serial::serial_print("  WARNING: User stack NOT 16-byte aligned!\n");
@@ -454,10 +431,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     let rflags: u64 = 0x202; // Interrupciones habilitadas
 
     asm!(
+        // Set up data segments
         "mov ds, ax",
         "mov es, ax",
         "mov fs, ax",
         "mov gs, ax",
+        
+        // Build iretq frame
         "push {ss}",     // SS
         "push {rsp}",    // RSP
         "push {rflags}", // RFLAGS
