@@ -76,8 +76,10 @@ impl BTreeNode {
     }
 
     /// Check if node is minimal (for deletion)
+    /// A node is minimal when it has exactly the minimum number of entries allowed (ORDER - 1)
+    #[allow(clippy::int_plus_one)] // Keep <= ORDER - 1 for clarity of B-tree semantics
     pub fn is_minimal(&self) -> bool {
-        self.entries.len() < ORDER
+        self.entries.len() <= ORDER - 1
     }
 
     /// Insert entry into node (assumes not full)

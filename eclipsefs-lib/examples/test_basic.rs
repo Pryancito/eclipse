@@ -49,7 +49,7 @@ fn main() -> EclipseFSResult<()> {
         let mut reader = EclipseFSReader::from_file(File::open(test_file).map_err(|e| {
             eprintln!("Error abriendo archivo: {}", e);
             eclipsefs_lib::EclipseFSError::IoError
-        })?).inspect_err(|&e| {
+        })?).inspect_err(|e| {
             eprintln!("Error creando reader: {:?}", e);
         })?;
 
