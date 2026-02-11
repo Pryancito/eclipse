@@ -209,8 +209,8 @@ struct Virtqueue {
     desc_phys: u64,
     avail_phys: u64,
     used_phys: u64,
-    free_head: u16,
-    num_used: u16,
+    next_avail: u16, // Index of the next available descriptor to allocate
+    num_used: u16,   // Number of descriptors currently allocated/in-use
     last_used_idx: u16,
 }
 
@@ -220,6 +220,10 @@ unsafe impl Send for Virtqueue {}
 impl Virtqueue {
     /// Create a new virtqueue with DMA-allocated memory
     unsafe fn new(queue_size: u16) -> Option<Self> {
+        crate::serial::serial_print("[VirtIO-VQ] Creating new virtqueue with size=");
+        crate::serial::serial_print_dec(queue_size as u64);
+        crate::serial::serial_print("\n");
+        
         // Calculate sizes according to VirtIO Legacy spec
         // The Used Ring must be aligned to 4096 bytes boundary
         
@@ -268,30 +272,19 @@ impl Virtqueue {
         crate::serial::serial_print_hex(used_phys);
         crate::serial::serial_print("\n");
         
-        // Initialize descriptors with free list
+        // Initialize descriptors
+        // We do NOT use a linked free list anymore. Descriptors are allocated sequentially.
+        // Just zero them out initially.
         for i in 0..queue_size {
             let desc = &mut *descriptors.add(i as usize);
             write_volatile(&mut desc.addr, 0);
             write_volatile(&mut desc.len, 0);
             write_volatile(&mut desc.flags, 0);
-            let next_val = if i + 1 < queue_size { i + 1 } else { 0 };
-            write_volatile(&mut desc.next, next_val);
-            clflush(desc as *const _ as u64);
+            write_volatile(&mut desc.next, 0);
         }
         sfence();
 
-        // Verification log - check first 4 descriptors
-        crate::serial::serial_print("[VirtIO-VQ] Init verify (v=");
-        crate::serial::serial_print_hex(descriptors as u64);
-        crate::serial::serial_print(" p=");
-        crate::serial::serial_print_hex(desc_phys);
-        crate::serial::serial_print("): ");
-        for i in 0..4 {
-            let next = read_volatile(&raw const (*descriptors.add(i)).next);
-            crate::serial::serial_print_dec(next as u64);
-            crate::serial::serial_print(", ");
-        }
-        crate::serial::serial_print("\n");
+        crate::serial::serial_print("[VirtIO-VQ] Initialized descriptors (counter-based allocation)\n");
         
         // Initialize available ring
         (*avail).flags = 0;
@@ -309,44 +302,30 @@ impl Virtqueue {
             desc_phys,
             avail_phys,
             used_phys,
-            free_head: 0,
+            next_avail: 0,
             num_used: 0,
             last_used_idx: 0,
         })
     }
     
-    /// Allocate a descriptor chain
+    /// Allocate a descriptor using a simple ring counter
     unsafe fn alloc_desc(&mut self) -> Option<u16> {
+        // Check if we have descriptors available
         if self.num_used >= self.queue_size {
+            crate::serial::serial_print("[VirtIO-VQ] alloc_desc: queue full\n");
             return None;
         }
         
-        let desc_idx = self.free_head;
-        let desc_ptr = self.descriptors.add(desc_idx as usize);
+        let desc_idx = self.next_avail;
         
-        // Read next free from the descriptor itself
-        let next_free = read_volatile(&raw const (*desc_ptr).next);
-        
-        // LOOP DETECTION: If we are about to set free_head back to an already allocated index (or 0 if we already returned 0)
-        if self.num_used > 0 && desc_idx == next_free {
-             crate::serial::serial_print("[VirtIO-VQ] FATAL: Free list loop detected at index ");
-             crate::serial::serial_print_dec(desc_idx as u64);
-             crate::serial::serial_print("\n");
-             return None;
-        }
-
-        self.free_head = next_free;
+        // Increment counter modulo queue_size
+        self.next_avail = (self.next_avail + 1) % self.queue_size;
         self.num_used += 1;
         
-        /*
-        crate::serial::serial_print("[VirtIO-VQ] alloc_desc(");
-        crate::serial::serial_print_dec(self.num_used as u64);
-        crate::serial::serial_print("): ret=");
-        crate::serial::serial_print_dec(desc_idx as u64);
-        crate::serial::serial_print(" next=");
-        crate::serial::serial_print_dec(self.free_head as u64);
-        crate::serial::serial_print("\n");
-        */
+        // Optional: clear the descriptor to be safe (though add_buf will overwrite it)
+        let desc = &mut *self.descriptors.add(desc_idx as usize);
+        write_volatile(&mut desc.flags, 0);
+        write_volatile(&mut desc.next, 0);
         
         Some(desc_idx)
     }
@@ -354,30 +333,34 @@ impl Virtqueue {
     /// Free a descriptor chain
     unsafe fn free_desc(&mut self, desc_idx: u16) {
         let mut idx = desc_idx;
+        let mut count = 0;
+        
+        // Walk the chain to count how many descriptors we are freeing
         loop {
-            let desc = &mut *self.descriptors.add(idx as usize);
-            let next = read_volatile(&raw const desc.next);
+            count += 1;
+            
+            let desc = &*self.descriptors.add(idx as usize);
             let flags = read_volatile(&raw const desc.flags);
-            let has_next = (flags & VIRTQ_DESC_F_NEXT) != 0;
+            let next = read_volatile(&raw const desc.next);
             
-            // Add to free list
-            write_volatile(&mut desc.addr, 0);
-            write_volatile(&mut desc.len, 0);
-            write_volatile(&mut desc.flags, 0);
-            write_volatile(&mut desc.next, self.free_head);
-            
-            clflush(desc as *const _ as u64);
-            
-            self.free_head = idx;
-            self.num_used -= 1;
-            
-            if !has_next {
+            if (flags & VIRTQ_DESC_F_NEXT) == 0 {
                 break;
             }
             idx = next;
         }
-        sfence();
+        
+        if count > self.num_used {
+             crate::serial::serial_print("[VirtIO-VQ] ERROR: Freeing more descriptors than allocated! count=");
+             crate::serial::serial_print_dec(count as u64);
+             crate::serial::serial_print(" num_used=");
+             crate::serial::serial_print_dec(self.num_used as u64);
+             crate::serial::serial_print("\n");
+             self.num_used = 0;
+        } else {
+            self.num_used -= count;
+        }
     }
+
     
     /// Add buffers to the queue
     unsafe fn add_buf(&mut self, buffers: &[(u64, u32, u16)]) -> Option<u16> {

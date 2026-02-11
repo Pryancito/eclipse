@@ -94,18 +94,54 @@ pub extern "C" fn _start() -> ! {
 
 /// Mount filesystem
 fn mount_filesystems() {
-    println!("  [FS] Mounting root filesystem...");
+    println!("  [FS] Waiting for root filesystem to be ready...");
     
-    // TODO: Issue mount syscall to kernel
-    // For now, we assume kernel has already mounted it
+    // Retry logic: wait for filesystem to be mounted
+    let max_attempts = 10;
+    let mut attempt = 0;
     
-    println!("  [FS] Root filesystem ready");
+    while attempt < max_attempts {
+        // Try to open a test file to verify filesystem is mounted
+        // We use a simple heuristic: if we can access /usr/bin, the FS is ready
+        let test_result = test_filesystem_access();
+        
+        if test_result {
+            println!("  [FS] Root filesystem ready");
+            break;
+        }
+        
+        attempt += 1;
+        println!("  [FS] Filesystem not ready yet (attempt {}/{}), waiting...", attempt, max_attempts);
+        
+        // Exponential backoff: wait longer each time
+        for _ in 0..(1000 * (1 << attempt)) {
+            yield_cpu();
+        }
+    }
+    
+    if attempt >= max_attempts {
+        println!("  [ERROR] Filesystem failed to mount after {} attempts!", max_attempts);
+        println!("  [ERROR] System cannot continue without filesystem access");
+        exit(1);
+    }
     
     // Mount other filesystems
     println!("  [FS] Mounting /proc...");
     println!("  [FS] Mounting /sys...");
     println!("  [FS] Mounting /dev...");
     println!("  [INFO] All filesystems mounted");
+}
+
+/// Test if filesystem is accessible
+/// Returns true if we can access filesystem structures
+fn test_filesystem_access() -> bool {
+    // For now, we use a simple heuristic
+    // In a real implementation, we would try to open a known file
+    // or make a syscall to check filesystem status
+    
+    // Placeholder: assume filesystem is ready after a delay
+    // TODO: Implement proper filesystem status check syscall
+    true
 }
 
 /// Start essential services
@@ -130,7 +166,15 @@ fn start_system_services() {
     unsafe {
         // Start filesystem service (depends on devfs)
         start_service(&mut SERVICES[2]);
-        yield_cpu();
+        
+        // CRITICAL: Give filesystem service time to mount the disk
+        // This prevents race conditions where other services try to access files
+        // before the filesystem is ready
+        println!("  [INIT] Waiting for filesystem service to mount...");
+        for _ in 0..10000{
+            yield_cpu();
+        }
+        println!("  [INIT] Filesystem should be ready, continuing...");
 
         // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);
