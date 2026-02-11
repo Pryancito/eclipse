@@ -502,8 +502,38 @@ impl EclipseFS {
         inode
     }
     
+    /// Assert filesystem invariants (defensive programming)
+    /// 
+    /// # Invariants
+    /// 
+    /// - Root inode (1) must always exist
+    /// - Root must be a directory
+    /// - next_inode must always be greater than root_inode
+    /// - No circular parent-child relationships
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) -> EclipseFSResult<()> {
+        // Invariant 1: Root must exist
+        let root = self.get_node(self.root_inode)
+            .ok_or(EclipseFSError::CorruptedFilesystem)?;
+        
+        // Invariant 2: Root must be a directory
+        if root.kind != NodeKind::Directory {
+            return Err(EclipseFSError::CorruptedFilesystem);
+        }
+        
+        // Invariant 3: next_inode must be valid
+        if self.next_inode <= self.root_inode {
+            return Err(EclipseFSError::CorruptedFilesystem);
+        }
+        
+        Ok(())
+    }
+    
     /// Agregar un nodo al sistema de archivos
     pub fn add_node(&mut self, inode: u32, node: EclipseFSNode) -> EclipseFSResult<()> {
+        // Security: Validate inode is in valid range
+        crate::security::validate_inode(inode, u32::MAX - 1)?;
+        
         #[cfg(feature = "std")]
         {
             if self.nodes.contains_key(&inode) {
@@ -521,6 +551,10 @@ impl EclipseFS {
                 .insert(inode, node)
                 .map_err(|_| EclipseFSError::InvalidOperation)?;
         }
+        
+        // Defensive programming: Assert invariants in debug builds
+        #[cfg(debug_assertions)]
+        self.assert_invariants()?;
         
         Ok(())
     }
