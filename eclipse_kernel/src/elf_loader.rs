@@ -486,7 +486,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     //   (because CALL pushes return address, making RSP misaligned after)
     //
     // We're at program entry (not a function call), so RSP should be 16-byte aligned.
-    // Stack layout at program start:
+    // Stack layout at program start (System V ABI):
     //   [RSP+0]  = argc
     //   [RSP+8]  = argv[0] (or NULL if no args)
     //   [RSP+16] = argv[1] (or NULL as terminator)
@@ -494,17 +494,30 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     //   [RSP + 8*(argc+1)] = NULL (end of argv)
     //   [RSP + 8*(argc+2)] = envp[0] (or NULL)
     //   ...
+    //   [RSP + 8*(argc+2+envc)] = NULL (end of envp)
+    //   [RSP + ...] = auxv[0].a_type (auxiliary vector entries)
+    //   [RSP + ...] = auxv[0].a_val
+    //   ...
+    //   [RSP + ...] = AT_NULL (0) to terminate auxv
+    //   [RSP + ...] = 0 (value for AT_NULL)
     
-    // For argc=0, we need 3 quadwords: argc, argv[0]=NULL, envp[0]=NULL
-    let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords, 16-byte aligned
+    // For argc=0, we need:
+    // - 1 qword: argc = 0
+    // - 1 qword: argv[0] = NULL (argv terminator)
+    // - 1 qword: envp[0] = NULL (envp terminator)
+    // - 2 qwords: auxv AT_NULL entry (a_type=0, a_val=0)
+    // Total: 5 quadwords = 40 bytes
+    let adjusted_stack = (stack_top - 40) & !0xF; // 5 quadwords, 16-byte aligned
     
-    // Write argc/argv/envp to user stack at the location where RSP will be
+    // Write argc/argv/envp/auxv to user stack at the location where RSP will be
     // IMPORTANT: We can access user memory here because CR3 is set to user process's page table
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
         *stack_ptr.offset(0) = 0; // argc = 0
-        *stack_ptr.offset(1) = 0; // argv[0] = NULL  
-        *stack_ptr.offset(2) = 0; // envp[0] = NULL
+        *stack_ptr.offset(1) = 0; // argv[0] = NULL (end of argv)
+        *stack_ptr.offset(2) = 0; // envp[0] = NULL (end of envp)
+        *stack_ptr.offset(3) = 0; // auxv[0].a_type = AT_NULL (0)
+        *stack_ptr.offset(4) = 0; // auxv[0].a_val = 0
     }
 
     let user_cs: u64 = 0x1b; // 0x18 | 3
