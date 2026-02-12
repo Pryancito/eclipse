@@ -431,15 +431,31 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
         loop { core::arch::asm!("hlt"); }
     }
     
-    // Aligned stack for System V ABI
-    let adjusted_stack = (stack_top - 24) & !0xF;
+    // System V ABI x86-64 stack alignment requirements:
+    // - At program entry: RSP must be 16-byte aligned (RSP & 0xF == 0)
+    // - Before CALL instruction: Stack arranged so (RSP+8) is 16-byte aligned
+    //   (because CALL pushes return address, making RSP misaligned after)
+    //
+    // We're at program entry (not a function call), so RSP should be 16-byte aligned.
+    // Stack layout at program start:
+    //   [RSP+0]  = argc
+    //   [RSP+8]  = argv[0] (or NULL if no args)
+    //   [RSP+16] = argv[1] (or NULL as terminator)
+    //   ...
+    //   [RSP + 8*(argc+1)] = NULL (end of argv)
+    //   [RSP + 8*(argc+2)] = envp[0] (or NULL)
+    //   ...
     
-    // Set up argc/argv on user stack
+    // For argc=0, we need 3 quadwords: argc, argv[0]=NULL, envp[0]=NULL
+    let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords, 16-byte aligned
+    
+    // Write argc/argv/envp to user stack at the location where RSP will be
+    // IMPORTANT: We can access user memory here because CR3 is set to user process's page table
     unsafe {
-        let stack_ptr = stack_top as *mut u64;
-        *stack_ptr.offset(-1) = 0; // envp[0] = NULL
-        *stack_ptr.offset(-2) = 0; // argv[0] = NULL  
-        *stack_ptr.offset(-3) = 0; // argc = 0
+        let stack_ptr = adjusted_stack as *mut u64;
+        *stack_ptr.offset(0) = 0; // argc = 0
+        *stack_ptr.offset(1) = 0; // argv[0] = NULL  
+        *stack_ptr.offset(2) = 0; // envp[0] = NULL
     }
 
     let user_cs: u64 = 0x1b; // 0x18 | 3
