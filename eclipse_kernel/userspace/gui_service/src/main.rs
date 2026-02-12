@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, O_RDONLY, mmap, munmap, lseek, SEEK_END, SEEK_SET, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat};
+use eclipse_libc::{println, getpid, yield_cpu, open, close, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void};
 
 /// Wait for filesystem to be mounted by trying to open a test path
 /// This prevents race conditions with filesystem_service startup
@@ -108,21 +108,26 @@ pub extern "C" fn _start() -> ! {
             loop { yield_cpu(); }
         }
         
-        println!("[GUI-SERVICE] Mapped at {:x}. Executing...", mapped_addr);
+        println!("[GUI-SERVICE] Mapped at {:x}. Spawning...", mapped_addr);
         
-        // Create slice for exec
+        // Create slice for spawn
         let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
         
-        // Replace current process with synthesis_app
-        let ret = exec(binary_slice);
+        // Spawn xfwl4 as a new process
+        let spawned_pid = spawn(binary_slice);
         
-        // Exec should not return on success
-        println!("[GUI-SERVICE] ERROR: exec() failed with code {}", ret);
+        if spawned_pid < 0 {
+            println!("[GUI-SERVICE] ERROR: spawn() failed");
+        } else {
+            println!("[GUI-SERVICE] Successfully spawned xfwl4 (PID: {})", spawned_pid);
+        }
         
         // Clean up
         munmap(mapped_addr, size as u64);
         close(fd);
     }
+
+    println!("[GUI-SERVICE] Service entering main loop...");
 
     // Fallback loop
     loop {

@@ -186,12 +186,19 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // Load embedded init
     if !init_loaded {
         serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
-        if let Some(pid) = elf_loader::load_elf(INIT_BINARY) {
-            serial::serial_print("[KERNEL] Init process loaded with PID: ");
-            serial::serial_print_dec(pid as u64);
-            serial::serial_print("\n");
-            scheduler::enqueue_process(pid);
-            serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+        match process::spawn_process(INIT_BINARY) {
+            Ok(pid) => {
+                serial::serial_print("[KERNEL] Init process loaded with PID: ");
+                serial::serial_print_dec(pid as u64);
+                serial::serial_print("\n");
+                scheduler::enqueue_process(pid);
+                serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+            },
+            Err(e) => {
+                serial::serial_print("[KERNEL] Failed to spawn init process: ");
+                serial::serial_print(e);
+                serial::serial_print("\n");
+            }
         }
     }
     

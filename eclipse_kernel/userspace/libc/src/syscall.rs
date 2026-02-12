@@ -23,6 +23,9 @@ pub const SYS_PCI_READ_CONFIG: u64 = 18;
 pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
 pub const SYS_MOUNT: u64 = 29;
 pub const SYS_FSTAT: u64 = 30;
+pub const SYS_SPAWN: u64 = 31;
+
+pub type c_void = core::ffi::c_void;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -159,6 +162,10 @@ pub fn fork() -> i32 {
 
 pub fn exec(elf_buffer: &[u8]) -> i32 {
     unsafe { syscall2(SYS_EXEC, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
+}
+
+pub fn spawn(elf_buffer: &[u8]) -> i32 {
+    unsafe { syscall2(SYS_SPAWN, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
 }
 
 pub fn wait(status: Option<&mut i32>) -> i32 {

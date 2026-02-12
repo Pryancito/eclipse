@@ -134,3 +134,10 @@ pub fn mount() -> Result<()> {
         crate::syscall0(SYS_MOUNT)
     })
 }
+
+/// Spawn a new process from an ELF buffer
+pub fn spawn(buf: &[u8]) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall2(SYS_SPAWN, buf.as_ptr() as usize, buf.len())
+    })
+}

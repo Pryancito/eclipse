@@ -806,7 +806,14 @@ unsafe extern "C" fn syscall_entry() {
         // 5. RIP (Saved in RCX)
         "push rcx",
         
-        // Now on Kernel Stack with IRETQ frame. Save GPs.
+        // Now on Kernel Stack with IRETQ frame.
+        // We push RBP first so we can use it as a reference for the Context structure
+        "push rbp",
+        "mov rbp, rsp",
+
+        // Save remaining GPRs (Context Structure)
+        // Order must match SyscallContext layout (which is in reverse of pushes)
+        // Offset from RBP: -8 (rax), -16 (rbx) ... -112 (r15)
         "push rax",
         "push rbx",
         "push rcx",
@@ -822,8 +829,8 @@ unsafe extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
         
-        "mov rbp, rsp",
-        "and rsp, -16", // Align
+        // Align stack for SysV ABI
+        "and rsp, -16", 
         
         // Map arguments (Linux Syscall ABI -> Rust Handler)
         // Linux: RAX (num), RDI (1), RSI (2), RDX (3), R10 (4), R8 (5), R9 (6)
@@ -842,7 +849,8 @@ unsafe extern "C" fn syscall_entry() {
         "call {handler}",
         
         "add rsp, 8", // Pop 7th arg
-        "mov rsp, rbp", // Restore stack
+        "mov rsp, rbp", // Restore stack to just after RBP push
+        "sub rsp, 112", // Move to start of GPRs (r15)
         
         // CRITICAL: Restore user data segments BEFORE popping registers
         "mov ax, 0x23",  // USER_DATA_SELECTOR

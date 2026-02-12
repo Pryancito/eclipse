@@ -19,6 +19,7 @@ pub mod header {
 }
 
 pub use types::*;
+pub use header::unistd::spawn;
 
 #[cfg(not(test))]
 #[global_allocator]

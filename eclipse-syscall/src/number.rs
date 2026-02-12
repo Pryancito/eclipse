@@ -27,3 +27,5 @@ pub const SYS_BRK: usize = 26;
 pub const SYS_REGISTER_DEVICE: usize = 27;
 pub const SYS_FMAP: usize = 28;
 pub const SYS_MOUNT: usize = 29;
+pub const SYS_FSTAT: usize = 30;
+pub const SYS_SPAWN: usize = 31;

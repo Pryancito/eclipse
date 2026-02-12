@@ -384,42 +384,14 @@ impl Virtqueue {
                 let next_idx = self.alloc_desc()?;
                 write_volatile(&mut desc.flags, flags | VIRTQ_DESC_F_NEXT);
                 write_volatile(&mut desc.next, next_idx);
-                
-                // Debug log (using volatile reads for accuracy)
-                crate::serial::serial_print("[VirtIO-VQ] Desc ");
-                crate::serial::serial_print_dec(i as u64);
-                crate::serial::serial_print(" (idx=");
-                crate::serial::serial_print_dec(curr_idx as u64);
-                crate::serial::serial_print("): addr=");
-                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.addr) });
-                crate::serial::serial_print(" len=");
-                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.len) } as u64);
-                crate::serial::serial_print(" flags=");
-                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.flags) } as u64);
-                crate::serial::serial_print(" next=");
-                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.next) } as u64);
-                crate::serial::serial_print("\n");
-                
+
                 clflush(desc as *const _ as u64);
                 curr_idx = next_idx;
             } else {
                 // Last buffer in chain
                 write_volatile(&mut desc.flags, flags);
                 write_volatile(&mut desc.next, 0);
-                
-                // Debug log
-                crate::serial::serial_print("[VirtIO-VQ] Desc ");
-                crate::serial::serial_print_dec(i as u64);
-                crate::serial::serial_print(" (idx=");
-                crate::serial::serial_print_dec(curr_idx as u64);
-                crate::serial::serial_print("): addr=");
-                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.addr) });
-                crate::serial::serial_print(" len=");
-                crate::serial::serial_print_dec(unsafe { core::ptr::read_volatile(&raw const desc.len) } as u64);
-                crate::serial::serial_print(" flags=");
-                crate::serial::serial_print_hex(unsafe { core::ptr::read_volatile(&raw const desc.flags) } as u64);
-                crate::serial::serial_print(" (last)\n");
-                
+
                 clflush(desc as *const _ as u64);
             }
         }

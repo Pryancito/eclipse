@@ -106,6 +106,13 @@ pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
 
+pub fn next_pid() -> ProcessId {
+    let mut next_pid = NEXT_PID.lock();
+    let pid = *next_pid;
+    *next_pid += 1;
+    pid
+}
+
 
 // Inicializar el proceso kernel (PID 0)
 pub fn init_kernel_process() {
@@ -143,8 +150,20 @@ pub fn init_kernel_process() {
     *CURRENT_PROCESS.lock() = Some(0);
 }
 
-/// Crear un nuevo proceso
+/// Crear un nuevo proceso (bajo nivel)
 pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> Option<ProcessId> {
+    let pid = next_pid();
+    let cr3 = crate::memory::create_process_paging();
+    
+    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+/// Inicializar un proceso con un PID y espacio de direcciones ya creados
+pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack_base: u64, stack_size: usize) -> bool {
     // Allocate kernel stack for this process
     let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
@@ -154,14 +173,10 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
     // CRITICAL: Disable interrupts to avoid deadlock with scheduler timer interrupt
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
-        let mut next_pid = NEXT_PID.lock();
         
         // Buscar slot libre
         for slot in table.iter_mut() {
             if slot.is_none() {
-                let pid = *next_pid;
-                *next_pid += 1;
-                
                 let mut process = Process::new();
                 process.id = pid;
                 process.state = ProcessState::Ready;
@@ -169,7 +184,7 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
                 process.stack_size = stack_size;
                 process.priority = 5; // Prioridad media por defecto
                 process.time_slice = 10; // 10 ticks
-                process.page_table_phys = crate::memory::create_process_paging();
+                process.page_table_phys = cr3;
                 
                 // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
                 let kernel_stack_top_aligned = kernel_stack_top & !0xF;
@@ -189,11 +204,36 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize) -> O
                 crate::serial::serial_print("\n");
 
                 *slot = Some(process);
-                return Some(pid);
+                return true;
             }
         }
-        None
+        false
     })
+}
+
+/// Ejecutar un binario ELF como un nuevo proceso
+pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
+    // 1. Crear el PID
+    let pid = next_pid();
+    
+    // 2. Crear las tablas de páginas (address space)
+    let cr3 = crate::memory::create_process_paging();
+    
+    // 3. Cargar el binario ELF
+    let entry_point = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    
+    // 4. Configurar el stack de usuario
+    let stack_base = 0x20000000;
+    let stack_size = 0x40000;
+    let stack_top = crate::elf_loader::setup_user_stack(cr3, stack_base, stack_size)?;
+    
+    // 5. Inicializar el proceso en la tabla de procesos
+    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size) {
+        crate::fd::fd_init_stdio(pid);
+        Ok(pid)
+    } else {
+        Err("Failed to insert process into table")
+    }
 }
 
 /// Obtener proceso actual

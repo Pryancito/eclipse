@@ -27,3 +27,12 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         Err(_) => -1,
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn spawn(buf: *const c_void, count: size_t) -> pid_t {
+    let slice = core::slice::from_raw_parts(buf as *const u8, count);
+    match eclipse_syscall::call::spawn(slice) {
+        Ok(pid) => pid as pid_t,
+        Err(_) => -1,
+    }
+}

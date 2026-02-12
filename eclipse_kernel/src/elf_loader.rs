@@ -43,12 +43,12 @@ const PT_LOAD: u32 = 1;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
 
-/// Cargar binario ELF en memoria y crear proceso
-pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
+
+/// Cargar los segmentos del ELF en el espacio de direcciones especificado
+pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64, &'static str> {
     // Verificar header ELF
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
-        serial::serial_print("ELF: File too small\n");
-        return None;
+        return Err("ELF: File too small");
     }
     
     let header = unsafe {
@@ -57,25 +57,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     
     // Verificar magic number
     if &header.e_ident[0..4] != &ELF_MAGIC {
-        serial::serial_print("ELF: Invalid magic number\n");
-        return None;
-    }
-    
-    // Verificar que sea 64-bit
-    if header.e_ident[4] != 2 {
-        serial::serial_print("ELF: Not 64-bit\n");
-        return None;
-    }
-    
-    serial::serial_print("ELF: Valid header found\n");
-    serial::serial_print("ELF: Entry point: ");
-    serial::serial_print_hex(header.e_entry);
-    serial::serial_print("\n");
-
-    // Validate Entry Point
-    if header.e_entry > USER_ADDR_MAX {
-         serial::serial_print("ELF: Entry point in kernel space (Security Violation)\n");
-         return None;
+        return Err("ELF: Invalid magic number");
     }
     
     // Iterate over program headers and load segments
@@ -84,55 +66,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     let ph_size = header.e_phentsize as usize;
     
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
-        serial::serial_print("ELF: Program headers out of bounds\n");
-        return None;
-    }
-    
-    // Check segments for validity BEFORE creating process
-    for i in 0..ph_count {
-        let offset = ph_offset + (i * ph_size);
-        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
-        
-        if ph.p_type == PT_LOAD {
-            if ph.p_vaddr > USER_ADDR_MAX || (ph.p_vaddr + ph.p_memsz) > USER_ADDR_MAX {
-                serial::serial_print("ELF: Segment overlaps kernel space (Security Violation)\n");
-                return None;
-            }
-        }
-    }
-    
-    // Default user stack at 512MB
-    let stack_base = 0x20000000; // 512MB
-    let stack_size = 0x40000;  // 256KB
-    
-    let pid = create_process(header.e_entry, stack_base, stack_size)?;
-    crate::fd::fd_init_stdio(pid); // Initialize stdio (log:)
-    
-    // Get the process to access its page table
-    let page_table_phys = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        let p = table[pid as usize].as_ref().unwrap();
-        p.page_table_phys
-    };
-    
-    // Allocate and map user stack
-    if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(stack_size, 0x200000) {
-        serial::serial_print("ELF: Mapping stack at ");
-        serial::serial_print_hex(stack_base);
-        serial::serial_print("\n");
-        // We map the 2MB block using 4KB pages for consistency and safety
-        // CRITICAL: Must include PAGE_USER flag so Ring 3 can access the stack
-        for i in 0..512 {
-            let offset = (i as u64) * 0x1000;
-            crate::memory::map_user_page_4kb(
-                page_table_phys, 
-                stack_base + offset, 
-                phys + offset, 
-                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
-            );
-        }
-        
-        crate::memory::walk_page_table(page_table_phys, stack_base);
+        return Err("ELF: Program headers out of bounds");
     }
 
     // Keep track of mapped 2MB regions to handle segments sharing the same page
@@ -142,91 +76,192 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         kernel_ptr: *mut u8,
         phys_addr: u64,
     }
-    let mut mapped_pages: [Option<MappedPage>; 8] = [None; 8];
+    let mut mapped_pages: [Option<MappedPage>; 16] = [None; 16];
     let mut mapped_count = 0;
+
+    serial::serial_print("ELF: Loading segments into space ");
+    serial::serial_print_hex(page_table_phys);
+    serial::serial_print("\n");
 
     // Iterate over program headers and load segments
     for i in 0..ph_count {
-        let offset = ph_offset + (i * ph_size);
-        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph_offset_entry = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[ph_offset_entry..].as_ptr() as *const Elf64ProgramHeader) };
         
         if ph.p_type == PT_LOAD {
             let vaddr_start = ph.p_vaddr;
-            let vaddr_page_base = vaddr_start & !0x1FFFFF;
-            
-            // Find or create mapped page
-            let mut current_page: Option<&MappedPage> = None;
-            for j in 0..mapped_count {
-                if let Some(ref mp) = mapped_pages[j] {
-                    if mp.vaddr_base == vaddr_page_base {
-                        current_page = Some(mp);
-                        break;
-                    }
-                }
-            }
-            
-            let target_kernel_ptr = if let Some(mp) = current_page {
-                mp.kernel_ptr
-            } else {
-                serial::serial_print("ELF: Mapping page at ");
-                serial::serial_print_hex(vaddr_page_base);
-                serial::serial_print("\n");
-                
-                // Allocate new 2MB block
-                if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                    // Zero the block
-                    unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
-                    
-                    let mp = MappedPage {
-                        vaddr_base: vaddr_page_base,
-                        kernel_ptr: kptr,
-                        phys_addr: phys,
-                    };
-                    mapped_pages[mapped_count] = Some(mp);
-                    mapped_count += 1;
-                    
-                    // Map it (CRITICAL: must be done for the segment to be accessible in user space)
-                    // We map the 2MB block using 512 4KB pages to be absolutely safe and avoid PSE issues
-                    // CRITICAL: Must include PAGE_USER flag so Ring 3 can access these pages
-                    for i in 0..512 {
-                        let offset = (i as u64) * 0x1000;
-                        crate::memory::map_user_page_4kb(
-                            page_table_phys, 
-                            vaddr_page_base + offset, 
-                            phys + offset, 
-                            crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
-                        );
-                    }
-                    
-                    // Diagnostic walk for the entry point specifically
-                    // crate::memory::walk_page_table(page_table_phys, vaddr_start);
-                    
-                    kptr
-                } else {
-                    return None;
-                }
-            };
+            let vaddr_end = vaddr_start + ph.p_memsz;
+            let file_size = ph.p_filesz;
+            let file_start_offset = ph.p_offset;
 
-            // Copy segment data
-            if ph.p_filesz > 0 {
-                serial::serial_print("ELF: Copying segment to ");
-                serial::serial_print_hex(vaddr_start);
-                serial::serial_print("\n");
-                
-                let file_offset = ph.p_offset as usize;
-                let in_page_offset = (vaddr_start - vaddr_page_base) as usize;
-                unsafe {
-                    let src = elf_data.as_ptr().add(file_offset);
-                    let dst = target_kernel_ptr.add(in_page_offset);
-                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+            // Align start and end to 2MB boundaries
+            let page_start = vaddr_start & !0x1FFFFF;
+            let page_end = (vaddr_end + 0x1FFFFF) & !0x1FFFFF;
+
+            let mut current_vaddr = page_start;
+            while current_vaddr < page_end {
+                // Find or create mapped page
+                let mut current_page: Option<MappedPage> = None;
+                for j in 0..mapped_count {
+                    if let Some(mp) = mapped_pages[j] {
+                        if mp.vaddr_base == current_vaddr {
+                            current_page = Some(mp);
+                            break;
+                        }
+                    }
                 }
+                
+                let target_kernel_ptr = if let Some(mp) = current_page {
+                    mp.kernel_ptr
+                } else {
+                    if mapped_count >= mapped_pages.len() {
+                        return Err("ELF: Too many segments/pages (limit 16)");
+                    }
+
+                    serial::serial_print("ELF: Mapping 2MB page at ");
+                    serial::serial_print_hex(current_vaddr);
+                    serial::serial_print("\n");
+                    
+                    // Allocate new 2MB block
+                    if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
+                        // Zero the block
+                        unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
+                        
+                        let mp = MappedPage {
+                            vaddr_base: current_vaddr,
+                            kernel_ptr: kptr,
+                            phys_addr: phys,
+                        };
+                        mapped_pages[mapped_count] = Some(mp);
+                        mapped_count += 1;
+                        
+                        // Map it in 4KB pages
+                        for i in 0..512 {
+                            let offset = (i as u64) * 0x1000;
+                            crate::memory::map_user_page_4kb(
+                                page_table_phys, 
+                                current_vaddr + offset, 
+                                phys + offset, 
+                                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
+                            );
+                        }
+                        kptr
+                    } else {
+                        return Err("Failed to allocate segment 2MB page");
+                    }
+                };
+
+                // Copy part of the segment data that falls into this 2MB page
+                if file_size > 0 {
+                    let page_vaddr_start = current_vaddr;
+                    let page_vaddr_end = current_vaddr + 0x200000;
+
+                    // Range intersection [vaddr_start, vaddr_start + file_size) AND [page_vaddr_start, page_vaddr_end)
+                    let intersect_start = core::cmp::max(vaddr_start, page_vaddr_start);
+                    let intersect_end = core::cmp::min(vaddr_start + file_size, page_vaddr_end);
+
+                    if intersect_start < intersect_end {
+                        let copy_size = (intersect_end - intersect_start) as usize;
+                        let in_file_offset = (intersect_start - vaddr_start) as usize;
+                        let in_page_offset = (intersect_start - page_vaddr_start) as usize;
+
+                        unsafe {
+                            let src = elf_data.as_ptr().add(file_start_offset as usize + in_file_offset);
+                            let dst = target_kernel_ptr.add(in_page_offset);
+                            core::ptr::copy_nonoverlapping(src, dst, copy_size);
+                        }
+                    }
+                }
+
+                current_vaddr += 0x200000;
             }
-            
-            // BSS is already zeroed because we zeroed the whole 2MB block
         }
     }
     
+    Ok(header.e_entry)
+}
+
+/// Preparar el stack de usuario
+pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize) -> Result<u64, &'static str> {
+    serial::serial_print("ELF: Setting up user stack at ");
+    serial::serial_print_hex(stack_base);
+    serial::serial_print(" size ");
+    serial::serial_print_dec(stack_size as u64);
+    serial::serial_print("\n");
+
+    // Allocate and map user stack
+    if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(stack_size, 0x200000) {
+        // We map the 2MB block using 4KB pages for consistency and safety
+        // CRITICAL: Must include PAGE_USER flag so Ring 3 can access the stack
+        for i in 0..(stack_size / 4096) {
+            let offset = (i as u64) * 0x1000;
+            crate::memory::map_user_page_4kb(
+                page_table_phys, 
+                stack_base + offset, 
+                phys + offset, 
+                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
+            );
+        }
+        
+        // crate::memory::walk_page_table(page_table_phys, stack_base);
+        Ok(stack_base + stack_size as u64)
+    } else {
+        Err("Failed to allocate user stack")
+    }
+}
+
+/// Cargar binario ELF en memoria y crear proceso
+pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
+    let entry_point = match load_info(elf_data) {
+        Ok(info) => info.0,
+        Err(_) => return None,
+    };
+
+    // Default user stack at 512MB
+    let stack_base = 0x20000000; // 512MB
+    let stack_size = 0x40000;  // 256KB
+    
+    let pid = create_process(entry_point, stack_base, stack_size)?;
+    crate::fd::fd_init_stdio(pid); // Initialize stdio (log:)
+    
+    // Get the process to access its page table
+    let page_table_phys = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        let p = table[pid as usize].as_ref().unwrap();
+        p.page_table_phys
+    };
+
+    if let Err(e) = load_elf_into_space(page_table_phys, elf_data) {
+        serial::serial_print("ELF: Load failed: ");
+        serial::serial_print(e);
+        serial::serial_print("\n");
+        return None;
+    }
+
+    if let Err(e) = setup_user_stack(page_table_phys, stack_base, stack_size) {
+        serial::serial_print("ELF: Stack setup failed: ");
+        serial::serial_print(e);
+        serial::serial_print("\n");
+        return None;
+    }
+
     Some(pid)
+}
+
+fn load_info(elf_data: &[u8]) -> Result<(u64, usize, usize, usize), &'static str> {
+    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
+        return Err("ELF: File too small");
+    }
+    
+    let header = unsafe {
+        &*(elf_data.as_ptr() as *const Elf64Header)
+    };
+    
+    if &header.e_ident[0..4] != &ELF_MAGIC {
+        return Err("ELF: Invalid magic number");
+    }
+    
+    Ok((header.e_entry, header.e_phoff as usize, header.e_phnum as usize, header.e_phentsize as usize))
 }
 
 /// Inicializar ELF loader
@@ -318,87 +353,101 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
         kernel_ptr: *mut u8,
         phys_addr: u64,
     }
-    let mut mapped_pages: [Option<MappedPage>; 8] = [None; 8];
+    let mut mapped_pages: [Option<MappedPage>; 16] = [None; 16];
     let mut mapped_count = 0;
 
     for i in 0..ph_count {
-        let offset = ph_offset + (i * ph_size);
-        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        let ph_offset_entry = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[ph_offset_entry..].as_ptr() as *const Elf64ProgramHeader) };
         
         if ph.p_type == PT_LOAD {
             let vaddr_start = ph.p_vaddr;
-            let vaddr_page_base = vaddr_start & !0x1FFFFF;
-            
-            // Find or create mapped page
-            let mut current_page: Option<&MappedPage> = None;
-            for j in 0..mapped_count {
-                if let Some(ref mp) = mapped_pages[j] {
-                    if mp.vaddr_base == vaddr_page_base {
-                        current_page = Some(mp);
-                        break;
+            let vaddr_end = vaddr_start + ph.p_memsz;
+            let file_size = ph.p_filesz;
+            let file_start_offset = ph.p_offset;
+
+            // Align start and end to 2MB boundaries
+            let page_start = vaddr_start & !0x1FFFFF;
+            let page_end = (vaddr_end + 0x1FFFFF) & !0x1FFFFF;
+
+            let mut current_vaddr = page_start;
+            while current_vaddr < page_end {
+                // Find or create mapped page
+                let mut current_page: Option<MappedPage> = None;
+                for j in 0..mapped_count {
+                    if let Some(mp) = mapped_pages[j] {
+                        if mp.vaddr_base == current_vaddr {
+                            current_page = Some(mp);
+                            break;
+                        }
                     }
                 }
-            }
-            
-            let target_kernel_ptr = if let Some(mp) = current_page {
-                mp.kernel_ptr
-            } else {
-                serial::serial_print("ELF: Mapping page for exec at ");
-                serial::serial_print_hex(vaddr_page_base);
-                serial::serial_print("\n");
                 
-                // Allocate new 2MB block
-                if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                    // Zero the block
-                    unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
-                    
-                    let mp = MappedPage {
-                        vaddr_base: vaddr_page_base,
-                        kernel_ptr: kptr,
-                        phys_addr: phys,
-                    };
-                    mapped_pages[mapped_count] = Some(mp);
-                    mapped_count += 1;
-                    
-                    // Map it
-                    // We map the 2MB block using 4KB pages for consistency and safety
-                    for i in 0..512 {
-                        let offset = (i as u64) * 0x1000;
-                        crate::memory::map_user_page_4kb(
-                            page_table_phys, 
-                            vaddr_page_base + offset, 
-                            phys + offset, 
-                            crate::memory::PAGE_USER | crate::memory::PAGE_WRITABLE
-                        );
+                let target_kernel_ptr = if let Some(mp) = current_page {
+                    mp.kernel_ptr
+                } else {
+                    if mapped_count >= mapped_pages.len() {
+                        serial::serial_print("ELF: Too many segments/pages for exec (limit 16)\n");
+                        return None;
                     }
-                    
+
                     serial::serial_print("ELF: Mapping page for exec at ");
-                    serial::serial_print_hex(vaddr_page_base);
-                    serial::serial_print(" to phys ");
-                    serial::serial_print_hex(phys);
+                    serial::serial_print_hex(current_vaddr);
                     serial::serial_print("\n");
                     
-                    crate::memory::walk_page_table(page_table_phys, vaddr_page_base);
-                    kptr
-                } else {
-                    serial::serial_print("ELF: Failed to allocate 2MB block\n");
-                    return None;
-                }
-            };
+                    // Allocate new 2MB block
+                    if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
+                        // Zero the block
+                        unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
+                        
+                        let mp = MappedPage {
+                            vaddr_base: current_vaddr,
+                            kernel_ptr: kptr,
+                            phys_addr: phys,
+                        };
+                        mapped_pages[mapped_count] = Some(mp);
+                        mapped_count += 1;
+                        
+                        // Map it
+                        for i in 0..512 {
+                            let offset = (i as u64) * 0x1000;
+                            crate::memory::map_user_page_4kb(
+                                page_table_phys, 
+                                current_vaddr + offset, 
+                                phys + offset, 
+                                crate::memory::PAGE_USER | crate::memory::PAGE_WRITABLE
+                            );
+                        }
+                        kptr
+                    } else {
+                        serial::serial_print("ELF: Failed to allocate 2MB block\n");
+                        return None;
+                    }
+                };
 
-            // Copy segment data
-            if ph.p_filesz > 0 {
-                serial::serial_print("ELF: Copying segment for exec to ");
-                serial::serial_print_hex(vaddr_start);
-                serial::serial_print("\n");
-                
-                let file_offset = ph.p_offset as usize;
-                let in_page_offset = (vaddr_start - vaddr_page_base) as usize;
-                unsafe {
-                    let src = elf_data.as_ptr().add(file_offset);
-                    let dst = target_kernel_ptr.add(in_page_offset);
-                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                // Copy part of the segment data that falls into this 2MB page
+                if file_size > 0 {
+                    let page_vaddr_start = current_vaddr;
+                    let page_vaddr_end = current_vaddr + 0x200000;
+
+                    // Range intersection
+                    let intersect_start = core::cmp::max(vaddr_start, page_vaddr_start);
+                    let intersect_end = core::cmp::min(vaddr_start + file_size, page_vaddr_end);
+
+                    if intersect_start < intersect_end {
+                        let copy_size = (intersect_end - intersect_start) as usize;
+                        let in_file_offset = (intersect_start - vaddr_start) as usize;
+                        let in_page_offset = (intersect_start - page_vaddr_start) as usize;
+
+                        unsafe {
+                            let src = elf_data.as_ptr().add(file_start_offset as usize + in_file_offset);
+                            let dst = target_kernel_ptr.add(in_page_offset);
+                            core::ptr::copy_nonoverlapping(src, dst, copy_size);
+                        }
+                    }
                 }
+
+                current_vaddr += 0x200000;
             }
         }
     }

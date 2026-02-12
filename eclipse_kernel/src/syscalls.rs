@@ -44,6 +44,7 @@ pub enum SyscallNumber {
     Fmap = 28,
     Mount = 29,
     Fstat = 30,
+    Spawn = 31,
 }
 
 /// lseek whence values (POSIX standard)
@@ -159,6 +160,7 @@ pub extern "C" fn syscall_handler(
         28 => sys_fmap(arg1, arg2, arg3),
         29 => sys_mount(),
         30 => sys_fstat(arg1, arg2),
+        31 => sys_spawn(arg1, arg2),
         _ => {
             serial::serial_print("Unknown syscall: ");
             serial::serial_print_hex(syscall_num);
@@ -519,6 +521,53 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     }
 }
 
+/// sys_spawn - Create a new process from an ELF buffer
+/// arg1: pointer to ELF buffer
+/// arg2: size of ELF buffer
+/// Returns: PID of new process on success, -1 on error
+fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
+    serial::serial_print("[SYSCALL] spawn() called with buffer at ");
+    serial::serial_print_hex(elf_ptr);
+    serial::serial_print(", size: ");
+    serial::serial_print_dec(elf_size);
+    serial::serial_print("\n");
+    
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+        serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
+        return u64::MAX;
+    }
+
+    if !is_user_pointer(elf_ptr, elf_size) {
+        serial::serial_print("[SYSCALL] spawn() security violation: invalid buffer pointer\n");
+        return u64::MAX;
+    }
+    
+    // Create slice from buffer
+    let elf_data = unsafe {
+        core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize)
+    };
+    
+    // Spawn the new process
+    match crate::process::spawn_process(elf_data) {
+        Ok(pid) => {
+            serial::serial_print("[SYSCALL] spawn() success, PID: ");
+            serial::serial_print_dec(pid as u64);
+            serial::serial_print("\n");
+            
+            // Add to scheduler
+            crate::scheduler::enqueue_process(pid);
+            
+            pid as u64
+        },
+        Err(e) => {
+            serial::serial_print("[SYSCALL] spawn() failed: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            u64::MAX
+        }
+    }
+}
+
 /// sys_wait - Wait for child process to terminate
 /// arg1: pointer to status variable (or 0 to ignore)
 /// Returns: PID of terminated child, or -1 on error
@@ -625,6 +674,11 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     serial::serial_print("[SYSCALL] register_device called\n");
     
     if name_ptr == 0 || name_len == 0 || name_len > 256 {
+        return u64::MAX;
+    }
+    
+    if !is_user_pointer(name_ptr, name_len) {
+        serial::serial_print("[SYSCALL] register_device security violation: invalid name pointer\n");
         return u64::MAX;
     }
     
