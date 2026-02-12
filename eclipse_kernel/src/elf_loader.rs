@@ -447,8 +447,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     // Actually, for correct ABI: RSP & 0xF should == 8 (not 0) at function entry
     // But for simplicity and since we're at program start (not function call), RSP & 0xF == 0 is fine
     
-    let adjusted_stack = stack_top - 24; // 3 quadwords for argc, argv[0], envp[0]
-    let adjusted_stack = adjusted_stack & !0xF; // 16-byte align
+    let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords for argc, argv[0], envp[0], 16-byte aligned
     
     // Write argc/argv/envp to user stack at the location where RSP will be
     // IMPORTANT: We can access user memory here because CR3 is set to user process's page table
