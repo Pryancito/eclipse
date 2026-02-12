@@ -443,9 +443,9 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     //   ...
     
     // For argc=0, we need 3 quadwords: argc, argv[0]=NULL, envp[0]=NULL
-    // Stack should be (stack_top - 24) aligned to 16 bytes, then 8 more for alignment
-    // Actually, for correct ABI: RSP & 0xF should == 8 (not 0) at function entry
-    // But for simplicity and since we're at program start (not function call), RSP & 0xF == 0 is fine
+    // System V ABI x86-64 requires RSP to be 16-byte aligned at program start.
+    // Note: When calling a function, (RSP+8) must be 16-byte aligned (i.e., RSP & 0xF == 8),
+    // but at program entry point (not a function call), RSP itself should be 16-byte aligned.
     
     let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords for argc, argv[0], envp[0], 16-byte aligned
     
