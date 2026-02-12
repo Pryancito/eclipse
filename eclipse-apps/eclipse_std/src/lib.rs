@@ -15,17 +15,21 @@
 #![no_std]
 #![feature(alloc_error_handler)]
 
-extern crate alloc;
+pub extern crate alloc;
 
 use core::panic::PanicInfo;
 
 pub mod heap;
+#[macro_use]
 pub mod macros;
 
-// Temporarily comment out new modules until we can fix eclipse-libc
-// pub mod io;
-// pub mod thread;
-// pub mod sync;
+pub mod io;
+pub mod fs;
+pub mod process;
+pub mod net;
+pub mod time;
+pub mod thread;
+pub mod sync;
 
 pub mod collections {
     //! Collections module - re-exports from alloc
@@ -45,10 +49,13 @@ pub mod prelude {
     pub use alloc::format;
     pub use alloc::boxed::Box;
     
-    // New imports (commented until eclipse-libc is fixed)
-    // pub use crate::io::{Read, Write, stdin, stdout, stderr};
-    // pub use crate::thread;
-    // pub use crate::sync::{Mutex, Condvar};
+    pub use crate::io::{Read, Write, stdin, stdout, stderr};
+    pub use crate::fs::{self, File};
+    pub use crate::process::{self, Command, Child};
+    pub use crate::net;
+    pub use crate::time;
+    pub use crate::thread;
+    pub use crate::sync::{Mutex, Condvar};
 }
 
 /// Initialize the Eclipse OS application runtime
@@ -68,9 +75,7 @@ where
     let exit_code = user_main();
     
     // Exit the application
-    unsafe {
-        eclipse_syscall::call::exit(exit_code);
-    }
+    eclipse_syscall::call::exit(exit_code);
 }
 
 /// Macro to create a main entry point for Eclipse OS applications
@@ -92,9 +97,8 @@ fn panic(info: &PanicInfo) -> ! {
         eprintln!("Location: {}:{}:{}", 
             location.file(), location.line(), location.column());
     }
-    if let Some(message) = info.message() {
-        eprintln!("Message: {}", message);
-    }
+    let message = info.message();
+    eprintln!("Message: {}", message);
     
     // Exit with error code
     unsafe {
@@ -114,5 +118,6 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     }
 }
 
-// Re-export macros
-pub use crate::macros::{print, println, eprint, eprintln};
+// Re-export macros - they are already exported via #[macro_export]
+// but we want them to be available via std::print! etc.
+// pub use crate::{print, println, eprint, eprintln};

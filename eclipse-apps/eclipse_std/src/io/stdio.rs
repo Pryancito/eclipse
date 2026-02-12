@@ -40,7 +40,7 @@ impl Read for Stdin {
                 buf.as_mut_ptr() as *mut c_void,
                 1,
                 buf.len(),
-                &mut stdin as *mut FILE
+                eclipse_libc::stdin
             );
             Ok(n)
         }
@@ -54,7 +54,7 @@ impl Write for Stdout {
                 buf.as_ptr() as *const c_void,
                 1,
                 buf.len(),
-                &mut stdout as *mut FILE
+                eclipse_libc::stdout
             );
             Ok(n)
         }
@@ -62,7 +62,7 @@ impl Write for Stdout {
     
     fn flush(&mut self) -> Result<()> {
         unsafe {
-            fflush(&mut stdout as *mut FILE);
+            fflush(eclipse_libc::stdout);
         }
         Ok(())
     }
@@ -75,7 +75,7 @@ impl Write for Stderr {
                 buf.as_ptr() as *const c_void,
                 1,
                 buf.len(),
-                &mut stderr as *mut FILE
+                eclipse_libc::stderr
             );
             Ok(n)
         }
@@ -83,7 +83,7 @@ impl Write for Stderr {
     
     fn flush(&mut self) -> Result<()> {
         unsafe {
-            fflush(&mut stderr as *mut FILE);
+            fflush(eclipse_libc::stderr);
         }
         Ok(())
     }

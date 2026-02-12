@@ -1,0 +1,731 @@
+warning: unused import: `crate::flag::*`
+ --> /home/moebius/eclipse/eclipse-syscall/src/call.rs:5:5
+  |
+5 | use crate::flag::*;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse-syscall` (lib) generated 1 warning (run `cargo fix --lib -p eclipse-syscall` to apply 1 suggestion)
+   Compiling eclipse-libc v0.1.0 (/home/moebius/eclipse/eclipse-libc)
+warning: unused import: `crate::c_str::strlen`
+ --> /home/moebius/eclipse/eclipse-libc/src/header/stdlib/mod.rs:4:5
+  |
+4 | use crate::c_str::strlen;
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `time_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/time/mod.rs:4:10
+  |
+4 | pub type time_t = c_long;
+  |          ^^^^^^ help: convert the identifier to upper camel case: `TimeT`
+  |
+  = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `clock_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/time/mod.rs:5:10
+  |
+5 | pub type clock_t = c_long;
+  |          ^^^^^^^ help: convert the identifier to upper camel case: `ClockT`
+
+warning: type `sig_atomic_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:4:10
+  |
+4 | pub type sig_atomic_t = c_int;
+  |          ^^^^^^^^^^^^ help: convert the identifier to upper camel case: `SigAtomicT`
+
+warning: type `sighandler_t` should have an upper camel case name
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:31:10
+   |
+31 | pub type sighandler_t = extern "C" fn(...
+   |          ^^^^^^^^^^^^ help: convert the identifier to upper camel case: `SighandlerT`
+
+warning: type `sigset_t` should have an upper camel case name
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:82:10
+   |
+82 | pub type sigset_t = c_ulong;
+   |          ^^^^^^^^ help: convert the identifier to upper camel case: `SigsetT`
+
+warning: unused variable: `pathname`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:341:33
+    |
+341 | ... fn remove(pathname: *const c_char...
+    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pathname`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `oldpath`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:346:33
+    |
+346 | ... fn rename(oldpath: *const c_char,...
+    |               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_oldpath`
+
+warning: unused variable: `newpath`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:346:57
+    |
+346 | ...st c_char, newpath: *const c_char)...
+    |               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_newpath`
+
+warning: unused variable: `start_routine`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/pthread/mod.rs:14:5
+   |
+14 |     start_routine: extern "C" fn(*mut ...
+   |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_start_routine`
+
+warning: unused variable: `arg`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/pthread/mod.rs:15:5
+   |
+15 |     arg: *mut c_void
+   |     ^^^ help: if this is intentional, prefix it with an underscore: `_arg`
+
+warning: unused variable: `signum`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:86:5
+   |
+86 |     signum: c_int,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_signum`
+
+warning: unused variable: `act`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:87:5
+   |
+87 |     act: *const sigaction,
+   |     ^^^ help: if this is intentional, prefix it with an underscore: `_act`
+
+warning: unused variable: `oldact`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:88:5
+   |
+88 |     oldact: *mut sigaction,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oldact`
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:39:44
+   |
+39 | ...safe { &mut STDIN_STRUCT as *mut FI...
+   |           ^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+help: use `&raw mut` instead to create a raw pointer
+   |
+39 | pub static mut stdin: *mut FILE = unsafe { &raw mut STDIN_STRUCT as *mut FILE };
+   |                                             +++
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:42:45
+   |
+42 | ...safe { &mut STDOUT_STRUCT as *mut F...
+   |           ^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+   |
+42 | pub static mut stdout: *mut FILE = unsafe { &raw mut STDOUT_STRUCT as *mut FILE };
+   |                                              +++
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:45:45
+   |
+45 | ...safe { &mut STDERR_STRUCT as *mut F...
+   |           ^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+   |
+45 | pub static mut stderr: *mut FILE = unsafe { &raw mut STDERR_STRUCT as *mut FILE };
+   |                                              +++
+
+warning: creating a mutable reference to mutable static
+ --> /home/moebius/eclipse/eclipse-libc/src/header/errno/mod.rs:9:5
+  |
+9 |     &mut ERRNO as *mut c_int
+  |     ^^^^^^^^^^ mutable reference to mutable static
+  |
+  = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+  = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+  |
+9 |     &raw mut ERRNO as *mut c_int
+  |      +++
+
+   Compiling eclipse_std v0.2.0 (/home/moebius/eclipse/eclipse-apps/eclipse_std)
+error[E0255]: the name `print` is defined multiple times
+   --> src/macros.rs:5:1
+    |
+  5 | macro_rules! print {
+    | ^^^^^^^^^^^^^^^^^^ `print` redefined here
+    |
+   ::: src/lib.rs:115:10
+    |
+115 | pub use {print, println, eprint, epri...
+    |          -------
+    |          |
+    |          previous import of the macro `print` here
+    |          help: remove unnecessary import
+    |
+    = note: `print` must be defined only once in the macro namespace of this module
+
+error[E0255]: the name `println` is defined multiple times
+   --> src/macros.rs:17:1
+    |
+ 17 | macro_rules! println {
+    | ^^^^^^^^^^^^^^^^^^^^ `println` redefined here
+    |
+   ::: src/lib.rs:115:17
+    |
+115 | ... {print, println, eprint, eprintln};
+    |             ---------
+    |             |
+    |             previous import of the macro `println` here
+    |             help: remove unnecessary import
+    |
+    = note: `println` must be defined only once in the macro namespace of this module
+
+error[E0255]: the name `eprint` is defined multiple times
+   --> src/macros.rs:35:1
+    |
+ 35 | macro_rules! eprint {
+    | ^^^^^^^^^^^^^^^^^^^ `eprint` redefined here
+    |
+   ::: src/lib.rs:115:26
+    |
+115 | ..., println, eprint, eprintln};
+    |               --------
+    |               |
+    |               previous import of the macro `eprint` here
+    |               help: remove unnecessary import
+    |
+    = note: `eprint` must be defined only once in the macro namespace of this module
+
+error[E0255]: the name `eprintln` is defined multiple times
+   --> src/macros.rs:47:1
+    |
+ 47 | macro_rules! eprintln {
+    | ^^^^^^^^^^^^^^^^^^^^^ `eprintln` redefined here
+    |
+   ::: src/lib.rs:115:34
+    |
+115 | ...n, eprint, eprintln};
+    |               -------- previous import of the macro `eprintln` here
+    |
+    = note: `eprintln` must be defined only once in the macro namespace of this module
+
+error[E0255]: the name `Mutex` is defined multiple times
+   --> src/sync/mod.rs:115:9
+    |
+  8 | pub struct Mutex<T: ?Sized> {
+    | --------------------------- previous definition of the type `Mutex` here
+...
+115 | pub use self::mutex::Mutex;
+    |         ^^^^^^^^^^^^^^^^^^ `Mutex` reimported here
+    |
+    = note: `Mutex` must be defined only once in the type namespace of this module
+help: you can use `as` to change the binding name of the import
+    |
+115 | pub use self::mutex::Mutex as OtherMutex;
+    |                            +++++++++++++
+
+error[E0255]: the name `Condvar` is defined multiple times
+   --> src/sync/mod.rs:116:9
+    |
+ 77 | pub struct Condvar {
+    | ------------------ previous definition of the type `Condvar` here
+...
+116 | pub use self::condvar::Condvar;
+    |         ^^^^^^^^^^^^^^^^^^^^^^ `Condvar` reimported here
+    |
+    = note: `Condvar` must be defined only once in the type namespace of this module
+help: you can use `as` to change the binding name of the import
+    |
+116 | pub use self::condvar::Condvar as OtherCondvar;
+    |                                +++++++++++++++
+
+warning: `eclipse-libc` (lib) generated 18 warnings (run `cargo fix --lib -p eclipse-libc` to apply 9 suggestions)
+error[E0425]: cannot find function `fread` in this scope
+  --> src/io/stdio.rs:39:21
+   |
+39 |             let n = fread(
+   |                     ^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::io::header::stdio::fread;
+   |
+ 3 + use eclipse_libc::header::stdio::fread;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+  --> src/io/stdio.rs:43:36
+   |
+43 |                 &mut stdin as *mut FILE
+   |                                    ^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::io::header::stdio::FILE;
+   |
+ 3 + use eclipse_libc::header::stdio::FILE;
+   |
+
+error[E0425]: cannot find function `fwrite` in this scope
+  --> src/io/stdio.rs:53:21
+   |
+53 |             let n = fwrite(
+   |                     ^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::io::header::stdio::fwrite;
+   |
+ 3 + use eclipse_libc::header::stdio::fwrite;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+  --> src/io/stdio.rs:57:37
+   |
+57 |                 &mut stdout as *mut FILE
+   |                                     ^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::io::header::stdio::FILE;
+   |
+ 3 + use eclipse_libc::header::stdio::FILE;
+   |
+
+error[E0425]: cannot find function `fflush` in this scope
+  --> src/io/stdio.rs:65:13
+   |
+65 |             fflush(&mut stdout as *mut...
+   |             ^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::io::header::stdio::fflush;
+   |
+ 3 + use eclipse_libc::header::stdio::fflush;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+  --> src/io/stdio.rs:65:40
+   |
+65 | ...ut FILE);
+   |       ^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::io::header::stdio::FILE;
+   |
+ 3 + use eclipse_libc::header::stdio::FILE;
+   |
+
+error[E0425]: cannot find function `fwrite` in this scope
+  --> src/io/stdio.rs:74:21
+   |
+74 |             let n = fwrite(
+   |                     ^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::io::header::stdio::fwrite;
+   |
+ 3 + use eclipse_libc::header::stdio::fwrite;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+  --> src/io/stdio.rs:78:37
+   |
+78 |                 &mut stderr as *mut FILE
+   |                                     ^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::io::header::stdio::FILE;
+   |
+ 3 + use eclipse_libc::header::stdio::FILE;
+   |
+
+error[E0425]: cannot find function `fflush` in this scope
+  --> src/io/stdio.rs:86:13
+   |
+86 |             fflush(&mut stderr as *mut...
+   |             ^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::io::header::stdio::fflush;
+   |
+ 3 + use eclipse_libc::header::stdio::fflush;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+  --> src/io/stdio.rs:86:40
+   |
+86 | ...ut FILE);
+   |       ^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::io::header::stdio::FILE;
+   |
+ 3 + use eclipse_libc::header::stdio::FILE;
+   |
+
+error[E0425]: cannot find type `FILE` in this scope
+   --> src/io/mod.rs:101:15
+    |
+101 |     ptr: *mut FILE,
+    |               ^^^^ not found in this scope
+    |
+help: consider importing one of these structs
+    |
+  5 + use crate::io::header::stdio::FILE;
+    |
+  5 + use eclipse_libc::header::stdio::FILE;
+    |
+
+error[E0425]: cannot find function `fopen` in this scope
+   --> src/io/mod.rs:114:23
+    |
+114 | ... let ptr = fopen(c_path.as_ptr() a...
+    |               ^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fopen;
+    |
+  5 + use eclipse_libc::header::stdio::fopen;
+    |
+
+error[E0425]: cannot find function `fopen` in this scope
+   --> src/io/mod.rs:134:23
+    |
+134 | ... let ptr = fopen(c_path.as_ptr() a...
+    |               ^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fopen;
+    |
+  5 + use eclipse_libc::header::stdio::fopen;
+    |
+
+error[E0425]: cannot find function `fread` in this scope
+   --> src/io/mod.rs:150:21
+    |
+150 |             let n = fread(
+    |                     ^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fread;
+    |
+  5 + use eclipse_libc::header::stdio::fread;
+    |
+
+error[E0425]: cannot find function `fwrite` in this scope
+   --> src/io/mod.rs:164:21
+    |
+164 |             let n = fwrite(
+    |                     ^^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fwrite;
+    |
+  5 + use eclipse_libc::header::stdio::fwrite;
+    |
+
+error[E0425]: cannot find function `fflush` in this scope
+   --> src/io/mod.rs:176:13
+    |
+176 |             fflush(self.ptr);
+    |             ^^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fflush;
+    |
+  5 + use eclipse_libc::header::stdio::fflush;
+    |
+
+error[E0425]: cannot find function `fclose` in this scope
+   --> src/io/mod.rs:185:13
+    |
+185 |             fclose(self.ptr);
+    |             ^^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  5 + use crate::io::header::stdio::fclose;
+    |
+  5 + use eclipse_libc::header::stdio::fclose;
+    |
+
+error[E0425]: cannot find type `pthread_t` in this scope
+  --> src/thread/mod.rs:10:13
+   |
+10 |     handle: pthread_t,
+   |             ^^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::thread::header::pthread::pthread_t;
+   |
+ 3 + use eclipse_libc::header::pthread::pthread_t;
+   |
+
+error[E0425]: cannot find type `pthread_t` in this scope
+  --> src/thread/mod.rs:63:25
+   |
+63 | ...ut handle: pthread_t = core::mem::z...
+   |               ^^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::thread::header::pthread::pthread_t;
+   |
+ 3 + use eclipse_libc::header::pthread::pthread_t;
+   |
+
+error[E0425]: cannot find function `pthread_create` in this scope
+  --> src/thread/mod.rs:64:22
+   |
+64 |         let result = pthread_create(
+   |                      ^^^^^^^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::thread::header::pthread::pthread_create;
+   |
+ 3 + use eclipse_libc::header::pthread::pthread_create;
+   |
+
+error[E0425]: cannot find type `pthread_t` in this scope
+  --> src/thread/mod.rs:65:33
+   |
+65 | ...le as *mut pthread_t,
+   |               ^^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::thread::header::pthread::pthread_t;
+   |
+ 3 + use eclipse_libc::header::pthread::pthread_t;
+   |
+
+error[E0425]: cannot find function `pthread_join` in this scope
+  --> src/thread/mod.rs:86:26
+   |
+86 | ...result = pthread_join(self.thread.h...
+   |             ^^^^^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these functions
+   |
+ 3 + use crate::thread::header::pthread::pthread_join;
+   |
+ 3 + use eclipse_libc::header::pthread::pthread_join;
+   |
+
+error[E0425]: cannot find function `yield_cpu` in this scope
+   --> src/thread/mod.rs:111:9
+    |
+111 |         yield_cpu();
+    |         ^^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  3 + use crate::thread::header::pthread::yield_cpu;
+    |
+  3 + use eclipse_libc::header::pthread::yield_cpu;
+    |
+
+error[E0425]: cannot find type `pthread_mutex_t` in this scope
+ --> src/sync/mod.rs:9:23
+  |
+9 |     inner: UnsafeCell<pthread_mutex_t>,
+  |                       ^^^^^^^^^^^^^^^ not found in this scope
+  |
+help: you might be missing a type parameter
+  |
+8 | pub struct Mutex<T: ?Sized, pthread_mutex_t> {
+  |                           +++++++++++++++++
+
+error[E0425]: cannot find value `PTHREAD_MUTEX_INITIALIZER` in this scope
+  --> src/sync/mod.rs:20:36
+   |
+20 | ...ew(PTHREAD_MUTEX_INITIALIZER),
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find type `pthread_cond_t` in this scope
+  --> src/sync/mod.rs:78:23
+   |
+78 |     inner: UnsafeCell<pthread_cond_t>,
+   |                       ^^^^^^^^^^^^^^ not found in this scope
+   |
+help: you might be missing a type parameter
+   |
+77 | pub struct Condvar<pthread_cond_t> {
+   |                   ++++++++++++++++
+
+error[E0425]: cannot find value `PTHREAD_COND_INITIALIZER` in this scope
+  --> src/sync/mod.rs:88:36
+   |
+88 | ...:new(PTHREAD_COND_INITIALIZER),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0659]: `alloc` is ambiguous
+  --> src/io/mod.rs:7:5
+   |
+ 7 | use alloc::string::String;
+   |     ^^^^^ ambiguous name
+   |
+   = note: ambiguous because of a conflict between a name from a glob import and an outer scope during import or macro resolution
+note: `alloc` could refer to the module imported here
+  --> src/io/mod.rs:6:5
+   |
+ 6 | use eclipse_libc::*;
+   |     ^^^^^^^^^^^^^^^
+   = help: consider adding an explicit import of `alloc` to disambiguate
+   = help: or use `self::alloc` to refer to this module unambiguously
+note: `alloc` could also refer to the crate imported here
+  --> src/lib.rs:18:1
+   |
+18 | extern crate alloc;
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: use `::alloc` to refer to this crate unambiguously
+
+error[E0659]: `alloc` is ambiguous
+  --> src/io/mod.rs:8:5
+   |
+ 8 | use alloc::vec::Vec;
+   |     ^^^^^ ambiguous name
+   |
+   = note: ambiguous because of a conflict between a name from a glob import and an outer scope during import or macro resolution
+note: `alloc` could refer to the module imported here
+  --> src/io/mod.rs:6:5
+   |
+ 6 | use eclipse_libc::*;
+   |     ^^^^^^^^^^^^^^^
+   = help: consider adding an explicit import of `alloc` to disambiguate
+   = help: or use `self::alloc` to refer to this module unambiguously
+note: `alloc` could also refer to the crate imported here
+  --> src/lib.rs:18:1
+   |
+18 | extern crate alloc;
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: use `::alloc` to refer to this crate unambiguously
+
+warning: unused import: `core::ptr`
+ --> src/io/mod.rs:5:5
+  |
+5 | use core::ptr;
+  |     ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ErrorKind` and `Error`
+ --> src/io/stdio.rs:3:34
+  |
+3 | ..., Result, Error, ErrorKind};
+  |              ^^^^^  ^^^^^^^^^
+
+warning: unused import: `::alloc::boxed::Box`
+ --> src/thread/mod.rs:6:5
+  |
+6 | use ::alloc::boxed::Box;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `core::ptr`
+ --> src/sync/mod.rs:3:5
+  |
+3 | use core::ptr;
+  |     ^^^^^^^^^
+
+warning: unused import: `eclipse_libc::*`
+ --> src/sync/mod.rs:5:5
+  |
+5 | use eclipse_libc::*;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `self::mutex::Mutex`
+   --> src/sync/mod.rs:115:9
+    |
+115 | pub use self::mutex::Mutex;
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::condvar::Condvar`
+   --> src/sync/mod.rs:116:9
+    |
+116 | pub use self::condvar::Condvar;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `eprint`, `eprintln`, `print`, and `println`
+   --> src/lib.rs:115:10
+    |
+115 | ...e {print, println, eprint, eprintln};
+    |       ^^^^^  ^^^^^^^  ^^^^^^  ^^^^^^^^
+
+error[E0425]: cannot find function `pthread_mutex_lock` in this scope
+  --> src/sync/mod.rs:28:13
+   |
+28 | ...       pthread_mutex_lock(self.inne...
+   |           ^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_mutex_trylock` in this scope
+  --> src/sync/mod.rs:39:26
+   |
+39 | ...lt = pthread_mutex_trylock(self.inn...
+   |         ^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_mutex_unlock` in this scope
+  --> src/sync/mod.rs:71:13
+   |
+71 | ...     pthread_mutex_unlock(self.mute...
+   |         ^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_cond_wait` in this scope
+  --> src/sync/mod.rs:95:13
+   |
+95 | ...       pthread_cond_wait(self.inner...
+   |           ^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_cond_signal` in this scope
+   --> src/sync/mod.rs:103:13
+    |
+103 | ...     pthread_cond_signal(self.inne...
+    |         ^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_cond_broadcast` in this scope
+   --> src/sync/mod.rs:110:13
+    |
+110 | ...     pthread_cond_broadcast(self.i...
+    |         ^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: unnecessary `unsafe` block
+  --> src/lib.rs:69:5
+   |
+69 |     unsafe {
+   |     ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+  --> src/lib.rs:97:5
+   |
+97 |     unsafe {
+   |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/lib.rs:109:5
+    |
+109 |     unsafe {
+    |     ^^^^^^ unnecessary `unsafe` block
+
+Some errors have detailed explanations: E0255, E0425, E0659.
+For more information about an error, try `rustc --explain E0255`.
+warning: `eclipse_std` (lib) generated 11 warnings
+error: could not compile `eclipse_std` (lib) due to 41 previous errors; 11 warnings emitted

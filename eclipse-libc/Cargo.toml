@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 eclipse-syscall = { path = "../eclipse-syscall" }
 
+[features]
+default = ["allocator"]
+allocator = []
+panic_handler = []
+
 [lib]
 name = "eclipse_libc"
 path = "src/lib.rs"

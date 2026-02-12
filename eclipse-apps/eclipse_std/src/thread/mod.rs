@@ -2,7 +2,8 @@
 
 use core::ptr;
 use eclipse_libc::*;
-use alloc::boxed::Box;
+use eclipse_libc::header::time::{timespec, nanosleep};
+use ::alloc::boxed::Box;
 
 /// Thread handle
 pub struct Thread {
@@ -43,8 +44,8 @@ where
 {
     unsafe {
         // Box the closure
-        let boxed = Box::new(f);
-        let raw = Box::into_raw(boxed);
+        let boxed = ::alloc::boxed::Box::new(f);
+        let raw = ::alloc::boxed::Box::into_raw(boxed);
         
         // Thread wrapper function
         extern "C" fn thread_wrapper<F, T>(arg: *mut c_void) -> *mut c_void
@@ -52,7 +53,7 @@ where
             F: FnOnce() -> T + Send + 'static,
         {
             unsafe {
-                let boxed = Box::from_raw(arg as *mut F);
+                let boxed = ::alloc::boxed::Box::from_raw(arg as *mut F);
                 let _ = boxed();
                 ptr::null_mut()
             }
@@ -93,12 +94,14 @@ impl<T> JoinHandle<T> {
     }
 }
 
+use crate::time::Duration;
+
 /// Sleep for a duration
-pub fn sleep(millis: u64) {
+pub fn sleep(dur: Duration) {
     unsafe {
         let ts = timespec {
-            tv_sec: (millis / 1000) as i64,
-            tv_nsec: ((millis % 1000) * 1_000_000) as i64,
+            tv_sec: dur.secs as i64,
+            tv_nsec: dur.nanos as i64,
         };
         nanosleep(&ts as *const timespec, ptr::null_mut());
     }

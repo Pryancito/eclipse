@@ -3,6 +3,8 @@
 use core::ptr;
 use core::cell::UnsafeCell;
 use eclipse_libc::*;
+use ::alloc::string::String;
+use ::alloc::vec::Vec;
 
 /// Mutual exclusion primitive
 pub struct Mutex<T: ?Sized> {
@@ -104,21 +106,9 @@ impl Condvar {
         }
     }
     
-    /// Signal all waiting threads
     pub fn notify_all(&self) {
         unsafe {
             pthread_cond_broadcast(self.inner.get());
         }
     }
-}
-
-pub use self::mutex::Mutex;
-pub use self::condvar::Condvar;
-
-mod mutex {
-    pub use super::Mutex;
-}
-
-mod condvar {
-    pub use super::Condvar;
 }

@@ -438,13 +438,14 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                     }
                     
                     new_pdpt.entries[i].set_addr(new_pd_phys, flags.bits());
+                    crate::serial::serial_printf(format_args!("[Paging] Cloned PD {} into User PDPT entry {}\n", pd_cloned, i));
                 } else {
                     new_pdpt.entries[i] = p_pdpt.entries[i].clone();
                 }
             }
             
             c_pml4.entries[0].set_addr(new_pdpt_phys, (x86_64::structures::paging::PageTableFlags::from_bits_truncate(p_pml4.entries[0].get_flags()) | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-            crate::serial::serial_printf(format_args!("[Paging] Cloned {} PD entries into User PDPT\n", pd_cloned));
+            crate::serial::serial_printf(format_args!("[Paging] Address Space Clone Complete (Child PML4[0] set)\n"));
         }
     }
 

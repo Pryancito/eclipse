@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 eclipse-syscall = { path = "../../eclipse-syscall" }
-# eclipse-libc = { path = "../../eclipse-libc" } # Temporarily disabled
+eclipse-libc = { path = "../../eclipse-libc", default-features = false }
 
 [lib]
 name = "eclipse_std"

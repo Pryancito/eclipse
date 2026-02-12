@@ -1,0 +1,320 @@
+warning: unused import: `crate::flag::*`
+ --> /home/moebius/eclipse/eclipse-syscall/src/call.rs:5:5
+  |
+5 | use crate::flag::*;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse-syscall` (lib) generated 1 warning (run `cargo fix --lib -p eclipse-syscall` to apply 1 suggestion)
+warning: unused import: `crate::c_str::strlen`
+ --> /home/moebius/eclipse/eclipse-libc/src/header/stdlib/mod.rs:4:5
+  |
+4 | use crate::c_str::strlen;
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `time_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/time/mod.rs:4:10
+  |
+4 | pub type time_t = c_long;
+  |          ^^^^^^ help: convert the identifier to upper camel case: `TimeT`
+  |
+  = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `clock_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/time/mod.rs:5:10
+  |
+5 | pub type clock_t = c_long;
+  |          ^^^^^^^ help: convert the identifier to upper camel case: `ClockT`
+
+warning: type `sig_atomic_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:4:10
+  |
+4 | pub type sig_atomic_t = c_int;
+  |          ^^^^^^^^^^^^ help: convert the identifier to upper camel case: `SigAtomicT`
+
+warning: type `sighandler_t` should have an upper camel case name
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:31:10
+   |
+31 | pub type sighandler_t = extern "C" fn(...
+   |          ^^^^^^^^^^^^ help: convert the identifier to upper camel case: `SighandlerT`
+
+warning: type `sigset_t` should have an upper camel case name
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:82:10
+   |
+82 | pub type sigset_t = c_ulong;
+   |          ^^^^^^^^ help: convert the identifier to upper camel case: `SigsetT`
+
+warning: unused variable: `pathname`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:341:33
+    |
+341 | ... fn remove(pathname: *const c_char...
+    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pathname`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `oldpath`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:346:33
+    |
+346 | ... fn rename(oldpath: *const c_char,...
+    |               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_oldpath`
+
+warning: unused variable: `newpath`
+   --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:346:57
+    |
+346 | ...st c_char, newpath: *const c_char)...
+    |               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_newpath`
+
+warning: unused variable: `signum`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:86:5
+   |
+86 |     signum: c_int,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_signum`
+
+warning: unused variable: `act`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:87:5
+   |
+87 |     act: *const sigaction,
+   |     ^^^ help: if this is intentional, prefix it with an underscore: `_act`
+
+warning: unused variable: `oldact`
+  --> /home/moebius/eclipse/eclipse-libc/src/header/signal/mod.rs:88:5
+   |
+88 |     oldact: *mut sigaction,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oldact`
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:39:44
+   |
+39 | ...safe { &mut STDIN_STRUCT as *mut FI...
+   |           ^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+help: use `&raw mut` instead to create a raw pointer
+   |
+39 | pub static mut stdin: *mut FILE = unsafe { &raw mut STDIN_STRUCT as *mut FILE };
+   |                                             +++
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:42:45
+   |
+42 | ...safe { &mut STDOUT_STRUCT as *mut F...
+   |           ^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+   |
+42 | pub static mut stdout: *mut FILE = unsafe { &raw mut STDOUT_STRUCT as *mut FILE };
+   |                                              +++
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-libc/src/header/stdio/mod.rs:45:45
+   |
+45 | ...safe { &mut STDERR_STRUCT as *mut F...
+   |           ^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+   |
+45 | pub static mut stderr: *mut FILE = unsafe { &raw mut STDERR_STRUCT as *mut FILE };
+   |                                              +++
+
+warning: creating a mutable reference to mutable static
+ --> /home/moebius/eclipse/eclipse-libc/src/header/errno/mod.rs:9:5
+  |
+9 |     &mut ERRNO as *mut c_int
+  |     ^^^^^^^^^^ mutable reference to mutable static
+  |
+  = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+  = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+help: use `&raw mut` instead to create a raw pointer
+  |
+9 |     &raw mut ERRNO as *mut c_int
+  |      +++
+
+warning: `eclipse-libc` (lib) generated 16 warnings (run `cargo fix --lib -p eclipse-libc` to apply 7 suggestions)
+   Compiling eclipse_std v0.2.0 (/home/moebius/eclipse/eclipse-apps/eclipse_std)
+error[E0761]: file for module `io` found at both "src/io.rs" and "src/io/mod.rs"
+  --> src/lib.rs:25:1
+   |
+25 | pub mod io;
+   | ^^^^^^^^^^^
+   |
+   = help: delete or rename one of them to remove the ambiguity
+
+error[E0761]: file for module `sync` found at both "src/sync.rs" and "src/sync/mod.rs"
+  --> src/lib.rs:27:1
+   |
+27 | pub mod sync;
+   | ^^^^^^^^^^^^^
+   |
+   = help: delete or rename one of them to remove the ambiguity
+
+error[E0432]: unresolved imports `crate::macros::print`, `crate::macros::println`, `crate::macros::eprint`, `crate::macros::eprintln`
+   --> src/lib.rs:116:25
+    |
+116 | ...::{print, println, eprint, eprintln};
+    |       ^^^^^  ^^^^^^^  ^^^^^^  ^^^^^^^^ no `eprintln` in `macros`
+    |       |      |        |
+    |       |      |        no `eprint` in `macros`
+    |       |      no `println` in `macros`
+    |       no `print` in `macros`
+    |
+    = note: this could be because a macro annotated with `#[macro_export]` will be exported at the root of the crate instead of the module where it is defined
+help: a macro with this name exists at the root of the crate
+    |
+116 - pub use crate::macros::{print, println, eprint, eprintln};
+116 + pub use crate::{print, macros::{println, eprint, eprintln}};
+    |
+help: a macro with this name exists at the root of the crate
+    |
+116 - pub use crate::macros::{print, println, eprint, eprintln};
+116 + pub use crate::{println, macros::{print, eprint, eprintln}};
+    |
+help: a macro with this name exists at the root of the crate
+    |
+116 - pub use crate::macros::{print, println, eprint, eprintln};
+116 + pub use crate::{eprint, macros::{print, println, eprintln}};
+    |
+help: a macro with this name exists at the root of the crate
+    |
+116 - pub use crate::macros::{print, println, eprint, eprintln};
+116 + pub use crate::{eprintln, macros::{print, println, eprint}};
+    |
+
+error[E0425]: cannot find type `pthread_t` in this scope
+ --> src/thread/mod.rs:9:13
+  |
+9 |     handle: pthread_t,
+  |             ^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find type `pthread_t` in this scope
+  --> src/thread/mod.rs:62:25
+   |
+62 | ...ut handle: pthread_t = core::mem::z...
+   |               ^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find type `pthread_t` in this scope
+  --> src/thread/mod.rs:64:33
+   |
+64 | ...le as *mut pthread_t,
+   |               ^^^^^^^^^ not found in this scope
+
+error[E0422]: cannot find struct, variant or union type `timespec` in this scope
+  --> src/thread/mod.rs:99:18
+   |
+99 |         let ts = timespec {
+   |                  ^^^^^^^^ not found in this scope
+   |
+help: consider importing one of these structs
+   |
+ 3 + use crate::thread::header::time::timespec;
+   |
+ 3 + use eclipse_libc::header::time::timespec;
+   |
+
+error[E0425]: cannot find function `nanosleep` in this scope
+   --> src/thread/mod.rs:103:9
+    |
+103 |         nanosleep(&ts as *const times...
+    |         ^^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these functions
+    |
+  3 + use crate::thread::header::time::nanosleep;
+    |
+  3 + use crate::thread::platform::eclipse::syscall::call::nanosleep;
+    |
+  3 + use eclipse_libc::header::time::nanosleep;
+    |
+  3 + use eclipse_libc::platform::eclipse::syscall::call::nanosleep;
+    |
+    = and 1 other candidate
+
+error[E0425]: cannot find type `timespec` in this scope
+   --> src/thread/mod.rs:103:33
+    |
+103 | ... as *const timespec, ptr::null_mut...
+    |               ^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these structs
+    |
+  3 + use crate::thread::header::time::timespec;
+    |
+  3 + use eclipse_libc::header::time::timespec;
+    |
+
+error[E0659]: `alloc` is ambiguous
+  --> src/thread/mod.rs:5:5
+   |
+ 5 | use alloc::boxed::Box;
+   |     ^^^^^ ambiguous name
+   |
+   = note: ambiguous because of a conflict between a name from a glob import and an outer scope during import or macro resolution
+note: `alloc` could refer to the module imported here
+  --> src/thread/mod.rs:4:5
+   |
+ 4 | use eclipse_libc::*;
+   |     ^^^^^^^^^^^^^^^
+   = help: consider adding an explicit import of `alloc` to disambiguate
+   = help: or use `self::alloc` to refer to this module unambiguously
+note: `alloc` could also refer to the crate imported here
+  --> src/lib.rs:18:1
+   |
+18 | extern crate alloc;
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: use `::alloc` to refer to this crate unambiguously
+
+error[E0425]: cannot find function `pthread_create` in this scope
+  --> src/thread/mod.rs:63:22
+   |
+63 |         let result = pthread_create(
+   |                      ^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `pthread_join` in this scope
+  --> src/thread/mod.rs:85:26
+   |
+85 | ...result = pthread_join(self.thread.h...
+   |             ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `yield_cpu` in this scope
+   --> src/thread/mod.rs:110:9
+    |
+110 |         yield_cpu();
+    |         ^^^^^^^^^ not found in this scope
+
+error[E0308]: mismatched types
+  --> src/lib.rs:93:12
+   |
+93 | ...et Some(message) = info.message() {
+   |       ^^^^^^^^^^^^^   -------------- this expression has type `PanicMessage<'_>`
+   |       |
+   |       expected `PanicMessage<'_>`, found `Option<_>`
+   |
+   = note: expected struct `PanicMessage<'_>`
+                found enum `Option<_>`
+
+warning: unnecessary `unsafe` block
+  --> src/lib.rs:69:5
+   |
+69 |     unsafe {
+   |     ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src/lib.rs:110:5
+    |
+110 |     unsafe {
+    |     ^^^^^^ unnecessary `unsafe` block
+
+Some errors have detailed explanations: E0308, E0422, E0425, E0432, E0659, E0761.
+For more information about an error, try `rustc --explain E0308`.
+warning: `eclipse_std` (lib) generated 2 warnings
+error: could not compile `eclipse_std` (lib) due to 14 previous errors; 2 warnings emitted

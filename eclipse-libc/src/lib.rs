@@ -19,9 +19,24 @@ pub mod header {
 }
 
 pub use types::*;
-pub use header::unistd::spawn;
+pub use header::stdio::*;
+pub use header::stdlib::*;
+pub use header::string::*;
+pub use header::pthread::*;
+pub use header::unistd::*;
+pub use header::time::*;
+pub use header::errno::*;
+pub use header::signal::*;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "allocator"))]
 #[global_allocator]
 static ALLOCATOR: alloc::Allocator = alloc::Allocator;
+
+#[cfg(all(not(test), feature = "panic_handler"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe {
+        eclipse_syscall::call::exit(1);
+    }
+}
 

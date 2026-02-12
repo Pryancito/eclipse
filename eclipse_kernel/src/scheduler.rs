@@ -174,6 +174,7 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     
     // Perform raw context switch
     unsafe {
+        crate::process::set_current_process(Some(to_pid));
         crate::process::switch_context(from_ctx, &*to_ptr, next_cr3);
     }
 }

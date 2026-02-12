@@ -4,8 +4,8 @@
 
 use core::ptr;
 use eclipse_libc::*;
-use alloc::string::String;
-use alloc::vec::Vec;
+use ::alloc::string::String;
+use ::alloc::vec::Vec;
 
 pub use self::stdio::{stdin, stdout, stderr, Stdin, Stdout, Stderr};
 
@@ -93,96 +93,5 @@ pub trait Write {
     
     fn flush(&mut self) -> Result<()> {
         Ok(())
-    }
-}
-
-/// File handle wrapping eclipse-libc FILE*
-pub struct File {
-    ptr: *mut FILE,
-    path: String,
-}
-
-impl File {
-    /// Open a file for reading
-    pub fn open(path: &str) -> Result<Self> {
-        let mut c_path = Vec::from(path.as_bytes());
-        c_path.push(0);
-        
-        let mode = b"r\0";
-        
-        unsafe {
-            let ptr = fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
-            if ptr.is_null() {
-                return Err(Error::new(ErrorKind::NotFound));
-            }
-            
-            Ok(File {
-                ptr,
-                path: String::from(path),
-            })
-        }
-    }
-    
-    /// Create a file for writing
-    pub fn create(path: &str) -> Result<Self> {
-        let mut c_path = Vec::from(path.as_bytes());
-        c_path.push(0);
-        
-        let mode = b"w\0";
-        
-        unsafe {
-            let ptr = fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
-            if ptr.is_null() {
-                return Err(Error::new(ErrorKind::PermissionDenied));
-            }
-            
-            Ok(File {
-                ptr,
-                path: String::from(path),
-            })
-        }
-    }
-}
-
-impl Read for File {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        unsafe {
-            let n = fread(
-                buf.as_mut_ptr() as *mut c_void,
-                1,
-                buf.len(),
-                self.ptr
-            );
-            Ok(n)
-        }
-    }
-}
-
-impl Write for File {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        unsafe {
-            let n = fwrite(
-                buf.as_ptr() as *const c_void,
-                1,
-                buf.len(),
-                self.ptr
-            );
-            Ok(n)
-        }
-    }
-    
-    fn flush(&mut self) -> Result<()> {
-        unsafe {
-            fflush(self.ptr);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for File {
-    fn drop(&mut self) {
-        unsafe {
-            fclose(self.ptr);
-        }
     }
 }

@@ -295,78 +295,73 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     stats.exceptions += 1;
     drop(stats);
     
-    crate::serial::serial_print("\n!!! EXCEPTION: ");
-    crate::serial::serial_print_dec(context.num);
-    crate::serial::serial_print(" Error: ");
-    crate::serial::serial_print_hex(context.error_code);
-    crate::serial::serial_print(" RIP: ");
-    crate::serial::serial_print_hex(context.rip);
-    crate::serial::serial_print(" !!!\n");
-    
-    // Dump all registers
-    crate::serial::serial_print("  RAX: "); crate::serial::serial_print_hex(context.rax);
-    crate::serial::serial_print(" RBX: "); crate::serial::serial_print_hex(context.rbx);
-    crate::serial::serial_print(" RCX: "); crate::serial::serial_print_hex(context.rcx);
-    crate::serial::serial_print(" RDX: "); crate::serial::serial_print_hex(context.rdx);
-    crate::serial::serial_print("\n");
-    crate::serial::serial_print("  RSI: "); crate::serial::serial_print_hex(context.rsi);
-    crate::serial::serial_print(" RDI: "); crate::serial::serial_print_hex(context.rdi);
-    crate::serial::serial_print(" RBP: "); crate::serial::serial_print_hex(context.rbp);
-    crate::serial::serial_print(" RSP: "); crate::serial::serial_print_hex(context.rsp);
-    crate::serial::serial_print("\n");
-    crate::serial::serial_print("  R8:  "); crate::serial::serial_print_hex(context.r8);
-    crate::serial::serial_print(" R9:  "); crate::serial::serial_print_hex(context.r9);
-    crate::serial::serial_print(" R10: "); crate::serial::serial_print_hex(context.r10);
-    crate::serial::serial_print(" R11: "); crate::serial::serial_print_hex(context.r11);
-    crate::serial::serial_print("\n");
-    crate::serial::serial_print("  R12: "); crate::serial::serial_print_hex(context.r12);
-    crate::serial::serial_print(" R13: "); crate::serial::serial_print_hex(context.r13);
-    crate::serial::serial_print(" R14: "); crate::serial::serial_print_hex(context.r14);
-    crate::serial::serial_print(" R15: "); crate::serial::serial_print_hex(context.r15);
-    crate::serial::serial_print("\n");
-    crate::serial::serial_print("  RFL: "); crate::serial::serial_print_hex(context.rflags);
-    crate::serial::serial_print(" CS:  "); crate::serial::serial_print_hex(context.cs);
-    crate::serial::serial_print(" SS:  "); crate::serial::serial_print_hex(context.ss);
-    crate::serial::serial_print("\n");
-    
     let cr3: u64;
     let cr2: u64;
     unsafe { 
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); 
         core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); 
     }
-    crate::serial::serial_print("  Active CR3: ");
-    crate::serial::serial_print_hex(cr3);
-    crate::serial::serial_print(" CR2: ");
-    crate::serial::serial_print_hex(cr2);
-    
-    if let Some(pid) = crate::process::current_process_id() {
-        crate::serial::serial_print(" PID: ");
-        crate::serial::serial_print_dec(pid as u64);
-    }
-    crate::serial::serial_print("\n");
+
+    let cpu_id = crate::process::get_cpu_id();
+    let pid = crate::process::current_process_id().unwrap_or(0);
+
+    let num = context.num;
+    let err = context.error_code;
+    let rip = context.rip;
+    let rax = context.rax;
+    let rbx = context.rbx;
+    let rcx = context.rcx;
+    let rdx = context.rdx;
+    let rsi = context.rsi;
+    let rdi = context.rdi;
+    let rbp = context.rbp;
+    let rsp = context.rsp;
+    let r8  = context.r8;
+    let r9  = context.r9;
+    let r10 = context.r10;
+    let r11 = context.r11;
+    let r12 = context.r12;
+    let r13 = context.r13;
+    let r14 = context.r14;
+    let r15 = context.r15;
+    let rfl = context.rflags;
+    let cs  = context.cs;
+    let ss  = context.ss;
+
+    crate::serial::serial_printf(format_args!(
+        "\n!!! EXCEPTION: {} Error: {:#018x} RIP: {:#018x} !!!\n\
+         CPU: {} PID: {} Active CR3: {:#018x} CR2: {:#018x}\n\
+         RAX: {:#018x} RBX: {:#018x} RCX: {:#018x} RDX: {:#018x}\n\
+         RSI: {:#018x} RDI: {:#018x} RBP: {:#018x} RSP: {:#018x}\n\
+         R8:  {:#018x} R9:  {:#018x} R10: {:#018x} R11: {:#018x}\n\
+         R12: {:#018x} R13: {:#018x} R14: {:#018x} R15: {:#018x}\n\
+         RFL: {:#018x} CS:  {:#018x} SS:  {:#018x}\n",
+        num, err, rip,
+        cpu_id, pid, cr3, cr2,
+        rax, rbx, rcx, rdx,
+        rsi, rdi, rbp, rsp,
+        r8,  r9,  r10, r11,
+        r12, r13, r14, r15,
+        rfl, cs, ss
+    ));
     
     // Stack dump (first 64 bytes)
-    crate::serial::serial_print("  Stack Dump at ");
-    crate::serial::serial_print_hex(context.rsp);
-    crate::serial::serial_print(":\n");
-    unsafe {
-        let stack_ptr = context.rsp as *const u64;
-        for i in 0..8 {
-            // Check if stack_ptr is in a safe range (simple heuristic)
-            if context.rsp >= 0xFFFF800000000000 {
+    if rsp >= 0xFFFF800000000000 || (rsp < 0x0000800000000000 && rsp > 0) {
+        crate::serial::serial_printf(format_args!("  Stack Dump at {:#018x}:\n", rsp));
+        unsafe {
+            let stack_ptr = rsp as *const u64;
+            for i in 0..8 {
+                // Try to prevent crash during dump if RSP is totally invalid
+                // This is a very basic check.
                 let val = core::ptr::read_volatile(stack_ptr.add(i));
-                crate::serial::serial_print("    [+");
-                crate::serial::serial_print_dec((i * 8) as u64);
-                crate::serial::serial_print("]: ");
-                crate::serial::serial_print_hex(val);
-                crate::serial::serial_print("\n");
+                crate::serial::serial_printf(format_args!("    [+{:#02x}]: {:#018x}\n", i * 8, val));
             }
         }
     }
     
+    if num == 3 { return; } // Breakpoint: return to let common_handler continue
+    
     loop { 
-        if context.num == 3 { return; } // Breakpoint
         unsafe { asm!("hlt") } 
     }
 }
