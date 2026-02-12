@@ -79,6 +79,8 @@ pub struct Process {
     pub page_table_phys: u64,          // Physical address of the PML4
     pub vmas: alloc::vec::Vec<VMARegion>, // Memory mappings
     pub brk_current: u64,                  // Current program break (heap end)
+    pub fs_base: u64,                     // TLS base (FS_BASE)
+    pub gs_base: u64,                     // Kernel/User swap GS base
 }
 
 impl Process {
@@ -96,6 +98,8 @@ impl Process {
             page_table_phys: 0,
             vmas: alloc::vec::Vec::new(),
             brk_current: 0,
+            fs_base: 0,
+            gs_base: 0,
         }
     }
 }
@@ -104,7 +108,32 @@ impl Process {
 const MAX_PROCESSES: usize = 64;
 pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
-static CURRENT_PROCESS: Mutex<Option<ProcessId>> = Mutex::new(None);
+
+/// Máximo número de CPUs soportadas
+const MAX_CPUS: usize = 16;
+/// Proceso actual por cada CPU
+static CURRENT_PROCESS: Mutex<[Option<ProcessId>; MAX_CPUS]> = Mutex::new([None; MAX_CPUS]);
+
+/// Obtener ID de la CPU actual (usando Local APIC ID vía CPUID)
+pub fn get_cpu_id() -> usize {
+    let cpuid_ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) cpuid_ebx,
+            inout("eax") 1 => _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, preserves_flags)
+        );
+    }
+    // Initial Local APIC ID is in EBX bits 24-31
+    let apic_id = (cpuid_ebx >> 24) as usize;
+    apic_id % MAX_CPUS
+}
 
 pub fn next_pid() -> ProcessId {
     let mut next_pid = NEXT_PID.lock();
@@ -146,8 +175,8 @@ pub fn init_kernel_process() {
     // Insertar en la tabla (slot 0)
     table[0] = Some(process);
     
-    // Establecer como actual
-    *CURRENT_PROCESS.lock() = Some(0);
+    // Establecer como actual en la CPU que inicializa
+    CURRENT_PROCESS.lock()[get_cpu_id()] = Some(0);
 }
 
 /// Crear un nuevo proceso (bajo nivel)
@@ -238,12 +267,12 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
 
 /// Obtener proceso actual
 pub fn current_process_id() -> Option<ProcessId> {
-    *CURRENT_PROCESS.lock()
+    CURRENT_PROCESS.lock()[get_cpu_id()]
 }
 
 /// Establecer proceso actual
 pub fn set_current_process(pid: Option<ProcessId>) {
-    *CURRENT_PROCESS.lock() = pid;
+    CURRENT_PROCESS.lock()[get_cpu_id()] = pid;
 }
 
 /// Obtener proceso por ID

@@ -108,6 +108,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 /// Entry point in Higher Half with clean stack
 extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
+    let cpu_id = crate::process::get_cpu_id();
+    serial::serial_printf(format_args!("\n\n!!! KERNEL BOOT START v3 !!! CPU ID: {} (Raw APIC info in get_cpu_id)\n\n", cpu_id));
     // Stage 1: Initialize BootInfo in centralized storage
     boot::init(boot_info_ptr);
     let boot_info = boot::get_boot_info();

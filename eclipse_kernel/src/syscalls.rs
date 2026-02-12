@@ -116,17 +116,10 @@ pub extern "C" fn syscall_handler(
         r14: context.r14,
         r15: context.r15,
     };
-
+    
     let mut stats = SYSCALL_STATS.lock();
     stats.total_calls += 1;
     drop(stats);
-    
-    // DEBUG: Trace all syscalls
-    // Limit verbosity - maybe only print specific ones or all for now
-    // DEBUG: Trace all syscalls
-    // crate::serial::serial_print("SYSCALL: ");
-    // crate::serial::serial_print_dec(syscall_num);
-    // crate::serial::serial_print("\n");
 
     let ret = match syscall_num {
         0 => sys_exit(arg1),
@@ -161,9 +154,12 @@ pub extern "C" fn syscall_handler(
         29 => sys_mount(),
         30 => sys_fstat(arg1, arg2),
         31 => sys_spawn(arg1, arg2),
+        32 => sys_arch_prctl(arg1, arg2),
         _ => {
-            serial::serial_print("Unknown syscall: ");
-            serial::serial_print_hex(syscall_num);
+            serial::serial_print("[SYSCALL] Unknown syscall: ");
+            serial::serial_print_dec(syscall_num);
+            serial::serial_print(" on CPU ");
+            serial::serial_print_dec(crate::process::get_cpu_id() as u64);
             serial::serial_print("\n");
             u64::MAX
         }
@@ -1256,134 +1252,78 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         return u64::MAX;
     }
     
-    let is_anonymous = (flags & MAP_ANONYMOUS) != 0;
-    let is_file_backed = !is_anonymous;
-    
-    // 2. Map pages
-    // We need the process's page table physical address
-    let page_table_phys = process::get_process_page_table(Some(current_pid));
-    
-    // Calculate page table flags
-    let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT 
-                     | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
-                     
-    if (prot & PROT_WRITE) != 0 {
-        pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
-    }
-    if (prot & PROT_EXEC) == 0 {
-        pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
-    }
+    // 3. Record VMA and update process once at the end
+    if let Some(mut proc) = process::get_process(current_pid) {
+        let is_anonymous = (flags & MAP_ANONYMOUS) != 0;
+        let is_file_backed = !is_anonymous;
+        
+        let page_table_phys = proc.page_table_phys;
+        
+        // Calculate page table flags
+        let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT 
+                         | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+                         
+        if (prot & PROT_WRITE) != 0 {
+            pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+        }
+        if (prot & PROT_EXEC) == 0 {
+            pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+        }
 
-    if is_file_backed {
-        // EAGER LOADING for file-backed mapping
-        // 1. Read file content
-        // 2. Allocate pages
-        // 3. Copy content
-        // 4. Map pages
-        
-        // Get file size and content
-        // We'll use the existing read_file_by_inode_at functionality via schemes
-        // But we need to go through the FD to get the inode
-        
-        if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
-            
-            // To emulate read_at, we need to:
-            // 1. Save current offset (lseek CUR 0)
-            // 2. Seek to desired offset
-            // 3. Read
-            // 4. Restore offset
-            // Note: This is not atomic with respect to other threads sharing the FD, 
-            // but for now it's the best we can do without scheme read_at support.
-            
-            // 1. Save current offset
-            // SEEK_CUR = 1
-            let old_offset = match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, 0, 1) {
-                Ok(off) => off as u64,
-                Err(_) => 0, // Assume 0 if lseek fails or not supported (unlikely for file)
-            };
-            
-            for i in 0..num_pages {
-                let page_offset = i * 4096;
-                let file_offset = 0 + page_offset; // Assuming offset 0 for now in mmap arg (todo: add offset arg)
-                
-                // Allocate a physical frame
-                let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
-                    Some(res) => res,
-                    None => return u64::MAX, // OOM
+        if is_file_backed {
+            if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
+                // Save current offset
+                let old_offset = match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, 0, 1) {
+                    Ok(off) => off as u64,
+                    Err(_) => 0,
                 };
                 
-                // Zero the frame first
-                unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
-                
-                // 2. Seek to chunk offset
-                // SEEK_SET = 0
-                let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, file_offset as isize, 0);
-                
-                // 3. Read from file into this frame
-                // We create a slice from the frame_ptr to read into
-                let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, 4096) };
-                
-                match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
-                    Ok(bytes_read) => {
-                        // DIAGNOSTIC: For first page, verify ELF magic
-                        if i == 0 && bytes_read >= 4 {
-                            serial::serial_print("[SYSCALL] mmap: First 4 bytes: ");
-                            for j in 0..4 {
-                                serial::serial_print_hex(frame_slice[j] as u64);
-                                serial::serial_print(" ");
-                            }
-                            serial::serial_print("\n");
+                for i in 0..num_pages {
+                    let page_offset = i * 4096;
+                    let file_offset = 0 + page_offset;
+                    
+                    let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
+                        Some(res) => res,
+                        None => return u64::MAX,
+                    };
+                    
+                    unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                    let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, file_offset as isize, 0);
+                    let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, 4096) };
+                    
+                    match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
+                        Ok(bytes_read) => {
+                            let vaddr = target_addr + page_offset;
+                            memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
+                        },
+                        Err(_) => {
+                            unsafe { memory::free_dma_buffer(frame_ptr, 4096, 4096) };
+                            return u64::MAX;
                         }
-                        
-                        // Map the frame to user space
-                        let vaddr = target_addr + page_offset;
-                        memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
-                    },
-                    Err(_) => {
-                        // Failed to read, free frame and abort?
-                        // For now just map zeros or partial
-                        unsafe { memory::free_dma_buffer(frame_ptr, 4096, 4096) };
-                        return u64::MAX;
                     }
                 }
+                let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
+            } else {
+                return u64::MAX;
             }
-            
-            // 4. Restore offset
-            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
-            
         } else {
-             serial::serial_print("[SYSCALL] mmap: invalid FD for file-backed mapping\n");
-             return u64::MAX;
+            // Anonymous mapping...
+            for i in 0..num_pages {
+                let page_offset = i * 4096;
+                let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
+                    Some(res) => res,
+                    None => return u64::MAX,
+                };
+                unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                let vaddr = target_addr + page_offset;
+                memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
+            }
         }
 
-    } else {
-        // ANONYMOUS MAPPING
-        // Just allocate zeroed pages
-        
-        for i in 0..num_pages {
-            let page_offset = i * 4096;
-            
-            // Allocate physical frame
-            let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
-                Some(res) => res,
-                None => return u64::MAX,
-            };
-            
-            // Zero it
-            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
-            
-            // Map it
-            let vaddr = target_addr + page_offset;
-            memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
-        }
-    }
-    
-    // 3. Record VMA in process
-    if let Some(mut proc) = process::get_process(current_pid) {
         let vma = VMARegion {
             start: target_addr,
             end: target_addr + aligned_length,
-            flags: flags, // Store original flags
+            flags: flags,
             file_backed: is_file_backed,
         };
         proc.vmas.push(vma);
@@ -1631,4 +1571,52 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
 /// Inicializar sistema de syscalls
 pub fn init() {
     serial::serial_print("Syscall system initialized\n");
+}
+
+/// sys_arch_prctl - Architecture-specific process control (Syscall 32)
+fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+
+    let pid = match crate::process::current_process_id() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+
+    match code {
+        ARCH_SET_FS => {
+            serial::serial_print("[SYSCALL] arch_prctl: ARCH_SET_FS to ");
+            serial::serial_print_hex(addr);
+            serial::serial_print("\n");
+            
+            // Validate address (canonical, user-space)
+            if addr > 0x0000_7FFF_FFFF_F000 {
+                return u64::MAX;
+            }
+
+            // Update process struct
+            if let Some(mut proc) = crate::process::get_process(pid) {
+                proc.fs_base = addr;
+                crate::process::update_process(pid, proc);
+            }
+
+            // Apply immediately to current CPU
+            unsafe {
+                use core::arch::asm;
+                let msr_fs_base = 0xC0000100u32;
+                let low = addr as u32;
+                let high = (addr >> 32) as u32;
+                asm!("wrmsr", in("ecx") msr_fs_base, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags));
+            }
+            0
+        },
+        _ => {
+            serial::serial_print("[SYSCALL] arch_prctl: Unsupported code ");
+            serial::serial_print_hex(code);
+            serial::serial_print("\n");
+            u64::MAX
+        }
+    }
 }

@@ -354,6 +354,7 @@ pub fn create_process_paging() -> u64 {
 /// Clone an existing process's page table (deep copy of user-space mappings)
 /// Returns the physical address of the child's PML4
 pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
+    crate::serial::serial_printf(format_args!("[Paging] Cloning Address Space: Parent CR3={:#x}\n", parent_pml4_phys));
     // 1. Create new skeleton page table (Copies Kernel Mappings)
     let child_pml4_phys = create_process_paging();
     
@@ -362,13 +363,16 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
         let c_pml4 = &mut *(phys_to_virt(child_pml4_phys) as *mut PageTable);
         
         // We focus on PML4[0] (Identity/User Map)
-        // If it is present, we must Deep Copy the USER portions.
         if p_pml4.entries[0].present() {
             // Allocate NEW PDPT
-            let mut new_pdpt = alloc::boxed::Box::new(PageTable::new());
+            let (new_pdpt_ptr, new_pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
+            core::ptr::write_bytes(new_pdpt_ptr, 0, 4096);
+            let new_pdpt = &mut *(new_pdpt_ptr as *mut PageTable);
+            
             let p_pdpt_phys = p_pml4.entries[0].get_addr();
             let p_pdpt = &*(phys_to_virt(p_pdpt_phys) as *const PageTable);
             
+            let mut pd_cloned = 0;
             for i in 0..512 {
                 if !p_pdpt.entries[i].present() { continue; }
                 
@@ -377,7 +381,10 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                 
                 if is_user {
                     // Allocate NEW PD
-                    let mut new_pd = alloc::boxed::Box::new(PageTable::new());
+                    let (new_pd_ptr, new_pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
+                    core::ptr::write_bytes(new_pd_ptr, 0, 4096);
+                    let new_pd = &mut *(new_pd_ptr as *mut PageTable);
+                    
                     let p_pd_phys = p_pdpt.entries[i].get_addr();
                     let p_pd = &*(phys_to_virt(p_pd_phys) as *const PageTable);
                     
@@ -396,12 +403,14 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                     core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 2 * 1024 * 1024);
                                     new_pd.entries[j].set_addr(new_frame_phys, pd_flags.bits());
                                 } else {
-                                    // Fallback: Share (Dangerous)
                                     new_pd.entries[j] = p_pd.entries[j].clone();
                                 }
                             } else {
                                 // Standard 4KB Page Table Deep Copy
-                                let mut new_pt = alloc::boxed::Box::new(PageTable::new());
+                                let (new_pt_ptr, new_pt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PT");
+                                core::ptr::write_bytes(new_pt_ptr, 0, 4096);
+                                let new_pt = &mut *(new_pt_ptr as *mut PageTable);
+                                
                                 let p_pt_phys = p_pd.entries[j].get_addr();
                                 let p_pt = &*(phys_to_virt(p_pt_phys) as *const PageTable);
                                 
@@ -414,34 +423,32 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                         let p_frame_phys = p_pt.entries[k].get_addr();
                                         let p_frame_virt = phys_to_virt(p_frame_phys) as *const u8;
                                         core::ptr::copy_nonoverlapping(p_frame_virt, new_frame_ptr, 4096);
-                                        new_pt.entries[k].set_addr(new_frame_phys, pt_flags.bits());
+                                        new_pt.entries[k].set_addr(new_frame_phys, (pt_flags | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
                                     } else {
                                         new_pt.entries[k] = p_pt.entries[k].clone();
                                     }
                                 }
                                 
-                                let new_pt_phys = virt_to_phys(alloc::boxed::Box::into_raw(new_pt) as u64);
                                 new_pd.entries[j].set_addr(new_pt_phys, pd_flags.bits());
                             }
+                            pd_cloned += 1;
                         } else {
-                            // Kernel Page or not present - Share
                             new_pd.entries[j] = p_pd.entries[j].clone();
                         }
                     }
                     
-                    let new_pd_phys = virt_to_phys(alloc::boxed::Box::into_raw(new_pd) as u64);
                     new_pdpt.entries[i].set_addr(new_pd_phys, flags.bits());
                 } else {
-                    // Kernel Mapping - Share
                     new_pdpt.entries[i] = p_pdpt.entries[i].clone();
                 }
             }
             
-            let new_pdpt_phys = virt_to_phys(alloc::boxed::Box::into_raw(new_pdpt) as u64);
-            c_pml4.entries[0].set_addr(new_pdpt_phys, p_pml4.entries[0].get_flags() | 0x4); // USER bit just in case
+            c_pml4.entries[0].set_addr(new_pdpt_phys, (x86_64::structures::paging::PageTableFlags::from_bits_truncate(p_pml4.entries[0].get_flags()) | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
+            crate::serial::serial_printf(format_args!("[Paging] Cloned {} PD entries into User PDPT\n", pd_cloned));
         }
     }
 
+    crate::serial::serial_printf(format_args!("[Paging] Cloning Complete: Child CR3={:#x}\n", child_pml4_phys));
     child_pml4_phys
 }
 

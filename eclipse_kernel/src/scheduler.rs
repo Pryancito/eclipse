@@ -101,13 +101,12 @@ pub fn schedule() {
                         perform_context_switch(current_pid, next_pid);
                     }
                 } else {
+                    crate::serial::serial_printf(format_args!("[Sched] Core {} picking first process PID {}\n", 
+                        crate::process::get_cpu_id(), next_pid));
                     set_current_process(Some(next_pid));
                     // Initial switch to first process if none was running
                     // We need a dummy context to switch from
                     let mut dummy = crate::process::Context::new();
-                    crate::serial::serial_print("SCHED: Initial switch to PID ");
-                    crate::serial::serial_print_dec(next_pid as u64);
-                    crate::serial::serial_print("\n");
                     perform_context_switch_to(&mut dummy, next_pid);
                 }
             }
@@ -135,18 +134,32 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
 }
 
 fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: ProcessId) {
-    let (to_ptr, to_kernel_stack, to_page_table) = {
+    let (to_ptr, to_kernel_stack, to_page_table, to_fs_base) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let to_process = table[to_pid as usize].as_mut().expect("To process not found");
         (
             &to_process.context as *const crate::process::Context,
             to_process.kernel_stack_top,
-            to_process.page_table_phys
+            to_process.page_table_phys,
+            to_process.fs_base
         )
     };
     
     // Update TSS RSP0
     crate::boot::set_tss_stack(to_kernel_stack);
+    
+    // Save current FS_BASE to from_ctx (optional, if we want to support user-mode changes being persisted)
+    // Actually, we should probably save it back to the Process struct, but switch_context takes from_ctx.
+    // Let's just restore the new one.
+    unsafe {
+        use core::arch::asm;
+        let msr_fs_base = 0xC0000100u32;
+        
+        // Load new FS_BASE
+        let low = to_fs_base as u32;
+        let high = (to_fs_base >> 32) as u32;
+        asm!("wrmsr", in("ecx") msr_fs_base, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags));
+    }
     
     // Switch address space if necessary
     // The kernel is mapped identically in all address spaces, so CR3 switching is safe

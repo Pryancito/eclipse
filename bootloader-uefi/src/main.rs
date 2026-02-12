@@ -108,6 +108,12 @@ fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
     for p in candidates.iter() {
         if let Ok(file) = root.open(p, FileMode::Read, FileAttribute::empty()) {
             if let Some(reg) = file.into_regular_file() {
+                unsafe {
+                    serial_write_str("BL: Encontrado kernel en path: ");
+                    // We can't easily print cstr16 to serial_write_str without conversion
+                    // but we can at least signal it found one.
+                    serial_write_str("CANDIDATO\r\n");
+                }
                 return Ok(reg);
             }
         }

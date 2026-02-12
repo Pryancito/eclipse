@@ -29,6 +29,8 @@ const SERIAL_PORT: u16 = 0x3F8; // COM1
 
 /// Estado del puerto serial
 static SERIAL_INITIALIZED: Mutex<bool> = Mutex::new(false);
+/// Lock para acceso al hardware del puerto serial (multicore stability)
+static SERIAL_PORT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Inicializar el puerto serial
 pub fn init() {
@@ -157,6 +159,7 @@ fn write_byte(byte: u8) {
 /// Escribir una cadena al puerto serial
 pub fn serial_print(s: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = SERIAL_PORT_LOCK.lock();
         if !*SERIAL_INITIALIZED.lock() {
             return;
         }
@@ -167,13 +170,44 @@ pub fn serial_print(s: &str) {
     });
 }
 
-/// Writer struct for formatted output support
+/// Writer para fmt::Write que usa el puerto serial con lock sincronizado
 pub struct SerialWriter;
 
 impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial_print(s);
         Ok(())
+    }
+}
+
+/// Imprimir con formato de forma sincronizada y atómica
+pub fn serial_printf(args: core::fmt::Arguments) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = SERIAL_PORT_LOCK.lock();
+        if !*SERIAL_INITIALIZED.lock() {
+            return;
+        }
+        let mut writer = RawSerialWriter;
+        let _ = core::fmt::write(&mut writer, args);
+    });
+}
+
+struct RawSerialWriter;
+impl core::fmt::Write for RawSerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.bytes() {
+            write_byte_internal(byte);
+        }
+        Ok(())
+    }
+}
+
+fn write_byte_internal(byte: u8) {
+    while !is_transmit_empty() {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        outb(SERIAL_PORT, byte);
     }
 }
 
