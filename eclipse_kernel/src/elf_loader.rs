@@ -431,9 +431,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
         loop { core::arch::asm!("hlt"); }
     }
     
-    // System V ABI x86-64 requires:
-    // - RSP must be 16-byte aligned before a call (i.e., (RSP+8) is 16-byte aligned at function entry)
-    // - Stack layout at program start:
+    // System V ABI x86-64 stack alignment requirements:
+    // - At program entry: RSP must be 16-byte aligned (RSP & 0xF == 0)
+    // - Before CALL instruction: Stack arranged so (RSP+8) is 16-byte aligned
+    //   (because CALL pushes return address, making RSP misaligned after)
+    //
+    // We're at program entry (not a function call), so RSP should be 16-byte aligned.
+    // Stack layout at program start:
     //   [RSP+0]  = argc
     //   [RSP+8]  = argv[0] (or NULL if no args)
     //   [RSP+16] = argv[1] (or NULL as terminator)
@@ -443,11 +447,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     //   ...
     
     // For argc=0, we need 3 quadwords: argc, argv[0]=NULL, envp[0]=NULL
-    // System V ABI x86-64 requires RSP to be 16-byte aligned at program start.
-    // Note: When calling a function, (RSP+8) must be 16-byte aligned (i.e., RSP & 0xF == 8),
-    // but at program entry point (not a function call), RSP itself should be 16-byte aligned.
-    
-    let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords for argc, argv[0], envp[0], 16-byte aligned
+    let adjusted_stack = (stack_top - 24) & !0xF; // 3 quadwords, 16-byte aligned
     
     // Write argc/argv/envp to user stack at the location where RSP will be
     // IMPORTANT: We can access user memory here because CR3 is set to user process's page table
