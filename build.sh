@@ -1652,9 +1652,9 @@ build_eclipsefs_cli() {
             print_status "eclipsefs CLI generado: $cli_path ($cli_size)"
         fi
     else
-        print_error "Error al compilar eclipsefs-cli"
+        print_error "Error al compilar eclipsefs-cli (saltando, es opcional)"
         cd ..
-        return 1
+        return 0
     fi
     
     cd ..
