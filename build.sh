@@ -290,7 +290,8 @@ build_userspace_services() {
     print_status "Verificando rust-src component..."
     rustup component add rust-src --toolchain nightly 2>/dev/null || true
     
-    # Lista de servicios a compilar (en orden de inicio)
+    # Lista de servicios a compilar (debe coincidir con el orden en eclipse_kernel/src/binaries.rs)
+    # NOTA: Si agregas/quitas servicios, actualiza también binaries.rs y syscalls.rs (sys_get_service_binary)
     local SERVICES="log_service devfs_service filesystem_service input_service display_service audio_service network_service gui_service"
     
     for service in $SERVICES; do
@@ -1652,7 +1653,7 @@ build_eclipsefs_cli() {
             print_status "eclipsefs CLI generado: $cli_path ($cli_size)"
         fi
     else
-        print_error "Error al compilar eclipsefs-cli (saltando, es opcional)"
+        print_warning "Compilación de eclipsefs-cli falló (componente opcional, continuando)"
         cd ..
         return 0
     fi
