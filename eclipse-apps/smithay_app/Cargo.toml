@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { path = "../../eclipse_kernel/userspace/libc" }
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
 
 [[bin]]
 name = "smithay_app"

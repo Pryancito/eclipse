@@ -1,0 +1,119 @@
+
+target/x86_64-unknown-none/release/eclipse_kernel:     formato del fichero elf64-x86-64
+
+
+Desensamblado de la sección .ltext._RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to:
+
+ffff80000020cbb6 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to>:
+ffff80000020cbb6:	41 57                	push   %r15
+ffff80000020cbb8:	41 56                	push   %r14
+ffff80000020cbba:	41 54                	push   %r12
+ffff80000020cbbc:	53                   	push   %rbx
+ffff80000020cbbd:	50                   	push   %rax
+ffff80000020cbbe:	48 89 fb             	mov    %rdi,%rbx
+ffff80000020cbc1:	49 be 10 5f 3e 00 00 	movabs $0xffff8000003e5f10,%r14
+ffff80000020cbc8:	80 ff ff 
+ffff80000020cbcb:	b1 01                	mov    $0x1,%cl
+ffff80000020cbcd:	31 c0                	xor    %eax,%eax
+ffff80000020cbcf:	f0 41 0f b0 0e       	lock cmpxchg %cl,(%r14)
+ffff80000020cbd4:	74 0d                	je     ffff80000020cbe3 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x2d>
+ffff80000020cbd6:	eb 02                	jmp    ffff80000020cbda <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x24>
+ffff80000020cbd8:	f3 90                	pause
+ffff80000020cbda:	41 8a 06             	mov    (%r14),%al
+ffff80000020cbdd:	84 c0                	test   %al,%al
+ffff80000020cbdf:	74 ec                	je     ffff80000020cbcd <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x17>
+ffff80000020cbe1:	eb f5                	jmp    ffff80000020cbd8 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x22>
+ffff80000020cbe3:	89 f7                	mov    %esi,%edi
+ffff80000020cbe5:	83 fe 3f             	cmp    $0x3f,%esi
+ffff80000020cbe8:	0f 87 44 01 00 00    	ja     ffff80000020cd32 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x17c>
+ffff80000020cbee:	4c 69 ff e8 00 00 00 	imul   $0xe8,%rdi,%r15
+ffff80000020cbf5:	48 b8 18 5f 3e 00 00 	movabs $0xffff8000003e5f18,%rax
+ffff80000020cbfc:	80 ff ff 
+ffff80000020cbff:	49 8d 3c 07          	lea    (%r15,%rax,1),%rdi
+ffff80000020cc03:	45 31 e4             	xor    %r12d,%r12d
+ffff80000020cc06:	4d 3b 24 07          	cmp    (%r15,%rax,1),%r12
+ffff80000020cc0a:	49 0f 40 fc          	cmovo  %r12,%rdi
+ffff80000020cc0e:	48 be e8 4b 30 00 00 	movabs $0xffff800000304be8,%rsi
+ffff80000020cc15:	80 ff ff 
+ffff80000020cc18:	48 b9 00 4c 30 00 00 	movabs $0xffff800000304c00,%rcx
+ffff80000020cc1f:	80 ff ff 
+ffff80000020cc22:	48 b8 1a 1f 20 00 00 	movabs $0xffff800000201f1a,%rax
+ffff80000020cc29:	80 ff ff 
+ffff80000020cc2c:	6a 14                	push   $0x14
+ffff80000020cc2e:	5a                   	pop    %rdx
+ffff80000020cc2f:	ff d0                	call   *%rax
+ffff80000020cc31:	48 be 38 5f 3e 00 00 	movabs $0xffff8000003e5f38,%rsi
+ffff80000020cc38:	80 ff ff 
+ffff80000020cc3b:	4c 01 fe             	add    %r15,%rsi
+ffff80000020cc3e:	48 b8 d8 5f 3e 00 00 	movabs $0xffff8000003e5fd8,%rax
+ffff80000020cc45:	80 ff ff 
+ffff80000020cc48:	49 8b 04 07          	mov    (%r15,%rax,1),%rax
+ffff80000020cc4c:	48 b9 e0 5f 3e 00 00 	movabs $0xffff8000003e5fe0,%rcx
+ffff80000020cc53:	80 ff ff 
+ffff80000020cc56:	49 8b 14 0f          	mov    (%r15,%rcx,1),%rdx
+ffff80000020cc5a:	41 c6 06 00          	movb   $0x0,(%r14)
+ffff80000020cc5e:	48 b9 e4 51 3e 00 00 	movabs $0xffff8000003e51e4,%rcx
+ffff80000020cc65:	80 ff ff 
+ffff80000020cc68:	48 89 01             	mov    %rax,(%rcx)
+ffff80000020cc6b:	0f 20 d8             	mov    %cr3,%rax
+ffff80000020cc6e:	48 39 c2             	cmp    %rax,%rdx
+ffff80000020cc71:	49 0f 44 d4          	cmove  %r12,%rdx
+ffff80000020cc75:	48 89 df             	mov    %rbx,%rdi
+ffff80000020cc78:	48 89 07             	mov    %rax,(%rdi)
+ffff80000020cc7b:	48 89 5f 08          	mov    %rbx,0x8(%rdi)
+ffff80000020cc7f:	48 89 4f 10          	mov    %rcx,0x10(%rdi)
+ffff80000020cc83:	48 89 57 18          	mov    %rdx,0x18(%rdi)
+ffff80000020cc87:	48 89 77 20          	mov    %rsi,0x20(%rdi)
+ffff80000020cc8b:	48 89 7f 28          	mov    %rdi,0x28(%rdi)
+ffff80000020cc8f:	48 89 6f 30          	mov    %rbp,0x30(%rdi)
+ffff80000020cc93:	4c 89 47 38          	mov    %r8,0x38(%rdi)
+ffff80000020cc97:	4c 89 4f 40          	mov    %r9,0x40(%rdi)
+ffff80000020cc9b:	4c 89 57 48          	mov    %r10,0x48(%rdi)
+ffff80000020cc9f:	4c 89 5f 50          	mov    %r11,0x50(%rdi)
+ffff80000020cca3:	4c 89 67 58          	mov    %r12,0x58(%rdi)
+ffff80000020cca7:	4c 89 6f 60          	mov    %r13,0x60(%rdi)
+ffff80000020ccab:	4c 89 77 68          	mov    %r14,0x68(%rdi)
+ffff80000020ccaf:	4c 89 7f 70          	mov    %r15,0x70(%rdi)
+ffff80000020ccb3:	48 89 e0             	mov    %rsp,%rax
+ffff80000020ccb6:	48 89 47 78          	mov    %rax,0x78(%rdi)
+ffff80000020ccba:	48 8d 05 65 00 00 00 	lea    0x65(%rip),%rax        # ffff80000020cd26 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x170>
+ffff80000020ccc1:	48 89 87 80 00 00 00 	mov    %rax,0x80(%rdi)
+ffff80000020ccc8:	9c                   	pushf
+ffff80000020ccc9:	58                   	pop    %rax
+ffff80000020ccca:	48 89 87 88 00 00 00 	mov    %rax,0x88(%rdi)
+ffff80000020ccd1:	48 85 d2             	test   %rdx,%rdx
+ffff80000020ccd4:	74 03                	je     ffff80000020ccd9 <_RNvNtCsjNA6UJ6W65t_14eclipse_kernel9scheduler25perform_context_switch_to+0x123>
+ffff80000020ccd6:	0f 22 da             	mov    %rdx,%cr3
+ffff80000020ccd9:	48 8b 66 78          	mov    0x78(%rsi),%rsp
+ffff80000020ccdd:	ff b6 80 00 00 00    	push   0x80(%rsi)
+ffff80000020cce3:	ff b6 88 00 00 00    	push   0x88(%rsi)
+ffff80000020cce9:	48 8b 06             	mov    (%rsi),%rax
+ffff80000020ccec:	48 8b 5e 08          	mov    0x8(%rsi),%rbx
+ffff80000020ccf0:	48 8b 4e 10          	mov    0x10(%rsi),%rcx
+ffff80000020ccf4:	48 8b 56 18          	mov    0x18(%rsi),%rdx
+ffff80000020ccf8:	48 8b 7e 28          	mov    0x28(%rsi),%rdi
+ffff80000020ccfc:	48 8b 6e 30          	mov    0x30(%rsi),%rbp
+ffff80000020cd00:	4c 8b 46 38          	mov    0x38(%rsi),%r8
+ffff80000020cd04:	4c 8b 4e 40          	mov    0x40(%rsi),%r9
+ffff80000020cd08:	4c 8b 56 48          	mov    0x48(%rsi),%r10
+ffff80000020cd0c:	4c 8b 5e 50          	mov    0x50(%rsi),%r11
+ffff80000020cd10:	4c 8b 66 58          	mov    0x58(%rsi),%r12
+ffff80000020cd14:	4c 8b 6e 60          	mov    0x60(%rsi),%r13
+ffff80000020cd18:	4c 8b 76 68          	mov    0x68(%rsi),%r14
+ffff80000020cd1c:	4c 8b 7e 70          	mov    0x70(%rsi),%r15
+ffff80000020cd20:	48 8b 76 20          	mov    0x20(%rsi),%rsi
+ffff80000020cd24:	9d                   	popf
+ffff80000020cd25:	c3                   	ret
+ffff80000020cd26:	48 83 c4 08          	add    $0x8,%rsp
+ffff80000020cd2a:	5b                   	pop    %rbx
+ffff80000020cd2b:	41 5c                	pop    %r12
+ffff80000020cd2d:	41 5e                	pop    %r14
+ffff80000020cd2f:	41 5f                	pop    %r15
+ffff80000020cd31:	c3                   	ret
+ffff80000020cd32:	48 ba d0 4b 30 00 00 	movabs $0xffff800000304bd0,%rdx
+ffff80000020cd39:	80 ff ff 
+ffff80000020cd3c:	48 b8 eb 2a 21 00 00 	movabs $0xffff800000212aeb,%rax
+ffff80000020cd43:	80 ff ff 
+ffff80000020cd46:	6a 40                	push   $0x40
+ffff80000020cd48:	5e                   	pop    %rsi
+ffff80000020cd49:	ff d0                	call   *%rax

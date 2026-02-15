@@ -17,8 +17,9 @@ impl Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 pub fn cvt(ret: usize) -> Result<usize> {
-    if ret == usize::MAX {
-        Err(Error::new(EINVAL))
+    if ret >= (usize::MAX - 4096) {
+        let errno = (usize::MAX - ret + 1) as i32;
+        Err(Error::new(if errno > 0 { errno } else { EINVAL }))
     } else {
         Ok(ret)
     }

@@ -21,7 +21,7 @@ pub struct TcpStream;
 
 impl TcpStream {
     pub fn connect(_addr: &str) -> Result<Self> {
-        Err(Error::new(ErrorKind::Other))
+        Err(Error::new(ErrorKind::Other, "not implemented"))
     }
 }
 
@@ -30,7 +30,7 @@ pub struct TcpListener;
 
 impl TcpListener {
     pub fn bind(_addr: &str) -> Result<Self> {
-        Err(Error::new(ErrorKind::Other))
+        Err(Error::new(ErrorKind::Other, "not implemented"))
     }
 }
 
@@ -39,6 +39,6 @@ pub struct UdpSocket;
 
 impl UdpSocket {
     pub fn bind(_addr: &str) -> Result<Self> {
-        Err(Error::new(ErrorKind::Other))
+        Err(Error::new(ErrorKind::Other, "not implemented"))
     }
 }

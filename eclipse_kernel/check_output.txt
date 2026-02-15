@@ -11,94 +11,124 @@ warning: `eclipsefs-lib` (lib) generated 1 warning
 warning: unused imports: `AtomicU64` and `Ordering`
  --> src/boot.rs:4:26
   |
-4 | ...tomic::{AtomicU64, Ordering};
-  |            ^^^^^^^^^  ^^^^^^^^
+4 | use core::sync::atomic::{AtomicU64, Ordering};
+  |                          ^^^^^^^^^  ^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
 
 warning: unnecessary parentheses around assigned value
-   --> src/boot.rs:290:16
+   --> src/boot.rs:291:16
     |
-290 | ...   cr0 |= (1 << 1);  // SET MP (bi...
-    |              ^      ^
+291 |         cr0 |= (1 << 1);  // SET MP (bit 1)
+    |                ^      ^
     |
     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
 help: remove these parentheses
     |
-290 -         cr0 |= (1 << 1);  // SET MP (bit 1)
-290 +         cr0 |= 1 << 1;  // SET MP (bit 1)
-    |
-
-warning: unnecessary parentheses around assigned value
-   --> src/boot.rs:296:16
-    |
-296 |         cr4 |= (1 << 9);  // OSFXSR
-    |                ^      ^
-    |
-help: remove these parentheses
-    |
-296 -         cr4 |= (1 << 9);  // OSFXSR
-296 +         cr4 |= 1 << 9;  // OSFXSR
+291 -         cr0 |= (1 << 1);  // SET MP (bit 1)
+291 +         cr0 |= 1 << 1;  // SET MP (bit 1)
     |
 
 warning: unnecessary parentheses around assigned value
    --> src/boot.rs:297:16
     |
-297 |         cr4 |= (1 << 10); // OSXMMEXCPT
+297 |         cr4 |= (1 << 9);  // OSFXSR
+    |                ^      ^
+    |
+help: remove these parentheses
+    |
+297 -         cr4 |= (1 << 9);  // OSFXSR
+297 +         cr4 |= 1 << 9;  // OSFXSR
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> src/boot.rs:298:16
+    |
+298 |         cr4 |= (1 << 10); // OSXMMEXCPT
     |                ^       ^
     |
 help: remove these parentheses
     |
-297 -         cr4 |= (1 << 10); // OSXMMEXCPT
-297 +         cr4 |= 1 << 10; // OSXMMEXCPT
+298 -         cr4 |= (1 << 10); // OSXMMEXCPT
+298 +         cr4 |= 1 << 10; // OSXMMEXCPT
     |
 
 warning: unused import: `x86_64::PhysAddr`
-   --> src/memory.rs:282:5
+   --> src/memory.rs:286:5
     |
-282 | use x86_64::PhysAddr;
+286 | use x86_64::PhysAddr;
     |     ^^^^^^^^^^^^^^^^
 
 warning: unnecessary parentheses around assigned value
-   --> src/serial.rs:206:21
+   --> src/serial.rs:245:21
     |
-206 | ...i] = (b'0' + (n % 10) as u8);
-    |         ^                     ^
+245 |         digits[i] = (b'0' + (n % 10) as u8);
+    |                     ^                     ^
     |
 help: remove these parentheses
     |
-206 -         digits[i] = (b'0' + (n % 10) as u8);
-206 +         digits[i] = b'0' + (n % 10) as u8;
+245 -         digits[i] = (b'0' + (n % 10) as u8);
+245 +         digits[i] = b'0' + (n % 10) as u8;
     |
 
 warning: unused import: `ProcessId`
- --> src/syscalls.rs:5:22
+ --> src/syscalls.rs:7:22
   |
-5 | use crate::process::{ProcessId, exit_pr...
+7 | use crate::process::{ProcessId, exit_proces...
   |                      ^^^^^^^^^
+
+warning: unused import: `ProcessId`
+    --> src/syscalls.rs:1241:43
+     |
+1241 | ...f, VMARegion, ProcessId};
+     |                  ^^^^^^^^^
+
+warning: unused import: `alloc::vec`
+    --> src/syscalls.rs:1244:9
+     |
+1244 |     use alloc::vec;
+     |         ^^^^^^^^^^
+
+warning: unused import: `crate::memory`
+    --> src/syscalls.rs:1445:9
+     |
+1445 |     use crate::memory;
+     |         ^^^^^^^^^^^^^
 
 warning: unused imports: `ProcessId` and `create_process`
  --> src/servers.rs:4:22
   |
-4 | ...ss::{create_process, ProcessId};
-  |         ^^^^^^^^^^^^^^  ^^^^^^^^^
+4 | ...cess::{create_process, ProcessId};
+  |           ^^^^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `alloc::boxed::Box`
+ --> src/servers.rs:8:5
+  |
+8 | use alloc::boxed::Box;
+  |     ^^^^^^^^^^^^^^^^^
 
 warning: unused imports: `read_volatile` and `write_volatile`
   --> src/pci.rs:25:17
    |
-25 | ...::{read_volatile, write_volatile};
-   |       ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+25 | ...tr::{read_volatile, write_volatile};
+   |         ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+
+warning: unused import: `alloc::boxed::Box`
+ --> src/filesystem.rs:5:5
+  |
+5 | use alloc::boxed::Box;
+  |     ^^^^^^^^^^^^^^^^^
 
 warning: unused import: `constants`
- --> src/filesystem.rs:6:73
+ --> src/filesystem.rs:7:73
   |
-6 | ...y, tlv_tags, constants};
-  |                 ^^^^^^^^^
+7 | ...try, tlv_tags, constants};
+  |                   ^^^^^^^^^
 
 warning: unused import: `eclipsefs_lib::NodeKind`
- --> src/filesystem.rs:7:5
+ --> src/filesystem.rs:8:5
   |
-7 | use eclipsefs_lib::NodeKind;
+8 | use eclipsefs_lib::NodeKind;
   |     ^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: unused import: `alloc::vec::Vec`
@@ -119,6 +149,18 @@ warning: unused import: `alloc::vec`
 10 | use alloc::vec;
    |     ^^^^^^^^^^
 
+warning: unused import: `alloc::boxed::Box`
+ --> src/scheme.rs:8:5
+  |
+8 | use alloc::boxed::Box;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::process::ProcessId`
+  --> src/scheme.rs:10:5
+   |
+10 | use crate::process::ProcessId;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
 warning: unused import: `crate::memory`
  --> src/elf_loader.rs:4:5
   |
@@ -131,94 +173,124 @@ warning: unused import: `core::ptr`
 2 | use core::ptr;
   |     ^^^^^^^^^
 
+error[E0425]: cannot find function `sys_mkdir` in this scope
+   --> src/syscalls.rs:192:15
+    |
+192 |         35 => sys_mkdir(arg1, arg2, arg3),
+    |               ^^^^^^^^^ not found in this scope
+
 warning: unnecessary `unsafe` block
-  --> src/memory.rs:75:29
+  --> src/memory.rs:79:29
    |
 57 |     unsafe {
    |     ------ because it's nested under this `unsafe` block
 ...
-75 |         let allocator_ref = unsafe { &...
+79 |         let allocator_ref = unsafe { &*all...
    |                             ^^^^^^ unnecessary `unsafe` block
    |
    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
 
-warning: unused variable: `data_ptr`
-   --> src/syscalls.rs:391:44
+warning: unused variable: `stack_top`
+   --> src/process.rs:257:9
     |
-391 | ...type: u64, data_ptr: u64) -> u64 {
-    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_data_ptr`
+257 |     let stack_top = crate::elf_loader::se...
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_stack_top`
     |
     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
 
-warning: unused variable: `desc_idx`
-   --> src/virtio.rs:756:21
+warning: unused variable: `data_ptr`
+   --> src/syscalls.rs:355:44
     |
-756 | ...       let desc_idx = queue.add_bu...
+355 | ...type: u64, data_ptr: u64) -> u64 {
+    |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_data_ptr`
+
+warning: variable does not need to be mutable
+    --> src/syscalls.rs:1303:21
+     |
+1303 | ...ome(mut proc) = process::get_process(...
+     |        ----^^^^
+     |        |
+     |        help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bytes_read`
+    --> src/syscalls.rs:1385:32
+     |
+1385 | ...                   Ok(bytes_read) => {
+     |                          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bytes_read`
+
+warning: unnecessary `unsafe` block
+   --> src/elf_loader.rs:456:5
+    |
+456 |     unsafe { x86_64::instructions::tlb::f...
+    |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `features`
+   --> src/virtio.rs:556:13
+    |
+556 |         let features = inl(self.io_base +...
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_features`
+
+warning: unnecessary `unsafe` block
+   --> src/virtio.rs:826:25
+    |
+744 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+826 |                 let b = unsafe { core::pt...
+    |                         ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `desc_idx`
+   --> src/virtio.rs:842:21
+    |
+842 | ...       let desc_idx = queue.add_buf(&b...
     |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_desc_idx`
 
 warning: unnecessary `unsafe` block
-   --> src/virtio.rs:930:30
-    |
-861 | ...   unsafe {
-    |       ------ because it's nested under this `unsafe` block
+    --> src/virtio.rs:1028:30
+     |
+ 959 | ...   unsafe {
+     |       ------ because it's nested under this `unsafe` block
 ...
-930 | ...           let status = unsafe { r...
-    |                            ^^^^^^ unnecessary `unsafe` block
+1028 | ...           let status = unsafe { read...
+     |                            ^^^^^^ unnecessary `unsafe` block
 
-error[E0382]: use of moved value: `header`
-  --> src/filesystem.rs:84:20
-   |
-71 | ...  Ok(header) => {
-   |         ------ move occurs because `header` has type `EclipseFSHeader`, which does not implement the `Copy` trait
-...
-80 | ...      FS.header = Some(header);
-   |                           ------ value moved here
-...
-84 | ...      if header.total_inodes >= 0xF...
-   |             ^^^^^^^^^^^^^^^^^^^ value used here after move
-   |
-help: consider cloning the value if the performance cost is acceptable
-   |
-80 |                 FS.header = Some(header.clone());
-   |                                        ++++++++
+warning: unused variable: `e`
+    --> src/virtio.rs:1159:20
+     |
+1159 | ...    if let Err(e) = device.read_block...
+     |                   ^ help: if this is intentional, prefix it with an underscore: `_e`
 
 warning: unnecessary `unsafe` block
-   --> src/filesystem.rs:449:28
+   --> src/filesystem.rs:540:34
     |
-449 |         let record_block = unsafe {
-    |                            ^^^^^^ unnecessary `unsafe` block
+540 |         let record_block_start = unsafe {
+    |                                  ^^^^^^ unnecessary `unsafe` block
 
-warning: unused variable: `direct_vaddr`
-   --> src/elf_loader.rs:407:9
-    |
-407 |     let direct_vaddr = crate::memory:...
-    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_direct_vaddr`
-
-For more information about this error, try `rustc --explain E0382`.
-warning: `eclipse_kernel` (lib) generated 21 warnings
-error: could not compile `eclipse_kernel` (lib) due to 1 previous error; 21 warnings emitted
-warning: build failed, waiting for other jobs to finish...
 warning: unnecessary `unsafe` block
-  --> src/main.rs:84:5
+  --> src/main.rs:85:5
    |
-84 |     unsafe {
+85 |     unsafe {
    |     ^^^^^^ unnecessary `unsafe` block
 
 warning: unused variable: `pml4_phys`
-   --> src/main.rs:114:9
+   --> src/main.rs:117:9
     |
-114 |     let pml4_phys = boot_info.pml4_addr;
+117 |     let pml4_phys = boot_info.pml4_addr;
     |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pml4_phys`
 
 warning: variable does not need to be mutable
-   --> src/main.rs:182:9
+   --> src/main.rs:186:9
     |
-182 |     let mut init_loaded = false;
+186 |     let mut init_loaded = false;
     |         ----^^^^^^^^^^^
     |         |
     |         help: remove this `mut`
-    |
-    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
-warning: `eclipse_kernel` (bin "eclipse_kernel") generated 25 warnings (21 duplicates)
-error: could not compile `eclipse_kernel` (bin "eclipse_kernel") due to 1 previous error; 25 warnings emitted
+For more information about this error, try `rustc --explain E0425`.
+warning: `eclipse_kernel` (bin "eclipse_kernel") generated 38 warnings (22 duplicates)
+error: could not compile `eclipse_kernel` (bin "eclipse_kernel") due to 1 previous error; 38 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+warning: `eclipse_kernel` (lib) generated 34 warnings (12 duplicates)
+error: could not compile `eclipse_kernel` (lib) due to 1 previous error; 34 warnings emitted

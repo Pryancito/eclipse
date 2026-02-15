@@ -15,7 +15,8 @@ use alloc::sync::Arc;
 pub mod error {
     pub const ENOENT: usize = 2;   // No such file or directory
     pub const EIO: usize = 5;      // I/O error
-    pub const EBADF: usize = 9;    // Bad file descriptor
+    pub const EEXIST: usize = 17;  // File exists (e.g. O_CREAT | O_EXCL)
+    pub const EBADF: usize = 9;   // Bad file descriptor
     pub const EINVAL: usize = 22;  // Invalid argument
     pub const ENOSYS: usize = 38;  // Function not implemented
 }
@@ -71,6 +72,16 @@ pub trait Scheme: Send + Sync {
 
     /// Map a resource into memory
     fn fmap(&self, _id: usize, _offset: usize, _len: usize) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
+
+    /// Perform a device-specific control operation
+    fn ioctl(&self, _id: usize, _request: usize, _arg: usize) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
+
+    /// Create a directory
+    fn mkdir(&self, _path: &str, _mode: u32) -> Result<usize, usize> {
         Err(error::ENOSYS)
     }
 }
@@ -196,4 +207,30 @@ pub fn fmap(scheme_idx: usize, id: usize, offset: usize, len: usize) -> Result<u
         Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
     };
     scheme.fmap(id, offset, len)
+}
+
+/// Perform an ioctl on a resource in a specific scheme
+pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+    };
+    scheme.ioctl(id, request, arg)
+}
+
+/// Create a directory by routing to the appropriate scheme
+pub fn mkdir(path: &str, mode: u32) -> Result<usize, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let relative_path = parts.next().unwrap_or("");
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.mkdir(relative_path, mode)
 }

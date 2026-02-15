@@ -7,4 +7,4 @@ build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
 runner = "qemu-system-x86_64"
-rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "code-model=large", "-C", "relocation-model=static"]
+rustflags = ["-C", "code-model=large", "-C", "relocation-model=static"]

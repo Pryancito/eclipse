@@ -2,8 +2,8 @@
 //! 
 //! This service:
 //! 1. Starts after network_service.
-//! 2. Initializes Xwayland (simulated).
-//! 3. Launches the XFwl4 Compositor (xfwl4) from disk.
+//! 2. Initializes Xfbdev (TinyX).
+//! 3. Launches the TinyX Framebuffer Server (Xfbdev) from disk.
 
 #![no_std]
 #![no_main]
@@ -54,26 +54,18 @@ pub extern "C" fn _start() -> ! {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("[GUI-SERVICE] Starting (PID: {})", pid);
     
-    // Simulate Xwayland startup
-    println!("[GUI-SERVICE] Initializing Xwayland support...");
-    println!("[GUI-SERVICE]   - Setting up X socket /tmp/.X11-unix/X0");
-    println!("[GUI-SERVICE]   - Starting Xwayland server on :0");
-    println!("[GUI-SERVICE]   - Xwayland ready");
-    println!("[GUI-SERVICE]   - DISPLAY=:0 configured");
-
-    // Wait for filesystem to be mounted before trying to load xfwl4
+    // Wait for filesystem to be mounted before trying to load Xfbdev
     println!("[GUI-SERVICE] Waiting for filesystem to be mounted...");
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem is ready!");
 
-    // Launch XFwl4 App
-    println!("[GUI-SERVICE] Launching XFwl4 Compositor (xfwl4)...");
+    // Launch Xfbdev (TinyX Framebuffer Server)
+    println!("[GUI-SERVICE] Launching TinyX Framebuffer Server (Xfbdev)...");
     
-    let app_path = "file:/usr/bin/xfwl4";
+    let app_path = "file:/usr/bin/Xfbdev";
     
     unsafe {
         // Open application file
-        // 0 for O_RDONLY (assuming standard flags)
         let fd = open(app_path, O_RDONLY, 0);
         
         if fd < 0 {
@@ -82,7 +74,7 @@ pub extern "C" fn _start() -> ! {
             loop { yield_cpu(); }
         }
         
-        // Use fstat to get file size instead of lseek (more reliable for larger files)
+        // Use fstat to get file size
         let mut st: Stat = core::mem::zeroed();
         if fstat(fd, &mut st) < 0 {
             println!("[GUI-SERVICE] ERROR: fstat failed for {}", app_path);
@@ -108,18 +100,18 @@ pub extern "C" fn _start() -> ! {
             loop { yield_cpu(); }
         }
         
-        println!("[GUI-SERVICE] Mapped at {:x}. Spawning...", mapped_addr);
+        println!("[GUI-SERVICE] Mapped at {:x}. Spawning Xfbdev...", mapped_addr);
         
         // Create slice for spawn
         let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
         
-        // Spawn xfwl4 as a new process
+        // Spawn Xfbdev as a new process
         let spawned_pid = spawn(binary_slice);
         
         if spawned_pid < 0 {
-            println!("[GUI-SERVICE] ERROR: spawn() failed");
+            println!("[GUI-SERVICE] ERROR: spawn() failed for Xfbdev");
         } else {
-            println!("[GUI-SERVICE] Successfully spawned xfwl4 (PID: {})", spawned_pid);
+            println!("[GUI-SERVICE] Successfully spawned Xfbdev (PID: {})", spawned_pid);
         }
         
         // Clean up
@@ -127,7 +119,7 @@ pub extern "C" fn _start() -> ! {
         close(fd);
     }
 
-    println!("[GUI-SERVICE] Service entering main loop...");
+    println!("[GUI-SERVICE] X server should be initializing on /dev/fb0...");
 
     // Fallback loop
     loop {

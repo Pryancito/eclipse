@@ -4,9 +4,15 @@ use crate::types::*;
 // Global errno variable
 static mut ERRNO: c_int = 0;
 
+#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
 #[no_mangle]
 pub unsafe fn __errno_location() -> *mut c_int {
-    &mut ERRNO as *mut c_int
+    &raw mut ERRNO as *mut c_int
+}
+
+#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+extern "C" {
+    pub fn __errno_location() -> *mut c_int;
 }
 
 // Error codes (POSIX standard)
@@ -43,9 +49,28 @@ pub const EMLINK: c_int = 31;
 pub const EPIPE: c_int = 32;
 pub const EDOM: c_int = 33;
 pub const ERANGE: c_int = 34;
+pub const ENOSYS: c_int = 35;
 
 pub const EWOULDBLOCK: c_int = EAGAIN;
 
+#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
+#[no_mangle]
+pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int {
+    let msg = strerror(errnum);
+    let len = crate::header::string::strlen(msg);
+    if len >= buflen {
+        return ERANGE;
+    }
+    crate::header::string::strcpy(buf, msg);
+    0
+}
+
+#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+extern "C" {
+    pub fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int;
+}
+
+#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn perror(s: *const c_char) {
     use crate::header::stdio::stderr;
@@ -72,6 +97,12 @@ pub unsafe extern "C" fn perror(s: *const c_char) {
     fputs(b"\n\0".as_ptr() as *const c_char, stderr);
 }
 
+#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+extern "C" {
+    pub fn perror(s: *const c_char);
+}
+
+#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror(errnum: c_int) -> *const c_char {
     let msg: &[u8] = match errnum {
@@ -86,4 +117,9 @@ pub unsafe extern "C" fn strerror(errnum: c_int) -> *const c_char {
         _ => b"Unknown error\0",
     };
     msg.as_ptr() as *const c_char
+}
+
+#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+extern "C" {
+    pub fn strerror(errnum: c_int) -> *const c_char;
 }

@@ -45,6 +45,7 @@ pub enum SyscallNumber {
     Mount = 29,
     Fstat = 30,
     Spawn = 31,
+    GetRandom = 33,
 }
 
 /// lseek whence values (POSIX standard)
@@ -95,6 +96,29 @@ pub extern "C" fn syscall_handler(
     _arg5: u64,
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
+    // Log registers for Syscall 27 (register_device) to catch corruption
+    if syscall_num == 27 {
+        serial::serial_print("[SYSCALL] register_device entry: num=");
+        serial::serial_print_dec(syscall_num);
+        serial::serial_print(" arg1=");
+        serial::serial_print_hex(arg1);
+        serial::serial_print(" arg2=");
+        serial::serial_print_dec(arg2);
+        serial::serial_print(" arg3=");
+        serial::serial_print_hex(arg3);
+        serial::serial_print("\n");
+        
+        serial::serial_print("[SYSCALL] register_device context: RAX=");
+        serial::serial_print_hex(context.rax);
+        serial::serial_print(" RDI=");
+        serial::serial_print_hex(context.rdi);
+        serial::serial_print(" RSI=");
+        serial::serial_print_hex(context.rsi);
+        serial::serial_print(" RDX=");
+        serial::serial_print_hex(context.rdx);
+        serial::serial_print("\n");
+    }
+
     // Read user context directly from the struct passed by assembly
     let process_context = crate::process::Context {
         rsp: context.rsp,
@@ -155,6 +179,7 @@ pub extern "C" fn syscall_handler(
         30 => sys_fstat(arg1, arg2),
         31 => sys_spawn(arg1, arg2),
         32 => sys_arch_prctl(arg1, arg2),
+        33 => sys_getrandom(arg1, arg2, arg3),
         _ => {
             serial::serial_print("[SYSCALL] Unknown syscall: ");
             serial::serial_print_dec(syscall_num);
@@ -170,9 +195,10 @@ pub extern "C" fn syscall_handler(
 
 /// Verify if a pointer range points to valid user memory
 /// User memory range: 0x0000_0000_0000_0000 to 0x0000_7FFF_FFFF_FFFF
+#[inline(never)]
 fn is_user_pointer(ptr: u64, len: u64) -> bool {
-    // Check for null pointer
-    if ptr == 0 {
+    // Check for null pointer or pointers in the first page (usually unmapped)
+    if ptr < 0x1000 {
         return false;
     }
     
@@ -666,6 +692,7 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
 }
 
 /// sys_register_device - Register a new device node (Syscall 27)
+#[inline(never)]
 fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     serial::serial_print("[SYSCALL] register_device called\n");
     
@@ -674,7 +701,11 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     }
     
     if !is_user_pointer(name_ptr, name_len) {
-        serial::serial_print("[SYSCALL] register_device security violation: invalid name pointer\n");
+        serial::serial_print("[SYSCALL] register_device validation FAILED: ptr=");
+        serial::serial_print_hex(name_ptr);
+        serial::serial_print(", len=");
+        serial::serial_print_dec(name_len);
+        serial::serial_print("\n");
         return u64::MAX;
     }
     
@@ -682,6 +713,15 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
         let slice = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
         core::str::from_utf8(slice).unwrap_or("")
     };
+    
+    // Stack check
+    let stack_var = 0;
+    serial::serial_print("[SYSCALL] register_device stack approx: ");
+    serial::serial_print_hex(&stack_var as *const i32 as u64);
+    serial::serial_print("\n");
+    serial::serial_print("[SYSCALL] register_device name: '");
+    serial::serial_print(name);
+    serial::serial_print("'\n");
     
     let device_type = match type_id {
         0 => crate::filesystem::DeviceType::Block,
@@ -1619,4 +1659,27 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             u64::MAX
         }
     }
+}
+
+/// sys_getrandom - Fill buffer with random bytes
+fn sys_getrandom(buf_ptr: u64, len: u64, _flags: u64) -> u64 {
+    if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
+        return u64::MAX;
+    }
+
+    if !is_user_pointer(buf_ptr, len) {
+        return u64::MAX;
+    }
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize) };
+    
+    // Very basic PRNG using RDTSC for now
+    // TODO: Use RDRAND if available or a better entropy source
+    let mut seed = unsafe { core::arch::x86_64::_rdtsc() };
+    for i in 0..len as usize {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        buf[i] = (seed >> 32) as u8;
+    }
+
+    len
 }

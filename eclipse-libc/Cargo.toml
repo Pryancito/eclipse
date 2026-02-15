@@ -1,5 +1,5 @@
 [package]
-name = "eclipse-libc"
+name = "eclipse-libc-posix"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,16 +7,23 @@ edition = "2021"
 eclipse-syscall = { path = "../eclipse-syscall" }
 
 [features]
-default = ["allocator"]
+default = ["std", "panic_handler", "allocator"]
 allocator = []
 panic_handler = []
+std = []
+extra_traits = []
+use_std = []
+align = []
+const-extern-fn = []
 
 [lib]
 name = "eclipse_libc"
 path = "src/lib.rs"
-crate-type = ["rlib"]
+crate-type = ["staticlib"]
 
 [profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"
+lto = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(eclipse_target)'] }
+

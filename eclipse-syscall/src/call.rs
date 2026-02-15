@@ -141,3 +141,17 @@ pub fn spawn(buf: &[u8]) -> Result<usize> {
         crate::syscall2(SYS_SPAWN, buf.as_ptr() as usize, buf.len())
     })
 }
+
+/// Fill buffer with random bytes
+pub fn getrandom(buf: &mut [u8], flags: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), flags)
+    })
+}
+
+/// Reposition read/write file offset
+pub fn lseek(fd: usize, offset: isize, whence: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_LSEEK, fd, offset as usize, whence)
+    })
+}

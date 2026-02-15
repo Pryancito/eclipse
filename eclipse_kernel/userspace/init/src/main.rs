@@ -159,7 +159,11 @@ fn start_essential_services() {
         start_service(&mut SERVICES[1]);
         
         // Give it time to initialize (minimal delay)
-        for _ in 0..5000{
+        // Give it time to initialize (minimal delay)
+        for i in 0..500{
+            if i % 100 == 0 {
+                println!("[INIT] Waiting for DevFS... {}", i);
+            }
             yield_cpu();
         }
     }
@@ -175,32 +179,37 @@ fn start_system_services() {
         // This prevents race conditions where other services try to access files
         // before the filesystem is ready
         println!("  [INIT] Waiting for filesystem service to mount...");
-        for _ in 0..5000{
+        for i in 0..5000 {
+            if i % 1000 == 0 { println!("    [INIT] FS wait... {}", i); }
             yield_cpu();
         }
         println!("  [INIT] Filesystem should be ready, continuing...");
 
         // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);
-        for _ in 0..5000{
+        for i in 0..5000 {
+            if i % 1000 == 0 { println!("    [INIT] Input wait... {}", i); }
             yield_cpu();
         }
         
         // Start display service (depends on input)
         start_service(&mut SERVICES[4]);
-        for _ in 0..5000{
+        for i in 0..5000 {
+            if i % 1000 == 0 { println!("    [INIT] Display wait... {}", i); }
             yield_cpu();
         }
 
         // Start audio service (depends on filesystem)
         start_service(&mut SERVICES[5]);
-        for _ in 0..5000{
+        for i in 0..5000 {
+            if i % 1000 == 0 { println!("    [INIT] Audio wait... {}", i); }
             yield_cpu();
         }
         
         // Start network service last (most complex)
         start_service(&mut SERVICES[6]);
-        for _ in 0..5000{
+        for i in 0..5000 {
+            if i % 1000 == 0 { println!("    [INIT] Network wait... {}", i); }
             yield_cpu();
         }
 

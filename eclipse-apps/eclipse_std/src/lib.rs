@@ -16,20 +16,31 @@
 #![feature(alloc_error_handler)]
 
 pub extern crate alloc;
+pub extern crate libc;
 
 use core::panic::PanicInfo;
 
+pub use core::fmt;
+pub mod ffi {
+    pub use crate::env::{OsStr, OsString};
+}
+
+pub use core::ptr;
 pub mod heap;
 #[macro_use]
 pub mod macros;
 
 pub mod io;
 pub mod fs;
+pub mod path;
 pub mod process;
 pub mod net;
+pub mod env;
 pub mod time;
 pub mod thread;
 pub mod sync;
+pub mod error;
+pub mod os;
 
 pub mod collections {
     //! Collections module - re-exports from alloc
@@ -41,6 +52,7 @@ pub mod collections {
 
 pub mod prelude {
     //! Prelude - common imports for Eclipse OS applications
+    pub use core::prelude::v1::*;
     pub use crate::heap::init_heap;
     pub use crate::{print, println, eprint, eprintln};
     pub use crate::eclipse_main;
@@ -51,12 +63,17 @@ pub mod prelude {
     
     pub use crate::io::{Read, Write, stdin, stdout, stderr};
     pub use crate::fs::{self, File};
+    pub use crate::path::{self, Path, PathBuf};
     pub use crate::process::{self, Command, Child};
     pub use crate::net;
     pub use crate::time;
     pub use crate::thread;
     pub use crate::sync::{Mutex, Condvar};
+    pub use alloc::borrow::{ToOwned, Borrow};
 }
+
+// Re-export core macros to be available via std::...
+pub use core::{panic, assert, assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, unreachable, write, writeln, todo, unimplemented, compile_error};
 
 /// Initialize the Eclipse OS application runtime
 pub fn init_runtime() {
@@ -82,14 +99,22 @@ where
 #[macro_export]
 macro_rules! eclipse_main {
     ($main_fn:ident) => {
+        #[cfg(not(any(target_os = "linux", unix)))]
         #[no_mangle]
         pub extern "C" fn _start() -> ! {
+            $crate::main_wrapper($main_fn)
+        }
+
+        #[cfg(any(target_os = "linux", unix))]
+        #[no_mangle]
+        pub extern "C" fn main(_argc: isize, _argv: *const *const u8) -> ! {
             $crate::main_wrapper($main_fn)
         }
     };
 }
 
 /// Panic handler for Eclipse OS applications
+#[cfg(feature = "panic-handler")]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     eprintln!("\n!!! PANIC !!!");
@@ -107,6 +132,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 /// Alloc error handler
+#[cfg(feature = "alloc-error-handler")]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     eprintln!("\n!!! ALLOCATION ERROR !!!");

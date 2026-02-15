@@ -2,7 +2,7 @@
 //!
 //! Provides std-like Command and Child interfaces for spawning and managing processes.
 
-use eclipse_libc::*;
+use libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::io::{Result, Error, ErrorKind};
@@ -29,19 +29,42 @@ impl Command {
         self
     }
     
+    /// Adds multiple arguments to pass to the program.
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<crate::env::OsStr>,
+    {
+        for arg in args {
+            self.arg(arg.as_ref());
+        }
+        self
+    }
+    
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
         // Eclipse OS currently spawns from an ELF buffer
         let buf = fs::read(&self.program)?;
         
         unsafe {
-            let pid = eclipse_libc::spawn(buf.as_ptr() as *const c_void, buf.len());
+            // TODO: Construct proper argv/envp
+            let pid = libc::spawn(
+                self.program.as_ptr() as *const i8,
+                core::ptr::null(),
+                core::ptr::null()
+            );
             if pid < 0 {
-                return Err(Error::new(ErrorKind::Other));
+                return Err(Error::new(ErrorKind::Other, "spawn failed"));
             }
             
             Ok(Child { pid })
         }
+    }
+
+    /// Executes the command as a child process, waiting for it to finish and collecting its exit status.
+    pub fn status(&mut self) -> Result<ExitStatus> {
+        let mut child = self.spawn()?;
+        child.wait()
     }
 }
 
@@ -70,6 +93,7 @@ impl Child {
 }
 
 /// Describes the result of a process after it has terminated.
+#[derive(Debug)]
 pub struct ExitStatus {
     code: i32,
 }

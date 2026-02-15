@@ -7,7 +7,7 @@ edition = "2021"
 # eclipse-libc provides syscall wrappers for the Eclipse microkernel
 # Path dependency is intentional: both are built as part of Eclipse OS
 # and eclipse-libc is specific to this kernel implementation
-eclipse-libc = { path = "../../eclipse_kernel/userspace/libc" }
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size

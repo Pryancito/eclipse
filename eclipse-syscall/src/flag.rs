@@ -10,6 +10,9 @@ pub const O_NOCTTY: usize = 0x0100;
 pub const O_TRUNC: usize = 0x0200;
 pub const O_APPEND: usize = 0x0400;
 pub const O_NONBLOCK: usize = 0x0800;
+pub const O_CLOEXEC: usize = 0x80000;
+pub const O_NOFOLLOW: usize = 0x20000;
+pub const O_DIRECTORY: usize = 0x10000;
 
 // mmap prot flags
 pub const PROT_NONE: usize = 0x0;

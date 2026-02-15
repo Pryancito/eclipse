@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_dir() {
             let relative = path.strip_prefix(&args.source)?;
             dirs.push(relative.to_path_buf());
         }
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if path.is_file() {
+        if entry.file_type().is_file() {
             let relative = path.strip_prefix(&args.source)?;
             let fs_path = PathBuf::from("/").join(relative);
 
@@ -159,15 +159,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if path.is_symlink() {
+        println!("  Processing path: {:?}", path);
+        if entry.file_type().is_symlink() {
             let relative = path.strip_prefix(&args.source)?;
             let fs_path = PathBuf::from("/").join(relative);
 
             let target = fs::read_link(path)?;
             let target_str = target.to_str().unwrap_or("");
 
+            println!("  Processing symlink: {:?}", fs_path);
+            
             let link_node = EclipseFSNode::new_symlink(target_str);
-            let link_inode = writer.create_node(link_node)?;
+            let link_inode = match writer.create_node(link_node) {
+                Ok(inode) => inode,
+                Err(e) => {
+                    eprintln!("ERROR: create_node failed for {:?} with {:?}", fs_path, e);
+                    return Err(Box::new(e));
+                }
+            };
 
             if args.verbose {
                 println!("  Created symlink: {:?} -> {:?} (inode {})",
@@ -180,7 +189,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(&parent_inode) = dir_inodes.get(&parent_path_buf) {
                     let parent = writer.get_node(parent_inode)?;
                     let name = fs_path.file_name().unwrap().to_str().unwrap();
-                    parent.add_child(name, link_inode)?;
+                    if let Err(e) = parent.add_child(name, link_inode) {
+                        eprintln!("ERROR: Failed to add symlink {:?} to parent {:?}: {:?}", name, parent_path_buf, e);
+                        // Print children of parent to see what exists
+                        for (existing_name, _) in parent.children.iter() {
+                            eprintln!("  Existing: {}", existing_name);
+                        }
+                        return Err(Box::new(e));
+                    }
                 }
             }
         }

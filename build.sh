@@ -36,7 +36,11 @@ print_step() {
 # Configuración
 KERNEL_TARGET="x86_64-unknown-none"
 UEFI_TARGET="x86_64-unknown-uefi"
+ECLIPSE_TARGET="$(pwd)/x86_64-unknown-eclipse.json"
+ECLIPSE_TARGET_NAME="x86_64-unknown-eclipse"
 BUILD_DIR="eclipse-os-build"
+BASE_DIR=$(pwd)
+mkdir -p "$BUILD_DIR"
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.1.0 ║"
@@ -103,7 +107,7 @@ build_eclipse_syscall() {
     cd eclipse-syscall
     
     print_status "Compilando eclipse-syscall..."
-    cargo build --release
+    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo -Z unstable-options build --release --target "$ECLIPSE_TARGET"
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-syscall compilado exitosamente"
@@ -121,12 +125,8 @@ prepare_sysroot() {
     print_step "Preparando sysroot..."
     mkdir -p "$BUILD_DIR/sysroot/usr/lib"
     mkdir -p "$BUILD_DIR/sysroot/usr/include"
-
-    # Crear librerías dummy para xkbcommon y pixman para satisfacer al linker
-    # Los símbolos reales se proporcionan vía Rust stubs en xfwl4/src/stubs.rs
-    print_status "Creando librerías dummy en sysroot..."
-    ar cr "$BUILD_DIR/sysroot/usr/lib/libxkbcommon.a"
-    ar cr "$BUILD_DIR/sysroot/usr/lib/libpixman-1.a"
+    # Los símbolos reales se proporcionan vía Rust stubs o libc
+    print_status "Skipping dummy library creation..."
 }
 
 # Función para compilar eclipse-libc
@@ -141,15 +141,15 @@ build_eclipse_libc() {
     cd eclipse-libc
     
     print_status "Compilando eclipse-libc..."
-    cargo build --release
+    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-libc compilado exitosamente"
         
-        # Instalar en sysroot como liblibc.a
-        mkdir -p "$BUILD_DIR/sysroot/usr/lib"
-        cp target/release/libeclipse_libc.a "$BUILD_DIR/sysroot/usr/lib/liblibc.a"
-        print_status "Instalado en sysroot: $BUILD_DIR/sysroot/usr/lib/liblibc.a"
+        # Instalar en sysroot como libc.a
+        mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
+        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.a" "$BASE_DIR/$BUILD_DIR/sysroot/usr/lib/libc.a"
+        print_status "Instalado en sysroot: $BASE_DIR/$BUILD_DIR/sysroot/usr/lib/libc.a"
     else
         print_error "Error al compilar eclipse-libc"
         cd ..
@@ -171,7 +171,7 @@ build_eclipse_std() {
     cd eclipse-apps/eclipse_std
     
     print_status "Compilando eclipse_std..."
-    cargo build --release
+    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo -Z unstable-options build --release --target "$ECLIPSE_TARGET"
     
     if [ $? -eq 0 ]; then
         print_success "eclipse_std compilado exitosamente"
@@ -184,44 +184,6 @@ build_eclipse_std() {
     cd ../..
 }
 
-# Función para compilar xfwl4 (Compositor Wayland)
-build_xfwl4() {
-    print_step "Compilando xfwl4 (Compositor Wayland)..."
-
-    if [ ! -d "eclipse-apps/xfwl4" ]; then
-        print_status "Directorio eclipse-apps/xfwl4 no encontrado, saltando..."
-        return 0
-    fi
-
-    cd eclipse-apps/xfwl4
-
-    print_status "Compilando xfwl4 para Eclipse OS..."
-    # Usamos target custom, no default features para evitar GTK/Glib, y activamos udev/egl
-    # Usamos target linux-musl para tener soporte de std (syscalls habilitadas en kernel)
-    # Linkamos contra eclipse-libc en sysroot
-    RUSTFLAGS="-C relocation-model=static -C link-arg=-nostdlib -L native=../../$BUILD_DIR/sysroot/usr/lib" cargo +nightly build \
-        --target x86_64-unknown-linux-musl \
-        --release \
-        --no-default-features \
-        --features eclipse \
-        -Z build-std=std,panic_abort
-
-    if [ $? -ne 0 ]; then
-        print_error "Error al compilar xfwl4"
-        cd ../..
-        return 1
-    fi
-
-    print_success "xfwl4 compilado exitosamente"
-    
-    local xfwl4_path="target/x86_64-unknown-linux-musl/release/xfwl4"
-    if [ -f "$xfwl4_path" ]; then
-        local xfwl4_size=$(du -h "$xfwl4_path" | cut -f1)
-        print_status "xfwl4 generado: $xfwl4_path ($xfwl4_size)"
-    fi
-
-    cd ../..
-}
 
 # Función para compilar el proceso init (embedded)
 build_eclipse_init() {
@@ -230,7 +192,7 @@ build_eclipse_init() {
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    RUSTFLAGS="-C link-arg=-Tlinker.ld -C relocation-model=static" rustup run nightly cargo build --release --target x86_64-unknown-none
+    RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"
@@ -314,13 +276,14 @@ build_installer() {
     
     # Compilar el instalador
     print_status "Compilando instalador..."
-    cargo build --release
+    SYSROOT_LDFLAGS="-C link-arg=-L$BASE_DIR/$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib"
+    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $SYSROOT_LDFLAGS $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=std,panic_abort
     
     if [ $? -eq 0 ]; then
         print_success "Instalador compilado exitosamente"
         
         # Mostrar información del instalador compilado
-        local installer_path="target/release/eclipse-installer"
+        local installer_path="target/x86_64-unknown-linux-musl/release/eclipse-installer"
         if [ -f "$installer_path" ]; then
             local installer_size=$(du -h "$installer_path" | cut -f1)
             print_status "Instalador generado: $installer_path ($installer_size)"
@@ -344,9 +307,10 @@ build_systemd() {
     
     cd eclipse-apps/systemd
     
-    # Compilar systemd para el target correcto
+    # Compilar systemd (no_std, bare metal init)
     print_status "Compilando systemd..."
-    RUSTFLAGS="-C no-redzone -C link-arg=-Tlinker.ld -C relocation-model=static" cargo +nightly build --release --target x86_64-unknown-none
+    # Usamos none target porque systemd es no_std y usa _start custom
+    RUSTFLAGS="-C relocation-model=static" cargo +nightly build --release --target x86_64-unknown-none
     
     if [ $? -eq 0 ]; then
         print_success "Systemd compilado exitosamente"
@@ -687,7 +651,6 @@ build_userland() {
     build_eclipse_std
     
     # Aplicaciones
-    build_xfwl4
     build_wayland_apps
     build_wayland_server
     build_cosmic_client
@@ -839,11 +802,12 @@ create_basic_distribution() {
             print_status "Systemd copiado e instalado en /usr/sbin/"
         fi
         
-        # Copiar xfwl4 si existe
-        if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
-            cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/xfwl4"
-            print_status "xfwl4 copiado e instalado en /usr/bin/"
+
+        # Copiar Xfbdev (TinyX) si existe
+        if [ -f "eclipse-apps/tinyx/kdrive/fbdev/Xfbdev" ]; then
+            cp "eclipse-apps/tinyx/kdrive/fbdev/Xfbdev" "$BUILD_DIR/usr/bin/"
+            chmod +x "$BUILD_DIR/usr/bin/Xfbdev"
+            print_status "Xfbdev (TinyX) copiado e instalado en /usr/bin/"
         fi
         
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
@@ -869,12 +833,6 @@ create_basic_distribution() {
         #     print_status "eclipse_taskbar instalado en /usr/bin/"
         # fi
         
-        # Copiar xfwl4 si existe
-        if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
-            cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
-            chmod +x "$BUILD_DIR/usr/bin/xfwl4"
-            print_status "xfwl4 instalado en /usr/bin/"
-        fi
         
         # Crear configuración de userland
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
@@ -900,7 +858,7 @@ wayland_text_editor = "/userland/bin/wayland_text_editor"
 
 [desktop_environment]
 # Nota: Algunos componentes del desktop environment no están implementados aún
-wayland_server = "/usr/bin/xfwl4"
+wayland_server = "/usr/bin/Xfbdev"
 # cosmic_desktop = "/userland/bin/eclipse_cosmic"
 # rwaybar = "/userland/bin/rwaybar"
 # eclipse_taskbar = "/userland/bin/eclipse_taskbar"
@@ -1099,11 +1057,6 @@ EOF
     # Copiar binarios de eclipse-apps si existen
         # Copiar binarios de Wayland y COSMIC a /usr/bin/
         #mkdir -p "$BUILD_DIR/usr/bin"
-        #if [ -f "eclipse-apps/xfwl4/target/release/xfwl4" ]; then
-        #    cp "eclipse-apps/xfwl4/target/release/xfwl4" "$BUILD_DIR/usr/bin/"
-        #    chmod +x "$BUILD_DIR/usr/bin/xfwl4"
-        #    print_status "xfwl4 instalado en usr/bin/"
-        #fi
 
     # if [ -f "eclipse-apps/target/release/eclipse_cosmic" ]; then
     #     cp "eclipse-apps/target/release/eclipse_cosmic" "$BUILD_DIR/userland/bin/"
@@ -1141,8 +1094,8 @@ EOF
     fi
 
     # Copiar el instalador si existe
-    if [ -f "target/release/eclipse-installer" ]; then
-        cp "target/release/eclipse-installer" "$BUILD_DIR/userland/bin/"
+    if [ -f "installer/target/x86_64-unknown-linux-musl/release/eclipse-installer" ]; then
+        cp "installer/target/x86_64-unknown-linux-musl/release/eclipse-installer" "$BUILD_DIR/userland/bin/"
         print_status "Instalador copiado a la distribución"
     else
         print_status "Instalador no encontrado - no se puede copiar"
@@ -1161,6 +1114,13 @@ userland_path = "/userland/bin/eclipse_userland"
 enable_debug = false
 log_level = "info"
 EOF
+    
+    # Crear symlink para fuentes (TinyX espera /usr/lib/X11/fonts)
+    mkdir -p "$BUILD_DIR/usr/lib/X11/fonts"
+    if [ -d "/usr/share/fonts/X11" ]; then
+        cp -r /usr/share/fonts/X11 "$BUILD_DIR/usr/lib/X11/fonts/"
+        print_status "Copiado de fuentes: /usr/share/fonts/X11 -> $BUILD_DIR/usr/lib/X11/fonts/"
+    fi
     
     print_success "Distribución básica creada en $BUILD_DIR"
 }
@@ -1250,19 +1210,10 @@ create_bootable_image() {
                     mkdir -p "$BUILD_DIR/sbin"
                     mkdir -p "$BUILD_DIR/usr/sbin"
                     cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/sbin/eclipse-systemd"
-                    cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/usr/sbin/eclipse-systemd"
                     chmod +x "$BUILD_DIR/sbin/eclipse-systemd"
-                    chmod +x "$BUILD_DIR/usr/sbin/eclipse-systemd"
-                    print_status "eclipse-systemd copiado a /sbin/ y /usr/sbin/"
+                    print_status "eclipse-systemd copiado a /sbin/"
                 fi
                 
-                # Copiar xfwl4 a la ubicacion estándar si existe
-                if [ -f "eclipse-apps/xfwl4/target/x86_64-unknown-linux-musl/release/xfwl4" ]; then
-                    mkdir -p "$BUILD_DIR/usr/bin"
-                    cp "eclipse-apps/xfwl4/target/x86_64-unknown-linux-musl/release/xfwl4" "$BUILD_DIR/usr/bin/xfwl4"
-                    chmod +x "$BUILD_DIR/usr/bin/xfwl4"
-                    print_status "xfwl4 copiado a /usr/bin/"
-                fi
 
                 # Copiar otros binarios importantes si existen
                 if [ -d "userland/target/release" ]; then
@@ -1428,8 +1379,8 @@ show_build_summary() {
     echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init"
     echo "  Kernel Eclipse OS: target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
-    echo "  Instalador: installer/target/release/eclipse-installer"
-    echo "  Systemd: eclipse-apps/systemd/target/release/eclipse-systemd"
+    echo "  Instalador: installer/target/x86_64-unknown-linux-musl/release/eclipse-installer"
+    echo "  Systemd: eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd"
     echo "  Userland principal: userland/target/release/eclipse_userland"
     echo "  Module Loader: userland/module_loader/target/release/module_loader"
     echo "  Graphics Module: userland/graphics_module/target/release/graphics_module"
@@ -1568,7 +1519,8 @@ build_eclipsefs_cli() {
     cd eclipsefs-cli
     
     print_status "Compilando eclipsefs CLI tool..."
-    RUSTFLAGS="-C relocation-model=pic" cargo build --release
+    SYSROOT_LDFLAGS="-C link-arg=-L$BASE_DIR/$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib"
+    RUSTFLAGS="-Zunstable-options -C relocation-model=pic $SYSROOT_LDFLAGS $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=std,panic_abort
     
     if [ $? -eq 0 ]; then
         print_success "eclipsefs-cli compilado exitosamente"
@@ -1601,7 +1553,6 @@ main() {
     build_systemd
     prepare_sysroot
     build_eclipse_libc
-    build_xfwl4
     # build_eclipse_apps
     # build_userland
     
@@ -1615,7 +1566,7 @@ main() {
     # But build_eclipse_apps only builds ipc and systemd.
     # Wait, build.sh:1322 says build_eclipse_apps builds ipc and systemd.
     # So I should keep build_eclipse_apps.
-    build_eclipse_apps
+    # build_eclipse_apps
     
     # build_userland builds: wayland_server, cosmic_client, module_loader etc.
     # These are failing.

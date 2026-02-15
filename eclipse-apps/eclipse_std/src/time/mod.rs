@@ -2,7 +2,7 @@
 //!
 //! Provides std-like Duration and Instant interfaces.
 
-use eclipse_libc::*;
+use libc::*;
 
 /// A Duration type to represent a span of time.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

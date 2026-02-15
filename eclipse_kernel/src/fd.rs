@@ -167,6 +167,14 @@ pub fn fd_init_stdio(pid: ProcessId) {
         let mut tables = FD_TABLES.lock();
         let pid_idx = pid as usize;
         if pid_idx < MAX_PROCESSES {
+            // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
+            tables[pid_idx].fds[0] = FileDescriptor {
+                in_use: true,
+                scheme_id,
+                resource_id,
+                offset: 0,
+                flags: 0,
+            };
             // FD 1: stdout
             tables[pid_idx].fds[1] = FileDescriptor {
                 in_use: true,

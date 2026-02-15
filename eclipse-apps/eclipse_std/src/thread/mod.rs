@@ -1,13 +1,15 @@
 //! Thread Module - Threading support using eclipse-libc pthread
 
 use core::ptr;
-use eclipse_libc::*;
-use eclipse_libc::header::time::{timespec, nanosleep};
+use libc::*;
+use core::prelude::v1::*;
+use libc::*;
+use libc::{timespec, nanosleep};
 use ::alloc::boxed::Box;
 
 /// Thread handle
 pub struct Thread {
-    handle: pthread_t,
+    handle: libc::pthread_t,
 }
 
 /// Join handle for a spawned thread
@@ -60,9 +62,9 @@ where
         }
         
         // Create pthread
-        let mut handle: pthread_t = core::mem::zeroed();
-        let result = pthread_create(
-            &mut handle as *mut pthread_t,
+        let mut handle: libc::pthread_t = core::mem::zeroed();
+        let result = libc::pthread_create(
+            &mut handle as *mut libc::pthread_t,
             ptr::null(),
             thread_wrapper::<F, T>,
             raw as *mut c_void
@@ -83,7 +85,7 @@ impl<T> JoinHandle<T> {
     /// Wait for the thread to finish
     pub fn join(self) -> Result<T, ()> {
         unsafe {
-            let result = pthread_join(self.thread.handle, ptr::null_mut());
+            let result = libc::pthread_join(self.thread.handle, ptr::null_mut());
             if result == 0 {
                 // TODO: return actual value
                 Err(())
@@ -110,6 +112,6 @@ pub fn sleep(dur: Duration) {
 /// Yield the current thread
 pub fn yield_now() {
     unsafe {
-        yield_cpu();
+        libc::yield_cpu();
     }
 }

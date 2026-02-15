@@ -1,9 +1,11 @@
 //! I/O Module - File and stream I/O using eclipse-libc
 //!
 //! Provides std-like I/O interfaces built on top of eclipse-libc's FILE streams.
+use libc::*;
+use core::prelude::v1::*;
 
 use core::ptr;
-use eclipse_libc::*;
+use libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 
@@ -25,17 +27,43 @@ pub struct Error {
 pub enum ErrorKind {
     NotFound,
     PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
     InvalidInput,
+    InvalidData,
+    TimedOut,
+    Interrupted,
+    Unsupported,
+    UnexpectedEof,
+    OutOfMemory,
     Other,
 }
 
 impl Error {
-    pub fn new(kind: ErrorKind) -> Self {
+    pub fn new<E>(kind: ErrorKind, _error: E) -> Self {
         Error { kind }
+    }
+    
+    pub fn from_raw_os_error(code: i32) -> Self {
+        // Simple mapping for now
+        Error { kind: ErrorKind::Other }
     }
     
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+}
+
+impl From<ErrorKind> for Error {
+    fn from(kind: ErrorKind) -> Error {
+        Error { kind }
     }
 }
 
@@ -68,7 +96,7 @@ pub trait Read {
                 buf.push_str(s);
                 Ok(n)
             }
-            Err(_) => Err(Error::new(ErrorKind::InvalidInput)),
+            Err(_) => Err(Error::new(ErrorKind::InvalidInput, "invalid utf-8")),
         }
     }
 }
@@ -82,7 +110,7 @@ pub trait Write {
         
         while total < buf.len() {
             match self.write(&buf[total..]) {
-                Ok(0) => return Err(Error::new(ErrorKind::Other)),
+                Ok(0) => return Err(Error::new(ErrorKind::Other, "zero-length write")),
                 Ok(n) => total += n,
                 Err(e) => return Err(e),
             }

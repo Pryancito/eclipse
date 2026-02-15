@@ -1,7 +1,7 @@
 //! Standard I/O - stdin, stdout, stderr
 
 use super::{Read, Write, Result, Error, ErrorKind};
-use eclipse_libc::*;
+use libc::*;
 
 /// Standard input
 pub struct Stdin {
@@ -36,11 +36,11 @@ pub fn stderr() -> Stderr {
 impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         unsafe {
-            let n = fread(
+            let n = libc::fread(
                 buf.as_mut_ptr() as *mut c_void,
                 1,
                 buf.len(),
-                eclipse_libc::stdin
+                libc::stdin
             );
             Ok(n)
         }
@@ -50,11 +50,11 @@ impl Read for Stdin {
 impl Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         unsafe {
-            let n = fwrite(
+            let n = libc::fwrite(
                 buf.as_ptr() as *const c_void,
                 1,
                 buf.len(),
-                eclipse_libc::stdout
+                libc::stdout
             );
             Ok(n)
         }
@@ -62,7 +62,7 @@ impl Write for Stdout {
     
     fn flush(&mut self) -> Result<()> {
         unsafe {
-            fflush(eclipse_libc::stdout);
+            libc::fflush(libc::stdout);
         }
         Ok(())
     }
@@ -71,11 +71,11 @@ impl Write for Stdout {
 impl Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         unsafe {
-            let n = fwrite(
+            let n = libc::fwrite(
                 buf.as_ptr() as *const c_void,
                 1,
                 buf.len(),
-                eclipse_libc::stderr
+                libc::stderr
             );
             Ok(n)
         }
@@ -83,7 +83,7 @@ impl Write for Stderr {
     
     fn flush(&mut self) -> Result<()> {
         unsafe {
-            fflush(eclipse_libc::stderr);
+            libc::fflush(libc::stderr);
         }
         Ok(())
     }

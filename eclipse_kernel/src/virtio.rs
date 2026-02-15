@@ -220,9 +220,9 @@ unsafe impl Send for Virtqueue {}
 impl Virtqueue {
     /// Create a new virtqueue with DMA-allocated memory
     unsafe fn new(queue_size: u16) -> Option<Self> {
-        crate::serial::serial_print("[VirtIO-VQ] Creating new virtqueue with size=");
-        crate::serial::serial_print_dec(queue_size as u64);
-        crate::serial::serial_print("\n");
+        // crate::serial::serial_print("[VirtIO-VQ] Creating new virtqueue with size=");
+        // crate::serial::serial_print_dec(queue_size as u64);
+        // crate::serial::serial_print("\n");
         
         // Calculate sizes according to VirtIO Legacy spec
         // The Used Ring must be aligned to 4096 bytes boundary
@@ -242,9 +242,9 @@ impl Virtqueue {
         
         let total_size = used_offset + used_size;
         
-        crate::serial::serial_print("[VirtIO] Allocating contiguous queue memory: ");
-        crate::serial::serial_print_dec(total_size as u64);
-        crate::serial::serial_print(" bytes (aligned to 4096)\n");
+        // crate::serial::serial_print("[VirtIO] Allocating contiguous queue memory: ");
+        // crate::serial::serial_print_dec(total_size as u64);
+        // crate::serial::serial_print(" bytes (aligned to 4096)\n");
         
         // Allocate single contiguous buffer (4096-byte aligned)
         let (mem_ptr, mem_phys) = crate::memory::alloc_dma_buffer(total_size, 4096)?;
@@ -262,15 +262,15 @@ impl Virtqueue {
         let used = mem_ptr.add(used_offset) as *mut VirtQUsed;
         let used_phys = mem_phys + used_offset as u64;
         
-        crate::serial::serial_print("[VirtIO]   Desc phys: ");
-        crate::serial::serial_print_hex(desc_phys);
-        crate::serial::serial_print("\n");
-        crate::serial::serial_print("[VirtIO]   Avail phys: ");
-        crate::serial::serial_print_hex(avail_phys);
-        crate::serial::serial_print("\n");
-        crate::serial::serial_print("[VirtIO]   Used phys: ");
-        crate::serial::serial_print_hex(used_phys);
-        crate::serial::serial_print("\n");
+        // crate::serial::serial_print("[VirtIO]   Desc phys: ");
+        // crate::serial::serial_print_hex(desc_phys);
+        // crate::serial::serial_print("\n");
+        // crate::serial::serial_print("[VirtIO]   Avail phys: ");
+        // crate::serial::serial_print_hex(avail_phys);
+        // crate::serial::serial_print("\n");
+        // crate::serial::serial_print("[VirtIO]   Used phys: ");
+        // crate::serial::serial_print_hex(used_phys);
+        // crate::serial::serial_print("\n");
         
         // Initialize descriptors
         // We do NOT use a linked free list anymore. Descriptors are allocated sequentially.
@@ -540,7 +540,7 @@ impl VirtIOBlockDevice {
     unsafe fn init_legacy_pci(&mut self) -> bool {
         use crate::serial;
         
-        serial::serial_print("[VirtIO] Initializing legacy PCI device\n");
+        // serial::serial_print("[VirtIO] Initializing legacy PCI device\n");
         
         // Reset device
         outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, 0);
@@ -554,9 +554,9 @@ impl VirtIOBlockDevice {
         
         // Read device features
         let features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
-        serial::serial_print("[VirtIO] Device features: ");
-        serial::serial_print_hex(features as u64);
-        serial::serial_print("\n");
+        // serial::serial_print("[VirtIO] Device features: ");
+        // serial::serial_print_hex(features as u64);
+        // serial::serial_print("\n");
         
         // Write driver features (accept all for now)
         outl(self.io_base + VIRTIO_PCI_DRIVER_FEATURES, 0);
@@ -566,9 +566,9 @@ impl VirtIOBlockDevice {
         
         // Get queue size
         let queue_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
-        serial::serial_print("[VirtIO] Queue size: ");
-        serial::serial_print_dec(queue_size as u64);
-        serial::serial_print("\n");
+        // serial::serial_print("[VirtIO] Queue size: ");
+        // serial::serial_print_dec(queue_size as u64);
+        // serial::serial_print("\n");
         
         if queue_size == 0 || queue_size > 256 {
             serial::serial_print("[VirtIO] Invalid queue size (must be 1-256): ");
@@ -578,9 +578,9 @@ impl VirtIOBlockDevice {
         }
         
         let actual_queue_size = queue_size;
-        serial::serial_print("[VirtIO] Using queue size: ");
-        serial::serial_print_dec(actual_queue_size as u64);
-        serial::serial_print("\n");
+        // serial::serial_print("[VirtIO] Using queue size: ");
+        // serial::serial_print_dec(actual_queue_size as u64);
+        // serial::serial_print("\n");
         
         // Create virtqueue
         match Virtqueue::new(actual_queue_size) {
@@ -617,10 +617,9 @@ impl VirtIOBlockDevice {
                 }
                 
                 // Verify status was set correctly
-                let final_status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
-                serial::serial_print("[VirtIO] Final device status: ");
-                serial::serial_print_hex(final_status as u64);
-                serial::serial_print("\n");
+                // serial::serial_print("[VirtIO] Final device status: ");
+                // serial::serial_print_hex(final_status as u64);
+                // serial::serial_print("\n");
                 
                 serial::serial_print("[VirtIO] Legacy PCI device initialized successfully\n");
                 true
@@ -757,18 +756,6 @@ impl VirtIOBlockDevice {
                 "Failed to allocate request buffer"
             })?;
             
-            crate::serial::serial_print("[VirtIO] READ block=");
-            crate::serial::serial_print_dec(block_num);
-            crate::serial::serial_print(" on device ");
-            crate::serial::serial_print_hex(self.mmio_base | self.io_base as u64);
-            crate::serial::serial_print("\n");
-
-            crate::serial::serial_print("[VirtIO] Request: v=");
-            crate::serial::serial_print_hex(req_ptr as u64);
-            crate::serial::serial_print(" p=");
-            crate::serial::serial_print_hex(req_phys);
-            crate::serial::serial_print("\n");
-            
             // Allocate status buffer
             // Align to 64 bytes to avoid false sharing
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 64)
@@ -790,12 +777,6 @@ impl VirtIOBlockDevice {
                     "Failed to allocate bounce buffer"
                 })?;
 
-            crate::serial::serial_print("[VirtIO] Bounce Buffer: v=");
-            crate::serial::serial_print_hex(bounce_ptr as u64);
-            crate::serial::serial_print(" p=");
-            crate::serial::serial_print_hex(bounce_phys);
-            crate::serial::serial_print("\n");
-
             // Zero out bounce buffer to detect if device actually writes to it
             core::ptr::write_bytes(bounce_ptr, 0, 4096);
 
@@ -814,22 +795,7 @@ impl VirtIOBlockDevice {
                 (bounce_phys, 4096, VIRTQ_DESC_F_WRITE),
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
-
-            // Debug log request content AFTER build
-            crate::serial::serial_print("[VirtIO] Header (p=");
-            crate::serial::serial_print_hex(req_phys);
-            crate::serial::serial_print("): type=");
-            crate::serial::serial_print_dec(req.req_type as u64);
-            crate::serial::serial_print(" sector=");
-            crate::serial::serial_print_dec(req.sector);
-            crate::serial::serial_print(" (raw: ");
-            for i in 0..16 {
-                let b = unsafe { core::ptr::read_volatile((req_ptr as *const u8).add(i)) };
-                crate::serial::serial_print_hex(b as u64);
-                crate::serial::serial_print(" ");
-            }
-            crate::serial::serial_print(")\n");
-            
+           
             // FLUSH CACHE (Ensure data reaches RAM before device reads it)
             clflush(req_ptr as u64);
             clflush(status_ptr as u64);
@@ -855,12 +821,6 @@ impl VirtIOBlockDevice {
                 } else {
                     return Err("Invalid device configuration");
                 }
-                
-                // Check initial status
-                let initial_status = read_volatile(status_ptr);
-                crate::serial::serial_print("[VirtIO] Pre-wait Status: 0x");
-                crate::serial::serial_print_hex(initial_status as u64);
-                crate::serial::serial_print("\n");
                 
                 // Wait for completion (Timeout using RDTSC)
                 // 2 GHz = 2 * 10^9 cycles/sec. 1ms = 2 * 10^6 cycles.
@@ -892,10 +852,6 @@ impl VirtIOBlockDevice {
                 if let Some((used_idx, len)) = queue.get_used() {
                     // Memory fence to ensure device writes are visible
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-                    
-                    crate::serial::serial_print("[VirtIO] Read completed: len=");
-                    crate::serial::serial_print_dec(len as u64);
-                    crate::serial::serial_print("\n");
                     
                     // Check status - MUST use volatile read as device writes this asynchronously
                     let status = read_volatile(status_ptr);

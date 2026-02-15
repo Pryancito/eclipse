@@ -122,9 +122,8 @@ impl Service {
 static mut SERVICES: [Option<Service>; MAX_SERVICES] = [const { None }; MAX_SERVICES];
 static mut SERVICE_COUNT: usize = 0;
 
-/// Entry point for eclipse-systemd
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+/// Entry point logic
+fn entry_point() -> ! {
     let pid = getpid();
     
     // Display banner
@@ -658,3 +657,15 @@ fn print_service_status() {
 
 // Note: Panic handler is provided by eclipse_libc
 
+// Entry point wrappers
+#[cfg(target_os = "none")]
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    entry_point()
+}
+
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
+    entry_point()
+}

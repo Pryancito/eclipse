@@ -165,14 +165,6 @@ pub fn mount() -> Result<(), &'static str> {
             let index = (inode - 1) as u64;
             let entry_offset = FS.inode_table_offset + (index * 8);
             
-            serial::serial_print("[FS] read_inode(");
-            serial::serial_print_dec(inode as u64);
-            serial::serial_print(") table_off=0x");
-            serial::serial_print_hex(FS.inode_table_offset);
-            serial::serial_print(" entry_off=0x");
-            serial::serial_print_hex(entry_offset);
-            serial::serial_print("\n");
-            
             let block_num = (entry_offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
             let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
             
@@ -188,21 +180,6 @@ pub fn mount() -> Result<(), &'static str> {
                 buffer[offset_in_block+4], buffer[offset_in_block+5], 
                 buffer[offset_in_block+6], buffer[offset_in_block+7]
             ]) as u64;
-            
-            serial::serial_print("[FS] INODE RAW: num=");
-            serial::serial_print_dec(inode_num);
-            serial::serial_print(" rel_off=");
-            serial::serial_print_dec(rel_offset);
-            serial::serial_print("\n");
-
-            serial::serial_print("[FS] Raw buffer dump (32 bytes at offset_in_block): ");
-            for i in 0..32 {
-                if offset_in_block + i < 4096 {
-                    serial::serial_print_hex(buffer[offset_in_block + i] as u64);
-                    serial::serial_print(" ");
-                }
-            }
-            serial::serial_print("\n");
              
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
             
@@ -827,29 +804,34 @@ pub fn init_devfs() {
     let mut registry = DEVICE_REGISTRY.lock();
     *registry = Some(BTreeMap::new());
     serial::serial_print("[FS] Device registry initialized\n");
+
+    // Framebuffer will be registered by display_service in userspace
 }
 
 /// Register a new device
 pub fn register_device(name: &str, device_type: DeviceType, driver_pid: u64) -> bool {
-    // Ensure registry is initialized
-    let mut registry_lock = DEVICE_REGISTRY.lock();
-    if registry_lock.is_none() {
-        *registry_lock = Some(BTreeMap::new());
-    }
-    
-    if let Some(registry) = registry_lock.as_mut() {
-        registry.insert(String::from(name), DeviceNode {
-            name: String::from(name),
-            device_type,
-            driver_pid,
-        });
+    // Disable interrupts to prevent context switch or stack corruption during lock
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // Ensure registry is initialized
+        let mut registry_lock = DEVICE_REGISTRY.lock();
+        if registry_lock.is_none() {
+            *registry_lock = Some(BTreeMap::new());
+        }
         
-        serial::serial_print("[FS] Registered device: /dev/");
-        serial::serial_print(name);
-        serial::serial_print("\n");
-        return true;
-    }
-    false
+        if let Some(registry) = registry_lock.as_mut() {
+            registry.insert(String::from(name), DeviceNode {
+                name: String::from(name),
+                device_type,
+                driver_pid,
+            });
+            
+            serial::serial_print("[FS] Registered device: /dev/");
+            serial::serial_print(name);
+            serial::serial_print("\n");
+            return true;
+        }
+        false
+    })
 }
 
 /// Lookup a device by name (e.g., "null")
@@ -862,13 +844,71 @@ pub fn lookup_device(name: &str) -> Option<DeviceNode> {
     }
 }
 
+// --- Framebuffer Structures ---
+
+#[repr(C)]
+struct fb_bitfield {
+    pub offset: u32,
+    pub length: u32,
+    pub msb_right: u32,
+}
+
+#[repr(C)]
+struct fb_var_screeninfo {
+    pub xres: u32,
+    pub yres: u32,
+    pub xres_virtual: u32,
+    pub yres_virtual: u32,
+    pub xoffset: u32,
+    pub yoffset: u32,
+    pub bits_per_pixel: u32,
+    pub grayscale: u32,
+    pub red: fb_bitfield,
+    pub green: fb_bitfield,
+    pub blue: fb_bitfield,
+    pub transp: fb_bitfield,
+    pub nonstd: u32,
+    pub activate: u32,
+    pub height: u32,
+    pub width: u32,
+    pub accel_flags: u32,
+    // ... other fields truncated for simplicity
+    pub reserved: [u32; 100], 
+}
+
+#[repr(C)]
+struct fb_fix_screeninfo {
+    pub id: [u8; 16],
+    pub smem_start: u64,
+    pub smem_len: u32,
+    pub type_: u32,
+    pub type_aux: u32,
+    pub visual: u32,
+    pub xpanstep: u16,
+    pub ypanstep: u16,
+    pub ywrapstep: u16,
+    pub line_length: u32,
+    pub mmio_start: u64,
+    pub mmio_len: u32,
+    pub accel: u32,
+    pub capabilities: u16,
+    pub reserved: [u16; 2],
+}
+
 // --- Redox-style Scheme Implementation ---
 
 use crate::scheme::{Scheme, Stat, error as scheme_error};
 
-struct OpenFile {
-    inode: u32,
-    offset: u64,
+/// Open flags (match POSIX / eclipse-syscall)
+const O_CREAT: usize = 0x0040;
+const O_EXCL: usize = 0x0080;
+
+/// Virtual files under /tmp (in-memory overlay for O_CREAT)
+static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+enum OpenFile {
+    Real { inode: u32, offset: u64 },
+    Virtual { path: String, offset: u64 },
 }
 
 static OPEN_FILES_SCHEME: Mutex<alloc::vec::Vec<Option<OpenFile>>> = Mutex::new(alloc::vec::Vec::new());
@@ -876,7 +916,7 @@ static OPEN_FILES_SCHEME: Mutex<alloc::vec::Vec<Option<OpenFile>>> = Mutex::new(
 pub struct FileSystemScheme;
 
 impl Scheme for FileSystemScheme {
-    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+    fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
         let mounted = is_mounted();
         if !mounted {
             serial::serial_print("[FS-SCHEME] open() failed: filesystem NOT mounted\n");
@@ -895,16 +935,56 @@ impl Scheme for FileSystemScheme {
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 for (i, slot) in open_files.iter_mut().enumerate() {
                     if slot.is_none() {
-                        *slot = Some(OpenFile { inode, offset: 0 });
+                        *slot = Some(OpenFile::Real { inode, offset: 0 });
                         return Ok(i);
                     }
                 }
-                
                 let id = open_files.len();
-                open_files.push(Some(OpenFile { inode, offset: 0 }));
+                open_files.push(Some(OpenFile::Real { inode, offset: 0 }));
                 Ok(id)
             }
-            Err(_) => Err(scheme_error::ENOENT),
+            Err(_) => {
+                let key = String::from(clean_path);
+                let is_tmp = clean_path.starts_with("tmp/") || clean_path == "tmp";
+                // Already exists in virtual /tmp? Open it.
+                {
+                    let vtmp = VIRTUAL_TMP.lock();
+                    if vtmp.contains_key(&key) {
+                        drop(vtmp);
+                        let mut open_files = OPEN_FILES_SCHEME.lock();
+                        for (i, slot) in open_files.iter_mut().enumerate() {
+                            if slot.is_none() {
+                                *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                                return Ok(i);
+                            }
+                        }
+                        let id = open_files.len();
+                        open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
+                        return Ok(id);
+                    }
+                }
+                // O_CREAT: create file if it doesn't exist (under /tmp only)
+                if (flags & O_CREAT) != 0 && is_tmp {
+                    let mut vtmp = VIRTUAL_TMP.lock();
+                    if (flags & O_EXCL) != 0 && vtmp.contains_key(&key) {
+                        return Err(scheme_error::EEXIST);
+                    }
+                    vtmp.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
+                    drop(vtmp);
+                    let mut open_files = OPEN_FILES_SCHEME.lock();
+                    for (i, slot) in open_files.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                            return Ok(i);
+                        }
+                    }
+                    let id = open_files.len();
+                    open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
+                    Ok(id)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            }
         }
     }
 
@@ -912,12 +992,35 @@ impl Scheme for FileSystemScheme {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
-        match Filesystem::read_file_by_inode_at(open_file.inode, buffer, open_file.offset) {
-            Ok(bytes_read) => {
-                open_file.offset += bytes_read as u64;
-                Ok(bytes_read)
+        match open_file {
+            OpenFile::Real { inode, offset } => {
+                match Filesystem::read_file_by_inode_at(*inode, buffer, *offset) {
+                    Ok(bytes_read) => {
+                        *offset += bytes_read as u64;
+                        Ok(bytes_read)
+                    }
+                    Err(_) => Err(scheme_error::EIO),
+                }
             }
-            Err(_) => Err(scheme_error::EIO),
+            OpenFile::Virtual { path, offset } => {
+                let path_clone = path.clone();
+                let off = *offset;
+                drop(open_files);
+                let vtmp = VIRTUAL_TMP.lock();
+                let content = vtmp.get(&path_clone).ok_or(scheme_error::EIO)?;
+                let start = off as usize;
+                if start >= content.len() {
+                    return Ok(0);
+                }
+                let n = core::cmp::min(buffer.len(), content.len() - start);
+                buffer[..n].copy_from_slice(&content[start..start + n]);
+                drop(vtmp);
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                if let Some(Some(OpenFile::Virtual { offset: o, .. })) = open_files.get_mut(id) {
+                    *o += n as u64;
+                }
+                Ok(n)
+            }
         }
     }
 
@@ -925,30 +1028,76 @@ impl Scheme for FileSystemScheme {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
-        match Filesystem::write_file_by_inode(open_file.inode, buffer, open_file.offset) {
-            Ok(bytes_written) => {
-                open_file.offset += bytes_written as u64;
-                Ok(bytes_written)
+        match open_file {
+            OpenFile::Real { inode, offset } => {
+                match Filesystem::write_file_by_inode(*inode, buffer, *offset) {
+                    Ok(bytes_written) => {
+                        *offset += bytes_written as u64;
+                        Ok(bytes_written)
+                    }
+                    Err(_) => Err(scheme_error::EIO),
+                }
             }
-            Err(_) => Err(scheme_error::EIO),
+            OpenFile::Virtual { path, offset } => {
+                let path_clone = path.clone();
+                let off = *offset as usize;
+                let n = buffer.len();
+                drop(open_files);
+                let mut vtmp = VIRTUAL_TMP.lock();
+                let content = vtmp.get_mut(&path_clone).ok_or(scheme_error::EIO)?;
+                let need_len = off + n;
+                if content.len() < need_len {
+                    content.resize(need_len, 0);
+                }
+                content[off..off + n].copy_from_slice(buffer);
+                drop(vtmp);
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                if let Some(Some(OpenFile::Virtual { offset: o, .. })) = open_files.get_mut(id) {
+                    *o += n as u64;
+                }
+                Ok(n)
+            }
         }
     }
 
-    fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {
+    fn lseek(&self, id: usize, seek_offset: isize, whence: usize) -> Result<usize, usize> {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
-        let new_offset = match whence {
-            0 => offset as u64, // SEEK_SET
-            1 => (open_file.offset as isize + offset) as u64, // SEEK_CUR
-            2 => { // SEEK_END
-                let size = Filesystem::get_file_size(open_file.inode).map_err(|_| scheme_error::EIO)? as u64;
-                (size as isize + offset) as u64
-            },
-            _ => return Err(scheme_error::EINVAL),
+        let (new_offset, is_virtual) = match open_file {
+            OpenFile::Real { inode, offset } => {
+                let size = Filesystem::get_file_size(*inode).map_err(|_| scheme_error::EIO)? as u64;
+                let no = match whence {
+                    0 => seek_offset as u64,
+                    1 => (*offset as isize + seek_offset) as u64,
+                    2 => (size as isize + seek_offset) as u64,
+                    _ => return Err(scheme_error::EINVAL),
+                };
+                *offset = no;
+                drop(open_files);
+                (no, false)
+            }
+            OpenFile::Virtual { path, offset } => {
+                let path_clone = path.clone();
+                let off = *offset;
+                drop(open_files);
+                let vtmp = VIRTUAL_TMP.lock();
+                let len = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
+                drop(vtmp);
+                let no = match whence {
+                    0 => seek_offset as u64,
+                    1 => (off as isize + seek_offset) as u64,
+                    2 => (len as isize + seek_offset) as u64,
+                    _ => return Err(scheme_error::EINVAL),
+                };
+                let mut open_files = OPEN_FILES_SCHEME.lock();
+                let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+                if let OpenFile::Virtual { offset: o, .. } = open_file {
+                    *o = no;
+                }
+                (no, true)
+            }
         };
-        
-        open_file.offset = new_offset;
         Ok(new_offset as usize)
     }
 
@@ -966,13 +1115,31 @@ impl Scheme for FileSystemScheme {
         let open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         
-        match Filesystem::get_file_size(open_file.inode) {
-            Ok(size) => {
-                stat.size = size;
+        match open_file {
+            OpenFile::Real { inode, .. } => match Filesystem::get_file_size(*inode) {
+                Ok(size) => {
+                    stat.size = size;
+                    Ok(0)
+                }
+                Err(_) => Err(scheme_error::EIO),
+            },
+            OpenFile::Virtual { path, .. } => {
+                let path_clone = path.clone();
+                drop(open_files);
+                let vtmp = VIRTUAL_TMP.lock();
+                stat.size = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
                 Ok(0)
             }
-            Err(_) => Err(scheme_error::EIO),
         }
+    }
+
+    fn mkdir(&self, path: &str, _mode: u32) -> Result<usize, usize> {
+        serial::serial_print("[FS-SCHEME] mkdir(");
+        serial::serial_print(path);
+        serial::serial_print(")\n");
+        
+        // Stub: Always return success for now to satisfy /tmp creation
+        Ok(0)
     }
 }
 
@@ -987,7 +1154,9 @@ impl Scheme for DevScheme {
         
         if lookup_device(clean_path).is_some() {
             // For now, we return a virtual ID based on the order in the registry
-            // This is a placeholder since devfs is currently mostly for registration info
+            if clean_path == "fb0" {
+                return Ok(100); // Magic ID for fb0
+            }
             Ok(0) 
         } else {
             Err(scheme_error::ENOENT)
@@ -1006,12 +1175,74 @@ impl Scheme for DevScheme {
         Ok(0)
     }
 
-    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        if id == 100 { // fb0
+            let fb_info = &crate::boot::get_boot_info().framebuffer;
+            stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
+            return Ok(0);
+        }
         Ok(0)
+    }
+
+    fn fmap(&self, id: usize, _offset: usize, _len: usize) -> Result<usize, usize> {
+        if id == 100 { // fb0
+            let fb_info = &crate::boot::get_boot_info().framebuffer;
+            if fb_info.base_address == 0 {
+                return Err(scheme_error::EIO);
+            }
+            // Return physical address
+            return Ok(fb_info.base_address as usize);
+        }
+        Err(scheme_error::ENOSYS)
+    }
+
+    fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+        if id == 100 { // fb0
+            match request {
+                0x4600 => { // FBIOGET_VSCREENINFO
+                    let fb_info = &crate::boot::get_boot_info().framebuffer;
+                    let var_info = unsafe { &mut *(arg as *mut fb_var_screeninfo) };
+                    var_info.xres = fb_info.width as u32;
+                    var_info.yres = fb_info.height as u32;
+                    var_info.xres_virtual = fb_info.width as u32;
+                    var_info.yres_virtual = fb_info.height as u32;
+                    var_info.bits_per_pixel = 32;
+                    var_info.red.offset = 16;
+                    var_info.red.length = 8;
+                    var_info.green.offset = 8;
+                    var_info.green.length = 8;
+                    var_info.blue.offset = 0;
+                    var_info.blue.length = 8;
+                    var_info.transp.offset = 24;
+                    var_info.transp.length = 8;
+                    return Ok(0);
+                }
+                0x4602 => { // FBIOGET_FSCREENINFO
+                    let fb_info = &crate::boot::get_boot_info().framebuffer;
+                    let fix_info = unsafe { &mut *(arg as *mut fb_fix_screeninfo) };
+                    fix_info.smem_start = fb_info.base_address as u64;
+                    fix_info.smem_len = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u32;
+                    fix_info.line_length = (fb_info.pixels_per_scan_line * 4) as u32;
+                    fix_info.visual = 2; // FB_VISUAL_TRUECOLOR
+                    return Ok(0);
+                }
+                _ => {
+                    serial::serial_print("DevScheme::ioctl: Unknown request: ");
+                    serial::serial_print_hex(request as u64);
+                    serial::serial_print("\n");
+                    return Err(scheme_error::EINVAL);
+                }
+            }
+        }
+        Err(scheme_error::EBADF)
     }
 
     fn close(&self, _id: usize) -> Result<usize, usize> {
         Ok(0)
+    }
+
+    fn mkdir(&self, _path: &str, _mode: u32) -> Result<usize, usize> {
+        Err(scheme_error::ENOSYS)
     }
 }
 

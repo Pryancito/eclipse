@@ -40,8 +40,11 @@ struct Elf64ProgramHeader {
 }
 
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;  // Segment executable
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+/// Minimum sane entry point; anything below is inside ELF header (64 bytes) or bogus
+const MIN_ENTRY_POINT: u64 = 0x80;
 
 
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado
@@ -67,6 +70,24 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
     
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
         return Err("ELF: Program headers out of bounds");
+    }
+    if header.e_entry < MIN_ENTRY_POINT {
+        return Err("ELF: Entry point in header or invalid (e_entry < 0x80)");
+    }
+    // Entry must lie inside an executable PT_LOAD segment
+    let mut entry_in_exec_segment = false;
+    for i in 0..ph_count {
+        let off = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_LOAD && (ph.p_flags & PF_X) != 0 {
+            if header.e_entry >= ph.p_vaddr && header.e_entry < ph.p_vaddr + ph.p_memsz {
+                entry_in_exec_segment = true;
+                break;
+            }
+        }
+    }
+    if !entry_in_exec_segment {
+        return Err("ELF: Entry point not in executable segment");
     }
 
     // Keep track of mapped 2MB regions to handle segments sharing the same page
@@ -315,17 +336,36 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     }
     serial::serial_print("\n");
 
+    let ph_offset = header.e_phoff as usize;
+    let ph_count = header.e_phnum as usize;
+    let ph_size = header.e_phentsize as usize;
+
     // Validate Entry Point
     if header.e_entry > USER_ADDR_MAX {
          serial::serial_print("ELF: Entry point in kernel space (Security Violation)\n");
          return None;
     }
-    
-    // Iterate over program headers and load segments
-    let ph_offset = header.e_phoff as usize;
-    let ph_count = header.e_phnum as usize;
-    let ph_size = header.e_phentsize as usize;
-    
+    if header.e_entry < MIN_ENTRY_POINT {
+        serial::serial_print("ELF: Entry point in ELF header or invalid (e_entry < 0x80)\n");
+        return None;
+    }
+    // Entry must lie inside an executable PT_LOAD segment (avoid jumping into ELF header/data)
+    let mut entry_in_exec_segment = false;
+    for i in 0..ph_count {
+        let offset = ph_offset + (i * ph_size);
+        let ph = unsafe { &*(elf_data[offset..].as_ptr() as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_LOAD && (ph.p_flags & PF_X) != 0 {
+            if header.e_entry >= ph.p_vaddr && header.e_entry < ph.p_vaddr + ph.p_memsz {
+                entry_in_exec_segment = true;
+                break;
+            }
+        }
+    }
+    if !entry_in_exec_segment {
+        serial::serial_print("ELF: Entry point not in executable segment (invalid or corrupted ELF)\n");
+        return None;
+    }
+
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
         serial::serial_print("ELF: Program headers out of bounds for exec\n");
         return None;
@@ -520,38 +560,31 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
         *stack_ptr.offset(4) = 0; // auxv[0].a_val = 0
     }
 
-    let user_cs: u64 = 0x1b; // 0x18 | 3
-    let user_ds: u64 = 0x23; // 0x20 | 3
-    let rflags: u64 = 0x202; // Interrupciones habilitadas
-    
+    // Segmentos y flags para iretq (Ring 3). Evitar rbx (reservado por LLVM en asm).
+    let user_cs: u64 = 0x1b;   // 0x18 | 3
+    let user_ds: u64 = 0x23;   // 0x20 | 3
+    let rflags: u64 = 0x202;   // IF=1
+
+    // Frame iretq: [RIP][CS][RFLAGS][RSP][SS]. Escrituras explícitas en pila (arreglo previo).
     asm!(
-        "cli",              // Disable interrupts during transition
-        
-        // Build iretq frame manually on kernel stack
-        "push {u_ss}",
-        "push {u_rsp}",
-        "push {u_flags}",
-        "push {u_cs}",
-        "push {u_rip}",
-        
-        // Set up user data segments
-        "mov ax, {ds_sel:x}",
+        "cli",
+        "sub rsp, 40",
+        "mov [rsp], rax",
+        "mov [rsp + 8], rcx",
+        "mov [rsp + 16], rdx",
+        "mov [rsp + 24], rsi",
+        "mov [rsp + 32], rdi",
+        "mov ax, r8w",
         "mov ds, ax",
         "mov es, ax",
-        
-        // Zero FS and GS segments
         "xor ax, ax",
         "mov fs, ax",
         "mov gs, ax",
-        
-        // COMPLETE REGISTER HYGIENE
         "xor rax, rax",
-        "xor rbx, rbx",
         "xor rcx, rcx",
         "xor rdx, rdx",
         "xor rsi, rsi",
         "xor rdi, rdi",
-        "xor rbp, rbp",
         "xor r8, r8",
         "xor r9, r9",
         "xor r10, r10",
@@ -560,15 +593,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
         "xor r13, r13",
         "xor r14, r14",
         "xor r15, r15",
-        
         "iretq",
-        
-        u_ss = in(reg) user_ds,
-        u_rsp = in(reg) adjusted_stack,
-        u_flags = in(reg) rflags,
-        u_cs = in(reg) user_cs,
-        u_rip = in(reg) entry_point,
-        ds_sel = in(reg) user_ds,
+        in("rax") entry_point,
+        in("rcx") user_cs,
+        in("rdx") rflags,
+        in("rsi") adjusted_stack,
+        in("rdi") user_ds,
+        in("r8") user_ds,
         options(noreturn)
     );
 }

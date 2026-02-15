@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { path = "../libc" }
+eclipse-libc = { package = "eclipse-libc-internal", path = "../libc" }
 
 [[bin]]
 name = "network_service"

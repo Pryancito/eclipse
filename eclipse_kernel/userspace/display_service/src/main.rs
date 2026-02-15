@@ -140,9 +140,30 @@ fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to white");
 }
 
+const SYS_REGISTER_DEVICE: u64 = 27;
+
+#[repr(u64)]
+enum DeviceType {
+    Display = 5,
+}
+
+fn register_device(name: &str, type_id: DeviceType) -> bool {
+    unsafe {
+        let mut result: u64;
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_REGISTER_DEVICE,
+            in("rdi") name.as_ptr() as u64,
+            in("rsi") name.len() as u64,
+            in("rdx") type_id as u64,
+            lateout("rax") result,
+            options(nostack)
+        );
+        result == 0
+    }
+}
+
 /// Create framebuffer device node /dev/fb0
-/// In a full implementation, this would communicate with devfs service
-/// or use a syscall to register the device node
 fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: usize) {
     println!("[DISPLAY-SERVICE] Creating framebuffer device node:");
     println!("[DISPLAY-SERVICE]   Device: /dev/fb0");
@@ -152,13 +173,12 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
     println!("[DISPLAY-SERVICE]   Resolution: {}x{}", fb_info.width, fb_info.height);
     println!("[DISPLAY-SERVICE]   Color depth: {}-bit", fb_info.bpp);
     println!("[DISPLAY-SERVICE]   Pitch: {} bytes/scanline", fb_info.pitch);
-    println!("[DISPLAY-SERVICE]   ✓ Device node /dev/fb0 registered");
     
-    // TODO: In a full implementation, this would:
-    // - Use a SYS_CREATE_DEVICE syscall to register with devfs
-    // - Or send IPC message to devfs_service to create the node
-    // - Set appropriate permissions (0660, video group)
-    // - Enable mmap() support for direct framebuffer access
+    if register_device("fb0", DeviceType::Display) {
+        println!("[DISPLAY-SERVICE]   ✓ Device node /dev/fb0 registered");
+    } else {
+        println!("[DISPLAY-SERVICE]   X Failed to register /dev/fb0");
+    }
 }
 
 /// Graphics driver types

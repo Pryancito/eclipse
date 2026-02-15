@@ -1,8 +1,10 @@
 //! File System Module - File operations using eclipse-libc
 //!
 //! Provides std-like File interface built on top of eclipse-libc's fopen/fread/fwrite.
+use libc::*;
+use core::prelude::v1::*;
 
-use eclipse_libc::*;
+use libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::io::{Read, Write, Result, Error, ErrorKind};
@@ -23,9 +25,9 @@ impl File {
         let mode = b"r\0";
         
         unsafe {
-            let ptr = fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
+            let ptr = libc::fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
             if ptr.is_null() {
-                return Err(Error::new(ErrorKind::NotFound));
+                return Err(Error::new(ErrorKind::NotFound, "file not found"));
             }
             
             Ok(File {
@@ -43,9 +45,9 @@ impl File {
         let mode = b"w\0";
         
         unsafe {
-            let ptr = fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
+            let ptr = libc::fopen(c_path.as_ptr() as *const c_char, mode.as_ptr() as *const c_char);
             if ptr.is_null() {
-                return Err(Error::new(ErrorKind::PermissionDenied));
+                return Err(Error::new(ErrorKind::PermissionDenied, "permission denied"));
             }
             
             Ok(File {
@@ -59,7 +61,7 @@ impl File {
 impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         unsafe {
-            let n = fread(
+            let n = libc::fread(
                 buf.as_mut_ptr() as *mut c_void,
                 1,
                 buf.len(),
@@ -73,7 +75,7 @@ impl Read for File {
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         unsafe {
-            let n = fwrite(
+            let n = libc::fwrite(
                 buf.as_ptr() as *const c_void,
                 1,
                 buf.len(),
@@ -85,7 +87,7 @@ impl Write for File {
     
     fn flush(&mut self) -> Result<()> {
         unsafe {
-            fflush(self.ptr);
+            libc::fflush(self.ptr);
         }
         Ok(())
     }
@@ -94,7 +96,7 @@ impl Write for File {
 impl Drop for File {
     fn drop(&mut self) {
         unsafe {
-            fclose(self.ptr);
+            libc::fclose(self.ptr);
         }
     }
 }

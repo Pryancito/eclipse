@@ -557,6 +557,10 @@ extern "C" fn timer_handler() {
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
     
+    // Procesar IPC pendiente (cola global -> mailboxes); el kernel main loop
+    // ya no se ejecuta tras el primer schedule(), así que debe hacerse aquí.
+    crate::ipc::process_messages();
+    
     // Llamar al scheduler si está disponible
     crate::scheduler::tick();
 }
@@ -701,24 +705,14 @@ unsafe extern "C" fn syscall_int80() {
         
         "and rsp, -16", // Alinear stack para SysV ABI
         
-        // Los argumentos de syscall de x86_64 suelen ser:
-        // rax = num
-        // rdi, rsi, rdx, r10, r8, r9
-        
-        // Mapear argumentos para la función Rust
-        // RDI (arg 0) = syscall_num (RAX)
-        // RSI (arg 1) = arg1 (RDI)
-        // RDX (arg 2) = arg2 (RSI)
-        // RCX (arg 3) = arg3 (RDX)
-        // R8  (arg 4) = arg4 (R10)
-        // R9  (arg 5) = arg5 (R8)
-        
-        "mov r9, r8",    // arg5 (from r8)
-        "mov r8, r10",   // arg4 (from r10)
-        "mov rcx, rdx",  // arg3 (from rdx)
-        "mov rdx, rsi",  // arg2 (from rsi)
-        "mov rsi, rdi",  // arg1 (from rdi)
-        "mov rdi, rax",  // syscall_num
+        // Mapear argumentos desde el frame guardado (mismo layout que syscall_entry)
+        // rbp-8=rax, rbp-48=rdi, rbp-40=rsi, rbp-32=rdx, rbp-72=r10, rbp-56=r8
+        "mov rdi, [rbp - 8]",   // syscall_num = saved rax
+        "mov rsi, [rbp - 48]",  // arg1 = saved rdi
+        "mov rdx, [rbp - 40]",  // arg2 = saved rsi
+        "mov rcx, [rbp - 32]",  // arg3 = saved rdx
+        "mov r8, [rbp - 72]",   // arg4 = saved r10
+        "mov r9, [rbp - 56]",   // arg5 = saved r8
         
         // Pasar puntero al contexto (RSP apunta a r15, que es el inicio de la estructura)
         // La estructura SyscallContext mapea exactamente el layout del stack desde r15 hasta ss
@@ -785,8 +779,7 @@ unsafe extern "C" fn syscall_entry() {
         // Layout: SS, RSP, RFLAGS, CS, RIP
         
         // 1. SS (User Data = 0x23)
-        "mov rax, 0x23",
-        "push rax",
+        "push 0x23",
         
         // 2. RSP (Saved User RSP)
         "push [rip + {user_rsp}]",
@@ -795,8 +788,7 @@ unsafe extern "C" fn syscall_entry() {
         "push r11",
         
         // 4. CS (User Code = 0x1B)
-        "mov rax, 0x1B",
-        "push rax",
+        "push 0x1B",
         
         // 5. RIP (Saved in RCX)
         "push rcx",
@@ -828,15 +820,15 @@ unsafe extern "C" fn syscall_entry() {
         "and rsp, -16", 
         
         // Map arguments (Linux Syscall ABI -> Rust Handler)
-        // Linux: RAX (num), RDI (1), RSI (2), RDX (3), R10 (4), R8 (5), R9 (6)
+        // SYSCALL instruction clobbers RCX and R11, so load args from saved frame.
+        // Stack layout: rbp, rax(-8), rbx(-16), rcx(-24), rdx(-32), rsi(-40), rdi(-48), r8(-56), r9(-64), r10(-72), ...
         // Rust Handler: sys_num, arg1, arg2, arg3, arg4, arg5, context
-        
-        "mov r9, r8",    // arg5 (from r8)
-        "mov r8, r10",   // arg4 (from r10)
-        "mov rcx, rdx",  // arg3 (from rdx)
-        "mov rdx, rsi",  // arg2 (from rsi)
-        "mov rsi, rdi",  // arg1 (from rdi)
-        "mov rdi, rax",  // syscall_num
+        "mov rdi, [rbp - 8]",   // syscall_num = saved rax
+        "mov rsi, [rbp - 48]",  // arg1 = saved rdi (e.g. fd for read)
+        "mov rdx, [rbp - 40]",  // arg2 = saved rsi (e.g. buf)
+        "mov rcx, [rbp - 32]",  // arg3 = saved rdx (e.g. count)
+        "mov r8, [rbp - 72]",   // arg4 = saved r10
+        "mov r9, [rbp - 56]",   // arg5 = saved r8
         
         "lea rax, [rbp - 112]", // Context Ptr (address of r15)
         "push rax",      // 7th arg

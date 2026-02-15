@@ -6,20 +6,75 @@ use core::ptr;
 
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: size_t) -> *mut c_void {
-    ptr::copy_nonoverlapping(src as *const u8, dest as *mut u8, n);
+    if n > 0 {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rcx") n => _,
+            inout("rdi") dest => _,
+            inout("rsi") src => _,
+        );
+    }
     dest
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: size_t) -> *mut c_void {
-    ptr::copy(src as *const u8, dest as *mut u8, n);
+    if n > 0 {
+        if (dest as usize) < (src as usize) {
+            // Adelante hacia atrás
+            core::arch::asm!(
+                "rep movsb",
+                inout("rcx") n => _,
+                inout("rdi") dest => _,
+                inout("rsi") src => _,
+            );
+        } else {
+            // Atrás hacia adelante
+            core::arch::asm!(
+                "std",
+                "rep movsb",
+                "cld",
+                inout("rcx") n => _,
+                inout("rdi") (dest as *mut u8).add(n - 1) => _,
+                inout("rsi") (src as *const u8).add(n - 1) => _,
+            );
+        }
+    }
     dest
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut c_void, c: c_int, n: size_t) -> *mut c_void {
-    ptr::write_bytes(s as *mut u8, c as u8, n);
+    if n > 0 {
+        core::arch::asm!(
+            "rep stosb",
+            inout("rcx") n => _,
+            inout("rdi") s => _,
+            in("al") c as u8,
+        );
+    }
     s
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcmp(s1: *const c_void, s2: *const c_void, n: size_t) -> c_int {
+    let s1 = s1 as *const u8;
+    let s2 = s2 as *const u8;
+    for i in 0..n {
+        if *s1.add(i) != *s2.add(i) {
+            return 1;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ffs(i: c_int) -> c_int {
+    if i == 0 {
+        0
+    } else {
+        i.trailing_zeros() as c_int + 1
+    }
 }
 
 #[no_mangle]
@@ -192,7 +247,7 @@ pub unsafe extern "C" fn strstr(haystack: *const c_char, needle: *const c_char) 
 
 #[no_mangle]
 pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
-    use crate::alloc::malloc;
+    use crate::internal_alloc::malloc;
     
     let len = strlen(s);
     let new_str = malloc(len + 1) as *mut c_char;
@@ -201,4 +256,68 @@ pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
     }
     memcpy(new_str as *mut c_void, s as *const c_void, len + 1);
     new_str
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: size_t) -> *mut c_void {
+    let p = s as *const u8;
+    let target = c as u8;
+    for i in 0..n {
+        if *p.add(i) == target {
+            return p.add(i) as *mut c_void;
+        }
+    }
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strnlen(s: *const c_char, maxlen: size_t) -> size_t {
+    let mut i = 0;
+    while i < maxlen && *s.add(i) != 0 {
+        i += 1;
+    }
+    i
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strcasecmp(s1: *const c_char, s2: *const c_char) -> c_int {
+    let mut i = 0;
+    loop {
+        let mut c1 = *s1.add(i) as u8;
+        let mut c2 = *s2.add(i) as u8;
+        
+        if c1 >= b'A' && c1 <= b'Z' { c1 += 32; }
+        if c2 >= b'A' && c2 <= b'Z' { c2 += 32; }
+        
+        if c1 == 0 && c2 == 0 {
+            return 0;
+        }
+        if c1 != c2 {
+            return c1 as c_int - c2 as c_int;
+        }
+        i += 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strncasecmp(s1: *const c_char, s2: *const c_char, n: size_t) -> c_int {
+    if n == 0 { return 0; }
+    for i in 0..n {
+        let mut c1 = *s1.add(i) as u8;
+        let mut c2 = *s2.add(i) as u8;
+        
+        if c1 >= b'A' && c1 <= b'Z' { c1 += 32; }
+        if c2 >= b'A' && c2 <= b'Z' { c2 += 32; }
+        
+        if c1 == 0 && c2 == 0 {
+            return 0;
+        }
+        if c1 != c2 {
+            return c1 as c_int - c2 as c_int;
+        }
+        if c1 == 0 {
+            return 0;
+        }
+    }
+    0
 }
