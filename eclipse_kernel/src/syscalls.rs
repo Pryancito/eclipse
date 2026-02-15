@@ -92,8 +92,8 @@ pub extern "C" fn syscall_handler(
     arg1: u64,
     arg2: u64,
     arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
+    arg4: u64,
+    arg5: u64,
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
     // Log registers for Syscall 27 (register_device) to catch corruption
@@ -145,6 +145,14 @@ pub extern "C" fn syscall_handler(
     stats.total_calls += 1;
     drop(stats);
 
+    // Linux ABI: translate so glibc static binaries (e.g. Xfbdev) work unchanged
+    let (syscall_num, arg1, arg2, arg3, arg4, arg5) = match translate_linux_abi(syscall_num, arg1, arg2, arg3, arg4, arg5) {
+        Some(t) => t,
+        None => (syscall_num, arg1, arg2, arg3, arg4, arg5),
+    };
+    let _arg4 = arg4;
+    let _arg5 = arg5;
+
     let ret = match syscall_num {
         0 => sys_exit(arg1),
         1 => sys_write(arg1, arg2, arg3),
@@ -180,6 +188,7 @@ pub extern "C" fn syscall_handler(
         31 => sys_spawn(arg1, arg2),
         32 => sys_arch_prctl(arg1, arg2),
         33 => sys_getrandom(arg1, arg2, arg3),
+        34 => sys_ioctl(arg1, arg2, arg3),
         _ => {
             serial::serial_print("[SYSCALL] Unknown syscall: ");
             serial::serial_print_dec(syscall_num);
@@ -191,6 +200,55 @@ pub extern "C" fn syscall_handler(
     };
 
     ret
+}
+
+/// Length of null-terminated string in user space (max max_len bytes).
+fn strlen_user(path_ptr: u64, max_len: usize) -> u64 {
+    if path_ptr == 0 || max_len == 0 {
+        return 0;
+    }
+    for i in 0..max_len {
+        if !is_user_pointer(path_ptr.wrapping_add(i as u64), 1) {
+            return i as u64;
+        }
+        let b = unsafe { *((path_ptr as usize + i) as *const u8) };
+        if b == 0 {
+            return i as u64;
+        }
+    }
+    max_len as u64
+}
+
+/// Translate Linux x86_64 syscall ABI to Eclipse numbers (for static glibc binaries like Xfbdev).
+/// Returns (eclipse_syscall_num, arg1, arg2, arg3, arg4, arg5) or None if not a known Linux syscall.
+fn translate_linux_abi(
+    num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> Option<(u64, u64, u64, u64, u64, u64)> {
+    let (eclipse_num, a1, a2, a3, a4, a5) = match num {
+        0 => (2, arg1, arg2, arg3, arg4, arg5),           // read -> 2
+        1 => (1, arg1, arg2, arg3, arg4, arg5),           // write -> 1
+        2 => {
+            let path_len = strlen_user(arg1, 4096);
+            (11, arg1, path_len, arg2, arg4, arg5)        // open(path, flags, mode) -> 11(path, len, flags)
+        }
+        3 => (12, arg1, arg2, arg3, arg4, arg5),          // close -> 12
+        5 => (30, arg1, arg2, arg3, arg4, arg5),          // fstat -> 30
+        8 => (14, arg1, arg2, arg3, arg4, arg5),          // lseek -> 14
+        9 => (20, arg1, arg2, arg3, arg4, arg5),          // mmap -> 20
+        11 => (21, arg1, arg2, arg3, arg4, arg5),         // munmap -> 21
+        12 => (26, arg1, arg2, arg3, arg4, arg5),         // brk -> 26
+        16 => (34, arg1, arg2, arg3, arg4, arg5),        // ioctl -> 34
+        39 => (6, arg1, arg2, arg3, arg4, arg5),          // getpid -> 6
+        60 => (0, arg1, arg2, arg3, arg4, arg5),         // exit -> 0
+        186 => (23, arg1, arg2, arg3, arg4, arg5),       // gettid -> 23
+        _ => return None,
+    };
+    Some((eclipse_num, a1, a2, a3, a4, a5))
 }
 
 /// Verify if a pointer range points to valid user memory
@@ -338,6 +396,27 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         }
     }
     
+    u64::MAX
+}
+
+/// sys_ioctl - Device control (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc.)
+fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
+    if arg != 0 && !is_user_pointer(arg, 512) {
+        return u64::MAX;
+    }
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            match crate::scheme::ioctl(
+                fd_entry.scheme_id,
+                fd_entry.resource_id,
+                request as usize,
+                arg as usize,
+            ) {
+                Ok(_) => return 0,
+                Err(_) => return u64::MAX,
+            }
+        }
+    }
     u64::MAX
 }
 
@@ -765,8 +844,19 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     serial::serial_print("\")\n");
 
     // Route through scheme system
-    // Paths starting with '/' are routed to the 'file:' scheme for compatibility
-    let (scheme_id, resource_id) = if path.starts_with('/') {
+    // /dev/xxx -> dev:xxx (framebuffer, etc.); other /paths -> file:path
+    let (scheme_id, resource_id) = if path.starts_with("/dev/") {
+        let dev_path = alloc::format!("dev:{}", path.trim_start_matches("/dev/"));
+        match crate::scheme::open(&dev_path, flags as usize, 0) {
+            Ok(res) => res,
+            Err(e) => {
+                serial::serial_print("[SYSCALL] open() dev failed: error ");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
+                return u64::MAX;
+            }
+        }
+    } else if path.starts_with('/') {
         match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
@@ -873,38 +963,14 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
 
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(phys_addr) => {
-                    serial::serial_print("SYS_FMAP: scheme::fmap returned phys_addr=");
-                    serial::serial_print_hex(phys_addr as u64);
-                    serial::serial_print("\n");
-                    
-                    // For now, we perform the mapping here.
-                    // Ideally, it would be a separate syscall or fmap would return something
-                    // that the kernel then maps into the process address space.
-                    
-                    // HACK: For display, we perform the actual mapping
-                    if fd_entry.scheme_id == 1 { // display: scheme
-                        serial::serial_print("SYS_FMAP: Mapping framebuffer for display scheme\n");
-                        let page_table = crate::process::get_process_page_table(crate::process::current_process_id());
-                        serial::serial_print("SYS_FMAP: Page table phys=");
-                        serial::serial_print_hex(page_table);
-                        serial::serial_print("\n");
-                        
-                        let vaddr = crate::memory::map_framebuffer_for_process(
-                            page_table,
-                            phys_addr as u64,
-                            len as u64
-                        );
-                        
-                        serial::serial_print("SYS_FMAP: map_framebuffer_for_process returned vaddr=");
-                        serial::serial_print_hex(vaddr);
-                        serial::serial_print("\n");
-                        
-                        return vaddr;
-                    }
-
-                    // Return physical address for others (not really a mapping yet)
-                    serial::serial_print("SYS_FMAP: Returning phys_addr for non-display scheme\n");
-                    return phys_addr as u64;
+                    // Any scheme that returns a physical address gets it mapped into the process
+                    let page_table = crate::process::get_process_page_table(crate::process::current_process_id());
+                    let vaddr = crate::memory::map_framebuffer_for_process(
+                        page_table,
+                        phys_addr as u64,
+                        len as u64
+                    );
+                    return vaddr;
                 }
                 Err(e) => {
                     serial::serial_print("SYS_FMAP: scheme::fmap failed with error ");
@@ -1220,9 +1286,12 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
+    const FD_ANONYMOUS: u64 = u64::MAX;
+    const FD_ANONYMOUS_32: u64 = 0xFFFF_FFFF;
 
-    // Log only briefly to avoid slowing large mappings (e.g. 8MB Xfbdev)
-    if length <= 1024 * 1024 {
+    // Log only briefly; skip when fd looks invalid to avoid spam from allocator retries
+    let fd_ok = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32 || fd < 256;
+    if length <= 1024 * 1024 && fd_ok {
         serial::serial_print("[SYSCALL] sys_mmap(addr=");
         serial::serial_print_hex(addr);
         serial::serial_print(", len=");
@@ -1235,6 +1304,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     if length == 0 {
         return u64::MAX;
     }
+
+    // fd == -1 (any common representation) means anonymous mapping (Linux behavior)
+    let force_anonymous = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32;
 
     // Align length to page size (4KB)
     let aligned_length = (length + 0xFFF) & !0xFFF;
@@ -1295,7 +1367,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     
     // 3. Record VMA and update process once at the end
     if let Some(mut proc) = process::get_process(current_pid) {
-        let is_anonymous = (flags & MAP_ANONYMOUS) != 0;
+        let is_anonymous = (flags & MAP_ANONYMOUS) != 0 || force_anonymous;
         let is_file_backed = !is_anonymous;
         
         let page_table_phys = proc.page_table_phys;
@@ -1313,6 +1385,20 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
 
         if is_file_backed {
             if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
+                // Try fmap first (e.g. /dev/fb0 framebuffer): map physical memory directly
+                if let Ok(phys_addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
+                    let vaddr = memory::map_framebuffer_for_process(page_table_phys, phys_addr as u64, aligned_length);
+                    let vma = VMARegion {
+                        start: vaddr,
+                        end: vaddr + aligned_length,
+                        flags: flags,
+                        file_backed: true,
+                    };
+                    proc.vmas.push(vma);
+                    process::update_process(current_pid, proc);
+                    return vaddr;
+                }
+                // Fall back to read loop for regular files
                 // Save current offset
                 let old_offset = match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, 0, 1) {
                     Ok(off) => off as u64,

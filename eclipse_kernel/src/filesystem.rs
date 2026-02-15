@@ -844,6 +844,19 @@ pub fn lookup_device(name: &str) -> Option<DeviceNode> {
     }
 }
 
+/// Resource id for "list directory" when opening dev: or dev:/
+const DEVDIR_LIST_ID: usize = 0xFFFF;
+
+/// List registered device names (for dev: directory read)
+pub fn list_device_names() -> alloc::vec::Vec<alloc::string::String> {
+    let registry_lock = DEVICE_REGISTRY.lock();
+    if let Some(registry) = registry_lock.as_ref() {
+        registry.keys().cloned().collect()
+    } else {
+        alloc::vec::Vec::new()
+    }
+}
+
 // --- Framebuffer Structures ---
 
 #[repr(C)]
@@ -1152,19 +1165,34 @@ impl Scheme for DevScheme {
         // Remove leading slash if present
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };
         
+        // dev: or dev:/ → list directory (device names)
+        if clean_path.is_empty() || clean_path == "/" {
+            return Ok(DEVDIR_LIST_ID);
+        }
         if lookup_device(clean_path).is_some() {
-            // For now, we return a virtual ID based on the order in the registry
             if clean_path == "fb0" {
                 return Ok(100); // Magic ID for fb0
             }
-            Ok(0) 
+            Ok(0)
         } else {
             Err(scheme_error::ENOENT)
         }
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
-        Ok(0) // Placeholder
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        if id == DEVDIR_LIST_ID {
+            let names = list_device_names();
+            let mut s = alloc::string::String::new();
+            for name in &names {
+                s.push_str(name);
+                s.push('\n');
+            }
+            let bytes = s.as_bytes();
+            let n = core::cmp::min(buffer.len(), bytes.len());
+            buffer[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
+        Ok(0) // Placeholder for device handles
     }
 
     fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {

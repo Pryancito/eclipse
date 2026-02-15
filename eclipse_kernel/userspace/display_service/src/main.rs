@@ -23,6 +23,8 @@ mod logo;
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
+const SYS_CLOSE: u64 = 12;
+const SYS_READ: u64 = 2;
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_FMAP: u64 = 28;
 
@@ -178,6 +180,68 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
         println!("[DISPLAY-SERVICE]   ✓ Device node /dev/fb0 registered");
     } else {
         println!("[DISPLAY-SERVICE]   X Failed to register /dev/fb0");
+    }
+
+    // List /dev/ via scheme "dev:" (kernel returns registered device names)
+    const DEV_PATH: &[u8] = b"dev:";
+    let dev_fd = unsafe {
+        let mut result: u64;
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") DEV_PATH.as_ptr() as u64,
+            in("rsi") DEV_PATH.len() as u64,
+            in("rdx") 0u64,
+            lateout("rax") result,
+            options(nostack)
+        );
+        result
+    };
+    if dev_fd != u64::MAX && dev_fd != 0 {
+        println!("[DISPLAY-SERVICE]   Listing /dev/:");
+        let mut buf = [0u8; 256];
+        loop {
+            let n = unsafe {
+                let mut result: u64;
+                core::arch::asm!(
+                    "int 0x80",
+                    in("rax") SYS_READ,
+                    in("rdi") dev_fd,
+                    in("rsi") buf.as_mut_ptr() as u64,
+                    in("rdx") buf.len() as u64,
+                    lateout("rax") result,
+                    options(nostack)
+                );
+                result
+            };
+            if n == 0 || n == u64::MAX {
+                break;
+            }
+            let n = n as usize;
+            let slice = &buf[..n];
+            let mut start = 0;
+            for (i, &b) in slice.iter().enumerate() {
+                if b == b'\n' {
+                    if start < i {
+                        if let Ok(s) = core::str::from_utf8(&slice[start..i]) {
+                            println!("[DISPLAY-SERVICE]     - {}", s);
+                        }
+                    }
+                    start = i + 1;
+                }
+            }
+            if n < buf.len() {
+                break;
+            }
+        }
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("rax") SYS_CLOSE,
+                in("rdi") dev_fd,
+                options(nostack)
+            );
+        }
     }
 }
 

@@ -155,3 +155,10 @@ pub fn lseek(fd: usize, offset: isize, whence: usize) -> Result<usize> {
         crate::syscall3(SYS_LSEEK, fd, offset as usize, whence)
     })
 }
+
+/// Perform device control (e.g. FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO)
+pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_IOCTL, fd, request, arg)
+    })
+}
