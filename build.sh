@@ -306,7 +306,7 @@ build_userspace_services() {
         fi
         
         # Compilar el servicio usando build-std (requerido por config.toml)
-        cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core
+        cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
         
         if [ $? -eq 0 ]; then
             local service_path="target/x86_64-unknown-none/release/$service"
