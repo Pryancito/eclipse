@@ -256,10 +256,14 @@ build_tinyx_for_eclipse_os() {
 build_eclipse_init() {
     print_step "Compilando init process (embedded)..."
     
+    # Asegurar que rust-src está instalado
+    print_status "Verificando rust-src component..."
+    rustup component add rust-src --toolchain nightly 2>/dev/null || true
+    
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --release --target x86_64-unknown-none
+    cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"
