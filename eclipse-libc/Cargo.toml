@@ -19,7 +19,8 @@ const-extern-fn = []
 [lib]
 name = "eclipse_libc"
 path = "src/lib.rs"
-crate-type = ["staticlib"]
+# rlib: para que eclipse_std y otros puedan usarlo como extern crate; staticlib: para enlazar como .a
+crate-type = ["rlib", "staticlib"]
 
 [profile.release]
 lto = false

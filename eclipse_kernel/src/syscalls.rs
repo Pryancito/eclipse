@@ -1221,15 +1221,16 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
 
-    serial::serial_print("[SYSCALL] sys_mmap(addr=");
-    serial::serial_print_hex(addr);
-    serial::serial_print(", len=");
-    serial::serial_print_dec(length);
-    serial::serial_print(", flags=");
-    serial::serial_print_hex(flags);
-    serial::serial_print(", fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(")\n");
+    // Log only briefly to avoid slowing large mappings (e.g. 8MB Xfbdev)
+    if length <= 1024 * 1024 {
+        serial::serial_print("[SYSCALL] sys_mmap(addr=");
+        serial::serial_print_hex(addr);
+        serial::serial_print(", len=");
+        serial::serial_print_dec(length);
+        serial::serial_print(", fd=");
+        serial::serial_print_dec(fd);
+        serial::serial_print(")\n");
+    }
 
     if length == 0 {
         return u64::MAX;
@@ -1317,30 +1318,40 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                     Ok(off) => off as u64,
                     Err(_) => 0,
                 };
-                
-                for i in 0..num_pages {
-                    let page_offset = i * 4096;
-                    let file_offset = 0 + page_offset;
-                    
-                    let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
+                // Process file in 256KB chunks to avoid 2000+ alloc/read/map (was ~minutes for 8MB)
+                const CHUNK_PAGES: u64 = 64;   // 256KB per chunk
+                const CHUNK_BYTES: u64 = CHUNK_PAGES * 4096;
+                let mut file_offset: u64 = 0;
+                let mut mapped_so_far: u64 = 0;
+                while mapped_so_far < aligned_length {
+                    let this_chunk_bytes = core::cmp::min(CHUNK_BYTES, aligned_length - mapped_so_far);
+                    let this_chunk_pages = (this_chunk_bytes + 4095) / 4096;
+                    let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(CHUNK_BYTES as usize, 4096) {
                         Some(res) => res,
-                        None => return u64::MAX,
+                        None => {
+                            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
+                            return u64::MAX;
+                        }
                     };
-                    
-                    unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                    unsafe { core::ptr::write_bytes(frame_ptr, 0, CHUNK_BYTES as usize); }
                     let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, file_offset as isize, 0);
-                    let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, 4096) };
-                    
+                    let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, this_chunk_bytes as usize) };
                     match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
-                        Ok(bytes_read) => {
-                            let vaddr = target_addr + page_offset;
-                            memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
-                        },
+                        Ok(_) => {
+                            for i in 0..this_chunk_pages {
+                                let page_offset = i * 4096;
+                                let vaddr = target_addr + mapped_so_far + page_offset;
+                                memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys + page_offset, pt_flags.bits());
+                            }
+                        }
                         Err(_) => {
-                            unsafe { memory::free_dma_buffer(frame_ptr, 4096, 4096) };
+                            unsafe { memory::free_dma_buffer(frame_ptr, CHUNK_BYTES as usize, 4096) };
+                            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
                             return u64::MAX;
                         }
                     }
+                    mapped_so_far += this_chunk_bytes;
+                    file_offset += this_chunk_bytes;
                 }
                 let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
             } else {
@@ -1369,9 +1380,11 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         proc.vmas.push(vma);
         process::update_process(current_pid, proc);
         
-        serial::serial_print("[SYSCALL] mmap successful: ");
-        serial::serial_print_hex(target_addr);
-        serial::serial_print("\n");
+        if aligned_length <= 1024 * 1024 {
+            serial::serial_print("[SYSCALL] mmap successful: ");
+            serial::serial_print_hex(target_addr);
+            serial::serial_print("\n");
+        }
         return target_addr;
     }
 

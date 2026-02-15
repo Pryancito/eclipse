@@ -107,7 +107,7 @@ build_eclipse_syscall() {
     cd eclipse-syscall
     
     print_status "Compilando eclipse-syscall..."
-    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo -Z unstable-options build --release --target "$ECLIPSE_TARGET"
+    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-syscall compilado exitosamente"
@@ -170,8 +170,8 @@ build_eclipse_std() {
     
     cd eclipse-apps/eclipse_std
     
-    print_status "Compilando eclipse_std..."
-    RUSTFLAGS="-Zunstable-options $RUSTFLAGS" cargo -Z unstable-options build --release --target "$ECLIPSE_TARGET"
+    print_status "Compilando eclipse_std (y deps: eclipse-syscall, eclipse-libc)..."
+    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse_std compilado exitosamente"
@@ -184,6 +184,64 @@ build_eclipse_std() {
     cd ../..
 }
 
+# Función para compilar e instalar libXfont 1.5 (para TinyX con fuentes built-in)
+build_libxfont15() {
+    print_step "Compilando libXfont 1.5..."
+    if [ ! -d "eclipse-apps/libXfont" ]; then
+        print_status "eclipse-apps/libXfont no encontrado, saltando..."
+        return 0
+    fi
+    local TINYX_INSTALL="$BASE_DIR/eclipse-apps/tinyx/install"
+    mkdir -p "$TINYX_INSTALL"
+    cd eclipse-apps/libXfont
+    if [ ! -f "config.status" ] || [ "x$FORCE_LIBXFONT_CONFIGURE" = x1 ]; then
+        print_status "Configurando libXfont 1.5 (prefix=$TINYX_INSTALL)..."
+        ./configure --prefix="$TINYX_INSTALL" --enable-builtins || { cd ../..; print_error "Configure libXfont falló"; return 1; }
+    fi
+    print_status "Compilando libXfont 1.5..."
+    make -j"$(nproc)" || { cd ../..; print_error "Make libXfont falló"; return 1; }
+    make install || { cd ../..; print_error "Make install libXfont falló"; return 1; }
+    print_success "libXfont 1.5 instalado en $TINYX_INSTALL"
+    cd ../..
+}
+
+# Función para compilar TinyX (Xfbdev) para Eclipse OS
+build_tinyx_for_eclipse_os() {
+    print_step "Compilando TinyX (Xfbdev) para Eclipse OS..."
+    if [ ! -d "eclipse-apps/tinyx" ]; then
+        print_status "eclipse-apps/tinyx no encontrado, saltando..."
+        return 0
+    fi
+    local TINYX_INSTALL="$BASE_DIR/eclipse-apps/tinyx/install"
+    if [ -f "eclipse-apps/tinyx/install/lib/pkgconfig/xfont.pc" ]; then
+        export PKG_CONFIG_PATH="$TINYX_INSTALL/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        export TINYX_USE_LIBXFONT1=1
+    fi
+    cd eclipse-apps/tinyx
+    if [ ! -f "Makefile" ] || ! grep -q "enable_builtin_fonts" configure 2>/dev/null; then
+        print_status "Configurando TinyX (configure-eclipse.sh)..."
+        ./configure-eclipse.sh || { cd ../..; print_error "Configure TinyX falló"; return 1; }
+    fi
+    SYSROOT_TINYX="${SYSROOT:-$BASE_DIR/$BUILD_DIR/sysroot}"
+    print_status "Compilando Xfbdev (make, enlace estático)..."
+    # CFLAGS con -fno-PIE para que el build con sysroot no use -fPIE del configure (PIE es para build nativo)
+    TINYX_SYSROOT_CFLAGS="-fno-PIE -O2 -ffunction-sections -fdata-sections -fvisibility=hidden -fno-unwind-tables -fno-asynchronous-unwind-tables -Wall"
+    TINYX_LDFLAGS_STATIC="-static -Wl,-O1 -Wl,-as-needed"
+    if make -j"$(nproc)" CC="gcc --sysroot=$SYSROOT_TINYX -fno-stack-protector -fno-PIE -O2" CFLAGS="$TINYX_SYSROOT_CFLAGS" LDFLAGS="-B$SYSROOT_TINYX/usr/lib -no-pie $TINYX_LDFLAGS_STATIC" LIBS="-lz" 2>/dev/null; then
+        print_success "TinyX (Xfbdev) compilado con sysroot Eclipse OS (estático)"
+    else
+        print_status "Make con sysroot falló, intentando make nativo (estático)..."
+        make clean 2>/dev/null || true
+        if make -j"$(nproc)" LDFLAGS="$TINYX_LDFLAGS_STATIC"; then
+            print_success "TinyX (Xfbdev) compilado (nativo, estático)"
+        else
+            cd ../..
+            print_error "Make TinyX falló"
+            return 1
+        fi
+    fi
+    cd ../..
+}
 
 # Función para compilar el proceso init (embedded)
 build_eclipse_init() {
@@ -637,25 +695,27 @@ build_cosmic_desktop() {
 build_userland() {
     print_step "Compilando módulos userland..."
 
-    build_userland_main
-    build_module_loader
-    build_graphics_module
-    build_app_framework
-    build_drm_system
-    build_wayland_integration
+    #build_userland_main
+    #build_module_loader
+    #build_graphics_module
+    #build_app_framework
+    #build_drm_system
+    #build_wayland_integration
     
     # Nuevos componentes base
     build_eclipse_syscall
     prepare_sysroot
     build_eclipse_libc
     build_eclipse_std
+    build_libxfont15
+    build_tinyx_for_eclipse_os
     
     # Aplicaciones
-    build_wayland_apps
-    build_wayland_server
-    build_cosmic_client
-    build_wayland_compositor
-    build_cosmic_desktop
+    #build_wayland_apps
+    #build_wayland_server
+    #build_cosmic_client
+    #build_wayland_compositor
+    #build_cosmic_desktop
 
     print_success "Todos los módulos userland compilados exitosamente"
 }
@@ -1553,8 +1613,8 @@ main() {
     build_systemd
     prepare_sysroot
     build_eclipse_libc
-    # build_eclipse_apps
-    # build_userland
+    build_eclipse_apps
+    build_userland
     
     # We still need systemd and ipc which are in eclipse_apps, so let's run them selectively?
     # Actually, eclipse-systemd is already built.

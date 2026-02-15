@@ -100,10 +100,6 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
     let mut mapped_pages: [Option<MappedPage>; 16] = [None; 16];
     let mut mapped_count = 0;
 
-    serial::serial_print("ELF: Loading segments into space ");
-    serial::serial_print_hex(page_table_phys);
-    serial::serial_print("\n");
-
     // Iterate over program headers and load segments
     for i in 0..ph_count {
         let ph_offset_entry = ph_offset + (i * ph_size);
@@ -139,10 +135,6 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
                         return Err("ELF: Too many segments/pages (limit 16)");
                     }
 
-                    serial::serial_print("ELF: Mapping 2MB page at ");
-                    serial::serial_print_hex(current_vaddr);
-                    serial::serial_print("\n");
-                    
                     // Allocate new 2MB block
                     if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
                         // Zero the block
@@ -204,12 +196,6 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
 
 /// Preparar el stack de usuario
 pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize) -> Result<u64, &'static str> {
-    serial::serial_print("ELF: Setting up user stack at ");
-    serial::serial_print_hex(stack_base);
-    serial::serial_print(" size ");
-    serial::serial_print_dec(stack_size as u64);
-    serial::serial_print("\n");
-
     // Allocate and map user stack
     if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(stack_size, 0x200000) {
         // We map the 2MB block using 4KB pages for consistency and safety
@@ -560,47 +546,57 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
         *stack_ptr.offset(4) = 0; // auxv[0].a_val = 0
     }
 
-    // Segmentos y flags para iretq (Ring 3). Evitar rbx (reservado por LLVM en asm).
-    let user_cs: u64 = 0x1b;   // 0x18 | 3
-    let user_ds: u64 = 0x23;   // 0x20 | 3
-    let rflags: u64 = 0x202;   // IF=1
+    // Frame iretq: CPU hace pop en orden RIP, CS, RFLAGS, RSP, SS.
+    // Construir en static para que el compilador no pueda corromper ni optimizar el RIP.
+    use core::ptr::addr_of_mut;
+    static mut IRET_FRAME: [u64; 5] = [0, 0x1b, 0x202, 0, 0x23]; // RIP, CS, RFLAGS, RSP, SS
+    unsafe {
+        let f = addr_of_mut!(IRET_FRAME);
+        (*f)[0] = entry_point;
+        (*f)[3] = adjusted_stack;
+    }
+    let frame_ptr = unsafe { core::ptr::addr_of!(IRET_FRAME) };
 
-    // Frame iretq: [RIP][CS][RFLAGS][RSP][SS]. Escrituras explícitas en pila (arreglo previo).
-    asm!(
-        "cli",
-        "sub rsp, 40",
-        "mov [rsp], rax",
-        "mov [rsp + 8], rcx",
-        "mov [rsp + 16], rdx",
-        "mov [rsp + 24], rsi",
-        "mov [rsp + 32], rdi",
-        "mov ax, r8w",
-        "mov ds, ax",
-        "mov es, ax",
-        "xor ax, ax",
-        "mov fs, ax",
-        "mov gs, ax",
-        "xor rax, rax",
-        "xor rcx, rcx",
-        "xor rdx, rdx",
-        "xor rsi, rsi",
-        "xor rdi, rdi",
-        "xor r8, r8",
-        "xor r9, r9",
-        "xor r10, r10",
-        "xor r11, r11",
-        "xor r12, r12",
-        "xor r13, r13",
-        "xor r14, r14",
-        "xor r15, r15",
-        "iretq",
-        in("rax") entry_point,
-        in("rcx") user_cs,
-        in("rdx") rflags,
-        in("rsi") adjusted_stack,
-        in("rdi") user_ds,
-        in("r8") user_ds,
-        options(noreturn)
-    );
+    // Copiar frame al stack del kernel y iretq
+    unsafe {
+        asm!(
+            "cli",
+            "sub rsp, 40",
+            "mov rax, [rdi]",
+            "mov [rsp], rax",
+            "mov rax, [rdi + 8]",
+            "mov [rsp + 8], rax",
+            "mov rax, [rdi + 16]",
+            "mov [rsp + 16], rax",
+            "mov rax, [rdi + 24]",
+            "mov [rsp + 24], rax",
+            "mov rax, [rdi + 32]",
+            "mov [rsp + 32], rax",
+            "mov ax, 0x23",
+            "mov ds, ax",
+            "mov es, ax",
+            "xor eax, eax",
+            "mov fs, ax",
+            "mov gs, ax",
+            "xor rax, rax",
+            "xor rbx, rbx",
+            "xor rcx, rcx",
+            "xor rdx, rdx",
+            "xor rsi, rsi",
+            "xor rdi, rdi",
+            "xor r8, r8",
+            "xor r9, r9",
+            "xor r10, r10",
+            "xor r11, r11",
+            "xor r12, r12",
+            "xor r13, r13",
+            "xor r14, r14",
+            "xor r15, r15",
+            "xor rbp, rbp",
+            "iretq",
+            in("rdi") frame_ptr,
+            options(noreturn)
+        );
+    }
 }
 
