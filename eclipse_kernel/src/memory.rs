@@ -281,6 +281,29 @@ pub fn get_cr3() -> u64 {
     cr3
 }
 
+/// Establecer CR3 (para cambiar espacio de direcciones)
+pub unsafe fn set_cr3(cr3: u64) {
+    core::arch::asm!(
+        "mov cr3, {}",
+        in(reg) cr3,
+        options(nostack, preserves_flags)
+    );
+}
+
+/// CR3 del kernel (higher-half); se guarda antes de ejecutar el primer proceso.
+/// Usado en exec() para leer el binario desde punteros devueltos por get_service_binary.
+static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// Guardar el CR3 actual como "kernel CR3". Llamar una sola vez al arranque, antes del scheduler.
+pub fn save_kernel_cr3() {
+    KERNEL_CR3.store(get_cr3(), Ordering::SeqCst);
+}
+
+/// Obtener el CR3 del kernel (0 si no se ha llamado save_kernel_cr3).
+pub fn get_kernel_cr3() -> u64 {
+    KERNEL_CR3.load(Ordering::SeqCst)
+}
+
 use x86_64::registers::control::Cr3;
 // use x86_64::structures::paging::PageTable; // Import removed to avoid conflict with local definition
 use x86_64::PhysAddr;

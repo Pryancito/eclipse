@@ -158,7 +158,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     syscalls::init();
     crate::scheme::init(); // Initialize Redox-style scheme system
     fd::init();
-    servers::init();
+    //servers::init();
     pci::init();
     nvidia::init();
     virtio::init();
@@ -180,7 +180,9 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // No need to store it manually
     
     serial::serial_print("Entering kernel main loop...\n");
-    
+    // Save kernel CR3 immediately (before any process runs) for exec() of service binaries
+    crate::memory::save_kernel_cr3();
+
     // Mount is now handled by userspace filesystem_service via SYS_MOUNT
     serial::serial_print("[KERNEL] Waiting for userspace to mount root filesystem...\n");
     let mut init_loaded = false;
@@ -205,7 +207,7 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     }
     
     serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
-    
+
     loop {
         ipc::process_messages();
         crate::scheduler::tick();

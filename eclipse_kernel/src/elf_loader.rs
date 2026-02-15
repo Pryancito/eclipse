@@ -277,12 +277,12 @@ pub fn init() {
 }
 
 /// Replace current process image with ELF binary (for exec())
-/// Returns entry point if successful
-pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
+/// Returns Ok(entry_point) or Err(message) for userspace to display
+pub fn replace_process_image(elf_data: &[u8]) -> Result<u64, &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
-        return None;
+        return Err("ELF: file too small");
     }
     
     let header = unsafe {
@@ -292,13 +292,13 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     // Verify magic number
     if &header.e_ident[0..4] != &ELF_MAGIC {
         serial::serial_print("ELF: Invalid magic number for exec\n");
-        return None;
+        return Err("ELF: invalid magic");
     }
     
     // Verify 64-bit
     if header.e_ident[4] != 2 {
         serial::serial_print("ELF: Not 64-bit for exec\n");
-        return None;
+        return Err("ELF: not 64-bit");
     }
     
     serial::serial_print("ELF: Valid exec binary, entry: ");
@@ -329,11 +329,11 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     // Validate Entry Point
     if header.e_entry > USER_ADDR_MAX {
          serial::serial_print("ELF: Entry point in kernel space (Security Violation)\n");
-         return None;
+         return Err("ELF: entry in kernel space");
     }
     if header.e_entry < MIN_ENTRY_POINT {
         serial::serial_print("ELF: Entry point in ELF header or invalid (e_entry < 0x80)\n");
-        return None;
+        return Err("ELF: entry < 0x80");
     }
     // Entry must lie inside an executable PT_LOAD segment (avoid jumping into ELF header/data)
     let mut entry_in_exec_segment = false;
@@ -349,12 +349,12 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     }
     if !entry_in_exec_segment {
         serial::serial_print("ELF: Entry point not in executable segment (invalid or corrupted ELF)\n");
-        return None;
+        return Err("ELF: entry not in exec segment");
     }
 
     if elf_data.len() < ph_offset + (ph_count * ph_size) {
         serial::serial_print("ELF: Program headers out of bounds for exec\n");
-        return None;
+        return Err("ELF: phdr out of bounds");
     }
 
     // Check segments for validity BEFORE loading
@@ -365,7 +365,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
         if ph.p_type == PT_LOAD {
             if ph.p_vaddr > USER_ADDR_MAX || (ph.p_vaddr + ph.p_memsz) > USER_ADDR_MAX {
                 serial::serial_print("ELF: Segment overlaps kernel space (Security Violation)\n");
-                return None;
+                return Err("ELF: segment in kernel space");
             }
         }
     }
@@ -414,7 +414,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                 } else {
                     if mapped_count >= mapped_pages.len() {
                         serial::serial_print("ELF: Too many segments/pages for exec (limit 16)\n");
-                        return None;
+                        return Err("ELF: too many pages (limit 16)");
                     }
 
                     serial::serial_print("ELF: Mapping page for exec at ");
@@ -447,7 +447,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
                         kptr
                     } else {
                         serial::serial_print("ELF: Failed to allocate 2MB block\n");
-                        return None;
+                        return Err("ELF: alloc 2MB failed");
                     }
                 };
 
@@ -481,7 +481,7 @@ pub fn replace_process_image(elf_data: &[u8]) -> Option<u64> {
     // Flush TLB to ensure new mappings are active
     unsafe { x86_64::instructions::tlb::flush_all(); }
 
-    Some(header.e_entry)
+    Ok(header.e_entry)
 }
 
 /// Jump to entry point in userspace (Ring 3)

@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary};
+use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -269,6 +269,17 @@ fn start_service(service: &mut Service) {
         
         // If exec succeeds, it should not return
         println!("  [CHILD] exec() returned with error: {}", result);
+        let mut errbuf = [0u8; 80];
+        let n = get_last_exec_error(&mut errbuf);
+        if n > 0 {
+            if let Ok(s) = core::str::from_utf8(&errbuf[..n]) {
+                println!("  [CHILD] exec reason: {}", s);
+            } else {
+                println!("  [CHILD] exec reason: ({} bytes, not utf8)", n);
+            }
+        } else {
+            println!("  [CHILD] exec reason: (kernel gave no message, n={})", n);
+        }
         exit(1);
     } else if pid > 0 {
         // Parent process - track the service

@@ -161,6 +161,16 @@ pub fn init() {
     crate::serial::serial_print("File descriptor system initialized\n");
 }
 
+/// Clone parent's fd table to child (call from fork). Child gets same open fds as parent.
+pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
+    let mut tables = FD_TABLES.lock();
+    let parent_idx = parent_pid as usize;
+    let child_idx = child_pid as usize;
+    if parent_idx < MAX_PROCESSES && child_idx < MAX_PROCESSES {
+        tables[child_idx] = tables[parent_idx];
+    }
+}
+
 /// Initialize standard I/O for a process
 pub fn fd_init_stdio(pid: ProcessId) {
     if let Ok((scheme_id, resource_id)) = crate::scheme::open("log:", 0, 0) {

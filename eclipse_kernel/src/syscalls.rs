@@ -189,6 +189,7 @@ pub extern "C" fn syscall_handler(
         32 => sys_arch_prctl(arg1, arg2),
         33 => sys_getrandom(arg1, arg2, arg3),
         34 => sys_ioctl(arg1, arg2, arg3),
+        35 => sys_get_last_exec_error(arg1, arg2),
         _ => {
             serial::serial_print("[SYSCALL] Unknown syscall: ");
             serial::serial_print_dec(syscall_num);
@@ -399,6 +400,29 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     u64::MAX
 }
 
+/// sys_get_last_exec_error - Copy last exec() failure message to user buffer (for init/services)
+fn sys_get_last_exec_error(out_ptr: u64, out_len: u64) -> u64 {
+    if out_ptr == 0 || out_len == 0 || out_len > 256 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(out_ptr, out_len) {
+        return u64::MAX;
+    }
+    let buf = LAST_EXEC_ERR.lock();
+    let mut copy_len = 0;
+    while copy_len < buf.len() && buf[copy_len] != 0 {
+        copy_len += 1;
+    }
+    let copy_len = core::cmp::min(copy_len, out_len as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), out_ptr as *mut u8, copy_len);
+        if copy_len < out_len as usize {
+            *((out_ptr as *mut u8).add(copy_len)) = 0;
+        }
+    }
+    copy_len as u64
+}
+
 /// sys_ioctl - Device control (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc.)
 fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
     if arg != 0 && !is_user_pointer(arg, 512) {
@@ -567,6 +591,20 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     }
 }
 
+/// Kernel half: get_service_binary returns pointers in this range
+const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
+
+/// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
+const LAST_EXEC_ERR_LEN: usize = 80;
+static LAST_EXEC_ERR: spin::Mutex<[u8; LAST_EXEC_ERR_LEN]> = spin::Mutex::new([0u8; LAST_EXEC_ERR_LEN]);
+
+fn set_last_exec_error(msg: &[u8]) {
+    let mut buf = LAST_EXEC_ERR.lock();
+    let n = core::cmp::min(msg.len(), LAST_EXEC_ERR_LEN.saturating_sub(1));
+    buf[..n].copy_from_slice(&msg[..n]);
+    buf[n] = 0;
+}
+
 /// sys_exec - Replace current process with new program
 /// arg1: pointer to ELF buffer
 /// arg2: size of ELF buffer
@@ -581,44 +619,79 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     serial::serial_print(", size: ");
     serial::serial_print_dec(elf_size);
     serial::serial_print("\n");
-    
+    set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
+
     if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+        set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
     }
     
-    // Create slice from buffer
-    let elf_data = unsafe {
-        core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize)
+    // When the pointer is in kernel half (from get_service_binary), the current process
+    // may not have that range mapped. Copy the ELF using kernel CR3 so we read valid data.
+    let kernel_cr3 = crate::memory::get_kernel_cr3();
+    if elf_ptr >= KERNEL_HALF && kernel_cr3 == 0 {
+        serial::serial_print("[SYSCALL] exec: kernel CR3 not set, copy may be invalid\n");
+    }
+    let elf_data: alloc::vec::Vec<u8> = if elf_ptr >= KERNEL_HALF && kernel_cr3 != 0 {
+        let current_cr3 = crate::memory::get_cr3();
+        unsafe {
+            crate::memory::set_cr3(crate::memory::get_kernel_cr3());
+        }
+        let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
+        let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
+        copy.extend_from_slice(src);
+        unsafe {
+            crate::memory::set_cr3(current_cr3);
+        }
+        copy
+    } else {
+        let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
+        let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
+        copy.extend_from_slice(src);
+        copy
     };
-    
+
+    // Comprobar que la copia tiene magic ELF (si no, el copy con kernel CR3 falló o no se usó)
+    if elf_data.len() < 4 || elf_data[0] != 0x7f || elf_data[1] != b'E' || elf_data[2] != b'L' || elf_data[3] != b'F' {
+        set_last_exec_error(b"exec: ELF copy invalid (bad magic)");
+        serial::serial_print("[SYSCALL] exec() copy has bad ELF magic\n");
+        return u64::MAX;
+    }
+
     // Replace current process with ELF binary
-    if let Some(entry_point) = crate::elf_loader::replace_process_image(elf_data) {
-        serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
-        serial::serial_print_hex(entry_point);
-        serial::serial_print("\n");
-        
-        // Initialize heap (brk) for the new process
-        if let Some(pid) = current_process_id() {
-            if let Some(mut proc) = crate::process::get_process(pid) {
-                // Set initial brk at 1GB if not already set
-                if proc.brk_current == 0 {
-                    proc.brk_current = 0x40000000;
-                    crate::process::update_process(pid, proc);
+    match crate::elf_loader::replace_process_image(elf_data.as_slice()) {
+        Ok(entry_point) => {
+            serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
+            serial::serial_print_hex(entry_point);
+            serial::serial_print("\n");
+            
+            // Initialize heap (brk) for the new process
+            if let Some(pid) = current_process_id() {
+                if let Some(mut proc) = crate::process::get_process(pid) {
+                    // Set initial brk at 1GB if not already set
+                    if proc.brk_current == 0 {
+                        proc.brk_current = 0x40000000;
+                        crate::process::update_process(pid, proc);
+                    }
                 }
             }
+            
+            // This doesn't return - we jump to the new process entry point
+            unsafe {
+                // Use standard userspace stack top (512MB + 256KB)
+                let stack_top: u64 = 0x20040000;
+                // CR3 should already be set to the current process's address space
+                crate::elf_loader::jump_to_userspace(entry_point, stack_top);
+            }
         }
-        
-        // This doesn't return - we jump to the new process entry point
-        unsafe {
-            // Use standard userspace stack top (512MB + 256KB)
-            let stack_top: u64 = 0x20040000;
-            // CR3 should already be set to the current process's address space
-            crate::elf_loader::jump_to_userspace(entry_point, stack_top);
+        Err(msg) => {
+            set_last_exec_error(msg.as_bytes());
+            serial::serial_print("[SYSCALL] exec() failed: ");
+            serial::serial_print(msg);
+            serial::serial_print("\n");
+            return u64::MAX;
         }
-    } else {
-        serial::serial_print("[SYSCALL] exec() failed to load ELF\n");
-        return u64::MAX;
     }
 }
 

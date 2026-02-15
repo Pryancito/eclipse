@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, close, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void};
+use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void};
 
 /// Wait for filesystem to be mounted by trying to open a test path
 /// This prevents race conditions with filesystem_service startup
@@ -106,17 +106,15 @@ pub extern "C" fn _start() -> ! {
         let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
         
         // Spawn Xfbdev as a new process
-        let spawned_pid = spawn(binary_slice);
-        
-        if spawned_pid < 0 {
-            println!("[GUI-SERVICE] ERROR: spawn() failed for Xfbdev");
-        } else {
-            println!("[GUI-SERVICE] Successfully spawned Xfbdev (PID: {})", spawned_pid);
-        }
+        let _exec_result = exec(binary_slice as &[u8]);
         
         // Clean up
         munmap(mapped_addr, size as u64);
         close(fd);
+
+        // If exec fails, we'll fall through to this point
+        println!("[GUI-SERVICE] ERROR: exec() failed for Xfbdev");
+        loop { yield_cpu(); }
     }
 
     println!("[GUI-SERVICE] X server should be initializing on /dev/fb0...");

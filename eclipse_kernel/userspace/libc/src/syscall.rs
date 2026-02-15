@@ -24,6 +24,7 @@ pub const SYS_PCI_WRITE_CONFIG: u64 = 19;
 pub const SYS_MOUNT: u64 = 29;
 pub const SYS_FSTAT: u64 = 30;
 pub const SYS_SPAWN: u64 = 31;
+pub const SYS_GET_LAST_EXEC_ERROR: u64 = 35;
 
 pub type c_void = core::ffi::c_void;
 
@@ -162,6 +163,20 @@ pub fn fork() -> i32 {
 
 pub fn exec(elf_buffer: &[u8]) -> i32 {
     unsafe { syscall2(SYS_EXEC, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
+}
+
+/// Get last exec() failure message from kernel (call after exec returns -1).
+/// Returns number of bytes written to buf, or 0 on error.
+pub fn get_last_exec_error(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let n = unsafe { syscall2(SYS_GET_LAST_EXEC_ERROR, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    if n == u64::MAX {
+        0
+    } else {
+        n as usize
+    }
 }
 
 pub fn spawn(elf_buffer: &[u8]) -> i32 {

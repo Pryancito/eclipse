@@ -105,7 +105,8 @@ impl Scheme for LogScheme {
     }
 
     fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
-        Err(error::EIO) // Log is write-only
+        // Log is write-only; read returns 0 (EOF) so stdin read(0) doesn't fail with EIO
+        Ok(0)
     }
 
     fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {

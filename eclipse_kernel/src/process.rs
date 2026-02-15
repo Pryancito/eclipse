@@ -480,6 +480,9 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rip;
             }
             
+            // Clone parent's fd table so child has stdin/stdout/stderr and any open files
+            crate::fd::fd_clone_for_fork(current_pid, child_pid);
+            
             // Set up context for child to start via trampoline
             child.context.rip = crate::interrupts::fork_child_trampoline as u64;
             child.context.rsp = kstack_ptr as u64;
