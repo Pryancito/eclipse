@@ -256,10 +256,14 @@ build_tinyx_for_eclipse_os() {
 build_eclipse_init() {
     print_step "Compilando init process (embedded)..."
     
+    # Asegurar que rust-src está instalado
+    print_status "Verificando rust-src component..."
+    rustup component add rust-src --toolchain nightly 2>/dev/null || true
+    
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    RUSTFLAGS="-C relocation-model=static" rustup run nightly cargo build --release --target x86_64-unknown-none
+    cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"
@@ -276,6 +280,55 @@ build_eclipse_init() {
     fi
     
     cd ../../..
+}
+
+# Función para compilar servicios de userspace
+build_userspace_services() {
+    print_step "Compilando servicios de userspace..."
+    
+    # Asegurar que rust-src está instalado
+    print_status "Verificando rust-src component..."
+    rustup component add rust-src --toolchain nightly 2>/dev/null || true
+    
+    # Lista de servicios a compilar (debe coincidir con el orden en eclipse_kernel/src/binaries.rs)
+    # NOTA: Si agregas/quitas servicios, actualiza también binaries.rs y syscalls.rs (sys_get_service_binary)
+    local SERVICES="log_service devfs_service filesystem_service input_service display_service audio_service network_service gui_service"
+    
+    for service in $SERVICES; do
+        print_status "Compilando $service..."
+        
+        if [ ! -d "eclipse_kernel/userspace/$service" ]; then
+            print_error "Directorio eclipse_kernel/userspace/$service no encontrado"
+            return 1
+        fi
+        
+        cd "eclipse_kernel/userspace/$service"
+        
+        if [ ! -f "Cargo.toml" ]; then
+            print_error "Cargo.toml no encontrado para $service"
+            cd ../../..
+            return 1
+        fi
+        
+        # Compilar el servicio usando build-std (requerido por config.toml)
+        cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
+        
+        if [ $? -eq 0 ]; then
+            local service_path="target/x86_64-unknown-none/release/$service"
+            if [ -f "$service_path" ]; then
+                local service_size=$(du -h "$service_path" | cut -f1)
+                print_status "$service generado: $service_size"
+            fi
+        else
+            print_error "Error al compilar $service"
+            cd ../../..
+            return 1
+        fi
+        
+        cd ../../..
+    done
+    
+    print_success "Todos los servicios de userspace compilados exitosamente"
 }
 
 # Función para compilar el kernel
@@ -1600,9 +1653,9 @@ build_eclipsefs_cli() {
             print_status "eclipsefs CLI generado: $cli_path ($cli_size)"
         fi
     else
-        print_error "Error al compilar eclipsefs-cli"
+        print_warning "Compilación de eclipsefs-cli falló (componente opcional, continuando)"
         cd ..
-        return 1
+        return 0
     fi
     
     cd ..
@@ -1616,6 +1669,7 @@ main() {
     build_populate_eclipsefs
     build_eclipsefs_cli
     build_eclipse_init
+    build_userspace_services
     build_kernel
     build_bootloader
     build_installer
