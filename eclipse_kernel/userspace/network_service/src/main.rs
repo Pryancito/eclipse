@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -360,6 +360,10 @@ pub extern "C" fn _start() -> ! {
     }
     
     println!("[NETWORK-SERVICE] Ready to process network traffic...");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
     
     // Main loop - process network packets
     let mut heartbeat_counter = 0u64;

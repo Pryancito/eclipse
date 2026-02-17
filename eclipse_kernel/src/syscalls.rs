@@ -145,10 +145,19 @@ pub extern "C" fn syscall_handler(
     stats.total_calls += 1;
     drop(stats);
 
-    // Linux ABI: translate so glibc static binaries (e.g. Xfbdev) work unchanged
-    let (syscall_num, arg1, arg2, arg3, arg4, arg5) = match translate_linux_abi(syscall_num, arg1, arg2, arg3, arg4, arg5) {
-        Some(t) => t,
-        None => (syscall_num, arg1, arg2, arg3, arg4, arg5),
+    // Linux ABI: translate only if process is marked as Linux (e.g. Xfbdev)
+    let is_linux = crate::process::current_process_id()
+        .and_then(|pid| crate::process::get_process(pid))
+        .map(|p| p.is_linux)
+        .unwrap_or(false);
+
+    let (syscall_num, arg1, arg2, arg3, arg4, arg5) = if is_linux {
+        match translate_linux_abi(syscall_num, arg1, arg2, arg3, arg4, arg5) {
+            Some(t) => t,
+            None => (syscall_num, arg1, arg2, arg3, arg4, arg5),
+        }
+    } else {
+        (syscall_num, arg1, arg2, arg3, arg4, arg5)
     };
     let _arg4 = arg4;
     let _arg5 = arg5;
@@ -157,7 +166,7 @@ pub extern "C" fn syscall_handler(
         0 => sys_exit(arg1),
         1 => sys_write(arg1, arg2, arg3),
         2 => sys_read(arg1, arg2, arg3),
-        3 => sys_send(arg1, arg2, arg3),
+        3 => sys_send(arg1, arg2, arg3, arg4),
         4 => sys_receive(arg1, arg2, arg3),
         5 => sys_yield(),
         6 => sys_getpid(),
@@ -199,7 +208,7 @@ pub extern "C" fn syscall_handler(
             u64::MAX
         }
     };
-
+    context.rax = ret;
     ret
 }
 
@@ -445,7 +454,8 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
 }
 
 /// sys_send - Enviar mensaje IPC
-fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64) -> u64 {
+/// arg4 = data_len (bytes to copy from data_ptr; max 256)
+fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.send_calls += 1;
     drop(stats);
@@ -463,10 +473,22 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64) -> u64 {
             _ => MessageType::User,
         };
         
-        // Por ahora enviamos un mensaje vacío (TODO: copiar data_ptr)
-        let data = [0u8; 32];
+        const MAX_MSG: usize = 256;
+        let len = core::cmp::min(data_len as usize, MAX_MSG);
+        let mut data = [0u8; 256];
+        if len > 0 && data_ptr != 0 {
+            if is_user_pointer(data_ptr, len as u64) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data_ptr as *const u8,
+                        data.as_mut_ptr(),
+                        len,
+                    );
+                }
+            }
+        }
         
-        if send_message(client_id, server_id as u32, message_type, &data) {
+        if send_message(client_id, server_id as u32, message_type, &data[..len]) {
             return 0; // Success
         }
     }
@@ -630,13 +652,22 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     // When the pointer is in kernel half (from get_service_binary), the current process
     // may not have that range mapped. Copy the ELF using kernel CR3 so we read valid data.
     let kernel_cr3 = crate::memory::get_kernel_cr3();
+    
+    serial::serial_print("[SYSCALL] exec: Preparing ELF copy (size=");
+    serial::serial_print_dec(elf_size);
+    serial::serial_print(", ptr=");
+    serial::serial_print_hex(elf_ptr);
+    serial::serial_print(")\n");
+
     if elf_ptr >= KERNEL_HALF && kernel_cr3 == 0 {
-        serial::serial_print("[SYSCALL] exec: kernel CR3 not set, copy may be invalid\n");
+        serial::serial_print("[SYSCALL] exec: WARNING: kernel CR3 not set, copy may be invalid\n");
     }
+
     let elf_data: alloc::vec::Vec<u8> = if elf_ptr >= KERNEL_HALF && kernel_cr3 != 0 {
+        serial::serial_print("[SYSCALL] exec: Copying from kernel space using kernel CR3\n");
         let current_cr3 = crate::memory::get_cr3();
         unsafe {
-            crate::memory::set_cr3(crate::memory::get_kernel_cr3());
+            crate::memory::set_cr3(kernel_cr3);
         }
         let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
         let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
@@ -644,11 +675,18 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         unsafe {
             crate::memory::set_cr3(current_cr3);
         }
+        serial::serial_print("[SYSCALL] exec: Kernel space copy complete (size=");
+        serial::serial_print_dec(copy.len() as u64);
+        serial::serial_print(")\n");
         copy
     } else {
+        serial::serial_print("[SYSCALL] exec: Copying from user space\n");
         let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
         let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
         copy.extend_from_slice(src);
+        serial::serial_print("[SYSCALL] exec: User space copy complete (size=");
+        serial::serial_print_dec(copy.len() as u64);
+        serial::serial_print(")\n");
         copy
     };
 
@@ -661,7 +699,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 
     // Replace current process with ELF binary
     match crate::elf_loader::replace_process_image(elf_data.as_slice()) {
-        Ok(entry_point) => {
+        Ok((entry_point, phdr_va, phnum)) => {
             serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
             serial::serial_print_hex(entry_point);
             serial::serial_print("\n");
@@ -677,12 +715,10 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                 }
             }
             
-            // This doesn't return - we jump to the new process entry point
+            // This doesn't return - we jump to the new process entry point (phdr_va/phnum for auxv)
             unsafe {
-                // Use standard userspace stack top (512MB + 256KB)
                 let stack_top: u64 = 0x20040000;
-                // CR3 should already be set to the current process's address space
-                crate::elf_loader::jump_to_userspace(entry_point, stack_top);
+                crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum);
             }
         }
         Err(msg) => {

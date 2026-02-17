@@ -79,17 +79,19 @@ fn flush_log_buffer() {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // TODO: Use PID in log messages when string formatting is available
-    let _pid = getpid();
+    let pid = getpid();
     
     log_message("╔══════════════════════════════════════════════════════════════╗");
     log_message("║              LOG SERVER / CONSOLE SERVICE                    ║");
     log_message("║         Serial Output + File Logging (/var/log/)             ║");
     log_message("╚══════════════════════════════════════════════════════════════╝");
     
-    // Use a simple string concatenation approach for PID
-    log_message("[LOG-SERVICE] Starting");
+    log_message("[LOG-SERVICE] Starting...");
     log_message("[LOG-SERVICE] Initializing logging subsystem...");
+    
+    // Explicitly log the PID
+    println!("[LOG-SERVICE] Running with PID: {}", pid);
+    
     log_message("[LOG-SERVICE] Serial port configured for output");
     log_message("[LOG-SERVICE] Log buffer allocated (4KB)");
     log_message("[LOG-SERVICE] Target log file: /var/log/system.log");
@@ -99,10 +101,13 @@ pub extern "C" fn _start() -> ! {
     let ppid = getppid();
     if ppid > 0 {
         // Send READY message (Type 255 = Signal/Process)
-        // This avoids collision with Network Server (ID 3)
         let ready_msg = b"READY";
         send(ppid as u32, 255, ready_msg);
-        log_message("[LOG-SERVICE] Sent READY signal to init");
+        
+        println!("[LOG-SERVICE] Sent READY signal to parent PID: {}", ppid);
+        log_message("[LOG-SERVICE] Handshake with init complete");
+    } else {
+        log_message("[LOG-SERVICE] WARNING: No parent PID (ppid=0), cannot signal READY");
     }
     
     // Main loop - handle log messages

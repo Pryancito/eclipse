@@ -185,19 +185,20 @@ mod target {
         if stream.is_null() {
             return -1;
         }
-        
+        /* No cerrar ni liberar stdin/stdout/stderr (estáticos); TinyX/OsInit los llama */
+        if stream == stdin || stream == stdout || stream == stderr {
+            let _ = fflush(stream);
+            return 0;
+        }
         fflush(stream);
-        
         let result = match sys_close((*stream).fd as usize) {
             Ok(_) => 0,
             Err(_) => -1,
         };
-        
         if !(*stream).buffer.is_null() {
             crate::header::stdlib::free((*stream).buffer as *mut c_void);
         }
         crate::header::stdlib::free(stream as *mut c_void);
-        
         result
     }
 
@@ -645,6 +646,19 @@ mod target {
     #[no_mangle]
     pub unsafe extern "C" fn snprintf(s: *mut c_char, n: size_t, format: *const c_char, args: ...) -> c_int {
         vsnprintf(s, n, format, args)
+    }
+
+    /// glibc fortified snprintf; TinyX (Xtrans) puede llamarlo. Redirige a snprintf.
+    #[no_mangle]
+    pub unsafe extern "C" fn __snprintf_chk(
+        s: *mut c_char,
+        maxlen: size_t,
+        _flag: c_int,
+        _os: size_t,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        vsnprintf(s, maxlen, format, args)
     }
 
     #[no_mangle]

@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, open, close, exec, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, open, close, exec, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void};
 
 /// Wait for filesystem to be mounted by trying to open a test path
 /// This prevents race conditions with filesystem_service startup
@@ -58,11 +58,15 @@ pub extern "C" fn _start() -> ! {
     println!("[GUI-SERVICE] Waiting for filesystem to be mounted...");
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem is ready!");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
 
     // Launch Xfbdev (TinyX Framebuffer Server)
     println!("[GUI-SERVICE] Launching TinyX Framebuffer Server (Xfbdev)...");
     
-    let app_path = "file:/usr/bin/Xfbdev";
+    let app_path = "file:/usr/bin/hello";
     
     unsafe {
         // Open application file

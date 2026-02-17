@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -284,13 +284,21 @@ pub extern "C" fn _start() -> ! {
         init_audio_mixer();
     }
     
-    // Register with snd: scheme
+    // Register with snd: scheme (optional; run in degraded mode if not available)
     println!("[AUDIO-SERVICE] Connecting to snd: scheme proxy...");
-    let snd_fd = sys_open("snd:").expect("Failed to open snd: scheme");
-    println!("[AUDIO-SERVICE]   Scheme handle: {}", snd_fd);
+    let snd_fd = sys_open("snd:");
+    if let Some(fd) = snd_fd {
+        println!("[AUDIO-SERVICE]   Scheme handle: {}", fd);
+    } else {
+        println!("[AUDIO-SERVICE]   WARNING: snd: scheme not available, running without audio");
+    }
 
-    // Report final status
+    // Report final status and signal READY to init
     println!("[AUDIO-SERVICE] Audio service ready");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
     
     if device_ready {
         println!("[AUDIO-SERVICE] Available audio devices:");
@@ -333,9 +341,11 @@ pub extern "C" fn _start() -> ! {
                 streams_active = 2;  // e.g., music playback + notification
                 samples_processed += 48000;  // 1 second at 48 kHz
                 
-                // Simulate sending audio data to kernel scheme
-                let dummy_data = [0u8; 1024];
-                sys_write(snd_fd, &dummy_data);
+                // Simulate sending audio data to kernel scheme (if snd: is available)
+                if let Some(fd) = snd_fd {
+                    let dummy_data = [0u8; 1024];
+                    sys_write(fd, &dummy_data);
+                }
             }
         }
         

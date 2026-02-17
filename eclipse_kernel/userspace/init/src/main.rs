@@ -62,86 +62,31 @@ static mut SERVICES: [Service; 8] = [
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              ECLIPSE OS INIT SYSTEM v0.1.0                   ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    // Usamos solo ASCII aquí para evitar posibles problemas con el formateo
+    // de caracteres Unicode complejos en las primeras trazas de arranque.
+    println!("==============================================================");
+    println!("==          ECLIPSE OS INIT SYSTEM v0.1.3-FIXED             ==");
+    println!("==============================================================");
     println!();
     println!("Init process started with PID: {}", pid);
     println!();
     
-    // Phase 1: Mount filesystems
-    println!("[INIT] Phase 1: Mounting filesystems...");
-    mount_filesystems();
-    println!();
-    
-    // Phase 2: Start essential services
-    println!("[INIT] Phase 2: Starting essential services...");
+    // Phase 1: Start essential services (log, devfs). Root is NOT mounted yet.
+    println!("[INIT] Phase 1: Starting essential services (log, devfs)...");
     start_essential_services();
     println!();
     
-    // Phase 3: Start system services
-    println!("[INIT] Phase 3: Starting system services...");
+    // Phase 2: Start filesystem service; it mounts the root. Then start rest of system services.
+    println!("[INIT] Phase 2: Starting system services (FS, input, display, etc.)...");
     start_system_services();
     println!();
     
-    // Phase 4: Enter main loop
-    println!("[INIT] Phase 4: Entering main loop...");
+    // Phase 3: Enter main loop
+    println!("[INIT] Phase 3: Entering main loop...");
     println!("[INFO] Init process running. System operational.");
     println!();
     
     main_loop();
-}
-
-/// Mount filesystem
-fn mount_filesystems() {
-    println!("  [FS] Waiting for root filesystem to be ready...");
-    
-    // Retry logic: wait for filesystem to be mounted
-    let max_attempts = 10;
-    let mut attempt = 0;
-    
-    while attempt < max_attempts {
-        // Try to open a test file to verify filesystem is mounted
-        // We use a simple heuristic: if we can access /usr/bin, the FS is ready
-        let test_result = test_filesystem_access();
-        
-        if test_result {
-            println!("  [FS] Root filesystem ready");
-            break;
-        }
-        
-        attempt += 1;
-        println!("  [FS] Filesystem not ready yet (attempt {}/{}), waiting...", attempt, max_attempts);
-        
-        // Exponential backoff: wait longer each time
-        for _ in 0..(1000 * (1 << attempt)) {
-            yield_cpu();
-        }
-    }
-    
-    if attempt >= max_attempts {
-        println!("  [ERROR] Filesystem failed to mount after {} attempts!", max_attempts);
-        println!("  [ERROR] System cannot continue without filesystem access");
-        exit(1);
-    }
-    
-    // Mount other filesystems
-    println!("  [FS] Mounting /proc...");
-    println!("  [FS] Mounting /sys...");
-    println!("  [FS] Mounting /dev...");
-    println!("  [INFO] All filesystems mounted");
-}
-
-/// Test if filesystem is accessible
-/// Returns true if we can access filesystem structures
-fn test_filesystem_access() -> bool {
-    // For now, we use a simple heuristic
-    // In a real implementation, we would try to open a known file
-    // or make a syscall to check filesystem status
-    
-    // Placeholder: assume filesystem is ready after a delay
-    // TODO: Implement proper filesystem status check syscall
-    true
 }
 
 /// Start essential services
@@ -150,22 +95,16 @@ fn start_essential_services() {
         // Start log server first - critical for debugging
         start_service(&mut SERVICES[0]);
         
-        // Give it time to initialize (minimal delay)
-        for _ in 0..5000{
-            yield_cpu();
-        }
+        // Wait for log service to be ready
+        println!("[INIT] Waiting for LOG service to signal READY...");
+        wait_for_ready("log", 5000);
         
         // Start device manager (devfs) - creates /dev nodes
         start_service(&mut SERVICES[1]);
         
-        // Give it time to initialize (minimal delay)
-        // Give it time to initialize (minimal delay)
-        for i in 0..500{
-            if i % 100 == 0 {
-                println!("[INIT] Waiting for DevFS... {}", i);
-            }
-            yield_cpu();
-        }
+        // Wait for devfs to be ready
+        println!("[INIT] Waiting for DevFS to signal READY...");
+        wait_for_ready("devfs", 5000);
     }
 }
 
@@ -175,47 +114,60 @@ fn start_system_services() {
         // Start filesystem service (depends on devfs)
         start_service(&mut SERVICES[2]);
         
-        // CRITICAL: Give filesystem service time to mount the disk
-        // This prevents race conditions where other services try to access files
-        // before the filesystem is ready
-        println!("  [INIT] Waiting for filesystem service to mount...");
-        for i in 0..5000 {
-            if i % 1000 == 0 { println!("    [INIT] FS wait... {}", i); }
-            yield_cpu();
-        }
-        println!("  [INIT] Filesystem should be ready, continuing...");
+        // Wait for filesystem service to mount the disk
+        println!("[INIT] Waiting for Filesystem service to signal READY...");
+        wait_for_ready("filesystem", 10000); // Give it more time
+        println!("  [FS] Root filesystem ready (mounted by filesystem service).");
 
         // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);
-        for i in 0..5000 {
-            if i % 1000 == 0 { println!("    [INIT] Input wait... {}", i); }
-            yield_cpu();
-        }
+        wait_for_ready("input", 5000);
         
         // Start display service (depends on input)
         start_service(&mut SERVICES[4]);
-        for i in 0..5000 {
-            if i % 1000 == 0 { println!("    [INIT] Display wait... {}", i); }
-            yield_cpu();
-        }
+        wait_for_ready("display", 5000);
 
         // Start audio service (depends on filesystem)
         start_service(&mut SERVICES[5]);
-        for i in 0..5000 {
-            if i % 1000 == 0 { println!("    [INIT] Audio wait... {}", i); }
-            yield_cpu();
-        }
+        wait_for_ready("audio", 5000);
         
         // Start network service last (most complex)
         start_service(&mut SERVICES[6]);
-        for i in 0..5000 {
-            if i % 1000 == 0 { println!("    [INIT] Network wait... {}", i); }
-            yield_cpu();
-        }
+        wait_for_ready("network", 5000);
 
         // Start GUI service (depends on network)
         start_service(&mut SERVICES[7]);
+        wait_for_ready("gui", 5000);
     }
+}
+
+/// Wait for a service to signal READY via IPC
+fn wait_for_ready(name: &str, timeout_ms: u32) {
+    let mut buffer = [0u8; 32];
+    let mut attempts = 0;
+    let max_attempts = timeout_ms / 10; // Yield every 10ms approx
+    
+    while attempts < max_attempts {
+        let (len, _sender) = eclipse_libc::receive(&mut buffer);
+        if len > 0 {
+            if len >= 5 && &buffer[..5] == b"READY" {
+                println!("[INIT] Service '{}' is READY", name);
+                return;
+            } else {
+                // If we got another message, just log it for now
+                println!("[INIT] Received unexpected IPC during wait for '{}': {} bytes", name, len);
+            }
+        }
+        
+        yield_cpu();
+        attempts += 1;
+        
+        if attempts % 100 == 0 {
+            println!("[INIT] Still waiting for '{}' ({}%)...", name, (attempts * 100) / max_attempts);
+        }
+    }
+    
+    println!("[INIT] WARNING: Timeout waiting for service '{}' to signal READY", name);
 }
 
 /// Start a service
@@ -229,9 +181,7 @@ fn start_service(service: &mut Service) {
     
     if pid == 0 {
         // Child process - execute the service
-        println!("  [CHILD] Child process for service: {}", service.name);
         
-        // Determine which service binary to load
         // Determine which service binary to load
         let service_id = match service.name {
             "log" => 0,
@@ -243,7 +193,7 @@ fn start_service(service: &mut Service) {
             "network" => 6,
             "gui" => 7,
             _ => {
-                println!("  [CHILD] Unknown service: {}", service.name);
+                println!("  [CHILD] ERROR: Unknown service: {}", service.name);
                 exit(1);
             }
         };
@@ -252,11 +202,9 @@ fn start_service(service: &mut Service) {
         let (bin_ptr, bin_size) = get_service_binary(service_id);
         
         if bin_ptr.is_null() || bin_size == 0 {
-            println!("  [CHILD] Failed to get service binary for: {}", service.name);
+            println!("  [CHILD] ERROR: Failed to get service binary for: {} (ID {})", service.name, service_id);
             exit(1);
         }
-        
-        println!("  [CHILD] Got service binary: {} bytes", bin_size);
         
         // Create slice from pointer
         let service_binary = unsafe {
@@ -264,22 +212,20 @@ fn start_service(service: &mut Service) {
         };
         
         // Execute the service binary
-        println!("  [CHILD] Executing service binary via exec()...");
-        let result = exec(service_binary);
+        let _result = exec(service_binary);
         
         // If exec succeeds, it should not return
-        println!("  [CHILD] exec() returned with error: {}", result);
+        println!("  [CHILD] ERROR: exec() failed for service: {}", service.name);
+        
+        // Try to get failure reason from kernel
         let mut errbuf = [0u8; 80];
         let n = get_last_exec_error(&mut errbuf);
         if n > 0 {
             if let Ok(s) = core::str::from_utf8(&errbuf[..n]) {
-                println!("  [CHILD] exec reason: {}", s);
-            } else {
-                println!("  [CHILD] exec reason: ({} bytes, not utf8)", n);
+                println!("  [CHILD] Failure reason: {}", s);
             }
-        } else {
-            println!("  [CHILD] exec reason: (kernel gave no message, n={})", n);
         }
+        
         exit(1);
     } else if pid > 0 {
         // Parent process - track the service

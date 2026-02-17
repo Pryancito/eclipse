@@ -17,7 +17,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send};
 
 mod logo;
 
@@ -936,6 +936,10 @@ pub extern "C" fn _start() -> ! {
 
     println!("[DISPLAY-SERVICE] Display service ready");
     println!("[DISPLAY-SERVICE] Ready to accept rendering requests...");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
     
     // Main loop - render frames and handle display events
     let mut heartbeat_counter = 0u64;

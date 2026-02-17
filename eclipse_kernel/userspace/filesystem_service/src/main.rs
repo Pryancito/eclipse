@@ -16,7 +16,7 @@ use alloc::format;
 use core::alloc::Layout;
 
 use eclipse_libc::{
-    println, getpid, yield_cpu, 
+    println, getpid, getppid, yield_cpu, send,
     open, close, read, lseek, 
     O_RDONLY, SEEK_SET,
     mount
@@ -241,6 +241,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     println!("[FS-SERVICE] Entering main loop...");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
     loop {
         yield_cpu();
     }

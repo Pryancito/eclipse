@@ -158,7 +158,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     syscalls::init();
     crate::scheme::init(); // Initialize Redox-style scheme system
     fd::init();
-    //servers::init();
+    servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
     pci::init();
     nvidia::init();
     virtio::init();

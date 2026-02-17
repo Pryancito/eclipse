@@ -22,7 +22,7 @@ for service in $SERVICES; do
         # Build for the same target as kernel or custom userspace target?
         # The include path is `target/x86_64-unknown-none/release/service_name`
         # So we use x86_64-unknown-none target
-        RUSTFLAGS="-C link-arg=-T$(pwd)/linker.ld -C relocation-model=static" cargo +nightly build --release --target x86_64-unknown-none
+        RUSTFLAGS="-C link-arg=-T$(pwd)/linker.ld" cargo +nightly build --release --target x86_64-unknown-none
         
         if [ $? -ne 0 ]; then
             echo "Failed to build $service"
@@ -38,7 +38,6 @@ done
 echo "Building eclipse-systemd..."
 if [ -d "eclipse-apps/systemd" ]; then
     cd eclipse-apps/systemd
-    cargo clean
     RUSTFLAGS="-C no-redzone" cargo +nightly build --release --target x86_64-unknown-none
     if [ $? -ne 0 ]; then
         echo "Failed to build eclipse-systemd"

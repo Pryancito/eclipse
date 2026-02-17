@@ -92,6 +92,13 @@ pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     ret
 }
 
+#[inline(always)]
+unsafe fn syscall4(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let ret: u64;
+    asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, lateout("rax") ret, options(nostack));
+    ret
+}
+
 pub fn exit(code: i32) -> ! {
     unsafe { syscall1(SYS_EXIT, code as u64); }
     loop {}
@@ -241,15 +248,16 @@ pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
         syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) as i64
     }
 }
-/// Send a message to a server
+/// Send a message to a server (kernel copies data_len bytes from data into the IPC message).
 /// Returns 0 on success, -1 on error
 pub fn send(server_id: u32, msg_type: u32, data: &[u8]) -> i32 {
     unsafe {
-        syscall3(
+        syscall4(
             SYS_SEND,
             server_id as u64,
             msg_type as u64,
-            data.as_ptr() as u64
+            data.as_ptr() as u64,
+            data.len() as u64
         ) as i32
     }
 }

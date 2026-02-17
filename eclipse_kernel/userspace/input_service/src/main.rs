@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -324,6 +324,10 @@ pub extern "C" fn _start() -> ! {
     
     // Report initialization status
     println!("[INPUT-SERVICE] Input service ready");
+    let ppid = getppid();
+    if ppid > 0 {
+        let _ = send(ppid, 255, b"READY");
+    }
     println!("[INPUT-SERVICE] Device summary:");
     println!("[INPUT-SERVICE]   USB controllers: {}", usb_controller_count);
     println!("[INPUT-SERVICE]   PS/2 keyboard: {}", if ps2_kbd_present { "Yes" } else { "No" });

@@ -1,9 +1,10 @@
 //! ELF Loader para cargar binarios en userspace
 
-use crate::process::{create_process, ProcessId};
+use crate::process::{create_process, current_process_id, get_process, ProcessId};
 use crate::memory;
 use crate::serial;
 use core::arch::asm;
+use core::ptr::write_volatile;
 
 /// ELF Header (64-bit)
 #[repr(C)]
@@ -97,7 +98,7 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
         kernel_ptr: *mut u8,
         phys_addr: u64,
     }
-    let mut mapped_pages: [Option<MappedPage>; 16] = [None; 16];
+    let mut mapped_pages: [Option<MappedPage>; 64] = [None; 64];
     let mut mapped_count = 0;
 
     // Iterate over program headers and load segments
@@ -223,12 +224,13 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
         Ok(info) => info.0,
         Err(_) => return None,
     };
+    let (phdr_va, phnum) = get_elf_phdr_info(elf_data).ok()?;
 
     // Default user stack at 512MB
     let stack_base = 0x20000000; // 512MB
     let stack_size = 0x40000;  // 256KB
     
-    let pid = create_process(entry_point, stack_base, stack_size)?;
+    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum)?;
     crate::fd::fd_init_stdio(pid); // Initialize stdio (log:)
     
     // Get the process to access its page table
@@ -276,9 +278,39 @@ pub fn init() {
     serial::serial_print("ELF loader initialized\n");
 }
 
+/// Return (phdr_va, phnum) for an ELF so the kernel can put AT_PHDR/AT_PHNUM in auxv.
+/// phdr_va = first PT_LOAD.p_vaddr + e_phoff (program headers live at that VA in the loaded image).
+pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
+    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
+        return Err("ELF: file too small");
+    }
+    let header = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
+    if &header.e_ident[0..4] != &ELF_MAGIC {
+        return Err("ELF: invalid magic");
+    }
+    let ph_offset = header.e_phoff as usize;
+    let ph_count = header.e_phnum as usize;
+    let ph_size = header.e_phentsize as usize;
+    if elf_data.len() < ph_offset + ph_count * ph_size {
+        return Err("ELF: phdr out of bounds");
+    }
+    let mut first_load_vaddr = None;
+    for i in 0..ph_count {
+        let off = ph_offset + i * ph_size;
+        let ph = unsafe { &*(elf_data[off..].as_ptr() as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_LOAD {
+            first_load_vaddr = Some(ph.p_vaddr);
+            break;
+        }
+    }
+    let first_load_vaddr = first_load_vaddr.ok_or("ELF: no PT_LOAD")?;
+    let phdr_va = first_load_vaddr + header.e_phoff;
+    Ok((phdr_va, header.e_phnum as u64))
+}
+
 /// Replace current process image with ELF binary (for exec())
-/// Returns Ok(entry_point) or Err(message) for userspace to display
-pub fn replace_process_image(elf_data: &[u8]) -> Result<u64, &'static str> {
+/// Returns Ok((entry_point, phdr_va, phnum)) or Err(message) for userspace to display
+pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -478,26 +510,39 @@ pub fn replace_process_image(elf_data: &[u8]) -> Result<u64, &'static str> {
         }
     }
 
+    // Ensure user stack is mapped (exec path doesn't create process, so stack may not exist yet)
+    const EXEC_STACK_BASE: u64 = 0x20000000;
+    const EXEC_STACK_SIZE: usize = 0x40000;
+    if setup_user_stack(page_table_phys, EXEC_STACK_BASE, EXEC_STACK_SIZE).is_err() {
+        serial::serial_print("ELF: exec stack setup failed (may be ok if already mapped)\n");
+    }
+
     // Flush TLB to ensure new mappings are active
     unsafe { x86_64::instructions::tlb::flush_all(); }
 
-    Ok(header.e_entry)
+    let (phdr_va, phnum) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
+    Ok((header.e_entry, phdr_va, phnum))
 }
 
 /// Jump to entry point in userspace (Ring 3)
+/// phdr_va and phnum are written to auxv (AT_PHDR, AT_PHNUM) so glibc can find program headers.
 /// This function never returns
-/// 
+///
 /// # Safety
 /// This function constructs a stack frame and executes `iretq` to switch privilege levels.
 /// It MUST be called with a valid userspace entry point and stack top.
 /// CR3 should already be set to the correct process address space before calling this.
-pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> ! {
+pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phdr_va: u64, phnum: u64) -> ! {
     // FORCE PRINT to ensure we reached this point
     serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
     serial::serial_print("  Entry: ");
     serial::serial_print_hex(entry_point);
-    serial::serial_print("\n  Stack: ");
+    serial::serial_print("  Stack: ");
     serial::serial_print_hex(stack_top);
+    serial::serial_print("  phdr_va: ");
+    serial::serial_print_hex(phdr_va);
+    serial::serial_print("  phnum: ");
+    serial::serial_print_dec(phnum);
     serial::serial_print("\n");
 
     // Verify entry point is in user space
@@ -527,23 +572,45 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64) -> 
     //   [RSP + ...] = AT_NULL (0) to terminate auxv
     //   [RSP + ...] = 0 (value for AT_NULL)
     
-    // For argc=0, we need:
+    // For argc=0 with auxv so glibc works (avoids CR2=0x388 from missing AT_PHDR).
+    // Linux kernel puts AT_PHDR/AT_PHNUM early; some glibc init reads phdr before full auxv parse.
     // - 1 qword: argc = 0
     // - 1 qword: argv[0] = NULL (argv terminator)
     // - 1 qword: envp[0] = NULL (envp terminator)
-    // - 2 qwords: auxv AT_NULL entry (a_type=0, a_val=0)
-    // Total: 5 quadwords = 40 bytes
-    let adjusted_stack = (stack_top - 40) & !0xF; // 5 quadwords, 16-byte aligned
-    
-    // Write argc/argv/envp/auxv to user stack at the location where RSP will be
-    // IMPORTANT: We can access user memory here because CR3 is set to user process's page table
+    // - auxv: AT_PHDR (3)=phdr_va, AT_PHNUM (5)=phnum, AT_PAGESZ (6)=4096, AT_NULL (0)=0
+    // Total: 3 + 2+2+2+2+2 = 11 quadwords = 88 bytes
+    const AT_PAGESZ: u64 = 6;
+    const AT_PHDR: u64 = 3;
+    const AT_PHNUM: u64 = 5;
+    const AT_NULL: u64 = 0;
+    let adjusted_stack = (stack_top - 88) & !0xF; // 11 quadwords, 16-byte aligned
+
+    // Ensure we're using the current process's CR3 so the write lands in user space (not kernel view)
+    if let Some(pid) = current_process_id() {
+        if let Some(proc) = get_process(pid) {
+            let want_cr3 = proc.page_table_phys;
+            let cur_cr3 = memory::get_cr3();
+            if want_cr3 != 0 && want_cr3 != cur_cr3 {
+                serial::serial_print("ELF: Setting CR3 to process before writing auxv\n");
+                unsafe { memory::set_cr3(want_cr3); }
+            }
+        }
+    }
+
+    // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHNUM first (some glibc inits use them early).
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
-        *stack_ptr.offset(0) = 0; // argc = 0
-        *stack_ptr.offset(1) = 0; // argv[0] = NULL (end of argv)
-        *stack_ptr.offset(2) = 0; // envp[0] = NULL (end of envp)
-        *stack_ptr.offset(3) = 0; // auxv[0].a_type = AT_NULL (0)
-        *stack_ptr.offset(4) = 0; // auxv[0].a_val = 0
+        write_volatile(stack_ptr.offset(0), 0u64);         // argc = 0
+        write_volatile(stack_ptr.offset(1), 0u64);        // argv[0] = NULL (end of argv)
+        write_volatile(stack_ptr.offset(2), 0u64);        // envp[0] = NULL (end of envp)
+        write_volatile(stack_ptr.offset(3), AT_PHDR);
+        write_volatile(stack_ptr.offset(4), phdr_va);    // must be first for early init (avoids 0+0x388)
+        write_volatile(stack_ptr.offset(5), AT_PHNUM);
+        write_volatile(stack_ptr.offset(6), phnum);
+        write_volatile(stack_ptr.offset(7), AT_PAGESZ);
+        write_volatile(stack_ptr.offset(8), 4096u64);    // page size (sysconf(_SC_PAGESIZE))
+        write_volatile(stack_ptr.offset(9), AT_NULL);
+        write_volatile(stack_ptr.offset(10), 0u64);
     }
 
     // Frame iretq: CPU hace pop en orden RIP, CS, RFLAGS, RSP, SS.
