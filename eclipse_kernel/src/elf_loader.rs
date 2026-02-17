@@ -476,8 +476,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     // - 1 qword: envp[0] = NULL (envp terminator)
     // - auxv: AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
     // - 16 bytes for AT_RANDOM data
-    // Total auxv entries: 5 (phdr, phent, phnum, pagesz, random) + 1 (null) = 6 entries * 2 qwords = 12 qwords
-    // Total: 3 (argc/v/p) + 12 (auxv) + 2 (random data) = 17 quadwords = 136 bytes.
+    // Total: 3 (argc/argv/envp) + 12 qwords (6 auxv entries × 2 qwords) + 2 (random data) = 17 quadwords = 136 bytes.
     // We subtract 144 bytes to keep 16-byte alignment.
     const AT_PAGESZ: u64 = 6;
     const AT_PHDR: u64 = 3;
@@ -514,7 +513,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         write_volatile(stack_ptr.offset(9), AT_PAGESZ);
         write_volatile(stack_ptr.offset(10), 4096u64);
         write_volatile(stack_ptr.offset(11), AT_RANDOM);
-        write_volatile(stack_ptr.offset(12), (adjusted_stack + 15 * 8) as u64); // Points to random data
+        write_volatile(stack_ptr.offset(12), (adjusted_stack + 15 * 8) as u64); // Address of random data at offset 15
         write_volatile(stack_ptr.offset(13), AT_NULL);
         write_volatile(stack_ptr.offset(14), 0u64);
         // Random data (16 bytes)
