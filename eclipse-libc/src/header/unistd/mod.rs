@@ -242,3 +242,8 @@ pub unsafe extern "C" fn fchown(_fd: c_int, _owner: uid_t, _group: gid_t) -> c_i
 pub unsafe extern "C" fn spawn(_path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
     -1
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn readlink(_path: *const c_char, _buf: *mut c_char, _bufsiz: size_t) -> ssize_t {
+    -1
+}

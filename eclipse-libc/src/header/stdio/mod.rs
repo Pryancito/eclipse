@@ -153,6 +153,11 @@ mod target {
     }
 
     #[no_mangle]
+    pub unsafe extern "C" fn fopen64(pathname: *const c_char, mode: *const c_char) -> *mut FILE {
+        fopen(pathname, mode)
+    }
+
+    #[no_mangle]
     pub unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut FILE {
         let (flags, _open_flags) = parse_mode(mode);
         if flags == 0 {
@@ -644,6 +649,17 @@ mod target {
     }
 
     #[no_mangle]
+    pub unsafe extern "C" fn __sprintf_chk(
+        s: *mut c_char,
+        _flag: c_int,
+        _os: size_t,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        vsprintf(s, format, args)
+    }
+
+    #[no_mangle]
     pub unsafe extern "C" fn snprintf(s: *mut c_char, n: size_t, format: *const c_char, args: ...) -> c_int {
         vsnprintf(s, n, format, args)
     }
@@ -659,6 +675,47 @@ mod target {
         args: ...
     ) -> c_int {
         vsnprintf(s, maxlen, format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __fprintf_chk(
+        stream: *mut FILE,
+        _flag: c_int,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        vfprintf(stream, format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __printf_chk(
+        _flag: c_int,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        vfprintf(stdout, format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __vfprintf_chk(
+        stream: *mut FILE,
+        _flag: c_int,
+        format: *const c_char,
+        ap: core::ffi::VaList
+    ) -> c_int {
+        vfprintf(stream, format, ap)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __vsnprintf_chk(
+        s: *mut c_char,
+        maxlen: size_t,
+        _flag: c_int,
+        _os: size_t,
+        format: *const c_char,
+        ap: core::ffi::VaList
+    ) -> c_int {
+        vsnprintf(s, maxlen, format, ap)
     }
 
     #[no_mangle]
@@ -726,6 +783,26 @@ mod target {
     }
 
     #[no_mangle]
+    pub unsafe extern "C" fn __asprintf_chk(
+        strp: *mut *mut c_char,
+        _flag: c_int,
+        format: *const c_char,
+        args: ...
+    ) -> c_int {
+        vasprintf(strp, format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __vasprintf_chk(
+        strp: *mut *mut c_char,
+        _flag: c_int,
+        format: *const c_char,
+        ap: core::ffi::VaList
+    ) -> c_int {
+        vasprintf(strp, format, ap)
+    }
+
+    #[no_mangle]
     pub unsafe extern "C" fn fscanf(_stream: *mut FILE, _format: *const c_char, _: ...) -> c_int {
         0
     }
@@ -738,6 +815,21 @@ mod target {
     #[no_mangle]
     pub unsafe extern "C" fn sscanf(_str: *const c_char, _format: *const c_char, _: ...) -> c_int {
         0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __isoc23_fscanf(stream: *mut FILE, format: *const c_char, args: ...) -> c_int {
+        fscanf(stream, format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __isoc23_scanf(format: *const c_char, args: ...) -> c_int {
+        scanf(format, args)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __isoc23_sscanf(s: *const c_char, format: *const c_char, args: ...) -> c_int {
+        sscanf(s, format, args)
     }
 }
 

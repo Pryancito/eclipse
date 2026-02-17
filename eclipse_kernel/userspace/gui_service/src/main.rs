@@ -44,76 +44,6 @@ fn wait_for_filesystem() {
     }
 }
 
-/// Start a service
-fn start_program(path: &str) {
-    println!("[PROGRAM] Starting {}...", path);
-    
-    // Fork a new process for the service
-    let pid = fork();
-    
-    if pid == 0 {
-        unsafe {
-            // Open application file
-            let fd = open(path, O_RDONLY, 0);
-            
-            if fd < 0 {
-                println!("[GUI-SERVICE] ERROR: Failed to open {}", path);
-                println!("[GUI-SERVICE] Entering sleep mode...");
-                loop { yield_cpu(); }
-            }
-            
-            // Use fstat to get file size
-            let mut st: Stat = core::mem::zeroed();
-            if fstat(fd, &mut st) < 0 {
-                println!("[GUI-SERVICE] ERROR: fstat failed for {}", path);
-                close(fd);
-                loop { yield_cpu(); }
-            }
-            
-            let size = st.size;
-            if size <= 0 {
-                println!("[GUI-SERVICE] ERROR: Invalid file size: {}", size);
-                close(fd);
-                loop { yield_cpu(); }
-            }
-
-            println!("[GUI-SERVICE] Mapping {} (size={} bytes)...", path, size);
-
-            // Map file into memory
-            let mapped_addr = mmap(0, size as u64, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
-            
-            if mapped_addr == u64::MAX || mapped_addr == 0 {
-                println!("[GUI-SERVICE] ERROR: mmap failed for {}", path);
-                close(fd);
-                loop { yield_cpu(); }
-            }
-            
-            println!("[GUI-SERVICE] Mapped at {:x}. Spawning {}...", mapped_addr, path);
-            
-            // Create slice for spawn
-            let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
-            
-            // Spawn Xfbdev as a new process
-            let _exec_result = spawn(binary_slice);
-            
-            // Clean up
-            munmap(mapped_addr, size as u64);
-            close(fd);
-
-            // If exec fails, we'll fall through to this point
-            println!("[GUI-SERVICE] ERROR: exec() failed for {}", path);
-            loop { yield_cpu(); }
-        }
-        exit(1);
-    } else if pid > 0 {
-        // Parent process - track the service
-        println!("  [PROGRAM] {} started with PID: {}", path, pid);
-    } else {
-        // Fork failed
-        println!("  [ERROR] Failed to fork service: {}", path);
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
@@ -131,7 +61,59 @@ pub extern "C" fn _start() -> ! {
     // Launch Xfbdev (TinyX Framebuffer Server)
     println!("[GUI-SERVICE] Launching TinyX Framebuffer Server (Xfbdev)...");
     
-    start_program("file:/usr/bin/Xfbdev");
+    let path = "file:/usr/bin/Xfbdev";
+    unsafe {
+        // Open application file
+        let fd = open(path, O_RDONLY, 0);
+        
+        if fd < 0 {
+            println!("[GUI-SERVICE] ERROR: Failed to open {}", path);
+            println!("[GUI-SERVICE] Entering sleep mode...");
+            loop { yield_cpu(); }
+        }
+        
+        // Use fstat to get file size
+        let mut st: Stat = core::mem::zeroed();
+        if fstat(fd, &mut st) < 0 {
+            println!("[GUI-SERVICE] ERROR: fstat failed for {}", path);
+            close(fd);
+            loop { yield_cpu(); }
+        }
+        
+        let size = st.size;
+        if size <= 0 {
+            println!("[GUI-SERVICE] ERROR: Invalid file size: {}", size);
+            close(fd);
+            loop { yield_cpu(); }
+        }
+
+        println!("[GUI-SERVICE] Mapping {} (size={} bytes)...", path, size);
+
+        // Map file into memory
+        let mapped_addr = mmap(0, size as u64, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        
+        if mapped_addr == u64::MAX || mapped_addr == 0 {
+            println!("[GUI-SERVICE] ERROR: mmap failed for {}", path);
+            close(fd);
+            loop { yield_cpu(); }
+        }
+        
+        println!("[GUI-SERVICE] Mapped at {:x}. Spawning {}...", mapped_addr, path);
+        
+        // Create slice for spawn
+        let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
+        
+        // Spawn Xfbdev as a new process
+        let exec_result = spawn(binary_slice);
+        
+        // Clean up
+        munmap(mapped_addr, size as u64);
+        close(fd);
+
+        // If exec fails, we'll fall through to this point
+        println!("[GUI-SERVICE] ERROR: exec() failed for {}", path);
+        loop { yield_cpu(); }
+    }
 
     println!("[GUI-SERVICE] X server should be initializing on /dev/fb0...");
 

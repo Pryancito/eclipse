@@ -108,6 +108,11 @@ pub unsafe extern "C" fn strtol(s: *const c_char, endptr: *mut *mut c_char, base
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn __isoc23_strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long {
+    strtol(s, endptr, base)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn strtoll(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_longlong {
     strtol(s, endptr, base) as c_longlong
 }
@@ -180,6 +185,11 @@ pub unsafe extern "C" fn strtoul(s: *const c_char, endptr: *mut *mut c_char, bas
     }
     
     result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __isoc23_strtoul(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong {
+    strtoul(s, endptr, base)
 }
 
 #[no_mangle]

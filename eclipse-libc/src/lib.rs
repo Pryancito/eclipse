@@ -2,6 +2,8 @@
 #![feature(c_variadic)]
 #![feature(linkage)]
 
+core::arch::global_asm!(include_str!("posix_stubs.s"));
+
 extern crate alloc;
 extern crate eclipse_syscall;
 
@@ -32,12 +34,16 @@ pub mod header {
     pub mod sys_utsname;
     pub mod sys_wait;
     pub mod sys_resource;
+    pub mod ctype;
+    pub mod fcntl;
     pub mod sys_stat;
     pub mod sys_select;
     pub mod termios;
-    pub mod ctype;
-    pub mod fcntl;
     pub mod sys_mman;
+    pub mod dirent;
+    pub mod pwd;
+    pub mod grp;
+    pub mod ifaddrs;
 }
 
 pub use types::*;
@@ -69,6 +75,10 @@ pub use header::termios::*;
 pub use header::ctype::*;
 pub use header::fcntl::*;
 pub use header::sys_mman::*;
+pub use header::dirent::*;
+pub use header::pwd::*;
+pub use header::grp::*;
+pub use header::ifaddrs::*;
 pub const O_RDONLY: c_int = eclipse_syscall::flag::O_RDONLY as c_int;
 pub const O_WRONLY: c_int = eclipse_syscall::flag::O_WRONLY as c_int;
 pub const O_RDWR: c_int = eclipse_syscall::flag::O_RDWR as c_int;

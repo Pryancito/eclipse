@@ -57,6 +57,41 @@ pub unsafe extern "C" fn memset(s: *mut c_void, c: c_int, n: size_t) -> *mut c_v
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn __memcpy_chk(dest: *mut c_void, src: *const c_void, n: size_t, _destlen: size_t) -> *mut c_void {
+    memcpy(dest, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __memset_chk(s: *mut c_void, c: c_int, n: size_t, _destlen: size_t) -> *mut c_void {
+    memset(s, c, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __memmove_chk(dest: *mut c_void, src: *const c_void, n: size_t, _destlen: size_t) -> *mut c_void {
+    memmove(dest, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __strcpy_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
+    strcpy(dest, src)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __strcat_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
+    strcat(dest, src)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __strncpy_chk(dest: *mut c_char, src: *const c_char, n: size_t, _destlen: size_t) -> *mut c_char {
+    strncpy(dest, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __stpcpy_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
+    stpcpy(dest, src)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn bcmp(s1: *const c_void, s2: *const c_void, n: size_t) -> c_int {
     let s1 = s1 as *const u8;
     let s2 = s2 as *const u8;
@@ -147,6 +182,19 @@ pub unsafe extern "C" fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c
         i += 1;
     }
     dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stpcpy(dest: *mut c_char, src: *const c_char) -> *mut c_char {
+    let mut i = 0;
+    loop {
+        let c = *src.add(i);
+        *dest.add(i) = c;
+        if c == 0 {
+            return dest.add(i);
+        }
+        i += 1;
+    }
 }
 
 #[no_mangle]

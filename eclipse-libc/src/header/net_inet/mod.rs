@@ -56,3 +56,13 @@ pub unsafe extern "C" fn ntohl(netlong: u32) -> u32 {
 pub unsafe extern "C" fn inet_addr(_cp: *const c_char) -> c_uint {
     0xffffffff
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn inet_pton(_af: c_int, _src: *const c_char, _dst: *mut c_void) -> c_int {
+    0 // Stub: failure
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn inet_ntop(_af: c_int, _src: *const c_void, _dst: *mut c_char, _size: socklen_t) -> *const c_char {
+    core::ptr::null() // Stub: failure
+}

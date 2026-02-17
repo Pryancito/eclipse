@@ -227,12 +227,21 @@ build_tinyx_for_eclipse_os() {
 #    TINYX_SYSROOT_CFLAGS="-fno-PIE -O2 -ffunction-sections -fdata-sections -fvisibility=hidden -fno-unwind-tables -fno-asynchronous-unwind-tables -Wall"
 #    TINYX_LDFLAGS_STATIC="-static -Wl,-O1 -Wl,-as-needed"
 #    if make -j"$(nproc)" CC="gcc --sysroot=$SYSROOT_TINYX -fno-stack-protector -fno-PIE -O2" CFLAGS="$TINYX_SYSROOT_CFLAGS" LDFLAGS="-B$SYSROOT_TINYX/usr/lib -no-pie $TINYX_LDFLAGS_STATIC" LIBS="-lz" 2>/dev/null; then
-    if make -j"$(nproc)"; then
-        print_success "TinyX (Xfbdev) compilado"
-    else
-        print_error "Make TinyX falló"
-        return 1
-    fi
+     print_status "Compilando CRT sin TLS (crt0_start.o, crt0_no_tls.o)..."
+        rm -f crt0_no_tls.o crt0_start.o
+        gcc -c -O2 -fno-stack-protector -fno-PIE crt0_start.S -o crt0_start.o
+        gcc -c -O2 -fno-stack-protector -fno-PIE crt0_no_tls.c -o crt0_no_tls.o
+        if [ -f "crt0_no_tls.o" ]; then
+            local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
+            TINYX_LDFLAGS_STATIC="-nostartfiles -L$SYSROOT_LIB -Wl,--entry=_start -Wl,--wrap=__libc_setup_tls $(pwd)/crt0_start.o $(pwd)/crt0_no_tls.o -static -no-pie -Wl,-O1 -Wl,-as-needed"
+            print_status "Enlazando Xfbdev con -nostartfiles, sysroot y --wrap=__libc_setup_tls"
+        fi
+        if make -j"$(nproc)" LDFLAGS="$TINYX_LDFLAGS_STATIC"; then
+            print_success "TinyX (Xfbdev) compilado"
+        else
+            print_error "Make TinyX falló"
+            return 1
+        fi
     
 #    else
 #        print_status "Make con sysroot falló, intentando make nativo (estático, CRT sin TLS)..."

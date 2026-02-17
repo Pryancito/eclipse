@@ -110,3 +110,24 @@ pub struct sockaddr_in6 {
     pub sin6_addr: in6_addr,
     pub sin6_scope_id: c_uint,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct passwd {
+    pub pw_name: *mut c_char,
+    pub pw_passwd: *mut c_char,
+    pub pw_uid: uid_t,
+    pub pw_gid: gid_t,
+    pub pw_gecos: *mut c_char,
+    pub pw_dir: *mut c_char,
+    pub pw_shell: *mut c_char,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct group {
+    pub gr_name: *mut c_char,
+    pub gr_passwd: *mut c_char,
+    pub gr_gid: gid_t,
+    pub gr_mem: *mut *mut c_char,
+}
