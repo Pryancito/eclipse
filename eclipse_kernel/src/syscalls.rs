@@ -703,7 +703,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 
     // Replace current process with ELF binary
     match crate::elf_loader::replace_process_image(elf_data.as_slice()) {
-        Ok((entry_point, max_vaddr, phdr_va, phnum)) => {
+        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize)) => {
             serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
             serial::serial_print_hex(entry_point);
             serial::serial_print(", brk: ");
@@ -721,7 +721,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             // This doesn't return - we jump to the new process entry point
             unsafe {
                 let stack_top: u64 = 0x20040000;
-                crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum);
+                crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum, phentsize);
             }
         }
         Err(msg) => {

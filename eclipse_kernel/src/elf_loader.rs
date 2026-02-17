@@ -241,13 +241,13 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
             return None;
         }
     };
-    let (phdr_va, phnum) = get_elf_phdr_info(elf_data).ok()?;
+    let (phdr_va, phnum, phentsize) = get_elf_phdr_info(elf_data).ok()?;
 
     // Default user stack at 512MB
     let stack_base = 0x20000000; // 512MB
     let stack_size = 0x40000;  // 256KB
     
-    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum, max_vaddr)?;
+    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr)?;
     crate::fd::fd_init_stdio(pid);
 
     if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
@@ -281,9 +281,9 @@ pub fn init() {
     serial::serial_print("ELF loader initialized\n");
 }
 
-/// Return (phdr_va, phnum) for an ELF so the kernel can put AT_PHDR/AT_PHNUM in auxv.
+/// Return (phdr_va, phnum, phentsize) for an ELF so the kernel can put AT_PHDR/AT_PHNUM/AT_PHENT in auxv.
 /// phdr_va = first PT_LOAD.p_vaddr + e_phoff (program headers live at that VA in the loaded image).
-pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
+pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: file too small");
     }
@@ -308,12 +308,12 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
     }
     let first_load_vaddr = first_load_vaddr.ok_or("ELF: no PT_LOAD")?;
     let phdr_va = first_load_vaddr + header.e_phoff;
-    Ok((phdr_va, header.e_phnum as u64))
+    Ok((phdr_va, header.e_phnum as u64, header.e_phentsize as u64))
 }
 
 /// Replace current process image with ELF binary (for exec())
-/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum)) or Err(message) for userspace to display
-pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64), &'static str> {
+/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize)) or Err(message) for userspace to display
+pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64), &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -418,19 +418,19 @@ pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64), &'
     let mut mapped_count = 0;
 
     let (entry_point, max_vaddr) = load_elf_into_space(page_table_phys, elf_data)?;
-    let (phdr_va, phnum) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
-    Ok((entry_point, max_vaddr, phdr_va, phnum))
+    let (phdr_va, phnum, phentsize) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
+    Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize))
 }
 
 /// Jump to entry point in userspace (Ring 3)
-/// phdr_va and phnum are written to auxv (AT_PHDR, AT_PHNUM) so glibc can find program headers.
+/// phdr_va, phnum, and phentsize are written to auxv (AT_PHDR, AT_PHNUM, AT_PHENT) so glibc can find program headers.
 /// This function never returns
 ///
 /// # Safety
 /// This function constructs a stack frame and executes `iretq` to switch privilege levels.
 /// It MUST be called with a valid userspace entry point and stack top.
 /// CR3 should already be set to the correct process address space before calling this.
-pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phdr_va: u64, phnum: u64) -> ! {
+pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phdr_va: u64, phnum: u64, phentsize: u64) -> ! {
     // FORCE PRINT to ensure we reached this point
     serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
     serial::serial_print("  Entry: ");
@@ -474,17 +474,17 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     // - 1 qword: argc = 0
     // - 1 qword: argv[0] = NULL (argv terminator)
     // - 1 qword: envp[0] = NULL (envp terminator)
-    // - auxv: AT_PHDR(3), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
+    // - auxv: AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
     // - 16 bytes for AT_RANDOM data
-    // Total auxv entries: 4 (phdr, phnum, pagesz, random) + 1 (null) = 5 entries * 2 qwords = 10 qwords
-    // Total: 3 (argc/v/p) + 10 (auxv) + 2 (random data) = 15 quadwords = 120 bytes.
-    // We subtract 128 bytes to keep 16-byte alignment.
+    // Total: 3 (argc/argv/envp) + 12 qwords (6 auxv entries × 2 qwords) + 2 (random data) = 17 quadwords = 136 bytes.
+    // We subtract 144 bytes to keep 16-byte alignment.
     const AT_PAGESZ: u64 = 6;
     const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
-    let adjusted_stack = (stack_top - 128) & !0xF;
+    let adjusted_stack = (stack_top - 144) & !0xF;
 
     // Ensure we're using the current process's CR3 so the write lands in user space (not kernel view)
     if let Some(pid) = current_process_id() {
@@ -498,7 +498,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         }
     }
 
-    // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHNUM first (some glibc inits use them early).
+    // Write argc/argv/envp/auxv. Put AT_PHDR/AT_PHENT/AT_PHNUM first (some glibc inits use them early).
     unsafe {
         let stack_ptr = adjusted_stack as *mut u64;
         write_volatile(stack_ptr.offset(0), 0u64);         // argc = 0
@@ -506,17 +506,19 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         write_volatile(stack_ptr.offset(2), 0u64);        // envp[0] = NULL (end of envp)
         write_volatile(stack_ptr.offset(3), AT_PHDR);
         write_volatile(stack_ptr.offset(4), phdr_va);
-        write_volatile(stack_ptr.offset(5), AT_PHNUM);
-        write_volatile(stack_ptr.offset(6), phnum);
-        write_volatile(stack_ptr.offset(7), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(8), 4096u64);
-        write_volatile(stack_ptr.offset(9), AT_RANDOM);
-        write_volatile(stack_ptr.offset(10), (adjusted_stack + 13 * 8) as u64); // Points to random data
-        write_volatile(stack_ptr.offset(11), AT_NULL);
-        write_volatile(stack_ptr.offset(12), 0u64);
+        write_volatile(stack_ptr.offset(5), AT_PHENT);
+        write_volatile(stack_ptr.offset(6), phentsize);
+        write_volatile(stack_ptr.offset(7), AT_PHNUM);
+        write_volatile(stack_ptr.offset(8), phnum);
+        write_volatile(stack_ptr.offset(9), AT_PAGESZ);
+        write_volatile(stack_ptr.offset(10), 4096u64);
+        write_volatile(stack_ptr.offset(11), AT_RANDOM);
+        write_volatile(stack_ptr.offset(12), (adjusted_stack + 15 * 8) as u64); // Address of random data at offset 15
+        write_volatile(stack_ptr.offset(13), AT_NULL);
+        write_volatile(stack_ptr.offset(14), 0u64);
         // Random data (16 bytes)
-        write_volatile(stack_ptr.offset(13), 0x12345678_9ABCDEF0u64);
-        write_volatile(stack_ptr.offset(14), 0x0FEDCBA9_87654321u64);
+        write_volatile(stack_ptr.offset(15), 0x12345678_9ABCDEF0u64);
+        write_volatile(stack_ptr.offset(16), 0x0FEDCBA9_87654321u64);
     }
 
     // Frame iretq: CPU hace pop en orden RIP, CS, RFLAGS, RSP, SS.
