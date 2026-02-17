@@ -959,9 +959,17 @@ impl Scheme for FileSystemScheme {
             Err(_) => {
                 let key = String::from(clean_path);
                 let is_tmp = clean_path.starts_with("tmp/") || clean_path == "tmp";
-                // Already exists in virtual /tmp? Open it.
-                {
-                    let vtmp = VIRTUAL_TMP.lock();
+                
+                if is_tmp {
+                    let mut vtmp = VIRTUAL_TMP.lock();
+                    // O_CREAT: create file if it doesn't exist
+                    if (flags & O_CREAT) != 0 {
+                        if (flags & O_EXCL) != 0 && vtmp.contains_key(&key) {
+                            return Err(scheme_error::EEXIST);
+                        }
+                        vtmp.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
+                    }
+
                     if vtmp.contains_key(&key) {
                         drop(vtmp);
                         let mut open_files = OPEN_FILES_SCHEME.lock();
@@ -976,27 +984,8 @@ impl Scheme for FileSystemScheme {
                         return Ok(id);
                     }
                 }
-                // O_CREAT: create file if it doesn't exist (under /tmp only)
-                if (flags & O_CREAT) != 0 && is_tmp {
-                    let mut vtmp = VIRTUAL_TMP.lock();
-                    if (flags & O_EXCL) != 0 && vtmp.contains_key(&key) {
-                        return Err(scheme_error::EEXIST);
-                    }
-                    vtmp.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
-                    drop(vtmp);
-                    let mut open_files = OPEN_FILES_SCHEME.lock();
-                    for (i, slot) in open_files.iter_mut().enumerate() {
-                        if slot.is_none() {
-                            *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
-                            return Ok(i);
-                        }
-                    }
-                    let id = open_files.len();
-                    open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
-                    Ok(id)
-                } else {
-                    Err(scheme_error::ENOENT)
-                }
+                
+                Err(scheme_error::ENOENT)
             }
         }
     }

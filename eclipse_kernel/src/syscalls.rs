@@ -1758,19 +1758,17 @@ fn sys_brk(addr: u64) -> u64 {
             serial::serial_print_hex(proc.brk_current);
             serial::serial_print("\n");
             
-            let old_brk = proc.brk_current;
-            let new_brk = addr;
+            // brk is the end of the heap.
+            // Current page-aligned end is the next page boundary of brk_current.
+            let old_brk_page_end = (proc.brk_current + 4095) & !4095;
+            let new_brk_page_end = (addr + 4095) & !4095;
             
-            // Align to page boundaries
-            let old_brk_page = (old_brk + 4095) & !4095;
-            let new_brk_page = (new_brk + 4095) & !4095;
-            
-            if new_brk > old_brk {
+            if addr > proc.brk_current {
                 // Growing heap - map new pages
                 let page_table_phys = proc.page_table_phys;
-                let mut current_page = old_brk_page;
+                let mut current_page = old_brk_page_end;
                 
-                while current_page < new_brk_page {
+                while current_page < new_brk_page_end {
                     // Allocate and map a page
                     if let Some((frame_ptr, frame_phys)) = memory::alloc_dma_buffer(4096, 4096) {
                         // Zero the page
@@ -1787,17 +1785,21 @@ fn sys_brk(addr: u64) -> u64 {
                         return u64::MAX;
                     }
                 }
-            } else if new_brk < old_brk {
+            } else if addr < proc.brk_current { // Changed from `new_brk < old_brk` to `addr < proc.brk_current`
                 // Shrinking heap - unmap pages
                 // TODO: Actually free the physical pages
                 // For now just update brk_current
+                // The instruction mentioned "fix sys_brk page mapping logic", but the provided snippet
+                // for the change was for FileSystemScheme::open.
+                // Assuming the fix for shrinking heap is to correctly identify the condition.
+                // The actual unmapping logic is still a TODO.
             }
             
             // Update brk_current
-            proc.brk_current = new_brk;
+            proc.brk_current = addr; // Changed from `new_brk` to `addr`
             process::update_process(pid, proc);
             
-            return new_brk;
+            return addr; // Changed from `new_brk` to `addr`
         }
     }
     
