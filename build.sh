@@ -200,7 +200,6 @@ build_libxfont15() {
     fi
     print_status "Compilando libXfont 1.5..."
     make -j"$(nproc)" || { cd ../..; print_error "Make libXfont falló"; return 1; }
-    make install || { cd ../..; print_error "Make install libXfont falló"; return 1; }
     print_success "libXfont 1.5 instalado en $TINYX_INSTALL"
     cd ../..
 }
@@ -1243,11 +1242,11 @@ enable_debug = false
 log_level = "info"
 EOF
     
-    # Crear symlink para fuentes (TinyX espera /usr/lib/X11/fonts)
-    mkdir -p "$BUILD_DIR/usr/lib/X11/fonts"
-    if [ -d "/usr/share/fonts/X11" ]; then
-        cp -r /usr/share/fonts/X11 "$BUILD_DIR/usr/lib/X11/fonts/"
-        print_status "Copiado de fuentes: /usr/share/fonts/X11 -> $BUILD_DIR/usr/lib/X11/fonts/"
+    # Crear symlink para fuentes (TinyX espera /usr/share/fonts/X11/)
+    mkdir -p "$BUILD_DIR/usr/share/fonts/X11/misc/"
+    if [ -d "/usr/share/fonts/X11/misc/" ]; then
+        cp -r /usr/share/fonts/X11/misc/ "$BUILD_DIR/usr/share/fonts/X11/misc/"
+        print_status "Copiado de fuentes a /usr/share/fonts/X11/misc/"
     fi
     
     print_success "Distribución básica creada en $BUILD_DIR"

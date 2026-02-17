@@ -182,11 +182,11 @@ pub fn init_kernel_process() {
 }
 
 /// Crear un nuevo proceso (bajo nivel). phdr_va/phnum 0,0 si no hay ELF (auxv AT_PHDR/AT_PHNUM).
-pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64) -> Option<ProcessId> {
+pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64, initial_brk: u64) -> Option<ProcessId> {
     let pid = next_pid();
     let cr3 = crate::memory::create_process_paging();
     
-    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum) {
+    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, initial_brk) {
         Some(pid)
     } else {
         None
@@ -195,7 +195,7 @@ pub fn create_process(entry_point: u64, stack_base: u64, stack_size: usize, phdr
 
 /// Inicializar un proceso con un PID y espacio de direcciones ya creados.
 /// phdr_va and phnum are passed to jump_to_userspace for the auxv (AT_PHDR, AT_PHNUM).
-pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64) -> bool {
+pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack_base: u64, stack_size: usize, phdr_va: u64, phnum: u64, initial_brk: u64) -> bool {
     // Allocate kernel stack for this process
     let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
@@ -230,6 +230,7 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                 process.context.rsp = kernel_stack_top_aligned;               // Stack del kernel para el trampolín
                 process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
                 process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
+                process.brk_current = initial_brk;
                 
                 crate::serial::serial_print("[PROC] Created process PID: ");
                 crate::serial::serial_print_dec(pid as u64);
@@ -254,7 +255,7 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
     let cr3 = crate::memory::create_process_paging();
     
     // 3. Cargar el binario ELF
-    let entry_point = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    let (entry_point, max_vaddr) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
     let (phdr_va, phnum) = crate::elf_loader::get_elf_phdr_info(elf_data)?;
     
     // 4. Configurar el stack de usuario
@@ -263,7 +264,7 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
     let _stack_top = crate::elf_loader::setup_user_stack(cr3, stack_base, stack_size)?;
     
     // 5. Inicializar el proceso en la tabla de procesos (phdr_va/phnum for auxv)
-    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum) {
+    if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, max_vaddr) {
         crate::fd::fd_init_stdio(pid);
         Ok(pid)
     } else {

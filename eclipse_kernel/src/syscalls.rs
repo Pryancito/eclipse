@@ -164,6 +164,8 @@ pub extern "C" fn syscall_handler(
 
     let ret = match syscall_num {
         0 => sys_exit(arg1),
+        231 => sys_exit(arg1),  // Linux exit_group; Eclipse libc may use this number too
+        158 => sys_arch_prctl(arg1, arg2),  // Linux arch_prctl (TLS); exec'd glibc binaries use this
         1 => sys_write(arg1, arg2, arg3),
         2 => sys_read(arg1, arg2, arg3),
         3 => sys_send(arg1, arg2, arg3, arg4),
@@ -255,7 +257,9 @@ fn translate_linux_abi(
         16 => (34, arg1, arg2, arg3, arg4, arg5),        // ioctl -> 34
         39 => (6, arg1, arg2, arg3, arg4, arg5),          // getpid -> 6
         60 => (0, arg1, arg2, arg3, arg4, arg5),         // exit -> 0
+        158 => (32, arg1, arg2, arg3, arg4, arg5),       // arch_prctl (TLS: ARCH_SET_FS etc.) -> 32
         186 => (23, arg1, arg2, arg3, arg4, arg5),       // gettid -> 23
+        231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
@@ -699,23 +703,22 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 
     // Replace current process with ELF binary
     match crate::elf_loader::replace_process_image(elf_data.as_slice()) {
-        Ok((entry_point, phdr_va, phnum)) => {
+        Ok((entry_point, max_vaddr, phdr_va, phnum)) => {
             serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
             serial::serial_print_hex(entry_point);
+            serial::serial_print(", brk: ");
+            serial::serial_print_hex(max_vaddr);
             serial::serial_print("\n");
             
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
-                    // Set initial brk at 1GB if not already set
-                    if proc.brk_current == 0 {
-                        proc.brk_current = 0x40000000;
-                        crate::process::update_process(pid, proc);
-                    }
+                    proc.brk_current = max_vaddr;
+                    crate::process::update_process(pid, proc);
                 }
             }
             
-            // This doesn't return - we jump to the new process entry point (phdr_va/phnum for auxv)
+            // This doesn't return - we jump to the new process entry point
             unsafe {
                 let stack_top: u64 = 0x20040000;
                 crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum);
@@ -1398,17 +1401,15 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     const FD_ANONYMOUS: u64 = u64::MAX;
     const FD_ANONYMOUS_32: u64 = 0xFFFF_FFFF;
 
-    // Log only briefly; skip when fd looks invalid to avoid spam from allocator retries
-    let fd_ok = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32 || fd < 256;
-    if length <= 1024 * 1024 && fd_ok {
-        serial::serial_print("[SYSCALL] sys_mmap(addr=");
-        serial::serial_print_hex(addr);
-        serial::serial_print(", len=");
-        serial::serial_print_dec(length);
-        serial::serial_print(", fd=");
-        serial::serial_print_dec(fd);
-        serial::serial_print(")\n");
-    }
+    serial::serial_print("[SYSCALL] sys_mmap(addr=");
+    serial::serial_print_hex(addr);
+    serial::serial_print(", len=");
+    serial::serial_print_dec(length);
+    serial::serial_print(", fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(", flags=");
+    serial::serial_print_hex(flags);
+    serial::serial_print(")\n");
 
     if length == 0 {
         return u64::MAX;
@@ -1575,11 +1576,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         proc.vmas.push(vma);
         process::update_process(current_pid, proc);
         
-        if aligned_length <= 1024 * 1024 {
-            serial::serial_print("[SYSCALL] mmap successful: ");
-            serial::serial_print_hex(target_addr);
-            serial::serial_print("\n");
-        }
+        serial::serial_print("[SYSCALL] mmap successful: ");
+        serial::serial_print_hex(target_addr);
+        serial::serial_print("\n");
         return target_addr;
     }
 
@@ -1741,14 +1740,23 @@ fn sys_brk(addr: u64) -> u64 {
         if let Some(mut proc) = process::get_process(pid) {
             // If addr is 0, just return current brk
             if addr == 0 {
+                serial::serial_print("[SYSCALL] brk(0) -> ");
+                serial::serial_print_hex(proc.brk_current);
+                serial::serial_print("\n");
                 return proc.brk_current;
             }
             
-            // Initialize brk if not set (first call)
+            // brk(0) query or first call initialization
             if proc.brk_current == 0 {
-                // Set initial brk at 1GB (above mmap region)
-                proc.brk_current = 0x40000000;
+                serial::serial_print("[SYSCALL] brk: process has no heap base set!\n");
+                return u64::MAX;
             }
+            
+            serial::serial_print("[SYSCALL] brk(");
+            serial::serial_print_hex(addr);
+            serial::serial_print(") current=");
+            serial::serial_print_hex(proc.brk_current);
+            serial::serial_print("\n");
             
             let old_brk = proc.brk_current;
             let new_brk = addr;
@@ -1822,6 +1830,7 @@ pub fn init() {
 }
 
 /// sys_arch_prctl - Architecture-specific process control (Syscall 32)
+/// TLS support: ARCH_SET_FS / ARCH_GET_FS for x86_64 thread pointer (%fs base).
 fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_GS: u64 = 0x1001;
     const ARCH_SET_FS: u64 = 0x1002;
@@ -1833,24 +1842,29 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         None => return u64::MAX,
     };
 
+    serial::serial_print("[SYSCALL] arch_prctl(code=");
+    serial::serial_print_hex(code);
+    serial::serial_print(", addr=");
+    serial::serial_print_hex(addr);
+    serial::serial_print(")\n");
+
     match code {
         ARCH_SET_FS => {
-            serial::serial_print("[SYSCALL] arch_prctl: ARCH_SET_FS to ");
+            serial::serial_print("[SYSCALL] arch_prctl setting FS_BASE to ");
             serial::serial_print_hex(addr);
             serial::serial_print("\n");
-            
             // Validate address (canonical, user-space)
             if addr > 0x0000_7FFF_FFFF_F000 {
                 return u64::MAX;
             }
 
-            // Update process struct
+            // Update process struct (used on context switch)
             if let Some(mut proc) = crate::process::get_process(pid) {
                 proc.fs_base = addr;
                 crate::process::update_process(pid, proc);
             }
 
-            // Apply immediately to current CPU
+            // Apply immediately to current CPU (MSR FS_BASE)
             unsafe {
                 use core::arch::asm;
                 let msr_fs_base = 0xC0000100u32;
@@ -1859,7 +1873,25 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
                 asm!("wrmsr", in("ecx") msr_fs_base, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags));
             }
             0
-        },
+        }
+        ARCH_GET_FS => {
+            // Linux ABI: write current fs_base to *addr (user pointer)
+            if addr == 0 || !is_user_pointer(addr, 8) {
+                return u64::MAX;
+            }
+            let fs_base = crate::process::current_process_id()
+                .and_then(|p| crate::process::get_process(p))
+                .map(|proc| proc.fs_base)
+                .unwrap_or(0);
+            unsafe {
+                (addr as *mut u64).write(fs_base);
+            }
+            0
+        }
+        ARCH_SET_GS | ARCH_GET_GS => {
+            // GS not used for TLS on x86_64; stub returns -ENOSYS
+            u64::MAX
+        }
         _ => {
             serial::serial_print("[SYSCALL] arch_prctl: Unsupported code ");
             serial::serial_print_hex(code);

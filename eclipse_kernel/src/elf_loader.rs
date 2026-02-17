@@ -49,7 +49,8 @@ const MIN_ENTRY_POINT: u64 = 0x80;
 
 
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado
-pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64, &'static str> {
+/// Devuelve Ok((entry_point, max_vaddr))
+pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
     // Verificar header ELF
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: File too small");
@@ -100,6 +101,7 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
     }
     let mut mapped_pages: [Option<MappedPage>; 64] = [None; 64];
     let mut mapped_count = 0;
+    let mut max_vaddr: u64 = 0;
 
     // Iterate over program headers and load segments
     for i in 0..ph_count {
@@ -111,6 +113,10 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
             let vaddr_end = vaddr_start + ph.p_memsz;
             let file_size = ph.p_filesz;
             let file_start_offset = ph.p_offset;
+            
+            if vaddr_end > max_vaddr {
+                max_vaddr = vaddr_end;
+            }
 
             // Align start and end to 2MB boundaries
             let page_start = vaddr_start & !0x1FFFFF;
@@ -192,7 +198,10 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<u64,
         }
     }
     
-    Ok(header.e_entry)
+    // Align max_vaddr to next 4KB page
+    let max_vaddr_aligned = (max_vaddr + 0xFFF) & !0xFFF;
+    
+    Ok((header.e_entry, max_vaddr_aligned))
 }
 
 /// Preparar el stack de usuario
@@ -220,9 +229,17 @@ pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize
 
 /// Cargar binario ELF en memoria y crear proceso
 pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
-    let entry_point = match load_info(elf_data) {
-        Ok(info) => info.0,
-        Err(_) => return None,
+    // We need a temporary space to get page_table_phys
+    let cr3 = crate::memory::create_process_paging();
+
+    let (entry_point, max_vaddr) = match load_elf_into_space(cr3, elf_data) {
+        Ok(res) => res,
+        Err(e) => {
+            serial::serial_print("ELF: Load failed: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            return None;
+        }
     };
     let (phdr_va, phnum) = get_elf_phdr_info(elf_data).ok()?;
 
@@ -230,24 +247,10 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     let stack_base = 0x20000000; // 512MB
     let stack_size = 0x40000;  // 256KB
     
-    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum)?;
-    crate::fd::fd_init_stdio(pid); // Initialize stdio (log:)
-    
-    // Get the process to access its page table
-    let page_table_phys = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        let p = table[pid as usize].as_ref().unwrap();
-        p.page_table_phys
-    };
+    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum, max_vaddr)?;
+    crate::fd::fd_init_stdio(pid);
 
-    if let Err(e) = load_elf_into_space(page_table_phys, elf_data) {
-        serial::serial_print("ELF: Load failed: ");
-        serial::serial_print(e);
-        serial::serial_print("\n");
-        return None;
-    }
-
-    if let Err(e) = setup_user_stack(page_table_phys, stack_base, stack_size) {
+    if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
         serial::serial_print("ELF: Stack setup failed: ");
         serial::serial_print(e);
         serial::serial_print("\n");
@@ -309,8 +312,8 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
 }
 
 /// Replace current process image with ELF binary (for exec())
-/// Returns Ok((entry_point, phdr_va, phnum)) or Err(message) for userspace to display
-pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
+/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum)) or Err(message) for userspace to display
+pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64), &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -411,117 +414,12 @@ pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64), &'stati
         kernel_ptr: *mut u8,
         phys_addr: u64,
     }
-    let mut mapped_pages: [Option<MappedPage>; 16] = [None; 16];
+    let mut mapped_pages: [Option<MappedPage>; 128] = [None; 128];
     let mut mapped_count = 0;
 
-    for i in 0..ph_count {
-        let ph_offset_entry = ph_offset + (i * ph_size);
-        let ph = unsafe { &*(elf_data[ph_offset_entry..].as_ptr() as *const Elf64ProgramHeader) };
-        
-        if ph.p_type == PT_LOAD {
-            let vaddr_start = ph.p_vaddr;
-            let vaddr_end = vaddr_start + ph.p_memsz;
-            let file_size = ph.p_filesz;
-            let file_start_offset = ph.p_offset;
-
-            // Align start and end to 2MB boundaries
-            let page_start = vaddr_start & !0x1FFFFF;
-            let page_end = (vaddr_end + 0x1FFFFF) & !0x1FFFFF;
-
-            let mut current_vaddr = page_start;
-            while current_vaddr < page_end {
-                // Find or create mapped page
-                let mut current_page: Option<MappedPage> = None;
-                for j in 0..mapped_count {
-                    if let Some(mp) = mapped_pages[j] {
-                        if mp.vaddr_base == current_vaddr {
-                            current_page = Some(mp);
-                            break;
-                        }
-                    }
-                }
-                
-                let target_kernel_ptr = if let Some(mp) = current_page {
-                    mp.kernel_ptr
-                } else {
-                    if mapped_count >= mapped_pages.len() {
-                        serial::serial_print("ELF: Too many segments/pages for exec (limit 16)\n");
-                        return Err("ELF: too many pages (limit 16)");
-                    }
-
-                    serial::serial_print("ELF: Mapping page for exec at ");
-                    serial::serial_print_hex(current_vaddr);
-                    serial::serial_print("\n");
-                    
-                    // Allocate new 2MB block
-                    if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                        // Zero the block
-                        unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
-                        
-                        let mp = MappedPage {
-                            vaddr_base: current_vaddr,
-                            kernel_ptr: kptr,
-                            phys_addr: phys,
-                        };
-                        mapped_pages[mapped_count] = Some(mp);
-                        mapped_count += 1;
-                        
-                        // Map it
-                        for i in 0..512 {
-                            let offset = (i as u64) * 0x1000;
-                            crate::memory::map_user_page_4kb(
-                                page_table_phys, 
-                                current_vaddr + offset, 
-                                phys + offset, 
-                                crate::memory::PAGE_USER | crate::memory::PAGE_WRITABLE
-                            );
-                        }
-                        kptr
-                    } else {
-                        serial::serial_print("ELF: Failed to allocate 2MB block\n");
-                        return Err("ELF: alloc 2MB failed");
-                    }
-                };
-
-                // Copy part of the segment data that falls into this 2MB page
-                if file_size > 0 {
-                    let page_vaddr_start = current_vaddr;
-                    let page_vaddr_end = current_vaddr + 0x200000;
-
-                    // Range intersection
-                    let intersect_start = core::cmp::max(vaddr_start, page_vaddr_start);
-                    let intersect_end = core::cmp::min(vaddr_start + file_size, page_vaddr_end);
-
-                    if intersect_start < intersect_end {
-                        let copy_size = (intersect_end - intersect_start) as usize;
-                        let in_file_offset = (intersect_start - vaddr_start) as usize;
-                        let in_page_offset = (intersect_start - page_vaddr_start) as usize;
-
-                        unsafe {
-                            let src = elf_data.as_ptr().add(file_start_offset as usize + in_file_offset);
-                            let dst = target_kernel_ptr.add(in_page_offset);
-                            core::ptr::copy_nonoverlapping(src, dst, copy_size);
-                        }
-                    }
-                }
-
-                current_vaddr += 0x200000;
-            }
-        }
-    }
-
-    // Ensure user stack is mapped (exec path doesn't create process, so stack may not exist yet)
-    const EXEC_STACK_BASE: u64 = 0x20000000;
-    const EXEC_STACK_SIZE: usize = 0x40000;
-    if setup_user_stack(page_table_phys, EXEC_STACK_BASE, EXEC_STACK_SIZE).is_err() {
-        serial::serial_print("ELF: exec stack setup failed (may be ok if already mapped)\n");
-    }
-
-    // Flush TLB to ensure new mappings are active
-    unsafe { x86_64::instructions::tlb::flush_all(); }
-
+    let (entry_point, max_vaddr) = load_elf_into_space(page_table_phys, elf_data)?;
     let (phdr_va, phnum) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
-    Ok((header.e_entry, phdr_va, phnum))
+    Ok((entry_point, max_vaddr, phdr_va, phnum))
 }
 
 /// Jump to entry point in userspace (Ring 3)
@@ -572,18 +470,21 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     //   [RSP + ...] = AT_NULL (0) to terminate auxv
     //   [RSP + ...] = 0 (value for AT_NULL)
     
-    // For argc=0 with auxv so glibc works (avoids CR2=0x388 from missing AT_PHDR).
-    // Linux kernel puts AT_PHDR/AT_PHNUM early; some glibc init reads phdr before full auxv parse.
+    // For argc=0 with auxv so glibc works.
     // - 1 qword: argc = 0
     // - 1 qword: argv[0] = NULL (argv terminator)
     // - 1 qword: envp[0] = NULL (envp terminator)
-    // - auxv: AT_PHDR (3)=phdr_va, AT_PHNUM (5)=phnum, AT_PAGESZ (6)=4096, AT_NULL (0)=0
-    // Total: 3 + 2+2+2+2+2 = 11 quadwords = 88 bytes
+    // - auxv: AT_PHDR(3), AT_PHNUM(5), AT_PAGESZ(6), AT_RANDOM(25), AT_NULL(0)
+    // - 16 bytes for AT_RANDOM data
+    // Total auxv entries: 4 (phdr, phnum, pagesz, random) + 1 (null) = 5 entries * 2 qwords = 10 qwords
+    // Total: 3 (argc/v/p) + 10 (auxv) + 2 (random data) = 15 quadwords = 120 bytes.
+    // We subtract 128 bytes to keep 16-byte alignment.
     const AT_PAGESZ: u64 = 6;
     const AT_PHDR: u64 = 3;
     const AT_PHNUM: u64 = 5;
+    const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
-    let adjusted_stack = (stack_top - 88) & !0xF; // 11 quadwords, 16-byte aligned
+    let adjusted_stack = (stack_top - 128) & !0xF;
 
     // Ensure we're using the current process's CR3 so the write lands in user space (not kernel view)
     if let Some(pid) = current_process_id() {
@@ -604,13 +505,18 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         write_volatile(stack_ptr.offset(1), 0u64);        // argv[0] = NULL (end of argv)
         write_volatile(stack_ptr.offset(2), 0u64);        // envp[0] = NULL (end of envp)
         write_volatile(stack_ptr.offset(3), AT_PHDR);
-        write_volatile(stack_ptr.offset(4), phdr_va);    // must be first for early init (avoids 0+0x388)
+        write_volatile(stack_ptr.offset(4), phdr_va);
         write_volatile(stack_ptr.offset(5), AT_PHNUM);
         write_volatile(stack_ptr.offset(6), phnum);
         write_volatile(stack_ptr.offset(7), AT_PAGESZ);
-        write_volatile(stack_ptr.offset(8), 4096u64);    // page size (sysconf(_SC_PAGESIZE))
-        write_volatile(stack_ptr.offset(9), AT_NULL);
-        write_volatile(stack_ptr.offset(10), 0u64);
+        write_volatile(stack_ptr.offset(8), 4096u64);
+        write_volatile(stack_ptr.offset(9), AT_RANDOM);
+        write_volatile(stack_ptr.offset(10), (adjusted_stack + 13 * 8) as u64); // Points to random data
+        write_volatile(stack_ptr.offset(11), AT_NULL);
+        write_volatile(stack_ptr.offset(12), 0u64);
+        // Random data (16 bytes)
+        write_volatile(stack_ptr.offset(13), 0x12345678_9ABCDEF0u64);
+        write_volatile(stack_ptr.offset(14), 0x0FEDCBA9_87654321u64);
     }
 
     // Frame iretq: CPU hace pop en orden RIP, CS, RFLAGS, RSP, SS.
@@ -642,7 +548,7 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             "mov ax, 0x23",
             "mov ds, ax",
             "mov es, ax",
-            "xor eax, eax",
+            "xor ax, ax",
             "mov fs, ax",
             "mov gs, ax",
             "xor rax, rax",

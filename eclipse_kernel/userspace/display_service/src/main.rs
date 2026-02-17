@@ -128,6 +128,39 @@ fn map_framebuffer_via_scheme(fd: usize, size: usize) -> Option<usize> {
     }
 }
 
+/// Open a path (e.g. "/dev/fb0") via syscall; returns fd or None
+fn open_path(path: &str) -> Option<usize> {
+    let fd: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN,
+            in("rdi") path.as_ptr() as u64,
+            in("rsi") path.len() as u64,
+            in("rdx") 0u64,
+            lateout("rax") fd,
+            options(nostack)
+        );
+    }
+    if fd == u64::MAX || (fd as i64) < 0 {
+        None
+    } else {
+        Some(fd as usize)
+    }
+}
+
+/// Close file descriptor
+fn close_fd(fd: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_CLOSE,
+            in("rdi") fd as u64,
+            options(nostack)
+        );
+    }
+}
+
 /// Clear framebuffer to white immediately after mapping
 /// Uses volatile writes to ensure visibility on memory-mapped framebuffer
 fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
@@ -163,6 +196,31 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
         );
         result == 0
     }
+}
+
+/// Draw the startup logo using /dev/fb0 (open -> mmap -> draw). Used to test the /dev/fb0 path.
+fn draw_logo_via_dev_fb0(fb: &Framebuffer) -> bool {
+    const PATH: &str = "/dev/fb0";
+    let fd = match open_path(PATH) {
+        Some(f) => f,
+        None => {
+            println!("[DISPLAY-SERVICE] draw_logo_via_dev_fb0: open(\"{}\") failed", PATH);
+            return false;
+        }
+    };
+    let size = (fb.pitch as usize) * (fb.mode.height as usize);
+    let vaddr = match map_framebuffer_via_scheme(fd, size) {
+        Some(a) => a,
+        None => {
+            println!("[DISPLAY-SERVICE] draw_logo_via_dev_fb0: mmap(fd={}, size={}) failed", fd, size);
+            close_fd(fd);
+            return false;
+        }
+    };
+    println!("[DISPLAY-SERVICE] Drawing logo via /dev/fb0 (fd={}, vaddr=0x{:X}, {}x{})", fd, vaddr, fb.mode.width, fb.mode.height);
+    logo::draw(vaddr, fb.pitch, fb.mode.bpp, fb.mode.width, fb.mode.height);
+    close_fd(fd);
+    true
 }
 
 /// Create framebuffer device node /dev/fb0
@@ -930,8 +988,12 @@ pub extern "C" fn _start() -> ! {
         println!("[DISPLAY-SERVICE] Final screen clear before starting...");
         let _ = clear_screen(fb, 0xFFFFFFFF);
 
-        println!("[DISPLAY-SERVICE] Drawing startup logo...");
-        logo::draw(fb.base_address, fb.pitch, fb.mode.bpp, fb.mode.width, fb.mode.height);
+        println!("[DISPLAY-SERVICE] Drawing startup logo via /dev/fb0...");
+        if draw_logo_via_dev_fb0(fb) {
+            println!("[DISPLAY-SERVICE]   ✓ Logo drawn via /dev/fb0");
+        } else {
+            println!("[DISPLAY-SERVICE]   ✗ Failed to draw logo via /dev/fb0");
+        }
     }
 
     println!("[DISPLAY-SERVICE] Display service ready");
