@@ -233,8 +233,8 @@ build_tinyx_for_eclipse_os() {
         gcc -c -O2 -fno-stack-protector -fno-PIE crt0_no_tls.c -o crt0_no_tls.o
         if [ -f "crt0_no_tls.o" ]; then
             local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
-            TINYX_LDFLAGS_STATIC="-nostartfiles -L$SYSROOT_LIB -Wl,--entry=_start -Wl,--wrap=__libc_setup_tls $(pwd)/crt0_start.o $(pwd)/crt0_no_tls.o -static -no-pie -Wl,-O1 -Wl,-as-needed"
-            print_status "Enlazando Xfbdev con -nostartfiles, sysroot y --wrap=__libc_setup_tls"
+            TINYX_LDFLAGS_STATIC="-nostartfiles -L$SYSROOT_LIB -Wl,--entry=_start $(pwd)/crt0_start.o $(pwd)/crt0_no_tls.o -static -no-pie -Wl,-O1 -Wl,-as-needed"
+            print_status "Enlazando Xfbdev con -nostartfiles, sysroot y CRT con TLS"
         fi
         if make -j"$(nproc)" LDFLAGS="$TINYX_LDFLAGS_STATIC"; then
             print_success "TinyX (Xfbdev) compilado"
@@ -252,8 +252,8 @@ build_tinyx_for_eclipse_os() {
 #        gcc -c -O2 -fno-stack-protector -fno-PIE crt0_start.S -o crt0_start.o || true
 #        gcc -c -O2 -fno-stack-protector -fno-PIE crt0_no_tls.c -o crt0_no_tls.o || true
 #        if [ -f "crt0_start.o" ] && [ -f "crt0_no_tls.o" ]; then
-#            TINYX_LDFLAGS_STATIC="-nostartfiles -Wl,--wrap=__libc_setup_tls $(pwd)/crt0_start.o $(pwd)/crt0_no_tls.o -static -no-pie -Wl,-O1 -Wl,-as-needed"
-#            print_status "Enlazando Xfbdev con -nostartfiles y --wrap=__libc_setup_tls"
+#            TINYX_LDFLAGS_STATIC="-nostartfiles $(pwd)/crt0_start.o $(pwd)/crt0_no_tls.o -static -no-pie -Wl,-O1 -Wl,-as-needed"
+#            print_status "Enlazando Xfbdev con -nostartfiles"
 #        fi
 #        if make -j"$(nproc)" LDFLAGS="$TINYX_LDFLAGS_STATIC"; then
 #            print_success "TinyX (Xfbdev) compilado (nativo, estático, sin TLS)"

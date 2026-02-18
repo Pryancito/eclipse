@@ -4,6 +4,21 @@ use crate::number::*;
 use crate::error::*;
 use crate::flag::*;
 
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
 /// Exit the current process
 pub fn exit(status: i32) -> ! {
     unsafe {
@@ -142,6 +157,20 @@ pub fn spawn(buf: &[u8]) -> Result<usize> {
     })
 }
 
+/// Get file status
+pub fn fstat(fd: usize, stat: &mut Stat) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall2(SYS_FSTAT, fd, stat as *mut Stat as usize)
+    })
+}
+
+/// Get file status relative to a directory
+pub fn fstat_at(dirfd: usize, path: &str, stat: &mut Stat, flags: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall4(SYS_FSTATAT, dirfd, path.as_ptr() as usize, stat as *mut Stat as usize, flags)
+    })
+}
+
 /// Fill buffer with random bytes
 pub fn getrandom(buf: &mut [u8], flags: usize) -> Result<usize> {
     cvt(unsafe {
@@ -160,5 +189,47 @@ pub fn lseek(fd: usize, offset: isize, whence: usize) -> Result<usize> {
 pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
     cvt(unsafe {
         crate::syscall3(SYS_IOCTL, fd, request, arg)
+    })
+}
+
+/// Create a socket endpoint
+pub fn socket(domain: usize, type_: usize, protocol: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_SOCKET, domain, type_, protocol)
+    })
+}
+
+/// Bind a name to a socket
+pub fn bind(fd: usize, addr: usize, addrlen: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall3(SYS_BIND, fd, addr, addrlen)
+    })
+}
+
+/// Listen for connections on a socket
+pub fn listen(fd: usize, backlog: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall2(SYS_LISTEN, fd, backlog)
+    })
+}
+
+/// Accept a connection on a socket
+pub fn accept(fd: usize, addr: usize, addrlen: usize) -> Result<usize> {
+    cvt(unsafe {
+        crate::syscall3(SYS_ACCEPT, fd, addr, addrlen)
+    })
+}
+
+/// Initiate a connection on a socket
+pub fn connect(fd: usize, addr: usize, addrlen: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall3(SYS_CONNECT, fd, addr, addrlen)
+    })
+}
+
+/// Create a directory
+pub fn mkdir(path: &str, mode: usize) -> Result<()> {
+    cvt_unit(unsafe {
+        crate::syscall2(SYS_MKDIR, path.as_ptr() as usize, mode)
     })
 }

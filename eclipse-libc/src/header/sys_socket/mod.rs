@@ -1,5 +1,7 @@
 //! sys/socket.h - Socket interface
 use crate::types::*;
+use core::ffi::c_int;
+use eclipse_syscall::call::{socket as sys_socket, bind as sys_bind, listen as sys_listen, accept as sys_accept, connect as sys_connect};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -10,28 +12,44 @@ pub struct sockaddr {
 
 
 #[no_mangle]
-pub unsafe extern "C" fn socket(_domain: c_int, _type: c_int, _protocol: c_int) -> c_int {
-    -1
+pub unsafe extern "C" fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int {
+    match sys_socket(domain as usize, type_ as usize, protocol as usize) {
+        Ok(fd) => fd as c_int,
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn bind(_sockfd: c_int, _addr: *const sockaddr, _addrlen: socklen_t) -> c_int {
-    -1
+pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
+    match sys_bind(sockfd as usize, addr as usize, addrlen as usize) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn listen(_sockfd: c_int, _backlog: c_int) -> c_int {
-    -1
+pub unsafe extern "C" fn listen(sockfd: c_int, backlog: c_int) -> c_int {
+    match sys_listen(sockfd as usize, backlog as usize) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn accept(_sockfd: c_int, _addr: *mut sockaddr, _addrlen: *mut socklen_t) -> c_int {
-    -1
+pub unsafe extern "C" fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
+    // Note: addr and addrlen can be null. Our sys_accept wrapper handles it if we pass them.
+    match sys_accept(sockfd as usize, addr as usize, addrlen as usize) {
+        Ok(fd) => fd as c_int,
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn connect(_sockfd: c_int, _addr: *const sockaddr, _addrlen: socklen_t) -> c_int {
-    -1
+pub unsafe extern "C" fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
+    match sys_connect(sockfd as usize, addr as usize, addrlen as usize) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]

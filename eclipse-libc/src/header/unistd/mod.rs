@@ -1,6 +1,7 @@
 //! unistd.h - POSIX OS API
 use crate::types::*;
-use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid};
+use crate::internal_alloc::{malloc, free};
+use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, mkdir as sys_mkdir, fstat as sys_fstat, Stat as sys_Stat};
 
 #[no_mangle]
 static mut FORCE_KEEP: i32 = 0;
@@ -239,8 +240,36 @@ pub unsafe extern "C" fn fchown(_fd: c_int, _owner: uid_t, _group: gid_t) -> c_i
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn spawn(_path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
-    -1
+pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
+    // For now, our sys_spawn only takes an ELF buffer. 
+    // We need to read the file first.
+    let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
+    match sys_open(path_str, 0) { // O_RDONLY
+        Ok(fd) => {
+             // In eclipse-libc we don't have a good way to read the whole file to a buffer easily without fstat/malloc
+             // But fstat is implemented. Let's try.
+             let mut st = sys_Stat::default();
+             if sys_fstat(fd, &mut st).is_ok() {
+                  let size = st.size as usize;
+                  let ptr = malloc(size);
+                  if !ptr.is_null() {
+                       let buf = core::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                       if sys_read(fd, buf).is_ok() {
+                            let res = match sys_spawn(buf) {
+                                 Ok(pid) => pid as pid_t,
+                                 Err(_) => -1,
+                            };
+                            free(ptr);
+                            sys_close(fd).ok();
+                            return res;
+                       }
+                  }
+             }
+             sys_close(fd).ok();
+             -1
+        },
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]

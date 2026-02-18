@@ -922,6 +922,7 @@ static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BT
 enum OpenFile {
     Real { inode: u32, offset: u64 },
     Virtual { path: String, offset: u64 },
+    Framebuffer,
 }
 
 static OPEN_FILES_SCHEME: Mutex<alloc::vec::Vec<Option<OpenFile>>> = Mutex::new(alloc::vec::Vec::new());
@@ -942,6 +943,19 @@ impl Scheme for FileSystemScheme {
 
         // Clean path to remove leading slash if present
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+
+        if clean_path == "dev/fb0" {
+             let mut open_files = OPEN_FILES_SCHEME.lock();
+             for (i, slot) in open_files.iter_mut().enumerate() {
+                 if slot.is_none() {
+                     *slot = Some(OpenFile::Framebuffer);
+                     return Ok(i);
+                 }
+             }
+             let id = open_files.len();
+             open_files.push(Some(OpenFile::Framebuffer));
+             return Ok(id);
+        }
 
         match Filesystem::lookup_path(clean_path) {
             Ok(inode) => {
@@ -1014,15 +1028,16 @@ impl Scheme for FileSystemScheme {
                 if start >= content.len() {
                     return Ok(0);
                 }
-                let n = core::cmp::min(buffer.len(), content.len() - start);
-                buffer[..n].copy_from_slice(&content[start..start + n]);
-                drop(vtmp);
+                let len = core::cmp::min(buffer.len(), content.len() - start);
+                buffer[..len].copy_from_slice(&content[start..start + len]);
+                
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 if let Some(Some(OpenFile::Virtual { offset: o, .. })) = open_files.get_mut(id) {
-                    *o += n as u64;
+                    *o += len as u64;
                 }
-                Ok(n)
+                Ok(len)
             }
+            OpenFile::Framebuffer => Ok(0),
         }
     }
 
@@ -1059,6 +1074,7 @@ impl Scheme for FileSystemScheme {
                 }
                 Ok(n)
             }
+            OpenFile::Framebuffer => Ok(buffer.len()),
         }
     }
 
@@ -1066,7 +1082,7 @@ impl Scheme for FileSystemScheme {
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
-        let (new_offset, is_virtual) = match open_file {
+        let new_offset = match open_file {
             OpenFile::Real { inode, offset } => {
                 let size = Filesystem::get_file_size(*inode).map_err(|_| scheme_error::EIO)? as u64;
                 let no = match whence {
@@ -1077,7 +1093,7 @@ impl Scheme for FileSystemScheme {
                 };
                 *offset = no;
                 drop(open_files);
-                (no, false)
+                no
             }
             OpenFile::Virtual { path, offset } => {
                 let path_clone = path.clone();
@@ -1097,8 +1113,9 @@ impl Scheme for FileSystemScheme {
                 if let OpenFile::Virtual { offset: o, .. } = open_file {
                     *o = no;
                 }
-                (no, true)
+                no
             }
+            OpenFile::Framebuffer => 0,
         };
         Ok(new_offset as usize)
     }
@@ -1132,6 +1149,11 @@ impl Scheme for FileSystemScheme {
                 stat.size = vtmp.get(&path_clone).map(|v| v.len() as u64).unwrap_or(0);
                 Ok(0)
             }
+            OpenFile::Framebuffer => {
+                let fb_info = &crate::boot::get_boot_info().framebuffer;
+                stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
+                Ok(0)
+            }
         }
     }
 
@@ -1140,8 +1162,80 @@ impl Scheme for FileSystemScheme {
         serial::serial_print(path);
         serial::serial_print(")\n");
         
-        // Stub: Always return success for now to satisfy /tmp creation
-        Ok(0)
+        let clean_path = if path.starts_with('/') { &path[1..] } else { path };
+        if clean_path.starts_with("tmp/") || clean_path == "tmp" {
+            let mut vtmp = VIRTUAL_TMP.lock();
+            vtmp.entry(String::from(clean_path)).or_insert_with(alloc::vec::Vec::new);
+            return Ok(0);
+        }
+
+        // Stub: fail for other directories if not in /tmp
+        Err(scheme_error::EINVAL)
+    }
+
+    fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+        let mut open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+        
+        serial::serial_print("[FS-SCHEME] ioctl request: ");
+        serial::serial_print_hex(request as u64);
+        serial::serial_print(" for ");
+        match open_file {
+            OpenFile::Framebuffer => {
+                serial::serial_print("Framebuffer\n");
+                match request as u32 {
+                    0x4600 => { // FBIOGET_VSCREENINFO
+                        let fb_info = &crate::boot::get_boot_info().framebuffer;
+                        let var_info = unsafe { &mut *(arg as *mut fb_var_screeninfo) };
+                        var_info.xres = fb_info.width as u32;
+                        var_info.yres = fb_info.height as u32;
+                        var_info.xres_virtual = fb_info.width as u32;
+                        var_info.yres_virtual = fb_info.height as u32;
+                        var_info.bits_per_pixel = 32;
+                        var_info.red.offset = 16;
+                        var_info.red.length = 8;
+                        var_info.green.offset = 8;
+                        var_info.green.length = 8;
+                        var_info.blue.offset = 0;
+                        var_info.blue.length = 8;
+                        var_info.transp.offset = 24;
+                        var_info.transp.length = 8;
+                        Ok(0)
+                    }
+                    0x4601 => { // FBIOPUT_VSCREENINFO
+                        crate::serial::serial_print("[FS-SCHEME] FBIOPUT_VSCREENINFO called (stub)\n");
+                        Ok(0)
+                    }
+                    0x4602 => { // FBIOGET_FSCREENINFO
+                        let fb_info = &crate::boot::get_boot_info().framebuffer;
+                        let fix_info = unsafe { &mut *(arg as *mut fb_fix_screeninfo) };
+                        fix_info.smem_start = fb_info.base_address as u64;
+                        fix_info.smem_len = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u32;
+                        fix_info.line_length = (fb_info.pixels_per_scan_line * 4) as u32;
+                        fix_info.visual = 2; // FB_VISUAL_TRUECOLOR
+                        Ok(0)
+                    }
+                    _ => Err(scheme_error::EINVAL),
+                }
+            }
+            _ => Err(scheme_error::ENOSYS),
+        }
+    }
+
+    fn fmap(&self, id: usize, _offset: usize, _len: usize) -> Result<usize, usize> {
+        let open_files = OPEN_FILES_SCHEME.lock();
+        let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
+        
+        match open_file {
+            OpenFile::Framebuffer => {
+                let fb_info = &crate::boot::get_boot_info().framebuffer;
+                if fb_info.base_address == 0 {
+                    return Err(scheme_error::EIO);
+                }
+                Ok(fb_info.base_address as usize)
+            }
+            _ => Err(scheme_error::ENOSYS),
+        }
     }
 }
 
@@ -1158,9 +1252,12 @@ impl Scheme for DevScheme {
         if clean_path.is_empty() || clean_path == "/" {
             return Ok(DEVDIR_LIST_ID);
         }
-        if lookup_device(clean_path).is_some() {
+        if lookup_device(clean_path).is_some() || clean_path == "keyboard" {
             if clean_path == "fb0" {
                 return Ok(100); // Magic ID for fb0
+            }
+            if clean_path == "keyboard" {
+                return Ok(101); // Magic ID for keyboard
             }
             Ok(0)
         } else {
@@ -1169,6 +1266,30 @@ impl Scheme for DevScheme {
     }
 
     fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        if id == 100 { // fb0
+            // Framebuffer is write-only/ioctl, returned 0 on read
+             return Ok(0);
+        }
+        
+        if id == 101 { // keyboard
+            if buffer.len() == 0 {
+                 return Ok(0);
+            }
+            
+            // Non-blocking read from keyboard buffer
+            let key = crate::interrupts::read_key();
+            if key != 0 {
+                buffer[0] = key;
+                return Ok(1);
+            } else {
+                // If non-blocking, return EAGAIN? Or 0?
+                // For now, return 0 (EOF behavior) or maybe block?
+                // Simpler: non-blocking, return 0 means no data yet.
+                // TinyX might poll.
+                return Ok(0);
+            }
+        }
+        
         if id == DEVDIR_LIST_ID {
             let names = list_device_names();
             let mut s = alloc::string::String::new();

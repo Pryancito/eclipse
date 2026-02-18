@@ -601,16 +601,56 @@ unsafe extern "C" fn irq_0() {
     );
 }
 
+// Keyboard Buffer (Circular)
+const KEY_BUFFER_SIZE: usize = 256;
+static KEY_BUFFER: Mutex<[u8; KEY_BUFFER_SIZE]> = Mutex::new([0; KEY_BUFFER_SIZE]);
+static KEY_HEAD: Mutex<usize> = Mutex::new(0);
+static KEY_TAIL: Mutex<usize> = Mutex::new(0);
+
 extern "C" fn keyboard_handler() {
+    let scancode: u8;
     unsafe {
-        let _scancode = inb(0x60);
+        scancode = inb(0x60);
     }
+    
+    // Buffer the key
+    let mut head = KEY_HEAD.lock();
+    let tail = KEY_TAIL.lock();
+    let next_head = (*head + 1) % KEY_BUFFER_SIZE;
+    
+    if next_head != *tail {
+        let mut buffer = KEY_BUFFER.lock();
+        buffer[*head] = scancode;
+        *head = next_head;
+    }
+    // else: buffer full, drop key
+    
+    drop(tail);
+    drop(head);
     
     let mut stats = INTERRUPT_STATS.lock();
     stats.irqs += 1;
     drop(stats);
     
     send_eoi(1);
+}
+
+/// Read a byte from the keyboard buffer (non-blocking)
+/// Returns 0 if empty (since 0 is not a valid scancode generally, unless error/break)
+pub fn read_key() -> u8 {
+    let mut tail = KEY_TAIL.lock();
+    let head = KEY_HEAD.lock();
+    
+    if *head == *tail {
+        return 0; // Buffer empty
+    }
+    
+    let buffer = KEY_BUFFER.lock();
+    let val = buffer[*tail];
+    // Advance tail
+    *tail = (*tail + 1) % KEY_BUFFER_SIZE;
+    
+    val
 }
 
 #[unsafe(naked)]
@@ -740,8 +780,7 @@ unsafe extern "C" fn syscall_int80() {
         "mov ax, 0x23",  // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
-        "mov fs, ax",
-        "mov gs, ax",
+        // FS and GS bases are managed by ARCH_SET_FS/GS MSRs
         
         "pop r15",
         "pop r14",
@@ -847,8 +886,10 @@ unsafe extern "C" fn syscall_entry() {
         "mov ax, 0x23",  // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
-        "mov fs, ax",
-        "mov gs, ax",
+        "mov es, ax",
+        // FS and GS must NOT be reloaded here as it would clear the Base address (MSR_FS_BASE)
+        // configured by sys_arch_prctl. Since kernel doesn't change them, just leave as is.
+
         
         "pop r15",
         "pop r14",

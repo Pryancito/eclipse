@@ -3,6 +3,7 @@
 //! Implementa la interfaz entre userspace y kernel
 
 use alloc::format;
+use alloc::string::String;
 
 use crate::process::{ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
@@ -45,7 +46,16 @@ pub enum SyscallNumber {
     Mount = 29,
     Fstat = 30,
     Spawn = 31,
+    ArchPrctl = 32,
     GetRandom = 33,
+    Ioctl = 34,
+    GetLastExecError = 35,
+    Socket = 100,
+    Bind = 101,
+    Listen = 102,
+    Accept = 103,
+    Connect = 104,
+    Mkdir = 105,
 }
 
 /// lseek whence values (POSIX standard)
@@ -97,25 +107,13 @@ pub extern "C" fn syscall_handler(
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
     // Log registers for Syscall 27 (register_device) to catch corruption
-    if syscall_num == 27 {
-        serial::serial_print("[SYSCALL] register_device entry: num=");
+    if syscall_num == 27 || (crate::process::current_process_id() == Some(10) && syscall_num != 1 && syscall_num != 2) {
+        serial::serial_print("[SYSCALL] PID 10 syscall: ");
         serial::serial_print_dec(syscall_num);
         serial::serial_print(" arg1=");
         serial::serial_print_hex(arg1);
         serial::serial_print(" arg2=");
-        serial::serial_print_dec(arg2);
-        serial::serial_print(" arg3=");
-        serial::serial_print_hex(arg3);
-        serial::serial_print("\n");
-        
-        serial::serial_print("[SYSCALL] register_device context: RAX=");
-        serial::serial_print_hex(context.rax);
-        serial::serial_print(" RDI=");
-        serial::serial_print_hex(context.rdi);
-        serial::serial_print(" RSI=");
-        serial::serial_print_hex(context.rsi);
-        serial::serial_print(" RDX=");
-        serial::serial_print_hex(context.rdx);
+        serial::serial_print_hex(arg2);
         serial::serial_print("\n");
     }
 
@@ -144,15 +142,29 @@ pub extern "C" fn syscall_handler(
     let mut stats = SYSCALL_STATS.lock();
     stats.total_calls += 1;
     drop(stats);
-
+ 
     // Linux ABI: translate only if process is marked as Linux (e.g. Xfbdev)
-    let is_linux = crate::process::current_process_id()
+    let mut is_linux = crate::process::current_process_id()
         .and_then(|pid| crate::process::get_process(pid))
         .map(|p| p.is_linux)
         .unwrap_or(false);
 
+    // Auto-detection: if it calls a high Linux-specific syscall, mark it as Linux permanently
+    if !is_linux && (syscall_num == 158 || syscall_num == 231 || syscall_num == 41 || syscall_num == 202) {
+         serial::serial_print("[SYSCALL] Auto-detected Linux binary via syscall ");
+         serial::serial_print_dec(syscall_num);
+         serial::serial_print("\n");
+         if let Some(pid) = crate::process::current_process_id() {
+             if let Some(mut proc) = crate::process::get_process(pid) {
+                 proc.is_linux = true;
+                 crate::process::update_process(pid, proc);
+                 is_linux = true;
+             }
+         }
+    }
+
     let (syscall_num, arg1, arg2, arg3, arg4, arg5) = if is_linux {
-        match translate_linux_abi(syscall_num, arg1, arg2, arg3, arg4, arg5) {
+        match translate_linux_abi_unique(syscall_num, arg1, arg2, arg3, arg4, arg5) {
             Some(t) => t,
             None => (syscall_num, arg1, arg2, arg3, arg4, arg5),
         }
@@ -201,21 +213,47 @@ pub extern "C" fn syscall_handler(
         33 => sys_getrandom(arg1, arg2, arg3),
         34 => sys_ioctl(arg1, arg2, arg3),
         35 => sys_get_last_exec_error(arg1, arg2),
+        100 => sys_socket(arg1, arg2, arg3),
+        101 => sys_bind(arg1, arg2, arg3),
+        102 => sys_listen(arg1, arg2),
+        103 => sys_accept(arg1, arg2, arg3),
+        104 => sys_connect(arg1, arg2, arg3),
+        105 => sys_mkdir(arg1, arg2),
+        106 => sys_fstatat(arg1, arg2, arg3, arg4),
+        107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
+        108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
+        109 => sys_unlink(arg1),
         _ => {
             serial::serial_print("[SYSCALL] Unknown syscall: ");
             serial::serial_print_dec(syscall_num);
+            if is_linux {
+                serial::serial_print(" (Linux translated)");
+            }
+            serial::serial_print(" from process ");
+            serial::serial_print_dec(crate::process::current_process_id().unwrap_or(0) as u64);
             serial::serial_print(" on CPU ");
             serial::serial_print_dec(crate::process::get_cpu_id() as u64);
             serial::serial_print("\n");
             u64::MAX
         }
     };
-    context.rax = ret;
-    ret
+    
+    // Linux Compatibility: Map results to signed if it's a Linux process
+    // glibc expects -1 for failure and sets errno based on the positive error code.
+    // Our kernel currently returns u64::MAX for error.
+    let final_ret = if is_linux && ret == u64::MAX {
+        // Return -1 (0xFFFFFFFFFFFFFFFF)
+        u64::MAX
+    } else {
+        ret
+    };
+
+    context.rax = final_ret;
+    final_ret
 }
 
 /// Length of null-terminated string in user space (max max_len bytes).
-fn strlen_user(path_ptr: u64, max_len: usize) -> u64 {
+fn strlen_user_unique(path_ptr: u64, max_len: usize) -> u64 {
     if path_ptr == 0 || max_len == 0 {
         return 0;
     }
@@ -233,7 +271,7 @@ fn strlen_user(path_ptr: u64, max_len: usize) -> u64 {
 
 /// Translate Linux x86_64 syscall ABI to Eclipse numbers (for static glibc binaries like Xfbdev).
 /// Returns (eclipse_syscall_num, arg1, arg2, arg3, arg4, arg5) or None if not a known Linux syscall.
-fn translate_linux_abi(
+fn translate_linux_abi_unique(
     num: u64,
     arg1: u64,
     arg2: u64,
@@ -245,7 +283,7 @@ fn translate_linux_abi(
         0 => (2, arg1, arg2, arg3, arg4, arg5),           // read -> 2
         1 => (1, arg1, arg2, arg3, arg4, arg5),           // write -> 1
         2 => {
-            let path_len = strlen_user(arg1, 4096);
+            let path_len = strlen_user_unique(arg1, 4096);
             (11, arg1, path_len, arg2, arg4, arg5)        // open(path, flags, mode) -> 11(path, len, flags)
         }
         3 => (12, arg1, arg2, arg3, arg4, arg5),          // close -> 12
@@ -257,9 +295,19 @@ fn translate_linux_abi(
         16 => (34, arg1, arg2, arg3, arg4, arg5),        // ioctl -> 34
         39 => (6, arg1, arg2, arg3, arg4, arg5),          // getpid -> 6
         60 => (0, arg1, arg2, arg3, arg4, arg5),         // exit -> 0
+        41 => (100, arg1, arg2, arg3, arg4, arg5),        // socket -> 100
+        42 => (104, arg1, arg2, arg3, arg4, arg5),        // connect -> 104
+        43 => (103, arg1, arg2, arg3, arg4, arg5),        // accept -> 103
+        49 => (101, arg1, arg2, arg3, arg4, arg5),        // bind -> 101
+        50 => (102, arg1, arg2, arg3, arg4, arg5),        // listen -> 102
+        83 => (105, arg1, arg2, arg3, arg4, arg5),        // mkdir -> 105
+        87 => (109, arg1, arg2, arg3, arg4, arg5),        // unlink -> 109
+        54 => (107, arg1, arg2, arg3, arg4, arg5),        // setsockopt -> 107
+        55 => (108, arg1, arg2, arg3, arg4, arg5),        // getsockopt -> 108
         158 => (32, arg1, arg2, arg3, arg4, arg5),       // arch_prctl (TLS: ARCH_SET_FS etc.) -> 32
         186 => (23, arg1, arg2, arg3, arg4, arg5),       // gettid -> 23
         231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
+        262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
@@ -438,9 +486,16 @@ fn sys_get_last_exec_error(out_ptr: u64, out_len: u64) -> u64 {
 
 /// sys_ioctl - Device control (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc.)
 fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
-    if arg != 0 && !is_user_pointer(arg, 512) {
-        return u64::MAX;
+    // Only check pointer if arg is likely a pointer (non-zero and in user range)
+    // Some ioctls take integer args, so strictly enforcing is_user_pointer might be wrong.
+    // However, if it IS a pointer, verify it.
+    // Let's rely on Scheme to validate, or just do range check if it LOOKS like a pointer?
+    // Safer: if arg looks like a kernel address, reject it.
+    if arg >= 0xFFFF800000000000 { // Kernel Higher Half
+        crate::serial::serial_print("[SYSCALL] sys_ioctl rejected kernel arg\n");
+        return -(crate::scheme::error::EFAULT as isize) as u64;
     }
+
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
             match crate::scheme::ioctl(
@@ -449,12 +504,21 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
                 request as usize,
                 arg as usize,
             ) {
-                Ok(_) => return 0,
-                Err(_) => return u64::MAX,
+                Ok(ret) => return ret as u64,
+                Err(e) => {
+                     crate::serial::serial_print("[SYSCALL] sys_ioctl failed: ");
+                     crate::serial::serial_print_dec(e as u64);
+                     crate::serial::serial_print(" for fd ");
+                     crate::serial::serial_print_dec(fd);
+                     crate::serial::serial_print(" req ");
+                     crate::serial::serial_print_hex(request);
+                     crate::serial::serial_print("\n");
+                     return -(e as isize) as u64;
+                }
             }
         }
     }
-    u64::MAX
+    -(crate::scheme::error::EBADF as isize) as u64
 }
 
 /// sys_send - Enviar mensaje IPC
@@ -1563,6 +1627,18 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 };
                 unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
                 let vaddr = target_addr + page_offset;
+                
+                // DEBUG: Check for stack collision
+                let rsp: u64;
+                unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+                if (frame_ptr as u64).abs_diff(rsp) < 0x2000 {
+                     crate::serial::serial_print("!!! DANGER: Allocator returned pointer near stack !!! Ptr: ");
+                     crate::serial::serial_print_hex(frame_ptr as u64);
+                     crate::serial::serial_print(" RSP: ");
+                     crate::serial::serial_print_hex(rsp);
+                     crate::serial::serial_print("\n");
+                }
+
                 memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
             }
         }
@@ -1924,4 +2000,329 @@ fn sys_getrandom(buf_ptr: u64, len: u64, _flags: u64) -> u64 {
     }
 
     len
+}
+
+// --- Socket Syscalls ---
+
+/// sys_socket - Create an endpoint for communication
+/// domain: AF_UNIX=1, AF_INET=2
+/// type: SOCK_STREAM=1, SOCK_DGRAM=2
+/// protocol: 0
+fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
+    serial::serial_print("[SYSCALL] socket(domain=");
+    serial::serial_print_dec(domain);
+    serial::serial_print(", type=");
+    serial::serial_print_dec(type_);
+    serial::serial_print(", protocol=");
+    serial::serial_print_dec(protocol);
+    serial::serial_print(")\n");
+
+    let path = if domain == 1 { "socket:unix" } else { "socket:" };
+
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open(path, 0, 0) {
+        if let Some(pid) = current_process_id() {
+             if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                 // Store info if it's the socket scheme
+                 if let Some(scheme) = crate::servers::get_socket_scheme() {
+                     // We would ideally verify scheme_id here, but for now we assume it matches
+                     // In the future, we can add a get_scheme method to SchemeRegistry.
+                 }
+                 return fd as u64;
+             }
+        }
+    }
+    u64::MAX
+}
+
+/// sys_bind - Bind a name to a socket
+/// fd: socket file descriptor
+/// addr: pointer to sockaddr structure
+/// addrlen: size of sockaddr structure
+fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    serial::serial_print("[SYSCALL] bind(fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(", addr=");
+    serial::serial_print_hex(addr);
+    serial::serial_print(", len=");
+    serial::serial_print_dec(addrlen);
+    serial::serial_print(")\n");
+    
+    // Validate arguments
+    if addr == 0 || addrlen < 2 {
+        return u64::MAX; // EINVAL
+    }
+    
+    if !is_user_pointer(addr, addrlen) {
+        return u64::MAX; // EFAULT
+    }
+    
+    // Read address family (first 2 bytes)
+    let family = unsafe { *(addr as *const u16) };
+    
+    if family == 1 { // AF_UNIX
+        // Path starts at offset 2
+        // Max path len in sockaddr_un is 108
+        // We need to parse strict C string or length-bounded string
+        
+        let path_start = addr + 2;
+        let mut path_len = strlen_user_unique(path_start, (addrlen - 2) as usize);
+        
+        // Handle Abstract Sockets (Linux): starts with \0
+        let is_abstract = if path_len == 0 && addrlen > 2 {
+            let first_byte = unsafe { *(path_start as *const u8) };
+            first_byte == 0
+        } else {
+            false
+        };
+
+        if is_abstract {
+            // For abstract sockets, the name IS the buffer (up to addrlen-2)
+            // We'll represent them as "@path" or similar in our internal string
+            // or just use a special prefix. Let's use "@" prefix.
+            path_len = (addrlen - 2) as u64;
+            if path_len > 107 { path_len = 107; }
+        }
+
+        // Copy path to kernel temporary buffer
+        let mut path_buf = [0u8; 110];
+        let mut final_path_str = String::new();
+
+        if is_abstract {
+            final_path_str.push('@');
+            unsafe {
+                // Skip the leading null byte for the actual name
+                core::ptr::copy_nonoverlapping((path_start + 1) as *const u8, path_buf.as_mut_ptr(), (path_len - 1) as usize);
+                if let Ok(s) = core::str::from_utf8(&path_buf[0..(path_len - 1) as usize]) {
+                    final_path_str.push_str(s);
+                }
+            }
+        } else {
+            if path_len > 107 { return u64::MAX; }
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_start as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+            }
+            if let Ok(s) = core::str::from_utf8(&path_buf[0..path_len as usize]) {
+                final_path_str.push_str(s);
+            }
+        }
+        
+        serial::serial_print("[SYSCALL] bind AF_UNIX path: '");
+        serial::serial_print(&final_path_str);
+        serial::serial_print("'\n");
+        
+        if final_path_str.is_empty() {
+             serial::serial_print("[SYSCALL] bind: path is empty! Checking first 16 bytes of addr...\n");
+             for i in 0..16 {
+                 let b = unsafe { *((addr + i) as *const u8) };
+                 serial::serial_print_hex(b as u64);
+                 serial::serial_print(" ");
+             }
+             serial::serial_print("\n");
+        }
+        
+        // Create the file node (only for non-abstract)
+        if !is_abstract {
+            if let Ok((_scheme_id, _resource_id)) = crate::scheme::open(&final_path_str, 0x40 | 0x80, 0o777) {
+                 // Successfully created file node. 
+            } else {
+                serial::serial_print("[SYSCALL] bind failed to create file node for path\n");
+            }
+        }
+
+        // Tell SocketScheme about it.
+        if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+            if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+                scheme.bind(fd_info.resource_id, final_path_str).ok();
+                return 0;
+            }
+        }
+        u64::MAX
+    } else {
+        serial::serial_print("[SYSCALL] bind: unsupported family\n");
+        0 // Pretend success for other families (AF_INET) if we just want to run
+    }
+}
+
+/// sys_listen - Listen for connections on a socket
+fn sys_listen(fd: u64, backlog: u64) -> u64 {
+    serial::serial_print("[SYSCALL] listen(fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(")\n");
+    
+    if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+        if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+            if scheme.listen(fd_info.resource_id).is_ok() {
+                return 0;
+            }
+        }
+    }
+    u64::MAX
+}
+
+/// sys_accept - Accept a connection on a socket
+fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
+    serial::serial_print("[SYSCALL] accept(fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(")\n");
+
+    if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+        if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+            match scheme.accept(fd_info.resource_id) {
+                Ok(new_res_id) => {
+                    // Create a new FD for the accepted connection
+                    if let Some(new_fd) = crate::fd::fd_open(pid, fd_info.scheme_id, new_res_id, fd_info.flags) {
+                        return new_fd as u64;
+                    }
+                },
+                Err(e) if e == crate::scheme::error::EAGAIN => {
+                    return u64::MAX; // Should return -EAGAIN if we have proper errno handling
+                },
+                Err(_) => return u64::MAX,
+            }
+        }
+    }
+    u64::MAX
+}
+
+fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    serial::serial_print("[SYSCALL] connect(fd=");
+    serial::serial_print_dec(fd);
+    serial::serial_print(")\n");
+
+    if addr == 0 || addrlen < 2 { return u64::MAX; }
+    let family = unsafe { *(addr as *const u16) };
+    
+    if family == 1 { // AF_UNIX
+        let path_start = addr + 2;
+        let path_len = strlen_user_unique(path_start, (addrlen - 2) as usize);
+        let mut path_buf = [0u8; 108];
+        if path_len > 107 { return u64::MAX; }
+        unsafe {
+            core::ptr::copy_nonoverlapping(path_start as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+        }
+        path_buf[path_len as usize] = 0;
+        let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+            Ok(s) => s,
+            Err(_) => return u64::MAX,
+        };
+
+        if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+            if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+                if scheme.connect(fd_info.resource_id, path_str).is_ok() {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    u64::MAX
+}
+
+/// sys_setsockopt - Set options on a socket
+fn sys_setsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u64) -> u64 {
+    // Stub: Always return success
+    0
+}
+
+/// sys_getsockopt - Get options on a socket
+fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u64) -> u64 {
+    // Stub: Always return success
+    0
+}
+
+fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
+    if path_ptr == 0 || stat_ptr == 0 { return u64::MAX; }
+    
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return u64::MAX; }
+    
+    let mut path_buf = [0u8; 256];
+    if path_len >= 256 { return u64::MAX; }
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    path_buf[path_len as usize] = 0;
+    
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // For now, we only support simple path lookup (ignoring dirfd if relative)
+    // In our RAM FS, everything is relative to root anyway if it starts with /
+    // Or relative to current dir? 
+    // We'll just use scheme::open but with O_STAT or similar if we had it.
+    // Instead, let's just use scheme::fstat on the path.
+    if let Ok((scheme_id, resource_id)) = crate::scheme::open(path_str, 0, 0) {
+        let mut stat = crate::scheme::Stat::default();
+        let res = if crate::scheme::fstat(scheme_id, resource_id, &mut stat).is_ok() {
+            unsafe {
+                *(stat_ptr as *mut crate::scheme::Stat) = stat;
+            }
+            0
+        } else {
+            u64::MAX
+        };
+        crate::scheme::close(scheme_id, resource_id).ok();
+        return res;
+    }
+    
+    u64::MAX
+}
+
+/// sys_mkdir - Create a directory
+fn sys_mkdir(path_ptr: u64, mode: u64) -> u64 {
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return u64::MAX; }
+    
+    // Copy path to buffer
+    // TODO: Dynamic allocation or larger buffer
+    let mut path_buf = [0u8; 256];
+    if path_len >= 256 { return u64::MAX; } // Path too long
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    
+    serial::serial_print("[SYSCALL] mkdir('");
+    serial::serial_print(path_str);
+    serial::serial_print("')\n");
+    
+    match crate::scheme::mkdir(path_str, mode as u32) {
+        Ok(_) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// sys_unlink - Delete a name and possibly the file it refers to
+fn sys_unlink(path_ptr: u64) -> u64 {
+    let path_len = strlen_user_unique(path_ptr, 4096);
+    if path_len == 0 { return u64::MAX; }
+    
+    let mut path_buf = [0u8; 256];
+    if path_len >= 256 { return u64::MAX; }
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
+    }
+    
+    let path_str = match core::str::from_utf8(&path_buf[0..path_len as usize]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    
+    serial::serial_print("[SYSCALL] unlink('");
+    serial::serial_print(path_str);
+    serial::serial_print("')\n");
+    
+    match crate::scheme::unlink(path_str) {
+        Ok(_) => 0,
+        Err(_) => u64::MAX,
+    }
 }

@@ -38,6 +38,8 @@ pub struct Stat {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
     pub atime: i64,
     pub mtime: i64,
     pub ctime: i64,

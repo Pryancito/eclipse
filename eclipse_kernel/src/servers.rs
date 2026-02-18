@@ -345,6 +345,154 @@ impl Scheme for NetworkScheme {
 }
 
 use alloc::sync::Arc;
+use spin::Mutex;
+
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    Unused,
+    Created,
+    Bound,
+    Listening,
+    Connected,
+}
+
+pub struct Socket {
+    pub id: usize,
+    pub domain: u32,
+    pub type_: u32,
+    pub protocol: u32,
+    pub state: SocketState,
+    pub path: Option<String>,
+}
+
+// --- Socket Scheme ---
+
+pub struct SocketScheme {
+    sockets: Mutex<BTreeMap<usize, Socket>>,
+}
+
+static NEXT_SOCKET_ID: Mutex<usize> = Mutex::new(1);
+
+impl SocketScheme {
+    pub fn new() -> Self {
+        Self {
+            sockets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn bind(&self, id: usize, path: String) -> Result<(), usize> {
+        let mut sockets = self.sockets.lock();
+        if let Some(socket) = sockets.get_mut(&id) {
+            socket.path = Some(path);
+            socket.state = SocketState::Bound;
+            Ok(())
+        } else {
+            Err(scheme_error::EBADF)
+        }
+    }
+
+    pub fn listen(&self, id: usize) -> Result<(), usize> {
+        let mut sockets = self.sockets.lock();
+        if let Some(socket) = sockets.get_mut(&id) {
+            socket.state = SocketState::Listening;
+            Ok(())
+        } else {
+            Err(scheme_error::EBADF)
+        }
+    }
+
+    pub fn accept(&self, id: usize) -> Result<usize, usize> {
+        let sockets = self.sockets.lock();
+        if let Some(socket) = sockets.get(&id) {
+            if socket.state == SocketState::Listening {
+                // Return EAGAIN for now to indicate no pending connections
+                return Err(scheme_error::EAGAIN);
+            }
+            return Err(scheme_error::EINVAL);
+        }
+        Err(scheme_error::EBADF)
+    }
+
+    pub fn connect(&self, id: usize, path: &str) -> Result<(), usize> {
+        let mut sockets = self.sockets.lock();
+        
+        // Find if any listening socket matches this path
+        let mut matched = false;
+        for s in sockets.values() {
+            if s.path.as_deref() == Some(path) && s.state == SocketState::Listening {
+                matched = true;
+                break;
+            }
+        }
+
+        if matched {
+            if let Some(socket) = sockets.get_mut(&id) {
+                socket.state = SocketState::Connected;
+                return Ok(());
+            }
+        }
+
+        Err(scheme_error::ENOENT)
+    }
+}
+
+impl Scheme for SocketScheme {
+    fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
+        // Allow opening "socket:" or "socket:unix", etc.
+        let mut next_id = NEXT_SOCKET_ID.lock();
+        let id = *next_id;
+        *next_id += 1;
+
+        let domain = if path.contains("unix") { 1 } else { 0 };
+
+        let mut sockets = self.sockets.lock();
+        sockets.insert(id, Socket {
+            id,
+            domain,
+            type_: 0, // Should be passed via flags?
+            protocol: 0,
+            state: SocketState::Created,
+            path: None,
+        });
+
+        Ok(id)
+    }
+
+    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
+        // Socket read: blocking or non-blocking
+        // For now, return 0 (EOF) or EAGAIN
+        Ok(0)
+    }
+
+    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
+        // Socket write
+        Ok(buf.len())
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Err(scheme_error::ESPIPE) // Sockets are not seekable
+    }
+
+    fn close(&self, _id: usize) -> Result<usize, usize> {
+        Ok(0)
+    }
+
+    fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
+        // S_IFSOCK = 0o140000 = 49152 (decimal)
+        _stat.mode = 0o140000; 
+        Ok(0)
+    }
+}
+
+static mut SOCKET_SCHEME: Option<Arc<SocketScheme>> = None;
+
+pub fn get_socket_scheme() -> Option<Arc<SocketScheme>> {
+    unsafe { SOCKET_SCHEME.clone() }
+}
 
 pub fn init() {
     init_servers();
@@ -352,4 +500,10 @@ pub fn init() {
     crate::scheme::register_scheme("input", Arc::new(InputScheme));
     crate::scheme::register_scheme("snd", Arc::new(AudioScheme));
     crate::scheme::register_scheme("net", Arc::new(NetworkScheme));
+    
+    let socket_scheme = Arc::new(SocketScheme::new());
+    unsafe {
+        SOCKET_SCHEME = Some(socket_scheme.clone());
+    }
+    crate::scheme::register_scheme("socket", socket_scheme);
 }

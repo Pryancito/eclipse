@@ -32,3 +32,13 @@ pub const SYS_SPAWN: usize = 31;
 pub const SYS_ARCH_PRCTL: usize = 32;
 pub const SYS_GETRANDOM: usize = 33;
 pub const SYS_IOCTL: usize = 34;
+pub const SYS_GET_LAST_EXEC_ERROR: usize = 35;
+
+// Socket syscalls (100+)
+pub const SYS_SOCKET: usize = 100;
+pub const SYS_BIND: usize = 101;
+pub const SYS_LISTEN: usize = 102;
+pub const SYS_ACCEPT: usize = 103;
+pub const SYS_CONNECT: usize = 104;
+pub const SYS_MKDIR: usize = 105;
+pub const SYS_FSTATAT: usize = 106;

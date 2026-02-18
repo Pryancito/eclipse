@@ -17,8 +17,11 @@ pub mod error {
     pub const EIO: usize = 5;      // I/O error
     pub const EEXIST: usize = 17;  // File exists (e.g. O_CREAT | O_EXCL)
     pub const EBADF: usize = 9;   // Bad file descriptor
+    pub const EAGAIN: usize = 11;  // Try again
     pub const EINVAL: usize = 22;  // Invalid argument
+    pub const ESPIPE: usize = 29;  // Illegal seek
     pub const ENOSYS: usize = 38;  // Function not implemented
+    pub const EFAULT: usize = 14;  // Bad address
 }
 
 /// Stat information for a resource
@@ -34,6 +37,9 @@ pub struct Stat {
     pub size: u64,
     pub blksize: u32,
     pub blocks: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
 }
 
 
@@ -82,6 +88,11 @@ pub trait Scheme: Send + Sync {
 
     /// Create a directory
     fn mkdir(&self, _path: &str, _mode: u32) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
+
+    /// Remove a file
+    fn unlink(&self, _path: &str) -> Result<usize, usize> {
         Err(error::ENOSYS)
     }
 }
@@ -234,4 +245,21 @@ pub fn mkdir(path: &str, mode: u32) -> Result<usize, usize> {
     };
 
     scheme.mkdir(relative_path, mode)
+}
+
+/// Remove a file by routing to the appropriate scheme
+pub fn unlink(path: &str) -> Result<usize, usize> {
+    let mut parts = path.splitn(2, ':');
+    let scheme_name = parts.next().ok_or(error::EINVAL)?;
+    let relative_path = parts.next().unwrap_or("");
+
+    let scheme = {
+        let reg = REGISTRY.lock();
+        let (_, scheme) = reg.schemes.iter()
+            .find(|(name, _)| name == scheme_name)
+            .ok_or(error::ENOENT)?;
+        Arc::clone(scheme)
+    };
+
+    scheme.unlink(relative_path)
 }

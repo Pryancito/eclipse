@@ -170,102 +170,110 @@ static PROCESS_MAILBOXES: Mutex<[Option<VecDeque<Message>>; 64]> = Mutex::new([c
 
 /// Inicializar el sistema IPC
 pub fn init() {
-    let mut ipc = IPC_SYSTEM.lock();
-    // Reset del sistema
-    ipc.message_id_counter.store(1, Ordering::SeqCst);
-    ipc.server_id_counter.store(1, Ordering::SeqCst);
-    ipc.client_id_counter.store(1, Ordering::SeqCst);
-    ipc.total_messages = 0;
-    
-    // Reset mailboxes
-    let mut mailboxes = PROCESS_MAILBOXES.lock();
-    for slot in mailboxes.iter_mut() {
-        *slot = None;
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut ipc = IPC_SYSTEM.lock();
+        // Reset del sistema
+        ipc.message_id_counter.store(1, Ordering::SeqCst);
+        ipc.server_id_counter.store(1, Ordering::SeqCst);
+        ipc.client_id_counter.store(1, Ordering::SeqCst);
+        ipc.total_messages = 0;
+        
+        // Reset mailboxes
+        let mut mailboxes = PROCESS_MAILBOXES.lock();
+        for slot in mailboxes.iter_mut() {
+            *slot = None;
+        }
+    });
 }
 
 /// Registrar un servidor
 pub fn register_server(name: &[u8], msg_type: MessageType, priority: u8) -> Option<ServerId> {
-    let mut ipc = IPC_SYSTEM.lock();
-    let server_id = ipc.server_id_counter.fetch_add(1, Ordering::SeqCst);
-    
-    // Buscar slot libre
-    for i in 0..32 {
-        if ipc.servers[i].is_none() {
-            let mut server = Server::new();
-            server.id = server_id;
-            server.msg_type = msg_type;
-            server.priority = priority;
-            server.state = ServerState::Starting;
-            
-            // Copiar nombre
-            let name_len = core::cmp::min(name.len(), 31);
-            for j in 0..name_len {
-                server.name[j] = name[j];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut ipc = IPC_SYSTEM.lock();
+        let server_id = ipc.server_id_counter.fetch_add(1, Ordering::SeqCst);
+        
+        // Buscar slot libre
+        for i in 0..32 {
+            if ipc.servers[i].is_none() {
+                let mut server = Server::new();
+                server.id = server_id;
+                server.msg_type = msg_type;
+                server.priority = priority;
+                server.state = ServerState::Starting;
+                
+                // Copiar nombre
+                let name_len = core::cmp::min(name.len(), 31);
+                for j in 0..name_len {
+                    server.name[j] = name[j];
+                }
+                
+                ipc.servers[i] = Some(server);
+                return Some(server_id);
             }
-            
-            ipc.servers[i] = Some(server);
-            return Some(server_id);
         }
-    }
-    
-    None
+        
+        None
+    })
 }
 
 /// Registrar un cliente
 pub fn register_client(name: &[u8], server_id: ServerId, permissions: u32) -> Option<ClientId> {
-    let mut ipc = IPC_SYSTEM.lock();
-    let client_id = ipc.client_id_counter.fetch_add(1, Ordering::SeqCst);
-    
-    // Buscar slot libre
-    for i in 0..256 {
-        if ipc.clients[i].is_none() {
-            let mut client = Client::new();
-            client.id = client_id;
-            client.server_id = server_id;
-            client.permissions = permissions;
-            
-            // Copiar nombre
-            let name_len = core::cmp::min(name.len(), 31);
-            for j in 0..name_len {
-                client.name[j] = name[j];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut ipc = IPC_SYSTEM.lock();
+        let client_id = ipc.client_id_counter.fetch_add(1, Ordering::SeqCst);
+        
+        // Buscar slot libre
+        for i in 0..256 {
+            if ipc.clients[i].is_none() {
+                let mut client = Client::new();
+                client.id = client_id;
+                client.server_id = server_id;
+                client.permissions = permissions;
+                
+                // Copiar nombre
+                let name_len = core::cmp::min(name.len(), 31);
+                for j in 0..name_len {
+                    client.name[j] = name[j];
+                }
+                
+                ipc.clients[i] = Some(client);
+                return Some(client_id);
             }
-            
-            ipc.clients[i] = Some(client);
-            return Some(client_id);
         }
-    }
-    
-    None
+        
+        None
+    })
 }
 
 /// Enviar un mensaje
 pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &[u8]) -> bool {
-    let mut ipc = IPC_SYSTEM.lock();
-    
-    // Crear mensaje
-    let mut msg = Message::new();
-    msg.id = ipc.message_id_counter.fetch_add(1, Ordering::SeqCst) as u64;
-    msg.from = from;
-    msg.to = to;
-    msg.msg_type = msg_type;
-    
-    let data_len = core::cmp::min(data.len(), MAX_MESSAGE_DATA);
-    msg.data[..data_len].copy_from_slice(&data[..data_len]);
-    msg.data_size = data_len as u32;
-    
-    // Agregar a la cola global
-    let tail = ipc.global_queue_tail;
-    let next_tail = (tail + 1) % 1024;
-    if next_tail == ipc.global_queue_head {
-        return false; // Cola llena
-    }
-    
-    ipc.global_message_queue[tail] = Some(msg);
-    ipc.global_queue_tail = next_tail;
-    ipc.total_messages += 1;
-    
-    true
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut ipc = IPC_SYSTEM.lock();
+        
+        // Crear mensaje
+        let mut msg = Message::new();
+        msg.id = ipc.message_id_counter.fetch_add(1, Ordering::SeqCst) as u64;
+        msg.from = from;
+        msg.to = to;
+        msg.msg_type = msg_type;
+        
+        let data_len = core::cmp::min(data.len(), MAX_MESSAGE_DATA);
+        msg.data[..data_len].copy_from_slice(&data[..data_len]);
+        msg.data_size = data_len as u32;
+        
+        // Agregar a la cola global
+        let tail = ipc.global_queue_tail;
+        let next_tail = (tail + 1) % 1024;
+        if next_tail == ipc.global_queue_head {
+            return false; // Cola llena
+        }
+        
+        ipc.global_message_queue[tail] = Some(msg);
+        ipc.global_queue_tail = next_tail;
+        ipc.total_messages += 1;
+        
+        true
+    })
 }
 
 /// Procesar mensajes pendientes
@@ -375,65 +383,64 @@ pub fn process_messages() {
 
 /// Obtener estadísticas del sistema IPC
 pub fn get_stats() -> (u32, u32, u64) {
-    let ipc = IPC_SYSTEM.lock();
-    let mut active_servers = 0;
-    let mut active_clients = 0;
-    
-    for server in &ipc.servers {
-        if let Some(_) = server {
-            active_servers += 1;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let ipc = IPC_SYSTEM.lock();
+        let mut active_servers = 0;
+        let mut active_clients = 0;
+        
+        for server in &ipc.servers {
+            if let Some(_) = server {
+                active_servers += 1;
+            }
         }
-    }
-    
-    for client in &ipc.clients {
-        if let Some(_) = client {
-            active_clients += 1;
+        
+        for client in &ipc.clients {
+            if let Some(_) = client {
+                active_clients += 1;
+            }
         }
-    }
-    
-    (active_servers, active_clients, ipc.total_messages)
+        
+        (active_servers, active_clients, ipc.total_messages)
+    })
 }
 
 /// Recibir mensaje para un cliente
 pub fn receive_message(client_id: ClientId) -> Option<Message> {
-    // 1. Check Process Mailbox first
-    let client_pid = client_id as usize;
-    if client_pid < 64 {
-        // We lock mailboxes first
-        let mut mailboxes = PROCESS_MAILBOXES.lock();
-        if let Some(queue) = &mut mailboxes[client_pid] {
-            if let Some(msg) = queue.pop_front() {
-                 crate::serial::serial_print("KERNEL IPC: Popped message from Mailbox ");
-                 crate::serial::serial_print_dec(client_pid as u64);
-                 crate::serial::serial_print("\n");
-                return Some(msg);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // 1. Check Process Mailbox first
+        let client_pid = client_id as usize;
+        if client_pid < 64 {
+            // We lock mailboxes first
+            let mut mailboxes = PROCESS_MAILBOXES.lock();
+            if let Some(queue) = &mut mailboxes[client_pid] {
+                if let Some(msg) = queue.pop_front() {
+                     crate::serial::serial_print("KERNEL IPC: Popped message from Mailbox ");
+                     crate::serial::serial_print_dec(client_pid as u64);
+                     crate::serial::serial_print("\n");
+                    return Some(msg);
+                }
             }
-        } else {
-             // DEBUG
-             // crate::serial::serial_print("IPC DEBUG: Mailbox ");
-             // crate::serial::serial_print_dec(client_pid as u64);
-             // crate::serial::serial_print(" is None\n");
-        }
-    }
-    
-    // 2. Check Global Queue (Legacy / Fallback)
-    let mut ipc = IPC_SYSTEM.lock();
-    
-    // Buscar mensajes en la cola global para este cliente
-    for i in 0..1024 {
-        let idx = (ipc.global_queue_head + i) % 1024;
-        if idx == ipc.global_queue_tail {
-            break;
         }
         
-        if let Some(ref msg) = ipc.global_message_queue[idx] {
-            if msg.to == client_id {
-                // Tomar el mensaje
-                let message = ipc.global_message_queue[idx].take();
-                return message;
+        // 2. Check Global Queue (Legacy / Fallback)
+        let mut ipc = IPC_SYSTEM.lock();
+        
+        // Buscar mensajes en la cola global para este cliente
+        for i in 0..1024 {
+            let idx = (ipc.global_queue_head + i) % 1024;
+            if idx == ipc.global_queue_tail {
+                break;
+            }
+            
+            if let Some(ref msg) = ipc.global_message_queue[idx] {
+                if msg.to == client_id {
+                    // Tomar el mensaje
+                    let message = ipc.global_message_queue[idx].take();
+                    return message;
+                }
             }
         }
-    }
-    
-    None
+        
+        None
+    })
 }
