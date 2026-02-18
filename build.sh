@@ -159,6 +159,42 @@ build_eclipse_libc() {
     cd ..
 }
 
+build_smithay_app() {
+    print_step "Compilando smithay_app (Rust Display Server Prototype)..."
+    
+    if [ ! -d "$BASE_DIR/eclipse-apps/smithay_app" ]; then
+        print_status "Directorio $BASE_DIR/eclipse-apps/smithay_app no encontrado, saltando..."
+        return 0
+    fi
+    
+    cd "$BASE_DIR/eclipse-apps/smithay_app"
+    
+    # Usar el target personalizado de Eclipse
+    cargo +nightly build --target ../../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release
+    
+    if [ $? -eq 0 ]; then
+        print_success "smithay_app compilado exitosamente"
+        
+        # Instalar en sysroot
+        mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
+        cp "target/x86_64-unknown-eclipse/release/smithay_app" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/smithay_app"
+        print_status "Instalado en sysroot: $BASE_DIR/$BUILD_DIR/sysroot/usr/bin/smithay_app"
+        
+        # También instalar directamente en la distribución si BUILD_DIR está definido
+        if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+            mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
+            cp "target/x86_64-unknown-eclipse/release/smithay_app" "$BASE_DIR/$BUILD_DIR/usr/bin/smithay_app"
+            print_status "Instalado en distribución: $BASE_DIR/$BUILD_DIR/usr/bin/smithay_app"
+        fi
+    else
+        print_error "Error al compilar smithay_app"
+        cd ../..
+        return 1
+    fi
+    
+    cd ../..
+}
+
 # Función para compilar eclipse_std
 build_eclipse_std() {
     print_step "Compilando eclipse_std..."
@@ -785,6 +821,7 @@ build_userland() {
     build_eclipse_std
     build_libxfont15
     build_tinyx_for_eclipse_os
+    build_smithay_app
     
     # Aplicaciones
     #build_wayland_apps
@@ -1237,6 +1274,13 @@ EOF
         print_status "Instalador no encontrado - no se puede copiar"
     fi
     
+    # Copiar smithay_app (Compositor Rust)
+    if [ -f "$BUILD_DIR/sysroot/usr/bin/smithay_app" ]; then
+        mkdir -p "$BUILD_DIR/usr/bin"
+        cp "$BUILD_DIR/sysroot/usr/bin/smithay_app" "$BUILD_DIR/usr/bin/"
+        print_status "smithay_app (Rust Compositor) copiado"
+    fi
+    
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
 # Configuración UEFI para Eclipse OS v0.1.0
@@ -1253,9 +1297,9 @@ EOF
     
     # Crear symlink para fuentes (TinyX espera /usr/share/fonts/X11/)
     mkdir -p "$BUILD_DIR/usr/share/fonts/X11/misc/"
-    if [ -d "/usr/share/fonts/X11/misc/" ]; then
-        cp -r /usr/share/fonts/X11/misc/ "$BUILD_DIR/usr/share/fonts/X11/misc/"
-        print_status "Copiado de fuentes a /usr/share/fonts/X11/misc/"
+    if [ -d "eclipse-apps/sources/" ]; then
+        cp -f eclipse-apps/sources/* "$BUILD_DIR/usr/share/fonts/X11/misc/"
+        print_status "Copiado de fuentes a $BUILD_DIR/usr/share/fonts/X11/misc/"
     fi
     
     print_success "Distribución básica creada en $BUILD_DIR"
@@ -1263,7 +1307,7 @@ EOF
 
 # Función para crear imagen USB booteable
 create_bootable_image() {
-    print_step "Creando imagen USB booteable..."
+    print_step "Creando imagen USB booteable (ROOTLESS mode)..."
     
     # Verificar que existan los archivos necesarios
     local BOOTLOADER_PATH="bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
@@ -1281,227 +1325,74 @@ create_bootable_image() {
     
     # Nombre del archivo de imagen
     local IMG_FILE="eclipse_os.img"
+    local ESP_IMG="esp_temp.img"
+    local ROOT_IMG="root_temp.img"
     
-    # Siempre recrear la imagen para tener 2 particiones
-    if [ -f "$IMG_FILE" ]; then
-        print_status "Eliminando imagen existente para recrear con 2 particiones..."
-        rm -f "$IMG_FILE"
-    fi
+    # 1. Crear la partición ESP (FAT32) con mtools
+    print_status "Creando partición ESP (512MB) sin root..."
+    rm -f "$ESP_IMG"
+    truncate -s 512M "$ESP_IMG"
+    mkfs.fat -F32 -n "ECLIPSE_OS" "$ESP_IMG" > /dev/null
     
-    print_status "Creando imagen de 2GB con 2 particiones..."
-    dd if=/dev/zero of="$IMG_FILE" bs=1M count=2048 status=progress 2>&1 | tail -1
+    # Crear directorios en la imagen FAT32 usando mtools
+    mmd -i "$ESP_IMG" ::/EFI
+    mmd -i "$ESP_IMG" ::/EFI/BOOT
+    mmd -i "$ESP_IMG" ::/boot
+    mmd -i "$ESP_IMG" ::/eclipse
     
-    # Crear particiones con parted (requiere GPT y 2 particiones)
-    # Buscar parted en ubicaciones comunes
-    PARTED_CMD=""
-    for path in /sbin/parted /usr/sbin/parted /usr/bin/parted parted; do
-        if command -v $path &> /dev/null || [ -x "$path" ]; then
-            PARTED_CMD="$path"
-            break
-        fi
-    done
+    # Copiar archivos usando mcopy
+    mcopy -i "$ESP_IMG" "$BOOTLOADER_PATH" ::/EFI/BOOT/BOOTX64.EFI
+    mcopy -i "$ESP_IMG" "$KERNEL_PATH" ::/boot/eclipse_kernel
     
-    if [ -n "$PARTED_CMD" ]; then
-        print_status "Creando tabla GPT y particiones con parted ($PARTED_CMD)..."
-        
-        # Crear tabla GPT
-        sudo "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
-        
-        # Partición 1: ESP (FAT32, 512MB) para bootloader y kernel
-        sudo "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 513MiB
-        sudo "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-        
-        # Partición 2: EclipseFS (resto) para sistema de archivos
-        sudo "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 513MiB 100%
-        
-        print_status "Configurando loop device..."
-        LOOP=$(sudo losetup -fP --show "$IMG_FILE")
-        print_status "Loop device: $LOOP"
-        
-        # Esperar a que aparezcan las particiones
-        sleep 1
-        
-        # Formatear partición 1 como FAT32
-        print_status "Formateando partición 1 (FAT32)..."
-        sudo mkfs.fat -F32 -n "ECLIPSE_OS" "${LOOP}p1"
-        
-        # Formatear partición 2 con EclipseFS usando mkfs-eclipsefs
-        print_status "Formateando partición 2 (EclipseFS)..."
-        
-        if [ -f "mkfs-eclipsefs/target/release/mkfs-eclipsefs" ]; then
-            # Usar mkfs-eclipsefs compilado
-            print_status "Usando mkfs-eclipsefs para formateo profesional..."
-            sudo ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "Eclipse OS Root" -N 10000 "${LOOP}p2"
-            print_success "✓ Partición 2 formateada con mkfs-eclipsefs"
-            
-            # Poblar el filesystem con los archivos de BUILD_DIR
-            if [ -f "populate-eclipsefs/target/release/populate-eclipsefs" ] && [ -d "$BUILD_DIR" ]; then
-                print_status "Poblando filesystem EclipseFS con archivos del sistema..."
-                
-                # Crear directorios estándar en BUILD_DIR si no existen
-                mkdir -p "$BUILD_DIR"/{bin,sbin,usr/{bin,sbin,lib},etc,var,tmp,home,root,dev,proc,sys}
-                
-                # Copiar eclipse-systemd a las ubicaciones estándar si existe
-                if [ -f "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" ]; then
-                    mkdir -p "$BUILD_DIR/sbin"
-                    mkdir -p "$BUILD_DIR/usr/sbin"
-                    cp "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd" "$BUILD_DIR/sbin/eclipse-systemd"
-                    chmod +x "$BUILD_DIR/sbin/eclipse-systemd"
-                    print_status "eclipse-systemd copiado a /sbin/"
-                fi
-                
-
-                # Copiar otros binarios importantes si existen
-                if [ -d "userland/target/release" ]; then
-                    mkdir -p "$BUILD_DIR/bin"
-                    mkdir -p "$BUILD_DIR/usr/bin"
-                    
-                    for binary in eclipse_userland module_loader graphics_module app_framework; do
-                        if [ -f "userland/target/release/$binary" ] || [ -f "userland/*/target/release/$binary" ]; then
-                            find userland -name "$binary" -path "*/release/$binary" -exec cp {} "$BUILD_DIR/bin/" \; 2>/dev/null
-                            print_status "$binary copiado a /bin/"
-                        fi
-                    done
-                fi
-                
-                # Usar populate-eclipsefs para copiar todo al filesystem
-                print_status "Ejecutando populate-eclipsefs..."
-                sudo ./populate-eclipsefs/target/release/populate-eclipsefs "${LOOP}p2" "$BUILD_DIR"
-                
-                if [ $? -eq 0 ]; then
-                    print_success "✓ Filesystem EclipseFS poblado exitosamente"
-                else
-                    print_error "Error al poblar filesystem EclipseFS"
-                fi
-            else
-                print_status "populate-eclipsefs o BUILD_DIR no encontrado, filesystem quedará vacío"
-            fi
-        else
-            # Fallback: header simple con Python
-            print_status "mkfs-eclipsefs no encontrado, usando método simple..."
-            
-            python3 << 'PYTHON_EOF'
-import struct
-import time
-import uuid
-
-header = bytearray(4096)
-header[0:4] = struct.pack('<I', 0x45434653)  # "ECFS"
-header[4:8] = struct.pack('<I', 0x00020000)  # v2.0
-header[8:16] = struct.pack('<Q', int(time.time()))
-header[16:20] = struct.pack('<I', 4096)
-header[20:28] = struct.pack('<Q', 380000)
-header[28:36] = struct.pack('<Q', 4096)
-header[36:44] = struct.pack('<Q', 128000)
-header[44:52] = struct.pack('<Q', 4096 + 128000)
-header[52:60] = struct.pack('<Q', 4096 + 128000 + 4096)
-header[100:111] = b"Eclipse OS\x00"
-header[200:216] = uuid.uuid4().bytes
-
-with open('/tmp/eclipsefs_header.bin', 'wb') as f:
-    f.write(header)
-PYTHON_EOF
-            
-            sudo dd if=/tmp/eclipsefs_header.bin of="${LOOP}p2" bs=4096 count=1 conv=notrunc status=none
-            rm -f /tmp/eclipsefs_header.bin
-            print_status "✓ Header EclipseFS escrito"
-        fi
-        
-        # Montar partición FAT32 y copiar archivos
-        print_status "Montando partición FAT32..."
-        MOUNT_POINT="/tmp/eclipse_efi_mount"
-        sudo mkdir -p "$MOUNT_POINT"
-        sudo mount "${LOOP}p1" "$MOUNT_POINT"
-        
-        # Crear estructura de directorios
-        print_status "Creando estructura EFI..."
-        sudo mkdir -p "$MOUNT_POINT/EFI/BOOT"
-        sudo mkdir -p "$MOUNT_POINT/boot"
-        sudo mkdir -p "$MOUNT_POINT/eclipse"
-        
-        # Copiar bootloader
-        print_status "Copiando bootloader..."
-        sudo cp "$BOOTLOADER_PATH" "$MOUNT_POINT/EFI/BOOT/BOOTX64.EFI"
-        
-        # Copiar kernel
-        print_status "Copiando kernel..."
-        sudo cp "$KERNEL_PATH" "$MOUNT_POINT/boot/eclipse_kernel"
-        
-        # Crear configuración de boot
-        cat > /tmp/boot.cfg << 'EOF'
+    # Crear configuración de boot
+    cat > boot_temp.cfg << 'EOF'
 # Eclipse OS Boot Configuration
 kernel=/boot/eclipse_kernel
 resolution=1024x768
 debug=false
 EOF
-        sudo cp /tmp/boot.cfg "$MOUNT_POINT/eclipse/boot.cfg"
-        rm /tmp/boot.cfg
+    mcopy -i "$ESP_IMG" boot_temp.cfg ::/eclipse/boot.cfg
+    rm boot_temp.cfg
+    
+    # 2. Crear la partición EclipseFS
+    print_status "Creando partición EclipseFS (1500MB) sin root..."
+    rm -f "$ROOT_IMG"
+    truncate -s 1500M "$ROOT_IMG"
+    
+    if [ -f "mkfs-eclipsefs/target/release/mkfs-eclipsefs" ]; then
+        ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "EclipseOS" -N 10000 "$ROOT_IMG" > /dev/null
         
-        # Copiar configuración UEFI si existe
-        if [ -f "$BUILD_DIR/efi/boot/uefi_config.txt" ]; then
-            sudo cp "$BUILD_DIR/efi/boot/uefi_config.txt" "$MOUNT_POINT/eclipse/"
+        if [ -f "populate-eclipsefs/target/release/populate-eclipsefs" ] && [ -d "$BUILD_DIR" ]; then
+            print_status "Poblando filesystem EclipseFS con populate-eclipsefs..."
+            ./populate-eclipsefs/target/release/populate-eclipsefs "$ROOT_IMG" "$BUILD_DIR" > /dev/null
         fi
-        
-        # Mostrar contenido
-        print_status "Contenido de la partición FAT32:"
-        ls -lah "$MOUNT_POINT/EFI/BOOT/"
-        ls -lah "$MOUNT_POINT/boot/"
-        
-        # Desmontar FAT32
-        print_status "Desmontando partición FAT32..."
-        
-        # Asegurar que no estamos en el directorio del punto de montaje
-        cd "$(dirname "$0")"
-        
-        # Sincronizar para vaciar todas las escrituras pendientes al disco
-        sync
-        
-        # Intentar desmontar con reintentos
-        UNMOUNT_RETRIES=5
-        UNMOUNT_SUCCESS=0
-        for i in $(seq 1 $UNMOUNT_RETRIES); do
-            if [ $i -gt 1 ]; then
-                print_status "Reintentando desmontaje (intento $i/$UNMOUNT_RETRIES)..."
-                sleep 1
-                sync
-            fi
-            if sudo umount "$MOUNT_POINT" 2>/dev/null; then
-                UNMOUNT_SUCCESS=1
-                break
-            fi
-        done
-        
-        if [ $UNMOUNT_SUCCESS -eq 1 ]; then
-            print_success "✓ Partición FAT32 desmontada correctamente"
-            sudo rmdir "$MOUNT_POINT" 2>/dev/null || true
-        else
-            print_error "Error al desmontar $MOUNT_POINT"
-            print_status "Intentando limpieza forzada..."
-            sudo umount -l "$MOUNT_POINT" 2>/dev/null || true
-            sleep 1
-            sudo rmdir "$MOUNT_POINT" 2>/dev/null || true
-        fi
-        
-        # Partición EclipseFS ya fue poblada con populate-eclipsefs
-        print_success "Partición EclipseFS lista con archivos del sistema"
-        print_status "Puede montar con: sudo eclipsefs-fuse ${LOOP}p2 /mnt"
-        
-        # Desconectar loop device
-        print_status "Limpiando loop device..."
-        sudo losetup -d "$LOOP"
-        
-        print_success "Imagen booteable con 2 particiones creada: $IMG_FILE ($(du -h "$IMG_FILE" | cut -f1))"
-        print_status "  Partición 1: ESP (FAT32, 512MB) - Bootloader + Kernel"
-        print_status "  Partición 2: EclipseFS (poblada) - Sistema con archivos"
-        
-    else
-        print_error "parted no encontrado. Se requiere para crear particiones GPT"
-        print_status "Instala con: sudo apt-get install parted"
-        return 1
     fi
     
+    # 3. Ensamblar la imagen final con tabla GPT
+    print_status "Ensamblando imagen final $IMG_FILE..."
+    rm -f "$IMG_FILE"
+    truncate -s 2100M "$IMG_FILE"
+    
+    # Usar parted en el archivo local (no requiere sudo para archivos)
+    PARTED_CMD="parted"
+    "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 513MiB
+    "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 513MiB 2013MiB
+    
+    # Escribir las particiones en los offsets correctos usando dd
+    print_status "Escribiendo particiones en la imagen final..."
+    # Offset 1MiB = seek 1 con bs=1M
+    dd if="$ESP_IMG" of="$IMG_FILE" bs=1M seek=1 conv=notrunc status=none
+    # Offset 513MiB = seek 513 con bs=1M
+    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=513 conv=notrunc status=none
+    
+    # Limpieza de archivos temporales
+    rm -f "$ESP_IMG" "$ROOT_IMG"
+    
+    print_success "✓ Imagen booteable creada exitosamente (ROOTLESS): $IMG_FILE ($(du -h "$IMG_FILE" | cut -f1))"
     echo ""
-    print_success "Para probar ejecuta: sudo ./qemu.sh"
+    print_success "Para probar ejecuta: ./qemu.sh"
 }
 
 # Función para mostrar resumen de construcción

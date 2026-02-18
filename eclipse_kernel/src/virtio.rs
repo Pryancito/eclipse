@@ -1142,6 +1142,14 @@ impl Scheme for DiskScheme {
         let new_offset = match whence {
             0 => offset as u64, // SEEK_SET
             1 => (open_disk.offset as isize + offset) as u64, // SEEK_CUR
+            2 => {
+                 // SEEK_END - for raw disks, we need the disk size. 
+                 // For now, let's assume a dummy large size or just return EINVAL if unknown.
+                 // Actually, many block drivers don't support SEEK_END easily without size info.
+                 // However, FileSystemScheme DOES support it because it knows file size.
+                 // Let's just return current offset if size unknown, or EINVAL.
+                 return Err(scheme_error::EINVAL)
+            },
             _ => return Err(scheme_error::EINVAL),
         };
         

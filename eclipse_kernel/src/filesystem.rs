@@ -66,8 +66,8 @@ static mut FS: Filesystem = Filesystem {
 
 impl Filesystem {
     /// Mount the root filesystem
-// Hardcoded partition offset for now (513 MiB / 4096 bytes = 131328 blocks)
-const PARTITION_OFFSET_BLOCKS: u64 = 131328;
+    /// Hardcoded partition offset for now (513 MiB / 4096 bytes = 131328 blocks)
+    pub const PARTITION_OFFSET_BLOCKS: u64 = 131328;
 
 pub fn mount() -> Result<(), &'static str> {
     // Enforce ATA initialization before mounting
@@ -149,8 +149,8 @@ pub fn mount() -> Result<(), &'static str> {
     }
 }
     
-    /// Read an inode entry
-    fn read_inode_entry(inode: u32) -> Result<InodeTableEntry, &'static str> {
+    /// Read an inode entry from the table
+    pub fn read_inode_entry(inode: u32) -> Result<InodeTableEntry, &'static str> {
         unsafe {
             let header = FS.header.as_ref().ok_or("FS not mounted")?;
             
@@ -503,7 +503,6 @@ pub fn mount() -> Result<(), &'static str> {
         None
     }
 
-    /// Get the size of a file by inode number
     /// Returns the content length from the CONTENT TLV
     pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
         unsafe {
@@ -1135,13 +1134,78 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode, .. } => match Filesystem::get_file_size(*inode) {
-                Ok(size) => {
-                    stat.size = size;
-                    Ok(0)
+            OpenFile::Real { inode, .. } => {
+                // Initial default stat
+                stat.ino = *inode as u64;
+                stat.mode = 0o100644; // Default regular file
+                stat.blksize = BLOCK_SIZE as u32;
+                stat.blocks = 0; // Will be updated if size is known
+
+                // Read the inode record to get full metadata
+                match Filesystem::read_inode_entry(*inode) {
+                    Ok(entry) => {
+                        let record_block_start = unsafe {
+                            Filesystem::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
+                        };
+                        let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+                        let mut block_buffer = vec![0u8; BLOCK_SIZE];
+                        
+                        if let Ok(_) = read_block_from_device(record_block_start, &mut block_buffer) {
+                             // Simple scan for Metadata TLVs in the first block
+                             let mut scan_offset = 8; // Skip record header
+                             while scan_offset + 6 <= BLOCK_SIZE - offset_in_first_block {
+                                 let idx = offset_in_first_block + scan_offset;
+                                 let tag = u16::from_le_bytes([block_buffer[idx], block_buffer[idx+1]]);
+                                 let length = u32::from_le_bytes([
+                                     block_buffer[idx+2], block_buffer[idx+3],
+                                     block_buffer[idx+4], block_buffer[idx+5]
+                                 ]) as usize;
+                                 
+                                 match tag {
+                                     tlv_tags::SIZE => {
+                                          if length == 8 {
+                                              stat.size = u64::from_le_bytes([
+                                                  block_buffer[idx+6], block_buffer[idx+7],
+                                                  block_buffer[idx+8], block_buffer[idx+9],
+                                                  block_buffer[idx+10], block_buffer[idx+11],
+                                                  block_buffer[idx+12], block_buffer[idx+13]
+                                              ]);
+                                              stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                                          }
+                                     }
+                                     tlv_tags::MODE => {
+                                          if length == 4 {
+                                              stat.mode = u32::from_le_bytes([
+                                                  block_buffer[idx+6], block_buffer[idx+7],
+                                                  block_buffer[idx+8], block_buffer[idx+9]
+                                              ]);
+                                          }
+                                     }
+                                     tlv_tags::MTIME => {
+                                          if length == 8 {
+                                              stat.mtime = i64::from_le_bytes([
+                                                  block_buffer[idx+6], block_buffer[idx+7],
+                                                  block_buffer[idx+8], block_buffer[idx+9],
+                                                  block_buffer[idx+10], block_buffer[idx+11],
+                                                  block_buffer[idx+12], block_buffer[idx+13]
+                                              ]);
+                                          }
+                                     }
+                                     tlv_tags::CONTENT => {
+                                         stat.size = length as u64;
+                                         stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                                     }
+                                     _ => {}
+                                 }
+                                 scan_offset += 6 + length;
+                                 if scan_offset >= BLOCK_SIZE { break; }
+                             }
+                        }
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => Err(scheme_error::EIO),
-            },
+                Ok(0)
+            }
             OpenFile::Virtual { path, .. } => {
                 let path_clone = path.clone();
                 drop(open_files);
@@ -1174,6 +1238,7 @@ impl Scheme for FileSystemScheme {
     }
 
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
+        unsafe { serial::serial_print("DEBUG: ioctl entry\n"); }
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
@@ -1215,7 +1280,16 @@ impl Scheme for FileSystemScheme {
                         fix_info.visual = 2; // FB_VISUAL_TRUECOLOR
                         Ok(0)
                     }
-                    _ => Err(scheme_error::EINVAL),
+                    0x4611 => { // FBIOPAN_DISPLAY — stub OK
+                        crate::serial::serial_print("[FS-SCHEME] FBIOPAN_DISPLAY (stub OK)\n");
+                        Ok(0)
+                    }
+                    _ => {
+                        crate::serial::serial_print("[FS-SCHEME] Unknown FB ioctl: ");
+                        crate::serial::serial_print_hex(request as u64);
+                        crate::serial::serial_print("\n");
+                        Err(scheme_error::EINVAL)
+                    }
                 }
             }
             _ => Err(scheme_error::ENOSYS),
@@ -1362,6 +1436,14 @@ impl Scheme for DevScheme {
                     fix_info.smem_len = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u32;
                     fix_info.line_length = (fb_info.pixels_per_scan_line * 4) as u32;
                     fix_info.visual = 2; // FB_VISUAL_TRUECOLOR
+                    return Ok(0);
+                }
+                0x4601 => { // FBIOPUT_VSCREENINFO — accept any mode change
+                    serial::serial_print("DevScheme::ioctl: FBIOPUT_VSCREENINFO (stub OK)\n");
+                    return Ok(0);
+                }
+                0x4611 => { // FBIOPAN_DISPLAY — stub OK
+                    serial::serial_print("DevScheme::ioctl: FBIOPAN_DISPLAY (stub OK)\n");
                     return Ok(0);
                 }
                 _ => {

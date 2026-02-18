@@ -58,10 +58,10 @@ pub extern "C" fn _start() -> ! {
         let _ = send(ppid, 255, b"READY");
     }
 
-    // Launch Xfbdev (TinyX Framebuffer Server)
-    println!("[GUI-SERVICE] Launching TinyX Framebuffer Server (Xfbdev)...");
+    // Launch smithay_app (Rust Display Server Prototype)
+    println!("[GUI-SERVICE] Launching Rust Display Server (smithay_app)...");
     
-    let path = "file:/usr/bin/Xfbdev";
+    let path = "file:/usr/bin/smithay_app";
     unsafe {
         // Open application file
         let fd = open(path, O_RDONLY, 0);

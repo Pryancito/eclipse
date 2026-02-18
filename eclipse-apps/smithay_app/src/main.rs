@@ -6,7 +6,16 @@
 #![no_std]
 #![no_main]
 
+
+
 use eclipse_libc::{println, getpid, yield_cpu, get_framebuffer_info, map_framebuffer, send, receive, FramebufferInfo};
+use embedded_graphics::{
+    pixelcolor::Rgb888,
+    prelude::*,
+    primitives::{Rectangle, PrimitiveStyleBuilder, CornerRadii},
+    text::{Text, TextStyle},
+    mono_font::{ascii::FONT_10X20, MonoTextStyle},
+};
 
 /// IPC Message Types for Xwayland protocol
 const MSG_TYPE_GRAPHICS: u32 = 0x00000010;  // Graphics messages
@@ -18,8 +27,7 @@ const MSG_TYPE_INPUT: u32 = 0x00000040;     // Input messages
 const MSG_TYPE_SIGNAL: u32 = 0x00000400;    // Signal messages
 
 /// Status update interval (iterations between status prints)
-/// Note: Actual time duration depends on yield_cpu() behavior and system load
-const STATUS_UPDATE_INTERVAL: u64 = 5000000;
+const STATUS_UPDATE_INTERVAL: u64 = 1000000;
 
 /// IPC message buffer size
 const IPC_BUFFER_SIZE: usize = 256;
@@ -28,8 +36,6 @@ const IPC_BUFFER_SIZE: usize = 256;
 struct FramebufferState {
     info: FramebufferInfo,
     base_addr: usize,
-    #[allow(dead_code)]
-    size: usize,
 }
 
 impl FramebufferState {
@@ -37,7 +43,6 @@ impl FramebufferState {
     fn init() -> Option<Self> {
         println!("[SMITHAY] Initializing framebuffer access...");
         
-        // Get framebuffer info from kernel
         let fb_info = match get_framebuffer_info() {
             Some(info) => {
                 println!("[SMITHAY]   - Framebuffer: {}x{} @ {} bpp", 
@@ -50,7 +55,6 @@ impl FramebufferState {
             }
         };
         
-        // Map framebuffer into our address space
         let fb_base = match map_framebuffer() {
             Some(addr) => {
                 println!("[SMITHAY]   - Framebuffer mapped at address: 0x{:x}", addr);
@@ -62,78 +66,47 @@ impl FramebufferState {
             }
         };
         
-        // Calculate framebuffer size
-        let fb_size = (fb_info.pitch * fb_info.height) as usize;
-        
         Some(FramebufferState {
             info: fb_info,
             base_addr: fb_base,
-            size: fb_size,
         })
     }
-    
-    /// Clear the framebuffer to a specific color (ARGB format)
-    fn clear(&self, color: u32) {
-        println!("[SMITHAY]   - Clearing framebuffer to color: 0x{:08x}", color);
-        
-        let pixel_count = (self.info.width * self.info.height) as usize;
+}
+
+/// DrawTarget implementation for our Framebuffer
+impl DrawTarget for FramebufferState {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        let width = self.info.width as i32;
+        let height = self.info.height as i32;
         let fb_ptr = self.base_addr as *mut u32;
-        
-        unsafe {
-            for i in 0..pixel_count {
-                core::ptr::write_volatile(fb_ptr.add(i), color);
-            }
-        }
-    }
-    
-    /// Draw a simple test pattern
-    fn draw_test_pattern(&self) {
-        println!("[SMITHAY]   - Drawing test pattern...");
-        
-        let width = self.info.width as usize;
-        let height = self.info.height as usize;
-        let fb_ptr = self.base_addr as *mut u32;
-        
-        unsafe {
-            for y in 0..height {
-                for x in 0..width {
-                    // Create a gradient pattern
-                    let r = ((x * 255) / width) as u8;
-                    let g = ((y * 255) / height) as u8;
-                    let b = 128u8;
-                    let color = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-                    
-                    let offset = y * width + x;
-                    core::ptr::write_volatile(fb_ptr.add(offset), color);
+
+        for Pixel(coord, color) in pixels.into_iter() {
+            if coord.x >= 0 && coord.x < width && coord.y >= 0 && coord.y < height {
+                let offset = (coord.y * width + coord.x) as usize;
+                // Convert Rgb888 to ARGB8888 (0xFFRRGGBB)
+                let raw_color = 0xFF000000 | 
+                    ((color.r() as u32) << 16) | 
+                    ((color.g() as u32) << 8) | 
+                    (color.b() as u32);
+                
+                unsafe {
+                    core::ptr::write_volatile(fb_ptr.add(offset), raw_color);
                 }
             }
         }
+        Ok(())
     }
 }
 
-/// X11 Socket Manager
-struct X11SocketManager {
-    socket_created: bool,
-}
-
-impl X11SocketManager {
-    fn new() -> Self {
-        Self {
-            socket_created: false,
-        }
-    }
-    
-    /// Create X11 socket at /tmp/.X11-unix/X0
-    fn create_socket(&mut self) -> bool {
-        println!("[SMITHAY] Creating X11 socket...");
-        println!("[SMITHAY]   - Socket path: /tmp/.X11-unix/X0");
-        
-        // In a real implementation, this would create the Unix domain socket
-        // For now, we simulate the creation
-        self.socket_created = true;
-        
-        println!("[SMITHAY]   - X11 socket created successfully");
-        true
+impl OriginDimensions for FramebufferState {
+    fn size(&self) -> Size {
+        Size::new(self.info.width as u32, self.info.height as u32)
     }
 }
 
@@ -153,7 +126,6 @@ impl IpcHandler {
     fn process_messages(&mut self) {
         let mut buffer = [0u8; IPC_BUFFER_SIZE];
         
-        // Try to receive messages
         let (len, sender_pid) = receive(&mut buffer);
         
         if len > 0 {
@@ -161,94 +133,92 @@ impl IpcHandler {
             println!("[SMITHAY] Received IPC message from PID {}: {} bytes", 
                 sender_pid, len);
             
-            // Echo back a simple acknowledgment
             let response = b"ACK";
             if send(sender_pid, MSG_TYPE_GRAPHICS, response) != 0 {
                 println!("[SMITHAY] WARNING: Failed to send ACK to PID {}", sender_pid);
             }
         }
     }
-    
-    /// Send a status update message
-    #[allow(dead_code)]
-    fn send_status(&self, target_pid: u32) {
-        let status_msg = b"SMITHAY_READY";
-        if send(target_pid, MSG_TYPE_GRAPHICS, status_msg) != 0 {
-            println!("[SMITHAY] WARNING: Failed to send status to PID {}", target_pid);
-        }
-    }
 }
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Re-align stack to 16 bytes for SSE instructions.
+    // Some linkers/stubs might have CALLED us, misaligning RSP by 8.
+    unsafe {
+        core::arch::asm!("and rsp, -16", options(nomem, nostack));
+    }
+    
     let pid = getpid();
     
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║         SMITHAY XWAYLAND COMPOSITOR v0.2.0                   ║");
-    println!("║         Using Eclipse OS IPC and /dev/fb0                    ║");
+    println!("║         SMITHAY XWAYLAND COMPOSITOR v0.2.1                   ║");
+    println!("║         (Rust Native Display Server Prototype)               ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("[SMITHAY] Starting (PID: {})", pid);
     
     // Initialize framebuffer
-    println!("[SMITHAY] Initializing graphics backend...");
-    let fb = match FramebufferState::init() {
-        Some(fb) => {
-            println!("[SMITHAY]   - Framebuffer backend ready");
-            fb
-        }
+    let mut fb = match FramebufferState::init() {
+        Some(fb) => fb,
         None => {
-            println!("[SMITHAY]   - CRITICAL: Cannot initialize framebuffer");
-            println!("[SMITHAY]   - Compositor cannot start without display");
-            loop {
-                yield_cpu();
-            }
+            println!("[SMITHAY] CRITICAL: Cannot start without display");
+            loop { yield_cpu(); }
         }
     };
     
-    // Clear framebuffer to dark background
-    fb.clear(0xFF1A1A1A); // Dark gray background
+    // Clear screen
+    fb.clear(Rgb888::new(26, 26, 26)).unwrap();
     
-    // Draw initial test pattern
-    fb.draw_test_pattern();
+    // Draw Header
+    let rect_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb888::new(45, 45, 45))
+        .stroke_color(Rgb888::new(100, 100, 255))
+        .stroke_width(2)
+        .build();
     
-    // Initialize X11 socket manager
-    println!("[SMITHAY] Initializing Xwayland integration...");
-    let mut x11_socket = X11SocketManager::new();
-    if !x11_socket.create_socket() {
-        println!("[SMITHAY]   - WARNING: Failed to create X11 socket");
-    } else {
-        println!("[SMITHAY]   - X Window Manager (XWM) started");
-        println!("[SMITHAY]   - Xwayland ready for X11 clients");
-    }
-    
+    Rectangle::new(Point::new(50, 50), Size::new(700, 100))
+        .into_styled(rect_style)
+        .draw(&mut fb).unwrap();
+
+    let text_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
+    Text::new("Eclipse OS - Rust Display Server", Point::new(80, 110), text_style)
+        .draw(&mut fb).unwrap();
+
+    // Draw Footer/Status Bar
+    Rectangle::new(Point::new(0, fb.info.height as i32 - 40), Size::new(fb.info.width as u32, 40))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 80, 150)).build())
+        .draw(&mut fb).unwrap();
+
+    Text::new("Ready | Wayland: 0 | X11: 0 | PID: 10", Point::new(20, fb.info.height as i32 - 15), 
+              MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE))
+        .draw(&mut fb).unwrap();
+
     // Initialize IPC handler
-    println!("[SMITHAY] Initializing IPC communication...");
     let mut ipc = IpcHandler::new();
-    println!("[SMITHAY]   - IPC handler ready");
     
     println!("[SMITHAY] Compositor ready and running");
-    println!("[SMITHAY] Display: {}x{} @ {} bpp", 
-        fb.info.width, fb.info.height, fb.info.bpp);
-    println!("[SMITHAY] Waiting for Wayland and X11 clients...");
 
-    // Main event loop
     let mut counter: u64 = 0;
     let mut last_status_counter: u64 = 0;
     
     loop {
         counter = counter.wrapping_add(1);
-        
-        // Process IPC messages every iteration
         ipc.process_messages();
         
-        // Print status update periodically
         if counter.wrapping_sub(last_status_counter) >= STATUS_UPDATE_INTERVAL {
-            println!("[SMITHAY] [Status] Active | Messages: {} | Wayland: 0 | X11: 0", 
-                ipc.message_count);
+            // Update the status bar text periodically
+            Rectangle::new(Point::new(0, fb.info.height as i32 - 40), Size::new(fb.info.width as u32, 40))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 80, 150)).build())
+                .draw(&mut fb).unwrap();
+
+            Text::new("Status: Running | Clients: 0 | IPC Msgs received", Point::new(20, fb.info.height as i32 - 15), 
+                      MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE))
+                .draw(&mut fb).unwrap();
+            
             last_status_counter = counter;
         }
         
-        // Yield to other processes
         yield_cpu();
     }
 }
+
+// Panic handler is provided by eclipse-libc

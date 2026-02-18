@@ -440,11 +440,29 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     }
     
     if let Some(pid) = current_process_id() {
+        let is_linux = crate::process::get_process(pid).map(|p| p.is_linux).unwrap_or(false);
+        if is_linux && len > 64 {
+             serial::serial_print("[DEBUG-READ] PID ");
+             serial::serial_print_dec(pid as u64);
+             serial::serial_print(" fd=");
+             serial::serial_print_dec(fd);
+             serial::serial_print(" len=");
+             serial::serial_print_dec(len);
+             serial::serial_print("\n");
+        }
+
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
             unsafe {
                 let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
-                    Ok(bytes_read) => return bytes_read as u64,
+                    Ok(bytes_read) => {
+                        if is_linux && len > 64 {
+                            serial::serial_print("[DEBUG-READ]   -> read ");
+                            serial::serial_print_dec(bytes_read as u64);
+                            serial::serial_print(" bytes\n");
+                        }
+                        return bytes_read as u64
+                    },
                     Err(e) => {
                         serial::serial_print("[SYSCALL] read() scheme error: ");
                         serial::serial_print_dec(e as u64);
@@ -1475,6 +1493,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     serial::serial_print_hex(flags);
     serial::serial_print(")\n");
 
+    serial::serial_print("DEBUG: sys_mmap start\n");
+
     if length == 0 {
         return u64::MAX;
     }
@@ -1655,9 +1675,11 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         serial::serial_print("[SYSCALL] mmap successful: ");
         serial::serial_print_hex(target_addr);
         serial::serial_print("\n");
+        serial::serial_print("DEBUG: sys_mmap successful, returning to handler\n");
         return target_addr;
     }
 
+    serial::serial_print("DEBUG: sys_mmap failed (proc not found)\n");
     u64::MAX
 }
 
@@ -1890,13 +1912,39 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
             let mut stat = crate::scheme::Stat::default();
             
             // Call scheme fstat
-            if crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat).is_ok() {
-                // Copy to user memory
-                unsafe {
-                    *(stat_ptr as *mut crate::scheme::Stat) = stat;
+            match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat) {
+                Ok(_) => {
+                    serial::serial_print("[FSTAT] fd=");
+                    serial::serial_print_dec(fd);
+                    serial::serial_print(" size=");
+                    serial::serial_print_dec(stat.size);
+                    serial::serial_print(" mode=");
+                    serial::serial_print_hex(stat.mode as u64);
+                    serial::serial_print(" mtime=");
+                    serial::serial_print_dec(stat.mtime as u64);
+                    serial::serial_print("\n");
+                    // Copy to user memory
+                    unsafe {
+                        *(stat_ptr as *mut crate::scheme::Stat) = stat;
+                    }
+                    return 0;
                 }
-                return 0;
+                Err(e) => {
+                    serial::serial_print("[FSTAT] fd=");
+                    serial::serial_print_dec(fd);
+                    serial::serial_print(" FAILED err=");
+                    serial::serial_print_dec(e as u64);
+                    serial::serial_print(" scheme_id=");
+                    serial::serial_print_dec(fd_entry.scheme_id as u64);
+                    serial::serial_print(" resource_id=");
+                    serial::serial_print_dec(fd_entry.resource_id as u64);
+                    serial::serial_print("\n");
+                }
             }
+        } else {
+            serial::serial_print("[FSTAT] fd=");
+            serial::serial_print_dec(fd);
+            serial::serial_print(" NO FD ENTRY\n");
         }
     }
     u64::MAX

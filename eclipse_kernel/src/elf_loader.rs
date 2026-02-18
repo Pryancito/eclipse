@@ -484,7 +484,12 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_PHNUM: u64 = 5;
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
-    let adjusted_stack = (stack_top - 144) & !0xF;
+    // System V ABI for x86-64 at program entry specifies RSP is 16-byte aligned (RSP % 16 == 0).
+    // HOWEVER, if the entry point is a standard C function (extern "C" fn), the compiler
+    // assumes it was CALLed and expects RSP % 16 == 8. 
+    // We adjust it to satisfy most compilers while keeping argc/argv/auxv at the base.
+    let base_stack = (stack_top - 144) & !0xF;
+    let adjusted_stack = base_stack - 8;
 
     // Ensure we're using the current process's CR3 so the write lands in user space (not kernel view)
     if let Some(pid) = current_process_id() {

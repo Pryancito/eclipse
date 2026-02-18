@@ -406,7 +406,7 @@ pub fn pci_read_config_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
 }
 
 /// Framebuffer information structure (matches kernel's FramebufferInfo in servers.rs)
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferInfo {
     pub address: u64,
