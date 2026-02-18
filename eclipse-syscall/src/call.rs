@@ -1,11 +1,81 @@
-//! High-level syscall wrappers
-
+//! High-level, type-safe syscall wrappers
+use crate::error::{cvt, cvt_unit, Result};
 use crate::number::*;
-use crate::error::*;
-use crate::flag::*;
+use crate::arch::*;
 
+/// Write to a file descriptor
+pub fn write(fd: usize, buf: &[u8]) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())) }
+}
+
+/// Read from a file descriptor
+pub fn read(fd: usize, buf: &mut [u8]) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len())) }
+}
+
+/// Close a file descriptor
+pub fn close(fd: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall1(SYS_CLOSE, fd)) }
+}
+
+/// Open a path with raw string and flags
+pub fn open(path: &str, flags: usize) -> Result<usize> {
+    unsafe {
+        cvt(syscall3(
+            SYS_OPEN,
+            path.as_ptr() as usize,
+            path.len(),
+            flags,
+        ))
+    }
+}
+
+/// lseek wrapper
+pub fn lseek(fd: usize, offset: isize, whence: usize) -> Result<isize> {
+    unsafe {
+        let ret = cvt(syscall3(SYS_LSEEK, fd, offset as usize, whence))?;
+        Ok(ret as isize)
+    }
+}
+
+/// Exit the current process
+pub fn exit(code: i32) -> ! {
+    unsafe {
+        syscall1(SYS_EXIT, code as usize);
+    }
+    loop {}
+}
+
+/// Get current PID
+pub fn getpid() -> usize {
+    unsafe { syscall0(SYS_GETPID) }
+}
+
+/// Yield the CPU (cooperative scheduling hint)
+pub fn sched_yield() -> Result<()> {
+    unsafe { cvt_unit(syscall0(SYS_YIELD)) }
+}
+
+/// Spawn a new process from an ELF buffer
+pub fn spawn(buf: &[u8]) -> Result<usize> {
+    unsafe { cvt(syscall2(SYS_SPAWN, buf.as_ptr() as usize, buf.len())) }
+}
+
+/// mkdir(path, mode)
+pub fn mkdir(path: &str, mode: usize) -> Result<()> {
+    unsafe {
+        cvt_unit(syscall3(
+            SYS_MKDIR,
+            path.as_ptr() as usize,
+            path.len(),
+            mode,
+        ))
+    }
+}
+
+/// Stat structure used by fstat/fstat_at
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Default, Clone, Copy)]
 pub struct Stat {
     pub dev: u64,
     pub ino: u64,
@@ -14,224 +84,86 @@ pub struct Stat {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
     pub atime: i64,
     pub mtime: i64,
     pub ctime: i64,
-    pub blksize: u32,
-    pub blocks: u64,
 }
 
-/// Exit the current process
-pub fn exit(status: i32) -> ! {
+/// fstat(fd, stat)
+pub fn fstat(fd: usize, stat: &mut Stat) -> Result<()> {
     unsafe {
-        crate::syscall1(SYS_EXIT, status as usize);
+        cvt_unit(syscall2(
+            SYS_FSTAT,
+            fd,
+            stat as *mut Stat as usize,
+        ))
     }
-    unreachable!()
 }
 
-/// Write to a file descriptor
-pub fn write(fd: usize, buf: &[u8]) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
-    })
+/// fstatat(dirfd, path, stat, flags)
+pub fn fstat_at(dirfd: usize, path: &str, stat: &mut Stat, flags: usize) -> Result<()> {
+    unsafe {
+        cvt_unit(syscall4(
+            SYS_FSTATAT,
+            dirfd,
+            path.as_ptr() as usize,
+            path.len(),
+            flags,
+        ))
+    }
 }
 
-/// Read from a file descriptor
-pub fn read(fd: usize, buf: &mut [u8]) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len())
-    })
-}
-
-/// Yield CPU to scheduler
-pub fn sched_yield() -> Result<()> {
-    cvt_unit(unsafe { crate::syscall0(SYS_YIELD) })
-}
-
-/// Get current process ID
-pub fn getpid() -> usize {
-    unsafe { crate::syscall0(SYS_GETPID) }
-}
-
-/// Get parent process ID
-pub fn getppid() -> usize {
-    unsafe { crate::syscall0(SYS_GETPPID) }
-}
-
-/// Open a file
-pub fn open(path: &str, flags: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_OPEN, path.as_ptr() as usize, path.len(), flags)
-    })
-}
-
-/// Close a file descriptor
-pub fn close(fd: usize) -> Result<()> {
-    cvt_unit(unsafe { crate::syscall1(SYS_CLOSE, fd) })
-}
-
-/// Map memory
+/// mmap(addr, length, prot, flags, fd, offset)
 pub fn mmap(
     addr: usize,
     length: usize,
     prot: usize,
     flags: usize,
     fd: isize,
-    offset: usize
+    offset: usize,
 ) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall6(
+    unsafe {
+        cvt(syscall6(
             SYS_MMAP,
             addr,
             length,
             prot,
             flags,
             fd as usize,
-            offset
-        )
-    })
-}
-
-/// Unmap memory
-pub fn munmap(addr: usize, length: usize) -> Result<()> {
-    cvt_unit(unsafe { crate::syscall2(SYS_MUNMAP, addr, length) })
-}
-
-/// Create a new thread or process
-pub fn clone(flags: usize, stack: usize, parent_tid: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_CLONE, flags, stack, parent_tid)
-    })
-}
-
-/// Get thread ID
-pub fn gettid() -> usize {
-    unsafe { crate::syscall0(SYS_GETTID) }
-}
-
-/// Fast userspace mutex operation
-pub fn futex(uaddr: usize, op: i32, val: i32, timeout: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall4(SYS_FUTEX, uaddr, op as usize, val as usize, timeout)
-    })
-}
-
-/// Sleep for specified nanoseconds  
-pub fn nanosleep(req: usize) -> Result<()> {
-    cvt_unit(unsafe { crate::syscall1(SYS_NANOSLEEP, req) })
-}
-
-/// Change program break (heap end)
-pub fn brk(addr: usize) -> Result<usize> {
-    let result = unsafe { crate::syscall1(SYS_BRK, addr) };
-    if result == usize::MAX {
-        Err(Error::new(ENOMEM))
-    } else {
-        Ok(result)
+            offset,
+        ))
     }
 }
 
-/// Map a resource in a scheme
-pub fn fmap(fd: usize, offset: usize, len: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_FMAP, fd, offset, len)
-    })
+/// munmap(addr, length)
+pub fn munmap(addr: usize, length: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_MUNMAP, addr, length)) }
 }
 
-/// Register a new device node
-pub fn register_device(name: &str, type_id: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall3(SYS_REGISTER_DEVICE, name.as_ptr() as usize, name.len(), type_id)
-    })
+/// socket(domain, type, protocol)
+pub fn socket(domain: usize, ty: usize, protocol: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_SOCKET, domain, ty, protocol)) }
 }
 
-/// Mount the root filesystem
-pub fn mount() -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall0(SYS_MOUNT)
-    })
+/// bind(fd, addr_ptr, addr_len)
+pub fn bind(fd: usize, addr_ptr: usize, addr_len: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall3(SYS_BIND, fd, addr_ptr, addr_len)) }
 }
 
-/// Spawn a new process from an ELF buffer
-pub fn spawn(buf: &[u8]) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall2(SYS_SPAWN, buf.as_ptr() as usize, buf.len())
-    })
-}
-
-/// Get file status
-pub fn fstat(fd: usize, stat: &mut Stat) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall2(SYS_FSTAT, fd, stat as *mut Stat as usize)
-    })
-}
-
-/// Get file status relative to a directory
-pub fn fstat_at(dirfd: usize, path: &str, stat: &mut Stat, flags: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall4(SYS_FSTATAT, dirfd, path.as_ptr() as usize, stat as *mut Stat as usize, flags)
-    })
-}
-
-/// Fill buffer with random bytes
-pub fn getrandom(buf: &mut [u8], flags: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), flags)
-    })
-}
-
-/// Reposition read/write file offset
-pub fn lseek(fd: usize, offset: isize, whence: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_LSEEK, fd, offset as usize, whence)
-    })
-}
-
-/// Perform device control (e.g. FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO)
-pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_IOCTL, fd, request, arg)
-    })
-}
-
-/// Create a socket endpoint
-pub fn socket(domain: usize, type_: usize, protocol: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_SOCKET, domain, type_, protocol)
-    })
-}
-
-/// Bind a name to a socket
-pub fn bind(fd: usize, addr: usize, addrlen: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall3(SYS_BIND, fd, addr, addrlen)
-    })
-}
-
-/// Listen for connections on a socket
+/// listen(fd, backlog)
 pub fn listen(fd: usize, backlog: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall2(SYS_LISTEN, fd, backlog)
-    })
+    unsafe { cvt_unit(syscall2(SYS_LISTEN, fd, backlog)) }
 }
 
-/// Accept a connection on a socket
-pub fn accept(fd: usize, addr: usize, addrlen: usize) -> Result<usize> {
-    cvt(unsafe {
-        crate::syscall3(SYS_ACCEPT, fd, addr, addrlen)
-    })
+/// accept(fd, addr_ptr, addr_len_ptr)
+pub fn accept(fd: usize, addr_ptr: usize, addr_len_ptr: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_ACCEPT, fd, addr_ptr, addr_len_ptr)) }
 }
 
-/// Initiate a connection on a socket
-pub fn connect(fd: usize, addr: usize, addrlen: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall3(SYS_CONNECT, fd, addr, addrlen)
-    })
+/// connect(fd, addr_ptr, addr_len)
+pub fn connect(fd: usize, addr_ptr: usize, addr_len: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall3(SYS_CONNECT, fd, addr_ptr, addr_len)) }
 }
 
-/// Create a directory
-pub fn mkdir(path: &str, mode: usize) -> Result<()> {
-    cvt_unit(unsafe {
-        crate::syscall2(SYS_MKDIR, path.as_ptr() as usize, mode)
-    })
-}

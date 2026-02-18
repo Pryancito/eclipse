@@ -244,10 +244,14 @@ fn start_service(service: &mut Service) {
 fn main_loop() -> ! {
     let mut counter: u64 = 0;
     let mut heartbeat_counter: u64 = 0;
-    
+    let mut ipc_buffer = [0u8; 32];
+ 
     loop {
         counter += 1;
         
+        // Procesar solicitudes IPC ligeras (por ejemplo, petición de PIDs de servicios)
+        handle_ipc_requests(&mut ipc_buffer);
+
         // Check service health every 100000 iterations
         if counter % 100000 == 0 {
             check_services();
@@ -266,6 +270,32 @@ fn main_loop() -> ! {
         // Yield CPU to other processes
         yield_cpu();
     }
+}
+
+/// Atender solicitudes IPC sencillas dirigidas a init (PID 1).
+/// Actualmente soporta:
+/// - "GET_INPUT_PID": devuelve el PID del servicio de entrada en un mensaje "INPT" + u32 LE.
+fn handle_ipc_requests(buffer: &mut [u8; 32]) {
+    let (len, sender) = eclipse_libc::receive(buffer);
+    if len == 0 || sender == 0 {
+        return;
+    }
+
+    // Petición de PID del servicio de entrada
+    if len >= 12 && &buffer[..12] == b"GET_INPUT_PID" {
+        let input_pid = unsafe { SERVICES[3].pid as u32 }; // Servicio "input"
+        let mut response = [0u8; 8];
+        response[0..4].copy_from_slice(b"INPT");
+        response[4..8].copy_from_slice(&input_pid.to_le_bytes());
+        let _ = eclipse_libc::send(sender, 0x40, &response);
+        return;
+    }
+
+    // Otros mensajes se registran para depuración básica
+    println!(
+        "[INIT] IPC no reconocido en main_loop: {} bytes desde PID {}",
+        len, sender
+    );
 }
 
 /// Check service health

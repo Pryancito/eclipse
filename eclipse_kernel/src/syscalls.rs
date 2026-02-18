@@ -593,9 +593,6 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
         return u64::MAX; // Error
     }
     
-    // DEBUG: Print entry
-    crate::serial::serial_print("R"); // R = syscall receive called
-    
     if let Some(client_id) = current_process_id() {
         // Intentar recibir mensaje
         if let Some(msg) = receive_message(client_id) {

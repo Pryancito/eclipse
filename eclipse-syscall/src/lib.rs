@@ -4,9 +4,9 @@
 #![no_std]
 
 pub mod number;
-pub mod call;
 pub mod error;
 pub mod flag;
+pub mod call;
 
 pub use error::{Error, Result};
 pub use number::*;

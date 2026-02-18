@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, pci_enum_devices, PciDeviceInfo};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -81,6 +81,7 @@ struct InputDevice {
 }
 
 /// Input event
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct InputEvent {
     device_id: u32,
@@ -334,6 +335,9 @@ pub extern "C" fn _start() -> ! {
     println!("[INPUT-SERVICE]   PS/2 mouse: {}", if ps2_mouse_present { "Yes" } else { "No" });
     println!("[INPUT-SERVICE]   USB devices: {}", usb_device_count);
     println!("[INPUT-SERVICE] Waiting for input events...");
+
+    // PID del cliente de display (por ejemplo, smithay_app), registrado vía IPC
+    let mut display_client_pid: u32 = 0;
     
     // Main loop - process input events
     let mut heartbeat_counter = 0u64;
@@ -344,6 +348,22 @@ pub extern "C" fn _start() -> ! {
     
     loop {
         heartbeat_counter += 1;
+
+        // Procesar mensajes IPC de control (por ejemplo, registro de cliente de display)
+        {
+            let mut buf = [0u8; 32];
+            let (len, sender_pid) = receive(&mut buf);
+            if len >= 8 && &buf[0..4] == b"SUBS" {
+                let mut id_bytes = [0u8; 4];
+                id_bytes.copy_from_slice(&buf[4..8]);
+                let client_pid = u32::from_le_bytes(id_bytes);
+                display_client_pid = client_pid;
+                println!(
+                    "[INPUT-SERVICE] Display client registrado: PID {} (desde PID {})",
+                    client_pid, sender_pid
+                );
+            }
+        }
         
         // In a real implementation, this would:
         // - Read from PS/2 keyboard controller (port 0x60)
@@ -367,6 +387,16 @@ pub extern "C" fn _start() -> ! {
             if event_queue.push(kbd_event) {
                 keyboard_events += 1;
                 total_events += 1;
+                // Enviar evento al cliente de display via IPC si está registrado
+                if display_client_pid != 0 {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            &kbd_event as *const InputEvent as *const u8,
+                            core::mem::size_of::<InputEvent>(),
+                        )
+                    };
+                    let _ = send(display_client_pid, 0x40, bytes);
+                }
                 // Report via scheme (if available)
                 if let Some(fd) = input_fd {
                     let buf = unsafe { core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
@@ -387,6 +417,16 @@ pub extern "C" fn _start() -> ! {
             if event_queue.push(mouse_event) {
                 mouse_events += 1;
                 total_events += 1;
+                // Enviar evento al cliente de display via IPC si está registrado
+                if display_client_pid != 0 {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            &mouse_event as *const InputEvent as *const u8,
+                            core::mem::size_of::<InputEvent>(),
+                        )
+                    };
+                    let _ = send(display_client_pid, 0x40, bytes);
+                }
             }
         }
         
