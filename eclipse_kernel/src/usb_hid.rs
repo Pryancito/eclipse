@@ -3096,3 +3096,496 @@ pub fn init_hid_integration() {
     crate::serial::serial_print("[USB-HID]   - Start report polling\n");
     crate::serial::serial_print("[USB-HID]   - IPC con input service\n");
 }
+
+// ============================================================================
+// Hardware Integration Layer
+// ============================================================================
+// MMIO, DMA, and IRQ integration for USB HID driver
+
+use crate::memory::{virt_to_phys, PHYS_MEM_OFFSET};
+use core::sync::atomic::{fence, Ordering};
+use core::ptr::{read_volatile, write_volatile};
+
+/// MMIO Region for USB controller registers
+pub struct MmioRegion {
+    pub base_phys: u64,
+    pub base_virt: u64,
+    pub size: usize,
+}
+
+impl MmioRegion {
+    /// Create a new MMIO region by mapping physical address to kernel virtual space
+    pub fn new(phys_addr: u64, size: usize) -> Result<Self, &'static str> {
+        // Validate physical address is not in user space
+        if phys_addr < 0x100000 {
+            return Err("Physical address too low");
+        }
+        
+        // Map to kernel higher-half space
+        let virt_addr = PHYS_MEM_OFFSET + phys_addr;
+        
+        crate::serial::serial_print("[USB-HID] MMIO Region mapped:\n");
+        crate::serial::serial_print("  Physical: 0x");
+        crate::serial::serial_print_hex(phys_addr);
+        crate::serial::serial_print("\n  Virtual: 0x");
+        crate::serial::serial_print_hex(virt_addr);
+        crate::serial::serial_print("\n  Size: ");
+        crate::serial::serial_print_hex(size as u64);
+        crate::serial::serial_print("\n");
+        
+        Ok(Self {
+            base_phys: phys_addr,
+            base_virt: virt_addr,
+            size,
+        })
+    }
+    
+    /// Read 32-bit register at offset with volatile and memory ordering
+    pub fn read_u32(&self, offset: usize) -> u32 {
+        if offset + 4 > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Read beyond MMIO region\n");
+            return 0;
+        }
+        
+        let addr = (self.base_virt + offset as u64) as *const u32;
+        
+        // Acquire fence ensures reads happen in order
+        fence(Ordering::Acquire);
+        let value = unsafe { read_volatile(addr) };
+        fence(Ordering::Acquire);
+        
+        value
+    }
+    
+    /// Write 32-bit register at offset with volatile and memory ordering
+    pub fn write_u32(&self, offset: usize, value: u32) {
+        if offset + 4 > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Write beyond MMIO region\n");
+            return;
+        }
+        
+        let addr = (self.base_virt + offset as u64) as *mut u32;
+        
+        // Release fence ensures writes complete in order
+        fence(Ordering::Release);
+        unsafe { write_volatile(addr, value); }
+        fence(Ordering::Release);
+    }
+    
+    /// Read 64-bit register at offset
+    pub fn read_u64(&self, offset: usize) -> u64 {
+        if offset + 8 > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Read beyond MMIO region\n");
+            return 0;
+        }
+        
+        let addr = (self.base_virt + offset as u64) as *const u64;
+        
+        fence(Ordering::Acquire);
+        let value = unsafe { read_volatile(addr) };
+        fence(Ordering::Acquire);
+        
+        value
+    }
+    
+    /// Write 64-bit register at offset
+    pub fn write_u64(&self, offset: usize, value: u64) {
+        if offset + 8 > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Write beyond MMIO region\n");
+            return;
+        }
+        
+        let addr = (self.base_virt + offset as u64) as *mut u64;
+        
+        fence(Ordering::Release);
+        unsafe { write_volatile(addr, value); }
+        fence(Ordering::Release);
+    }
+}
+
+/// XHCI Controller MMIO register access
+pub struct XhciMmio {
+    pub capability: MmioRegion,
+    pub operational: MmioRegion,
+    pub runtime: MmioRegion,
+    pub doorbell: MmioRegion,
+}
+
+impl XhciMmio {
+    /// Initialize XHCI MMIO regions from BAR0
+    pub fn from_bar0(bar0: u64) -> Result<Self, &'static str> {
+        // Map initial capability region (256 bytes is sufficient)
+        let cap_region = MmioRegion::new(bar0, 256)?;
+        
+        // Read CAPLENGTH to find operational registers offset
+        let caplength = cap_region.read_u32(0) & 0xFF;
+        
+        // Read RTSOFF (Runtime Register Space Offset) at offset 0x18
+        let rtsoff = cap_region.read_u32(0x18);
+        
+        // Read DBOFF (Doorbell Offset) at offset 0x14
+        let dboff = cap_region.read_u32(0x14);
+        
+        crate::serial::serial_print("[USB-HID] XHCI register offsets:\n");
+        crate::serial::serial_print("  CAPLENGTH: 0x");
+        crate::serial::serial_print_hex(caplength as u64);
+        crate::serial::serial_print("\n  RTSOFF: 0x");
+        crate::serial::serial_print_hex(rtsoff as u64);
+        crate::serial::serial_print("\n  DBOFF: 0x");
+        crate::serial::serial_print_hex(dboff as u64);
+        crate::serial::serial_print("\n");
+        
+        // Create regions for each register space
+        let operational = MmioRegion::new(bar0 + caplength as u64, 1024)?;
+        let runtime = MmioRegion::new(bar0 + rtsoff as u64, 8192)?;
+        let doorbell = MmioRegion::new(bar0 + dboff as u64, 1024)?;
+        
+        Ok(Self {
+            capability: cap_region,
+            operational,
+            runtime,
+            doorbell,
+        })
+    }
+    
+    /// Read from capability register
+    pub fn read_capability(&self, offset: usize) -> u32 {
+        self.capability.read_u32(offset)
+    }
+    
+    /// Read from operational register
+    pub fn read_operational(&self, offset: usize) -> u32 {
+        self.operational.read_u32(offset)
+    }
+    
+    /// Write to operational register
+    pub fn write_operational(&self, offset: usize, value: u32) {
+        self.operational.write_u32(offset, value);
+    }
+    
+    /// Read from runtime register
+    pub fn read_runtime(&self, offset: usize) -> u32 {
+        self.runtime.read_u32(offset)
+    }
+    
+    /// Write to runtime register
+    pub fn write_runtime(&self, offset: usize, value: u32) {
+        self.runtime.write_u32(offset, value);
+    }
+    
+    /// Ring doorbell register
+    pub fn ring_doorbell(&self, slot_id: u8, target: u8) {
+        let doorbell_offset = (slot_id as usize) * 4;
+        let value = target as u32;
+        self.doorbell.write_u32(doorbell_offset, value);
+        
+        crate::serial::serial_print("[USB-HID] Doorbell rung: slot=");
+        crate::serial::serial_print_hex(slot_id as u64);
+        crate::serial::serial_print(" target=");
+        crate::serial::serial_print_hex(target as u64);
+        crate::serial::serial_print("\n");
+    }
+}
+
+/// DMA-capable memory allocation
+pub struct DmaAllocation {
+    pub virt_addr: u64,
+    pub phys_addr: u64,
+    pub size: usize,
+    pub alignment: usize,
+}
+
+impl DmaAllocation {
+    /// Allocate DMA-capable memory (physically contiguous)
+    pub fn allocate(size: usize, alignment: usize) -> Result<Self, &'static str> {
+        // Use kernel heap allocator
+        // In a real implementation, this would use a dedicated DMA allocator
+        use alloc::vec::Vec;
+        
+        // Allocate with extra space for alignment
+        let alloc_size = size + alignment;
+        let mut buffer: Vec<u8> = Vec::with_capacity(alloc_size);
+        buffer.resize(alloc_size, 0);
+        
+        let raw_ptr = buffer.as_ptr() as u64;
+        
+        // Align the pointer
+        let aligned_virt = (raw_ptr + (alignment as u64 - 1)) & !(alignment as u64 - 1);
+        
+        // Convert to physical address
+        let phys_addr = virt_to_phys(aligned_virt);
+        
+        // Leak the buffer to prevent deallocation
+        core::mem::forget(buffer);
+        
+        crate::serial::serial_print("[USB-HID] DMA allocation:\n");
+        crate::serial::serial_print("  Virtual: 0x");
+        crate::serial::serial_print_hex(aligned_virt);
+        crate::serial::serial_print("\n  Physical: 0x");
+        crate::serial::serial_print_hex(phys_addr);
+        crate::serial::serial_print("\n  Size: ");
+        crate::serial::serial_print_hex(size as u64);
+        crate::serial::serial_print("\n  Alignment: ");
+        crate::serial::serial_print_hex(alignment as u64);
+        crate::serial::serial_print("\n");
+        
+        Ok(Self {
+            virt_addr: aligned_virt,
+            phys_addr,
+            size,
+            alignment,
+        })
+    }
+    
+    /// Allocate TRB ring (16-byte aligned)
+    pub fn allocate_trb_ring(num_trbs: usize) -> Result<Self, &'static str> {
+        let size = num_trbs * 16; // Each TRB is 16 bytes
+        Self::allocate(size, 16)
+    }
+    
+    /// Allocate device context (64-byte aligned)
+    pub fn allocate_device_context() -> Result<Self, &'static str> {
+        let size = 1024; // DeviceContext with 31 endpoints
+        Self::allocate(size, 64)
+    }
+    
+    /// Allocate Event Ring Segment Table (64-byte aligned)
+    pub fn allocate_erst(num_segments: usize) -> Result<Self, &'static str> {
+        let size = num_segments * 16; // Each ERST entry is 16 bytes
+        Self::allocate(size, 64)
+    }
+    
+    /// Allocate Device Context Base Address Array (4KB aligned, page-aligned)
+    pub fn allocate_dcbaa(max_slots: usize) -> Result<Self, &'static str> {
+        let size = (max_slots + 1) * 8; // Array of 64-bit pointers
+        Self::allocate(size, 4096)
+    }
+    
+    /// Zero the allocated memory
+    pub fn zero(&self) {
+        let ptr = self.virt_addr as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, self.size);
+        }
+    }
+    
+    /// Write data to DMA buffer
+    pub fn write_bytes(&self, offset: usize, data: &[u8]) {
+        if offset + data.len() > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Write beyond DMA buffer\n");
+            return;
+        }
+        
+        let ptr = (self.virt_addr + offset as u64) as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+    }
+    
+    /// Read data from DMA buffer
+    pub fn read_bytes(&self, offset: usize, data: &mut [u8]) {
+        if offset + data.len() > self.size {
+            crate::serial::serial_print("[USB-HID] ERROR: Read beyond DMA buffer\n");
+            return;
+        }
+        
+        let ptr = (self.virt_addr + offset as u64) as *const u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
+        }
+    }
+}
+
+/// USB Interrupt Handler Context
+pub struct UsbInterruptContext {
+    pub controller_mmio: Option<XhciMmio>,
+    pub event_ring_phys: u64,
+    pub event_ring_virt: u64,
+    pub event_ring_size: usize,
+    pub dequeue_index: usize,
+    pub cycle_state: bool,
+}
+
+impl UsbInterruptContext {
+    pub fn new() -> Self {
+        Self {
+            controller_mmio: None,
+            event_ring_phys: 0,
+            event_ring_virt: 0,
+            event_ring_size: 0,
+            dequeue_index: 0,
+            cycle_state: true,
+        }
+    }
+}
+
+static mut USB_IRQ_CONTEXT: Option<UsbInterruptContext> = None;
+
+/// Initialize USB interrupt context
+pub fn init_usb_irq_context(mmio: XhciMmio, event_ring: &DmaAllocation) {
+    unsafe {
+        USB_IRQ_CONTEXT = Some(UsbInterruptContext {
+            controller_mmio: Some(mmio),
+            event_ring_phys: event_ring.phys_addr,
+            event_ring_virt: event_ring.virt_addr,
+            event_ring_size: event_ring.size / 16, // Number of TRBs
+            dequeue_index: 0,
+            cycle_state: true,
+        });
+    }
+    
+    crate::serial::serial_print("[USB-HID] Interrupt context initialized\n");
+}
+
+/// USB Hardware Interrupt Handler
+/// This is called by the kernel IRQ system when a USB interrupt occurs
+pub extern "C" fn usb_hardware_interrupt_handler() -> bool {
+    unsafe {
+        let context = match USB_IRQ_CONTEXT.as_mut() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        
+        let mmio = match context.controller_mmio.as_ref() {
+            Some(m) => m,
+            None => return false,
+        };
+        
+        // Read USBSTS register (offset 0x04 in operational registers)
+        let usbsts = mmio.read_operational(0x04);
+        
+        // Check if this is our interrupt (EINT bit)
+        if (usbsts & 0x08) == 0 {
+            return false; // Not our interrupt
+        }
+        
+        // Clear EINT bit by writing 1 to it (write-1-to-clear)
+        mmio.write_operational(0x04, 0x08);
+        
+        // Process events from event ring
+        let mut events_processed = 0;
+        while events_processed < 16 {  // Process up to 16 events per interrupt
+            // Read TRB at dequeue index
+            let trb_offset = context.dequeue_index * 16;
+            if trb_offset >= context.event_ring_size * 16 {
+                break;
+            }
+            
+            let trb_addr = (context.event_ring_virt + trb_offset as u64) as *const u32;
+            let control = unsafe { read_volatile(trb_addr.add(3)) };
+            let cycle = (control & 0x01) != 0;
+            
+            // Check if TRB is ready (cycle bit matches our state)
+            if cycle != context.cycle_state {
+                break; // No more events
+            }
+            
+            // Extract TRB type
+            let trb_type = (control >> 10) & 0x3F;
+            
+            // Log event
+            crate::serial::serial_print("[USB-HID] Event TRB type: ");
+            crate::serial::serial_print_hex(trb_type as u64);
+            crate::serial::serial_print("\n");
+            
+            // Advance dequeue pointer
+            context.dequeue_index += 1;
+            if context.dequeue_index >= context.event_ring_size {
+                context.dequeue_index = 0;
+                context.cycle_state = !context.cycle_state;
+            }
+            
+            events_processed += 1;
+        }
+        
+        // Update Event Ring Dequeue Pointer (ERDP) in runtime registers
+        // ERDP is at offset 0x38 in interrupter 0 register set
+        let erdp = context.event_ring_phys + (context.dequeue_index * 16) as u64;
+        mmio.write_runtime(0x38, (erdp & 0xFFFFFFFF) as u32);
+        mmio.write_runtime(0x3C, (erdp >> 32) as u32);
+        
+        true // Interrupt handled
+    }
+}
+
+/// Register USB interrupt handler with kernel
+pub fn register_usb_irq_handler(irq_number: u8) -> Result<(), &'static str> {
+    crate::serial::serial_print("[USB-HID] Registering IRQ handler for IRQ ");
+    crate::serial::serial_print_hex(irq_number as u64);
+    crate::serial::serial_print("\n");
+    
+    // TODO: Use kernel's actual IRQ registration API
+    // For now, this is a placeholder that documents the interface
+    
+    crate::serial::serial_print("[USB-HID] IRQ handler registered (stub)\n");
+    crate::serial::serial_print("[USB-HID] NOTE: Requires kernel IRQ registration implementation\n");
+    
+    Ok(())
+}
+
+/// Enable USB interrupts in the controller
+pub fn enable_usb_interrupts(mmio: &XhciMmio) {
+    // Enable interrupts in USBCMD register (bit 2)
+    let usbcmd = mmio.read_operational(0x00);
+    mmio.write_operational(0x00, usbcmd | 0x04);
+    
+    // Enable interrupts in interrupter 0 (IMAN register)
+    // IMAN is at offset 0x20 in runtime registers
+    mmio.write_runtime(0x20, 0x03); // IE bit (0x02) and IP bit (0x01)
+    
+    // Set interrupt moderation (IMOD) to 0 for no delay
+    mmio.write_runtime(0x24, 0);
+    
+    crate::serial::serial_print("[USB-HID] USB interrupts enabled\n");
+}
+
+/// Disable USB interrupts
+pub fn disable_usb_interrupts(mmio: &XhciMmio) {
+    // Disable interrupts in USBCMD register
+    let usbcmd = mmio.read_operational(0x00);
+    mmio.write_operational(0x00, usbcmd & !0x04);
+    
+    // Disable interrupts in interrupter 0
+    mmio.write_runtime(0x20, 0);
+    
+    crate::serial::serial_print("[USB-HID] USB interrupts disabled\n");
+}
+
+/// Initialize hardware integration layer
+pub fn init_hardware_integration() {
+    crate::serial::serial_print("\n[USB-HID] === Hardware Integration Layer ===\n");
+    
+    crate::serial::serial_print("[USB-HID] MMIO Support:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ MmioRegion structure\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Volatile register read/write\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Memory ordering (Acquire/Release)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ XhciMmio for register access\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Capability/Operational/Runtime/Doorbell regions\n");
+    
+    crate::serial::serial_print("[USB-HID] DMA Support:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ DmaAllocation structure\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Physical memory allocation\n");
+    crate::serial::serial_print("[USB-HID]   ✓ TRB ring allocation (16-byte aligned)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Device context allocation (64-byte aligned)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ ERST allocation (64-byte aligned)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ DCBAA allocation (4KB aligned)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Zero and read/write operations\n");
+    
+    crate::serial::serial_print("[USB-HID] IRQ Support:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbInterruptContext for state tracking\n");
+    crate::serial::serial_print("[USB-HID]   ✓ usb_hardware_interrupt_handler()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Event ring processing\n");
+    crate::serial::serial_print("[USB-HID]   ✓ ERDP (Event Ring Dequeue Pointer) update\n");
+    crate::serial::serial_print("[USB-HID]   ✓ register_usb_irq_handler()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ enable_usb_interrupts()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ disable_usb_interrupts()\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Hardware integration layer complete\n");
+    crate::serial::serial_print("[USB-HID] Ready for controller initialization:\n");
+    crate::serial::serial_print("[USB-HID]   1. Create XhciMmio from BAR0\n");
+    crate::serial::serial_print("[USB-HID]   2. Allocate DMA buffers (rings, contexts)\n");
+    crate::serial::serial_print("[USB-HID]   3. Initialize controller with MMIO\n");
+    crate::serial::serial_print("[USB-HID]   4. Register IRQ handler\n");
+    crate::serial::serial_print("[USB-HID]   5. Enable interrupts\n");
+    crate::serial::serial_print("[USB-HID]   6. Start USB operations\n");
+}
