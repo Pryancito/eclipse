@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "smithay_app",
+    "sidewind_core",
+    "sidewind_sdk",
+    "sidewind_wayland",
+    "sidewind_xwayland",
+    "demo_client",
+    "wayland_handshake",
+    "x11_bridge_test",
+    "systemd",
+    "eclipse_std",
+]
+
+exclude = [
+    "libs/ipc",
+]
+
+[workspace.dependencies]
+sidewind_core = { path = "sidewind_core" }
+sidewind_sdk = { path = "sidewind_sdk" }
+sidewind_wayland = { path = "sidewind_wayland" }
+sidewind_xwayland = { path = "sidewind_xwayland" }

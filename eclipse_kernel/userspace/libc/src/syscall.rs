@@ -113,6 +113,17 @@ pub fn read_mouse_packet() -> Option<u32> {
     }
 }
 
+/// Input event from input_service to compositor (shared layout - must match input_service)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputEvent {
+    pub device_id: u32,
+    pub event_type: u8,  // 0=key, 1=mouse_move, 2=mouse_button, 3=mouse_scroll
+    pub code: u16,
+    pub value: i32,
+    pub timestamp: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Stat {

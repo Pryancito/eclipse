@@ -1,0 +1,8 @@
+[package]
+name = "sidewind_sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
+sidewind_core = { path = "../sidewind_core" }

@@ -725,6 +725,25 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
     }
 }
 
+/// Allocate a single 4KB physical frame for anonymous mmap (userspace).
+/// Uses a bump allocator from a fixed physical region - NO kernel heap.
+/// This avoids heap/stack collision (alloc_dma_buffer uses heap).
+/// Returns Some(phys_addr) or None if exhausted.
+/// Physical address is accessible at phys_to_virt(phys_addr).
+static ANON_MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
+
+const ANON_MMAP_PHYS_START: u64 = 0x1000_0000;  // 256MB - above typical kernel
+const ANON_MMAP_PHYS_END: u64 = 0xB000_0000;    // Stop before 2.75GB (PCI hole ~3GB)
+
+pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
+    let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
+    let frame_phys = ANON_MMAP_PHYS_START + next;
+    if frame_phys >= ANON_MMAP_PHYS_END {
+        return None;
+    }
+    Some(frame_phys)
+}
+
 /// Map framebuffer physical memory into process page tables
 /// Returns virtual address where framebuffer is mapped, or 0 on failure
 pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_size: u64) -> u64 {
@@ -732,11 +751,18 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     use x86_64::instructions::tlb::flush_all;
     use crate::serial;
     
+    // Rechazar fb en espacio kernel o dirección nula
+    if fb_phys_addr == 0 || fb_phys_addr >= 0xFFFF_8000_0000_0000 {
+        serial::serial_print("MAP_FB: ERROR - Invalid framebuffer physical address\n");
+        return 0;
+    }
+    
     // For identity mapping, we'll map the framebuffer at its physical address
     let virtual_addr = fb_phys_addr;
     
-    // Round size up to 2MB pages
-    let num_pages = (fb_size + 0x1FFFFF) / 0x200000;
+    // Round size up to 2MB pages; mínimo 2 páginas (4MB) para cubrir stride/overflow
+    let min_size = core::cmp::max(fb_size, 0x400000);
+    let num_pages = (min_size + 0x1FFFFF) / 0x200000;
     
     serial::serial_print("MAP_FB: Identity mapping ");
     serial::serial_print_dec(num_pages);
@@ -845,4 +871,12 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     walk_page_table(page_table_phys, virtual_addr);
     
     virtual_addr
+}
+/// Map a physical memory range into a process's page table using 4KB pages
+pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: u64, flags: u64) {
+    let num_pages = (length + 0xFFF) / 0x1000;
+    for i in 0..num_pages {
+        let page_offset = i * 0x1000;
+        map_user_page_4kb(page_table_phys, vaddr + page_offset, paddr + page_offset, flags);
+    }
 }

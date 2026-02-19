@@ -291,6 +291,16 @@ fn handle_ipc_requests(buffer: &mut [u8; 32]) {
         return;
     }
 
+    // Petición de PID del servicio de pantalla ("GET_DISPLAY_PID" = 15 bytes)
+    if len >= 15 && &buffer[..15] == b"GET_DISPLAY_PID" {
+        let display_pid = unsafe { SERVICES[4].pid as u32 }; // Servicio "display" (Smithay)
+        let mut response = [0u8; 8];
+        response[0..4].copy_from_slice(b"DSPL");
+        response[4..8].copy_from_slice(&display_pid.to_le_bytes());
+        let _ = eclipse_libc::send(sender, 0x10, &response);
+        return;
+    }
+
     // Otros mensajes se registran para depuración básica
     println!(
         "[INIT] IPC no reconocido en main_loop: {} bytes desde PID {}",

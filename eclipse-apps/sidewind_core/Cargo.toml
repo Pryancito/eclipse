@@ -1,0 +1,7 @@
+[package]
+name = "sidewind_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# core and alloc are provided by the toolchain/sysroot

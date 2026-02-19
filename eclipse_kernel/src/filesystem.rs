@@ -1308,6 +1308,19 @@ impl Scheme for FileSystemScheme {
                 }
                 Ok(fb_info.base_address as usize)
             }
+            OpenFile::Virtual { path, .. } => {
+                let vtmp = VIRTUAL_TMP.lock();
+                if let Some(content) = vtmp.get(path) {
+                    let ptr = content.as_ptr() as u64;
+                    if content.is_empty() {
+                         return Err(scheme_error::EINVAL);
+                    }
+                    let phys = crate::memory::virt_to_phys(ptr);
+                    Ok(phys as usize)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            }
             _ => Err(scheme_error::ENOSYS),
         }
     }

@@ -159,40 +159,47 @@ build_eclipse_libc() {
     cd ..
 }
 
-build_smithay_app() {
-    print_step "Compilando smithay_app (Rust Display Server Prototype)..."
+build_sidewind_project() {
+    print_step "Compilando proyecto Sidewind (Workspace)..."
     
-    if [ ! -d "$BASE_DIR/eclipse-apps/smithay_app" ]; then
-        print_status "Directorio $BASE_DIR/eclipse-apps/smithay_app no encontrado, saltando..."
+    if [ ! -d "$BASE_DIR/eclipse-apps" ]; then
+        print_status "Directorio $BASE_DIR/eclipse-apps no encontrado, saltando..."
         return 0
     fi
     
-    cd "$BASE_DIR/eclipse-apps/smithay_app"
+    cd "$BASE_DIR/eclipse-apps"
     
-    # Usar el target personalizado de Eclipse
-    cargo +nightly build --target ../../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release
+    # Compilar todo el workspace usando el target personalizado de Eclipse
+    print_status "Compilando workspace Sidewind para target Eclipse..."
+    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release
     
     if [ $? -eq 0 ]; then
-        print_success "smithay_app compilado exitosamente"
+        print_success "Proyecto Sidewind compilado exitosamente"
         
-        # Instalar en sysroot
-        mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
-        cp "target/x86_64-unknown-eclipse/release/smithay_app" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/smithay_app"
-        print_status "Instalado en sysroot: $BASE_DIR/$BUILD_DIR/sysroot/usr/bin/smithay_app"
+        # Lista de binarios a instalar
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test"
         
-        # También instalar directamente en la distribución si BUILD_DIR está definido
-        if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
-            mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
-            cp "target/x86_64-unknown-eclipse/release/smithay_app" "$BASE_DIR/$BUILD_DIR/usr/bin/smithay_app"
-            print_status "Instalado en distribución: $BASE_DIR/$BUILD_DIR/usr/bin/smithay_app"
-        fi
+        for bin in $BINS; do
+            if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
+                # Instalar en sysroot
+                mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin"
+                cp "target/x86_64-unknown-eclipse/release/$bin" "$BASE_DIR/$BUILD_DIR/sysroot/usr/bin/$bin"
+                print_status "Instalado en sysroot: /usr/bin/$bin"
+                
+                # Instalar en distribución
+                if [ -d "$BASE_DIR/$BUILD_DIR" ]; then
+                    mkdir -p "$BASE_DIR/$BUILD_DIR/usr/bin"
+                    cp "target/x86_64-unknown-eclipse/release/$bin" "$BASE_DIR/$BUILD_DIR/usr/bin/$bin"
+                fi
+            fi
+        done
     else
-        print_error "Error al compilar smithay_app"
-        cd ../..
+        print_error "Error al compilar el proyecto Sidewind"
+        cd "$BASE_DIR"
         return 1
     fi
     
-    cd ../..
+    cd "$BASE_DIR"
 }
 
 # Función para compilar eclipse_std
@@ -821,7 +828,7 @@ build_userland() {
     build_eclipse_std
     build_libxfont15
     build_tinyx_for_eclipse_os
-    build_smithay_app
+    build_sidewind_project
     
     # Aplicaciones
     #build_wayland_apps
@@ -1450,27 +1457,8 @@ show_build_summary() {
 }
 
 # Función para compilar eclipse-apps (IPC + systemd)
-build_eclipse_apps() {
-    print_step "Compilando workspace eclipse-apps (IPC + systemd)..."
-
-    if [ ! -d "eclipse-apps" ]; then
-        print_status "Directorio eclipse-apps no encontrado, saltando..."
-        return 0
-    fi
-
-    cd eclipse-apps
-
-    print_status "Compilando librería eclipse_ipc..."
-    cd libs/ipc && RUSTFLAGS="-C relocation-model=pic" cargo build --release || { cd ../..; print_error "Fallo compilando eclipse_ipc"; return 1; }
-    cd ../..
-
-    # print_status "Compilando eclipse-systemd..."
-    # cd systemd && cargo build --release --target x86_64-unknown-none || { cd ..; print_error "Fallo compilando eclipse-systemd"; return 1; }
-    # cd ..
-
-    print_success "eclipse-apps compilado completamente"
-    cd ..
-}
+# build_eclipse_apps fue eliminado: libs/ipc es una crate std y
+# no es compatible con el workspace no_std del target Eclipse.
 
 # Función para compilar mkfs-eclipsefs
 build_mkfs_eclipsefs() {
@@ -1581,20 +1569,8 @@ main() {
     build_systemd
     prepare_sysroot
     build_eclipse_libc
-    build_eclipse_apps
+    build_sidewind_project
     build_userland
-    
-    # We still need systemd and ipc which are in eclipse_apps, so let's run them selectively?
-    # Actually, eclipse-systemd is already built.
-    # But create_basic_distribution needs them.
-    # Let's run a modified version of these or just trust they are there?
-    # build_eclipse_apps runs: ipc, systemd.
-    # ipc failed before but passed with PIC? No, it passed.
-    # So build_eclipse_apps should be fine if we remove other things?
-    # But build_eclipse_apps only builds ipc and systemd.
-    # Wait, build.sh:1322 says build_eclipse_apps builds ipc and systemd.
-    # So I should keep build_eclipse_apps.
-    # build_eclipse_apps
     
     # build_userland builds: wayland_server, cosmic_client, module_loader etc.
     # These are failing.

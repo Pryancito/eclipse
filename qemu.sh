@@ -64,6 +64,7 @@ elif [ -b "$DISK" ]; then
 fi
 
 print_info "=== Iniciando Eclipse OS en QEMU ==="
+print_warning ">>> RATON: Pulsa Ctrl+Alt+G para capturar el raton en la ventana QEMU <<<"
 print_info "Disco principal: $DISK"
 print_info "Memoria: $MEMORY"
 print_info "CPUs: $CPUS"
@@ -71,11 +72,12 @@ print_info "Controlador USB: $([ "$USE_XHCI" = "1" ] && echo "XHCI (USB 3.0)" ||
 print_info "Ratón: $([ "$PS2_MOUSE" = "1" ] && echo "PS/2 (compatible con Eclipse)" || echo "USB (no soportado por kernel)")"
 print_info ""
 print_info "Controles:"
-print_info "  - Ctrl+Alt+G: Capturar/soltar ratón (PS/2)"
+print_info "  - Ctrl+Alt+G: IMPORTANTE - Capturar/soltar ratón en la ventana QEMU"
+print_info "                (sin capturar, el ratón NO se mueve en Eclipse)"
 print_info "  - Ctrl+A, X: Salir de QEMU"
 print_info "  - Ctrl+A, C: Consola de monitor QEMU"
 print_info ""
-print_warning "Nota: Ratón PS/2 por defecto. Para USB: PS2_MOUSE=0 ./qemu.sh"
+print_warning "IMPORTANTE: Para que el ratón funcione, pulsa Ctrl+Alt+G tras iniciar QEMU"
 echo ""
 
 # OVMF (UEFI firmware) - intentar diferentes ubicaciones comunes

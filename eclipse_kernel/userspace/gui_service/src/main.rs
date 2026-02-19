@@ -1,124 +1,118 @@
-//! GUI Service - Launches Graphical Environment
-//! 
-//! This service:
-//! 1. Starts after network_service.
-//! 2. Initializes Xfbdev (TinyX).
-//! 3. Launches the TinyX Framebuffer Server (Xfbdev) from disk.
+//! GUI Service - Launches and supervises the Sidewind compositor (smithay_app)
+//!
+//! Responsibilities:
+//! 1. Wait for filesystem to be ready.
+//! 2. Launch smithay_app from disk.
+//! 3. Supervise it: if it crashes, wait a moment and relaunch (watchdog).
 
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, open, close, exec, spawn, O_RDONLY, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, c_void, fork, exit};
+use eclipse_libc::{
+    println, getpid, getppid, yield_cpu, send, open, close, O_RDONLY,
+    mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, wait, spawn,
+};
 
-/// Wait for filesystem to be mounted by trying to open a test path
-/// This prevents race conditions with filesystem_service startup
+const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
+/// Yield iterations between restart attempts (~1s of busy-wait)
+const RESTART_DELAY_YIELDS: u32 = 500_000;
+/// Maximum restart attempts (0 = unlimited)
+const MAX_RESTARTS: u32 = 0;
+
+/// Wait for filesystem to be mounted.
 fn wait_for_filesystem() {
+    const MAX_ATTEMPTS: u32 = 200;
     let mut attempts = 0;
-    // Max 100 attempts with ~1000 yields each = reasonable timeout for service startup
-    // This allows filesystem_service time to mount without blocking indefinitely
-    const MAX_ATTEMPTS: u32 = 100;
-    
     loop {
-        // Try to open a simple test path to check if filesystem is mounted
-        // We use a path that should exist on the filesystem
-        let test_fd = open("file:/", O_RDONLY, 0);
-        
-        if test_fd >= 0 {
-            // Filesystem is mounted! Close the test fd and return
-            close(test_fd);
+        let fd = open("file:/", O_RDONLY, 0);
+        if fd >= 0 {
+            close(fd);
             return;
         }
-        
         attempts += 1;
         if attempts >= MAX_ATTEMPTS {
-            println!("[GUI-SERVICE] WARNING: Filesystem still not mounted after {} attempts", attempts);
-            println!("[GUI-SERVICE] Continuing anyway...");
+            println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
             return;
         }
-        
-        // Small delay before retry - yield to other processes
-        // Reduced from 1000 to 100 iterations for faster checking
-        for _ in 0..100 {
-            yield_cpu();
-        }
+        for _ in 0..50 { yield_cpu(); }
     }
+}
+
+/// Load and spawn smithay_app. Returns the child PID or -1 on failure.
+unsafe fn spawn_compositor() -> i32 {
+    let fd = open(COMPOSITOR_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        println!("[GUI-SERVICE] ERROR: Cannot open {}", COMPOSITOR_PATH);
+        return -1;
+    }
+
+    let mut st: Stat = core::mem::zeroed();
+    if fstat(fd, &mut st) < 0 || st.size <= 0 {
+        println!("[GUI-SERVICE] ERROR: fstat failed or size=0 for {}", COMPOSITOR_PATH);
+        close(fd);
+        return -1;
+    }
+
+    let size = st.size as u64;
+    let mapped = mmap(0, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if mapped == u64::MAX || mapped == 0 {
+        println!("[GUI-SERVICE] ERROR: mmap failed for {}", COMPOSITOR_PATH);
+        return -1;
+    }
+
+    let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
+    let child_pid = spawn(binary);
+    munmap(mapped, size);
+
+    child_pid
 }
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
-    
+
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                    GUI SERVICE                               ║");
+    println!("║         GUI SERVICE - Sidewind Compositor Supervisor         ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("[GUI-SERVICE] Starting (PID: {})", pid);
-    
+    println!("[GUI-SERVICE] PID={}", pid);
+
+    // Notify parent (systemd/init) that we are ready
     let ppid = getppid();
     if ppid > 0 {
         let _ = send(ppid, 255, b"READY");
     }
 
-    // Launch smithay_app (Rust Display Server Prototype)
-    println!("[GUI-SERVICE] Launching Rust Display Server (smithay_app)...");
-    
-    let path = "file:/usr/bin/smithay_app";
-    unsafe {
-        // Open application file
-        let fd = open(path, O_RDONLY, 0);
-        
-        if fd < 0 {
-            println!("[GUI-SERVICE] ERROR: Failed to open {}", path);
-            println!("[GUI-SERVICE] Entering sleep mode...");
-            loop { yield_cpu(); }
-        }
-        
-        // Use fstat to get file size
-        let mut st: Stat = core::mem::zeroed();
-        if fstat(fd, &mut st) < 0 {
-            println!("[GUI-SERVICE] ERROR: fstat failed for {}", path);
-            close(fd);
-            loop { yield_cpu(); }
-        }
-        
-        let size = st.size;
-        if size <= 0 {
-            println!("[GUI-SERVICE] ERROR: Invalid file size: {}", size);
-            close(fd);
-            loop { yield_cpu(); }
-        }
+    // Wait for filesystem before loading compositor from disk
+    wait_for_filesystem();
+    println!("[GUI-SERVICE] Filesystem ready.");
 
-        println!("[GUI-SERVICE] Mapping {} (size={} bytes)...", path, size);
-
-        // Map file into memory
-        let mapped_addr = mmap(0, size as u64, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
-        
-        if mapped_addr == u64::MAX || mapped_addr == 0 {
-            println!("[GUI-SERVICE] ERROR: mmap failed for {}", path);
-            close(fd);
-            loop { yield_cpu(); }
-        }
-        
-        println!("[GUI-SERVICE] Mapped at {:x}. Spawning {}...", mapped_addr, path);
-        
-        // Create slice for spawn
-        let binary_slice = core::slice::from_raw_parts(mapped_addr as *const u8, size as usize);
-        
-        // Spawn Xfbdev as a new process
-        let exec_result = spawn(binary_slice);
-        
-        // Clean up
-        munmap(mapped_addr, size as u64);
-        close(fd);
-
-        // If exec fails, we'll fall through to this point
-        println!("[GUI-SERVICE] ERROR: exec() failed for {}", path);
-        loop { yield_cpu(); }
-    }
-
-    println!("[GUI-SERVICE] X server should be initializing on /dev/fb0...");
-
-    // Fallback loop
+    // Supervisor watchdog loop
+    let mut restarts: u32 = 0;
     loop {
-        yield_cpu();
+        println!("[GUI-SERVICE] Launching {} (attempt #{})...", COMPOSITOR_PATH, restarts + 1);
+
+        let child_pid = unsafe { spawn_compositor() };
+
+        if child_pid <= 0 {
+            println!("[GUI-SERVICE] Failed to spawn compositor. Retrying in a moment...");
+        } else {
+            println!("[GUI-SERVICE] Compositor running as PID {}", child_pid);
+            // Wait for the compositor to exit
+            let mut status: i32 = 0;
+            let exited = wait(Some(&mut status));
+            println!("[GUI-SERVICE] Compositor (PID {}) exited (status={}).", child_pid, exited);
+        }
+
+        restarts += 1;
+        if MAX_RESTARTS > 0 && restarts >= MAX_RESTARTS {
+            println!("[GUI-SERVICE] Max restarts ({}) reached. Giving up.", MAX_RESTARTS);
+            loop { yield_cpu(); }
+        }
+
+        // Brief delay before restarting
+        println!("[GUI-SERVICE] Restarting compositor in ~1s...");
+        for _ in 0..RESTART_DELAY_YIELDS { yield_cpu(); }
     }
 }

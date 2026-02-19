@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -80,18 +80,7 @@ struct InputDevice {
     polling_rate: u32,  // Hz
 }
 
-/// Input event (layout must match smithay_app)
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct InputEvent {
-    device_id: u32,
-    event_type: u8,  // 0=key, 1=mouse_move, 2=mouse_button, 3=mouse_scroll
-    code: u16,
-    value: i32,
-    timestamp: u64,
-}
-
-/// Tamaño fijo para evitar problemas de layout/stack
+/// Tamaño fijo (InputEvent viene de eclipse_libc)
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
 /// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11)

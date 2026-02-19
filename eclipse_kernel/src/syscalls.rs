@@ -363,7 +363,10 @@ fn sys_exit(exit_code: u64) -> u64 {
     stats.exit_calls += 1;
     drop(stats);
     
-    serial::serial_print("Process exiting with code: ");
+    let pid = current_process_id().unwrap_or(0);
+    serial::serial_print("Process ID: ");
+    serial::serial_print_dec(pid as u64);
+    serial::serial_print(" exiting with code: ");
     serial::serial_print_hex(exit_code);
     serial::serial_print("\n");
     
@@ -642,6 +645,15 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
                     copy_len
                 );
                 user_buf.copy_from_slice(&msg.data[..copy_len]);
+                
+                // NUNCA pasar punteros kernel (0xffff8000...) a userspace - sanitizar
+                const KERNEL_BASE: u64 = 0xFFFF_8000_0000_0000;
+                for i in (0..copy_len.saturating_sub(7)).step_by(8) {
+                    let val = (user_buf.as_ptr().add(i) as *const u64).read_unaligned();
+                    if val >= KERNEL_BASE {
+                        (user_buf.as_mut_ptr().add(i) as *mut u64).write_unaligned(0);
+                    }
+                }
                 
                 // Si se proporcionó un puntero para el PID del remitente, escribirlo
                 if sender_pid_ptr != 0 {
@@ -1444,10 +1456,12 @@ fn sys_map_framebuffer() -> u64 {
     // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
     // Map 2x size to support double buffering in display_service
     let single_frame_size = (kernel_fb.pixels_per_scan_line * kernel_fb.height * 4) as u64;
-    let fb_size = single_frame_size * 2;
+    let mut fb_size = single_frame_size * 2;
     
     // Align to 4KB (page size)
-    let fb_size = (fb_size + 0xFFF) & !0xFFF;
+    fb_size = (fb_size + 0xFFF) & !0xFFF;
+    // Add 4MB padding for stride/alignment quirks (evita Page Fault al escribir en regiones adyacentes)
+    fb_size = fb_size.saturating_add(0x400000);
     
     serial::serial_print("MAP_FB: Framebuffer mapping request (Double Buffered)\n");
     serial::serial_print("  Phys addr: ");
@@ -1721,17 +1735,23 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         if is_file_backed {
             if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
                 // Try fmap first (e.g. /dev/fb0 framebuffer): map physical memory directly
-                if let Ok(phys_addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
-                    let vaddr = memory::map_framebuffer_for_process(page_table_phys, phys_addr as u64, aligned_length);
+                if let Ok(addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
+                    // NEVER pass kernel addresses to map_physical_range - convert to physical
+                    let phys_addr = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                        (addr as u64) - crate::memory::PHYS_MEM_OFFSET
+                    } else {
+                        addr as u64
+                    };
+                    memory::map_physical_range(page_table_phys, phys_addr, aligned_length, target_addr, pt_flags.bits());
                     let vma = VMARegion {
-                        start: vaddr,
-                        end: vaddr + aligned_length,
+                        start: target_addr,
+                        end: target_addr + aligned_length,
                         flags: flags,
                         file_backed: true,
                     };
                     proc.vmas.push(vma);
                     process::update_process(current_pid, proc);
-                    return vaddr;
+                    return target_addr;
                 }
                 // Fall back to read loop for regular files
                 // Save current offset
@@ -1779,27 +1799,18 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 return u64::MAX;
             }
         } else {
-            // Anonymous mapping...
+            // Anonymous mapping: use physical frame allocator, NOT kernel heap.
+            // alloc_dma_buffer uses heap and can collide with kernel stack (DANGER).
             for i in 0..num_pages {
                 let page_offset = i * 4096;
-                let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(4096, 4096) {
-                    Some(res) => res,
+                let frame_phys = match memory::alloc_phys_frame_for_anon_mmap() {
+                    Some(p) => p,
                     None => return u64::MAX,
                 };
-                unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                // Zero the frame via direct physical map (no heap)
+                let frame_virt = memory::phys_to_virt(frame_phys) as *mut u8;
+                unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
                 let vaddr = target_addr + page_offset;
-                
-                // DEBUG: Check for stack collision
-                let rsp: u64;
-                unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
-                if (frame_ptr as u64).abs_diff(rsp) < 0x2000 {
-                     crate::serial::serial_print("!!! DANGER: Allocator returned pointer near stack !!! Ptr: ");
-                     crate::serial::serial_print_hex(frame_ptr as u64);
-                     crate::serial::serial_print(" RSP: ");
-                     crate::serial::serial_print_hex(rsp);
-                     crate::serial::serial_print("\n");
-                }
-
                 memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
             }
         }

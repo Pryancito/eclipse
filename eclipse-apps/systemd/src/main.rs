@@ -22,7 +22,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive, send};
 
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
@@ -527,12 +527,30 @@ fn start_service(service: &mut Service, _service_idx: usize) {
 /// Main service manager loop
 fn main_loop() -> ! {
     let mut tick: u64 = 0;
-    
     let mut heartbeat_counter: u64 = 0;
     
     loop {
         tick += 1;
         
+        // Handle incoming IPC queries (e.g. GET_INPUT_PID from smithay_app)
+        {
+            let mut buf = [0u8; 32];
+            let (len, sender) = receive(&mut buf);
+            if len >= 13 && &buf[0..13] == b"GET_INPUT_PID" {
+                // Find input.service (index 3 in the services array)
+                let input_pid: i32 = unsafe {
+                    if SERVICE_COUNT > 3 {
+                        if let Some(ref svc) = SERVICES[3] { svc.pid } else { 0 }
+                    } else { 0 }
+                };
+                // Reply: b"INPT" + 4-byte LE PID
+                let mut reply = [0u8; 8];
+                reply[0..4].copy_from_slice(b"INPT");
+                reply[4..8].copy_from_slice(&(input_pid as u32).to_le_bytes());
+                let _ = send(sender, 0x40, &reply);
+            }
+        }
+
         // Every MONITOR_INTERVAL ticks, check service health
         if tick % MONITOR_INTERVAL == 0 {
             monitor_services();
