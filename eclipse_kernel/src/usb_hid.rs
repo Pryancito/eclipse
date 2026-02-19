@@ -756,11 +756,14 @@ pub fn init() {
         initialized_count, usb_controllers.len()
     ));
     
-    // TODO: Enumerar dispositivos HID conectados
+    // Fase 3: Framework de enumeración de dispositivos
+    enumerate_usb_devices_stub();
+    
+    // TODO: Implementar enumeración real de dispositivos USB
     // TODO: Identificar periféricos gaming y configurar polling rate alto
     // TODO: Configurar buffers DMA para transferencias de alta frecuencia
     
-    crate::serial::serial_print("[USB-HID] Fase 2 completada (enumeración de dispositivos pendiente)\n");
+    crate::serial::serial_print("\n[USB-HID] Fase 3 completada (implementación de driver pendiente)\n");
 }
 
 /// Detectar controladores USB vía PCI
@@ -904,4 +907,255 @@ fn init_uhci_controller(controller: &UsbController) -> UsbControllerState {
         controller.bus, controller.device, controller.function
     ));
     UsbControllerState::Uninitialized
+}
+
+//
+// ========== Phase 3: USB Device Enumeration Framework ==========
+//
+
+/// Tipos de descriptores USB estándar
+/// USB Specification 2.0, Chapter 9
+pub const USB_DESC_DEVICE: u8 = 0x01;
+pub const USB_DESC_CONFIGURATION: u8 = 0x02;
+pub const USB_DESC_STRING: u8 = 0x03;
+pub const USB_DESC_INTERFACE: u8 = 0x04;
+pub const USB_DESC_ENDPOINT: u8 = 0x05;
+pub const USB_DESC_HID: u8 = 0x21;
+pub const USB_DESC_HID_REPORT: u8 = 0x22;
+
+/// USB Device Descriptor
+/// USB Specification 2.0, Section 9.6.1
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct UsbDeviceDescriptor {
+    pub b_length: u8,              // 0x12 (18 bytes)
+    pub b_descriptor_type: u8,     // 0x01 (DEVICE)
+    pub bcd_usb: u16,              // USB Specification Release Number (BCD)
+    pub b_device_class: u8,        // Class code
+    pub b_device_sub_class: u8,    // Subclass code
+    pub b_device_protocol: u8,     // Protocol code
+    pub b_max_packet_size0: u8,    // Max packet size for endpoint 0
+    pub id_vendor: u16,            // Vendor ID
+    pub id_product: u16,           // Product ID
+    pub bcd_device: u16,           // Device release number (BCD)
+    pub i_manufacturer: u8,        // Index of manufacturer string
+    pub i_product: u8,             // Index of product string
+    pub i_serial_number: u8,       // Index of serial number string
+    pub b_num_configurations: u8,  // Number of configurations
+}
+
+/// USB Configuration Descriptor
+/// USB Specification 2.0, Section 9.6.3
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct UsbConfigurationDescriptor {
+    pub b_length: u8,              // 0x09 (9 bytes)
+    pub b_descriptor_type: u8,     // 0x02 (CONFIGURATION)
+    pub w_total_length: u16,       // Total length of data for this configuration
+    pub b_num_interfaces: u8,      // Number of interfaces
+    pub b_configuration_value: u8, // Configuration value
+    pub i_configuration: u8,       // Index of configuration string
+    pub bm_attributes: u8,         // Configuration characteristics
+    pub b_max_power: u8,           // Maximum power consumption (2mA units)
+}
+
+/// USB Interface Descriptor
+/// USB Specification 2.0, Section 9.6.5
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct UsbInterfaceDescriptor {
+    pub b_length: u8,              // 0x09 (9 bytes)
+    pub b_descriptor_type: u8,     // 0x04 (INTERFACE)
+    pub b_interface_number: u8,    // Interface number
+    pub b_alternate_setting: u8,   // Alternate setting
+    pub b_num_endpoints: u8,       // Number of endpoints (excluding EP0)
+    pub b_interface_class: u8,     // Class code
+    pub b_interface_sub_class: u8, // Subclass code
+    pub b_interface_protocol: u8,  // Protocol code
+    pub i_interface: u8,           // Index of interface string
+}
+
+/// USB Endpoint Descriptor
+/// USB Specification 2.0, Section 9.6.6
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct UsbEndpointDescriptor {
+    pub b_length: u8,              // 0x07 (7 bytes)
+    pub b_descriptor_type: u8,     // 0x05 (ENDPOINT)
+    pub b_endpoint_address: u8,    // Endpoint address (direction + number)
+    pub bm_attributes: u8,         // Endpoint attributes
+    pub w_max_packet_size: u16,    // Maximum packet size
+    pub b_interval: u8,            // Polling interval
+}
+
+// USB Interface Classes
+pub const USB_CLASS_HID: u8 = 0x03;        // Human Interface Device
+
+// HID Subclasses
+pub const HID_SUBCLASS_NONE: u8 = 0x00;    // No subclass
+pub const HID_SUBCLASS_BOOT: u8 = 0x01;    // Boot Interface Subclass
+
+// HID Protocols (for Boot Subclass)
+pub const HID_PROTOCOL_NONE: u8 = 0x00;    // None
+pub const HID_PROTOCOL_KEYBOARD: u8 = 0x01; // Keyboard
+pub const HID_PROTOCOL_MOUSE: u8 = 0x02;   // Mouse
+
+/// HID Descriptor
+/// HID Specification 1.11, Section 6.2.1
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct HidDescriptor {
+    pub b_length: u8,              // Descriptor length
+    pub b_descriptor_type: u8,     // 0x21 (HID)
+    pub bcd_hid: u16,              // HID Class Specification release
+    pub b_country_code: u8,        // Country code
+    pub b_num_descriptors: u8,     // Number of class descriptors
+    pub b_descriptor_type2: u8,    // Type of class descriptor (0x22 = Report)
+    pub w_descriptor_length: u16,  // Total length of Report descriptor
+}
+
+// HID Request Types
+pub const HID_REQUEST_GET_REPORT: u8 = 0x01;
+pub const HID_REQUEST_GET_IDLE: u8 = 0x02;
+pub const HID_REQUEST_GET_PROTOCOL: u8 = 0x03;
+pub const HID_REQUEST_SET_REPORT: u8 = 0x09;
+pub const HID_REQUEST_SET_IDLE: u8 = 0x0A;
+pub const HID_REQUEST_SET_PROTOCOL: u8 = 0x0B;
+
+// HID Report Types
+pub const HID_REPORT_INPUT: u8 = 0x01;
+pub const HID_REPORT_OUTPUT: u8 = 0x02;
+pub const HID_REPORT_FEATURE: u8 = 0x03;
+
+/// Estado de dispositivo USB
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsbDeviceState {
+    Attached,       // Dispositivo físicamente conectado
+    Powered,        // Dispositivo recibiendo energía
+    Default,        // Dispositivo en estado por defecto (después de reset)
+    Addressed,      // Dispositivo con dirección asignada
+    Configured,     // Dispositivo configurado y listo
+    Suspended,      // Dispositivo suspendido
+}
+
+/// Tipo de dispositivo HID detectado
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HidDeviceType {
+    Keyboard,
+    Mouse,
+    Gamepad,
+    Other,
+}
+
+/// Información de dispositivo USB enumerado
+#[derive(Debug, Clone, Copy)]
+pub struct UsbDevice {
+    pub address: u8,                    // Dirección USB asignada (1-127)
+    pub port: u8,                       // Puerto del hub donde está conectado
+    pub state: UsbDeviceState,          // Estado actual del dispositivo
+    pub vendor_id: u16,                 // Vendor ID (del descriptor)
+    pub product_id: u16,                // Product ID (del descriptor)
+    pub device_class: u8,               // Clase del dispositivo
+    pub max_packet_size: u8,            // Tamaño máximo de paquete EP0
+    pub is_hid: bool,                   // Es un dispositivo HID
+    pub hid_type: Option<HidDeviceType>, // Tipo de HID si aplica
+    pub is_gaming: bool,                // Es un periférico gaming
+}
+
+impl UsbDevice {
+    /// Crear un dispositivo USB sin inicializar
+    pub const fn new() -> Self {
+        Self {
+            address: 0,
+            port: 0,
+            state: UsbDeviceState::Attached,
+            vendor_id: 0,
+            product_id: 0,
+            device_class: 0,
+            max_packet_size: 8,
+            is_hid: false,
+            hid_type: None,
+            is_gaming: false,
+        }
+    }
+}
+
+/// Identificar si un dispositivo es HID basado en interface descriptor
+fn is_hid_device(interface_desc: &UsbInterfaceDescriptor) -> bool {
+    interface_desc.b_interface_class == USB_CLASS_HID
+}
+
+/// Determinar tipo de dispositivo HID basado en protocolo boot
+fn get_hid_device_type(interface_desc: &UsbInterfaceDescriptor) -> HidDeviceType {
+    if interface_desc.b_interface_class != USB_CLASS_HID {
+        return HidDeviceType::Other;
+    }
+    
+    // Boot Interface Subclass con protocolo específico
+    if interface_desc.b_interface_sub_class == HID_SUBCLASS_BOOT {
+        match interface_desc.b_interface_protocol {
+            HID_PROTOCOL_KEYBOARD => HidDeviceType::Keyboard,
+            HID_PROTOCOL_MOUSE => HidDeviceType::Mouse,
+            _ => HidDeviceType::Other,
+        }
+    } else {
+        // Sin boot protocol, podría ser gamepad u otro
+        HidDeviceType::Other
+    }
+}
+
+/// Identificar si un dispositivo HID es un periférico gaming
+/// Usa la base de datos de gaming devices implementada en Phase 1
+fn is_gaming_peripheral(vendor_id: u16, product_id: u16) -> bool {
+    // Reutilizar la función existente de Phase 1
+    is_gaming_device(vendor_id, product_id)
+}
+
+/// Framework de enumeración de dispositivos USB
+/// 
+/// Esta función stub documenta el proceso de enumeración:
+/// 1. Detectar nueva conexión de dispositivo
+/// 2. Reset del puerto
+/// 3. Leer Device Descriptor (primeros 8 bytes)
+/// 4. Asignar dirección única
+/// 5. Leer Device Descriptor completo
+/// 6. Leer Configuration Descriptor
+/// 7. Leer Interface Descriptors
+/// 8. Identificar clase HID y tipo (keyboard/mouse)
+/// 9. Configurar dispositivo
+/// 10. Para HID: leer HID Descriptor y Report Descriptor
+/// 11. Para gaming: aplicar configuraciones específicas
+fn enumerate_usb_devices_stub() {
+    crate::serial::serial_print("\n[USB-HID] === Fase 3: Framework de Enumeración ===\n");
+    crate::serial::serial_print("[USB-HID] Proceso de enumeración USB:\n");
+    crate::serial::serial_print("[USB-HID]   1. Detectar conexión de dispositivo (port status change)\n");
+    crate::serial::serial_print("[USB-HID]   2. Reset del puerto USB\n");
+    crate::serial::serial_print("[USB-HID]   3. Leer Device Descriptor (primeros 8 bytes para max_packet_size)\n");
+    crate::serial::serial_print("[USB-HID]   4. Asignar dirección USB única (1-127)\n");
+    crate::serial::serial_print("[USB-HID]   5. SET_ADDRESS al dispositivo\n");
+    crate::serial::serial_print("[USB-HID]   6. Leer Device Descriptor completo\n");
+    crate::serial::serial_print("[USB-HID]   7. Leer Configuration Descriptor\n");
+    crate::serial::serial_print("[USB-HID]   8. Leer Interface Descriptors\n");
+    crate::serial::serial_print("[USB-HID]   9. Identificar clase HID (0x03)\n");
+    crate::serial::serial_print("[USB-HID]   10. Determinar tipo: Keyboard (0x01) o Mouse (0x02)\n");
+    crate::serial::serial_print("[USB-HID]   11. SET_CONFIGURATION\n");
+    crate::serial::serial_print("[USB-HID]   12. Para HID: Leer HID Descriptor y Report Descriptor\n");
+    crate::serial::serial_print("[USB-HID]   13. Para gaming: Detectar vendor/product en database\n");
+    crate::serial::serial_print("[USB-HID]   14. Configurar polling rate (1000Hz para gaming)\n");
+    crate::serial::serial_print("[USB-HID]   15. Iniciar transferencias interrupt para reportes\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Estructuras de datos listas:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbDeviceDescriptor\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbConfigurationDescriptor\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbInterfaceDescriptor\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbEndpointDescriptor\n");
+    crate::serial::serial_print("[USB-HID]   ✓ HidDescriptor\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbDevice (tracking)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Gaming device database (67 modelos)\n");
+    
+    crate::serial::serial_print("\n[USB-HID] NOTA: Enumeración real requiere:\n");
+    crate::serial::serial_print("[USB-HID]   - Controlador XHCI/EHCI funcional\n");
+    crate::serial::serial_print("[USB-HID]   - Implementación de USB protocol transactions\n");
+    crate::serial::serial_print("[USB-HID]   - Manejo de interrupciones USB\n");
+    crate::serial::serial_print("[USB-HID]   - Buffers DMA para transferencias\n");
 }
