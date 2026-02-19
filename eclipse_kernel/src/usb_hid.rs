@@ -557,9 +557,118 @@ fn get_roccat_keyboard_caps(product_id: u16) -> GamingDeviceCapabilities {
     }
 }
 
-/// Inicializar soporte USB HID gaming (stub).
+/// Información de controlador USB detectado
+#[derive(Debug, Clone, Copy)]
+pub struct UsbController {
+    pub controller_type: UsbControllerType,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub bar0: u32,
+    pub interrupt_line: u8,
+}
+
+/// Tipos de controladores USB
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsbControllerType {
+    UHCI,  // USB 1.1
+    OHCI,  // USB 1.1 (alternativo)
+    EHCI,  // USB 2.0
+    XHCI,  // USB 3.0+
+}
+
+impl UsbControllerType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UsbControllerType::UHCI => "UHCI (USB 1.1)",
+            UsbControllerType::OHCI => "OHCI (USB 1.1)",
+            UsbControllerType::EHCI => "EHCI (USB 2.0)",
+            UsbControllerType::XHCI => "XHCI (USB 3.0+)",
+        }
+    }
+}
+
+/// Inicializar soporte USB HID.
+/// Detecta controladores USB vía PCI y prepara estructuras para futura inicialización.
 pub fn init() {
-    // TODO: detectar controladores USB vía PCI, init EHCI/XHCI, enumerar dispositivos HID
-    // TODO: identificar periféricos gaming y configurar polling rate alto
-    // TODO: configurar buffers DMA para transferencias de alta frecuencia
+    crate::serial::serial_print("[USB-HID] Inicializando soporte USB HID...\n");
+    
+    // Detectar controladores USB vía PCI
+    let usb_controllers = detect_usb_controllers();
+    
+    if usb_controllers.is_empty() {
+        crate::serial::serial_print("[USB-HID] No se encontraron controladores USB\n");
+        return;
+    }
+    
+    crate::serial::serial_print("[USB-HID] Controladores USB detectados:\n");
+    for controller in &usb_controllers {
+        crate::serial::serial_print(&alloc::format!(
+            "[USB-HID]   {} en {:02X}:{:02X}.{} (Vendor: 0x{:04X}, Device: 0x{:04X})\n",
+            controller.controller_type.as_str(),
+            controller.bus,
+            controller.device,
+            controller.function,
+            controller.vendor_id,
+            controller.device_id
+        ));
+        crate::serial::serial_print(&alloc::format!(
+            "[USB-HID]     BAR0: 0x{:08X}, IRQ: {}\n",
+            controller.bar0,
+            controller.interrupt_line
+        ));
+    }
+    
+    // Contar por tipo
+    let xhci_count = usb_controllers.iter().filter(|c| c.controller_type == UsbControllerType::XHCI).count();
+    let ehci_count = usb_controllers.iter().filter(|c| c.controller_type == UsbControllerType::EHCI).count();
+    let ohci_count = usb_controllers.iter().filter(|c| c.controller_type == UsbControllerType::OHCI).count();
+    let uhci_count = usb_controllers.iter().filter(|c| c.controller_type == UsbControllerType::UHCI).count();
+    
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] Total: {} controladores (XHCI: {}, EHCI: {}, OHCI: {}, UHCI: {})\n",
+        usb_controllers.len(), xhci_count, ehci_count, ohci_count, uhci_count
+    ));
+    
+    // TODO: Inicializar controladores XHCI/EHCI
+    // TODO: Enumerar dispositivos HID conectados
+    // TODO: Identificar periféricos gaming y configurar polling rate alto
+    // TODO: Configurar buffers DMA para transferencias de alta frecuencia
+    
+    crate::serial::serial_print("[USB-HID] Detección completada (inicialización pendiente)\n");
+}
+
+/// Detectar controladores USB vía PCI
+fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
+    let mut controllers = alloc::vec::Vec::new();
+    
+    // Buscar todos los controladores USB
+    let pci_devices = crate::pci::find_usb_controllers();
+    
+    for pci_dev in pci_devices {
+        let controller_type = match pci_dev.subclass {
+            0x00 => UsbControllerType::UHCI,
+            0x10 => UsbControllerType::OHCI,
+            0x20 => UsbControllerType::EHCI,
+            0x30 => UsbControllerType::XHCI,
+            _ => continue,
+        };
+        
+        let controller = UsbController {
+            controller_type,
+            bus: pci_dev.bus,
+            device: pci_dev.device,
+            function: pci_dev.function,
+            vendor_id: pci_dev.vendor_id,
+            device_id: pci_dev.device_id,
+            bar0: pci_dev.bar0,
+            interrupt_line: pci_dev.interrupt_line,
+        };
+        
+        controllers.push(controller);
+    }
+    
+    controllers
 }
