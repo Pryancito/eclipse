@@ -762,11 +762,13 @@ pub fn init() {
     // Stage 2: Control Transfer Infrastructure
     init_control_transfer_infrastructure();
     
-    // TODO: Implementar enumeración real de dispositivos USB
-    // TODO: Identificar periféricos gaming y configurar polling rate alto
-    // TODO: Configurar buffers DMA para transferencias de alta frecuencia
+    // Stage 3: XHCI Driver Core
+    init_xhci_driver_core();
     
-    crate::serial::serial_print("\n[USB-HID] Todas las fases completadas (implementación de driver pendiente)\n");
+    // TODO: Stage 4 - Interrupt handling and event processing
+    // TODO: Stage 5 - HID integration and input event generation
+    
+    crate::serial::serial_print("\n[USB-HID] Todas las fases y stages completados (MMIO integration pendiente)\n");
 }
 
 /// Detectar controladores USB vía PCI
@@ -1842,4 +1844,584 @@ pub fn init_control_transfer_infrastructure() {
     crate::serial::serial_print("[USB-HID]   - TRB submission y completion\n");
     crate::serial::serial_print("[USB-HID]   - Event ring polling\n");
     crate::serial::serial_print("[USB-HID]   - Doorbell register access\n");
+}
+
+// ============================================================================
+// Stage 3: XHCI Driver Core
+// ============================================================================
+
+/// XHCI Command Ring - Circular buffer for command TRBs
+/// Used to submit commands to the controller (Address Device, Configure Endpoint, etc.)
+pub struct CommandRing {
+    ring: TrbRing,
+    command_ring_control: u64, // Physical address + RCS for CRCR register
+}
+
+impl CommandRing {
+    /// Create a new command ring with specified capacity
+    pub fn new(capacity: usize) -> Self {
+        let ring = TrbRing::new(capacity);
+        let command_ring_control = 0; // TODO: Set physical address of ring
+        
+        CommandRing {
+            ring,
+            command_ring_control,
+        }
+    }
+    
+    /// Submit a command TRB to the ring
+    pub fn submit_command(&mut self, trb: Trb) -> Result<(), &'static str> {
+        if self.ring.is_full() {
+            return Err("Command ring is full");
+        }
+        
+        self.ring.enqueue(trb)?;
+        
+        // TODO: Ring doorbell 0 to notify controller
+        crate::serial::serial_print("[XHCI] Command TRB submitted\n");
+        
+        Ok(())
+    }
+    
+    /// Get the command ring control register value (for CRCR)
+    pub fn get_crcr(&self) -> u64 {
+        self.command_ring_control
+    }
+}
+
+/// XHCI Transfer Ring - Circular buffer for transfer TRBs  
+/// One ring per device endpoint for data transfers
+pub struct TransferRing {
+    ring: TrbRing,
+    endpoint_address: u8,  // Device endpoint this ring is for
+    device_slot: u8,       // Device slot ID (1-255)
+}
+
+impl TransferRing {
+    /// Create a new transfer ring for an endpoint
+    pub fn new(capacity: usize, device_slot: u8, endpoint_address: u8) -> Self {
+        let ring = TrbRing::new(capacity);
+        
+        TransferRing {
+            ring,
+            endpoint_address,
+            device_slot,
+        }
+    }
+    
+    /// Submit a transfer TRB to the ring
+    pub fn submit_transfer(&mut self, trb: Trb) -> Result<(), &'static str> {
+        if self.ring.is_full() {
+            return Err("Transfer ring is full");
+        }
+        
+        self.ring.enqueue(trb)?;
+        
+        // TODO: Ring doorbell for device slot
+        crate::serial::serial_print("[XHCI] Transfer TRB submitted\n");
+        
+        Ok(())
+    }
+    
+    /// Get physical address of ring (for endpoint context)
+    pub fn get_ring_address(&self) -> u64 {
+        // TODO: Return physical address of ring buffer
+        0
+    }
+}
+
+/// XHCI Event Ring - Circular buffer for event TRBs from controller
+/// Controller writes completion events here
+pub struct EventRing {
+    ring: TrbRing,
+    event_ring_segment_table: u64, // Physical address of ERST
+    event_ring_dequeue_pointer: u64, // ERDP register value
+}
+
+impl EventRing {
+    /// Create a new event ring with specified capacity
+    pub fn new(capacity: usize) -> Self {
+        let ring = TrbRing::new(capacity);
+        
+        EventRing {
+            ring,
+            event_ring_segment_table: 0,
+            event_ring_dequeue_pointer: 0,
+        }
+    }
+    
+    /// Process next event TRB from the ring
+    pub fn process_next_event(&mut self) -> Option<Trb> {
+        match self.ring.dequeue() {
+            Ok(trb) => {
+                // TODO: Update ERDP register
+                Some(trb)
+            }
+            Err(_) => None,
+        }
+    }
+    
+    /// Check if there are pending events
+    pub fn has_pending_events(&self) -> bool {
+        !self.ring.is_empty()
+    }
+    
+    /// Get ERST base address (for runtime register)
+    pub fn get_erst_base(&self) -> u64 {
+        self.event_ring_segment_table
+    }
+    
+    /// Get current ERDP value (for runtime register)
+    pub fn get_erdp(&self) -> u64 {
+        self.event_ring_dequeue_pointer
+    }
+}
+
+/// XHCI Slot Context - Device addressing and routing information
+/// Part of Device Context structure (Section 6.2.2)
+#[repr(C)]
+pub struct SlotContext {
+    pub route_string: u32,        // Route string bits 0-19, speed bits 20-23, etc.
+    pub port_info: u32,           // Root hub port, number of ports, context entries
+    pub tt_info: u32,             // TT hub slot ID, TT port number, TT think time
+    pub device_state: u32,        // Slot state, device address, reserved
+    pub reserved: [u32; 4],       // Reserved for future use
+}
+
+impl SlotContext {
+    /// Create a new slot context for a device
+    pub fn new() -> Self {
+        SlotContext {
+            route_string: 0,
+            port_info: 0,
+            tt_info: 0,
+            device_state: 0,
+            reserved: [0; 4],
+        }
+    }
+    
+    /// Set device address in slot context
+    pub fn set_device_address(&mut self, address: u8) {
+        // Device address is in bits 0-7 of device_state
+        self.device_state = (self.device_state & !0xFF) | (address as u32);
+    }
+    
+    /// Get device address from slot context
+    pub fn get_device_address(&self) -> u8 {
+        (self.device_state & 0xFF) as u8
+    }
+}
+
+/// XHCI Endpoint Context - Endpoint state and transfer ring info
+/// Part of Device Context structure (Section 6.2.3)
+#[repr(C)]
+pub struct EndpointContext {
+    pub ep_state: u32,            // Endpoint state, mult, max streams, etc.
+    pub ep_info: u32,             // Interval, error count, endpoint type, etc.
+    pub tr_dequeue_pointer: u64,  // Transfer Ring Dequeue Pointer (physical)
+    pub transfer_info: u32,       // Average TRB length, max ESIT payload
+    pub reserved: [u32; 3],       // Reserved for future use
+}
+
+impl EndpointContext {
+    /// Create a new endpoint context
+    pub fn new() -> Self {
+        EndpointContext {
+            ep_state: 0,
+            ep_info: 0,
+            tr_dequeue_pointer: 0,
+            transfer_info: 0,
+            reserved: [0; 3],
+        }
+    }
+    
+    /// Set transfer ring dequeue pointer
+    pub fn set_tr_dequeue_pointer(&mut self, address: u64, dcs: bool) {
+        // DCS (Dequeue Cycle State) is bit 0
+        self.tr_dequeue_pointer = address | (dcs as u64);
+    }
+    
+    /// Set endpoint type (Control, Isoch, Bulk, Interrupt)
+    pub fn set_endpoint_type(&mut self, ep_type: u8) {
+        // Endpoint type is in bits 3-5 of ep_info
+        self.ep_info = (self.ep_info & !(0x7 << 3)) | ((ep_type as u32) << 3);
+    }
+}
+
+/// Endpoint type constants for EndpointContext
+pub const EP_TYPE_CONTROL: u8 = 4;
+pub const EP_TYPE_ISOCH_OUT: u8 = 1;
+pub const EP_TYPE_BULK_OUT: u8 = 2;
+pub const EP_TYPE_INTERRUPT_OUT: u8 = 3;
+pub const EP_TYPE_ISOCH_IN: u8 = 5;
+pub const EP_TYPE_BULK_IN: u8 = 6;
+pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
+
+/// XHCI Device Context - Contains slot context and endpoint contexts
+/// Section 6.2.1 of XHCI specification
+#[repr(C, align(64))]
+pub struct DeviceContext {
+    pub slot_context: SlotContext,
+    pub endpoint_contexts: [EndpointContext; 31], // EP 0-30
+}
+
+impl DeviceContext {
+    /// Create a new device context
+    pub fn new() -> Self {
+        DeviceContext {
+            slot_context: SlotContext::new(),
+            endpoint_contexts: [EndpointContext::new(); 31],
+        }
+    }
+}
+
+/// XHCI Input Control Context - Specifies which contexts to modify
+/// Section 6.2.5.1
+#[repr(C)]
+pub struct InputControlContext {
+    pub drop_context_flags: u32,   // Bits indicate contexts to drop
+    pub add_context_flags: u32,    // Bits indicate contexts to add/modify
+    pub reserved: [u32; 5],        // Reserved
+    pub configuration_value: u8,   // Configuration value
+    pub interface_number: u8,      // Interface number
+    pub alternate_setting: u8,     // Alternate setting
+    pub reserved2: u8,
+}
+
+impl InputControlContext {
+    /// Create a new input control context
+    pub fn new() -> Self {
+        InputControlContext {
+            drop_context_flags: 0,
+            add_context_flags: 0,
+            reserved: [0; 5],
+            configuration_value: 0,
+            interface_number: 0,
+            alternate_setting: 0,
+            reserved2: 0,
+        }
+    }
+    
+    /// Add a context (slot or endpoint) to be configured
+    pub fn add_context(&mut self, context_index: u8) {
+        self.add_context_flags |= 1 << context_index;
+    }
+    
+    /// Drop a context (remove endpoint)
+    pub fn drop_context(&mut self, context_index: u8) {
+        self.drop_context_flags |= 1 << context_index;
+    }
+}
+
+/// XHCI Input Context - Used for Address Device and Configure Endpoint commands
+/// Section 6.2.5
+#[repr(C, align(64))]
+pub struct InputContext {
+    pub input_control_context: InputControlContext,
+    pub device_context: DeviceContext,
+}
+
+impl InputContext {
+    /// Create a new input context
+    pub fn new() -> Self {
+        InputContext {
+            input_control_context: InputControlContext::new(),
+            device_context: DeviceContext::new(),
+        }
+    }
+}
+
+/// TRB Builder - Helper functions to create specific TRB types
+
+/// Create a Link TRB to chain ring segments
+pub fn build_link_trb(next_segment: u64, toggle_cycle: bool) -> Trb {
+    let mut control = (TRB_TYPE_LINK << 10) as u32;
+    if toggle_cycle {
+        control |= 0x2; // Toggle Cycle bit
+    }
+    
+    Trb {
+        parameter: next_segment,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a No Op Command TRB (for testing)
+pub fn build_noop_command_trb() -> Trb {
+    Trb {
+        parameter: 0,
+        status: 0,
+        control: (TRB_TYPE_NOOP_COMMAND << 10) as u32,
+    }
+}
+
+/// Create an Enable Slot Command TRB
+pub fn build_enable_slot_trb(slot_type: u8) -> Trb {
+    let control = ((TRB_TYPE_ENABLE_SLOT << 10) | ((slot_type as u32) << 16)) as u32;
+    
+    Trb {
+        parameter: 0,
+        status: 0,
+        control,
+    }
+}
+
+/// Create an Address Device Command TRB
+pub fn build_address_device_trb(input_context_ptr: u64, slot_id: u8, bsr: bool) -> Trb {
+    let mut control = ((TRB_TYPE_ADDRESS_DEVICE << 10) | ((slot_id as u32) << 24)) as u32;
+    if bsr {
+        control |= 0x200; // Block Set Address Request
+    }
+    
+    Trb {
+        parameter: input_context_ptr,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a Configure Endpoint Command TRB
+pub fn build_configure_endpoint_trb(input_context_ptr: u64, slot_id: u8) -> Trb {
+    let control = ((TRB_TYPE_CONFIGURE_ENDPOINT << 10) | ((slot_id as u32) << 24)) as u32;
+    
+    Trb {
+        parameter: input_context_ptr,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a Setup Stage TRB (for control transfers)
+pub fn build_setup_stage_trb(setup_packet: &UsbSetupPacket) -> Trb {
+    // Setup packet goes in parameter field (8 bytes)
+    let param_low = setup_packet.bm_request_type as u64
+        | ((setup_packet.b_request as u64) << 8)
+        | ((setup_packet.w_value as u64) << 16)
+        | ((setup_packet.w_index as u64) << 32)
+        | ((setup_packet.w_length as u64) << 48);
+    
+    let control = ((TRB_TYPE_SETUP << 10) | (8 << 17)) as u32; // 8 bytes
+    
+    Trb {
+        parameter: param_low,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a Data Stage TRB (for control transfers)
+pub fn build_data_stage_trb(data_buffer: u64, length: u16, direction_in: bool) -> Trb {
+    let mut control = ((TRB_TYPE_DATA << 10) | ((length as u32) << 17)) as u32;
+    if direction_in {
+        control |= 0x10000; // DIR bit for IN transfers
+    }
+    
+    Trb {
+        parameter: data_buffer,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a Status Stage TRB (for control transfers)
+pub fn build_status_stage_trb(direction_in: bool) -> Trb {
+    let mut control = (TRB_TYPE_STATUS << 10) as u32;
+    if direction_in {
+        control |= 0x10000; // DIR bit (opposite of data stage)
+    }
+    
+    Trb {
+        parameter: 0,
+        status: 0,
+        control,
+    }
+}
+
+/// Create a Normal TRB (for bulk/interrupt transfers)
+pub fn build_normal_trb(data_buffer: u64, length: u16, ioc: bool) -> Trb {
+    let mut control = ((TRB_TYPE_NORMAL << 10) | ((length as u32) << 17)) as u32;
+    if ioc {
+        control |= 0x20; // Interrupt On Completion
+    }
+    
+    Trb {
+        parameter: data_buffer,
+        status: 0,
+        control,
+    }
+}
+
+// Additional TRB type constants for Stage 3
+pub const TRB_TYPE_ENABLE_SLOT: u8 = 9;
+pub const TRB_TYPE_ADDRESS_DEVICE: u8 = 11;
+pub const TRB_TYPE_CONFIGURE_ENDPOINT: u8 = 12;
+pub const TRB_TYPE_NOOP_COMMAND: u8 = 23;
+
+/// XHCI Doorbell Register structure
+#[repr(C)]
+pub struct DoorbellRegister {
+    value: u32,
+}
+
+impl DoorbellRegister {
+    /// Ring a doorbell for a device slot and endpoint
+    pub fn ring(&mut self, target: u8, stream_id: u16) {
+        // Target is bits 0-7, Stream ID is bits 16-31
+        self.value = (target as u32) | ((stream_id as u32) << 16);
+        
+        // TODO: Write to actual MMIO doorbell register
+        crate::serial::serial_print("[XHCI] Doorbell rung: target=");
+        crate::serial::serial_print_u64(target as u64);
+        crate::serial::serial_print(" stream=");
+        crate::serial::serial_print_u64(stream_id as u64);
+        crate::serial::serial_print("\n");
+    }
+}
+
+/// XHCI Controller State - Tracks controller operational state
+pub struct XhciControllerState {
+    pub command_ring: Option<CommandRing>,
+    pub event_rings: Vec<EventRing>,
+    pub device_contexts: Vec<Option<DeviceContext>>, // Index by slot ID
+    pub mmio_base: u64,
+    pub operational_base: u64,
+    pub runtime_base: u64,
+    pub doorbell_base: u64,
+    pub max_slots: u8,
+    pub max_ports: u8,
+}
+
+impl XhciControllerState {
+    /// Create a new XHCI controller state
+    pub fn new(mmio_base: u64) -> Self {
+        XhciControllerState {
+            command_ring: None,
+            event_rings: Vec::new(),
+            device_contexts: Vec::new(),
+            mmio_base,
+            operational_base: 0,
+            runtime_base: 0,
+            doorbell_base: 0,
+            max_slots: 0,
+            max_ports: 0,
+        }
+    }
+    
+    /// Initialize controller rings and structures
+    pub fn initialize(&mut self) -> Result<(), &'static str> {
+        crate::serial::serial_print("[XHCI] Initializing controller rings...\n");
+        
+        // Create command ring (64 TRBs)
+        let command_ring = CommandRing::new(64);
+        self.command_ring = Some(command_ring);
+        
+        // Create event ring for interrupter 0 (256 TRBs)
+        let event_ring = EventRing::new(256);
+        self.event_rings.push(event_ring);
+        
+        // Allocate device context array
+        for _ in 0..256 {
+            self.device_contexts.push(None);
+        }
+        
+        crate::serial::serial_print("[XHCI] Controller rings initialized\n");
+        Ok(())
+    }
+    
+    /// Start the XHCI controller
+    pub fn start_controller(&mut self) -> Result<(), &'static str> {
+        crate::serial::serial_print("[XHCI] Starting controller...\n");
+        
+        // TODO: Actual XHCI start sequence:
+        // 1. Wait for CNR (Controller Not Ready) = 0
+        // 2. Program max slots enabled
+        // 3. Program DCBAAP (Device Context Base Address Array Pointer)
+        // 4. Program command ring pointer (CRCR)
+        // 5. Program event ring (ERSTSZ, ERSTBA, ERDP)
+        // 6. Enable interrupts
+        // 7. Set Run/Stop bit in USBCMD
+        
+        crate::serial::serial_print("[XHCI] Controller start stub completed\n");
+        Ok(())
+    }
+    
+    /// Submit a command TRB to the command ring
+    pub fn submit_command(&mut self, trb: Trb) -> Result<(), &'static str> {
+        if let Some(ref mut cmd_ring) = self.command_ring {
+            cmd_ring.submit_command(trb)?;
+            
+            // TODO: Ring doorbell 0 (host controller doorbell)
+            
+            Ok(())
+        } else {
+            Err("Command ring not initialized")
+        }
+    }
+    
+    /// Process pending events from event ring
+    pub fn process_events(&mut self) {
+        if self.event_rings.is_empty() {
+            return;
+        }
+        
+        let event_ring = &mut self.event_rings[0];
+        while let Some(event_trb) = event_ring.process_next_event() {
+            let trb_type = event_trb.get_trb_type();
+            
+            crate::serial::serial_print("[XHCI] Event TRB type: ");
+            crate::serial::serial_print_u64(trb_type as u64);
+            crate::serial::serial_print("\n");
+            
+            // TODO: Process different event types:
+            // - Command Completion (type 33)
+            // - Transfer Event (type 32)
+            // - Port Status Change (type 34)
+            // - Bandwidth Request (type 35)
+            // - Doorbell Event (type 36)
+            // - Host Controller Event (type 37)
+        }
+    }
+}
+
+/// Initialize Stage 3 XHCI driver core infrastructure
+pub fn init_xhci_driver_core() {
+    crate::serial::serial_print("\n[USB-HID] === Stage 3: XHCI Driver Core ===\n");
+    
+    crate::serial::serial_print("[USB-HID] XHCI Ring Structures:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ CommandRing (command submission)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ TransferRing (data transfers per endpoint)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ EventRing (completion events)\n");
+    
+    crate::serial::serial_print("[USB-HID] XHCI Context Structures:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ SlotContext (device addressing)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ EndpointContext (endpoint state)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ DeviceContext (slot + 31 endpoints)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ InputContext (for commands)\n");
+    
+    crate::serial::serial_print("[USB-HID] TRB Builders:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_enable_slot_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_address_device_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_configure_endpoint_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_setup_stage_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_data_stage_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_status_stage_trb()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ build_normal_trb()\n");
+    
+    crate::serial::serial_print("[USB-HID] Controller Operations:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ XhciControllerState (state tracking)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ initialize() (rings and structures)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ start_controller() (start sequence stub)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ submit_command() (command submission)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ process_events() (event processing)\n");
+    
+    crate::serial::serial_print("[USB-HID] Doorbell Operations:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ DoorbellRegister::ring()\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Stage 3 framework complete\n");
+    crate::serial::serial_print("[USB-HID] NOTA: Requiere integración MMIO:\n");
+    crate::serial::serial_print("[USB-HID]   - Mapear registros XHCI a memoria virtual\n");
+    crate::serial::serial_print("[USB-HID]   - Escribir/leer registros capability/operational/runtime\n");
+    crate::serial::serial_print("[USB-HID]   - Configurar interrupts MSI/MSI-X\n");
+    crate::serial::serial_print("[USB-HID]   - Allocar DMA buffers físicos\n");
 }
