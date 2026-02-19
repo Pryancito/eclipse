@@ -478,3 +478,41 @@ pub fn find_ac97() -> Option<PciDevice> {
         .find(|dev| dev.is_ac97())
         .copied()
 }
+
+/// Find all USB controllers
+pub fn find_usb_controllers() -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .filter(|dev| dev.is_usb_controller())
+        .copied()
+        .collect()
+}
+
+/// Find USB controllers by type
+pub fn find_usb_by_type(subclass: u8) -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .filter(|dev| dev.is_usb_controller() && dev.subclass == subclass)
+        .copied()
+        .collect()
+}
+
+/// Find XHCI (USB 3.0+) controllers
+pub fn find_xhci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_usb_by_type(PCI_SUBCLASS_USB_XHCI)
+}
+
+/// Find EHCI (USB 2.0) controllers
+pub fn find_ehci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_usb_by_type(PCI_SUBCLASS_USB_EHCI)
+}
+
+/// Find OHCI (USB 1.1) controllers
+pub fn find_ohci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_usb_by_type(PCI_SUBCLASS_USB_OHCI)
+}
+
+/// Find UHCI (USB 1.1) controllers
+pub fn find_uhci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_usb_by_type(PCI_SUBCLASS_USB_UHCI)
+}

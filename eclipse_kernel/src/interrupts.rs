@@ -101,6 +101,12 @@ struct IdtDescriptor {
 /// IDT estática del kernel
 static mut KERNEL_IDT: Idt = Idt::new();
 
+/// IRQ handler function type
+type IrqHandler = fn();
+
+/// IRQ handler table for IRQs 0-15 (interrupts 32-47)
+static mut IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
+
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
 const IDT_RING_0: u8 = 0b00000000;
@@ -742,40 +748,20 @@ extern "C" fn mouse_handler() {
         let mut packed: u32 = 0;
         let mut do_push = false;
 
+        // Acumular el byte recibido
+        pkt[*idx] = b;
+        *idx += 1;
+        
+        // Al completar 3 bytes, empujar inmediatamente (ratón estándar 3-byte)
         if *idx == 3 {
-            // Tenemos 3 bytes. El nuevo byte b es: byte 4 (scroll) o byte 0 del siguiente (ratón 3-byte)
-            if (b & 0x08) != 0 {
-                // Es byte 0 del siguiente paquete → paquete actual era 3-byte
-                let buttons = pkt[0] & 0x07;
-                let dx = pkt[1] as i8 as i16;
-                let dy = pkt[2] as i8 as i16;
-                packed = (buttons as u32)
-                    | ((dx as i8 as u8 as u32) << 8)
-                    | ((dy as i8 as u8 as u32) << 16);
-                do_push = true;
-                pkt[0] = b;
-                *idx = 1;
-            } else {
-                // Byte 4 (scroll)
-                pkt[3] = b;
-                let buttons = pkt[0] & 0x07;
-                let dx = pkt[1] as i8 as i16;
-                let dy = pkt[2] as i8 as i16;
-                let dz = pkt[3] as i8;
-                packed = (buttons as u32)
-                    | ((dx as i8 as u8 as u32) << 8)
-                    | ((dy as i8 as u8 as u32) << 16)
-                    | ((dz as u8 as u32) << 24);
-                do_push = true;
-                *idx = 0;
-            }
-        } else {
-            pkt[*idx] = b;
-            *idx += 1;
-            if *idx >= 3 {
-                // Solo 3 bytes hasta ahora; esperamos el próximo para decidir 3 vs 4 byte
-                // (no hacemos push aún, será en el próximo IRQ cuando idx==3)
-            }
+            let buttons = pkt[0] & 0x07;
+            let dx = pkt[1] as i8 as i16;
+            let dy = pkt[2] as i8 as i16;
+            packed = (buttons as u32)
+                | ((dx as i8 as u8 as u32) << 8)
+                | ((dy as i8 as u8 as u32) << 16);
+            do_push = true;
+            *idx = 0;
         }
 
         if do_push {
@@ -865,6 +851,83 @@ pub fn get_stats() -> InterruptStats {
         irqs: stats.irqs,
         timer_ticks: stats.timer_ticks,
     }
+}
+
+/// Register a custom IRQ handler for the given IRQ number (0-15)
+/// This allows device drivers to register their interrupt handlers dynamically
+pub fn set_irq_handler(irq_num: u8, handler: fn()) -> Result<(), &'static str> {
+    if irq_num >= 16 {
+        return Err("IRQ number must be 0-15");
+    }
+    
+    unsafe {
+        IRQ_HANDLERS[irq_num as usize] = Some(handler);
+        
+        // Install the IRQ wrapper in the IDT
+        let interrupt_num = 32 + irq_num;
+        match irq_num {
+            11 => {
+                KERNEL_IDT.entries[interrupt_num as usize].set_handler(
+                    irq_11 as *const () as u64,
+                    0x08,
+                    IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE
+                );
+            }
+            _ => {
+                // For other IRQs, we'd need to add wrapper functions
+                return Err("IRQ wrapper not implemented for this IRQ number");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Generic IRQ handler that dispatches to registered handler
+extern "C" fn irq_11_handler() {
+    unsafe {
+        if let Some(handler) = IRQ_HANDLERS[11] {
+            handler();
+        }
+    }
+    
+    let mut stats = INTERRUPT_STATS.lock();
+    stats.irqs += 1;
+    drop(stats);
+    
+    send_eoi(11);
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_11() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym irq_11_handler,
+    );
 }
 
 // ============================================================================
