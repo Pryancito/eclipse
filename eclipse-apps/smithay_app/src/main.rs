@@ -649,6 +649,71 @@ impl DrawTarget for FramebufferState {
         }
         Ok(())
     }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        if self.base_addr < 0x1000 {
+            return Ok(());
+        }
+        let width = self.info.width as i32;
+        let height = self.info.height as i32;
+        let fb_ptr = self.base_addr as *mut u32;
+
+        let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
+        if intersection.is_zero_sized() {
+            return Ok(());
+        }
+
+        let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+        
+        for y in intersection.top_left.y..intersection.top_left.y + intersection.size.height as i32 {
+            let offset_start = (y as usize * width as usize) + intersection.top_left.x as usize;
+            for x in 0..intersection.size.width as usize {
+                unsafe {
+                    core::ptr::write_volatile(fb_ptr.add(offset_start + x), raw_color);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        if self.base_addr < 0x1000 {
+            return Ok(());
+        }
+        let width = self.info.width as i32;
+        let height = self.info.height as i32;
+        let fb_ptr = self.base_addr as *mut u32;
+
+        let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
+        if intersection.is_zero_sized() {
+            return Ok(());
+        }
+
+        let mut colors_iter = colors.into_iter();
+
+        for y in area.top_left.y..area.top_left.y + area.size.height as i32 {
+            for x in area.top_left.x..area.top_left.x + area.size.width as i32 {
+                if let Some(color) = colors_iter.next() {
+                    // Solo dibujamos si estamos dentro de la intersección real visible
+                    if x >= intersection.top_left.x && x < intersection.top_left.x + intersection.size.width as i32 &&
+                       y >= intersection.top_left.y && y < intersection.top_left.y + intersection.size.height as i32 
+                    {
+                        let offset = (y as usize * width as usize) + x as usize;
+                        let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+                        unsafe {
+                            core::ptr::write_volatile(fb_ptr.add(offset), raw_color);
+                        }
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OriginDimensions for FramebufferState {
@@ -804,7 +869,8 @@ fn draw_surface_content(fb: &mut FramebufferState, w: &ShellWindow, s: &External
     let fb_w = fb.info.width as i32;
     let fb_h = fb.info.height as i32;
     let pitch_px = (fb.info.pitch / 4).max(1) as i32; // stride in pixels (u32)
-    let max_offset = (fb_w * fb_h) as usize;
+    let max_dst_offset = (pitch_px * fb_h) as usize; // use pitch instead of width
+    let max_src_offset = s.buffer_size / 4; // buffer size in u32 pixels
 
     let content_y = w.y + ShellWindow::TITLE_H;
     let content_w = w.w;
@@ -820,15 +886,17 @@ fn draw_surface_content(fb: &mut FramebufferState, w: &ShellWindow, s: &External
         if w.x + start_x < 0 { start_x = -w.x; }
         if w.x + end_x > fb_w { end_x = fb_w - w.x; }
         if start_x >= end_x { continue; }
-        let dst_offset = (dy as i64 * pitch_px as i64 + (w.x + start_x) as i64) as usize;
+        let dst_offset = (dy as usize * pitch_px as usize) + (w.x + start_x) as usize;
         let copy_len = (end_x - start_x) as usize;
-        if dst_offset > max_offset || dst_offset + copy_len > max_offset { continue; }
-        let src_row = unsafe { src_ptr.add((py * content_w) as usize) };
-        let dst_row = unsafe { dst_ptr.add(dst_offset) };
+        if dst_offset >= max_dst_offset || dst_offset + copy_len > max_dst_offset { continue; }
+        
+        let src_offset = (py as usize * content_w as usize) + start_x as usize;
+        if src_offset >= max_src_offset || src_offset + copy_len > max_src_offset { continue; }
+        
         unsafe {
             core::ptr::copy_nonoverlapping(
-                src_row.add(start_x as usize),
-                dst_row,
+                src_ptr.add(src_offset),
+                dst_ptr.add(dst_offset),
                 copy_len,
             );
         }

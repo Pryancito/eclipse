@@ -779,7 +779,8 @@ fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
     let pci_devices = crate::pci::find_usb_controllers();
     
     for pci_dev in pci_devices {
-        let controller_type = match pci_dev.subclass {
+        // Tipo viene de prog_if (no de subclass) según especificación PCI
+        let controller_type = match pci_dev.prog_if {
             0x00 => UsbControllerType::UHCI,
             0x10 => UsbControllerType::OHCI,
             0x20 => UsbControllerType::EHCI,
@@ -824,33 +825,75 @@ fn init_xhci_controller(controller: &UsbController) -> UsbControllerState {
         controller.bus, controller.device, controller.function
     ));
     
-    // BAR0 contiene la dirección base de los registros MMIO
-    let bar0 = controller.bar0;
-    if bar0 == 0 {
-        crate::serial::serial_print("[USB-HID]   ERROR: BAR0 es 0, controlador no configurado\n");
+    // Habilitar el dispositivo PCI (Memory Space + Bus Master) antes de tocar MMIO
+    unsafe {
+        let pci_dev = crate::pci::PciDevice {
+            bus: controller.bus,
+            device: controller.device,
+            function: controller.function,
+            vendor_id: controller.vendor_id,
+            device_id: controller.device_id,
+            class_code: 0,
+            subclass: 0,
+            prog_if: 0,
+            header_type: 0,
+            bar0: controller.bar0,
+            interrupt_line: controller.interrupt_line,
+        };
+        crate::pci::enable_device(&pci_dev, true);
+    }
+    
+    // Leer BAR0. XHCI suele tener BAR 64-bit, pero en QEMU/OVMF la parte alta (BAR1)
+    // puede no ser correcta o apuntar a región no mapeada (~2GB -> Page Fault).
+    // Usamos solo la parte baja 32-bit: dirección física baja (ej. 0x8000) está siempre
+    // mapeada en el higher-half del kernel.
+    let bar0 = unsafe {
+        crate::pci::pci_config_read_u32(controller.bus, controller.device, controller.function, 0x10)
+    };
+    if bar0 == 0 || bar0 == 0xFFFF_FFFF {
+        crate::serial::serial_print("[USB-HID]   ERROR: BAR0 inválido (0 o no programado)\n");
         return UsbControllerState::Error;
     }
     
-    // Limpiar bit 0 (tipo de memoria) para obtener dirección real
     let mmio_base = (bar0 & !0xF) as u64;
     
     crate::serial::serial_print(&alloc::format!(
-        "[USB-HID]   MMIO Base: 0x{:016X}\n", mmio_base
+        "[USB-HID]   BAR0=0x{:08X}, MMIO Base (phys)=0x{:016X}\n", bar0, mmio_base
     ));
     
-    // TODO: Mapear MMIO a espacio virtual del kernel
-    // TODO: Leer capability registers
-    // TODO: Verificar versión XHCI
-    // TODO: Determinar offsets de operational/runtime/doorbell registers
-    // TODO: Reset del controlador (USBCMD.RESET)
-    // TODO: Esperar a que USBSTS.CNR = 0 (controller ready)
-    // TODO: Configurar estructuras de datos (command ring, event ring, DCBAA)
-    // TODO: Iniciar controlador (USBCMD.RUN)
+    // Mapear y leer registros de capability/operational/runtime/doorbell
+    let mmio = match XhciMmio::from_bar0(mmio_base) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::serial::serial_print("[USB-HID]   ERROR: XhciMmio::from_bar0 falló: ");
+            crate::serial::serial_print(e);
+            crate::serial::serial_print("\n");
+            return UsbControllerState::Error;
+        }
+    };
     
-    crate::serial::serial_print("[USB-HID]   Inicialización XHCI stub completada\n");
-    crate::serial::serial_print("[USB-HID]   NOTA: Funcionalidad completa requiere implementación de driver\n");
+    // Leer versión y parámetros estructurales básicos
+    let caplen_hciver = mmio.read_capability(0x00);
+    let hcsparams1 = mmio.read_capability(0x04);
     
-    UsbControllerState::Uninitialized
+    let caplength = (caplen_hciver & 0xFF) as u8;
+    let hciversion = ((caplen_hciver >> 16) & 0xFFFF) as u16;
+    let max_slots = (hcsparams1 & 0xFF) as u8;
+    let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
+    
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   XHCI v{:X}.{:X}, CAPLENGTH=0x{:02X}, MaxSlots={}, MaxPorts={}\n",
+        (hciversion >> 8),
+        (hciversion & 0xFF),
+        caplength,
+        max_slots,
+        max_ports
+    ));
+    
+    crate::serial::serial_print("[USB-HID]   XHCI MMIO mapeado correctamente (driver aún en modo stub)\n");
+    
+    // Por ahora no arrancamos el controlador ni tocamos TRBs; sólo marcamos listo.
+    UsbControllerState::Ready
 }
 
 /// Inicializar controlador EHCI (USB 2.0)
@@ -1304,6 +1347,11 @@ impl Trb {
             self.control &= !1;
         }
     }
+    
+    /// Alias para compatibilidad con código previo
+    pub fn get_trb_type(&self) -> u8 {
+        self.trb_type()
+    }
 }
 
 /// Ring de TRBs para XHCI
@@ -1349,6 +1397,39 @@ impl TrbRing {
         } else {
             self.dequeue_index - self.enqueue_index - 1
         }
+    }
+    
+    /// Verificar si el ring está vacío
+    pub fn is_empty(&self) -> bool {
+        self.enqueue_index == self.dequeue_index
+    }
+    
+    /// Encolar un TRB en el ring
+    pub fn enqueue(&mut self, mut trb: Trb) -> Result<(), &'static str> {
+        if self.is_full() {
+            return Err("TRB ring is full");
+        }
+        let idx = self.enqueue_index;
+        // Actualizar cycle bit del TRB según el estado actual del productor
+        trb.set_cycle_bit(self.cycle_state);
+        self.trbs[idx] = trb;
+        self.enqueue_index = (self.enqueue_index + 1) % self.capacity;
+        // Al envolver, invertir el Producer Cycle State
+        if self.enqueue_index == 0 {
+            self.cycle_state = !self.cycle_state;
+        }
+        Ok(())
+    }
+    
+    /// Desencolar un TRB del ring
+    pub fn dequeue(&mut self) -> Result<Trb, &'static str> {
+        if self.is_empty() {
+            return Err("TRB ring is empty");
+        }
+        let idx = self.dequeue_index;
+        let trb = self.trbs[idx];
+        self.dequeue_index = (self.dequeue_index + 1) % self.capacity;
+        Ok(trb)
     }
 }
 
@@ -2015,6 +2096,7 @@ impl SlotContext {
 /// XHCI Endpoint Context - Endpoint state and transfer ring info
 /// Part of Device Context structure (Section 6.2.3)
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct EndpointContext {
     pub ep_state: u32,            // Endpoint state, mult, max streams, etc.
     pub ep_info: u32,             // Interval, error count, endpoint type, etc.
@@ -2135,7 +2217,7 @@ impl InputContext {
 
 /// Create a Link TRB to chain ring segments
 pub fn build_link_trb(next_segment: u64, toggle_cycle: bool) -> Trb {
-    let mut control = (TRB_TYPE_LINK << 10) as u32;
+    let mut control = (u32::from(TRB_TYPE_LINK)) << 10;
     if toggle_cycle {
         control |= 0x2; // Toggle Cycle bit
     }
@@ -2152,13 +2234,13 @@ pub fn build_noop_command_trb() -> Trb {
     Trb {
         parameter: 0,
         status: 0,
-        control: (TRB_TYPE_NOOP_COMMAND << 10) as u32,
+        control: (u32::from(TRB_TYPE_NOOP_COMMAND)) << 10,
     }
 }
 
 /// Create an Enable Slot Command TRB
 pub fn build_enable_slot_trb(slot_type: u8) -> Trb {
-    let control = ((TRB_TYPE_ENABLE_SLOT << 10) | ((slot_type as u32) << 16)) as u32;
+    let control = (u32::from(TRB_TYPE_ENABLE_SLOT) << 10) | ((slot_type as u32) << 16);
     
     Trb {
         parameter: 0,
@@ -2169,7 +2251,7 @@ pub fn build_enable_slot_trb(slot_type: u8) -> Trb {
 
 /// Create an Address Device Command TRB
 pub fn build_address_device_trb(input_context_ptr: u64, slot_id: u8, bsr: bool) -> Trb {
-    let mut control = ((TRB_TYPE_ADDRESS_DEVICE << 10) | ((slot_id as u32) << 24)) as u32;
+    let mut control = (u32::from(TRB_TYPE_ADDRESS_DEVICE) << 10) | ((slot_id as u32) << 24);
     if bsr {
         control |= 0x200; // Block Set Address Request
     }
@@ -2183,7 +2265,7 @@ pub fn build_address_device_trb(input_context_ptr: u64, slot_id: u8, bsr: bool) 
 
 /// Create a Configure Endpoint Command TRB
 pub fn build_configure_endpoint_trb(input_context_ptr: u64, slot_id: u8) -> Trb {
-    let control = ((TRB_TYPE_CONFIGURE_ENDPOINT << 10) | ((slot_id as u32) << 24)) as u32;
+    let control = (u32::from(TRB_TYPE_CONFIGURE_ENDPOINT) << 10) | ((slot_id as u32) << 24);
     
     Trb {
         parameter: input_context_ptr,
@@ -2201,7 +2283,7 @@ pub fn build_setup_stage_trb(setup_packet: &UsbSetupPacket) -> Trb {
         | ((setup_packet.w_index as u64) << 32)
         | ((setup_packet.w_length as u64) << 48);
     
-    let control = ((TRB_TYPE_SETUP << 10) | (8 << 17)) as u32; // 8 bytes
+    let control = (u32::from(TRB_TYPE_SETUP) << 10) | (8u32 << 17); // 8 bytes
     
     Trb {
         parameter: param_low,
@@ -2212,7 +2294,7 @@ pub fn build_setup_stage_trb(setup_packet: &UsbSetupPacket) -> Trb {
 
 /// Create a Data Stage TRB (for control transfers)
 pub fn build_data_stage_trb(data_buffer: u64, length: u16, direction_in: bool) -> Trb {
-    let mut control = ((TRB_TYPE_DATA << 10) | ((length as u32) << 17)) as u32;
+    let mut control = (u32::from(TRB_TYPE_DATA) << 10) | ((length as u32) << 17);
     if direction_in {
         control |= 0x10000; // DIR bit for IN transfers
     }
@@ -2226,7 +2308,7 @@ pub fn build_data_stage_trb(data_buffer: u64, length: u16, direction_in: bool) -
 
 /// Create a Status Stage TRB (for control transfers)
 pub fn build_status_stage_trb(direction_in: bool) -> Trb {
-    let mut control = (TRB_TYPE_STATUS << 10) as u32;
+    let mut control = (u32::from(TRB_TYPE_STATUS)) << 10;
     if direction_in {
         control |= 0x10000; // DIR bit (opposite of data stage)
     }
@@ -2240,7 +2322,7 @@ pub fn build_status_stage_trb(direction_in: bool) -> Trb {
 
 /// Create a Normal TRB (for bulk/interrupt transfers)
 pub fn build_normal_trb(data_buffer: u64, length: u16, ioc: bool) -> Trb {
-    let mut control = ((TRB_TYPE_NORMAL << 10) | ((length as u32) << 17)) as u32;
+    let mut control = (u32::from(TRB_TYPE_NORMAL) << 10) | ((length as u32) << 17);
     if ioc {
         control |= 0x20; // Interrupt On Completion
     }
@@ -2272,9 +2354,9 @@ impl DoorbellRegister {
         
         // TODO: Write to actual MMIO doorbell register
         crate::serial::serial_print("[XHCI] Doorbell rung: target=");
-        crate::serial::serial_print_u64(target as u64);
+        crate::serial::serial_print_dec(target as u64);
         crate::serial::serial_print(" stream=");
-        crate::serial::serial_print_u64(stream_id as u64);
+        crate::serial::serial_print_dec(stream_id as u64);
         crate::serial::serial_print("\n");
     }
 }
@@ -2282,8 +2364,8 @@ impl DoorbellRegister {
 /// XHCI Controller State - Tracks controller operational state
 pub struct XhciControllerState {
     pub command_ring: Option<CommandRing>,
-    pub event_rings: Vec<EventRing>,
-    pub device_contexts: Vec<Option<DeviceContext>>, // Index by slot ID
+    pub event_rings: alloc::vec::Vec<EventRing>,
+    pub device_contexts: alloc::vec::Vec<Option<DeviceContext>>, // Index by slot ID
     pub mmio_base: u64,
     pub operational_base: u64,
     pub runtime_base: u64,
@@ -2297,8 +2379,8 @@ impl XhciControllerState {
     pub fn new(mmio_base: u64) -> Self {
         XhciControllerState {
             command_ring: None,
-            event_rings: Vec::new(),
-            device_contexts: Vec::new(),
+            event_rings: alloc::vec::Vec::new(),
+            device_contexts: alloc::vec::Vec::new(),
             mmio_base,
             operational_base: 0,
             runtime_base: 0,
@@ -2370,7 +2452,7 @@ impl XhciControllerState {
             let trb_type = event_trb.get_trb_type();
             
             crate::serial::serial_print("[XHCI] Event TRB type: ");
-            crate::serial::serial_print_u64(trb_type as u64);
+            crate::serial::serial_print_dec(trb_type as u64);
             crate::serial::serial_print("\n");
             
             // TODO: Process different event types:
@@ -2565,7 +2647,7 @@ pub const PORT_SPEED_SUPER: u8 = 4;     // USB 3.0 SuperSpeed (5 Gbps)
 /// Reset a USB port
 pub fn reset_port(port_id: u8) -> Result<(), &'static str> {
     crate::serial::serial_print("[USB-HID] Resetting port ");
-    crate::serial::serial_print_num(port_id as u64);
+    crate::serial::serial_print_dec(port_id as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Write to port status control register
@@ -2579,7 +2661,7 @@ pub fn reset_port(port_id: u8) -> Result<(), &'static str> {
 /// Clear port status change bits
 pub fn clear_port_change_bits(port_id: u8) {
     crate::serial::serial_print("[USB-HID] Clearing port ");
-    crate::serial::serial_print_num(port_id as u64);
+    crate::serial::serial_print_dec(port_id as u64);
     crate::serial::serial_print(" change bits\n");
     
     // TODO: Write 1 to CSC, PEC, WRC, OCC, PRC, PLC, CEC bits to clear them
@@ -2588,7 +2670,7 @@ pub fn clear_port_change_bits(port_id: u8) {
 /// Get port speed
 pub fn get_port_speed(port_id: u8) -> u8 {
     crate::serial::serial_print("[USB-HID] Reading port ");
-    crate::serial::serial_print_num(port_id as u64);
+    crate::serial::serial_print_dec(port_id as u64);
     crate::serial::serial_print(" speed\n");
     
     // TODO: Read port status control register and extract speed
@@ -2598,7 +2680,7 @@ pub fn get_port_speed(port_id: u8) -> u8 {
 /// Wait for port reset to complete
 pub fn wait_for_port_reset_complete(port_id: u8) -> Result<(), &'static str> {
     crate::serial::serial_print("[USB-HID] Waiting for port ");
-    crate::serial::serial_print_num(port_id as u64);
+    crate::serial::serial_print_dec(port_id as u64);
     crate::serial::serial_print(" reset complete\n");
     
     // TODO: Poll PR bit until it's cleared (max 200ms timeout)
@@ -2613,9 +2695,9 @@ pub fn process_command_completion_event(event: &CommandCompletionEvent) {
     
     crate::serial::serial_print("[USB-HID] Command Completion Event:\n");
     crate::serial::serial_print("[USB-HID]   Completion Code: ");
-    crate::serial::serial_print_num(completion_code as u64);
+    crate::serial::serial_print_dec(completion_code as u64);
     crate::serial::serial_print("\n[USB-HID]   Slot ID: ");
-    crate::serial::serial_print_num(slot_id as u64);
+    crate::serial::serial_print_dec(slot_id as u64);
     crate::serial::serial_print("\n");
     
     if event.is_success() {
@@ -2636,13 +2718,13 @@ pub fn process_transfer_event(event: &TransferEvent) {
     
     crate::serial::serial_print("[USB-HID] Transfer Event:\n");
     crate::serial::serial_print("[USB-HID]   Completion Code: ");
-    crate::serial::serial_print_num(completion_code as u64);
+    crate::serial::serial_print_dec(completion_code as u64);
     crate::serial::serial_print("\n[USB-HID]   Residual Length: ");
-    crate::serial::serial_print_num(residual_length as u64);
+    crate::serial::serial_print_dec(residual_length as u64);
     crate::serial::serial_print("\n[USB-HID]   Slot ID: ");
-    crate::serial::serial_print_num(slot_id as u64);
+    crate::serial::serial_print_dec(slot_id as u64);
     crate::serial::serial_print("\n[USB-HID]   Endpoint ID: ");
-    crate::serial::serial_print_num(endpoint_id as u64);
+    crate::serial::serial_print_dec(endpoint_id as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Invoke transfer completion callbacks
@@ -2654,7 +2736,7 @@ pub fn process_port_status_change_event(event: &PortStatusChangeEvent) {
     
     crate::serial::serial_print("[USB-HID] Port Status Change Event:\n");
     crate::serial::serial_print("[USB-HID]   Port ID: ");
-    crate::serial::serial_print_num(port_id as u64);
+    crate::serial::serial_print_dec(port_id as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Read port status register
@@ -2706,7 +2788,7 @@ pub fn usb_interrupt_handler_stub() -> bool {
 /// Register USB interrupt handler
 pub fn register_usb_interrupt_handler(irq: u8) -> Result<(), &'static str> {
     crate::serial::serial_print("[USB-HID] Registering interrupt handler for IRQ ");
-    crate::serial::serial_print_num(irq as u64);
+    crate::serial::serial_print_dec(irq as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Use kernel IRQ registration API
@@ -2716,14 +2798,14 @@ pub fn register_usb_interrupt_handler(irq: u8) -> Result<(), &'static str> {
 
 /// Completion tracker
 pub struct CompletionTracker {
-    pending_commands: Vec<(u64, u64)>,  // (TRB pointer, timestamp)
+    pending_commands: alloc::vec::Vec<(u64, u64)>,  // (TRB pointer, timestamp)
     timeout_ms: u64,
 }
 
 impl CompletionTracker {
     pub fn new() -> Self {
         Self {
-            pending_commands: Vec::new(),
+            pending_commands: alloc::vec::Vec::new(),
             timeout_ms: 5000,  // 5 second timeout
         }
     }
@@ -2737,7 +2819,7 @@ impl CompletionTracker {
         Err("Not implemented - requires event ring polling")
     }
     
-    pub fn mark_command_complete(&mut, _trb_pointer: u64, _completion_code: u8) {
+    pub fn mark_command_complete(&mut self, _trb_pointer: u64, _completion_code: u8) {
         crate::serial::serial_print("[USB-HID] Command marked complete\n");
         
         // TODO: Record completion, signal waiting threads
@@ -2836,7 +2918,7 @@ impl HidDevice {
 pub fn attach_hid_device(device: HidDevice) -> Result<(), &'static str> {
     crate::serial::serial_print("[USB-HID] Attaching HID device:\n");
     crate::serial::serial_print("[USB-HID]   Address: ");
-    crate::serial::serial_print_num(device.device_address as u64);
+    crate::serial::serial_print_dec(device.device_address as u64);
     crate::serial::serial_print("\n[USB-HID]   Type: ");
     match device.device_type {
         HidDeviceType::Keyboard => crate::serial::serial_print("Keyboard"),
@@ -2861,7 +2943,7 @@ pub fn attach_hid_device(device: HidDevice) -> Result<(), &'static str> {
 /// Detach a HID device
 pub fn detach_hid_device(device_address: u8) {
     crate::serial::serial_print("[USB-HID] Detaching HID device ");
-    crate::serial::serial_print_num(device_address as u64);
+    crate::serial::serial_print_dec(device_address as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Remove from global list
@@ -2872,15 +2954,15 @@ pub fn detach_hid_device(device_address: u8) {
 pub fn parse_keyboard_report(
     current: &HidKeyboardReport,
     previous: Option<&HidKeyboardReport>,
-) -> Vec<InputEvent> {
-    let mut events = Vec::new();
+) -> alloc::vec::Vec<InputEvent> {
+    let mut events = alloc::vec::Vec::new();
     
     // Check modifier changes
     if let Some(prev) = previous {
         let modifier_changes = current.modifiers ^ prev.modifiers;
         
-        if modifier_changes & MODIFIER_LEFT_CTRL != 0 {
-            let pressed = (current.modifiers & MODIFIER_LEFT_CTRL) != 0;
+        if modifier_changes & MOD_LEFT_CTRL != 0 {
+            let pressed = (current.modifiers & MOD_LEFT_CTRL) != 0;
             events.push(InputEvent {
                 event_type: if pressed { InputEventType::KeyPress } else { InputEventType::KeyRelease },
                 code: 0x1D, // Left Ctrl
@@ -2919,8 +3001,8 @@ pub fn parse_keyboard_report(
 pub fn parse_mouse_report(
     current: &HidMouseReport,
     previous: Option<&HidMouseReport>,
-) -> Vec<InputEvent> {
-    let mut events = Vec::new();
+) -> alloc::vec::Vec<InputEvent> {
+    let mut events = alloc::vec::Vec::new();
     
     // Check button changes
     if let Some(prev) = previous {
@@ -2989,7 +3071,7 @@ pub fn parse_mouse_report(
 /// HID interrupt handler - processes incoming reports
 pub fn hid_interrupt_handler(device_address: u8, report_data: &[u8]) {
     crate::serial::serial_print("[USB-HID] HID report received from device ");
-    crate::serial::serial_print_num(device_address as u64);
+    crate::serial::serial_print_dec(device_address as u64);
     crate::serial::serial_print("\n");
     
     // TODO: Lookup device by address
@@ -3001,12 +3083,12 @@ pub fn hid_interrupt_handler(device_address: u8, report_data: &[u8]) {
     if report_data.len() >= 8 {
         // Could be keyboard report
         crate::serial::serial_print("[USB-HID]   Report length: ");
-        crate::serial::serial_print_num(report_data.len() as u64);
+        crate::serial::serial_print_dec(report_data.len() as u64);
         crate::serial::serial_print(" (keyboard format)\n");
     } else if report_data.len() >= 3 {
         // Could be mouse report
         crate::serial::serial_print("[USB-HID]   Report length: ");
-        crate::serial::serial_print_num(report_data.len() as u64);
+        crate::serial::serial_print_dec(report_data.len() as u64);
         crate::serial::serial_print(" (mouse format)\n");
     }
 }
@@ -3015,30 +3097,32 @@ pub fn hid_interrupt_handler(device_address: u8, report_data: &[u8]) {
 pub fn configure_gaming_peripheral(device_address: u8, vendor_id: u16, product_id: u16) -> Result<(), &'static str> {
     crate::serial::serial_print("[USB-HID] Configuring gaming peripheral:\n");
     crate::serial::serial_print("[USB-HID]   Device: ");
-    crate::serial::serial_print_num(device_address as u64);
+    crate::serial::serial_print_dec(device_address as u64);
     crate::serial::serial_print("\n[USB-HID]   Vendor: 0x");
-    crate::serial::serial_print_num(vendor_id as u64);
+    crate::serial::serial_print_dec(vendor_id as u64);
     crate::serial::serial_print("\n[USB-HID]   Product: 0x");
-    crate::serial::serial_print_num(product_id as u64);
+    crate::serial::serial_print_dec(product_id as u64);
     crate::serial::serial_print("\n");
     
     // Get gaming capabilities from database
     if is_gaming_device(vendor_id, product_id) {
-        let caps = get_gaming_capabilities(vendor_id, product_id);
-        
-        crate::serial::serial_print("[USB-HID]   Max DPI: ");
-        crate::serial::serial_print_num(caps.max_dpi as u64);
-        crate::serial::serial_print("\n[USB-HID]   Polling Rate: ");
-        crate::serial::serial_print_num(caps.polling_rate as u64);
-        crate::serial::serial_print("Hz\n");
-        
-        // TODO: Send vendor-specific commands to configure:
-        // - Set polling rate to 1000Hz
-        // - Set DPI to max or user preference
-        // - Enable all buttons
-        // - Configure RGB lighting (if supported)
-        
-        crate::serial::serial_print("[USB-HID]   Gaming features configured (stub)\n");
+        if let Some(caps) = get_gaming_capabilities(vendor_id, product_id) {
+            crate::serial::serial_print("[USB-HID]   Max DPI: ");
+            crate::serial::serial_print_dec(caps.max_dpi as u64);
+            crate::serial::serial_print("\n[USB-HID]   Max Polling Rate: ");
+            crate::serial::serial_print_dec(caps.max_polling_rate as u64);
+            crate::serial::serial_print("Hz\n");
+            
+            // TODO: Send vendor-specific commands to configure:
+            // - Set polling rate to 1000Hz
+            // - Set DPI to max or user preference
+            // - Enable all buttons
+            // - Configure RGB lighting (if supported)
+            
+            crate::serial::serial_print("[USB-HID]   Gaming features configured (stub)\n");
+        } else {
+            crate::serial::serial_print("[USB-HID]   No capability entry found in database\n");
+        }
     }
     
     Ok(())
@@ -3051,7 +3135,7 @@ pub fn send_input_events(events: &[InputEvent]) {
     }
     
     crate::serial::serial_print("[USB-HID] Sending ");
-    crate::serial::serial_print_num(events.len() as u64);
+    crate::serial::serial_print_dec(events.len() as u64);
     crate::serial::serial_print(" input events\n");
     
     // TODO: Send events to input service via IPC
@@ -3102,7 +3186,7 @@ pub fn init_hid_integration() {
 // ============================================================================
 // MMIO, DMA, and IRQ integration for USB HID driver
 
-use crate::memory::{virt_to_phys, PHYS_MEM_OFFSET};
+use crate::memory::{virt_to_phys, phys_to_virt, PHYS_MEM_OFFSET};
 use core::sync::atomic::{fence, Ordering};
 use core::ptr::{read_volatile, write_volatile};
 
@@ -3116,13 +3200,13 @@ pub struct MmioRegion {
 impl MmioRegion {
     /// Create a new MMIO region by mapping physical address to kernel virtual space
     pub fn new(phys_addr: u64, size: usize) -> Result<Self, &'static str> {
-        // Validate physical address is not in user space
-        if phys_addr < 0x100000 {
-            return Err("Physical address too low");
+        // Rechazar solo dirección cero; MMIO puede estar en espacio físico bajo o alto
+        if phys_addr == 0 {
+            return Err("Physical address is zero");
         }
         
-        // Map to kernel higher-half space
-        let virt_addr = PHYS_MEM_OFFSET + phys_addr;
+        // Usar phys_to_virt para respetar el mapeo del kernel (evita solapamiento con región kernel)
+        let virt_addr = phys_to_virt(phys_addr);
         
         crate::serial::serial_print("[USB-HID] MMIO Region mapped:\n");
         crate::serial::serial_print("  Physical: 0x");
@@ -3217,8 +3301,14 @@ impl XhciMmio {
         // Map initial capability region (256 bytes is sufficient)
         let cap_region = MmioRegion::new(bar0, 256)?;
         
+        // Diagnóstico: leer raw dword en offset 0 (CAPLENGTH+HCIVERSION)
+        let raw_cap0 = cap_region.read_u32(0);
+        crate::serial::serial_print("[USB-HID] Raw CAP[0]=0x");
+        crate::serial::serial_print_hex(raw_cap0 as u64);
+        crate::serial::serial_print(" (esperado: ~0x00000120 para XHCI 1.0)\n");
+        
         // Read CAPLENGTH to find operational registers offset
-        let caplength = cap_region.read_u32(0) & 0xFF;
+        let caplength = raw_cap0 & 0xFF;
         
         // Read RTSOFF (Runtime Register Space Offset) at offset 0x18
         let rtsoff = cap_region.read_u32(0x18);

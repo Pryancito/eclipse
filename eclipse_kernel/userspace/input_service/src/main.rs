@@ -483,7 +483,7 @@ pub extern "C" fn _start() -> ! {
         while let Some(packed) = read_mouse_packet() {
             let buttons = (packed & 0xFF) as u8;
             let dx = ((packed >> 8) as u8) as i8 as i32;
-            let dy = ((packed >> 16) as u8) as i8 as i32;
+            let dy = -(((packed >> 16) as u8) as i8 as i32);
 
             // Eventos de movimiento (X, Y)
             if dx != 0 {
@@ -494,14 +494,13 @@ pub extern "C" fn _start() -> ! {
                     value: dx,
                     timestamp: heartbeat_counter,
                 };
-                if event_queue.push(ev) {
-                    mouse_events += 1;
-                    total_events += 1;
-                    for i in 0..display_client_count {
-                        let pid = display_clients[i];
-                        send_event_to_client(pid, &ev);
-                    }
+                mouse_events += 1;
+                total_events += 1;
+                for i in 0..display_client_count {
+                    let pid = display_clients[i];
+                    send_event_to_client(pid, &ev);
                 }
+                let _ = event_queue.push(ev);
             }
             if dy != 0 {
                 let ev = InputEvent {
@@ -511,14 +510,13 @@ pub extern "C" fn _start() -> ! {
                     value: dy,
                     timestamp: heartbeat_counter,
                 };
-                if event_queue.push(ev) {
-                    mouse_events += 1;
-                    total_events += 1;
-                    for i in 0..display_client_count {
-                        let pid = display_clients[i];
-                        send_event_to_client(pid, &ev);
-                    }
+                mouse_events += 1;
+                total_events += 1;
+                for i in 0..display_client_count {
+                    let pid = display_clients[i];
+                    send_event_to_client(pid, &ev);
                 }
+                let _ = event_queue.push(ev);
             }
 
             // Eventos de botones (code 0=left, 1=right, 2=middle; value 0=release, 1=press)
@@ -534,14 +532,13 @@ pub extern "C" fn _start() -> ! {
                         value: if now { 1 } else { 0 },
                         timestamp: heartbeat_counter,
                     };
-                    if event_queue.push(ev) {
-                        mouse_events += 1;
-                        total_events += 1;
-                        for i in 0..display_client_count {
-                            let pid = display_clients[i];
-                            send_event_to_client(pid, &ev);
-                        }
+                    mouse_events += 1;
+                    total_events += 1;
+                    for i in 0..display_client_count {
+                        let pid = display_clients[i];
+                        send_event_to_client(pid, &ev);
                     }
+                    let _ = event_queue.push(ev);
                 }
             }
             prev_mouse_buttons = buttons;
@@ -556,14 +553,13 @@ pub extern "C" fn _start() -> ! {
                     value: scroll,
                     timestamp: heartbeat_counter,
                 };
-                if event_queue.push(ev) {
-                    mouse_events += 1;
-                    total_events += 1;
-                    for i in 0..display_client_count {
-                        let pid = display_clients[i];
-                        send_event_to_client(pid, &ev);
-                    }
+                mouse_events += 1;
+                total_events += 1;
+                for i in 0..display_client_count {
+                    let pid = display_clients[i];
+                    send_event_to_client(pid, &ev);
                 }
+                let _ = event_queue.push(ev);
             }
         }
 
@@ -581,89 +577,22 @@ pub extern "C" fn _start() -> ! {
                 value,
                 timestamp: heartbeat_counter,
             };
-            if event_queue.push(kbd_event) {
-                keyboard_events += 1;
-                total_events += 1;
-                for i in 0..display_client_count {
-                    let pid = display_clients[i];
-                    send_event_to_client(pid, &kbd_event);
-                }
-                if let Some(fd) = input_fd {
-                    let buf = unsafe {
-                        core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>())
-                    };
-                    sys_write(fd, buf);
-                }
+            keyboard_events += 1;
+            total_events += 1;
+            for i in 0..display_client_count {
+                let pid = display_clients[i];
+                send_event_to_client(pid, &kbd_event);
             }
+            if let Some(fd) = input_fd {
+                let buf = unsafe {
+                    core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>())
+                };
+                sys_write(fd, buf);
+            }
+            let _ = event_queue.push(kbd_event);
         }
 
-        // Simulate occasional input events (si no hay teclado real)
-        if heartbeat_counter % 100000 == 0 {
-            // Simulate keyboard event
-            let kbd_event = InputEvent {
-                device_id: 0,
-                event_type: 0,  // Key event
-                code: 0x1E,     // 'A' key
-                value: 1,       // Key press
-                timestamp: heartbeat_counter,
-            };
-            if event_queue.push(kbd_event) {
-                keyboard_events += 1;
-                total_events += 1;
-                for i in 0..display_client_count {
-                    let pid = display_clients[i];
-                    send_event_to_client(pid, &kbd_event);
-                }
-                // Report via scheme (if available)
-                if let Some(fd) = input_fd {
-                    let buf = unsafe { core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
-                    sys_write(fd, buf);
-                }
-            }
-        }
-        
-        if heartbeat_counter % 150000 == 0 {
-            // Simulate mouse movement (X and Y)
-            let mouse_x = InputEvent {
-                device_id: 1,
-                event_type: 1,
-                code: 0,   // X axis
-                value: 10,
-                timestamp: heartbeat_counter,
-            };
-            let mouse_y = InputEvent {
-                device_id: 1,
-                event_type: 1,
-                code: 1,   // Y axis
-                value: 5,
-                timestamp: heartbeat_counter,
-            };
-            for ev in [mouse_x, mouse_y] {
-                if event_queue.push(ev) {
-                    mouse_events += 1;
-                    total_events += 1;
-                    for i in 0..display_client_count {
-                        let pid = display_clients[i];
-                        send_event_to_client(pid, &ev);
-                    }
-                }
-            }
-        }
-        
-        if heartbeat_counter % 200000 == 0 {
-            // Simulate tablet event
-            let tablet_event = InputEvent {
-                device_id: 4,
-                event_type: 2,  // Absolute position
-                code: 0,        // X coordinate
-                value: 16384,   // Center of screen
-                timestamp: heartbeat_counter,
-            };
-            if event_queue.push(tablet_event) {
-                tablet_events += 1;
-                total_events += 1;
-            }
-        }
+        // No simulate occasional input events - removes fake jumpiness
         
         // Process events from queue (simulate consumption)
         if heartbeat_counter % 50000 == 0 {

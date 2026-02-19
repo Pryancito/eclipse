@@ -755,8 +755,19 @@ extern "C" fn mouse_handler() {
         // Al completar 3 bytes, empujar inmediatamente (ratón estándar 3-byte)
         if *idx == 3 {
             let buttons = pkt[0] & 0x07;
-            let dx = pkt[1] as i8 as i16;
-            let dy = pkt[2] as i8 as i16;
+            
+            // X movement: 9-bit signed integer (Sign bit is pkt[0] bit 4)
+            let mut dx = pkt[1] as i32;
+            if (pkt[0] & 0x10) != 0 { dx -= 256; }
+            
+            // Y movement: 9-bit signed integer (Sign bit is pkt[0] bit 5)
+            let mut dy = pkt[2] as i32;
+            if (pkt[0] & 0x20) != 0 { dy -= 256; }
+            
+            // Clamp to [-128, 127] to fit in the 8-bit slice of the packed u32
+            dx = dx.clamp(-128, 127);
+            dy = dy.clamp(-128, 127);
+            
             packed = (buttons as u32)
                 | ((dx as i8 as u8 as u32) << 8)
                 | ((dy as i8 as u8 as u32) << 16);
@@ -812,7 +823,19 @@ unsafe extern "C" fn irq_1() {
         "push rax",
         "push rcx",
         "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
         "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
         "pop rdx",
         "pop rcx",
         "pop rax",
@@ -832,7 +855,19 @@ unsafe extern "C" fn irq_12() {
         "push rax",
         "push rcx",
         "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
         "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
         "pop rdx",
         "pop rcx",
         "pop rax",

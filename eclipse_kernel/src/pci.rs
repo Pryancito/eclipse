@@ -54,11 +54,18 @@ const PCI_SUBCLASS_BRIDGE_HOST: u8 = 0x00;
 const PCI_SUBCLASS_BRIDGE_ISA: u8 = 0x01;
 const PCI_SUBCLASS_BRIDGE_PCI: u8 = 0x04;  // PCI-to-PCI bridge
 
-/// PCI Serial Bus Subclasses
-const PCI_SUBCLASS_USB_UHCI: u8 = 0x00;  // USB UHCI controller
-const PCI_SUBCLASS_USB_OHCI: u8 = 0x10;  // USB OHCI controller
-const PCI_SUBCLASS_USB_EHCI: u8 = 0x20;  // USB EHCI controller (USB 2.0)
-const PCI_SUBCLASS_USB_XHCI: u8 = 0x30;  // USB XHCI controller (USB 3.0+)
+/// PCI Serial Bus Subclass for USB
+/// Según la especificación PCI:
+///   - class_code = 0x0C (Serial Bus Controller)
+///   - subclass   = 0x03 (USB)
+///   - prog_if    selecciona UHCI/OHCI/EHCI/XHCI
+const PCI_SUBCLASS_USB: u8 = 0x03;
+
+/// PCI Serial Bus Programming Interface (prog_if) values for USB
+const PCI_PROGIF_USB_UHCI: u8 = 0x00;  // USB UHCI controller
+const PCI_PROGIF_USB_OHCI: u8 = 0x10;  // USB OHCI controller
+const PCI_PROGIF_USB_EHCI: u8 = 0x20;  // USB EHCI controller (USB 2.0)
+const PCI_PROGIF_USB_XHCI: u8 = 0x30;  // USB XHCI controller (USB 3.0+)
 
 /// PCI Configuration Space Registers
 const PCI_REG_VENDOR_ID: u8 = 0x00;
@@ -122,10 +129,14 @@ impl PciDevice {
             (0x06, 0x00) => "Host Bridge",
             (0x06, 0x01) => "ISA Bridge",
             (0x06, 0x04) => "PCI-to-PCI Bridge",
-            (0x0C, 0x00) => "USB UHCI Controller",
-            (0x0C, 0x10) => "USB OHCI Controller",
-            (0x0C, 0x20) => "USB EHCI Controller",
-            (0x0C, 0x30) => "USB XHCI Controller",
+            // USB controllers: class 0x0C, subclass 0x03, prog_if distingue tipo
+            (0x0C, PCI_SUBCLASS_USB) => match self.prog_if {
+                PCI_PROGIF_USB_UHCI => "USB UHCI Controller",
+                PCI_PROGIF_USB_OHCI => "USB OHCI Controller",
+                PCI_PROGIF_USB_EHCI => "USB EHCI Controller",
+                PCI_PROGIF_USB_XHCI => "USB XHCI Controller",
+                _ => "USB Controller",
+            },
             _ => "Unknown Device",
         }
     }
@@ -137,11 +148,12 @@ impl PciDevice {
 
     /// Check if this is a USB controller
     pub fn is_usb_controller(&self) -> bool {
-        self.class_code == PCI_CLASS_SERIAL_BUS && 
-        (self.subclass == PCI_SUBCLASS_USB_UHCI || 
-         self.subclass == PCI_SUBCLASS_USB_OHCI ||
-         self.subclass == PCI_SUBCLASS_USB_EHCI ||
-         self.subclass == PCI_SUBCLASS_USB_XHCI)
+        self.class_code == PCI_CLASS_SERIAL_BUS &&
+        self.subclass == PCI_SUBCLASS_USB &&
+        (self.prog_if == PCI_PROGIF_USB_UHCI ||
+         self.prog_if == PCI_PROGIF_USB_OHCI ||
+         self.prog_if == PCI_PROGIF_USB_EHCI ||
+         self.prog_if == PCI_PROGIF_USB_XHCI)
     }
 
     /// Get USB controller type
@@ -149,11 +161,11 @@ impl PciDevice {
         if !self.is_usb_controller() {
             return None;
         }
-        match self.subclass {
-            PCI_SUBCLASS_USB_UHCI => Some("UHCI (USB 1.1)"),
-            PCI_SUBCLASS_USB_OHCI => Some("OHCI (USB 1.1)"),
-            PCI_SUBCLASS_USB_EHCI => Some("EHCI (USB 2.0)"),
-            PCI_SUBCLASS_USB_XHCI => Some("XHCI (USB 3.0+)"),
+        match self.prog_if {
+            PCI_PROGIF_USB_UHCI => Some("UHCI (USB 1.1)"),
+            PCI_PROGIF_USB_OHCI => Some("OHCI (USB 1.1)"),
+            PCI_PROGIF_USB_EHCI => Some("EHCI (USB 2.0)"),
+            PCI_PROGIF_USB_XHCI => Some("XHCI (USB 3.0+)"),
             _ => None,
         }
     }
@@ -489,30 +501,30 @@ pub fn find_usb_controllers() -> alloc::vec::Vec<PciDevice> {
 }
 
 /// Find USB controllers by type
-pub fn find_usb_by_type(subclass: u8) -> alloc::vec::Vec<PciDevice> {
+pub fn find_usb_by_type(prog_if: u8) -> alloc::vec::Vec<PciDevice> {
     let devices = PCI_DEVICES.lock();
     devices.iter()
-        .filter(|dev| dev.is_usb_controller() && dev.subclass == subclass)
+        .filter(|dev| dev.is_usb_controller() && dev.prog_if == prog_if)
         .copied()
         .collect()
 }
 
 /// Find XHCI (USB 3.0+) controllers
 pub fn find_xhci_controllers() -> alloc::vec::Vec<PciDevice> {
-    find_usb_by_type(PCI_SUBCLASS_USB_XHCI)
+    find_usb_by_type(PCI_PROGIF_USB_XHCI)
 }
 
 /// Find EHCI (USB 2.0) controllers
 pub fn find_ehci_controllers() -> alloc::vec::Vec<PciDevice> {
-    find_usb_by_type(PCI_SUBCLASS_USB_EHCI)
+    find_usb_by_type(PCI_PROGIF_USB_EHCI)
 }
 
 /// Find OHCI (USB 1.1) controllers
 pub fn find_ohci_controllers() -> alloc::vec::Vec<PciDevice> {
-    find_usb_by_type(PCI_SUBCLASS_USB_OHCI)
+    find_usb_by_type(PCI_PROGIF_USB_OHCI)
 }
 
 /// Find UHCI (USB 1.1) controllers
 pub fn find_uhci_controllers() -> alloc::vec::Vec<PciDevice> {
-    find_usb_by_type(PCI_SUBCLASS_USB_UHCI)
+    find_usb_by_type(PCI_PROGIF_USB_UHCI)
 }

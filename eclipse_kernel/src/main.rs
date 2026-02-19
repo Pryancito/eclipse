@@ -161,7 +161,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     fd::init();
     servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
     pci::init();
-    usb_hid::init(); // stub, plan para ratón/teclado USB
+    // usb_hid::init(); // stub, plan para ratón/teclado USB. Comentado para usar la emulación PS/2 del BIOS/OVMF para USB.
     nvidia::init();
     virtio::init();
     ata::init();
