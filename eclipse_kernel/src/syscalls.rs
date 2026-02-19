@@ -50,6 +50,10 @@ pub enum SyscallNumber {
     GetRandom = 33,
     Ioctl = 34,
     GetLastExecError = 35,
+    GetGpuDisplayInfo = 38,
+    SetCursorPosition = 39,
+    GpuAllocDisplayBuffer = 40,
+    GpuPresent = 41,
     Socket = 100,
     Bind = 101,
     Listen = 102,
@@ -106,11 +110,13 @@ pub extern "C" fn syscall_handler(
     arg5: u64,
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
-    // Log registers for Syscall 27 (register_device) to catch corruption
-    if syscall_num == 27 || (crate::process::current_process_id() == Some(10) && syscall_num != 1 && syscall_num != 2) {
-        serial::serial_print("[SYSCALL] PID 10 syscall: ");
-        serial::serial_print_dec(syscall_num);
-        serial::serial_print(" arg1=");
+    // Log Syscall 27 (register_device) to catch corruption.
+    // Nota: Para yield (5) y otros, arg1/arg2 son registros del usuario (rdi/rsi);
+    // el kernel no los usa. Valores como 0xFFFF8000... indican contenido residual.
+    if syscall_num == 27 {
+        serial::serial_print("[SYSCALL] PID ");
+        serial::serial_print_dec(crate::process::current_process_id().unwrap_or(0) as u64);
+        serial::serial_print(" syscall 27 (register_device) arg1=");
         serial::serial_print_hex(arg1);
         serial::serial_print(" arg2=");
         serial::serial_print_hex(arg2);
@@ -213,6 +219,12 @@ pub extern "C" fn syscall_handler(
         33 => sys_getrandom(arg1, arg2, arg3),
         34 => sys_ioctl(arg1, arg2, arg3),
         35 => sys_get_last_exec_error(arg1, arg2),
+        36 => sys_read_key(),
+        37 => sys_read_mouse_packet(),
+        38 => sys_get_gpu_display_info(arg1),
+        39 => sys_set_cursor_position(arg1, arg2),
+        40 => sys_gpu_alloc_display_buffer(arg1, arg2, arg3),
+        41 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),
         100 => sys_socket(arg1, arg2, arg3),
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
@@ -502,6 +514,22 @@ fn sys_get_last_exec_error(out_ptr: u64, out_len: u64) -> u64 {
     copy_len as u64
 }
 
+/// sys_read_key - Read one scancode from PS/2 keyboard buffer (non-blocking).
+/// Returns 0 if buffer empty, otherwise the scancode (1-255).
+fn sys_read_key() -> u64 {
+    crate::interrupts::read_key() as u64
+}
+
+/// sys_read_mouse_packet - Read one PS/2 mouse packet (non-blocking).
+/// Returns 0 if buffer empty; otherwise packed u32: buttons | (dx<<8) | (dy<<16), dx/dy sign-extended from i8.
+fn sys_read_mouse_packet() -> u64 {
+    let p = crate::interrupts::read_mouse_packet();
+    if p == 0xFFFFFFFF {
+        return 0;
+    }
+    p as u64
+}
+
 /// sys_ioctl - Device control (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc.)
 fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
     // Only check pointer if arg is likely a pointer (non-zero and in user range)
@@ -546,6 +574,10 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> u64 
     stats.send_calls += 1;
     drop(stats);
     
+    // Rechazar data_ptr en página nula (evita crash 0x11)
+    if data_len > 0 && data_ptr != 0 && data_ptr < 0x1000 {
+        return u64::MAX;
+    }
     if let Some(client_id) = current_process_id() {
         let message_type = match msg_type {
             1 => MessageType::System,
@@ -588,23 +620,28 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     stats.receive_calls += 1;
     drop(stats);
     
-    // Validar parámetros
-    if buffer_ptr == 0 || size == 0 || size > 4096 {
+    // Rechazar punteros en página nula (evita crash 0x11 por punteros corruptos)
+    if buffer_ptr < 0x1000 || (sender_pid_ptr != 0 && sender_pid_ptr < 0x1000) {
+        return u64::MAX;
+    }
+    let copy_len = core::cmp::min(size as usize, 32);
+    if size == 0 || size > 4096 || !is_user_pointer(buffer_ptr, copy_len as u64) {
+        return u64::MAX; // Error
+    }
+    if sender_pid_ptr != 0 && !is_user_pointer(sender_pid_ptr, 8) {
         return u64::MAX; // Error
     }
     
     if let Some(client_id) = current_process_id() {
         // Intentar recibir mensaje
         if let Some(msg) = receive_message(client_id) {
-            crate::serial::serial_print("!"); // ! = Message found
-            
-            // Copiar mensaje a buffer de usuario
+            // Copiar mensaje a buffer de usuario (ya validado arriba)
             unsafe {
                 let user_buf = core::slice::from_raw_parts_mut(
                     buffer_ptr as *mut u8,
-                    core::cmp::min(size as usize, 32)
+                    copy_len
                 );
-                user_buf.copy_from_slice(&msg.data[..core::cmp::min(size as usize, 32)]);
+                user_buf.copy_from_slice(&msg.data[..copy_len]);
                 
                 // Si se proporcionó un puntero para el PID del remitente, escribirlo
                 if sender_pid_ptr != 0 {
@@ -1153,12 +1190,17 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
             serial::serial_print("\n");
 
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
-                Ok(phys_addr) => {
-                    // Any scheme that returns a physical address gets it mapped into the process
+                Ok(addr) => {
+                    // Convertir dirección kernel a física si aplica (evita crash 0xffff8000...)
+                    let phys_addr: u64 = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                        (addr as u64) - crate::memory::PHYS_MEM_OFFSET
+                    } else {
+                        addr as u64
+                    };
                     let page_table = crate::process::get_process_page_table(crate::process::current_process_id());
                     let vaddr = crate::memory::map_framebuffer_for_process(
                         page_table,
-                        phys_addr as u64,
+                        phys_addr,
                         len as u64
                     );
                     return vaddr;
@@ -1252,6 +1294,17 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
 
         let kernel_fb = &*kernel_fb_ptr;
         
+        // NUNCA pasar direcciones kernel (0xffff8000...) a userspace - convertir a física
+        let mut fb_address = if kernel_fb.base_address >= 0xFFFF_8000_0000_0000 {
+            kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
+        } else {
+            kernel_fb.base_address
+        };
+        // Safeguard: si por cualquier razón seguimos con dirección kernel, forzar conversión
+        if fb_address >= 0xFFFF_8000_0000_0000 {
+            fb_address -= crate::memory::PHYS_MEM_OFFSET;
+        }
+        
         // Calculate BPP from pixel format
         // Pixel format 1 = RGB, typically 32bpp
         // For now, assume 32bpp for RGB formats
@@ -1263,7 +1316,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         
         // Create syscall structure
         let syscall_fb = FramebufferInfo {
-            address: kernel_fb.base_address,
+            address: fb_address,
             width: kernel_fb.width,
             height: kernel_fb.height,
             pitch,
@@ -1284,6 +1337,90 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
     0 // Success
 }
 
+/// sys_get_gpu_display_info - Get display dimensions from VirtIO GPU (if present)
+/// arg1: pointer to userspace buffer (8 bytes: width u32, height u32)
+/// Returns 0 on success, u64::MAX if no VirtIO GPU or invalid buffer
+fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
+    if user_buffer == 0 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(user_buffer, 8) {
+        return u64::MAX;
+    }
+    let Some((width, height)) = crate::virtio::get_gpu_display_info() else {
+        return u64::MAX;
+    };
+    unsafe {
+        let buf = user_buffer as *mut [u32; 2];
+        (*buf)[0] = width;
+        (*buf)[1] = height;
+    }
+    0
+}
+
+/// sys_set_cursor_position - Set VirtIO GPU hardware cursor position
+/// arg1: x (u32), arg2: y (u32). Returns 0 on success, u64::MAX on failure.
+fn sys_set_cursor_position(arg1: u64, arg2: u64) -> u64 {
+    let x = arg1 as u32;
+    let y = arg2 as u32;
+    if crate::virtio::set_cursor_position(x, y) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_gpu_alloc_display_buffer - Allocate VirtIO GPU 2D buffer and map into process
+/// arg1: width (u32), arg2: height (u32), arg3: output buffer ptr (24 bytes)
+/// Output layout: vaddr u64, resource_id u32, pitch u32, size u64
+/// Returns 0 on success, u64::MAX on failure
+fn sys_gpu_alloc_display_buffer(width: u64, height: u64, out_ptr: u64) -> u64 {
+    let (width, height) = (width as u32, height as u32);
+    if width == 0 || height == 0 || out_ptr == 0 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(out_ptr, 24) {
+        return u64::MAX;
+    }
+    let Some((phys_addr, resource_id, pitch, size)) = crate::virtio::gpu_alloc_display_buffer(width, height) else {
+        return u64::MAX;
+    };
+    let current_pid = crate::process::current_process_id();
+    let page_table_phys = crate::process::get_process_page_table(current_pid);
+    if page_table_phys == 0 {
+        return u64::MAX;
+    }
+    let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, phys_addr, size as u64);
+    if vaddr == 0 {
+        return u64::MAX;
+    }
+    unsafe {
+        let buf = out_ptr as *mut u8;
+        core::ptr::write_unaligned(buf as *mut u64, vaddr);
+        core::ptr::write_unaligned(buf.add(8) as *mut u32, resource_id);
+        core::ptr::write_unaligned(buf.add(12) as *mut u32, pitch);
+        core::ptr::write_unaligned(buf.add(16) as *mut u64, size as u64);
+    }
+    0
+}
+
+/// sys_gpu_present - Present GPU buffer to screen (transfer + flush)
+/// arg1: resource_id, arg2: x, arg3: y, arg4: w, arg5: h
+/// Returns 0 on success, u64::MAX on failure
+fn sys_gpu_present(resource_id: u64, x: u64, y: u64, w: u64, h: u64) -> u64 {
+    if crate::virtio::gpu_present(
+        resource_id as u32,
+        x as u32,
+        y as u32,
+        w as u32,
+        h as u32,
+    ) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
 /// sys_map_framebuffer - Map framebuffer physical memory into process virtual space
 /// Returns the virtual address where framebuffer is mapped, or 0 on failure
 fn sys_map_framebuffer() -> u64 {
@@ -1296,6 +1433,13 @@ fn sys_map_framebuffer() -> u64 {
     
     let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
     
+    // NUNCA usar dirección kernel - convertir a física para mapeo
+    let fb_phys = if kernel_fb.base_address >= 0xFFFF_8000_0000_0000 {
+        kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
+    } else {
+        kernel_fb.base_address
+    };
+    
     // Calculate framebuffer size correctly
     // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
     // Map 2x size to support double buffering in display_service
@@ -1307,7 +1451,7 @@ fn sys_map_framebuffer() -> u64 {
     
     serial::serial_print("MAP_FB: Framebuffer mapping request (Double Buffered)\n");
     serial::serial_print("  Phys addr: ");
-    serial::serial_print_hex(kernel_fb.base_address);
+    serial::serial_print_hex(fb_phys);
     serial::serial_print("\n  Size: ");
     serial::serial_print_hex(fb_size);
     serial::serial_print("\n");
@@ -1321,8 +1465,8 @@ fn sys_map_framebuffer() -> u64 {
         return 0;
     }
     
-    // Map framebuffer into process address space
-    let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, kernel_fb.base_address, fb_size);
+    // Map framebuffer into process address space (identity mapping: vaddr = phys)
+    let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, fb_phys, fb_size);
     serial::serial_print("MAP_FB: Done. Returning v=");
     serial::serial_print_hex(vaddr);
     serial::serial_print("\n");

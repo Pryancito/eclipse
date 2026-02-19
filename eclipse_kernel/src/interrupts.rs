@@ -125,6 +125,7 @@ pub fn init() {
         // Configurar handlers de IRQ (32-47)
         KERNEL_IDT.entries[32].set_handler(irq_0 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[33].set_handler(irq_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        KERNEL_IDT.entries[44].set_handler(irq_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
         // Configurar syscall handler (int 0x80)
         // Must be callable from Ring 3 (DPL 3) or it will cause #GP
@@ -168,12 +169,64 @@ pub fn init() {
     
     // Inicializar PIT (Timer)
     init_pit();
-    
+
+    // Habilitar ratón PS/2 (puerto auxiliar)
+    init_ps2_mouse();
+
     // Habilitar interrupciones
     unsafe {
         asm!("sti", options(nomem, nostack));
         crate::serial::serial_print("[INT] Interrupts ENABLED\n");
     }
+}
+
+/// Inicializar ratón PS/2: habilitar puerto auxiliar y enviar "enable data reporting".
+/// Si el controlador no responde (timeout), continúa sin ratón para no colgar el boot.
+fn init_ps2_mouse() {
+    const TIMEOUT: u32 = 0x8000; // Evitar bucles infinitos en VMs/sin PS/2
+    let mut ok = true;
+    unsafe {
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 {
+                break;
+            }
+            if i == TIMEOUT - 1 {
+                ok = false;
+            }
+        }
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 mouse: controller busy (timeout), skipping\n");
+            return;
+        }
+        outb(0x64, 0xA8); // Enable auxiliary device (mouse) port
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 {
+                break;
+            }
+            if i == TIMEOUT - 1 {
+                ok = false;
+            }
+        }
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 mouse: timeout after A8, skipping\n");
+            return;
+        }
+        outb(0x64, 0xD4); // Next byte goes to mouse
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 {
+                break;
+            }
+            if i == TIMEOUT - 1 {
+                ok = false;
+            }
+        }
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 mouse: timeout after D4, skipping\n");
+            return;
+        }
+        outb(0x60, 0xF4); // Enable data reporting
+    }
+    crate::serial::serial_print("[INT] PS/2 mouse init done\n");
 }
 
 /// Inicializar PIC 8259
@@ -195,10 +248,21 @@ fn init_pic() {
         outb(0x21, 0x01);
         outb(0xA1, 0x01);
         
-        // Habilitar solo timer y teclado
-        outb(0x21, 0xFC); // Mask: 11111100 (solo IRQ0 y IRQ1)
-        outb(0xA1, 0xFF); // Mask todo el slave
+        // Habilitar timer, teclado y cascade (IRQ2) en el master
+        // Slave: IRQ12 (ratón) enmascarada inicialmente para evitar IRQs antes del scheduler
+        // Master: enable IRQ0, IRQ1, IRQ2 => mask 11111000 = 0xF8
+        // Slave: mask all initially (0xFF); unmask_mouse_irq() tras scheduler::init()
+        outb(0x21, 0xF8);
+        outb(0xA1, 0xFF);
     }
+}
+
+/// Desenmascarar IRQ 12 (ratón PS/2). Llamar tras scheduler::init().
+pub fn unmask_mouse_irq() {
+    unsafe {
+        outb(0xA1, 0xEF); // Slave: enable IRQ12 => mask 11101111
+    }
+    crate::serial::serial_print("[INT] Mouse IRQ12 enabled\n");
 }
 
 /// Inicializar PIT 8253/8254
@@ -653,6 +717,106 @@ pub fn read_key() -> u8 {
     val
 }
 
+// Mouse Buffer (Circular) - stores packed PS/2 packets (buttons, dx, dy)
+const MOUSE_BUFFER_SIZE: usize = 128;
+static MOUSE_BUFFER: Mutex<[u32; MOUSE_BUFFER_SIZE]> = Mutex::new([0; MOUSE_BUFFER_SIZE]);
+static MOUSE_HEAD: Mutex<usize> = Mutex::new(0);
+static MOUSE_TAIL: Mutex<usize> = Mutex::new(0);
+
+// Packet assembly state (3-byte standard, 4-byte con rueda)
+static MOUSE_PACKET: Mutex<[u8; 4]> = Mutex::new([0; 4]);
+static MOUSE_PACKET_IDX: Mutex<usize> = Mutex::new(0);
+
+extern "C" fn mouse_handler() {
+    let b = unsafe { inb(0x60) };
+
+    let mut idx = MOUSE_PACKET_IDX.lock();
+    {
+        let mut pkt = MOUSE_PACKET.lock();
+
+        if *idx == 0 && (b & 0x08) == 0 {
+            send_eoi(12);
+            return;
+        }
+
+        let mut packed: u32 = 0;
+        let mut do_push = false;
+
+        if *idx == 3 {
+            // Tenemos 3 bytes. El nuevo byte b es: byte 4 (scroll) o byte 0 del siguiente (ratón 3-byte)
+            if (b & 0x08) != 0 {
+                // Es byte 0 del siguiente paquete → paquete actual era 3-byte
+                let buttons = pkt[0] & 0x07;
+                let dx = pkt[1] as i8 as i16;
+                let dy = pkt[2] as i8 as i16;
+                packed = (buttons as u32)
+                    | ((dx as i8 as u8 as u32) << 8)
+                    | ((dy as i8 as u8 as u32) << 16);
+                do_push = true;
+                pkt[0] = b;
+                *idx = 1;
+            } else {
+                // Byte 4 (scroll)
+                pkt[3] = b;
+                let buttons = pkt[0] & 0x07;
+                let dx = pkt[1] as i8 as i16;
+                let dy = pkt[2] as i8 as i16;
+                let dz = pkt[3] as i8;
+                packed = (buttons as u32)
+                    | ((dx as i8 as u8 as u32) << 8)
+                    | ((dy as i8 as u8 as u32) << 16)
+                    | ((dz as u8 as u32) << 24);
+                do_push = true;
+                *idx = 0;
+            }
+        } else {
+            pkt[*idx] = b;
+            *idx += 1;
+            if *idx >= 3 {
+                // Solo 3 bytes hasta ahora; esperamos el próximo para decidir 3 vs 4 byte
+                // (no hacemos push aún, será en el próximo IRQ cuando idx==3)
+            }
+        }
+
+        if do_push {
+
+            // Push into circular buffer
+            let mut head = MOUSE_HEAD.lock();
+            let tail = MOUSE_TAIL.lock();
+            let next_head = (*head + 1) % MOUSE_BUFFER_SIZE;
+            if next_head != *tail {
+                let mut buf = MOUSE_BUFFER.lock();
+                buf[*head] = packed;
+                *head = next_head;
+            }
+            drop(tail);
+            drop(head);
+        }
+    }
+
+    let mut stats = INTERRUPT_STATS.lock();
+    stats.irqs += 1;
+    drop(stats);
+
+    send_eoi(12);
+}
+
+/// Read one packed PS/2 mouse packet from buffer (non-blocking).
+/// Returns 0xFFFFFFFF if empty; otherwise packed u32: buttons | (dx as u8)<<8 | (dy as u8)<<16.
+pub fn read_mouse_packet() -> u32 {
+    let mut tail = MOUSE_TAIL.lock();
+    let head = MOUSE_HEAD.lock();
+
+    if *head == *tail {
+        return 0xFFFFFFFF;
+    }
+
+    let buf = MOUSE_BUFFER.lock();
+    let val = buf[*tail];
+    *tail = (*tail + 1) % MOUSE_BUFFER_SIZE;
+    val
+}
+
 #[unsafe(naked)]
 unsafe extern "C" fn irq_1() {
     core::arch::naked_asm!(
@@ -670,6 +834,26 @@ unsafe extern "C" fn irq_1() {
         "pop rbp",
         "iretq",
         sym keyboard_handler,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_12() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "call {}",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym mouse_handler,
     );
 }
 

@@ -202,4 +202,5 @@ pub fn get_stats() -> SchedulerStats {
 /// Inicializar scheduler
 pub fn init() {
     crate::serial::serial_print("Scheduler initialized\n");
+    crate::interrupts::unmask_mouse_irq();
 }

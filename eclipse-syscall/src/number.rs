@@ -33,6 +33,8 @@ pub const SYS_ARCH_PRCTL: usize = 32;
 pub const SYS_GETRANDOM: usize = 33;
 pub const SYS_IOCTL: usize = 34;
 pub const SYS_GET_LAST_EXEC_ERROR: usize = 35;
+pub const SYS_GET_GPU_DISPLAY_INFO: usize = 38;
+pub const SYS_SET_CURSOR_POSITION: usize = 39;
 
 // Socket syscalls (100+)
 pub const SYS_SOCKET: usize = 100;

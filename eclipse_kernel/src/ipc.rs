@@ -294,49 +294,28 @@ pub fn process_messages() {
             
             let head = ipc.global_queue_head;
             if let Some(msg) = ipc.global_message_queue[head] {
-                // DEBUG: Print all messages processed
-                 crate::serial::serial_print("KERNEL IPC: Processing msg type ");
-                 crate::serial::serial_print_hex(msg.msg_type as u64);
-                 crate::serial::serial_print(" from ");
-                 crate::serial::serial_print_dec(msg.from as u64);
-                 crate::serial::serial_print(" to ");
-                 crate::serial::serial_print_dec(msg.to as u64);
-                 crate::serial::serial_print("\n");
-
-                // Check if it's a Signal message - route to Process Mailbox
-                if msg.msg_type == MessageType::Signal {
+                // Signal e Input (P2P): enrutar a Process Mailbox cuando destino es un proceso
+                let is_p2p = msg.msg_type == MessageType::Signal || msg.msg_type == MessageType::Input;
+                if is_p2p {
                     let pid = msg.to as usize;
                     
-                    // If PID is within range (0..64)
-                    if pid < 64 {
-                        // Remove from global queue
-                        if let Some(signal_msg) = ipc.global_message_queue[head].take() {
-                             ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
-                             
-                             let mut mailboxes = PROCESS_MAILBOXES.lock();
-                             if mailboxes[pid].is_none() {
-                                 mailboxes[pid] = Some(VecDeque::new());
-                             }
-                             
-                             if let Some(queue) = &mut mailboxes[pid] {
-                             // Limit queue size to avoid kernel memory exhaustion
-                             if queue.len() < 32 {
-                                 queue.push_back(signal_msg);
-                                 crate::serial::serial_print("KERNEL IPC: Pushed Signal to Mailbox ");
-                                 crate::serial::serial_print_dec(pid as u64);
-                                 crate::serial::serial_print("\n");
-                             } else {
-                                 crate::serial::serial_print("KERNEL IPC: Mailbox full for PID ");
-                                 crate::serial::serial_print_dec(pid as u64);
-                                 crate::serial::serial_print("\n");
-                             }
-                         }
-                    }
+                    if pid > 0 && pid < 64 {
+                        if let Some(taken_msg) = ipc.global_message_queue[head].take() {
+                            ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                            
+                            let mut mailboxes = PROCESS_MAILBOXES.lock();
+                            if mailboxes[pid].is_none() {
+                                mailboxes[pid] = Some(VecDeque::new());
+                            }
+                            if let Some(queue) = &mut mailboxes[pid] {
+                                if queue.len() < 32 {
+                                    queue.push_back(taken_msg);
+                                }
+                            }
+                        }
                     } else {
-                        // Invalid PID, just consume/discard
                         ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
                     }
-                    
                     continue;
                 }
                 
@@ -414,9 +393,6 @@ pub fn receive_message(client_id: ClientId) -> Option<Message> {
             let mut mailboxes = PROCESS_MAILBOXES.lock();
             if let Some(queue) = &mut mailboxes[client_pid] {
                 if let Some(msg) = queue.pop_front() {
-                     crate::serial::serial_print("KERNEL IPC: Popped message from Mailbox ");
-                     crate::serial::serial_print_dec(client_pid as u64);
-                     crate::serial::serial_print("\n");
                     return Some(msg);
                 }
             }

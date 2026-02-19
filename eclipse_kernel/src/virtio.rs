@@ -77,6 +77,7 @@ const VIRTIO_MAGIC: u32 = 0x74726976;
 
 /// VirtIO device IDs
 const VIRTIO_ID_BLOCK: u32 = 2;
+const VIRTIO_ID_GPU: u32 = 16;
 
 /// VirtIO device status flags
 const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
@@ -199,6 +200,132 @@ const VIRTIO_BLK_T_OUT: u32 = 1;  // Write
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
+/// VirtIO GPU commands (virtio_gpu.h)
+const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x0100;
+const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const VIRTIO_GPU_CMD_RESOURCE_UNREF: u32 = 0x0102;
+const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
+const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
+const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
+const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+const VIRTIO_GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
+const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
+const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
+const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
+const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
+const CURSOR_RESOURCE_ID: u32 = 1;
+const DISPLAY_BUFFER_RESOURCE_ID: u32 = 2;
+const CURSOR_WIDTH: u32 = 64;
+const CURSOR_HEIGHT: u32 = 64;
+
+/// VirtIO GPU control header (24 bytes)
+#[repr(C, packed)]
+struct VirtioGpuCtrlHdr {
+    ctrl_type: u32,
+    flags: u32,
+    fence_id: u64,
+    ctx_id: u32,
+    ring_idx: u8,
+    padding: [u8; 3],
+}
+
+/// VirtIO GPU display info response (per scanout)
+#[repr(C, packed)]
+struct VirtioGpuDisplayOne {
+    r_x: u32,
+    r_y: u32,
+    r_width: u32,
+    r_height: u32,
+    enabled: u32,
+    flags: u32,
+}
+
+/// VirtIO GPU full display info response
+#[repr(C, packed)]
+struct VirtioGpuRespDisplayInfo {
+    hdr: VirtioGpuCtrlHdr,
+    pmodes: [VirtioGpuDisplayOne; VIRTIO_GPU_MAX_SCANOUTS],
+}
+
+/// VirtIO GPU MOVE_CURSOR/UPDATE_CURSOR request
+#[repr(C, packed)]
+struct VirtioGpuUpdateCursorReq {
+    hdr: VirtioGpuCtrlHdr,
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+    pos_padding: u32,
+    resource_id: u32,
+    hot_x: u32,
+    hot_y: u32,
+    padding2: u32,
+}
+
+/// virtio_gpu_rect
+#[repr(C, packed)]
+struct VirtioGpuRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// RESOURCE_CREATE_2D request
+#[repr(C, packed)]
+struct VirtioGpuResourceCreate2d {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+}
+
+/// virtio_gpu_mem_entry
+#[repr(C, packed)]
+struct VirtioGpuMemEntry {
+    addr: u64,
+    length: u32,
+    padding: u32,
+}
+
+/// RESOURCE_ATTACH_BACKING request (mem_entries follow in same buffer)
+#[repr(C, packed)]
+struct VirtioGpuResourceAttachBacking {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    nr_entries: u32,
+}
+
+/// SET_SCANOUT request
+#[repr(C, packed)]
+struct VirtioGpuSetScanout {
+    hdr: VirtioGpuCtrlHdr,
+    r: VirtioGpuRect,
+    scanout_id: u32,
+    resource_id: u32,
+}
+
+/// TRANSFER_TO_HOST_2D request
+#[repr(C, packed)]
+struct VirtioGpuTransferToHost2d {
+    hdr: VirtioGpuCtrlHdr,
+    r: VirtioGpuRect,
+    offset: u64,
+    resource_id: u32,
+    padding: u32,
+}
+
+/// RESOURCE_FLUSH request
+#[repr(C, packed)]
+struct VirtioGpuResourceFlush {
+    hdr: VirtioGpuCtrlHdr,
+    r: VirtioGpuRect,
+    resource_id: u32,
+    padding: u32,
+}
 
 /// Virtqueue structure
 struct Virtqueue {
@@ -1002,6 +1129,603 @@ impl VirtIOBlockDevice {
     }
 }
 
+// ============== VirtIO GPU Driver ==============
+
+/// VirtIO GPU device driver
+pub struct VirtIOGpuDevice {
+    mmio_base: u64,
+    io_base: u16,
+    control_queue: Option<Virtqueue>,
+    cursor_resource_created: bool,
+    /// Cursor bitmap DMA allocation (kept for device to read)
+    cursor_bitmap: Option<(*mut u8, u64)>,
+}
+
+// Safety: GPU device uses raw pointers but is only accessed through Mutex
+unsafe impl Send for VirtIOGpuDevice {}
+
+static GPU_DEVICES: Mutex<alloc::vec::Vec<VirtIOGpuDevice>> = Mutex::new(alloc::vec::Vec::new());
+
+impl VirtIOGpuDevice {
+    /// Create from PCI I/O ports (legacy)
+    unsafe fn new_from_pci_io(io_base: u16) -> Self {
+        VirtIOGpuDevice {
+            mmio_base: 0,
+            io_base,
+            control_queue: None,
+            cursor_resource_created: false,
+            cursor_bitmap: None,
+        }
+    }
+
+    /// Create from PCI memory BAR
+    unsafe fn new_from_pci_mmio(mmio_base: u64) -> Self {
+        VirtIOGpuDevice {
+            mmio_base,
+            io_base: 0,
+            control_queue: None,
+            cursor_resource_created: false,
+            cursor_bitmap: None,
+        }
+    }
+
+    /// Send control command, expect OK_NODATA response. Caller owns req allocation.
+    fn send_ctrl_cmd_nodata(&mut self, req_phys: u64, req_size: usize) -> Result<(), &'static str> {
+        let queue = self.control_queue.as_mut().ok_or("No control queue")?;
+        let resp_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64)
+            .ok_or("alloc resp failed")?;
+        unsafe { core::ptr::write_bytes(resp_ptr, 0, resp_size); }
+        let buffers = [
+            (req_phys, req_size as u32, 0u16),
+            (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
+        ];
+        let head = unsafe {
+            match queue.add_buf(&buffers) {
+                Some(h) => h,
+                None => {
+                    crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+                    return Err("add_buf failed");
+                }
+            }
+        };
+        unsafe {
+            if self.io_base != 0 {
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES { core::hint::spin_loop(); }
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            } else if self.mmio_base != 0 {
+                let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES { core::hint::spin_loop(); }
+                write_volatile(&mut (*regs).queue_notify, 0);
+            }
+        }
+        let mut timeout = 100_000;
+        loop {
+            unsafe { if queue.has_used() { break; } }
+            if timeout == 0 {
+                unsafe { queue.free_desc(head); crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
+                return Err("timeout");
+            }
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+        let (used_head, _) = unsafe { queue.get_used().unwrap_or((0, 0)) };
+        unsafe { queue.free_desc(used_head); }
+        let ctrl_type = unsafe {
+            core::ptr::read_unaligned((resp_ptr as *const u8).add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *const u32)
+        };
+        unsafe { crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
+        if ctrl_type != VIRTIO_GPU_RESP_OK_NODATA {
+            return Err("unexpected response");
+        }
+        Ok(())
+    }
+
+    /// Initialize legacy PCI (I/O ports)
+    unsafe fn init_legacy_pci(&mut self) -> bool {
+        // Reset
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, 0);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER as u8));
+
+        // Features
+        let _features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
+        outl(self.io_base + VIRTIO_PCI_DRIVER_FEATURES, 0);
+
+        // Control queue (queue 0)
+        outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+        let queue_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        if queue_size == 0 || queue_size > 256 {
+            return false;
+        }
+        let actual_size = if queue_size > 64 { 64 } else { queue_size };
+
+        match Virtqueue::new(actual_size) {
+            Some(queue) => {
+                let queue_pfn = (queue.desc_phys / 4096) as u32;
+                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, queue_pfn);
+                self.control_queue = Some(queue);
+
+                let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+                outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
+                for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
+                    core::hint::spin_loop();
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Initialize MMIO
+    unsafe fn init_mmio(&mut self) -> bool {
+        let regs = self.mmio_base as *mut VirtIOMMIORegs;
+        let magic = read_volatile(&(*regs).magic_value);
+        if magic != VIRTIO_MAGIC {
+            return false;
+        }
+        let device_id = read_volatile(&(*regs).device_id);
+        if device_id != VIRTIO_ID_GPU {
+            return false;
+        }
+
+        write_volatile(&mut (*regs).status, 0);
+        write_volatile(&mut (*regs).status, VIRTIO_STATUS_ACKNOWLEDGE);
+        let status = read_volatile(&(*regs).status);
+        write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_DRIVER);
+
+        write_volatile(&mut (*regs).device_features_sel, 0);
+        let _features = read_volatile(&(*regs).device_features);
+        write_volatile(&mut (*regs).driver_features_sel, 0);
+        write_volatile(&mut (*regs).driver_features, 0);
+
+        let status = read_volatile(&(*regs).status);
+        write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_FEATURES_OK);
+        let status = read_volatile(&(*regs).status);
+        if (status & VIRTIO_STATUS_FEATURES_OK) == 0 {
+            return false;
+        }
+
+        write_volatile(&mut (*regs).queue_sel, 0);
+        let queue_size = read_volatile(&(*regs).queue_num_max);
+        if queue_size == 0 || queue_size > 256 {
+            return false;
+        }
+        let actual_size = if queue_size > 64 { 64 } else { queue_size } as u32;
+
+        match Virtqueue::new(actual_size as u16) {
+            Some(queue) => {
+                write_volatile(&mut (*regs).queue_num, actual_size);
+                write_volatile(&mut (*regs).queue_desc_low, (queue.desc_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_desc_high, (queue.desc_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_driver_low, (queue.avail_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_driver_high, (queue.avail_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_device_low, (queue.used_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_device_high, (queue.used_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_ready, 1);
+                self.control_queue = Some(queue);
+
+                let status = read_volatile(&(*regs).status);
+                write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_DRIVER_OK);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Get display info via GET_DISPLAY_INFO command
+    pub fn get_display_info(&mut self) -> Result<(u32, u32), &'static str> {
+        let queue = self.control_queue.as_mut().ok_or("No control queue")?;
+
+        let req_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        let resp_size = core::mem::size_of::<VirtioGpuRespDisplayInfo>();
+
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64)
+            .ok_or("alloc req failed")?;
+        let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64)
+            .ok_or_else(|| {
+                unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64) };
+                "alloc resp failed"
+            })?;
+
+        // Zero buffers
+        unsafe {
+            core::ptr::write_bytes(req_ptr, 0, req_size);
+            core::ptr::write_bytes(resp_ptr, 0, resp_size);
+        }
+
+        // Set request type = GET_DISPLAY_INFO (use unaligned write for packed struct)
+        unsafe {
+            core::ptr::write_unaligned(
+                req_ptr.add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32,
+                VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
+            );
+        }
+
+        // Descriptor chain: [request out] -> [response in]
+        let buffers = [
+            (req_phys, req_size as u32, 0u16),           // device-readable
+            (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE), // device-writable
+        ];
+
+        let head = unsafe {
+            match queue.add_buf(&buffers) {
+                Some(h) => h,
+                None => {
+                    crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                    crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+                    return Err("add_buf failed");
+                }
+            }
+        };
+
+        unsafe {
+            if self.io_base != 0 {
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
+                    core::hint::spin_loop();
+                }
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            } else if self.mmio_base != 0 {
+                let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
+                    core::hint::spin_loop();
+                }
+                write_volatile(&mut (*regs).queue_notify, 0);
+            }
+        }
+
+        // Poll for completion
+        let mut timeout = 1_000_000;
+        loop {
+            unsafe {
+                if queue.has_used() {
+                    break;
+                }
+            }
+            if timeout == 0 {
+                unsafe {
+                    queue.free_desc(head);
+                    crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                    crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+                }
+                return Err("get_display_info timeout");
+            }
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+
+        let (used_head, _len) = unsafe { queue.get_used().unwrap_or((0, 0)) };
+        unsafe { queue.free_desc(used_head); }
+
+        let resp_base = resp_ptr as *const u8;
+        let ctrl_type_offset = core::mem::offset_of!(VirtioGpuRespDisplayInfo, hdr)
+            + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
+        let ctrl_type = unsafe {
+            core::ptr::read_unaligned(resp_base.add(ctrl_type_offset) as *const u32)
+        };
+        if ctrl_type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+            unsafe {
+                crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+            }
+            return Err("unexpected response type");
+        }
+
+        // First enabled scanout - use unaligned reads for packed struct
+        let pmodes_offset = core::mem::offset_of!(VirtioGpuRespDisplayInfo, pmodes);
+        let mode_size = core::mem::size_of::<VirtioGpuDisplayOne>();
+        let enabled_offset = core::mem::offset_of!(VirtioGpuDisplayOne, enabled);
+        let r_width_offset = core::mem::offset_of!(VirtioGpuDisplayOne, r_width);
+        let r_height_offset = core::mem::offset_of!(VirtioGpuDisplayOne, r_height);
+
+        let mut width = 0u32;
+        let mut height = 0u32;
+        for i in 0..VIRTIO_GPU_MAX_SCANOUTS {
+            let mode_base = pmodes_offset + i * mode_size;
+            let enabled = unsafe {
+                core::ptr::read_unaligned(
+                    resp_base.add(mode_base + enabled_offset) as *const u32
+                )
+            };
+            if enabled != 0 {
+                width = unsafe {
+                    core::ptr::read_unaligned(
+                        resp_base.add(mode_base + r_width_offset) as *const u32
+                    )
+                };
+                height = unsafe {
+                    core::ptr::read_unaligned(
+                        resp_base.add(mode_base + r_height_offset) as *const u32
+                    )
+                };
+                break;
+            }
+        }
+
+        unsafe {
+            crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+            crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+        }
+        Ok((width, height))
+    }
+
+    /// Initialize cursor with image: RESOURCE_CREATE_2D, ATTACH_BACKING, UPDATE_CURSOR
+    pub fn init_cursor(&mut self) -> Result<(), &'static str> {
+        if self.cursor_resource_created {
+            return Ok(());
+        }
+        let cursor_size = (CURSOR_WIDTH * CURSOR_HEIGHT * 4) as usize;
+        let (bitmap_ptr, bitmap_phys) = crate::memory::alloc_dma_buffer(cursor_size, 4096)
+            .ok_or("alloc cursor bitmap failed")?;
+        unsafe {
+            core::ptr::write_bytes(bitmap_ptr, 0, cursor_size);
+            // Simple 64x64 arrow: white center cross, black outline, transparent elsewhere
+            let ptr = bitmap_ptr as *mut u8;
+            for y in 0..CURSOR_HEIGHT {
+                for x in 0..CURSOR_WIDTH {
+                    let i = (y * CURSOR_WIDTH + x) as usize * 4;
+                    let (b, g, r, a) = if (x >= 28 && x < 36) || (y >= 28 && y < 36) {
+                        if (x >= 30 && x < 34) || (y >= 30 && y < 34) {
+                            (255, 255, 255, 255) // white center
+                        } else {
+                            (0, 0, 0, 255) // black outline
+                        }
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    *ptr.add(i) = b;
+                    *ptr.add(i + 1) = g;
+                    *ptr.add(i + 2) = r;
+                    *ptr.add(i + 3) = a;
+                }
+            }
+        }
+        self.cursor_bitmap = Some((bitmap_ptr, bitmap_phys));
+
+        self.resource_create_2d(CURSOR_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, CURSOR_WIDTH, CURSOR_HEIGHT)?;
+        self.resource_attach_backing(CURSOR_RESOURCE_ID, &[(bitmap_phys, cursor_size as u32)])?;
+
+        // UPDATE_CURSOR: set cursor image at (0,0), hotspot center (32,32)
+        self.update_cursor(0, 0, 0, 32, 32)?;
+        self.cursor_resource_created = true;
+        Ok(())
+    }
+
+    /// UPDATE_CURSOR: set cursor image and position
+    fn update_cursor(&mut self, scanout_id: u32, x: u32, y: u32, hot_x: u32, hot_y: u32) -> Result<(), &'static str> {
+        let req_size = core::mem::size_of::<VirtioGpuUpdateCursorReq>();
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64)
+            .ok_or("alloc update_cursor failed")?;
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let req_base = req_ptr as *mut u8;
+        let base = core::mem::offset_of!(VirtioGpuUpdateCursorReq, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
+        unsafe {
+            core::ptr::write_unaligned(req_base.add(base) as *mut u32, VIRTIO_GPU_CMD_UPDATE_CURSOR);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, scanout_id)) as *mut u32, scanout_id);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, x)) as *mut u32, x);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, y)) as *mut u32, y);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, resource_id)) as *mut u32, CURSOR_RESOURCE_ID);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_x)) as *mut u32, hot_x);
+            core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_y)) as *mut u32, hot_y);
+        }
+        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        Ok(())
+    }
+
+    /// RESOURCE_CREATE_2D: create a 2D resource (for scanout or cursor)
+    pub fn resource_create_2d(&mut self, resource_id: u32, format: u32, width: u32, height: u32) -> Result<(), &'static str> {
+        let req_size = core::mem::size_of::<VirtioGpuResourceCreate2d>();
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64).ok_or("alloc create2d failed")?;
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let r = req_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32, VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, resource_id)) as *mut u32, resource_id);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, format)) as *mut u32, format);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, width)) as *mut u32, width);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, height)) as *mut u32, height);
+        }
+        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        Ok(())
+    }
+
+    /// RESOURCE_ATTACH_BACKING: attach guest memory to resource (addr_phys, length) per entry
+    pub fn resource_attach_backing(&mut self, resource_id: u32, entries: &[(u64, u32)]) -> Result<(), &'static str> {
+        let attach_size = core::mem::size_of::<VirtioGpuResourceAttachBacking>()
+            + entries.len() * core::mem::size_of::<VirtioGpuMemEntry>();
+        let (attach_ptr, attach_phys) = crate::memory::alloc_dma_buffer(attach_size, 64).ok_or("alloc attach failed")?;
+        unsafe { core::ptr::write_bytes(attach_ptr, 0, attach_size); }
+        let ab = attach_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(ab.add(core::mem::offset_of!(VirtioGpuResourceAttachBacking, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+            core::ptr::write_unaligned(ab.add(core::mem::offset_of!(VirtioGpuResourceAttachBacking, resource_id)) as *mut u32, resource_id);
+            core::ptr::write_unaligned(ab.add(core::mem::offset_of!(VirtioGpuResourceAttachBacking, nr_entries)) as *mut u32, entries.len() as u32);
+        }
+        let ent_off = core::mem::size_of::<VirtioGpuResourceAttachBacking>();
+        for (i, &(addr, len)) in entries.iter().enumerate() {
+            let e = ent_off + i * core::mem::size_of::<VirtioGpuMemEntry>();
+            unsafe {
+                core::ptr::write_unaligned(ab.add(e + core::mem::offset_of!(VirtioGpuMemEntry, addr)) as *mut u64, addr);
+                core::ptr::write_unaligned(ab.add(e + core::mem::offset_of!(VirtioGpuMemEntry, length)) as *mut u32, len);
+            }
+        }
+        self.send_ctrl_cmd_nodata(attach_phys, attach_size)?;
+        unsafe { crate::memory::free_dma_buffer(attach_ptr, attach_size, 64); }
+        Ok(())
+    }
+
+    /// SET_SCANOUT: assign resource to display output
+    pub fn set_scanout(&mut self, scanout_id: u32, resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> Result<(), &'static str> {
+        let req_size = core::mem::size_of::<VirtioGpuSetScanout>();
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64).ok_or("alloc set_scanout failed")?;
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let r = req_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32, VIRTIO_GPU_CMD_SET_SCANOUT);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, r) + core::mem::offset_of!(VirtioGpuRect, x)) as *mut u32, x);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, r) + core::mem::offset_of!(VirtioGpuRect, y)) as *mut u32, y);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, r) + core::mem::offset_of!(VirtioGpuRect, width)) as *mut u32, w);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, r) + core::mem::offset_of!(VirtioGpuRect, height)) as *mut u32, h);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, scanout_id)) as *mut u32, scanout_id);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, resource_id)) as *mut u32, resource_id);
+        }
+        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        Ok(())
+    }
+
+    /// TRANSFER_TO_HOST_2D: copy guest memory to resource
+    pub fn transfer_to_host_2d(&mut self, resource_id: u32, x: u32, y: u32, w: u32, h: u32, offset: u64) -> Result<(), &'static str> {
+        let req_size = core::mem::size_of::<VirtioGpuTransferToHost2d>();
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64).ok_or("alloc transfer failed")?;
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let r = req_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, r) + core::mem::offset_of!(VirtioGpuRect, x)) as *mut u32, x);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, r) + core::mem::offset_of!(VirtioGpuRect, y)) as *mut u32, y);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, r) + core::mem::offset_of!(VirtioGpuRect, width)) as *mut u32, w);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, r) + core::mem::offset_of!(VirtioGpuRect, height)) as *mut u32, h);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, offset)) as *mut u64, offset);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, resource_id)) as *mut u32, resource_id);
+        }
+        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        Ok(())
+    }
+
+    /// RESOURCE_FLUSH: flush resource to display
+    pub fn resource_flush(&mut self, resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> Result<(), &'static str> {
+        let req_size = core::mem::size_of::<VirtioGpuResourceFlush>();
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64).ok_or("alloc flush failed")?;
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let r = req_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32, VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, x)) as *mut u32, x);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, y)) as *mut u32, y);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, width)) as *mut u32, w);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, height)) as *mut u32, h);
+            core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, resource_id)) as *mut u32, resource_id);
+        }
+        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        Ok(())
+    }
+
+    /// Move hardware cursor (VIRTIO_GPU_CMD_MOVE_CURSOR)
+    pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> Result<(), &'static str> {
+        let queue = self.control_queue.as_mut().ok_or("No control queue")?;
+
+        let req_size = core::mem::size_of::<VirtioGpuUpdateCursorReq>();
+        let resp_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
+
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64)
+            .ok_or("alloc req failed")?;
+        let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64)
+            .ok_or_else(|| {
+                unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64) };
+                "alloc resp failed"
+            })?;
+
+        unsafe {
+            core::ptr::write_bytes(req_ptr, 0, req_size);
+            core::ptr::write_bytes(resp_ptr, 0, resp_size);
+        }
+
+        let req_base = req_ptr as *mut u8;
+        unsafe {
+            core::ptr::write_unaligned(
+                req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hdr)
+                    + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32,
+                VIRTIO_GPU_CMD_MOVE_CURSOR,
+            );
+            core::ptr::write_unaligned(
+                req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, scanout_id)) as *mut u32,
+                scanout_id,
+            );
+            core::ptr::write_unaligned(
+                req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, x)) as *mut u32,
+                x,
+            );
+            core::ptr::write_unaligned(
+                req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, y)) as *mut u32,
+                y,
+            );
+        }
+
+        let buffers = [
+            (req_phys, req_size as u32, 0u16),
+            (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
+        ];
+
+        let head = unsafe {
+            match queue.add_buf(&buffers) {
+                Some(h) => h,
+                None => {
+                    crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                    crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+                    return Err("add_buf failed");
+                }
+            }
+        };
+
+        unsafe {
+            if self.io_base != 0 {
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES { core::hint::spin_loop(); }
+                outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            } else if self.mmio_base != 0 {
+                let regs = self.mmio_base as *mut VirtIOMMIORegs;
+                for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES { core::hint::spin_loop(); }
+                write_volatile(&mut (*regs).queue_notify, 0);
+            }
+        }
+
+        let mut timeout = 100_000;
+        loop {
+            unsafe {
+                if queue.has_used() { break; }
+            }
+            if timeout == 0 {
+                unsafe {
+                    queue.free_desc(head);
+                    crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                    crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+                }
+                return Err("move_cursor timeout");
+            }
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+
+        let (used_head, _len) = unsafe { queue.get_used().unwrap_or((0, 0)) };
+        unsafe { queue.free_desc(used_head); }
+
+        let resp_base = resp_ptr as *const u8;
+        let ctrl_type = unsafe {
+            core::ptr::read_unaligned(
+                resp_base.add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *const u32
+            )
+        };
+        if ctrl_type != VIRTIO_GPU_RESP_OK_NODATA {
+            unsafe {
+                crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+                crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+            }
+            return Err("unexpected response");
+        }
+
+        unsafe {
+            crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+            crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+        }
+        Ok(())
+    }
+}
+
 /// Initialize VirtIO devices
 pub fn init() {
     use crate::serial;
@@ -1035,9 +1759,64 @@ pub fn init() {
             }
         }
     }
-    
-    serial::serial_print("[VirtIO] Total devices initialized: ");
+
+    // Search for VirtIO GPU devices (PCI 0x1050)
+    for dev in crate::pci::get_all_devices() {
+        if dev.is_virtio() && dev.device_id == 0x1050 {
+            serial::serial_print("[VirtIO-GPU] Found virtio-gpu on PCI Bus=");
+            serial::serial_print_dec(dev.bus as u64);
+            serial::serial_print(" Dev=");
+            serial::serial_print_dec(dev.device as u64);
+            serial::serial_print("\n");
+
+            unsafe {
+                crate::pci::enable_device(&dev, true);
+                let bar0 = crate::pci::get_bar(&dev, 0);
+
+                if (bar0 & 1) != 0 {
+                    // I/O ports (legacy)
+                    let io_base = (bar0 & !0x3) as u16;
+                    let mut gpu = VirtIOGpuDevice::new_from_pci_io(io_base);
+                    if gpu.init_legacy_pci() {
+                        serial::serial_print("[VirtIO-GPU] Initialized (I/O) at port ");
+                        serial::serial_print_hex(io_base as u64);
+                        serial::serial_print("\n");
+                        if let Ok((w, h)) = gpu.get_display_info() {
+                            serial::serial_print("[VirtIO-GPU] Display: ");
+                            serial::serial_print_dec(w as u64);
+                            serial::serial_print("x");
+                            serial::serial_print_dec(h as u64);
+                            serial::serial_print("\n");
+                        }
+                        GPU_DEVICES.lock().push(gpu);
+                    }
+                } else {
+                    // MMIO (memory BAR)
+                    let bar_phys = (bar0 as u64 & 0xFFFFFFF0);
+                    let mmio_base = crate::memory::PHYS_MEM_OFFSET + bar_phys;
+                    let mut gpu = VirtIOGpuDevice::new_from_pci_mmio(mmio_base);
+                    if gpu.init_mmio() {
+                        serial::serial_print("[VirtIO-GPU] Initialized (MMIO) at ");
+                        serial::serial_print_hex(mmio_base);
+                        serial::serial_print("\n");
+                        if let Ok((w, h)) = gpu.get_display_info() {
+                            serial::serial_print("[VirtIO-GPU] Display: ");
+                            serial::serial_print_dec(w as u64);
+                            serial::serial_print("x");
+                            serial::serial_print_dec(h as u64);
+                            serial::serial_print("\n");
+                        }
+                        GPU_DEVICES.lock().push(gpu);
+                    }
+                }
+            }
+        }
+    }
+
+    serial::serial_print("[VirtIO] Total block devices: ");
     serial::serial_print_dec(BLOCK_DEVICES.lock().len() as u64);
+    serial::serial_print(", GPU devices: ");
+    serial::serial_print_dec(GPU_DEVICES.lock().len() as u64);
     serial::serial_print("\n");
 
     // Register as disk: scheme
@@ -1065,6 +1844,73 @@ pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
     }
 }
 
+/// Check if a VirtIO GPU was initialized
+pub fn has_virtio_gpu() -> bool {
+    !GPU_DEVICES.lock().is_empty()
+}
+
+/// Get display dimensions from first VirtIO GPU (if available)
+pub fn get_gpu_display_info() -> Option<(u32, u32)> {
+    let mut devices = GPU_DEVICES.lock();
+    if let Some(dev) = devices.get_mut(0) {
+        dev.get_display_info().ok()
+    } else {
+        None
+    }
+}
+
+/// Set hardware cursor position on first VirtIO GPU (scanout 0)
+pub fn set_cursor_position(x: u32, y: u32) -> bool {
+    let mut devices = GPU_DEVICES.lock();
+    if let Some(dev) = devices.get_mut(0) {
+        if !dev.cursor_resource_created {
+            let _ = dev.init_cursor();
+        }
+        dev.move_cursor(0, x, y).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Allocate a VirtIO GPU display buffer (2D resource with DMA backing).
+/// Returns Some((phys_addr, resource_id, pitch, size)) on success.
+/// The caller must map phys_addr to userspace and call gpu_present to flip.
+pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u32, usize)> {
+    let pitch = width.wrapping_mul(4);
+    let size = (pitch as usize).wrapping_mul(height as usize);
+    if size == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let (buf_ptr, buf_phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
+    unsafe { core::ptr::write_bytes(buf_ptr, 0, size); }
+
+    let mut devices = GPU_DEVICES.lock();
+    let dev = devices.get_mut(0)?;
+    if dev.resource_create_2d(DISPLAY_BUFFER_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, width, height).is_err() {
+        unsafe { crate::memory::free_dma_buffer(buf_ptr, size, 4096); }
+        return None;
+    }
+    if dev.resource_attach_backing(DISPLAY_BUFFER_RESOURCE_ID, &[(buf_phys, size as u32)]).is_err() {
+        unsafe { crate::memory::free_dma_buffer(buf_ptr, size, 4096); }
+        return None;
+    }
+    if dev.set_scanout(0, DISPLAY_BUFFER_RESOURCE_ID, 0, 0, width, height).is_err() {
+        unsafe { crate::memory::free_dma_buffer(buf_ptr, size, 4096); }
+        return None;
+    }
+    Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch, size))
+}
+
+/// Present display buffer to screen: transfer guest memory to GPU and flush.
+pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
+    let mut devices = GPU_DEVICES.lock();
+    let dev = match devices.get_mut(0) {
+        Some(d) => d,
+        None => return false,
+    };
+    dev.transfer_to_host_2d(resource_id, x, y, w, h, 0).is_ok()
+        && dev.resource_flush(resource_id, x, y, w, h).is_ok()
+}
 
 // --- Redox-style Scheme Implementation ---
 

@@ -27,6 +27,7 @@ const SYS_CLOSE: u64 = 12;
 const SYS_READ: u64 = 2;
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_FMAP: u64 = 28;
+const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
 
 /// Framebuffer constants
 const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
@@ -103,6 +104,24 @@ fn get_kernel_framebuffer_info() -> Option<FramebufferInfoFromKernel> {
         Some(info)
     } else {
         None
+    }
+}
+
+/// Query VirtIO GPU display dimensions (if present). Logs when available.
+fn log_virtio_gpu_display_info() {
+    let mut dims = [0u32, 0u32];
+    let result: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_GET_GPU_DISPLAY_INFO,
+            in("rdi") dims.as_mut_ptr() as u64,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    if result == 0 && (dims[0] > 0 || dims[1] > 0) {
+        println!("[DISPLAY-SERVICE] VirtIO GPU display: {}x{}", dims[0], dims[1]);
     }
 }
 
@@ -856,7 +875,8 @@ pub extern "C" fn _start() -> ! {
     
     // Detect available graphics hardware
     println!("[DISPLAY-SERVICE] Scanning for graphics hardware...");
-    
+    log_virtio_gpu_display_info();
+
     let mut active_driver = GraphicsDriver::None;
     let mut framebuffer: Option<Framebuffer> = None;
     let mut stats = DisplayStats {

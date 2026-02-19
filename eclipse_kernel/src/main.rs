@@ -34,6 +34,7 @@ mod ata;
 mod fd;  // File descriptor management
 mod scheme; // Redox-style scheme system
 mod bcache; // Buffer Cache
+mod usb_hid; // USB HID (stub)
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
@@ -160,6 +161,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     fd::init();
     servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
     pci::init();
+    usb_hid::init(); // stub, plan para ratón/teclado USB
     nvidia::init();
     virtio::init();
     ata::init();

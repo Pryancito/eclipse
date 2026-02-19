@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -80,15 +80,35 @@ struct InputDevice {
     polling_rate: u32,  // Hz
 }
 
-/// Input event
+/// Input event (layout must match smithay_app)
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct InputEvent {
     device_id: u32,
-    event_type: u8,  // 0=key, 1=mouse_move, 2=mouse_button
+    event_type: u8,  // 0=key, 1=mouse_move, 2=mouse_button, 3=mouse_scroll
     code: u16,
     value: i32,
     timestamp: u64,
+}
+
+/// Tamaño fijo para evitar problemas de layout/stack
+const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
+
+/// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11)
+fn send_event_to_client(pid: u32, ev: &InputEvent) {
+    if pid == 0 || pid > 63 {
+        return;
+    }
+    let mut buf = [0u8; 32];
+    let len = core::cmp::min(INPUT_EVENT_SIZE, buf.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            ev as *const InputEvent as *const u8,
+            buf.as_mut_ptr(),
+            len,
+        );
+    }
+    let _ = send(pid, 0x40, &buf[..len]);
 }
 
 /// Input event queue
@@ -336,9 +356,14 @@ pub extern "C" fn _start() -> ! {
     println!("[INPUT-SERVICE]   USB devices: {}", usb_device_count);
     println!("[INPUT-SERVICE] Waiting for input events...");
 
-    // PID del cliente de display (por ejemplo, smithay_app), registrado vía IPC
-    let mut display_client_pid: u32 = 0;
-    
+    // Clientes de display suscritos (máx 8)
+    const MAX_DISPLAY_CLIENTS: usize = 8;
+    let mut display_clients: [u32; MAX_DISPLAY_CLIENTS] = [0; MAX_DISPLAY_CLIENTS];
+    let mut display_client_count: usize = 0;
+
+    // Estado previo de botones del ratón PS/2 para detectar cambios (bit0=left, bit1=right, bit2=middle)
+    let mut prev_mouse_buttons: u8 = 0;
+
     // Main loop - process input events
     let mut heartbeat_counter = 0u64;
     let mut total_events = 0u64;
@@ -357,24 +382,145 @@ pub extern "C" fn _start() -> ! {
                 let mut id_bytes = [0u8; 4];
                 id_bytes.copy_from_slice(&buf[4..8]);
                 let client_pid = u32::from_le_bytes(id_bytes);
-                display_client_pid = client_pid;
-                println!(
-                    "[INPUT-SERVICE] Display client registrado: PID {} (desde PID {})",
-                    client_pid, sender_pid
-                );
+                let mut added = false;
+                for i in 0..MAX_DISPLAY_CLIENTS {
+                    if display_clients[i] == 0 || display_clients[i] == client_pid {
+                        display_clients[i] = client_pid;
+                        if i >= display_client_count {
+                            display_client_count = i + 1;
+                        }
+                        added = true;
+                        break;
+                    }
+                }
+                if added {
+                    println!(
+                        "[INPUT-SERVICE] Display client registrado: PID {} ({} clientes)",
+                        client_pid, display_client_count
+                    );
+                }
             }
         }
         
-        // In a real implementation, this would:
-        // - Read from PS/2 keyboard controller (port 0x60)
-        // - Read from PS/2 mouse controller (port 0x60 after 0xD4 command)
-        // - Poll USB HID devices via USB controller interrupt endpoints
-        // - Handle tablet absolute positioning events
-        // - Queue events for consumers
-        // - Send events via IPC to interested processes (e.g., display service)
-        // - Handle special keys (Ctrl+Alt+Del, etc.)
-        
-        // Simulate occasional input events
+        // Drenar ratón PS/2 real (kernel buffer vía syscall read_mouse_packet)
+        while let Some(packed) = read_mouse_packet() {
+            let buttons = (packed & 0xFF) as u8;
+            let dx = ((packed >> 8) as u8) as i8 as i32;
+            let dy = ((packed >> 16) as u8) as i8 as i32;
+
+            // Eventos de movimiento (X, Y)
+            if dx != 0 {
+                let ev = InputEvent {
+                    device_id: 1,
+                    event_type: 1,
+                    code: 0,
+                    value: dx,
+                    timestamp: heartbeat_counter,
+                };
+                if event_queue.push(ev) {
+                    mouse_events += 1;
+                    total_events += 1;
+                    for i in 0..display_client_count {
+                        let pid = display_clients[i];
+                        send_event_to_client(pid, &ev);
+                    }
+                }
+            }
+            if dy != 0 {
+                let ev = InputEvent {
+                    device_id: 1,
+                    event_type: 1,
+                    code: 1,
+                    value: dy,
+                    timestamp: heartbeat_counter,
+                };
+                if event_queue.push(ev) {
+                    mouse_events += 1;
+                    total_events += 1;
+                    for i in 0..display_client_count {
+                        let pid = display_clients[i];
+                        send_event_to_client(pid, &ev);
+                    }
+                }
+            }
+
+            // Eventos de botones (code 0=left, 1=right, 2=middle; value 0=release, 1=press)
+            for i in 0..3u8 {
+                let mask = 1u8 << i;
+                let now = (buttons & mask) != 0;
+                let was = (prev_mouse_buttons & mask) != 0;
+                if now != was {
+                    let ev = InputEvent {
+                        device_id: 1,
+                        event_type: 2, // mouse_button
+                        code: i as u16,
+                        value: if now { 1 } else { 0 },
+                        timestamp: heartbeat_counter,
+                    };
+                    if event_queue.push(ev) {
+                        mouse_events += 1;
+                        total_events += 1;
+                        for i in 0..display_client_count {
+                            let pid = display_clients[i];
+                            send_event_to_client(pid, &ev);
+                        }
+                    }
+                }
+            }
+            prev_mouse_buttons = buttons;
+
+            // Scroll (byte alto del packed, PS/2 extendido 4-byte)
+            let scroll = (packed >> 24) as i8 as i32;
+            if scroll != 0 {
+                let ev = InputEvent {
+                    device_id: 1,
+                    event_type: 3, // mouse_scroll
+                    code: 0,       // vertical
+                    value: scroll,
+                    timestamp: heartbeat_counter,
+                };
+                if event_queue.push(ev) {
+                    mouse_events += 1;
+                    total_events += 1;
+                    for i in 0..display_client_count {
+                        let pid = display_clients[i];
+                        send_event_to_client(pid, &ev);
+                    }
+                }
+            }
+        }
+
+        // Drenar teclado PS/2 real (kernel buffer vía syscall read_key)
+        while let Some(sc) = read_key_scancode() {
+            let value = if (sc & 0x80) != 0 { 0 } else { 1 }; // break = 0, make = 1
+            let code = sc & 0x7F;
+            if code == 0 {
+                continue;
+            }
+            let kbd_event = InputEvent {
+                device_id: 0,
+                event_type: 0,
+                code: code as u16,
+                value,
+                timestamp: heartbeat_counter,
+            };
+            if event_queue.push(kbd_event) {
+                keyboard_events += 1;
+                total_events += 1;
+                for i in 0..display_client_count {
+                    let pid = display_clients[i];
+                    send_event_to_client(pid, &kbd_event);
+                }
+                if let Some(fd) = input_fd {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>())
+                    };
+                    sys_write(fd, buf);
+                }
+            }
+        }
+
+        // Simulate occasional input events (si no hay teclado real)
         if heartbeat_counter % 100000 == 0 {
             // Simulate keyboard event
             let kbd_event = InputEvent {
@@ -387,15 +533,9 @@ pub extern "C" fn _start() -> ! {
             if event_queue.push(kbd_event) {
                 keyboard_events += 1;
                 total_events += 1;
-                // Enviar evento al cliente de display via IPC si está registrado
-                if display_client_pid != 0 {
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &kbd_event as *const InputEvent as *const u8,
-                            core::mem::size_of::<InputEvent>(),
-                        )
-                    };
-                    let _ = send(display_client_pid, 0x40, bytes);
+                for i in 0..display_client_count {
+                    let pid = display_clients[i];
+                    send_event_to_client(pid, &kbd_event);
                 }
                 // Report via scheme (if available)
                 if let Some(fd) = input_fd {
@@ -406,26 +546,29 @@ pub extern "C" fn _start() -> ! {
         }
         
         if heartbeat_counter % 150000 == 0 {
-            // Simulate mouse movement
-            let mouse_event = InputEvent {
+            // Simulate mouse movement (X and Y)
+            let mouse_x = InputEvent {
                 device_id: 1,
-                event_type: 1,  // Mouse move
-                code: 0,        // X axis
-                value: 10,      // Delta X
+                event_type: 1,
+                code: 0,   // X axis
+                value: 10,
                 timestamp: heartbeat_counter,
             };
-            if event_queue.push(mouse_event) {
-                mouse_events += 1;
-                total_events += 1;
-                // Enviar evento al cliente de display via IPC si está registrado
-                if display_client_pid != 0 {
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &mouse_event as *const InputEvent as *const u8,
-                            core::mem::size_of::<InputEvent>(),
-                        )
-                    };
-                    let _ = send(display_client_pid, 0x40, bytes);
+            let mouse_y = InputEvent {
+                device_id: 1,
+                event_type: 1,
+                code: 1,   // Y axis
+                value: 5,
+                timestamp: heartbeat_counter,
+            };
+            for ev in [mouse_x, mouse_y] {
+                if event_queue.push(ev) {
+                    mouse_events += 1;
+                    total_events += 1;
+                    for i in 0..display_client_count {
+                        let pid = display_clients[i];
+                        send_event_to_client(pid, &ev);
+                    }
                 }
             }
         }

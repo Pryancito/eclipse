@@ -25,8 +25,93 @@ pub const SYS_MOUNT: u64 = 29;
 pub const SYS_FSTAT: u64 = 30;
 pub const SYS_SPAWN: u64 = 31;
 pub const SYS_GET_LAST_EXEC_ERROR: u64 = 35;
+pub const SYS_READ_KEY: u64 = 36;
+pub const SYS_READ_MOUSE_PACKET: u64 = 37;
+pub const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
+pub const SYS_SET_CURSOR_POSITION: u64 = 39;
+pub const SYS_GPU_ALLOC_DISPLAY_BUFFER: u64 = 40;
+pub const SYS_GPU_PRESENT: u64 = 41;
 
 pub type c_void = core::ffi::c_void;
+
+/// Set VirtIO GPU hardware cursor position. Returns true on success.
+pub fn set_cursor_position(x: u32, y: u32) -> bool {
+    let r = unsafe { syscall2(SYS_SET_CURSOR_POSITION, x as u64, y as u64) };
+    r != u64::MAX
+}
+
+/// Get display dimensions from VirtIO GPU (if present).
+/// Writes (width, height) as two u32s into the buffer.
+/// Returns true on success, false if no VirtIO GPU.
+pub fn get_gpu_display_info(out: &mut [u32; 2]) -> bool {
+    let r = unsafe { syscall1(SYS_GET_GPU_DISPLAY_INFO, out.as_mut_ptr() as u64) };
+    r != u64::MAX
+}
+
+/// Output struct for gpu_alloc_display_buffer (24 bytes)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GpuDisplayBufferInfo {
+    pub vaddr: u64,
+    pub resource_id: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+/// Allocate VirtIO GPU display buffer and map into process.
+/// Returns Some(info) on success, None on failure.
+pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<GpuDisplayBufferInfo> {
+    let mut out = GpuDisplayBufferInfo::default();
+    let r = unsafe {
+        syscall3(
+            SYS_GPU_ALLOC_DISPLAY_BUFFER,
+            width as u64,
+            height as u64,
+            &mut out as *mut _ as u64,
+        )
+    };
+    if r == 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Present GPU buffer to screen (transfer + flush).
+pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
+    let r = unsafe {
+        syscall5(
+            SYS_GPU_PRESENT,
+            resource_id as u64,
+            x as u64,
+            y as u64,
+            w as u64,
+            h as u64,
+        )
+    };
+    r != u64::MAX
+}
+
+/// Read one PS/2 scancode from kernel buffer (non-blocking). Returns None if empty.
+pub fn read_key_scancode() -> Option<u8> {
+    let r = unsafe { syscall0(SYS_READ_KEY) };
+    if r == 0 {
+        None
+    } else {
+        Some(r as u8)
+    }
+}
+
+/// Read one PS/2 mouse packet from kernel buffer (non-blocking).
+/// Returns None if empty. Otherwise Some(packed): buttons = packed & 0xFF, dx = (packed>>8) as i8, dy = (packed>>16) as i8.
+pub fn read_mouse_packet() -> Option<u32> {
+    let r = unsafe { syscall0(SYS_READ_MOUSE_PACKET) };
+    if r == 0 {
+        None
+    } else {
+        Some(r as u32)
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -98,6 +183,13 @@ pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 unsafe fn syscall4(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     let ret: u64;
     asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, lateout("rax") ret, options(nostack));
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall5(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
+    let ret: u64;
+    asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, in("r8") arg5, lateout("rax") ret, options(nostack));
     ret
 }
 

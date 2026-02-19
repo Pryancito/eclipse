@@ -5,6 +5,8 @@
 Smithay App is a Wayland compositor with Xwayland support designed specifically for Eclipse OS. It provides a graphical environment that supports both Wayland and X11 applications using the native Eclipse OS IPC system and direct framebuffer access via `/dev/fb0`.
 
 > **📘 Technical Documentation**: For detailed information about the `no_std` and `no_main` configuration and how smithay_app is loaded by initd, see [TECHNICAL.md](TECHNICAL.md).
+>
+> **📐 Design Reference**: smithay_app se basa en [xfwl4](../xfwl4) como referencia de diseño. Ver [XFWL4_REFERENCE.md](XFWL4_REFERENCE.md) para patrones portables (focus, ciclado, keybindings).
 
 ## Features
 

@@ -281,8 +281,8 @@ fn handle_ipc_requests(buffer: &mut [u8; 32]) {
         return;
     }
 
-    // Petición de PID del servicio de entrada
-    if len >= 12 && &buffer[..12] == b"GET_INPUT_PID" {
+    // Petición de PID del servicio de entrada ("GET_INPUT_PID" = 13 bytes)
+    if len >= 13 && &buffer[..13] == b"GET_INPUT_PID" {
         let input_pid = unsafe { SERVICES[3].pid as u32 }; // Servicio "input"
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"INPT");

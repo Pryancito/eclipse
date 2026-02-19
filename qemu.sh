@@ -43,6 +43,7 @@ DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si 
 MEMORY="8G"
 CPUS="4"
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
+PS2_MOUSE="${PS2_MOUSE:-1}"  # 1=PS/2 ratón (Eclipse lo soporta), 0=USB mouse/tablet
 USB_PORTS_2="${USB_PORTS_2:-4}"  # Número de puertos USB 2.0
 USB_PORTS_3="${USB_PORTS_3:-4}"  # Número de puertos USB 3.0
 CREATE_USB_DISK="${CREATE_USB_DISK:-1}"  # Crear disco USB de prueba
@@ -67,12 +68,14 @@ print_info "Disco principal: $DISK"
 print_info "Memoria: $MEMORY"
 print_info "CPUs: $CPUS"
 print_info "Controlador USB: $([ "$USE_XHCI" = "1" ] && echo "XHCI (USB 3.0)" || echo "Legacy (UHCI/EHCI)")"
+print_info "Ratón: $([ "$PS2_MOUSE" = "1" ] && echo "PS/2 (compatible con Eclipse)" || echo "USB (no soportado por kernel)")"
 print_info ""
 print_info "Controles:"
+print_info "  - Ctrl+Alt+G: Capturar/soltar ratón (PS/2)"
 print_info "  - Ctrl+A, X: Salir de QEMU"
 print_info "  - Ctrl+A, C: Consola de monitor QEMU"
 print_info ""
-print_warning "Nota: Para cambiar a USB legacy, ejecuta: USE_XHCI=0 sudo ./qemu.sh"
+print_warning "Nota: Ratón PS/2 por defecto. Para USB: PS2_MOUSE=0 ./qemu.sh"
 echo ""
 
 # OVMF (UEFI firmware) - intentar diferentes ubicaciones comunes
@@ -143,26 +146,32 @@ QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"
 # Configuración de display
 QEMU_CMD="$QEMU_CMD -vga virtio"
 
-# Configuración de dispositivos USB
-if [ "$USE_XHCI" = "1" ]; then
-    print_info "Usando controlador XHCI (USB 3.0)"
-    print_info "Puertos USB 2.0: $USB_PORTS_2, Puertos USB 3.0: $USB_PORTS_3"
-    
-    # Agregar controlador XHCI
-    QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
-    
-    # Agregar dispositivos USB al controlador XHCI
-    QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
-    QEMU_CMD="$QEMU_CMD -device usb-mouse,bus=xhci.0,port=2"
-    QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=3"
-    QEMU_CMD="$QEMU_CMD -no-shutdown"
-    QEMU_CMD="$QEMU_CMD -d int"
+# Configuración de dispositivos de entrada
+# Eclipse soporta PS/2; USB HID está en desarrollo.
+if [ "$PS2_MOUSE" = "1" ]; then
+    # PS/2: usa el i8042 integrado (teclado + ratón). Sin usb-mouse/tablet.
+    print_info "Ratón PS/2 habilitado (Ctrl+Alt+G para capturar)"
+    if [ "$USE_XHCI" = "1" ]; then
+        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
+        QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
+    else
+        QEMU_CMD="$QEMU_CMD -usb"
+        QEMU_CMD="$QEMU_CMD -device usb-kbd"
+    fi
 else
-    print_warning "Usando controlador USB legacy (UHCI/EHCI)"
-    QEMU_CMD="$QEMU_CMD -usb"
-    QEMU_CMD="$QEMU_CMD -device usb-tablet"
-    QEMU_CMD="$QEMU_CMD -device usb-kbd"
+    # USB mouse/tablet (el kernel NO lo soporta aún)
+    if [ "$USE_XHCI" = "1" ]; then
+        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
+        QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
+        QEMU_CMD="$QEMU_CMD -device usb-mouse,bus=xhci.0,port=2"
+        QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=3"
+    else
+        QEMU_CMD="$QEMU_CMD -usb"
+        QEMU_CMD="$QEMU_CMD -device usb-tablet"
+        QEMU_CMD="$QEMU_CMD -device usb-kbd"
+    fi
 fi
+QEMU_CMD="$QEMU_CMD -no-shutdown"
 
 # Puerto de monitor QEMU (para debugging)
 QEMU_CMD="$QEMU_CMD -serial stdio"
