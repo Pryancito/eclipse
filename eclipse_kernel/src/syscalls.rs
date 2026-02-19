@@ -100,6 +100,10 @@ static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     lseek_calls: 0,
 });
 
+/// Maximum path length for syscall path buffers
+/// Linux uses PATH_MAX = 4096, we use 1024 as a reasonable compromise
+const MAX_PATH_LENGTH: usize = 1024;
+
 /// Handler principal de syscalls
 pub extern "C" fn syscall_handler(
     syscall_num: u64,
@@ -2529,8 +2533,8 @@ fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     let path_len = strlen_user_unique(path_ptr, 4096);
     if path_len == 0 { return u64::MAX; }
     
-    let mut path_buf = [0u8; 256];
-    if path_len >= 256 { return u64::MAX; }
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 { return u64::MAX; }
     
     unsafe {
         core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
@@ -2570,9 +2574,8 @@ fn sys_mkdir(path_ptr: u64, mode: u64) -> u64 {
     if path_len == 0 { return u64::MAX; }
     
     // Copy path to buffer
-    // TODO: Dynamic allocation or larger buffer
-    let mut path_buf = [0u8; 256];
-    if path_len >= 256 { return u64::MAX; } // Path too long
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 { return u64::MAX; } // Path too long
     
     unsafe {
         core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
@@ -2598,8 +2601,8 @@ fn sys_unlink(path_ptr: u64) -> u64 {
     let path_len = strlen_user_unique(path_ptr, 4096);
     if path_len == 0 { return u64::MAX; }
     
-    let mut path_buf = [0u8; 256];
-    if path_len >= 256 { return u64::MAX; }
+    let mut path_buf = [0u8; MAX_PATH_LENGTH];
+    if path_len >= MAX_PATH_LENGTH as u64 { return u64::MAX; }
     
     unsafe {
         core::ptr::copy_nonoverlapping(path_ptr as *const u8, path_buf.as_mut_ptr(), path_len as usize);
