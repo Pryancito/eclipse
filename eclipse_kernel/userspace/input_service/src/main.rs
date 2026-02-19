@@ -101,7 +101,7 @@ impl GamingCapabilities {
             is_gaming: true,
             max_dpi: 16000,
             adjustable_dpi: true,
-            extra_buttons: 5,  // Back, Forward, DPI+, DPI-, Profile
+            extra_buttons: 8,  // Back, Forward, DPI+, DPI-, Profile + 3 more
             polling_rate_max: 1000,
             n_key_rollover: false,
             macro_keys: 0,

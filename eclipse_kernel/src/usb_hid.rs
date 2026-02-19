@@ -68,7 +68,8 @@ pub mod vendors {
 }
 
 /// Detectar si un dispositivo USB es un periférico gaming
-pub fn is_gaming_device(vendor_id: u16, product_id: u16) -> bool {
+/// TODO: Verificar product_id contra lista de modelos gaming conocidos
+pub fn is_gaming_device(vendor_id: u16, _product_id: u16) -> bool {
     use vendors::*;
     
     match vendor_id {
@@ -82,19 +83,22 @@ pub fn is_gaming_device(vendor_id: u16, product_id: u16) -> bool {
 }
 
 /// Obtener capacidades de dispositivo gaming
+/// TODO: Añadir configuraciones específicas por vendor/producto
 pub fn get_gaming_capabilities(vendor_id: u16, product_id: u16) -> Option<GamingDeviceCapabilities> {
     if !is_gaming_device(vendor_id, product_id) {
         return None;
     }
     
     // Configuración por defecto para dispositivos gaming
+    // En una implementación real, diferentes productos tendrían specs diferentes
+    // (ej: Razer DeathAdder puede llegar a 20000 DPI, mientras otros a 16000)
     Some(GamingDeviceCapabilities {
         vendor_id,
         product_id,
         max_polling_rate: 1000,
         max_dpi: 16000,
         adjustable_dpi: true,
-        extra_buttons: 5,
+        extra_buttons: 8,
         n_key_rollover: true,
         macro_keys: 6,
         rgb_support: true,
