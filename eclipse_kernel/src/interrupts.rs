@@ -101,6 +101,12 @@ struct IdtDescriptor {
 /// IDT estática del kernel
 static mut KERNEL_IDT: Idt = Idt::new();
 
+/// IRQ handler function type
+type IrqHandler = fn();
+
+/// IRQ handler table for IRQs 0-15 (interrupts 32-47)
+static mut IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
+
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
 const IDT_RING_0: u8 = 0b00000000;
@@ -845,6 +851,83 @@ pub fn get_stats() -> InterruptStats {
         irqs: stats.irqs,
         timer_ticks: stats.timer_ticks,
     }
+}
+
+/// Register a custom IRQ handler for the given IRQ number (0-15)
+/// This allows device drivers to register their interrupt handlers dynamically
+pub fn set_irq_handler(irq_num: u8, handler: fn()) -> Result<(), &'static str> {
+    if irq_num >= 16 {
+        return Err("IRQ number must be 0-15");
+    }
+    
+    unsafe {
+        IRQ_HANDLERS[irq_num as usize] = Some(handler);
+        
+        // Install the IRQ wrapper in the IDT
+        let interrupt_num = 32 + irq_num;
+        match irq_num {
+            11 => {
+                KERNEL_IDT.entries[interrupt_num as usize].set_handler(
+                    irq_11 as *const () as u64,
+                    0x08,
+                    IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE
+                );
+            }
+            _ => {
+                // For other IRQs, we'd need to add wrapper functions
+                return Err("IRQ wrapper not implemented for this IRQ number");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Generic IRQ handler that dispatches to registered handler
+extern "C" fn irq_11_handler() {
+    unsafe {
+        if let Some(handler) = IRQ_HANDLERS[11] {
+            handler();
+        }
+    }
+    
+    let mut stats = INTERRUPT_STATS.lock();
+    stats.irqs += 1;
+    drop(stats);
+    
+    send_eoi(11);
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_11() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym irq_11_handler,
+    );
 }
 
 // ============================================================================

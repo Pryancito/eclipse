@@ -3514,13 +3514,18 @@ pub fn register_usb_irq_handler(irq_number: u8) -> Result<(), &'static str> {
     crate::serial::serial_print_hex(irq_number as u64);
     crate::serial::serial_print("\n");
     
-    // TODO: Use kernel's actual IRQ registration API
-    // For now, this is a placeholder that documents the interface
+    // Register the USB interrupt handler with the kernel's IRQ system
+    crate::interrupts::set_irq_handler(irq_number, usb_irq_handler_wrapper)?;
     
-    crate::serial::serial_print("[USB-HID] IRQ handler registered (stub)\n");
-    crate::serial::serial_print("[USB-HID] NOTE: Requires kernel IRQ registration implementation\n");
+    crate::serial::serial_print("[USB-HID] IRQ handler registered successfully\n");
     
     Ok(())
+}
+
+/// Wrapper function that bridges kernel IRQ system to USB hardware interrupt handler
+fn usb_irq_handler_wrapper() {
+    // Call the actual USB interrupt handler
+    usb_hardware_interrupt_handler();
 }
 
 /// Enable USB interrupts in the controller
