@@ -1159,3 +1159,307 @@ fn enumerate_usb_devices_stub() {
     crate::serial::serial_print("[USB-HID]   - Manejo de interrupciones USB\n");
     crate::serial::serial_print("[USB-HID]   - Buffers DMA para transferencias\n");
 }
+
+//
+// ========== Stage 1: Foundation - DMA and Transfer Infrastructure ==========
+//
+
+/// Tipos de transferencias USB
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsbTransferType {
+    Control,     // Control transfers (setup, data, status)
+    Bulk,        // Bulk transfers (large data)
+    Interrupt,   // Interrupt transfers (HID reports, periodic)
+    Isochronous, // Isochronous transfers (audio/video, not used for HID)
+}
+
+/// Estado de una transferencia USB
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsbTransferStatus {
+    Pending,      // Transfer en cola
+    InProgress,   // Transfer en progreso
+    Completed,    // Transfer completada exitosamente
+    Error,        // Transfer con error
+    Stalled,      // Endpoint stalled
+    Cancelled,    // Transfer cancelada
+}
+
+/// Buffer DMA para transferencias USB
+/// 
+/// Representa un buffer de memoria física para DMA.
+/// USB controllers requieren direcciones físicas contiguas.
+#[derive(Debug)]
+pub struct DmaBuffer {
+    pub virt_addr: u64,      // Dirección virtual del buffer
+    pub phys_addr: u64,      // Dirección física (para DMA)
+    pub size: usize,         // Tamaño del buffer en bytes
+    pub allocated: bool,     // Si el buffer está en uso
+}
+
+impl DmaBuffer {
+    /// Crear un buffer DMA sin inicializar
+    pub const fn new() -> Self {
+        Self {
+            virt_addr: 0,
+            phys_addr: 0,
+            size: 0,
+            allocated: false,
+        }
+    }
+    
+    /// Verificar si el buffer es válido
+    pub fn is_valid(&self) -> bool {
+        self.allocated && self.virt_addr != 0 && self.phys_addr != 0 && self.size > 0
+    }
+}
+
+/// Solicitud de transferencia USB
+/// 
+/// Representa una transferencia USB genérica.
+/// Se usa como base para control, bulk, interrupt transfers.
+pub struct UsbTransferRequest {
+    pub transfer_type: UsbTransferType,
+    pub status: UsbTransferStatus,
+    pub device_address: u8,      // Dirección del dispositivo (1-127)
+    pub endpoint: u8,            // Número de endpoint (0-15)
+    pub direction_in: bool,      // true = IN (device to host), false = OUT
+    pub data_buffer: DmaBuffer,  // Buffer para datos
+    pub actual_length: usize,    // Bytes transferidos realmente
+    pub max_packet_size: u16,    // Tamaño máximo de paquete
+}
+
+impl UsbTransferRequest {
+    /// Crear una nueva solicitud de transferencia
+    pub fn new(transfer_type: UsbTransferType) -> Self {
+        Self {
+            transfer_type,
+            status: UsbTransferStatus::Pending,
+            device_address: 0,
+            endpoint: 0,
+            direction_in: true,
+            data_buffer: DmaBuffer::new(),
+            actual_length: 0,
+            max_packet_size: 64,
+        }
+    }
+}
+
+//
+// ========== XHCI Transfer Request Block (TRB) Structures ==========
+//
+
+/// TRB Type codes
+/// XHCI Specification Section 6.4.6
+pub const TRB_TYPE_NORMAL: u8 = 1;
+pub const TRB_TYPE_SETUP: u8 = 2;
+pub const TRB_TYPE_DATA: u8 = 3;
+pub const TRB_TYPE_STATUS: u8 = 4;
+pub const TRB_TYPE_LINK: u8 = 6;
+pub const TRB_TYPE_COMMAND_COMPLETION: u8 = 33;
+pub const TRB_TYPE_PORT_STATUS_CHANGE: u8 = 34;
+
+/// Transfer Request Block (TRB)
+/// XHCI Specification Section 4.11
+/// 
+/// Estructura básica de 16 bytes para todos los TRBs.
+/// Los campos específicos dependen del tipo de TRB.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Trb {
+    pub parameter: u64,      // TRB-specific parameter (varies by type)
+    pub status: u32,         // TRB status field
+    pub control: u32,        // Control field (includes Cycle bit, TRB Type)
+}
+
+impl Trb {
+    /// Crear un TRB vacío
+    pub const fn new() -> Self {
+        Self {
+            parameter: 0,
+            status: 0,
+            control: 0,
+        }
+    }
+    
+    /// Obtener el tipo de TRB del campo control
+    pub fn trb_type(&self) -> u8 {
+        ((self.control >> 10) & 0x3F) as u8
+    }
+    
+    /// Obtener el Cycle bit
+    pub fn cycle_bit(&self) -> bool {
+        (self.control & 1) != 0
+    }
+    
+    /// Establecer el Cycle bit
+    pub fn set_cycle_bit(&mut self, cycle: bool) {
+        if cycle {
+            self.control |= 1;
+        } else {
+            self.control &= !1;
+        }
+    }
+}
+
+/// Ring de TRBs para XHCI
+/// 
+/// Estructura circular para Command Ring, Transfer Ring, o Event Ring.
+/// Usa el Producer Cycle State (PCS) para detectar wrap-around.
+pub struct TrbRing {
+    pub trbs: alloc::vec::Vec<Trb>,  // Array de TRBs
+    pub enqueue_index: usize,         // Índice de escritura
+    pub dequeue_index: usize,         // Índice de lectura
+    pub cycle_state: bool,            // Producer Cycle State
+    pub capacity: usize,              // Capacidad del ring (número de TRBs)
+}
+
+impl TrbRing {
+    /// Crear un nuevo ring de TRBs
+    pub fn new(capacity: usize) -> Self {
+        let mut trbs = alloc::vec::Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            trbs.push(Trb::new());
+        }
+        
+        Self {
+            trbs,
+            enqueue_index: 0,
+            dequeue_index: 0,
+            cycle_state: true,
+            capacity,
+        }
+    }
+    
+    /// Verificar si el ring está lleno
+    pub fn is_full(&self) -> bool {
+        // Ring está lleno si enqueue alcanza dequeue con mismo cycle state
+        let next = (self.enqueue_index + 1) % self.capacity;
+        next == self.dequeue_index
+    }
+    
+    /// Obtener espacio disponible en el ring
+    pub fn available_space(&self) -> usize {
+        if self.enqueue_index >= self.dequeue_index {
+            self.capacity - (self.enqueue_index - self.dequeue_index) - 1
+        } else {
+            self.dequeue_index - self.enqueue_index - 1
+        }
+    }
+}
+
+//
+// ========== HID Boot Protocol Report Structures ==========
+//
+
+/// Reporte de teclado en Boot Protocol
+/// HID Specification Appendix B.1
+/// 
+/// 8 bytes: [Modifiers, Reserved, Key1, Key2, Key3, Key4, Key5, Key6]
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct HidKeyboardReport {
+    pub modifiers: u8,       // Bit 0: Left Control, Bit 1: Left Shift, etc.
+    pub reserved: u8,        // Debe ser 0
+    pub keys: [u8; 6],       // Array de keycodes presionados (0 = ninguno)
+}
+
+impl HidKeyboardReport {
+    pub const fn new() -> Self {
+        Self {
+            modifiers: 0,
+            reserved: 0,
+            keys: [0; 6],
+        }
+    }
+    
+    /// Verificar si una tecla está presionada
+    pub fn is_key_pressed(&self, keycode: u8) -> bool {
+        self.keys.iter().any(|&k| k == keycode)
+    }
+}
+
+// Keyboard modifier bits
+pub const MOD_LEFT_CTRL: u8 = 1 << 0;
+pub const MOD_LEFT_SHIFT: u8 = 1 << 1;
+pub const MOD_LEFT_ALT: u8 = 1 << 2;
+pub const MOD_LEFT_GUI: u8 = 1 << 3;
+pub const MOD_RIGHT_CTRL: u8 = 1 << 4;
+pub const MOD_RIGHT_SHIFT: u8 = 1 << 5;
+pub const MOD_RIGHT_ALT: u8 = 1 << 6;
+pub const MOD_RIGHT_GUI: u8 = 1 << 7;
+
+/// Reporte de ratón en Boot Protocol
+/// HID Specification Appendix B.2
+/// 
+/// 3 bytes mínimo: [Buttons, X, Y]
+/// 4 bytes con scroll wheel: [Buttons, X, Y, Wheel]
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct HidMouseReport {
+    pub buttons: u8,         // Bit 0: Button 1 (left), Bit 1: Button 2 (right), etc.
+    pub x: i8,               // Movimiento X (relativo)
+    pub y: i8,               // Movimiento Y (relativo)
+    pub wheel: i8,           // Scroll wheel (si está disponible)
+}
+
+impl HidMouseReport {
+    pub const fn new() -> Self {
+        Self {
+            buttons: 0,
+            x: 0,
+            y: 0,
+            wheel: 0,
+        }
+    }
+    
+    /// Verificar si un botón está presionado
+    pub fn is_button_pressed(&self, button: u8) -> bool {
+        (self.buttons & (1 << button)) != 0
+    }
+}
+
+// Mouse button bits
+pub const MOUSE_BUTTON_LEFT: u8 = 0;
+pub const MOUSE_BUTTON_RIGHT: u8 = 1;
+pub const MOUSE_BUTTON_MIDDLE: u8 = 2;
+
+/// Pool de buffers DMA para gestión eficiente
+/// 
+/// Pre-aloca buffers DMA para evitar fragmentación.
+pub struct DmaBufferPool {
+    buffers: alloc::vec::Vec<DmaBuffer>,
+    buffer_size: usize,
+}
+
+impl DmaBufferPool {
+    /// Crear un nuevo pool de buffers
+    pub fn new(count: usize, buffer_size: usize) -> Self {
+        let mut buffers = alloc::vec::Vec::with_capacity(count);
+        for _ in 0..count {
+            buffers.push(DmaBuffer::new());
+        }
+        
+        Self {
+            buffers,
+            buffer_size,
+        }
+    }
+    
+    /// Obtener un buffer libre del pool
+    pub fn allocate(&mut self) -> Option<&mut DmaBuffer> {
+        self.buffers.iter_mut().find(|b| !b.allocated)
+    }
+    
+    /// Liberar un buffer de vuelta al pool
+    pub fn free(&mut self, buffer: &DmaBuffer) {
+        if let Some(b) = self.buffers.iter_mut().find(|b| b.phys_addr == buffer.phys_addr) {
+            b.allocated = false;
+        }
+    }
+    
+    /// Obtener estadísticas del pool
+    pub fn stats(&self) -> (usize, usize) {
+        let allocated = self.buffers.iter().filter(|b| b.allocated).count();
+        (allocated, self.buffers.len())
+    }
+}
