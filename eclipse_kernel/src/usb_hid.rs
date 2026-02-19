@@ -590,6 +590,108 @@ impl UsbControllerType {
     }
 }
 
+/// Estado de inicialización del controlador USB
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsbControllerState {
+    Uninitialized,
+    Initializing,
+    Ready,
+    Error,
+}
+
+//
+// ========== XHCI (USB 3.0+) Register Definitions ==========
+//
+
+/// XHCI Capability Registers (offset 0x00)
+/// Según XHCI Specification Rev 1.2, Section 5.3
+#[repr(C)]
+#[derive(Debug)]
+pub struct XhciCapabilityRegisters {
+    pub caplength: u8,       // 0x00: Capability Register Length
+    pub reserved: u8,        // 0x01: Reserved
+    pub hciversion: u16,     // 0x02: Interface Version Number
+    pub hcsparams1: u32,     // 0x04: Structural Parameters 1
+    pub hcsparams2: u32,     // 0x08: Structural Parameters 2
+    pub hcsparams3: u32,     // 0x0C: Structural Parameters 3
+    pub hccparams1: u32,     // 0x10: Capability Parameters 1
+    pub dboff: u32,          // 0x14: Doorbell Offset
+    pub rtsoff: u32,         // 0x18: Runtime Register Space Offset
+    pub hccparams2: u32,     // 0x1C: Capability Parameters 2
+}
+
+/// XHCI Operational Registers
+/// Offset = CAPLENGTH (typically 0x20)
+#[repr(C)]
+#[derive(Debug)]
+pub struct XhciOperationalRegisters {
+    pub usbcmd: u32,         // 0x00: USB Command
+    pub usbsts: u32,         // 0x04: USB Status
+    pub pagesize: u32,       // 0x08: Page Size
+    pub reserved1: [u32; 2], // 0x0C-0x10: Reserved
+    pub dnctrl: u32,         // 0x14: Device Notification Control
+    pub crcr: u64,           // 0x18: Command Ring Control
+    pub reserved2: [u32; 4], // 0x20-0x2C: Reserved
+    pub dcbaap: u64,         // 0x30: Device Context Base Address Array Pointer
+    pub config: u32,         // 0x38: Configure
+}
+
+// XHCI USB Command Register (USBCMD) bits
+pub const XHCI_CMD_RUN: u32 = 1 << 0;         // Run/Stop
+pub const XHCI_CMD_RESET: u32 = 1 << 1;       // Host Controller Reset
+pub const XHCI_CMD_INTE: u32 = 1 << 2;        // Interrupter Enable
+pub const XHCI_CMD_HSEE: u32 = 1 << 3;        // Host System Error Enable
+
+// XHCI USB Status Register (USBSTS) bits
+pub const XHCI_STS_HCH: u32 = 1 << 0;         // HC Halted
+pub const XHCI_STS_HSE: u32 = 1 << 2;         // Host System Error
+pub const XHCI_STS_EINT: u32 = 1 << 3;        // Event Interrupt
+pub const XHCI_STS_CNR: u32 = 1 << 11;        // Controller Not Ready
+
+//
+// ========== EHCI (USB 2.0) Register Definitions ==========
+//
+
+/// EHCI Capability Registers
+/// Según EHCI Specification Rev 1.0, Section 2.2
+#[repr(C)]
+#[derive(Debug)]
+pub struct EhciCapabilityRegisters {
+    pub caplength: u8,       // 0x00: Capability Register Length
+    pub reserved: u8,        // 0x01: Reserved
+    pub hciversion: u16,     // 0x02: Interface Version Number
+    pub hcsparams: u32,      // 0x04: Structural Parameters
+    pub hccparams: u32,      // 0x08: Capability Parameters
+    pub hcsp_portroute: u64, // 0x0C: Companion Port Route Description
+}
+
+/// EHCI Operational Registers
+/// Offset = CAPLENGTH (typically 0x10)
+#[repr(C)]
+#[derive(Debug)]
+pub struct EhciOperationalRegisters {
+    pub usbcmd: u32,         // 0x00: USB Command
+    pub usbsts: u32,         // 0x04: USB Status
+    pub usbintr: u32,        // 0x08: USB Interrupt Enable
+    pub frindex: u32,        // 0x0C: Frame Index
+    pub ctrldssegment: u32,  // 0x10: Control Data Structure Segment
+    pub periodiclistbase: u32, // 0x14: Periodic Frame List Base Address
+    pub asynclistaddr: u32,  // 0x18: Asynchronous List Address
+    pub reserved: [u32; 9],  // 0x1C-0x3C: Reserved
+    pub configflag: u32,     // 0x40: Configured Flag
+}
+
+// EHCI USB Command Register (USBCMD) bits
+pub const EHCI_CMD_RUN: u32 = 1 << 0;         // Run/Stop
+pub const EHCI_CMD_RESET: u32 = 1 << 1;       // Host Controller Reset
+pub const EHCI_CMD_PSE: u32 = 1 << 4;         // Periodic Schedule Enable
+pub const EHCI_CMD_ASE: u32 = 1 << 5;         // Asynchronous Schedule Enable
+
+// EHCI USB Status Register (USBSTS) bits
+pub const EHCI_STS_INT: u32 = 1 << 0;         // USB Interrupt
+pub const EHCI_STS_ERR: u32 = 1 << 1;         // USB Error Interrupt
+pub const EHCI_STS_HCHALTED: u32 = 1 << 12;   // HC Halted
+
 /// Inicializar soporte USB HID.
 /// Detecta controladores USB vía PCI y prepara estructuras para futura inicialización.
 pub fn init() {
@@ -632,12 +734,33 @@ pub fn init() {
         usb_controllers.len(), xhci_count, ehci_count, ohci_count, uhci_count
     ));
     
-    // TODO: Inicializar controladores XHCI/EHCI
+    crate::serial::serial_print("\n[USB-HID] === Fase 2: Inicialización de Controladores ===\n");
+    
+    // Intentar inicializar cada controlador
+    let mut initialized_count = 0;
+    for controller in &usb_controllers {
+        let state = match controller.controller_type {
+            UsbControllerType::XHCI => init_xhci_controller(controller),
+            UsbControllerType::EHCI => init_ehci_controller(controller),
+            UsbControllerType::OHCI => init_ohci_controller(controller),
+            UsbControllerType::UHCI => init_uhci_controller(controller),
+        };
+        
+        if state == UsbControllerState::Ready {
+            initialized_count += 1;
+        }
+    }
+    
+    crate::serial::serial_print(&alloc::format!(
+        "\n[USB-HID] Inicialización completada: {}/{} controladores listos\n",
+        initialized_count, usb_controllers.len()
+    ));
+    
     // TODO: Enumerar dispositivos HID conectados
     // TODO: Identificar periféricos gaming y configurar polling rate alto
     // TODO: Configurar buffers DMA para transferencias de alta frecuencia
     
-    crate::serial::serial_print("[USB-HID] Detección completada (inicialización pendiente)\n");
+    crate::serial::serial_print("[USB-HID] Fase 2 completada (enumeración de dispositivos pendiente)\n");
 }
 
 /// Detectar controladores USB vía PCI
@@ -671,4 +794,114 @@ fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
     }
     
     controllers
+}
+
+//
+// ========== USB Controller Initialization Functions ==========
+//
+
+/// Inicializar controlador XHCI (USB 3.0+)
+/// 
+/// Esta es una implementación stub que prepara la estructura básica.
+/// La inicialización completa requiere:
+/// 1. Mapear registros MMIO desde BAR0
+/// 2. Reset del controlador
+/// 3. Configurar command ring
+/// 4. Configurar event ring
+/// 5. Configurar device context base array
+/// 6. Iniciar el controlador
+fn init_xhci_controller(controller: &UsbController) -> UsbControllerState {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] Inicializando XHCI en {:02X}:{:02X}.{}...\n",
+        controller.bus, controller.device, controller.function
+    ));
+    
+    // BAR0 contiene la dirección base de los registros MMIO
+    let bar0 = controller.bar0;
+    if bar0 == 0 {
+        crate::serial::serial_print("[USB-HID]   ERROR: BAR0 es 0, controlador no configurado\n");
+        return UsbControllerState::Error;
+    }
+    
+    // Limpiar bit 0 (tipo de memoria) para obtener dirección real
+    let mmio_base = (bar0 & !0xF) as u64;
+    
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   MMIO Base: 0x{:016X}\n", mmio_base
+    ));
+    
+    // TODO: Mapear MMIO a espacio virtual del kernel
+    // TODO: Leer capability registers
+    // TODO: Verificar versión XHCI
+    // TODO: Determinar offsets de operational/runtime/doorbell registers
+    // TODO: Reset del controlador (USBCMD.RESET)
+    // TODO: Esperar a que USBSTS.CNR = 0 (controller ready)
+    // TODO: Configurar estructuras de datos (command ring, event ring, DCBAA)
+    // TODO: Iniciar controlador (USBCMD.RUN)
+    
+    crate::serial::serial_print("[USB-HID]   Inicialización XHCI stub completada\n");
+    crate::serial::serial_print("[USB-HID]   NOTA: Funcionalidad completa requiere implementación de driver\n");
+    
+    UsbControllerState::Uninitialized
+}
+
+/// Inicializar controlador EHCI (USB 2.0)
+/// 
+/// Esta es una implementación stub que prepara la estructura básica.
+/// La inicialización completa requiere:
+/// 1. Mapear registros MMIO desde BAR0
+/// 2. Reset del controlador
+/// 3. Configurar periodic/async schedules
+/// 4. Configurar frame list
+/// 5. Iniciar el controlador
+fn init_ehci_controller(controller: &UsbController) -> UsbControllerState {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] Inicializando EHCI en {:02X}:{:02X}.{}...\n",
+        controller.bus, controller.device, controller.function
+    ));
+    
+    let bar0 = controller.bar0;
+    if bar0 == 0 {
+        crate::serial::serial_print("[USB-HID]   ERROR: BAR0 es 0, controlador no configurado\n");
+        return UsbControllerState::Error;
+    }
+    
+    let mmio_base = (bar0 & !0xF) as u64;
+    
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   MMIO Base: 0x{:016X}\n", mmio_base
+    ));
+    
+    // TODO: Mapear MMIO a espacio virtual del kernel
+    // TODO: Leer capability registers
+    // TODO: Determinar offset de operational registers (CAPLENGTH)
+    // TODO: Reset del controlador (USBCMD.RESET)
+    // TODO: Esperar a que USBSTS.HCHALTED = 1
+    // TODO: Configurar periodic frame list
+    // TODO: Configurar async schedule list
+    // TODO: Configurar CONFIGFLAG
+    // TODO: Iniciar controlador (USBCMD.RUN)
+    
+    crate::serial::serial_print("[USB-HID]   Inicialización EHCI stub completada\n");
+    crate::serial::serial_print("[USB-HID]   NOTA: Funcionalidad completa requiere implementación de driver\n");
+    
+    UsbControllerState::Uninitialized
+}
+
+/// Inicializar controlador OHCI (USB 1.1)
+fn init_ohci_controller(controller: &UsbController) -> UsbControllerState {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] OHCI en {:02X}:{:02X}.{} - inicialización no implementada\n",
+        controller.bus, controller.device, controller.function
+    ));
+    UsbControllerState::Uninitialized
+}
+
+/// Inicializar controlador UHCI (USB 1.1)
+fn init_uhci_controller(controller: &UsbController) -> UsbControllerState {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] UHCI en {:02X}:{:02X}.{} - inicialización no implementada\n",
+        controller.bus, controller.device, controller.function
+    ));
+    UsbControllerState::Uninitialized
 }
