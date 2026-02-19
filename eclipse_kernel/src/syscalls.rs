@@ -2191,15 +2191,108 @@ fn sys_getrandom(buf_ptr: u64, len: u64, _flags: u64) -> u64 {
 
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize) };
     
-    // Very basic PRNG using RDTSC for now
-    // TODO: Use RDRAND if available or a better entropy source
-    let mut seed = unsafe { core::arch::x86_64::_rdtsc() };
-    for i in 0..len as usize {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        buf[i] = (seed >> 32) as u8;
+    // Try to use RDRAND instruction if available, otherwise fall back to RDTSC-based PRNG
+    if has_rdrand() {
+        fill_random_rdrand(buf);
+    } else {
+        fill_random_rdtsc(buf);
     }
 
     len
+}
+
+/// Check if RDRAND instruction is available via CPUID
+fn has_rdrand() -> bool {
+    unsafe {
+        let ecx: u32;
+        
+        // CPUID leaf 1: Feature Information
+        // We only care about ECX, so we save/restore EBX to avoid LLVM issues
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(nomem, nostack, preserves_flags)
+        );
+        
+        // RDRAND is bit 30 of ECX
+        (ecx & (1 << 30)) != 0
+    }
+}
+
+/// Fill buffer with random data using RDRAND instruction
+fn fill_random_rdrand(buf: &mut [u8]) {
+    let mut offset = 0;
+    
+    // Fill 8 bytes at a time using RDRAND
+    while offset + 8 <= buf.len() {
+        let mut val: u64 = 0;
+        let mut success = false;
+        
+        // Try up to 10 times (RDRAND can fail if entropy is low)
+        for _ in 0..10 {
+            unsafe {
+                let mut cf: u8;
+                core::arch::asm!(
+                    "rdrand {val}",
+                    "setc {cf}",
+                    val = out(reg) val,
+                    cf = out(reg_byte) cf,
+                    options(nomem, nostack)
+                );
+                if cf != 0 {
+                    success = true;
+                    break;
+                }
+            }
+        }
+        
+        if success {
+            buf[offset..offset+8].copy_from_slice(&val.to_le_bytes());
+            offset += 8;
+        } else {
+            // RDRAND failed, fall back to RDTSC for remaining bytes
+            fill_random_rdtsc(&mut buf[offset..]);
+            return;
+        }
+    }
+    
+    // Fill remaining bytes (less than 8)
+    if offset < buf.len() {
+        let mut val: u64 = 0;
+        unsafe {
+            for _ in 0..10 {
+                let mut cf: u8;
+                core::arch::asm!(
+                    "rdrand {val}",
+                    "setc {cf}",
+                    val = out(reg) val,
+                    cf = out(reg_byte) cf,
+                    options(nomem, nostack)
+                );
+                if cf != 0 {
+                    let remaining = buf.len() - offset;
+                    let bytes = val.to_le_bytes();
+                    buf[offset..].copy_from_slice(&bytes[..remaining]);
+                    return;
+                }
+            }
+        }
+        // If RDRAND failed, fall back to RDTSC
+        fill_random_rdtsc(&mut buf[offset..]);
+    }
+}
+
+/// Fill buffer with random data using RDTSC-based PRNG (fallback)
+fn fill_random_rdtsc(buf: &mut [u8]) {
+    let mut seed = unsafe { core::arch::x86_64::_rdtsc() };
+    for i in 0..buf.len() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        buf[i] = (seed >> 32) as u8;
+    }
 }
 
 // --- Socket Syscalls ---
