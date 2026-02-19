@@ -742,40 +742,20 @@ extern "C" fn mouse_handler() {
         let mut packed: u32 = 0;
         let mut do_push = false;
 
+        // Acumular el byte recibido
+        pkt[*idx] = b;
+        *idx += 1;
+        
+        // Al completar 3 bytes, empujar inmediatamente (ratón estándar 3-byte)
         if *idx == 3 {
-            // Tenemos 3 bytes. El nuevo byte b es: byte 4 (scroll) o byte 0 del siguiente (ratón 3-byte)
-            if (b & 0x08) != 0 {
-                // Es byte 0 del siguiente paquete → paquete actual era 3-byte
-                let buttons = pkt[0] & 0x07;
-                let dx = pkt[1] as i8 as i16;
-                let dy = pkt[2] as i8 as i16;
-                packed = (buttons as u32)
-                    | ((dx as i8 as u8 as u32) << 8)
-                    | ((dy as i8 as u8 as u32) << 16);
-                do_push = true;
-                pkt[0] = b;
-                *idx = 1;
-            } else {
-                // Byte 4 (scroll)
-                pkt[3] = b;
-                let buttons = pkt[0] & 0x07;
-                let dx = pkt[1] as i8 as i16;
-                let dy = pkt[2] as i8 as i16;
-                let dz = pkt[3] as i8;
-                packed = (buttons as u32)
-                    | ((dx as i8 as u8 as u32) << 8)
-                    | ((dy as i8 as u8 as u32) << 16)
-                    | ((dz as u8 as u32) << 24);
-                do_push = true;
-                *idx = 0;
-            }
-        } else {
-            pkt[*idx] = b;
-            *idx += 1;
-            if *idx >= 3 {
-                // Solo 3 bytes hasta ahora; esperamos el próximo para decidir 3 vs 4 byte
-                // (no hacemos push aún, será en el próximo IRQ cuando idx==3)
-            }
+            let buttons = pkt[0] & 0x07;
+            let dx = pkt[1] as i8 as i16;
+            let dy = pkt[2] as i8 as i16;
+            packed = (buttons as u32)
+                | ((dx as i8 as u8 as u32) << 8)
+                | ((dy as i8 as u8 as u32) << 16);
+            do_push = true;
+            *idx = 0;
         }
 
         if do_push {
