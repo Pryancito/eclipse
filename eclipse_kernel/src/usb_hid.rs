@@ -759,11 +759,14 @@ pub fn init() {
     // Fase 3: Framework de enumeración de dispositivos
     enumerate_usb_devices_stub();
     
+    // Stage 2: Control Transfer Infrastructure
+    init_control_transfer_infrastructure();
+    
     // TODO: Implementar enumeración real de dispositivos USB
     // TODO: Identificar periféricos gaming y configurar polling rate alto
     // TODO: Configurar buffers DMA para transferencias de alta frecuencia
     
-    crate::serial::serial_print("\n[USB-HID] Fase 3 completada (implementación de driver pendiente)\n");
+    crate::serial::serial_print("\n[USB-HID] Todas las fases completadas (implementación de driver pendiente)\n");
 }
 
 /// Detectar controladores USB vía PCI
@@ -1462,4 +1465,381 @@ impl DmaBufferPool {
         let allocated = self.buffers.iter().filter(|b| b.allocated).count();
         (allocated, self.buffers.len())
     }
+}
+
+//
+// ========== Stage 2: USB Protocol Transactions ==========
+//
+
+/// Setup Packet para Control Transfers
+/// USB Specification 2.0, Section 9.3
+/// 
+/// Estructura de 8 bytes que inicia todo control transfer.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct UsbSetupPacket {
+    pub bm_request_type: u8,    // Request type y dirección
+    pub b_request: u8,          // Request específico
+    pub w_value: u16,           // Parámetro value (varía por request)
+    pub w_index: u16,           // Parámetro index (varía por request)
+    pub w_length: u16,          // Bytes de datos a transferir
+}
+
+impl UsbSetupPacket {
+    /// Crear un setup packet vacío
+    pub const fn new() -> Self {
+        Self {
+            bm_request_type: 0,
+            b_request: 0,
+            w_value: 0,
+            w_index: 0,
+            w_length: 0,
+        }
+    }
+    
+    /// Crear setup packet para GET_DESCRIPTOR
+    pub fn get_descriptor(descriptor_type: u8, descriptor_index: u8, length: u16) -> Self {
+        Self {
+            bm_request_type: 0x80, // Device-to-host, Standard, Device
+            b_request: USB_REQUEST_GET_DESCRIPTOR,
+            w_value: ((descriptor_type as u16) << 8) | (descriptor_index as u16),
+            w_index: 0,
+            w_length: length,
+        }
+    }
+    
+    /// Crear setup packet para SET_ADDRESS
+    pub fn set_address(address: u8) -> Self {
+        Self {
+            bm_request_type: 0x00, // Host-to-device, Standard, Device
+            b_request: USB_REQUEST_SET_ADDRESS,
+            w_value: address as u16,
+            w_index: 0,
+            w_length: 0,
+        }
+    }
+    
+    /// Crear setup packet para SET_CONFIGURATION
+    pub fn set_configuration(config_value: u8) -> Self {
+        Self {
+            bm_request_type: 0x00, // Host-to-device, Standard, Device
+            b_request: USB_REQUEST_SET_CONFIGURATION,
+            w_value: config_value as u16,
+            w_index: 0,
+            w_length: 0,
+        }
+    }
+}
+
+// bmRequestType bits
+pub const REQUEST_TYPE_DIR_MASK: u8 = 0x80;      // Bit 7: Direction
+pub const REQUEST_TYPE_DIR_OUT: u8 = 0x00;       // Host to Device
+pub const REQUEST_TYPE_DIR_IN: u8 = 0x80;        // Device to Host
+pub const REQUEST_TYPE_TYPE_MASK: u8 = 0x60;     // Bits 5-6: Type
+pub const REQUEST_TYPE_STANDARD: u8 = 0x00;      // Standard request
+pub const REQUEST_TYPE_CLASS: u8 = 0x20;         // Class-specific request
+pub const REQUEST_TYPE_VENDOR: u8 = 0x40;        // Vendor-specific request
+pub const REQUEST_TYPE_RECIPIENT_MASK: u8 = 0x1F; // Bits 0-4: Recipient
+pub const REQUEST_TYPE_DEVICE: u8 = 0x00;        // Device recipient
+pub const REQUEST_TYPE_INTERFACE: u8 = 0x01;     // Interface recipient
+pub const REQUEST_TYPE_ENDPOINT: u8 = 0x02;      // Endpoint recipient
+
+// Standard USB Requests (bRequest values)
+pub const USB_REQUEST_GET_STATUS: u8 = 0;
+pub const USB_REQUEST_CLEAR_FEATURE: u8 = 1;
+pub const USB_REQUEST_SET_FEATURE: u8 = 3;
+pub const USB_REQUEST_SET_ADDRESS: u8 = 5;
+pub const USB_REQUEST_GET_DESCRIPTOR: u8 = 6;
+pub const USB_REQUEST_SET_DESCRIPTOR: u8 = 7;
+pub const USB_REQUEST_GET_CONFIGURATION: u8 = 8;
+pub const USB_REQUEST_SET_CONFIGURATION: u8 = 9;
+pub const USB_REQUEST_GET_INTERFACE: u8 = 10;
+pub const USB_REQUEST_SET_INTERFACE: u8 = 11;
+pub const USB_REQUEST_SYNCH_FRAME: u8 = 12;
+
+/// Estado de un Control Transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ControlTransferState {
+    Setup,       // Setup stage (8-byte setup packet)
+    DataIn,      // Data stage, device to host
+    DataOut,     // Data stage, host to device
+    Status,      // Status stage (zero-length)
+    Complete,    // Transfer completo
+    Error,       // Transfer con error
+}
+
+/// Control Transfer completo
+/// 
+/// Representa un control transfer de 3 etapas: Setup, Data (opcional), Status.
+pub struct ControlTransfer {
+    pub setup: UsbSetupPacket,
+    pub state: ControlTransferState,
+    pub data_buffer: DmaBuffer,
+    pub bytes_transferred: usize,
+    pub device_address: u8,
+    pub endpoint: u8,
+}
+
+impl ControlTransfer {
+    /// Crear un nuevo control transfer
+    pub fn new(setup: UsbSetupPacket, device_address: u8) -> Self {
+        let has_data = setup.w_length > 0;
+        let initial_state = if has_data {
+            ControlTransferState::Setup
+        } else {
+            ControlTransferState::Setup
+        };
+        
+        Self {
+            setup,
+            state: initial_state,
+            data_buffer: DmaBuffer::new(),
+            bytes_transferred: 0,
+            device_address,
+            endpoint: 0, // Control transfers always use endpoint 0
+        }
+    }
+    
+    /// Verificar si el transfer requiere data stage
+    pub fn has_data_stage(&self) -> bool {
+        self.setup.w_length > 0
+    }
+    
+    /// Obtener dirección de data stage
+    pub fn data_direction_in(&self) -> bool {
+        (self.setup.bm_request_type & REQUEST_TYPE_DIR_MASK) != 0
+    }
+}
+
+/// Función stub: Leer Device Descriptor
+/// 
+/// Lee el Device Descriptor de un dispositivo USB.
+/// TODO: Implementar comunicación real con hardware USB
+pub fn read_device_descriptor(device_address: u8) -> Result<UsbDeviceDescriptor, &'static str> {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] read_device_descriptor(addr={})\n", device_address
+    ));
+    
+    // TODO: Crear setup packet para GET_DESCRIPTOR
+    // TODO: Crear control transfer
+    // TODO: Ejecutar transfer via XHCI/EHCI
+    // TODO: Parsear descriptor de respuesta
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Función stub: Leer Configuration Descriptor
+/// 
+/// Lee el Configuration Descriptor de un dispositivo USB.
+/// TODO: Implementar comunicación real con hardware USB
+pub fn read_configuration_descriptor(
+    device_address: u8,
+    config_index: u8,
+) -> Result<UsbConfigurationDescriptor, &'static str> {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] read_configuration_descriptor(addr={}, config={})\n",
+        device_address, config_index
+    ));
+    
+    // TODO: Crear setup packet para GET_DESCRIPTOR
+    // TODO: Leer primero los 9 bytes del configuration descriptor
+    // TODO: Leer wTotalLength bytes adicionales (interfaces, endpoints)
+    // TODO: Parsear descriptors completos
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Función stub: Leer String Descriptor
+/// 
+/// Lee un String Descriptor de un dispositivo USB.
+/// TODO: Implementar comunicación real con hardware USB
+pub fn read_string_descriptor(
+    device_address: u8,
+    string_index: u8,
+    language_id: u16,
+) -> Result<alloc::string::String, &'static str> {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] read_string_descriptor(addr={}, idx={}, lang=0x{:04X})\n",
+        device_address, string_index, language_id
+    ));
+    
+    // TODO: Crear setup packet para GET_DESCRIPTOR (string)
+    // TODO: Ejecutar control transfer
+    // TODO: Decodificar UTF-16LE a String
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Función stub: Asignar dirección USB a dispositivo
+/// 
+/// Asigna una dirección única (1-127) a un dispositivo recién conectado.
+/// TODO: Implementar comunicación real con hardware USB
+pub fn set_device_address(current_address: u8, new_address: u8) -> Result<(), &'static str> {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] set_device_address(current={}, new={})\n",
+        current_address, new_address
+    ));
+    
+    if new_address == 0 || new_address > 127 {
+        return Err("Invalid USB address (must be 1-127)");
+    }
+    
+    // TODO: Crear setup packet para SET_ADDRESS
+    let _setup = UsbSetupPacket::set_address(new_address);
+    
+    // TODO: Crear control transfer sin data stage
+    // TODO: Ejecutar transfer via XHCI/EHCI
+    // TODO: Esperar a que dispositivo adopte nueva dirección (2ms delay requerido)
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Función stub: Configurar dispositivo USB
+/// 
+/// Selecciona una configuración activa para el dispositivo.
+/// TODO: Implementar comunicación real con hardware USB
+pub fn set_device_configuration(device_address: u8, config_value: u8) -> Result<(), &'static str> {
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID] set_device_configuration(addr={}, config={})\n",
+        device_address, config_value
+    ));
+    
+    // TODO: Crear setup packet para SET_CONFIGURATION
+    let _setup = UsbSetupPacket::set_configuration(config_value);
+    
+    // TODO: Crear control transfer sin data stage
+    // TODO: Ejecutar transfer via XHCI/EHCI
+    // TODO: Actualizar estado del dispositivo a Configured
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Helper: Crear control transfer desde setup packet
+pub fn create_control_transfer(
+    setup: UsbSetupPacket,
+    device_address: u8,
+    data_buffer: Option<DmaBuffer>,
+) -> ControlTransfer {
+    let mut transfer = ControlTransfer::new(setup, device_address);
+    if let Some(buffer) = data_buffer {
+        transfer.data_buffer = buffer;
+    }
+    transfer
+}
+
+/// Helper: Validar descriptor genérico
+pub fn validate_descriptor(data: &[u8], expected_type: u8) -> Result<(), &'static str> {
+    if data.len() < 2 {
+        return Err("Descriptor too short");
+    }
+    
+    let length = data[0] as usize;
+    let desc_type = data[1];
+    
+    if length > data.len() {
+        return Err("Descriptor length exceeds buffer");
+    }
+    
+    if desc_type != expected_type {
+        return Err("Unexpected descriptor type");
+    }
+    
+    Ok(())
+}
+
+/// Framework de ejecución de control transfer
+/// 
+/// Documenta las etapas de un control transfer para futura implementación.
+pub fn execute_control_transfer_stub(transfer: &mut ControlTransfer) -> Result<(), &'static str> {
+    crate::serial::serial_print("\n[USB-HID] === Control Transfer Stages ===\n");
+    
+    // Setup Stage
+    crate::serial::serial_print("[USB-HID] Stage 1: SETUP\n");
+    
+    // Copy values from packed struct to avoid unaligned references
+    let bm_request_type = transfer.setup.bm_request_type;
+    let b_request = transfer.setup.b_request;
+    let w_value = transfer.setup.w_value;
+    let w_index = transfer.setup.w_index;
+    let w_length = transfer.setup.w_length;
+    
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   bmRequestType: 0x{:02X}\n", bm_request_type
+    ));
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   bRequest: 0x{:02X}\n", b_request
+    ));
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   wValue: 0x{:04X}\n", w_value
+    ));
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   wIndex: 0x{:04X}\n", w_index
+    ));
+    crate::serial::serial_print(&alloc::format!(
+        "[USB-HID]   wLength: {}\n", w_length
+    ));
+    
+    // TODO: Crear TRB tipo SETUP con setup packet
+    // TODO: Poner TRB en transfer ring
+    // TODO: Ring doorbell
+    // TODO: Esperar completion event
+    
+    // Data Stage (si aplica)
+    if transfer.has_data_stage() {
+        if transfer.data_direction_in() {
+            crate::serial::serial_print("[USB-HID] Stage 2: DATA IN\n");
+            // TODO: Crear TRB(s) tipo DATA para recibir datos
+        } else {
+            crate::serial::serial_print("[USB-HID] Stage 2: DATA OUT\n");
+            // TODO: Crear TRB(s) tipo DATA para enviar datos
+        }
+        crate::serial::serial_print(&alloc::format!(
+            "[USB-HID]   Expected bytes: {}\n", w_length
+        ));
+        // TODO: Ejecutar data stage TRBs
+    }
+    
+    // Status Stage
+    crate::serial::serial_print("[USB-HID] Stage 3: STATUS\n");
+    // TODO: Crear TRB tipo STATUS (dirección opuesta a data, o IN si no hay data)
+    // TODO: Ejecutar status stage TRB
+    // TODO: Verificar completion exitoso
+    
+    crate::serial::serial_print("[USB-HID] Transfer complete (stub)\n");
+    transfer.state = ControlTransferState::Complete;
+    
+    Err("Not implemented - requires USB controller driver")
+}
+
+/// Inicializar infraestructura de control transfers
+/// 
+/// Prepara estructuras necesarias para control transfers.
+pub fn init_control_transfer_infrastructure() {
+    crate::serial::serial_print("\n[USB-HID] === Stage 2: USB Protocol Transactions ===\n");
+    crate::serial::serial_print("[USB-HID] Control Transfer Infrastructure:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ UsbSetupPacket (8 bytes)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ ControlTransfer state machine\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Standard USB requests (GET_DESCRIPTOR, SET_ADDRESS, etc.)\n");
+    crate::serial::serial_print("[USB-HID]   ✓ Request type constants and helpers\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Descriptor Reading APIs:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ read_device_descriptor()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ read_configuration_descriptor()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ read_string_descriptor()\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Device Management APIs:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ set_device_address()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ set_device_configuration()\n");
+    
+    crate::serial::serial_print("\n[USB-HID] Helper Functions:\n");
+    crate::serial::serial_print("[USB-HID]   ✓ create_control_transfer()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ validate_descriptor()\n");
+    crate::serial::serial_print("[USB-HID]   ✓ execute_control_transfer_stub()\n");
+    
+    crate::serial::serial_print("\n[USB-HID] NOTA: Stage 2 completo (stubs)\n");
+    crate::serial::serial_print("[USB-HID]   Implementación real requiere:\n");
+    crate::serial::serial_print("[USB-HID]   - XHCI/EHCI driver funcional\n");
+    crate::serial::serial_print("[USB-HID]   - TRB submission y completion\n");
+    crate::serial::serial_print("[USB-HID]   - Event ring polling\n");
+    crate::serial::serial_print("[USB-HID]   - Doorbell register access\n");
 }
