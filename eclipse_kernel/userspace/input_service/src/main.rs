@@ -143,16 +143,21 @@ fn send_event_to_client(pid: u32, ev: &InputEvent) {
     if pid == 0 || pid > 63 {
         return;
     }
-    let mut buf = [0u8; 32];
-    let len = core::cmp::min(INPUT_EVENT_SIZE, buf.len());
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            ev as *const InputEvent as *const u8,
-            buf.as_mut_ptr(),
-            len,
-        );
-    }
-    let _ = send(pid, 0x40, &buf[..len]);
+    // Zero-initialize the buffer and copy each field individually at its repr(C) offset.
+    // Copying the raw struct bytes would include undefined implicit padding bytes (offset 5
+    // and offsets 12-15 in the repr(C) layout), which the kernel's IPC sanitizer can mistake
+    // for kernel pointers (>= 0xFFFF_8000_0000_0000) and zero out - corrupting the 'value'
+    // field and making all key-press events (value=1) look like key-release events (value=0)
+    // to the compositor.
+    let mut buf = [0u8; INPUT_EVENT_SIZE];
+    buf[0..4].copy_from_slice(&ev.device_id.to_le_bytes());
+    buf[4] = ev.event_type;
+    // buf[5] = 0; // implicit padding byte, kept as 0
+    buf[6..8].copy_from_slice(&ev.code.to_le_bytes());
+    buf[8..12].copy_from_slice(&ev.value.to_le_bytes());
+    // buf[12..16] = 0; // implicit padding bytes, kept as 0
+    buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
+    let _ = send(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
 }
 
 /// Input event queue
