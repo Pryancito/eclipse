@@ -196,7 +196,12 @@ pub fn init_paging(kernel_phys_base: u64) {
     PHYS_OFFSET.store(kernel_phys_base, Ordering::Relaxed);
     
     crate::serial::serial_print("✓ Higher half physical map verified\n");
-    crate::serial::serial_print("✓ Paging enabled and working\n");
+    
+    // Diagnostic: Print PML4 entries to find physical 0 map
+    unsafe {
+    }
+    
+    // crate::serial::serial_print("✓ Paging enabled and working\n");
 }
 
 /// Debug function: Walk the page table and print entries
@@ -256,7 +261,8 @@ pub fn walk_page_table(pml4_phys: u64, vaddr: u64) {
         return;
     }
     
-    let pt_virt = PHYS_MEM_OFFSET + pd_entry.get_addr();
+    let pt_phys = pd_entry.get_addr();
+    let pt_virt = phys_to_virt(pt_phys);
     let pt = unsafe { &*(pt_virt as *const PageTable) };
     let pt_entry = &pt.entries[pt_idx];
     
@@ -265,6 +271,10 @@ pub fn walk_page_table(pml4_phys: u64, vaddr: u64) {
     crate::serial::serial_print("]: ");
     crate::serial::serial_print_hex(pt_entry.entry);
     crate::serial::serial_print("\n");
+}
+
+pub fn walk_current(vaddr: u64) {
+    walk_page_table(get_cr3(), vaddr);
 }
 
 /// Obtener dirección física de CR3
@@ -311,11 +321,63 @@ use x86_64::PhysAddr;
 /// This enforces strict Higher Half only execution for the kernel.
 pub fn remove_identity_mapping() {
     let cr3 = get_cr3();
-    let pml4_virt = PHYS_MEM_OFFSET + cr3;
+    let pml4_virt = phys_to_virt(cr3);
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     pml4.entries[0] = PageTableEntry::new();
     
     // Flush TLB to ensure the change takes effect
+    flush_tlb();
+}
+
+/// Force physical address 0 to be mapped at virtual address 0 (Identity)
+pub fn map_physical_low_memory() {
+    let cr3 = get_cr3();
+    let pml4_virt = phys_to_virt(cr3);
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    
+    if !pml4.entries[0].present() {
+        return;
+    }
+    
+    let pdpt_phys = pml4.entries[0].get_addr();
+    let pdpt_virt = phys_to_virt(pdpt_phys);
+    let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
+    
+    if !pdpt.entries[0].present() || pdpt.entries[0].is_huge() {
+        return;
+    }
+    
+    let pd_phys = pdpt.entries[0].get_addr();
+    let pd_virt = phys_to_virt(pd_phys);
+    let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
+    
+    // Map the first 2MB to physical 0 (ignore kernel_phys_base shift)
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
+    pd.entries[0].set_addr(0, flags);
+    
+    crate::serial::serial_print("[MEM] Low memory (0..2MiB) mapped to physical 0 (True Identity)\n");
+    flush_tlb();
+}
+
+/// Temporarily restore or remove identity mapping (PML4[0])
+/// This is used during AP startup to allow cores to transition to long mode.
+pub fn set_identity_map(enabled: bool) {
+    let cr3 = get_cr3();
+    let pml4_virt = phys_to_virt(cr3);
+    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    
+    if enabled {
+        // Copy the Direct Map entry (PML4[288]) to PML4[0]
+        pml4.entries[0] = pml4.entries[288];
+    } else {
+        // Remove identity map
+        pml4.entries[0] = PageTableEntry::new();
+    }
+    
+    flush_tlb();
+}
+
+fn flush_tlb() {
     unsafe {
         core::arch::asm!(
             "mov rax, cr3",

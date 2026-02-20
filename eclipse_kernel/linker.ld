@@ -18,6 +18,14 @@ SECTIONS
         KEEP(*(.init))
     }
 
+    /* Trampolín para SMP (Application Processors) */
+    .trampoline ALIGN(4096) : AT(ADDR(.trampoline) - KERNEL_BASE)
+    {
+        trampoline_start = .;
+        *(.trampoline)
+        trampoline_end = .;
+    }
+
     /* Sección de tablas de páginas */
     .page_tables ALIGN(4096) : AT(ADDR(.page_tables) - KERNEL_BASE)
     {

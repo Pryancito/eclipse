@@ -18,6 +18,11 @@ static INTERRUPT_STATS: Mutex<InterruptStats> = Mutex::new(InterruptStats {
     timer_ticks: 0,
 });
 
+/// Get current timer ticks (1 tick = 1ms at 1000Hz)
+pub fn ticks() -> u64 {
+    INTERRUPT_STATS.lock().timer_ticks
+}
+
 /// Scratch space para guardar RSP de usuario durante syscall entry
 static mut USER_RSP_SCRATCH: u64 = 0;
 
@@ -154,21 +159,11 @@ pub fn init() {
         // 4. Setup SFMASK (Mask Interrupts 0x200)
         wrmsr(MSR_SFMASK, 0x200);
         
-        // Cargar IDT
-        let idt_descriptor = IdtDescriptor {
-            limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base: &raw const KERNEL_IDT as *const _ as u64,
-        };
-        
-        asm!(
-            "lidt [{}]",
-            in(reg) &idt_descriptor,
-            options(nostack, preserves_flags)
-        );
+        load_idt();
     }
     
     // Deshabilitar APIC (para volver a modo Legacy PIC)
-    disable_apic();
+    // disable_apic();
 
     // Inicializar PIC
     init_pic();
@@ -185,6 +180,22 @@ pub fn init() {
         crate::serial::serial_print("[INT] Interrupts ENABLED\n");
     }
 }
+
+pub fn load_idt() {
+    unsafe {
+        let idt_descriptor = IdtDescriptor {
+            limit: (core::mem::size_of::<Idt>() - 1) as u16,
+            base: &raw const KERNEL_IDT as *const _ as u64,
+        };
+        
+        asm!(
+            "lidt [{}]",
+            in(reg) &idt_descriptor,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 
 /// Inicializar ratón PS/2: habilitar puerto auxiliar y enviar "enable data reporting".
 /// Si el controlador no responde (timeout), continúa sin ratón para no colgar el boot.

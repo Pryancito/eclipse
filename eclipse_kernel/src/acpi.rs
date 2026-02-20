@@ -47,6 +47,7 @@ pub struct AcpiInfo {
     pub lapic_addr: u64,
     pub cpu_count: usize,
     pub ioapic_addr: u64,
+    pub apic_ids: [u8; 32], // Support up to 32 CPUs
 }
 
 static mut ACPI_INFO: Option<AcpiInfo> = None;
@@ -138,6 +139,7 @@ pub fn init(rsdp_phys: u64) {
         let mut lapic_phys: u64 = 0;
         let mut ioapic_phys: u64 = 0;
         let mut cpu_count = 0;
+        let mut apic_ids = [0u8; 32];
 
         for i in 0..entry_count {
             let table_phys = if is_xsdt {
@@ -169,7 +171,10 @@ pub fn init(rsdp_phys: u64) {
                             let apic_id = *current_entry.add(3);
                             let flags = *(current_entry.add(4) as *const u32);
                             if flags & 1 != 0 { // Enabled
-                                cpu_count += 1;
+                                if cpu_count < 32 {
+                                    apic_ids[cpu_count] = apic_id;
+                                    cpu_count += 1;
+                                }
                                 serial_printf(format_args!("[ACPI]   - CPU {} (APIC ID {})\n", processor_id, apic_id));
                             }
                         }
@@ -190,6 +195,7 @@ pub fn init(rsdp_phys: u64) {
             lapic_addr: lapic_phys,
             cpu_count,
             ioapic_addr: ioapic_phys,
+            apic_ids,
         });
 
         serial_printf(format_args!("[ACPI] Discovery complete: {} CPUs, LAPIC={:#x}, IOAPIC={:#x}\n", 

@@ -21,6 +21,7 @@ mod interrupts;
 mod ipc;
 mod serial;
 mod process;
+mod cpu;
 mod scheduler;
 mod syscalls;
 mod servers;
@@ -36,6 +37,7 @@ mod scheme; // Redox-style scheme system
 mod bcache; // Buffer Cache
 mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery
+mod apic;    // Local APIC
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
@@ -125,12 +127,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     boot::load_gdt();
     boot::enable_sse();
 
-    // Stage 3: Strict User/Kernel Separation
-    // Remove the 16GB identity mapping provided by the bootloader.
-    // After this, only Higher Half (Kernel) and explicitly mapped User locations are valid.
-    memory::remove_identity_mapping();
-    serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
-
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
@@ -141,9 +137,8 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     serial::serial_print("Initializing ACPI...\n");
     acpi::init(boot_info.rsdp_addr);
     
-    serial::serial_print("Testing IDT with breakpoint...\n");
-    x86_64::instructions::interrupts::int3();
-    serial::serial_print("IDT test passed\n");
+    serial::serial_print("Initializing Local APIC...\n");
+    apic::init();
     
     serial::serial_print("Initializing memory system...\n");
     memory::init();
@@ -151,12 +146,12 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Init DevFS before other subsystems
     filesystem::init_devfs();
     
-    serial::serial_print("Testing early heap allocation...\n");
-    let test_vec = vec![0u8; 128];
-    serial::serial_print("Early heap allocation successful, ptr: ");
-    serial::serial_print_hex(test_vec.as_ptr() as u64);
-    serial::serial_print("\n");
-    core::mem::drop(test_vec);
+    serial::serial_print("Starting secondary CPUs...\n");
+    cpu::start_aps();
+
+    // Stage 3: Strict User/Kernel Separation - Moved after AP startup
+    memory::remove_identity_mapping();
+    serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
      
     ipc::init();
     process::init_kernel_process();
