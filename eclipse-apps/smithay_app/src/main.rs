@@ -261,6 +261,7 @@ struct InputState {
     drag_offset_x: i32,
     drag_offset_y: i32,
     focused_window: Option<usize>,
+    modifiers: u32,
 }
 
 impl InputState {
@@ -286,6 +287,7 @@ impl InputState {
             drag_offset_x: 0,
             drag_offset_y: 0,
             focused_window: None,
+            modifiers: 0,
         }
     }
 
@@ -293,11 +295,25 @@ impl InputState {
         match ev.event_type {
             // Keyboard: usar KeyAction (ref: xfwl4 process_common_key_action)
             0 => {
-                if ev.value != 1 { return; }
-                let action = scancode_to_action(ev.code);
+                let pressed = ev.value == 1;
+
+                // Update Modifiers (Make = 1, Break = 0)
+                match ev.code {
+                    0x2A | 0x36 => { if pressed { self.modifiers |= 1; } else { self.modifiers &= !1; } } // Shift
+                    0x1D => { if pressed { self.modifiers |= 2; } else { self.modifiers &= !2; } } // Ctrl
+                    0x38 => { if pressed { self.modifiers |= 4; } else { self.modifiers &= !4; } } // Alt
+                    _ => {}
+                }
+
+                let action = if self.modifiers & 4 != 0 {
+                    scancode_to_action(ev.code)
+                } else {
+                    KeyAction::None
+                };
+                
                 match action {
                     KeyAction::None => {
-                        // Forward to client if focused
+                        // Forward ALL keys (Make AND Break) to client if focused
                         if let Some(f_idx) = self.focused_window {
                             if let WindowContent::External(s_idx) = windows[f_idx].content {
                                 let pid = surfaces[s_idx as usize].pid;
@@ -305,7 +321,7 @@ impl InputState {
                                     event_type: SWND_EVENT_TYPE_KEY,
                                     data1: ev.code as i32,
                                     data2: ev.value as i32,
-                                    data3: 0,
+                                    data3: self.modifiers as i32,
                                 };
                                 let _ = send(pid, MSG_TYPE_INPUT, unsafe {
                                     core::slice::from_raw_parts(&event as *const _ as *const u8, core::mem::size_of::<SideWindEvent>())
@@ -313,25 +329,25 @@ impl InputState {
                             }
                         }
                     }
-                    KeyAction::Clear => self.request_clear = true,
-                    KeyAction::SetColor(c) => self.stroke_color = c.min(4),
-                    KeyAction::CycleStrokeSize => {
+                    KeyAction::Clear => if pressed { self.request_clear = true; },
+                    KeyAction::SetColor(c) => if pressed { self.stroke_color = c.min(4); },
+                    KeyAction::CycleStrokeSize => if pressed {
                         self.stroke_size = match self.stroke_size {
                             2 => 4,
                             4 => 6,
                             _ => 2,
                         };
-                    }
-                    KeyAction::SensitivityPlus => self.mouse_sensitivity = (self.mouse_sensitivity + 25).min(200),
-                    KeyAction::SensitivityMinus => self.mouse_sensitivity = (self.mouse_sensitivity - 25).max(50),
-                    KeyAction::InvertY => self.invert_y = !self.invert_y,
-                    KeyAction::CenterCursor => self.request_center_cursor = true,
-                    KeyAction::NewWindow => self.request_new_window = true,
-                    KeyAction::CloseWindow => self.request_close_window = true,
-                    KeyAction::CycleForward => self.request_cycle_forward = true,
-                    KeyAction::CycleBackward => self.request_cycle_backward = true,
-                    KeyAction::Minimize => self.request_minimize = true,
-                    KeyAction::Restore => self.request_restore = true,
+                    },
+                    KeyAction::SensitivityPlus => if pressed { self.mouse_sensitivity = (self.mouse_sensitivity + 25).min(200); },
+                    KeyAction::SensitivityMinus => if pressed { self.mouse_sensitivity = (self.mouse_sensitivity - 25).max(50); },
+                    KeyAction::InvertY => if pressed { self.invert_y = !self.invert_y; },
+                    KeyAction::CenterCursor => if pressed { self.request_center_cursor = true; },
+                    KeyAction::NewWindow => if pressed { self.request_new_window = true; },
+                    KeyAction::CloseWindow => if pressed { self.request_close_window = true; },
+                    KeyAction::CycleForward => if pressed { self.request_cycle_forward = true; },
+                    KeyAction::CycleBackward => if pressed { self.request_cycle_backward = true; },
+                    KeyAction::Minimize => if pressed { self.request_minimize = true; },
+                    KeyAction::Restore => if pressed { self.request_restore = true; },
                 }
             }
             // Mouse move: code 0 = X, code 1 = Y

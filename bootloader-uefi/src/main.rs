@@ -33,6 +33,7 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     pub pml4_addr: u64,
     pub kernel_phys_base: u64,
+    pub rsdp_addr: u64,
 }
 
 // Global allocator simple
@@ -1043,20 +1044,24 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
             }
         }
 
-        serial_write_str("BL: Higher half physical map: 0xFFFF800000000000 -> 0x0 (16GB)\r\n");
-        serial_write_str("BL: Identity mapping: 0x0 -> 0x0 (16GB) for bootloader\r\n");
-
+        // Create the Higher Half Direct Map (HHDM)
+        // PML4[288] -> 0xFFFF900000000000
+        *pml4.add(288) = (pdpt_phys_map & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        
         // === RECURSIVE PAGE TABLE MAPPING ===
         // PML4[511] points to PML4 itself
         *pml4.add(511) = (pml4_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
         
+        serial_write_str("BL: Higher half physical map: 0xFFFF900000000000 -> 0x0 (16GB)\r\n");
+        serial_write_str("BL: Identity mapping: 0x0 -> 0x0 (16GB) for bootloader\r\n");
         serial_write_str("BL: Recursive mapping: PML4[511] -> PML4\r\n");
 
         // Debug output
         serial_write_str("BL: Page tables configured:\r\n");
         serial_write_str("  PML4[0]   -> Identity map (0-16GB)\r\n");
-        serial_write_str("  PML4[256] -> Higher half physical map (0xFFFF800000000000)\r\n");
-        serial_write_str("  PML4[511] -> Recursive (page table access)\r\n");
+        serial_write_str("  PML4[256] -> Kernel Virtual (Points to same PDPT as 288 for now)\r\n");
+        serial_write_str("  PML4[288] -> HHDM (0xFFFF900000000000)\r\n");
+        serial_write_str("  PML4[511] -> Recursive\r\n");
     }
 
     unsafe { serial_write_str("DEBUG: prepare_page_tables_only completed\r\n"); }
@@ -1267,10 +1272,33 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             // Reservar memoria persistente para pasar al kernel (BootInfo)
             if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
                 boot_info_ptr = phys;
+
+                // Encontrar ACPI RSDP en la tabla de configuración
+                let mut rsdp_addr: u64 = 0;
+                for entry in system_table.config_table() {
+                    if entry.guid == uefi::table::cfg::ACPI2_GUID {
+                        rsdp_addr = entry.address as u64;
+                        unsafe { 
+                            serial_write_str("BL: Encontrado ACPI 2.0 RSDP en "); 
+                            serial_write_hex64(rsdp_addr);
+                            serial_write_str("\r\n");
+                        }
+                        break;
+                    } else if entry.guid == uefi::table::cfg::ACPI_GUID {
+                        rsdp_addr = entry.address as u64;
+                        unsafe { 
+                            serial_write_str("BL: Encontrado ACPI 1.0 RSDP en "); 
+                            serial_write_hex64(rsdp_addr);
+                            serial_write_str("\r\n");
+                        }
+                    }
+                }
+
                 unsafe {
                     // Inicializar BootInfo
                     let dst = phys as *mut BootInfo;
                     (*dst).framebuffer = framebuffer_info;
+                    (*dst).rsdp_addr = rsdp_addr;
                     // PML4 y PhysBase se rellenarán después
                 }
             }

@@ -35,6 +35,7 @@ mod fd;  // File descriptor management
 mod scheme; // Redox-style scheme system
 mod bcache; // Buffer Cache
 mod usb_hid; // USB HID (stub)
+mod acpi;    // ACPI discovery
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
@@ -135,6 +136,10 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     memory::init_paging(kernel_phys_base);
     
     interrupts::init();
+    
+    // Stage 4.5: ACPI and APIC discovery
+    serial::serial_print("Initializing ACPI...\n");
+    acpi::init(boot_info.rsdp_addr);
     
     serial::serial_print("Testing IDT with breakpoint...\n");
     x86_64::instructions::interrupts::int3();

@@ -25,6 +25,7 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     pub pml4_addr: u64,
     pub kernel_phys_base: u64,
+    pub rsdp_addr: u64,
 }
 
 /// Static storage for BootInfo
@@ -45,6 +46,7 @@ static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
     },
     pml4_addr: 0,
     kernel_phys_base: 0,
+    rsdp_addr: 0,
 });
 
 /// Initialize boot info from the pointer passed by the bootloader

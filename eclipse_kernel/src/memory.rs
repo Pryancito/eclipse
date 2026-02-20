@@ -8,16 +8,15 @@
 use linked_list_allocator::LockedHeap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Higher Half offset for physical memory mapping
-/// All physical RAM is mapped at this virtual address
-/// Physical address X is accessible at (PHYS_MEM_OFFSET + X)
-pub const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
+pub const PHYS_MEM_OFFSET: u64 = 0xFFFF900000000000;
 
-/// Physical offset for virtual-to-physical address translation (legacy)
-/// This is now set to 0 since we use higher half mapping
+/// Virtual address where the kernel is mapped (Higher Half)
+pub const KERNEL_OFFSET: u64 = 0xFFFF800000000000;
+
+/// Physical offset for virtual-to-physical address translation
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-/// Size of the kernel region with offset-based mapping (256MB = 128 * 2MB pages)
+/// Size of the kernel region with offset-based mapping (256MB)
 const KERNEL_REGION_SIZE: u64 = 0x10000000;
 
 /// Kernel heap size (64 MB)
@@ -666,31 +665,22 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
     let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
-    // 1. Check if the address is in the kernel/heap shifted range (first 256MB)
-    if virt_addr >= PHYS_MEM_OFFSET && virt_addr < PHYS_MEM_OFFSET + KERNEL_REGION_SIZE {
-        return (virt_addr - PHYS_MEM_OFFSET) + phys_offset;
-    }
-    
-    // 2. Default higher half physical map (Virt = Base + Phys)
+    // 1. Physical memory map (0xFFFF9000...)
     if virt_addr >= PHYS_MEM_OFFSET {
         return virt_addr - PHYS_MEM_OFFSET;
     }
     
-    // 3. Low memory identity map (fallback/early boot)
+    // 2. Kernel region (0xFFFF8000...)
+    if virt_addr >= KERNEL_OFFSET && virt_addr < KERNEL_OFFSET + KERNEL_REGION_SIZE {
+        return (virt_addr - KERNEL_OFFSET) + phys_offset;
+    }
+    
+    // 3. Fallback (Identity map)
     virt_addr
 }
 
-/// Convert physical address to virtual address (inverse of virt_to_phys)
-/// Returns the higher half virtual address for accessing physical memory
 pub fn phys_to_virt(phys_addr: u64) -> u64 {
-    let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
-    
-    // Check if the physical address is in the range where the kernel is mapped
-    if phys_addr >= phys_offset && phys_addr < phys_offset + KERNEL_REGION_SIZE {
-        return (phys_addr - phys_offset) + PHYS_MEM_OFFSET;
-    }
-    
-    // Otherwise it's standard direct mapping
+    // Standard direct mapping via HHDM at 0xFFFF900000000000
     PHYS_MEM_OFFSET + phys_addr
 }
 
