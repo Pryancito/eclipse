@@ -202,7 +202,7 @@ enum KeyAction {
 /// Scancodes US QWERTY → KeyAction (tabla de keybindings)
 fn scancode_to_action(scancode: u16) -> KeyAction {
     match scancode {
-        0x21 => KeyAction::Clear,           // C
+        0x2E => KeyAction::Clear,           // C (was incorrectly 0x21 which is F)
         0x02 => KeyAction::SetColor(0),     // 1
         0x03 => KeyAction::SetColor(1),     // 2
         0x04 => KeyAction::SetColor(2),     // 3

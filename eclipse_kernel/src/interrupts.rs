@@ -708,19 +708,21 @@ extern "C" fn keyboard_handler() {
 /// Read a byte from the keyboard buffer (non-blocking)
 /// Returns 0 if empty (since 0 is not a valid scancode generally, unless error/break)
 pub fn read_key() -> u8 {
-    let mut tail = KEY_TAIL.lock();
-    let head = KEY_HEAD.lock();
-    
-    if *head == *tail {
-        return 0; // Buffer empty
-    }
-    
-    let buffer = KEY_BUFFER.lock();
-    let val = buffer[*tail];
-    // Advance tail
-    *tail = (*tail + 1) % KEY_BUFFER_SIZE;
-    
-    val
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tail = KEY_TAIL.lock();
+        let head = KEY_HEAD.lock();
+        
+        if *head == *tail {
+            return 0; // Buffer empty
+        }
+        
+        let buffer = KEY_BUFFER.lock();
+        let val = buffer[*tail];
+        // Advance tail
+        *tail = (*tail + 1) % KEY_BUFFER_SIZE;
+        
+        val
+    })
 }
 
 // Mouse Buffer (Circular) - stores packed PS/2 packets (buttons, dx, dy)
@@ -776,7 +778,6 @@ extern "C" fn mouse_handler() {
         }
 
         if do_push {
-
             // Push into circular buffer
             let mut head = MOUSE_HEAD.lock();
             let tail = MOUSE_TAIL.lock();
@@ -801,17 +802,19 @@ extern "C" fn mouse_handler() {
 /// Read one packed PS/2 mouse packet from buffer (non-blocking).
 /// Returns 0xFFFFFFFF if empty; otherwise packed u32: buttons | (dx as u8)<<8 | (dy as u8)<<16.
 pub fn read_mouse_packet() -> u32 {
-    let mut tail = MOUSE_TAIL.lock();
-    let head = MOUSE_HEAD.lock();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tail = MOUSE_TAIL.lock();
+        let head = MOUSE_HEAD.lock();
 
-    if *head == *tail {
-        return 0xFFFFFFFF;
-    }
+        if *head == *tail {
+            return 0xFFFFFFFF;
+        }
 
-    let buf = MOUSE_BUFFER.lock();
-    let val = buf[*tail];
-    *tail = (*tail + 1) % MOUSE_BUFFER_SIZE;
-    val
+        let buf = MOUSE_BUFFER.lock();
+        let val = buf[*tail];
+        *tail = (*tail + 1) % MOUSE_BUFFER_SIZE;
+        val
+    })
 }
 
 #[unsafe(naked)]
