@@ -75,10 +75,24 @@ const PCI_REG_STATUS: u8 = 0x06;
 const PCI_REG_CLASS_CODE: u8 = 0x08;
 const PCI_REG_HEADER_TYPE: u8 = 0x0E;
 const PCI_REG_BAR0: u8 = 0x10;
+const PCI_REG_CAP_PTR: u8 = 0x34;
 const PCI_REG_PRIMARY_BUS: u8 = 0x18;      // For PCI-to-PCI bridges
 const PCI_REG_SECONDARY_BUS: u8 = 0x19;    // For PCI-to-PCI bridges
 const PCI_REG_SUBORDINATE_BUS: u8 = 0x1A;  // For PCI-to-PCI bridges
 const PCI_REG_INTERRUPT_LINE: u8 = 0x3C;
+
+/// PCI Capability IDs
+const PCI_CAP_ID_VNDR: u8 = 0x09;
+
+/// VirtIO PCI capability types (VIRTIO_PCI_CAP_*)
+pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+/// virtio_pci_cap layout (read from PCI config)
+/// cap_vndr=0, cap_next=1, cap_len=2, cfg_type=3, bar=4, id=5, offset=8, length=12
+/// virtio_pci_notify_cap extends with notify_off_multiplier at offset 16
 
 /// PCI Command Register Bits
 const PCI_COMMAND_IO: u16 = 0x01;
@@ -479,6 +493,64 @@ pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
     }
     
     bar
+}
+
+/// Find first capability with given ID. Returns offset in config space (0 = not found).
+pub unsafe fn pci_find_capability(dev: &PciDevice, cap_id: u8) -> u8 {
+    let mut pos = pci_config_read_u8(dev.bus, dev.device, dev.function, PCI_REG_CAP_PTR);
+    if pos == 0 {
+        return 0;
+    }
+    while pos != 0 {
+        let id = pci_config_read_u8(dev.bus, dev.device, dev.function, pos);
+        if id == cap_id {
+            return pos;
+        }
+        pos = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+    }
+    0
+}
+
+/// Find VirtIO capability by cfg_type. Returns (bar, offset, length).
+/// For NOTIFY_CFG, use pci_find_virtio_notify_cap for notify_off_multiplier.
+pub unsafe fn pci_find_virtio_cap(dev: &PciDevice, cfg_type: u8) -> Option<(u8, u32, u32)> {
+    let mut pos = pci_config_read_u8(dev.bus, dev.device, dev.function, PCI_REG_CAP_PTR);
+    while pos != 0 {
+        let cap_id = pci_config_read_u8(dev.bus, dev.device, dev.function, pos);
+        let next = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+        if cap_id == PCI_CAP_ID_VNDR {
+            let cap_cfg_type = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 3);
+            let bar = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 4);
+            if bar < 6 && cap_cfg_type == cfg_type {
+                let offset = pci_config_read_u32(dev.bus, dev.device, dev.function, pos + 8);
+                let length = pci_config_read_u32(dev.bus, dev.device, dev.function, pos + 12);
+                return Some((bar, offset, length));
+            }
+        }
+        pos = next;
+    }
+    None
+}
+
+/// Find VirtIO NOTIFY capability and return (bar, offset, length, notify_off_multiplier).
+pub unsafe fn pci_find_virtio_notify_cap(dev: &PciDevice) -> Option<(u8, u32, u32, u32)> {
+    let mut pos = pci_config_read_u8(dev.bus, dev.device, dev.function, PCI_REG_CAP_PTR);
+    while pos != 0 {
+        let cap_id = pci_config_read_u8(dev.bus, dev.device, dev.function, pos);
+        let next = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+        if cap_id == PCI_CAP_ID_VNDR {
+            let cap_cfg_type = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 3);
+            let bar = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 4);
+            if bar < 6 && cap_cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG {
+                let offset = pci_config_read_u32(dev.bus, dev.device, dev.function, pos + 8);
+                let length = pci_config_read_u32(dev.bus, dev.device, dev.function, pos + 12);
+                let mult = pci_config_read_u32(dev.bus, dev.device, dev.function, pos + 16);
+                return Some((bar, offset, length, mult));
+            }
+        }
+        pos = next;
+    }
+    None
 }
 
 /// Find all audio devices (Intel HDA, AC97, etc.)

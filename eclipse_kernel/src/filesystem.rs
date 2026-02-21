@@ -23,12 +23,25 @@ fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'sta
         }
 
         let offset = block_num * 4096;
-        let _ = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0)
-            .map_err(|_| "Disk seek error")?;
+        if let Err(e) = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0) {
+            serial::serial_print("[FS-DEBUG] read_block lseek failed: block=");
+            serial::serial_print_dec(block_num);
+            serial::serial_print(" err=");
+            serial::serial_print_dec(e as u64);
+            serial::serial_print("\n");
+            return Err("Disk seek error");
+        }
         
         match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
             Ok(_) => Ok(()),
-            Err(_) => Err("Disk read error"),
+            Err(e) => {
+                serial::serial_print("[FS-DEBUG] read_block read failed: block=");
+                serial::serial_print_dec(block_num);
+                serial::serial_print(" err=");
+                serial::serial_print_dec(e as u64);
+                serial::serial_print("\n");
+                Err("Disk read error")
+            }
         }
     }
 }
@@ -219,14 +232,26 @@ pub fn mount() -> Result<(), &'static str> {
     /// Read file content by inode with offset
     /// Does NOT buffer the entire file. Reads directly for the requested range.
     pub fn read_file_by_inode_at(inode: u32, buffer: &mut [u8], offset: u64) -> Result<usize, &'static str> {
-        let entry = Self::read_inode_entry(inode)?;
+        let entry = Self::read_inode_entry(inode).map_err(|e| {
+            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_inode_entry failed inode=");
+            serial::serial_print_dec(inode as u64);
+            serial::serial_print("\n");
+            e
+        })?;
         
         // Read the first block of the node record to find CONTENT TLV
         let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
         let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         
         let mut block_buffer = vec![0u8; 4096];
-        read_block_from_device(block_num, &mut block_buffer)?;
+        read_block_from_device(block_num, &mut block_buffer).map_err(|e| {
+            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(1) failed inode=");
+            serial::serial_print_dec(inode as u64);
+            serial::serial_print(" block=");
+            serial::serial_print_dec(block_num);
+            serial::serial_print("\n");
+            e
+        })?;
         
         if offset_in_block + 8 > 4096 {
              return Err("Node header crosses block boundary");
@@ -267,9 +292,10 @@ pub fn mount() -> Result<(), &'static str> {
         }
         
         if !found {
-            // Could be in next block if first block is filled with metadata?
-            // For now, assume it's in first block.
-             return Err("CONTENT TLV not found in first block");
+            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: CONTENT TLV not found inode=");
+            serial::serial_print_dec(inode as u64);
+            serial::serial_print("\n");
+            return Err("CONTENT TLV not found in first block");
         }
         
         if offset >= content_length as u64 {
@@ -289,7 +315,14 @@ pub fn mount() -> Result<(), &'static str> {
             let current_block = (current_abs_pos / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
             let current_off = (current_abs_pos % BLOCK_SIZE as u64) as usize;
             
-            read_block_from_device(current_block, &mut block_buffer)?;
+            read_block_from_device(current_block, &mut block_buffer).map_err(|e| {
+                serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(2) failed inode=");
+                serial::serial_print_dec(inode as u64);
+                serial::serial_print(" block=");
+                serial::serial_print_dec(current_block);
+                serial::serial_print("\n");
+                e
+            })?;
             
             let chunk_size = min(read_len - bytes_read, 4096 - current_off);
             buffer[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[current_off..current_off+chunk_size]);

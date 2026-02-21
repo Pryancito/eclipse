@@ -16,6 +16,7 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 - **UEFI**: Soporte nativo para firmware UEFI moderno
 - **Gestión de memoria**: Sistema de memoria avanzado con paginación
 - **Interrupciones**: Manejo completo de interrupciones del sistema
+- **Drivers de Hardware**: XHCI (USB 3.0+), NVIDIA GPU, VGA
 - **Servidores del Sistema**: FileSystem, Graphics, Network, Input, Audio, AI, Security
 
 ### 🖥️ Sistema de Display Avanzado
@@ -212,6 +213,23 @@ fallback = "vga"            # Fallback a VGA si DRM falla
 primary_device = "/dev/dri/card0"  # Dispositivo DRM principal
 multi_gpu = true            # Habilitar soporte multi-GPU
 compositor = true           # Habilitar compositor de ventanas
+
+## ⌨️ USB & Input Devices (XHCI)
+
+Eclipse OS incluye un stack USB moderno centrado en XHCI para un rendimiento óptimo en hardware actual.
+
+### Características del Stack USB
+- ✅ **XHCI Core**: Implementación completa de registros Capability, Operational y Runtime.
+- ✅ **Rings Natas**: Gestión de Command, Event y Transfer Rings con alineación de 64 bits.
+- ✅ **Enumeración Automática**: Detección de dispositivos, reset de puertos y asignación de direcciones.
+- ✅ **Control Transfers**: Intercambio de descriptores USB (Device, Configuration, Interface).
+- ✅ **Soporte HID**: Infraestructura para teclados y ratones USB.
+
+### Interfaz de Entrada
+El sistema de entrada (`input_service`) unifica múltiples fuentes:
+- **USB HID**: Soporte nativo para periféricos USB modernos.
+- **PS/2**: Fallback para hardware legacy.
+- **VirtIO-Input**: Optimizado para entornos virtualizados (QEMU).
 ```
 
 ## 🎮 Soporte para GPUs NVIDIA
@@ -393,12 +411,13 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 - **Versión**: 0.1.0
 - **Estado**: En desarrollo activo
-- **Kernel**: Funcional con VGA y UEFI
+- **Kernel**: Funcional con VGA, UEFI y XHCI
+- **USB**: Stack XHCI funcional con enumeración de dispositivos
 - **Userland**: Sistema DRM implementado
 - **Gráficos**: Sistema de 6 fases con soporte Multi-GPU
-- **Sistema de Ventanas**: En integración
+- **Sistema de Ventanas**: En integración (Wayland/wlroots)
 - **Aplicaciones**: En desarrollo
-- **Hardware**: Probado en QEMU y hardware real
+- **Hardware**: Probado en QEMU (Intel XHCI) y hardware real
 
 ## Roadmap
 

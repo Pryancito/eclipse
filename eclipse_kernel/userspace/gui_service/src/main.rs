@@ -9,9 +9,14 @@
 #![no_main]
 
 use eclipse_libc::{
-    println, getpid, getppid, yield_cpu, send, open, close, O_RDONLY,
-    mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, Stat, wait, spawn,
+    println, getpid, getppid, yield_cpu, send, open, close, read, O_RDONLY,
+    mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
+    SEEK_END,
 };
+
+/// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
+const MAX_COMPOSITOR_SIZE: usize = 512 * 1024;
+static mut LOAD_BUF: [u8; MAX_COMPOSITOR_SIZE] = [0; MAX_COMPOSITOR_SIZE];
 
 const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
 /// Yield iterations between restart attempts (~1s of busy-wait)
@@ -47,24 +52,40 @@ unsafe fn spawn_compositor() -> i32 {
     }
 
     let mut st: Stat = core::mem::zeroed();
-    if fstat(fd, &mut st) < 0 || st.size <= 0 {
-        println!("[GUI-SERVICE] ERROR: fstat failed or size=0 for {}", COMPOSITOR_PATH);
-        close(fd);
-        return -1;
-    }
-
-    let size = st.size as u64;
-    let mapped = mmap(0, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
-    close(fd);
-
-    if mapped == u64::MAX || mapped == 0 {
-        println!("[GUI-SERVICE] ERROR: mmap failed for {}", COMPOSITOR_PATH);
-        return -1;
-    }
-
-    let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
-    let child_pid = spawn(binary);
-    munmap(mapped, size);
+    let size = if fstat(fd, &mut st) >= 0 && st.size > 0 {
+        st.size as u64
+    } else {
+        // Fallback: fstat may return size=0 (EclipseFS fstat bug). Use lseek(SEEK_END).
+        let sz = lseek(fd, 0, SEEK_END);
+        if sz <= 0 {
+            println!("[GUI-SERVICE] ERROR: fstat and lseek(SEEK_END) failed for {}", COMPOSITOR_PATH);
+            close(fd);
+            return -1;
+        }
+        let _ = lseek(fd, 0, 0); // Reset to start for mmap
+        sz as u64
+    };
+    let child_pid = {
+        let mapped = mmap(0, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        if mapped != u64::MAX && mapped != 0 {
+            close(fd);
+            let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
+            let pid = spawn(binary);
+            let _ = munmap(mapped, size);
+            pid
+        } else {
+            // mmap failed (e.g. file scheme). Fallback: load via read().
+            let _ = lseek(fd, 0, 0); // SEEK_SET to start
+            let buf = unsafe { &mut LOAD_BUF[..size.min(MAX_COMPOSITOR_SIZE as u64) as usize] };
+            let n = read(fd as u32, buf);
+            close(fd);
+            if n < 0 || n as u64 != size {
+                println!("[GUI-SERVICE] ERROR: read failed for {} (got {})", COMPOSITOR_PATH, n);
+                return -1;
+            }
+            spawn(unsafe { &LOAD_BUF[..size as usize] })
+        }
+    };
 
     child_pid
 }

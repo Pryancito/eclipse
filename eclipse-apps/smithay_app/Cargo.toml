@@ -8,7 +8,9 @@ eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel
 sidewind_core = { path = "../sidewind_core" }
 sidewind_wayland = { path = "../sidewind_wayland" }
 sidewind_xwayland = { package = "sidewind-xwayland", path = "../sidewind_xwayland" }
+sidewind_sdk = { path = "../sidewind_sdk" }
 embedded-graphics = "0.8.1"
+micromath = "2.1.0"
 
 [[bin]]
 name = "smithay_app"

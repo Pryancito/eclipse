@@ -54,6 +54,11 @@ pub enum SyscallNumber {
     SetCursorPosition = 39,
     GpuAllocDisplayBuffer = 40,
     GpuPresent = 41,
+    VirglCtxCreate = 42,
+    VirglCtxDestroy = 43,
+    VirglSubmit3d = 44,
+    VirglCtxAttachResource = 45,
+    VirglCtxDetachResource = 46,
     Socket = 100,
     Bind = 101,
     Listen = 102,
@@ -228,7 +233,15 @@ pub extern "C" fn syscall_handler(
         38 => sys_get_gpu_display_info(arg1),
         39 => sys_set_cursor_position(arg1, arg2),
         40 => sys_gpu_alloc_display_buffer(arg1, arg2, arg3),
-        41 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),
+        41 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),   // Eclipse native
+        250 => sys_gpu_present(arg1, arg2, arg3, arg4, arg5),  // alias (avoids Linux socket=41 conflict)
+        42 => sys_virgl_ctx_create(arg1, arg2),
+        43 => sys_virgl_ctx_destroy(arg1),
+        44 => sys_virgl_submit_3d(arg1, arg2, arg3),
+        45 => sys_virgl_ctx_attach_resource(arg1, arg2),
+        46 => sys_virgl_ctx_detach_resource(arg1, arg2),
+        47 => sys_virgl_alloc_backing(arg1),
+        48 => sys_virgl_resource_attach_backing(arg1, arg2, arg3),
         100 => sys_socket(arg1, arg2, arg3),
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
@@ -933,25 +946,34 @@ fn sys_wait(_status_ptr: u64) -> u64 {
     };
     
     // Look for terminated child processes
-    let processes = process::list_processes();
-    for (pid, state) in processes.iter() {
-        if *pid == 0 {
-            continue;
-        }
+    loop {
+        let mut has_children = false;
+        let processes = process::list_processes();
         
-        if state == &process::ProcessState::Terminated {
+        for (pid, state) in processes.iter() {
+            if *pid == 0 {
+                continue;
+            }
+            
             if let Some(proc) = process::get_process(*pid) {
                 if proc.parent_pid == Some(current_pid) {
-                    // TODO: Clean up child process resources
-                    // TODO: Write exit status to status_ptr if non-zero
-                    
-                    return *pid as u64;
+                    has_children = true;
+                    if state == &process::ProcessState::Terminated {
+                        // TODO: Clean up child process resources
+                        // TODO: Write exit status to status_ptr if non-zero
+                        
+                        return *pid as u64;
+                    }
                 }
             }
         }
+        
+        if !has_children {
+            return u64::MAX; // -1 indicates no children (ECHILD)
+        }
+        
+        crate::scheduler::yield_cpu();
     }
-    
-    u64::MAX // -1 indicates no children or error
 }
 
 /// sys_get_service_binary - Get pointer and size of embedded service binary
@@ -1356,6 +1378,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
 /// sys_get_gpu_display_info - Get display dimensions from VirtIO GPU (if present)
 /// arg1: pointer to userspace buffer (8 bytes: width u32, height u32)
 /// Returns 0 on success, u64::MAX if no VirtIO GPU or invalid buffer
+/// Override: if GPU reports <=800x600 (e.g. QEMU default 640x480), use 1280x1024
 fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
     if user_buffer == 0 {
         return u64::MAX;
@@ -1365,6 +1388,11 @@ fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
     }
     let Some((width, height)) = crate::virtio::get_gpu_display_info() else {
         return u64::MAX;
+    };
+    let (width, height) = if width <= 800 || height <= 600 {
+        (1280u32, 1024u32)
+    } else {
+        (width, height)
     };
     unsafe {
         let buf = user_buffer as *mut [u32; 2];
@@ -1431,6 +1459,131 @@ fn sys_gpu_present(resource_id: u64, x: u64, y: u64, w: u64, h: u64) -> u64 {
         w as u32,
         h as u32,
     ) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_virgl_ctx_create - Create a Virgl 3D context
+/// arg1: pointer to debug name (optional, can be 0)
+/// arg2: max length to copy (0-64). If 0 and ptr valid, treat as null-terminated up to 64
+/// Returns ctx_id (1..16) on success, 0 on failure
+fn sys_virgl_ctx_create(name_ptr: u64, max_len: u64) -> u64 {
+    let mut buf = [0u8; 64];
+    let name_slice: &[u8] = if name_ptr == 0 {
+        &[]
+    } else {
+        let len = (max_len as usize).min(64);
+        if len == 0 {
+            // Null-terminated: copy up to 64 bytes until we hit \0
+            let mut i = 0;
+            while i < 64 {
+                if !is_user_pointer(name_ptr.wrapping_add(i as u64), 1) {
+                    break;
+                }
+                let b = unsafe { core::ptr::read(name_ptr.wrapping_add(i as u64) as *const u8) };
+                buf[i] = b;
+                if b == 0 {
+                    break;
+                }
+                i += 1;
+            }
+            &buf[..i]
+        } else {
+            if !is_user_pointer(name_ptr, len as u64) {
+                return 0;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(name_ptr as *const u8, buf.as_mut_ptr(), len);
+            }
+            &buf[..len]
+        }
+    };
+    crate::virtio::virgl_ctx_create(name_slice).map(u64::from).unwrap_or(0)
+}
+
+/// sys_virgl_ctx_destroy - Destroy a Virgl 3D context
+/// arg1: ctx_id (1..16)
+/// Returns 0 on success, u64::MAX on failure
+fn sys_virgl_ctx_destroy(ctx_id: u64) -> u64 {
+    if crate::virtio::virgl_ctx_destroy(ctx_id as u32) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_virgl_ctx_attach_resource - Attach resource to Virgl context
+fn sys_virgl_ctx_attach_resource(ctx_id: u64, resource_id: u64) -> u64 {
+    if crate::virtio::virgl_ctx_attach_resource(ctx_id as u32, resource_id as u32) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_virgl_ctx_detach_resource - Detach resource from Virgl context
+fn sys_virgl_ctx_detach_resource(ctx_id: u64, resource_id: u64) -> u64 {
+    if crate::virtio::virgl_ctx_detach_resource(ctx_id as u32, resource_id as u32) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_virgl_alloc_backing - Allocate backing memory for Virgl 3D resource
+/// arg1: size in bytes
+/// Returns vaddr (identity-mapped, vaddr == phys) on success, 0 on failure
+fn sys_virgl_alloc_backing(size: u64) -> u64 {
+    let size = size as usize;
+    let Some((phys_addr, alloc_size)) = crate::virtio::virgl_alloc_backing(size) else {
+        return 0;
+    };
+    let current_pid = crate::process::current_process_id();
+    let page_table_phys = crate::process::get_process_page_table(current_pid);
+    if page_table_phys == 0 {
+        return 0;
+    }
+    let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, phys_addr, alloc_size as u64);
+    if vaddr == 0 {
+        0
+    } else {
+        vaddr
+    }
+}
+
+/// sys_virgl_resource_attach_backing - Attach backing memory to Virgl resource
+/// arg1: resource_id, arg2: vaddr (from virgl_alloc_backing, identity-mapped), arg3: size
+/// Returns 0 on success, u64::MAX on failure
+fn sys_virgl_resource_attach_backing(resource_id: u64, vaddr: u64, size: u64) -> u64 {
+    if size == 0 {
+        return u64::MAX;
+    }
+    if crate::virtio::virgl_resource_attach_backing(resource_id as u32, vaddr, size as usize) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_virgl_submit_3d - Submit Virgl 3D command buffer
+/// arg1: ctx_id, arg2: pointer to command buffer, arg3: length
+/// Returns 0 on success, u64::MAX on failure
+fn sys_virgl_submit_3d(ctx_id: u64, cmd_ptr: u64, cmd_len: u64) -> u64 {
+    const MAX_SUBMIT_SIZE: usize = 256 * 1024; // 256KB
+    let len = cmd_len as usize;
+    if len == 0 || len > MAX_SUBMIT_SIZE {
+        return u64::MAX;
+    }
+    if cmd_ptr == 0 || !is_user_pointer(cmd_ptr, len as u64) {
+        return u64::MAX;
+    }
+    let mut buf = alloc::vec![0u8; len];
+    unsafe {
+        core::ptr::copy_nonoverlapping(cmd_ptr as *const u8, buf.as_mut_ptr(), len);
+    }
+    if crate::virtio::virgl_submit_3d(ctx_id as u32, &buf) {
         0
     } else {
         u64::MAX
@@ -2306,26 +2459,22 @@ fn fill_random_rdtsc(buf: &mut [u8]) {
 /// type: SOCK_STREAM=1, SOCK_DGRAM=2
 /// protocol: 0
 fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
-    serial::serial_print("[SYSCALL] socket(domain=");
-    serial::serial_print_dec(domain);
-    serial::serial_print(", type=");
-    serial::serial_print_dec(type_);
-    serial::serial_print(", protocol=");
-    serial::serial_print_dec(protocol);
-    serial::serial_print(")\n");
-
     let path = if domain == 1 { "socket:unix" } else { "socket:" };
 
-    if let Ok((scheme_id, resource_id)) = crate::scheme::open(path, 0, 0) {
-        if let Some(pid) = current_process_id() {
-             if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
-                 // Store info if it's the socket scheme
-                 if let Some(scheme) = crate::servers::get_socket_scheme() {
-                     // We would ideally verify scheme_id here, but for now we assume it matches
-                     // In the future, we can add a get_scheme method to SchemeRegistry.
-                 }
-                 return fd as u64;
-             }
+    match crate::scheme::open(path, 0, 0) {
+        Ok((scheme_id, resource_id)) => {
+            if let Some(pid) = current_process_id() {
+                if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
+                    return fd as u64;
+                }
+            }
+        }
+        Err(_) => {
+            serial::serial_print("[SYSCALL] socket(domain=");
+            serial::serial_print_dec(domain);
+            serial::serial_print(", type=");
+            serial::serial_print_dec(type_);
+            serial::serial_print(") -> failed\n");
         }
     }
     u64::MAX

@@ -48,6 +48,8 @@ PS2_MOUSE="${PS2_MOUSE:-0}"  # 1=PS/2 ratón, 0=USB mouse/tablet (recomendado)
 USB_PORTS_2="${USB_PORTS_2:-4}"  # Número de puertos USB 2.0
 USB_PORTS_3="${USB_PORTS_3:-4}"  # Número de puertos USB 3.0
 CREATE_USB_DISK="${CREATE_USB_DISK:-1}"  # Crear disco USB de prueba
+# Resolución VirtIO GPU (por defecto 1280x1024). Ej: RESOLUTION=1920x1080 ./qemu.sh
+RESOLUTION="${RESOLUTION:-1280x1024}"
 
 # Verificar que el disco existe (archivo o dispositivo de bloque)
 if [ ! -f "$DISK" ] && [ ! -b "$DISK" ]; then
@@ -71,6 +73,7 @@ print_info "Memoria: $MEMORY"
 print_info "CPUs: $CPUS"
 print_info "Controlador USB: $([ "$USE_XHCI" = "1" ] && echo "XHCI (USB 3.0)" || echo "Legacy (UHCI/EHCI)")"
 print_info "Ratón: $([ "$PS2_MOUSE" = "1" ] && echo "PS/2 (modo legacy)" || echo "USB HID (recomendado)")"
+print_info "Resolución GPU: $RESOLUTION (export RESOLUTION=1920x1080 para cambiar)"
 print_info ""
 print_info "Controles:"
 print_info "  - Ctrl+Alt+G: IMPORTANTE - Capturar/soltar ratón en la ventana QEMU"
@@ -147,7 +150,23 @@ QEMU_CMD="$QEMU_CMD -smp $CPUS"
 QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"
 
 # Configuración de display
-QEMU_CMD="$QEMU_CMD -vga virtio"
+# VIRGL=1 habilita aceleración 3D (virtio-vga-gl). Requiere virgl en host.
+# NOTA: QEMU virtio-vga/virtio-gpu-pci usan VirtIO 1.0 (modern); nuestro driver soporta Legacy.
+#       Hasta implementar VirtIO 1.0 PCI modern, GPU devices: 0 (display vía efifb/framebuffer).
+# Resolución: xres,yres (ej: 1024x768 → xres=1024,yres=768)
+RES_X="${RESOLUTION%%x*}"
+RES_Y="${RESOLUTION##*x}"
+[ -z "$RES_X" ] && RES_X=1024
+[ -z "$RES_Y" ] && RES_Y=768
+
+VIRGL="${VIRGL:-0}"
+if [ "$VIRGL" = "1" ]; then
+    QEMU_CMD="$QEMU_CMD -device virtio-vga-gl,xres=$RES_X,yres=$RES_Y"
+    print_info "Virgl 3D habilitado (virtio-vga-gl), resolución ${RES_X}x${RES_Y}"
+else
+    QEMU_CMD="$QEMU_CMD -device virtio-vga,xres=$RES_X,yres=$RES_Y"
+    print_info "VirtIO GPU: ${RES_X}x${RES_Y}"
+fi
 
 # Configuración de dispositivos de entrada
 if [ "$PS2_MOUSE" = "1" ]; then
@@ -175,7 +194,7 @@ QEMU_CMD="$QEMU_CMD -no-shutdown"
 
 # Puerto de monitor QEMU (para debugging)
 QEMU_CMD="$QEMU_CMD -serial stdio"
-QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
+#QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
 
 # Debugging flags (Unconditional)
 QEMU_CMD="$QEMU_CMD -no-reboot"

@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
 sidewind_core = { path = "../sidewind_core" }
+embedded-graphics = "0.8.1"
+micromath = "2.1.0"

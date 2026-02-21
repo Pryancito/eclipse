@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod ui;
+
 use eclipse_libc::{send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
 use sidewind_core::{SideWindMessage, MSG_TYPE_GRAPHICS, MSG_TYPE_INPUT, SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_COMMIT, SideWindEvent};
 

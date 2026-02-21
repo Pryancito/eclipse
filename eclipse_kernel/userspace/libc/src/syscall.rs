@@ -30,7 +30,15 @@ pub const SYS_READ_MOUSE_PACKET: u64 = 37;
 pub const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
 pub const SYS_SET_CURSOR_POSITION: u64 = 39;
 pub const SYS_GPU_ALLOC_DISPLAY_BUFFER: u64 = 40;
-pub const SYS_GPU_PRESENT: u64 = 41;
+/// 250 = gpu_present (avoid conflict with Linux socket=41)
+pub const SYS_GPU_PRESENT: u64 = 250;
+pub const SYS_VIRGL_CTX_CREATE: u64 = 42;
+pub const SYS_VIRGL_CTX_DESTROY: u64 = 43;
+pub const SYS_VIRGL_SUBMIT_3D: u64 = 44;
+pub const SYS_VIRGL_CTX_ATTACH_RESOURCE: u64 = 45;
+pub const SYS_VIRGL_CTX_DETACH_RESOURCE: u64 = 46;
+pub const SYS_VIRGL_ALLOC_BACKING: u64 = 47;
+pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
 pub type c_void = core::ffi::c_void;
 
@@ -89,6 +97,71 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
             h as u64,
         )
     };
+    r != u64::MAX
+}
+
+/// Create a Virgl 3D context. Returns ctx_id (1..16) on success, None on failure.
+/// name: optional debug name (max 64 bytes). Pass empty slice for no name.
+pub fn virgl_ctx_create(name: &[u8]) -> Option<u32> {
+    let ptr = if name.is_empty() {
+        0
+    } else {
+        name.as_ptr() as u64
+    };
+    let len = name.len().min(64) as u64;
+    let r = unsafe { syscall2(SYS_VIRGL_CTX_CREATE, ptr, len) };
+    if r == 0 {
+        None
+    } else {
+        Some(r as u32)
+    }
+}
+
+/// Destroy a Virgl 3D context. Returns true on success.
+pub fn virgl_ctx_destroy(ctx_id: u32) -> bool {
+    let r = unsafe { syscall1(SYS_VIRGL_CTX_DESTROY, ctx_id as u64) };
+    r != u64::MAX
+}
+
+/// Attach resource to Virgl context. Returns true on success.
+pub fn virgl_ctx_attach_resource(ctx_id: u32, resource_id: u32) -> bool {
+    let r = unsafe { syscall2(SYS_VIRGL_CTX_ATTACH_RESOURCE, ctx_id as u64, resource_id as u64) };
+    r != u64::MAX
+}
+
+/// Detach resource from Virgl context. Returns true on success.
+pub fn virgl_ctx_detach_resource(ctx_id: u32, resource_id: u32) -> bool {
+    let r = unsafe { syscall2(SYS_VIRGL_CTX_DETACH_RESOURCE, ctx_id as u64, resource_id as u64) };
+    r != u64::MAX
+}
+
+/// Submit Virgl 3D command buffer. Returns true on success.
+pub fn virgl_submit_3d(ctx_id: u32, cmd_data: &[u8]) -> bool {
+    let ptr = if cmd_data.is_empty() {
+        0
+    } else {
+        cmd_data.as_ptr() as u64
+    };
+    let len = cmd_data.len() as u64;
+    let r = unsafe { syscall3(SYS_VIRGL_SUBMIT_3D, ctx_id as u64, ptr, len) };
+    r != u64::MAX
+}
+
+/// Allocate backing memory for Virgl 3D resource. Returns Some(vaddr) on success.
+/// The vaddr is identity-mapped (vaddr == phys); use it for resource_attach_backing.
+pub fn virgl_alloc_backing(size: usize) -> Option<u64> {
+    let r = unsafe { syscall1(SYS_VIRGL_ALLOC_BACKING, size as u64) };
+    if r == 0 {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// Attach backing memory to Virgl resource. vaddr must be from virgl_alloc_backing.
+/// Returns true on success.
+pub fn virgl_resource_attach_backing(resource_id: u32, vaddr: u64, size: usize) -> bool {
+    let r = unsafe { syscall3(SYS_VIRGL_RESOURCE_ATTACH_BACKING, resource_id as u64, vaddr, size as u64) };
     r != u64::MAX
 }
 

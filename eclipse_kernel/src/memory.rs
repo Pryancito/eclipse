@@ -796,133 +796,41 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     Some(frame_phys)
 }
 
+/// Fixed virtual address for GPU framebuffer (avoids identity-mapping page faults)
+/// 8GB - above typical heap/stack/mmap, in canonical user range
+const GPU_FB_VADDR_BASE: u64 = 0x0000_0002_0000_0000;
+
 /// Map framebuffer physical memory into process page tables
+/// Uses fixed vaddr + 4KB pages (same path as mmap) to avoid Page Fault 14 on identity mapping
 /// Returns virtual address where framebuffer is mapped, or 0 on failure
 pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_size: u64) -> u64 {
     use x86_64::structures::paging::PageTableFlags as Flags;
-    use x86_64::instructions::tlb::flush_all;
     use crate::serial;
     
-    // Rechazar fb en espacio kernel o dirección nula
     if fb_phys_addr == 0 || fb_phys_addr >= 0xFFFF_8000_0000_0000 {
         serial::serial_print("MAP_FB: ERROR - Invalid framebuffer physical address\n");
         return 0;
     }
     
-    // For identity mapping, we'll map the framebuffer at its physical address
-    let virtual_addr = fb_phys_addr;
+    // Align size to 4KB
+    let aligned_size = (fb_size + 0xFFF) & !0xFFF;
     
-    // Round size up to 2MB pages; mínimo 2 páginas (4MB) para cubrir stride/overflow
-    let min_size = core::cmp::max(fb_size, 0x400000);
-    let num_pages = (min_size + 0x1FFFFF) / 0x200000;
+    let virt_addr = GPU_FB_VADDR_BASE;
+    let pt_flags = (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits();
     
-    serial::serial_print("MAP_FB: Identity mapping ");
-    serial::serial_print_dec(num_pages);
-    serial::serial_print(" pages (2MB each)\n");
+    serial::serial_print("MAP_FB: Mapping ");
+    serial::serial_print_dec((aligned_size / 4096) as u64);
+    serial::serial_print("x4KB pages at vaddr=");
+    serial::serial_print_hex(virt_addr);
+    serial::serial_print(" (same path as mmap)\n");
     
-    // Access the process's PML4
-    let pml4_virt = phys_to_virt(page_table_phys);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+    map_physical_range(page_table_phys, fb_phys_addr, aligned_size, virt_addr, pt_flags);
     
-    // For each 2MB page of the framebuffer
-    for page_idx in 0..num_pages {
-        let page_phys = fb_phys_addr + (page_idx * 0x200000);
-        let page_virt = page_phys; // Identity mapping
-        
-        // Calculate indices for page table walk
-        let pml4_idx = ((page_virt >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((page_virt >> 30) & 0x1FF) as usize;
-        let pd_idx = ((page_virt >> 21) & 0x1FF) as usize;
-        
-        // Get or create PDPT
-        if !pml4.entries[pml4_idx].present() {
-            if let Some((pdpt_ptr, pdpt_phys)) = alloc_dma_buffer(4096, 4096) {
-                unsafe { core::ptr::write_bytes(pdpt_ptr, 0, 4096); }
-                pml4.entries[pml4_idx].set_addr(
-                    pdpt_phys,
-                    (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits()
-                );
-            } else {
-                return 0;
-            }
-        } else {
-            // FORCE User access bit on existing entry
-            let mut ent = pml4.entries[pml4_idx];
-            let flags = (ent.get_flags() | Flags::USER_ACCESSIBLE.bits()) & !Flags::NO_EXECUTE.bits();
-            ent.set_addr(ent.get_addr(), flags);
-            pml4.entries[pml4_idx] = ent;
-            
-            if page_idx == 0 {
-                serial::serial_print("  PML4[");
-                serial::serial_print_dec(pml4_idx as u64);
-                serial::serial_print("] setup, Entry: ");
-                serial::serial_print_hex(pml4.entries[pml4_idx].entry);
-                serial::serial_print("\n");
-            }
-        }
-        
-        // Get PDPT
-        let pdpt_phys = pml4.entries[pml4_idx].get_addr();
-        let pdpt_virt = phys_to_virt(pdpt_phys);
-        let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
-        
-        // Get or create PD
-        if !pdpt.entries[pdpt_idx].present() {
-            if let Some((pd_ptr, pd_phys)) = alloc_dma_buffer(4096, 4096) {
-                unsafe { core::ptr::write_bytes(pd_ptr, 0, 4096); }
-                pdpt.entries[pdpt_idx].set_addr(
-                    pd_phys,
-                    (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits()
-                );
-            } else {
-                return 0;
-            }
-        } else {
-            // FORCE User access bit on existing entry
-            let mut ent = pdpt.entries[pdpt_idx];
-            if ent.is_huge() {
-                serial::serial_print("MAP_FB: ERROR - 1GB Huge Page conflict at PDPT index ");
-                serial::serial_print_dec(pdpt_idx as u64);
-                serial::serial_print("\n");
-                return 0;
-            }
-            let flags = (ent.get_flags() | Flags::USER_ACCESSIBLE.bits()) & !Flags::NO_EXECUTE.bits();
-            ent.set_addr(ent.get_addr(), flags);
-            pdpt.entries[pdpt_idx] = ent;
-        }
-        
-        // Get PD
-        let pd_phys = pdpt.entries[pdpt_idx].get_addr();
-        let pd_virt = phys_to_virt(pd_phys);
-        let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
-        
-        // Map Page (2MB) - Identity mapping for framebuffer
-        // Important: Huge Page bit + User Accessible + Write Through
-        let final_flags = Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE | Flags::HUGE_PAGE | Flags::WRITE_THROUGH;
-        pd.entries[pd_idx].set_addr(page_phys, final_flags.bits());
-        
-        if true {
-            serial::serial_print("MAP_FB: Mapped v=");
-            serial::serial_print_hex(page_virt);
-            serial::serial_print(" (PML4=");
-            serial::serial_print_dec(pml4_idx as u64);
-            serial::serial_print(", PDPT=");
-            serial::serial_print_dec(pdpt_idx as u64);
-            serial::serial_print(", PD=");
-            serial::serial_print_dec(pd_idx as u64);
-            serial::serial_print(") Entry: ");
-            serial::serial_print_hex(pd.entries[pd_idx].entry);
-            serial::serial_print("\n");
-        }
-    }
+    serial::serial_print("MAP_FB: Done v=");
+    serial::serial_print_hex(virt_addr);
+    serial::serial_print("\n");
     
-    // Flush TLB globally
-    flush_all();
-    
-    // VERIFY: Walk the table for the first address
-    walk_page_table(page_table_phys, virtual_addr);
-    
-    virtual_addr
+    virt_addr
 }
 /// Map a physical memory range into a process's page table using 4KB pages
 pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: u64, flags: u64) {
