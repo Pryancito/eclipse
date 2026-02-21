@@ -566,7 +566,7 @@ pub struct UsbController {
     pub function: u8,
     pub vendor_id: u16,
     pub device_id: u16,
-    pub bar0: u32,
+    pub bar0: u64,
     pub interrupt_line: u8,
 }
 
@@ -847,18 +847,16 @@ fn init_xhci_controller(controller: &UsbController) -> UsbControllerState {
     // puede no ser correcta o apuntar a región no mapeada (~2GB -> Page Fault).
     // Usamos solo la parte baja 32-bit: dirección física baja (ej. 0x8000) está siempre
     // mapeada en el higher-half del kernel.
-    let bar0 = unsafe {
-        crate::pci::pci_config_read_u32(controller.bus, controller.device, controller.function, 0x10)
-    };
-    if bar0 == 0 || bar0 == 0xFFFF_FFFF {
+    let bar0 = controller.bar0;
+    if bar0 == 0 || bar0 == 0xFFFF_FFFF_FFFF_FFFF {
         crate::serial::serial_print("[USB-HID]   ERROR: BAR0 inválido (0 o no programado)\n");
         return UsbControllerState::Error;
     }
     
-    let mmio_base = (bar0 & !0xF) as u64;
+    let mmio_base = bar0 & !0xF;
     
     crate::serial::serial_print(&alloc::format!(
-        "[USB-HID]   BAR0=0x{:08X}, MMIO Base (phys)=0x{:016X}\n", bar0, mmio_base
+        "[USB-HID]   BAR0=0x{:016X}, MMIO Base (phys)=0x{:016X}\n", bar0, mmio_base
     ));
     
     // Mapear y leer registros de capability/operational/runtime/doorbell
@@ -890,11 +888,44 @@ fn init_xhci_controller(controller: &UsbController) -> UsbControllerState {
         max_ports
     ));
     
-    crate::serial::serial_print("[USB-HID]   XHCI MMIO mapeado correctamente (driver aún en modo stub)\n");
+    crate::serial::serial_print("[USB-HID]   Iniciando secuencias de hardware reales\n");
     
-    // Por ahora no arrancamos el controlador ni tocamos TRBs; sólo marcamos listo.
+    let mut state = XhciControllerState::new(mmio_base, mmio);
+    state.max_slots = max_slots;
+    state.max_ports = max_ports;
+    
+    // Perform controller initialization
+    if let Err(e) = state.initialize() {
+        crate::serial::serial_print("[USB-HID]   ERROR initializing XHCI struct: ");
+        crate::serial::serial_print(e);
+        crate::serial::serial_print("\n");
+        return UsbControllerState::Error;
+    }
+    
+    // Store in global state
+    unsafe {
+        XHCI = Some(state);
+        // Start the controller
+        if let Err(e) = XHCI.as_mut().unwrap().start_controller() {
+            crate::serial::serial_print("[USB-HID]   ERROR starting XHCI: ");
+            crate::serial::serial_print(e);
+            crate::serial::serial_print("\n");
+            return UsbControllerState::Error;
+        }
+        
+        // Enumerate ports
+        if let Err(e) = XHCI.as_mut().unwrap().enumerate_ports() {
+            crate::serial::serial_print("[USB-HID]   ERROR enumerating ports: ");
+            crate::serial::serial_print(e);
+            crate::serial::serial_print("\n");
+        }
+    }
+    
     UsbControllerState::Ready
 }
+
+/// Estado global del controlador XHCI principal
+pub static mut XHCI: Option<XhciControllerState> = None;
 
 /// Inicializar controlador EHCI (USB 2.0)
 /// 
@@ -912,12 +943,12 @@ fn init_ehci_controller(controller: &UsbController) -> UsbControllerState {
     ));
     
     let bar0 = controller.bar0;
-    if bar0 == 0 {
+    if bar0 == 0 || bar0 == 0xFFFF_FFFF_FFFF_FFFF {
         crate::serial::serial_print("[USB-HID]   ERROR: BAR0 es 0, controlador no configurado\n");
         return UsbControllerState::Error;
     }
     
-    let mmio_base = (bar0 & !0xF) as u64;
+    let mmio_base = bar0 & !0xF;
     
     crate::serial::serial_print(&alloc::format!(
         "[USB-HID]   MMIO Base: 0x{:016X}\n", mmio_base
@@ -1359,77 +1390,124 @@ impl Trb {
 /// Estructura circular para Command Ring, Transfer Ring, o Event Ring.
 /// Usa el Producer Cycle State (PCS) para detectar wrap-around.
 pub struct TrbRing {
-    pub trbs: alloc::vec::Vec<Trb>,  // Array de TRBs
-    pub enqueue_index: usize,         // Índice de escritura
-    pub dequeue_index: usize,         // Índice de lectura
-    pub cycle_state: bool,            // Producer Cycle State
-    pub capacity: usize,              // Capacidad del ring (número de TRBs)
+    pub allocation: DmaAllocation,    // Continuous DMA segment
+    pub enqueue_index: usize,         // Software write index
+    pub dequeue_index: usize,         // Software read index
+    pub cycle_state: bool,            // Producer Cycle State (CR/TR) or Consumer Cycle State (ER)
+    pub capacity: usize,              // Number of TRBs (including Link TRB if present)
+    pub has_link_trb: bool,           // True for Command/Transfer rings
 }
 
 impl TrbRing {
-    /// Crear un nuevo ring de TRBs
-    pub fn new(capacity: usize) -> Self {
-        let mut trbs = alloc::vec::Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            trbs.push(Trb::new());
+    /// Create a new TRB ring
+    pub fn new(capacity: usize, has_link_trb: bool) -> Result<Self, &'static str> {
+        let allocation = DmaAllocation::allocate_trb_ring(capacity)?;
+        allocation.zero();
+        
+        if has_link_trb && capacity > 1 {
+            // Setup Link TRB at the end pointing back to the start
+            let link_trb = build_link_trb(allocation.phys_addr, true);
+            let offset = (capacity - 1) * 16;
+            allocation.write_u64(offset, link_trb.parameter);
+            allocation.write_u64(offset + 8, (link_trb.status as u64) | ((link_trb.control as u64) << 32));
         }
         
-        Self {
-            trbs,
+        Ok(Self {
+            allocation,
             enqueue_index: 0,
             dequeue_index: 0,
-            cycle_state: true,
+            cycle_state: true, // PCS or CCS starts at 1
             capacity,
-        }
+            has_link_trb,
+        })
     }
     
-    /// Verificar si el ring está lleno
+    /// Check if ring is full (respecting Link TRB if present)
     pub fn is_full(&self) -> bool {
-        // Ring está lleno si enqueue alcanza dequeue con mismo cycle state
-        let next = (self.enqueue_index + 1) % self.capacity;
-        next == self.dequeue_index
+        let usable_capacity = if self.has_link_trb { self.capacity - 1 } else { self.capacity };
+        (self.enqueue_index + 1) % usable_capacity == self.dequeue_index
     }
-    
-    /// Obtener espacio disponible en el ring
-    pub fn available_space(&self) -> usize {
-        if self.enqueue_index >= self.dequeue_index {
-            self.capacity - (self.enqueue_index - self.dequeue_index) - 1
-        } else {
-            self.dequeue_index - self.enqueue_index - 1
-        }
-    }
-    
-    /// Verificar si el ring está vacío
+
+    /// Check if ring is empty (using software indices)
     pub fn is_empty(&self) -> bool {
         self.enqueue_index == self.dequeue_index
     }
+
+    /// Peek at the TRB at dequeue index and check Cycle Bit (for Event Rings)
+    pub fn peek_event(&self) -> Option<Trb> {
+        let offset = self.dequeue_index * 16;
+        let mut trb_data = [0u64; 2];
+        self.allocation.read_bytes(offset, unsafe {
+            core::slice::from_raw_parts_mut(trb_data.as_mut_ptr() as *mut u8, 16)
+        });
+        
+        let trb = Trb {
+            parameter: trb_data[0],
+            status: (trb_data[1] & 0xFFFFFFFF) as u32,
+            control: (trb_data[1] >> 32) as u32,
+        };
+        
+        // If Cycle Bit matches CCS, there is a new event
+        if trb.cycle_bit() == self.cycle_state {
+            Some(trb)
+        } else {
+            None
+        }
+    }
+
+    /// Pop an event from the ring (for Event Rings)
+    pub fn pop_event(&mut self) -> Option<Trb> {
+        let trb = self.peek_event()?;
+        
+        // Advance dequeue index
+        self.dequeue_index = (self.dequeue_index + 1) % self.capacity;
+        
+        // If wrap around, toggle CCS
+        if self.dequeue_index == 0 {
+            self.cycle_state = !self.cycle_state;
+        }
+        
+        Some(trb)
+    }
     
-    /// Encolar un TRB en el ring
+
+    
+    /// Enqueue a TRB in the ring (for Command/Transfer Rings)
     pub fn enqueue(&mut self, mut trb: Trb) -> Result<(), &'static str> {
         if self.is_full() {
             return Err("TRB ring is full");
         }
+        
+        let usable_capacity = if self.has_link_trb { self.capacity - 1 } else { self.capacity };
         let idx = self.enqueue_index;
-        // Actualizar cycle bit del TRB según el estado actual del productor
         trb.set_cycle_bit(self.cycle_state);
-        self.trbs[idx] = trb;
-        self.enqueue_index = (self.enqueue_index + 1) % self.capacity;
-        // Al envolver, invertir el Producer Cycle State
-        if self.enqueue_index == 0 {
+        
+        let offset = idx * 16;
+        self.allocation.write_u64(offset, trb.parameter);
+        self.allocation.write_u64(offset + 8, (trb.status as u64) | ((trb.control as u64) << 32));
+        
+        self.enqueue_index = (self.enqueue_index + 1) % usable_capacity;
+        
+        if self.has_link_trb && self.enqueue_index == 0 {
+            // Reached link TRB, hardware traverses it, we toggle cycle state
+            let link_offset = (self.capacity - 1) * 16;
+            
+            let mut link_word2 = 0u64;
+            self.allocation.read_bytes(link_offset + 8, unsafe {
+                core::slice::from_raw_parts_mut(&mut link_word2 as *mut u64 as *mut u8, 8)
+            });
+            
+            // Match Link TRB cycle to current PCS
+            if self.cycle_state {
+                link_word2 |= 1;
+            } else {
+                link_word2 &= !1;
+            }
+            
+            self.allocation.write_u64(link_offset + 8, link_word2);
             self.cycle_state = !self.cycle_state;
         }
         Ok(())
-    }
-    
-    /// Desencolar un TRB del ring
-    pub fn dequeue(&mut self) -> Result<Trb, &'static str> {
-        if self.is_empty() {
-            return Err("TRB ring is empty");
-        }
-        let idx = self.dequeue_index;
-        let trb = self.trbs[idx];
-        self.dequeue_index = (self.dequeue_index + 1) % self.capacity;
-        Ok(trb)
     }
 }
 
@@ -1940,28 +2018,29 @@ pub struct CommandRing {
 
 impl CommandRing {
     /// Create a new command ring with specified capacity
-    pub fn new(capacity: usize) -> Self {
-        let ring = TrbRing::new(capacity);
-        let command_ring_control = 0; // TODO: Set physical address of ring
+    pub fn new(capacity: usize) -> Result<Self, &'static str> {
+        let ring = TrbRing::new(capacity, true)?;
+        let command_ring_control = ring.allocation.phys_addr;
         
-        CommandRing {
+        Ok(CommandRing {
             ring,
             command_ring_control,
-        }
+        })
     }
     
-    /// Submit a command TRB to the ring
-    pub fn submit_command(&mut self, trb: Trb) -> Result<(), &'static str> {
+    /// Submit a command TRB to the ring and return its physical address
+    pub fn submit_command(&mut self, trb: Trb) -> Result<u64, &'static str> {
         if self.ring.is_full() {
             return Err("Command ring is full");
         }
         
+        let enqueue_index = self.ring.enqueue_index;
+        let trb_phys = self.ring.allocation.phys_addr + (enqueue_index as u64 * 16);
         self.ring.enqueue(trb)?;
         
-        // TODO: Ring doorbell 0 to notify controller
         crate::serial::serial_print("[XHCI] Command TRB submitted\n");
         
-        Ok(())
+        Ok(trb_phys)
     }
     
     /// Get the command ring control register value (for CRCR)
@@ -1980,14 +2059,14 @@ pub struct TransferRing {
 
 impl TransferRing {
     /// Create a new transfer ring for an endpoint
-    pub fn new(capacity: usize, device_slot: u8, endpoint_address: u8) -> Self {
-        let ring = TrbRing::new(capacity);
+    pub fn new(capacity: usize, device_slot: u8, endpoint_address: u8) -> Result<Self, &'static str> {
+        let ring = TrbRing::new(capacity, true)?;
         
-        TransferRing {
+        Ok(TransferRing {
             ring,
             endpoint_address,
             device_slot,
-        }
+        })
     }
     
     /// Submit a transfer TRB to the ring
@@ -2006,8 +2085,7 @@ impl TransferRing {
     
     /// Get physical address of ring (for endpoint context)
     pub fn get_ring_address(&self) -> u64 {
-        // TODO: Return physical address of ring buffer
-        0
+        self.ring.allocation.phys_addr
     }
 }
 
@@ -2015,31 +2093,35 @@ impl TransferRing {
 /// Controller writes completion events here
 pub struct EventRing {
     ring: TrbRing,
-    event_ring_segment_table: u64, // Physical address of ERST
-    event_ring_dequeue_pointer: u64, // ERDP register value
+    event_ring_segment_table: DmaAllocation, // Buffer for ERST
 }
 
 impl EventRing {
     /// Create a new event ring with specified capacity
-    pub fn new(capacity: usize) -> Self {
-        let ring = TrbRing::new(capacity);
+    pub fn new(capacity: usize) -> Result<Self, &'static str> {
+        let ring = TrbRing::new(capacity, false)?;
         
-        EventRing {
+        // One segment for now
+        let erst = DmaAllocation::allocate_erst(1)?;
+        erst.zero();
+        
+        // Configure first ERST entry
+        // 64-bit Ring Segment Base Address
+        erst.write_u64(0, ring.allocation.phys_addr);
+        // Size of the ring segment in TRBs
+        erst.write_u64(8, capacity as u64); // Bits 0-15: size, 16-31: reserved
+        
+        let erdp = ring.allocation.phys_addr;
+        
+        Ok(EventRing {
             ring,
-            event_ring_segment_table: 0,
-            event_ring_dequeue_pointer: 0,
-        }
+            event_ring_segment_table: erst,
+        })
     }
     
     /// Process next event TRB from the ring
     pub fn process_next_event(&mut self) -> Option<Trb> {
-        match self.ring.dequeue() {
-            Ok(trb) => {
-                // TODO: Update ERDP register
-                Some(trb)
-            }
-            Err(_) => None,
-        }
+        self.ring.pop_event()
     }
     
     /// Check if there are pending events
@@ -2049,12 +2131,12 @@ impl EventRing {
     
     /// Get ERST base address (for runtime register)
     pub fn get_erst_base(&self) -> u64 {
-        self.event_ring_segment_table
+        self.event_ring_segment_table.phys_addr
     }
     
     /// Get current ERDP value (for runtime register)
     pub fn get_erdp(&self) -> u64 {
-        self.event_ring_dequeue_pointer
+        self.ring.allocation.phys_addr + (self.ring.dequeue_index as u64 * 16)
     }
 }
 
@@ -2263,6 +2345,56 @@ pub fn build_address_device_trb(input_context_ptr: u64, slot_id: u8, bsr: bool) 
     }
 }
 
+/// Create a Setup Stage TRB for Control Transfers
+pub fn build_setup_trb(request_type: u8, request: u8, value: u16, index: u16, length: u16, transfer_type: u8) -> Trb {
+    let parameter = (request_type as u64) | ((request as u64) << 8) | ((value as u64) << 16) | ((index as u64) << 32) | ((length as u64) << 48);
+    let status = 8; // TRB Transfer Length (bits 16:0) = 8
+    
+    // TRB Type = 2 (Setup Stage), IDT (bit 6) = 1, TRT (bits 16-17)
+    let control = (2 << 10) | (1 << 6) | ((transfer_type as u32) << 16);
+    
+    Trb {
+        parameter,
+        status,
+        control,
+    }
+}
+
+/// Create a Data Stage TRB for Control Transfers
+pub fn build_data_trb(buffer_ptr: u64, length: u32, is_in: bool) -> Trb {
+    let status = length & 0x1FFFF; // TRB Transfer Length (bits 16:0)
+    
+    // TRB Type = 3 (Data Stage), DIR (bit 16)
+    let mut control = 3 << 10;
+    if is_in {
+        control |= 1 << 16;
+    }
+    
+    Trb {
+        parameter: buffer_ptr,
+        status,
+        control,
+    }
+}
+
+/// Create a Status Stage TRB for Control Transfers
+pub fn build_status_trb(is_in: bool, ioc: bool) -> Trb {
+    // TRB Type = 4 (Status Stage), DIR (bit 16), IOC (bit 5)
+    let mut control = 4 << 10;
+    if is_in {
+        control |= 1 << 16;
+    }
+    if ioc {
+        control |= 1 << 5;
+    }
+    
+    Trb {
+        parameter: 0,
+        status: 0,
+        control,
+    }
+}
+
 /// Create a Configure Endpoint Command TRB
 pub fn build_configure_endpoint_trb(input_context_ptr: u64, slot_id: u8) -> Trb {
     let control = (u32::from(TRB_TYPE_CONFIGURE_ENDPOINT) << 10) | ((slot_id as u32) << 24);
@@ -2363,28 +2495,30 @@ impl DoorbellRegister {
 
 /// XHCI Controller State - Tracks controller operational state
 pub struct XhciControllerState {
+    pub mmio: Option<XhciMmio>,
     pub command_ring: Option<CommandRing>,
     pub event_rings: alloc::vec::Vec<EventRing>,
-    pub device_contexts: alloc::vec::Vec<Option<DeviceContext>>, // Index by slot ID
+    pub device_contexts_dma: alloc::vec::Vec<Option<DmaAllocation>>, // Index by slot ID
+    pub transfer_rings: alloc::vec::Vec<Option<TransferRing>>,       // Index by slot ID * 31 + ep_idx
+    pub dcbaa: Option<DmaAllocation>,
+    pub dcbaa_phys: u64,
     pub mmio_base: u64,
-    pub operational_base: u64,
-    pub runtime_base: u64,
-    pub doorbell_base: u64,
     pub max_slots: u8,
     pub max_ports: u8,
 }
 
 impl XhciControllerState {
     /// Create a new XHCI controller state
-    pub fn new(mmio_base: u64) -> Self {
+    pub fn new(mmio_base: u64, mmio: XhciMmio) -> Self {
         XhciControllerState {
+            mmio: Some(mmio),
             command_ring: None,
             event_rings: alloc::vec::Vec::new(),
-            device_contexts: alloc::vec::Vec::new(),
+            device_contexts_dma: alloc::vec::Vec::new(),
+            transfer_rings: alloc::vec::Vec::new(),
+            dcbaa: None,
+            dcbaa_phys: 0,
             mmio_base,
-            operational_base: 0,
-            runtime_base: 0,
-            doorbell_base: 0,
             max_slots: 0,
             max_ports: 0,
         }
@@ -2392,56 +2526,390 @@ impl XhciControllerState {
     
     /// Initialize controller rings and structures
     pub fn initialize(&mut self) -> Result<(), &'static str> {
-        crate::serial::serial_print("[XHCI] Initializing controller rings...\n");
+        crate::serial::serial_print("[XHCI] Initializing controller rings and structures...\n");
         
-        // Create command ring (64 TRBs)
-        let command_ring = CommandRing::new(64);
+        let mmio = self.mmio.as_ref().ok_or("MMIO not found")?;
+
+        // 1. Allocate Device Context Base Address Array (DCBAA)
+        let max_slots = self.max_slots as usize;
+        let dcbaa = DmaAllocation::allocate_dcbaa(max_slots)?;
+        dcbaa.zero();
+
+        // 2. Setup Scratchpad Buffers if needed
+        let hcsparams2 = mmio.read_capability(0x08);
+        let max_scratchpad_hi = (hcsparams2 >> 27) & 0x1F;
+        let max_scratchpad_lo = (hcsparams2 >> 21) & 0x1F;
+        let max_scratchpad_bufs = (max_scratchpad_hi << 5) | max_scratchpad_lo;
+        
+        if max_scratchpad_bufs > 0 {
+            crate::serial::serial_print(&alloc::format!("[XHCI] Allocating {} scratchpad buffers\n", max_scratchpad_bufs));
+            
+            // Allocate Scatter/Gather Array of pointers
+            let sp_array = DmaAllocation::allocate((max_scratchpad_bufs as usize) * 8, 64)?;
+            sp_array.zero();
+            
+            // Allocate actual pages and fill array
+            for i in 0..max_scratchpad_bufs {
+                let page = DmaAllocation::allocate(4096, 4096)?;
+                page.zero();
+                sp_array.write_u64((i as usize) * 8, page.phys_addr);
+            }
+            
+            // Put array pointer in DCBAA[0]
+            dcbaa.write_u64(0, sp_array.phys_addr);
+        }
+
+        self.dcbaa_phys = dcbaa.phys_addr;
+        self.dcbaa = Some(dcbaa);
+
+        // 3. Create command ring (64 TRBs)
+        let command_ring = CommandRing::new(64)?;
         self.command_ring = Some(command_ring);
         
-        // Create event ring for interrupter 0 (256 TRBs)
-        let event_ring = EventRing::new(256);
+        // 4. Create event ring for interrupter 0 (256 TRBs)
+        let event_ring = EventRing::new(256)?;
         self.event_rings.push(event_ring);
         
         // Allocate device context array
-        for _ in 0..256 {
-            self.device_contexts.push(None);
+        for _ in 0..=max_slots {
+            self.device_contexts_dma.push(None); // Empty contexts initially
+        }
+        
+        // Pre-allocate transfer rings array (32 endpoints per slot, including slot 0 which is unused)
+        for _ in 0..=(max_slots * 32) {
+            self.transfer_rings.push(None);
         }
         
         crate::serial::serial_print("[XHCI] Controller rings initialized\n");
         Ok(())
     }
     
-    /// Start the XHCI controller
+    /// Start the XHCI controller with proper reset sequence
     pub fn start_controller(&mut self) -> Result<(), &'static str> {
         crate::serial::serial_print("[XHCI] Starting controller...\n");
+        let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
+
+        // 1. Wait until Controller Not Ready (CNR) is 0
+        let mut timeout = 10000;
+        while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
+            timeout -= 1;
+            if timeout == 0 { return Err("Timeout waiting for CNR to clear before reset"); }
+        }
+
+        // 2. Perform Host Controller Reset (HCRST)
+        crate::serial::serial_print("[XHCI] Asserting HCRST...\n");
+        let mut usbcmd = mmio.read_operational(0x00);
+        usbcmd |= 1 << 1; // HCRST
+        mmio.write_operational(0x00, usbcmd);
+
+        // Wait for HCRST to clear
+        timeout = 10000;
+        while (mmio.read_operational(0x00) & (1 << 1)) != 0 {
+            timeout -= 1;
+            if timeout == 0 { return Err("Timeout waiting for HCRST to clear"); }
+        }
+
+        // Wait for CNR to clear again
+        timeout = 10000;
+        while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
+            timeout -= 1;
+            if timeout == 0 { return Err("Timeout waiting for CNR to clear after reset"); }
+        }
         
-        // TODO: Actual XHCI start sequence:
-        // 1. Wait for CNR (Controller Not Ready) = 0
-        // 2. Program max slots enabled
-        // 3. Program DCBAAP (Device Context Base Address Array Pointer)
-        // 4. Program command ring pointer (CRCR)
-        // 5. Program event ring (ERSTSZ, ERSTBA, ERDP)
-        // 6. Enable interrupts
-        // 7. Set Run/Stop bit in USBCMD
+        crate::serial::serial_print("[XHCI] Controller Reset Complete\n");
+
+        // 3. Program MaxSlotsEnabled in CONFIG register
+        let config = mmio.read_operational(0x38);
+        mmio.write_operational(0x38, (config & !0xFF) | (self.max_slots as u32));
+
+        // 4. Program DCBAAP
+        let dcbaa_phys = self.dcbaa_phys;
+        mmio.write_operational(0x30, dcbaa_phys as u32);
+        mmio.write_operational(0x34, (dcbaa_phys >> 32) as u32);
+
+        // 5. Program Command Ring Control Register (CRCR)
+        if let Some(ref cmd_ring) = self.command_ring {
+            let cr_phys = cmd_ring.get_crcr();
+            mmio.write_operational(0x18, (cr_phys as u32) | 1); // Enable Ring Cycle State (RCS)
+            mmio.write_operational(0x1C, (cr_phys >> 32) as u32);
+        }
+
+        // 6. Program Event Ring
+        if !self.event_rings.is_empty() {
+            let er_ring = &self.event_rings[0];
+            // ERSTSZ (Runtime 0x28)
+            mmio.write_runtime(0x28, 1);
+            // ERDP (Runtime 0x38)
+            let erdp = er_ring.get_erdp();
+            mmio.write_runtime(0x38, erdp as u32);
+            mmio.write_runtime(0x3C, (erdp >> 32) as u32);
+            // ERSTBA (Runtime 0x30)
+            let erstba = er_ring.get_erst_base();
+            mmio.write_runtime(0x30, erstba as u32);
+            mmio.write_runtime(0x34, (erstba >> 32) as u32);
+        }
+
+        // 7. Enable Interrupts
+        crate::serial::serial_print("[XHCI] Enabling native interrupts...\n");
+        mmio.write_runtime(0x20, 0x03); // IP (1) | IE (2)
+        let mut cmd = mmio.read_operational(0x00);
+        cmd |= 1 << 2; // INTE
         
-        crate::serial::serial_print("[XHCI] Controller start stub completed\n");
+        // 8. Start Controller
+        cmd |= 1; // R/S bit
+        mmio.write_operational(0x00, cmd);
+
+        crate::serial::serial_print("[XHCI] Controller started successfully.\n");
         Ok(())
     }
     
-    /// Submit a command TRB to the command ring
-    pub fn submit_command(&mut self, trb: Trb) -> Result<(), &'static str> {
-        if let Some(ref mut cmd_ring) = self.command_ring {
-            cmd_ring.submit_command(trb)?;
-            
-            // TODO: Ring doorbell 0 (host controller doorbell)
-            
-            Ok(())
+    /// Submit a command TRB to the command ring and ring the doorbell
+    pub fn submit_command(&mut self, trb: Trb) -> Result<u64, &'static str> {
+        let trb_phys = if let Some(ref mut cmd_ring) = self.command_ring {
+            cmd_ring.submit_command(trb)?
         } else {
-            Err("Command ring not initialized")
+            return Err("Command ring not initialized");
+        };
+        
+        // Ring doorbell 0 (Host Controller), target 0 (Command Ring)
+        if let Some(ref mmio) = self.mmio {
+            mmio.ring_doorbell(0, 0);
         }
+        
+        Ok(trb_phys)
+    }
+    /// Poll the event ring for a specific TRB completion
+    pub fn poll_event_blocking(&mut self, target_trb_phys: u64, trb_type_filter: u8) -> Result<Trb, &'static str> {
+        let mut timeout = 5000000;
+        while timeout > 0 {
+            if let Some(event_ring) = self.event_rings.get_mut(0) {
+                if let Some(event) = event_ring.process_next_event() {
+                    let trb_type = event.get_trb_type();
+                    
+                    // Update ERDP and clear EHB
+                    if let Some(ref mmio) = self.mmio {
+                        let erdp = event_ring.get_erdp();
+                        mmio.write_runtime(0x38, (erdp as u32) | 0x08);
+                        mmio.write_runtime(0x3C, (erdp >> 32) as u32);
+                    }
+                    
+                    if trb_type == trb_type_filter {
+                        if event.parameter == target_trb_phys {
+                            let comp_code = (event.status >> 24) & 0xFF;
+                            if comp_code == 1 || comp_code == 13 { // Success or Short Packet
+                                return Ok(event);
+                            } else {
+                                crate::serial::serial_print(&alloc::format!("[XHCI] Event failed with code {}\n", comp_code));
+                                return Err("Event indicated failure");
+                            }
+                        }
+                    }
+                }
+            }
+            timeout -= 1;
+        }
+        Err("Poll timeout")
+    }
+    /// Submit a command and spin-wait for its completion event
+    pub fn execute_command_blocking(&mut self, trb: Trb) -> Result<Trb, &'static str> {
+        let trb_phys = self.submit_command(trb)?;
+        self.poll_event_blocking(trb_phys, 33) // 33 = Command Completion
+    }
+
+    /// Enumerate ports to find connected devices
+    pub fn enumerate_ports(&mut self) -> Result<(), &'static str> {
+        crate::serial::serial_print("[XHCI] Enumerating ports...\n");
+        let max_ports = self.max_ports;
+
+        for i in 1..=max_ports {
+            let port_offset = 0x400 + ((i as usize - 1) * 0x10);
+            
+            // Temporary block to scope the mmio reference
+            let (is_connected, portsc) = {
+                let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
+                let portsc = mmio.read_operational(port_offset);
+                ((portsc & 1) != 0, portsc)
+            };
+
+            if is_connected {
+                crate::serial::serial_print(&alloc::format!("[XHCI] Device connected on port {}\n", i));
+                
+                // Assert Port Reset (PR, bit 4)
+                if let Some(ref mmio) = self.mmio {
+                    mmio.write_operational(port_offset, portsc | (1 << 4));
+                }
+
+                // Wait for Port Reset Change (PRC, bit 21) or Reset to complete
+                let mut timeout = 100000;
+                let mut reset_complete = false;
+                while timeout > 0 {
+                    if let Some(ref mmio) = self.mmio {
+                        let status = mmio.read_operational(port_offset);
+                        if (status & (1 << 21)) != 0 || (status & (1 << 4)) == 0 {
+                            reset_complete = true;
+                            break;
+                        }
+                    }
+                    timeout -= 1;
+                }
+
+                if !reset_complete {
+                    crate::serial::serial_print(&alloc::format!("[XHCI] Timeout resetting port {}\n", i));
+                    continue;
+                }
+
+                crate::serial::serial_print(&alloc::format!("[XHCI] Port {} reset complete\n", i));
+
+                let mut port_speed = 0;
+                // Read speed and clear status change bits
+                if let Some(ref mmio) = self.mmio {
+                    let current = mmio.read_operational(port_offset);
+                    port_speed = (current >> 10) & 0x0F;
+                    crate::serial::serial_print(&alloc::format!("[XHCI] Port {} speed: {}\n", i, port_speed));
+                    
+                    let clear_mask = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
+                    mmio.write_operational(port_offset, (current & 0x0E00C3E0) | clear_mask);
+                }
+                
+                // Enable Slot
+                crate::serial::serial_print(&alloc::format!("[XHCI] Issuing Enable Slot Command for port {}\n", i));
+                let enable_trb = build_enable_slot_trb(0);
+                
+                match self.execute_command_blocking(enable_trb) {
+                    Ok(completion_event) => {
+                        let completion_code = (completion_event.status >> 24) & 0xFF;
+                        let slot_id = (completion_event.control >> 24) & 0xFF;
+                        crate::serial::serial_print(&alloc::format!("[XHCI] Enable Slot success, Slot ID: {}, Code: {}\n", slot_id, completion_code));
+                        
+                        // Proceed to Address Device etc.
+                        crate::serial::serial_print(&alloc::format!("[XHCI] Allocating contexts for Slot {}\n", slot_id));
+                        let slot_idx = slot_id as usize;
+                        if let Ok(dev_ctx_dma) = DmaAllocation::allocate(1024, 64) {
+                            dev_ctx_dma.zero();
+                            // Store in DCBAA
+                            if let Some(ref dcbaa) = self.dcbaa {
+                                dcbaa.write_u64(slot_idx * 8, dev_ctx_dma.phys_addr);
+                            }
+                            self.device_contexts_dma[slot_idx] = Some(dev_ctx_dma);
+                            
+                            // Allocate Input Context
+                            if let Ok(input_ctx_dma) = DmaAllocation::allocate(2048, 64) {
+                                input_ctx_dma.zero();
+                                
+                                // Initialize Input Control Context
+                                // add_context_flags = Slot Context (bit 0) | EP0 Context (bit 1)
+                                input_ctx_dma.write_u32(4, 0x03);
+                                
+                                // Initialize Slot Context (starts at offset 32)
+                                let route_string = (port_speed << 20) | (1 << 27); // speed and 1 context entry
+                                let root_hub_port = i as u32;
+                                input_ctx_dma.write_u32(32, route_string);
+                                input_ctx_dma.write_u32(36, root_hub_port << 16); // port_info
+                                
+                                // Initialize EP0 Context (starts at offset 64)
+                                if let Ok(tr_ring) = TransferRing::new(64, slot_id as u8, 0) {
+                                    let tr_phys = tr_ring.get_ring_address();
+                                    self.transfer_rings[slot_idx * 32] = Some(tr_ring);
+                                    
+                                    // ep_info: error count=3, type=4 (Control)
+                                    // Max Packet Size: 8 for LS, 8/64 for FS, 64 for HS, 512 for SS
+                                    let mps = match port_speed {
+                                        2 => 8,   // Low Speed
+                                        3 => 64,  // High Speed
+                                        4 => 512, // Super Speed
+                                        _ => 64,  // Default to 64 (Full Speed usually works with this)
+                                    };
+                                    input_ctx_dma.write_u32(68, (3 << 1) | (4 << 3) | (mps << 16));
+                                    input_ctx_dma.write_u64(72, tr_phys | 1); // TR Dequeue Pointer with DCS (bit 0) = 1
+                                    
+                                    crate::serial::serial_print("[XHCI] Issuing Address Device Command\n");
+                                    let address_trb = build_address_device_trb(input_ctx_dma.phys_addr, slot_id as u8, false);
+                                    
+                                    match self.execute_command_blocking(address_trb) {
+                                        Ok(addr_completion) => {
+                                            let code = (addr_completion.status >> 24) & 0xFF;
+                                            crate::serial::serial_print(&alloc::format!("[XHCI] Address Device success, Code: {}\n", code));
+                                            
+                                            // Request Device Descriptor
+                                            if let Err(e) = self.request_device_descriptor(slot_id as u8) {
+                                                crate::serial::serial_print("[XHCI] request_device_descriptor failed: ");
+                                                crate::serial::serial_print(e);
+                                                crate::serial::serial_print("\n");
+                                            }
+                                        },
+                                        Err(e) => {
+                                            crate::serial::serial_print("[XHCI] Address Device failed: ");
+                                            crate::serial::serial_print(e);
+                                            crate::serial::serial_print("\n");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        crate::serial::serial_print("[XHCI] Enable Slot failed: ");
+                        crate::serial::serial_print(e);
+                        crate::serial::serial_print("\n");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Perform a control transfer to read the Device Descriptor
+    pub fn request_device_descriptor(&mut self, slot_id: u8) -> Result<(), &'static str> {
+        crate::serial::serial_print(&alloc::format!("[XHCI] Requesting Device Descriptor for slot {}\n", slot_id));
+        
+        // Allocate DMA buffer for the descriptor (18 bytes, aligned to 64)
+        let desc_buffer = DmaAllocation::allocate(64, 64)?;
+        desc_buffer.zero();
+        
+        // Setup Stage: GET_DESCRIPTOR (Device)
+        let setup_trb = build_setup_trb(0x80, 0x06, 0x0100, 0x0000, 18, 3); // 3 = IN Data Stage
+        let data_trb = build_data_trb(desc_buffer.phys_addr, 18, true); // true = IN
+        let status_trb = build_status_trb(false, true); // false = OUT, true = IOC
+        
+        let slot_idx = slot_id as usize;
+        let mut status_trb_phys = 0;
+        
+        if let Some(ref mut tr_ring) = self.transfer_rings[slot_idx * 32] {
+            tr_ring.submit_transfer(setup_trb)?;
+            tr_ring.submit_transfer(data_trb)?;
+            status_trb_phys = tr_ring.ring.allocation.phys_addr + (tr_ring.ring.enqueue_index as u64 * 16);
+            tr_ring.submit_transfer(status_trb)?;
+            
+            // Ring doorbell for EP0 (Target 1)
+            let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
+            mmio.ring_doorbell(slot_id, 1);
+        } else {
+            return Err("EP0 transfer ring not initialized");
+        }
+        
+        // Poll for Transfer Event (type 32)
+        self.poll_event_blocking(status_trb_phys, 32)?;
+
+        
+        // Parse descriptor
+        let mut desc_data = [0u8; 18];
+        desc_buffer.read_bytes(0, &mut desc_data);
+        
+        crate::serial::serial_print("[XHCI] Device Descriptor received:\n");
+        crate::serial::serial_print(&alloc::format!("  bLength: {}\n", desc_data[0]));
+        crate::serial::serial_print(&alloc::format!("  bDescriptorType: {}\n", desc_data[1]));
+        crate::serial::serial_print(&alloc::format!("  bcdUSB: {:02X}{:02X}\n", desc_data[3], desc_data[2]));
+        crate::serial::serial_print(&alloc::format!("  bDeviceClass: {:02X}\n", desc_data[4]));
+        crate::serial::serial_print(&alloc::format!("  bDeviceSubClass: {:02X}\n", desc_data[5]));
+        crate::serial::serial_print(&alloc::format!("  bDeviceProtocol: {:02X}\n", desc_data[6]));
+        crate::serial::serial_print(&alloc::format!("  bMaxPacketSize0: {}\n", desc_data[7]));
+        crate::serial::serial_print(&alloc::format!("  idVendor: {:02X}{:02X}\n", desc_data[9], desc_data[8]));
+        crate::serial::serial_print(&alloc::format!("  idProduct: {:02X}{:02X}\n", desc_data[11], desc_data[10]));
+        
+        Ok(())
     }
     
-    /// Process pending events from event ring
+    /// Process pending events from event ring (for async interrupts)
     pub fn process_events(&mut self) {
         if self.event_rings.is_empty() {
             return;
@@ -2455,13 +2923,12 @@ impl XhciControllerState {
             crate::serial::serial_print_dec(trb_type as u64);
             crate::serial::serial_print("\n");
             
-            // TODO: Process different event types:
-            // - Command Completion (type 33)
-            // - Transfer Event (type 32)
-            // - Port Status Change (type 34)
-            // - Bandwidth Request (type 35)
-            // - Doorbell Event (type 36)
-            // - Host Controller Event (type 37)
+            // Update ERDP
+            if let Some(ref mmio) = self.mmio {
+                let erdp = event_ring.get_erdp();
+                mmio.write_runtime(0x38, erdp as u32);
+                mmio.write_runtime(0x3C, (erdp >> 32) as u32);
+            }
         }
     }
 }
@@ -3186,7 +3653,7 @@ pub fn init_hid_integration() {
 // ============================================================================
 // MMIO, DMA, and IRQ integration for USB HID driver
 
-use crate::memory::{virt_to_phys, phys_to_virt, PHYS_MEM_OFFSET};
+use crate::memory::virt_to_phys;
 use core::sync::atomic::{fence, Ordering};
 use core::ptr::{read_volatile, write_volatile};
 
@@ -3205,8 +3672,8 @@ impl MmioRegion {
             return Err("Physical address is zero");
         }
         
-        // Usar phys_to_virt para respetar el mapeo del kernel (evita solapamiento con región kernel)
-        let virt_addr = phys_to_virt(phys_addr);
+        // Use map_mmio_range to ensure the physical address is accessible in virtual space
+        let virt_addr = crate::memory::map_mmio_range(phys_addr, size);
         
         crate::serial::serial_print("[USB-HID] MMIO Region mapped:\n");
         crate::serial::serial_print("  Physical: 0x");
@@ -3326,9 +3793,10 @@ impl XhciMmio {
         crate::serial::serial_print("\n");
         
         // Create regions for each register space
-        let operational = MmioRegion::new(bar0 + caplength as u64, 1024)?;
-        let runtime = MmioRegion::new(bar0 + rtsoff as u64, 8192)?;
-        let doorbell = MmioRegion::new(bar0 + dboff as u64, 1024)?;
+    let operational_size = 0x1000; // Suficiente espacio para cubrir PORTSC (offset 0x400+)
+    let operational = MmioRegion::new(bar0 + caplength as u64, operational_size)?;
+    let runtime = MmioRegion::new(bar0 + rtsoff as u64, 8192)?;
+    let doorbell = MmioRegion::new(bar0 + dboff as u64, 1024)?;
         
         Ok(Self {
             capability: cap_region,
@@ -3427,10 +3895,10 @@ impl DmaAllocation {
         })
     }
     
-    /// Allocate TRB ring (16-byte aligned)
+    /// Allocate TRB ring (64-byte aligned as required by CRCR/TR dequeue pointers)
     pub fn allocate_trb_ring(num_trbs: usize) -> Result<Self, &'static str> {
         let size = num_trbs * 16; // Each TRB is 16 bytes
-        Self::allocate(size, 16)
+        Self::allocate(size, 64)
     }
     
     /// Allocate device context (64-byte aligned)
@@ -3483,6 +3951,16 @@ impl DmaAllocation {
         unsafe {
             core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
         }
+    }
+    
+    /// Write 32-bit value to DMA buffer (little endian)
+    pub fn write_u32(&self, offset: usize, value: u32) {
+        self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    /// Write 64-bit value to DMA buffer (little endian)
+    pub fn write_u64(&self, offset: usize, value: u64) {
+        self.write_bytes(offset, &value.to_le_bytes());
     }
 }
 

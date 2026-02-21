@@ -164,19 +164,18 @@ else
     # Dispositivos de entrada USB HID (teclado + ratón/tablet)
     if [ "$USE_XHCI" = "1" ]; then
         QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
-        QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
         QEMU_CMD="$QEMU_CMD -device usb-mouse,bus=xhci.0,port=2"
         QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=3"
     else
         QEMU_CMD="$QEMU_CMD -usb"
         QEMU_CMD="$QEMU_CMD -device usb-tablet"
-        QEMU_CMD="$QEMU_CMD -device usb-kbd"
     fi
 fi
 QEMU_CMD="$QEMU_CMD -no-shutdown"
 
 # Puerto de monitor QEMU (para debugging)
 QEMU_CMD="$QEMU_CMD -serial stdio"
+QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
 
 # Debugging flags (Unconditional)
 QEMU_CMD="$QEMU_CMD -no-reboot"

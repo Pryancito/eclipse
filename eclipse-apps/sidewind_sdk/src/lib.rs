@@ -6,7 +6,7 @@ use sidewind_core::{SideWindMessage, MSG_TYPE_GRAPHICS, MSG_TYPE_INPUT, SWND_OP_
 /// Discover the compositor's PID by talking to init (PID 1)
 pub fn discover_composer() -> Option<u32> {
     const INIT_PID: u32 = 1;
-    let _ = send(INIT_PID, 0x10, b"GET_DISPLAY_PID");
+    let _ = send(INIT_PID, 255, b"GET_DISPLAY_PID");
 
     let mut buffer = [0u8; 32];
     for _ in 0..100 {

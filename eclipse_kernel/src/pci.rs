@@ -98,7 +98,7 @@ pub struct PciDevice {
     pub subclass: u8,
     pub prog_if: u8,
     pub header_type: u8,
-    pub bar0: u32,
+    pub bar0: u64,
     pub interrupt_line: u8,
 }
 
@@ -291,7 +291,14 @@ unsafe fn scan_function(bus: u8, device: u8, function: u8) -> Option<PciDevice> 
     let subclass = ((class_info >> 16) & 0xFF) as u8;
     let prog_if = ((class_info >> 8) & 0xFF) as u8;
     let header_type = pci_config_read_u8(bus, device, function, PCI_REG_HEADER_TYPE);
-    let bar0 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0);
+    let mut bar0 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0) as u64;
+    
+    // Check if BAR0 is a 64-bit memory BAR
+    if (bar0 & 0x1) == 0 && (bar0 & 0x6) == 0x4 {
+        let bar1 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0 + 4) as u64;
+        bar0 |= bar1 << 32;
+    }
+    
     let interrupt_line = pci_config_read_u8(bus, device, function, PCI_REG_INTERRUPT_LINE);
     
     Some(PciDevice {
@@ -461,9 +468,17 @@ pub unsafe fn enable_device(dev: &PciDevice, enable_bus_master: bool) {
     pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, command);
 }
 
-/// Get BAR (Base Address Register) value
-pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u32 {
-    pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4))
+/// Get BAR (Base Address Register) value as 64-bit
+pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
+    let mut bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4)) as u64;
+    
+    // Check if it's a 64-bit memory BAR
+    if (bar & 0x1) == 0 && (bar & 0x6) == 0x4 {
+        let next_bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4) + 4) as u64;
+        bar |= next_bar << 32;
+    }
+    
+    bar
 }
 
 /// Find all audio devices (Intel HDA, AC97, etc.)

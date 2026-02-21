@@ -932,3 +932,18 @@ pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: 
         map_user_page_4kb(page_table_phys, vaddr + page_offset, paddr + page_offset, flags);
     }
 }
+
+/// Map a physical MMIO range into the kernel's virtual address space (HHDM region)
+/// Returns the virtual address (PHYS_MEM_OFFSET + paddr)
+pub fn map_mmio_range(paddr: u64, length: usize) -> u64 {
+    let virt_addr = PHYS_MEM_OFFSET + paddr;
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE;
+    
+    // Map in current page tables
+    map_physical_range(get_cr3(), paddr, length as u64, virt_addr, flags);
+    
+    // Flush TLB to ensure the new mapping is visible
+    flush_tlb();
+    
+    virt_addr
+}
