@@ -426,7 +426,7 @@ const VIRGL_RESOURCE_FLAG_Y_0_TOP: u32 = 1 << 0;
 const VIRGL_MAX_CTX: u32 = 16;
 const VIRGL_CTX_ID_MIN: u32 = 1;
 
-/// Virtqueue structure
+/// Virtqueue structure (Free List Architecture)
 struct Virtqueue {
     queue_size: u16,
     descriptors: *mut VirtQDescriptor,
@@ -435,8 +435,8 @@ struct Virtqueue {
     desc_phys: u64,
     avail_phys: u64,
     used_phys: u64,
-    next_avail: u16, // Index of the next available descriptor to allocate
-    num_used: u16,   // Number of descriptors currently allocated/in-use
+    free_head: u16,      // Índice del primer descriptor disponible
+    num_free: u16,       // Cantidad de descriptores libres restantes
     last_used_idx: u16,
 }
 
@@ -446,80 +446,54 @@ unsafe impl Send for Virtqueue {}
 impl Virtqueue {
     /// Create a new virtqueue with DMA-allocated memory
     unsafe fn new(queue_size: u16) -> Option<Self> {
-        // crate::serial::serial_print("[VirtIO-VQ] Creating new virtqueue with size=");
-        // crate::serial::serial_print_dec(queue_size as u64);
-        // crate::serial::serial_print("\n");
-        
-        // Calculate sizes according to VirtIO Legacy spec
-        // The Used Ring must be aligned to 4096 bytes boundary
-        
         let desc_size = core::mem::size_of::<VirtQDescriptor>() * queue_size as usize;
-        let avail_size = 6 + 2 * queue_size as usize + 2; // flags + idx + ring + used_event
-        let used_size = 6 + 8 * queue_size as usize + 2; // flags + idx + ring + avail_event
-        
-        // Calculate offsets
+        let avail_size = 6 + 2 * queue_size as usize + 2;
+        let used_size = 6 + 8 * queue_size as usize + 2;
+
         let avail_offset = desc_size;
-        
-        // Used ring must be 4096-byte aligned
+
         let mut used_offset = avail_offset + avail_size;
         if used_offset % 4096 != 0 {
             used_offset = (used_offset + 4095) & !4095;
         }
-        
+
         let total_size = used_offset + used_size;
-        
-        // crate::serial::serial_print("[VirtIO] Allocating contiguous queue memory: ");
-        // crate::serial::serial_print_dec(total_size as u64);
-        // crate::serial::serial_print(" bytes (aligned to 4096)\n");
-        
-        // Allocate single contiguous buffer (4096-byte aligned)
+
         let (mem_ptr, mem_phys) = crate::memory::alloc_dma_buffer(total_size, 4096)?;
-        
-        // Zero out memory
         core::ptr::write_bytes(mem_ptr, 0, total_size);
-        
-        // Calculate pointers and physical addresses
+
         let descriptors = mem_ptr as *mut VirtQDescriptor;
         let desc_phys = mem_phys;
-        
+
         let avail = mem_ptr.add(avail_offset) as *mut VirtQAvail;
         let avail_phys = mem_phys + avail_offset as u64;
-        
+
         let used = mem_ptr.add(used_offset) as *mut VirtQUsed;
         let used_phys = mem_phys + used_offset as u64;
-        
-        // crate::serial::serial_print("[VirtIO]   Desc phys: ");
-        // crate::serial::serial_print_hex(desc_phys);
-        // crate::serial::serial_print("\n");
-        // crate::serial::serial_print("[VirtIO]   Avail phys: ");
-        // crate::serial::serial_print_hex(avail_phys);
-        // crate::serial::serial_print("\n");
-        // crate::serial::serial_print("[VirtIO]   Used phys: ");
-        // crate::serial::serial_print_hex(used_phys);
-        // crate::serial::serial_print("\n");
-        
-        // Initialize descriptors
-        // We do NOT use a linked free list anymore. Descriptors are allocated sequentially.
-        // Just zero them out initially.
+
+        // Inicializar descriptores como una cadena enlazada (Free List)
         for i in 0..queue_size {
             let desc = &mut *descriptors.add(i as usize);
             write_volatile(&mut desc.addr, 0);
             write_volatile(&mut desc.len, 0);
             write_volatile(&mut desc.flags, 0);
-            write_volatile(&mut desc.next, 0);
+
+            if i < queue_size - 1 {
+                write_volatile(&mut desc.next, i + 1);
+            } else {
+                write_volatile(&mut desc.next, 0xFFFF);
+            }
         }
         sfence();
 
-        crate::serial::serial_print("[VirtIO-VQ] Initialized descriptors (counter-based allocation)\n");
-        
-        // Initialize available ring
+        crate::serial::serial_print("[VirtIO-VQ] Initialized descriptors (Free List allocation)\n");
+
         (*avail).flags = 0;
         (*avail).idx = 0;
-        
-        // Initialize used ring
+
         (*used).flags = 0;
         (*used).idx = 0;
-        
+
         Some(Virtqueue {
             queue_size,
             descriptors,
@@ -528,123 +502,109 @@ impl Virtqueue {
             desc_phys,
             avail_phys,
             used_phys,
-            next_avail: 0,
-            num_used: 0,
+            free_head: 0,
+            num_free: queue_size,
             last_used_idx: 0,
         })
     }
-    
-    /// Allocate a descriptor using a simple ring counter
+
+    /// Allocate a descriptor from the Free List
     unsafe fn alloc_desc(&mut self) -> Option<u16> {
-        // Check if we have descriptors available
-        if self.num_used >= self.queue_size {
+        if self.num_free == 0 || self.free_head == 0xFFFF {
             crate::serial::serial_print("[VirtIO-VQ] alloc_desc: queue full\n");
             return None;
         }
-        
-        let desc_idx = self.next_avail;
-        
-        // Increment counter modulo queue_size
-        self.next_avail = (self.next_avail + 1) % self.queue_size;
-        self.num_used += 1;
-        
-        // Optional: clear the descriptor to be safe (though add_buf will overwrite it)
-        let desc = &mut *self.descriptors.add(desc_idx as usize);
+
+        let head_idx = self.free_head;
+        let desc = &mut *self.descriptors.add(head_idx as usize);
+
+        self.free_head = read_volatile(&raw const desc.next);
+        self.num_free -= 1;
+
         write_volatile(&mut desc.flags, 0);
         write_volatile(&mut desc.next, 0);
-        
-        Some(desc_idx)
+
+        Some(head_idx)
     }
-    
-    /// Free a descriptor chain
-    unsafe fn free_desc(&mut self, desc_idx: u16) {
-        let mut idx = desc_idx;
+
+    /// Free a descriptor chain and return it to the Free List
+    unsafe fn free_desc(&mut self, head_idx: u16) {
+        let mut current = head_idx;
         let mut count = 0;
-        
-        // Walk the chain to count how many descriptors we are freeing
+
         loop {
             count += 1;
-            
-            let desc = &*self.descriptors.add(idx as usize);
+            let desc = &*self.descriptors.add(current as usize);
             let flags = read_volatile(&raw const desc.flags);
-            let next = read_volatile(&raw const desc.next);
-            
+
             if (flags & VIRTQ_DESC_F_NEXT) == 0 {
+                let tail_desc = &mut *self.descriptors.add(current as usize);
+                write_volatile(&mut tail_desc.next, self.free_head);
                 break;
             }
-            idx = next;
+            current = read_volatile(&raw const desc.next);
         }
-        
-        if count > self.num_used {
-             crate::serial::serial_print("[VirtIO-VQ] ERROR: Freeing more descriptors than allocated! count=");
-             crate::serial::serial_print_dec(count as u64);
-             crate::serial::serial_print(" num_used=");
-             crate::serial::serial_print_dec(self.num_used as u64);
-             crate::serial::serial_print("\n");
-             self.num_used = 0;
-        } else {
-            self.num_used -= count;
-        }
+
+        self.free_head = head_idx;
+        self.num_free += count;
     }
 
     
-    /// Add buffers to the queue
+    /// Add buffers to the queue (Atomic allocation)
+    /// La asignación es atómica: si no hay espacio para TODA la cadena, no se extrae nada de la Free List.
+    /// Evita el leak de descriptores cuando alloc_desc falla mid-chain y el head ya fue desvinculado.
     unsafe fn add_buf(&mut self, buffers: &[(u64, u32, u16)]) -> Option<u16> {
         if buffers.is_empty() || buffers.len() > self.queue_size as usize {
             return None;
         }
-        
-        // Allocate descriptors and build chain
-        let head = self.alloc_desc()?;
+
+        // Pre-vuelo: verificar espacio para toda la cadena antes de tocar la Free List
+        if self.num_free < buffers.len() as u16 {
+            return None;
+        }
+
+        let head = self.alloc_desc().unwrap();
         let mut curr_idx = head;
-        
+
         for (i, &(addr, len, flags)) in buffers.iter().enumerate() {
             let desc = &mut *self.descriptors.add(curr_idx as usize);
-            
-            // Write base fields
+
             write_volatile(&mut desc.addr, addr);
             write_volatile(&mut desc.len, len);
-            
+
             if i + 1 < buffers.len() {
-                // Not the last buffer, link to next
-                let next_idx = self.alloc_desc()?;
+                let next_idx = self.alloc_desc().unwrap();
                 write_volatile(&mut desc.flags, flags | VIRTQ_DESC_F_NEXT);
                 write_volatile(&mut desc.next, next_idx);
 
                 clflush(desc as *const _ as u64);
                 curr_idx = next_idx;
             } else {
-                // Last buffer in chain
                 write_volatile(&mut desc.flags, flags);
                 write_volatile(&mut desc.next, 0);
 
                 clflush(desc as *const _ as u64);
             }
         }
-        
-        // Add to available ring
+
         let avail = &mut *self.avail;
         let ring_idx = read_volatile(&avail.idx) as usize % self.queue_size as usize;
         write_volatile(&mut avail.ring[ring_idx], head);
-        
-        // FLUSH ring entry
+
         clflush(&avail.ring[ring_idx] as *const _ as u64);
 
-        // Update index - this tells the device there's work to do
         let new_idx = read_volatile(&avail.idx).wrapping_add(1);
-        
-        // Memory barriers to ensure all descriptor writes are visible before idx update
+
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        sfence(); 
-        
+        sfence();
+
         write_volatile(&mut avail.idx, new_idx);
         clflush(&avail.idx as *const _ as u64);
         sfence();
 
-        // Ensure update is visible before notification
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         sfence();
-        
+
         Some(head)
     }
     
@@ -1133,16 +1093,17 @@ impl VirtIOBlockDevice {
     }
     
     /// Write a block to the device
+    /// Uses bounce buffer: el buffer de usuario puede no ser físicamente contiguo (cruza páginas),
+    /// lo que haría que virt_to_phys devuelva direcciones incorrectas y el dispositivo sobrescriba
+    /// RAM aleatoria. Copiamos a DMA contiguo antes de enviar.
     pub fn write_block(&mut self, block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
         if buffer.len() < 4096 {
             return Err("Buffer too small (need 4096 bytes)");
         }
         
-        // VirtIO block write
         unsafe {
             let queue = self.queue.as_mut().ok_or("No virtqueue available")?;
             
-            // Allocate DMA buffers
             let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(
                 core::mem::size_of::<VirtIOBlockReq>(), 16
             ).ok_or("Failed to allocate request buffer")?;
@@ -1150,24 +1111,38 @@ impl VirtIOBlockDevice {
             let (status_ptr, status_phys) = crate::memory::alloc_dma_buffer(1, 1)
                 .ok_or("Failed to allocate status buffer")?;
             
-            let buffer_phys = crate::memory::virt_to_phys(buffer.as_ptr() as u64);
+            let (bounce_ptr, bounce_phys) = crate::memory::alloc_dma_buffer(4096, 4096)
+                .ok_or("Failed to allocate write bounce buffer")?;
             
-            // Build request header
+            core::ptr::copy_nonoverlapping(buffer.as_ptr(), bounce_ptr, 4096);
+            
             let req = &mut *(req_ptr as *mut VirtIOBlockReq);
-            req.req_type = VIRTIO_BLK_T_OUT; // Write
+            req.req_type = VIRTIO_BLK_T_OUT;
             req.reserved = 0;
             req.sector = block_num * 8;
             
-            // Build descriptor chain: request -> data -> status
             let buffers = [
                 (req_phys, core::mem::size_of::<VirtIOBlockReq>() as u32, 0),
-                (buffer_phys, 4096, 0), // Data is read by device
+                (bounce_phys, 4096, 0),
                 (status_phys, 1, VIRTQ_DESC_F_WRITE),
             ];
             
-            let _desc_idx = queue.add_buf(&buffers).ok_or("Failed to add buffer to queue")?;
+            let _desc_idx = match queue.add_buf(&buffers) {
+                Some(idx) => idx,
+                None => {
+                    crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                    crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
+                    crate::memory::free_dma_buffer(status_ptr, 1, 1);
+                    return Err("Failed to add buffer to queue");
+                }
+            };
             
-            // Memory barrier before notifying device to ensure all writes are visible
+            clflush(req_ptr as u64);
+            for i in (0..4096).step_by(64) {
+                clflush((bounce_ptr as u64) + i);
+            }
+            sfence();
+            
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             
             // Notify device
@@ -1179,8 +1154,8 @@ impl VirtIOBlockDevice {
                 let regs = self.mmio_base as *mut VirtIOMMIORegs;
                 write_volatile(&mut (*regs).queue_notify, 0);
             } else {
-                // Invalid device configuration
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 return Err("Invalid device configuration");
             }
@@ -1198,6 +1173,7 @@ impl VirtIOBlockDevice {
                 crate::serial::serial_print(")\n");
                 
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 return Err("VirtIO write timeout");
             }
@@ -1212,6 +1188,7 @@ impl VirtIOBlockDevice {
                 
                 queue.free_desc(used_idx);
                 crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+                crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
                 crate::memory::free_dma_buffer(status_ptr, 1, 1);
                 
                 if status != VIRTIO_BLK_S_OK {
@@ -1222,6 +1199,7 @@ impl VirtIOBlockDevice {
             }
             
             crate::memory::free_dma_buffer(req_ptr, core::mem::size_of::<VirtIOBlockReq>(), 16);
+            crate::memory::free_dma_buffer(bounce_ptr, 4096, 4096);
             crate::memory::free_dma_buffer(status_ptr, 1, 1);
             Err("No used buffer returned")
         }
@@ -1322,26 +1300,28 @@ impl VirtIOGpuDevice {
     }
 
     /// Send control command, expect OK_NODATA response. Caller owns req allocation.
+    /// CRÍTICO: Barreras de memoria e invalidación de caché antes de leer/liberar resp_ptr.
+    /// El dispositivo marca "used" cuando encola la DMA; la escritura real en RAM puede llegar
+    /// microsegundos después. Liberar resp_ptr antes fuerza reutilización y corrupción silenciosa.
     fn send_ctrl_cmd_nodata(&mut self, req_phys: u64, req_size: usize) -> Result<(), &'static str> {
         let (io, mmio, modern) = (self.io_base, self.mmio_base, self.modern_notify_addr);
         let queue = self.control_queue.as_mut().ok_or("No control queue")?;
         let resp_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
 
-        // Drain any stale used-ring entries left over from a previous timed-out command.
-        // Without this, the next call would immediately consume a stale response, misidentify
-        // it as the current command's response, and corrupt the queue permanently — causing
-        // every subsequent gpu_present() to silently fail and the screen to freeze.
         while let Some((stale_head, _)) = unsafe { queue.get_used() } {
             unsafe { queue.free_desc(stale_head) };
         }
 
         let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64)
             .ok_or("alloc resp failed")?;
-        unsafe { core::ptr::write_bytes(resp_ptr, 0, resp_size); }
+
+        unsafe { core::ptr::write_bytes(resp_ptr, 0x55, resp_size); }
+
         let buffers = [
             (req_phys, req_size as u32, 0u16),
             (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
         ];
+
         let head = unsafe {
             match queue.add_buf(&buffers) {
                 Some(h) => h,
@@ -1351,36 +1331,65 @@ impl VirtIOGpuDevice {
                 }
             }
         };
+
         unsafe { Self::gpu_notify_queue(io, mmio, modern); }
 
-        // Wait for OUR specific command to complete.  Increased timeout (500k ≈ 4.5 ms) to
-        // handle QEMU virtio-gpu latency spikes on loaded hosts without triggering the
-        // stale-response corruption path described above.
-        let mut timeout = 500_000;
+        let start_time = rdtsc();
+        let timeout_cycles = 4_000_000_000u64;
+
         let used_head = loop {
             if let Some((used, _)) = unsafe { queue.get_used() } {
                 if used == head {
-                    // This is the response for our command.
                     break used;
                 }
-                // Stale entry from a previous timeout — drain and keep waiting.
                 unsafe { queue.free_desc(used); }
             }
-            if timeout == 0 {
-                unsafe { queue.free_desc(head); crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
-                return Err("timeout");
+            if rdtsc().wrapping_sub(start_time) > timeout_cycles {
+                unsafe { crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
+                return Err("GPU hardware timeout");
             }
-            timeout -= 1;
             core::hint::spin_loop();
         };
-        unsafe { queue.free_desc(used_head); }
-        let ctrl_type = unsafe {
-            core::ptr::read_unaligned((resp_ptr as *const u8).add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *const u32)
-        };
-        unsafe { crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+        for i in (0..resp_size).step_by(64) {
+            unsafe { clflush((resp_ptr as u64) + i as u64); }
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+
+        let ctrl_type_offset = core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
+        let ctrl_type_ptr = unsafe { (resp_ptr as *const u8).add(ctrl_type_offset) as *const u32 };
+
+        let mut transfer_timeout = 100_000;
+        let mut ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
+
+        while ctrl_type == 0x55555555 && transfer_timeout > 0 {
+            core::hint::spin_loop();
+            unsafe { clflush(ctrl_type_ptr as u64); }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
+            transfer_timeout -= 1;
+        }
+
+        unsafe {
+            queue.free_desc(used_head);
+            crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+        }
+
+        if transfer_timeout == 0 {
+            crate::serial::serial_print("[VirtIO-GPU] WARNING: Response DMA transfer timed out\n");
+            return Err("DMA transfer incomplete");
+        }
+
         if ctrl_type != VIRTIO_GPU_RESP_OK_NODATA {
+            crate::serial::serial_print("[VirtIO-GPU] Error: Unexpected ctrl_type 0x");
+            crate::serial::serial_print_hex(ctrl_type as u64);
+            crate::serial::serial_print("\n");
             return Err("unexpected response");
         }
+
         Ok(())
     }
 
@@ -1796,8 +1805,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_x)) as *mut u32, hot_x);
             core::ptr::write_unaligned(req_base.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_y)) as *mut u32, hot_y);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1814,8 +1824,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, width)) as *mut u32, width);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, height)) as *mut u32, height);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1860,8 +1871,9 @@ impl VirtIOGpuDevice {
                 core::ptr::write_unaligned(ab.add(e + core::mem::offset_of!(VirtioGpuMemEntry, length)) as *mut u32, len);
             }
         }
-        self.send_ctrl_cmd_nodata(attach_phys, attach_size)?;
+        let r = self.send_ctrl_cmd_nodata(attach_phys, attach_size);
         unsafe { crate::memory::free_dma_buffer(attach_ptr, attach_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1880,8 +1892,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, scanout_id)) as *mut u32, scanout_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1900,8 +1913,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, offset)) as *mut u64, offset);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1919,8 +1933,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, height)) as *mut u32, h);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -1965,8 +1980,9 @@ impl VirtIOGpuDevice {
             }
         }
 
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         self.virgl_ctx_mask |= 1 << (ctx_id - 1);
         Ok(ctx_id)
     }
@@ -2000,8 +2016,9 @@ impl VirtIOGpuDevice {
             );
         }
 
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         self.virgl_ctx_mask &= !(1 << (ctx_id - 1));
         Ok(())
     }
@@ -2021,8 +2038,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctx_id)) as *mut u32, ctx_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -2041,8 +2059,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctx_id)) as *mut u32, ctx_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -2091,8 +2110,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate3d, flags)) as *mut u32, flags);
         }
 
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -2138,8 +2158,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, layer_stride)) as *mut u32, layer_stride);
         }
 
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -2185,8 +2206,9 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, layer_stride)) as *mut u32, layer_stride);
         }
 
-        self.send_ctrl_cmd_nodata(req_phys, req_size)?;
+        let r = self.send_ctrl_cmd_nodata(req_phys, req_size);
         unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+        r?;
         Ok(())
     }
 
@@ -2216,8 +2238,9 @@ impl VirtIOGpuDevice {
             core::ptr::copy_nonoverlapping(cmd_data.as_ptr(), r.add(hdr_size), cmd_data.len());
         }
 
-        self.send_ctrl_cmd_nodata(buf_phys, total_size)?;
+        let r = self.send_ctrl_cmd_nodata(buf_phys, total_size);
         unsafe { crate::memory::free_dma_buffer(buf_ptr, total_size, 64); }
+        r?;
         Ok(())
     }
 }

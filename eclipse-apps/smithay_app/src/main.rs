@@ -1041,13 +1041,14 @@ impl FramebufferState {
         }
     }
 
-    /// Present frame: VirtIO GPU (transfer+flush) or legacy copy
-    fn present(&self) {
-        if self.base_addr < 0x1000 { return; }
+    /// Present frame: VirtIO GPU (transfer+flush) or legacy copy.
+    /// Returns false si la cola GPU está llena (add_buf None); el caller debe yield para drenar.
+    fn present(&self) -> bool {
+        if self.base_addr < 0x1000 { return true; }
         let w = self.info.width;
         let h = self.info.height;
         if let Some(rid) = self.gpu_resource_id {
-            let _ = gpu_present(rid, 0, 0, w, h);
+            gpu_present(rid, 0, 0, w, h)
         } else if self.front_addr >= 0x1000 {
             let pitch = self.info.pitch.max(self.info.width * 4);
             let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
@@ -1062,6 +1063,9 @@ impl FramebufferState {
                     );
                 }
             }
+            true
+        } else {
+            true
         }
     }
 
@@ -2597,7 +2601,12 @@ pub extern "C" fn _start() -> ! {
         }
 
         // 8. Presentar frame (Copia back -> front)
-        fb.present();
+        // Si la cola VirtIO está llena (add_buf retorna None), yield para drenar la GPU
+        if !fb.present() {
+            for _ in 0..64 {
+                yield_cpu();
+            }
+        }
 
         // 9. Ceder CPU: más yields tras present para evitar starving input_service (reduce freezes 2–3 min)
         for _ in 0..(if had_events { 6 } else { 16 }) {
