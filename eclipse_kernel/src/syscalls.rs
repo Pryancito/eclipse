@@ -931,9 +931,9 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
 }
 
 /// sys_wait - Wait for child process to terminate
-/// arg1: pointer to status variable (or 0 to ignore)
+/// arg1: pointer to status variable (or 0 for non-blocking poll / WNOHANG semantics)
 /// Returns: PID of terminated child, or -1 on error
-fn sys_wait(_status_ptr: u64) -> u64 {
+fn sys_wait(status_ptr: u64) -> u64 {
     use crate::process;
     
     let mut stats = SYSCALL_STATS.lock();
@@ -974,6 +974,12 @@ fn sys_wait(_status_ptr: u64) -> u64 {
         
         if !has_children {
             return u64::MAX; // -1 indicates no children (ECHILD)
+        }
+
+        // When status_ptr == 0 the caller wants a non-blocking poll (WNOHANG semantics).
+        // Return immediately so init's main loop can keep servicing IPC requests.
+        if status_ptr == 0 {
+            return u64::MAX;
         }
         
         crate::scheduler::yield_cpu();

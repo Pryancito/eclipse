@@ -303,6 +303,14 @@ struct VirtioGpuResourceCreate2d {
     height: u32,
 }
 
+/// RESOURCE_UNREF request
+#[repr(C, packed)]
+struct VirtioGpuResourceUnref {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    padding: u32,
+}
+
 /// virtio_gpu_mem_entry
 #[repr(C, packed)]
 struct VirtioGpuMemEntry {
@@ -1811,6 +1819,27 @@ impl VirtIOGpuDevice {
         Ok(())
     }
 
+    /// RESOURCE_UNREF: release a GPU resource. Errors are silently ignored so this
+    /// can safely be called before resource_create_2d to handle compositor restarts.
+    pub fn resource_unref(&mut self, resource_id: u32) {
+        let req_size = core::mem::size_of::<VirtioGpuResourceUnref>();
+        let (req_ptr, req_phys) = match crate::memory::alloc_dma_buffer(req_size, 64) {
+            Some(p) => p,
+            None => return,
+        };
+        unsafe { core::ptr::write_bytes(req_ptr, 0, req_size); }
+        let r = req_ptr as *mut u8;
+        unsafe {
+            let ctrl_off = core::mem::offset_of!(VirtioGpuResourceUnref, hdr)
+                + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
+            let id_off = core::mem::offset_of!(VirtioGpuResourceUnref, resource_id);
+            core::ptr::write_unaligned(r.add(ctrl_off) as *mut u32, VIRTIO_GPU_CMD_RESOURCE_UNREF);
+            core::ptr::write_unaligned(r.add(id_off) as *mut u32, resource_id);
+        }
+        let _ = self.send_ctrl_cmd_nodata(req_phys, req_size);
+        unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64); }
+    }
+
     /// RESOURCE_ATTACH_BACKING: attach guest memory to resource (addr_phys, length) per entry
     pub fn resource_attach_backing(&mut self, resource_id: u32, entries: &[(u64, u32)]) -> Result<(), &'static str> {
         let attach_size = core::mem::size_of::<VirtioGpuResourceAttachBacking>()
@@ -2539,6 +2568,8 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
 
     let mut devices = GPU_DEVICES.lock();
     let dev = devices.get_mut(0)?;
+    // Release any pre-existing resource so compositor restarts always succeed.
+    dev.resource_unref(DISPLAY_BUFFER_RESOURCE_ID);
     if dev.resource_create_2d(DISPLAY_BUFFER_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, width, height).is_err() {
         unsafe { crate::memory::free_dma_buffer(buf_ptr, size, 4096); }
         return None;
