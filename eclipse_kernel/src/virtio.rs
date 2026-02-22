@@ -1318,6 +1318,15 @@ impl VirtIOGpuDevice {
         let (io, mmio, modern) = (self.io_base, self.mmio_base, self.modern_notify_addr);
         let queue = self.control_queue.as_mut().ok_or("No control queue")?;
         let resp_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
+
+        // Drain any stale used-ring entries left over from a previous timed-out command.
+        // Without this, the next call would immediately consume a stale response, misidentify
+        // it as the current command's response, and corrupt the queue permanently — causing
+        // every subsequent gpu_present() to silently fail and the screen to freeze.
+        while let Some((stale_head, _)) = unsafe { queue.get_used() } {
+            unsafe { queue.free_desc(stale_head) };
+        }
+
         let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64)
             .ok_or("alloc resp failed")?;
         unsafe { core::ptr::write_bytes(resp_ptr, 0, resp_size); }
@@ -1335,17 +1344,27 @@ impl VirtIOGpuDevice {
             }
         };
         unsafe { Self::gpu_notify_queue(io, mmio, modern); }
-        let mut timeout = 100_000;
-        loop {
-            unsafe { if queue.has_used() { break; } }
+
+        // Wait for OUR specific command to complete.  Increased timeout (500k ≈ 4.5 ms) to
+        // handle QEMU virtio-gpu latency spikes on loaded hosts without triggering the
+        // stale-response corruption path described above.
+        let mut timeout = 500_000;
+        let used_head = loop {
+            if let Some((used, _)) = unsafe { queue.get_used() } {
+                if used == head {
+                    // This is the response for our command.
+                    break used;
+                }
+                // Stale entry from a previous timeout — drain and keep waiting.
+                unsafe { queue.free_desc(used); }
+            }
             if timeout == 0 {
                 unsafe { queue.free_desc(head); crate::memory::free_dma_buffer(resp_ptr, resp_size, 64); }
                 return Err("timeout");
             }
             timeout -= 1;
             core::hint::spin_loop();
-        }
-        let (used_head, _) = unsafe { queue.get_used().unwrap_or((0, 0)) };
+        };
         unsafe { queue.free_desc(used_head); }
         let ctrl_type = unsafe {
             core::ptr::read_unaligned((resp_ptr as *const u8).add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *const u32)
