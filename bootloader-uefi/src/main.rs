@@ -7,7 +7,7 @@ use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, Directory, RegularFile, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::table::boot::{AllocateType, MemoryType, BootServices, OpenProtocolParams, OpenProtocolAttributes, SearchType};
+use uefi::table::boot::{AllocateType, MemoryType, BootServices, OpenProtocolParams, OpenProtocolAttributes, ScopedProtocol, SearchType};
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::Identify;
 use core::mem;
@@ -1232,27 +1232,40 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Intentar obtener información del framebuffer usando Graphics Output Protocol
     {
         let bs = system_table.boot_services();
-        // Buscar el protocolo GOP en todos los handles disponibles
-        let mut gop_protocol = None;
-        
-        // Obtener todos los handles
-        if let Ok(handles) = bs.locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID)) {
-            for gop_handle in handles.iter() {
-                if let Ok(gop) = unsafe { 
-                    bs.open_protocol::<GraphicsOutput>(
-                        OpenProtocolParams {
-                            handle: *gop_handle,
-                            agent: handle,
-                            controller: None,
-                        },
-                        OpenProtocolAttributes::GetProtocol,
-                    )
-                } {
-                    gop_protocol = Some(gop);
-                    break;
+        let mut gop_protocol: Option<ScopedProtocol<GraphicsOutput>> = None;
+
+        #[cfg(not(feature = "no_gop"))]
+        {
+            unsafe { serial_write_str("BL: antes locate_handle_buffer GOP\r\n"); }
+            let gop_result = bs.locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID));
+            unsafe { serial_write_str("BL: locate_handle_buffer GOP retornó\r\n"); }
+            if let Ok(handles) = gop_result {
+                unsafe { serial_write_str("BL: buscando GOP en handles\r\n"); }
+                let mut n: usize = 0;
+                for gop_handle in handles.iter() {
+                    if n >= 8 { break; }
+                    n += 1;
+                    if let Ok(gop) = unsafe {
+                        bs.open_protocol::<GraphicsOutput>(
+                            OpenProtocolParams {
+                                handle: *gop_handle,
+                                agent: handle,
+                                controller: None,
+                            },
+                            OpenProtocolAttributes::GetProtocol,
+                        )
+                    } {
+                        gop_protocol = Some(gop);
+                        break;
+                    }
                 }
+            } else {
+                unsafe { serial_write_str("BL: locate_handle_buffer GOP falló\r\n"); }
             }
         }
+
+        #[cfg(feature = "no_gop")]
+        unsafe { serial_write_str("BL: no_gop: display vía GPU (VirtIO/NVIDIA/VESA)\r\n"); }
         
         if let Some(mut gop) = gop_protocol {
             let mode = gop.current_mode_info();
@@ -1390,9 +1403,28 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 serial_write_str("BL: Pantalla limpiada y mensaje mostrado\r\n");
             }
         } else {
-            unsafe { 
-                serial_write_str("BL: GOP no encontrado, usando VGA\r\n");
+            unsafe {
+                serial_write_str("BL: GOP no encontrado (o no_gop)\r\n");
                 log_append_bytes(b"[BL] GOP not found\r\n");
+            }
+            // Asignar BootInfo de todas formas (kernel lo necesita: pml4, rsdp, etc.)
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+                boot_info_ptr = phys;
+                let mut rsdp_addr: u64 = 0;
+                for entry in system_table.config_table() {
+                    if entry.guid == uefi::table::cfg::ACPI2_GUID {
+                        rsdp_addr = entry.address as u64;
+                        break;
+                    } else if entry.guid == uefi::table::cfg::ACPI_GUID {
+                        rsdp_addr = entry.address as u64;
+                        break;
+                    }
+                }
+                unsafe {
+                    let dst = phys as *mut BootInfo;
+                    (*dst).framebuffer = framebuffer_info; // base_address=0, kernel usará VirtIO
+                    (*dst).rsdp_addr = rsdp_addr;
+                }
             }
         }
     }

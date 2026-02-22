@@ -2202,6 +2202,9 @@ pub extern "C" fn _start() -> ! {
     let _ = Text::new("Eclipse OS - Rust Display Server", Point::new(80, 110), text_style)
         .draw(&mut fb);
 
+    // Present immediately to replace boot/display logo (VirtIO scanout switch)
+    let _ = fb.present();
+
     // Discover input_service PID and subscribe to its events
     if let Some(input_pid) = query_input_service_pid() {
         subscribe_to_input_service(input_pid, pid);

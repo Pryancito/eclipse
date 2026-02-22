@@ -209,20 +209,20 @@ impl Scheme for DisplayScheme {
     }
 
     fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
-        let fb_info = &crate::boot::get_boot_info().framebuffer;
-        if fb_info.base_address == 0 {
+        let (fb_phys, fb_size) = if crate::boot::get_boot_info().framebuffer.base_address != 0
+            && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
+        {
+            let fi = &crate::boot::get_boot_info().framebuffer;
+            (fi.base_address, (fi.pixels_per_scan_line * fi.height * 4) as usize)
+        } else if let Some((phys, _w, _h, pitch, size)) = crate::virtio::get_primary_virtio_display() {
+            (phys, size)
+        } else {
             return Err(scheme_error::EIO);
-        }
+        };
 
-        // Direct write to framebuffer (not optimized, but consistent)
-        let fb_ptr = (crate::memory::PHYS_MEM_OFFSET + fb_info.base_address) as *mut u8;
-        let fb_size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as usize; // Assuming 32bpp
-        
+        let fb_ptr = (crate::memory::PHYS_MEM_OFFSET + fb_phys) as *mut u8;
         let to_copy = buf.len().min(fb_size);
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), fb_ptr, to_copy);
-        }
-        
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), fb_ptr, to_copy); }
         Ok(to_copy)
     }
 
@@ -231,7 +231,7 @@ impl Scheme for DisplayScheme {
     }
 
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
-        Ok(0) // Simplified seeker
+        Ok(0)
     }
 
     fn close(&self, _id: usize) -> Result<usize, usize> {
@@ -239,18 +239,30 @@ impl Scheme for DisplayScheme {
     }
 
     fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
-        let fb_info = &crate::boot::get_boot_info().framebuffer;
-        _stat.size = (fb_info.pixels_per_scan_line * fb_info.height * 4) as u64;
+        if crate::boot::get_boot_info().framebuffer.base_address != 0
+            && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
+        {
+            let fi = &crate::boot::get_boot_info().framebuffer;
+            _stat.size = (fi.pixels_per_scan_line * fi.height * 4) as u64;
+        } else if let Some((_phys, _w, _h, _pitch, size)) = crate::virtio::get_primary_virtio_display() {
+            _stat.size = size as u64;
+        } else {
+            return Err(scheme_error::EIO);
+        }
         Ok(0)
     }
 
     fn fmap(&self, _id: usize, _offset: usize, _len: usize) -> Result<usize, usize> {
         let fb_info = &crate::boot::get_boot_info().framebuffer;
-        if fb_info.base_address == 0 {
-            return Err(scheme_error::EIO);
+        if fb_info.base_address != 0 && fb_info.base_address != 0xDEADBEEF {
+            return Ok(fb_info.base_address as usize);
         }
-        // Return physical address
-        Ok(fb_info.base_address as usize)
+        if let Some((phys, _w, _h, _pitch, size)) = crate::virtio::get_primary_virtio_display() {
+            if _len <= size {
+                return Ok(phys as usize);
+            }
+        }
+        Err(scheme_error::EIO)
     }
 }
 

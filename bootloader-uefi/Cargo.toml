@@ -3,6 +3,12 @@ name = "eclipse-bootloader-uefi"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["no_gop"]
+# no_gop: sin GOP; todo display vía GPU (VirtIO, NVIDIA, VESA) en kernel/userspace
+# Evita bloqueo con virtio-gpu y unifica arquitectura de gráficos
+no_gop = []
+
 [[bin]]
 name = "eclipse-bootloader"
 path = "src/main.rs"

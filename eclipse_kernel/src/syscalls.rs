@@ -1313,62 +1313,38 @@ fn sys_mount() -> u64 {
 /// Returns 0 on success, -1 on failure
 fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
     use crate::servers::FramebufferInfo;
-    
-    if user_buffer == 0 {
-        return u64::MAX; // -1 as u64
-    }
-    
-    let fb_info_ptr = crate::boot::get_framebuffer_info();
-    serial::serial_print("[SYSCALL] get_framebuffer_info ptr: ");
-    serial::serial_print_hex(fb_info_ptr);
-    serial::serial_print("\n");
 
-    if fb_info_ptr == 0 {
-        serial::serial_print("[SYSCALL] ERROR: Framebuffer info pointer is NULL\n");
-        return u64::MAX; // -1 as u64
+    if user_buffer == 0 {
+        return u64::MAX;
     }
-    
-    // The boot/kernel FramebufferInfo is what we want.
-    // We just need to make sure we copy it to the userspace buffer format.
-    
-    // NOTE: boot::get_framebuffer_info() returns a pointer to the FramebufferInfo struct inside BootInfo
-    let kernel_fb_ptr = crate::boot::get_framebuffer_info() as *const crate::boot::FramebufferInfo;
+    if !is_user_pointer(user_buffer, core::mem::size_of::<FramebufferInfo>() as u64) {
+        return u64::MAX;
+    }
+
+    let (fb_address, width, height, pitch) = if crate::boot::get_boot_info().framebuffer.base_address != 0
+        && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
+    {
+        let k = &crate::boot::get_boot_info().framebuffer;
+        let addr = if k.base_address >= 0xFFFF_8000_0000_0000 {
+            k.base_address - crate::memory::PHYS_MEM_OFFSET
+        } else {
+            k.base_address
+        };
+        let pitch = k.pixels_per_scan_line * 4;
+        (addr, k.width, k.height, pitch)
+    } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
+        (phys, w, h, p)
+    } else {
+        return u64::MAX;
+    };
 
     unsafe {
-        if kernel_fb_ptr.is_null() {
-             serial::serial_print("[SYSCALL] ERROR: Kernel framebuffer pointer is null\n");
-             return u64::MAX;
-        }
-
-        let kernel_fb = &*kernel_fb_ptr;
-        
-        // NUNCA pasar direcciones kernel (0xffff8000...) a userspace - convertir a física
-        let mut fb_address = if kernel_fb.base_address >= 0xFFFF_8000_0000_0000 {
-            kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
-        } else {
-            kernel_fb.base_address
-        };
-        // Safeguard: si por cualquier razón seguimos con dirección kernel, forzar conversión
-        if fb_address >= 0xFFFF_8000_0000_0000 {
-            fb_address -= crate::memory::PHYS_MEM_OFFSET;
-        }
-        
-        // Calculate BPP from pixel format
-        // Pixel format 1 = RGB, typically 32bpp
-        // For now, assume 32bpp for RGB formats
-        let bpp: u16 = 32;
-        let bytes_per_pixel = bpp / 8;
-        
-        // Calculate pitch (bytes per scanline)
-        let pitch = kernel_fb.pixels_per_scan_line * bytes_per_pixel as u32;
-        
-        // Create syscall structure
         let syscall_fb = FramebufferInfo {
             address: fb_address,
-            width: kernel_fb.width,
-            height: kernel_fb.height,
+            width,
+            height,
             pitch,
-            bpp,
+            bpp: 32,
             red_mask_size: 8,
             red_mask_shift: 16,
             green_mask_size: 8,
@@ -1376,19 +1352,14 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
             blue_mask_size: 8,
             blue_mask_shift: 0,
         };
-        
-        // Copy to userspace buffer
-        let user_fb_info = user_buffer as *mut FramebufferInfo;
-        core::ptr::write(user_fb_info, syscall_fb);
+        core::ptr::write(user_buffer as *mut FramebufferInfo, syscall_fb);
     }
-    
-    0 // Success
+    0
 }
 
 /// sys_get_gpu_display_info - Get display dimensions from VirtIO GPU (if present)
 /// arg1: pointer to userspace buffer (8 bytes: width u32, height u32)
 /// Returns 0 on success, u64::MAX if no VirtIO GPU or invalid buffer
-/// Override: if GPU reports <=800x600 (e.g. QEMU default 640x480), use 1280x1024
 fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
     if user_buffer == 0 {
         return u64::MAX;
@@ -1398,11 +1369,6 @@ fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
     }
     let Some((width, height)) = crate::virtio::get_gpu_display_info() else {
         return u64::MAX;
-    };
-    let (width, height) = if width <= 800 || height <= 600 {
-        (1280u32, 1024u32)
-    } else {
-        (width, height)
     };
     unsafe {
         let buf = user_buffer as *mut [u32; 2];
