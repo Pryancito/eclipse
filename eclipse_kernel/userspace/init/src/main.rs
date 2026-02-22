@@ -65,7 +65,7 @@ pub extern "C" fn _start() -> ! {
     // Usamos solo ASCII aquí para evitar posibles problemas con el formateo
     // de caracteres Unicode complejos en las primeras trazas de arranque.
     println!("==============================================================");
-    println!("==          ECLIPSE OS INIT SYSTEM v0.1.3-FIXED             ==");
+    println!("==          ECLIPSE OS INIT SYSTEM v0.1.3-DEBUG-REALLY     ==");
     println!("==============================================================");
     println!();
     println!("Init process started with PID: {}", pid);
@@ -148,14 +148,15 @@ fn wait_for_ready(name: &str, timeout_ms: u32) {
     let max_attempts = timeout_ms / 10; // Yield every 10ms approx
     
     while attempts < max_attempts {
-        let (len, _sender) = eclipse_libc::receive(&mut buffer);
+        let (len, sender) = eclipse_libc::receive(&mut buffer);
         if len > 0 {
             if len >= 5 && &buffer[..5] == b"READY" {
-                println!("[INIT] Service '{}' is READY", name);
+                println!("[INIT] Service '{}' is READY (received from PID {})", name, sender);
                 return;
             } else {
-                // If we got another message, just log it for now
-                println!("[INIT] Received unexpected IPC during wait for '{}': {} bytes", name, len);
+                // If we got another message (like GET_INPUT_PID), process it so we don't block the system
+                println!("[INIT] Handling concurrent IPC request during wait for '{}' ({} bytes from PID {}) [DEBUG-UNIQUE]", name, len, sender);
+                process_single_ipc_request(&buffer, len, sender);
             }
         }
         
@@ -281,6 +282,13 @@ fn handle_ipc_requests(buffer: &mut [u8; 32]) {
         return;
     }
 
+    process_single_ipc_request(buffer, len, sender);
+}
+
+/// Helper function to process a single IPC request.
+/// This allows processing messages directly from wait_for_ready's receive loop.
+fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
+
     // Petición de PID del servicio de entrada ("GET_INPUT_PID" = 13 bytes)
     if len >= 13 && &buffer[..13] == b"GET_INPUT_PID" {
         let input_pid = unsafe { SERVICES[3].pid as u32 }; // Servicio "input"
@@ -303,7 +311,7 @@ fn handle_ipc_requests(buffer: &mut [u8; 32]) {
 
     // Otros mensajes se registran para depuración básica
     println!(
-        "[INIT] IPC no reconocido en main_loop: {} bytes desde PID {}",
+        "[INIT] IPC no reconocido ({} bytes desde PID {})",
         len, sender
     );
 }

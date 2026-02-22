@@ -1,4 +1,14 @@
 #![no_std]
+//! SideWind SDK: ventanas e IPC con el compositor de Eclipse OS.
+//!
+//! Estructuras IPC (SideWindEvent, SideWindMessage) usan #[repr(C)] en sidewind_core
+//! para garantizar alineación binaria en el cruce de frontera IPC.
+//!
+//! # IPC y Deadlocks
+//!
+//! El kernel de Eclipse OS usa **receive() no bloqueante**: si no hay mensajes retorna (0, 0)
+//! inmediatamente. No hay "Zombie Receive" que cause deadlock. Para evitar starvation al
+//! drenar muchos eventos, inserta `yield_cpu()` periódicamente en bucles de poll_event.
 
 pub mod font_terminus_12;
 pub mod font_terminus_14;
@@ -11,13 +21,19 @@ pub mod ui;
 use eclipse_libc::{send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
 use sidewind_core::{SideWindMessage, MSG_TYPE_GRAPHICS, MSG_TYPE_INPUT, SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_COMMIT, SideWindEvent};
 
-/// Discover the compositor's PID by talking to init (PID 1)
+/// Descubre el PID del compositor preguntando a init (PID 1).
+///
+/// # Limitación
+/// `receive()` consume cualquier mensaje; si otro proceso envía algo antes de que init
+/// responda DSPL, ese mensaje se pierde. Llamar al inicio, antes de otros IPC.
 pub fn discover_composer() -> Option<u32> {
     const INIT_PID: u32 = 1;
+    const MAX_RETRIES: u32 = 500; // Carga alta/IPC lento: más intentos
+
     let _ = send(INIT_PID, 255, b"GET_DISPLAY_PID");
 
     let mut buffer = [0u8; 32];
-    for _ in 0..100 {
+    for _ in 0..MAX_RETRIES {
         let (len, sender) = receive(&mut buffer);
         if len >= 8 && sender == INIT_PID && &buffer[0..4] == b"DSPL" {
             let mut pid_bytes = [0u8; 4];
@@ -91,10 +107,12 @@ impl SideWindSurface {
         })
     }
 
+    /// Buffer framebuffer mapeado. El slice vive mientras `self` está prestado.
+    /// No guardar el puntero crudo ni el slice más allá del ámbito de uso.
+    #[inline]
     pub fn buffer(&mut self) -> &mut [u32] {
-        unsafe {
-            core::slice::from_raw_parts_mut(self.vaddr, (self.width * self.height) as usize)
-        }
+        let len = (self.width as usize).saturating_mul(self.height as usize);
+        unsafe { core::slice::from_raw_parts_mut(self.vaddr, len) }
     }
 
     pub fn commit(&self) {
@@ -108,23 +126,19 @@ impl SideWindSurface {
         let _ = send(self.composer_pid, MSG_TYPE_GRAPHICS, msg_bytes);
     }
 
+    /// Lee un evento del compositor si hay alguno. SideWindEvent tiene #[repr(C)].
+    /// receive() es no bloqueante: retorna None inmediatamente si no hay mensajes.
+    /// En bucles que drenan eventos, añade `yield_cpu()` cada N iteraciones para evitar starvation.
     pub fn poll_event(&self) -> Option<SideWindEvent> {
         let mut buffer = [0u8; core::mem::size_of::<SideWindEvent>()];
         let (len, sender) = receive(&mut buffer);
         if len == core::mem::size_of::<SideWindEvent>() && sender == self.composer_pid {
-            let mut event = SideWindEvent {
-                event_type: 0, data1: 0, data2: 0, data3: 0
-            };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    buffer.as_ptr(),
-                    &mut event as *mut _ as *mut u8,
-                    len,
-                );
-            }
-            return Some(event);
+            Some(unsafe {
+                core::ptr::read_unaligned(buffer.as_ptr() as *const SideWindEvent)
+            })
+        } else {
+            None
         }
-        None
     }
 
     pub fn width(&self) -> u32 { self.width }
@@ -137,8 +151,8 @@ impl SideWindSurface {
 
 impl Drop for SideWindSurface {
     fn drop(&mut self) {
-        // Send DESTROY message
-        let mut msg = SideWindMessage::new_commit(); // reuse helper for empty msg
+        // Envía DESTROY al compositor
+        let mut msg = SideWindMessage::new_commit();
         msg.op = SWND_OP_DESTROY;
         let msg_bytes = unsafe {
             core::slice::from_raw_parts(
@@ -148,7 +162,8 @@ impl Drop for SideWindSurface {
         };
         let _ = send(self.composer_pid, MSG_TYPE_GRAPHICS, msg_bytes);
 
-        // Unmap memory
+        // Unmap: en terminación abrupta (kill -9) Drop no se ejecuta;
+        // el kernel limpia automáticamente VMAs del proceso.
         unsafe {
             munmap(self.vaddr as u64, self.size_bytes as u64);
         }

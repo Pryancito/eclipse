@@ -1,6 +1,7 @@
 #![no_std]
 #![feature(c_variadic)]
 #![feature(linkage)]
+#![feature(alloc_error_handler)]
 
 core::arch::global_asm!(include_str!("posix_stubs.s"));
 
@@ -113,10 +114,33 @@ extern "C" {
 static ALLOCATOR: internal_alloc::Allocator = internal_alloc::Allocator;
 
 #[cfg(all(not(test), feature = "panic_handler", any(target_os = "none", target_os = "linux", eclipse_target)))]
+struct StderrWriter;
+impl core::fmt::Write for StderrWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let _ = eclipse_syscall::call::write(2, s.as_bytes());
+        Ok(())
+    }
+}
+
+#[cfg(all(not(test), feature = "panic_handler", any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[panic_handler]
 #[linkage = "weak"]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    eclipse_syscall::call::exit(1)
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut w = StderrWriter;
+    let _ = core::fmt::write(&mut w, core::format_args!("panic at "));
+    if let Some(location) = info.location() {
+        let _ = core::fmt::write(&mut w, core::format_args!("{}:{}\n", location.file(), location.line()));
+    }
+    let _ = core::fmt::write(&mut w, core::format_args!("  Message: {}\n", info.message()));
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
+#[cfg(all(not(test), feature = "allocator", any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[alloc_error_handler]
+fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    panic!("allocation error: {:?}", layout)
 }
 
 #[no_mangle]

@@ -101,6 +101,9 @@ const MSG_TYPE_SIGNAL: u32 = 0x00000400;    // Signal messages
 /// Status update interval (iterations between status prints)
 const STATUS_UPDATE_INTERVAL: u64 = 1000000;
 
+/// Cada N frames, burst de yields para evitar starvation de input_service (mitiga cuelgues 2–3 min)
+const YIELD_BURST_INTERVAL: u64 = 300;
+
 /// IPC message buffer size
 const IPC_BUFFER_SIZE: usize = 256;
 
@@ -1295,18 +1298,11 @@ impl IpcHandler {
         if len > 0 {
             self.message_count += 1;
             
-            // Check for SideWind Message
+            // SideWindMessage tiene #[repr(C)] en sidewind_core
             if len >= core::mem::size_of::<SideWindMessage>() && &buffer[0..4] == b"SWND" {
-                let mut sw = SideWindMessage {
-                    tag: 0, op: 0, x: 0, y: 0, w: 0, h: 0, name: [0; 32]
+                let sw = unsafe {
+                    core::ptr::read_unaligned(buffer.as_ptr() as *const SideWindMessage)
                 };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        buffer.as_ptr(),
-                        &mut sw as *mut SideWindMessage as *mut u8,
-                        core::mem::size_of::<SideWindMessage>(),
-                    );
-                }
                 
                 // Extra validation: must have correct tag
                 if sw.tag == SIDEWIND_TAG {
@@ -1315,19 +1311,11 @@ impl IpcHandler {
                     println!("[SMITHAY] Dropping invalid SideWind message from PID {}", sender_pid);
                 }
             }
-            // InputEvent DEBE ir antes del fallback Wayland: input_service también tiene sender_pid != 0,
-            // y antes tratábamos todos los mensajes de input como Wayland -> panic al parsear protocolo.
+            // InputEvent tiene #[repr(C)]. DEBE ir antes del fallback Wayland.
             if len == core::mem::size_of::<InputEvent>() {
-                let mut ev = InputEvent {
-                    device_id: 0, event_type: 0, code: 0, value: 0, timestamp: 0,
+                let ev = unsafe {
+                    core::ptr::read_unaligned(buffer.as_ptr() as *const InputEvent)
                 };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        buffer.as_ptr(),
-                        &mut ev as *mut InputEvent as *mut u8,
-                        core::mem::size_of::<InputEvent>(),
-                    );
-                }
                 return Some(CompositorEvent::Input(ev));
             }
             if sender_pid != 0 && len >= 4 && &buffer[0..4] == b"X11M" {
@@ -1969,20 +1957,26 @@ fn draw_icon_small(fb: &mut FramebufferState, center: Point, raw_data: &[u8], si
 fn query_input_service_pid() -> Option<u32> {
     const INIT_PID: u32 = 1;
     const REQUEST: &[u8] = b"GET_INPUT_PID";
+    const MAX_RETRIES: u32 = 2000; // Carga alta: esperar respuesta de init
 
     // Phase 1: ask init (PID 1) for the input_service PID
+    println!("[SMITHAY] Requesting input_service PID from init (PID 1)...");
     let sent_ok = send(INIT_PID, MSG_TYPE_INPUT, REQUEST) == 0;
     if sent_ok {
         let mut buffer = [0u8; IPC_BUFFER_SIZE];
-        for _ in 0..2000 {
+        for _ in 0..MAX_RETRIES {
             let (len, sender_pid) = receive(&mut buffer);
-            if len >= 8 && sender_pid == INIT_PID && &buffer[0..4] == b"INPT" {
-                let mut id_bytes = [0u8; 4];
-                id_bytes.copy_from_slice(&buffer[4..8]);
-                let pid = u32::from_le_bytes(id_bytes);
-                if pid != 0 {
-                    println!("[SMITHAY] input_service PID from init: {}", pid);
-                    return Some(pid);
+            if len > 0 {
+                if len >= 8 && sender_pid == INIT_PID && &buffer[0..4] == b"INPT" {
+                    let mut id_bytes = [0u8; 4];
+                    id_bytes.copy_from_slice(&buffer[4..8]);
+                    let pid = u32::from_le_bytes(id_bytes);
+                    if pid != 0 {
+                        println!("[SMITHAY] Success: input_service PID from init is {}", pid);
+                        return Some(pid);
+                    }
+                } else {
+                    println!("[SMITHAY] Received other IPC during PID query: {} bytes from PID {}", len, sender_pid);
                 }
             }
             yield_cpu();
@@ -2120,6 +2114,7 @@ fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut
         }
         SWND_OP_DESTROY => { // Destroy
              if let Some(s_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
+                 // En terminación abrupta del compositor, el kernel limpia VMAs automáticamente
                  munmap(surfaces[s_idx].vaddr as u64, surfaces[s_idx].buffer_size as u64);
                  surfaces[s_idx].active = false;
 
@@ -2276,10 +2271,18 @@ pub extern "C" fn _start() -> ! {
         // 2. Dibujar UI estática (Header/Footer simplificado)
         // Eliminado de aquí, se dibuja después de las animaciones en el loop
 
-        // 3. Procesar eventos IPC
-        while let Some(event) = ipc.process_messages() {
-            had_events = true;
-            match event {
+        // 3. Procesar eventos IPC; límite por frame para evitar starvation de otros procesos
+        const MAX_EVENTS_PER_FRAME: usize = 64;
+        let mut ipc_drain_count = 0usize;
+        while ipc_drain_count < MAX_EVENTS_PER_FRAME {
+            match ipc.process_messages() {
+                Some(event) => {
+                    had_events = true;
+                    ipc_drain_count += 1;
+                    if ipc_drain_count % 8 == 0 {
+                        yield_cpu();
+                    }
+                    match event {
                 CompositorEvent::Input(ev) => {
                     input_state.apply_event(
                         &ev,
@@ -2325,11 +2328,13 @@ pub extern "C" fn _start() -> ! {
                     // Primitive XWM handling: if it's a "MAP" command
                     if data.len() >= 4 && &data[0..4] == b"MAP " {
                         // Very simplified: MAP <id>
-                        // In reality would parse X11 MapRequest
                         println!("[SMITHAY] XWM: MapRequest received");
                         xwm.handle_map_request(0); // stub
                     }
                 }
+                    }
+                }
+                None => break,
             }
         }
 
@@ -2490,6 +2495,7 @@ pub extern "C" fn _start() -> ! {
             if windows[i].closing && windows[i].curr_w < 5.0 {
                 if let WindowContent::External(s_idx) = windows[i].content {
                     if (s_idx as usize) < surfaces.len() {
+                        // Unmap al finalizar animación de cierre
                         munmap(surfaces[s_idx as usize].vaddr as u64, surfaces[s_idx as usize].buffer_size as u64);
                         surfaces[s_idx as usize].active = false;
                     }
@@ -2593,9 +2599,15 @@ pub extern "C" fn _start() -> ! {
         // 8. Presentar frame (Copia back -> front)
         fb.present();
 
-        // 9. Siempre ceder CPU para evitar monopolizar y que input_service responda
-        for _ in 0..(if had_events { 2 } else { 8 }) {
+        // 9. Ceder CPU: más yields tras present para evitar starving input_service (reduce freezes 2–3 min)
+        for _ in 0..(if had_events { 6 } else { 16 }) {
             yield_cpu();
+        }
+        // Cada YIELD_BURST_INTERVAL frames: burst extra para garantizar time-slice a input_service
+        if counter > 0 && counter % YIELD_BURST_INTERVAL == 0 {
+            for _ in 0..64 {
+                yield_cpu();
+            }
         }
         
         if counter.wrapping_sub(last_status_counter) >= STATUS_UPDATE_INTERVAL {

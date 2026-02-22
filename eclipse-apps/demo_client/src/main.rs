@@ -94,9 +94,16 @@ pub extern "C" fn _start() -> ! {
 
     let mut frame = 0u32;
 
+    let mut events_this_drain = 0u32;
+    const YIELD_EVERY_N_EVENTS: u32 = 8; // Evita monopolio CPU al drenar cola IPC
+
     loop {
-        // Poll events
+        // Poll events (receive es no bloqueante)
         while let Some(ev) = surface.poll_event() {
+            events_this_drain += 1;
+            if events_this_drain % YIELD_EVERY_N_EVENTS == 0 {
+                yield_cpu();
+            }
             match ev.event_type {
                 SWND_EVENT_TYPE_RESIZE => {
                     surface.set_size(ev.data1 as u32, ev.data2 as u32);
@@ -104,6 +111,7 @@ pub extern "C" fn _start() -> ! {
                 _ => {}
             }
         }
+        events_this_drain = 0;
 
         let w = surface.width();
         let h = surface.height();

@@ -5,10 +5,6 @@ edition = "2021"
 authors = ["Eclipse OS Team"]
 description = "Microkernel nativo de Eclipse OS escrito desde cero en Rust"
 
-# [lib]
-# name = "eclipse_kernel"
-# crate-type = ["staticlib"]
-
 [[bin]]
 name = "eclipse_kernel"
 path = "src/main.rs"

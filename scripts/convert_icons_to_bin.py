@@ -6,9 +6,12 @@ iconos-eclipse-2 = 1x3 (close, min, max)
 logo-eclipse = logo completo
 """
 from pathlib import Path
+from typing import Optional
 from PIL import Image
 
 SRC = Path("/home/moebius/Imágenes")
+# Fuentes alternativas para iconos de ventana (minimizar, maximizar, cerrar)
+SRC_ALT = [Path("/home/moebius/Documentos"), Path("/home/moebius/Imagenes")]
 DST = Path(__file__).resolve().parent.parent / "eclipse-apps" / "sidewind_sdk" / "assets"
 
 # (x, y, w, h) en px, o None = imagen completa resize
@@ -18,11 +21,17 @@ LAYOUTS = {
     "archivos.jpg": [(None, "files.bin")],
     "aplicaciones.jpg": [(None, "apps.bin")],
     "red.jpg": [(None, "network.bin")],
+    # Fallback: imagen combinada 1x3 (close, min, max) - se usa si no hay archivos individuales
     "iconos-eclipse-2.jpg": [
-        ((0, 0, 341, 1024), "btn_close.bin"),   # col 1
-        ((341, 0, 342, 1024), "btn_min.bin"),   # col 2
-        ((682, 0, 342, 1024), "btn_max.bin"),   # col 3
+        ((0, 0, 341, 1024), "btn_close.bin"),
+        ((341, 0, 342, 1024), "btn_min.bin"),
+        ((682, 0, 342, 1024), "btn_max.bin"),
     ],
+    # Iconos de barra de título: archivos individuales (se buscan en SRC o SRC_ALT)
+    # Procesados después para sobrescribir el fallback
+    "minimizar.jpg": [(None, "btn_min.bin")],
+    "maximizar.jpg": [(None, "btn_max.bin")],
+    "cerrar.jpg": [(None, "btn_close.bin")],
     # Logo: recorte centrado 600x600, negro transparente (color-key en UI)
     # IMPORTANTE: el motivo (S/logo) debe estar centrado en la imagen fuente
     # para que se vea bien en pantalla. Si aparece descentrado, ajustar
@@ -65,12 +74,23 @@ def to_rgb888(img: Image.Image, size: tuple[int, int], black_to_transparent: boo
             out[i], out[i + 1], out[i + 2] = r, g, b
     return bytes(out)
 
+def find_source(src_name: str) -> Optional[Path]:
+    """Busca el archivo en SRC o en las carpetas alternativas."""
+    candidate = SRC / src_name
+    if candidate.exists():
+        return candidate
+    for alt in SRC_ALT:
+        candidate = alt / src_name
+        if candidate.exists():
+            return candidate
+    return None
+
 def main():
     DST.mkdir(parents=True, exist_ok=True)
     for src_name, items in LAYOUTS.items():
-        src_path = SRC / src_name
-        if not src_path.exists():
-            print(f"Omitiendo {src_name} (no existe)")
+        src_path = find_source(src_name)
+        if src_path is None:
+            print(f"Omitiendo {src_name} (no existe en SRC ni en alternativas)")
             continue
         img = Image.open(src_path)
         for item in items:

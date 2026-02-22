@@ -97,12 +97,15 @@ pub extern "C" fn _start() -> ! {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║         GUI SERVICE - Sidewind Compositor Supervisor         ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
-    println!("[GUI-SERVICE] PID={}", pid);
+    let ppid = getppid();
+    println!("[GUI-SERVICE] PID={}, PPID={}", pid, ppid);
 
     // Notify parent (systemd/init) that we are ready
-    let ppid = getppid();
     if ppid > 0 {
+        println!("[GUI-SERVICE] Sending READY to init (PID {})...", ppid);
         let _ = send(ppid, 255, b"READY");
+    } else {
+        println!("[GUI-SERVICE] WARNING: No parent process found to signal READY!");
     }
 
     // Wait for filesystem before loading compositor from disk

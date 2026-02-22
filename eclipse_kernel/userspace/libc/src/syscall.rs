@@ -440,8 +440,8 @@ pub fn send(server_id: u32, msg_type: u32, data: &[u8]) -> i32 {
     }
 }
 
-/// Receive a message
-/// Returns (length, sender_pid) or (0, 0) if no message
+/// Receive a message (non-blocking).
+/// Returns (length, sender_pid) or (0, 0) if no message. Never blocks.
 pub fn receive(buffer: &mut [u8]) -> (usize, u32) {
     let mut sender_pid: u64 = 0;
     
