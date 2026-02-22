@@ -720,8 +720,8 @@ extern "C" fn keyboard_handler() {
 /// Returns 0 if empty (since 0 is not a valid scancode generally, unless error/break)
 pub fn read_key() -> u8 {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tail = KEY_TAIL.lock();
         let head = KEY_HEAD.lock();
+        let mut tail = KEY_TAIL.lock();
         
         if *head == *tail {
             return 0; // Buffer empty
@@ -814,8 +814,8 @@ extern "C" fn mouse_handler() {
 /// Returns 0xFFFFFFFF if empty; otherwise packed u32: buttons | (dx as u8)<<8 | (dy as u8)<<16.
 pub fn read_mouse_packet() -> u32 {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut tail = MOUSE_TAIL.lock();
         let head = MOUSE_HEAD.lock();
+        let mut tail = MOUSE_TAIL.lock();
 
         if *head == *tail {
             return 0xFFFFFFFF;

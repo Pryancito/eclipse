@@ -9,6 +9,8 @@ sidewind_core = { path = "../sidewind_core" }
 sidewind_wayland = { path = "../sidewind_wayland" }
 sidewind_xwayland = { package = "sidewind-xwayland", path = "../sidewind_xwayland" }
 sidewind_sdk = { path = "../sidewind_sdk" }
+eclipse-syscall = { path = "../../eclipse-syscall" }
+heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
 

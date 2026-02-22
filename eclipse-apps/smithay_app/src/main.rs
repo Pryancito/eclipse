@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+extern crate eclipse_syscall;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +33,16 @@ unsafe impl GlobalAlloc for StaticAllocator {
             let aligned = (current + align - 1) & !(align - 1);
             if aligned + size > HEAP_SIZE {
                 // OOM — log and return null (caller will panic via OOM handler)
-                // Cannot use println! here as it may itself allocate
+                // Cannot use println! easily as it may allocate. Use raw syscall.
+                let msg = b"[SMITHAY] FATAL ERROR: Static 8MB Heap Exhausted\n";
+                unsafe {
+                    eclipse_syscall::syscall3(
+                        eclipse_syscall::number::SYS_WRITE,
+                        2, // stderr
+                        msg.as_ptr() as usize,
+                        msg.len()
+                    );
+                }
                 return core::ptr::null_mut();
             }
             if HEAP_PTR.compare_exchange(current, aligned + size, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -65,12 +75,15 @@ use embedded_graphics::{
     prelude::*,
     primitives::{Rectangle, Circle, Line, Polyline, PrimitiveStyleBuilder, Arc},
     text::Text,
-    mono_font::{ascii::FONT_6X10, ascii::FONT_10X20, MonoTextStyle},
+    mono_font::MonoTextStyle,
     image::ImageRaw,
 };
 use micromath::F32Ext;
 
 use sidewind_sdk::ui::{self, icons, colors, Notification, NotificationPanel, Taskbar, Widget};
+use sidewind_sdk::{font_terminus_12, font_terminus_14, font_terminus_20, font_terminus_24};
+use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
+use heapless;
 
 /// Kernel PHYS_MEM_OFFSET (Eclipse: physical X → kernel virt X + this)
 /// Si map_framebuffer devuelve dir kernel por error, convertir a identity
@@ -119,7 +132,9 @@ struct ShellWindow {
     curr_h: f32,
     minimized: bool,
     maximized: bool,
+    closing: bool,
     stored_rect: (i32, i32, i32, i32),
+    workspace: u8,
     content: WindowContent,
 }
 
@@ -206,8 +221,8 @@ fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -
 enum CompositorEvent {
     Input(InputEvent),
     SideWind(SideWindMessage, u32), // message, sender_pid
-    Wayland(alloc::vec::Vec<u8>, u32), // data, sender_pid
-    X11(alloc::vec::Vec<u8>, u32), // data, sender_pid
+    Wayland(heapless::Vec<u8, 256>, u32), // data, sender_pid
+    X11(heapless::Vec<u8, 256>, u32), // data, sender_pid
 }
 
 struct WaylandClient {
@@ -218,6 +233,7 @@ struct WaylandClient {
 /// Cursor simple (cruz) - estable; 64x64 RGBA causaba crash al mover ratón
 const CURSOR_SIZE: i32 = 24;
 const MAX_EXTERNAL_SURFACES: usize = 16;
+const MAX_WAYLAND_CLIENTS: usize = 8;
 
 /// Acciones de teclado (referencia: xfwl4 input_handler KeyAction)
 #[derive(Clone, Copy, PartialEq)]
@@ -246,14 +262,26 @@ enum KeyAction {
     ToggleLock,
     /// Alternar Notificaciones (Super+V)
     ToggleNotifications,
+    ToggleLauncher,
+    SnapLeft,
+    SnapRight,
+    SwitchWorkspace(u8),
+    CycleWindowVisual,
+    ToggleSearch,
+    ArrowUp,
+    ArrowDown,
+    Input(char),
+    Enter,
+    Backspace,
 }
 
 /// Scancodes US QWERTY → KeyAction (tabla de keybindings)
-fn scancode_to_action(scancode: u16) -> KeyAction {
+/// Scancodes US QWERTY → KeyAction (tabla de keybindings)
+fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
     match scancode {
-        0x2E => KeyAction::Clear,           // C (was incorrectly 0x21 which is F)
-        0x02 => KeyAction::SetColor(0),     // 1
-        0x03 => KeyAction::SetColor(1),     // 2
+        0x2E => KeyAction::Clear,           // C
+        0x02 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(0) } else { KeyAction::SetColor(0) }, // 1
+        0x03 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(1) } else { KeyAction::SetColor(1) }, // 2
         0x04 => KeyAction::SetColor(2),     // 3
         0x05 => KeyAction::SetColor(3),     // 4
         0x06 => KeyAction::SetColor(4),     // 5
@@ -264,13 +292,65 @@ fn scancode_to_action(scancode: u16) -> KeyAction {
         0x47 => KeyAction::CenterCursor,    // Home
         0x31 => KeyAction::NewWindow,       // N
         0x01 => KeyAction::CloseWindow,     // Escape
-        0x0F => KeyAction::CycleForward,    // Tab
-        0x29 => KeyAction::CycleBackward,   // ` (backtick, arriba de Tab)
+        0x0F => if (modifiers & 4) != 0 { KeyAction::CycleWindowVisual } else { KeyAction::CycleForward }, // Tab
+        0x29 => KeyAction::CycleBackward,   // `
         0x32 => KeyAction::Minimize,        // M
-        0x5B => KeyAction::ToggleDashboard, // Left Meta/Super
-        0x26 => if true { KeyAction::ToggleLock } else { KeyAction::None }, // L (need modifiers check)
-        0x2F => if true { KeyAction::ToggleNotifications } else { KeyAction::None }, // V
+        0x5B => KeyAction::ToggleDashboard, // Super
+        0x26 => KeyAction::ToggleLock,      // L
+        0x2F => KeyAction::ToggleNotifications, // V
+        0x1E => KeyAction::ToggleLauncher,      // A
+        0x4B => KeyAction::SnapLeft,        // Left
+        0x4D => KeyAction::SnapRight,       // Right
+        0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None }, // Space (Super+Space)
+        0x48 => KeyAction::ArrowUp,         // Up
+        0x50 => KeyAction::ArrowDown,       // Down
+        0x1C => KeyAction::Enter,           // Enter
+        0x0E => KeyAction::Backspace,       // Backspace
         _ => KeyAction::None,
+    }
+}
+
+/// Mapeo básico de scancodes a caracteres ASCII (US QWERTY)
+fn scancode_to_char(code: u16, shift: bool) -> Option<char> {
+    match (code, shift) {
+        (0x1E, false) => Some('a'), (0x1E, true) => Some('A'),
+        (0x30, false) => Some('b'), (0x30, true) => Some('B'),
+        (0x2E, false) => Some('c'), (0x2E, true) => Some('C'),
+        (0x20, false) => Some('d'), (0x20, true) => Some('D'),
+        (0x12, false) => Some('e'), (0x12, true) => Some('E'),
+        (0x21, false) => Some('f'), (0x21, true) => Some('F'),
+        (0x22, false) => Some('g'), (0x22, true) => Some('G'),
+        (0x23, false) => Some('h'), (0x23, true) => Some('H'),
+        (0x17, false) => Some('i'), (0x17, true) => Some('I'),
+        (0x24, false) => Some('j'), (0x24, true) => Some('J'),
+        (0x25, false) => Some('k'), (0x25, true) => Some('K'),
+        (0x26, false) => Some('l'), (0x26, true) => Some('L'),
+        (0x32, false) => Some('m'), (0x32, true) => Some('M'),
+        (0x31, false) => Some('n'), (0x31, true) => Some('N'),
+        (0x18, false) => Some('o'), (0x18, true) => Some('O'),
+        (0x19, false) => Some('p'), (0x19, true) => Some('P'),
+        (0x10, false) => Some('q'), (0x10, true) => Some('Q'),
+        (0x13, false) => Some('r'), (0x13, true) => Some('R'),
+        (0x1F, false) => Some('s'), (0x1F, true) => Some('S'),
+        (0x14, false) => Some('t'), (0x14, true) => Some('T'),
+        (0x16, false) => Some('u'), (0x16, true) => Some('U'),
+        (0x2F, false) => Some('v'), (0x2F, true) => Some('V'),
+        (0x11, false) => Some('w'), (0x11, true) => Some('W'),
+        (0x2D, false) => Some('x'), (0x2D, true) => Some('X'),
+        (0x15, false) => Some('y'), (0x15, true) => Some('Y'),
+        (0x2C, false) => Some('z'), (0x2C, true) => Some('Z'),
+        (0x39, _) => Some(' '),
+        (0x02, false) => Some('1'), (0x02, true) => Some('!'),
+        (0x03, false) => Some('2'), (0x03, true) => Some('@'),
+        (0x04, false) => Some('3'), (0x04, true) => Some('#'),
+        (0x05, false) => Some('4'), (0x05, true) => Some('$'),
+        (0x06, false) => Some('5'), (0x06, true) => Some('%'),
+        (0x07, false) => Some('6'), (0x07, true) => Some('^'),
+        (0x08, false) => Some('7'), (0x08, true) => Some('&'),
+        (0x09, false) => Some('8'), (0x09, true) => Some('*'),
+        (0x0A, false) => Some('9'), (0x0A, true) => Some('('),
+        (0x0B, false) => Some('0'), (0x0B, true) => Some(')'),
+        _ => None,
     }
 }
 
@@ -325,6 +405,21 @@ struct InputState {
     quick_settings_active: bool,
     context_menu_active: bool,
     context_menu_pos: Point,
+    
+    // Animation states for overlays
+    notif_curr_x: f32,
+    launcher_curr_y: f32,
+    
+    // Phase 9: Workspaces & Alt-Tab
+    current_workspace: u8,
+    workspace_offset: f32, // Para transición de scroll
+    alt_tab_active: bool,
+
+    // Phase 7: Search
+    search_active: bool,
+    search_query: heapless::String<32>,
+    search_selected_idx: usize,
+    search_curr_y: f32, // Animation
 }
 
 impl InputState {
@@ -365,6 +460,18 @@ impl InputState {
             quick_settings_active: false,
             context_menu_active: false,
             context_menu_pos: Point::new(0, 0),
+            
+            notif_curr_x: width as f32,
+            launcher_curr_y: height as f32,
+
+            current_workspace: 0,
+            workspace_offset: 0.0,
+            alt_tab_active: false,
+
+            search_active: false,
+            search_query: heapless::String::<32>::new(),
+            search_selected_idx: 0,
+            search_curr_y: 0.0,
         }
     }
 
@@ -383,8 +490,23 @@ impl InputState {
                     _ => {}
                 }
 
-                let action = if self.modifiers & (4 | 8) != 0 {
-                    scancode_to_action(ev.code)
+                let action = if self.search_active {
+                    match ev.code {
+                        0x01 => KeyAction::ToggleSearch,
+                        0x1C => KeyAction::Enter,
+                        0x0E => KeyAction::Backspace,
+                        0x48 => KeyAction::ArrowUp,
+                        0x50 => KeyAction::ArrowDown,
+                        _ => {
+                            if let Some(c) = scancode_to_char(ev.code, (self.modifiers & 1) != 0) {
+                                KeyAction::Input(c)
+                            } else {
+                                KeyAction::None
+                            }
+                        }
+                    }
+                } else if self.modifiers & (4 | 8) != 0 {
+                    scancode_to_action(ev.code, self.modifiers)
                 } else {
                     KeyAction::None
                 };
@@ -429,6 +551,76 @@ impl InputState {
                     KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
                     KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
                     KeyAction::ToggleNotifications => if pressed && (self.modifiers & 8 != 0) { self.notifications_active = !self.notifications_active; },
+                    KeyAction::ToggleLauncher => if pressed && (self.modifiers & 8 != 0) { self.launcher_active = !self.launcher_active; },
+                    KeyAction::SnapLeft => if pressed && (self.modifiers & 8 != 0) {
+                        if let Some(idx) = self.focused_window {
+                            if idx < *window_count {
+                                windows[idx].x = 0;
+                                windows[idx].y = ShellWindow::TITLE_H;
+                                windows[idx].w = fb_width / 2;
+                                windows[idx].h = fb_height - ShellWindow::TITLE_H - 44;
+                            }
+                        }
+                    },
+                    KeyAction::SnapRight => if pressed && (self.modifiers & 8 != 0) {
+                        if let Some(i) = self.focused_window {
+                            if i < *window_count {
+                                let top_bar = 80;
+                                windows[i].w = fb_width / 2;
+                                windows[i].h = fb_height - top_bar;
+                                windows[i].x = fb_width / 2;
+                                windows[i].y = top_bar;
+                                windows[i].curr_w = windows[i].w as f32;
+                                windows[i].curr_h = windows[i].h as f32;
+                            } else {
+                                self.focused_window = None;
+                            }
+                        }
+                    },
+                    KeyAction::SwitchWorkspace(w) => if pressed && (self.modifiers & 8 != 0) {
+                        self.current_workspace = w;
+                    },
+                    KeyAction::CycleWindowVisual => if pressed {
+                        if (self.modifiers & 4) != 0 { // Alt
+                            self.alt_tab_active = true;
+                            self.request_cycle_forward = true;
+                        }
+                    },
+                    KeyAction::ToggleSearch => if pressed {
+                        self.search_active = !self.search_active;
+                        if self.search_active {
+                            self.search_query.clear();
+                            self.search_selected_idx = 0;
+                            self.dashboard_active = false;
+                        }
+                    },
+                    KeyAction::Input(c) => if pressed && self.search_active {
+                        if self.search_query.len() < 32 {
+                            self.search_query.push(c);
+                            self.search_selected_idx = 0;
+                        }
+                    },
+                    KeyAction::Backspace => if pressed && self.search_active {
+                        self.search_query.pop();
+                    },
+                    KeyAction::ArrowUp => if pressed && self.search_active {
+                        self.search_selected_idx = self.search_selected_idx.saturating_sub(1);
+                    },
+                    KeyAction::ArrowDown => if pressed && self.search_active {
+                        self.search_selected_idx += 1;
+                    },
+                    KeyAction::Enter => if pressed && self.search_active {
+                        self.execute_search();
+                        self.search_active = false;
+                    },
+                }
+                
+                if !pressed && ev.code == 0x01 && self.search_active {
+                    self.search_active = false;
+                }
+                
+                if !pressed && ev.code == 0x0F { // Tab release
+                    self.alt_tab_active = false;
                 }
             }
             // Mouse move: code 0 = X, code 1 = Y
@@ -437,6 +629,26 @@ impl InputState {
                 if ev.code == 0 {
                     self.cursor_x = (self.cursor_x + delta)
                         .clamp(0, fb_width.saturating_sub(1));
+                        
+                    // Snapping logic (Super + Left/Right)
+                    if self.modifiers == 8 {
+                        if let Some(idx) = self.focused_window {
+                            if idx < *window_count {
+                                if ev.value < -20 { // Snap Left
+                                    windows[idx].x = 0;
+                                    windows[idx].y = ShellWindow::TITLE_H;
+                                    windows[idx].w = fb_width / 2;
+                                    windows[idx].h = fb_height - ShellWindow::TITLE_H - 44;
+                                } else if ev.value > 20 { // Snap Right
+                                    windows[idx].x = fb_width / 2;
+                                    windows[idx].y = ShellWindow::TITLE_H;
+                                    windows[idx].w = fb_width / 2;
+                                    windows[idx].h = fb_height - ShellWindow::TITLE_H - 44;
+                                }
+                            }
+                        }
+                    }
+
                     // Arrastrar ventana
                     if let Some(idx) = self.dragging_window {
                         if idx < *window_count {
@@ -447,7 +659,7 @@ impl InputState {
                     }
                     if let Some(idx) = self.resizing_window {
                         if idx < *window_count {
-                            let new_w = (self.cursor_x - windows[idx].x + 8).max(50);
+                            let new_w = (self.cursor_x - windows[idx].x + 8).max(50).min(MAX_SURFACE_DIM as i32);
                             windows[idx].w = new_w;
                         }
                     }
@@ -464,7 +676,7 @@ impl InputState {
                     }
                     if let Some(idx) = self.resizing_window {
                         if idx < *window_count {
-                            let new_h = (self.cursor_y - windows[idx].y + 8).max(ShellWindow::TITLE_H + 20);
+                            let new_h = (self.cursor_y - windows[idx].y + 8).max(ShellWindow::TITLE_H + 20).min(MAX_SURFACE_DIM as i32);
                             windows[idx].h = new_h;
                         }
                     }
@@ -473,34 +685,38 @@ impl InputState {
                 // If resizing, notify client
                 if let Some(f_idx) = self.resizing_window {
                      if let WindowContent::External(s_idx) = windows[f_idx].content {
-                        let pid = surfaces[s_idx as usize].pid;
-                        let event = SideWindEvent {
-                            event_type: SWND_EVENT_TYPE_RESIZE,
-                            data1: windows[f_idx].w,
-                            data2: windows[f_idx].h - ShellWindow::TITLE_H,
-                            data3: 0,
-                        };
-                        let _ = send(pid, MSG_TYPE_INPUT, unsafe {
-                            core::slice::from_raw_parts(&event as *const _ as *const u8, core::mem::size_of::<SideWindEvent>())
-                        });
+                        if (s_idx as usize) < surfaces.len() {
+                            let pid = surfaces[s_idx as usize].pid;
+                            let event = SideWindEvent {
+                                event_type: SWND_EVENT_TYPE_RESIZE,
+                                data1: windows[f_idx].w,
+                                data2: windows[f_idx].h - ShellWindow::TITLE_H,
+                                data3: 0,
+                            };
+                            let _ = send(pid, MSG_TYPE_INPUT, unsafe {
+                                core::slice::from_raw_parts(&event as *const _ as *const u8, core::mem::size_of::<SideWindEvent>())
+                            });
+                        }
                     }
                 }
                 
                 // Forward move to client if focused
                 if let Some(f_idx) = self.focused_window {
                     if let WindowContent::External(s_idx) = windows[f_idx].content {
-                        let pid = surfaces[s_idx as usize].pid;
-                        let rel_x = self.cursor_x - windows[f_idx].x;
-                        let rel_y = self.cursor_y - (windows[f_idx].y + ShellWindow::TITLE_H);
-                        let event = SideWindEvent {
-                            event_type: SWND_EVENT_TYPE_MOUSE_MOVE,
-                            data1: rel_x,
-                            data2: rel_y,
-                            data3: 0,
-                        };
-                        let _ = send(pid, MSG_TYPE_INPUT, unsafe {
-                            core::slice::from_raw_parts(&event as *const _ as *const u8, core::mem::size_of::<SideWindEvent>())
-                        });
+                        if (s_idx as usize) < surfaces.len() {
+                            let pid = surfaces[s_idx as usize].pid;
+                            let rel_x = self.cursor_x - windows[f_idx].x;
+                            let rel_y = self.cursor_y - (windows[f_idx].y + ShellWindow::TITLE_H);
+                            let event = SideWindEvent {
+                                event_type: SWND_EVENT_TYPE_MOUSE_MOVE,
+                                data1: rel_x,
+                                data2: rel_y,
+                                data3: 0,
+                            };
+                            let _ = send(pid, MSG_TYPE_INPUT, unsafe {
+                                core::slice::from_raw_parts(&event as *const _ as *const u8, core::mem::size_of::<SideWindEvent>())
+                            });
+                        }
                     }
                 }
             }
@@ -638,40 +854,25 @@ impl InputState {
 
     /// Cursor al estilo xfwl4: solo dibujar encima, sin save/restore de fondo.
     /// xfwl4 redibuja todo el frame; aquí evitamos read_region/write_region que causaban crash.
+    /// Cursor al estilo HUD procedural
     fn draw_cursor(&mut self, fb: &mut FramebufferState) {
-        let size = CURSOR_SIZE;
-        let width = fb.info.width as i32;
-        let height = fb.info.height as i32;
-        let max_x = width.saturating_sub(size).max(0);
-        let max_y = height.saturating_sub(size).max(0);
-        let x = self.cursor_x.clamp(0, max_x);
-        let y = self.cursor_y.clamp(0, max_y);
+        let _ = ui::draw_hud_cursor(fb, Point::new(self.cursor_x, self.cursor_y), colors::ACCENT_CYAN);
+    }
 
-        // Blit manual con "transparency key" (negro = transparente)
-        let pitch_px = (fb.info.pitch / 4).max(fb.info.width as u32) as i32;
-        let dst_ptr = fb.base_addr as *mut u32;
-        let c_size = CURSOR_SIZE; // cursor.bin is 24x24 pixels
-
-        for cy in 0..c_size {
-            let dy = y + cy;
-            if dy < 0 || dy >= height { continue; }
-            for cx in 0..c_size {
-                let dx = x + cx;
-                if dx < 0 || dx >= width { continue; }
-                let src_idx = ((cy * c_size) + cx) as usize * 3;
-                let r = icons::CURSOR[src_idx] as u32;
-                let g = icons::CURSOR[src_idx + 1] as u32;
-                let b = icons::CURSOR[src_idx + 2] as u32;
-                
-                // Key de transparencia: si es muy oscuro (fondo negro de DALL-E), saltar
-                if r < 20 && g < 20 && b < 20 { continue; }
-                
-                let raw = 0xFF000000 | (r << 16) | (g << 8) | b;
-                let offset = (dy * pitch_px + dx) as usize;
-                unsafe {
-                    core::ptr::write_volatile(dst_ptr.add(offset), raw);
-                }
-            }
+    fn execute_search(&mut self) {
+        let query = self.search_query.as_str();
+        if query == "term" || query == "terminal" {
+            self.request_new_window = true;
+        } else if query == "ws1" || query == "work 1" {
+            self.current_workspace = 0;
+        } else if query == "ws2" || query == "work 2" {
+            self.current_workspace = 1;
+        } else if query == "lock" {
+            self.lock_active = true;
+        } else if query == "clear" {
+            self.request_clear = true;
+        } else if query == "diag" || query == "system" {
+            self.dashboard_active = true;
         }
     }
 }
@@ -682,6 +883,7 @@ struct FramebufferState {
     base_addr: usize,   // drawing target (back buffer or VirtIO GPU buffer)
     front_addr: usize,  // physical framebuffer (legacy FB only; 0 when VirtIO GPU)
     gpu_resource_id: Option<u32>,  // Some(resource_id) when using VirtIO GPU 2D
+    background_addr: usize, // Static background cache (Phase 8)
 }
 
 impl FramebufferState {
@@ -714,11 +916,19 @@ impl FramebufferState {
                         blue_mask_size: 8,
                         blue_mask_shift: 0,
                     };
+                    let fb_size = (info.pitch as u64) * (info.height as u64);
+                    let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if bg_buffer == 0 || bg_buffer == u64::MAX {
+                        println!("[SMITHAY]   - ERROR: Failed to allocate background buffer (GPU)");
+                        return None;
+                    }
+
                     return Some(FramebufferState {
                         info,
                         base_addr: gpu_info.vaddr as usize,
                         front_addr: 0,
                         gpu_resource_id: Some(gpu_info.resource_id),
+                        background_addr: bg_buffer as usize,
                     });
                 } else {
                     println!("[SMITHAY]   - VirtIO GPU vaddr invalid: 0x{:x}", gpu_info.vaddr);
@@ -773,11 +983,18 @@ impl FramebufferState {
         let mut info = fb_info;
         info.address = fb_base as u64;
 
+        let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if bg_buffer == 0 || bg_buffer == u64::MAX {
+            println!("[SMITHAY]   - ERROR: Failed to allocate background buffer (Legacy)");
+            return None;
+        }
+
         Some(FramebufferState {
             info,
             base_addr: back_buffer as usize,
             front_addr: fb_base,
             gpu_resource_id: None,
+            background_addr: bg_buffer as usize,
         })
     }
 
@@ -800,6 +1017,23 @@ impl FramebufferState {
                 unsafe {
                     core::ptr::write_volatile(ptr.add(row_start + x), raw);
                 }
+            }
+        }
+    }
+
+    /// Present a specific region to the GPU (Phase 8 - Partial Refresh)
+    fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) {
+        if self.base_addr < 0x1000 { return; }
+        if let Some(rid) = self.gpu_resource_id {
+            // Clamp and convert to u32
+            let fb_w = self.info.width as i32;
+            let fb_h = self.info.height as i32;
+            let rx = x.clamp(0, fb_w);
+            let ry = y.clamp(0, fb_h);
+            let rw = w.clamp(0, fb_w - rx);
+            let rh = h.clamp(0, fb_h - ry);
+            if rw > 0 && rh > 0 {
+                let _ = gpu_present(rid, rx as u32, ry as u32, rw as u32, rh as u32);
             }
         }
     }
@@ -828,6 +1062,38 @@ impl FramebufferState {
         }
     }
 
+    /// Prerender static background to cache (Phase 8)
+    fn pre_render_background(&mut self) {
+        if self.background_addr < 0x1000 { return; }
+        
+        let old_base = self.base_addr;
+        self.base_addr = self.background_addr;
+        
+        // Draw static cosmic background to cache
+        self.clear_back_buffer_raw(colors::COSMIC_DEEP);
+        let _ = ui::draw_cosmic_background(self);
+        let logo_r = ((self.info.width.min(self.info.height) as i32) / 2 - 120).min(280).max(120);
+        let cx = (self.info.width as f32 / 2.0).round() as i32;
+        let cy = (self.info.height as f32 / 2.0).round() as i32;
+        let _ = ui::draw_eclipse_logo(self, Point::new(cx, cy), 0, logo_r);
+        
+        self.base_addr = old_base;
+    }
+
+    /// Blit entire background cache to current back buffer (Phase 8)
+    fn blit_background(&self) {
+        if self.base_addr < 0x1000 || self.background_addr < 0x1000 { return; }
+        let pitch = self.info.pitch.max(self.info.width * 4);
+        let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.background_addr as *const u8,
+                self.base_addr as *mut u8,
+                size_bytes,
+            );
+        }
+    }
+
     /// Dibuja una cruz (vertical + horizontal) con escrituras directas; evita embedded_graphics
     fn draw_cross_raw(&mut self, cx: i32, cy: i32, half: i32, raw_color: u32) {
         let width = self.info.width as i32;
@@ -851,6 +1117,50 @@ impl FramebufferState {
         }
     }
 
+    /// Blit a raw buffer (e.g. from an ExternalSurface) to the back buffer
+    fn blit_buffer(&mut self, x: i32, y: i32, w: u32, h: u32, src: *const u32, src_size: usize) {
+        if self.base_addr < 0x1000 { return; }
+        if src.is_null() { return; }
+        if w == 0 || h == 0 { return; }
+        
+        let fb_w = self.info.width as i32;
+        let fb_h = self.info.height as i32;
+        let pitch_px = (self.info.pitch / 4).max(self.info.width) as i32;
+        let dst_ptr = self.base_addr as *mut u32;
+        let w_i = w as i32;
+
+        for iy in 0..h as i32 {
+            let dy = y + iy;
+            if dy < 0 || dy >= fb_h { continue; }
+            
+            // Ensure source row is within source buffer size
+            let src_row_start = (iy * w_i) as usize;
+            let bytes_needed = (src_row_start + w as usize).saturating_mul(4);
+            if bytes_needed > src_size { break; }
+
+            if x >= 0 && x + w_i <= fb_w {
+                let row_offset = (dy * pitch_px + x) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.add(src_row_start),
+                        dst_ptr.add(row_offset),
+                        w as usize,
+                    );
+                }
+            } else {
+                for ix in 0..w_i {
+                    let dx = x + ix;
+                    if dx >= 0 && dx < fb_w {
+                        let off = (dy * pitch_px + dx) as usize;
+                        unsafe {
+                            let color = core::ptr::read_volatile(src.add(src_row_start + ix as usize));
+                            core::ptr::write_volatile(dst_ptr.add(off), color);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// DrawTarget implementation for our Framebuffer
@@ -981,6 +1291,7 @@ impl IpcHandler {
         
         let (len, sender_pid) = receive(&mut buffer);
         
+        let len = len.min(buffer.len()); // Clamp to avoid out-of-bounds slice
         if len > 0 {
             self.message_count += 1;
             
@@ -1020,10 +1331,14 @@ impl IpcHandler {
                 return Some(CompositorEvent::Input(ev));
             }
             if sender_pid != 0 && len >= 4 && &buffer[0..4] == b"X11M" {
-                return Some(CompositorEvent::X11(buffer[4..len].to_vec(), sender_pid));
+                let mut x11_data = heapless::Vec::new();
+                let _ = x11_data.extend_from_slice(&buffer[4..len]);
+                return Some(CompositorEvent::X11(x11_data, sender_pid));
             }
             if sender_pid != 0 {
-                return Some(CompositorEvent::Wayland(buffer[..len].to_vec(), sender_pid));
+                let mut wl_data = heapless::Vec::new();
+                let _ = wl_data.extend_from_slice(&buffer[..len]);
+                return Some(CompositorEvent::Wayland(wl_data, sender_pid));
             }
 
             let response = b"ACK";
@@ -1036,28 +1351,26 @@ impl IpcHandler {
     }
 }
 
-/// Dibuja el Dashboard de Eclipse OS (Fase 6)
+/// Dibuja el Dashboard de Eclipse OS (estilo código referencia: Panel + Gauges + Terminal)
 fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    
+
     // 1. Fondo semitransparente (Oscurecer escritorio)
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
         .draw(fb);
 
-    // 2. Efecto de "Grid" activo
-    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64);
-    
-    // 3. Paneles de Widgets
-    use sidewind_sdk::ui::{Panel, Gauge, Widget};
+    // 2. Grid (referencia)
+    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
 
+    // 3. Paneles de Widgets (referencia: Panel + Gauges + Terminal)
+    use sidewind_sdk::ui::{Panel, Gauge, Terminal, Widget};
     let p_w = 600;
     let p_h = 400;
     let px = (w - p_w) / 2;
     let py = (h - p_h) / 2;
 
-    // Panel Central: System Monitor
     let main_panel = Panel {
         position: Point::new(px, py),
         size: Size::new(p_w as u32, p_h as u32),
@@ -1065,15 +1378,13 @@ fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
     };
     let _ = main_panel.draw(fb);
 
-    // Widgets dentro del panel
     let g1 = Gauge {
         center: main_panel.position + Point::new(120, 180),
         radius: 70,
-        value: 0.45 + (counter as f32 / 50.0).sin() * 0.1, // Animado
+        value: 0.45 + (counter as f32 / 50.0).sin() * 0.1,
         label: "CARGA CPU",
     };
     let _ = g1.draw(fb);
-
     let g2 = Gauge {
         center: main_panel.position + Point::new(300, 180),
         radius: 70,
@@ -1081,7 +1392,6 @@ fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
         label: "MEMORIA VRAM",
     };
     let _ = g2.draw(fb);
-
     let g3 = Gauge {
         center: main_panel.position + Point::new(480, 180),
         radius: 70,
@@ -1090,15 +1400,18 @@ fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
     };
     let _ = g3.draw(fb);
 
-    // 4. Terminal mockup
-    use sidewind_sdk::ui::Terminal;
+    let term_lines: &[&str] = &[
+        "eclipse@os:~$ sysinfo --live",
+        "CPU: 45% | MEM: 72% | NET: 15%",
+        "> system status nominal",
+    ];
     let term = Terminal {
         position: main_panel.position + Point::new(30, 240),
         size: Size::new(p_w as u32 - 60, 130),
+        lines: term_lines,
     };
     let _ = term.draw(fb);
 
-    // 5. Texto informativo inferior
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
     let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 100), label_style).draw(fb);
 }
@@ -1108,67 +1421,178 @@ fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
 fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    let center = Point::new(w / 2, h / 2);
+    let center = Point::new((w as f32 / 2.0).round() as i32, (h as f32 / 2.0).round() as i32);
 
     // 1. Fondo negro profundo
     let _ = fb.clear(colors::BACKGROUND_DEEP);
 
-    // 2. Logo central masivo (ECLIPSE)
-    let _ = ui::draw_eclipse_logo(fb, center);
+    // 2. Logo central masivo (ECLIPSE) - 600x600 en circunferencia, negro transparente
+    let logo_r = ((w.min(h) / 2) - 100).min(300).max(150);
+    let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
 
-    // 3. Texto de estado bloqueado
-    let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
-    let _ = Text::new("SISTEMA BLOQUEADO", center + Point::new(-90, 220), label_style).draw(fb);
-    
-    // 4. Reloj
-    let time_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-    let _ = Text::new("20:42:15", center + Point::new(-45, -280), time_style).draw(fb);
+    let label_glow = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::new(40, 120, 180));
+    let label_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
+    let lbl_pos = center + Point::new(-90, 220);
+    let _ = Text::new("SISTEMA BLOQUEADO", lbl_pos + Point::new(1, 1), label_glow).draw(fb);
+    let _ = Text::new("SISTEMA BLOQUEADO", lbl_pos, label_style).draw(fb);
+
+    // 4. Reloj (simulado desde counter: 60 ticks ≈ 1 seg)
+    let total_secs = 74520 + (counter / 60) % 86400; // 20:42:00 + tiempo
+    let hrs = (total_secs / 3600) % 24;
+    let mins = (total_secs / 60) % 60;
+    let secs = total_secs % 60;
+    let mut time_str = heapless::String::<12>::new();
+    let _ = core::fmt::write(&mut time_str, format_args!("{:02}:{:02}:{:02}", hrs, mins, secs));
+    let time_glow = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::new(60, 180, 255));
+    let time_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let time_pos = center + Point::new(-45, -280);
+    let _ = Text::new(&time_str, time_pos + Point::new(1, 1), time_glow).draw(fb);
+    let _ = Text::new(&time_str, time_pos, time_style).draw(fb);
+    let date_str = "22 FEB 2026";
+    let date_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::GLOW_DIM);
+    let _ = Text::new(date_str, center + Point::new(-50, -248), date_style).draw(fb);
 
     // 5. Ticker inferior
     if (counter / 30) % 2 == 0 {
-        let _ = Text::new("> DESBLOQUEAR CON SUPER + L <", center + Point::new(-160, h / 2 - 50), label_style).draw(fb);
+        let tick_pos = center + Point::new(-160, h / 2 - 50);
+        let _ = Text::new("> DESBLOQUEAR CON SUPER + L <", tick_pos + Point::new(1, 1), label_glow).draw(fb);
+        let _ = Text::new("> DESBLOQUEAR CON SUPER + L <", tick_pos, label_style).draw(fb);
+    }
+    
+    // 6. Glitch effect (random technical lines)
+    if counter % 45 < 3 {
+        let line_color = Rgb888::new(40, 100, 255);
+        let gl_y = (counter % h as u64) as i32;
+        let _ = Line::new(Point::new(0, gl_y), Point::new(w, gl_y)).into_styled(PrimitiveStyleBuilder::new().stroke_color(line_color).stroke_width(1).build()).draw(fb);
+        let _ = Line::new(Point::new(0, gl_y + 2), Point::new(w, gl_y + 2)).into_styled(PrimitiveStyleBuilder::new().stroke_color(line_color).stroke_width(1).build()).draw(fb);
     }
 }
 
-/// Dibuja el Centro de Notificaciones (Fase 7)
-fn draw_notifications(fb: &mut FramebufferState, notifications: &[Option<sidewind_sdk::ui::Notification>]) {
+/// Dibuja el Centro de Notificaciones con animación de desplazamiento
+fn draw_notifications(fb: &mut FramebufferState, notifications: &[Option<sidewind_sdk::ui::Notification>], curr_x: f32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     
     let p_w = 300;
-    let mut active_notifs = alloc::vec::Vec::new();
+    let mut active_notifs = heapless::Vec::<sidewind_sdk::ui::Notification, 5>::new();
     for n in notifications {
         if let Some(val) = n {
-            active_notifs.push(*val);
+            let _ = active_notifs.push(*val);
         }
     }
 
     let panel = NotificationPanel {
-        position: Point::new(w - p_w, 80), 
+        position: Point::new(curr_x as i32, 80), 
         size: Size::new(p_w as u32, h as u32 - 160),
         notifications: &active_notifs,
     };
     let _ = panel.draw(fb);
 }
 
-/// Dibuja el App Launcher (Fase 8)
-fn draw_launcher(fb: &mut FramebufferState) {
+/// Dibuja el Global Search HUD (Fase 7)
+fn draw_search_hud(fb: &mut FramebufferState, query: &str, selected_idx: usize, counter: u64, curr_y: f32) {
+    let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    // Launcher panel bottom-left
-    let rect = Rectangle::new(Point::new(10, h - 350), Size::new(300, 300));
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(10, 15, 30)).stroke_color(colors::GLOW_MID).stroke_width(1).build();
-    let _ = rect.into_styled(bg_style).draw(fb);
+    
+    let panel_w = 600;
+    let panel_h = 70;
+    let px = (w - panel_w) / 2;
+    let py = (h / 4) + curr_y as i32;
 
-    let title_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
-    let item_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+    // Glassmorphism panel
+    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_PANEL).stroke_color(colors::GLOW_HI).stroke_width(2).build())
+        .draw(fb);
+    let _ = Rectangle::new(Point::new(px + 2, py + 2), Size::new((panel_w - 4) as u32, 2))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_HIGHLIGHT).build())
+        .draw(fb);
 
-    let _ = Text::new("SISTEMA CENTRAL", Point::new(25, h - 320), title_style).draw(fb);
-    let _ = Line::new(Point::new(10, h - 300), Point::new(310, h - 300)).into_styled(bg_style).draw(fb);
+    // Outer glow
+    let _ = Rectangle::new(Point::new(px - 3, py - 3), Size::new(panel_w as u32 + 6, panel_h as u32 + 6))
+        .into_styled(PrimitiveStyleBuilder::new().stroke_color(Rgb888::new(30, 100, 200)).stroke_width(2).build())
+        .draw(fb);
 
-    let items = ["1. Terminal Local", "2. Monitor de Recursos", "3. Gestor de Archivos", "4. Configuración", "5. Desconexión"];
-    for (i, item) in items.iter().enumerate() {
-        let _ = ui::draw_glowing_hexagon(fb, Point::new(40, h - 260 + (i as i32 * 40)), 15, colors::ACCENT_BLUE);
-        let _ = Text::new(item, Point::new(70, h - 253 + (i as i32 * 40)), item_style).draw(fb);
+    let _ = ui::draw_glowing_hexagon(fb, Point::new(px + 40, py + 35), 18, colors::ACCENT_CYAN);
+    
+    // Text input
+    let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let mut display_query = heapless::String::<64>::new();
+    let _ = display_query.push_str("> ");
+    let _ = display_query.push_str(query);
+    
+    // Cursor effect
+    if (counter / 30) % 2 == 0 {
+        let _ = display_query.push('_');
+    }
+    
+    let _ = Text::new(&display_query, Point::new(px + 80, py + 45), text_style).draw(fb);
+
+    // Results panel
+    if !query.is_empty() {
+        let results = ["EJECUTAR TERMINAL", "SISTEMA: WORKSPACE 1", "SISTEMA: WORKSPACE 2", "ANALISIS DIAGNOSTICO", "BLOQUEAR ESTACION"];
+        let max_results = results.len();
+        
+        for i in 0..max_results {
+            let ry = py + panel_h + 10 + (i as i32 * 45);
+            let is_selected = i == selected_idx % max_results;
+            let bg_color = if is_selected { colors::GLOW_MID } else { colors::GLASS_PANEL };
+            let text_color = if is_selected { colors::WHITE } else { colors::GLOW_MID };
+            
+            let _ = Rectangle::new(Point::new(px, ry), Size::new(panel_w as u32, 40))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).stroke_color(colors::GLOW_DIM).stroke_width(1).build())
+                .draw(fb);
+            
+            let _ = Text::new(results[i], Point::new(px + 20, ry + 26), MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, text_color)).draw(fb);
+            
+            if is_selected {
+                // Focus indicator
+                let _ = Rectangle::new(Point::new(px - 10, ry + 5), Size::new(4, 30))
+                    .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::ACCENT_CYAN).build())
+                    .draw(fb);
+            }
+        }
+    } else {
+        // Placeholder text
+        let hint_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::GLOW_DIM);
+        let _ = Text::new("ESCRIBA EL NOMBRE DE UNA APLICACION O COMANDO...", Point::new(px + 80, py + 42), hint_style).draw(fb);
+    }
+}
+
+/// Dibuja el App Launcher (Fase 8)
+/// Dibuja el App Launcher (estilo consistente con taskbar y dashboard)
+fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {
+    let _w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    let ly = curr_y as i32;
+    let rect = Rectangle::new(Point::new(10, ly), Size::new(340, 340));
+    let _ = ui::draw_glass_card(fb, rect, "EJECUTAR // SERVICIOS", colors::ACCENT_CYAN);
+
+    let bracket_style = PrimitiveStyleBuilder::new().stroke_color(colors::ACCENT_CYAN).stroke_width(1).build();
+    let tl = rect.top_left;
+    let br = rect.top_left + Point::new(rect.size.width as i32, rect.size.height as i32);
+    let _ = Line::new(tl, tl + Point::new(35, 0)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(tl, tl + Point::new(0, 35)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(br - Point::new(36, 1), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(br - Point::new(1, 36), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
+
+    let title_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
+    let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(31, ly + 39), title_glow).draw(fb);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(30, ly + 38), title_style).draw(fb);
+
+    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let items = [
+        ("Terminal", icons::SYSTEM),
+        ("Archivos", icons::FILES),
+        ("Red", icons::NETWORK),
+        ("Ajustes", icons::APPS),
+    ];
+
+    for (i, (name, icon)) in items.iter().enumerate() {
+        let py = ly + 75 + (i as i32 * 62);
+        let _ = ui::draw_glowing_hexagon(fb, Point::new(50, py + 20), 22, colors::ACCENT_CYAN);
+        let _ = ui::draw_standard_icon(fb, Point::new(50, py + 20), *icon);
+        let _ = Text::new(name, Point::new(85, py + 28), item_style).draw(fb);
     }
 }
 
@@ -1176,108 +1600,205 @@ fn draw_launcher(fb: &mut FramebufferState) {
 fn draw_quick_settings(fb: &mut FramebufferState) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    // Quick settings bottom-right
     let rect = Rectangle::new(Point::new(w - 260, h - 210), Size::new(250, 160));
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(15, 20, 35)).stroke_color(colors::GLOW_MID).stroke_width(1).build();
-    let _ = rect.into_styled(bg_style).draw(fb);
+    let _ = ui::draw_glass_card(fb, rect, "QUICK SETTINGS", colors::GLOW_HI);
 
-    let text_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-    let _ = Text::new("RED: [ESTABLE]", Point::new(w - 240, h - 170), text_style).draw(fb);
-    let _ = Text::new("VOL: [|||||   ] 60%", Point::new(w - 240, h - 130), text_style).draw(fb);
-    let _ = Text::new("ENRG:[OPTIMO ] 92%", Point::new(w - 240, h - 90), text_style).draw(fb);
+    let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let _ = Text::new("RED:  [ESTABLE]", Point::new(w - 240, h - 170), text_style).draw(fb);
+    
+    let bar_size = Size::new(200, 15);
+    let _ = Text::new("VOL", Point::new(w - 240, h - 135), text_style).draw(fb);
+    let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 130), bar_size, 0.6, colors::ACCENT_CYAN);
+    
+    let _ = Text::new("ENRG", Point::new(w - 240, h - 95), text_style).draw(fb);
+    let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 90), bar_size, 0.92, colors::GLOW_HI);
+}
+
+/// Dibuja el Alt-Tab HUD (Fase 9)
+fn draw_alt_tab_hud(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
+    let w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    
+    let panel_w = 600;
+    let panel_h = 50;
+    let px = w / 2 - panel_w / 2;
+    let py = h / 2 - 250;
+    
+    let rect = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32));
+    let _ = ui::draw_glass_card(fb, rect, "SEARCH // EXECUTE", colors::ACCENT_CYAN);
+    let _ = ui::draw_glowing_hexagon(fb, Point::new(px + 40, py + 25), 18, colors::ACCENT_CYAN);
+    let title_glow = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::new(40, 120, 180));
+    let title_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
+    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let focus_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
+    let title_pos = Point::new(w / 2 - 130, py + 35);
+    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos + Point::new(1, 1), title_glow).draw(fb);
+    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos, title_style).draw(fb);
+    
+    for i in 0..window_count {
+        let iy = h / 2 - panel_h / 2 + 70 + (i as i32 * 30);
+        let style = if Some(i) == focused { focus_style } else { item_style };
+        let prefix = if Some(i) == focused { "> " } else { "  " };
+        let _ = Text::new(prefix, Point::new(w / 2 - 180, iy), style).draw(fb);
+        let _ = Text::new("Shell Window", Point::new(w / 2 - 150, iy), style).draw(fb);
+    }
+    let hint_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::GLOW_DIM);
+    let _ = Text::new("ALT+TAB: navegar | SOLTAR: seleccionar", Point::new(w / 2 - 145, py + panel_h - 25), hint_style).draw(fb);
 }
 
 /// Dibuja el Desktop Context Menu (Fase 8)
 fn draw_context_menu(fb: &mut FramebufferState, pos: Point) {
     let rect = Rectangle::new(pos, Size::new(200, 150));
-    let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(5, 5, 10)).stroke_color(colors::GLOW_DIM).stroke_width(1).build();
+    let bg_style = PrimitiveStyleBuilder::new()
+        .fill_color(colors::GLASS_PANEL)
+        .stroke_color(colors::GLASS_BORDER)
+        .stroke_width(1)
+        .build();
     let _ = rect.into_styled(bg_style).draw(fb);
+    let _ = Rectangle::new(pos + Point::new(2, 2), Size::new(196, 2))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_HIGHLIGHT).build())
+        .draw(fb);
 
-    let text_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+    let menu_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
+    let menu_title = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
+    let _ = Text::new("MENU", pos + Point::new(16, 19), menu_glow).draw(fb);
+    let _ = Text::new("MENU", pos + Point::new(15, 18), menu_title).draw(fb);
+    let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
     let items = ["Nueva Ventana", "Configurar Fondo", "Cambiar Tema", "Propiedades"];
     for (i, item) in items.iter().enumerate() {
-        let _ = Text::new(item, pos + Point::new(15, 30 + (i as i32 * 35)), text_style).draw(fb);
+        let _ = Text::new(item, pos + Point::new(15, 38 + (i as i32 * 35)), text_style).draw(fb);
     }
 }
 
-fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface]) {
-    for (i, w) in windows.iter().take(window_count).enumerate() {
+/// Which window button is under (cursor_x, cursor_y) given window screen rect (wx, wy, ww)
+fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww: i32) -> Option<WindowButton> {
+    let btn_y = wy + (ShellWindow::TITLE_H - ui::BUTTON_ICON_SIZE as i32) / 2;
+    let btn_margin = 5;
+    let btn_size = ui::BUTTON_ICON_SIZE as i32;
+    if cursor_y < btn_y || cursor_y >= btn_y + btn_size { return None; }
+    if cursor_x < wx || cursor_x >= wx + ww { return None; }
+    let close_x = wx + ww - btn_size - btn_margin;
+    if cursor_x >= close_x && cursor_x < close_x + btn_size { return Some(WindowButton::Close); }
+    let max_x = close_x - btn_size - btn_margin;
+    if cursor_x >= max_x && cursor_x < max_x + btn_size { return Some(WindowButton::Maximize); }
+    let min_x = max_x - btn_size - btn_margin;
+    if cursor_x >= min_x && cursor_x < min_x + btn_size { return Some(WindowButton::Minimize); }
+    None
+}
+
+fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32) {
+    let fb_w = fb.info.width as i32;
+    let mut hovered_win_idx: Option<usize> = None;
+    let mut hovered_button: Option<WindowButton> = None;
+    for (i, w) in windows.iter().take(window_count).enumerate().rev() {
         if w.content == WindowContent::None { continue; }
-        // Si está minimizado Y ya se encogió mucho (animación terminada), dejar de dibujar aquí
-        // para que solo se vea el icono del escritorio
-        if w.minimized && w.curr_w < 50.0 { continue; }
-        
-        let is_focused = focused_window == Some(i);
-        
-        // 1. Draw Frame
-        draw_window_decoration(fb, w, is_focused);
-        
-        // 2. Draw Content (Solo si no es demasiado pequeña)
-        if w.curr_w > 100.0 {
-            match w.content {
-                WindowContent::InternalDemo => {
-                    let text_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
-                    let _ = Text::new("Internal Window", Point::new(w.curr_x as i32 + 10, w.curr_y as i32 + ShellWindow::TITLE_H + 30), text_style)
-                        .draw(fb);
-                }
-                WindowContent::External(idx) => {
-                    if (idx as usize) < surfaces.len() && surfaces[idx as usize].active {
-                        draw_surface_content(fb, w, &surfaces[idx as usize]);
-                    }
-                }
-                WindowContent::None => {}
-            }
+        let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
+        let wy = w.curr_y as i32;
+        let ww = w.curr_w as i32;
+        let wh = w.curr_h as i32;
+        if effective_x + ww <= 0 || effective_x >= fb_w { continue; }
+        if w.minimized && ww < 50 { continue; }
+        if cursor_x >= effective_x && cursor_x < effective_x + ww && cursor_y >= wy && cursor_y < wy + wh {
+            hovered_button = window_button_hover_at(cursor_x, cursor_y, effective_x, wy, ww);
+            hovered_win_idx = Some(i);
+            break;
         }
     }
+    for (i, w) in windows.iter().take(window_count).enumerate() {
+        if w.content == WindowContent::None { continue; }
+        let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
+        if effective_x + w.curr_w as i32 <= 0 || effective_x >= fb_w { continue; }
+        if w.minimized && w.curr_w < 50.0 { continue; }
+        let focused = Some(i) == focused_window;
+        let btn_hover = if hovered_win_idx == Some(i) { hovered_button } else { None };
+        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover);
+    }
 }
 
-fn draw_window_decoration(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool) {
-    let wx = w.curr_x as i32;
+fn draw_surface_content_at(fb: &mut FramebufferState, w: &ShellWindow, s: &ExternalSurface, x: i32) {
+    if s.vaddr == 0 || s.buffer_size == 0 { return; }
+    let wx = x;
+    let wy = w.curr_y as i32;
+    let ww = (w.curr_w as i32).max(0);
+    let wh = (w.curr_h as i32).max(0);
+    let content_w = (ww - 10).max(0) as u32;
+    let content_h = (wh - ShellWindow::TITLE_H - 10).max(0) as u32;
+    if content_w == 0 || content_h == 0 { return; }
+    
+    // Safety check: ensure the surface buffer is large enough for the window dimensions
+    let needed = (content_w as usize).saturating_mul(content_h as usize).saturating_mul(4);
+    if needed > s.buffer_size {
+        // Just draw what we can or skip
+        return;
+    }
+
+    fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
+}
+
+fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>) -> Result<(), ()> {
+    draw_window_decoration_at(fb, w, is_focused, x, button_hover);
+    if w.curr_w > 100.0 {
+        match w.content {
+            WindowContent::InternalDemo => {
+                let wx = x;
+                let wy = w.curr_y as i32;
+                let ww = w.curr_w as i32;
+                let wh = w.curr_h as i32;
+                let content_top = wy + ShellWindow::TITLE_H;
+                let content_h = (wh - ShellWindow::TITLE_H).max(0);
+                let pad = 8;
+                let cx = wx + pad;
+                let cy = content_top + pad;
+                let cw = (ww - pad * 2).max(0) as u32;
+                let ch = (content_h - pad * 2).max(0) as u32;
+                let _ = Rectangle::new(Point::new(cx, cy), Size::new(cw, ch))
+                    .into_styled(PrimitiveStyleBuilder::new().stroke_color(colors::GLOW_MID).stroke_width(1).build()).draw(fb);
+                
+                let prompt = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
+                let text = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::WARM_WHITE);
+                let _ = Text::new("> eclipse --version", Point::new(cx + 10, cy + 22), prompt).draw(fb);
+                let _ = Text::new("Eclipse OS 0.1.0 // kernel 6.x", Point::new(cx + 10, cy + 42), text).draw(fb);
+                let _ = Text::new("> status --active", Point::new(cx + 10, cy + 62), prompt).draw(fb);
+                let _ = Text::new("TOTAL SERVICES: 42 // UPTIME: 1h 24m", Point::new(cx + 10, cy + 82), text).draw(fb);
+                let _ = Text::new("> _", Point::new(cx + 10, cy + 102), prompt).draw(fb);
+            }
+            WindowContent::External(idx) => {
+                if (idx as usize) < surfaces.len() && surfaces[idx as usize].active {
+                    draw_surface_content_at(fb, w, &surfaces[idx as usize], x);
+                }
+            }
+            WindowContent::None => {}
+        }
+    }
+    Ok(())
+}
+
+fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, x: i32, button_hover: Option<WindowButton>) {
+    let wx = x;
     let wy = w.curr_y as i32;
     let ww = w.curr_w as i32;
     let wh = w.curr_h as i32;
+    let rect = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, wh as u32));
+
+    let accent = if is_focused { colors::ACCENT_CYAN } else { colors::GLOW_DIM };
+
+    let _ = ui::draw_window_shadow(fb, rect);
     
-    // Window Border/Glow
-    let accent = if is_focused { colors::ACCENT_BLUE } else { Rgb888::new(40, 60, 100) };
-    let border_style = PrimitiveStyleBuilder::new()
-        .stroke_color(accent)
-        .stroke_width(2)
-        .fill_color(colors::PANEL_BG)
-        .build();
-    
-    let _ = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, wh as u32))
-        .into_styled(border_style)
-        .draw(fb);
+    // Draw the main glass window body
+    let _ = ui::draw_glass_card(fb, rect, "ECLIPSE // TERMINAL", accent);
 
-    // Title Bar
-    let title_bg = colors::TITLE_BAR_BG;
-    let title_style = PrimitiveStyleBuilder::new().fill_color(title_bg).build();
-    let _ = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, ShellWindow::TITLE_H as u32))
-        .into_styled(title_style)
-        .draw(fb);
-
-    // Title text (Solo si hay espacio)
-    if ww > 100 {
-        let text_style = MonoTextStyle::new(&FONT_6X10, colors::WHITE);
-        let _ = Text::new("ECLIPSE // TERMINAL", Point::new(wx + 10, wy + 20), text_style).draw(fb);
-    }
-
-    // Window Buttons (Right aligned in title bar - solo si hay espacio)
+    // Window Buttons (Right aligned in title bar) with hover feedback
     if ww > 80 {
         let btn_y = wy + (ShellWindow::TITLE_H - ui::BUTTON_ICON_SIZE as i32) / 2;
         let btn_margin = 5;
         
-        // Close button
         let close_x = wx + ww - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
-        let _ = ui::draw_button_icon(fb, Point::new(close_x, btn_y), icons::BTN_CLOSE);
-        
-        // Maximize button
         let max_x = close_x - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
-        let _ = ui::draw_button_icon(fb, Point::new(max_x, btn_y), icons::BTN_MAX);
-        
-        // Minimize button
         let min_x = max_x - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
-        let _ = ui::draw_button_icon(fb, Point::new(min_x, btn_y), icons::BTN_MIN);
+
+        let _ = ui::draw_button_icon_with_hover(fb, Point::new(close_x, btn_y), icons::BTN_CLOSE, button_hover == Some(WindowButton::Close), colors::ACCENT_RED);
+        let _ = ui::draw_button_icon_with_hover(fb, Point::new(max_x, btn_y), icons::BTN_MAX, button_hover == Some(WindowButton::Maximize), accent);
+        let _ = ui::draw_button_icon_with_hover(fb, Point::new(min_x, btn_y), icons::BTN_MIN, button_hover == Some(WindowButton::Minimize), accent);
     }
 
     // Resize Handle (bottom-right)
@@ -1289,6 +1810,17 @@ fn draw_window_decoration(fb: &mut FramebufferState, w: &ShellWindow, is_focused
         Point::new(wx + ww - ShellWindow::RESIZE_HANDLE_SIZE, wy + wh - ShellWindow::RESIZE_HANDLE_SIZE),
         Size::new(ShellWindow::RESIZE_HANDLE_SIZE as u32, ShellWindow::RESIZE_HANDLE_SIZE as u32)
     ).into_styled(handle_style).draw(fb);
+
+    if is_focused {
+        let corner_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_HIGHLIGHT).stroke_width(2).build();
+        let c_len = 15;
+        // Top-left
+        let _ = Line::new(Point::new(wx, wy), Point::new(wx + c_len, wy)).into_styled(corner_style).draw(fb);
+        let _ = Line::new(Point::new(wx, wy), Point::new(wx, wy + c_len)).into_styled(corner_style).draw(fb);
+        // Top-right
+        let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww - c_len, wy)).into_styled(corner_style).draw(fb);
+        let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww, wy + c_len)).into_styled(corner_style).draw(fb);
+    }
 }
 
 fn draw_surface_content(fb: &mut FramebufferState, w: &ShellWindow, s: &ExternalSurface) {
@@ -1335,103 +1867,76 @@ fn draw_surface_content(fb: &mut FramebufferState, w: &ShellWindow, s: &External
 }
 
 
-/// Dibuja el fondo futurista de Eclipse OS y las apps minimizadas
-fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, counter: u64) {
-    // 1. Fondo cósmico: gradiente + nebulosas
-    let _ = ui::draw_cosmic_background(fb);
-
-    // 2. Campo de estrellas (cosmic enhanced)
-    let mut star_seed = 0xACE1u32;
-    let _ = ui::draw_starfield_cosmic(fb, &mut star_seed);
-
+/// Dibuja el fondo futurista de Eclipse OS (estilo código referencia)
+fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    let center = Point::new(w / 2, h / 2);
 
-    // 3. Grid sutil (cosmic)
-    let _ = ui::draw_grid(fb, Rgb888::new(18, 28, 55), 48);
+    // 1. Fondo cósmico + estrellas
+    let _ = ui::draw_cosmic_background(fb);
+    let mut star_seed = 0xACE1u32;
+    let _ = ui::draw_starfield_cosmic(fb, &mut star_seed, Point::zero());
 
-    // 3. LOGO CENTRAL "ECLIPSE OS" (SDK)
-    let _ = ui::draw_eclipse_logo(fb, center);
+    let center = Point::new((w as f32 / 2.0).round() as i32, (h as f32 / 2.0).round() as i32);
 
-    // 4. ICONOS HEXAGONALES (Sistema, Apps, Archivos, Red)
-    let hex_color = Rgb888::new(100, 200, 255);
+    // 2. Grid (referencia: 18, 28, 55, spacing 48)
+    let _ = ui::draw_grid(fb, Rgb888::new(18, 28, 55), 48, Point::zero());
+
+    // 3. Logo central ECLIPSE OS - 600x600 en circunferencia, negro transparente
+    // Radio limitado para no solaparse con HUD (y~65) ni con hexágonos (~380px del centro)
+    let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
+    let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
+
+    // 4. Iconos hexagonales - diagonal (hex_content 42 evita sobrecarga por píxeles)
+    let icon_color = Rgb888::new(100, 200, 255);
     let hex_size = 50;
-    
-    // System
+    let hex_content = 42;
     let p_sys = center + Point::new(-380, -120);
-    let _ = ui::draw_glowing_hexagon(fb, p_sys, hex_size, hex_color);
-    let _ = ui::draw_standard_icon(fb, p_sys, icons::SYSTEM);
-    
-    // Apps
     let p_apps = center + Point::new(-380, 120);
-    let _ = ui::draw_glowing_hexagon(fb, p_apps, hex_size, hex_color);
-    let _ = ui::draw_standard_icon(fb, p_apps, icons::APPS);
-    
-    // Files
     let p_files = center + Point::new(380, -120);
-    let _ = ui::draw_glowing_hexagon(fb, p_files, hex_size, hex_color);
-    let _ = ui::draw_standard_icon(fb, p_files, icons::FILES);
-    
-    // Network
     let p_net = center + Point::new(380, 120);
-    let _ = ui::draw_glowing_hexagon(fb, p_net, hex_size, hex_color);
+
+    let _ = ui::draw_glowing_hexagon(fb, p_sys, hex_size, icon_color);
+    let _ = ui::draw_standard_icon(fb, p_sys, icons::SYSTEM);
+    let _ = ui::draw_glowing_hexagon(fb, p_apps, hex_size, icon_color);
+    let _ = ui::draw_standard_icon(fb, p_apps, icons::APPS);
+    let _ = ui::draw_glowing_hexagon(fb, p_files, hex_size, icon_color);
+    let _ = ui::draw_standard_icon(fb, p_files, icons::FILES);
+    let _ = ui::draw_glowing_hexagon(fb, p_net, hex_size, icon_color);
     let _ = ui::draw_standard_icon(fb, p_net, icons::NETWORK);
-    
-    // Etiquetas (Calidad HUD - Nombres en Español + Tamaño Mayor)
+
     let label_style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(180, 220, 255));
     let _ = Text::new("SISTEMA", p_sys + Point::new(-35, 85), label_style).draw(fb);
     let _ = Text::new("APLICACIONES", p_apps + Point::new(-60, 85), label_style).draw(fb);
     let _ = Text::new("ARCHIVOS", p_files + Point::new(-40, 85), label_style).draw(fb);
     let _ = Text::new("RED", p_net + Point::new(-15, 85), label_style).draw(fb);
 
-    // 5. HUD SUPERIOR (glass panels)
+    // 5. HUD superior (referencia: APLICACIONES ACTIVAS / SISTEMA ONLINE)
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
     let hud_bg = colors::GLASS_PANEL;
-    
-    // Panel Izquierdo
+
     let _ = Rectangle::new(Point::new(15, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
-    // Brackets
     let _ = Line::new(Point::new(15, 15), Point::new(35, 15)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(15, 15), Point::new(15, 35)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(255, 65), Point::new(235, 65)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(255, 65), Point::new(255, 45)).into_styled(hud_line_style).draw(fb);
     let _ = Text::new("APLICACIONES ACTIVAS", Point::new(30, 45), label_style).draw(fb);
 
-    // Panel Derecho
     let rx = w - 255;
     let _ = Rectangle::new(Point::new(rx, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(rx, 65), Point::new(rx + 20, 65)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(rx, 65), Point::new(rx, 45)).into_styled(hud_line_style).draw(fb);
-    // Dynamic status text (Phase 5)
-    let _seconds = counter / 30; // Approx 30 FPS
-    let _h_ = (_seconds / 3600) % 24;
-    let _m_ = (_seconds / 60) % 60;
-    let _s_ = _seconds % 60;
-    let mut _time_buf = [0u8; 32];
-    let _time_str = {
-        let mut _idx = 0;
-        let _labels = ["TIEMPO: ", "0", "0", ":", "0", "0", ":", "0", "0"];
-        let _vals = [_h_ / 10, _h_ % 10, _m_ / 10, _m_ % 10, _s_ / 10, _s_ % 10];
-        // Hardcoded simple formatter for no_std
-        unsafe { core::slice::from_raw_parts(b"TIEMPO: 00:42:15".as_ptr(), 16) }
-    };
     let dot = if (counter / 15) % 2 == 0 { "*" } else { " " };
-    let mut _hud_text = [0u8; 24];
-    let hud_str = "SISTEMA ONLINE ";
-    let _ = Text::new(hud_str, Point::new(rx + 20, 45), label_style).draw(fb);
+    let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 45), label_style).draw(fb);
     let _ = Text::new(dot, Point::new(rx + 200, 45), label_style).draw(fb);
 
-    // 6. TASKBAR (SDK Widget) - cosmic dock
-    let taskbar = Taskbar {
-        width: fb.info.width as u32,
-        y: h - 44,
-        active_app: None,
-    };
+    // 6. TASKBAR (SDK)
+    let taskbar_y = h - 44;
+    let taskbar = Taskbar { width: fb.info.width as u32, y: taskbar_y, active_app: None };
     let _ = taskbar.draw(fb);
-    
+
     let help_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
     let _ = Text::new("SUPER: Dash | SUPER+L: Lock | SUPER+V: Notifs", Point::new(w - 450, h - 15), help_style).draw(fb);
 
@@ -1439,19 +1944,14 @@ fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window_cou
     let mut min_count = 0;
     for i in 0..window_count {
         if windows[i].content != WindowContent::None && windows[i].minimized {
-            // Dibujar icono pequeño en el escritorio
             let p = Point::new(100 + (min_count % 3) * 120, 250 + (min_count / 3) * 150);
             let _ = ui::draw_glowing_hexagon(fb, p, 35, colors::ACCENT_BLUE);
-            
-            // Icono genérico o según contenido
             match windows[i].content {
-                WindowContent::External(_) => { let _ = ui::draw_standard_icon(fb, p, icons::APPS); },
-                _ => { let _ = ui::draw_standard_icon(fb, p, icons::SYSTEM); },
+                WindowContent::External(_) => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::APPS); },
+                _ => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::SYSTEM); },
             }
-            
             let label = if let WindowContent::External(_) = windows[i].content { "APP" } else { "DEMO" };
             let _ = Text::new(label, p + Point::new(-15, 60), label_style).draw(fb);
-            
             min_count += 1;
         }
     }
@@ -1512,26 +2012,60 @@ fn subscribe_to_input_service(input_pid: u32, self_pid: u32) {
     }
 }
 
-fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut [ExternalSurface], windows: &mut [ShellWindow], window_count: &mut usize) {
+/// Max allowed surface dimensions to prevent integer overflow and excessive memory
+const MAX_SURFACE_DIM: u32 = 8192;
+/// Max buffer size (width * height * 4) to avoid DoS
+const MAX_SURFACE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+
+fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut [ExternalSurface], windows: &mut [ShellWindow], window_count: &mut usize, input_state: &mut InputState) {
+    let current_workspace = input_state.current_workspace;
     match msg.op {
         SWND_OP_CREATE => { // Create
-            // Construct path "/tmp/" + name
+            // Validate dimensions to prevent integer overflow and DoS
+            if msg.w == 0 || msg.h == 0 || msg.w > MAX_SURFACE_DIM || msg.h > MAX_SURFACE_DIM {
+                println!("[SMITHAY] SideWind: Invalid dimensions {}x{}", msg.w, msg.h);
+                return;
+            }
+            let buffer_size = (msg.w as u64).checked_mul(msg.h as u64)
+                .and_then(|p| p.checked_mul(4))
+                .filter(|&b| b <= MAX_SURFACE_BYTES);
+            let buffer_size = match buffer_size {
+                Some(s) => s,
+                None => {
+                    println!("[SMITHAY] SideWind: Buffer size overflow or too large");
+                    return;
+                }
+            };
+            // Path traversal: reject "..", "/", and other path separators in name
             let mut path = [0u8; 64];
             path[0..5].copy_from_slice(b"/tmp/");
             let mut name_len = 0;
             while name_len < 32 && msg.name[name_len] != 0 {
-                path[5 + name_len] = msg.name[name_len];
+                let c = msg.name[name_len];
+                if c == b'.' && name_len + 1 < 32 && msg.name[name_len + 1] == b'.' {
+                    println!("[SMITHAY] SideWind: Path traversal attempt rejected");
+                    return;
+                }
+                if c == b'/' || c == b'\\' {
+                    println!("[SMITHAY] SideWind: Invalid character in buffer name");
+                    return;
+                }
+                path[5 + name_len] = c;
                 name_len += 1;
             }
-            let path_str = unsafe { core::str::from_utf8_unchecked(&path[..5+name_len]) };
+            let path_str = match core::str::from_utf8(&path[..5+name_len]) {
+                Ok(s) => s,
+                Err(_) => {
+                    println!("[SMITHAY] SideWind: Invalid UTF-8 in buffer path, ignoring");
+                    return;
+                }
+            };
             
             let fd = open(path_str, O_RDWR, 0);
             if fd < 0 {
                 println!("[SMITHAY] SideWind: Failed to open buffer {}", path_str);
                 return;
             }
-            
-            let buffer_size = (msg.w * msg.h * 4) as u64;
             let vaddr = mmap(0, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             close(fd);
             
@@ -1567,9 +2101,18 @@ fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut
                         curr_h: (msg.h as i32 + ShellWindow::TITLE_H) as f32,
                         minimized: false,
                         maximized: false,
+                        closing: false,
                         stored_rect: (msg.x, msg.y, msg.w as i32, msg.h as i32 + ShellWindow::TITLE_H),
+                        workspace: current_workspace,
                         content: WindowContent::External(s_idx as u32),
                     };
+                    
+                    // Zoom-in: start from center
+                    windows[*window_count].curr_x = (msg.x + msg.w as i32 / 2) as f32;
+                    windows[*window_count].curr_y = (msg.y + (msg.h as i32 + ShellWindow::TITLE_H) / 2) as f32;
+                    windows[*window_count].curr_w = 0.0;
+                    windows[*window_count].curr_h = 0.0;
+
                     *window_count += 1;
                     println!("[SMITHAY] SideWind: Surface created for PID {} ({}x{})", sender_pid, msg.w, msg.h);
                 }
@@ -1586,17 +2129,26 @@ fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut
                      for i in w_idx..(*window_count - 1) {
                          windows[i] = windows[i+1];
                      }
-                     *window_count -= 1;
-                 }
-                 println!("[SMITHAY] SideWind: Surface destroyed for PID {}", sender_pid);
-             }
-        }
-        SWND_OP_UPDATE | SWND_OP_COMMIT => { // Update Position or Commit (signal redraw)
-             if let Some(w_idx) = windows.iter().position(|w| matches!(w.content, WindowContent::External(idx) if surfaces[idx as usize].pid == sender_pid)) {
-                 if msg.op == SWND_OP_UPDATE {
-                    windows[w_idx].x = msg.x;
-                    windows[w_idx].y = msg.y;
-                 }
+                     *window_count -= 1; // This line was missing in the provided snippet, but is crucial.
+                      // Synchronize focused/dragging/resizing indices
+                      if input_state.focused_window == Some(w_idx) { input_state.focused_window = None; }
+                      else if let Some(f) = input_state.focused_window { if f > w_idx { input_state.focused_window = Some(f - 1); } }
+
+                      if input_state.dragging_window == Some(w_idx) { input_state.dragging_window = None; }
+                      else if let Some(d) = input_state.dragging_window { if d > w_idx { input_state.dragging_window = Some(d - 1); } }
+
+                      if input_state.resizing_window == Some(w_idx) { input_state.resizing_window = None; }
+                      else if let Some(r) = input_state.resizing_window { if r > w_idx { input_state.resizing_window = Some(r - 1); } }
+                  }
+                  println!("[SMITHAY] SideWind: Surface destroyed for PID {}", sender_pid);
+              }
+         }
+         SWND_OP_UPDATE | SWND_OP_COMMIT => { // Update Position or Commit (signal redraw)
+              if let Some(w_idx) = windows.iter().position(|w| matches!(w.content, WindowContent::External(idx) if idx < surfaces.len() as u32 && surfaces[idx as usize].pid == sender_pid)) {
+                  if msg.op == SWND_OP_UPDATE {
+                     windows[w_idx].x = msg.x;
+                     windows[w_idx].y = msg.y;
+                  }
                  // COMMIT could be used for damage tracking later, for now we redraw every frame anyway
              }
         }
@@ -1634,8 +2186,8 @@ pub extern "C" fn _start() -> ! {
         fb.info.width as i32,
         fb.info.height as i32,
     );
-    // Clear screen
-    fb.clear(Rgb888::new(26, 26, 26)).unwrap();
+    // Clear screen (ignore draw errors to avoid blocking the compositor)
+    let _ = fb.clear(Rgb888::new(26, 26, 26));
 
     // Draw Header
     let rect_style = PrimitiveStyleBuilder::new()
@@ -1644,12 +2196,12 @@ pub extern "C" fn _start() -> ! {
         .stroke_width(2)
         .build();
 
-    Rectangle::new(Point::new(50, 50), Size::new(700, 100))
+    let _ = Rectangle::new(Point::new(50, 50), Size::new(700, 100))
         .into_styled(rect_style)
-        .draw(&mut fb).unwrap();
-    let text_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
-    Text::new("Eclipse OS - Rust Display Server", Point::new(80, 110), text_style)
-        .draw(&mut fb).unwrap();
+        .draw(&mut fb);
+    let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::WHITE);
+    let _ = Text::new("Eclipse OS - Rust Display Server", Point::new(80, 110), text_style)
+        .draw(&mut fb);
 
     // Discover input_service PID and subscribe to its events
     if let Some(input_pid) = query_input_service_pid() {
@@ -1677,23 +2229,28 @@ pub extern "C" fn _start() -> ! {
     // Ventanas (Z-order stack, máx 16)
     const MAX_WINDOWS_COUNT: usize = 16;
     let mut windows: [ShellWindow; MAX_WINDOWS_COUNT] = [const { ShellWindow {
-        x:0, y:0, w:0, h:0, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, stored_rect: (0,0,0,0), content: WindowContent::None
+        x:0, y:0, w:0, h:0, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::None
     } }; MAX_WINDOWS_COUNT];
 
     // Demo inicial
     windows[0] = ShellWindow {
         x: 100, y: 100, w: 400, h: 300,
-        curr_x: 100.0, curr_y: 100.0, curr_w: 400.0, curr_h: 300.0,
+        curr_x: (100 + 400/2) as f32, 
+        curr_y: (100 + 300/2) as f32, 
+        curr_w: 0.0, 
+        curr_h: 0.0,
         minimized: false,
         maximized: false,
+        closing: false,
         stored_rect: (100, 100, 400, 300),
+        workspace: 0,
         content: WindowContent::InternalDemo,
     };
     let mut window_count: usize = 1;
 
-    // Cursor: con VirtIO GPU el hw cursor no se dibuja correctamente en QEMU,
-    // usar siempre cursor software (draw_cursor) que sí funciona.
-    let use_hw_cursor = false;
+    // Cursor: VirtIO GPU hw cursor (set true to try; may glitch in QEMU)
+    const USE_HW_CURSOR: bool = false;
+    let use_hw_cursor = USE_HW_CURSOR;
 
     // Dibujar cursor desde el primer frame (antes del loop)
     if use_hw_cursor {
@@ -1709,7 +2266,7 @@ pub extern "C" fn _start() -> ! {
     // Solo actualizar cursor VirtIO cuando cambie (evita saturar la cola y congelar el ratón)
     let mut last_hw_cursor_x: i32 = input_state.cursor_x;
     let mut last_hw_cursor_y: i32 = input_state.cursor_y;
-    let mut wayland_clients: alloc::vec::Vec<WaylandClient> = alloc::vec::Vec::new();
+    let mut wayland_clients: heapless::Vec<WaylandClient, MAX_WAYLAND_CLIENTS> = heapless::Vec::new();
     let mut xwm = sidewind_xwayland::XwmState::new();
 
     loop {
@@ -1734,18 +2291,25 @@ pub extern "C" fn _start() -> ! {
                     );
                 }
                 CompositorEvent::SideWind(sw, sender_pid) => {
-                    handle_sidewind_message(sw, sender_pid, &mut surfaces, &mut windows, &mut window_count);
+                    handle_sidewind_message(sw, sender_pid, &mut surfaces, &mut windows, &mut window_count, &mut input_state);
                 }
                 CompositorEvent::Wayland(data, sender_pid) => {
-                    // Find or create client
-                    let client_idx = wayland_clients.iter().position(|c| c.pid == sender_pid)
-                        .unwrap_or_else(|| {
-                            wayland_clients.push(WaylandClient {
+                    // Find or create client (capped to avoid heap exhaustion)
+                    let client_idx = wayland_clients.iter().position(|c| c.pid == sender_pid);
+                    let client_idx = match client_idx {
+                        Some(i) => i,
+                        None => {
+                            if wayland_clients.len() >= MAX_WAYLAND_CLIENTS {
+                                // Reject new clients when full
+                                continue;
+                            }
+                            let _ = wayland_clients.push(WaylandClient {
                                 pid: sender_pid,
                                 conn: sidewind_wayland::WaylandConnection::new(),
                             });
                             wayland_clients.len() - 1
-                        });
+                        }
+                    };
                     
                     let client = &mut wayland_clients[client_idx];
                     let _ = client.conn.process_message(&data);
@@ -1753,9 +2317,8 @@ pub extern "C" fn _start() -> ! {
                     // Flush all pending events to client
                     // In a real system, we might need a way to ensure the client is ready
                     // But here we use IPC send which is usually reliable for small chunks.
-                    while !client.conn.pending_events.is_empty() {
-                        let event_data = client.conn.pending_events.remove(0);
-                        let _ = send(sender_pid, sidewind_core::MSG_TYPE_WAYLAND, &event_data);
+                    while let Some(event_data) = client.conn.pending_events.pop_front() {
+                        let _ = send(sender_pid, MSG_TYPE_GRAPHICS, &event_data);
                     }
                 }
                 CompositorEvent::X11(data, _sender_pid) => {
@@ -1776,22 +2339,8 @@ pub extern "C" fn _start() -> ! {
                 .filter(|i| *i < window_count)
                 .unwrap_or(window_count - 1);
             
-            if let WindowContent::External(s_idx) = windows[to_close].content {
-                if (s_idx as usize) < surfaces.len() {
-                    munmap(surfaces[s_idx as usize].vaddr as u64, surfaces[s_idx as usize].buffer_size as u64);
-                    surfaces[s_idx as usize].active = false;
-                }
-            }
-
-            for i in to_close..(window_count - 1) {
-                windows[i] = windows[i+1];
-            }
-            windows[window_count - 1] = ShellWindow { 
-                x:0, y:0, w:0, h:0, 
-                curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
-                minimized: false, maximized: false, stored_rect: (0,0,0,0), content: WindowContent::None 
-            };
-            window_count -= 1;
+            // Mark for closing animation instead of immediate removal
+            windows[to_close].closing = true;
             
             input_state.dragging_window = None;
             input_state.focused_window = None;
@@ -1889,13 +2438,15 @@ pub extern "C" fn _start() -> ! {
                 y: 160 + (window_count as i32) * 15,
                 w: 240,
                 h: 180,
-                curr_x: (60 + (window_count as i32) * 20) as f32,
-                curr_y: (160 + (window_count as i32) * 15) as f32,
-                curr_w: 240.0,
-                curr_h: 180.0,
+                curr_x: (60 + (window_count as i32) * 20 + 120) as f32,
+                curr_y: (160 + (window_count as i32) * 15 + 90) as f32,
+                curr_w: 0.0,
+                curr_h: 0.0,
                 minimized: false,
                 maximized: false,
+                closing: false,
                 stored_rect: (60 + (window_count as i32) * 20, 160 + (window_count as i32) * 15, 240, 180),
+                workspace: input_state.current_workspace,
                 content: WindowContent::InternalDemo,
             };
             window_count += 1;
@@ -1913,23 +2464,52 @@ pub extern "C" fn _start() -> ! {
 
         // --- Animación de Ventanas (Fase 5) ---
         let mut min_count_anim = 0;
-        for w in windows.iter_mut().take(window_count) {
-            if w.content == WindowContent::None { continue; }
+        let mut i = 0;
+        while i < window_count {
+            if windows[i].content == WindowContent::None { i += 1; continue; }
             
-            let (tx, ty, tw, th) = if w.minimized {
+            let (tx, ty, tw, th) = if windows[i].closing {
+                // Shrink to center of window
+                (windows[i].curr_x + windows[i].curr_w / 2.0, windows[i].curr_y + windows[i].curr_h / 2.0, 0.0, 0.0)
+            } else if windows[i].minimized {
                 let px = (100 + (min_count_anim % 3) * 120) as f32;
                 let py = (250 + (min_count_anim / 3) * 150) as f32;
                 min_count_anim += 1;
                 (px - 20.0, py - 40.0, 40.0, 40.0) // Fly to icon
             } else {
-                (w.x as f32, w.y as f32, w.w as f32, w.h as f32)
+                (windows[i].x as f32, windows[i].y as f32, windows[i].w as f32, windows[i].h as f32)
             };
 
-            let lerp = 0.25;
-            w.curr_x += (tx - w.curr_x) * lerp;
-            w.curr_y += (ty - w.curr_y) * lerp;
-            w.curr_w += (tw - w.curr_w) * lerp;
-            w.curr_h += (th - w.curr_h) * lerp;
+            let lerp = if windows[i].closing { 0.32 } else { 0.22 };
+            windows[i].curr_x += (tx - windows[i].curr_x) * lerp;
+            windows[i].curr_y += (ty - windows[i].curr_y) * lerp;
+            windows[i].curr_w += (tw - windows[i].curr_w) * lerp;
+            windows[i].curr_h += (th - windows[i].curr_h) * lerp;
+            
+            // If closing and small enough, remove it
+            if windows[i].closing && windows[i].curr_w < 5.0 {
+                if let WindowContent::External(s_idx) = windows[i].content {
+                    if (s_idx as usize) < surfaces.len() {
+                        munmap(surfaces[s_idx as usize].vaddr as u64, surfaces[s_idx as usize].buffer_size as u64);
+                        surfaces[s_idx as usize].active = false;
+                    }
+                }
+                // Remove from array
+                for j in i..(window_count - 1) {
+                    windows[j] = windows[j+1];
+                }
+                windows[window_count - 1] = ShellWindow { 
+                    x:0, y:0, w:0, h:0, 
+                    curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+                    minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0),
+                    workspace: 0,
+                    content: WindowContent::None 
+                };
+                window_count -= 1;
+                // Don't increment i
+            } else {
+                i += 1;
+            }
         }
 
         // Toggle Dashboard (Super key)
@@ -1938,44 +2518,55 @@ pub extern "C" fn _start() -> ! {
             input_state.request_dashboard = false;
         }
 
-        // 2. Borrado completo del back buffer y dibujar UI estática
-        // Clear raw primero para sobrescribir cualquier contenido previo (logo de boot, etc.)
-        fb.clear_back_buffer_raw(colors::COSMIC_DEEP);
         if !input_state.lock_active {
-            if counter <= 5 { println!("[SMITHAY] main loop 1: draw_static_ui"); }
-            draw_static_ui(&mut fb, &windows, window_count, counter);
+            // Interpolación para centro de notificaciones (Slide-in right)
+            let target_notif_x = if input_state.notifications_active { (fb.info.width as i32 - 300) as f32 } else { fb.info.width as f32 };
+            input_state.notif_curr_x += (target_notif_x - input_state.notif_curr_x) * 0.2;
+
+            // Interpolación para lanzador (Slide-up bottom)
+            let target_launcher_y = if input_state.launcher_active { (fb.info.height as i32 - 370) as f32 } else { fb.info.height as f32 };
+            input_state.launcher_curr_y += (target_launcher_y - input_state.launcher_curr_y) * 0.2;
+
+            // Interpolación para workspaces
+            let target_ws_offset = (input_state.current_workspace as f32) * (fb.info.width as f32);
+            input_state.workspace_offset += (target_ws_offset - input_state.workspace_offset) * 0.15;
+
+            // Interpolación para search HUD (Slide down from top)
+            let target_search_y = if input_state.search_active { 0.0 } else { -(fb.info.height as f32 / 2.0) };
+            input_state.search_curr_y += (target_search_y - input_state.search_curr_y) * 0.15;
+
+            draw_static_ui(&mut fb, &windows, window_count, counter, input_state.cursor_x, input_state.cursor_y);
 
             // Dibujar ventanas (solo si el dashboard NO está activo)
             if !input_state.dashboard_active {
-                if counter <= 5 { println!("[SMITHAY] main loop 2: draw_shell_windows"); }
-                draw_shell_windows(&mut fb, &windows, window_count, input_state.focused_window, &surfaces);
+                draw_shell_windows(&mut fb, &windows, window_count, input_state.focused_window, &surfaces, input_state.workspace_offset, input_state.current_workspace, input_state.cursor_x, input_state.cursor_y);
             } else {
                 draw_dashboard(&mut fb, counter);
             }
 
             // Phase 8 Overlays
-            if input_state.launcher_active {
-                if counter <= 5 { println!("[SMITHAY] main loop 4: draw_launcher"); }
-                draw_launcher(&mut fb);
-            }
             if input_state.quick_settings_active {
-                if counter <= 5 { println!("[SMITHAY] main loop 5: draw_quick_settings"); }
                 draw_quick_settings(&mut fb);
             }
             if input_state.context_menu_active {
-                if counter <= 5 { println!("[SMITHAY] main loop 6: draw_context_menu"); }
                 draw_context_menu(&mut fb, input_state.context_menu_pos);
             }
 
-            // Dibujar notificaciones si modo activo
-            if input_state.notifications_active {
-                draw_notifications(&mut fb, &input_state.notifications);
+            // Overlays animados
+            draw_launcher(&mut fb, input_state.launcher_curr_y);
+            draw_notifications(&mut fb, &input_state.notifications, input_state.notif_curr_x);
+
+            if input_state.alt_tab_active {
+                draw_alt_tab_hud(&mut fb, &windows, window_count, input_state.focused_window);
+            }
+
+            if input_state.search_active || input_state.search_curr_y > -(fb.info.height as f32 / 2.0) + 5.0 {
+                draw_search_hud(&mut fb, &input_state.search_query, input_state.search_selected_idx, counter, input_state.search_curr_y);
             }
         } else {
             draw_lock_screen(&mut fb, counter);
         }
 
-        if counter <= 5 { println!("[SMITHAY] main loop 7: draw_mouse_and_present"); }
         // Si botón izquierdo pulsado y no arrastrando: dibujar trazo
         if input_state.mouse_buttons & 1 != 0 && input_state.dragging_window.is_none() {
             let dot_size = input_state.stroke_size.clamp(2, 8);
@@ -2002,18 +2593,15 @@ pub extern "C" fn _start() -> ! {
         // 8. Presentar frame (Copia back -> front)
         fb.present();
 
-        // 9. Reducir CPU cuando idle
-        if !had_events {
-            for _ in 0..8 {
-                yield_cpu();
-            }
+        // 9. Siempre ceder CPU para evitar monopolizar y que input_service responda
+        for _ in 0..(if had_events { 2 } else { 8 }) {
+            yield_cpu();
         }
         
         if counter.wrapping_sub(last_status_counter) >= STATUS_UPDATE_INTERVAL {
-            // Solo barra, sin Text (evitar posible acceso a dir kernel en MonoTextStyle/font)
-            Rectangle::new(Point::new(0, fb.info.height as i32 - 40), Size::new(fb.info.width as u32, 40))
+            let _ = Rectangle::new(Point::new(0, fb.info.height as i32 - 40), Size::new(fb.info.width as u32, 40))
                 .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 80, 150)).build())
-                .draw(&mut fb).unwrap();
+                .draw(&mut fb);
             last_status_counter = counter;
         }
         

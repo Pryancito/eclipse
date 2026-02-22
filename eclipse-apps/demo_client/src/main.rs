@@ -9,6 +9,7 @@ use eclipse_libc::{println, yield_cpu};
 use sidewind_sdk::{discover_composer, SideWindSurface};
 use sidewind_sdk::ui::{self, icons, colors};
 use sidewind_core::SWND_EVENT_TYPE_RESIZE;
+use micromath::F32Ext;
 use embedded_graphics::{
     pixelcolor::Rgb888,
     prelude::*,
@@ -81,8 +82,13 @@ pub extern "C" fn _start() -> ! {
         yield_cpu();
     };
 
-    let mut surface = SideWindSurface::new(composer_pid, 300, 200, 480, 360, "eclipse_demo")
-        .expect("[ECLIPSE-DEMO] Failed to create surface");
+    let mut surface = match SideWindSurface::new(composer_pid, 300, 200, 480, 360, "eclipse_demo") {
+        Some(s) => s,
+        None => {
+            println!("[ECLIPSE-DEMO] Failed to create surface, idling");
+            loop { yield_cpu(); }
+        }
+    };
 
     println!("[ECLIPSE-DEMO] Surface created. Using SideWind UI tokens.");
 
@@ -112,18 +118,47 @@ pub extern "C" fn _start() -> ! {
         // 1. Background (Eclipse Deep Blue)
         let _ = target.clear(colors::BACKGROUND_DEEP);
 
-        // 2. Center Glowing Hexagon
-        let center = Point::new(w as i32 / 2, h as i32 / 2);
-        let _ = ui::draw_glowing_hexagon(&mut target, center, 80, colors::ACCENT_BLUE);
+        // 2. Main Panel Container
+        use sidewind_sdk::ui::{Panel, Gauge, Terminal, Widget};
+        let main_panel = Panel {
+            position: Point::new(10, 10),
+            size: Size::new(w - 20, h - 20),
+            title: "SYSTEM PERFORMANCE MONITOR",
+        };
+        let _ = main_panel.draw(&mut target);
 
-        // 3. Central Icon (System)
-        let _ = ui::draw_standard_icon(&mut target, center, icons::SYSTEM);
+        // 3. CPU Gauge
+        let g1 = Gauge {
+            center: Point::new(w as i32 / 4, 100),
+            radius: 50,
+            value: 0.35 + (frame as f32 / 40.0).sin().abs() * 0.4,
+            label: "CPU LOAD",
+        };
+        let _ = g1.draw(&mut target);
 
-        // 4. Animated accent
-        let rect_x = (frame % w) as i32;
-        let _ = Rectangle::new(Point::new(rect_x, (h-5) as i32), Size::new(40, 2))
-            .into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(colors::ACCENT_BLUE))
-            .draw(&mut target);
+        // 4. Memory Gauge
+        let g2 = Gauge {
+            center: Point::new(w as i32 * 3 / 4, 100),
+            radius: 50,
+            value: 0.62 + (frame as f32 / 60.0).cos().abs() * 0.1,
+            label: "RAM USAGE",
+        };
+        let _ = g2.draw(&mut target);
+
+        // 5. System Logs (Terminal)
+        let log_lines = [
+            "[LOG] KERNEL MODULE LOADED: VIRTIO_GPU",
+            "[LOG] SYSCALL INVOKED: MMAP(ANON)",
+            "[LOG] IO_PORT STATUS: STABLE",
+            "[LOG] SYSTEM UPTIME: 00:04:15",
+            "root@eclipse:~# monitor --poll",
+        ];
+        let term = Terminal {
+            position: Point::new(30, 180),
+            size: Size::new(w - 60, 140),
+            lines: &log_lines,
+        };
+        let _ = term.draw(&mut target);
 
         surface.commit();
         frame = frame.wrapping_add(1);

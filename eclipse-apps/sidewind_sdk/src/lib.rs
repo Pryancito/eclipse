@@ -1,5 +1,11 @@
 #![no_std]
 
+pub mod font_terminus_12;
+pub mod font_terminus_14;
+pub mod font_terminus_16;
+pub mod font_terminus_18;
+pub mod font_terminus_20;
+pub mod font_terminus_24;
 pub mod ui;
 
 use eclipse_libc::{send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};

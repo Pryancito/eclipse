@@ -644,8 +644,7 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     if buffer_ptr < 0x1000 || (sender_pid_ptr != 0 && sender_pid_ptr < 0x1000) {
         return u64::MAX;
     }
-    let copy_len = core::cmp::min(size as usize, 32);
-    if size == 0 || size > 4096 || !is_user_pointer(buffer_ptr, copy_len as u64) {
+    if size == 0 || size > 4096 {
         return u64::MAX; // Error
     }
     if sender_pid_ptr != 0 && !is_user_pointer(sender_pid_ptr, 8) {
@@ -655,7 +654,12 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     if let Some(client_id) = current_process_id() {
         // Intentar recibir mensaje
         if let Some(msg) = receive_message(client_id) {
-            // Copiar mensaje a buffer de usuario (ya validado arriba)
+            // copy_len: min(user_size, actual_data_size, 256) - no copiar más de lo necesario
+            let data_len = (msg.data_size as usize).min(msg.data.len());
+            let copy_len = core::cmp::min(size as usize, data_len);
+            if copy_len == 0 || !is_user_pointer(buffer_ptr, copy_len as u64) {
+                return u64::MAX;
+            }
             unsafe {
                 let user_buf = core::slice::from_raw_parts_mut(
                     buffer_ptr as *mut u8,

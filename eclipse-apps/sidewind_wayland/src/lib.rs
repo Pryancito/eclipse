@@ -2,6 +2,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use core::mem::size_of;
 
 /// Wayland wire protocol message header
@@ -14,14 +15,14 @@ pub struct WaylandHeader {
 
 pub struct WaylandConnection {
     pub registry: ObjectRegistry,
-    pub pending_events: Vec<Vec<u8>>,
+    pub pending_events: VecDeque<Vec<u8>>,
 }
 
 impl WaylandConnection {
     pub fn new() -> Self {
         Self { 
             registry: ObjectRegistry::new(),
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -34,7 +35,7 @@ impl WaylandConnection {
         data.extend_from_slice(args);
         // Align to 32-bit if needed (though Wayland events usually are)
         while data.len() % 4 != 0 { data.push(0); }
-        self.pending_events.push(data);
+        self.pending_events.push_back(data);
     }
 
     pub fn process_message(&mut self, data: &[u8]) -> Option<Vec<u8>> {

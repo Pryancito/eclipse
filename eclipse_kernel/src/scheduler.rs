@@ -24,11 +24,11 @@ static SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats {
 pub fn enqueue_process(pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = READY_QUEUE.lock();
+        let head = QUEUE_HEAD.lock();
         let mut tail = QUEUE_TAIL.lock();
-        let head = *QUEUE_HEAD.lock();
         
         let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-        if next_tail != head {
+        if next_tail != *head {
             queue[*tail] = Some(pid);
             *tail = next_tail;
         }
@@ -116,19 +116,20 @@ pub fn schedule() {
 
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let from_ptr = match table[from_pid as usize].as_mut() {
+            Some(p) => &mut p.context as *mut crate::process::Context,
+            None => return, // Process exited, skip switch
+        };
+        let to_exists = table[to_pid as usize].is_some();
+        drop(table);
+        if !to_exists {
+            return;
+        }
         let mut stats = SCHEDULER_STATS.lock();
         stats.context_switches += 1;
         drop(stats);
-        
         set_current_process(Some(to_pid));
-        
-        // Use a temporary scope to get a pointer to the context
-        let from_ptr = {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            let from_process = table[from_pid as usize].as_mut().expect("From process not found");
-            &mut from_process.context as *mut crate::process::Context
-        };
-        
         perform_context_switch_to(unsafe { &mut *from_ptr }, to_pid);
     });
 }
@@ -136,7 +137,10 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
 fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: ProcessId) {
     let (to_ptr, to_kernel_stack, to_page_table, to_fs_base) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
-        let to_process = table[to_pid as usize].as_mut().expect("To process not found");
+        let to_process = match table[to_pid as usize].as_mut() {
+            Some(p) => p,
+            None => return,
+        };
         (
             &to_process.context as *const crate::process::Context,
             to_process.kernel_stack_top,
