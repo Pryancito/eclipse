@@ -959,13 +959,18 @@ fn sys_wait(status_ptr: u64) -> u64 {
                 continue;
             }
             
-            if let Some(proc) = process::get_process(*pid) {
+            if let Some(mut proc) = process::get_process(*pid) {
                 if proc.parent_pid == Some(current_pid) {
                     has_children = true;
                     if state == &process::ProcessState::Terminated {
-                        // TODO: Clean up child process resources
-                        // TODO: Write exit status to status_ptr if non-zero
-                        
+                        // Reap the child: clear parent_pid so wait() does not return
+                        // the same terminated child on subsequent calls.  Without this,
+                        // the caller (e.g. init's reap_zombies) would busy-loop forever
+                        // re-receiving the same PID.
+                        // Note: full resource cleanup (kernel stack, page tables, FDs)
+                        // is deferred; the process entry stays as Terminated in the table.
+                        proc.parent_pid = None;
+                        process::update_process(*pid, proc);
                         return *pid as u64;
                     }
                 }
