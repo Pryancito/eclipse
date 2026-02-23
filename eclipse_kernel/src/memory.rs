@@ -784,8 +784,16 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
 /// Physical address is accessible at phys_to_virt(phys_addr).
 static ANON_MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
 
-const ANON_MMAP_PHYS_START: u64 = 0x1000_0000;  // 256MB - above typical kernel
+const ANON_MMAP_PHYS_START: u64 = 0x4000_0000;  // 1GB - leaves 0.25-1GB for GPU/DMA pools
 const ANON_MMAP_PHYS_END: u64 = 0xB000_0000;    // Stop before 2.75GB (PCI hole ~3GB)
+
+/// Dedicated physical memory region for GPU Firmware (Phase 3)
+pub const GPU_FW_PHYS_BASE: u64 = 0x2000_0000;  // 512MB
+pub const GPU_FW_MAX_SIZE: u64 = 32 * 1024 * 1024; // 32MB
+
+/// Dedicated physical memory region for GSP RPC Queues (Phase 6)
+pub const GPU_RPC_PHYS_BASE: u64 = 0x2200_0000; // 544MB
+pub const GPU_RPC_MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB for queues
 
 pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);

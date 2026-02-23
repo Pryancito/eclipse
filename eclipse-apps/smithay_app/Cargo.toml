@@ -18,8 +18,3 @@ micromath = "2.1.0"
 name = "smithay_app"
 path = "src/main.rs"
 
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"
-codegen-units = 1

@@ -181,9 +181,16 @@ impl InputState {
                     KeyAction::None => {
                         if let Some(f_idx) = self.focused_window {
                             if let WindowContent::External(s_idx) = windows[f_idx].content {
-                                let pid = surfaces[s_idx as usize].pid;
-                                let se = SideWindEvent { event_type: SWND_EVENT_TYPE_KEY, data1: ev.code as i32, data2: ev.value as i32, data3: self.modifiers as i32 };
-                                let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                                if (s_idx as usize) < surfaces.len() {
+                                    let pid = surfaces[s_idx as usize].pid;
+                                    let se = SideWindEvent { 
+                                        event_type: SWND_EVENT_TYPE_KEY, 
+                                        data1: ev.code as i32, 
+                                        data2: ev.value as i32, 
+                                        data3: self.modifiers as i32 
+                                    };
+                                    let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                                }
                             }
                         }
                     }
@@ -193,24 +200,80 @@ impl InputState {
                     KeyAction::NewWindow => if pressed { self.request_new_window = true; },
                     KeyAction::CloseWindow => if pressed { self.request_close_window = true; },
                     KeyAction::CycleForward => if pressed { self.request_cycle_forward = true; },
+                    KeyAction::CycleBackward => if pressed { self.request_cycle_backward = true; },
+                    KeyAction::CycleStrokeSize => if pressed {
+                        self.stroke_size = match self.stroke_size { 2 => 4, 4 => 6, _ => 2 };
+                    },
+                    KeyAction::SensitivityPlus => if pressed { self.mouse_sensitivity = (self.mouse_sensitivity + 25).min(200); },
+                    KeyAction::SensitivityMinus => if pressed { self.mouse_sensitivity = (self.mouse_sensitivity - 25).max(50); },
+                    KeyAction::InvertY => if pressed { self.invert_y = !self.invert_y; },
+                    KeyAction::Minimize => if pressed { self.request_minimize = true; },
+                    KeyAction::Restore => if pressed { self.request_restore = true; },
                     KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
                     KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
+                    KeyAction::ToggleNotifications => if pressed && (self.modifiers & 8 != 0) { self.notifications_active = !self.notifications_active; },
                     KeyAction::ToggleLauncher => if pressed && (self.modifiers & 8 != 0) { self.launcher_active = !self.launcher_active; },
-                    KeyAction::ToggleSearch => if pressed { self.search_active = !self.search_active; if self.search_active { self.search_query.clear(); } },
-                    _ => {}
+                    KeyAction::ToggleSearch => if pressed { 
+                        self.search_active = !self.search_active; 
+                        if self.search_active { self.search_query.clear(); self.dashboard_active = false; } 
+                    },
+                    KeyAction::SnapLeft => if pressed && (self.modifiers & 8 != 0) {
+                        if let Some(idx) = self.focused_window {
+                            if idx < *window_count {
+                                windows[idx].x = 0;
+                                windows[idx].y = ShellWindow::TITLE_H;
+                                windows[idx].w = fb_width / 2;
+                                windows[idx].h = fb_height - ShellWindow::TITLE_H - 44;
+                            }
+                        }
+                    },
+                    KeyAction::SnapRight => if pressed && (self.modifiers & 8 != 0) {
+                        if let Some(idx) = self.focused_window {
+                            if idx < *window_count {
+                                windows[idx].x = fb_width / 2;
+                                windows[idx].y = ShellWindow::TITLE_H;
+                                windows[idx].w = fb_width / 2;
+                                windows[idx].h = fb_height - ShellWindow::TITLE_H - 44;
+                            }
+                        }
+                    },
+                    KeyAction::SwitchWorkspace(w) => if pressed && (self.modifiers & 8 != 0) { self.current_workspace = w; },
+                    KeyAction::CycleWindowVisual => if pressed && (self.modifiers & 4 != 0) { self.alt_tab_active = true; self.request_cycle_forward = true; },
+                    KeyAction::ArrowUp => if pressed && self.search_active { self.search_selected_idx = self.search_selected_idx.saturating_sub(1); },
+                    KeyAction::ArrowDown => if pressed && self.search_active { self.search_selected_idx += 1; },
+                    KeyAction::Backspace => if pressed && self.search_active { self.search_query.pop(); },
+                    KeyAction::Enter => if pressed && self.search_active { self.execute_search(); self.search_active = false; },
+                    KeyAction::Input(c) => if pressed && self.search_active { if self.search_query.len() < 32 { let _ = self.search_query.push(c); } },
                 }
+                if !pressed && ev.code == 0x0F { self.alt_tab_active = false; }
             }
             1 => { // Mouse move
                 let d = (ev.value * self.mouse_sensitivity) / 100;
                 if ev.code == 0 {
-                    self.cursor_x = (self.cursor_x + d).clamp(0, fb_width - 1);
-                    if let Some(idx) = self.dragging_window { windows[idx].x = (windows[idx].x + d).clamp(0, fb_width - windows[idx].w); }
-                    if let Some(idx) = self.resizing_window { windows[idx].w = (self.cursor_x - windows[idx].x + 8).max(50).min(MAX_SURFACE_DIM as i32); }
+                    self.cursor_x = (self.cursor_x + d).clamp(0, fb_width.wrapping_sub(1));
+                    if let Some(idx) = self.dragging_window { 
+                        if idx < *window_count {
+                            windows[idx].x = (windows[idx].x + d).clamp(0, fb_width.wrapping_sub(windows[idx].w)); 
+                        }
+                    }
+                    if let Some(idx) = self.resizing_window { 
+                        if idx < *window_count {
+                            windows[idx].w = (self.cursor_x - windows[idx].x + 8).max(50).min(MAX_SURFACE_DIM as i32); 
+                        }
+                    }
                 } else if ev.code == 1 {
                     let dy = if self.invert_y { -d } else { d };
-                    self.cursor_y = (self.cursor_y + dy).clamp(0, fb_height - 1);
-                    if let Some(idx) = self.dragging_window { windows[idx].y = (windows[idx].y + dy).clamp(0, fb_height - windows[idx].h); }
-                    if let Some(idx) = self.resizing_window { windows[idx].h = (self.cursor_y - windows[idx].y + 8).max(50).min(MAX_SURFACE_DIM as i32); }
+                    self.cursor_y = (self.cursor_y + dy).clamp(0, fb_height.wrapping_sub(1));
+                    if let Some(idx) = self.dragging_window { 
+                        if idx < *window_count {
+                            windows[idx].y = (windows[idx].y + dy).clamp(0, fb_height.wrapping_sub(windows[idx].h)); 
+                        }
+                    }
+                    if let Some(idx) = self.resizing_window { 
+                        if idx < *window_count {
+                            windows[idx].h = (self.cursor_y - windows[idx].y + 8).max(ShellWindow::TITLE_H + 20).min(MAX_SURFACE_DIM as i32); 
+                        }
+                    }
                 }
             }
             2 => { // Mouse button

@@ -58,15 +58,12 @@ impl ShellWindow {
         
         if py < btn_y || py >= btn_y + btn_size { return WindowButton::None; }
         
-        // Close button
         let close_x = self.x + self.w - btn_size - btn_margin;
         if px >= close_x && px < close_x + btn_size { return WindowButton::Close; }
         
-        // Maximize button
         let max_x = close_x - btn_size - btn_margin;
         if px >= max_x && px < max_x + btn_size { return WindowButton::Maximize; }
         
-        // Minimize button
         let min_x = max_x - btn_size - btn_margin;
         if px >= min_x && px < min_x + btn_size { return WindowButton::Minimize; }
         
@@ -74,10 +71,6 @@ impl ShellWindow {
     }
 
     pub const RESIZE_HANDLE_SIZE: i32 = 16;
-    pub fn resize_handle_contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x + self.w - Self::RESIZE_HANDLE_SIZE && px < self.x + self.w
-            && py >= self.y + self.h - Self::RESIZE_HANDLE_SIZE && py < self.y + self.h
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +82,16 @@ pub struct ExternalSurface {
     pub active: bool,
 }
 
+pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -> Option<usize> {
+    for i in (0..count).rev() {
+        let w = &windows[i];
+        if w.content != WindowContent::None && !w.minimized && w.contains(px, py) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: usize) -> Option<usize> {
     if count == 0 { return None; }
     let step = if forward { 1 } else { count.wrapping_sub(1) };
@@ -98,16 +101,6 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             return Some(i);
         }
         i = (i.wrapping_add(step)) % count;
-    }
-    None
-}
-
-pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -> Option<usize> {
-    for i in (0..count).rev() {
-        let w = &windows[i];
-        if w.content != WindowContent::None && !w.minimized && w.contains(px, py) {
-            return Some(i);
-        }
     }
     None
 }

@@ -40,9 +40,16 @@
 //! - NVIDIA GPU Architecture documentation
 //! - PCI Express Base Specification
 
-use crate::pci::{PciDevice, find_nvidia_gpus};
+use crate::pci::{PciDevice, find_nvidia_gpus, get_bar};
+use crate::memory::{map_mmio_range, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
 use crate::serial;
+use crate::filesystem;
 use alloc::vec::Vec;
+use alloc::vec;
+
+// Use our shared NVIDIA abstraction crate
+use sidewind_nvidia::registers::*;
+use sidewind_nvidia::gsp::*;
 
 /// NVIDIA GPU Architecture Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +72,13 @@ pub struct NvidiaGpuInfo {
     pub sm_count: u32,  // Streaming Multiprocessor count
     pub rt_cores: u32,  // Ray Tracing cores
     pub tensor_cores: u32,  // Tensor cores for AI
+}
+
+/// Active NVIDIA GPU with mapped registers
+pub struct NvidiaGpu {
+    pub info: NvidiaGpuInfo,
+    pub bar0_virt: u64,
+    pub bar0_size: usize,
 }
 
 impl NvidiaGpuInfo {
@@ -137,6 +151,112 @@ fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32, u32, 
         
         // Default/Unknown
         _ => (NvidiaArchitecture::Unknown, "Unknown NVIDIA GPU", 0, 0, 0),
+    }
+}
+
+/// NVIDIA GSP Firmware Loader
+pub struct GspLoader;
+
+impl GspLoader {
+    /// Load GSP firmware from filesystem into a dedicated physical region
+    pub fn load_firmware(path: &str) -> Result<NvidiaFirmware, &'static str> {
+        serial::serial_print("[NVIDIA] Loading GSP firmware from ");
+        serial::serial_print(path);
+        serial::serial_print("...\n");
+
+        let inode = filesystem::Filesystem::lookup_path(path).map_err(|_| "Firmware file not found")?;
+        let size = filesystem::Filesystem::get_file_size(inode).map_err(|_| "Failed to get firmware size")?;
+        
+        serial::serial_print("[NVIDIA]   Firmware size: ");
+        serial::serial_print_dec(size);
+        serial::serial_print(" bytes\n");
+
+        if size > GPU_FW_MAX_SIZE {
+            return Err("Firmware too large (exceeds GPU_FW_MAX_SIZE)");
+        }
+
+        // Use the centralized GPU hardware region defined in memory.rs
+        let phys_base = GPU_FW_PHYS_BASE;
+        let virt_base = PHYS_MEM_OFFSET + phys_base;
+
+        serial::serial_print("[NVIDIA]   Allocating firmware memory at Phys: 0x");
+        serial::serial_print_hex(phys_base);
+        serial::serial_print("\n");
+
+        // Read the file in 4KB chunks
+        let mut offset: u64 = 0;
+        let mut chunk = [0u8; 4096];
+        
+        while offset < size {
+            let to_read = core::cmp::min(4096, (size - offset) as usize);
+            let bytes_read = filesystem::Filesystem::read_file_by_inode_at(inode, &mut chunk[..to_read], offset)?;
+            
+            if bytes_read == 0 { break; }
+
+            // Copy chunk to target physical memory via Higher Half mapping
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    (virt_base + offset) as *mut u8,
+                    bytes_read
+                );
+            }
+
+            offset += bytes_read as u64;
+            
+            // Progress indicator every 1MB
+            if offset % (1024 * 1024) == 0 {
+                serial::serial_print(".");
+            }
+        }
+        serial::serial_print(" Done\n");
+
+        Ok(NvidiaFirmware {
+            phys_base,
+            virt_base,
+            size: size as usize,
+        })
+    }
+}
+
+/// Represents loaded NVIDIA firmware in memory
+pub struct NvidiaFirmware {
+    pub phys_base: u64,
+    pub virt_base: u64,
+    pub size: usize,
+}
+
+/// GSP RPC Client
+pub struct RpcClient {
+    pub queue_virt: *mut GspRpcQueue,
+}
+
+impl RpcClient {
+    pub fn new(phys_base: u64) -> Self {
+        let virt = (PHYS_MEM_OFFSET + phys_base) as *mut GspRpcQueue;
+        unsafe {
+            GspRpcQueue::init_at(virt);
+        }
+        Self { queue_virt: virt }
+    }
+
+    pub fn send_command(&mut self, opcode: GspOpcode, payload: &[u8]) -> Result<(), GspStatus> {
+        let header = GspHeader {
+            opcode: opcode as u32,
+            seq_num: 0, // TODO: Incrementing sequence
+            status: 0,
+            payload_len: payload.len() as u32,
+        };
+        
+        unsafe {
+            (*self.queue_virt).push(header, payload)
+        }
+    }
+
+    pub fn poll_response(&mut self) -> Option<GspMessage<GSP_RPC_PAYLOAD_SIZE>> {
+        unsafe {
+            (*self.queue_virt).pop()
+        }
     }
 }
 
@@ -253,6 +373,116 @@ pub fn init() {
             crate::pci::enable_device(&gpu, true);
         }
         serial::serial_print("[NVIDIA]   Device enabled (I/O, Memory, Bus Master)\n");
+
+        // --- Phase 1: PCI & BAR Mapping Audit ---
+        // Attempt to map BAR0 (usually 16MB or 32MB of control registers)
+        let bar0_phys = unsafe { get_bar(gpu, 0) };
+        let bar0_size = 16 * 1024 * 1024; // Standard for many NVIDIA GPUs
+        
+        serial::serial_print("[NVIDIA]   Mapping BAR0 (Phys: 0x");
+        serial::serial_print_hex(bar0_phys);
+        serial::serial_print(")...\n");
+
+        let bar0_virt = map_mmio_range(bar0_phys, bar0_size);
+        
+        serial::serial_print("[NVIDIA]   Mapped BAR0 to Virt: 0x");
+        serial::serial_print_hex(bar0_virt);
+        serial::serial_print("\n");
+
+        // Identity Register Test (PMC_BOOT_0 is usually at 0x0 in BAR0)
+        // This register often contains the GPU ID (0xDEAD... or similar architecture markers)
+        let boot_0 = unsafe { core::ptr::read_volatile((bar0_virt + NV_PMC_BOOT_0 as u64) as *const u32) };
+        serial::serial_print("[NVIDIA]   PMC_BOOT_0: 0x");
+        serial::serial_print_hex(boot_0 as u64);
+        serial::serial_print("\n");
+
+        if boot_0 != 0 && boot_0 != 0xFFFFFFFF {
+            serial::serial_print("[NVIDIA]   ✓ BAR0 Audit PASSED: Hardware responsive\n");
+            
+            // --- Phase 3: Firmware Loading Implementation ---
+            // In a real scenario, we'd look for the specific architecture firmware
+            // e.g., /lib/firmware/nvidia/turing/gsp.bin
+            let fw_path = "/lib/firmware/gsp.bin";
+            match GspLoader::load_firmware(fw_path) {
+                Ok(fw) => {
+                    serial::serial_print("[NVIDIA]   ✓ Firmware loaded at Phys: 0x");
+                    serial::serial_print_hex(fw.phys_base);
+                    serial::serial_print("\n");
+                    
+                    // --- Phase 4: GSP Boot Kick-off ---
+                    serial::serial_print("[NVIDIA]   Booting GSP processor...\n");
+                    
+                    unsafe {
+                        // 1. Configure Firmware Location
+                        let fw_addr_lo = (fw.phys_base & 0xFFFFFFFF) as u32;
+                        let fw_addr_hi = (fw.phys_base >> 32) as u32;
+                        
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_PHYS_ADDR_LO as u64) as *mut u32, fw_addr_lo);
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_PHYS_ADDR_HI as u64) as *mut u32, fw_addr_hi);
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_SIZE as u64) as *mut u32, fw.size as u32);
+                        
+                        // 2. Kick the GSP
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_CTRL as u64) as *mut u32, NV_GSP_CTRL_RUN);
+                        
+                        serial::serial_print("[NVIDIA]   GSP kicked. Waiting for handshake");
+                        
+                        // 3. Initialize RPC Client
+                        let mut rpc = RpcClient::new(GPU_RPC_PHYS_BASE);
+                        
+                        // 4. Simple Handshake Poll (diagnostic)
+                        let mut success = false;
+                        for i in 0..1000 {
+                            let status = core::ptr::read_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *const u32);
+                            if status == 0x52454144 { // "READ" in hex (example handshake)
+                                success = true;
+                                break;
+                            }
+                            if i % 100 == 0 { serial::serial_print("."); }
+                            // Small delay
+                            for _ in 0..100000 { core::hint::spin_loop(); }
+                        }
+                        
+                        if success {
+                            serial::serial_print(" ✓ GSP READY\n");
+                            
+                            // Send a test RPC (Get Build Info)
+                            serial::serial_print("[NVIDIA]   Sending GSP RPC: SystemGetBuildInfo\n");
+                            if let Err(e) = rpc.send_command(GspOpcode::SystemGetBuildInfo, &[]) {
+                                serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
+                                serial::serial_print_dec(e as u64);
+                                serial::serial_print("\n");
+                            } else {
+                                // Wait for response
+                                serial::serial_print("[NVIDIA]   Waiting for GSP response...");
+                                let mut response_found = false;
+                                for _ in 0..100 {
+                                    if let Some(msg) = rpc.poll_response() {
+                                        serial::serial_print(" ✓ Received Response (Op: 0x");
+                                        serial::serial_print_hex(msg.header.opcode as u64);
+                                        serial::serial_print(")\n");
+                                        response_found = true;
+                                        break;
+                                    }
+                                    for _ in 0..100000 { core::hint::spin_loop(); }
+                                }
+                                if !response_found {
+                                    serial::serial_print(" ⚠ Timeout waiting for response\n");
+                                }
+                            }
+                        } else {
+                            serial::serial_print(" ⚠ GSP Timeout\n");
+                        }
+                    }
+                }
+                Err(e) => {
+                    serial::serial_print("[NVIDIA]   ⚠ Firmware load failed: ");
+                    serial::serial_print(e);
+                    serial::serial_print("\n");
+                }
+            }
+        } else {
+            serial::serial_print("[NVIDIA]   ⚠ BAR0 Audit FAILED: Hardware not responding correctly\n");
+        }
     }
     
     serial::serial_print("[NVIDIA] Initialization complete\n");

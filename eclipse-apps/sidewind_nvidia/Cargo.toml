@@ -1,0 +1,13 @@
+[package]
+name = "sidewind-nvidia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# We will likely need heapless for fixed-size RPC buffers
+heapless = "0.8"
+bitflags = "2.4"
+
+[features]
+default = ["no_std"]
+no_std = []

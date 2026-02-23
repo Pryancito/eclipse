@@ -416,7 +416,10 @@ pub fn draw_search_hud(fb: &mut FramebufferState, query: &str, selected_idx: usi
     let _ = display_query.push_str(query);
     if (counter / 30) % 2 == 0 { let _ = display_query.push('_'); }
     let _ = Text::new(&display_query, Point::new(px + 80, py + 45), text_style).draw(fb);
-    if !query.is_empty() {
+    if query.is_empty() {
+        let hint_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::GLOW_DIM);
+        let _ = Text::new("ESCRIBA EL NOMBRE DE UNA APLICACION O COMANDO...", Point::new(px + 80, py + 42), hint_style).draw(fb);
+    } else {
         let results = ["EJECUTAR TERMINAL", "SISTEMA: WORKSPACE 1", "SISTEMA: WORKSPACE 2", "ANALISIS DIAGNOSTICO", "BLOQUEAR ESTACION"];
         for i in 0..results.len() {
             let ry = py + panel_h + 10 + (i as i32 * 45);
@@ -432,10 +435,23 @@ pub fn draw_search_hud(fb: &mut FramebufferState, query: &str, selected_idx: usi
 }
 
 pub fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {
-    let h = fb.info.height as i32;
     let ly = curr_y as i32;
     let rect = Rectangle::new(Point::new(10, ly), Size::new(340, 340));
     let _ = ui::draw_glass_card(fb, rect, "EJECUTAR // SERVICIOS", colors::ACCENT_CYAN);
+
+    let bracket_style = PrimitiveStyleBuilder::new().stroke_color(colors::ACCENT_CYAN).stroke_width(1).build();
+    let tl = rect.top_left;
+    let br = rect.top_left + Point::new(rect.size.width as i32, rect.size.height as i32);
+    let _ = Line::new(tl, tl + Point::new(35, 0)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(tl, tl + Point::new(0, 35)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(br - Point::new(36, 1), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
+    let _ = Line::new(br - Point::new(1, 36), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
+
+    let title_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
+    let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(31, ly + 39), title_glow).draw(fb);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(30, ly + 38), title_style).draw(fb);
+
     let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
     let items = [("Terminal", icons::SYSTEM), ("Archivos", icons::FILES), ("Red", icons::NETWORK), ("Ajustes", icons::APPS)];
     for (i, (name, icon)) in items.iter().enumerate() {
@@ -453,7 +469,11 @@ pub fn draw_quick_settings(fb: &mut FramebufferState) {
     let _ = ui::draw_glass_card(fb, rect, "QUICK SETTINGS", colors::GLOW_HI);
     let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
     let _ = Text::new("RED:  [ESTABLE]", Point::new(w - 240, h - 170), text_style).draw(fb);
-    let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 130), Size::new(200, 15), 0.6, colors::ACCENT_CYAN);
+    let bar_size = Size::new(200, 15);
+    let _ = Text::new("VOL", Point::new(w - 240, h - 135), text_style).draw(fb);
+    let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 130), bar_size, 0.6, colors::ACCENT_CYAN);
+    let _ = Text::new("ENRG", Point::new(w - 240, h - 95), text_style).draw(fb);
+    let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 90), bar_size, 0.92, colors::GLOW_HI);
 }
 
 pub fn draw_alt_tab_hud(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
@@ -513,9 +533,10 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
     None
 }
 
-pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, cursor_x: i32, cursor_y: i32) {
+pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
+    let mut hovered_button: Option<WindowButton> = None;
     let mut hovered_button: Option<WindowButton> = None;
     
     for (i, w) in windows.iter().take(window_count).enumerate().rev() {
@@ -604,6 +625,14 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     let accent = if is_focused { colors::ACCENT_CYAN } else { colors::GLOW_DIM };
     let _ = ui::draw_window_shadow(fb, rect);
     let _ = ui::draw_glass_card(fb, rect, "ECLIPSE // TERMINAL", accent);
+
+    // Glossy title glow
+    if ww > 100 {
+        let title_glow_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
+        let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::WHITE);
+        let _ = Text::new("ECLIPSE // TERMINAL", Point::new(wx + 11, wy + 19), title_glow_style).draw(fb);
+        let _ = Text::new("ECLIPSE // TERMINAL", Point::new(wx + 10, wy + 18), title_style).draw(fb);
+    }
     if ww > 80 {
         let btn_y = wy + (ShellWindow::TITLE_H - ui::BUTTON_ICON_SIZE as i32) / 2;
         let btn_margin = 5;
@@ -615,12 +644,18 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
         let _ = ui::draw_button_icon_with_hover(fb, Point::new(min_x, btn_y), icons::BTN_MIN, button_hover == Some(WindowButton::Minimize), accent);
     }
     let handle_style = PrimitiveStyleBuilder::new().stroke_color(accent).stroke_width(1).build();
-    let _ = Rectangle::new(Point::new(wx + ww - 16, wy + wh - 16), Size::new(16, 16)).into_styled(handle_style).draw(fb);
+    let _ = Rectangle::new(
+        Point::new(wx + ww - ShellWindow::RESIZE_HANDLE_SIZE, wy + wh - ShellWindow::RESIZE_HANDLE_SIZE),
+        Size::new(ShellWindow::RESIZE_HANDLE_SIZE as u32, ShellWindow::RESIZE_HANDLE_SIZE as u32)
+    ).into_styled(handle_style).draw(fb);
+
     if is_focused {
         let corner_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_HIGHLIGHT).stroke_width(2).build();
         let c_len = 15;
+        // Top-left
         let _ = Line::new(Point::new(wx, wy), Point::new(wx + c_len, wy)).into_styled(corner_style).draw(fb);
         let _ = Line::new(Point::new(wx, wy), Point::new(wx, wy + c_len)).into_styled(corner_style).draw(fb);
+        // Top-right
         let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww - c_len, wy)).into_styled(corner_style).draw(fb);
         let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww, wy + c_len)).into_styled(corner_style).draw(fb);
     }
@@ -645,17 +680,34 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
         let _ = ui::draw_standard_icon(fb, p, icon);
         let _ = Text::new(label, p + label_off, label_style).draw(fb);
     }
+    // HUD Superior
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
-    let _ = Rectangle::new(Point::new(15, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_PANEL).build()).draw(fb);
+    let hud_bg = colors::GLASS_PANEL;
+
+    let _ = Rectangle::new(Point::new(15, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
+    let _ = Line::new(Point::new(15, 15), Point::new(35, 15)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(15, 15), Point::new(15, 35)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(255, 65), Point::new(235, 65)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(255, 65), Point::new(255, 45)).into_styled(hud_line_style).draw(fb);
     let _ = Text::new("APLICACIONES ACTIVAS", Point::new(30, 45), label_style).draw(fb);
+
     let rx = w - 255;
-    let _ = Rectangle::new(Point::new(rx, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_PANEL).build()).draw(fb);
+    let _ = Rectangle::new(Point::new(rx, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
+    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 65), Point::new(rx + 20, 65)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 65), Point::new(rx, 45)).into_styled(hud_line_style).draw(fb);
     let dot = if (counter / 15) % 2 == 0 { "*" } else { " " };
     let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 45), label_style).draw(fb);
     let _ = Text::new(dot, Point::new(rx + 200, 45), label_style).draw(fb);
+
     let taskbar_y = h - 44;
     let taskbar = Taskbar { width: fb.info.width as u32, y: taskbar_y as i32, active_app: None };
     let _ = taskbar.draw(fb);
+
+    let help_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+    let _ = Text::new("SUPER: Dash | SUPER+L: Lock | SUPER+V: Notifs", Point::new(w - 450, h - 15), help_style).draw(fb);
+
     let mut min_count = 0;
     for i in 0..window_count {
         if windows[i].content != WindowContent::None && windows[i].minimized {
@@ -665,6 +717,8 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
                 WindowContent::External(_) => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::APPS); },
                 _ => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::SYSTEM); },
             }
+            let label = if let WindowContent::External(_) = windows[i].content { "APP" } else { "DEMO" };
+            let _ = Text::new(label, p + Point::new(-15, 60), label_style).draw(fb);
             min_count += 1;
         }
     }
@@ -672,4 +726,11 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
 
 pub fn draw_cursor(fb: &mut FramebufferState, pos: Point) {
     let _ = ui::draw_hud_cursor(fb, pos, colors::ACCENT_CYAN);
+}
+
+pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
+    let d = 4u32;
+    let color = STROKE_COLORS[color_idx.min(4) as usize];
+    let _ = Rectangle::new(Point::new(x, y), Size::new(d, d))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build()).draw(fb);
 }

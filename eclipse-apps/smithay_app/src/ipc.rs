@@ -60,7 +60,16 @@ pub fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: 
             if let Some(s_idx) = surface_idx {
                 if *window_count < windows.len() {
                     surfaces[s_idx] = ExternalSurface { id: sender_pid, pid: sender_pid, vaddr: 0x1000, buffer_size: (msg.w * msg.h * 4) as usize, active: true };
-                    windows[*window_count] = ShellWindow { x: msg.x, y: msg.y, w: msg.w as i32, h: msg.h as i32 + 26, curr_x: msg.x as f32, curr_y: msg.y as f32, curr_w: msg.w as f32, curr_h: (msg.h as i32 + 26) as f32, minimized: false, maximized: false, closing: false, stored_rect: (msg.x, msg.y, msg.w as i32, msg.h as i32 + 26), workspace: input_state.current_workspace, content: WindowContent::External(s_idx as u32) };
+                    windows[*window_count] = ShellWindow { 
+                        x: msg.x, y: msg.y, w: msg.w as i32, h: msg.h as i32 + 26, 
+                        curr_x: (msg.x + msg.w as i32 / 2) as f32, 
+                        curr_y: (msg.y + (msg.h as i32 + 26) / 2) as f32, 
+                        curr_w: 0.0, curr_h: 0.0, 
+                        minimized: false, maximized: false, closing: false, 
+                        stored_rect: (msg.x, msg.y, msg.w as i32, msg.h as i32 + 26), 
+                        workspace: input_state.current_workspace, 
+                        content: WindowContent::External(s_idx as u32) 
+                    };
                     *window_count += 1;
                 }
             }
@@ -71,6 +80,20 @@ pub fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: 
                 if let Some(w_idx) = windows.iter().position(|w| w.content == WindowContent::External(s_idx as u32)) {
                     for i in w_idx..(*window_count - 1) { windows[i] = windows[i+1]; }
                     *window_count -= 1;
+                    if input_state.focused_window == Some(w_idx) { input_state.focused_window = None; }
+                    else if let Some(f) = input_state.focused_window { if f > w_idx { input_state.focused_window = Some(f - 1); } }
+                    if input_state.dragging_window == Some(w_idx) { input_state.dragging_window = None; }
+                    else if let Some(d) = input_state.dragging_window { if d > w_idx { input_state.dragging_window = Some(d - 1); } }
+                    if input_state.resizing_window == Some(w_idx) { input_state.resizing_window = None; }
+                    else if let Some(r) = input_state.resizing_window { if r > w_idx { input_state.resizing_window = Some(r - 1); } }
+                }
+            }
+        }
+        SWND_OP_UPDATE | SWND_OP_COMMIT => {
+            if let Some(w_idx) = windows.iter().position(|w| matches!(w.content, WindowContent::External(idx) if idx < surfaces.len() as u32 && surfaces[idx as usize].pid == sender_pid)) {
+                if msg.op == SWND_OP_UPDATE {
+                    windows[w_idx].x = msg.x;
+                    windows[w_idx].y = msg.y;
                 }
             }
         }
