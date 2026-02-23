@@ -2710,17 +2710,23 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
     // Flush CPU cache so GPU DMA sees userspace writes
     if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
         let fb_phys = *DISPLAY_FB_PHYS.lock();
-        let fb_size = *DISPLAY_FB_SIZE.lock();
-        if fb_phys != 0 && fb_size > 0 {
-            let virt = crate::memory::phys_to_virt(fb_phys);
-            const CACHE_LINE: u64 = 64;
-            let end = virt + fb_size as u64;
-            let mut addr = virt;
-            while addr < end {
-                unsafe { clflush(addr); }
-                addr += CACHE_LINE;
+        if fb_phys != 0 {
+            if let Some((_, _, _, pitch, _)) = get_primary_virtio_display() {
+                let virt = crate::memory::phys_to_virt(fb_phys);
+                let pitch = pitch as u64;
+
+                // Optimized: only flush the dirty rectangle
+                for row in y..(y + h) {
+                    let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
+                    let row_end = row_addr + (w as u64 * 4);
+                    let mut addr = row_addr & !63; // Align to cache line (64 bytes)
+                    while addr < row_end {
+                        unsafe { clflush(addr); }
+                        addr += 64;
+                    }
+                }
+                unsafe { sfence(); }
             }
-            unsafe { sfence(); }
         }
     }
     let mut devices = GPU_DEVICES.lock();

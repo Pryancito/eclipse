@@ -1,0 +1,246 @@
+use embedded_graphics::prelude::*;
+use eclipse_libc::{InputEvent, send};
+use sidewind_core::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_MOVE, SWND_EVENT_TYPE_MOUSE_BUTTON, SWND_EVENT_TYPE_RESIZE};
+use sidewind_sdk::ui::{Notification};
+use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM};
+
+#[derive(Clone)]
+pub enum CompositorEvent {
+    Input(InputEvent),
+    SideWind(SideWindMessage, u32), // message, sender_pid
+    Wayland(heapless::Vec<u8, 256>, u32), // data, sender_pid
+    X11(heapless::Vec<u8, 256>, u32), // data, sender_pid
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum KeyAction {
+    None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
+    InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
+    Minimize, Restore, ToggleDashboard, ToggleLock, ToggleNotifications, ToggleLauncher,
+    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch,
+    ArrowUp, ArrowDown, Input(char), Enter, Backspace,
+}
+
+pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
+    match scancode {
+        0x2E => KeyAction::Clear,
+        0x02 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(0) } else { KeyAction::SetColor(0) },
+        0x03 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(1) } else { KeyAction::SetColor(1) },
+        0x04 => KeyAction::SetColor(2),
+        0x05 => KeyAction::SetColor(3),
+        0x06 => KeyAction::SetColor(4),
+        0x0B => KeyAction::CycleStrokeSize,
+        0x0D => KeyAction::SensitivityPlus,
+        0x0C => KeyAction::SensitivityMinus,
+        0x17 => KeyAction::InvertY,
+        0x47 => KeyAction::CenterCursor,
+        0x31 => KeyAction::NewWindow,
+        0x01 => KeyAction::CloseWindow,
+        0x0F => if (modifiers & 4) != 0 { KeyAction::CycleWindowVisual } else { KeyAction::CycleForward },
+        0x29 => KeyAction::CycleBackward,
+        0x32 => KeyAction::Minimize,
+        0x5B => KeyAction::ToggleDashboard,
+        0x26 => KeyAction::ToggleLock,
+        0x2F => KeyAction::ToggleNotifications,
+        0x1E => KeyAction::ToggleLauncher,
+        0x4B => KeyAction::SnapLeft,
+        0x4D => KeyAction::SnapRight,
+        0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None },
+        0x48 => KeyAction::ArrowUp,
+        0x50 => KeyAction::ArrowDown,
+        0x1C => KeyAction::Enter,
+        0x0E => KeyAction::Backspace,
+        _ => KeyAction::None,
+    }
+}
+
+pub fn scancode_to_char(code: u16, shift: bool) -> Option<char> {
+    match (code, shift) {
+        (0x1E, false) => Some('a'), (0x1E, true) => Some('A'),
+        (0x30, false) => Some('b'), (0x30, true) => Some('B'),
+        (0x2E, false) => Some('c'), (0x2E, true) => Some('C'),
+        (0x20, false) => Some('d'), (0x20, true) => Some('D'),
+        (0x12, false) => Some('e'), (0x12, true) => Some('E'),
+        (0x21, false) => Some('f'), (0x21, true) => Some('F'),
+        (0x22, false) => Some('g'), (0x22, true) => Some('G'),
+        (0x23, false) => Some('h'), (0x23, true) => Some('H'),
+        (0x17, false) => Some('i'), (0x17, true) => Some('I'),
+        (0x24, false) => Some('j'), (0x24, true) => Some('J'),
+        (0x25, false) => Some('k'), (0x25, true) => Some('K'),
+        (0x26, false) => Some('l'), (0x26, true) => Some('L'),
+        (0x32, false) => Some('m'), (0x32, true) => Some('M'),
+        (0x31, false) => Some('n'), (0x31, true) => Some('N'),
+        (0x18, false) => Some('o'), (0x18, true) => Some('O'),
+        (0x19, false) => Some('p'), (0x19, true) => Some('P'),
+        (0x10, false) => Some('q'), (0x10, true) => Some('Q'),
+        (0x13, false) => Some('r'), (0x13, true) => Some('R'),
+        (0x1F, false) => Some('s'), (0x1F, true) => Some('S'),
+        (0x14, false) => Some('t'), (0x14, true) => Some('T'),
+        (0x16, false) => Some('u'), (0x16, true) => Some('U'),
+        (0x2F, false) => Some('v'), (0x2F, true) => Some('V'),
+        (0x11, false) => Some('w'), (0x11, true) => Some('W'),
+        (0x2D, false) => Some('x'), (0x2D, true) => Some('X'),
+        (0x15, false) => Some('y'), (0x15, true) => Some('Y'),
+        (0x2C, false) => Some('z'), (0x2C, true) => Some('Z'),
+        (0x39, _) => Some(' '),
+        (0x02, _) => Some('1'), (0x03, _) => Some('2'), (0x04, _) => Some('3'), (0x05, _) => Some('4'), (0x06, _) => Some('5'),
+        _ => None,
+    }
+}
+
+pub struct InputState {
+    pub cursor_x: i32,
+    pub cursor_y: i32,
+    pub mouse_buttons: u8,
+    pub request_clear: bool,
+    pub stroke_color: u8,
+    pub stroke_size: i32,
+    pub mouse_sensitivity: i32,
+    pub invert_y: bool,
+    pub request_center_cursor: bool,
+    pub request_new_window: bool,
+    pub request_close_window: bool,
+    pub request_cycle_forward: bool,
+    pub request_cycle_backward: bool,
+    pub request_minimize: bool,
+    pub request_maximize: bool,
+    pub request_restore: bool,
+    pub dragging_window: Option<usize>,
+    pub resizing_window: Option<usize>,
+    pub drag_offset_x: i32,
+    pub drag_offset_y: i32,
+    pub focused_window: Option<usize>,
+    pub modifiers: u32,
+    pub request_dashboard: bool,
+    pub dashboard_active: bool,
+    pub lock_active: bool,
+    pub notifications_active: bool,
+    pub notifications: [Option<Notification>; 5],
+    pub launcher_active: bool,
+    pub quick_settings_active: bool,
+    pub context_menu_active: bool,
+    pub context_menu_pos: Point,
+    pub notif_curr_x: f32,
+    pub launcher_curr_y: f32,
+    pub current_workspace: u8,
+    pub workspace_offset: f32,
+    pub alt_tab_active: bool,
+    pub search_active: bool,
+    pub search_query: heapless::String<32>,
+    pub search_selected_idx: usize,
+    pub search_curr_y: f32,
+}
+
+impl InputState {
+    pub fn new(width: i32, height: i32) -> Self {
+        Self {
+            cursor_x: width / 2, cursor_y: height / 2, mouse_buttons: 0,
+            request_clear: false, stroke_color: 0, stroke_size: 4,
+            mouse_sensitivity: 100, invert_y: false, request_center_cursor: false,
+            request_new_window: false, request_close_window: false,
+            request_cycle_forward: false, request_cycle_backward: false,
+            request_minimize: false, request_maximize: false, request_restore: false,
+            dragging_window: None, resizing_window: None, drag_offset_x: 0, drag_offset_y: 0,
+            focused_window: None, modifiers: 0, request_dashboard: false,
+            dashboard_active: false, lock_active: false, notifications_active: false,
+            notifications: [ Some(Notification { title: "SISTEMA", body: "Núcleos óptimos.", icon_type: 0 }), Some(Notification { title: "SEGURIDAD", body: "Encriptación activa.", icon_type: 0 }), None, None, None ],
+            launcher_active: false, quick_settings_active: false, context_menu_active: false,
+            context_menu_pos: Point::new(0, 0), notif_curr_x: width as f32,
+            launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
+            alt_tab_active: false, search_active: false, search_query: heapless::String::<32>::new(),
+            search_selected_idx: 0, search_curr_y: 0.0,
+        }
+    }
+
+    pub fn apply_event(&mut self, ev: &InputEvent, fb_width: i32, fb_height: i32, windows: &mut [ShellWindow], window_count: &mut usize, surfaces: &[ExternalSurface]) {
+        match ev.event_type {
+            0 => { // Keyboard
+                let pressed = ev.value == 1;
+                match ev.code {
+                    0x2A | 0x36 => { if pressed { self.modifiers |= 1; } else { self.modifiers &= !1; } }
+                    0x1D => { if pressed { self.modifiers |= 2; } else { self.modifiers &= !2; } }
+                    0x38 => { if pressed { self.modifiers |= 4; } else { self.modifiers &= !4; } }
+                    0x5B => { if pressed { self.modifiers |= 8; } else { self.modifiers &= !8; } }
+                    _ => {}
+                }
+                let action = if self.search_active {
+                    match ev.code {
+                        0x01 => KeyAction::ToggleSearch,
+                        0x1C => KeyAction::Enter,
+                        0x0E => KeyAction::Backspace,
+                        0x48 => KeyAction::ArrowUp,
+                        0x50 => KeyAction::ArrowDown,
+                        _ => { if let Some(c) = scancode_to_char(ev.code, (self.modifiers & 1) != 0) { KeyAction::Input(c) } else { KeyAction::None } }
+                    }
+                } else if self.modifiers & (4 | 8) != 0 {
+                    scancode_to_action(ev.code, self.modifiers)
+                } else {
+                    KeyAction::None
+                };
+                match action {
+                    KeyAction::None => {
+                        if let Some(f_idx) = self.focused_window {
+                            if let WindowContent::External(s_idx) = windows[f_idx].content {
+                                let pid = surfaces[s_idx as usize].pid;
+                                let se = SideWindEvent { event_type: SWND_EVENT_TYPE_KEY, data1: ev.code as i32, data2: ev.value as i32, data3: self.modifiers as i32 };
+                                let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                            }
+                        }
+                    }
+                    KeyAction::Clear => if pressed { self.request_clear = true; },
+                    KeyAction::SetColor(c) => if pressed { self.stroke_color = c.min(4); },
+                    KeyAction::CenterCursor => if pressed { self.request_center_cursor = true; },
+                    KeyAction::NewWindow => if pressed { self.request_new_window = true; },
+                    KeyAction::CloseWindow => if pressed { self.request_close_window = true; },
+                    KeyAction::CycleForward => if pressed { self.request_cycle_forward = true; },
+                    KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
+                    KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
+                    KeyAction::ToggleLauncher => if pressed && (self.modifiers & 8 != 0) { self.launcher_active = !self.launcher_active; },
+                    KeyAction::ToggleSearch => if pressed { self.search_active = !self.search_active; if self.search_active { self.search_query.clear(); } },
+                    _ => {}
+                }
+            }
+            1 => { // Mouse move
+                let d = (ev.value * self.mouse_sensitivity) / 100;
+                if ev.code == 0 {
+                    self.cursor_x = (self.cursor_x + d).clamp(0, fb_width - 1);
+                    if let Some(idx) = self.dragging_window { windows[idx].x = (windows[idx].x + d).clamp(0, fb_width - windows[idx].w); }
+                    if let Some(idx) = self.resizing_window { windows[idx].w = (self.cursor_x - windows[idx].x + 8).max(50).min(MAX_SURFACE_DIM as i32); }
+                } else if ev.code == 1 {
+                    let dy = if self.invert_y { -d } else { d };
+                    self.cursor_y = (self.cursor_y + dy).clamp(0, fb_height - 1);
+                    if let Some(idx) = self.dragging_window { windows[idx].y = (windows[idx].y + dy).clamp(0, fb_height - windows[idx].h); }
+                    if let Some(idx) = self.resizing_window { windows[idx].h = (self.cursor_y - windows[idx].y + 8).max(50).min(MAX_SURFACE_DIM as i32); }
+                }
+            }
+            2 => { // Mouse button
+                let btn = ev.code as u8;
+                let pressed = ev.value != 0;
+                let old = self.mouse_buttons;
+                if pressed { self.mouse_buttons |= 1 << btn; } else { self.mouse_buttons &= !(1 << btn); }
+                if (self.mouse_buttons & 1 != 0) && (old & 1 == 0) {
+                    self.launcher_active = false; self.context_menu_active = false;
+                    if self.cursor_y >= fb_height - 40 { if self.cursor_x < 150 { self.launcher_active = true; } }
+                    else if let Some(idx) = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count) {
+                        let top = *window_count - 1; if idx != top { windows.swap(idx, top); }
+                        self.focused_window = Some(top);
+                        let b = windows[top].check_button_click(self.cursor_x, self.cursor_y);
+                        match b { WindowButton::Close => self.request_close_window = true, _ => { self.dragging_window = Some(top); self.drag_offset_x = self.cursor_x - windows[top].x; self.drag_offset_y = self.cursor_y - windows[top].y; } }
+                    } else { self.focused_window = None; }
+                } else if (self.mouse_buttons & 2 != 0) && (old & 2 == 0) {
+                    self.launcher_active = false; self.quick_settings_active = false;
+                    if focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count).is_none() {
+                        self.context_menu_active = true;
+                        self.context_menu_pos = Point::new(self.cursor_x, self.cursor_y);
+                    } else { self.context_menu_active = false; }
+                } else if self.mouse_buttons & 1 == 0 { self.dragging_window = None; self.resizing_window = None; }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn execute_search(&mut self) {
+        if self.search_query == "term" { self.request_new_window = true; }
+        else if self.search_query == "lock" { self.lock_active = true; }
+    }
+}
