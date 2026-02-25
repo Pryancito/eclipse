@@ -830,6 +830,35 @@ pub fn read_mouse_packet() -> u32 {
     })
 }
 
+/// Inject a scancode into the keyboard buffer (used by USB HID driver).
+pub fn push_key(scancode: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut head = KEY_HEAD.lock();
+        let tail = KEY_TAIL.lock();
+        let next_head = (*head + 1) % KEY_BUFFER_SIZE;
+        if next_head != *tail {
+            let mut buffer = KEY_BUFFER.lock();
+            buffer[*head] = scancode;
+            *head = next_head;
+        }
+    });
+}
+
+/// Inject a packed mouse packet into the mouse buffer (used by USB HID driver).
+/// Format: buttons | (dx as u8)<<8 | (dy as u8)<<16
+pub fn push_mouse_packet(packet: u32) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut head = MOUSE_HEAD.lock();
+        let tail = MOUSE_TAIL.lock();
+        let next_head = (*head + 1) % MOUSE_BUFFER_SIZE;
+        if next_head != *tail {
+            let mut buf = MOUSE_BUFFER.lock();
+            buf[*head] = packet;
+            *head = next_head;
+        }
+    });
+}
+
 #[unsafe(naked)]
 unsafe extern "C" fn irq_1() {
     core::arch::naked_asm!(

@@ -1,35 +1,24 @@
 //! USB HID (Human Interface Device) - Gaming Peripherals Support
-//! 
-//! Rewrite using the 'xhci' crate for robust hardware compatibility.
+//!
+//! Uses the 'xhci' crate for robust XHCI hardware access.
+//! Persistent state (DMA rings, contexts) is kept in a static Mutex so
+//! the hardware never points to freed memory.
 
 use alloc::vec::Vec;
 use alloc::format;
 use core::ptr::{read_volatile, write_volatile};
-use crate::memory::{phys_to_virt, virt_to_phys, alloc_dma_buffer};
+use crate::memory::{phys_to_virt, alloc_dma_buffer};
 use core::num::NonZeroUsize;
+use spin::Mutex;
 
-/// Capacidades de dispositivos gaming
-#[derive(Debug, Clone, Copy)]
-pub struct GamingDeviceCapabilities {
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub max_polling_rate: u32,  // Hz
-    pub max_dpi: u32,            // For mice
-    pub adjustable_dpi: bool,
-    pub extra_buttons: u8,
-    pub n_key_rollover: bool,    // For keyboards
-    pub macro_keys: u8,
-    pub rgb_support: bool,
-}
+// ============================================================================
+// Timeout constant (conservative: ~50 ms on bare metal at ~10 M iter/s)
+// ============================================================================
+const TIMEOUT: usize = 500_000;
 
-pub mod vendors {
-    pub const LOGITECH: u16 = 0x046D;
-    pub const RAZER: u16 = 0x1532;
-    pub const CORSAIR: u16 = 0x1B1C;
-    pub const STEELSERIES: u16 = 0x1038;
-    pub const ROCCAT: u16 = 0x1E7D;
-}
-
+// ============================================================================
+// DMA allocation helper
+// ============================================================================
 pub struct DmaAllocation {
     pub virt_addr: u64,
     pub phys_addr: u64,
@@ -42,8 +31,28 @@ impl DmaAllocation {
             unsafe { core::ptr::write_bytes(ptr, 0, size); }
             Ok(Self { virt_addr: ptr as u64, phys_addr: phys, size })
         } else {
-            Err("Failed to allocate DMA buffer")
+            Err("DMA alloc failed")
         }
+    }
+
+    pub fn write_u32(&self, offset: usize, val: u32) {
+        if offset + 4 > self.size { return; }
+        unsafe { write_volatile((self.virt_addr + offset as u64) as *mut u32, val); }
+    }
+
+    pub fn read_u32(&self, offset: usize) -> u32 {
+        if offset + 4 > self.size { return 0; }
+        unsafe { read_volatile((self.virt_addr + offset as u64) as *const u32) }
+    }
+
+    pub fn write_u64(&self, offset: usize, val: u64) {
+        if offset + 8 > self.size { return; }
+        unsafe { write_volatile((self.virt_addr + offset as u64) as *mut u64, val); }
+    }
+
+    pub fn read_u64(&self, offset: usize) -> u64 {
+        if offset + 8 > self.size { return 0; }
+        unsafe { read_volatile((self.virt_addr + offset as u64) as *const u64) }
     }
 
     pub fn write_bytes(&self, offset: usize, data: &[u8]) {
@@ -59,7 +68,9 @@ impl DmaAllocation {
     }
 }
 
-/// Generic TRB Ring management
+// ============================================================================
+// XHCI TRB ring
+// ============================================================================
 pub struct XhciRing {
     pub dma: DmaAllocation,
     pub num_trbs: usize,
@@ -70,36 +81,27 @@ pub struct XhciRing {
 impl XhciRing {
     pub fn new(num_trbs: usize) -> Result<Self, &'static str> {
         let dma = DmaAllocation::new(num_trbs * 16, 64)?;
-        Ok(Self {
-            dma,
-            num_trbs,
-            enqueue_index: 0,
-            cycle_state: true,
-        })
+        Ok(Self { dma, num_trbs, enqueue_index: 0, cycle_state: true })
     }
 
+    /// Write a TRB to the ring (sets cycle bit) and advance the enqueue pointer.
     pub fn push_trb(&mut self, mut trb: [u32; 4]) {
-        // Set cycle bit
-        if self.cycle_state {
-            trb[3] |= 1;
-        } else {
-            trb[3] &= !1;
-        }
-
+        if self.cycle_state { trb[3] |= 1; } else { trb[3] &= !1; }
         let offset = self.enqueue_index * 16;
-        self.dma.write_bytes(offset, unsafe { 
-            core::slice::from_raw_parts(trb.as_ptr() as *const u8, 16) 
+        self.dma.write_bytes(offset, unsafe {
+            core::slice::from_raw_parts(trb.as_ptr() as *const u8, 16)
         });
-
         self.enqueue_index += 1;
-        if self.enqueue_index >= self.num_trbs - 1 { 
+        if self.enqueue_index >= self.num_trbs - 1 {
             self.enqueue_index = 0;
             self.cycle_state = !self.cycle_state;
         }
     }
 }
 
-/// Mapper for the xhci crate to access MMIO via our HHDM
+// ============================================================================
+// xhci crate mapper (HHDM)
+// ============================================================================
 #[derive(Clone, Copy)]
 pub struct XhciMapper;
 impl xhci::accessor::Mapper for XhciMapper {
@@ -109,189 +111,452 @@ impl xhci::accessor::Mapper for XhciMapper {
     fn unmap(&mut self, _virt_base: usize, _bytes: usize) {}
 }
 
-pub struct XhciController {
-    bus: u8,
-    dev: u8,
-    func: u8,
+// ============================================================================
+// Persistent XHCI runtime state (keeps DMA allocations alive)
+// ============================================================================
+struct XhciRuntime {
     bar0: u64,
+    num_ports: u8,
+    _dcbaa: DmaAllocation,
+    cmd_ring: XhciRing,
+    event_ring: DmaAllocation,
+    _erst: DmaAllocation,
+    event_dequeue_phys: u64,
+    event_cycle: bool,
+    // Per-port HID interrupt transfer ring and report buffer (index = port number)
+    hid_rings: Vec<Option<XhciRing>>,
+    hid_bufs: Vec<Option<DmaAllocation>>,
 }
 
-impl XhciController {
-    pub fn new(bus: u8, dev: u8, func: u8, bar0: u64) -> Self {
-        Self { bus, dev, func, bar0 }
-    }
+static XHCI_RUNTIME: Mutex<Option<XhciRuntime>> = Mutex::new(None);
 
-    pub fn init(&self) -> Result<(), &'static str> {
-        crate::serial::serial_print(&format!("[USB-XHCI] Initializing XHCI at {:02X}:{:02X}.{} (BAR0: 0x{:X})\n", 
-            self.bus, self.dev, self.func, self.bar0));
+// ============================================================================
+// USB HID Usage (page 0x07) to PS/2 Set-1 make scancode table
+// ============================================================================
+/// Maps USB HID keyboard usage IDs (0x04..=0x73) to PS/2 Set-1 make scancodes.
+/// 0x00 means "no mapping".
+#[rustfmt::skip]
+const HID_TO_PS2: [u8; 0x74] = [
+    // 0x00-0x03: reserved / error / POST fail / undefined
+    0x00, 0x00, 0x00, 0x00,
+    // 0x04 a, 0x05 b, ... 0x1D z
+    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
+    0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+    // 0x1E 1, 0x1F 2, 0x20 3, 0x21 4, 0x22 5, 0x23 6, 0x24 7, 0x25 8, 0x26 9, 0x27 0
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+    // 0x28 Enter, 0x29 Escape, 0x2A Backspace, 0x2B Tab
+    0x1C, 0x01, 0x0E, 0x0F,
+    // 0x2C Space, 0x2D -, 0x2E =, 0x2F [, 0x30 ], 0x31 \, 0x32 #, 0x33 ;, 0x34 ', 0x35 `, 0x36 ,, 0x37 ., 0x38 /
+    0x39, 0x0C, 0x0D, 0x1A, 0x1B, 0x2B, 0x2B, 0x27, 0x28, 0x29, 0x33, 0x34, 0x35,
+    // 0x39 CapsLock
+    0x3A,
+    // 0x3A F1, 0x3B F2, ... 0x45 F12
+    0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x57, 0x58,
+    // 0x46 PrintScreen, 0x47 ScrollLock, 0x48 Pause
+    0x00, 0x46, 0x00,
+    // 0x49 Insert, 0x4A Home, 0x4B PageUp, 0x4C Delete, 0x4D End, 0x4E PageDown
+    0x00, 0x00, 0x00, 0x53, 0x00, 0x00,
+    // 0x4F Right, 0x50 Left, 0x51 Down, 0x52 Up
+    0x00, 0x00, 0x00, 0x00,
+    // 0x53 NumLock, 0x54 KP/, 0x55 KP*, 0x56 KP-, 0x57 KP+, 0x58 KPEnter
+    0x45, 0x00, 0x37, 0x4A, 0x4E, 0x00,
+    // 0x59 KP1 .. 0x61 KP9
+    0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49,
+    // 0x62 KP0, 0x63 KP.
+    0x52, 0x53,
+    // 0x64 \|, 0x65 App, 0x66 Power
+    0x56, 0x00, 0x00,
+    // 0x67 KP=, 0x68..0x6F F13..F20
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x70..0x73
+    0x00, 0x00, 0x00, 0x00,
+];
 
-        let mapper = XhciMapper;
-        // Timeout conservador: 500_000 iteraciones (~50ms aprox en bare metal)
-        const TIMEOUT: usize = 500_000;
+/// Translate a USB HID keyboard usage ID to a PS/2 Set-1 make scancode.
+fn hid_key_to_ps2(usage: u8) -> u8 {
+    if (usage as usize) < HID_TO_PS2.len() { HID_TO_PS2[usage as usize] } else { 0 }
+}
 
-        unsafe {
-            let mut regs = xhci::Registers::new(self.bar0 as usize, mapper);
-            let operational = &mut regs.operational;
-            let capability = &regs.capability;
+// ============================================================================
+// HID boot protocol report structures
+// ============================================================================
+/// 8-byte USB HID boot-protocol keyboard report
+#[repr(C)]
+struct HidKeyboardReport {
+    modifier: u8,
+    _reserved: u8,
+    keycodes: [u8; 6],
+}
 
-            // --- BIOS Handoff (xHCI Extended Capabilities LEGSUP) ---
-            // Leer HCCPARAMS1 para obtener xECP offset
-            let hccparams1 = capability.hccparams1.read_volatile();
-            let xecp = hccparams1.xhci_extended_capabilities_pointer() as usize;
-            crate::serial::serial_print(&format!("[USB-XHCI] xECP offset: 0x{:X}\n", xecp));
-            if xecp != 0 {
-                let cap_base = (self.bar0 as usize + xecp * 4) as *mut u32;
-                let legsup = read_volatile(cap_base);
-                crate::serial::serial_print(&format!("[USB-XHCI] LEGSUP before handoff: 0x{:08X}\n", legsup));
-                // Si BIOS OS Owned Semaphore (bit 24) está a 0, pedir ownership
-                if (legsup & (1 << 24)) == 0 {
-                    write_volatile(cap_base, legsup | (1 << 24)); // Set OS Owned Semaphore
-                    // Esperar a que BIOS libere (bit 16 = BIOS Owned Semaphore)
-                    let mut t = 500_000usize;
-                    loop {
-                        let v = read_volatile(cap_base);
-                        if (v & (1 << 16)) == 0 { break; } // BIOS liberó
-                        if t == 0 {
-                            crate::serial::serial_print("[USB-XHCI] WARN: BIOS handoff timeout, forcing ownership\n");
-                            // Forzar: limpiar bit BIOS owned
-                            write_volatile(cap_base, v & !(1 << 16));
-                            break;
-                        }
-                        t -= 1;
-                        core::hint::spin_loop();
+/// 3-byte USB HID boot-protocol mouse report
+#[repr(C)]
+struct HidMouseReport {
+    buttons: u8,
+    x: i8,
+    y: i8,
+}
+
+// ============================================================================
+// Vendor/capability info (kept for ABI compatibility)
+// ============================================================================
+#[derive(Debug, Clone, Copy)]
+pub struct GamingDeviceCapabilities {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub max_polling_rate: u32,
+    pub max_dpi: u32,
+    pub adjustable_dpi: bool,
+    pub extra_buttons: u8,
+    pub n_key_rollover: bool,
+    pub macro_keys: u8,
+    pub rgb_support: bool,
+}
+
+pub mod vendors {
+    pub const LOGITECH: u16 = 0x046D;
+    pub const RAZER: u16 = 0x1532;
+    pub const CORSAIR: u16 = 0x1B1C;
+    pub const STEELSERIES: u16 = 0x1038;
+    pub const ROCCAT: u16 = 0x1E7D;
+}
+
+// ============================================================================
+// XHCI controller initialisation
+// ============================================================================
+fn init_xhci(bus: u8, dev: u8, func: u8, bar0: u64) -> Result<(), &'static str> {
+    crate::serial::serial_print(&format!(
+        "[USB-XHCI] Init {:02X}:{:02X}.{} BAR0=0x{:X}\n",
+        bus, dev, func, bar0
+    ));
+
+    let mapper = XhciMapper;
+
+    unsafe {
+        let mut regs = xhci::Registers::new(bar0 as usize, mapper);
+
+        // --- BIOS/OS handoff (LEGSUP) ---
+        let xecp = regs.capability.hccparams1.read_volatile()
+            .xhci_extended_capabilities_pointer() as usize;
+        if xecp != 0 {
+            let cap_base = (bar0 as usize + xecp * 4) as *mut u32;
+            let legsup = read_volatile(cap_base);
+            if (legsup & (1 << 24)) == 0 {
+                write_volatile(cap_base, legsup | (1 << 24));
+                let mut t = TIMEOUT;
+                loop {
+                    let v = read_volatile(cap_base);
+                    if (v & (1 << 16)) == 0 { break; }
+                    if t == 0 {
+                        write_volatile(cap_base, v & !(1 << 16));
+                        crate::serial::serial_print("[USB-XHCI] WARN: BIOS handoff timeout\n");
+                        break;
                     }
-                    crate::serial::serial_print(&format!("[USB-XHCI] LEGSUP after handoff: 0x{:08X}\n", read_volatile(cap_base)));
-                }
-            }
-
-            // 1. Wait for CNR (Controller Not Ready)
-            crate::serial::serial_print("[USB-XHCI] Step 1: Waiting for CNR...\n");
-            let mut timeout = TIMEOUT;
-            while operational.usbsts.read_volatile().controller_not_ready() {
-                if timeout == 0 {
-                    crate::serial::serial_print("[USB-XHCI] WARN: CNR timeout, skipping controller\n");
-                    return Ok(()); // No bloquear el arranque
-                }
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-            crate::serial::serial_print("[USB-XHCI] Step 1: CNR cleared\n");
-
-            // 2. Stop the controller si no está parado
-            crate::serial::serial_print("[USB-XHCI] Step 2: Stopping controller...\n");
-            if !operational.usbsts.read_volatile().hc_halted() {
-                operational.usbcmd.update_volatile(|u| { u.clear_run_stop(); });
-                let mut timeout = TIMEOUT;
-                while !operational.usbsts.read_volatile().hc_halted() {
-                    if timeout == 0 {
-                        crate::serial::serial_print("[USB-XHCI] WARN: Stop timeout, skipping controller\n");
-                        return Ok(());
-                    }
-                    timeout -= 1;
+                    t -= 1;
                     core::hint::spin_loop();
-                }
-            }
-            crate::serial::serial_print("[USB-XHCI] Step 2: Controller halted\n");
-
-            // 3. Reset del controlador
-            crate::serial::serial_print("[USB-XHCI] Step 3: Resetting controller...\n");
-            operational.usbcmd.update_volatile(|u| { u.set_host_controller_reset(); });
-            let mut timeout = TIMEOUT;
-            while operational.usbcmd.read_volatile().host_controller_reset() {
-                if timeout == 0 {
-                    crate::serial::serial_print("[USB-XHCI] WARN: HC Reset timeout, skipping controller\n");
-                    return Ok(());
-                }
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-            crate::serial::serial_print("[USB-XHCI] Step 3: Reset done\n");
-
-            // SPEC XHCI §4.2: Tras reset, esperar de nuevo CNR antes de cualquier acceso
-            crate::serial::serial_print("[USB-XHCI] Step 3b: Waiting CNR after reset...\n");
-            let mut timeout = TIMEOUT;
-            while operational.usbsts.read_volatile().controller_not_ready() {
-                if timeout == 0 {
-                    crate::serial::serial_print("[USB-XHCI] WARN: Post-reset CNR timeout, skipping controller\n");
-                    return Ok(());
-                }
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-            crate::serial::serial_print("[USB-XHCI] Step 3b: CNR cleared after reset\n");
-
-            // 4. Max Slots
-            let max_slots = capability.hcsparams1.read_volatile().number_of_device_slots();
-            crate::serial::serial_print(&format!("[USB-XHCI] Step 4: Max slots = {}\n", max_slots));
-            operational.config.update_volatile(|c| { c.set_max_device_slots_enabled(max_slots); });
-
-            // 5. DCBAA
-            crate::serial::serial_print("[USB-XHCI] Step 5: DCBAA...\n");
-            let dcbaa = DmaAllocation::new((max_slots as usize + 1) * 8, 4096)?;
-            operational.dcbaap.update_volatile(|d| { d.set(dcbaa.phys_addr); });
-
-            // 6. Command Ring
-            crate::serial::serial_print("[USB-XHCI] Step 6: Command Ring...\n");
-            let cmd_ring = XhciRing::new(256)?;
-            operational.crcr.update_volatile(|c| {
-                c.set_command_ring_pointer(cmd_ring.dma.phys_addr);
-                c.set_ring_cycle_state();
-            });
-
-            // 7. Event Ring
-            crate::serial::serial_print("[USB-XHCI] Step 7: Event Ring...\n");
-            let event_ring = DmaAllocation::new(4096, 64)?;
-            let erst = DmaAllocation::new(16, 64)?;
-            erst.write_bytes(0, &event_ring.phys_addr.to_le_bytes());
-            erst.write_bytes(8, &(256u32).to_le_bytes());
-            
-            let mut interrupter0 = regs.interrupter_register_set.interrupter_mut(0);
-            interrupter0.iman.update_volatile(|i| { i.set_interrupt_enable(); });
-            interrupter0.erstsz.update_volatile(|e| { e.set(1); });
-            interrupter0.erstba.update_volatile(|e| { e.set(erst.phys_addr); });
-            interrupter0.erdp.update_volatile(|e| { e.set_event_ring_dequeue_pointer(event_ring.phys_addr); });
-
-            // 8. Arrancar
-            crate::serial::serial_print("[USB-XHCI] Step 8: Starting controller...\n");
-            operational.usbcmd.update_volatile(|u| {
-                u.set_interrupter_enable();
-                u.set_run_stop();
-            });
-            
-            let mut timeout = TIMEOUT;
-            while operational.usbsts.read_volatile().hc_halted() {
-                if timeout == 0 {
-                    crate::serial::serial_print("[USB-XHCI] WARN: Controller start timeout, skipping\n");
-                    return Ok(());
-                }
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-
-            crate::serial::serial_print("[USB-XHCI] Controller fully active\n");
-            
-            // Port Check
-            let num_ports = capability.hcsparams1.read_volatile().number_of_ports();
-            crate::serial::serial_print(&format!("[USB-XHCI] Checking {} ports...\n", num_ports));
-            for i in 0..num_ports {
-                let port_set = regs.port_register_set.read_volatile_at(i as usize);
-                let portsc = port_set.portsc;
-                if portsc.current_connect_status() {
-                    crate::serial::serial_print(&format!("[USB-XHCI] Port {}: Active device detected\n", i));
                 }
             }
         }
 
-        Ok(())
+        // 1. Wait for CNR
+        let mut t = TIMEOUT;
+        while regs.operational.usbsts.read_volatile().controller_not_ready() {
+            if t == 0 { crate::serial::serial_print("[USB-XHCI] WARN: CNR timeout\n"); return Ok(()); }
+            t -= 1; core::hint::spin_loop();
+        }
+
+        // 2. Stop if running
+        if !regs.operational.usbsts.read_volatile().hc_halted() {
+            regs.operational.usbcmd.update_volatile(|u| { u.clear_run_stop(); });
+            let mut t = TIMEOUT;
+            while !regs.operational.usbsts.read_volatile().hc_halted() {
+                if t == 0 { crate::serial::serial_print("[USB-XHCI] WARN: stop timeout\n"); return Ok(()); }
+                t -= 1; core::hint::spin_loop();
+            }
+        }
+
+        // 3. Reset
+        regs.operational.usbcmd.update_volatile(|u| { u.set_host_controller_reset(); });
+        let mut t = TIMEOUT;
+        while regs.operational.usbcmd.read_volatile().host_controller_reset() {
+            if t == 0 { crate::serial::serial_print("[USB-XHCI] WARN: reset timeout\n"); return Ok(()); }
+            t -= 1; core::hint::spin_loop();
+        }
+        // Post-reset CNR
+        let mut t = TIMEOUT;
+        while regs.operational.usbsts.read_volatile().controller_not_ready() {
+            if t == 0 { crate::serial::serial_print("[USB-XHCI] WARN: post-reset CNR timeout\n"); return Ok(()); }
+            t -= 1; core::hint::spin_loop();
+        }
+
+        // 4. Max slots
+        let max_slots = regs.capability.hcsparams1.read_volatile().number_of_device_slots();
+        regs.operational.config.update_volatile(|c| { c.set_max_device_slots_enabled(max_slots); });
+
+        // 5. DCBAA
+        let dcbaa = DmaAllocation::new((max_slots as usize + 1) * 8, 4096)?;
+        regs.operational.dcbaap.update_volatile(|d| { d.set(dcbaa.phys_addr); });
+
+        // 6. Command ring
+        let cmd_ring = XhciRing::new(256)?;
+        regs.operational.crcr.update_volatile(|c| {
+            c.set_command_ring_pointer(cmd_ring.dma.phys_addr);
+            c.set_ring_cycle_state();
+        });
+
+        // 7. Event ring (single segment, 256 TRBs)
+        const EVENT_TRBS: usize = 256;
+        let event_ring = DmaAllocation::new(EVENT_TRBS * 16, 64)?;
+        let erst = DmaAllocation::new(16, 64)?;
+        erst.write_u64(0, event_ring.phys_addr);
+        erst.write_u32(8, EVENT_TRBS as u32);
+        erst.write_u32(12, 0);
+
+        {
+            let mut ir0 = regs.interrupter_register_set.interrupter_mut(0);
+            ir0.iman.update_volatile(|i| { i.set_interrupt_enable(); });
+            ir0.erstsz.update_volatile(|e| { e.set(1); });
+            ir0.erstba.update_volatile(|e| { e.set(erst.phys_addr); });
+            ir0.erdp.update_volatile(|e| { e.set_event_ring_dequeue_pointer(event_ring.phys_addr); });
+        }
+
+        // 8. Start controller
+        regs.operational.usbcmd.update_volatile(|u| {
+            u.set_interrupter_enable();
+            u.set_run_stop();
+        });
+        let mut t = TIMEOUT;
+        while regs.operational.usbsts.read_volatile().hc_halted() {
+            if t == 0 { crate::serial::serial_print("[USB-XHCI] WARN: start timeout\n"); return Ok(()); }
+            t -= 1; core::hint::spin_loop();
+        }
+        crate::serial::serial_print("[USB-XHCI] Controller running\n");
+
+        // 9. Enumerate ports and reset connected ones
+        let num_ports = regs.capability.hcsparams1.read_volatile().number_of_ports();
+        crate::serial::serial_print(&format!("[USB-XHCI] {} ports\n", num_ports));
+
+        let event_dequeue_phys = event_ring.phys_addr;
+        let mut hid_rings: Vec<Option<XhciRing>> = (0..num_ports).map(|_| None).collect();
+        let mut hid_bufs: Vec<Option<DmaAllocation>> = (0..num_ports).map(|_| None).collect();
+
+        for i in 0..num_ports as usize {
+            let portsc = regs.port_register_set.read_volatile_at(i).portsc;
+            if !portsc.current_connect_status() { continue; }
+
+            crate::serial::serial_print(&format!("[USB-XHCI] Port {}: device connected, resetting\n", i));
+
+            // Issue port reset
+            regs.port_register_set.update_volatile_at(i, |p| {
+                p.portsc.set_port_reset();
+            });
+
+            // Wait for port reset complete (PR bit cleared, PRC set)
+            let mut t = TIMEOUT;
+            loop {
+                let sc = regs.port_register_set.read_volatile_at(i).portsc;
+                if !sc.port_reset() { break; }
+                if t == 0 { crate::serial::serial_print(&format!("[USB-XHCI] Port {}: reset timeout\n", i)); break; }
+                t -= 1; core::hint::spin_loop();
+            }
+
+            // Set up a simple interrupt transfer ring for this port (HID polling)
+            // 64-byte report buffer; ring with 8 slots
+            match (XhciRing::new(8), DmaAllocation::new(64, 64)) {
+                (Ok(ring), Ok(buf)) => {
+                    crate::serial::serial_print(&format!("[USB-XHCI] Port {}: HID ring ready\n", i));
+                    hid_rings[i] = Some(ring);
+                    hid_bufs[i] = Some(buf);
+                }
+                _ => {
+                    crate::serial::serial_print(&format!("[USB-XHCI] Port {}: HID ring alloc failed\n", i));
+                }
+            }
+        }
+
+        // Store runtime state (keeps all DMA allocations alive)
+        *XHCI_RUNTIME.lock() = Some(XhciRuntime {
+            bar0,
+            num_ports,
+            _dcbaa: dcbaa,
+            cmd_ring,
+            event_ring,
+            _erst: erst,
+            event_dequeue_phys,
+            event_cycle: true,
+            hid_rings,
+            hid_bufs,
+        });
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Event ring polling (called periodically from the scheduler or a task)
+// ============================================================================
+
+/// Parse a USB HID keyboard boot-protocol report and inject PS/2 scancodes.
+fn process_keyboard_report(new: &[u8; 8], old: &[u8; 8]) {
+    // Modifier keys (0xE0-0xE7 → usage IDs)
+    const MOD_SCANCODES: [u8; 8] = [
+        0x1D, // Left Ctrl
+        0x2A, // Left Shift
+        0x38, // Left Alt
+        0x5B, // Left GUI (extended - we emit simple)
+        0x1D, // Right Ctrl
+        0x36, // Right Shift
+        0x38, // Right Alt
+        0x5C, // Right GUI
+    ];
+
+    let old_mod = old[0];
+    let new_mod = new[0];
+
+    // Modifier changes
+    for bit in 0..8u8 {
+        let mask = 1u8 << bit;
+        let was = (old_mod & mask) != 0;
+        let is = (new_mod & mask) != 0;
+        let sc = MOD_SCANCODES[bit as usize];
+        if !was && is { crate::interrupts::push_key(sc); }      // press
+        if was && !is { crate::interrupts::push_key(sc | 0x80); } // release
+    }
+
+    // Key releases (in old but not new)
+    for &k in old[2..8].iter() {
+        if k == 0 || k == 1 { continue; }
+        if !new[2..8].contains(&k) {
+            let sc = hid_key_to_ps2(k);
+            if sc != 0 { crate::interrupts::push_key(sc | 0x80); }
+        }
+    }
+
+    // Key presses (in new but not old)
+    for &k in new[2..8].iter() {
+        if k == 0 || k == 1 { continue; }
+        if !old[2..8].contains(&k) {
+            let sc = hid_key_to_ps2(k);
+            if sc != 0 { crate::interrupts::push_key(sc); }
+        }
     }
 }
 
+/// Parse a USB HID mouse boot-protocol report and inject a PS/2-style packet.
+fn process_mouse_report(data: &[u8]) {
+    if data.len() < 3 { return; }
+    let buttons = data[0] & 0x07;
+    let dx = data[1] as i8;
+    let dy = data[2] as i8;
+    // Pack: buttons | dx<<8 | dy<<16 (same format as PS/2 handler)
+    let packet = (buttons as u32)
+        | ((dx as u8 as u32) << 8)
+        | ((dy as u8 as u32) << 16);
+    crate::interrupts::push_mouse_packet(packet);
+}
+
+/// Poll the XHCI event ring for Transfer Events carrying HID reports.
+/// Call this from a periodic kernel task or interrupt handler.
+pub fn poll() {
+    let mut guard = XHCI_RUNTIME.lock();
+    let rt = match guard.as_mut() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let bar0 = rt.bar0;
+    let event_ring_virt = rt.event_ring.virt_addr;
+    let event_ring_size = rt.event_ring.size / 16; // number of TRBs
+
+    // We process one TRB at a time to avoid holding the lock too long.
+    // TRB layout: [0..8] parameter, [8..12] status, [12..16] control
+    // Cycle bit is bit 0 of control word (word[3]).
+    let ptr_phys = rt.event_dequeue_phys;
+    let base_phys = rt.event_ring.phys_addr;
+    // Index into the ring
+    let idx = ((ptr_phys - base_phys) / 16) as usize;
+
+    let trb_virt = (event_ring_virt + idx as u64 * 16) as *const u32;
+    let ctrl = unsafe { read_volatile(trb_virt.add(3)) };
+    let cycle_bit = (ctrl & 1) != 0;
+
+    if cycle_bit != rt.event_cycle {
+        // No new event
+        return;
+    }
+
+    // Read TRB
+    let w0 = unsafe { read_volatile(trb_virt) };
+    let w1 = unsafe { read_volatile(trb_virt.add(1)) };
+    let _w2 = unsafe { read_volatile(trb_virt.add(2)) };
+    let trb_type = (ctrl >> 10) & 0x3F;
+
+    // TRB type 32 = Transfer Event
+    if trb_type == 32 {
+        let _slot_id = (ctrl >> 24) & 0xFF;
+        let ep_id = (ctrl >> 16) & 0x1F;
+        let _transfer_len = _w2 & 0x00FF_FFFF;
+        let completion_code = (_w2 >> 24) & 0xFF;
+
+        // completion_code 1 = Success, 13 = Short Packet
+        if completion_code == 1 || completion_code == 13 {
+            // Find the HID buffer associated with this slot/endpoint
+            // For boot protocol, ep_id 3 = interrupt IN endpoint 1
+            // We use port index as a proxy here; a full driver would track slot→port
+            let port_hint = (ep_id.saturating_sub(2)) as usize;
+            if port_hint < rt.hid_bufs.len() {
+                if let Some(ref buf) = rt.hid_bufs[port_hint] {
+                    let mut data = [0u8; 8];
+                    buf.read_bytes(0, &mut data);
+
+                    // Heuristic: determine keyboard vs mouse by report length hint
+                    // In boot protocol, keyboard = 8 bytes, mouse = 3-4 bytes.
+                    // We check if byte 1 is 0x00 (reserved in keyboard report).
+                    let is_keyboard = data[1] == 0;
+
+                    if is_keyboard {
+                        // Compare against zero (no previous report tracking yet)
+                        let old = [0u8; 8];
+                        process_keyboard_report(&[data[0], data[1], data[2], data[3],
+                                                  data[4], data[5], data[6], data[7]], &old);
+                    } else {
+                        process_mouse_report(&data);
+                    }
+                }
+            }
+        }
+        let _ = (w0, w1); // suppress unused
+    }
+
+    // Advance dequeue pointer
+    let next_idx = (idx + 1) % event_ring_size;
+    if next_idx == 0 {
+        rt.event_cycle = !rt.event_cycle;
+    }
+    rt.event_dequeue_phys = base_phys + next_idx as u64 * 16;
+
+    // Update hardware dequeue pointer
+    unsafe {
+        let mut regs = xhci::Registers::new(bar0 as usize, XhciMapper);
+        regs.interrupter_register_set.interrupter_mut(0)
+            .erdp.update_volatile(|e| {
+                e.set_event_ring_dequeue_pointer(rt.event_dequeue_phys);
+            });
+    }
+}
+
+// ============================================================================
+// Public init entry point
+// ============================================================================
 pub fn init() {
     let controllers = crate::pci::find_usb_controllers();
     for dev in controllers {
         if dev.prog_if == 0x30 {
-            let xhci = XhciController::new(dev.bus, dev.device, dev.function, dev.bar0 & !0xF);
-            let _ = xhci.init();
+            // Enable PCI bus master before MMIO access
+            unsafe { crate::pci::enable_device(&dev, true); }
+            let bar0 = dev.bar0 & !0xF;
+            if bar0 == 0 { continue; }
+            let _ = init_xhci(dev.bus, dev.device, dev.function, bar0);
         }
     }
 }
+
