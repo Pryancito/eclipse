@@ -112,12 +112,12 @@ fn start_essential_services() {
 fn start_system_services() {
     unsafe {
         // Start filesystem service (depends on devfs)
-        start_service(&mut SERVICES[2]);
+        //start_service(&mut SERVICES[2]);
         
         // Wait for filesystem service to mount the disk
-        println!("[INIT] Waiting for Filesystem service to signal READY...");
-        wait_for_ready("filesystem", 10000); // Give it more time
-        println!("  [FS] Root filesystem ready (mounted by filesystem service).");
+        //println!("[INIT] Waiting for Filesystem service to signal READY...");
+        //wait_for_ready("filesystem", 10000); // Give it more time
+        //println!("  [FS] Root filesystem ready (mounted by filesystem service).");
 
         // Start input service (depends on filesystem)
         start_service(&mut SERVICES[3]);

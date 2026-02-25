@@ -6,6 +6,43 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
 };
 use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID};
+use spin::Mutex;
+
+// Buffer estático para acumular líneas de log hasta recibir '\n'
+const LOG_BUF_SIZE: usize = 128;
+struct LogBuffer {
+    buf: [u8; LOG_BUF_SIZE],
+    len: usize,
+}
+impl LogBuffer {
+    const fn new() -> Self {
+        Self { buf: [0u8; LOG_BUF_SIZE], len: 0 }
+    }
+    fn push_str(&mut self, s: &str) -> Option<usize> {
+        // Returns Some(pos_of_newline) si hay \n en el string dado
+        let mut newline_pos = None;
+        for b in s.bytes() {
+            if b == b'\n' {
+                newline_pos = Some(self.len);
+                // No guardamos el \n en el buffer
+            } else {
+                if self.len < LOG_BUF_SIZE {
+                    self.buf[self.len] = b;
+                    self.len += 1;
+                }
+            }
+        }
+        newline_pos
+    }
+    fn flush(&mut self) -> &str {
+        let s = core::str::from_utf8(&self.buf[..self.len]).unwrap_or("");
+        s
+    }
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+static LOG_BUFFER: Mutex<LogBuffer> = Mutex::new(LogBuffer::new());
 
 /// Kernel framebuffer wrapper for embedded-graphics DrawTarget
 pub struct KernelFramebuffer {
@@ -127,26 +164,26 @@ pub fn bar(progress: u32) {
     }
 }
 
-pub fn log(msg: &str) {
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+/// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
+fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
     let virt = crate::memory::phys_to_virt(phys) as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
-    
-    let bar_width = 400;
-    let bar_height = 20;
-    let x = (width as i32 - bar_width as i32) / 2;
-    let y = (height as i32 - bar_height as i32) / 2;
 
-    // Position text ABOVE the bar
+    let bar_width = 400u32;
+    let bar_height = 20i32;
+    let x = (width as i32 - bar_width as i32) / 2;
+    let y = (height as i32 - bar_height) / 2;
+
+    // Posición del texto: ENCIMA de la barra
     let log_y = y - 10;
-    
+
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(Rgb888::WHITE)
         .background_color(Rgb888::BLACK)
         .build();
 
-    // Clear a small area for the last message
+    // Limpiar área del mensaje anterior
     let _ = Rectangle::new(Point::new(x, log_y - 10), Size::new(bar_width, 12))
         .into_styled(PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::BLACK)
@@ -154,20 +191,44 @@ pub fn log(msg: &str) {
         .draw(&mut fb);
 
     const LOG_CHAR_LIMIT: usize = 64;
-
-    // Filter out newlines
-    let clean_msg = msg.trim_end_matches(|c| c == '\r' || c == '\n');
-    let truncated_msg = if clean_msg.len() > LOG_CHAR_LIMIT {
-        &clean_msg[clean_msg.len() - LOG_CHAR_LIMIT..]
+    let truncated = if line.len() > LOG_CHAR_LIMIT {
+        &line[line.len() - LOG_CHAR_LIMIT..]
     } else {
-        clean_msg
+        line
     };
 
-    let _ = Text::new(truncated_msg, Point::new(x, log_y), text_style)
+    let _ = Text::new(truncated, Point::new(x, log_y), text_style)
         .draw(&mut fb);
 
-    // VirtIO GPU requires explicit present
+    // VirtIO GPU requiere present explícito
     if source == FbSource::VirtIO {
         let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, (log_y - 12) as u32, bar_width, 24);
     }
+}
+
+/// Acumula `msg` en el buffer de línea. Solo renderiza en pantalla cuando llega un '\n'.
+pub fn log(msg: &str) {
+    let mut buf = LOG_BUFFER.lock();
+    let got_newline = buf.push_str(msg);
+
+    if got_newline.is_some() {
+        // Sin alloc: copiamos el contenido del buffer a un array en el stack
+        const MAX: usize = LOG_BUF_SIZE;
+        let mut tmp = [0u8; MAX];
+        let line_bytes = buf.flush().as_bytes();
+        let n = line_bytes.len().min(MAX);
+        tmp[..n].copy_from_slice(&line_bytes[..n]);
+        let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
+
+        // Obtener info del framebuffer y renderizar.
+        // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
+        if let Some((phys, width, height, pitch, source)) = get_fb_info() {
+            buf.clear();
+            drop(buf);
+            render_log_line(line, source, width, height, pitch, phys);
+        } else {
+            buf.clear();
+        }
+    }
+    // Si no hay '\n', el texto queda en el buffer esperando el siguiente fragmento.
 }

@@ -360,6 +360,12 @@ pub fn process_messages() {
     });
 }
 
+/// ¿Hay mensajes pendientes por procesar?
+pub fn has_pending_messages() -> bool {
+    let ipc = IPC_SYSTEM.lock();
+    ipc.global_queue_head != ipc.global_queue_tail
+}
+
 /// Obtener estadísticas del sistema IPC
 pub fn get_stats() -> (u32, u32, u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {

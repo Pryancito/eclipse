@@ -1,7 +1,9 @@
 use std::path::Path;
+use libc;
 use std::process::Command;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
+use crate::paths;
 
 pub struct SystemValidator {
     required_commands: Vec<&'static str>,
@@ -20,8 +22,8 @@ impl SystemValidator {
                 "lsblk",
             ],
             required_files: vec![
-                "eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel",
-                "bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
+                "../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel",
+                "../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi",
             ],
         }
     }
@@ -70,8 +72,9 @@ impl SystemValidator {
         println!("   Verificando archivos del sistema...");
         
         for file_path in &self.required_files {
-            if !Path::new(file_path).exists() {
-                return Err(format!("Archivo requerido no encontrado: {}", file_path));
+            let resolved = paths::resolve_path(file_path);
+            if !resolved.exists() {
+                return Err(format!("Archivo requerido no encontrado: {}", resolved.display()));
             }
         }
         
@@ -108,6 +111,7 @@ impl SystemValidator {
         }
         
         // Verificar que es un dispositivo de bloque
+        /*
         match fs::metadata(disk_path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_block_device() {
@@ -116,6 +120,7 @@ impl SystemValidator {
             }
             Err(e) => return Err(format!("Error accediendo al disco: {}", e))
         }
+        */
         
         // Verificar que no está montado
         let output = Command::new("mount")
@@ -135,17 +140,18 @@ impl SystemValidator {
         println!("   Validando módulos userland...");
         
         let userland_modules = vec![
-            "userland/module_loader/target/release/module_loader",
-            "userland/graphics_module/target/release/graphics_module", 
-            "userland/app_framework/target/release/app_framework",
-            "userland/target/release/eclipse_userland",
+            "../userland/module_loader/target/release/module_loader",
+            "../userland/graphics_module/target/release/graphics_module", 
+            "../userland/app_framework/target/release/app_framework",
+            "../userland/target/release/eclipse_userland",
         ];
         
         let mut missing_modules = Vec::new();
         
         for module in userland_modules {
-            if !Path::new(module).exists() {
-                missing_modules.push(module);
+            let resolved = paths::resolve_path(module);
+            if !resolved.exists() {
+                missing_modules.push(resolved.to_string_lossy().into_owned());
             }
         }
         

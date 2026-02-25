@@ -146,8 +146,10 @@ impl DirectInstaller {
         println!("  - Bootloader: UEFI");
         println!("  - Kernel: Eclipse OS v0.1.0");
         println!("  - Sistema de archivos: EclipseFS v2.0 (RAM-based)");
-        println!("  - Eclipse-systemd: Instalado en /sbin/init");
-        println!("  - Wayland Compositor: eclipse_wayland en /usr/bin");
+        println!("  - Eclipse-systemd: Instalado en /usr/sbin/eclipse-systemd");
+        println!("  - Wayland Compositor: smithay_app en /usr/bin");
+        println!("  - Demo Client: demo_client en /usr/bin");
+        println!("  - Userland: Módulos instalados en /userland/bin");
         println!("  - COSMIC Desktop: eclipse_cosmic en /usr/bin");
         println!("  - Graphics Module: Instalado en userland");
         println!("  - Userland: Modulos compilados e instalados");
@@ -439,10 +441,14 @@ impl DirectInstaller {
             // Crear directorios del sistema
             fs::create_dir_all(format!("{}/usr/sbin", self.root_mount_point))
                 .map_err(|e| format!("Error creando /usr/sbin: {}", e))?;
+            fs::create_dir_all(format!("{}/usr/bin", self.root_mount_point))
+                .map_err(|e| format!("Error creando /usr/bin: {}", e))?;
             fs::create_dir_all(format!("{}/sbin", self.root_mount_point))
                 .map_err(|e| format!("Error creando /sbin: {}", e))?;
             fs::create_dir_all(format!("{}/etc/eclipse/systemd/system", self.root_mount_point))
                 .map_err(|e| format!("Error creando /etc/eclipse/systemd/system: {}", e))?;
+            fs::create_dir_all(format!("{}/userland/bin", self.root_mount_point))
+                .map_err(|e| format!("Error creando /userland/bin: {}", e))?;
 
             // Copiar eclipse-systemd a /usr/sbin (donde el kernel lo busca)
             fs::copy(systemd_source, format!("{}/usr/sbin/eclipse-systemd", self.root_mount_point))
@@ -537,9 +543,14 @@ impl DirectInstaller {
 
         // Instalar aplicaciones de eclipse-apps
         let apps_to_install = vec![
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "/usr/bin/demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/wayland_handshake", "/usr/bin/wayland_handshake"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/x11_bridge_test", "/usr/bin/x11_bridge_test"),
+            // Mantener rutas antiguas para compatibilidad
             ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
-            ("eclipse-apps/xfwl4/target/release/xfwl4", "/usr/bin/xfwl4"),
             ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
+            ("eclipse-apps/xfwl4/target/release/xfwl4", "/usr/bin/xfwl4"),
         ];
 
         for (source, dest) in apps_to_install {
@@ -638,6 +649,8 @@ impl DirectInstaller {
             ("userland/graphics_module/target/release/graphics_module", "graphics_module"),
             ("userland/app_framework/target/release/app_framework", "app_framework"),
             ("userland/target/release/eclipse_userland", "eclipse_userland"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "demo_client"),
         ];
 
         for (source, name) in userland_modules {
@@ -661,11 +674,11 @@ kernel = "/eclipse_kernel"
 module_loader = "/userland/bin/module_loader"
 graphics_module = "/userland/bin/graphics_module"
 app_framework = "/userland/bin/app_framework"
-eclipse_userland = "/userland/bin/eclipse-userland"
+eclipse_userland = "/userland/bin/eclipse_userland"
 
 [services]
-waylandd = "/usr/bin/eclipse_wayland"
-cosmic = "/usr/bin/eclipse_cosmic"
+waylandd = "/usr/bin/smithay_app"
+cosmic = "/usr/bin/demo_client"
 
 [ipc]
 socket_path = "/run/eclipse/wayland.sock"
@@ -849,7 +862,7 @@ Desarrollado con amor en Rust
         // Instalar binarios del sistema
         self.install_system_binaries(&mut eclipsefs)?;
         // Asegurar eclipse-systemd en /usr/sbin con permisos ejecutables
-        if let Err(e) = eclipsefs.install_binary("/usr/sbin/eclipse-systemd", "../eclipse-apps/systemd/target/release/eclipse-systemd") {
+        if let Err(e) = eclipsefs.install_binary("/usr/sbin/eclipse-systemd", "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd") {
             println!("       ⚠ No se pudo instalar /usr/sbin/eclipse-systemd: {}", e);
         } else {
             // Nada: por defecto se crea con 0644; si hace falta, extender EclipseFSInstaller con chmod
@@ -943,7 +956,9 @@ Desarrollado con amor en Rust
             "usr", "usr/bin", "usr/sbin", "usr/lib", "usr/share",
             "bin", "sbin", "etc", "var", "var/log", "var/tmp",
             "home", "root", "tmp", "proc", "sys", "dev", "boot",
-            "lib", "lib64", "opt", "mnt", "media", "run", "run/eclipse"
+            "lib", "lib64", "opt", "mnt", "media", "run", "run/eclipse",
+            "userland", "userland/bin", "userland/lib", "userland/config",
+            "etc/eclipse", "etc/eclipse/systemd", "etc/eclipse/systemd/system"
         ];
         
         for dir in &directories {
@@ -964,6 +979,15 @@ Desarrollado con amor en Rust
         println!("       🤖 Copiando modelos AI...");
         self.copy_ai_models_to_tempdir(temp_dir)?;
         
+        // Listar contenido de temp_dir para depuración
+        println!("       🔍 Contenido de {} antes de poblar:", temp_dir);
+        let ls_output = std::process::Command::new("ls")
+            .args(&["-R", temp_dir])
+            .output();
+        if let Ok(ls) = ls_output {
+            println!("{}", String::from_utf8_lossy(&ls.stdout));
+        }
+        
         // Usar populate-eclipsefs para copiar todo al filesystem
         println!("       💾 Poblando filesystem EclipseFS...");
         let populate_path = "populate-eclipsefs/target/release/populate-eclipsefs";
@@ -972,9 +996,15 @@ Desarrollado con amor en Rust
         }
         
         let output = std::process::Command::new(populate_path)
-            .args(&[partition, temp_dir])
+            .args(&["-v", partition, temp_dir])
             .output()
             .map_err(|e| format!("Error ejecutando populate-eclipsefs: {}", e))?;
+        
+        println!("       📄 Resultado de populate-eclipsefs:");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        if !output.status.success() {
+            println!("       ❌ Error stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
         
         if !output.status.success() {
             return Err(format!("populate-eclipsefs falló: {}", String::from_utf8_lossy(&output.stderr)));
@@ -984,6 +1014,10 @@ Desarrollado con amor en Rust
         let _ = std::process::Command::new("rm")
             .args(&["-rf", temp_dir])
             .output();
+        
+        // Sincronizar cambios al disco
+        let _ = std::process::Command::new("sync").output();
+        let _ = std::process::Command::new("partprobe").arg(partition).output();
         
         println!("       ✅ Sistema de archivos EclipseFS poblado exitosamente");
         Ok(())
@@ -1031,8 +1065,8 @@ Desarrollado con amor en Rust
     fn copy_system_files_to_tempdir(&self, temp_dir: &str) -> Result<(), String> {
         // Copiar eclipse-systemd
         let systemd_paths = vec![
-            "eclipse-apps/systemd/target/release/eclipse-systemd",
-            "eclipse-apps/target/release/eclipse-systemd",
+            "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd",
+            "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse-systemd",
         ];
         
         let mut systemd_copied = false;
@@ -1047,6 +1081,11 @@ Desarrollado con amor en Rust
                 let usr_sbin_dest = format!("{}/usr/sbin/eclipse-systemd", temp_dir);
                 fs::copy(source, &usr_sbin_dest)
                     .map_err(|e| format!("Error copiando eclipse-systemd a /usr/sbin: {}", e))?;
+                
+                // Copiar a /sbin/init
+                let init_dest = format!("{}/sbin/init", temp_dir);
+                fs::copy(source, &init_dest)
+                    .map_err(|e| format!("Error copiando eclipse-systemd a /sbin/init: {}", e))?;
                 
                 // Hacer ejecutables
                 #[cfg(unix)]
@@ -1070,27 +1109,89 @@ Desarrollado con amor en Rust
         
         // Copiar otros binarios del sistema
         let binaries = vec![
-            ("userland/target/release/eclipse_userland", "bin/eclipse_userland"),
-            ("userland/module_loader/target/release/module_loader", "bin/module_loader"),
-            ("userland/graphics_module/target/release/graphics_module", "bin/graphics_module"),
-            ("userland/app_framework/target/release/app_framework", "bin/app_framework"),
+            ("userland/target/release/eclipse_userland", "userland/bin/eclipse_userland"),
+            ("userland/module_loader/target/release/module_loader", "userland/bin/module_loader"),
+            ("userland/graphics_module/target/release/graphics_module", "userland/bin/graphics_module"),
+            ("userland/app_framework/target/release/app_framework", "userland/bin/app_framework"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "usr/bin/demo_client"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/wayland_handshake", "usr/bin/wayland_handshake"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/x11_bridge_test", "usr/bin/x11_bridge_test"),
+            ("eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel", "boot/eclipse_kernel"),
         ];
         
         for (source, dest_rel) in &binaries {
             if Path::new(source).exists() {
                 let dest = format!("{}/{}", temp_dir, dest_rel);
-                fs::copy(source, &dest)
-                    .map_err(|e| format!("Error copiando {}: {}", source, e))?;
-                
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = fs::metadata(&dest).unwrap().permissions();
-                    perms.set_mode(0o755);
-                    fs::set_permissions(&dest, perms).ok();
+                if let Err(e) = fs::copy(source, &dest) {
+                    println!("         ❌ Error copiando {}: {}", source, e);
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = fs::metadata(&dest) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(0o755);
+                            let _ = fs::set_permissions(&dest, perms);
+                        }
+                    }
+                    println!("         ✓ {} copiado a {}", source, dest);
                 }
-                
-                println!("         ✓ {} copiado", dest_rel);
+            } else {
+                println!("         ⚠️  Fuente no encontrada: {}", source);
+            }
+        }
+        
+        // Copiar servicios de systemd
+        let systemd_config_source = "eclipse-apps/etc/eclipse/systemd/system";
+        if Path::new(systemd_config_source).exists() {
+            let config_dest = format!("{}/etc/eclipse/systemd/system", temp_dir);
+            if let Ok(entries) = fs::read_dir(systemd_config_source) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let file_name = path.file_name().unwrap();
+                        let dest = format!("{}/{}", config_dest, file_name.to_string_lossy());
+                        if let Err(e) = fs::copy(&path, &dest) {
+                            println!("         ⚠️ Error copiando servicio {}: {}", file_name.to_string_lossy(), e);
+                        }
+                    }
+                }
+                println!("         ✓ Servicios systemd copiados");
+            }
+        }
+        
+        // Crear scripts de inicio si no existen en el origen
+        println!("         📝 Creando scripts de inicio...");
+        let start_drm = r#"#!/bin/bash
+echo "Iniciando Eclipse OS con sistema DRM..."
+export RUST_LOG=info
+./eclipse_userland
+"#;
+        let _ = fs::write(format!("{}/userland/bin/start_drm.sh", temp_dir), start_drm);
+        
+        let start_desktop = r#"#!/bin/bash
+echo "🌙 Iniciando Eclipse OS Desktop Environment..."
+mkdir -p /tmp/eclipse/shm
+mkdir -p /tmp/eclipse
+export XDG_RUNTIME_DIR="/tmp/$(id -u)-runtime"
+mkdir -p "$XDG_RUNTIME_DIR"
+export WAYLAND_DISPLAY="wayland-0"
+export ECLIPSE_IPC_SOCKET="/run/eclipse/wayland.sock"
+sleep infinity
+"#;
+        let _ = fs::write(format!("{}/userland/bin/start_desktop.sh", temp_dir), start_desktop);
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for script in &["start_drm.sh", "start_desktop.sh"] {
+                let path = format!("{}/userland/bin/{}", temp_dir, script);
+                if let Ok(metadata) = fs::metadata(&path) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&path, perms);
+                }
             }
         }
         
@@ -1179,7 +1280,7 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         println!("       📦 Copiando archivos del sistema a EclipseFS...");
         
         // Copiar eclipse-systemd
-        let systemd_source = "eclipse-apps/target/release/eclipse-systemd";
+        let systemd_source = "eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd";
         if Path::new(systemd_source).exists() {
             let systemd_content = fs::read(systemd_source)
                 .map_err(|e| format!("Error leyendo eclipse-systemd: {}", e))?;
@@ -1200,9 +1301,9 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Copiar otros binarios del sistema
         let binaries = vec![
-            ("eclipse-apps/target/release/eclipse-shell", "/usr/bin/bash"),
-            ("eclipse-apps/target/release/eclipse-shell", "/usr/bin/sh"),
-            ("userland/target/release/eclipse-userland", "/usr/bin/userland"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/bash"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/sh"),
+            ("userland/target/release/eclipse_userland", "/usr/bin/userland"),
         ];
         
         for (source, dest) in &binaries {
@@ -1315,7 +1416,7 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         }
         
         // Instalar xfwl4
-        let smithay_path = "eclipse-apps/xfwl4/target/release/xfwl4";
+        let smithay_path = "eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app";
         if Path::new(smithay_path).exists() {
             eclipsefs.install_binary("/usr/bin/xfwl4", smithay_path)?;
             println!("         ✓ xfwl4 instalado en /usr/bin/");
@@ -1325,12 +1426,12 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Instalar otros binarios del sistema
         let binaries = vec![
-            ("/usr/bin/eclipse_wayland", "eclipse-apps/target/release/eclipse_wayland"),
-            ("/usr/bin/eclipse_cosmic", "eclipse-apps/target/release/eclipse_cosmic"),
-            ("/usr/bin/rwaybar", "eclipse-apps/target/release/rwaybar"),
-            ("/usr/bin/eclipse_taskbar", "eclipse-apps/target/release/eclipse_taskbar"),
-            ("/usr/bin/eclipse_notifications", "eclipse-apps/target/release/eclipse_notifications"),
-            ("/usr/bin/eclipse_window_manager", "eclipse-apps/target/release/eclipse_window_manager"),
+            ("/usr/bin/smithay_app", "eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app"),
+            ("/usr/bin/demo_client", "eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client"),
+            ("/usr/bin/rwaybar", "eclipse-apps/target/x86_64-unknown-eclipse/release/rwaybar"),
+            ("/usr/bin/eclipse_taskbar", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_taskbar"),
+            ("/usr/bin/eclipse_notifications", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_notifications"),
+            ("/usr/bin/eclipse_window_manager", "eclipse-apps/target/x86_64-unknown-eclipse/release/eclipse_window_manager"),
         ];
         
         for (install_path, source_path) in binaries {
@@ -1415,10 +1516,10 @@ tmpfs           /tmp            tmpfs   defaults        0       0
         
         // Copiar aplicaciones desde eclipse-apps
         let apps = vec![
-            ("eclipse-apps/target/release/eclipse_wayland", "/usr/bin/eclipse_wayland"),
-            ("eclipse-apps/target/release/eclipse_cosmic", "/usr/bin/eclipse_cosmic"),
-            ("eclipse-apps/systemd/target/release/eclipse-systemd", "/usr/sbin/eclipse-systemd"),
-            ("eclipse-apps/systemd/target/release/eclipse-systemd", "/sbin/eclipse-systemd"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "/usr/bin/smithay_app"),
+            ("eclipse-apps/target/x86_64-unknown-eclipse/release/demo_client", "/usr/bin/demo_client"),
+            ("eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "/usr/sbin/eclipse-systemd"),
+            ("eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "/sbin/eclipse-systemd"),
         ];
         
         for (source, dest) in apps {

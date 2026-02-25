@@ -40,6 +40,8 @@ pub const SYS_VIRGL_CTX_DETACH_RESOURCE: u64 = 46;
 pub const SYS_VIRGL_ALLOC_BACKING: u64 = 47;
 pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
+pub const SYS_GET_STORAGE_DEVICE_COUNT: u64 = 50;
+
 pub type c_void = core::ffi::c_void;
 
 /// Set VirtIO GPU hardware cursor position. Returns true on success.
@@ -459,6 +461,11 @@ pub fn receive(buffer: &mut [u8]) -> (usize, u32) {
     } else {
         (0, 0)
     }
+}
+
+/// Get the number of registered block devices
+pub fn get_storage_device_count() -> usize {
+    unsafe { syscall0(SYS_GET_STORAGE_DEVICE_COUNT) as usize }
 }
 
 /// PCI device information structure

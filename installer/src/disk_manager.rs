@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::fs;
+use std::path::Path;
 use std::os::unix::fs::FileTypeExt;
 use crate::DiskInfo;
 
@@ -58,6 +59,16 @@ impl DiskManager {
             Err(e) => {
                 eprintln!("Error escaneando discos: {}", e);
             }
+        }
+        
+        // Inyectar disco de prueba para desarrollo
+        if Path::new("test_disk.img").exists() {
+            self.disks.push(DiskInfo {
+                name: "test_disk.img".to_string(),
+                size: "500M".to_string(),
+                model: "Eclipse Test Disk".to_string(),
+                disk_type: "Test Image".to_string(),
+            });
         }
     }
     

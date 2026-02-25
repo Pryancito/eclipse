@@ -1,0 +1,66 @@
+   Compiling eclipse-installer v0.1.0 (/home/moebius/eclipse/installer)
+error[E0433]: failed to resolve: use of undeclared type `Path`
+  --> src/disk_manager.rs:64:12
+   |
+64 |         if Path::new("test_disk.img").e...
+   |            ^^^^ use of undeclared type `Path`
+   |
+help: consider importing this struct
+   |
+ 1 + use std::path::Path;
+   |
+
+warning: unused import: `std::os::unix::fs::FileTypeExt`
+ --> src/validation.rs:4:5
+  |
+4 | use std::os::unix::fs::FileTypeExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::path::PathBuf`
+ --> src/installer_core/installer.rs:9:5
+  |
+9 | use std::path::PathBuf;
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `walkdir::WalkDir`
+ --> src/distro/preparer.rs:4:5
+  |
+4 | use walkdir::WalkDir;
+  |     ^^^^^^^^^^^^^^^^
+
+error[E0658]: use of unstable library feature `rustc_private`: this crate is being loaded from the sysroot, an unstable location; did you mean to load this crate from crates.io via `Cargo.toml` instead?
+ --> src/main.rs:2:1
+  |
+2 | extern crate libc;
+  | ^^^^^^^^^^^^^^^^^^
+  |
+  = note: see issue #27812 <https://github.com/rust-lang/rust/issues/27812> for more information
+  = help: add `#![feature(rustc_private)]` to the crate attributes to enable
+  = note: this compiler was built on 2026-01-26; consider upgrading it if it is out of date
+
+warning: unused variable: `metadata`
+  --> src/direct_installer.rs:25:19
+   |
+25 | ... if let Ok(metadata) = fs::metadata(...
+   |               ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_metadata`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `partition_suffix`
+   --> src/direct_installer.rs:275:13
+    |
+275 | ...   let partition_suffix = if disk.n...
+    |           ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_partition_suffix`
+
+warning: unused variable: `disk_path`
+   --> src/validation.rs:164:36
+    |
+164 | ...ace(&self, disk_path: &str) -> Resu...
+    |               ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_disk_path`
+
+Some errors have detailed explanations: E0433, E0658.
+For more information about an error, try `rustc --explain E0433`.
+warning: `eclipse-installer` (bin "eclipse-installer") generated 6 warnings
+error: could not compile `eclipse-installer` (bin "eclipse-installer") due to 2 previous errors; 6 warnings emitted

@@ -67,6 +67,7 @@ pub struct Filesystem {
     inode_table_offset: u64,
     disk_scheme_id: usize,
     disk_resource_id: usize,
+    partition_offset: u64,
 }
 
 static mut FS: Filesystem = Filesystem {
@@ -75,17 +76,33 @@ static mut FS: Filesystem = Filesystem {
     inode_table_offset: 0,
     disk_scheme_id: 0,
     disk_resource_id: 0,
+    partition_offset: 0,
 };
 
 impl Filesystem {
-    /// Mount the root filesystem
-    /// Partition layout: FAT32 1MiB–101MiB (100MB), EclipseFS from 101MiB
-    /// 101 MiB / 4096 bytes = 25856 blocks
-    pub const PARTITION_OFFSET_BLOCKS: u64 = 25856;
+    /// Partition offset in 4096-byte blocks.
+    /// - When mounted as disk:NpM the DiskScheme already applies the partition
+    ///   byte offset, so we must start reading at block 0 of the partition view.
+    /// - When mounted as disk:N (whole disk), EclipseFS historically starts at
+    ///   block 25856 (101 MiB).
+    pub const PARTITION_OFFSET_BLOCKS_DEFAULT: u64 = 25856;
+    pub const PARTITION_OFFSET_BLOCKS_PART:    u64 = 0;
     pub fn mount(device_path: &str) -> Result<(), &'static str> {
-    // Enforce ATA initialization before mounting
-    // This is handled in main.rs but good to be sure
-    
+        // Determine partition offset:
+        //   disk:NpM  → DiskScheme already seeks to the partition start → offset = 0
+        //   disk:N@O  → DiskScheme already seeks to block O → offset = 0
+        //   disk:N    → whole disk, EclipseFS historically at block 25856
+        let has_explicit_offset = (device_path.contains('p') || device_path.contains('@')) &&
+            device_path.find(':').map(|i| {
+                let suffix = &device_path[i+1..];
+                suffix.contains('p') || suffix.contains('@')
+            }).unwrap_or(false);
+        let part_offset = if has_explicit_offset {
+            Self::PARTITION_OFFSET_BLOCKS_PART    // 0
+        } else {
+            Self::PARTITION_OFFSET_BLOCKS_DEFAULT // 25856
+        };
+
     unsafe {
         if FS.mounted {
             return Err("Filesystem already mounted");
@@ -101,6 +118,7 @@ impl Filesystem {
             Ok((s_id, r_id)) => {
                 FS.disk_scheme_id = s_id;
                 FS.disk_resource_id = r_id;
+                FS.partition_offset = part_offset;
                 serial::serial_print("[FS] Disk handle opened successfully\n");
             }
             Err(e) => {
@@ -118,7 +136,7 @@ impl Filesystem {
         let mut superblock = vec![0u8; 4096];
         
         serial::serial_print("[FS] Reading superblock from block device...\n");
-        read_block_from_device(Self::PARTITION_OFFSET_BLOCKS, &mut superblock)?;
+        read_block_from_device(part_offset, &mut superblock)?;
         serial::serial_print("[FS] Superblock read successfully\n");
         
         // Parse header using library
@@ -152,7 +170,7 @@ impl Filesystem {
                 FS.header = Some(header);
                 FS.mounted = true;
                 
-                serial::serial_print("[FS] Filesystem mounted successfully. FS.mounted set to true.\n");
+                serial::serial_print("[FS] Filesystem mounted successfully.\n");
 
                 Ok(())
             },
@@ -160,6 +178,11 @@ impl Filesystem {
                 serial::serial_print("[FS] Invalid EclipseFS header: ");
                 serial::serial_print_dec(e as u64);
                 serial::serial_print("\n");
+                // Close the handle we just opened so the caller can retry on
+                // the next disk without leaking open-file slots.
+                let _ = crate::scheme::close(FS.disk_scheme_id, FS.disk_resource_id);
+                FS.disk_scheme_id = 0;
+                FS.disk_resource_id = 0;
                 Err("Invalid EclipseFS header")
             }
         }
@@ -182,7 +205,7 @@ impl Filesystem {
             let index = (inode - 1) as u64;
             let entry_offset = FS.inode_table_offset + (index * 8);
             
-            let block_num = (entry_offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+            let block_num = (entry_offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
             let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
             
             let mut buffer = vec![0u8; 4096];
@@ -244,7 +267,7 @@ impl Filesystem {
         })?;
         
         // Read the first block of the node record to find CONTENT TLV
-        let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
         let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         
         let mut block_buffer = vec![0u8; 4096];
@@ -266,40 +289,57 @@ impl Filesystem {
             block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
         ]) as usize;
 
-        // Parse TLVs in the first block to find CONTENT
-        // We assume headers structure (CONTENT tag) appears in the first block.
-        // If not, we'd need to scan more blocks, but population tool puts it early.
-        
-        let header_end = min(4096, offset_in_block + record_size);
-        let valid_data = &block_buffer[offset_in_block+8..header_end]; // Skip 8 byte node header
-        
-        let mut tlv_cursor = 0;
-        let mut content_start_offset_rel = 0; // Relative to node data start (after 8 bytes)
+        // Parse TLVs to find CONTENT
+        // We assume headers structure (CONTENT tag) appears in the first few blocks.
+        // We scan up to 16 blocks (64KiB) of metadata to find the tag.
+        let mut tlv_offset_rel = 8; // Skip 8-byte record header
+        let mut content_start_offset_rel = 0;
         let mut content_length = 0;
         let mut found = false;
-        
-        while tlv_cursor + 6 <= valid_data.len() {
-            let tag = u16::from_le_bytes([valid_data[tlv_cursor], valid_data[tlv_cursor+1]]);
+
+        let mut current_block_rel = 0;
+        let mut current_block_buf = block_buffer; // Reuse the buffer
+
+        while tlv_offset_rel + 6 <= record_size {
+            let block_idx = (offset_in_block + tlv_offset_rel) / BLOCK_SIZE;
+            let block_off = (offset_in_block + tlv_offset_rel) % BLOCK_SIZE;
+
+            if block_idx > current_block_rel {
+                current_block_rel = block_idx;
+                if current_block_rel >= 16 { break; } // Safety limit
+                if let Err(_) = read_block_from_device(block_num + current_block_rel as u64, &mut current_block_buf) {
+                    break;
+                }
+            }
+
+            // Ensure header doesn't cross block boundary (simple check)
+            if block_off + 6 > BLOCK_SIZE {
+                 // Boundary case: Skip to next block start for next header
+                 tlv_offset_rel += BLOCK_SIZE - block_off;
+                 continue;
+            }
+
+            let tag = u16::from_le_bytes([current_block_buf[block_off], current_block_buf[block_off+1]]);
             let length = u32::from_le_bytes([
-                valid_data[tlv_cursor+2], valid_data[tlv_cursor+3], 
-                valid_data[tlv_cursor+4], valid_data[tlv_cursor+5]
+                current_block_buf[block_off+2], current_block_buf[block_off+3], 
+                current_block_buf[block_off+4], current_block_buf[block_off+5]
             ]) as usize;
             
             if tag == tlv_tags::CONTENT {
-                content_start_offset_rel = tlv_cursor + 6;
+                content_start_offset_rel = tlv_offset_rel + 6;
                 content_length = length;
                 found = true;
                 break;
             }
             
-            tlv_cursor += 6 + length;
+            tlv_offset_rel += 6 + length;
         }
         
         if !found {
             serial::serial_print("[FS-DEBUG] read_file_by_inode_at: CONTENT TLV not found inode=");
             serial::serial_print_dec(inode as u64);
             serial::serial_print("\n");
-            return Err("CONTENT TLV not found in first block");
+            return Err("CONTENT TLV not found");
         }
         
         if offset >= content_length as u64 {
@@ -309,14 +349,15 @@ impl Filesystem {
         let read_len = min(buffer.len(), content_length - offset as usize);
         
         // precise byte offset on disk where requested data starts
-        let absolute_data_start = entry.offset + 8 + content_start_offset_rel as u64 + offset;
+        let absolute_data_start = entry.offset + content_start_offset_rel as u64 + offset;
         
         // Read data from disk block by block
         let mut bytes_read = 0;
         let mut current_abs_pos = absolute_data_start;
+        let mut block_buffer = current_block_buf; // Take buffer back
         
         while bytes_read < read_len {
-            let current_block = (current_abs_pos / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+            let current_block = (current_abs_pos / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
             let current_off = (current_abs_pos % BLOCK_SIZE as u64) as usize;
             
             read_block_from_device(current_block, &mut block_buffer).map_err(|e| {
@@ -363,7 +404,7 @@ impl Filesystem {
         let entry = Self::read_inode_entry(inode)?;
         
         // Read the full node record first
-        let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
         let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         
         let mut block_buffer = vec![0u8; 4096];
@@ -551,7 +592,7 @@ impl Filesystem {
         
         // Calculate record location
         let record_block_start = unsafe {
-            Self::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
+            FS.partition_offset + (entry.offset / BLOCK_SIZE as u64)
         };
         let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
         
@@ -707,7 +748,7 @@ impl Filesystem {
              
              // Load whole record (same logic as read_file_by_inode basically)
              // TODO: Refactor duplication
-             let block_num = (entry.offset / BLOCK_SIZE as u64) + Self::PARTITION_OFFSET_BLOCKS;
+             let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
              let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
              
              let mut block_buffer = vec![0u8; 4096];
@@ -776,13 +817,114 @@ impl Filesystem {
 }
 
 
-/// Initialize the filesystem subsystem
+/// Initialize the filesystem subsystem and mount the root filesystem.
+///
+/// Auto-scans **all** registered block devices (disk:0, disk:1, …) and mounts
+/// the first one that contains a valid EclipseFS superblock.  This makes the
+/// kernel work correctly in QEMU (typically disk:0), on real hardware (typically
+/// disk:1 when disk:0 is the EFI system partition), and in any other disk layout
+/// without any hard-coded index.
 pub fn init() {
-    serial::serial_print("Initializing filesystem subsystem...\n");
+    serial::serial_print("[FS] Initializing filesystem subsystem...\n");
     crate::bcache::init();
     crate::scheme::register_scheme("file", alloc::sync::Arc::new(FileSystemScheme));
     crate::scheme::register_scheme("dev", alloc::sync::Arc::new(DevScheme));
+
+    // The disk: scheme must already be registered before we reach here.
+    let device_count = crate::storage::device_count();
+    serial::serial_print("[FS] Available storage devices: ");
+    serial::serial_print_dec(device_count as u64);
+    serial::serial_print("\n");
+
+    if device_count == 0 {
+        serial::serial_print("[FS] WARNING: No storage devices found. Root filesystem NOT mounted.\n");
+        return;
+    }
+
+    // Try each registered disk in order until we find one with a valid EclipseFS
+    // header.  We build the path on the stack as a fixed-size byte array so we
+    // don't need alloc at this early stage.
+    // Try each registered disk and its partitions in order until we find a root.
+    let mut mounted = false;
+    for idx in 0..device_count {
+        // We will try these patterns for each disk:
+        // 1. "disk:N" (Legacy offset 101MiB)
+        // 2. "disk:Np1", "disk:Np2", "disk:Np3", "disk:Np4" (GPT partitions)
+        
+        for variant in 0..=4 {
+            let mut path_buf = [0u8; 12]; // "disk:Npx" + NUL
+            let path_str = if variant == 0 {
+                // Case 0: disk:N
+                format_into_buf(&mut path_buf, "disk:", idx as u64, None)
+            } else {
+                // Case 1..4: disk:NpM
+                format_into_buf(&mut path_buf, "disk:", idx as u64, Some(variant as u64))
+            };
+
+            serial::serial_print("[FS] Probing ");
+            serial::serial_print(path_str);
+            serial::serial_print("... ");
+
+            match mount_root(path_str) {
+                Ok(()) => {
+                    mounted = true;
+                    break;
+                }
+                Err(_) => {
+                }
+            }
+        }
+        
+        if mounted { break; }
+    }
+
+    if !mounted {
+        serial::serial_print("[FS] ERROR: System will continue without a root filesystem.\n");
+    }
 }
+
+/// Helper to format "disk:N" or "disk:NpM" without heavy formatting machinery
+fn format_into_buf<'a>(buf: &'a mut [u8], prefix: &str, n: u64, p: Option<u64>) -> &'a str {
+    let mut pos = 0;
+    // Copy prefix
+    for b in prefix.as_bytes() {
+        buf[pos] = *b;
+        pos += 1;
+    }
+    // Copy N
+    pos = write_decimal(buf, pos, n);
+    // Copy pM if present
+    if let Some(p_val) = p {
+        buf[pos] = b'p';
+        pos += 1;
+        pos = write_decimal(buf, pos, p_val);
+    }
+    core::str::from_utf8(&buf[..pos]).unwrap_or("?")
+}
+
+fn write_decimal(buf: &mut [u8], mut pos: usize, mut n: u64) -> usize {
+    if n == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
+    let start = pos;
+    while n > 0 {
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        pos += 1;
+    }
+    // Reverse digits
+    let end = pos;
+    let mut i = start;
+    let mut j = end - 1;
+    while i < j {
+        buf.swap(i, j);
+        i += 1;
+        j -= 1;
+    }
+    end
+}
+
 
 /// Mount the root filesystem
 pub fn mount_root(device_path: &str) -> Result<(), &'static str> {
@@ -1182,7 +1324,7 @@ impl Scheme for FileSystemScheme {
                 match Filesystem::read_inode_entry(*inode) {
                     Ok(entry) => {
                         let record_block_start = unsafe {
-                            Filesystem::PARTITION_OFFSET_BLOCKS + (entry.offset / BLOCK_SIZE as u64)
+                            FS.partition_offset + (entry.offset / BLOCK_SIZE as u64)
                         };
                         let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
                         let mut block_buffer = vec![0u8; BLOCK_SIZE];
@@ -1198,15 +1340,18 @@ impl Scheme for FileSystemScheme {
                                      block_buffer[idx+4], block_buffer[idx+5]
                                  ]) as usize;
                                  
-                                 // CRITICAL: Ensure we don't read past the end of the block buffer
-                                 if idx + 6 + length > BLOCK_SIZE {
-                                     serial::serial_print("[FS-DEBUG] TLV record too large or truncated at block end\n");
+                                 // CRITICAL: Ensure we don't read past the end of the block buffer for the TLV header.
+                                 // We only check if the header + 6 bytes fit. For tags like CONTENT,
+                                 // the length field correctly specifies the full file size, which
+                                 // naturally exceeds a single block.
+                                 if idx + 6 > BLOCK_SIZE {
+                                     serial::serial_print("[FS-DEBUG] TLV header truncated at block end\n");
                                      break;
                                  }
 
                                  match tag {
                                      tlv_tags::SIZE => {
-                                          if length == 8 {
+                                          if idx + 6 + 8 <= BLOCK_SIZE {
                                               stat.size = u64::from_le_bytes([
                                                   block_buffer[idx+6], block_buffer[idx+7],
                                                   block_buffer[idx+8], block_buffer[idx+9],
@@ -1217,7 +1362,7 @@ impl Scheme for FileSystemScheme {
                                           }
                                      }
                                      tlv_tags::MODE => {
-                                          if length == 4 {
+                                          if idx + 6 + 4 <= BLOCK_SIZE {
                                               stat.mode = u32::from_le_bytes([
                                                   block_buffer[idx+6], block_buffer[idx+7],
                                                   block_buffer[idx+8], block_buffer[idx+9]
@@ -1225,7 +1370,7 @@ impl Scheme for FileSystemScheme {
                                           }
                                      }
                                      tlv_tags::MTIME => {
-                                          if length == 8 {
+                                          if idx + 6 + 8 <= BLOCK_SIZE {
                                               stat.mtime = i64::from_le_bytes([
                                                   block_buffer[idx+6], block_buffer[idx+7],
                                                   block_buffer[idx+8], block_buffer[idx+9],

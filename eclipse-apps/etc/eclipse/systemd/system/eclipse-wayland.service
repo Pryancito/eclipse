@@ -5,7 +5,7 @@ Requires=hardware.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/eclipse-wayland
+ExecStart=/usr/bin/smithay_app
 Restart=on-failure
 
 [Install]

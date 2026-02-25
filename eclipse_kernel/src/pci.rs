@@ -471,12 +471,15 @@ pub fn find_sata_ahci() -> Option<PciDevice> {
 }
 
 /// Find all SATA AHCI controllers
+/// Matches:
+///   - class=0x01, subclass=0x06, prog_if=0x01  (standard AHCI)
+///   - class=0x01, subclass=0x01, prog_if=0x01  (some Intel chipsets report IDE-like subclass but AHCI mode)
 pub fn find_all_sata_ahci() -> alloc::vec::Vec<PciDevice> {
     let devices = PCI_DEVICES.lock();
     devices.iter().filter(|dev| {
         dev.class_code == PCI_CLASS_STORAGE
-            && dev.subclass == PCI_SUBCLASS_SATA
             && dev.prog_if == PCI_PROGIF_AHCI
+            && (dev.subclass == PCI_SUBCLASS_SATA || dev.subclass == 0x01)
     }).copied().collect()
 }
 

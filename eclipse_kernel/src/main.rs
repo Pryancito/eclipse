@@ -104,7 +104,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     
     // Explicit raw asm for early confirmation (COM1)
     unsafe {
-        for &b in b"[KERNEL] _start reached via COM1\r\n" {
+        for &b in b"[KERNEL] _start reached via COM1\n" {
             let mut timeout = 1_000_000;
             let mut status: u8;
             while timeout > 0 {
@@ -300,8 +300,13 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     ahci::init();
     serial::serial_print("[INIT] Initializing ATA...\n");
     ata::init();
+    // Register disk: scheme AFTER all storage drivers have registered their devices.
+    // This is essential on real hardware (AHCI) where virtio::init() is a no-op.
+    storage::register_disk_scheme();
+    // List all detected storage devices before mounting
+    storage::list_devices();
     progress::bar(89);
-    
+
     serial::serial_print("[INIT] Initializing Filesystem...\n");
     filesystem::init();
     progress::bar(90);
@@ -352,11 +357,17 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
 
     loop {
-        ipc::process_messages();
-        crate::scheduler::tick();
-        crate::scheduler::schedule();
-        for _ in 0..10000 {
-            core::hint::spin_loop();
+        // Procesar mensajes IPC mientras haya pendientes
+        if crate::ipc::has_pending_messages() {
+            ipc::process_messages();
+        } else {
+            // Si no hay mensajes ni otros procesos listos, "dormir" hasta la siguiente interrupción
+            unsafe {
+                x86_64::instructions::interrupts::enable_and_hlt();
+            }
         }
+        
+        // Intentar planificar otros procesos (p.ej. tras recibir un mensaje o una interrupción)
+        crate::scheduler::schedule();
     }
 }

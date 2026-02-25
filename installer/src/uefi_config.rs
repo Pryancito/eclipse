@@ -18,7 +18,7 @@ impl UefiConfigManager {
 
 [system]
 kernel_path = "/eclipse_kernel"
-userland_path = "/userland/bin/eclipse-userland"
+userland_path = "/userland/bin/eclipse_userland"
 bootloader_path = "/EFI/BOOT/BOOTX64.EFI"
 
 [debug]
@@ -43,7 +43,7 @@ required_modules = [
     "module_loader",
     "graphics_module", 
     "app_framework",
-    "eclipse-userland"
+    "eclipse_userland"
 ]
 
 [security]
@@ -149,7 +149,7 @@ args = "--enable-gui --enable-terminal"
 [eclipse_userland]
 enabled = true
 priority = 4
-path = "/userland/bin/eclipse-userland"
+path = "/userland/bin/eclipse_userland"
 args = "--start-services"
 
 [ipc_common]

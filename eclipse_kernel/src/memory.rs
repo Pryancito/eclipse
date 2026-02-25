@@ -13,6 +13,9 @@ pub const PHYS_MEM_OFFSET: u64 = 0xFFFF900000000000;
 /// Virtual address where the kernel is mapped (Higher Half)
 pub const KERNEL_OFFSET: u64 = 0xFFFF800000000000;
 
+/// Virtual address base for MMIO mappings (PML4[500])
+pub const MMIO_VADDR_BASE: u64 = 0xFFFFFA0000000000;
+
 /// Physical offset for virtual-to-physical address translation
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
@@ -570,6 +573,11 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
         
         // 2. PDPT -> PD
         let pdpt_entry = &mut pdpt.entries[pdpt_idx];
+        if pdpt_entry.present() && pdpt_entry.is_huge() {
+             // Handle 1GB huge page (currently just a warning and fallback)
+             crate::serial::serial_print("WARNING: map_user_page_4kb encountered 1GB HUGE PAGE\n");
+             return;
+        }
         if !pdpt_entry.present() {
             let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
             core::ptr::write_bytes(pd_ptr, 0, 4096);
@@ -583,6 +591,11 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
         
         // 3. PD -> PT
         let pd_entry = &mut pd.entries[pd_idx];
+        if pd_entry.present() && pd_entry.is_huge() {
+             // Handle 2MB huge page
+             crate::serial::serial_print("WARNING: map_user_page_4kb encountered 2MB HUGE PAGE\n");
+             return;
+        }
         if !pd_entry.present() {
             let (pt_ptr, pt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PT");
             core::ptr::write_bytes(pt_ptr, 0, 4096);
@@ -727,6 +740,11 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
 pub fn virt_to_phys(virt_addr: u64) -> u64 {
     let phys_offset = PHYS_OFFSET.load(Ordering::Relaxed);
     
+    // 0. MMIO region (0xFFFFFA00...)
+    if virt_addr >= MMIO_VADDR_BASE {
+        return virt_addr - MMIO_VADDR_BASE;
+    }
+    
     // 1. Physical memory map (0xFFFF9000...)
     if virt_addr >= PHYS_MEM_OFFSET {
         return virt_addr - PHYS_MEM_OFFSET;
@@ -849,17 +867,105 @@ pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: 
     }
 }
 
-/// Map a physical MMIO range into the kernel's virtual address space (HHDM region)
-/// Returns the virtual address (PHYS_MEM_OFFSET + paddr)
+/// Map a physical MMIO range into the kernel's virtual address space.
+///
+/// Virtual address = MMIO_VADDR_BASE + paddr (unique per physical address).
+/// Flags: Present + Writable + PWT + PCD  =>  UC (Uncacheable) for MMIO.
+///
+/// IMPORTANT: We always use the KERNEL CR3 (saved at boot before any
+/// scheduler switch).  If the scheduler is already running and a user
+/// process CR3 is active, `get_cr3()` would return the wrong table and
+/// the MMIO mapping would silently disappear from the kernel's view on
+/// the next context switch.  On real hardware this reliably prevents the
+/// AHCI controller from ever being accessible.
 pub fn map_mmio_range(paddr: u64, length: usize) -> u64 {
-    let virt_addr = PHYS_MEM_OFFSET + paddr;
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE;
-    
-    // Map in current page tables
-    map_physical_range(get_cr3(), paddr, length as u64, virt_addr, flags);
-    
-    // Flush TLB to ensure the new mapping is visible
+    let virt_addr = MMIO_VADDR_BASE + paddr;
+
+    // UC flags: PWT + PCD guarantee Uncacheable on all x86_64 CPUs.
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE;
+
+    // Use the saved kernel CR3. Falls back to the current CR3 only if
+    // save_kernel_cr3() has not been called yet (early boot).
+    let kernel_cr3 = {
+        let k = KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed);
+        if k == 0 { get_cr3() } else { k }
+    };
+
+    // Walk/create 4-level page table entries with kernel-only flags.
+    // We cannot use map_physical_range / map_user_page_4kb here because
+    // those helpers forcibly add USER_ACCESSIBLE and remove NX, which is
+    // wrong for kernel MMIO mappings.
+    mmio_map_kernel_range(kernel_cr3, paddr, length as u64, virt_addr, flags);
+
+    // Flush the entire TLB so the new mapping is visible on this CPU.
     flush_tlb();
-    
+
     virt_addr
+}
+
+/// Walk (and create if missing) page-table levels to map a physical MMIO
+/// range at a kernel virtual address using 4KB pages.
+///
+/// Unlike `map_user_page_4kb` this function:
+///   - Never sets USER_ACCESSIBLE on any level.
+///   - Does NOT strip the NX bit.
+///   - Uses the caller-supplied `flags` verbatim for the leaf PTEs.
+fn mmio_map_kernel_range(cr3: u64, paddr: u64, length: u64, vaddr: u64, flags: u64) {
+    let num_pages = (length + 0xFFF) / 0x1000;
+    for i in 0..num_pages {
+        let off = i * 0x1000;
+        mmio_map_kernel_page(cr3, vaddr + off, paddr + off, flags);
+    }
+}
+
+/// Map a single 4KB kernel MMIO page (no USER_ACCESSIBLE on any level).
+fn mmio_map_kernel_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
+    // Intermediate entries: Present + Writable (no User, no huge).
+    const INTER: u64 = PAGE_PRESENT | PAGE_WRITABLE;
+
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        // PML4
+        let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
+        let pml4_e = &mut pml4.entries[pml4_idx];
+        if !pml4_e.present() {
+            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                core::ptr::write_bytes(ptr, 0, 4096);
+                pml4_e.set_entry(phys, INTER);
+            } else { return; }
+        }
+        let pdpt_phys = pml4_e.get_addr();
+
+        // PDPT
+        let pdpt = &mut *(phys_to_virt(pdpt_phys) as *mut PageTable);
+        let pdpt_e = &mut pdpt.entries[pdpt_idx];
+        if !pdpt_e.present() {
+            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                core::ptr::write_bytes(ptr, 0, 4096);
+                pdpt_e.set_entry(phys, INTER);
+            } else { return; }
+        }
+        if pdpt_e.is_huge() { return; }
+        let pd_phys = pdpt_e.get_addr();
+
+        // PD
+        let pd = &mut *(phys_to_virt(pd_phys) as *mut PageTable);
+        let pd_e = &mut pd.entries[pd_idx];
+        if !pd_e.present() {
+            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                core::ptr::write_bytes(ptr, 0, 4096);
+                pd_e.set_entry(phys, INTER);
+            } else { return; }
+        }
+        if pd_e.is_huge() { return; }
+        let pt_phys = pd_e.get_addr();
+
+        // PT (leaf)
+        let pt = &mut *(phys_to_virt(pt_phys) as *mut PageTable);
+        pt.entries[pt_idx].set_entry(paddr, flags);
+    }
 }

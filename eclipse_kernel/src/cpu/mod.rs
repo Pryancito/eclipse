@@ -299,6 +299,8 @@ pub extern "C" fn ap_entry() -> ! {
     crate::apic::init();
     
     loop {
-        core::hint::spin_loop();
+        unsafe {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        }
     }
 }

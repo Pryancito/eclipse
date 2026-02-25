@@ -65,6 +65,7 @@ pub enum SyscallNumber {
     Accept = 103,
     Connect = 104,
     Mkdir = 105,
+    GetStorageDeviceCount = 50,
 }
 
 /// lseek whence values (POSIX standard)
@@ -248,6 +249,7 @@ pub extern "C" fn syscall_handler(
         103 => sys_accept(arg1, arg2, arg3),
         104 => sys_connect(arg1, arg2, arg3),
         105 => sys_mkdir(arg1, arg2),
+        50 => sys_get_storage_device_count(),
         106 => sys_fstatat(arg1, arg2, arg3, arg4),
         107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
@@ -2769,4 +2771,9 @@ fn sys_unlink(path_ptr: u64) -> u64 {
         Ok(_) => 0,
         Err(_) => u64::MAX,
     }
+}
+
+/// sys_get_storage_device_count - Get the number of registered block devices
+fn sys_get_storage_device_count() -> u64 {
+    crate::storage::device_count() as u64
 }
