@@ -97,6 +97,31 @@ pub struct HidMouseReport {
     pub wheel: i8,    // Scroll wheel
 }
 
+/// USB HID generic absolute pointer report (e.g. QEMU usb-tablet, 6 bytes).
+/// Format: buttons(1) + x_lo(1) + x_hi(1) + y_lo(1) + y_hi(1) + wheel(1)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HidTabletReport {
+    pub buttons: u8,
+    pub x_lo:    u8,
+    pub x_hi:    u8,
+    pub y_lo:    u8,
+    pub y_hi:    u8,
+    pub wheel:   i8,
+}
+
+impl HidTabletReport {
+    pub fn x(&self) -> u16 { u16::from_le_bytes([self.x_lo, self.x_hi]) }
+    pub fn y(&self) -> u16 { u16::from_le_bytes([self.y_lo, self.y_hi]) }
+}
+
+/// Marker for generic HID / unknown protocol (our internal use).
+pub const HID_PROTOCOL_GENERIC: u8  = 0xFF;
+/// Marker for USB absolute pointer / tablet.
+pub const HID_PROTOCOL_TABLET: u8   = 0x03;
+/// USB tablet coordinate range (QEMU usb-tablet uses 0–32767).
+const TABLET_MAX: u32 = 32767;
+
 // ===========================================================================
 // HID Usage ID → PS/2 Set 1 Scancode Table
 //
@@ -678,6 +703,9 @@ pub struct XhciControllerState {
     pub mmio_base:       u64,
     pub max_slots:       u8,
     pub max_ports:       u8,
+    /// Framebuffer dimensions for tablet absolute → relative conversion
+    pub fb_width:        u32,
+    pub fb_height:       u32,
 }
 
 impl XhciControllerState {
@@ -693,6 +721,8 @@ impl XhciControllerState {
             mmio_base,
             max_slots: 0,
             max_ports: 0,
+            fb_width: 1024,
+            fb_height: 768,
         }
     }
 
@@ -1069,12 +1099,11 @@ impl XhciControllerState {
                 hid_protocol = 0;
 
                 if iface_class == USB_CLASS_HID {
-                    // Support both Boot and None subclasses if they look like keyboards/mice
                     if iface_subclass == HID_SUBCLASS_BOOT || iface_subclass == HID_SUBCLASS_NONE {
                         hid_protocol = iface_protocol;
-                        // If subclass is NONE but protocol is 0 (generic), we'll still try to find an INT IN EP
                         if hid_protocol == 0 {
-                            hid_protocol = 0xFF; // Mark as "some HID"
+                            // protocol=0 with no boot subclass = generic / absolute pointer (tablet)
+                            hid_protocol = HID_PROTOCOL_TABLET;
                         }
                     }
                 }
@@ -1169,6 +1198,8 @@ impl XhciControllerState {
         let ring_idx = slot_id as usize * 32 + xhci_ep_id as usize;
         if ring_idx < self.transfer_rings.len() {
             self.transfer_rings[ring_idx] = Some(int_ring);
+        } else {
+             return Err("Transfer ring index out of bounds");
         }
 
         // Submit Configure Endpoint command
@@ -1178,8 +1209,12 @@ impl XhciControllerState {
         }
 
         // Allocate HID report buffer
-        // If protocol is unknown (0xFF), default to 8 bytes which covers most keyboards and mice
-        let report_buf_size = if hid_protocol == HID_PROTOCOL_MOUSE { 4 } else { 8 };
+        let report_buf_size = match hid_protocol {
+            HID_PROTOCOL_KEYBOARD => 8,
+            HID_PROTOCOL_MOUSE    => 4,
+            HID_PROTOCOL_TABLET   => 6,
+            _                     => 8,
+        };
         let report_buf = DmaAllocation::allocate(report_buf_size, 64)?;
         report_buf.zero();
 
@@ -1293,14 +1328,23 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
             // Read report from buffer (phys addr → virt via HHDM)
             let virt = crate::memory::phys_to_virt(dev.buf_phys);
 
-            if dev.protocol == HID_PROTOCOL_KEYBOARD && dev.buf_size >= 8 {
-                let report_ptr = virt as *const HidKeyboardReport;
-                let report = core::ptr::read_volatile(report_ptr);
+            // Determine protocol if still unknown (255)
+            let mut proto = dev.protocol;
+            if proto == 255 {
+                if dev.buf_size >= 8 { proto = HID_PROTOCOL_KEYBOARD; }
+                else if dev.buf_size >= 6 { proto = HID_PROTOCOL_TABLET; }
+                else if dev.buf_size >= 3 { proto = HID_PROTOCOL_MOUSE; }
+            }
+
+            if proto == HID_PROTOCOL_KEYBOARD && dev.buf_size >= 8 {
+                let report = core::ptr::read_volatile(virt as *const HidKeyboardReport);
                 process_keyboard_report(&report);
-            } else if dev.protocol == HID_PROTOCOL_MOUSE && dev.buf_size >= 3 {
-                let report_ptr = virt as *const HidMouseReport;
-                let report = core::ptr::read_volatile(report_ptr);
+            } else if proto == HID_PROTOCOL_MOUSE && dev.buf_size >= 3 {
+                let report = core::ptr::read_volatile(virt as *const HidMouseReport);
                 process_mouse_report(&report);
+            } else if proto == HID_PROTOCOL_TABLET && dev.buf_size >= 6 {
+                let report = core::ptr::read_volatile(virt as *const HidTabletReport);
+                process_tablet_report(&report);
             }
             return;
         }
@@ -1355,6 +1399,51 @@ fn process_mouse_report(report: &HidMouseReport) {
         | ((report.y as u8 as u32) << 16);
     crate::interrupts::push_mouse_packet(packet);
     unsafe { LAST_MOUSE_REPORT = *report; }
+}
+
+/// Last tablet cursor position (absolute, in tablet units)
+static mut TABLET_LAST_X: u16 = 0xFFFF; // sentinel: not yet initialised
+static mut TABLET_LAST_Y: u16 = 0xFFFF;
+
+/// Convert a USB tablet HID absolute report to relative mouse deltas.
+/// The tablet sends 16-bit absolute X/Y in range 0..TABLET_MAX.
+/// We scale to the current framebuffer size and push a relative packet.
+fn process_tablet_report(report: &HidTabletReport) {
+    let abs_x = report.x() as u32;
+    let abs_y = report.y() as u32;
+
+    // Get framebuffer size from XHCI state
+    let (fb_w, fb_h) = unsafe {
+        if let Some(ref xhci) = XHCI {
+            (xhci.fb_width, xhci.fb_height)
+        } else {
+            (1024, 768)
+        }
+    };
+
+    // Convert absolute tablet coord to absolute screen pixel
+    let screen_x = ((abs_x * fb_w) / (TABLET_MAX + 1)).min(fb_w - 1) as i32;
+    let screen_y = ((abs_y * fb_h) / (TABLET_MAX + 1)).min(fb_h - 1) as i32;
+
+    // On first packet just store position without emitting a move
+    let (last_x, last_y) = unsafe { (TABLET_LAST_X, TABLET_LAST_Y) };
+    if last_x == 0xFFFF {
+        unsafe { TABLET_LAST_X = screen_x as u16; TABLET_LAST_Y = screen_y as u16; }
+        return;
+    }
+
+    let prev_x = last_x as i32;
+    let prev_y = last_y as i32;
+    let dx = (screen_x - prev_x).clamp(-127, 127) as i8;
+    let dy = (screen_y - prev_y).clamp(-127, 127) as i8;
+
+    unsafe { TABLET_LAST_X = screen_x as u16; TABLET_LAST_Y = screen_y as u16; }
+
+    // Push relative packet (same format as PS/2 mouse)
+    let packet: u32 = (report.buttons as u32)
+        | ((dx as u8 as u32) << 8)
+        | ((dy as u8 as u32) << 16);
+    crate::interrupts::push_mouse_packet(packet);
 }
 
 // ===========================================================================
@@ -1489,6 +1578,11 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
     let mut state = XhciControllerState::new(bar0, mmio);
     state.max_slots = max_slots;
     state.max_ports = max_ports;
+    // Read framebuffer size for tablet absolute-to-relative conversion
+    if let Some((_phys, fb_w, fb_h, _pitch, _src)) = crate::boot::get_fb_info() {
+        state.fb_width  = fb_w;
+        state.fb_height = fb_h;
+    }
 
     if let Err(e) = state.initialize() {
         crate::serial::serial_print(&alloc::format!("[XHCI] initialize() failed: {}\n", e));

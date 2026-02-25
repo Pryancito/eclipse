@@ -196,11 +196,12 @@ if [ "$PS2_MOUSE" = "1" ]; then
         QEMU_CMD="$QEMU_CMD -device usb-kbd"
     fi
 else
-    # Dispositivos de entrada USB HID (teclado + ratón/tablet)
+    # Teclado: PS/2 (IRQ 1, sigue funcionando como antes).
+    # Ratón: usb-tablet (puntero absoluto). No necesita Ctrl+Alt+G.
+    # process_tablet_report() convierte coords absolutas → deltas relativos.
     if [ "$USE_XHCI" = "1" ]; then
         QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
-        QEMU_CMD="$QEMU_CMD -device usb-mouse,bus=xhci.0,port=2"
-        QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=3"
+        QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=1"
     else
         QEMU_CMD="$QEMU_CMD -usb"
         QEMU_CMD="$QEMU_CMD -device usb-tablet"
