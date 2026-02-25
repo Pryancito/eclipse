@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -446,6 +446,15 @@ pub extern "C" fn _start() -> ! {
     // Estado previo de botones del ratón PS/2 para detectar cambios (bit0=left, bit1=right, bit2=middle)
     let mut prev_mouse_buttons: u8 = 0;
 
+    // Cursor position (absolute, clamped to screen bounds)
+    let (screen_width, screen_height) = get_framebuffer_info()
+        .map(|fb| (fb.width as i32, fb.height as i32))
+        .unwrap_or((1024, 768));
+    let mut cursor_x: i32 = screen_width / 2;
+    let mut cursor_y: i32 = screen_height / 2;
+    // Place cursor at screen center initially
+    set_cursor_position(cursor_x as u32, cursor_y as u32);
+
     // Main loop - process input events
     let mut heartbeat_counter = 0u64;
     let mut total_events = 0u64;
@@ -489,6 +498,13 @@ pub extern "C" fn _start() -> ! {
             let buttons = (packed & 0xFF) as u8;
             let dx = ((packed >> 8) as u8) as i8 as i32;
             let dy = -(((packed >> 16) as u8) as i8 as i32);
+
+            // Actualizar posición del cursor y moverlo en el hardware
+            if dx != 0 || dy != 0 {
+                cursor_x = (cursor_x + dx).max(0).min(screen_width - 1);
+                cursor_y = (cursor_y + dy).max(0).min(screen_height - 1);
+                set_cursor_position(cursor_x as u32, cursor_y as u32);
+            }
 
             // Eventos de movimiento (X, Y)
             if dx != 0 {

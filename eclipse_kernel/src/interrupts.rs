@@ -230,6 +230,34 @@ fn init_ps2_mouse() {
             crate::serial::serial_print("[INT] PS/2 mouse: timeout after A8, skipping\n");
             return;
         }
+
+        // Enable aux (mouse) interrupt in PS/2 controller command byte:
+        // Read current command byte, set bit 1 (aux IRQ enable), clear bit 5 (aux port disable)
+        outb(0x64, 0x20); // Read Command Byte
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 1 != 0 { break; } // wait for output buffer full
+            if i == TIMEOUT - 1 { ok = false; }
+        }
+        if ok {
+            let cmd = inb(0x60);
+            let new_cmd = (cmd | 0x02) & !0x20; // set bit1 (aux IRQ), clear bit5 (aux clock disable)
+            for i in 0..TIMEOUT {
+                if inb(0x64) & 2 == 0 { break; }
+                if i == TIMEOUT - 1 { ok = false; }
+            }
+            if ok {
+                outb(0x64, 0x60); // Write Command Byte
+                for i in 0..TIMEOUT {
+                    if inb(0x64) & 2 == 0 { break; }
+                    if i == TIMEOUT - 1 { ok = false; }
+                }
+                if ok {
+                    outb(0x60, new_cmd);
+                }
+            }
+        }
+        ok = true; // Continue even if command byte update failed
+
         outb(0x64, 0xD4); // Next byte goes to mouse
         for i in 0..TIMEOUT {
             if inb(0x64) & 2 == 0 {
@@ -244,6 +272,14 @@ fn init_ps2_mouse() {
             return;
         }
         outb(0x60, 0xF4); // Enable data reporting
+
+        // Drain ACK byte (0xFA) from output buffer so it doesn't confuse the mouse handler
+        for _i in 0..TIMEOUT {
+            if inb(0x64) & 1 != 0 {
+                let _ = inb(0x60); // read and discard ACK
+                break;
+            }
+        }
     }
     crate::serial::serial_print("[INT] PS/2 mouse init done\n");
 }
