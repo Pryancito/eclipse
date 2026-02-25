@@ -74,6 +74,14 @@ const SECTOR_SIZE: usize = 512;
 pub const AHCI_BLOCK_SIZE: usize = 4096;
 const SECTORS_PER_BLOCK: u64 = (AHCI_BLOCK_SIZE / SECTOR_SIZE) as u64;
 
+// Spin-loop delay budgets.
+// On a 3 GHz CPU, spin_loop() takes roughly 3–10 ns per iteration.
+// 1 000 000 iterations ≈ 3–10 ms — more than enough for the required ≥ 1 ms holds.
+/// Iterations used to hold COMRESET asserted for ≥ 1 ms before releasing.
+const COMRESET_HOLD_ITERATIONS: u32 = 1_000_000;
+/// Iterations used after HBA reset to let the controller and PHY stabilise.
+const HBA_STABILIZE_ITERATIONS: u32 = 1_000_000;
+
 // ── AHCI DMA structures (must match AHCI spec layout exactly) ────────────────
 
 /// Command Header — 32 bytes.  32 headers form the 1 KiB Command List.
@@ -224,7 +232,7 @@ impl AhciPort {
             // Assert COMRESET: DET=1 in PxSCTL
             self.pwreg(PORT_SCTL, (self.preg(PORT_SCTL) & !0x0F) | 0x01);
             // Hold for ≥1 ms
-            for _ in 0..1_000_000 { core::hint::spin_loop(); }
+            for _ in 0..COMRESET_HOLD_ITERATIONS { core::hint::spin_loop(); }
             // De-assert COMRESET: DET=0
             self.pwreg(PORT_SCTL, self.preg(PORT_SCTL) & !0x0F);
         }
@@ -267,7 +275,11 @@ impl AhciPort {
     /// Issue the command already built in slot 0 and spin-poll to completion.
     /// Returns `true` on success.
     fn exec_cmd(&self) -> bool {
-        // Full memory barrier before touching the CI register
+        // mfence ensures all prior writes to the command table and command list
+        // (normal cacheable memory) are visible to the HBA's DMA engine before
+        // we set PxCI.  Without this barrier the CPU store buffer could reorder
+        // the metadata writes after the PxCI write, causing the HBA to read
+        // stale (zeroed) command data on real hardware.
         unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
 
         // Clear interrupt status
@@ -560,7 +572,7 @@ fn init_controller(dev: &pci::PciDevice) {
     hwreg(base, HBA_GHC, GHC_AE);
 
     // Let the HBA and PHY layers stabilise (~1 ms on real hardware)
-    for _ in 0..1_000_000 { core::hint::spin_loop(); }
+    for _ in 0..HBA_STABILIZE_ITERATIONS { core::hint::spin_loop(); }
 
     // ── 5. Read capabilities and port bitmask ────────────────────────────────
     let cap = hreg(base, HBA_CAP);
