@@ -79,8 +79,9 @@ static mut FS: Filesystem = Filesystem {
 
 impl Filesystem {
     /// Mount the root filesystem
-    /// Hardcoded partition offset for now (513 MiB / 4096 bytes = 131328 blocks)
-    pub const PARTITION_OFFSET_BLOCKS: u64 = 131328;
+    /// Partition layout: FAT32 1MiB–101MiB (100MB), EclipseFS from 101MiB
+    /// 101 MiB / 4096 bytes = 25856 blocks
+    pub const PARTITION_OFFSET_BLOCKS: u64 = 25856;
     pub fn mount(device_path: &str) -> Result<(), &'static str> {
     // Enforce ATA initialization before mounting
     // This is handled in main.rs but good to be sure
