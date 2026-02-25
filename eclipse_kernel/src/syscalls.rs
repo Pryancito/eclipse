@@ -1115,6 +1115,10 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     if path_ptr == 0 || path_len == 0 || path_len > 4096 {
         return u64::MAX;
     }
+
+    if !is_user_pointer(path_ptr, path_len) {
+        return u64::MAX;
+    }
     
     // Extract path string
     let path = unsafe {
@@ -1718,13 +1722,13 @@ fn sys_pci_read_config(device_location: u64, offset: u64, size: u64) -> u64 {
     let bus = ((device_location >> 16) & 0xFF) as u8;
     let device = ((device_location >> 8) & 0xFF) as u8;
     let function = (device_location & 0xFF) as u8;
-    let offset = offset as u8;
-    
-    // Validate parameters
+
+    // Validate parameters before truncating offset to u8 to avoid silent wrap-around
     if device > 31 || function > 7 || offset > 252 {
         serial::serial_print("[SYSCALL] pci_read_config - invalid parameters\n");
         return u64::MAX;
     }
+    let offset = offset as u8;
     
     unsafe {
         match size {
@@ -1749,13 +1753,13 @@ fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
     let bus = ((device_location >> 16) & 0xFF) as u8;
     let device = ((device_location >> 8) & 0xFF) as u8;
     let function = (device_location & 0xFF) as u8;
-    let offset = offset as u8;
-    
-    // Validate parameters
+
+    // Validate parameters before truncating offset to u8 to avoid silent wrap-around
     if device > 31 || function > 7 || offset > 252 {
         serial::serial_print("[SYSCALL] pci_write_config - invalid parameters\n");
         return u64::MAX;
     }
+    let offset = offset as u8;
     
     // For now, only allow writing to command register (offset 0x04)
     // This is a security measure - we don't want userspace to mess with arbitrary PCI config
@@ -2191,19 +2195,19 @@ fn sys_brk(addr: u64) -> u64 {
                         
                         current_page += 4096;
                     } else {
-                        // Out of memory - restore old brk
+                        // Out of memory: update brk to the last successfully mapped page
+                        // to avoid orphaning already-mapped page-table entries. Return the
+                        // new (partial) break so the caller sees the actual heap boundary.
+                        // This follows Linux brk() semantics where the syscall returns the
+                        // new break regardless of whether it reached the requested address.
+                        proc.brk_current = current_page;
                         process::update_process(pid, proc);
-                        return u64::MAX;
+                        return current_page;
                     }
                 }
-            } else if addr < proc.brk_current { // Changed from `new_brk < old_brk` to `addr < proc.brk_current`
+            } else if addr < proc.brk_current {
                 // Shrinking heap - unmap pages
                 // TODO: Actually free the physical pages
-                // For now just update brk_current
-                // The instruction mentioned "fix sys_brk page mapping logic", but the provided snippet
-                // for the change was for FileSystemScheme::open.
-                // Assuming the fix for shrinking heap is to correctly identify the condition.
-                // The actual unmapping logic is still a TODO.
             }
             
             // Update brk_current

@@ -1487,7 +1487,6 @@ unsafe extern "C" fn syscall_entry() {
         "mov ax, 0x23",  // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
-        "mov es, ax",
         // FS and GS must NOT be reloaded here as it would clear the Base address (MSR_FS_BASE)
         // configured by sys_arch_prctl. Since kernel doesn't change them, just leave as is.
 

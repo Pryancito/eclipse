@@ -415,15 +415,49 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
 /// Terminar proceso actual
 pub fn exit_process() {
     if let Some(pid) = current_process_id() {
-        let mut table = PROCESS_TABLE.lock();
-        for slot in table.iter_mut() {
-            if let Some(p) = slot {
-                if p.id == pid {
-                    p.state = ProcessState::Terminated;
-                    break;
+        // Collect open file descriptors so we can close them outside the lock
+        let mut to_close: [(usize, usize); crate::fd::MAX_FDS_PER_PROCESS] =
+            [(0, 0); crate::fd::MAX_FDS_PER_PROCESS];
+        let mut close_count = 0;
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut tables = crate::fd::FD_TABLES.lock();
+            let pid_idx = pid as usize;
+            if pid_idx < crate::fd::MAX_FD_PROCESSES {
+                for fd in 0..crate::fd::MAX_FDS_PER_PROCESS {
+                    if tables[pid_idx].fds[fd].in_use {
+                        to_close[close_count] = (
+                            tables[pid_idx].fds[fd].scheme_id,
+                            tables[pid_idx].fds[fd].resource_id,
+                        );
+                        close_count += 1;
+                        tables[pid_idx].fds[fd].in_use = false;
+                    }
                 }
             }
+        });
+
+        // Close scheme resources outside the FD table lock
+        for i in 0..close_count {
+            if crate::scheme::close(to_close[i].0, to_close[i].1).is_err() {
+                crate::serial::serial_printf(format_args!(
+                    "[PROC] exit: scheme::close failed for scheme_id={} resource_id={}\n",
+                    to_close[i].0, to_close[i].1
+                ));
+            }
         }
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = PROCESS_TABLE.lock();
+            for slot in table.iter_mut() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        p.state = ProcessState::Terminated;
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
