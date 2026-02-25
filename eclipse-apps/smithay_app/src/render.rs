@@ -537,7 +537,6 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
-    let mut hovered_button: Option<WindowButton> = None;
     
     for (i, w) in windows.iter().take(window_count).enumerate().rev() {
         if w.content == WindowContent::None { continue; }
