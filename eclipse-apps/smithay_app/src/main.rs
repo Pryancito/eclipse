@@ -7,9 +7,6 @@ extern crate eclipse_syscall;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use eclipse_libc::{println, getpid, yield_cpu};
-use embedded_graphics::prelude::*;
-use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder};
 
 mod compositor;
 mod render;
@@ -20,8 +17,8 @@ mod backend;
 mod state;
 
 use state::SmithayState;
-use crate::compositor::{ShellWindow, WindowContent, MAX_WINDOWS_COUNT};
-use crate::compositor::ExternalSurface;
+use crate::compositor::ShellWindow;
+use crate::compositor::WindowContent;
 use ipc::{query_input_service_pid, subscribe_to_input_service};
 
 const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB
@@ -76,26 +73,6 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         state.process_events();
-        
-        // --- Handle Window Lifecycle Requests ---
-        if state.input.request_close_window && state.space.window_count > 0 {
-            let idx = state.input.focused_window.unwrap_or(state.space.window_count - 1);
-            state.space.windows[idx].closing = true;
-            state.input.request_close_window = false;
-            state.input.dragging_window = None;
-            state.input.focused_window = None;
-        }
-
-        if state.input.request_new_window && state.space.window_count < MAX_WINDOWS_COUNT {
-            let wc = state.space.window_count as i32;
-            state.space.map_window(ShellWindow {
-                x: 60 + wc * 20, y: 160 + wc * 15, w: 240, h: 180,
-                curr_x: (60 + wc * 20 + 120) as f32, curr_y: (160 + wc * 15 + 90) as f32, curr_w: 0.0, curr_h: 0.0,
-                minimized: false, maximized: false, closing: false, stored_rect: (60 + wc * 20, 160 + wc * 15, 240, 180),
-                workspace: state.input.current_workspace, content: WindowContent::InternalDemo,
-            });
-            state.input.request_new_window = false;
-        }
         
         state.update();
         state.render();

@@ -140,7 +140,7 @@ const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
 /// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11)
 fn send_event_to_client(pid: u32, ev: &InputEvent) {
-    if pid == 0 || pid > 63 {
+    if pid == 0 {
         return;
     }
     // Zero-initialize the buffer and copy each field individually at its repr(C) offset.

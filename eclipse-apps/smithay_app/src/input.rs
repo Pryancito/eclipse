@@ -250,10 +250,10 @@ impl InputState {
             1 => { // Mouse move
                 let d = (ev.value * self.mouse_sensitivity) / 100;
                 if ev.code == 0 {
-                    self.cursor_x = (self.cursor_x + d).clamp(0, fb_width.wrapping_sub(1));
+                    self.cursor_x = (self.cursor_x + d).clamp(0, (fb_width - 1).max(0));
                     if let Some(idx) = self.dragging_window { 
                         if idx < *window_count {
-                            windows[idx].x = (windows[idx].x + d).clamp(0, fb_width.wrapping_sub(windows[idx].w)); 
+                            windows[idx].x = (windows[idx].x + d).clamp(0, (fb_width - windows[idx].w).max(0)); 
                         }
                     }
                     if let Some(idx) = self.resizing_window { 
@@ -263,10 +263,10 @@ impl InputState {
                     }
                 } else if ev.code == 1 {
                     let dy = if self.invert_y { -d } else { d };
-                    self.cursor_y = (self.cursor_y + dy).clamp(0, fb_height.wrapping_sub(1));
+                    self.cursor_y = (self.cursor_y + dy).clamp(0, (fb_height - 1).max(0));
                     if let Some(idx) = self.dragging_window { 
                         if idx < *window_count {
-                            windows[idx].y = (windows[idx].y + dy).clamp(0, fb_height.wrapping_sub(windows[idx].h)); 
+                            windows[idx].y = (windows[idx].y + dy).clamp(0, (fb_height - windows[idx].h).max(0)); 
                         }
                     }
                     if let Some(idx) = self.resizing_window { 
@@ -281,6 +281,21 @@ impl InputState {
                 let pressed = ev.value != 0;
                 let old = self.mouse_buttons;
                 if pressed { self.mouse_buttons |= 1 << btn; } else { self.mouse_buttons &= !(1 << btn); }
+                // Forward mouse button events to the focused external window client
+                if let Some(f_idx) = self.focused_window {
+                    if let WindowContent::External(s_idx) = windows[f_idx].content {
+                        if (s_idx as usize) < surfaces.len() {
+                            let pid = surfaces[s_idx as usize].pid;
+                            let se = SideWindEvent {
+                                event_type: SWND_EVENT_TYPE_MOUSE_BUTTON,
+                                data1: btn as i32,
+                                data2: ev.value,
+                                data3: 0,
+                            };
+                            let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                        }
+                    }
+                }
                 if (self.mouse_buttons & 1 != 0) && (old & 1 == 0) {
                     self.launcher_active = false; self.context_menu_active = false;
                     if self.cursor_y >= fb_height - 40 { if self.cursor_x < 150 { self.launcher_active = true; } }
@@ -288,7 +303,12 @@ impl InputState {
                         let top = *window_count - 1; if idx != top { windows.swap(idx, top); }
                         self.focused_window = Some(top);
                         let b = windows[top].check_button_click(self.cursor_x, self.cursor_y);
-                        match b { WindowButton::Close => self.request_close_window = true, _ => { self.dragging_window = Some(top); self.drag_offset_x = self.cursor_x - windows[top].x; self.drag_offset_y = self.cursor_y - windows[top].y; } }
+                        match b {
+                            WindowButton::Close => self.request_close_window = true,
+                            WindowButton::Minimize => self.request_minimize = true,
+                            WindowButton::Maximize => self.request_maximize = true,
+                            WindowButton::None => { self.dragging_window = Some(top); self.drag_offset_x = self.cursor_x - windows[top].x; self.drag_offset_y = self.cursor_y - windows[top].y; }
+                        }
                     } else { self.focused_window = None; }
                 } else if (self.mouse_buttons & 2 != 0) && (old & 2 == 0) {
                     self.launcher_active = false; self.quick_settings_active = false;
