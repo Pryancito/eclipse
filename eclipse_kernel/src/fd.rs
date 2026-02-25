@@ -8,10 +8,10 @@ use spin::Mutex;
 use crate::process::ProcessId;
 
 /// Maximum number of open files per process
-const MAX_FDS_PER_PROCESS: usize = 64;
+pub const MAX_FDS_PER_PROCESS: usize = 64;
 
 /// Maximum number of processes (matching scheduler limit)
-const MAX_PROCESSES: usize = 64;
+pub const MAX_FD_PROCESSES: usize = 64;
 
 /// File descriptor entry
 #[derive(Clone, Debug, Copy)]
@@ -38,7 +38,7 @@ impl FileDescriptor {
 /// Per-process file descriptor table  
 #[derive(Copy, Clone)]
 pub struct FdTable {
-    fds: [FileDescriptor; MAX_FDS_PER_PROCESS],
+    pub fds: [FileDescriptor; MAX_FDS_PER_PROCESS],
 }
 
 impl FdTable {
@@ -99,11 +99,11 @@ impl FdTable {
 }
 
 /// Global file descriptor tables (one per process)
-static FD_TABLES: Mutex<[FdTable; MAX_PROCESSES]> = Mutex::new([FdTable::new(); MAX_PROCESSES]);
+pub static FD_TABLES: Mutex<[FdTable; MAX_FD_PROCESSES]> = Mutex::new([FdTable::new(); MAX_FD_PROCESSES]);
 
 /// Get the FD table for a process
-pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable; MAX_PROCESSES]>> {
-    if (pid as usize) < MAX_PROCESSES {
+pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable; MAX_FD_PROCESSES]>> {
+    if (pid as usize) < MAX_FD_PROCESSES {
         Some(FD_TABLES.lock())
     } else {
         None
@@ -114,7 +114,7 @@ pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable
 pub fn fd_open(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
     let mut tables = FD_TABLES.lock();
     let pid_idx = pid as usize;
-    if pid_idx < MAX_PROCESSES {
+    if pid_idx < MAX_FD_PROCESSES {
         tables[pid_idx].allocate(scheme_id, resource_id, flags)
     } else {
         None
@@ -125,7 +125,7 @@ pub fn fd_open(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32)
 pub fn fd_get(pid: ProcessId, fd: usize) -> Option<FileDescriptor> {
     let tables = FD_TABLES.lock();
     let pid_idx = pid as usize;
-    if pid_idx < MAX_PROCESSES {
+    if pid_idx < MAX_FD_PROCESSES {
         tables[pid_idx].get(fd).cloned()
     } else {
         None
@@ -136,7 +136,7 @@ pub fn fd_get(pid: ProcessId, fd: usize) -> Option<FileDescriptor> {
 pub fn fd_update_offset(pid: ProcessId, fd: usize, new_offset: u64) -> bool {
     let mut tables = FD_TABLES.lock();
     let pid_idx = pid as usize;
-    if pid_idx < MAX_PROCESSES {
+    if pid_idx < MAX_FD_PROCESSES {
         if let Some(fd_entry) = tables[pid_idx].get_mut(fd) {
             fd_entry.offset = new_offset;
             return true;
@@ -149,7 +149,7 @@ pub fn fd_update_offset(pid: ProcessId, fd: usize, new_offset: u64) -> bool {
 pub fn fd_close(pid: ProcessId, fd: usize) -> bool {
     let mut tables = FD_TABLES.lock();
     let pid_idx = pid as usize;
-    if pid_idx < MAX_PROCESSES {
+    if pid_idx < MAX_FD_PROCESSES {
         tables[pid_idx].close(fd)
     } else {
         false
@@ -166,7 +166,7 @@ pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
     let mut tables = FD_TABLES.lock();
     let parent_idx = parent_pid as usize;
     let child_idx = child_pid as usize;
-    if parent_idx < MAX_PROCESSES && child_idx < MAX_PROCESSES {
+    if parent_idx < MAX_FD_PROCESSES && child_idx < MAX_FD_PROCESSES {
         tables[child_idx] = tables[parent_idx];
     }
 }
@@ -176,7 +176,7 @@ pub fn fd_init_stdio(pid: ProcessId) {
     if let Ok((scheme_id, resource_id)) = crate::scheme::open("log:", 0, 0) {
         let mut tables = FD_TABLES.lock();
         let pid_idx = pid as usize;
-        if pid_idx < MAX_PROCESSES {
+        if pid_idx < MAX_FD_PROCESSES {
             // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
             tables[pid_idx].fds[0] = FileDescriptor {
                 in_use: true,
