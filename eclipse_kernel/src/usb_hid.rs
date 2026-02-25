@@ -1472,6 +1472,16 @@ pub fn register_usb_irq_handler(irq: u8) -> Result<(), &'static str> {
     crate::interrupts::set_irq_handler(irq, usb_irq_handler)
 }
 
+/// Poll the XHCI event ring for pending HID events.
+/// Called from the timer interrupt as a fallback when IRQ-based delivery is unavailable.
+pub fn poll() {
+    unsafe {
+        if let Some(ref mut xhci) = XHCI {
+            xhci.process_events();
+        }
+    }
+}
+
 // ===========================================================================
 // Initialization Entry Point
 // ===========================================================================

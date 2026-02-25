@@ -812,6 +812,11 @@ extern "C" fn timer_handler() {
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
     
+    // Poll USB HID events every 8ms as a fallback for controllers that don't fire IRQs
+    if TIMER_TICKS.load(Ordering::Relaxed) % 8 == 0 {
+        crate::usb_hid::poll();
+    }
+
     // Procesar IPC pendiente (cola global -> mailboxes); el kernel main loop
     // ya no se ejecuta tras el primer schedule(), así que debe hacerse aquí.
     crate::ipc::process_messages();
@@ -1113,6 +1118,20 @@ pub fn set_irq_handler(irq_num: u8, handler: fn()) -> Result<(), &'static str> {
         // Install the IRQ wrapper in the IDT
         let interrupt_num = 32 + irq_num;
         match irq_num {
+            9 => {
+                KERNEL_IDT.entries[interrupt_num as usize].set_handler(
+                    irq_9 as *const () as u64,
+                    0x08,
+                    IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE
+                );
+            }
+            10 => {
+                KERNEL_IDT.entries[interrupt_num as usize].set_handler(
+                    irq_10 as *const () as u64,
+                    0x08,
+                    IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE
+                );
+            }
             11 => {
                 KERNEL_IDT.entries[interrupt_num as usize].set_handler(
                     irq_11 as *const () as u64,
@@ -1131,6 +1150,94 @@ pub fn set_irq_handler(irq_num: u8, handler: fn()) -> Result<(), &'static str> {
 }
 
 /// Generic IRQ handler that dispatches to registered handler
+extern "C" fn irq_9_handler() {
+    unsafe {
+        if let Some(handler) = IRQ_HANDLERS[9] {
+            handler();
+        }
+    }
+    let mut stats = INTERRUPT_STATS.lock();
+    stats.irqs += 1;
+    drop(stats);
+    send_eoi(9);
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_9() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym irq_9_handler,
+    );
+}
+
+extern "C" fn irq_10_handler() {
+    unsafe {
+        if let Some(handler) = IRQ_HANDLERS[10] {
+            handler();
+        }
+    }
+    let mut stats = INTERRUPT_STATS.lock();
+    stats.irqs += 1;
+    drop(stats);
+    send_eoi(10);
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_10() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym irq_10_handler,
+    );
+}
+
 extern "C" fn irq_11_handler() {
     unsafe {
         if let Some(handler) = IRQ_HANDLERS[11] {
