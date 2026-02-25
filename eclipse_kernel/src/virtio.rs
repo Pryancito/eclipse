@@ -237,7 +237,7 @@ const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
 const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
-const CURSOR_RESOURCE_ID: u32 = 1;
+const CURSOR_RESOURCE_ID: u32 = 0x40;
 const DISPLAY_BUFFER_RESOURCE_ID: u32 = 2;
 
 /// Display buffer phys/size for cache flush before DMA (userspace writes go to CPU cache)
@@ -1272,7 +1272,10 @@ pub struct VirtIOGpuDevice {
     modern_common: u64,
     /// VirtIO 1.0 modern: notify region virt addr to write queue index (0 = legacy)
     modern_notify_addr: u64,
+    /// VirtIO 1.0 modern: notify region virt addr for cursor queue
+    cursor_notify_addr: u64,
     control_queue: Option<Virtqueue>,
+    cursor_queue: Option<Virtqueue>,
     cursor_resource_created: bool,
     /// Cursor bitmap DMA allocation (kept for device to read)
     cursor_bitmap: Option<(*mut u8, u64)>,
@@ -1300,7 +1303,9 @@ impl VirtIOGpuDevice {
             io_base,
             modern_common: 0,
             modern_notify_addr: 0,
+            cursor_notify_addr: 0,
             control_queue: None,
+            cursor_queue: None,
             cursor_resource_created: false,
             cursor_bitmap: None,
             virgl_supported: false,
@@ -1312,19 +1317,19 @@ impl VirtIOGpuDevice {
         }
     }
 
-    /// Notify device of queue 0 (control queue)
+    /// Notify device of a specific queue
     #[inline]
-    unsafe fn gpu_notify_queue(io_base: u16, mmio_base: u64, modern_notify_addr: u64) {
+    unsafe fn gpu_notify_queue(io_base: u16, mmio_base: u64, modern_notify_addr: u64, q_idx: u16) {
         for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
             core::hint::spin_loop();
         }
         if io_base != 0 {
-            outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0);
+            outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, q_idx);
         } else if mmio_base != 0 {
             let regs = mmio_base as *mut VirtIOMMIORegs;
-            write_volatile(&mut (*regs).queue_notify, 0);
+            write_volatile(&mut (*regs).queue_notify, q_idx as u32);
         } else if modern_notify_addr != 0 {
-            core::ptr::write_volatile(modern_notify_addr as *mut u16, 0);
+            core::ptr::write_volatile(modern_notify_addr as *mut u16, q_idx);
         }
     }
 
@@ -1334,8 +1339,10 @@ impl VirtIOGpuDevice {
             mmio_base,
             modern_common: 0,
             modern_notify_addr: 0,
+            cursor_notify_addr: 0,
             io_base: 0,
             control_queue: None,
+            cursor_queue: None,
             cursor_resource_created: false,
             cursor_bitmap: None,
             virgl_supported: false,
@@ -1362,14 +1369,19 @@ impl VirtIOGpuDevice {
         false
     }
 
-    /// Send control command, expect OK_NODATA. Uses static buffers (Zero-Allocation Hot Path).
-    /// Caller must write request into self.req_buf_ptr before calling.
-    fn send_ctrl_cmd_nodata(&mut self, req_size: usize) -> Result<(), &'static str> {
+    /// Send command, expect OK_NODATA. Uses static buffers.
+    fn send_gpu_cmd_nodata(&mut self, req_size: usize, use_cursor_queue: bool) -> Result<(), &'static str> {
         if self.req_buf_ptr.is_null() || self.resp_buf_ptr.is_null() {
             return Err("static buffers not allocated");
         }
-        let (io, mmio, modern) = (self.io_base, self.mmio_base, self.modern_notify_addr);
-        let queue = self.control_queue.as_mut().ok_or("No control queue")?;
+
+        let (io, mmio) = (self.io_base, self.mmio_base);
+        let (queue, modern, q_idx) = if use_cursor_queue && self.cursor_queue.is_some() {
+            (self.cursor_queue.as_mut().unwrap(), self.cursor_notify_addr, 1u16)
+        } else {
+            (self.control_queue.as_mut().ok_or("No control queue")?, self.modern_notify_addr, 0u16)
+        };
+
         let resp_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
         let resp_ptr = self.resp_buf_ptr;
 
@@ -1377,7 +1389,15 @@ impl VirtIOGpuDevice {
             unsafe { queue.free_desc(stale_head) };
         }
 
-        unsafe { core::ptr::write_bytes(resp_ptr, 0x55, resp_size); }
+        unsafe {
+            core::ptr::write_bytes(resp_ptr, 0x55, resp_size);
+            // FLUSH request AND response buffers (FULL 512 bytes) before notifying device
+            for i in (0..512).step_by(64) {
+                clflush((self.req_buf_ptr as u64) + i as u64);
+                clflush((resp_ptr as u64) + i as u64);
+            }
+            sfence();
+        }
 
         let buffers = [
             (self.req_buf_phys, req_size as u32, 0u16),
@@ -1391,7 +1411,7 @@ impl VirtIOGpuDevice {
             }
         };
 
-        unsafe { Self::gpu_notify_queue(io, mmio, modern); }
+        unsafe { Self::gpu_notify_queue(io, mmio, modern, q_idx); }
 
         let start_time = rdtsc();
         let timeout_cycles = 4_000_000_000u64;
@@ -1412,38 +1432,30 @@ impl VirtIOGpuDevice {
             core::hint::spin_loop();
         };
 
+        // Invalidate response buffer after device is done
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         for i in (0..resp_size).step_by(64) {
             unsafe { clflush((resp_ptr as u64) + i as u64); }
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
-        let ctrl_type_offset = core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
-        let ctrl_type_ptr = unsafe { (resp_ptr as *const u8).add(ctrl_type_offset) as *const u32 };
-
-        let mut transfer_timeout = 100_000;
-        let mut ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
-
-        while ctrl_type == 0x55555555 && transfer_timeout > 0 {
-            core::hint::spin_loop();
-            unsafe { clflush(ctrl_type_ptr as u64); }
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-            ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
-            transfer_timeout -= 1;
-        }
-
         unsafe { queue.free_desc(used_head); }
 
-        if transfer_timeout == 0 {
-            crate::serial::serial_print("[VirtIO-GPU] WARNING: Response DMA transfer timed out\n");
-            return Err("DMA transfer incomplete");
+        if use_cursor_queue {
+            // Cursor commands (UPDATE_CURSOR, MOVE_CURSOR) don't have a response header in the spec.
+            return Ok(());
         }
+
+        let ctrl_type_offset = core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
+        let ctrl_type = unsafe { core::ptr::read_volatile((resp_ptr as *const u8).add(ctrl_type_offset) as *const u32) };
+
         if ctrl_type != VIRTIO_GPU_RESP_OK_NODATA {
-            if ctrl_type != 0x1203 {
-                crate::serial::serial_print("[VirtIO-GPU] Error: Unexpected ctrl_type ");
-                crate::serial::serial_print_hex(ctrl_type as u64);
-                crate::serial::serial_print("\n");
-            }
+            let cmd_type = unsafe { core::ptr::read_volatile(self.req_buf_ptr as *const u32) };
+            crate::serial::serial_print("[VirtIO-GPU] Command ");
+            crate::serial::serial_print_hex(cmd_type as u64);
+            crate::serial::serial_print(" failed. Response: ");
+            crate::serial::serial_print_hex(ctrl_type as u64);
+            crate::serial::serial_print("\n");
             return Err("unexpected response");
         }
         Ok(())
@@ -1463,13 +1475,20 @@ impl VirtIOGpuDevice {
         while let Some((stale_head, _)) = unsafe { queue.get_used() } {
             unsafe { queue.free_desc(stale_head) };
         }
-        unsafe { core::ptr::write_bytes(resp_ptr, 0x55, resp_size); }
+        unsafe {
+            core::ptr::write_bytes(resp_ptr, 0x55, resp_size);
+            // FLUSH request buffer before notifying device
+            for i in (0..req_size).step_by(64) {
+                clflush((self.req_buf_ptr as u64) + i as u64);
+            }
+            sfence();
+        }
         let buffers = [
             (self.req_buf_phys, req_size as u32, 0u16),
             (self.resp_buf_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
         ];
         let head = unsafe { queue.add_buf(&buffers).ok_or("add_buf failed")? };
-        unsafe { Self::gpu_notify_queue(io, mmio, modern); }
+        unsafe { Self::gpu_notify_queue(io, mmio, modern, 0); }
         let start_time = rdtsc();
         let timeout_cycles = 4_000_000_000u64;
         let used_head = loop {
@@ -1490,7 +1509,7 @@ impl VirtIOGpuDevice {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let ctrl_type_offset = core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type);
         let ctrl_type_ptr = unsafe { (resp_ptr as *const u8).add(ctrl_type_offset) as *const u32 };
-        let mut transfer_timeout = 100_000;
+        let mut transfer_timeout = 1000000;
         let mut ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
         while ctrl_type == 0x55555555 && transfer_timeout > 0 {
             core::hint::spin_loop();
@@ -1527,35 +1546,46 @@ impl VirtIOGpuDevice {
         };
         outl(self.io_base + VIRTIO_PCI_DRIVER_FEATURES, driver_features);
         self.virgl_supported = driver_features != 0;
+        crate::serial::serial_print("[VirtIO-GPU] Legacy PCI features: dev=");
+        crate::serial::serial_print_hex(dev_features as u64);
+        crate::serial::serial_print(" negotiated=");
+        crate::serial::serial_print_hex(driver_features as u64);
+        crate::serial::serial_print("\n");
 
         // Control queue (queue 0)
         outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
-        let queue_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
-        crate::serial::serial_print("[VirtIO-GPU] Legacy queue_size=");
-        crate::serial::serial_print_dec(queue_size as u64);
-        crate::serial::serial_print("\n");
-        if queue_size == 0 || queue_size > 256 {
+        let q0_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        if q0_size == 0 || q0_size > 256 {
             return false;
         }
-        let actual_size = if queue_size > 64 { 64 } else { queue_size };
-
-        match Virtqueue::new(actual_size) {
-            Some(queue) => {
-                let queue_pfn = (queue.desc_phys / 4096) as u32;
-                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, queue_pfn);
-                self.control_queue = Some(queue);
-                if !self.allocate_static_buffers() {
-                    return false;
-                }
-                let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
-                outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
-                for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
-                    core::hint::spin_loop();
-                }
-                true
-            }
-            None => false,
+        let actual_q0 = if q0_size > 64 { 64 } else { q0_size };
+        if let Some(q0) = Virtqueue::new(actual_q0) {
+            outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q0.desc_phys / 4096) as u32);
+            self.control_queue = Some(q0);
+        } else {
+            return false;
         }
+
+        // Cursor queue (queue 1)
+        outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 1);
+        let q1_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        if q1_size != 0 && q1_size <= 256 {
+            let actual_q1 = if q1_size > 64 { 64 } else { q1_size };
+            if let Some(q1) = Virtqueue::new(actual_q1) {
+                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q1.desc_phys / 4096) as u32);
+                self.cursor_queue = Some(q1);
+            }
+        }
+
+        if !self.allocate_static_buffers() {
+            return false;
+        }
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
+        for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
+            core::hint::spin_loop();
+        }
+        true
     }
 
     /// Initialize MMIO
@@ -1592,6 +1622,11 @@ impl VirtIOGpuDevice {
         write_volatile(&mut (*regs).driver_features_sel, 0);
         write_volatile(&mut (*regs).driver_features, driver_features);
         self.virgl_supported = driver_features != 0;
+        crate::serial::serial_print("[VirtIO-GPU] MMIO features: dev=");
+        crate::serial::serial_print_hex(dev_features as u64);
+        crate::serial::serial_print(" negotiated=");
+        crate::serial::serial_print_hex(driver_features as u64);
+        crate::serial::serial_print("\n");
 
         let status = read_volatile(&(*regs).status);
         write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_FEATURES_OK);
@@ -1603,36 +1638,51 @@ impl VirtIOGpuDevice {
             return false;
         }
 
+        // Control queue (queue 0)
         write_volatile(&mut (*regs).queue_sel, 0);
-        let queue_size = read_volatile(&(*regs).queue_num_max);
-        crate::serial::serial_print("[VirtIO-GPU] MMIO queue_num_max=");
-        crate::serial::serial_print_dec(queue_size as u64);
-        crate::serial::serial_print("\n");
-        if queue_size == 0 || queue_size > 256 {
+        let q0_size = read_volatile(&(*regs).queue_num_max);
+        if q0_size == 0 || q0_size > 256 {
             return false;
         }
-        let actual_size = if queue_size > 64 { 64 } else { queue_size } as u32;
-
-        match Virtqueue::new(actual_size as u16) {
-            Some(queue) => {
-                write_volatile(&mut (*regs).queue_num, actual_size);
-                write_volatile(&mut (*regs).queue_desc_low, (queue.desc_phys & 0xFFFFFFFF) as u32);
-                write_volatile(&mut (*regs).queue_desc_high, (queue.desc_phys >> 32) as u32);
-                write_volatile(&mut (*regs).queue_driver_low, (queue.avail_phys & 0xFFFFFFFF) as u32);
-                write_volatile(&mut (*regs).queue_driver_high, (queue.avail_phys >> 32) as u32);
-                write_volatile(&mut (*regs).queue_device_low, (queue.used_phys & 0xFFFFFFFF) as u32);
-                write_volatile(&mut (*regs).queue_device_high, (queue.used_phys >> 32) as u32);
-                write_volatile(&mut (*regs).queue_ready, 1);
-                self.control_queue = Some(queue);
-                if !self.allocate_static_buffers() {
-                    return false;
-                }
-                let status = read_volatile(&(*regs).status);
-                write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_DRIVER_OK);
-                true
-            }
-            None => false,
+        let actual_q0 = if q0_size > 64 { 64 } else { q0_size } as u32;
+        if let Some(q0) = Virtqueue::new(actual_q0 as u16) {
+            write_volatile(&mut (*regs).queue_num, actual_q0);
+            write_volatile(&mut (*regs).queue_desc_low, (q0.desc_phys & 0xFFFFFFFF) as u32);
+            write_volatile(&mut (*regs).queue_desc_high, (q0.desc_phys >> 32) as u32);
+            write_volatile(&mut (*regs).queue_driver_low, (q0.avail_phys & 0xFFFFFFFF) as u32);
+            write_volatile(&mut (*regs).queue_driver_high, (q0.avail_phys >> 32) as u32);
+            write_volatile(&mut (*regs).queue_device_low, (q0.used_phys & 0xFFFFFFFF) as u32);
+            write_volatile(&mut (*regs).queue_device_high, (q0.used_phys >> 32) as u32);
+            write_volatile(&mut (*regs).queue_ready, 1);
+            self.control_queue = Some(q0);
+        } else {
+            return false;
         }
+
+        // Cursor queue (queue 1)
+        write_volatile(&mut (*regs).queue_sel, 1);
+        let q1_size = read_volatile(&(*regs).queue_num_max);
+        if q1_size != 0 && q1_size <= 256 {
+            let actual_q1 = if q1_size > 64 { 64 } else { q1_size } as u32;
+            if let Some(q1) = Virtqueue::new(actual_q1 as u16) {
+                write_volatile(&mut (*regs).queue_num, actual_q1);
+                write_volatile(&mut (*regs).queue_desc_low, (q1.desc_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_desc_high, (q1.desc_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_driver_low, (q1.avail_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_driver_high, (q1.avail_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_device_low, (q1.used_phys & 0xFFFFFFFF) as u32);
+                write_volatile(&mut (*regs).queue_device_high, (q1.used_phys >> 32) as u32);
+                write_volatile(&mut (*regs).queue_ready, 1);
+                self.cursor_queue = Some(q1);
+            }
+        }
+
+        if !self.allocate_static_buffers() {
+            return false;
+        }
+        let status = read_volatile(&(*regs).status);
+        write_volatile(&mut (*regs).status, status | VIRTIO_STATUS_DRIVER_OK);
+        true
     }
 
     /// Initialize VirtIO 1.0 PCI modern (virtio-gpu-pci, virtio-vga)
@@ -1651,9 +1701,14 @@ impl VirtIOGpuDevice {
 
         let common_virt = crate::memory::map_mmio_range(bar_common + common_off as u64, common_len as usize);
         let _isr_virt = crate::memory::map_mmio_range(bar_isr + isr_off as u64, 1);
-        // Notify region: map enough for one notify (2 bytes) at our queue's offset
-        // We'll get queue_notify_off from common config, then map notify_base + off*mult
-        let notify_base_virt = crate::memory::map_mmio_range(bar_notify + notify_off as u64, 0x100);
+        let notify_base_virt = crate::memory::map_mmio_range(bar_notify + notify_off as u64, _notify_len as usize);
+        serial::serial_print("[VirtIO-GPU] Modern notify: off=");
+        serial::serial_print_hex(notify_off as u64);
+        serial::serial_print(" len=");
+        serial::serial_print_hex(_notify_len as u64);
+        serial::serial_print(" mult=");
+        serial::serial_print_hex(notify_mult as u64);
+        serial::serial_print("\n");
 
         // Helper: write common config
         let common_w8 = |off: usize, v: u8| {
@@ -1683,16 +1738,24 @@ impl VirtIOGpuDevice {
         common_w8(VIRTIO_PCI_COMMON_STATUS, st | VIRTIO_STATUS_DRIVER as u8);
 
         // Features: must set VIRTIO_F_VERSION_1 (bit 32). Select 0 = low 32, 1 = high 32.
-        common_w32(VIRTIO_PCI_COMMON_GFSELECT, 0);
+        common_w32(VIRTIO_PCI_COMMON_DFSELECT, 0);
         let dev_lo = common_r32(VIRTIO_PCI_COMMON_DF);
-        common_w32(VIRTIO_PCI_COMMON_GFSELECT, 1);
+        common_w32(VIRTIO_PCI_COMMON_DFSELECT, 1);
         let dev_hi = common_r32(VIRTIO_PCI_COMMON_DF);
+
         let guest_lo = if (dev_lo & VIRTIO_GPU_F_VIRGL) != 0 { VIRTIO_GPU_F_VIRGL } else { 0 };
         let guest_hi = if (dev_hi & VIRTIO_F_VERSION_1_HI) != 0 { VIRTIO_F_VERSION_1_HI } else { 0 };
+
         common_w32(VIRTIO_PCI_COMMON_GFSELECT, 0);
         common_w32(VIRTIO_PCI_COMMON_GF, guest_lo);
         common_w32(VIRTIO_PCI_COMMON_GFSELECT, 1);
         common_w32(VIRTIO_PCI_COMMON_GF, guest_hi);
+
+        serial::serial_print("[VirtIO-GPU] Modern features: dev=");
+        serial::serial_print_hex(dev_lo as u64 | ((dev_hi as u64) << 32));
+        serial::serial_print(" negotiated=");
+        serial::serial_print_hex(guest_lo as u64 | ((guest_hi as u64) << 32));
+        serial::serial_print("\n");
 
         common_w8(VIRTIO_PCI_COMMON_STATUS, common_r8(VIRTIO_PCI_COMMON_STATUS) | VIRTIO_STATUS_FEATURES_OK as u8);
         if (common_r8(VIRTIO_PCI_COMMON_STATUS) & (VIRTIO_STATUS_FEATURES_OK as u8)) == 0 {
@@ -1700,42 +1763,75 @@ impl VirtIOGpuDevice {
             return None;
         }
 
+        // Initialize Queue 0 (control) and Queue 1 (cursor)
+        let mut q_control = None;
+        let mut q_cursor = None;
+        let mut q0_notify_addr = 0;
+        let mut q1_notify_addr = 0;
+
         // Queue 0 (control)
         common_w16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
-        let queue_size = common_r16(VIRTIO_PCI_COMMON_Q_SIZE);
-        serial::serial_print("[VirtIO-GPU] Modern queue_size=");
-        serial::serial_print_dec(queue_size as u64);
-        serial::serial_print("\n");
-        if queue_size == 0 || queue_size > 256 {
+        let q0_size = common_r16(VIRTIO_PCI_COMMON_Q_SIZE);
+        if q0_size != 0 && q0_size <= 256 {
+            let actual_q0 = if q0_size > 64 { 64 } else { q0_size };
+            if let Some(q0) = Virtqueue::new(actual_q0) {
+                common_w16(VIRTIO_PCI_COMMON_Q_SIZE, actual_q0);
+                common_w32(VIRTIO_PCI_COMMON_Q_DESCLO, (q0.desc_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_DESCHI, (q0.desc_phys >> 32) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_AVAILLO, (q0.avail_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_AVAILHI, (q0.avail_phys >> 32) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_USEDLO, (q0.used_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_USEDHI, (q0.used_phys >> 32) as u32);
+                let q0_notify_off = common_r16(VIRTIO_PCI_COMMON_Q_NOFF);
+                common_w16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
+                q0_notify_addr = notify_base_virt + (q0_notify_off as u32 * notify_mult) as u64;
+                serial::serial_print("[VirtIO-GPU] Q0 notify=");
+                serial::serial_print_hex(q0_notify_addr);
+                serial::serial_print("\n");
+                q_control = Some(q0);
+            }
+        }
+
+        // Queue 1 (cursor)
+        common_w16(VIRTIO_PCI_COMMON_Q_SELECT, 1);
+        let q1_size = common_r16(VIRTIO_PCI_COMMON_Q_SIZE);
+        if q1_size != 0 && q1_size <= 256 {
+            let actual_q1 = if q1_size > 64 { 64 } else { q1_size };
+            if let Some(q1) = Virtqueue::new(actual_q1) {
+                common_w16(VIRTIO_PCI_COMMON_Q_SIZE, actual_q1);
+                common_w32(VIRTIO_PCI_COMMON_Q_DESCLO, (q1.desc_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_DESCHI, (q1.desc_phys >> 32) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_AVAILLO, (q1.avail_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_AVAILHI, (q1.avail_phys >> 32) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_USEDLO, (q1.used_phys & 0xFFFFFFFF) as u32);
+                common_w32(VIRTIO_PCI_COMMON_Q_USEDHI, (q1.used_phys >> 32) as u32);
+                let q1_notify_off = common_r16(VIRTIO_PCI_COMMON_Q_NOFF);
+                common_w16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
+                q1_notify_addr = notify_base_virt + (q1_notify_off as u32 * notify_mult) as u64;
+                serial::serial_print("[VirtIO-GPU] Q1 notify=");
+                serial::serial_print_hex(q1_notify_addr);
+                serial::serial_print("\n");
+                q_cursor = Some(q1);
+            }
+        }
+
+        if q_control.is_none() {
+            serial::serial_print("[VirtIO-GPU] Modern: Failed to initialize control queue\n");
             return None;
         }
-        let actual_size = if queue_size > 64 { 64 } else { queue_size };
-
-        let queue = Virtqueue::new(actual_size)?;
-        common_w16(VIRTIO_PCI_COMMON_Q_SIZE, actual_size);
-        common_w32(VIRTIO_PCI_COMMON_Q_DESCLO, (queue.desc_phys & 0xFFFFFFFF) as u32);
-        common_w32(VIRTIO_PCI_COMMON_Q_DESCHI, (queue.desc_phys >> 32) as u32);
-        common_w32(VIRTIO_PCI_COMMON_Q_AVAILLO, (queue.avail_phys & 0xFFFFFFFF) as u32);
-        common_w32(VIRTIO_PCI_COMMON_Q_AVAILHI, (queue.avail_phys >> 32) as u32);
-        common_w32(VIRTIO_PCI_COMMON_Q_USEDLO, (queue.used_phys & 0xFFFFFFFF) as u32);
-        common_w32(VIRTIO_PCI_COMMON_Q_USEDHI, (queue.used_phys >> 32) as u32);
-
-        let queue_notify_off = common_r16(VIRTIO_PCI_COMMON_Q_NOFF);
-        common_w16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
-
-        let notify_offset_bytes = (queue_notify_off as u32 * notify_mult) as u64;
-        let notify_addr_virt = notify_base_virt + notify_offset_bytes;
 
         common_w8(VIRTIO_PCI_COMMON_STATUS, common_r8(VIRTIO_PCI_COMMON_STATUS) | VIRTIO_STATUS_DRIVER_OK as u8);
 
-        serial::serial_print("[VirtIO-GPU] Initialized (VirtIO 1.0 PCI modern)\n");
+        serial::serial_print("[VirtIO-GPU-V2] Initialized (VirtIO 1.0 PCI modern)\n");
 
         let mut gpu = VirtIOGpuDevice {
             mmio_base: 0,
             io_base: 0,
             modern_common: common_virt,
-            modern_notify_addr: notify_addr_virt,
-            control_queue: Some(queue),
+            modern_notify_addr: q0_notify_addr,
+            cursor_notify_addr: q1_notify_addr,
+            control_queue: q_control,
+            cursor_queue: q_cursor,
             cursor_resource_created: false,
             cursor_bitmap: None,
             virgl_supported: guest_lo != 0,
@@ -1778,6 +1874,11 @@ impl VirtIOGpuDevice {
                 req_ptr.add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32,
                 VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
             );
+            // FLUSH request buffer
+            for i in (0..req_size).step_by(64) {
+                clflush((req_ptr as u64) + i as u64);
+            }
+            sfence();
         }
 
         // Descriptor chain: [request out] -> [response in]
@@ -1798,7 +1899,7 @@ impl VirtIOGpuDevice {
             }
         };
 
-        unsafe { Self::gpu_notify_queue(io, mmio, modern); }
+        unsafe { Self::gpu_notify_queue(io, mmio, modern, 0); }
 
         // Poll for completion
         let mut timeout = 1_000_000;
@@ -1908,6 +2009,15 @@ impl VirtIOGpuDevice {
         }
         self.cursor_bitmap = Some((bitmap_ptr, bitmap_phys));
 
+        // Flush cursor bitmap data
+        unsafe {
+            for i in (0..cursor_size).step_by(64) {
+                clflush((bitmap_ptr as u64) + i as u64);
+            }
+            sfence();
+        }
+
+        self.resource_unref(CURSOR_RESOURCE_ID); // Limpiar si ya existía
         self.resource_create_2d(CURSOR_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, CURSOR_WIDTH, CURSOR_HEIGHT)?;
         self.resource_attach_backing(CURSOR_RESOURCE_ID, &[(bitmap_phys, cursor_size as u32)])?;
 
@@ -1931,7 +2041,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_x)) as *mut u32, hot_x);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hot_y)) as *mut u32, hot_y);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, true)
     }
 
     /// RESOURCE_CREATE_2D: create a 2D resource (for scanout or cursor)
@@ -1946,7 +2056,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, width)) as *mut u32, width);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate2d, height)) as *mut u32, height);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// RESOURCE_UNREF: release a GPU resource. Errors are silently ignored so this
@@ -1985,7 +2095,7 @@ impl VirtIOGpuDevice {
                 core::ptr::write_unaligned(ab.add(e + core::mem::offset_of!(VirtioGpuMemEntry, length)) as *mut u32, len);
             }
         }
-        self.send_ctrl_cmd_nodata(attach_size)
+        self.send_gpu_cmd_nodata(attach_size, false)
     }
 
     /// SET_SCANOUT: assign resource to display output
@@ -2002,7 +2112,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, scanout_id)) as *mut u32, scanout_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuSetScanout, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// TRANSFER_TO_HOST_2D: copy guest memory to resource
@@ -2019,7 +2129,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, offset)) as *mut u64, offset);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferToHost2d, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// RESOURCE_FLUSH: flush resource to display
@@ -2035,7 +2145,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, r) + core::mem::offset_of!(VirtioGpuRect, height)) as *mut u32, h);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceFlush, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Move hardware cursor - uses UPDATE_CURSOR (more reliable than MOVE_CURSOR in QEMU)
@@ -2076,7 +2186,7 @@ impl VirtIOGpuDevice {
             }
         }
 
-        self.send_ctrl_cmd_nodata(req_size)?;
+        self.send_gpu_cmd_nodata(req_size, false)?;
         self.virgl_ctx_mask |= 1 << (ctx_id - 1);
         Ok(ctx_id)
     }
@@ -2106,7 +2216,7 @@ impl VirtIOGpuDevice {
                 ctx_id,
             );
         }
-        self.send_ctrl_cmd_nodata(req_size)?;
+        self.send_gpu_cmd_nodata(req_size, false)?;
         self.virgl_ctx_mask &= !(1 << (ctx_id - 1));
         Ok(())
     }
@@ -2124,7 +2234,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctx_id)) as *mut u32, ctx_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Detach resource from context (Virgl).
@@ -2140,7 +2250,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, hdr) + core::mem::offset_of!(VirtioGpuCtrlHdr, ctx_id)) as *mut u32, ctx_id);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCtxResource, resource_id)) as *mut u32, resource_id);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Create a 3D resource (Virgl). resource_id must be unique, not 0.
@@ -2184,7 +2294,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate3d, nr_samples)) as *mut u32, nr_samples);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuResourceCreate3d, flags)) as *mut u32, flags);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Transfer guest memory to 3D resource (Virgl).
@@ -2225,7 +2335,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, stride)) as *mut u32, stride);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, layer_stride)) as *mut u32, layer_stride);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Transfer 3D resource to guest memory (Virgl).
@@ -2266,7 +2376,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, stride)) as *mut u32, stride);
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuTransferHost3d, layer_stride)) as *mut u32, layer_stride);
         }
-        self.send_ctrl_cmd_nodata(req_size)
+        self.send_gpu_cmd_nodata(req_size, false)
     }
 
     /// Submit 3D command buffer to context (Virgl).
@@ -2294,7 +2404,7 @@ impl VirtIOGpuDevice {
             core::ptr::write_unaligned(r.add(core::mem::offset_of!(VirtioGpuCmdSubmit, size)) as *mut u32, size);
             core::ptr::copy_nonoverlapping(cmd_data.as_ptr(), r.add(hdr_size), cmd_data.len());
         }
-        self.send_ctrl_cmd_nodata(total_size)
+        self.send_gpu_cmd_nodata(total_size, false)
     }
 }
 
