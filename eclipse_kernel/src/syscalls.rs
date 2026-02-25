@@ -547,7 +547,7 @@ fn sys_read_key() -> u64 {
 fn sys_read_mouse_packet() -> u64 {
     let p = crate::interrupts::read_mouse_packet();
     if p == 0xFFFFFFFF {
-        return 0;
+        return u64::MAX; // Empty marker
     }
     p as u64
 }

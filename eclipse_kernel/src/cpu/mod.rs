@@ -256,26 +256,27 @@ fn delay_ms(ms: u64) {
     }
 }
 
+
 use crate::serial::serial_printf;
 
 /// Detectar si estamos ejecutando bajo un hipervisor (QEMU/KVM, etc.).
 /// Usa CPUID leaf 1, ECX[31] = Hypervisor Present.
 pub fn is_running_under_hypervisor() -> bool {
-    let mut eax: u32 = 1;
-    let mut ebx: u32 = 0;
-    let mut ecx: u32 = 0;
-    let mut edx: u32 = 0;
+    let mut ecx_val: u32;
     unsafe {
         core::arch::asm!(
+            "push rbx",
             "cpuid",
-            inout("eax") eax,
-            out("ebx") ebx,
-            out("ecx") ecx,
-            out("edx") edx,
+            "mov {ecx_out:e}, ecx",
+            "pop rbx",
+            ecx_out = out(reg) ecx_val,
+            inout("eax") 1 => _,
+            out("ecx") _,
+            out("edx") _,
             options(nomem, nostack, preserves_flags)
         );
     }
-    (ecx & (1 << 31)) != 0
+    (ecx_val & (1 << 31)) != 0
 }
 
 /// AP Entry point (called from trampoline)

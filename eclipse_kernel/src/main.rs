@@ -303,8 +303,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Register disk: scheme AFTER all storage drivers have registered their devices.
     // This is essential on real hardware (AHCI) where virtio::init() is a no-op.
     storage::register_disk_scheme();
-    // List all detected storage devices before mounting
-    storage::list_devices();
     progress::bar(89);
 
     serial::serial_print("[INIT] Initializing Filesystem...\n");

@@ -181,7 +181,7 @@ pub fn read_key_scancode() -> Option<u8> {
 /// Returns None if empty. Otherwise Some(packed): buttons = packed & 0xFF, dx = (packed>>8) as i8, dy = (packed>>16) as i8.
 pub fn read_mouse_packet() -> Option<u32> {
     let r = unsafe { syscall0(SYS_READ_MOUSE_PACKET) };
-    if r == 0 {
+    if r == u64::MAX {
         None
     } else {
         Some(r as u32)

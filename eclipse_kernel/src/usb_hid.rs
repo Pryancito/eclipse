@@ -1055,11 +1055,28 @@ impl XhciControllerState {
             if desc_len < 2 { break; }
 
             if desc_type == USB_DESC_INTERFACE && offset + 9 <= total_len {
+                let iface_idx      = cfg_data[offset + 2];
                 let iface_class    = cfg_data[offset + 5];
                 let iface_subclass = cfg_data[offset + 6];
                 let iface_protocol = cfg_data[offset + 7];
-                if iface_class == USB_CLASS_HID && iface_subclass == HID_SUBCLASS_BOOT {
-                    hid_protocol = iface_protocol;
+
+                crate::serial::serial_print(&alloc::format!(
+                    "[XHCI] Interface {}: class={:02X} subclass={:02X} protocol={:02X}\n",
+                    iface_idx, iface_class, iface_subclass, iface_protocol
+                ));
+
+                // Always reset detection state when entering a new interface
+                hid_protocol = 0;
+
+                if iface_class == USB_CLASS_HID {
+                    // Support both Boot and None subclasses if they look like keyboards/mice
+                    if iface_subclass == HID_SUBCLASS_BOOT || iface_subclass == HID_SUBCLASS_NONE {
+                        hid_protocol = iface_protocol;
+                        // If subclass is NONE but protocol is 0 (generic), we'll still try to find an INT IN EP
+                        if hid_protocol == 0 {
+                            hid_protocol = 0xFF; // Mark as "some HID"
+                        }
+                    }
                 }
             }
 
@@ -1073,6 +1090,8 @@ impl XhciControllerState {
                     ep_addr     = addr;
                     ep_mps      = mps;
                     ep_interval = interval;
+                    // If we found a valid endpoint and hid_protocol was unknown, make a guess if possible
+                    // or just keep it as 0xFF which indicates success finding an EP.
                 }
             }
 
@@ -1159,7 +1178,8 @@ impl XhciControllerState {
         }
 
         // Allocate HID report buffer
-        let report_buf_size = if hid_protocol == HID_PROTOCOL_KEYBOARD { 8 } else { 4 };
+        // If protocol is unknown (0xFF), default to 8 bytes which covers most keyboards and mice
+        let report_buf_size = if hid_protocol == HID_PROTOCOL_MOUSE { 4 } else { 8 };
         let report_buf = DmaAllocation::allocate(report_buf_size, 64)?;
         report_buf.zero();
 
@@ -1369,6 +1389,13 @@ pub fn register_usb_irq_handler(irq: u8) -> Result<(), &'static str> {
 
 pub fn init() {
     crate::serial::serial_print("[USB-HID] Initializing USB HID driver\n");
+
+    // Skip USB HID initialization in QEMU/Hypervisors to avoid conflicts with PS/2
+    // which is the default and works more reliably there.
+    //if crate::cpu::is_running_under_hypervisor() {
+    //    crate::serial::serial_print("[USB-HID] Hypervisor detected. Skipping USB HID to use PS/2 for better compatibility.\n");
+    //    return;
+    //}
 
     let controllers = detect_usb_controllers();
     if controllers.is_empty() {
