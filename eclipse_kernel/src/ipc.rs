@@ -286,8 +286,8 @@ pub fn process_messages() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut ipc = IPC_SYSTEM.lock();
         
-        // Procesar hasta 10 mensajes por llamada para no bloquear
-        for _ in 0..10 {
+        // Process up to 32 messages per call to drain the queue quickly without holding the lock too long
+        for _ in 0..32 {
             if ipc.global_queue_head == ipc.global_queue_tail {
                 break; // Cola vacía
             }
@@ -308,7 +308,7 @@ pub fn process_messages() {
                                 mailboxes[pid] = Some(VecDeque::new());
                             }
                             if let Some(queue) = &mut mailboxes[pid] {
-                                if queue.len() < 32 {
+                                if queue.len() < 256 {
                                     queue.push_back(taken_msg);
                                 }
                             }
@@ -394,10 +394,12 @@ pub fn get_stats() -> (u32, u32, u64) {
 /// Recibir mensaje para un cliente
 pub fn receive_message(client_id: ClientId) -> Option<Message> {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // 1. Check Process Mailbox first
+        // Check Process Mailbox: P2P messages (Signal/Input) are routed here by process_messages().
+        // The timer calls process_messages() every 1 ms, so messages arrive in the mailbox quickly.
+        // The previous O(n) global-queue linear scan was holding IPC_SYSTEM with IRQs disabled for
+        // up to 1024 iterations, starving the keyboard/mouse IRQ handlers whenever the queue grew.
         let client_pid = client_id as usize;
         if client_pid < 64 {
-            // We lock mailboxes first
             let mut mailboxes = PROCESS_MAILBOXES.lock();
             if let Some(queue) = &mut mailboxes[client_pid] {
                 if let Some(msg) = queue.pop_front() {
@@ -405,26 +407,7 @@ pub fn receive_message(client_id: ClientId) -> Option<Message> {
                 }
             }
         }
-        
-        // 2. Check Global Queue (Legacy / Fallback)
-        let mut ipc = IPC_SYSTEM.lock();
-        
-        // Buscar mensajes en la cola global para este cliente
-        for i in 0..1024 {
-            let idx = (ipc.global_queue_head + i) % 1024;
-            if idx == ipc.global_queue_tail {
-                break;
-            }
-            
-            if let Some(ref msg) = ipc.global_message_queue[idx] {
-                if msg.to == client_id {
-                    // Tomar el mensaje
-                    let message = ipc.global_message_queue[idx].take();
-                    return message;
-                }
-            }
-        }
-        
+
         None
     })
 }
