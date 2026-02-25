@@ -239,9 +239,9 @@ fn init_audio_mixer() {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                     AUDIO SERVICE                            ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|                     AUDIO SERVICE                            |");
+    println!("+--------------------------------------------------------------+");
     println!("[AUDIO-SERVICE] Starting (PID: {})", pid);
     println!("[AUDIO-SERVICE] Initializing audio subsystem...");
     

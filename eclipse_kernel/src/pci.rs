@@ -343,7 +343,7 @@ unsafe fn scan_device(bus: u8, device: u8) {
         // If this is a PCI-to-PCI bridge, scan the secondary bus
         if pci_dev.is_pci_bridge() {
             let secondary_bus = pci_config_read_u8(bus, device, 0, PCI_REG_SECONDARY_BUS);
-            if secondary_bus != 0 {
+            if secondary_bus != 0 && secondary_bus > bus {
                 scan_bus(secondary_bus);
             }
         }
@@ -360,7 +360,7 @@ unsafe fn scan_device(bus: u8, device: u8) {
                     // Check if any other function is also a bridge
                     if func_dev.is_pci_bridge() {
                         let secondary_bus = pci_config_read_u8(bus, device, function, PCI_REG_SECONDARY_BUS);
-                        if secondary_bus != 0 {
+                        if secondary_bus != 0 && secondary_bus > bus {
                             scan_bus(secondary_bus);
                         }
                     }
@@ -442,6 +442,37 @@ pub fn init() {
 /// Get a list of all discovered PCI devices
 pub fn get_all_devices() -> alloc::vec::Vec<PciDevice> {
     PCI_DEVICES.lock().clone()
+}
+
+/// SATA AHCI: class 0x01, subclass 0x06, prog_if 0x01
+const PCI_SUBCLASS_SATA: u8 = 0x06;
+const PCI_PROGIF_AHCI: u8 = 0x01;
+
+/// NVMe: class 0x01, subclass 0x08
+const PCI_SUBCLASS_NVME: u8 = 0x08;
+
+/// Find first NVMe controller
+pub fn find_nvme_controller() -> Option<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter().find(|dev| {
+        dev.class_code == PCI_CLASS_STORAGE
+            && dev.subclass == PCI_SUBCLASS_NVME
+    }).copied()
+}
+
+/// Find first SATA AHCI controller
+pub fn find_sata_ahci() -> Option<PciDevice> {
+    find_all_sata_ahci().first().copied()
+}
+
+/// Find all SATA AHCI controllers
+pub fn find_all_sata_ahci() -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter().filter(|dev| {
+        dev.class_code == PCI_CLASS_STORAGE
+            && dev.subclass == PCI_SUBCLASS_SATA
+            && dev.prog_if == PCI_PROGIF_AHCI
+    }).copied().collect()
 }
 
 /// Find first VirtIO block device

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["no_gop"]
+default = []  # sin no_gop: usar GOP (OVMF); para no_gop: cargo build --no-default-features
 # no_gop: sin GOP; todo display vía GPU (VirtIO, NVIDIA, VESA) en kernel/userspace
 # Evita bloqueo con virtio-gpu y unifica arquitectura de gráficos
 no_gop = []
@@ -16,6 +16,10 @@ path = "src/main.rs"
 [dependencies]
 uefi = "0.25.0"
 goblin = { version = "0.7", default-features = false, features = ["elf32", "elf64", "alloc"] }
+embedded-graphics = { version = "0.8", default-features = false }
+x86_64 = { version = "0.14", default-features = false, features = ["instructions"] }
+volatile = { version = "0.2", default-features = false }
+
 
 [profile.dev]
 panic = "abort"

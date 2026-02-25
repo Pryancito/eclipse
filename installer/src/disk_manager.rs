@@ -71,15 +71,17 @@ impl DiskManager {
     }
     
     fn get_disk_type(&self, disk_path: &str) -> String {
-        // Determinar el tipo de disco
+        // Determinar el tipo de disco (compatible con kernel: VirtIO, AHCI, NVMe, ATA)
         if disk_path.contains("nvme") {
             "NVMe SSD".to_string()
+        } else if disk_path.contains("vd") {
+            "VirtIO".to_string()
         } else if disk_path.contains("sd") {
-            "SATA/SCSI".to_string()
+            "SATA/AHCI".to_string()
         } else if disk_path.contains("hd") {
-            "IDE".to_string()
+            "IDE/ATA".to_string()
         } else {
-            "Unknown".to_string()
+            "Block Device".to_string()
         }
     }
     

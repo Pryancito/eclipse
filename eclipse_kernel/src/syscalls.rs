@@ -221,7 +221,7 @@ pub extern "C" fn syscall_handler(
         26 => sys_brk(arg1),
         27 => sys_register_device(arg1, arg2, arg3),
         28 => sys_fmap(arg1, arg2, arg3),
-        29 => sys_mount(),
+        29 => sys_mount(arg1, arg2),
         30 => sys_fstat(arg1, arg2),
         31 => sys_spawn(arg1, arg2),
         32 => sys_arch_prctl(arg1, arg2),
@@ -1292,9 +1292,27 @@ pub fn get_stats() -> SyscallStats {
 }
 
 /// sys_mount - Mount the root filesystem
-fn sys_mount() -> u64 {
+fn sys_mount(path_ptr: u64, path_len: u64) -> u64 {
     serial::serial_print("[SYSCALL] mount() called\n");
-    match crate::filesystem::mount_root() {
+    
+    // Default to disk:0 if no path provided (backward compatibility)
+    let device_path = if path_ptr != 0 && path_len != 0 && path_len <= 1024 {
+        if !is_user_pointer(path_ptr, path_len) {
+            return u64::MAX;
+        }
+        unsafe {
+            let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+            core::str::from_utf8(slice).unwrap_or("disk:0")
+        }
+    } else {
+        "disk:0"
+    };
+
+    serial::serial_print("[SYSCALL] mount(\"");
+    serial::serial_print(device_path);
+    serial::serial_print("\")\n");
+
+    match crate::filesystem::mount_root(device_path) {
         Ok(_) => 0,
         Err(e) => {
             serial::serial_print("[SYSCALL] mount() failed: ");

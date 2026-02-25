@@ -1,9 +1,12 @@
 #![no_std]
 
-//! sidewind_nvidia - A shared hardware abstraction layer for modern NVIDIA GPUs
-//! 
-//! This crate provides protocol definitions for communicating with the
-//! GSP (GPU System Processor) micro-OS via RPC (Remote Procedure Call).
+//! sidewind_nvidia - NVIDIA GPU abstraction (Nova-aligned)
+//!
+//! Hardware abstraction layer for GSP-based NVIDIA GPUs, aligned with the
+//! **Nova** driver (Linux kernel: nova-core / nova-drm).
+//!
+//! Provides protocol definitions for GSP (GPU System Processor) RPC and
+//! BAR0 register layouts.
 
 pub mod gsp {
     /// GSP Status Codes
@@ -16,19 +19,36 @@ pub mod gsp {
         Timeout = 3,
         InvalidArg = 4,
         NotSupported = 5,
+        NoMemory = 6,
+        InvalidState = 7,
+        HardwareError = 8,
     }
 
-    /// RPC Opcode for GSP messages
+    /// RPC Opcode for GSP messages (Nova-aligned)
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u32)]
     pub enum GspOpcode {
         SystemGetBuildInfo = 0x01,
         ControlGetCaps = 0x02,
+        ControlGetGpuInfo = 0x03,
+        
+        // GPU Lifecycle
+        GspLoadGpuGroup = 0x08,
+        GspUnloadGpuGroup = 0x09,
+        
+        // Resource Management
         MemoryAllocate = 0x10,
         MemoryFree = 0x11,
+        MemoryMap = 0x12,
+        MemoryUnmap = 0x13,
+        
+        // Engine Initialization
         DisplaySetup = 0x20,
         GraphicsInit = 0x30,
         ComputeInit = 0x40,
+        VideoInit = 0x50,
+        
+        // Debug/Diagnostic
         InternalPoll = 0xFFFF,
     }
 
@@ -48,6 +68,22 @@ pub mod gsp {
     pub struct GspMessage<const P: usize> {
         pub header: GspHeader,
         pub payload: [u8; P],
+    }
+
+    /// Payload for ControlGetCaps
+    #[repr(C)]
+    pub struct GspCapsPayload {
+        pub count: u32,
+        pub caps: [u32; 32],
+    }
+
+    /// Payload for MemoryAllocate
+    #[repr(C)]
+    pub struct GspMemAllocPayload {
+        pub size: u64,
+        pub alignment: u64,
+        pub type_flags: u32,
+        pub unused: u32,
     }
 
     /// GSP Mailbox layout (usually in BAR0)
@@ -131,6 +167,7 @@ pub mod gsp {
 
 pub mod registers {
     //! Common NVIDIA Register Offsets (BAR0)
+    //! Aligned with Nova / open-gpu-kernel-modules.
     
     /// PMC (Power Management Controller)
     pub const NV_PMC_BOOT_0: u32 = 0x00000000;

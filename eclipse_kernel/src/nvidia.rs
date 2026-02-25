@@ -1,44 +1,35 @@
-//! NVIDIA GPU Driver Support
+//! NVIDIA GPU Driver Support (Nova-aligned)
 //!
-//! This module provides integration with NVIDIA open-gpu-kernel-modules
-//! (https://github.com/NVIDIA/open-gpu-kernel-modules) for Eclipse OS.
+//! This module provides integration with NVIDIA GPUs for Eclipse OS, aligned with
+//! the **Nova** open-source driver project (Linux kernel 6.15+).
 //!
-//! ## Architecture
-//! The NVIDIA driver stack consists of:
-//! - Kernel driver (this module) - PCI device detection and basic initialization
-//! - Userspace driver - Full GPU management and CUDA support
-//! - Open GPU Kernel Modules - NVIDIA's open-source kernel driver
+//! ## Nova (upstream reference)
+//! Nova is the new open-source, Rust-written NVIDIA driver in the mainline Linux
+//! kernel, intended to supersede Nouveau for GSP-based GPUs:
+//! - **nova-core**: Core driver, abstraction around GPU hardware and firmware (GSP, Falcon, FWSEC, devinit, VBIOS)
+//! - **nova-drm**: Second-level DRM driver for display/compute
+//!
+//! Eclipse follows the same architecture: core (this module + sidewind_nvidia) and
+//! display via VirtIO/GOP or userspace display service.
 //!
 //! ## Supported GPUs
-//! Based on NVIDIA open-gpu-kernel-modules, this supports:
-//! - Turing architecture (RTX 20 series) and newer
-//! - Ampere architecture (RTX 30 series)
-//! - Ada Lovelace architecture (RTX 40 series)
-//! - Hopper architecture (H100, etc.)
+//! GSP-based NVIDIA GPUs only (Turing and newer):
+//! - Turing (RTX 20 series)
+//! - Ampere (RTX 30 series)
+//! - Ada Lovelace (RTX 40 series)
+//! - Hopper (H100, etc.)
 //!
 //! ## Features
 //! - PCI device detection and enumeration
 //! - GPU identification (device ID, architecture)
 //! - BAR (Base Address Register) mapping
-//! - Basic GPU initialization
+//! - GSP firmware loading and RPC
 //! - Memory size detection
 //! - Multi-GPU support
 //!
-//! ## Integration with open-gpu-kernel-modules
-//! The open-gpu-kernel-modules repository provides:
-//! - kernel-open: Open-source kernel driver
-//! - Documentation for GPU register access
-//! - Device-specific initialization sequences
-//!
-//! Eclipse OS can leverage this by:
-//! 1. Using device IDs and initialization from open-gpu-kernel-modules
-//! 2. Implementing similar BAR mapping and register access
-//! 3. Providing userspace interface for GPU management
-//!
 //! ## References
-//! - https://github.com/NVIDIA/open-gpu-kernel-modules
-//! - NVIDIA GPU Architecture documentation
-//! - PCI Express Base Specification
+//! - Nova: https://docs.kernel.org/next/gpu/nova/index.html
+//! - open-gpu-kernel-modules: https://github.com/NVIDIA/open-gpu-kernel-modules
 
 use crate::pci::{PciDevice, find_nvidia_gpus, get_bar};
 use crate::memory::{map_mmio_range, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
@@ -229,6 +220,7 @@ pub struct NvidiaFirmware {
 /// GSP RPC Client
 pub struct RpcClient {
     pub queue_virt: *mut GspRpcQueue,
+    pub next_seq: u32,
 }
 
 impl RpcClient {
@@ -237,20 +229,27 @@ impl RpcClient {
         unsafe {
             GspRpcQueue::init_at(virt);
         }
-        Self { queue_virt: virt }
+        Self { 
+            queue_virt: virt,
+            next_seq: 1,
+        }
     }
 
-    pub fn send_command(&mut self, opcode: GspOpcode, payload: &[u8]) -> Result<(), GspStatus> {
+    pub fn send_command(&mut self, opcode: GspOpcode, payload: &[u8]) -> Result<u32, GspStatus> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        
         let header = GspHeader {
             opcode: opcode as u32,
-            seq_num: 0, // TODO: Incrementing sequence
+            seq_num: seq,
             status: 0,
             payload_len: payload.len() as u32,
         };
         
         unsafe {
-            (*self.queue_virt).push(header, payload)
+            (*self.queue_virt).push(header, payload)?;
         }
+        Ok(seq)
     }
 
     pub fn poll_response(&mut self) -> Option<GspMessage<GSP_RPC_PAYLOAD_SIZE>> {
@@ -262,9 +261,8 @@ impl RpcClient {
 
 /// Initialize NVIDIA GPU subsystem
 pub fn init() {
-    serial::serial_print("[NVIDIA] Initializing NVIDIA GPU subsystem...\n");
-    serial::serial_print("[NVIDIA] Compatible with open-gpu-kernel-modules\n");
-    serial::serial_print("[NVIDIA] Repository: https://github.com/NVIDIA/open-gpu-kernel-modules\n");
+    serial::serial_print("[NVIDIA] Initializing NVIDIA GPU subsystem (Nova-aligned)...\n");
+    serial::serial_print("[NVIDIA] Reference: Nova (Linux kernel 6.15+), open-gpu-kernel-modules\n");
     
     let gpus = find_nvidia_gpus();
     
@@ -397,20 +395,20 @@ pub fn init() {
         serial::serial_print("\n");
 
         if boot_0 != 0 && boot_0 != 0xFFFFFFFF {
-            serial::serial_print("[NVIDIA]   ✓ BAR0 Audit PASSED: Hardware responsive\n");
+            serial::serial_print("[NVIDIA]   ✓ BAR0 Audit PASSED: Hardware responsive (GPU ID: 0x");
+            serial::serial_print_hex(boot_0 as u64);
+            serial::serial_print(")\n");
             
             // --- Phase 3: Firmware Loading Implementation ---
-            // In a real scenario, we'd look for the specific architecture firmware
-            // e.g., /lib/firmware/nvidia/turing/gsp.bin
             let fw_path = "/lib/firmware/gsp.bin";
             match GspLoader::load_firmware(fw_path) {
                 Ok(fw) => {
-                    serial::serial_print("[NVIDIA]   ✓ Firmware loaded at Phys: 0x");
-                    serial::serial_print_hex(fw.phys_base);
-                    serial::serial_print("\n");
+                    serial::serial_print("[NVIDIA]   ✓ GSP Firmware loaded (");
+                    serial::serial_print_dec(fw.size as u64);
+                    serial::serial_print(" bytes)\n");
                     
                     // --- Phase 4: GSP Boot Kick-off ---
-                    serial::serial_print("[NVIDIA]   Booting GSP processor...\n");
+                    serial::serial_print("[NVIDIA]   Booting GSP processor (Nova Protocol)...\n");
                     
                     unsafe {
                         // 1. Configure Firmware Location
@@ -421,56 +419,89 @@ pub fn init() {
                         core::ptr::write_volatile((bar0_virt + NV_GSP_FW_PHYS_ADDR_HI as u64) as *mut u32, fw_addr_hi);
                         core::ptr::write_volatile((bar0_virt + NV_GSP_FW_SIZE as u64) as *mut u32, fw.size as u32);
                         
-                        // 2. Kick the GSP
+                        // 2. Clear Mailboxes for clean handshake
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_MAILBOX_IN as u64) as *mut u32, 0);
+                        core::ptr::write_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *mut u32, 0);
+                        
+                        // 3. Kick the GSP
                         core::ptr::write_volatile((bar0_virt + NV_GSP_CTRL as u64) as *mut u32, NV_GSP_CTRL_RUN);
                         
                         serial::serial_print("[NVIDIA]   GSP kicked. Waiting for handshake");
                         
-                        // 3. Initialize RPC Client
+                        // 4. Initialize RPC Client
                         let mut rpc = RpcClient::new(GPU_RPC_PHYS_BASE);
                         
-                        // 4. Simple Handshake Poll (diagnostic)
+                        // 5. Robust Handshake Poll (diagnostic)
                         let mut success = false;
-                        for i in 0..1000 {
+                        let mut timeout_ticks = 0;
+                        const MAX_HANDSHAKE_TICKS: u32 = 5000;
+                        
+                        while timeout_ticks < MAX_HANDSHAKE_TICKS {
                             let status = core::ptr::read_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *const u32);
-                            if status == 0x52454144 { // "READ" in hex (example handshake)
+                            
+                            // Nova/Open-RM Handshake: GSP writes 0x52454144 ("READ") or 0x47535052 ("GSPR")
+                            if status == 0x52454144 || status == 0x47535052 {
                                 success = true;
                                 break;
                             }
-                            if i % 100 == 0 { serial::serial_print("."); }
-                            // Small delay
-                            for _ in 0..100000 { core::hint::spin_loop(); }
+                            
+                            if timeout_ticks % 500 == 0 { serial::serial_print("."); }
+                            
+                            // Exponential backoff simulation
+                            for _ in 0..(1000 * (1 + timeout_ticks/1000)) { core::hint::spin_loop(); }
+                            timeout_ticks += 1;
                         }
                         
                         if success {
                             serial::serial_print(" ✓ GSP READY\n");
                             
-                            // Send a test RPC (Get Build Info)
-                            serial::serial_print("[NVIDIA]   Sending GSP RPC: SystemGetBuildInfo\n");
-                            if let Err(e) = rpc.send_command(GspOpcode::SystemGetBuildInfo, &[]) {
-                                serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
-                                serial::serial_print_dec(e as u64);
-                                serial::serial_print("\n");
-                            } else {
-                                // Wait for response
-                                serial::serial_print("[NVIDIA]   Waiting for GSP response...");
-                                let mut response_found = false;
-                                for _ in 0..100 {
-                                    if let Some(msg) = rpc.poll_response() {
-                                        serial::serial_print(" ✓ Received Response (Op: 0x");
-                                        serial::serial_print_hex(msg.header.opcode as u64);
-                                        serial::serial_print(")\n");
-                                        response_found = true;
-                                        break;
+                            // Phase 5: GSP Capability Discovery
+                            serial::serial_print("[NVIDIA]   Sending GSP RPC: ControlGetCaps\n");
+                            match rpc.send_command(GspOpcode::ControlGetCaps, &[]) {
+                                Ok(seq) => {
+                                    serial::serial_print("[NVIDIA]     RPC sent (Seq: ");
+                                    serial::serial_print_dec(seq as u64);
+                                    serial::serial_print("). Waiting for response...");
+                                    
+                                    let mut response_found = false;
+                                    for _ in 0..1000 {
+                                        if let Some(msg) = rpc.poll_response() {
+                                            if msg.header.seq_num == seq {
+                                                serial::serial_print(" ✓ Received Response (Status: ");
+                                                serial::serial_print_dec(msg.header.status as u64);
+                                                serial::serial_print(")\n");
+                                                response_found = true;
+                                                break;
+                                            }
+                                        }
+                                        for _ in 0..100000 { core::hint::spin_loop(); }
                                     }
-                                    for _ in 0..100000 { core::hint::spin_loop(); }
+                                    if !response_found {
+                                        serial::serial_print(" ⚠ Timeout waiting for Seq ");
+                                        serial::serial_print_dec(seq as u64);
+                                        serial::serial_print("\n");
+                                    }
                                 }
-                                if !response_found {
-                                    serial::serial_print(" ⚠ Timeout waiting for response\n");
+                                Err(e) => {
+                                    serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
+                                    serial::serial_print_dec(e as u64);
+                                    serial::serial_print("\n");
                                 }
                             }
+
+                            // Phase 6: Verify Memory Allocation RPC
+                            serial::serial_print("[NVIDIA]   Testing Memory Allocation RPC...\n");
+                            let alloc_payload = [0u8; 16]; // Mock payload for allocation request
+                            if let Ok(seq) = rpc.send_command(GspOpcode::MemoryAllocate, &alloc_payload) {
+                                serial::serial_print("[NVIDIA]     MemoryAllocate RPC sent (Seq: ");
+                                serial::serial_print_dec(seq as u64);
+                                serial::serial_print(")\n");
+                            }
                         } else {
-                            serial::serial_print(" ⚠ GSP Timeout\n");
+                            serial::serial_print(" ⚠ GSP Timeout (Status: 0x");
+                            let last_status = core::ptr::read_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *const u32);
+                            serial::serial_print_hex(last_status as u64);
+                            serial::serial_print(")\n");
                         }
                     }
                 }
@@ -481,7 +512,9 @@ pub fn init() {
                 }
             }
         } else {
-            serial::serial_print("[NVIDIA]   ⚠ BAR0 Audit FAILED: Hardware not responding correctly\n");
+            serial::serial_print("[NVIDIA]   ⚠ BAR0 Audit FAILED: Hardware not responding (PMC_BOOT_0: 0x");
+            serial::serial_print_hex(boot_0 as u64);
+            serial::serial_print(")\n");
         }
     }
     

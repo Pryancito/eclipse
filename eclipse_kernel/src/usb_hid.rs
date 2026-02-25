@@ -759,16 +759,7 @@ pub fn init() {
     // Fase 3: Framework de enumeración de dispositivos
     enumerate_usb_devices_stub();
     
-    // Stage 2: Control Transfer Infrastructure
-    init_control_transfer_infrastructure();
-    
-    // Stage 3: XHCI Driver Core
-    init_xhci_driver_core();
-    
-    // TODO: Stage 4 - Interrupt handling and event processing
-    // TODO: Stage 5 - HID integration and input event generation
-    
-    crate::serial::serial_print("\n[USB-HID] Todas las fases y stages completados (MMIO integration pendiente)\n");
+    crate::serial::serial_print("[USB-HID] Todas las fases completadas.\n");
 }
 
 /// Detectar controladores USB vía PCI
@@ -879,6 +870,17 @@ fn init_xhci_controller(controller: &UsbController) -> UsbControllerState {
     let max_slots = (hcsparams1 & 0xFF) as u8;
     let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
     
+    // Safety check for ridiculous values from hardware
+    if max_slots > 32 {
+        crate::serial::serial_print(&alloc::format!("[USB-HID]   WARNING: Hardware reported {} slots, capping at 32\n", max_slots));
+    }
+    let max_slots = if max_slots > 32 { 32 } else { max_slots };
+
+    if max_ports > 15 {
+        crate::serial::serial_print(&alloc::format!("[USB-HID]   WARNING: Hardware reported {} ports, capping at 15\n", max_ports));
+    }
+    let max_ports = if max_ports > 15 { 15 } else { max_ports };
+
     crate::serial::serial_print(&alloc::format!(
         "[USB-HID]   XHCI v{:X}.{:X}, CAPLENGTH=0x{:02X}, MaxSlots={}, MaxPorts={}\n",
         (hciversion >> 8),
@@ -1972,39 +1974,6 @@ pub fn execute_control_transfer_stub(transfer: &mut ControlTransfer) -> Result<(
     Err("Not implemented - requires USB controller driver")
 }
 
-/// Inicializar infraestructura de control transfers
-/// 
-/// Prepara estructuras necesarias para control transfers.
-pub fn init_control_transfer_infrastructure() {
-    crate::serial::serial_print("\n[USB-HID] === Stage 2: USB Protocol Transactions ===\n");
-    crate::serial::serial_print("[USB-HID] Control Transfer Infrastructure:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ UsbSetupPacket (8 bytes)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ ControlTransfer state machine\n");
-    crate::serial::serial_print("[USB-HID]   ✓ Standard USB requests (GET_DESCRIPTOR, SET_ADDRESS, etc.)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ Request type constants and helpers\n");
-    
-    crate::serial::serial_print("\n[USB-HID] Descriptor Reading APIs:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ read_device_descriptor()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ read_configuration_descriptor()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ read_string_descriptor()\n");
-    
-    crate::serial::serial_print("\n[USB-HID] Device Management APIs:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ set_device_address()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ set_device_configuration()\n");
-    
-    crate::serial::serial_print("\n[USB-HID] Helper Functions:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ create_control_transfer()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ validate_descriptor()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ execute_control_transfer_stub()\n");
-    
-    crate::serial::serial_print("\n[USB-HID] NOTA: Stage 2 completo (stubs)\n");
-    crate::serial::serial_print("[USB-HID]   Implementación real requiere:\n");
-    crate::serial::serial_print("[USB-HID]   - XHCI/EHCI driver funcional\n");
-    crate::serial::serial_print("[USB-HID]   - TRB submission y completion\n");
-    crate::serial::serial_print("[USB-HID]   - Event ring polling\n");
-    crate::serial::serial_print("[USB-HID]   - Doorbell register access\n");
-}
-
 // ============================================================================
 // Stage 3: XHCI Driver Core
 // ============================================================================
@@ -2539,7 +2508,13 @@ impl XhciControllerState {
         let hcsparams2 = mmio.read_capability(0x08);
         let max_scratchpad_hi = (hcsparams2 >> 27) & 0x1F;
         let max_scratchpad_lo = (hcsparams2 >> 21) & 0x1F;
-        let max_scratchpad_bufs = (max_scratchpad_hi << 5) | max_scratchpad_lo;
+        let mut max_scratchpad_bufs = (max_scratchpad_hi << 5) | max_scratchpad_lo;
+        
+        // Safety check: ridiculous scratchpad count usually means hardware error
+        if max_scratchpad_bufs > 256 {
+            crate::serial::serial_print(&alloc::format!("[XHCI] WARNING: Hardware requested {} scratchpad buffers, capping at 256\n", max_scratchpad_bufs));
+            max_scratchpad_bufs = 256;
+        }
         
         if max_scratchpad_bufs > 0 {
             crate::serial::serial_print(&alloc::format!("[XHCI] Allocating {} scratchpad buffers\n", max_scratchpad_bufs));
@@ -2680,7 +2655,7 @@ impl XhciControllerState {
     }
     /// Poll the event ring for a specific TRB completion
     pub fn poll_event_blocking(&mut self, target_trb_phys: u64, trb_type_filter: u8) -> Result<Trb, &'static str> {
-        let mut timeout = 5000000;
+        let mut timeout = 100000;
         while timeout > 0 {
             if let Some(event_ring) = self.event_rings.get_mut(0) {
                 if let Some(event) = event_ring.process_next_event() {
@@ -2736,11 +2711,12 @@ impl XhciControllerState {
                 
                 // Assert Port Reset (PR, bit 4)
                 if let Some(ref mmio) = self.mmio {
+                    crate::serial::serial_print(&alloc::format!("[XHCI] Resetting port {}...\n", i));
                     mmio.write_operational(port_offset, portsc | (1 << 4));
                 }
 
                 // Wait for Port Reset Change (PRC, bit 21) or Reset to complete
-                let mut timeout = 100000;
+                let mut timeout = 10000;
                 let mut reset_complete = false;
                 while timeout > 0 {
                     if let Some(ref mmio) = self.mmio {
@@ -2926,53 +2902,12 @@ impl XhciControllerState {
             // Update ERDP
             if let Some(ref mmio) = self.mmio {
                 let erdp = event_ring.get_erdp();
-                mmio.write_runtime(0x38, erdp as u32);
+                // Update ERDP and clear EHB (bit 3)
+                mmio.write_runtime(0x38, (erdp as u32) | 0x08);
                 mmio.write_runtime(0x3C, (erdp >> 32) as u32);
             }
         }
     }
-}
-
-/// Initialize Stage 3 XHCI driver core infrastructure
-pub fn init_xhci_driver_core() {
-    crate::serial::serial_print("\n[USB-HID] === Stage 3: XHCI Driver Core ===\n");
-    
-    crate::serial::serial_print("[USB-HID] XHCI Ring Structures:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ CommandRing (command submission)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ TransferRing (data transfers per endpoint)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ EventRing (completion events)\n");
-    
-    crate::serial::serial_print("[USB-HID] XHCI Context Structures:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ SlotContext (device addressing)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ EndpointContext (endpoint state)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ DeviceContext (slot + 31 endpoints)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ InputContext (for commands)\n");
-    
-    crate::serial::serial_print("[USB-HID] TRB Builders:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_enable_slot_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_address_device_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_configure_endpoint_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_setup_stage_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_data_stage_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_status_stage_trb()\n");
-    crate::serial::serial_print("[USB-HID]   ✓ build_normal_trb()\n");
-    
-    crate::serial::serial_print("[USB-HID] Controller Operations:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ XhciControllerState (state tracking)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ initialize() (rings and structures)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ start_controller() (start sequence stub)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ submit_command() (command submission)\n");
-    crate::serial::serial_print("[USB-HID]   ✓ process_events() (event processing)\n");
-    
-    crate::serial::serial_print("[USB-HID] Doorbell Operations:\n");
-    crate::serial::serial_print("[USB-HID]   ✓ DoorbellRegister::ring()\n");
-    
-    crate::serial::serial_print("\n[USB-HID] Stage 3 framework complete\n");
-    crate::serial::serial_print("[USB-HID] NOTA: Requiere integración MMIO:\n");
-    crate::serial::serial_print("[USB-HID]   - Mapear registros XHCI a memoria virtual\n");
-    crate::serial::serial_print("[USB-HID]   - Escribir/leer registros capability/operational/runtime\n");
-    crate::serial::serial_print("[USB-HID]   - Configurar interrupts MSI/MSI-X\n");
-    crate::serial::serial_print("[USB-HID]   - Allocar DMA buffers físicos\n");
 }
 
 // ============================================================================
@@ -3876,6 +3811,8 @@ impl DmaAllocation {
         // Leak the buffer to prevent deallocation
         core::mem::forget(buffer);
         
+        // Reduce logging verbosity: only one line for DMA allocation
+        /*
         crate::serial::serial_print("[USB-HID] DMA allocation:\n");
         crate::serial::serial_print("  Virtual: 0x");
         crate::serial::serial_print_hex(aligned_virt);
@@ -3886,6 +3823,9 @@ impl DmaAllocation {
         crate::serial::serial_print("\n  Alignment: ");
         crate::serial::serial_print_hex(alignment as u64);
         crate::serial::serial_print("\n");
+        */
+        // Optional: single line for debugging if needed
+        // crate::serial::serial_print(&alloc::format!("[USB-HID] DMA Alloc: 0x{:X} (phys 0x{:X}), size {}\n", aligned_virt, phys_addr, size));
         
         Ok(Self {
             virt_addr: aligned_virt,

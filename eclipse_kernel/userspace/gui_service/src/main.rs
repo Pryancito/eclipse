@@ -94,9 +94,9 @@ unsafe fn spawn_compositor() -> i32 {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
 
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║         GUI SERVICE - Sidewind Compositor Supervisor         ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|         GUI SERVICE - Sidewind Compositor Supervisor         |");
+    println!("+--------------------------------------------------------------+");
     let ppid = getppid();
     println!("[GUI-SERVICE] PID={}, PPID={}", pid, ppid);
 
@@ -112,31 +112,6 @@ pub extern "C" fn _start() -> ! {
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem ready.");
 
-    // Supervisor watchdog loop
-    let mut restarts: u32 = 0;
-    loop {
-        println!("[GUI-SERVICE] Launching {} (attempt #{})...", COMPOSITOR_PATH, restarts + 1);
-
-        let child_pid = unsafe { spawn_compositor() };
-
-        if child_pid <= 0 {
-            println!("[GUI-SERVICE] Failed to spawn compositor. Retrying in a moment...");
-        } else {
-            println!("[GUI-SERVICE] Compositor running as PID {}", child_pid);
-            // Wait for the compositor to exit
-            let mut status: i32 = 0;
-            let exited = wait(Some(&mut status));
-            println!("[GUI-SERVICE] Compositor (PID {}) exited (status={}).", child_pid, exited);
-        }
-
-        restarts += 1;
-        if MAX_RESTARTS > 0 && restarts >= MAX_RESTARTS {
-            println!("[GUI-SERVICE] Max restarts ({}) reached. Giving up.", MAX_RESTARTS);
-            loop { yield_cpu(); }
-        }
-
-        // Brief delay before restarting
-        println!("[GUI-SERVICE] Restarting compositor in ~1s...");
-        for _ in 0..RESTART_DELAY_YIELDS { yield_cpu(); }
-    }
+    unsafe { let _ = spawn_compositor(); }
+    loop { yield_cpu(); }
 }

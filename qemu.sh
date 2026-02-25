@@ -48,6 +48,8 @@ PS2_MOUSE="${PS2_MOUSE:-0}"  # 1=PS/2 ratón, 0=USB mouse/tablet (recomendado)
 USB_PORTS_2="${USB_PORTS_2:-4}"  # Número de puertos USB 2.0
 USB_PORTS_3="${USB_PORTS_3:-4}"  # Número de puertos USB 3.0
 CREATE_USB_DISK="${CREATE_USB_DISK:-1}"  # Crear disco USB de prueba
+# Disco: virtio (por defecto) o ahci (para probar driver AHCI)
+USE_AHCI="${USE_AHCI:-0}"  # 1=AHCI SATA, 0=VirtIO
 # VirtIO GPU: 1=activado (por defecto), 0=VGA estándar
 VIRTIO_GPU="${VIRTIO_GPU:-1}"
 # VirtIO tipo: vga (virtio-vga, GOP compatible) o gpu (virtio-gpu PCI-only)
@@ -81,6 +83,7 @@ print_info "Memoria: $MEMORY"
 print_info "CPUs: $CPUS"
 print_info "Controlador USB: $([ "$USE_XHCI" = "1" ] && echo "XHCI (USB 3.0)" || echo "Legacy (UHCI/EHCI)")"
 print_info "Ratón: $([ "$PS2_MOUSE" = "1" ] && echo "PS/2 (modo legacy)" || echo "USB HID (recomendado)")"
+print_info "Disco: $([ "$USE_AHCI" = "1" ] && echo "AHCI (SATA)" || echo "VirtIO")"
 print_info "VirtIO GPU: $([ "$VIRTIO_GPU" = "1" ] && echo "Activado" || echo "Desactivado (VGA std)")"
 print_info "Resolución: $RESOLUTION (export RESOLUTION=1920x1080 para cambiar)"
 print_info ""
@@ -151,9 +154,17 @@ if [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ]; then
     QEMU_CMD="$QEMU_CMD -drive if=pflash,format=raw,file=$TEMP_OVMF_VARS"
 fi
 
-# Configuración básica
-# Usar VirtIO para estandarizar el manejo de discos entre hardware real y emulado
-QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=virtio"
+# Configuración del disco: VirtIO (por defecto) o AHCI
+if [ "$USE_AHCI" = "1" ]; then
+    # AHCI: emula controlador SATA (para probar driver AHCI de Eclipse)
+    QEMU_CMD="$QEMU_CMD -device ahci,id=ahci"
+    QEMU_CMD="$QEMU_CMD -drive if=none,file=$DISK,format=raw,id=disk0"
+    QEMU_CMD="$QEMU_CMD -device ide-hd,bus=ahci.0,drive=disk0"
+    print_info "Disco configurado con AHCI (SATA)"
+else
+    # VirtIO: recomendado para rendimiento
+    QEMU_CMD="$QEMU_CMD -drive file=$DISK,format=raw,if=virtio"
+fi
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
 QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"

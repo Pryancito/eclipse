@@ -141,8 +141,8 @@ impl DirectInstaller {
         println!();
         println!("Resumen de la instalacion:");
         println!("  - Disco: {}", disk.name);
-        println!("  - Particion EFI: {}1 (FAT32)", disk.name);
-        println!("  - Particion root: {}2 (EclipseFS)", disk.name);
+        println!("  - Particion EFI: {} (FAT32)", self.get_partition_name(&disk.name, 1));
+        println!("  - Particion root: {} (EclipseFS)", self.get_partition_name(&disk.name, 2));
         println!("  - Bootloader: UEFI");
         println!("  - Kernel: Eclipse OS v0.1.0");
         println!("  - Sistema de archivos: EclipseFS v2.0 (RAM-based)");
@@ -368,13 +368,20 @@ impl DirectInstaller {
 
         // Solución 2: Usar efibootmgr para crear una entrada de arranque explícita
         println!("   Creando entrada de arranque UEFI con efibootmgr...");
-        let disk_name = disk.name.trim_end_matches(char::is_numeric);
-        let part_num = "1"; // Asumimos que la EFI es la partición 1
+        // Para NVMe: /dev/nvme0n1 (disco completo), part 1
+        // Para SATA: /dev/sda, part 1
+        let (disk_for_efi, part_num) = if disk.name.contains("nvme") {
+            (disk.name.as_str(), "1")  // nvme0n1, partición 1
+        } else {
+            // sd/hd: extraer disco base (quitar último dígito si es partición)
+            let base = disk.name.trim_end_matches(|c: char| c.is_ascii_digit());
+            (base, "1")
+        };
 
         let output = std::process::Command::new("efibootmgr")
             .args(&[
                 "--create",
-                "--disk", disk_name,
+                "--disk", disk_for_efi,
                 "--part", part_num,
                 "--label", "Eclipse OS",
                 "--loader", "\\EFI\\eclipse\\eclipse-bootloader.efi",
@@ -943,6 +950,10 @@ Desarrollado con amor en Rust
                 .map_err(|e| format!("Error creando directorio {}: {}", dir, e))?;
         }
         
+        // Crear /etc/fstab con particiones correctas (NVMe, SATA, etc.)
+        println!("       📋 Creando /etc/fstab...");
+        self.create_fstab_in_tempdir(temp_dir, partition)?;
+        
         // Copiar archivos del sistema al directorio temporal
         println!("       📦 Copiando archivos del sistema...");
         self.copy_system_files_to_tempdir(temp_dir)?;
@@ -1101,6 +1112,39 @@ Desarrollado con amor en Rust
         self.copy_dir_to_tempdir(source_path, Path::new(&ai_models_dest))?;
         
         println!("         ✓ Modelos AI copiados");
+        Ok(())
+    }
+
+    /// Crear /etc/fstab en directorio temporal con particiones correctas (NVMe, SATA, AHCI)
+    fn create_fstab_in_tempdir(&self, temp_dir: &str, root_partition: &str) -> Result<(), String> {
+        let efi_partition = if root_partition.contains("nvme") && root_partition.contains('p') {
+            root_partition.replace("p2", "p1")
+        } else if let Some(base) = root_partition.strip_suffix('2') {
+            format!("{}1", base)
+        } else {
+            return Err("No se pudo derivar partición EFI desde root".to_string());
+        };
+
+        let fstab_content = format!(
+            r#"# /etc/fstab: static file system information
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+proc            /proc           proc    defaults        0       0
+sysfs           /sys            sysfs   defaults        0       0
+devtmpfs        /dev            devtmpfs defaults       0       0
+tmpfs           /tmp            tmpfs   defaults        0       0
+{}       /boot           vfat    defaults        0       2
+{}       /               eclipsefs defaults      0       1
+"#,
+            efi_partition, root_partition
+        );
+
+        let etc_dir = format!("{}/etc", temp_dir);
+        fs::create_dir_all(&etc_dir)
+            .map_err(|e| format!("Error creando {}: {}", etc_dir, e))?;
+
+        fs::write(format!("{}/etc/fstab", temp_dir), fstab_content)
+            .map_err(|e| format!("Error creando /etc/fstab: {}", e))?;
+
         Ok(())
     }
     
@@ -1865,7 +1909,7 @@ WantedBy=multi-user.target
     fn create_system_config_files(&self, eclipsefs: &mut EclipseFSInstaller) -> Result<(), String> {
         println!("       📝 Creando archivos de configuración del sistema...");
         
-        // Crear /etc/fstab
+        // Crear /etc/fstab (fallback para ruta create_eclipsefs_image; setup_eclipsefs usa create_fstab_in_tempdir)
         let fstab_content = "# /etc/fstab: static file system information
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
 proc            /proc           proc    defaults        0       0

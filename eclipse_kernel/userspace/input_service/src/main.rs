@@ -378,9 +378,9 @@ fn create_device_nodes() {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                    INPUT SERVICE                             ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|                    INPUT SERVICE                             |");
+    println!("+--------------------------------------------------------------+");
     println!("[INPUT-SERVICE] Starting (PID: {})", pid);
     println!("[INPUT-SERVICE] Initializing input subsystem...");
     

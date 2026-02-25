@@ -5,22 +5,24 @@
 use core::arch::asm;
 use spin::Mutex;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 /// Estadísticas de interrupciones
 pub struct InterruptStats {
     pub exceptions: u64,
     pub irqs: u64,
-    pub timer_ticks: u64,
 }
 
 static INTERRUPT_STATS: Mutex<InterruptStats> = Mutex::new(InterruptStats {
     exceptions: 0,
     irqs: 0,
-    timer_ticks: 0,
 });
+
+static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Get current timer ticks (1 tick = 1ms at 1000Hz)
 pub fn ticks() -> u64 {
-    INTERRUPT_STATS.lock().timer_ticks
+    TIMER_TICKS.load(Ordering::Relaxed)
 }
 
 /// Scratch space para guardar RSP de usuario durante syscall entry
@@ -634,8 +636,8 @@ unsafe extern "C" fn exception_12() {
 
 
 extern "C" fn timer_handler() {
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     let mut stats = INTERRUPT_STATS.lock();
-    stats.timer_ticks += 1;
     stats.irqs += 1;
     drop(stats);
     
@@ -898,7 +900,6 @@ pub fn get_stats() -> InterruptStats {
     InterruptStats {
         exceptions: stats.exceptions,
         irqs: stats.irqs,
-        timer_ticks: stats.timer_ticks,
     }
 }
 

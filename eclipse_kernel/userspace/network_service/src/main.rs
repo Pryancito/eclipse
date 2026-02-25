@@ -272,9 +272,9 @@ fn configure_interface_dhcp(interface: &str) {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                   NETWORK SERVICE                            ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|                   NETWORK SERVICE                            |");
+    println!("+--------------------------------------------------------------+");
     println!("[NETWORK-SERVICE] Starting (PID: {})", pid);
     println!("[NETWORK-SERVICE] Initializing network subsystem...");
     

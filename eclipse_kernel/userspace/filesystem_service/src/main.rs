@@ -205,39 +205,55 @@ pub extern "C" fn _start() -> ! {
 
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              FILESYSTEM SERVICE (VFS)                        ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|              FILESYSTEM SERVICE (VFS)                        |");
+    println!("+--------------------------------------------------------------+");
     println!("[FS-SERVICE] Starting (PID: {})", pid);
     
-    println!("[FS-SERVICE] Opening disk:0 via scheme registry...");
-    match BlockDevice::new("disk:0") {
-        Ok(device) => {
-            println!("[FS-SERVICE] Device opened successfully");
-            
-            match EclipseFS::mount(&device) {
-                Ok(fs) => {
-                    println!("[FS-SERVICE] Filesystem mounted!");
-                    println!("[FS-SERVICE] Version: {}.{}", 
-                        fs.header.version >> 16, fs.header.version & 0xFFFF);
-                        
-                    // Notify kernel to mount root
-                    println!("[FS-SERVICE] Notifying kernel to mount root...");
-                    if mount() == 0 {
-                        println!("[FS-SERVICE] Kernel root mount successful!");
-                    } else {
-                        println!("[FS-SERVICE] Kernel root mount FAILED!");
+    println!("[FS-SERVICE] Probing for root filesystem (disk:0 to disk:7)...");
+    
+    let mut found = false;
+    for i in 0..8 {
+        let device_name = format!("disk:{}", i);
+        println!("[FS-SERVICE] Probing {}...", device_name);
+        
+        match BlockDevice::new(&device_name) {
+            Ok(device) => {
+                match EclipseFS::mount(&device) {
+                    Ok(fs) => {
+                        println!("[FS-SERVICE] Valid filesystem found on {}!", device_name);
+                        println!("[FS-SERVICE] Version: {}.{}", 
+                            fs.header.version >> 16, fs.header.version & 0xFFFF);
+                            
+                        // Notify kernel to mount root with this specific device
+                        println!("[FS-SERVICE] Notifying kernel to mount {} as root...", device_name);
+                        if mount(&device_name) == 0 {
+                            println!("[FS-SERVICE] Kernel root mount successful!");
+                            
+                            // List root directory from our side to verify
+                            if let Err(e) = fs.list_dir(1) {
+                                 println!("[FS-SERVICE] Failed to list root: {}", e);
+                            }
+                            
+                            found = true;
+                            break;
+                        } else {
+                            println!("[FS-SERVICE] Kernel root mount FAILED for {}!", device_name);
+                        }
+                    },
+                    Err(_) => {
+                        // Not an EclipseFS disk, continue probing
                     }
-                        
-                    // List root directory
-                    if let Err(e) = fs.list_dir(1) {
-                         println!("[FS-SERVICE] Failed to list root: {}", e);
-                    }
-                },
-                Err(e) => println!("[FS-SERVICE] Mount failed: {}", e),
+                }
+            },
+            Err(_) => {
+                // Device not found or busy, continue probing
             }
-        },
-        Err(e) => println!("[FS-SERVICE] Failed to open disk:0: {}", e),
+        }
+    }
+
+    if !found {
+        println!("[FS-SERVICE] CRITICAL: No EclipseFS root partition found!");
     }
 
     println!("[FS-SERVICE] Entering main loop...");

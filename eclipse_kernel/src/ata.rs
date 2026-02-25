@@ -125,8 +125,11 @@ impl AtaDrive {
                 return false; // Drive does not exist
             }
             
-            // Poll until BSY is clear
-            while Self::inb(ATA_STATUS_PORT) & STATUS_BSY != 0 {}
+            // Poll until BSY is clear with timeout
+            match self.wait_for_bsy_clear() {
+                Ok(_) => {},
+                Err(_) => return false,
+            }
             
             // Check LBA mid/high ports to see if it's ATAPI and not ATA
             let mid = Self::inb(ATA_LBA_MID_PORT);
@@ -138,15 +141,10 @@ impl AtaDrive {
                 return false;
             }
             
-            // Poll until DRQ or ERR is set
-            loop {
-                let status = Self::inb(ATA_STATUS_PORT);
-                if status & STATUS_ERR != 0 {
-                    return false; // Error identifying
-                }
-                if status & STATUS_DRQ != 0 {
-                    break;
-                }
+            // Poll until DRQ or ERR is set with timeout
+            match self.wait_for_drq() {
+                Ok(_) => {},
+                Err(_) => return false,
             }
             
             // Read identification data (256 words = 512 bytes)
@@ -235,8 +233,10 @@ impl AtaDrive {
         }
         
         unsafe {
-            // Wait for drive to be ready
-            while Self::inb(ATA_STATUS_PORT) & STATUS_BSY != 0 {}
+            // Wait for drive to be ready with timeout
+            if self.wait_for_bsy_clear().is_err() {
+                return Err("ATA Timeout (BSY not clear)");
+            }
             
             // Select drive and bits 24-27 of LBA
             // 0xE0 = LBA Mode (bit 6) + 0xA0 (Drive select)
@@ -261,15 +261,9 @@ impl AtaDrive {
             // Send Read Command
             Self::outb(ATA_COMMAND_PORT, ATA_CMD_READ_SECTORS);
             
-            // Wait for data
-            loop {
-                let status = Self::inb(ATA_STATUS_PORT);
-                if status & STATUS_ERR != 0 {
-                    return Err("ATA Read Error");
-                }
-                if status & STATUS_DRQ != 0 {
-                    break;
-                }
+            // Wait for data with timeout
+            if self.wait_for_drq().is_err() {
+                return Err("ATA Read Error: Timeout waiting for DRQ");
             }
             
             // Read 256 words (512 bytes)
@@ -290,8 +284,10 @@ impl AtaDrive {
         }
         
         unsafe {
-            // Wait for drive to be ready
-            while Self::inb(ATA_STATUS_PORT) & STATUS_BSY != 0 {}
+            // Wait for drive to be ready with timeout
+            if self.wait_for_bsy_clear().is_err() {
+                return Err("ATA Timeout (BSY not clear, LBA48)");
+            }
             
             // Select drive
             let drive_select = if self.master { 0x40 } else { 0x50 }; // LBA mode bit 6
@@ -318,15 +314,9 @@ impl AtaDrive {
             // Send Read Command (LBA48 extended)
             Self::outb(ATA_COMMAND_PORT, ATA_CMD_READ_SECTORS_EXT);
             
-            // Wait for data
-            loop {
-                let status = Self::inb(ATA_STATUS_PORT);
-                if status & STATUS_ERR != 0 {
-                    return Err("ATA Read Error (LBA48)");
-                }
-                if status & STATUS_DRQ != 0 {
-                    break;
-                }
+            // Wait for data with timeout
+            if self.wait_for_drq().is_err() {
+                return Err("ATA Read Error: Timeout waiting for DRQ (LBA48)");
             }
             
             // Read 256 words (512 bytes)
@@ -339,6 +329,43 @@ impl AtaDrive {
         
         Ok(())
     }
+
+    /// Wait for BSY bit to clear with timeout and floating bus check
+    fn wait_for_bsy_clear(&self) -> Result<(), &'static str> {
+        let mut timeout = 1_000_000;
+        while timeout > 0 {
+            let status = unsafe { Self::inb(ATA_STATUS_PORT) };
+            if status == 0xFF {
+                return Err("ATA Floating Bus (0xFF)");
+            }
+            if status & STATUS_BSY == 0 {
+                return Ok(());
+            }
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+        Err("ATA Timeout waiting for BSY clear")
+    }
+
+    /// Wait for DRQ bit to be set with timeout and error check
+    fn wait_for_drq(&self) -> Result<(), &'static str> {
+        let mut timeout = 1_000_000;
+        while timeout > 0 {
+            let status = unsafe { Self::inb(ATA_STATUS_PORT) };
+            if status == 0xFF {
+                return Err("ATA Floating Bus (0xFF)");
+            }
+            if status & STATUS_ERR != 0 {
+                return Err("ATA Status Error");
+            }
+            if status & STATUS_DRQ != 0 {
+                return Ok(());
+            }
+            timeout -= 1;
+            core::hint::spin_loop();
+        }
+        Err("ATA Timeout waiting for DRQ")
+    }
 }
 
 /// Initialize the ATA system
@@ -350,6 +377,7 @@ pub fn init() {
     let mut master = AtaDrive::new(true);
     if master.init() {
         *ATA_DRIVE.lock() = Some(master);
+        crate::storage::register_device(alloc::sync::Arc::new(AtaDisk));
         return; // Master drive found and initialized
     }
     
@@ -358,9 +386,39 @@ pub fn init() {
     let mut slave = AtaDrive::new(false);
     if slave.init() {
         *ATA_DRIVE.lock() = Some(slave);
+        crate::storage::register_device(alloc::sync::Arc::new(AtaDisk));
     } else {
         crate::serial::serial_print("[ATA] No ATA drives found on primary bus\n");
     }
+}
+
+struct AtaDisk;
+
+impl crate::storage::BlockDevice for AtaDisk {
+    fn read(&self, block: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+        read_block(block, buffer)
+    }
+
+    fn write(&self, _block: u64, _buffer: &[u8]) -> Result<(), &'static str> {
+        Err("ATA write not implemented")
+    }
+
+    fn capacity(&self) -> u64 {
+        if let Some(ref drive) = *ATA_DRIVE.lock() {
+            drive.max_lba / 8
+        } else {
+            0
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ATA"
+    }
+}
+
+/// Check if an ATA drive is available and initialized.
+pub fn is_available() -> bool {
+    ATA_DRIVE.lock().is_some()
 }
 
 /// Read block(s) from ATA drive

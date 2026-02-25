@@ -28,7 +28,7 @@ use spin::Mutex;
 const SERIAL_PORT: u16 = 0x3F8; // COM1
 
 /// Estado del puerto serial
-static SERIAL_INITIALIZED: Mutex<bool> = Mutex::new(false);
+static mut SERIAL_INITIALIZED: bool = false;
 /// Lock para acceso al hardware del puerto serial (multicore stability)
 static SERIAL_PORT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -52,20 +52,9 @@ pub fn init() {
         outb(SERIAL_PORT + 2, 0xC7);
         
         // IRQs habilitadas, RTS/DSR set
-        outb(SERIAL_PORT + 4, 0x0B);
+        outb(SERIAL_PORT + 4, 0x0F);
         
-        // Modo loopback para test
-        outb(SERIAL_PORT + 4, 0x1E);
-        
-        // Enviar byte de test
-        outb(SERIAL_PORT + 0, 0xAE);
-        
-        // Verificar que el serial funciona
-        if inb(SERIAL_PORT + 0) == 0xAE {
-            // Serial funciona, configurar en modo normal
-            outb(SERIAL_PORT + 4, 0x0F);
-            *SERIAL_INITIALIZED.lock() = true;
-        }
+        SERIAL_INITIALIZED = true;
     }
 }
 
@@ -82,8 +71,10 @@ fn is_data_available() -> bool {
 /// Leer un byte del puerto serial (blocking)
 /// Retorna None si no hay datos disponibles
 pub fn read_byte() -> Option<u8> {
-    if !*SERIAL_INITIALIZED.lock() {
-        return None;
+    unsafe {
+        if !SERIAL_INITIALIZED {
+            return None;
+        }
     }
     
     if is_data_available() {
@@ -104,8 +95,10 @@ pub fn read_byte_blocking() -> u8 {
 /// Leer múltiples bytes del serial hasta llenar el buffer o timeout
 /// Retorna el número de bytes leídos
 pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
-    if !*SERIAL_INITIALIZED.lock() {
-        return 0;
+    unsafe {
+        if !SERIAL_INITIALIZED {
+            return 0;
+        }
     }
     
     let mut count = 0;
@@ -131,12 +124,12 @@ pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
 
 /// Escribir un byte al puerto serial (versión pública)
 pub fn serial_print_byte(byte: u8) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if !*SERIAL_INITIALIZED.lock() {
+    unsafe {
+        if !SERIAL_INITIALIZED {
             return;
         }
-        write_byte(byte);
-    });
+    }
+    write_byte(byte);
 }
 
 /// Escribir un caracter al puerto serial
@@ -146,27 +139,34 @@ pub fn serial_print_char(c: char) {
 
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
-    // Esperar a que el buffer de transmisión esté vacío
-    while !is_transmit_empty() {
+    // Esperar a que el buffer de transmisión esté vacío con un timeout de seguridad
+    // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
+    let mut timeout = 1_000_000;
+    while !is_transmit_empty() && timeout > 0 {
         core::hint::spin_loop();
+        timeout -= 1;
     }
     
-    unsafe {
-        outb(SERIAL_PORT, byte);
+    if timeout > 0 {
+        unsafe {
+            outb(SERIAL_PORT, byte);
+        }
     }
 }
 
-/// Escribir una cadena al puerto serial
+/// Escribir una cadena al puerto serial (y al framebuffer si está inicializado)
 pub fn serial_print(s: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = SERIAL_PORT_LOCK.lock();
-        if !*SERIAL_INITIALIZED.lock() {
-            return;
+        unsafe {
+            if SERIAL_INITIALIZED {
+                for byte in s.bytes() {
+                    write_byte(byte);
+                }
+            }
         }
-        
-        for byte in s.bytes() {
-            write_byte(byte);
-        }
+        // Also log to screen
+        crate::progress::log(s);
     });
 }
 
@@ -184,9 +184,6 @@ impl core::fmt::Write for SerialWriter {
 pub fn serial_printf(args: core::fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let _lock = SERIAL_PORT_LOCK.lock();
-        if !*SERIAL_INITIALIZED.lock() {
-            return;
-        }
         let mut writer = RawSerialWriter;
         let _ = core::fmt::write(&mut writer, args);
     });
@@ -195,62 +192,65 @@ pub fn serial_printf(args: core::fmt::Arguments) {
 struct RawSerialWriter;
 impl core::fmt::Write for RawSerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for byte in s.bytes() {
-            write_byte_internal(byte);
+        unsafe {
+            if SERIAL_INITIALIZED {
+                for byte in s.bytes() {
+                    write_byte_internal(byte);
+                }
+            }
         }
+        // Also log to screen
+        crate::progress::log(s);
         Ok(())
     }
 }
 
 fn write_byte_internal(byte: u8) {
-    while !is_transmit_empty() {
+    let mut timeout = 1_000_000;
+    while !is_transmit_empty() && timeout > 0 {
         core::hint::spin_loop();
+        timeout -= 1;
     }
-    unsafe {
-        outb(SERIAL_PORT, byte);
+    
+    if timeout > 0 {
+        unsafe {
+            outb(SERIAL_PORT, byte);
+        }
     }
 }
 
-/// Escribir un número en hexadecimal
+/// Escribir un número en hexadecimal (a serial y framebuffer)
 pub fn serial_print_hex(num: u64) {
-    if !*SERIAL_INITIALIZED.lock() {
-        return;
-    }
-    
-    serial_print("0x");
     let hex_chars = b"0123456789ABCDEF";
-    
-    for i in (0..16).rev() {
-        let nibble = ((num >> (i * 4)) & 0xF) as usize;
-        write_byte(hex_chars[nibble]);
+    let mut buf = [0u8; 20];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nibble = ((num >> ((15 - i) * 4)) & 0xF) as usize;
+        buf[2 + i] = hex_chars[nibble];
     }
+    serial_print(core::str::from_utf8(&buf).unwrap());
 }
 
-/// Escribir un número decimal
+/// Escribir un número decimal (a serial y framebuffer)
 pub fn serial_print_dec(num: u64) {
-    if !*SERIAL_INITIALIZED.lock() {
-        return;
-    }
-    
     if num == 0 {
-        write_byte(b'0');
+        serial_print("0");
         return;
     }
-    
     let mut n = num;
     let mut digits = [0u8; 20];
     let mut i = 0;
-    
     while n > 0 {
-        digits[i] = (b'0' + (n % 10) as u8);
+        digits[i] = b'0' + (n % 10) as u8;
         n /= 10;
         i += 1;
     }
-    
-    while i > 0 {
-        i -= 1;
-        write_byte(digits[i]);
+    let mut buf = [0u8; 20];
+    for j in 0..i {
+        buf[j] = digits[i - 1 - j];
     }
+    serial_print(core::str::from_utf8(&buf[..i]).unwrap());
 }
 
 /// Escribir a un puerto de I/O

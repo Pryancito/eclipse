@@ -81,10 +81,10 @@ fn flush_log_buffer() {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    log_message("╔══════════════════════════════════════════════════════════════╗");
-    log_message("║              LOG SERVER / CONSOLE SERVICE                    ║");
-    log_message("║         Serial Output + File Logging (/var/log/)             ║");
-    log_message("╚══════════════════════════════════════════════════════════════╝");
+    log_message("+--------------------------------------------------------------+");
+    log_message("|              LOG SERVER / CONSOLE SERVICE                    |");
+    log_message("|         Serial Output + File Logging (/var/log/)             |");
+    log_message("+--------------------------------------------------------------+");
     
     log_message("[LOG-SERVICE] Starting...");
     log_message("[LOG-SERVICE] Initializing logging subsystem...");

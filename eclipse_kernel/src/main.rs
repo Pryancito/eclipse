@@ -32,6 +32,10 @@ mod virtio;
 mod filesystem;
 mod binaries;
 mod ata;
+mod ahci;
+mod nvme;
+mod storage;
+mod progress;
 mod fd;  // File descriptor management
 mod scheme; // Redox-style scheme system
 mod bcache; // Buffer Cache
@@ -78,13 +82,114 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
-    // Initialize serial for debugging using early (bootloader provided) stack
-    serial::init();
-    serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
-    
-    if boot_info_ptr == 0 {
-        panic!("BootInfo pointer is null!");
+    // DIAGNÓSTICO: RED SQUARE (30,0) al entrar en el kernel
+    // El framebuffer info está al inicio de BootInfo
+    unsafe {
+        let base_ptr = boot_info_ptr as *const u64;
+        let fb_base = *base_ptr;
+        let pitch_ptr = (boot_info_ptr + 16) as *const u32; // base(8) + width(4) + height(4)
+        let pitch = *pitch_ptr;
+        
+        if fb_base != 0 && fb_base != 0xDEADBEEF {
+            let fb = fb_base as *mut u32;
+            for y in 0..10 {
+                for x in 30..40 {
+                    *fb.add(y * pitch as usize + x) = 0xFF0000;
+                }
+            }
+        }
     }
+
+    // 1. Initialize serial for diagnostics immediately
+    
+    // Explicit raw asm for early confirmation (COM1)
+    unsafe {
+        for &b in b"[KERNEL] _start reached via COM1\r\n" {
+            let mut timeout = 1_000_000;
+            let mut status: u8;
+            while timeout > 0 {
+                core::arch::asm!("in al, dx", in("dx") 0x3F8u16 + 5, out("al") status);
+                if (status & 0x20) != 0 { break; }
+                timeout -= 1;
+            }
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+        }
+    }
+
+    serial::init();
+    
+    // VERIFICACIÓN MANUAL DE DIRECCIONES
+    serial::serial_print("[KERNEL] FB Phys Base: ");
+    serial::serial_print_hex(boot_info_ptr); // This is just the ptr, let's get the base from it
+    serial::serial_print("\n");
+    
+    let fb_base_val: u64 = unsafe { *(boot_info_ptr as *const u64) };
+    serial::serial_print("[KERNEL] FB Base Value: ");
+    serial::serial_print_hex(fb_base_val);
+    serial::serial_print("\n");
+
+    let cr3_val: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val); }
+    serial::serial_print("[KERNEL] Current CR3: ");
+    serial::serial_print_hex(cr3_val);
+    serial::serial_print("\n");
+
+    // 2. Initialize boot info (Necessary for bar() to find the framebuffer)
+    boot::init(boot_info_ptr);
+    
+    // DIAGNÓSTICO: CYAN SQUARE (40,0) después de boot::init
+    unsafe {
+        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+            let fb = fb_base as *mut u32;
+            for y in 0..10 {
+                for x in 40..50 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0x00FFFF; // Cyan
+                }
+            }
+        }
+    }
+
+    // DIAGNÓSTICO: YELLOW SQUARE (50,0) antes de progress::bar(42)
+    unsafe {
+        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+            let fb = fb_base as *mut u32; // Identity (physical)
+            for y in 0..10 {
+                for x in 50..60 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFF00; // Yellow
+                }
+            }
+        }
+    }
+
+    // DIAGNÓSTICO: ORANGE SQUARE (60,0) usando HHDM (Virtual)
+    // Esto verifica si el mapeo 0xFFFF9000... es válido
+    unsafe {
+        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+            let virt = crate::memory::phys_to_virt(fb_base) as *mut u32;
+            for y in 0..10 {
+                for x in 60..70 {
+                    *virt.add(y * (pitch as usize / 4) + x) = 0xFFA500; // Orange
+                }
+            }
+        }
+    }
+
+    // 4. Initial progress (distinguish from bootloader's 40%)
+    progress::bar(42);
+    
+    // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
+    unsafe {
+        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+            let fb = fb_base as *mut u32;
+            for y in 0..10 {
+                for x in 60..70 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF; // White
+                }
+            }
+        }
+    }
+
+    serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
 
     unsafe {
         serial::serial_print("[KERNEL] BOOT_STACK addr: ");
@@ -112,15 +217,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 /// Entry point in Higher Half with clean stack
 extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
+    serial::serial_print("[KERNEL] kernel_bootstrap entry\n");
     let cpu_id = crate::process::get_cpu_id();
     serial::serial_printf(format_args!("\n\n!!! KERNEL BOOT START v3 !!! CPU ID: {} (Raw APIC info in get_cpu_id)\n\n", cpu_id));
-    // Stage 1: Initialize BootInfo in centralized storage
-    boot::init(boot_info_ptr);
+    // Stage 1: Get BootInfo from centralized storage (already initialized in _start)
     let boot_info = boot::get_boot_info();
     
     let pml4_phys = boot_info.pml4_addr;
     let kernel_phys_base = boot_info.kernel_phys_base;
 
+    // progress::bar(60) will be called after paging init
     serial::serial_print("Switched to Higher Half Stack successfully\n");
 
     // Stage 2: Basic hardware initialization
@@ -130,6 +236,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
+    progress::bar(60);
     
     interrupts::init();
     
@@ -139,36 +246,67 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     
     serial::serial_print("Initializing Local APIC...\n");
     apic::init();
+    progress::bar(65);
     
     serial::serial_print("Initializing memory system...\n");
     memory::init();
+    progress::bar(70);
     
     // Init DevFS before other subsystems
     filesystem::init_devfs();
     
     serial::serial_print("Starting secondary CPUs...\n");
     cpu::start_aps();
+    progress::bar(75);
 
     // Stage 3: Strict User/Kernel Separation - Moved after AP startup
     memory::remove_identity_mapping();
+    progress::bar(80);
     serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
      
+    serial::serial_print("[INIT] Initializing IPC...\n");
     ipc::init();
+    serial::serial_print("[INIT] Initializing kernel process...\n");
     process::init_kernel_process();
+    serial::serial_print("[INIT] Initializing scheduler...\n");
     scheduler::init();
+    progress::bar(85);
+    serial::serial_print("[INIT] Initializing syscalls...\n");
     syscalls::init();
+    serial::serial_print("[INIT] Initializing scheme system...\n");
     crate::scheme::init(); // Initialize Redox-style scheme system
+    serial::serial_print("[INIT] Initializing file descriptors...\n");
     fd::init();
+    serial::serial_print("[INIT] Initializing services...\n");
     servers::init(); // Register display:, input:, snd:, net: schemes so display_service can open display:
-    // crate::video::init();
-    pci::init();
-    usb_hid::init(); // enable USB HID testing
-    nvidia::init();
-    virtio::init();
-    ata::init();
-    filesystem::init();
+    progress::bar(86);
     
-    serial::serial_print("Microkernel initialized successfully!\n");
+    // crate::video::init();
+    serial::serial_print("[INIT] Initializing PCI...\n");
+    pci::init();
+    progress::bar(87);
+    
+    serial::serial_print("[INIT] Initializing USB HID...\n");
+    usb_hid::init(); // enable USB HID testing
+    progress::bar(88);
+    
+    serial::serial_print("[INIT] Initializing NVIDIA...\n");
+    nvidia::init();
+    serial::serial_print("[INIT] Initializing VirtIO...\n");
+    virtio::init();
+    serial::serial_print("[INIT] Initializing NVMe...\n");
+    nvme::init();
+    serial::serial_print("[INIT] Initializing AHCI...\n");
+    ahci::init();
+    serial::serial_print("[INIT] Initializing ATA...\n");
+    ata::init();
+    progress::bar(89);
+    
+    serial::serial_print("[INIT] Initializing Filesystem...\n");
+    filesystem::init();
+    progress::bar(90);
+    
+    serial::serial_print("[INIT] Initialization Complete. Entering kernel_main.\n");
     
     // Final Stage: Jump to main loop
     kernel_main(boot_info);
@@ -198,6 +336,7 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
                 serial::serial_print("[KERNEL] Init process loaded with PID: ");
                 serial::serial_print_dec(pid as u64);
                 serial::serial_print("\n");
+                progress::bar(95);
                 scheduler::enqueue_process(pid);
                 serial::serial_print("[KERNEL] Init process scheduled for execution\n");
             },
@@ -209,6 +348,7 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         }
     }
     
+    progress::bar(100);
     serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
 
     loop {

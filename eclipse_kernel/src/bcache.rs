@@ -14,6 +14,7 @@ const BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]
 struct CacheEntry {
+    device_idx: usize,
     block_num: u64,
     valid: bool,
     dirty: bool,
@@ -23,6 +24,7 @@ struct CacheEntry {
 impl CacheEntry {
     fn new() -> Self {
         Self {
+            device_idx: 0,
             block_num: 0,
             valid: false,
             dirty: false,
@@ -46,7 +48,7 @@ struct GlobalCache {
 // We'll initialize Empty and reserve in init().
 
 static CACHE: Mutex<BufferCache> = Mutex::new(BufferCache {
-    entries: [CacheEntry { block_num: 0, valid: false, dirty: false, last_access: 0 }; CACHE_SIZE],
+    entries: [CacheEntry { device_idx: 0, block_num: 0, valid: false, dirty: false, last_access: 0 }; CACHE_SIZE],
     data: Vec::new(), 
     access_counter: 0,
 });
@@ -63,28 +65,26 @@ pub fn init() {
 }
 
 /// Helper to read from underlying device
-fn read_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    // Try VirtIO first
-    if let Ok(_) = crate::virtio::read_block(block_num, buffer) {
-        return Ok(());
+fn read_from_device(device_idx: usize, block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+    if let Some(dev) = crate::storage::get_device(device_idx) {
+        dev.read(block_num, buffer)
+    } else {
+        Err("Device not found")
     }
-    // Fallback to ATA
-    crate::ata::read_block(block_num, buffer)
 }
 
 /// Helper to write to underlying device
-fn write_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    // Try VirtIO first
-    if let Ok(_) = crate::virtio::write_block(block_num, buffer) {
-        return Ok(());
+fn write_to_device(device_idx: usize, block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+    if let Some(dev) = crate::storage::get_device(device_idx) {
+        dev.write(block_num, buffer)
+    } else {
+        Err("Device not found")
     }
-    // ATA write not implemented
-    Err("Device write failed")
 }
 
 
 /// Read a block through the cache
-pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+pub fn read_block(device_idx: usize, block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
     if buffer.len() != BLOCK_SIZE {
         return Err("Buffer size must be 4096");
     }
@@ -94,7 +94,7 @@ pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str>
     // 1. Search Cache
     let mut hit_idx = None;
     for i in 0..CACHE_SIZE {
-        if cache.entries[i].valid && cache.entries[i].block_num == block_num {
+        if cache.entries[i].valid && cache.entries[i].device_idx == device_idx && cache.entries[i].block_num == block_num {
             hit_idx = Some(i);
             break;
         }
@@ -134,25 +134,22 @@ pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str>
 
     // 3. Evict Victim
     let block_to_write = cache.entries[victim_idx].block_num;
+    let dev_to_write = cache.entries[victim_idx].device_idx;
     let is_dirty = cache.entries[victim_idx].valid && cache.entries[victim_idx].dirty;
     
     if is_dirty {
         // Write-Back: We must write the dirty block to disk before replacing it
-        // We clone the data to release the lock? No, keep it simple.
-        // NOTE: This blocks the whole cache during device write. 
-        if let Err(_) = write_to_device(block_to_write, &cache.data[victim_idx]) {
+        if let Err(_) = write_to_device(dev_to_write, block_to_write, &cache.data[victim_idx]) {
              crate::serial::serial_print("[BCACHE] WRITE ERROR during eviction\n");
-             // We can't do much here except log it.
         }
     }
 
     // 4. Fill from Disk
-    // Release lock logic would be complex here, so we hold it.
-    // Read directly into the cache slot
-    match read_from_device(block_num, &mut cache.data[victim_idx]) {
+    match read_from_device(device_idx, block_num, &mut cache.data[victim_idx]) {
         Ok(_) => {
             // Update Metadata
             cache.access_counter += 1;
+            cache.entries[victim_idx].device_idx = device_idx;
             cache.entries[victim_idx].block_num = block_num;
             cache.entries[victim_idx].valid = true;
             cache.entries[victim_idx].dirty = false;
@@ -167,7 +164,7 @@ pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str>
 }
 
 /// Write a block through the cache (Write-Back)
-pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+pub fn write_block(device_idx: usize, block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
     if buffer.len() != BLOCK_SIZE {
         return Err("Buffer size must be 4096");
     }
@@ -177,7 +174,7 @@ pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
     // 1. Check if block is in cache
     let mut target_idx = None;
     for i in 0..CACHE_SIZE {
-        if cache.entries[i].valid && cache.entries[i].block_num == block_num {
+        if cache.entries[i].valid && cache.entries[i].device_idx == device_idx && cache.entries[i].block_num == block_num {
             target_idx = Some(i);
             break;
         }
@@ -212,7 +209,8 @@ pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
         // Evict if dirty
         if cache.entries[victim_idx].valid && cache.entries[victim_idx].dirty {
             let dirty_block = cache.entries[victim_idx].block_num;
-             if let Err(_) = write_to_device(dirty_block, &cache.data[victim_idx]) {
+            let dirty_dev = cache.entries[victim_idx].device_idx;
+             if let Err(_) = write_to_device(dirty_dev, dirty_block, &cache.data[victim_idx]) {
                  crate::serial::serial_print("[BCACHE] WRITE ERROR during eviction\n");
              }
         }
@@ -220,11 +218,8 @@ pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
     };
 
     // 3. Update Cache (Write-Hit / Write-Allocate)
-    // We simply overwrite the cache slot with new data and mark it dirty.
-    // We do NOT need to read from disk if we are overwriting the whole block (4096 bytes).
-    // The buffer size check at the top ensures we have a full block.
-    
     cache.access_counter += 1;
+    cache.entries[idx].device_idx = device_idx;
     cache.entries[idx].block_num = block_num;
     cache.entries[idx].valid = true;
     cache.entries[idx].dirty = true; // Cached Copy is now newer than Disk
@@ -243,7 +238,8 @@ pub fn flush() {
     for i in 0..CACHE_SIZE {
         if cache.entries[i].valid && cache.entries[i].dirty {
              let block_num = cache.entries[i].block_num;
-             if let Ok(_) = write_to_device(block_num, &cache.data[i]) {
+             let device_idx = cache.entries[i].device_idx;
+             if let Ok(_) = write_to_device(device_idx, block_num, &cache.data[i]) {
                  cache.entries[i].dirty = false;
              } else {
                  crate::serial::serial_print("[BCACHE] Failed to flush block ");

@@ -81,8 +81,7 @@ impl Filesystem {
     /// Mount the root filesystem
     /// Hardcoded partition offset for now (513 MiB / 4096 bytes = 131328 blocks)
     pub const PARTITION_OFFSET_BLOCKS: u64 = 131328;
-
-pub fn mount() -> Result<(), &'static str> {
+    pub fn mount(device_path: &str) -> Result<(), &'static str> {
     // Enforce ATA initialization before mounting
     // This is handled in main.rs but good to be sure
     
@@ -93,19 +92,23 @@ pub fn mount() -> Result<(), &'static str> {
         
         serial::serial_print("[FS] Attempting to mount eclipsefs...\n");
 
-        // Open disk:0 (RootFS in our QEMU setup)
-        serial::serial_print("[FS] Opening disk:0 via scheme registry...\n");
-        match crate::scheme::open("disk:0", 0, 0) {
+        // Open device via scheme registry
+        serial::serial_print("[FS] Opening ");
+        serial::serial_print(device_path);
+        serial::serial_print(" via scheme registry...\n");
+        match crate::scheme::open(device_path, 0, 0) {
             Ok((s_id, r_id)) => {
                 FS.disk_scheme_id = s_id;
                 FS.disk_resource_id = r_id;
                 serial::serial_print("[FS] Disk handle opened successfully\n");
             }
             Err(e) => {
-                serial::serial_print("[FS] Failed to open disk:1 - error ");
+                serial::serial_print("[FS] Failed to open device: ");
+                serial::serial_print(device_path);
+                serial::serial_print(". Error code: ");
                 serial::serial_print_dec(e as u64);
                 serial::serial_print("\n");
-                return Err("Failed to open storage device");
+                return Err("Failed to open disk device");
             }
         }
         
@@ -781,8 +784,8 @@ pub fn init() {
 }
 
 /// Mount the root filesystem
-pub fn mount_root() -> Result<(), &'static str> {
-    Filesystem::mount()
+pub fn mount_root(device_path: &str) -> Result<(), &'static str> {
+    Filesystem::mount(device_path)
 }
 
 /// Read a file from the filesystem
@@ -1194,6 +1197,12 @@ impl Scheme for FileSystemScheme {
                                      block_buffer[idx+4], block_buffer[idx+5]
                                  ]) as usize;
                                  
+                                 // CRITICAL: Ensure we don't read past the end of the block buffer
+                                 if idx + 6 + length > BLOCK_SIZE {
+                                     serial::serial_print("[FS-DEBUG] TLV record too large or truncated at block end\n");
+                                     break;
+                                 }
+
                                  match tag {
                                      tlv_tags::SIZE => {
                                           if length == 8 {
@@ -1231,7 +1240,6 @@ impl Scheme for FileSystemScheme {
                                      _ => {}
                                  }
                                  scan_offset += 6 + length;
-                                 if scan_offset >= BLOCK_SIZE { break; }
                              }
                         }
                     }

@@ -639,9 +639,9 @@ fn init_nvidia_driver() -> Result<Framebuffer, &'static str> {
 /// Implements VBE 2.0/3.0 support with 2D acceleration
 fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE] Initializing VESA/VBE driver...");
-    println!("[DISPLAY-SERVICE]   ╔════════════════════════════════════════╗");
-    println!("[DISPLAY-SERVICE]   ║  VESA BIOS Extensions (VBE) 2.0/3.0  ║");
-    println!("[DISPLAY-SERVICE]   ╚════════════════════════════════════════╝");
+    println!("[DISPLAY-SERVICE]   +--------------------------------------------+");
+    println!("[DISPLAY-SERVICE]   |  VESA BIOS Extensions (VBE) 2.0/3.0  |");
+    println!("[DISPLAY-SERVICE]   +--------------------------------------------+");
     
     // Step 1: Get display handle via scheme
     println!("[DISPLAY-SERVICE]   - Opening display: handle via scheme registry...");
@@ -717,9 +717,9 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
     println!("[DISPLAY-SERVICE]     * V-Sync enabled for tear-free rendering");
     println!("[DISPLAY-SERVICE]     * Target refresh rate: 60 Hz");
     
-    println!("[DISPLAY-SERVICE]   ╔════════════════════════════════════════╗");
-    println!("[DISPLAY-SERVICE]   ║    VESA driver initialized successfully    ║");
-    println!("[DISPLAY-SERVICE]   ╚════════════════════════════════════════╝");
+    println!("[DISPLAY-SERVICE]   +--------------------------------------------+");
+    println!("[DISPLAY-SERVICE]   |    VESA driver initialized successfully    |");
+    println!("[DISPLAY-SERVICE]   +--------------------------------------------+");
     
     Ok(Framebuffer {
         base_address: fb_base,
@@ -867,9 +867,9 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
 pub extern "C" fn _start() -> ! {
     let pid = getpid();
     
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              GRAPHICS / DISPLAY SERVICE                      ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("+--------------------------------------------------------------+");
+    println!("|              GRAPHICS / DISPLAY SERVICE                      |");
+    println!("+--------------------------------------------------------------+");
     println!("[DISPLAY-SERVICE] Starting (PID: {})", pid);
     println!("[DISPLAY-SERVICE] Initializing graphics subsystem...");
     

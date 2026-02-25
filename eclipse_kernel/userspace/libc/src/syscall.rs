@@ -639,8 +639,8 @@ pub fn map_framebuffer() -> Option<usize> {
 }
 
 /// Mount the root filesystem
-pub fn mount() -> i32 {
-    unsafe { syscall0(SYS_MOUNT) as i32 }
+pub fn mount(device_name: &str) -> i32 {
+    unsafe { syscall2(SYS_MOUNT, device_name.as_ptr() as u64, device_name.len() as u64) as i32 }
 }
 
 pub const PROT_READ: u64 = 0x1;

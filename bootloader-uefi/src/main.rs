@@ -12,6 +12,8 @@ use uefi::proto::console::gop::GraphicsOutput;
 use uefi::Identify;
 use core::mem;
 
+mod progress;
+
 // Estructura para pasar información del framebuffer al kernel
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +37,8 @@ pub struct BootInfo {
     pub kernel_phys_base: u64,
     pub rsdp_addr: u64,
 }
+
+static mut GLOBAL_FB_INFO: Option<FramebufferInfo> = None;
 
 // Global allocator simple
 struct SimpleAllocator;
@@ -69,12 +73,12 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 const KERNEL_PHYS_LOAD_ADDR: u64 = 0x0020_0000;
 const PT_LOAD: u32 = 1;
 const KERNEL_VIRT_BASE: u64 = 0xFFFF800000000000; // Dirección base del kernel (Higher Half)
-const MAX_KERNEL_ALLOCATION: u64 = 64 * 1024 * 1024; // 64 MiB como límite razonable para el kernel
+const MAX_KERNEL_ALLOCATION: u64 = 256 * 1024 * 1024; // 256 MiB como límite razonable para el kernel
 
 // Higher Half Kernel constants (Redox-style)
 /// Physical memory is mapped to this virtual address range
 /// All physical RAM from 0x0 to 4GB will be accessible at PHYS_MEM_OFFSET + phys_addr
-const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
+const PHYS_MEM_OFFSET: u64 = 0xFFFF900000000000;
 
 /// Kernel code and data will be mapped here
 /// This is separate from the physical memory map
@@ -164,6 +168,9 @@ unsafe fn serial_write_byte(b: u8) {
 
 unsafe fn serial_write_str(s: &str) {
     for &c in s.as_bytes() { serial_write_byte(c); }
+    if let Some(info) = &GLOBAL_FB_INFO {
+        progress::log(s, info);
+    }
 }
 
 unsafe fn serial_write_hex32(val: u32) {
@@ -284,103 +291,64 @@ fn flush_log_to_file(bs: &BootServices, image_handle: Handle) {
 /// - pml4_phys es una dirección física válida de una tabla PML4
 /// - fb_base y fb_size son válidos y no causan desbordamiento
 /// - Esta función se llama en contexto apropiado del bootloader antes de ExitBootServices
-fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_size: u64) {
-    // SAFETY: serial_write_str solo escribe a puertos serie, es seguro en contexto bootloader
-    unsafe {
-        serial_write_str("BL: mapeando framebuffer en page tables...\r\n");
-    }
+fn map_framebuffer_range(bs: &BootServices, pml4_phys: u64, virt_base: u64, phys_base: u64, size: u64) {
     let p_w: u64 = 0x003; // Present | Write
     let ps: u64 = 0x080;   // Page Size (2MiB)
     let addr_mask: u64 = 0x000F_FFFF_FFFF_F000u64;
 
-    // Calcular límites alineados a 2MiB para evitar mapeos parciales
-    let phys_start = fb_base & !0x1F_FFFFu64; // 2MiB aligned down
+    let virt_start = virt_base & !0x1F_FFFFu64;
+    let virt_end = virt_base.saturating_add(size).checked_add(0x1F_FFFFu64).map(|v| v & !0x1F_FFFFu64).unwrap_or(u64::MAX & !0x1F_FFFFu64);
     
-    // Validar que fb_base + fb_size no desborde
-    let fb_end = fb_base.checked_add(fb_size)
-        .unwrap_or_else(|| {
-            // SAFETY: solo escribe a puerto serie
-            unsafe { serial_write_str("BL: ERROR - framebuffer address overflow\r\n"); }
-            // Si desborda, usar el valor máximo seguro
-            u64::MAX - 0x1F_FFFFu64
-        });
-    
-    let phys_end = fb_end.checked_add(0x1F_FFFFu64)
-        .map(|v| v & !0x1F_FFFFu64)
-        .unwrap_or_else(|| {
-            // Si desborda, usar el máximo alineado posible
-            u64::MAX & !0x1F_FFFFu64
-        });
-
-    // SAFETY: Asumimos que pml4_phys apunta a memoria válida alineada a 4KB
-    // Esta es una precondición de la función
     let pml4_ptr = pml4_phys as *mut u64;
 
-    let mut addr = phys_start;
-    while addr < phys_end {
-        // Calcular índice PML4 (bits 39-47)
-        let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
-        
-        // SAFETY: pml4_idx está limitado a 0-511 por el mask 0x1FF, por lo que
-        // pml4_ptr.add(pml4_idx) siempre está dentro de los límites de la tabla PML4 (512 entradas)
-        let pdpt_entry = unsafe { pml4_ptr.add(pml4_idx) };
-        
-        // SAFETY: pdpt_entry apunta a una entrada válida de la tabla PML4
-        let mut pdpt_phys: u64 = unsafe { *pdpt_entry } & addr_mask;
+    let mut curr_virt = virt_start;
+    let mut curr_phys = phys_base & !0x1F_FFFFu64;
+
+    while curr_virt < virt_end {
+        let pml4_idx = ((curr_virt >> 39) & 0x1FF) as usize;
+        let pml4_entry = unsafe { pml4_ptr.add(pml4_idx) };
+        let mut pdpt_phys = unsafe { *pml4_entry } & addr_mask;
         
         if pdpt_phys == 0 {
-            // Necesitamos crear una nueva tabla PDPT
-            if let Ok(new_pdpt) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
-                // SAFETY: new_pdpt es memoria recién asignada de 4096 bytes por UEFI
+            if let Ok(new_pdpt) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
                 unsafe { core::ptr::write_bytes(new_pdpt as *mut u8, 0, 4096); }
                 pdpt_phys = new_pdpt & addr_mask;
-                // SAFETY: pdpt_entry apunta a entrada válida en PML4
-                unsafe { *pdpt_entry = pdpt_phys | p_w; }
-            } else {
-                // SAFETY: solo escribe a puerto serie
-                unsafe { serial_write_str("BL: ERROR alloc PDPT\r\n"); }
-                break;
-            }
+                unsafe { *pml4_entry = pdpt_phys | p_w; }
+            } else { break; }
         }
 
-        // SAFETY: pdpt_phys ahora contiene una dirección válida de tabla PDPT
         let pdpt_ptr = pdpt_phys as *mut u64;
-        let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
-        
-        // SAFETY: pdpt_idx está limitado a 0-511, dentro de límites de PDPT
+        let pdpt_idx = ((curr_virt >> 30) & 0x1FF) as usize;
         let pd_entry = unsafe { pdpt_ptr.add(pdpt_idx) };
-        
-        // SAFETY: pd_entry apunta a entrada válida de PDPT
-        let mut pd_phys: u64 = unsafe { *pd_entry } & addr_mask;
+        let mut pd_phys = unsafe { *pd_entry } & addr_mask;
         
         if pd_phys == 0 {
-            // Necesitamos crear una nueva tabla PD
-            if let Ok(new_pd) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
-                // SAFETY: new_pd es memoria recién asignada de 4096 bytes por UEFI
+            if let Ok(new_pd) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
                 unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
                 pd_phys = new_pd & addr_mask;
-                // SAFETY: pd_entry apunta a entrada válida en PDPT
                 unsafe { *pd_entry = pd_phys | p_w; }
-            } else {
-                // SAFETY: solo escribe a puerto serie
-                unsafe { serial_write_str("BL: ERROR alloc PD\r\n"); }
-                break;
-            }
+            } else { break; }
         }
 
-        // SAFETY: pd_phys ahora contiene una dirección válida de tabla PD
         let pd_ptr = pd_phys as *mut u64;
-        let pd_idx = ((addr >> 21) & 0x1FF) as usize;
-        
-        // SAFETY: pd_idx está limitado a 0-511, dentro de límites de PD
-        // Escribimos una entrada de página de 2MiB con mapeo de identidad
+        let pd_idx = ((curr_virt >> 21) & 0x1FF) as usize;
         unsafe {
-            *pd_ptr.add(pd_idx) = (addr & addr_mask) | p_w | ps;
+            *pd_ptr.add(pd_idx) = (curr_phys & addr_mask) | p_w | ps;
         }
 
-        // Avanzar al siguiente bloque de 2MiB, usando saturating_add para prevenir overflow
-        addr = addr.saturating_add(0x20_0000u64); // next 2MiB
+        curr_virt = curr_virt.saturating_add(0x20_0000u64);
+        curr_phys = curr_phys.saturating_add(0x20_0000u64);
     }
+}
+
+fn map_framebuffer_identity(bs: &BootServices, pml4_phys: u64, fb_base: u64, fb_size: u64) {
+    unsafe {
+        serial_write_str("BL: Mapeando framebuffer (Identity y HHDM)...\r\n");
+    }
+    // 1. Identity map
+    map_framebuffer_range(bs, pml4_phys, fb_base, fb_base, fb_size);
+    // 2. HHDM map (0xFFFF9000...)
+    map_framebuffer_range(bs, pml4_phys, 0xFFFF900000000000u64 + fb_base, fb_base, fb_size);
 }
 
 // ELF64 estructuras mínimas
@@ -968,43 +936,52 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
     // Allocate page tables
-    // We need: 1 PML4, 1 PDPT for higher half physical map, 
-    // AND PDs for identity mapping. The bootloader is at ~5.3GB (0x140000000+).
-    // So we need to map at least 8GB to be safe. Let's do 16GB (16 PDs).
-    let num_pds = 16; // 16GB
+    // We need: 1 PML4, 3 PDPTs (Identity, HHDM, Kernel)
+    // AND 1024 PDs (512 for Direct Map, 512 for Kernel Mapping)
     
     let pml4_phys = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPml4(e.status()))?;
 
-    // PDPT for higher half physical memory mapping (0xFFFF800000000000+)
-    let pdpt_phys_map = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
+    // PDPT for Identity (0x0+)
+    let pdpt_low = bs
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
         
-    // PDPT for low memory identity mapping
-    let pdpt_low = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
+    // PDPT for HH Direct Map (HHDM) (0xFFFF900000000000+)
+    let pdpt_hhdm = bs
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
         .map_err(|e| BootError::AllocPdpt(e.status()))?;
 
-    // Use a vector/array for PDs. Since we don't have Vec easily, we'll allocate a contiguous block if possible
-    // or just an array of pointers.
-    // Let's allocate them individually to be safe.
-    let mut pd_phys_arr: [u64; 16] = [0; 16];
-    for i in 0..num_pds {
-        pd_phys_arr[i] = bs
-            .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1)
+    // PDPT for Kernel Zone (0xFFFF800000000000+)
+    let pdpt_kernel = bs
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+        .map_err(|e| BootError::AllocPdpt(e.status()))?;
+
+    // Allocate all PDs in two sets. 
+    // To be safe with fragmentation, we'll allocate them individually.
+    let mut pds_direct: [u64; 512] = [0; 512];
+    let mut pds_kernel: [u64; 512] = [0; 512];
+    
+    for i in 0..512 {
+        pds_direct[i] = bs
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .map_err(|e| BootError::AllocPd(e.status()))?;
+        pds_kernel[i] = bs
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .map_err(|e| BootError::AllocPd(e.status()))?;
     }
 
     unsafe {
         // Clear all tables
         core::ptr::write_bytes(pml4_phys as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pdpt_phys_map as *mut u8, 0, 4096);
         core::ptr::write_bytes(pdpt_low as *mut u8, 0, 4096);
+        core::ptr::write_bytes(pdpt_hhdm as *mut u8, 0, 4096);
+        core::ptr::write_bytes(pdpt_kernel as *mut u8, 0, 4096);
         
-        for i in 0..num_pds {
-            core::ptr::write_bytes(pd_phys_arr[i] as *mut u8, 0, 4096);
+        for i in 0..512 {
+            core::ptr::write_bytes(pds_direct[i] as *mut u8, 0, 4096);
+            core::ptr::write_bytes(pds_kernel[i] as *mut u8, 0, 4096);
         }
 
         // Flags
@@ -1012,54 +989,62 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
         let ps = 0x080u64;  // Page Size (2 MiB)
 
         let pml4 = pml4_phys as *mut u64;
-        let pdpt_map = pdpt_phys_map as *mut u64;
-        let pdpt_low_ptr = pdpt_low as *mut u64;
+        let p_low = pdpt_low as *mut u64;
+        let p_hhdm = pdpt_hhdm as *mut u64;
+        let p_kernel = pdpt_kernel as *mut u64;
 
-        // === HIGHER HALF PHYSICAL MEMORY MAP ===
-        // Map all physical RAM (0-16GB) to 0xFFFF800000000000+
-        *pml4.add(256) = (pdpt_phys_map & 0x000F_FFFF_FFFF_F000u64) | p_w;
-
-        // Link the PDs to the PDPT (each PD maps 1GB)
-        for i in 0..num_pds {
-            *pdpt_map.add(i) = (pd_phys_arr[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
-        }
-
-        // === IDENTITY MAPPING (0-16GB) ===
-        // PML4[0] -> PDPT for identity mapping
+        // PML4[0] covers Identity (0-512GB)
         *pml4.add(0) = (pdpt_low & 0x000F_FFFF_FFFF_F000u64) | p_w;
-        
-        // Link the same PDs to low memory PDPT for identity mapping
-        for i in 0..num_pds {
-            *pdpt_low_ptr.add(i) = (pd_phys_arr[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        // PML4[256] covers Kernel Mapping (0xFFFF8000...)
+        *pml4.add(256) = (pdpt_kernel & 0x000F_FFFF_FFFF_F000u64) | p_w;
+        // PML4[288] covers Direct Map/HHDM (0xFFFF9000...)
+        *pml4.add(288) = (pdpt_hhdm & 0x000F_FFFF_FFFF_F000u64) | p_w;
+
+        // Link PDs for Identity and HHDM (Direct maps share the same PDs pointing to 0->0)
+        for i in 0..512 {
+            let entry = (pds_direct[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+            *p_low.add(i) = entry;
+            *p_hhdm.add(i) = entry;
         }
 
-        // Fill each PD with 2MB pages mapping physical memory
-        // This populates both the higher half map AND the identity map since they share PDs
-        for pd_idx in 0..num_pds {
-            let pd = pd_phys_arr[pd_idx] as *mut u64;
+        // Link PDs for Kernel (Dedicated pages to avoid corruption during remapping)
+        for i in 0..512 {
+            let entry = (pds_kernel[i] & 0x000F_FFFF_FFFF_F000u64) | p_w;
+            *p_kernel.add(i) = entry;
+        }
+
+        // Fill Direct Map PDs with 2MB pages mapping phys 0 -> 0
+        for pd_idx in 0..512 {
+            let pd = pds_direct[pd_idx] as *mut u64;
             for entry_idx in 0..512 {
-                // Physical address for this 2MB page
+                let phys_addr = (pd_idx as u64) * 0x40000000 + (entry_idx as u64) * 0x200000;
+                *pd.add(entry_idx) = (phys_addr & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
+            }
+        }
+        
+        // Fill Kernel PDs with 2MB pages mapping phys 0 -> 0 as baseline
+        // map_kernel_virtual_to_physical will overwrite specific entries later
+        for pd_idx in 0..512 {
+            let pd = pds_kernel[pd_idx] as *mut u64;
+            for entry_idx in 0..512 {
                 let phys_addr = (pd_idx as u64) * 0x40000000 + (entry_idx as u64) * 0x200000;
                 *pd.add(entry_idx) = (phys_addr & 0x000F_FFFF_FFFF_F000u64) | p_w | ps;
             }
         }
 
-        // Create the Higher Half Direct Map (HHDM)
-        // PML4[288] -> 0xFFFF900000000000
-        *pml4.add(288) = (pdpt_phys_map & 0x000F_FFFF_FFFF_F000u64) | p_w;
-        
         // === RECURSIVE PAGE TABLE MAPPING ===
         // PML4[511] points to PML4 itself
         *pml4.add(511) = (pml4_phys & 0x000F_FFFF_FFFF_F000u64) | p_w;
         
-        serial_write_str("BL: Higher half physical map: 0xFFFF900000000000 -> 0x0 (16GB)\r\n");
-        serial_write_str("BL: Identity mapping: 0x0 -> 0x0 (16GB) for bootloader\r\n");
+        serial_write_str("BL: Higher half physical map (HHDM): 0xFFFF900000000000 -> 0x0 (512GB)\r\n");
+        serial_write_str("BL: Higher half kernel zone: 0xFFFF800000000000 -> 0x0 (512GB)\r\n");
+        serial_write_str("BL: Identity mapping: 0x0 -> 0x0 (512GB) for bootloader\r\n");
         serial_write_str("BL: Recursive mapping: PML4[511] -> PML4\r\n");
 
         // Debug output
         serial_write_str("BL: Page tables configured:\r\n");
-        serial_write_str("  PML4[0]   -> Identity map (0-16GB)\r\n");
-        serial_write_str("  PML4[256] -> Kernel Virtual (Points to same PDPT as 288 for now)\r\n");
+        serial_write_str("  PML4[0]   -> Identity map (0-512GB)\r\n");
+        serial_write_str("  PML4[256] -> Kernel Virtual (0xFFFF800000000000)\r\n");
         serial_write_str("  PML4[288] -> HHDM (0xFFFF900000000000)\r\n");
         serial_write_str("  PML4[511] -> Recursive\r\n");
     }
@@ -1282,8 +1267,10 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 framebuffer_info.blue_mask = mask.blue;
                 framebuffer_info.reserved_mask = mask.reserved;
             }
+            // Activar log en pantalla global
+            unsafe { GLOBAL_FB_INFO = Some(framebuffer_info); }
             // Reservar memoria persistente para pasar al kernel (BootInfo)
-            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
                 boot_info_ptr = phys;
 
                 // Encontrar ACPI RSDP en la tabla de configuración
@@ -1319,6 +1306,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             unsafe {
                 serial_write_str("BL: GOP encontrado\r\n");
                 log_append_bytes(b"[BL] GOP ok\r\n");
+                progress::bar(10, &framebuffer_info);
                 // Log puntero de boot_info reservado (si existe)
                 serial_write_str("BL: boot_info_ptr=0x");
                 let mut h = [0u8; 18];
@@ -1387,20 +1375,17 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 buf[n] = b'\r'; n+=1; buf[n] = b'\n'; n+=1;
                 for i in 0..n { serial_write_byte(buf[i]); }
                 
-                // Limpiar pantalla con negro y mostrar mensaje de inicio
-                serial_write_str("BL: Limpiando pantalla y mostrando mensaje...\r\n");
-                let fb_ptr = framebuffer_info.base_address as *mut u32;
-                let stride = framebuffer_info.pixels_per_scan_line;
-                
-                // Limpiar pantalla con negro (0x00000000)
-                for y in 0..framebuffer_info.height {
-                    for x in 0..framebuffer_info.width {
-                        let offset = (y * stride + x) as isize;
-                        core::ptr::write_volatile(fb_ptr.offset(offset), 0x00000000);
-                    }
+                // Limpiar pantalla con negro y mostrar progreso inicial
+                serial_write_str("BL: Limpiando pantalla y mostrando progreso...\r\n");
+                unsafe {
+                    let fb_ptr = framebuffer_info.base_address as *mut u8;
+                    let fb_size = (framebuffer_info.height as u64)
+                        .saturating_mul(framebuffer_info.pixels_per_scan_line as u64)
+                        .saturating_mul(4) as usize;
+                    core::ptr::write_bytes(fb_ptr, 0, fb_size);
                 }
-                
-                serial_write_str("BL: Pantalla limpiada y mensaje mostrado\r\n");
+                progress::bar(0, &framebuffer_info);
+                serial_write_str("BL: Pantalla limpiada y progreso inicial mostrado\r\n");
             }
         } else {
             unsafe {
@@ -1408,7 +1393,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 log_append_bytes(b"[BL] GOP not found\r\n");
             }
             // Asignar BootInfo de todas formas (kernel lo necesita: pml4, rsdp, etc.)
-            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, 1) {
+            if let Ok(phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1) {
                 boot_info_ptr = phys;
                 let mut rsdp_addr: u64 = 0;
                 for entry in system_table.config_table() {
@@ -1432,10 +1417,8 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     {
         use core::fmt::Write as _;
         let out = system_table.stdout();
-        let _ = out.write_str("Iniciando Sistema Operativo Eclipse v0.1.0\n");
-        let _ = out.write_str("\n");
-        let _ = out.write_str("Pasando el control al kernel...\n");
-        unsafe { serial_write_str("BL: antes ExitBootServices\r\n"); }
+        let _ = out.write_str("Relocalizando kernel...\n");
+        unsafe { serial_write_str("BL: relocalizando kernel\r\n"); }
     }
 
     // CARGAR EL KERNEL ANTES DE EXIT_BOOT_SERVICES Y SALTAR INMEDIATAMENTE
@@ -1446,6 +1429,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     {
         let bs = system_table.boot_services();
+        progress::bar(20, &framebuffer_info);
         let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
 
         match load_kernel_from_data(bs, kernel_data) {
@@ -1462,13 +1446,17 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     serial_write_str("\r\n");
                 }
                 
+                progress::bar(30, &framebuffer_info);
                 // Mapear la dirección virtual del kernel a su dirección física real
                 // La dirección virtual base es KERNEL_VIRT_BASE
                 map_kernel_virtual_to_physical(pml4_phys, KERNEL_VIRT_BASE, kernel_phys_base, total_len);
+                progress::bar(32, &framebuffer_info);
                 
-                // BACK TO VIRTUAL ENTRY POINT
-                // We are switching page tables in the bootloader now, so we must jump to
-                // the VIRTUAL address which is mapped in the new page tables.
+                {
+                    let out = system_table.stdout();
+                    let _ = out.write_str("Kernel relocalizado. Prepando framebuffer...\n");
+                }
+
                 kernel_entry_phys = entry_point_virt;
                 kernel_base = kernel_phys_base;
                 kernel_size = total_len;
@@ -1513,6 +1501,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // Volcar log a archivo antes de ExitBootServices y mapear framebuffer
     {
+        progress::bar(35, &framebuffer_info);
         let bs = system_table.boot_services();
         // Mapear framebuffer detectado para que siga accesible tras cambiar CR3
         if framebuffer_info.base_address != 0 && framebuffer_info.width > 0 && framebuffer_info.height > 0 {
@@ -1523,182 +1512,95 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
         flush_log_to_file(bs, handle);
     }
-
-    // ExitBootServices (uefi 0.25.0)
-    // IMPORTANTE: Usar BOOT_SERVICES_CODE para mantener la memoria del kernel intacta
-    let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::BOOT_SERVICES_CODE);
-    unsafe { serial_write_str("BL: despues ExitBootServices\r\n"); }
-    // Nota: Framebuffer mapping simplificado por ahora
-
-    // Configurar paginación identidad y pila y saltar al kernel (sin usar la pila después de cambiarla)
+    // Configurar paginación identidad y pila y saltar al kernel
     unsafe {
-
-        // DEBUG: Verificar estado antes del salto
-        serial_write_str("BL: DEBUG antes del salto:\r\n");
-        serial_write_str("BL: kernel_entry_phys=");
-        serial_write_hex64(kernel_entry_phys);
-        serial_write_str(" pml4_phys=");
-        serial_write_hex64(pml4_phys);
-        serial_write_str(" stack_top=");
-        serial_write_hex64(stack_top);
-        serial_write_str("\r\n");
-
-        // Verificar que el código esté en la dirección física correcta
-        serial_write_str("BL: verificando kernel en PA ");
-        serial_write_hex64(kernel_base);
-        serial_write_str(": ");
-        let kernel_ptr = kernel_base as *const u8;
-        for i in 0..16 {
-            let byte = unsafe { *kernel_ptr.add(i) };
-            serial_write_hex8(byte);
-            serial_write_str(" ");
-        }
-        serial_write_str("\r\n");
-
-        // DEBUG: Mostrar qué va a pasar justo antes del assembly
-        serial_write_str("BL: saltando a kernel entry point...\r\n");
-        
-        // Verificar que el kernel esté realmente cargado ANTES del salto
-        serial_write_str("BL: verificando kernel ANTES del salto: ");
-        let kernel_check_ptr = kernel_base as *const u8;
-        for i in 0..32 {
-            let byte = unsafe { *kernel_check_ptr.add(i) };
-            serial_write_hex8(byte);
-            if i % 8 == 7 { serial_write_str(" "); }
-        }
-        serial_write_str("\r\n");
+        progress::bar(40, &framebuffer_info);
 
         // CONFIGURAR PAGINACIÓN CON MAPEO DE IDENTIDAD SIMPLE
         serial_write_str("BL: configurando paginacion con identidad...\r\n");
 
-        // Configurar CR3 con el PML4 que ya tenemos (que tiene mapeo de identidad)
-        let cr3_value = pml4_phys;
-        let rsp_alineado = stack_top & !0xFu64;
-
-        // SALTAR AL KERNEL PASANDO INFORMACIÓN DEL FRAMEBUFFER
-        // ⚠️  INSTRUCCIONES CRÍTICAS PARA BOOTLOADER - NO DESHABILITAR ⚠️
-        // Estas instrucciones SON necesarias para que el bootloader funcione
-
-        // Configurar SSE (necesario para evitar #UD)
-        core::arch::asm!(
-            "mov rax, cr0",
-            "and rax, ~(1 << 2)",        // CR0.EM = 0
-            "or  rax,  (1 << 1)",        // CR0.MP = 1
-            "mov cr0, rax",
-            "mov rax, cr4",
-            "or  rax,  (1 << 9)",        // CR4.OSFXSR = 1
-            "or  rax,  (1 << 10)",       // CR4.OSXMMEXCPT = 1
-            "mov cr4, rax"
-        );
-
-        // DEBUG VISUAL DEL BOOTLOADER - RECTÁNGULOS DE COLORES PARA DIAGNÓSTICO
-        if boot_info_ptr != 0 {
-            // Actualizar BootInfo con valores finales
-            unsafe {
-                let dst = boot_info_ptr as *mut BootInfo;
-                (*dst).pml4_addr = cr3_value;
-                (*dst).kernel_phys_base = kernel_base;
-            };
-
-            let fb_info = unsafe { (*(boot_info_ptr as *const BootInfo)).framebuffer };
-            if fb_info.base_address != 0 {
-                let fb_ptr = fb_info.base_address as *mut u32;
-                let stride = fb_info.pixels_per_scan_line; // Usar stride en lugar de width
-                
-                // DEBUG SERIAL: Valores críticos antes del salto
-                serial_write_str("BL: DEBUG CRITICO - Valores antes del salto:\r\n");
-                serial_write_str("BL: CR3 (PML4): ");
-                serial_write_hex64(cr3_value);
-                serial_write_str("\r\nBL: RSP (Stack): ");
-                serial_write_hex64(rsp_alineado);
-                serial_write_str("\r\nBL: Entry Point: ");
-                serial_write_hex64(kernel_entry_phys);
-                serial_write_str("\r\nBL: Boot Info: ");
-                serial_write_hex64(boot_info_ptr);
-                
-                // DEBUG DETALLADO DEL FRAMEBUFFER
-                serial_write_str("\r\nBL: FRAMEBUFFER DETALLADO:\r\n");
-                serial_write_str("BL: Base Address: ");
-                serial_write_hex64(fb_info.base_address);
-                serial_write_str("\r\nBL: Width: ");
-                serial_write_hex64(fb_info.width as u64);
-                serial_write_str("\r\nBL: Height: ");
-                serial_write_hex64(fb_info.height as u64);
-                serial_write_str("\r\nBL: Pixels per Scan Line: ");
-                serial_write_hex64(fb_info.pixels_per_scan_line as u64);
-                serial_write_str("\r\nBL: Pixel Format: ");
-                serial_write_hex64(fb_info.pixel_format as u64);
-                
-                serial_write_str("\r\nBL: Ejecutando salto al kernel...\r\n");
+        // DIAGNÓSTICO: GREEN SQUARE (0,0) antes de ExitBootServices
+        if framebuffer_info.base_address != 0 {
+            let fb_ptr = framebuffer_info.base_address as *mut u32;
+            let pitch = framebuffer_info.pixels_per_scan_line as usize;
+            for y in 0..10 {
+                for x in 0..10 {
+                    unsafe { *fb_ptr.add(y * pitch + x) = 0x00FF00; }
+                }
             }
         }
 
-        // DEBUG SERIAL: Justo antes de las instrucciones de ensamblador
-        serial_write_str("BL: EJECUTANDO INSTRUCCIONES DE ENSAMBLADOR...\r\n");
-        serial_write_str("BL: Configurando CR3, RSP, RDI, RAX...\r\n");
-        
-        // DEBUG DEL ESTADO DE LA CPU
-        serial_write_str("BL: ESTADO DE LA CPU ANTES DEL SALTO:\r\n");
-        
-        // Leer CR0
-        let cr0_val: u64;
-        unsafe {
-            core::arch::asm!("mov {}, cr0", out(reg) cr0_val);
+        let out = system_table.stdout();
+        let _ = out.write_str("Saliendo de servicios UEFI y saltando al kernel...\n");
+        let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::BOOT_SERVICES_CODE);
+
+        // DIAGNÓSTICO: BLUE SQUARE (10,0) después de ExitBootServices
+        if framebuffer_info.base_address != 0 {
+            let fb_ptr = framebuffer_info.base_address as *mut u32;
+            let pitch = framebuffer_info.pixels_per_scan_line as usize;
+            for y in 0..10 {
+                for x in 10..20 {
+                    unsafe { *fb_ptr.add(y * pitch + x) = 0x0000FF; }
+                }
+            }
         }
-        serial_write_str("BL: CR0: ");
-        serial_write_hex64(cr0_val);
-        serial_write_str("\r\n");
-        
-        // Leer CR4
-        let cr4_val: u64;
-        unsafe {
-            core::arch::asm!("mov {}, cr4", out(reg) cr4_val);
+
+        // ACTUALIZAR BOOTINFO CON VALORES FINALES
+        if boot_info_ptr != 0 {
+            unsafe {
+                let dst = boot_info_ptr as *mut BootInfo;
+                (*dst).pml4_addr = pml4_phys;
+                (*dst).kernel_phys_base = kernel_base;
+            }
         }
-        serial_write_str("BL: CR4: ");
-        serial_write_hex64(cr4_val);
-        serial_write_str("\r\n");
         
-        // Leer CR3 actual
-        let cr3_current: u64;
-        unsafe {
-            core::arch::asm!("mov {}, cr3", out(reg) cr3_current);
+        serial_write_str("BL: JUMP TO KERNEL NOW\r\n");
+
+        // DIAGNÓSTICO: MAGENTA SQUARE (20,0) justo antes del salto
+        if framebuffer_info.base_address != 0 {
+            let fb_ptr = framebuffer_info.base_address as *mut u32;
+            let pitch = framebuffer_info.pixels_per_scan_line as usize;
+            for y in 0..10 {
+                for x in 20..30 {
+                    unsafe { *fb_ptr.add(y * pitch + x) = 0xFF00FF; }
+                }
+            }
         }
-        serial_write_str("BL: CR3 actual (UEFI): ");
-        serial_write_hex64(cr3_current);
-        serial_write_str("\r\n");
+
+        let cr3_value = pml4_phys;
+        let rsp_alineado = stack_top & !0xFu64;
+
+        // USAREMOS x86_64 CRATE PARA CONFIGURAR SSE DE FORMA SEGURA
+        // (Aunque seguiremos en ASM para el salto final por control total)
         
-        // Debug adicional del entry point
-        serial_write_str("BL: Entry point calculado: 0x");
-        serial_write_hex64(kernel_entry_phys);
-        serial_write_str("\r\n");
-        serial_write_str("BL: Boot info ptr: 0x");
-        serial_write_hex64(boot_info_ptr);
-        serial_write_str("\r\n");
-        serial_write_str("BL: PML4 address (for kernel): 0x");
-        serial_write_hex64(cr3_value);
-        serial_write_str("\r\n");
-        
-        // Debug crítico: mostrar entry_reg exacto antes del salto
-        serial_write_str("BL: Entry Virtual antes del salto: 0x");
-        serial_write_hex64(kernel_entry_phys);
-        serial_write_str("\r\n");
-        
-        serial_write_str("BL: Loading new page tables (CR3)...\r\n");
-        
-        // Pasar parámetros al kernel:
-        // RDI = framebuffer_info_ptr (ARG1)
-        // RSI = kernel_base (ARG2)  
-        // RDX = pml4_phys (ARG3) - Kernel checks this
-        // RAX = entry point
         core::arch::asm!(
-            "mov cr3, rax",      // Load new Page Tables (PML4) -> CR3
-            "xor rbp, rbp",      // Clear RBP
-            "mov rsp, rsi",      // Set RSP
-            "jmp rdx",           // Jump to kernel
-            in("rdi") boot_info_ptr, // Argument 1: BootInfo pointer
-            in("rsi") rsp_alineado,  // New Stack Pointer
-            in("rdx") kernel_entry_phys, // Kernel Entry Point
-            in("rax") pml4_phys      // PML4 Physical Address (loaded into CR3)
+            "cli",                      // 1. Deshabilitar interrupciones
+            
+            // 2. Configurar SSE (necesario para evitar #UD en el kernel)
+            "mov rcx, cr0",
+            "and rcx, ~(1 << 2)",       // CR0.EM = 0
+            "or  rcx,  (1 << 1)",       // CR0.MP = 1
+            "mov cr0, rcx",
+            "mov rcx, cr4",
+            "or  rcx,  (1 << 9)",       // CR4.OSFXSR = 1
+            "or  rcx,  (1 << 10)",      // CR4.OSXMMEXCPT = 1
+            "mov cr4, rcx",
+            
+            // 3. Activar nuevas tablas de páginas
+            "mov cr3, rax",
+            
+            // 4. Configurar nueva pila
+            "xor rbp, rbp",
+            "mov rsp, rsi",
+            
+            // 5. SALTO FINAL AL KERNEL
+            "jmp rdx",
+            
+            in("rdi") boot_info_ptr,
+            in("rsi") rsp_alineado,
+            in("rdx") kernel_entry_phys,
+            in("rax") pml4_phys,
+            options(noreturn)
         );
 
         // Si llegamos aquí, el kernel retornó (no debería pasar)

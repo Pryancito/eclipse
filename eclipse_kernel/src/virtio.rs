@@ -8,6 +8,7 @@ use spin::Mutex;
 use core::arch::asm;
 
 use crate::serial;
+use crate::storage::BlockDevice;
 
 /// Read time stamp counter
 #[inline]
@@ -662,25 +663,29 @@ impl Virtqueue {
     }
 }
 
-/// VirtIO block device driver
-pub struct VirtIOBlockDevice {
-    mmio_base: u64,       // MMIO base address (0 if using I/O ports)
-    io_base: u16,         // I/O port base (0 if using MMIO)
+/// VirtIO block device driver inner state
+struct VirtIOBlockDeviceInner {
+    mmio_base: u64,
+    io_base: u16,
     queue_size: u16,
     queue: Option<Virtqueue>,
 }
 
-static BLOCK_DEVICES: Mutex<alloc::vec::Vec<VirtIOBlockDevice>> = Mutex::new(alloc::vec::Vec::new());
+/// VirtIO block device driver
+pub struct VirtIOBlockDevice {
+    inner: Mutex<VirtIOBlockDeviceInner>,
+}
+
+static BLOCK_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIOBlockDevice>>> = Mutex::new(alloc::vec::Vec::new());
 
 impl VirtIOBlockDevice {
     /// Create a new VirtIO block device from MMIO base
-    unsafe fn new(mmio_base: u64) -> Option<Self> {
+    pub unsafe fn new(mmio_base: u64) -> Option<Self> {
         let regs = mmio_base as *mut VirtIOMMIORegs;
         
         // Check magic value
         let magic = read_volatile(&(*regs).magic_value);
         if magic != VIRTIO_MAGIC {
-            // No VirtIO device found
             return None;
         }
         
@@ -697,35 +702,50 @@ impl VirtIOBlockDevice {
         }
         
         Some(VirtIOBlockDevice {
-            mmio_base,
-            io_base: 0,
-            queue_size: 8,
-            queue: None,
+            inner: Mutex::new(VirtIOBlockDeviceInner {
+                mmio_base,
+                io_base: 0,
+                queue_size: 8,
+                queue: None,
+            }),
         })
     }
     
     /// Create a new VirtIO block device from PCI BAR address
-    unsafe fn new_from_pci(bar_addr: u64) -> Option<Self> {
-        // For PCI devices, the BAR points to VirtIO registers
-        // Create device structure  
+    pub unsafe fn new_from_pci(bar_addr: u64) -> Option<Self> {
         Some(VirtIOBlockDevice {
-            mmio_base: bar_addr,
-            io_base: 0,
-            queue_size: 8,
-            queue: None,
+            inner: Mutex::new(VirtIOBlockDeviceInner {
+                mmio_base: bar_addr,
+                io_base: 0,
+                queue_size: 8,
+                queue: None,
+            }),
         })
     }
     
     /// Create a new VirtIO block device from PCI I/O ports
-    unsafe fn new_from_pci_io(io_base: u16) -> Option<Self> {
+    pub unsafe fn new_from_pci_io(io_base: u16) -> Option<Self> {
         Some(VirtIOBlockDevice {
-            mmio_base: 0,
-            io_base,
-            queue_size: 8,
-            queue: None,
+            inner: Mutex::new(VirtIOBlockDeviceInner {
+                mmio_base: 0,
+                io_base,
+                queue_size: 8,
+                queue: None,
+            }),
         })
     }
     
+    /// Initialize the VirtIO block device
+    pub unsafe fn init(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.io_base != 0 {
+            return inner.init_legacy_pci();
+        }
+        inner.init_mmio()
+    }
+}
+
+impl VirtIOBlockDeviceInner {
     /// Initialize the VirtIO block device
     unsafe fn init(&mut self) -> bool {
         if self.io_base != 0 {
@@ -2299,12 +2319,15 @@ pub fn init() {
                 
                 if (bar0 & 1) != 0 {
                     let io_base = (bar0 & !0x3) as u16;
-                    if let Some(mut virt_dev) = VirtIOBlockDevice::new_from_pci_io(io_base) {
+                    if let Some(virt_dev) = VirtIOBlockDevice::new_from_pci_io(io_base) {
                         if virt_dev.init() {
                             serial::serial_print("[VirtIO] Initialized device at ");
                             serial::serial_print_hex(io_base as u64);
                             serial::serial_print("\n");
-                            BLOCK_DEVICES.lock().push(virt_dev);
+                            
+                            let arc_dev = alloc::sync::Arc::new(virt_dev);
+                            BLOCK_DEVICES.lock().push(arc_dev.clone());
+                            crate::storage::register_device(arc_dev);
                         }
                     }
                 }
@@ -2440,23 +2463,45 @@ pub fn init() {
 }
 
 /// Global wrapper to read a block from the first available VirtIO device
-pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    let mut devices = BLOCK_DEVICES.lock();
-    if let Some(dev) = devices.get_mut(0) {
-        dev.read_block(block_num, buffer)
-    } else {
-        Err("No VirtIO block device found")
+impl crate::storage::BlockDevice for VirtIOBlockDevice {
+    fn read(&self, block: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+        let mut inner = self.inner.lock();
+        inner.read_block(block, buffer)
+    }
+
+    fn write(&self, block: u64, buffer: &[u8]) -> Result<(), &'static str> {
+        let mut inner = self.inner.lock();
+        inner.write_block(block, buffer)
+    }
+
+    fn capacity(&self) -> u64 {
+        // TODO: Read capacity from VirtIO config space
+        1024 * 1024 // Dummy 4GB for now
+    }
+
+    fn name(&self) -> &'static str {
+        "VirtIO"
     }
 }
 
-/// Global wrapper to write a block to the first available VirtIO device
-pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    let mut devices = BLOCK_DEVICES.lock();
-    if let Some(dev) = devices.get_mut(0) {
-        dev.write_block(block_num, buffer)
-    } else {
-        Err("No VirtIO block device found")
+/// Global hook for reading block (for legacy bcache compatibility)
+pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+    if let Some(dev) = crate::storage::get_device(0) {
+        if dev.name() == "VirtIO" {
+            return dev.read(block_num, buffer);
+        }
     }
+    Err("VirtIO device not found")
+}
+
+/// Global hook for writing block
+pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+    if let Some(dev) = crate::storage::get_device(0) {
+        if dev.name() == "VirtIO" {
+            return dev.write(block_num, buffer);
+        }
+    }
+    Err("VirtIO device not found")
 }
 
 /// Check if a VirtIO GPU was initialized
@@ -2745,6 +2790,8 @@ use crate::scheme::{Scheme, Stat, error as scheme_error};
 struct OpenDisk {
     disk_idx: usize,
     offset: u64, // offset in bytes
+    /// When true, use bcache (AHCI/ATA) instead of VirtIO BLOCK_DEVICES
+    use_bcache: bool,
 }
 
 static OPEN_DISKS: Mutex<alloc::vec::Vec<Option<OpenDisk>>> = Mutex::new(alloc::vec::Vec::new());
@@ -2754,38 +2801,58 @@ pub struct DiskScheme;
 impl Scheme for DiskScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
         let disk_idx = path.parse::<usize>().map_err(|_| scheme_error::EINVAL)?;
-        
-        let devices = BLOCK_DEVICES.lock();
-        if disk_idx >= devices.len() {
+
+        let storage_device = crate::storage::get_device(disk_idx);
+        if storage_device.is_none() {
+            serial::serial_print("[DISK-SCHEME] open failed: disk_idx=");
+            serial::serial_print_dec(disk_idx as u64);
+            serial::serial_print(" not found (Storage device count=");
+            serial::serial_print_dec(crate::storage::device_count() as u64);
+            serial::serial_print(")\n");
             return Err(scheme_error::ENOENT);
         }
+
+        // For now, DiskScheme handle still needs to know if it's using bcache or not.
+        // Actually, we can make all devices use BCache if we want, or none.
+        // Let's decide based on whether it's a VirtIO device or not (legacy behavior).
+        // BUT, if we have a unified BlockDevice trait, we can just use BCache for everything.
+        
+        let use_bcache = true; // Use BCache for everything for consistency
 
         let mut open_disks = OPEN_DISKS.lock();
         for (i, slot) in open_disks.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(OpenDisk { disk_idx, offset: 0 });
+                *slot = Some(OpenDisk { disk_idx, offset: 0, use_bcache });
                 return Ok(i);
             }
         }
-        
+
         let id = open_disks.len();
-        open_disks.push(Some(OpenDisk { disk_idx, offset: 0 }));
+        open_disks.push(Some(OpenDisk { disk_idx, offset: 0, use_bcache }));
         Ok(id)
     }
 
     fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
-        let mut devices = BLOCK_DEVICES.lock();
         let mut open_disks = OPEN_DISKS.lock();
         let open_disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
-        
+
         // Convert byte offset to block number
         let block_num = open_disk.offset / 4096;
         let offset_in_block = (open_disk.offset % 4096) as usize;
-        
+
         let mut temp_block = alloc::vec![0u8; 4096];
-        let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
-        
-        if let Err(e) = device.read_block(block_num, &mut temp_block) {
+        let read_ok = if open_disk.use_bcache {
+            crate::bcache::read_block(open_disk.disk_idx, block_num, &mut temp_block).is_ok()
+        } else {
+            let mut devices = BLOCK_DEVICES.lock();
+            if let Some(device) = devices.get_mut(open_disk.disk_idx) {
+                device.read(block_num, &mut temp_block).is_ok()
+            } else {
+                false
+            }
+        };
+
+        if !read_ok {
             serial::serial_print("[DISK-SCHEME] read_block failed for disk ");
             serial::serial_print_dec(open_disk.disk_idx as u64);
             serial::serial_print(" block ");
@@ -2793,18 +2860,70 @@ impl Scheme for DiskScheme {
             serial::serial_print("\n");
             return Err(scheme_error::EIO);
         }
-        
+
         let available = 4096 - offset_in_block;
         let to_copy = core::cmp::min(buffer.len(), available);
-        
+
         buffer[..to_copy].copy_from_slice(&temp_block[offset_in_block..offset_in_block + to_copy]);
-        
+
         open_disk.offset += to_copy as u64;
         Ok(to_copy)
     }
 
-    fn write(&self, _id: usize, _buffer: &[u8]) -> Result<usize, usize> {
-        Err(scheme_error::EIO) // Read-only for now
+    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+        let mut open_disks = OPEN_DISKS.lock();
+        let open_disk = open_disks.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
+
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let block_num = open_disk.offset / 4096;
+        let offset_in_block = (open_disk.offset % 4096) as usize;
+
+        if open_disk.use_bcache {
+            if offset_in_block != 0 || buffer.len() != 4096 {
+                // Partial block write: read-modify-write
+                let mut temp_block = alloc::vec![0u8; 4096];
+                if crate::bcache::read_block(open_disk.disk_idx, block_num, &mut temp_block).is_err() {
+                    return Err(scheme_error::EIO);
+                }
+                let to_copy = core::cmp::min(buffer.len(), 4096 - offset_in_block);
+                temp_block[offset_in_block..offset_in_block + to_copy].copy_from_slice(&buffer[..to_copy]);
+                if crate::bcache::write_block(open_disk.disk_idx, block_num, &temp_block).is_err() {
+                    return Err(scheme_error::EIO);
+                }
+                open_disk.offset += to_copy as u64;
+                return Ok(to_copy);
+            }
+            if crate::bcache::write_block(open_disk.disk_idx, block_num, buffer).is_err() {
+                return Err(scheme_error::EIO);
+            }
+            open_disk.offset += buffer.len() as u64;
+            Ok(buffer.len())
+        } else {
+            let mut devices = BLOCK_DEVICES.lock();
+            let device = devices.get_mut(open_disk.disk_idx).ok_or(scheme_error::EIO)?;
+            let mut temp_block = alloc::vec![0u8; 4096];
+            if offset_in_block != 0 || buffer.len() != 4096 {
+                if device.read(block_num, &mut temp_block).is_err() {
+                    return Err(scheme_error::EIO);
+                }
+                let to_copy = core::cmp::min(buffer.len(), 4096 - offset_in_block);
+                temp_block[offset_in_block..offset_in_block + to_copy].copy_from_slice(&buffer[..to_copy]);
+                if device.write(block_num, &temp_block).is_err() {
+                    return Err(scheme_error::EIO);
+                }
+                open_disk.offset += to_copy as u64;
+                Ok(to_copy)
+            } else {
+                if device.write(block_num, buffer).is_err() {
+                    return Err(scheme_error::EIO);
+                }
+                open_disk.offset += buffer.len() as u64;
+                Ok(buffer.len())
+            }
+        }
     }
 
     fn lseek(&self, id: usize, offset: isize, whence: usize) -> Result<usize, usize> {

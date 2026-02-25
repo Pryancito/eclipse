@@ -195,6 +195,9 @@ fn show_help() {
     println!("  - Haz una copia de seguridad de tus datos importantes");
     println!("  - Asegúrate de seleccionar el disco correcto");
     println!();
+    println!("Discos soportados:");
+    println!("  - NVMe, SATA/AHCI, VirtIO, IDE/ATA");
+    println!();
     println!("Proceso de instalación:");
     println!("  1. Selección del disco de destino");
     println!("  2. Creación de particiones (EFI + Root)");

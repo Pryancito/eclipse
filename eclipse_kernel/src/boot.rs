@@ -1,5 +1,7 @@
 //! Inicialización del sistema y GDT
 
+use crate::memory::PHYS_MEM_OFFSET;
+
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +30,16 @@ pub struct BootInfo {
     pub rsdp_addr: u64,
 }
 
+/// Framebuffer source for gpu_present
+#[derive(Clone, Copy, PartialEq)]
+pub enum FbSource {
+    VirtIO,
+    Uefi,
+}
+
+/// VirtIO GPU resource ID for display buffer (must match virtio.rs)
+pub const VIRTIO_DISPLAY_RESOURCE_ID: u32 = 2;
+
 /// Static storage for BootInfo
 /// We use a single Option<BootInfo> to store the copy of the boot info
 /// Initialized to Some(dummy) to force it into .data section instead of .bss
@@ -52,23 +64,12 @@ static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
 /// Initialize boot info from the pointer passed by the bootloader
 pub fn init(boot_info_ptr: u64) {
     if boot_info_ptr == 0 {
-        panic!("BootInfo pointer is null in boot::init");
+        return;
     }
     
     unsafe {
-        crate::serial::serial_print("[BOOT] Initializing BootInfo storage...\n");
         let boot_info_ref = &*(boot_info_ptr as *const BootInfo);
         BOOT_INFO = Some(*boot_info_ref);
-        
-        crate::serial::serial_print("[BOOT] BootInfo stored at: ");
-        crate::serial::serial_print_hex(&raw const BOOT_INFO as u64);
-        crate::serial::serial_print("\n");
-        
-        if let Some(bi) = &BOOT_INFO {
-            crate::serial::serial_print("[BOOT] Framebuffer base: ");
-            crate::serial::serial_print_hex(bi.framebuffer.base_address);
-            crate::serial::serial_print("\n");
-        }
     }
 }
 
@@ -87,6 +88,28 @@ pub fn get_framebuffer_info() -> u64 {
         }
         0
     }
+}
+
+/// Try to get framebuffer info. Prefer GOP (bootloader) over VirtIO for real hardware (e.g. NVIDIA).
+pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
+    // 1. GOP framebuffer from bootloader (UEFI) - primary for real hardware
+    let fi = unsafe { &BOOT_INFO.as_ref()?.framebuffer };
+    if fi.base_address != 0 && fi.base_address != 0xDEADBEEF && fi.width > 0 && fi.height > 0 {
+        let phys = if fi.base_address >= 0xFFFF_8000_0000_0000 {
+            fi.base_address.saturating_sub(PHYS_MEM_OFFSET)
+        } else {
+            fi.base_address
+        };
+        let pitch = fi.pixels_per_scan_line * 4;
+        return Some((phys, fi.width, fi.height, pitch, FbSource::Uefi));
+    }
+    // 2. VirtIO display (fallback when no GOP, e.g. QEMU no_gop)
+    if let Some((phys, w, h, pitch, _size)) = crate::virtio::get_primary_virtio_display() {
+        if phys != 0 && w > 0 && h > 0 {
+            return Some((phys, w, h, pitch, FbSource::VirtIO));
+        }
+    }
+    None
 }
 
 /// Descriptor de la GDT
