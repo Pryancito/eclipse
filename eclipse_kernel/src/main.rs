@@ -287,7 +287,11 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     progress::bar(87);
     
     serial::serial_print("[INIT] Initializing USB HID...\n");
-    usb_hid::init(); // enable USB HID testing
+    if crate::cpu::is_running_under_hypervisor() {
+        usb_hid::init(); // enable USB HID testing under QEMU/KVM
+    } else {
+        serial::serial_print("[INIT] Skipping experimental USB HID on bare metal (avoiding BSOD)\n");
+    }
     progress::bar(88);
     
     serial::serial_print("[INIT] Initializing NVIDIA...\n");

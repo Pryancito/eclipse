@@ -344,6 +344,85 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 // ============================================================================
+// Kernel Fault Recovery (setjmp/longjmp style)
+// ============================================================================
+
+/// Saved CPU state for fault recovery. When active, page faults and GP faults
+/// will restore this state and jump back to the caller with RAX=1 (= error)
+/// instead of triggering a BSOD. Clear with `clear_recovery_point()` after.
+#[repr(C)]
+pub struct KernelRecoveryPoint {
+    /// return RIP to jump to on fault (the instruction after the `set_recovery_point` call site)
+    pub rip:    u64,
+    pub rsp:    u64,
+    pub rbp:    u64,
+    pub rbx:    u64,
+    pub r12:    u64,
+    pub r13:    u64,
+    pub r14:    u64,
+    pub r15:    u64,
+    pub rflags: u64,
+    /// Non-zero = recovery point is active
+    pub active: u64,
+}
+
+impl KernelRecoveryPoint {
+    pub const fn new() -> Self {
+        Self { rip: 0, rsp: 0, rbp: 0, rbx: 0, r12: 0, r13: 0, r14: 0, r15: 0, rflags: 0, active: 0 }
+    }
+}
+
+/// Global recovery point (one per CPU — currently single-CPU kernel).
+pub static mut KERNEL_RECOVERY: KernelRecoveryPoint = KernelRecoveryPoint::new();
+
+/// Set a kernel recovery point. Returns `false` on first call (normal path).
+/// If a fault fires, execution resumes here and returns `true` (error path).
+///
+/// # Safety
+/// Must be called from kernel context (Ring 0) only.
+/// The recovery point is NOT re-entrant; only one level of nesting is supported.
+/// Always pair with `clear_recovery_point()` once the risky section is done.
+#[inline(never)]
+pub unsafe fn set_recovery_point() -> bool {
+    let result: u64;
+    // Pass the struct pointer as an `in(reg)` so the compiler emits a
+    // 64-bit address materialisation (mov rXX, imm64 + lea), avoiding
+    // R_X86_64_32S relocations that can't reach higher-half addresses.
+    let rec_ptr: u64 = &raw mut KERNEL_RECOVERY as u64;
+    core::arch::asm!(
+        // rax already holds rec_ptr (passed as inout)
+        // Capture the resume RIP via a forward LEA to label 2:
+        "lea {rip_val}, [rip + 2f]",
+        "mov [{rec} + 0],  {rip_val}",  // recovery.rip
+        "mov [{rec} + 8],  rsp",         // recovery.rsp
+        "mov [{rec} + 16], rbp",         // recovery.rbp
+        "mov [{rec} + 24], rbx",         // recovery.rbx
+        "mov [{rec} + 32], r12",         // recovery.r12
+        "mov [{rec} + 40], r13",         // recovery.r13
+        "mov [{rec} + 48], r14",         // recovery.r14
+        "mov [{rec} + 56], r15",         // recovery.r15
+        "pushfq",
+        "pop  {rip_val}",
+        "mov [{rec} + 64], {rip_val}",  // recovery.rflags
+        "mov qword ptr [{rec} + 72], 1",// recovery.active = 1
+        "xor eax, eax",                 // return 0 = false (normal path)
+        "2:",
+        // On fault, handler restores state and jumps here with rax=1
+        rec     = in(reg) rec_ptr,
+        rip_val = out(reg) _,
+        out("rax") result,
+        options(nostack),
+    );
+    result != 0
+}
+
+/// Clear the active recovery point so faults revert to BSOD behaviour.
+#[inline]
+pub unsafe fn clear_recovery_point() {
+    core::ptr::write_volatile(&raw mut KERNEL_RECOVERY.active, 0);
+}
+
+// ============================================================================
 // Exception Handlers
 // ============================================================================
 
@@ -447,7 +526,60 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     }
     
     if num == 3 { return; } // Breakpoint: return to let common_handler continue
-    
+
+    // ---- Fault Recovery: if a recovery point is active, longjmp back ----
+    // Only intercept Page Fault (#PF=14) and General Protection (#GP=13) here,
+    // since those are the faults that can arise from probing unmapped MMIO.
+    if num == 14 || num == 13 {
+        let active = unsafe { core::ptr::read_volatile(&raw const KERNEL_RECOVERY.active) };
+        if active != 0 {
+            crate::serial::serial_printf(format_args!(
+                "[RECOVERY] Fault #{} at RIP={:#018x} CR2={:#018x} — jumping to recovery point\n",
+                num, rip, cr2
+            ));
+            // Deactivate the recovery point *before* restoring state so a fault
+            // inside the handler itself doesn't loop forever.
+            unsafe { core::ptr::write_volatile(&raw mut KERNEL_RECOVERY.active, 0); }
+
+            // Restore saved state and return to the saved RIP with RAX=1
+            // (signals `set_recovery_point()` returned `true` = error).
+            unsafe {
+                let rec_ptr: u64 = &raw const KERNEL_RECOVERY as u64;
+                core::arch::asm!(
+                    "mov rsp, [rcx +  8]",  // restore rsp
+                    "mov rbp, [rcx + 16]",  // restore rbp
+                    "mov rbx, [rcx + 24]",  // restore rbx
+                    "mov r12, [rcx + 32]",
+                    "mov r13, [rcx + 40]",
+                    "mov r14, [rcx + 48]",
+                    "mov r15, [rcx + 56]",
+                    "push qword ptr [rcx + 64]",  // rflags
+                    "popfq",
+                    "mov rax, 1",                   // return value = true (fault occurred)
+                    "jmp qword ptr [rcx +  0]",   // jump to saved rip
+                    in("rcx") rec_ptr,
+                    options(noreturn)
+                );
+            }
+        }
+    }
+    // ---- End Fault Recovery ----
+
+    // Mostrar BSOD en pantalla
+    crate::progress::bsod(&crate::progress::BsodInfo {
+        exception_num: num,
+        error_code:    err,
+        rip, rsp, cr2, cr3,
+        rax, rbx, rcx, rdx,
+        rsi, rdi, rbp,
+        r8, r9, r10, r11,
+        r12, r13, r14, r15,
+        rflags: rfl,
+        cs, ss,
+        cpu_id: cpu_id as u64,
+        pid:    pid    as u64,
+    });
+
     loop { 
         unsafe { asm!("hlt") } 
     }
