@@ -1378,21 +1378,21 @@ EOF
     # 3. Ensamblar la imagen final con tabla GPT
     print_status "Ensamblando imagen final $IMG_FILE..."
     rm -f "$IMG_FILE"
-    truncate -s 2100M "$IMG_FILE"
+    truncate -s 700M "$IMG_FILE"
     
     # Usar parted en el archivo local (no requiere sudo para archivos)
     PARTED_CMD="parted"
     "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 513MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 101MiB
     "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 513MiB 2013MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 101MiB 601MiB
     
     # Escribir las particiones en los offsets correctos usando dd
     print_status "Escribiendo particiones en la imagen final..."
     # Offset 1MiB = seek 1 con bs=1M
     dd if="$ESP_IMG" of="$IMG_FILE" bs=1M seek=1 conv=notrunc status=none
-    # Offset 513MiB = seek 513 con bs=1M
-    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=513 conv=notrunc status=none
+    # Offset 101MiB = seek 101 con bs=1M
+    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=101 conv=notrunc status=none
     
     # Limpieza de archivos temporales
     rm -f "$ESP_IMG" "$ROOT_IMG"

@@ -38,8 +38,9 @@ fn alloc_error_handler(layout: Layout) -> ! {
 
 /// Block size
 const BLOCK_SIZE: usize = 4096;
-/// Partition offset (same as kernel for now)
-const PARTITION_OFFSET_BLOCKS: u64 = 131328;
+/// Partition offset: FAT32 occupies 1MiB–101MiB (100MB), EclipseFS starts at 101MiB.
+/// 101 MiB / 4096 bytes per block = 25856 blocks
+const PARTITION_OFFSET_BLOCKS: u64 = 25856;
 
 /// Block Device Wrapper
 struct BlockDevice {
@@ -249,7 +250,7 @@ pub extern "C" fn _start() -> ! {
                     Err(e) => {
                         println!("[FS-SERVICE]   {} — no EclipseFS at block {} ({})",
                             device_name, PARTITION_OFFSET_BLOCKS, e);
-                        println!("[FS-SERVICE]   (EFI partition must occupy 1MiB–513MiB so root starts at 513MiB)");
+                        println!("[FS-SERVICE]   (EFI partition must occupy 1MiB–101MiB so root starts at 101MiB)");
                     }
                 }
             },
