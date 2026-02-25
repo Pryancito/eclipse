@@ -1,11 +1,11 @@
 //! NVMe (NVM Express) Driver
 //!
 //! Uses the nvme-oxide crate for PCIe NVMe disk access.
-//! Integrates with bcache for block I/O.
+//! Supports multiple NVMe controllers and all namespaces on each controller.
+//! Each namespace is registered as an independent block device (disk:N).
 
-use spin::Mutex;
-use nvme_oxide::{Dma, NVMeDev};
 use alloc::sync::Arc;
+use nvme_oxide::{Dma, NVMeDev};
 use crate::{memory, serial, pci};
 
 /// Eclipse OS implementation of the nvme-oxide Dma trait.
@@ -36,140 +36,175 @@ impl Dma for EclipseNvmeDma {
         memory::virt_to_phys(va as u64) as usize
     }
 
-    fn page_size(&self) -> usize {
-        4096
-    }
+    fn page_size(&self) -> usize { 4096 }
 }
 
-static NVME_DEV: Mutex<Option<Arc<NVMeDev<EclipseNvmeDma>>>> = Mutex::new(None);
-static NVME_NS: Mutex<Option<Arc<nvme_oxide::Ns<EclipseNvmeDma>>>> = Mutex::new(None);
-static NVME_BLK_SZ: Mutex<usize> = Mutex::new(4096);
+// ── Eclipse OS block size ────────────────────────────────────────────────────
 
-/// Initialize NVMe driver if a controller is present.
-pub fn init() {
-    let nvme_dev = pci::find_nvme_controller();
-    let Some(dev) = nvme_dev else {
-        return;
-    };
+/// Block size used by the Eclipse OS storage layer (4 KiB).
+const ECLIPSE_BLOCK_SIZE: usize = 4096;
 
-    let bar0_phys = unsafe { pci::get_bar(&dev, 0) };
-    let bar0_phys = (bar0_phys & !0xF) as usize;
-    if bar0_phys == 0 {
-        serial::serial_print("[NVMe] No valid BAR0\n");
-        return;
-    }
+// ── NvmeDisk — one NVMe namespace exposed as a block device ─────────────────
 
-    unsafe { pci::enable_device(&dev, true); }
-
-    let dma = EclipseNvmeDma;
-    match NVMeDev::new(bar0_phys, dma) {
-        Ok(arc_dev) => {
-            serial::serial_print("[NVMe] Controller initialized\n");
-
-            let ns = arc_dev.ns(1).or_else(|| arc_dev.ns_list().first().cloned());
-            if let Some(ns) = ns {
-                let blk_sz = ns.blk_sz();
-                let blk_cnt = ns.blk_cnt();
-                serial::serial_print("[NVMe] NS1: blk_sz=");
-                serial::serial_print_dec(blk_sz as u64);
-                serial::serial_print(" blk_cnt=");
-                serial::serial_print_dec(blk_cnt);
-                serial::serial_print("\n");
-
-                *NVME_DEV.lock() = Some(arc_dev);
-                *NVME_NS.lock() = Some(ns);
-                *NVME_BLK_SZ.lock() = blk_sz;
-
-                crate::storage::register_device(Arc::new(NvmeDisk));
-            } else {
-                serial::serial_print("[NVMe] No namespace found\n");
-            }
-        }
-        Err(_e) => {
-            serial::serial_print("[NVMe] Init failed\n");
-        }
-    }
+struct NvmeDisk {
+    /// The NVMe namespace Arc — keeps both namespace and device alive.
+    ns: Arc<nvme_oxide::Ns<EclipseNvmeDma>>,
+    /// NVMe logical block size in bytes (typically 512 or 4096).
+    blk_sz: usize,
+    /// Drive capacity expressed in 4096-byte Eclipse blocks.
+    total_blocks: u64,
+    /// Keeps the NVMeDev (and its DMA allocations) alive for the lifetime
+    /// of this disk handle, even if no other Arc to the device exists.
+    _dev: Arc<NVMeDev<EclipseNvmeDma>>,
 }
 
-struct NvmeDisk;
+// NvmeDisk holds raw pointers inside nvme-oxide types.  Eclipse OS runs a
+// cooperative, single-threaded kernel scheduler, so cross-thread aliasing
+// cannot occur in practice.
+unsafe impl Send for NvmeDisk {}
+unsafe impl Sync for NvmeDisk {}
 
 impl crate::storage::BlockDevice for NvmeDisk {
     fn read(&self, block: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-        read_block(block, buffer)
+        if buffer.len() != ECLIPSE_BLOCK_SIZE {
+            return Err("Buffer must be 4096 bytes");
+        }
+        if self.blk_sz == 0 {
+            return Err("NVMe: zero block size");
+        }
+        if self.blk_sz >= ECLIPSE_BLOCK_SIZE {
+            // e.g. blk_sz == 4096: one NVMe block = one Eclipse block.
+            self.ns.read(block, buffer).map_err(|_| "NVMe read failed")
+        } else {
+            // e.g. blk_sz == 512: read multiple NVMe sectors per Eclipse block.
+            let spb = (ECLIPSE_BLOCK_SIZE / self.blk_sz) as u64; // sectors per block
+            let lba_base = block * spb;
+            let mut off = 0usize;
+            for i in 0..spb {
+                self.ns.read(lba_base + i, &mut buffer[off..off + self.blk_sz])
+                    .map_err(|_| "NVMe read failed")?;
+                off += self.blk_sz;
+            }
+            Ok(())
+        }
     }
 
     fn write(&self, block: u64, buffer: &[u8]) -> Result<(), &'static str> {
-        write_block(block, buffer)
-    }
-
-    fn capacity(&self) -> u64 {
-        let ns = NVME_NS.lock();
-        if let Some(ns) = ns.as_ref() {
-            let blk_sz = *NVME_BLK_SZ.lock();
-            let sectors_per_block = 4096 / blk_sz as u64;
-            ns.blk_cnt() / sectors_per_block
+        if buffer.len() != ECLIPSE_BLOCK_SIZE {
+            return Err("Buffer must be 4096 bytes");
+        }
+        if self.blk_sz == 0 {
+            return Err("NVMe: zero block size");
+        }
+        if self.blk_sz >= ECLIPSE_BLOCK_SIZE {
+            self.ns.write(block, buffer).map_err(|_| "NVMe write failed")
         } else {
-            0
+            let spb = (ECLIPSE_BLOCK_SIZE / self.blk_sz) as u64;
+            let lba_base = block * spb;
+            let mut off = 0usize;
+            for i in 0..spb {
+                self.ns.write(lba_base + i, &buffer[off..off + self.blk_sz])
+                    .map_err(|_| "NVMe write failed")?;
+                off += self.blk_sz;
+            }
+            Ok(())
         }
     }
 
-    fn name(&self) -> &'static str {
-        "NVMe"
+    fn capacity(&self) -> u64 { self.total_blocks }
+
+    fn name(&self) -> &'static str { "NVMe" }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Initialise NVMe drivers for every detected controller.
+/// Each namespace on each controller is registered as an independent block device.
+pub fn init() {
+    let controllers = pci::find_all_nvme_controllers();
+    if controllers.is_empty() {
+        return;
+    }
+    for (idx, dev) in controllers.iter().enumerate() {
+        serial::serial_print("[NVMe] Initialising controller ");
+        serial::serial_print_dec(idx as u64);
+        serial::serial_print("\n");
+        init_controller(dev);
     }
 }
 
-fn read_ns(lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    let ns = NVME_NS.lock();
-    let Some(ns) = ns.as_ref() else { return Err("No NVMe namespace"); };
-    ns.read(lba, buf).map_err(|_| "NVMe read failed")
-}
-
-fn write_ns(lba: u64, buf: &[u8]) -> Result<(), &'static str> {
-    let ns = NVME_NS.lock();
-    let Some(ns) = ns.as_ref() else { return Err("No NVMe namespace"); };
-    ns.write(lba, buf).map_err(|_| "NVMe write failed")
-}
-
-/// Read one 4096-byte block. Bcache uses 4096; NVMe may use 512 or 4096.
-pub fn read_block(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
-    if buffer.len() != 4096 {
-        return Err("Buffer must be 4096 bytes");
+fn init_controller(dev: &pci::PciDevice) {
+    // NVMe BAR0 is the 64-bit MMIO Controller Memory Buffer (CMB).
+    let bar0_raw = unsafe { pci::get_bar(dev, 0) };
+    let bar0_phys = (bar0_raw & !0xF) as usize;
+    if bar0_phys == 0 {
+        serial::serial_print("[NVMe] No valid BAR0 — skipping controller\n");
+        return;
     }
-    let blk_sz = *NVME_BLK_SZ.lock();
-    if blk_sz == 4096 {
-        read_ns(block_num, buffer)
-    } else {
-        let lba_base = block_num * 8;
-        let mut off = 0;
-        for i in 0..8 {
-            let sector = &mut buffer[off..off + 512];
-            read_ns(lba_base + i, sector)?;
-            off += 512;
+
+    unsafe { pci::enable_device(dev, true); }
+
+    match NVMeDev::new(bar0_phys, EclipseNvmeDma) {
+        Ok(arc_dev) => {
+            // ns_list() returns a borrowed slice; clone into an owned Vec so we
+            // can append the NS-1 fallback when the list is empty.
+            let mut namespaces: alloc::vec::Vec<Arc<nvme_oxide::Ns<EclipseNvmeDma>>> =
+                arc_dev.ns_list().to_vec();
+            if namespaces.is_empty() {
+                if let Some(ns1) = arc_dev.ns(1) {
+                    namespaces.push(ns1);
+                } else {
+                    serial::serial_print("[NVMe] No namespaces found\n");
+                    return;
+                }
+            }
+
+            for ns in namespaces {
+                let blk_sz  = ns.blk_sz();
+                let blk_cnt = ns.blk_cnt();
+
+                if blk_sz == 0 {
+                    serial::serial_print("[NVMe] Namespace with blk_sz=0, skipping\n");
+                    continue;
+                }
+
+                // Convert raw NVMe block count to 4096-byte Eclipse blocks.
+                let total_blocks = if blk_sz >= ECLIPSE_BLOCK_SIZE {
+                    blk_cnt * (blk_sz / ECLIPSE_BLOCK_SIZE) as u64
+                } else {
+                    blk_cnt / (ECLIPSE_BLOCK_SIZE / blk_sz) as u64
+                };
+
+                serial::serial_print("[NVMe] NS blk_sz=");
+                serial::serial_print_dec(blk_sz as u64);
+                serial::serial_print(" blk_cnt=");
+                serial::serial_print_dec(blk_cnt);
+                serial::serial_print(" -> ");
+                serial::serial_print_dec(total_blocks);
+                serial::serial_print(" 4KiB blocks\n");
+
+                crate::storage::register_device(Arc::new(NvmeDisk {
+                    ns,
+                    blk_sz,
+                    total_blocks,
+                    _dev: arc_dev.clone(),
+                }));
+            }
         }
-        Ok(())
-    }
-}
-
-/// Write one 4096-byte block.
-pub fn write_block(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
-    if buffer.len() != 4096 {
-        return Err("Buffer must be 4096 bytes");
-    }
-    let blk_sz = *NVME_BLK_SZ.lock();
-    if blk_sz == 4096 {
-        write_ns(block_num, buffer)
-    } else {
-        let lba_base = block_num * 8;
-        let mut off = 0;
-        for i in 0..8 {
-            write_ns(lba_base + i, &buffer[off..off + 512])?;
-            off += 512;
+        Err(_) => {
+            serial::serial_print("[NVMe] Controller init failed\n");
         }
-        Ok(())
     }
 }
 
-/// Check if NVMe driver is available.
+/// Returns `true` if at least one NVMe block device has been registered.
 pub fn is_available() -> bool {
-    NVME_NS.lock().is_some()
+    for i in 0..crate::storage::device_count() {
+        if let Some(dev) = crate::storage::get_device(i) {
+            if dev.name() == "NVMe" {
+                return true;
+            }
+        }
+    }
+    false
 }

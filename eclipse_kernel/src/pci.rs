@@ -453,11 +453,16 @@ const PCI_SUBCLASS_NVME: u8 = 0x08;
 
 /// Find first NVMe controller
 pub fn find_nvme_controller() -> Option<PciDevice> {
+    find_all_nvme_controllers().into_iter().next()
+}
+
+/// Find all NVMe controllers
+pub fn find_all_nvme_controllers() -> alloc::vec::Vec<PciDevice> {
     let devices = PCI_DEVICES.lock();
-    devices.iter().find(|dev| {
+    devices.iter().filter(|dev| {
         dev.class_code == PCI_CLASS_STORAGE
             && dev.subclass == PCI_SUBCLASS_NVME
-    }).copied()
+    }).copied().collect()
 }
 
 /// Find first SATA AHCI controller
