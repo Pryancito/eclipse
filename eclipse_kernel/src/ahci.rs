@@ -79,8 +79,13 @@ const SECTORS_PER_BLOCK: u64 = (AHCI_BLOCK_SIZE / SECTOR_SIZE) as u64;
 // 1 000 000 iterations ≈ 3–10 ms — more than enough for the required ≥ 1 ms holds.
 /// Iterations used to hold COMRESET asserted for ≥ 1 ms before releasing.
 const COMRESET_HOLD_ITERATIONS: u32 = 1_000_000;
-/// Iterations used after HBA reset to let the controller and PHY stabilise.
+/// Iterations used after HBA reset to let the controller and PHY stabilise (~1 ms initial).
 const HBA_STABILIZE_ITERATIONS: u32 = 1_000_000;
+/// Maximum iterations to wait for any port to show DET≠0 after HBA reset (~2 s on 3 GHz).
+/// Real SATA drives can take up to 2 seconds for link negotiation after a hard reset.
+const HBA_LINK_WAIT_ITERATIONS: u32 = 200_000_000;
+/// Maximum iterations to wait for TFD.BSY=0 after DET=3 (~1 s on 3 GHz).
+const TFD_BSY_WAIT_ITERATIONS: u32 = 100_000_000;
 
 // ── AHCI DMA structures (must match AHCI spec layout exactly) ────────────────
 
@@ -258,6 +263,29 @@ impl AhciPort {
             serial::serial_print_hex(self.preg(PORT_SSTS) as u64);
             serial::serial_print(")\n");
             return false;
+        }
+
+        // 6.5. Wait for TFD.STS.BSY and TFD.STS.DRQ to clear.
+        // After DET=3, real drives may still be performing their internal reset
+        // (ATA signature detection, spin-up, etc.).  Issuing commands while BSY=1
+        // causes them to be rejected on real hardware.
+        let mut tfd_timeout = TFD_BSY_WAIT_ITERATIONS;
+        loop {
+            let tfd = self.preg(PORT_TFD);
+            // BSY = bit 7, DRQ = bit 3
+            if tfd & 0x88 == 0 {
+                break;
+            }
+            if tfd_timeout == 0 {
+                serial::serial_print("[AHCI] Port ");
+                serial::serial_print_dec(self.port_index as u64);
+                serial::serial_print(": TFD BSY/DRQ did not clear (TFD=");
+                serial::serial_print_hex(tfd as u64);
+                serial::serial_print("), proceeding anyway\n");
+                break;
+            }
+            tfd_timeout -= 1;
+            core::hint::spin_loop();
         }
 
         // 7. Clear any errors that accumulated during bring-up
@@ -571,7 +599,7 @@ fn init_controller(dev: &pci::PciDevice) {
     // Re-assert AHCI Enable (some controllers clear AE on reset)
     hwreg(base, HBA_GHC, GHC_AE);
 
-    // Let the HBA and PHY layers stabilise (~1 ms on real hardware)
+    // Let the HBA and PHY layers stabilise (~1 ms initial delay)
     for _ in 0..HBA_STABILIZE_ITERATIONS { core::hint::spin_loop(); }
 
     // ── 5. Read capabilities and port bitmask ────────────────────────────────
@@ -586,6 +614,32 @@ fn init_controller(dev: &pci::PciDevice) {
     serial::serial_print(" PI=");
     serial::serial_print_hex(pi as u64);
     serial::serial_print("\n");
+
+    // On real hardware, SATA link negotiation after a global HBA reset can take
+    // up to 2 seconds.  Wait until at least one implemented port shows DET≠0
+    // (device present) before we proceed, so that the per-port DET=0 skip below
+    // does not prematurely discard a drive that is still negotiating.
+    let mut link_wait = HBA_LINK_WAIT_ITERATIONS;
+    loop {
+        let mut any_det = false;
+        for p in 0u32..32 {
+            if pi & (1 << p) == 0 { continue; }
+            let pb = base + 0x100 + (p as u64 * 0x80);
+            let det = unsafe {
+                core::ptr::read_volatile((pb + PORT_SSTS as u64) as *const u32)
+            } & 0x0F;
+            if det != 0 {
+                any_det = true;
+                break;
+            }
+        }
+        if any_det || link_wait == 0 { break; }
+        link_wait -= 1;
+        core::hint::spin_loop();
+    }
+    if link_wait == 0 {
+        serial::serial_print("[AHCI] Warning: no port showed DET≠0 within link-wait timeout\n");
+    }
 
     // ── 6. Initialise every implemented port ─────────────────────────────────
     let mut registered = 0usize;
@@ -605,8 +659,10 @@ fn init_controller(dev: &pci::PciDevice) {
         serial::serial_print_hex(ssts as u64);
         serial::serial_print("\n");
 
-        // DET=0: no device.  DET=4: offline.  DET=1 or 3: present (init will sort it out).
-        if det == 0 || det == 4 { continue; }
+        // DET=4 means the port is offline/disabled — skip it.
+        // DET=0 still gets a chance: the per-port init() issues COMRESET and
+        // waits up to ~3 s for the link to come up.
+        if det == 4 { continue; }
 
         // Allocate aligned DMA structures for this port
         let (cl_virt, cl_phys) = alloc_dma(1024, 1024); // 1 KiB command list
