@@ -289,50 +289,37 @@ impl Filesystem {
             block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
         ]) as usize;
 
-        // Parse TLVs to find CONTENT
-        // We assume headers structure (CONTENT tag) appears in the first few blocks.
-        // We scan up to 16 blocks (64KiB) of metadata to find the tag.
-        let mut tlv_offset_rel = 8; // Skip 8-byte record header
-        let mut content_start_offset_rel = 0;
-        let mut content_length = 0;
+        // Parse TLVs to find CONTENT.
+        // Read two consecutive blocks into a contiguous buffer to correctly handle
+        // TLV headers that may span a block boundary.  All metadata TLVs before
+        // CONTENT are at most ~111 bytes into the record, so two blocks (8 KiB)
+        // are always sufficient to locate the CONTENT TLV header.
+        let mut content_start_offset_rel = 0usize;
+        let mut content_length = 0usize;
         let mut found = false;
 
-        let mut current_block_rel = 0;
-        let mut current_block_buf = block_buffer; // Reuse the buffer
+        let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
+        scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
+        if let Err(_) = read_block_from_device(block_num + 1, &mut scan_buf[BLOCK_SIZE..]) {
+            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(second) failed, TLV scan limited to first block\n");
+        }
+        // Record data begins at offset_in_block within scan_buf.
+        let record_data = &scan_buf[offset_in_block..];
+        let mut tlv_pos = 8usize; // Skip 8-byte record header
 
-        while tlv_offset_rel + 6 <= record_size {
-            let block_idx = (offset_in_block + tlv_offset_rel) / BLOCK_SIZE;
-            let block_off = (offset_in_block + tlv_offset_rel) % BLOCK_SIZE;
-
-            if block_idx > current_block_rel {
-                current_block_rel = block_idx;
-                if current_block_rel >= 16 { break; } // Safety limit
-                if let Err(_) = read_block_from_device(block_num + current_block_rel as u64, &mut current_block_buf) {
-                    break;
-                }
-            }
-
-            // Ensure header doesn't cross block boundary (simple check)
-            if block_off + 6 > BLOCK_SIZE {
-                 // Boundary case: Skip to next block start for next header
-                 tlv_offset_rel += BLOCK_SIZE - block_off;
-                 continue;
-            }
-
-            let tag = u16::from_le_bytes([current_block_buf[block_off], current_block_buf[block_off+1]]);
+        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
+            let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
             let length = u32::from_le_bytes([
-                current_block_buf[block_off+2], current_block_buf[block_off+3], 
-                current_block_buf[block_off+4], current_block_buf[block_off+5]
+                record_data[tlv_pos + 2], record_data[tlv_pos + 3],
+                record_data[tlv_pos + 4], record_data[tlv_pos + 5],
             ]) as usize;
-            
             if tag == tlv_tags::CONTENT {
-                content_start_offset_rel = tlv_offset_rel + 6;
+                content_start_offset_rel = tlv_pos + 6;
                 content_length = length;
                 found = true;
                 break;
             }
-            
-            tlv_offset_rel += 6 + length;
+            tlv_pos += 6 + length;
         }
         
         if !found {
@@ -354,7 +341,6 @@ impl Filesystem {
         // Read data from disk block by block
         let mut bytes_read = 0;
         let mut current_abs_pos = absolute_data_start;
-        let mut block_buffer = current_block_buf; // Take buffer back
         
         while bytes_read < read_len {
             let current_block = (current_abs_pos / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
@@ -1330,58 +1316,57 @@ impl Scheme for FileSystemScheme {
                         let mut block_buffer = vec![0u8; BLOCK_SIZE];
                         
                         if let Ok(_) = read_block_from_device(record_block_start, &mut block_buffer) {
-                             // Simple scan for Metadata TLVs in the first block
-                             let mut scan_offset = 8; // Skip record header
-                             while scan_offset + 6 <= BLOCK_SIZE - offset_in_first_block {
-                                 let idx = offset_in_first_block + scan_offset;
-                                 let tag = u16::from_le_bytes([block_buffer[idx], block_buffer[idx+1]]);
+                             // Read two blocks into a contiguous buffer to handle TLV headers
+                             // that may span a block boundary.
+                             let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
+                             scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
+                             if let Err(_) = read_block_from_device(record_block_start + 1, &mut scan_buf[BLOCK_SIZE..]) {
+                                 serial::serial_print("[FS-DEBUG] fstat: read_block(second) failed, TLV scan limited to first block\n");
+                             }
+                             // Record data begins at offset_in_first_block within scan_buf.
+                             let record_data = &scan_buf[offset_in_first_block..];
+                             let mut scan_offset = 8usize; // Skip record header
+                             while scan_offset + 6 <= record_data.len() {
+                                 let tag = u16::from_le_bytes([record_data[scan_offset], record_data[scan_offset+1]]);
                                  let length = u32::from_le_bytes([
-                                     block_buffer[idx+2], block_buffer[idx+3],
-                                     block_buffer[idx+4], block_buffer[idx+5]
+                                     record_data[scan_offset+2], record_data[scan_offset+3],
+                                     record_data[scan_offset+4], record_data[scan_offset+5]
                                  ]) as usize;
-                                 
-                                 // CRITICAL: Ensure we don't read past the end of the block buffer for the TLV header.
-                                 // We only check if the header + 6 bytes fit. For tags like CONTENT,
-                                 // the length field correctly specifies the full file size, which
-                                 // naturally exceeds a single block.
-                                 if idx + 6 > BLOCK_SIZE {
-                                     serial::serial_print("[FS-DEBUG] TLV header truncated at block end\n");
-                                     break;
-                                 }
 
                                  match tag {
                                      tlv_tags::SIZE => {
-                                          if idx + 6 + 8 <= BLOCK_SIZE {
+                                          if scan_offset + 6 + 8 <= record_data.len() {
                                               stat.size = u64::from_le_bytes([
-                                                  block_buffer[idx+6], block_buffer[idx+7],
-                                                  block_buffer[idx+8], block_buffer[idx+9],
-                                                  block_buffer[idx+10], block_buffer[idx+11],
-                                                  block_buffer[idx+12], block_buffer[idx+13]
+                                                  record_data[scan_offset+6], record_data[scan_offset+7],
+                                                  record_data[scan_offset+8], record_data[scan_offset+9],
+                                                  record_data[scan_offset+10], record_data[scan_offset+11],
+                                                  record_data[scan_offset+12], record_data[scan_offset+13]
                                               ]);
                                               stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
                                           }
                                      }
                                      tlv_tags::MODE => {
-                                          if idx + 6 + 4 <= BLOCK_SIZE {
+                                          if scan_offset + 6 + 4 <= record_data.len() {
                                               stat.mode = u32::from_le_bytes([
-                                                  block_buffer[idx+6], block_buffer[idx+7],
-                                                  block_buffer[idx+8], block_buffer[idx+9]
+                                                  record_data[scan_offset+6], record_data[scan_offset+7],
+                                                  record_data[scan_offset+8], record_data[scan_offset+9]
                                               ]);
                                           }
                                      }
                                      tlv_tags::MTIME => {
-                                          if idx + 6 + 8 <= BLOCK_SIZE {
+                                          if scan_offset + 6 + 8 <= record_data.len() {
                                               stat.mtime = i64::from_le_bytes([
-                                                  block_buffer[idx+6], block_buffer[idx+7],
-                                                  block_buffer[idx+8], block_buffer[idx+9],
-                                                  block_buffer[idx+10], block_buffer[idx+11],
-                                                  block_buffer[idx+12], block_buffer[idx+13]
+                                                  record_data[scan_offset+6], record_data[scan_offset+7],
+                                                  record_data[scan_offset+8], record_data[scan_offset+9],
+                                                  record_data[scan_offset+10], record_data[scan_offset+11],
+                                                  record_data[scan_offset+12], record_data[scan_offset+13]
                                               ]);
                                           }
                                      }
                                      tlv_tags::CONTENT => {
                                          stat.size = length as u64;
                                          stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                                         break; // CONTENT is the last TLV we care about
                                      }
                                      _ => {}
                                  }
