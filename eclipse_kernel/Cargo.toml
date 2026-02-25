@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 # Dependencias básicas para bare metal
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
-simple-ahci = { version = "0.1.1-preview.1", default-features = false }
 nvme-oxide = { version = "0.4", default-features = false }
 x86_64 = { version = "0.14", default-features = false, features = ["abi_x86_interrupt", "inline_asm", "instructions"] }
 volatile = { version = "0.2", default-features = false }

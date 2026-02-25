@@ -25,8 +25,10 @@ const RESTART_DELAY_YIELDS: u32 = 500_000;
 const MAX_RESTARTS: u32 = 0;
 
 /// Wait for filesystem to be mounted.
+/// On real SATA/AHCI hardware the disk may take several seconds to initialise,
+/// so we use a generous timeout (≈30 s worth of yields).
 fn wait_for_filesystem() {
-    const MAX_ATTEMPTS: u32 = 200;
+    const MAX_ATTEMPTS: u32 = 3000;
     let mut attempts = 0;
     loop {
         let fd = open("file:/", O_RDONLY, 0);
