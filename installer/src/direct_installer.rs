@@ -205,10 +205,12 @@ impl DirectInstaller {
             return Err(format!("No se pudo crear tabla GPT en {}: {}", disk.name, String::from_utf8_lossy(&output.stderr)));
         }
 
-        // Crear partición EFI (100MB)
-        println!("   Creando particion EFI (100MB)...");
+        // Crear partición EFI (512MB — debe coincidir con PARTITION_OFFSET_BLOCKS=131328 del kernel)
+        // La partición root EclipseFS debe comenzar en 513MiB del disco físico para que
+        // PARTITION_OFFSET_BLOCKS * 4096 = 131328 * 4096 = 513MiB apunte al superbloque correcto.
+        println!("   Creando particion EFI (512MB)...");
         let output = std::process::Command::new("parted")
-            .args(&[&disk.name, "mkpart", "EFI", "fat32", "1MiB", "100MiB"])
+            .args(&[&disk.name, "mkpart", "EFI", "fat32", "1MiB", "513MiB"])
             .output()
             .map_err(|e| format!("Error ejecutando parted: {}", e))?;
 
@@ -226,10 +228,10 @@ impl DirectInstaller {
             return Err(format!("No se pudo marcar particion EFI como ESP: {}", String::from_utf8_lossy(&output.stderr)));
         }
 
-        // Crear partición root (resto del disco, 100MB)
-        println!("   Creando particion root (resto del disco)...");
+        // Crear partición root (resto del disco, comenzando en 513MiB)
+        println!("   Creando particion root (resto del disco, desde 513MiB)...");
         let output = std::process::Command::new("parted")
-            .args(&[&disk.name, "mkpart", "ROOT", "ext4", "100MiB", "100%"])
+            .args(&[&disk.name, "mkpart", "ROOT", "ext4", "513MiB", "100%"])
             .output()
             .map_err(|e| format!("Error ejecutando parted: {}", e))?;
 

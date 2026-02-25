@@ -211,6 +211,9 @@ pub extern "C" fn _start() -> ! {
     println!("[FS-SERVICE] Starting (PID: {})", pid);
     
     println!("[FS-SERVICE] Probing for root filesystem (disk:0 to disk:7)...");
+    println!("[FS-SERVICE] EclipseFS expected at block {} ({} MiB from disk start)",
+        PARTITION_OFFSET_BLOCKS,
+        (PARTITION_OFFSET_BLOCKS * BLOCK_SIZE as u64) / (1024 * 1024));
     
     let mut found = false;
     for i in 0..8 {
@@ -219,6 +222,8 @@ pub extern "C" fn _start() -> ! {
         
         match BlockDevice::new(&device_name) {
             Ok(device) => {
+                println!("[FS-SERVICE]   {} opened, reading superblock at block {}...",
+                    device_name, PARTITION_OFFSET_BLOCKS);
                 match EclipseFS::mount(&device) {
                     Ok(fs) => {
                         println!("[FS-SERVICE] Valid filesystem found on {}!", device_name);
@@ -241,19 +246,30 @@ pub extern "C" fn _start() -> ! {
                             println!("[FS-SERVICE] Kernel root mount FAILED for {}!", device_name);
                         }
                     },
-                    Err(_) => {
-                        // Not an EclipseFS disk, continue probing
+                    Err(e) => {
+                        println!("[FS-SERVICE]   {} — no EclipseFS at block {} ({})",
+                            device_name, PARTITION_OFFSET_BLOCKS, e);
+                        println!("[FS-SERVICE]   (EFI partition must occupy 1MiB–513MiB so root starts at 513MiB)");
                     }
                 }
             },
-            Err(_) => {
-                // Device not found or busy, continue probing
+            Err(e) => {
+                println!("[FS-SERVICE]   {} — could not open device ({})", device_name, e);
             }
         }
     }
 
     if !found {
-        println!("[FS-SERVICE] CRITICAL: No EclipseFS root partition found!");
+        println!("[FS-SERVICE] CRITICAL: No EclipseFS root partition found on any disk!");
+        println!("[FS-SERVICE] Checked disk:0 to disk:7 at block offset {}", PARTITION_OFFSET_BLOCKS);
+        println!("[FS-SERVICE] The root partition must start at {} MiB on the physical disk.",
+            (PARTITION_OFFSET_BLOCKS * 4096) / (1024 * 1024));
+        // Do NOT signal READY — the rest of the system must not start without a filesystem.
+        // Enter a spin loop so the user can see the diagnostics on screen.
+        println!("[FS-SERVICE] Halting — filesystem not mounted.");
+        loop {
+            yield_cpu();
+        }
     }
 
     println!("[FS-SERVICE] Entering main loop...");
