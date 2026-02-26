@@ -45,6 +45,10 @@ pub mod gsp {
         // Engine Initialization
         DisplaySetup = 0x20,
         GraphicsInit = 0x30,
+        /// OpenGL context creation (software GL handshake with GSP)
+        OpenGLContextCreate = 0x31,
+        /// Map a VRAM surface for an OpenGL render target
+        OpenGLSurfaceMap = 0x32,
         ComputeInit = 0x40,
         VideoInit = 0x50,
         
@@ -84,6 +88,22 @@ pub mod gsp {
         pub alignment: u64,
         pub type_flags: u32,
         pub unused: u32,
+    }
+
+    /// Payload for OpenGL context creation (OpenGLContextCreate RPC).
+    /// Sent to the GSP to announce that a software-GL context is active
+    /// and to request a VRAM surface mapping.
+    #[derive(Debug, Clone, Copy)]
+    #[repr(C)]
+    pub struct GspOpenGLPayload {
+        /// Desired render-target width in pixels.
+        pub width: u32,
+        /// Desired render-target height in pixels.
+        pub height: u32,
+        /// Pixel format: 0 = BGRA8, 1 = RGBA8.
+        pub format: u32,
+        /// Reserved / padding.
+        pub _pad: u32,
     }
 
     /// GSP Mailbox layout (usually in BAR0)

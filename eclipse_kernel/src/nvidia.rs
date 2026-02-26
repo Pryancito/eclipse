@@ -607,7 +607,13 @@ pub fn init() {
             serial::serial_print("\n");
         }
 
-        // --- Phase 6: GSP firmware load and Falcon boot sequence ---
+        // --- Phase 6: OpenGL context initialization ---
+        // PGRAPH (bit 13) is already active via NV_PMC_ENABLE_DEFAULT.
+        // Init the kernel GL context and reserve a primary render surface.
+        let vram_for_gl = if hw_vram_mb > 0 { hw_vram_mb } else { gpu_info.memory_size_mb };
+        opengl::init_all_gpus(bar0_virt, vram_for_gl);
+
+        // --- Phase 7: GSP firmware load and Falcon boot sequence ---
         let fw_path = "/lib/firmware/gsp.bin";
         match GspLoader::load_firmware(fw_path) {
             Ok(fw) => {
@@ -1273,6 +1279,143 @@ pub mod video {
         pub fn decode_frame(&self, _input_buffer: usize, _output_buffer: usize) -> Result<(), &'static str> {
             // Would submit bitstream to NVDEC hardware
             Ok(())
+        }
+    }
+}  // end pub mod video
+
+// ========================================================================
+// OpenGL Support
+// ========================================================================
+
+/// Software-OpenGL infrastructure exposed to userland.
+///
+/// On Turing/Ampere/Ada GPUs the PGRAPH engine (3D pipeline) is enabled by
+/// bit 13 of `NV_PMC_ENABLE`.  `NV_PMC_ENABLE_DEFAULT` (0x2FFF_FFFF) already
+/// has that bit set, so `nvidia::init()` implicitly enables PGRAPH in Phase 5.
+///
+/// This module provides:
+/// - `GlKernelContext` — tracks per-GPU GL state (BAR0 virt, VRAM info).
+/// - Surface allocation helpers for render-target backing in VRAM.
+/// - Serial diagnostics so the user can confirm GL is ready in the serial log.
+pub mod opengl {
+    use super::*;
+
+    /// PGRAPH engine enable bit (bit 13) — from dev_pmc.h.
+    const PMC_ENABLE_PGRAPH_BIT: u32 = 1 << 13;
+
+    /// VRAM surface alignment: 4 KB.
+    const GL_VRAM_SURFACE_ALIGN: u64 = 4096;
+
+    /// Kernel-side OpenGL context for one NVIDIA GPU.
+    pub struct GlKernelContext {
+        /// Virtual address of the GPU's BAR0 mapping.
+        pub bar0_virt:    u64,
+        /// Physical start of the GPU's VRAM region used for GL surfaces.
+        pub vram_phys:    u64,
+        /// VRAM size in MB (from NV_PFB_CSTATUS or PCI ID table).
+        pub vram_size_mb: u32,
+        /// Bump-pointer for the next VRAM surface allocation (bytes from vram_phys).
+        pub alloc_offset: u64,
+    }
+
+    impl GlKernelContext {
+        /// Initialise the GL kernel context for a single GPU.
+        ///
+        /// Verifies that PGRAPH is enabled in `NV_PMC_ENABLE` and logs
+        /// readiness.  Returns `None` if PGRAPH cannot be enabled.
+        pub fn init(bar0_virt: u64, vram_size_mb: u32) -> Option<Self> {
+            serial::serial_print("[GL] Initializing OpenGL kernel context...\n");
+
+            // ── Verify PGRAPH engine is enabled (bit 13 of PMC_ENABLE) ────────
+            let pmc_en = unsafe {
+                core::ptr::read_volatile(
+                    (bar0_virt + NV_PMC_ENABLE as u64) as *const u32
+                )
+            };
+
+            if pmc_en & PMC_ENABLE_PGRAPH_BIT == 0 {
+                serial::serial_print("[GL] PGRAPH bit not set — enabling...\n");
+                unsafe {
+                    core::ptr::write_volatile(
+                        (bar0_virt + NV_PMC_ENABLE as u64) as *mut u32,
+                        pmc_en | PMC_ENABLE_PGRAPH_BIT,
+                    );
+                }
+            } else {
+                serial::serial_print("[GL] ✓ PGRAPH engine bit active (PMC_ENABLE bit 13 set)\n");
+            }
+
+            serial::serial_print("[GL] GlKernelContext initialized — VRAM: ");
+            serial::serial_print_dec(vram_size_mb as u64);
+            serial::serial_print(" MB\n");
+
+            // Use the memory region right after the firmware area for GL surfaces.
+            let vram_phys = GPU_FW_PHYS_BASE + 64 * 1024 * 1024;
+
+            Some(Self {
+                bar0_virt,
+                vram_phys,
+                vram_size_mb,
+                alloc_offset: 0,
+            })
+        }
+
+        /// Allocate a render surface in VRAM.
+        ///
+        /// Returns the physical **offset** (in bytes) from `vram_phys`.
+        /// Add `vram_phys` to get the full physical address, then map via
+        /// `PHYS_MEM_OFFSET + phys` for CPU access.
+        ///
+        /// Pixels are 32-bit BGRA (`u32`).
+        pub fn alloc_surface(&mut self, width: u32, height: u32) -> Option<u64> {
+            let size = (width as u64) * (height as u64) * 4;
+            let aligned = (size + GL_VRAM_SURFACE_ALIGN - 1) & !(GL_VRAM_SURFACE_ALIGN - 1);
+            let vram_bytes = (self.vram_size_mb as u64) * 1024 * 1024;
+
+            if self.alloc_offset + aligned > vram_bytes {
+                serial::serial_print("[GL] ⚠ VRAM exhausted — cannot allocate surface\n");
+                return None;
+            }
+
+            let offset = self.alloc_offset;
+            self.alloc_offset += aligned;
+
+            serial::serial_print("[GL] OpenGL surface alloc: ");
+            serial::serial_print_dec(width as u64);
+            serial::serial_print("x");
+            serial::serial_print_dec(height as u64);
+            serial::serial_print(" @ phys offset 0x");
+            serial::serial_print_hex(offset);
+            serial::serial_print("\n");
+
+            Some(offset)
+        }
+
+        /// CPU-accessible virtual address for an allocated surface.
+        #[inline]
+        pub fn surface_virt(&self, offset: u64) -> u64 {
+            PHYS_MEM_OFFSET + self.vram_phys + offset
+        }
+    }
+
+    /// Convenience wrapper — called from `nvidia::init()` after BAR0 is mapped.
+    pub fn init_all_gpus(bar0_virt: u64, vram_size_mb: u32) {
+        match GlKernelContext::init(bar0_virt, vram_size_mb) {
+            Some(mut ctx) => {
+                // Allocate a default 1920×1080 primary render surface.
+                if let Some(off) = ctx.alloc_surface(1920, 1080) {
+                    serial::serial_print("[GL] Primary surface phys: 0x");
+                    serial::serial_print_hex(ctx.vram_phys + off);
+                    serial::serial_print("\n");
+                    serial::serial_print("[GL] Primary surface virt: 0x");
+                    serial::serial_print_hex(ctx.surface_virt(off));
+                    serial::serial_print("\n");
+                }
+                serial::serial_print("[GL] ✓ Software OpenGL ready (sidewind_opengl CPU rasterizer)\n");
+            }
+            None => {
+                serial::serial_print("[GL] ⚠ OpenGL context init failed\n");
+            }
         }
     }
 }

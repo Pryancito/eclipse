@@ -12,6 +12,7 @@ members = [
     "systemd",
     "eclipse_std",
     "sidewind_nvidia",
+    "sidewind_opengl",
     "libs/ipc",
     "input_test",
 ]
