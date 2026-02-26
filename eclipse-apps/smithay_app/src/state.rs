@@ -279,3 +279,70 @@ impl SmithayState {
         render::draw_cursor(&mut self.backend.fb, embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compositor::{ShellWindow, WindowContent};
+
+    #[test]
+    fn test_state_init() {
+        let state = SmithayState::new();
+        assert!(state.is_some());
+        let s = state.unwrap();
+        assert_eq!(s.backend.fb.info.width, 1024);
+    }
+
+    #[test]
+    fn test_maximize_request() {
+        let mut state = SmithayState::new().unwrap();
+        
+        // Setup a window
+        state.space.map_window(ShellWindow {
+            x: 100, y: 100, w: 400, h: 300,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 400.0, curr_h: 300.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (100, 100, 400, 300),
+            workspace: 0, content: WindowContent::InternalDemo,
+        });
+        
+        state.input.focused_window = Some(0);
+        state.input.request_maximize = true;
+        
+        state.update(); // calls handle_requests
+        
+        let win = &state.space.windows[0];
+        assert!(win.maximized);
+        assert_eq!(win.x, 0);
+        assert_eq!(win.y, 0);
+        assert_eq!(win.w, 1024);
+        assert_eq!(win.h, 768 - 45); // h - 45 as per code
+        
+        // Restore
+        state.input.request_maximize = true;
+        state.update();
+        let win = &state.space.windows[0];
+        assert!(!win.maximized);
+        assert_eq!(win.x, 100);
+        assert_eq!(win.w, 400);
+    }
+
+    #[test]
+    fn test_minimize_request() {
+        let mut state = SmithayState::new().unwrap();
+        state.space.map_window(ShellWindow {
+            x: 100, y: 100, w: 400, h: 300,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 400.0, curr_h: 300.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (100, 100, 400, 300),
+            workspace: 0, content: WindowContent::InternalDemo,
+        });
+        
+        state.input.focused_window = Some(0);
+        state.input.request_minimize = true;
+        state.update();
+        
+        assert!(state.space.windows[0].minimized);
+        assert_eq!(state.input.focused_window, None);
+    }
+}

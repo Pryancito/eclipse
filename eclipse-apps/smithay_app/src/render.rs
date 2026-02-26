@@ -113,6 +113,26 @@ impl FramebufferState {
         })
     }
 
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self {
+            info: FramebufferInfo {
+                address: 0,
+                width: 1024,
+                height: 768,
+                pitch: 1024 * 4,
+                bpp: 32,
+                red_mask_size: 8, red_mask_shift: 16,
+                green_mask_size: 8, green_mask_shift: 8,
+                blue_mask_size: 8, blue_mask_shift: 0,
+            },
+            base_addr: 0x1000,
+            front_addr: 0,
+            gpu_resource_id: None,
+            background_addr: 0x2000,
+        }
+    }
+
     pub fn clear_back_buffer_raw(&self, color: Rgb888) {
         if self.base_addr < 0x1000 { return; }
         let pitch = self.info.pitch.max(self.info.width * 4);

@@ -2,39 +2,47 @@
 //! 
 //! Este módulo exporta las funcionalidades del microkernel como biblioteca
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![feature(abi_x86_interrupt)]
 
 use core::panic::PanicInfo;
 
 extern crate alloc;
 
-// pub mod boot;
-// pub mod memory;
-// pub mod interrupts;
-// pub mod ipc;
-// pub mod serial;
-// pub mod process;
-// pub mod scheduler;
-// pub mod syscalls;
-// pub mod servers;
+pub mod boot;
+pub mod memory;
+pub mod interrupts;
+pub mod serial;
+pub mod ipc;
+pub mod process;
+pub mod cpu;
+pub mod scheduler;
+pub mod syscalls;
+pub mod servers;
 pub mod binaries;
-// pub mod pci;
-// pub mod nvidia;
-// pub mod virtio;
+pub mod pci;
+pub mod nvidia;
+pub mod virtio;
 
-// pub mod filesystem;
-// pub mod ata;
-// pub mod fd;  // File descriptor management
-// pub mod bcache; // Buffer Cache
-// pub mod scheme; // Redox-style schemes
-// mod elf_loader;
+pub mod filesystem;
+pub mod ata;
+pub mod ahci;
+pub mod nvme;
+pub mod storage;
+pub mod fd;
+pub mod progress;
+pub mod scheme;
+pub mod bcache;
+pub mod usb_hid;
+mod elf_loader;
+pub mod acpi;
+pub mod apic;
+mod memory_builtins;
 
 // Re-exportar tipos importantes
-// pub use ipc::{Message, MessageType, ServerId, ClientId};
-// pub use memory::{PageTable, PageTableEntry};
-// pub use interrupts::InterruptStats;
-// pub use process::{Process, ProcessId, ProcessState, Context};
+pub use ipc::{Message, MessageType, ServerId, ClientId};
+pub use memory::{PageTable, PageTableEntry};
+pub use process::{Process, ProcessId, ProcessState, Context};
 // pub use scheduler::SchedulerStats;
 // pub use syscalls::SyscallStats;
 

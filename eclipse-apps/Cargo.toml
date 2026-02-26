@@ -12,13 +12,15 @@ members = [
     "systemd",
     "eclipse_std",
     "sidewind_nvidia",
-]
-
-exclude = [
     "libs/ipc",
+    "input_test",
 ]
+exclude = ["libs/ipc_tests"]
+
+
 
 [workspace.dependencies]
+eclipse_ipc = { path = "libs/ipc" }
 sidewind_core = { path = "sidewind_core" }
 sidewind_sdk = { path = "sidewind_sdk" }
 sidewind_wayland = { path = "sidewind_wayland" }

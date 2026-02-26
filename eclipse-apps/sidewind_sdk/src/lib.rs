@@ -19,7 +19,8 @@ pub mod font_terminus_24;
 pub mod ui;
 
 use eclipse_libc::{send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
-use sidewind_core::{SideWindMessage, MSG_TYPE_GRAPHICS, MSG_TYPE_INPUT, SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_COMMIT, SideWindEvent};
+use eclipse_ipc::prelude::IpcChannel;
+use sidewind_core::{SideWindMessage, SWND_OP_DESTROY, SideWindEvent};
 
 /// Descubre el PID del compositor preguntando a init (PID 1).
 ///
@@ -87,13 +88,7 @@ impl SideWindSurface {
 
         // 3. Send CREATE message to compositor
         let msg = SideWindMessage::new_create(x, y, w, h, name);
-        let msg_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &msg as *const SideWindMessage as *const u8,
-                core::mem::size_of::<SideWindMessage>(),
-            )
-        };
-        if send(composer_pid, MSG_TYPE_GRAPHICS, msg_bytes) != 0 {
+        if !IpcChannel::send_sidewind(composer_pid, &msg) {
             unsafe { munmap(vaddr, size_bytes as u64); }
             return None;
         }
@@ -117,13 +112,7 @@ impl SideWindSurface {
 
     pub fn commit(&self) {
         let msg = SideWindMessage::new_commit();
-        let msg_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &msg as *const SideWindMessage as *const u8,
-                core::mem::size_of::<SideWindMessage>(),
-            )
-        };
-        let _ = send(self.composer_pid, MSG_TYPE_GRAPHICS, msg_bytes);
+        let _ = IpcChannel::send_sidewind(self.composer_pid, &msg);
     }
 
     /// Lee un evento del compositor si hay alguno. SideWindEvent tiene #[repr(C)].
@@ -154,13 +143,7 @@ impl Drop for SideWindSurface {
         // Envía DESTROY al compositor
         let mut msg = SideWindMessage::new_commit();
         msg.op = SWND_OP_DESTROY;
-        let msg_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &msg as *const SideWindMessage as *const u8,
-                core::mem::size_of::<SideWindMessage>(),
-            )
-        };
-        let _ = send(self.composer_pid, MSG_TYPE_GRAPHICS, msg_bytes);
+        let _ = IpcChannel::send_sidewind(self.composer_pid, &msg);
 
         // Unmap: en terminación abrupta (kill -9) Drop no se ejecuta;
         // el kernel limpia automáticamente VMAs del proceso.

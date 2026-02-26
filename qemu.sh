@@ -43,8 +43,9 @@ DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si 
 MEMORY="8G"
 CPUS="4"
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
-# Por defecto usamos dispositivos de entrada USB (ratón/teclado HID)
-PS2_MOUSE="${PS2_MOUSE:-0}"  # 1=PS/2 ratón, 0=USB mouse/tablet (recomendado)
+# Por defecto usamos dispositivos de entrada SOLO USB (teclado + ratón HID)
+# PS2_MOUSE=1 activa el modo PS/2 legacy (sin USB HID)
+PS2_MOUSE="${PS2_MOUSE:-0}"  # 1=PS/2 legado, 0=USB HID (teclado+ratón, recomendado)
 USB_PORTS_2="${USB_PORTS_2:-4}"  # Número de puertos USB 2.0
 USB_PORTS_3="${USB_PORTS_3:-4}"  # Número de puertos USB 3.0
 CREATE_USB_DISK="${CREATE_USB_DISK:-1}"  # Crear disco USB de prueba
@@ -186,24 +187,26 @@ fi
 
 # Configuración de dispositivos de entrada
 if [ "$PS2_MOUSE" = "1" ]; then
-    # PS/2: usa el i8042 integrado (teclado + ratón). Sin usb-mouse/tablet.
-    print_info "Ratón PS/2 habilitado (modo compatibilidad; Ctrl+Alt+G para capturar)"
+    # Modo PS/2 legacy: teclado + ratón a través del i8042.
+    print_info "Entrada: PS/2 legacy (i8042). Ctrl+Alt+G para capturar el ratón."
     if [ "$USE_XHCI" = "1" ]; then
         QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
+    else
+        QEMU_CMD="$QEMU_CMD -usb"
+    fi
+else
+    # Modo USB puro: teclado y ratón/tablet 100% USB HID.
+    # Se deshabilita el i8042 para que no haya fallback PS/2.
+    print_info "Entrada: USB HID puro (teclado + tablet XHCI). PS/2 desactivado."
+    if [ "$USE_XHCI" = "1" ]; then
+        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
+        # Puerto 1: teclado USB HID
         QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
+        # Puerto 2: tablet USB (puntero absoluto; no requiere Ctrl+Alt+G)
+        QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=2"
     else
         QEMU_CMD="$QEMU_CMD -usb"
         QEMU_CMD="$QEMU_CMD -device usb-kbd"
-    fi
-else
-    # Teclado: PS/2 (IRQ 1, sigue funcionando como antes).
-    # Ratón: usb-tablet (puntero absoluto). No necesita Ctrl+Alt+G.
-    # process_tablet_report() convierte coords absolutas → deltas relativos.
-    if [ "$USE_XHCI" = "1" ]; then
-        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
-        QEMU_CMD="$QEMU_CMD -device usb-tablet,bus=xhci.0,port=1"
-    else
-        QEMU_CMD="$QEMU_CMD -usb"
         QEMU_CMD="$QEMU_CMD -device usb-tablet"
     fi
 fi

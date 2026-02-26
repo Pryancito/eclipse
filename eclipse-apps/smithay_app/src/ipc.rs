@@ -1,74 +1,89 @@
-use eclipse_libc::{receive, send, yield_cpu, InputEvent};
-const IPC_BUFFER_SIZE: usize = 256;
-use sidewind_core::{SideWindMessage, SIDEWIND_TAG, SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
+//! Handler IPC del compositor.
+//! Usa `eclipse_ipc` como API unificada: fast path y slow path son transparentes.
+
+use eclipse_ipc::prelude::*;
+use eclipse_ipc::types::EclipseMessage;
+use sidewind_core::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
-use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_EXTERNAL_SURFACES, MAX_WINDOWS_COUNT, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
-const MSG_TYPE_INPUT: u32 = 0x00000040;
+use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM};
 
 pub struct IpcHandler {
+    channel: IpcChannel,
     pub message_count: u64,
 }
 
 impl IpcHandler {
     pub fn new() -> Self {
-        Self { message_count: 0 }
+        Self {
+            channel: IpcChannel::new(),
+            message_count: 0,
+        }
     }
 
+    /// Recibir y clasificar el siguiente mensaje IPC (no bloqueante).
+    /// Fast path (InputEvent) → slow path (SideWind, control) de forma automática.
     pub fn process_messages(&mut self) -> Option<CompositorEvent> {
-        let mut buffer = [0u8; IPC_BUFFER_SIZE];
-        let (len, sender_pid) = receive(&mut buffer);
-        let len = len.min(buffer.len());
-        if len > 0 {
-            self.message_count += 1;
-            if len >= core::mem::size_of::<SideWindMessage>() && &buffer[0..4] == b"SWND" {
-                let sw = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const SideWindMessage) };
-                if sw.tag == SIDEWIND_TAG { return Some(CompositorEvent::SideWind(sw, sender_pid)); }
+        match self.channel.recv()? {
+            EclipseMessage::Input(ev) => {
+                self.message_count += 1;
+                Some(CompositorEvent::Input(ev))
             }
-            if len == core::mem::size_of::<InputEvent>() {
-                let ev = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const InputEvent) };
-                return Some(CompositorEvent::Input(ev));
+            EclipseMessage::SideWind(sw, pid) => {
+                self.message_count += 1;
+                Some(CompositorEvent::SideWind(sw, pid))
             }
+            // Mensajes de control y raw: ignorar en el compositor (son para el input_service)
+            _ => None,
         }
-        None
     }
 }
+
+// ============================================================================
+// Funciones de arranque del compositor (delegan a eclipse_ipc::services)
+// ============================================================================
 
 pub fn query_input_service_pid() -> Option<u32> {
-    let _ok = send(1, 0x00000040, b"GET_INPUT_PID") == 0;
-    let mut buffer = [0u8; IPC_BUFFER_SIZE];
-    for _ in 0..1000 {
-        let (len, sender_pid) = receive(&mut buffer);
-        if len >= 8 && sender_pid == 1 && &buffer[0..4] == b"INPT" {
-            let mut id = [0u8; 4]; id.copy_from_slice(&buffer[4..8]);
-            return Some(u32::from_le_bytes(id));
-        }
-        yield_cpu();
-    }
-    None
+    eclipse_ipc::services::query_input_service_pid()
 }
 
-pub fn subscribe_to_input_service(input_pid: u32, self_pid: u32) {
-    let mut msg = [0u8; 8]; msg[0..4].copy_from_slice(b"SUBS"); msg[4..8].copy_from_slice(&self_pid.to_le_bytes());
-    let _ = send(input_pid, 0x00000040, &msg);
+pub fn subscribe_to_input_service(input_pid: u32, self_pid: u32) -> bool {
+    eclipse_ipc::services::subscribe_to_input(input_pid, self_pid)
 }
 
-pub fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: &mut [ExternalSurface], windows: &mut [ShellWindow], window_count: &mut usize, input_state: &mut InputState) {
+// ============================================================================
+// Lógica de ventanas SideWind (sin cambios, solo movida aquí para claridad)
+// ============================================================================
+
+pub fn handle_sidewind_message(
+    msg: sidewind_core::SideWindMessage,
+    sender_pid: u32,
+    surfaces: &mut [ExternalSurface],
+    windows: &mut [ShellWindow],
+    window_count: &mut usize,
+    input_state: &mut InputState,
+) {
     match msg.op {
         SWND_OP_CREATE => {
-            if msg.w == 0 || msg.h == 0 || msg.w > MAX_SURFACE_DIM || msg.h > MAX_SURFACE_DIM { return; }
+            if msg.w == 0 || msg.h == 0 || msg.w > MAX_SURFACE_DIM || msg.h > MAX_SURFACE_DIM {
+                return;
+            }
             let surface_idx = surfaces.iter().position(|s| !s.active);
             if let Some(s_idx) = surface_idx {
                 if *window_count < windows.len() {
-                    surfaces[s_idx] = ExternalSurface { id: sender_pid, pid: sender_pid, vaddr: 0x1000, buffer_size: (msg.w * msg.h * 4) as usize, active: true };
-                    windows[*window_count] = ShellWindow { 
-                        x: msg.x, y: msg.y, w: msg.w as i32, h: msg.h as i32 + 26, 
-                        curr_x: (msg.x + msg.w as i32 / 2) as f32, 
-                        curr_y: (msg.y + (msg.h as i32 + 26) / 2) as f32, 
-                        curr_w: 0.0, curr_h: 0.0, 
-                        minimized: false, maximized: false, closing: false, 
-                        stored_rect: (msg.x, msg.y, msg.w as i32, msg.h as i32 + 26), 
-                        workspace: input_state.current_workspace, 
-                        content: WindowContent::External(s_idx as u32) 
+                    surfaces[s_idx] = ExternalSurface {
+                        id: sender_pid, pid: sender_pid, vaddr: 0x1000,
+                        buffer_size: (msg.w * msg.h * 4) as usize, active: true,
+                    };
+                    windows[*window_count] = ShellWindow {
+                        x: msg.x, y: msg.y,
+                        w: msg.w as i32, h: msg.h as i32 + 26,
+                        curr_x: (msg.x + msg.w as i32 / 2) as f32,
+                        curr_y: (msg.y + (msg.h as i32 + 26) / 2) as f32,
+                        curr_w: 0.0, curr_h: 0.0,
+                        minimized: false, maximized: false, closing: false,
+                        stored_rect: (msg.x, msg.y, msg.w as i32, msg.h as i32 + 26),
+                        workspace: input_state.current_workspace,
+                        content: WindowContent::External(s_idx as u32),
                     };
                     *window_count += 1;
                 }
@@ -78,9 +93,9 @@ pub fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: 
             if let Some(s_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
                 surfaces[s_idx].active = false;
                 if let Some(w_idx) = windows.iter().position(|w| w.content == WindowContent::External(s_idx as u32)) {
-                    for i in w_idx..(*window_count - 1) { windows[i] = windows[i+1]; }
+                    for i in w_idx..(*window_count - 1) { windows[i] = windows[i + 1]; }
                     *window_count -= 1;
-                    if input_state.focused_window == Some(w_idx) { input_state.focused_window = None; }
+                    if input_state.focused_window == Some(w_idx)  { input_state.focused_window = None; }
                     else if let Some(f) = input_state.focused_window { if f > w_idx { input_state.focused_window = Some(f - 1); } }
                     if input_state.dragging_window == Some(w_idx) { input_state.dragging_window = None; }
                     else if let Some(d) = input_state.dragging_window { if d > w_idx { input_state.dragging_window = Some(d - 1); } }
@@ -90,13 +105,126 @@ pub fn handle_sidewind_message(msg: SideWindMessage, sender_pid: u32, surfaces: 
             }
         }
         SWND_OP_UPDATE | SWND_OP_COMMIT => {
-            if let Some(w_idx) = windows.iter().position(|w| matches!(w.content, WindowContent::External(idx) if idx < surfaces.len() as u32 && surfaces[idx as usize].pid == sender_pid)) {
+            if let Some(w_idx) = windows.iter().position(|w| {
+                matches!(w.content, WindowContent::External(idx)
+                    if (idx as usize) < surfaces.len() && surfaces[idx as usize].pid == sender_pid)
+            }) {
                 if msg.op == SWND_OP_UPDATE {
                     windows[w_idx].x = msg.x;
                     windows[w_idx].y = msg.y;
+                    if msg.w > 0 && msg.h > 0 && msg.w <= MAX_SURFACE_DIM && msg.h <= MAX_SURFACE_DIM {
+                        windows[w_idx].w = msg.w as i32;
+                        windows[w_idx].h = msg.h as i32 + 26;
+                        if let WindowContent::External(s_idx) = windows[w_idx].content {
+                            surfaces[s_idx as usize].buffer_size = (msg.w * msg.h * 4) as usize;
+                        }
+                    }
                 }
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eclipse_libc::{mock_push_receive, mock_clear};
+    use eclipse_libc::InputEvent;
+    use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
+
+    #[test]
+    fn test_ipc_input_routing() {
+        mock_clear();
+        let mut handler = IpcHandler::new();
+        
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 0,
+            code: 30,
+            value: 1,
+            timestamp: 12345,
+        };
+        let data = unsafe { core::slice::from_raw_parts(&ev as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
+        mock_push_receive(data.to_vec(), 500);
+        
+        let result = handler.process_messages();
+        assert!(result.is_some());
+        match result.unwrap() {
+            CompositorEvent::Input(recv_ev) => {
+                assert_eq!(recv_ev.code, 30);
+                assert_eq!(recv_ev.value, 1);
+            }
+            _ => panic!("Expected Input event"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_sidewind_routing() {
+        mock_clear();
+        let mut handler = IpcHandler::new();
+        
+        let sw = SideWindMessage::new_create(10, 20, 100, 200, "TestWin");
+        let data = unsafe { core::slice::from_raw_parts(&sw as *const _ as *const u8, core::mem::size_of::<SideWindMessage>()) };
+        mock_push_receive(data.to_vec(), 600);
+        
+        let result = handler.process_messages();
+        assert!(result.is_some());
+        match result.unwrap() {
+            CompositorEvent::SideWind(recv_sw, sender_pid) => {
+                assert_eq!(sender_pid, 600);
+                assert_eq!(recv_sw.tag, SIDEWIND_TAG);
+                assert_eq!(recv_sw.op, sidewind_core::SWND_OP_CREATE);
+                assert_eq!(recv_sw.w, 100);
+            }
+            _ => panic!("Expected SideWind event"),
+        }
+    }
+
+    #[test]
+    fn test_handle_create_window() {
+        let mut surfaces = [const { ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false } }; 16];
+        let mut windows = [const { ShellWindow {
+            x: 0, y: 0, w: 0, h: 0,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+            minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0),
+            workspace: 0, content: WindowContent::None,
+        } }; 32];
+        let mut window_count = 0;
+        let mut input_state = InputState::new(1024, 768);
+        
+        let msg = SideWindMessage::new_create(100, 100, 400, 300, "App");
+        handle_sidewind_message(msg, 700, &mut surfaces, &mut windows, &mut window_count, &mut input_state);
+        
+        assert_eq!(window_count, 1);
+        assert_eq!(windows[0].x, 100);
+        assert_eq!(windows[0].w, 400);
+        assert_eq!(windows[0].h, 300 + 26); // Title bar height
+        assert!(surfaces.iter().any(|s| s.active && s.pid == 700));
+    }
+
+    #[test]
+    fn test_handle_destroy_window() {
+        let mut surfaces = [const { ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false } }; 16];
+        let mut windows = [const { ShellWindow {
+            x: 0, y: 0, w: 0, h: 0,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+            minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0),
+            workspace: 0, content: WindowContent::None,
+        } }; 32];
+        let mut window_count = 0;
+        let mut input_state = InputState::new(1024, 768);
+        
+        // Create first
+        let msg_create = SideWindMessage::new_create(100, 100, 400, 300, "App");
+        handle_sidewind_message(msg_create, 700, &mut surfaces, &mut windows, &mut window_count, &mut input_state);
+        assert_eq!(window_count, 1);
+        
+        // Destroy
+        let msg_destroy = SideWindMessage { op: SWND_OP_DESTROY, x: 0, y: 0, w: 0, h: 0, tag: SIDEWIND_TAG, name: [0; 32] };
+        handle_sidewind_message(msg_destroy, 700, &mut surfaces, &mut windows, &mut window_count, &mut input_state);
+        
+        assert_eq!(window_count, 0);
+        assert!(!surfaces[0].active);
     }
 }

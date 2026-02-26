@@ -6,6 +6,10 @@ authors = ["Eclipse OS Team"]
 description = "Aplicación de test para el Sistema de Entrada Unificado"
 
 [dependencies]
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
+sidewind_sdk = { path = "../sidewind_sdk" }
+eclipse_ipc = { path = "../libs/ipc" }
+micromath = "2.1.0"
 
 [profile.release]
 panic = "abort"

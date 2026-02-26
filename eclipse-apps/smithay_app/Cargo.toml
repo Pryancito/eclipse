@@ -2,9 +2,15 @@
 name = "smithay_app"
 version = "0.1.0"
 edition = "2021"
+resolver = "2"
+
+[lib]
+name = "smithay_app"
+path = "src/lib.rs"
 
 [dependencies]
 eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable"] }
 sidewind_core = { path = "../sidewind_core" }
 sidewind_wayland = { path = "../sidewind_wayland" }
 sidewind_xwayland = { package = "sidewind-xwayland", path = "../sidewind_xwayland" }

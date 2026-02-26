@@ -11,7 +11,11 @@ pub struct Backend {
 
 impl Backend {
     pub fn new() -> Option<Self> {
-        let fb = FramebufferState::init()?;
+        #[cfg(not(test))]
+        let fb = crate::render::FramebufferState::init()?;
+        #[cfg(test)]
+        let fb = crate::render::FramebufferState::mock();
+        
         let ipc = IpcHandler::new();
         Some(Self { fb, ipc })
     }

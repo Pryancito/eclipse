@@ -7,7 +7,7 @@ use alloc::string::String;
 
 use crate::process::{ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
-use crate::ipc::{MessageType, send_message, receive_message};
+use crate::ipc::{MessageType, send_message, receive_message, pop_small_message};
 use crate::serial;
 use spin::Mutex;
 
@@ -254,6 +254,7 @@ pub extern "C" fn syscall_handler(
         107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
         109 => sys_unlink(arg1),
+        200 => sys_receive_fast(context), // Fast path: datos en registros, sin buffer
         _ => {
             serial::serial_print("[SYSCALL] Unknown syscall: ");
             serial::serial_print_dec(syscall_num);
@@ -647,38 +648,32 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
         return u64::MAX;
     }
     if size == 0 || size > 4096 {
-        return u64::MAX; // Error
+        return u64::MAX;
+    }
+    if !is_user_pointer(buffer_ptr, size) {
+        return u64::MAX;
     }
     if sender_pid_ptr != 0 && !is_user_pointer(sender_pid_ptr, 8) {
-        return u64::MAX; // Error
+        return u64::MAX;
     }
     
     if let Some(client_id) = current_process_id() {
-        // Intentar recibir mensaje
         if let Some(msg) = receive_message(client_id) {
-            // copy_len: min(user_size, actual_data_size, 256) - no copiar más de lo necesario
+            // Calcular cuántos bytes copiar al buffer del usuario
             let data_len = (msg.data_size as usize).min(msg.data.len());
             let copy_len = core::cmp::min(size as usize, data_len);
-            if copy_len == 0 || !is_user_pointer(buffer_ptr, copy_len as u64) {
-                return u64::MAX;
-            }
+
             unsafe {
-                let user_buf = core::slice::from_raw_parts_mut(
-                    buffer_ptr as *mut u8,
-                    copy_len
-                );
-                user_buf.copy_from_slice(&msg.data[..copy_len]);
-                
-                // NUNCA pasar punteros kernel (0xffff8000...) a userspace - sanitizar
-                const KERNEL_BASE: u64 = 0xFFFF_8000_0000_0000;
-                for i in (0..copy_len.saturating_sub(7)).step_by(8) {
-                    let val = (user_buf.as_ptr().add(i) as *const u64).read_unaligned();
-                    if val >= KERNEL_BASE {
-                        (user_buf.as_mut_ptr().add(i) as *mut u64).write_unaligned(0);
-                    }
+                // Copiar datos del mensaje (puede ser 0 bytes, lo cual es válido)
+                if copy_len > 0 {
+                    let user_buf = core::slice::from_raw_parts_mut(
+                        buffer_ptr as *mut u8,
+                        copy_len,
+                    );
+                    user_buf.copy_from_slice(&msg.data[..copy_len]);
                 }
-                
-                // Si se proporcionó un puntero para el PID del remitente, escribirlo
+
+                // Escribir el PID del remitente si se solicitó
                 if sender_pid_ptr != 0 {
                     *(sender_pid_ptr as *mut u64) = msg.from as u64;
                 }
@@ -687,8 +682,41 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
         }
     }
     
-    // crate::serial::serial_print("0"); // 0 = Only print if debugging spam needed
     0 // No hay mensajes
+}
+
+/// sys_receive_fast - Fast path IPC: entrega mensaje pequeño (≤24 bytes) directo en registros.
+///
+/// Retorna en RAX el data_size (0 = sin mensaje). Si hay mensaje:
+///   RDI = data[0..8]  (primer u64 LE)
+///   RSI = data[8..16] (segundo u64 LE)
+///   RDX = data[16..24] (tercer u64 LE)
+///   RCX = sender PID (msg.from)
+///
+/// Si el siguiente mensaje en el mailbox es > 24 bytes, retorna 0 (usa receive normal).
+fn sys_receive_fast(context: &mut crate::interrupts::SyscallContext) -> u64 {
+    if let Some(client_id) = current_process_id() {
+        if let Some(msg) = pop_small_message(client_id) {
+            // Empaquetar data[0..24] en 3 palabras de 64 bits (little-endian)
+            let mut w = [0u64; 3];
+            for i in 0..3 {
+                let off = i * 8;
+                let end = (off + 8).min(msg.data.len());
+                if off < end {
+                    let mut buf = [0u8; 8];
+                    buf[..end - off].copy_from_slice(&msg.data[off..end]);
+                    w[i] = u64::from_le_bytes(buf);
+                }
+            }
+            // Escribir en el contexto: se restaurarán al hacer iretq
+            context.rdi = w[0];
+            context.rsi = w[1];
+            context.rdx = w[2];
+            context.rcx = msg.from as u64;
+            return msg.data_size as u64;
+        }
+    }
+    0 // Sin mensaje pequeño disponible → usar receive() normal
 }
 
 /// sys_yield - Ceder CPU voluntariamente

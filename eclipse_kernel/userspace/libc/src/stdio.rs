@@ -19,7 +19,7 @@ pub struct StdoutWriter;
 impl core::fmt::Write for StdoutWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         puts(s);
-        Ok(())
+        core::result::Result::Ok(())
     }
 }
 

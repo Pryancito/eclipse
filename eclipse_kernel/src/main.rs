@@ -53,6 +53,7 @@ struct BootStack {
 static mut BOOT_STACK: BootStack = BootStack { stack: [0; 65536] };
 
 /// Panic handler del kernel
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial::serial_print("at ");
@@ -70,6 +71,7 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     panic!("allocation error: {:?}", layout)
@@ -79,6 +81,7 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 /// 
 /// Parámetros (x86_64 calling convention):
 /// - RDI: boot_info_ptr - Pointer to BootInfo structure
+#[cfg(not(test))]
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {

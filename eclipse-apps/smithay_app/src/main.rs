@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 extern crate alloc;
 extern crate eclipse_syscall;
@@ -8,18 +8,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use eclipse_libc::{println, getpid, yield_cpu};
 
-mod compositor;
-mod render;
-mod input;
-mod ipc;
-mod space;
-mod backend;
-mod state;
-
-use state::SmithayState;
-use crate::compositor::ShellWindow;
-use crate::compositor::WindowContent;
-use ipc::{query_input_service_pid, subscribe_to_input_service};
+use smithay_app::state::SmithayState;
+use smithay_app::compositor::{ShellWindow, WindowContent};
+use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service};
 
 const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB
 #[repr(align(4096))]

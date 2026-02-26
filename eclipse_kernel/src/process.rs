@@ -206,8 +206,8 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
         
-        // Buscar slot libre
-        for slot in table.iter_mut() {
+        // Buscar slot libre (enumerate para conocer el índice del slot)
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
             if slot.is_none() {
                 let mut process = Process::new();
                 process.id = pid;
@@ -235,11 +235,15 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                 
                 crate::serial::serial_print("[PROC] Created process PID: ");
                 crate::serial::serial_print_dec(pid as u64);
-                crate::serial::serial_print(" with CR3: ");
+                crate::serial::serial_print(" slot: ");
+                crate::serial::serial_print_dec(slot_idx as u64);
+                crate::serial::serial_print(" CR3: ");
                 crate::serial::serial_print_hex(process.page_table_phys);
                 crate::serial::serial_print("\n");
 
                 *slot = Some(process);
+                // Registrar en tabla inversa PID → slot O(1) para IPC
+                crate::ipc::register_pid_slot(pid, slot_idx);
                 return true;
             }
         }
@@ -291,6 +295,24 @@ pub fn get_process(pid: ProcessId) -> Option<Process> {
             if let Some(p) = process {
                 if p.id == pid {
                     return Some(p.clone());
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Obtener el índice de slot (0..MAX_PROCESSES) de un proceso por su PID.
+/// A diferencia del PID (que es monotónico), el slot index es reutilizable
+/// y siempre cabe en el array de mailboxes IPC (también de 64 entradas).
+/// Devuelve None si el proceso no existe o está terminado.
+pub fn pid_to_slot(pid: ProcessId) -> Option<usize> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let table = PROCESS_TABLE.lock();
+        for (i, slot) in table.iter().enumerate() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    return Some(i);
                 }
             }
         }
@@ -449,10 +471,15 @@ pub fn exit_process() {
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = PROCESS_TABLE.lock();
-            for slot in table.iter_mut() {
+            for (slot_idx, slot) in table.iter_mut().enumerate() {
                 if let Some(p) = slot {
                     if p.id == pid {
                         p.state = ProcessState::Terminated;
+                        // Eliminar de la tabla inversa PID → slot (O(1) para IPC)
+                        crate::ipc::unregister_pid_slot(pid);
+                        // Limpiar el buzón IPC para que el próximo proceso del slot
+                        // no reciba mensajes del anterior.
+                        crate::ipc::clear_mailbox_slot(slot_idx);
                         break;
                     }
                 }

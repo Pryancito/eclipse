@@ -1,0 +1,3 @@
+# Sin build-std para que los tests en host usen el core de la toolchain
+# y no haya conflicto de lang items. Ejecutar desde libs/ipc_tests:
+#   cargo test --target x86_64-unknown-linux-gnu

@@ -1,5 +1,42 @@
-//! Syscall wrappers para Eclipse OS
 use core::arch::asm;
+
+#[cfg(all(target_env = "gnu", not(test)))]
+extern crate alloc;
+#[cfg(all(target_env = "gnu", not(test)))]
+use alloc::vec::Vec;
+#[cfg(all(target_env = "gnu", test))]
+use std::vec::Vec;
+#[cfg(target_env = "gnu")]
+use spin::Mutex;
+
+#[cfg(target_env = "gnu")]
+lazy_static::lazy_static! {
+    pub static ref MOCK_RECEIVE_QUEUE: Mutex<Vec<(Vec<u8>, u32)>> = Mutex::new(Vec::new());
+    pub static ref MOCK_RECEIVE_FAST_QUEUE: Mutex<Vec<([u8; 24], u32, usize)>> = Mutex::new(Vec::new());
+    pub static ref MOCK_SEND_LOG: Mutex<Vec<(u32, u32, Vec<u8>)>> = Mutex::new(Vec::new());
+}
+
+#[cfg(target_env = "gnu")]
+pub fn mock_push_receive(data: Vec<u8>, from: u32) {
+    MOCK_RECEIVE_QUEUE.lock().push((data, from));
+}
+
+#[cfg(target_env = "gnu")]
+pub fn mock_push_receive_fast(data: [u8; 24], from: u32, size: usize) {
+    MOCK_RECEIVE_FAST_QUEUE.lock().push((data, from, size));
+}
+
+#[cfg(target_env = "gnu")]
+pub fn mock_get_sent() -> Vec<(u32, u32, Vec<u8>)> {
+    (*MOCK_SEND_LOG.lock()).to_vec()
+}
+
+#[cfg(target_env = "gnu")]
+pub fn mock_clear() {
+    MOCK_RECEIVE_QUEUE.lock().clear();
+    MOCK_RECEIVE_FAST_QUEUE.lock().clear();
+    MOCK_SEND_LOG.lock().clear();
+}
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -41,6 +78,8 @@ pub const SYS_VIRGL_ALLOC_BACKING: u64 = 47;
 pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
 pub const SYS_GET_STORAGE_DEVICE_COUNT: u64 = 50;
+/// Fast path IPC: mensaje entregado en registros, sin buffer en memoria
+pub const SYS_RECEIVE_FAST: u64 = 200;
 
 pub type c_void = core::ffi::c_void;
 
@@ -70,7 +109,7 @@ pub struct GpuDisplayBufferInfo {
 
 /// Allocate VirtIO GPU display buffer and map into process.
 /// Returns Some(info) on success, None on failure.
-pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<GpuDisplayBufferInfo> {
+pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> core::option::Option<GpuDisplayBufferInfo> {
     let mut out = GpuDisplayBufferInfo::default();
     let r = unsafe {
         syscall3(
@@ -81,9 +120,9 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<GpuDisplayBuf
         )
     };
     if r == 0 {
-        Some(out)
+        core::option::Option::Some(out)
     } else {
-        None
+        core::option::Option::None
     }
 }
 
@@ -104,18 +143,18 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
 
 /// Create a Virgl 3D context. Returns ctx_id (1..16) on success, None on failure.
 /// name: optional debug name (max 64 bytes). Pass empty slice for no name.
-pub fn virgl_ctx_create(name: &[u8]) -> Option<u32> {
+pub fn virgl_ctx_create(name: &[u8]) -> core::option::Option<u32> {
     let ptr = if name.is_empty() {
         0
     } else {
         name.as_ptr() as u64
     };
-    let len = name.len().min(64) as u64;
+    let len = core::cmp::Ord::min(name.len(), 64) as u64;
     let r = unsafe { syscall2(SYS_VIRGL_CTX_CREATE, ptr, len) };
     if r == 0 {
-        None
+        core::option::Option::None
     } else {
-        Some(r as u32)
+        core::option::Option::Some(r as u32)
     }
 }
 
@@ -151,12 +190,12 @@ pub fn virgl_submit_3d(ctx_id: u32, cmd_data: &[u8]) -> bool {
 
 /// Allocate backing memory for Virgl 3D resource. Returns Some(vaddr) on success.
 /// The vaddr is identity-mapped (vaddr == phys); use it for resource_attach_backing.
-pub fn virgl_alloc_backing(size: usize) -> Option<u64> {
+pub fn virgl_alloc_backing(size: usize) -> core::option::Option<u64> {
     let r = unsafe { syscall1(SYS_VIRGL_ALLOC_BACKING, size as u64) };
     if r == 0 {
-        None
+        core::option::Option::None
     } else {
-        Some(r)
+        core::option::Option::Some(r)
     }
 }
 
@@ -168,23 +207,23 @@ pub fn virgl_resource_attach_backing(resource_id: u32, vaddr: u64, size: usize) 
 }
 
 /// Read one PS/2 scancode from kernel buffer (non-blocking). Returns None if empty.
-pub fn read_key_scancode() -> Option<u8> {
+pub fn read_key_scancode() -> core::option::Option<u8> {
     let r = unsafe { syscall0(SYS_READ_KEY) };
     if r == 0 {
-        None
+        core::option::Option::None
     } else {
-        Some(r as u8)
+        core::option::Option::Some(r as u8)
     }
 }
 
 /// Read one PS/2 mouse packet from kernel buffer (non-blocking).
 /// Returns None if empty. Otherwise Some(packed): buttons = packed & 0xFF, dx = (packed>>8) as i8, dy = (packed>>16) as i8.
-pub fn read_mouse_packet() -> Option<u32> {
+pub fn read_mouse_packet() -> core::option::Option<u32> {
     let r = unsafe { syscall0(SYS_READ_MOUSE_PACKET) };
     if r == u64::MAX {
-        None
+        core::option::Option::None
     } else {
-        Some(r as u32)
+        core::option::Option::Some(r as u32)
     }
 }
 
@@ -237,6 +276,7 @@ pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;
 
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 unsafe fn syscall0(n: u64) -> u64 {
     let ret: u64;
@@ -244,6 +284,15 @@ unsafe fn syscall0(n: u64) -> u64 {
     ret
 }
 
+#[cfg(target_env = "gnu")]
+unsafe fn syscall0(n: u64) -> u64 {
+    match n {
+        SYS_YIELD => 0,
+        _ => 0,
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 unsafe fn syscall1(n: u64, arg1: u64) -> u64 {
     let ret: u64;
@@ -251,6 +300,12 @@ unsafe fn syscall1(n: u64, arg1: u64) -> u64 {
     ret
 }
 
+#[cfg(target_env = "gnu")]
+unsafe fn syscall1(_n: u64, _arg1: u64) -> u64 {
+    0
+}
+
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 unsafe fn syscall2(n: u64, arg1: u64, arg2: u64) -> u64 {
     let ret: u64;
@@ -258,6 +313,12 @@ unsafe fn syscall2(n: u64, arg1: u64, arg2: u64) -> u64 {
     ret
 }
 
+#[cfg(target_env = "gnu")]
+unsafe fn syscall2(_n: u64, _arg1: u64, _arg2: u64) -> u64 {
+    0
+}
+
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let ret: u64;
@@ -265,6 +326,38 @@ pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     ret
 }
 
+#[cfg(target_env = "gnu")]
+pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+    match n {
+        SYS_WRITE => {
+            // arg1: fd, arg2: vaddr, arg3: len
+            let buf = core::slice::from_raw_parts(arg2 as *const u8, arg3 as usize);
+            
+            // Usar la syscall real del host (Linux) vía extern "C"
+            extern "C" {
+                fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+            }
+            
+            unsafe {
+                write(arg1 as i32, buf.as_ptr(), buf.len());
+            }
+            arg3
+        }
+        SYS_RECEIVE => {
+            let mut q = MOCK_RECEIVE_QUEUE.lock();
+            if q.is_empty() { return 0; }
+            let (data, from) = q.remove(0);
+            let buf = core::slice::from_raw_parts_mut(arg1 as *mut u8, arg2 as usize);
+            let len = core::cmp::Ord::min(data.len(), arg2 as usize);
+            buf[..len].copy_from_slice(&data[..len]);
+            *(arg3 as *mut u64) = from as u64;
+            len as u64
+        }
+        _ => 0
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 unsafe fn syscall4(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     let ret: u64;
@@ -272,11 +365,29 @@ unsafe fn syscall4(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     ret
 }
 
+#[cfg(target_env = "gnu")]
+unsafe fn syscall4(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    match n {
+        SYS_SEND => {
+            let buf = core::slice::from_raw_parts(arg3 as *const u8, arg4 as usize);
+            MOCK_SEND_LOG.lock().push((arg1 as u32, arg2 as u32, buf.to_vec()));
+            0
+        }
+        _ => 0
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
 #[inline(always)]
 unsafe fn syscall5(n: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
     let ret: u64;
     asm!("int 0x80", in("rax") n, in("rdi") arg1, in("rsi") arg2, in("rdx") arg3, in("r10") arg4, in("r8") arg5, lateout("rax") ret, options(nostack));
     ret
+}
+
+#[cfg(target_env = "gnu")]
+unsafe fn syscall5(_n: u64, _arg1: u64, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> u64 {
+    0
 }
 
 pub fn exit(code: i32) -> ! {
@@ -370,10 +481,10 @@ pub fn spawn(elf_buffer: &[u8]) -> i32 {
     unsafe { syscall2(SYS_SPAWN, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
 }
 
-pub fn wait(status: Option<&mut i32>) -> i32 {
+pub fn wait(status: core::option::Option<&mut i32>) -> i32 {
     let status_ptr = match status {
-        Some(s) => s as *mut i32 as u64,
-        None => 0,
+        core::option::Option::Some(s) => s as *mut i32 as u64,
+        core::option::Option::None => 0,
     };
     unsafe { syscall1(SYS_WAIT, status_ptr) as i32 }
 }
@@ -461,6 +572,53 @@ pub fn receive(buffer: &mut [u8]) -> (usize, u32) {
     } else {
         (0, 0)
     }
+}
+
+
+
+/// Fast path receive: el kernel escribe datos directamente en registros, sin buffer en memoria.
+/// Solo funciona para mensajes ≤24 bytes (e.g. `InputEvent`).
+/// Retorna `Some((data[24], sender_pid, data_size))` si hay mensaje pequeño,
+/// o `None` si no hay mensaje o el siguiente es grande (usar `receive()` como fallback).
+#[cfg(not(target_env = "gnu"))]
+pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
+    let size: u64;
+    let w0: u64;
+    let w1: u64;
+    let w2: u64;
+    let from: u64;
+    unsafe {
+        // int 0x80 con SYS_RECEIVE_FAST:
+        asm!(
+            "int 0x80",
+            inout("rax") SYS_RECEIVE_FAST => size,
+            lateout("rdi") w0,
+            lateout("rsi") w1,
+            lateout("rdx") w2,
+            lateout("rcx") from,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    if size > 0 {
+        let mut data = [0u8; 24];
+        data[0..8].copy_from_slice(&w0.to_le_bytes());
+        data[8..16].copy_from_slice(&w1.to_le_bytes());
+        data[16..24].copy_from_slice(&w2.to_le_bytes());
+        core::option::Option::Some((data, from as u32, size as usize))
+    } else {
+        core::option::Option::None
+    }
+}
+
+#[cfg(target_env = "gnu")]
+pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
+    let mut q = MOCK_RECEIVE_FAST_QUEUE.lock();
+    if q.is_empty() { return core::option::Option::None; }
+    core::option::Option::Some(q.remove(0))
 }
 
 /// Get the number of registered block devices
@@ -607,7 +765,7 @@ pub struct FramebufferInfo {
 
 /// Get framebuffer information from the kernel
 /// Returns Some(FramebufferInfo) on success, None on failure
-pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
+pub fn get_framebuffer_info() -> core::option::Option<FramebufferInfo> {
     let mut fb_info = FramebufferInfo {
         address: 0,
         width: 0,
@@ -627,21 +785,21 @@ pub fn get_framebuffer_info() -> Option<FramebufferInfo> {
     };
     
     if result == 0 {
-        Some(fb_info)
+        core::option::Option::Some(fb_info)
     } else {
-        None
+        core::option::Option::None
     }
 }
 
 /// Map framebuffer into process address space
 /// Returns the virtual address of the mapped framebuffer on success, None on failure
-pub fn map_framebuffer() -> Option<usize> {
+pub fn map_framebuffer() -> core::option::Option<usize> {
     let result = unsafe { syscall0(SYS_MAP_FRAMEBUFFER) };
     
     if result != 0 {
-        Some(result as usize)
+        core::option::Option::Some(result as usize)
     } else {
-        None
+        core::option::Option::None
     }
 }
 
@@ -661,7 +819,7 @@ pub const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Map memory
 /// Returns: Address of mapped memory, or u64::MAX on error
-pub fn mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> u64 {
+pub fn mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i32, _offset: u64) -> u64 {
     // Note: offset is currently ignored by kernel sys_mmap signature but we should pass it if we update kernel
     // For now, kernel only takes 5 args, and our syscall5 helper doesn't exist yet either.
     // Wait, sys_mmap defined in kernel takes 5 args: addr, length, prot, flags, fd. Offset is missing!

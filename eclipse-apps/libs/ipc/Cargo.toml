@@ -2,12 +2,22 @@
 name = "eclipse_ipc"
 version = "0.1.0"
 edition = "2021"
-authors = ["Eclipse Rust Team"]
-description = "Biblioteca de comunicación inter-proceso para Eclipse OS"
+authors = ["Eclipse OS Team"]
+description = "Biblioteca IPC tipada no_std para Eclipse OS"
+
+[features]
+# Expone parse_fast/parse_slow para tests de integración (no usar en producción).
+testable = []
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
-tokio = { version = "1.0", features = ["net", "io-util", "rt", "time"] }
-bytes = "1.0"
-mio = "0.8"
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../../eclipse_kernel/userspace/libc" }
+sidewind_core = { path = "../../sidewind_core" }
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+
+[profile.dev]
+opt-level = "s"

@@ -51,6 +51,7 @@ static mut HEAP: KernelHeap = KernelHeap {
     memory: [0; HEAP_SIZE],
 };
 
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -76,15 +77,22 @@ pub fn init() {
         crate::serial::serial_print_hex(heap_start_high);
         crate::serial::serial_print("\n");
         
-        // Get raw pointer to ALLOCATOR and dereference explicitly
-        let allocator_ptr = &raw const ALLOCATOR;
-        let allocator_ref = unsafe { &*allocator_ptr };
-        let mut allocator = allocator_ref.lock();
-        
-        // Initialize allocator with Higher Half address
-        allocator.init(heap_start_high as *mut u8, HEAP_SIZE);
-        
-        crate::serial::serial_print("[MEM] Allocator initialized\n");
+        #[cfg(not(test))]
+        {
+            // Get raw pointer to ALLOCATOR and dereference explicitly
+            let allocator_ptr = &raw const ALLOCATOR;
+            let allocator_ref = unsafe { &*allocator_ptr };
+            let mut allocator = allocator_ref.lock();
+            
+            // Initialize allocator with Higher Half address
+            allocator.init(heap_start_high as *mut u8, HEAP_SIZE);
+            
+            crate::serial::serial_print("[MEM] Allocator initialized\n");
+        }
+        #[cfg(test)]
+        {
+            crate::serial::serial_print("[MEM] Using std allocator for tests\n");
+        }
     }
 }
 
@@ -282,24 +290,34 @@ pub fn walk_current(vaddr: u64) {
 
 /// Obtener dirección física de CR3
 pub fn get_cr3() -> u64 {
-    let cr3: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, cr3",
-            out(reg) cr3,
-            options(nostack, preserves_flags)
-        );
+    #[cfg(not(test))]
+    {
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) cr3,
+                options(nostack, preserves_flags)
+            );
+        }
+        cr3
     }
-    cr3
+    #[cfg(test)]
+    {
+        0x1000 // Mock value
+    }
 }
 
 /// Establecer CR3 (para cambiar espacio de direcciones)
-pub unsafe fn set_cr3(cr3: u64) {
-    core::arch::asm!(
-        "mov cr3, {}",
-        in(reg) cr3,
-        options(nostack, preserves_flags)
-    );
+pub unsafe fn set_cr3(_cr3: u64) {
+    #[cfg(not(test))]
+    {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) _cr3,
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 /// CR3 del kernel (higher-half); se guarda antes de ejecutar el primer proceso.
@@ -381,6 +399,7 @@ pub fn set_identity_map(enabled: bool) {
 }
 
 fn flush_tlb() {
+    #[cfg(not(test))]
     unsafe {
         core::arch::asm!(
             "mov rax, cr3",
