@@ -165,6 +165,34 @@ pub const PAGE_ACCESSED: u64 = 1 << 5;
 pub const PAGE_DIRTY: u64 = 1 << 6;
 pub const PAGE_HUGE: u64 = 1 << 7;
 pub const PAGE_GLOBAL: u64 = 1 << 8;
+pub const PAGE_PAT: u64 = 1 << 7; // PAT for 4KB pages
+pub const PAGE_PAT_HUGE: u64 = 1 << 12; // PAT for Huge pages
+
+/// Initialize Page Attribute Table (PAT)
+/// 
+/// Default PAT:
+/// PA0: WB (06), PA1: WT (04), PA2: UC- (07), PA3: UC (00)
+/// PA4: WB (06), PA5: WT (04), PA6: UC- (07), PA7: UC (00)
+/// 
+/// Customized PAT:
+/// PA1: WC (01) -> PWT=1, PCD=0, PAT=0
+pub fn init_pat() {
+    let mut pat: u64;
+    unsafe {
+        // Read IA32_PAT MSR (0x277)
+        core::arch::asm!("rdmsr", in("ecx") 0x277u32, out("eax") pat, out("edx") _);
+        
+        // Preserve PA0 (WB), set PA1 to WC (01)
+        // PAT is 8 entries of 8 bits each.
+        // PA1 is bits 8-15.
+        pat &= !(0xFF << 8);
+        pat |= 0x01 << 8;
+        
+        // Write back IA32_PAT
+        core::arch::asm!("wrmsr", in("ecx") 0x277u32, in("eax") pat as u32, in("edx") (pat >> 32) as u32);
+    }
+    crate::serial::serial_print("[MEM] PAT initialized (PA1=WC)\n");
+}
 
 // Las tablas ahora están arriba para mayor seguridad
 
@@ -861,7 +889,8 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     let aligned_size = (fb_size + 0xFFF) & !0xFFF;
     
     let virt_addr = GPU_FB_VADDR_BASE;
-    let pt_flags = (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits();
+    // WC flags: PWT=1, PCD=0 (maps to PAT Index 1 which we set to WC)
+    let pt_flags = (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE | Flags::WRITE_THROUGH).bits();
     
     serial::serial_print("MAP_FB: Mapping ");
     serial::serial_print_dec((aligned_size / 4096) as u64);

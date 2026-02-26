@@ -236,6 +236,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Stage 2: Basic hardware initialization
     boot::load_gdt();
     boot::enable_sse();
+    memory::init_pat();
 
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");

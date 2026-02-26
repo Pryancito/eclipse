@@ -275,86 +275,44 @@ fn init_ps2_keyboard() {
 /// Inicializar ratón PS/2: habilitar puerto auxiliar y enviar "enable data reporting".
 /// Si el controlador no responde (timeout), continúa sin ratón para no colgar el boot.
 fn init_ps2_mouse() {
-    const TIMEOUT: u32 = 0x8000; // Evitar bucles infinitos en VMs/sin PS/2
-    let mut ok = true;
-    unsafe {
-        for i in 0..TIMEOUT {
-            if inb(0x64) & 2 == 0 {
-                break;
-            }
-            if i == TIMEOUT - 1 {
-                ok = false;
-            }
-        }
-        if !ok {
-            crate::serial::serial_print("[INT] PS/2 mouse: controller busy (timeout), skipping\n");
-            return;
-        }
-        outb(0x64, 0xA8); // Enable auxiliary device (mouse) port
-        for i in 0..TIMEOUT {
-            if inb(0x64) & 2 == 0 {
-                break;
-            }
-            if i == TIMEOUT - 1 {
-                ok = false;
-            }
-        }
-        if !ok {
-            crate::serial::serial_print("[INT] PS/2 mouse: timeout after A8, skipping\n");
-            return;
-        }
+    if !wait_ps2_write() {
+        crate::serial::serial_print("[INT] PS/2: controller busy, skipping mouse init\n");
+        return;
+    }
 
-        // Enable aux (mouse) interrupt in PS/2 controller command byte:
-        // Read current command byte, set bit 1 (aux IRQ enable), clear bit 5 (aux port disable)
+    unsafe {
+        // Enable mouse port
+        outb(0x64, 0xA8); 
+        if !wait_ps2_write() { return; }
+
+        // Update command byte (enable KBD + MOUSE interrupts, enable both ports)
         outb(0x64, 0x20); // Read Command Byte
-        for i in 0..TIMEOUT {
-            if inb(0x64) & 1 != 0 { break; } // wait for output buffer full
-            if i == TIMEOUT - 1 { ok = false; }
-        }
-        if ok {
+        if wait_ps2_read() {
             let cmd = inb(0x60);
-            let new_cmd = (cmd | 0x02) & !0x20; // set bit1 (aux IRQ), clear bit5 (aux clock disable)
-            for i in 0..TIMEOUT {
-                if inb(0x64) & 2 == 0 { break; }
-                if i == TIMEOUT - 1 { ok = false; }
-            }
-            if ok {
+            let new_cmd = (cmd | 0x03) & !0x30; // set bits 0,1; clear bits 4,5
+            
+            if wait_ps2_write() {
                 outb(0x64, 0x60); // Write Command Byte
-                for i in 0..TIMEOUT {
-                    if inb(0x64) & 2 == 0 { break; }
-                    if i == TIMEOUT - 1 { ok = false; }
-                }
-                if ok {
+                if wait_ps2_write() {
                     outb(0x60, new_cmd);
                 }
             }
         }
-        ok = true; // Continue even if command byte update failed
 
-        outb(0x64, 0xD4); // Next byte goes to mouse
-        for i in 0..TIMEOUT {
-            if inb(0x64) & 2 == 0 {
-                break;
-            }
-            if i == TIMEOUT - 1 {
-                ok = false;
-            }
-        }
-        if !ok {
-            crate::serial::serial_print("[INT] PS/2 mouse: timeout after D4, skipping\n");
-            return;
-        }
-        outb(0x60, 0xF4); // Enable data reporting
-
-        // Drain ACK byte (0xFA) from output buffer so it doesn't confuse the mouse handler
-        for _i in 0..TIMEOUT {
-            if inb(0x64) & 1 != 0 {
-                let _ = inb(0x60); // read and discard ACK
-                break;
+        // Enable data reporting for mouse
+        if wait_ps2_write() {
+            outb(0x64, 0xD4); // Next byte to mouse
+            if wait_ps2_write() {
+                outb(0x60, 0xF4); // Enable data reporting
+                
+                // Drain ACK
+                if wait_ps2_read() {
+                    let _ = inb(0x60);
+                }
             }
         }
     }
-    crate::serial::serial_print("[INT] PS/2 mouse init done\n");
+    crate::serial::serial_print("[INT] PS/2 mouse/kbd ports enabled\n");
 }
 
 /// Inicializar PIC 8259
@@ -968,6 +926,11 @@ extern "C" fn keyboard_handler() {
         scancode = inb(0x60);
     }
     
+    // Debug: log scancode to serial
+    // crate::serial::serial_print("[INT] Keyboard IRQ scancode: ");
+    // crate::serial::serial_print_hex(scancode as u64);
+    // crate::serial::serial_print("\n");
+
     // Buffer the key
     let mut head = KEY_HEAD.lock();
     let tail = KEY_TAIL.lock();
@@ -977,6 +940,7 @@ extern "C" fn keyboard_handler() {
         let mut buffer = KEY_BUFFER.lock();
         buffer[*head] = scancode;
         *head = next_head;
+        KEY_PUSH_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     // else: buffer full, drop key
     
