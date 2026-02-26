@@ -278,52 +278,40 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
 
 /// Procesar mensajes pendientes
 pub fn process_messages() {
-    // CRITICAL: We must disable interrupts while processing messages because
-    // this function runs in the kernel task (interrupts enabled).
-    // If an interrupt (like a syscall) occurs while we hold IPC_SYSTEM,
-    // and that syscall tries to access IPC_SYSTEM (e.g. sys_send/sys_receive),
-    // we will DEADLOCK.
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut ipc = IPC_SYSTEM.lock();
-        
-        // Process up to 32 messages per call to drain the queue quickly without holding the lock too long
-        for _ in 0..32 {
+    // CRITICAL: IPC_SYSTEM and PROCESS_MAILBOXES must NEVER be held simultaneously.
+    // On multi-core systems both locks can be held by different CPUs with IRQs disabled,
+    // causing the mouse IRQ to be delayed long enough to lose PS/2 bytes.
+    // Fix: extract each message under IPC_SYSTEM alone, release it, then deliver
+    // P2P messages to the mailbox under PROCESS_MAILBOXES alone.
+    for _ in 0..32 {
+        // Phase 1: Extract one message from the global queue (IPC_SYSTEM only).
+        // Returns: Some(Some((pid, msg))) = P2P for mailbox delivery
+        //          Some(None)             = message delivered to server (or dropped)
+        //          None                   = queue empty, stop
+        let p2p = x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut ipc = IPC_SYSTEM.lock();
+
             if ipc.global_queue_head == ipc.global_queue_tail {
-                break; // Cola vacía
+                return None; // Queue empty - stop the outer loop
             }
-            
+
             let head = ipc.global_queue_head;
             if let Some(msg) = ipc.global_message_queue[head] {
-                // Signal e Input (P2P): enrutar a Process Mailbox cuando destino es un proceso
-                let is_p2p = msg.msg_type == MessageType::Signal || msg.msg_type == MessageType::Input;
+                // Signal and Input (P2P): route to Process Mailbox
+                let is_p2p = msg.msg_type == MessageType::Signal
+                    || msg.msg_type == MessageType::Input;
                 if is_p2p {
                     let pid = msg.to as usize;
-                    
+                    ipc.global_message_queue[head] = None;
+                    ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
                     if pid > 0 && pid < 64 {
-                        if let Some(taken_msg) = ipc.global_message_queue[head].take() {
-                            ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
-                            
-                            let mut mailboxes = PROCESS_MAILBOXES.lock();
-                            if mailboxes[pid].is_none() {
-                                mailboxes[pid] = Some(VecDeque::new());
-                            }
-                            if let Some(queue) = &mut mailboxes[pid] {
-                                if queue.len() < 256 {
-                                    queue.push_back(taken_msg);
-                                }
-                            }
-                        }
-                    } else {
-                        ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                        return Some(Some((pid, msg))); // deliver to mailbox in Phase 2
                     }
-                    continue;
+                    return Some(None); // invalid pid – dropped, continue
                 }
-                
-                // For other messages, check if they are for a registered kernel server
-                // Only if we find a destination server do we take it out of the global queue
+
+                // Non-P2P: deliver to a registered kernel server
                 let mut found_server_idx = None;
-                
-                // First pass: find the server index without mutable borrow
                 for i in 0..32 {
                     if let Some(ref server) = ipc.servers[i] {
                         if server.id == msg.to {
@@ -332,9 +320,7 @@ pub fn process_messages() {
                         }
                     }
                 }
-                
                 if let Some(idx) = found_server_idx {
-                    // Found destination server - take message and deliver
                     if let Some(taken_msg) = ipc.global_message_queue[head].take() {
                         if let Some(ref mut server) = ipc.servers[idx] {
                             let tail = server.queue_tail;
@@ -345,19 +331,37 @@ pub fn process_messages() {
                             }
                         }
                     }
+                } else {
+                    // No server found – clear slot so it isn't processed again
+                    ipc.global_message_queue[head] = None;
                 }
-                
-                // Advance head (if delivered or not handled/dropped)
                 ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
             } else {
-                // Slot empty but head points to it? Should not happen if logic is correct
                 ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
             }
+            Some(None) // continue outer loop
+        });
+
+        match p2p {
+            None => break, // queue was empty
+            Some(None) => {} // already handled (server delivery or dropped)
+            Some(Some((pid, msg))) => {
+                // Phase 2: Deliver P2P message to mailbox (PROCESS_MAILBOXES only,
+                // IPC_SYSTEM is NOT held here).
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    let mut mailboxes = PROCESS_MAILBOXES.lock();
+                    if mailboxes[pid].is_none() {
+                        mailboxes[pid] = Some(VecDeque::new());
+                    }
+                    if let Some(queue) = &mut mailboxes[pid] {
+                        if queue.len() < 256 {
+                            queue.push_back(msg);
+                        }
+                    }
+                });
+            }
         }
-        
-        // DEBUG
-        // crate::serial::serial_print("Done loop\n");
-    });
+    }
 }
 
 /// ¿Hay mensajes pendientes por procesar?
