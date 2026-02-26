@@ -180,16 +180,25 @@ fn close_fd(fd: usize) {
     }
 }
 
-/// Clear framebuffer to white immediately after mapping
-/// Uses volatile writes to ensure visibility on memory-mapped framebuffer
+/// Clear framebuffer to white immediately after mapping.
+/// Uses `rep stosd` (bulk DWORD fill) which is dramatically faster than
+/// per-pixel volatile writes on write-combining EFI GOP framebuffers.
 fn clear_framebuffer_on_init(fb_base: usize, fb_size: usize) {
     println!("[DISPLAY-SERVICE]   - Clearing screen (framebuffer)...");
-    let fb_ptr = fb_base as *mut u32;
-    let pixel_count = fb_size / BYTES_PER_PIXEL;
+    let dword_count = fb_size / 4;
+    if dword_count == 0 {
+        return;
+    }
     unsafe {
-        for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), 0x00FFFFFF);
-        }
+        core::arch::asm!(
+            "rep stosd",
+            in("eax") 0x00FFFFFFu32, // white (A=0, R=FF, G=FF, B=FF)
+            inout("rdi") fb_base => _,
+            inout("rcx") dword_count => _,
+            options(nostack, preserves_flags),
+        );
+        // sfence ensures WC-buffer is flushed to the display
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
     }
     println!("[DISPLAY-SERVICE]     ✓ Screen cleared to white");
 }
@@ -824,32 +833,37 @@ fn swap_buffers(fb: &Framebuffer) -> Result<(), &'static str> {
     }
 }
 
-/// Perform optimized screen clear
+/// Perform optimized screen clear using `rep stosd` (bulk DWORD fill).
+/// Much faster than per-pixel volatile writes on WC/UC framebuffer memory.
 fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
-    // Clear primary framebuffer
-    println!("[DISPLAY-SERVICE] DEBUG: Clearing FB base=0x{:X}, size=0x{:X}", fb.base_address, fb.size);
-    let fb_ptr = fb.base_address as *mut u32;
-    let pixel_count = fb.size / BYTES_PER_PIXEL;
-    
-    // Use volatile writes for all colors to ensure visibility on memory-mapped framebuffer
-    unsafe {
-        for i in 0..pixel_count {
-            core::ptr::write_volatile(fb_ptr.add(i), color);
+    let dword_count = fb.size / 4;
+    if dword_count > 0 {
+        unsafe {
+            core::arch::asm!(
+                "rep stosd",
+                in("eax") color,
+                inout("rdi") fb.base_address => _,
+                inout("rcx") dword_count => _,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
         }
     }
-    
-    // Also clear back buffer if it exists
     if fb.back_buffer != 0 {
-        let back_buf_addr = fb.back_buffer;
-        println!("[DISPLAY-SERVICE] DEBUG: Clearing BACK FB base=0x{:X}", back_buf_addr);
-        let back_ptr = back_buf_addr as *mut u32;
-        unsafe {
-            for i in 0..pixel_count {
-                core::ptr::write_volatile(back_ptr.add(i), color);
+        let dword_count_bb = fb.size / 4;
+        if dword_count_bb > 0 {
+            unsafe {
+                core::arch::asm!(
+                    "rep stosd",
+                    in("eax") color,
+                    inout("rdi") fb.back_buffer => _,
+                    inout("rcx") dword_count_bb => _,
+                    options(nostack, preserves_flags),
+                );
+                core::arch::asm!("sfence", options(nostack, preserves_flags));
             }
         }
     }
-    
     Ok(())
 }
 

@@ -1448,16 +1448,18 @@ fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
     0
 }
 
-/// sys_set_cursor_position - Set VirtIO GPU hardware cursor position
-/// arg1: x (u32), arg2: y (u32). Returns 0 on success, u64::MAX on failure.
+/// sys_set_cursor_position - Set cursor position.
+/// On VirtIO GPU (QEMU): uses hardware cursor via MOVE_CURSOR command.
+/// On real hardware (EFI GOP): renders a software cursor into the framebuffer.
+/// arg1: x (u32), arg2: y (u32). Always returns 0.
 fn sys_set_cursor_position(arg1: u64, arg2: u64) -> u64 {
     let x = arg1 as u32;
     let y = arg2 as u32;
-    if crate::virtio::set_cursor_position(x, y) {
-        0
-    } else {
-        u64::MAX
+    if !crate::virtio::set_cursor_position(x, y) {
+        // No VirtIO GPU — fall back to software cursor painted into EFI GOP framebuffer.
+        crate::sw_cursor::update(x, y);
     }
+    0
 }
 
 /// sys_gpu_alloc_display_buffer - Allocate VirtIO GPU 2D buffer and map into process

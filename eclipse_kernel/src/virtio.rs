@@ -1354,10 +1354,11 @@ impl VirtIOGpuDevice {
         }
     }
 
-    /// Asigna memoria DMA estática (512 bytes req + resp) al arranque.
+    /// Asigna memoria DMA estática (4096 bytes req + 512 bytes resp) al arranque.
     /// Zero-Allocation Hot Path: evita alloc/free en transfer_to_host_2d, resource_flush, etc.
+    /// 4096-byte req buffer allows virgl 3D command streams up to ~4 KB.
     unsafe fn allocate_static_buffers(&mut self) -> bool {
-        if let Some((rq_ptr, rq_phys)) = crate::memory::alloc_dma_buffer(512, 64) {
+        if let Some((rq_ptr, rq_phys)) = crate::memory::alloc_dma_buffer(4096, 64) {
             if let Some((rsp_ptr, rsp_phys)) = crate::memory::alloc_dma_buffer(512, 64) {
                 self.req_buf_ptr = rq_ptr;
                 self.req_buf_phys = rq_phys;
@@ -1391,9 +1392,13 @@ impl VirtIOGpuDevice {
 
         unsafe {
             core::ptr::write_bytes(resp_ptr, 0x55, resp_size);
-            // FLUSH request AND response buffers (FULL 512 bytes) before notifying device
-            for i in (0..512).step_by(64) {
+            // Flush only the bytes actually used (not always 512) to minimise cache traffic.
+            let req_flush = (req_size + 63) & !63;
+            for i in (0..req_flush).step_by(64) {
                 clflush((self.req_buf_ptr as u64) + i as u64);
+            }
+            let resp_flush = (resp_size + 63) & !63;
+            for i in (0..resp_flush).step_by(64) {
                 clflush((resp_ptr as u64) + i as u64);
             }
             sfence();
@@ -1986,19 +1991,30 @@ impl VirtIOGpuDevice {
             .ok_or("alloc cursor bitmap failed")?;
         unsafe {
             core::ptr::write_bytes(bitmap_ptr, 0, cursor_size);
-            // Simple 64x64 arrow: white center cross, black outline, transparent elsewhere
+            // Arrow cursor: tip at top-left (0,0) — hotspot matches (0,0) below.
+            // At row y the right edge is at column y/2 (1:2 slope: 1 pixel right per
+            // 2 pixels down), drawn over the first 48 rows of the 64×64 bitmap.
             let ptr = bitmap_ptr as *mut u8;
+            let arrow_max_row = 48u32;
             for y in 0..CURSOR_HEIGHT {
                 for x in 0..CURSOR_WIDTH {
                     let i = (y * CURSOR_WIDTH + x) as usize * 4;
-                    let (b, g, r, a) = if (x >= 28 && x < 36) || (y >= 28 && y < 36) {
-                        if (x >= 30 && x < 34) || (y >= 30 && y < 34) {
-                            (255, 255, 255, 255) // white center
+                    let (b, g, r, a) = if y < arrow_max_row {
+                        let right_edge = y / 2;
+                        if x <= right_edge {
+                            let is_border = x == 0
+                                || x == right_edge
+                                || y == arrow_max_row - 1;
+                            if is_border {
+                                (0u8, 0u8, 0u8, 255u8) // opaque black (BGRA)
+                            } else {
+                                (255u8, 255u8, 255u8, 255u8) // opaque white
+                            }
                         } else {
-                            (0, 0, 0, 255) // black outline
+                            (0, 0, 0, 0) // transparent
                         }
                     } else {
-                        (0, 0, 0, 0)
+                        (0, 0, 0, 0) // transparent
                     };
                     *ptr.add(i) = b;
                     *ptr.add(i + 1) = g;
@@ -2021,8 +2037,8 @@ impl VirtIOGpuDevice {
         self.resource_create_2d(CURSOR_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, CURSOR_WIDTH, CURSOR_HEIGHT)?;
         self.resource_attach_backing(CURSOR_RESOURCE_ID, &[(bitmap_phys, cursor_size as u32)])?;
 
-        // UPDATE_CURSOR: set cursor image at (0,0), hotspot center (32,32)
-        self.update_cursor(0, 0, 0, 32, 32)?;
+        // UPDATE_CURSOR: upload cursor image; hotspot at (0,0) matches arrow tip
+        self.update_cursor(0, 0, 0, 0, 0)?;
         self.cursor_resource_created = true;
         Ok(())
     }
@@ -2148,9 +2164,34 @@ impl VirtIOGpuDevice {
         self.send_gpu_cmd_nodata(req_size, false)
     }
 
-    /// Move hardware cursor - uses UPDATE_CURSOR (more reliable than MOVE_CURSOR in QEMU)
+    /// Move hardware cursor — uses MOVE_CURSOR (0x0301), a lightweight position-only update
+    /// that does not re-send the cursor bitmap. Much faster than UPDATE_CURSOR for every
+    /// mouse-movement event (called potentially hundreds of times per second).
     pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> Result<(), &'static str> {
-        self.update_cursor(scanout_id, x, y, 32, 32)
+        let req_size = core::mem::size_of::<VirtioGpuUpdateCursorReq>();
+        let r = self.req_buf_ptr;
+        unsafe {
+            core::ptr::write_bytes(r, 0, req_size);
+            core::ptr::write_unaligned(
+                r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, hdr)
+                    + core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32,
+                VIRTIO_GPU_CMD_MOVE_CURSOR, // 0x0301: position-only, no bitmap resend
+            );
+            core::ptr::write_unaligned(
+                r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, scanout_id)) as *mut u32,
+                scanout_id,
+            );
+            core::ptr::write_unaligned(
+                r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, x)) as *mut u32,
+                x,
+            );
+            core::ptr::write_unaligned(
+                r.add(core::mem::offset_of!(VirtioGpuUpdateCursorReq, y)) as *mut u32,
+                y,
+            );
+            // resource_id = 0 (position-only; GPU keeps the bitmap from the last UPDATE_CURSOR)
+        }
+        self.send_gpu_cmd_nodata(req_size, true)
     }
 
     /// Create a Virgl 3D context (requires virgl_supported).
@@ -2392,7 +2433,7 @@ impl VirtIOGpuDevice {
 
         let hdr_size = core::mem::size_of::<VirtioGpuCmdSubmit>();
         let total_size = hdr_size + cmd_data.len();
-        if total_size > 512 {
+        if total_size > 4096 {
             return Err("3D command exceeds static buffer");
         }
 

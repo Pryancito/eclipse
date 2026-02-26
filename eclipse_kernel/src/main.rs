@@ -42,6 +42,7 @@ mod bcache; // Buffer Cache
 mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery
 mod apic;    // Local APIC
+mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
