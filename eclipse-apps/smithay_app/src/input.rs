@@ -22,7 +22,8 @@ pub enum KeyAction {
 }
 
 pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
-    match scancode {
+    let code = (scancode & 0x7FFF) as u8;
+    match code {
         0x2E => KeyAction::Clear,
         0x02 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(0) } else { KeyAction::SetColor(0) },
         0x03 => if (modifiers & 8) != 0 { KeyAction::SwitchWorkspace(1) } else { KeyAction::SetColor(1) },
@@ -156,7 +157,8 @@ impl InputState {
         match ev.event_type {
             0 => { // Keyboard
                 let pressed = ev.value == 1;
-                match ev.code {
+                let code = (ev.code & 0x7FFF) as u8;
+                match code {
                     0x2A | 0x36 => { if pressed { self.modifiers |= 1; } else { self.modifiers &= !1; } }
                     0x1D => { if pressed { self.modifiers |= 2; } else { self.modifiers &= !2; } }
                     0x38 => { if pressed { self.modifiers |= 4; } else { self.modifiers &= !4; } }
@@ -164,13 +166,13 @@ impl InputState {
                     _ => {}
                 }
                 let action = if self.search_active {
-                    match ev.code {
+                    match code {
                         0x01 => KeyAction::ToggleSearch,
                         0x1C => KeyAction::Enter,
                         0x0E => KeyAction::Backspace,
                         0x48 => KeyAction::ArrowUp,
                         0x50 => KeyAction::ArrowDown,
-                        _ => { if let Some(c) = scancode_to_char(ev.code, (self.modifiers & 1) != 0) { KeyAction::Input(c) } else { KeyAction::None } }
+                        _ => { if let Some(c) = scancode_to_char(code as u16, (self.modifiers & 1) != 0) { KeyAction::Input(c) } else { KeyAction::None } }
                     }
                 } else if self.modifiers & (4 | 8) != 0 {
                     scancode_to_action(ev.code, self.modifiers)

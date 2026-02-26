@@ -199,7 +199,7 @@ else
     # Se deshabilita el i8042 para que no haya fallback PS/2.
     print_info "Entrada: USB HID puro (teclado + tablet XHCI). PS/2 desactivado."
     if [ "$USE_XHCI" = "1" ]; then
-        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci,p2=$USB_PORTS_2,p3=$USB_PORTS_3"
+        QEMU_CMD="$QEMU_CMD -device qemu-xhci,id=xhci"
         # Puerto 1: teclado USB HID
         QEMU_CMD="$QEMU_CMD -device usb-kbd,bus=xhci.0,port=1"
         # Puerto 2: tablet USB (puntero absoluto; no requiere Ctrl+Alt+G)

@@ -600,7 +600,12 @@ pub extern "C" fn _start() -> ! {
 
         // Drenar teclado PS/2 real (kernel buffer vía syscall read_key)
         let mut kbd_batch = 0u32;
+        let mut has_e0 = false;
         while let Some(sc) = read_key_scancode() {
+            if sc == 0xE0 {
+                has_e0 = true;
+                continue;
+            }
             kbd_batch += 1;
             if kbd_batch >= 8 {
                 yield_cpu();
@@ -609,12 +614,17 @@ pub extern "C" fn _start() -> ! {
             let value = if (sc & 0x80) != 0 { 0 } else { 1 }; // break = 0, make = 1
             let code = sc & 0x7F;
             if code == 0 {
+                has_e0 = false;
                 continue;
             }
+            // Use bit 15 as a flag for extended (E0) scancodes
+            let final_code = if has_e0 { (code as u16) | 0x8000 } else { code as u16 };
+            has_e0 = false;
+
             let kbd_event = InputEvent {
                 device_id: 0,
                 event_type: 0,
-                code: code as u16,
+                code: final_code,
                 value,
                 timestamp: heartbeat_counter,
             };

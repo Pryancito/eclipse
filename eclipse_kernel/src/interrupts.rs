@@ -810,6 +810,31 @@ extern "C" fn timer_handler() {
     stats.irqs += 1;
     drop(stats);
     
+    // Heartbeat de depuración cada ~5 s: quién tuvo CPU, último syscall, mensajes descartados (mailbox lleno), recv ok/empty
+    if ticks > 0 && ticks % 5000 == 0 {
+        let cur_pid = crate::process::current_process_id().unwrap_or(0);
+        let last_sys = crate::syscalls::LAST_SYSCALL_NUM.load(Ordering::Relaxed);
+        let dropped = crate::ipc::DROPPED_P2P_MSGS.load(Ordering::Relaxed);
+        let p2p_del = crate::ipc::P2P_DELIVERED.swap(0, Ordering::Relaxed);
+        let recv_ok = crate::syscalls::RECV_OK.swap(0, Ordering::Relaxed);
+        let recv_empty = crate::syscalls::RECV_EMPTY.swap(0, Ordering::Relaxed);
+        let mouse_push = MOUSE_PUSH_COUNT.swap(0, Ordering::Relaxed);
+        let key_push = KEY_PUSH_COUNT.swap(0, Ordering::Relaxed);
+        let usb_poll = crate::usb_hid::USB_POLL_COUNT.swap(0, Ordering::Relaxed);
+        let usb_xfer = crate::usb_hid::USB_TRANSFER_EVENTS.swap(0, Ordering::Relaxed);
+        let runs = crate::scheduler::take_run_counts();
+        crate::serial::serial_printf(format_args!(
+            "[DBG] tick={} cur_pid={} last_sys={} drop={} p2p={} recv_ok={} recv_empty={} mouse={} key={} usb_poll={} usb_xfer={}",
+            ticks, cur_pid, last_sys, dropped, p2p_del, recv_ok, recv_empty, mouse_push, key_push, usb_poll, usb_xfer
+        ));
+        for i in 1..runs.len() {
+            if runs[i] > 0 {
+                crate::serial::serial_printf(format_args!(" {}:{}", i, runs[i]));
+            }
+        }
+        crate::serial::serial_printf(format_args!("\n"));
+    }
+    
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
     

@@ -204,13 +204,13 @@ pub static HID_TO_PS2: [u8; 256] = [
     // 0x40 F7  0x41 F8  0x42 F9  0x43 F10  0x44 F11  0x45 F12
        0x41,  0x42,  0x43,  0x44,  0x57,  0x58,
     // 0x46 PrintScreen  0x47 ScrollLock  0x48 Pause
-       0,     0x46,  0,
+       0,     0x46,  0x1D, // 0x48 is Pause, but often shared or E1; use 0x1D/Ctrl as placeholder
     // 0x49 Insert  0x4A Home  0x4B PageUp  0x4C Delete  0x4D End  0x4E PageDown
-       0,     0,     0,     0,     0,     0,
+       0x52,  0x47,  0x49,  0x53,  0x4F,  0x51,
     // 0x4F RightArrow  0x50 LeftArrow  0x51 DownArrow  0x52 UpArrow
-       0,     0,     0,     0,
+       0x4D,  0x4B,  0x50,  0x48,
     // 0x53 NumLock  0x54 KP/  0x55 KP*  0x56 KP-  0x57 KP+  0x58 KPEnter
-       0x45,  0,     0x37,  0x4A,  0x4E,  0,
+       0x45,  0x35,  0x37,  0x4A,  0x4E,  0x1C,
     // 0x59 KP1   0x5A KP2   0x5B KP3   0x5C KP4
        0x4F,  0x50,  0x51,  0x4B,
     // 0x5D KP5   0x5E KP6   0x5F KP7   0x60 KP8
@@ -231,24 +231,45 @@ pub static HID_TO_PS2: [u8; 256] = [
        0, 0, 0, 0,                           // 0xDC-0xDF
     // Modifier keys (reported in byte 0, but also appear at 0xE0-0xE7)
     // 0xE0 LCtrl  0xE1 LShift  0xE2 LAlt   0xE3 LGUI
-       0x1D,  0x2A,  0x38,  0,
+       0x1D,  0x2A,  0x38,  0x5B,
     // 0xE4 RCtrl  0xE5 RShift  0xE6 RAlt   0xE7 RGUI
-       0,     0x36,  0,     0,
+       0x1D,  0x36,  0x38,  0x5C,
     // 0xE8–0xFF: unmapped (24 bytes)
        0, 0, 0, 0, 0, 0, 0, 0, // 0xE8-0xEF
        0, 0, 0, 0, 0, 0, 0, 0, // 0xF0-0xF7
        0, 0, 0, 0, 0, 0, 0, 0, // 0xF8-0xFF
 ];
 
+// Helper to push a scancode, handling extended prefixes and release bit.
+fn push_scancode(make_code: u8, extended: bool, release: bool) {
+    if make_code == 0 { return; }
+    if extended { interrupts::push_key(0xE0); }
+    let mut final_code = make_code;
+    if release { final_code |= 0x80; }
+    interrupts::push_key(final_code);
+}
+
+/// Helper to determine if a usage ID or modifier requires the E0 prefix.
+fn is_extended_usage(usage_id: u8) -> bool {
+    match usage_id {
+        0x49..=0x53 => true, // Insert, Home, PgDn, Del, End, Arrows
+        0x54 => true,        // KP/
+        0x58 => true,        // KP Enter
+        _ => false,
+    }
+}
+
 // PS/2 Set 1 break code = make code | 0x80
-// Modifier bitmask → PS/2 scancode mapping (bit index, make code)
-const MODIFIER_SCANCODES: [(u8, u8); 6] = [
-    (0, 0x1D), // Left Ctrl
-    (1, 0x2A), // Left Shift
-    (2, 0x38), // Left Alt
-    (4, 0x1D), // Right Ctrl (same scancode as Left Ctrl for simplicity)
-    (5, 0x36), // Right Shift
-    (6, 0x38), // Right Alt (same scancode as Left Alt for simplicity)
+// Modifier bitmask → PS/2 scancode mapping (bit index, make code, extended)
+const MODIFIER_SCANCODES: [(u8, u8, bool); 8] = [
+    (0, 0x1D, false), // Left Ctrl
+    (1, 0x2A, false), // Left Shift
+    (2, 0x38, false), // Left Alt
+    (3, 0x5B, true),  // Left GUI (Super)
+    (4, 0x1D, true),  // Right Ctrl
+    (5, 0x36, false), // Right Shift
+    (6, 0x38, true),  // Right Alt
+    (7, 0x5C, true),  // Right GUI (Super)
 ];
 
 // ===========================================================================
@@ -767,6 +788,28 @@ static mut HID_DEVICES: [Option<HidEndpoint>; MAX_HID_DEVICES] = [
     None, None, None, None, None, None, None, None,
 ];
 
+fn find_hid_buf_phys(slot_id: u8, ep_id: u8) -> u64 {
+    unsafe {
+        for dev in HID_DEVICES.iter().flatten() {
+            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
+                return dev.buf_phys;
+            }
+        }
+    }
+    0
+}
+
+fn find_hid_buf_size(slot_id: u8, ep_id: u8) -> usize {
+    unsafe {
+        for dev in HID_DEVICES.iter().flatten() {
+            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
+                return dev.buf_size;
+            }
+        }
+    }
+    0
+}
+
 // ===========================================================================
 // XHCI Controller State
 // ===========================================================================
@@ -953,6 +996,31 @@ impl XhciControllerState {
                             }
                         }
                     }
+
+                    // If we popped a Transfer Event that wasn't our target, process it anyway
+                    // so we don't lose HID reports during initialization.
+                    if trb_type == 32 {
+                         USB_TRANSFER_EVENTS.fetch_add(1, Ordering::Relaxed);
+                         let slot_id = ((ev.control >> 24) & 0xFF) as u8;
+                         let ep_id   = ((ev.control >> 16) & 0x1F) as u8;
+                         process_hid_transfer_event(slot_id, ep_id);
+
+                         // Re-submit
+                         let ring_idx = slot_id as usize * 32 + ep_id as usize;
+                         if let Some(Some(ref mut tr)) = self.transfer_rings.get_mut(ring_idx) {
+                             tr.ring.advance_transfer_dequeue();
+                             let buf_phys = find_hid_buf_phys(slot_id, ep_id);
+                             let buf_size = find_hid_buf_size(slot_id, ep_id);
+                             if buf_phys != 0 {
+                                 let normal = build_normal_trb(buf_phys, buf_size as u16, true);
+                                 if tr.submit(normal).is_ok() {
+                                     if let Some(ref mmio) = self.mmio {
+                                         mmio.ring_doorbell(slot_id, ep_id);
+                                     }
+                                 }
+                             }
+                         }
+                    }
                 }
             }
             timeout -= 1;
@@ -1054,7 +1122,8 @@ impl XhciControllerState {
                 Err(e) => { serial::serial_print(&alloc::format!("[XHCI] TR alloc failed: {}\n", e)); continue; }
             };
             input_ctx.write_u64(72, ep0_ring.get_address() | 1);
-            self.transfer_rings[slot_idx * 32] = Some(ep0_ring);
+            // EP0 ring is at slot_idx * 32 + 1 (DCI 1)
+            self.transfer_rings[slot_idx * 32 + 1] = Some(ep0_ring);
 
             // Address Device
             let addr_ev = match self.execute_command(build_address_device_trb(input_ctx.phys_addr, slot_id, false)) {
@@ -1219,7 +1288,7 @@ impl XhciControllerState {
         let setcfg_setup = build_setup_trb(0x00, 0x09, 1, 0, 0, 0);
         let setcfg_stat  = build_status_trb(true, true);
         let setcfg_phys = {
-            let tr = self.transfer_rings[slot_id as usize * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(setcfg_setup)?;
             tr.submit(setcfg_stat)?
         };
@@ -1230,7 +1299,7 @@ impl XhciControllerState {
         let prot_setup = build_setup_trb(0x21, HID_REQUEST_SET_PROTOCOL, 0, 0, 0, 0);
         let prot_stat  = build_status_trb(true, true);
         let prot_phys = {
-            let tr = self.transfer_rings[slot_id as usize * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(prot_setup)?;
             tr.submit(prot_stat)?
         };
@@ -1241,7 +1310,7 @@ impl XhciControllerState {
         let idle_setup = build_setup_trb(0x21, HID_REQUEST_SET_IDLE, 0, 0, 0, 0);
         let idle_stat  = build_status_trb(true, true);
         let idle_phys = {
-            let tr = self.transfer_rings[slot_id as usize * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(idle_setup)?;
             tr.submit(idle_stat)?
         };
@@ -1373,6 +1442,7 @@ impl XhciControllerState {
 fn port_speed_from_slot(_slot_id: u8) -> u32 { 3 } // Assume High Speed
 
 fn register_hid_device(mut dev: HidEndpoint) {
+    serial::serial_print(&alloc::format!("[XHCI] Registering HID device (slot={} ep={} proto={} size={})\n", dev.slot_id, dev.endpoint_id, dev.protocol, dev.buf_size));
     unsafe {
         for slot in HID_DEVICES.iter_mut() {
             if slot.is_none() {
@@ -1384,30 +1454,9 @@ fn register_hid_device(mut dev: HidEndpoint) {
     }
 }
 
-fn find_hid_buf_phys(slot_id: u8, ep_id: u8) -> u64 {
-    unsafe {
-        for dev in HID_DEVICES.iter().flatten() {
-            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
-                return dev.buf_phys;
-            }
-        }
-    }
-    0
-}
 
-fn find_hid_buf_size(slot_id: u8, ep_id: u8) -> usize {
-    unsafe {
-        for dev in HID_DEVICES.iter().flatten() {
-            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
-                return dev.buf_size;
-            }
-        }
-    }
-    8
-}
-
-/// Called when a Transfer Event arrives for a HID device.
 fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
+    serial::serial_print(&alloc::format!("[XHCI] Transfer event: slot={} ep={}\n", slot_id, ep_id));
     unsafe {
         for dev in HID_DEVICES.iter_mut().flatten() {
             if dev.slot_id != slot_id || dev.endpoint_id != ep_id { continue; }
@@ -1415,9 +1464,9 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
             // Read report from buffer (phys addr → virt via HHDM)
             let virt = memory::phys_to_virt(dev.buf_phys);
 
-            // Determine protocol if still unknown (255)
+            // Determine protocol if unknown or unassigned
             let mut proto = dev.protocol;
-            if proto == 255 {
+            if proto == 0 || proto == 255 {
                 if dev.buf_size >= 8 { proto = HID_PROTOCOL_KEYBOARD; }
                 else if dev.buf_size >= 6 { proto = HID_PROTOCOL_TABLET; }
                 else if dev.buf_size >= 3 { proto = HID_PROTOCOL_MOUSE; }
@@ -1432,6 +1481,8 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
             } else if proto == HID_PROTOCOL_TABLET && dev.buf_size >= 6 {
                 let report = core::ptr::read_volatile(virt as *const HidTabletReport);
                 process_tablet_report(dev, &report);
+            } else {
+                serial::serial_print(&alloc::format!("[XHCI] Unknown HID protocol/size (slot={} ep={} proto={} size={})\n", slot_id, ep_id, proto, dev.buf_size));
             }
             return;
         }
@@ -1450,12 +1501,12 @@ fn process_keyboard_report(dev: &mut HidEndpoint, report: &HidKeyboardReport) {
     };
 
     // Modifier key changes
-    for (bit, scancode) in &MODIFIER_SCANCODES {
+    for (bit, scancode, extended) in &MODIFIER_SCANCODES {
         let mask = 1u8 << bit;
         let was = (prev.modifiers & mask) != 0;
         let now = (report.modifiers & mask) != 0;
-        if now && !was { interrupts::push_key(*scancode); }
-        else if !now && was { interrupts::push_key(*scancode | 0x80); }
+        if now && !was { push_scancode(*scancode, *extended, false); }
+        else if !now && was { push_scancode(*scancode, *extended, true); }
     }
 
     // Key presses (new keys that weren't pressed before)
@@ -1465,7 +1516,7 @@ fn process_keyboard_report(dev: &mut HidEndpoint, report: &HidKeyboardReport) {
             if prev_hid == hid { continue 'outer_press; } // still held
         }
         let sc = HID_TO_PS2[hid as usize];
-        if sc != 0 { interrupts::push_key(sc); }
+        if sc != 0 { push_scancode(sc, is_extended_usage(hid), false); }
     }
 
     // Key releases (keys that were pressed but aren't now)
@@ -1475,7 +1526,7 @@ fn process_keyboard_report(dev: &mut HidEndpoint, report: &HidKeyboardReport) {
             if hid == prev_hid { continue 'outer_rel; } // still held
         }
         let sc = HID_TO_PS2[prev_hid as usize];
-        if sc != 0 { interrupts::push_key(sc | 0x80); }
+        if sc != 0 { push_scancode(sc, is_extended_usage(prev_hid), true); }
     }
 
     dev.last_report = HidLastReport::Keyboard(*report);
@@ -1574,6 +1625,15 @@ pub fn poll() {
     USB_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
     unsafe {
         if let Some(ref mut xhci) = XHCI {
+            // Check if controller halted (USBSTS bit 0)
+            if let Some(ref mmio) = xhci.mmio {
+                let sts = mmio.read_operational(0x04);
+                if (sts & 1) != 0 {
+                    serial::serial_print("[XHCI] Controller HALTED! Status: ");
+                    serial::serial_print_hex(sts as u64);
+                    serial::serial_print("\n");
+                }
+            }
             xhci.process_events();
         }
     }
@@ -1803,6 +1863,59 @@ mod tests {
         let keys = mock_interrupts::KEYS.lock().unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], 0x9E);
+    }
+
+    #[test]
+    fn test_keyboard_super_key() {
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let mut dev = HidEndpoint {
+            slot_id: 1, endpoint_id: 1, protocol: HID_PROTOCOL_KEYBOARD,
+            buf_virt: 0, buf_phys: 0, buf_size: 8,
+            last_report: HidLastReport::None,
+        };
+
+        // Press Left Super (HID modifier bit 3 -> scancodes E0 5B)
+        let report = HidKeyboardReport {
+            modifiers: 1 << 3, reserved: 0, keys: [0, 0, 0, 0, 0, 0],
+        };
+        process_keyboard_report(&mut dev, &report);
+        
+        let keys = mock_interrupts::KEYS.lock().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], 0xE0);
+        assert_eq!(keys[1], 0x5B);
+        drop(keys);
+
+        // Release Left Super (E0 DB)
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let report_off = HidKeyboardReport::default();
+        process_keyboard_report(&mut dev, &report_off);
+        
+        let keys = mock_interrupts::KEYS.lock().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], 0xE0);
+        assert_eq!(keys[1], 0xDB);
+    }
+
+    #[test]
+    fn test_keyboard_arrow_keys() {
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let mut dev = HidEndpoint {
+            slot_id: 1, endpoint_id: 1, protocol: HID_PROTOCOL_KEYBOARD,
+            buf_virt: 0, buf_phys: 0, buf_size: 8,
+            last_report: HidLastReport::None,
+        };
+
+        // Press Up Arrow (HID 0x52 -> scancodes E0 48)
+        let report = HidKeyboardReport {
+            modifiers: 0, reserved: 0, keys: [0x52, 0, 0, 0, 0, 0],
+        };
+        process_keyboard_report(&mut dev, &report);
+        
+        let keys = mock_interrupts::KEYS.lock().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], 0xE0);
+        assert_eq!(keys[1], 0x48);
     }
 
     #[test]
