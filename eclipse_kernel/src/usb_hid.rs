@@ -15,6 +15,8 @@
 
 use core::sync::atomic::{fence, AtomicU64, Ordering};
 use core::ptr::{read_volatile, write_volatile};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_mm_clflush;
 
 #[cfg(not(test))]
 use crate::memory;
@@ -42,6 +44,7 @@ mod mock_interrupts {
     pub fn push_key(sc: u8) { KEYS.lock().unwrap().push(sc); }
     pub fn push_mouse_packet(p: u32) { MOUSE.lock().unwrap().push(p); }
     pub fn set_irq_handler(_irq: u8, _handler: fn()) -> Result<(), &'static str> { Ok(()) }
+    pub fn ticks() -> u64 { 0 }
 }
 #[cfg(test)]
 mod mock_serial {
@@ -515,13 +518,30 @@ impl TrbRing {
         Some(trb)
     }
 
-    /// Enqueue a TRB with the current cycle bit (for Command/Transfer Ring).
+    /// Enqueue a TRB con el Cycle Bit actual (para Command/Transfer Ring).
+    ///
+    /// Importante en hardware real: el Cycle Bit (en `control`) se escribe LO ÚLTIMO,
+    /// después de haber escrito `parameter` y `status` y de una barrera de memoria,
+    /// para evitar que el controlador vea un TRB parcialmente escrito.
     pub fn enqueue(&mut self, mut trb: Trb) -> Result<(), &'static str> {
         if self.is_full() { return Err("TRB ring is full"); }
         trb.set_cycle_bit(self.cycle_state);
+
         let off = self.enqueue_index * 16;
-        self.allocation.write_u64(off, trb.parameter);
-        self.allocation.write_u64(off + 8, (trb.status as u64) | ((trb.control as u64) << 32));
+
+        // Dwords 0–2: parameter[63:0] y status[31:0]
+        let param_lo = (trb.parameter & 0xFFFF_FFFF) as u32;
+        let param_hi = (trb.parameter >> 32) as u32;
+        self.allocation.write_u32(off,     param_lo);
+        self.allocation.write_u32(off + 4, param_hi);
+        self.allocation.write_u32(off + 8, trb.status);
+
+        // Asegurar que los datos llegan a RAM antes del Cycle Bit.
+        fence(Ordering::Release);
+
+        // Dword 3: control (incluye Cycle Bit).
+        self.allocation.write_u32(off + 12, trb.control);
+
         self.enqueue_index = (self.enqueue_index + 1) % self.usable();
         if self.enqueue_index == 0 {
             self.cycle_state = !self.cycle_state;
@@ -825,6 +845,8 @@ pub struct XhciControllerState {
     pub mmio_base:       u64,
     pub max_slots:       u8,
     pub max_ports:       u8,
+    pub slot_speeds:     [u32; 64], // Store speed (High/Full/Low) per slot id
+    pub context_size:    usize,     // 32 or 64 bytes
     /// Framebuffer dimensions for tablet absolute → relative conversion
     pub fb_width:        u32,
     pub fb_height:       u32,
@@ -843,6 +865,8 @@ impl XhciControllerState {
             mmio_base,
             max_slots: 0,
             max_ports: 0,
+            slot_speeds: [0; 64],
+            context_size: 32, // Default to 32
             fb_width: 1024,
             fb_height: 768,
         }
@@ -974,8 +998,10 @@ impl XhciControllerState {
             if let Some(er) = self.event_rings.get_mut(0) {
                 if let Some(ev) = er.ring.peek_event() {
                     let trb_type = ev.get_trb_type();
-                    let erdp = er.get_erdp();
+                    // Avanzar primero el dequeue index del Event Ring…
                     er.ring.pop_event();
+                    // …y solo entonces actualizar ERDP para que apunte al siguiente TRB.
+                    let erdp = er.get_erdp();
 
                     // Update ERDP (clear EHB)
                     if let Some(ref mmio) = self.mmio {
@@ -1057,12 +1083,22 @@ impl XhciControllerState {
                 mmio.write_operational(port_off, portsc | (1 << 4));
             }
 
-            // Wait for PRC (bit 21) or PR clear (bit 4)
+            // Wait for PRC (bit 21) or PR clear (bit 4).
+            // En hardware real el reset de puerto tarda entre ~10–50ms; usamos ticks() en vez de un bucle fijo.
             let mut done = false;
-            for _ in 0..100_000 {
+            let start_ticks = interrupts::ticks();
+            loop {
                 let mmio = self.mmio.as_ref().ok_or("No MMIO")?;
                 let s = mmio.read_operational(port_off);
-                if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 { done = true; break; }
+                if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 {
+                    done = true;
+                    break;
+                }
+                if interrupts::ticks().wrapping_sub(start_ticks) > 100 {
+                    // Timeout ~100ms
+                    break;
+                }
+                core::hint::spin_loop();
             }
             if !done {
                 serial::serial_print(&alloc::format!("[XHCI] Port {} reset timeout\n", port));
@@ -1087,9 +1123,15 @@ impl XhciControllerState {
             };
             let slot_id = ((ev.control >> 24) & 0xFF) as u8;
             serial::serial_print(&alloc::format!("[XHCI] Slot ID: {}\n", slot_id));
+            
+            // Store speed for this slot
+            if slot_id > 0 && (slot_id as usize) < self.slot_speeds.len() {
+                self.slot_speeds[slot_id as usize] = port_speed;
+            }
 
-            // Allocate device context
-            let dev_ctx = match DmaAllocation::allocate(1024, 64) {
+            // Allocate device context (Slot + 31 Endpoints)
+            let dev_ctx_size = 32 * self.context_size;
+            let dev_ctx = match DmaAllocation::allocate(dev_ctx_size, 64) {
                 Ok(d) => d,
                 Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Dev ctx alloc failed: {}\n", e)); continue; }
             };
@@ -1100,28 +1142,35 @@ impl XhciControllerState {
             let slot_idx = slot_id as usize;
             self.device_contexts[slot_idx] = Some(dev_ctx);
 
-            // Allocate input context
-            let input_ctx = match DmaAllocation::allocate(2048, 64) {
+            // Allocate input context (Control + Slot + 31 Endpoints)
+            let input_ctx_size = 33 * self.context_size;
+            let input_ctx = match DmaAllocation::allocate(input_ctx_size, 64) {
                 Ok(ic) => ic,
                 Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Input ctx alloc failed: {}\n", e)); continue; }
             };
             input_ctx.zero();
-            // Add flags: Slot (bit 0) + EP0 (bit 1)
-            input_ctx.write_u32(4, 0x03);
-            // Slot context: speed + 1 context entry
-            let route = (port_speed << 20) | (1 << 27);
-            input_ctx.write_u32(32, route);
-            input_ctx.write_u32(36, (port as u32) << 16);
-            // EP0 context
+            
+            let csz = self.context_size;
+            // Input Control Context (index 0)
+            input_ctx.write_u32(4, 0x03); // add_flags: Slot (bit 0) + EP0 (bit 1)
+            
+            // Slot context (index 1)
+            let slot_ctx_off = 1 * csz;
+            let route = (port_speed << 20) | (1 << 27); // 1 context entry
+            input_ctx.write_u32(slot_ctx_off + 0, route);
+            input_ctx.write_u32(slot_ctx_off + 4, (port as u32) << 16);
+            
+            // EP0 context (index 2)
+            let ep0_ctx_off = 2 * csz;
             let mps: u32 = match port_speed { 2 => 8, 4 => 512, _ => 64 };
-            input_ctx.write_u32(68, (3 << 1) | (EP_TYPE_CONTROL as u32) << 3 | (mps << 16));
-
+            input_ctx.write_u32(ep0_ctx_off + 4, (3 << 1) | (EP_TYPE_CONTROL as u32) << 3 | (mps << 16));
+            
             // EP0 transfer ring
             let ep0_ring = match TransferRing::new(64, slot_id, 0) {
                 Ok(r) => r,
                 Err(e) => { serial::serial_print(&alloc::format!("[XHCI] TR alloc failed: {}\n", e)); continue; }
             };
-            input_ctx.write_u64(72, ep0_ring.get_address() | 1);
+            input_ctx.write_u64(ep0_ctx_off + 8, ep0_ring.get_address() | 1);
             // EP0 ring is at slot_idx * 32 + 1 (DCI 1)
             self.transfer_rings[slot_idx * 32 + 1] = Some(ep0_ring);
 
@@ -1221,10 +1270,14 @@ impl XhciControllerState {
 
         // Parse descriptors to find HID interrupt IN endpoint
         let mut offset = 0usize;
-        let mut hid_protocol = 0u8;
-        let mut ep_addr = 0u8;
-        let mut ep_interval = 10u8;
-        let mut ep_mps = 8u16;
+        let mut best_iface_idx = 0u8;
+        let mut best_protocol  = 0u8;
+        let mut best_ep_addr   = 0u8;
+        let mut best_ep_interval = 10u8;
+        let mut best_ep_mps    = 8u16;
+
+        let mut current_iface_idx = 0u8;
+        let mut current_hid_proto = 0u8;
 
         while offset < total_len {
             if offset + 2 > total_len { break; }
@@ -1233,55 +1286,64 @@ impl XhciControllerState {
             if desc_len < 2 { break; }
 
             if desc_type == USB_DESC_INTERFACE && offset + 9 <= total_len {
-                let iface_idx      = cfg_data[offset + 2];
+                current_iface_idx  = cfg_data[offset + 2];
                 let iface_class    = cfg_data[offset + 5];
                 let iface_subclass = cfg_data[offset + 6];
                 let iface_protocol = cfg_data[offset + 7];
 
                 serial::serial_print(&alloc::format!(
                     "[XHCI] Interface {}: class={:02X} subclass={:02X} protocol={:02X}\n",
-                    iface_idx, iface_class, iface_subclass, iface_protocol
+                    current_iface_idx, iface_class, iface_subclass, iface_protocol
                 ));
 
-                // Always reset detection state when entering a new interface
-                hid_protocol = 0;
-
+                current_hid_proto = 0;
                 if iface_class == USB_CLASS_HID {
                     if iface_subclass == HID_SUBCLASS_BOOT || iface_subclass == HID_SUBCLASS_NONE {
-                        hid_protocol = iface_protocol;
-                        if hid_protocol == 0 {
-                            // protocol=0 with no boot subclass = generic / absolute pointer (tablet)
-                            hid_protocol = HID_PROTOCOL_TABLET;
+                        current_hid_proto = iface_protocol;
+                        if current_hid_proto == 0 {
+                            current_hid_proto = HID_PROTOCOL_TABLET;
                         }
                     }
                 }
             }
 
-            if desc_type == USB_DESC_ENDPOINT && offset + 7 <= total_len && hid_protocol != 0 {
+            if desc_type == USB_DESC_ENDPOINT && offset + 7 <= total_len && current_hid_proto != 0 {
                 let addr       = cfg_data[offset + 2];
                 let attributes = cfg_data[offset + 3];
                 let mps        = u16::from_le_bytes([cfg_data[offset + 4], cfg_data[offset + 5]]);
                 let interval   = cfg_data[offset + 6];
+                
                 // We want an Interrupt IN endpoint
                 if (addr & 0x80) != 0 && (attributes & 0x03) == 0x03 {
-                    ep_addr     = addr;
-                    ep_mps      = mps;
-                    ep_interval = interval;
-                    // If we found a valid endpoint and hid_protocol was unknown, make a guess if possible
-                    // or just keep it as 0xFF which indicates success finding an EP.
+                    // Priority logic: Keyboard (1) > Mouse (2) > Tablet (3) > others
+                    let mut better = best_ep_addr == 0;
+                    if !better {
+                        if current_hid_proto == HID_PROTOCOL_KEYBOARD && best_protocol != HID_PROTOCOL_KEYBOARD {
+                            better = true;
+                        } else if current_hid_proto == HID_PROTOCOL_MOUSE && best_protocol != HID_PROTOCOL_KEYBOARD && best_protocol != HID_PROTOCOL_MOUSE {
+                            better = true;
+                        }
+                    }
+                    
+                    if better {
+                        best_iface_idx   = current_iface_idx;
+                        best_protocol    = current_hid_proto;
+                        best_ep_addr     = addr;
+                        best_ep_mps      = mps;
+                        best_ep_interval = interval;
+                    }
                 }
             }
-
             offset += desc_len;
         }
 
-        if ep_addr == 0 {
+        if best_ep_addr == 0 {
             return Err("No HID interrupt IN endpoint found");
         }
 
         serial::serial_print(&alloc::format!(
-            "[XHCI] HID slot={} protocol={} ep=0x{:02X} mps={} interval={}\n",
-            slot_id, hid_protocol, ep_addr, ep_mps, ep_interval
+            "[XHCI] Selected HID: slot={} iface={} protocol={} ep=0x{:02X} mps={} interval={}\n",
+            slot_id, best_iface_idx, best_protocol, best_ep_addr, best_ep_mps, best_ep_interval
         ));
 
         // SET_CONFIGURATION (value 1)
@@ -1296,7 +1358,7 @@ impl XhciControllerState {
         let _ = self.poll_event(setcfg_phys, 32);
 
         // SET_PROTOCOL = Boot Protocol (0)
-        let prot_setup = build_setup_trb(0x21, HID_REQUEST_SET_PROTOCOL, 0, 0, 0, 0);
+        let prot_setup = build_setup_trb(0x21, HID_REQUEST_SET_PROTOCOL, 0, best_iface_idx as u16, 0, 0);
         let prot_stat  = build_status_trb(true, true);
         let prot_phys = {
             let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
@@ -1307,7 +1369,7 @@ impl XhciControllerState {
         let _ = self.poll_event(prot_phys, 32);
 
         // SET_IDLE = 0 (report on change only)
-        let idle_setup = build_setup_trb(0x21, HID_REQUEST_SET_IDLE, 0, 0, 0, 0);
+        let idle_setup = build_setup_trb(0x21, HID_REQUEST_SET_IDLE, 0, best_iface_idx as u16, 0, 0);
         let idle_stat  = build_status_trb(true, true);
         let idle_phys = {
             let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
@@ -1318,8 +1380,8 @@ impl XhciControllerState {
         let _ = self.poll_event(idle_phys, 32);
 
         // Calculate XHCI endpoint ID
-        let ep_number = ep_addr & 0x0F;
-        let ep_dir_in = (ep_addr & 0x80) != 0;
+        let ep_number = best_ep_addr & 0x0F;
+        let ep_dir_in = (best_ep_addr & 0x80) != 0;
         let xhci_ep_id = ep_number * 2 + if ep_dir_in { 1 } else { 0 };
 
         // Build Configure Endpoint input context
@@ -1328,17 +1390,18 @@ impl XhciControllerState {
         // Add: Slot context (bit 0) + new endpoint context (bit xhci_ep_id)
         cfg_ctx.write_u32(4, 0x01 | (1u32 << xhci_ep_id));
         // Slot context: update Context Entries to highest enabled DCI
-        cfg_ctx.write_u32(32, (port_speed_from_slot(slot_id) << 20) | ((xhci_ep_id as u32) << 27));
+        let speed = self.slot_speeds[slot_id as usize];
+        cfg_ctx.write_u32(32, (speed << 20) | ((xhci_ep_id as u32) << 27));
         // Endpoint context DWORD1: ErrorCount=3, EPType=Interrupt IN, MaxPacketSize
-        let ep_dword2: u32 = ((ep_mps as u32) << 16) // MaxPacketSize (bits 31:16)
-            | (3 << 1)                                 // Error Count (bits 2:1) = 3
-            | ((EP_TYPE_INTERRUPT_IN as u32) << 3);   // EP Type (bits 5:3) = 7
+        let ep_dword2: u32 = ((best_ep_mps as u32) << 16) // MaxPacketSize (bits 31:16)
+            | (3 << 1)                                     // Error Count (bits 2:1) = 3
+            | ((EP_TYPE_INTERRUPT_IN as u32) << 3);       // EP Type (bits 5:3) = 7
 
         // Endpoint context offset in input context: 32 (icc) + 32 (slot) + (xhci_ep_id-1)*32
         let ep_ctx_off = 32 + 32 + (xhci_ep_id as usize - 1) * 32;
 
         // Allocate interrupt IN transfer ring
-        let int_ring = TransferRing::new(256, slot_id, ep_addr)?;
+        let int_ring = TransferRing::new(256, slot_id, best_ep_addr)?;
         let int_ring_phys = int_ring.get_address();
         cfg_ctx.write_u32(ep_ctx_off + 4, ep_dword2);
         cfg_ctx.write_u64(ep_ctx_off + 8, int_ring_phys | 1); // DCS = 1
@@ -1357,7 +1420,7 @@ impl XhciControllerState {
         }
 
         // Allocate HID report buffer
-        let report_buf_size = match hid_protocol {
+        let report_buf_size = match best_protocol {
             HID_PROTOCOL_KEYBOARD => 8,
             HID_PROTOCOL_MOUSE    => 4,
             HID_PROTOCOL_TABLET   => 6,
@@ -1378,14 +1441,15 @@ impl XhciControllerState {
         register_hid_device(HidEndpoint {
             slot_id,
             endpoint_id: xhci_ep_id,
-            protocol: hid_protocol,
+            protocol: best_protocol,
             buf_virt: report_buf.phys_addr, // intentionally using phys here for simplicity; virt = HHDM + phys
             buf_phys: report_buf.phys_addr,
             buf_size: report_buf_size,
             last_report: HidLastReport::None,
         });
 
-        serial::serial_print(&alloc::format!("[XHCI] HID device registered (slot={} proto={})\n", slot_id, hid_protocol));
+        serial::serial_print(&alloc::format!("[XHCI] HID device registered (slot={} iface={} proto={})\n", slot_id, best_iface_idx, best_protocol));
+
         Ok(())
     }
 
@@ -1439,7 +1503,7 @@ impl XhciControllerState {
     }
 }
 
-fn port_speed_from_slot(_slot_id: u8) -> u32 { 3 } // Assume High Speed
+
 
 fn register_hid_device(mut dev: HidEndpoint) {
     serial::serial_print(&alloc::format!("[XHCI] Registering HID device (slot={} ep={} proto={} size={})\n", dev.slot_id, dev.endpoint_id, dev.protocol, dev.buf_size));
@@ -1463,6 +1527,20 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
 
             // Read report from buffer (phys addr → virt via HHDM)
             let virt = memory::phys_to_virt(dev.buf_phys);
+
+            // En hardware real, el dispositivo escribe el informe vía DMA; la CPU puede
+            // seguir viendo datos antiguos en caché. Invalidamos la caché de este
+            // rango antes de leer el informe.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut addr = virt;
+                let end = virt + dev.buf_size as u64;
+                while addr < end {
+                    _mm_clflush(addr as *const u8);
+                    addr += 64;
+                }
+                fence(Ordering::SeqCst);
+            }
 
             // Determine protocol if unknown or unassigned
             let mut proto = dev.protocol;
@@ -1605,6 +1683,8 @@ fn usb_irq_handler() {
         if (usbsts & 0x08) == 0 { return; } // not our interrupt
         // Clear EINT (write-1-to-clear)
         mmio.write_operational(0x04, 0x08);
+        // Clear IP in IMAN (interrupter 0)
+        mmio.write_runtime(0x20, 0x03); // IP + IE
 
         xhci.process_events();
     }
@@ -1740,11 +1820,18 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
     let max_slots  = (hcsparams1 & 0xFF) as u8;
     let max_ports  = ((hcsparams1 >> 24) & 0xFF) as u8;
 
-    serial::serial_print(&alloc::format!("[XHCI] MaxSlots={} MaxPorts={}\n", max_slots, max_ports));
+    let hccparams1 = mmio.read_capability(0x10);
+    let csz = (hccparams1 >> 2) & 1; // Bit 2: Context Size (CSZ)
+    
+    serial::serial_print(&alloc::format!(
+        "[XHCI] MaxSlots={} MaxPorts={} HCCPARAMS1=0x{:08X} (CSZ={})\n",
+        max_slots, max_ports, hccparams1, csz
+    ));
 
     let mut state = XhciControllerState::new(bar0, mmio);
     state.max_slots = max_slots;
     state.max_ports = max_ports;
+    state.context_size = if csz == 1 { 64 } else { 32 };
     // Read framebuffer size for tablet absolute-to-relative conversion
     if let Some((_phys, fb_w, fb_h, _pitch, _src)) = crate::boot::get_fb_info() {
         state.fb_width  = fb_w;
