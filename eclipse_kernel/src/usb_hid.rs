@@ -1207,7 +1207,7 @@ impl XhciControllerState {
 
         let status_phys = {
             let slot_idx = slot_id as usize;
-            let tr = self.transfer_rings[slot_idx * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_idx * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(setup)?;
             tr.submit(data)?;
             tr.submit(stat)?
@@ -1237,7 +1237,7 @@ impl XhciControllerState {
         let stat  = build_status_trb(false, true);
 
         let stat_phys = {
-            let tr = self.transfer_rings[slot_id as usize * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(setup)?;
             tr.submit(data)?;
             tr.submit(stat)?
@@ -1257,7 +1257,7 @@ impl XhciControllerState {
         let stat2  = build_status_trb(false, true);
 
         let stat2_phys = {
-            let tr = self.transfer_rings[slot_id as usize * 32].as_mut().ok_or("No EP0 ring")?;
+            let tr = self.transfer_rings[slot_id as usize * 32 + 1].as_mut().ok_or("No EP0 ring")?;
             tr.submit(setup2)?;
             tr.submit(data2)?;
             tr.submit(stat2)?

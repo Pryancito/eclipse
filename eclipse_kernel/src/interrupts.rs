@@ -173,12 +173,10 @@ pub fn init() {
     // Inicializar PIT (Timer)
     init_pit();
 
-    // Habilitar dispositivos PS/2 (kbd + mouse)
-    unsafe {
-        if wait_ps2_write() {
-            outb(0x64, 0xAE); // Enable first port (keyboard)
-        }
-    }
+    // Habilitar teclado PS/2 (puerto principal)
+    init_ps2_keyboard();
+
+    // Habilitar ratón PS/2 (puerto auxiliar)
     init_ps2_mouse();
 
     // Habilitar interrupciones
@@ -204,26 +202,74 @@ pub fn load_idt() {
 }
 
 
-/// Wait for PS/2 controller to be ready for writing to 0x60/0x64
-fn wait_ps2_write() -> bool {
+/// Inicializar teclado PS/2: habilitar IRQ de teclado (bit 0) y puerto de teclado (clear bit 4)
+/// en el byte de comando del controlador PS/2. Envía "enable scanning" (0xF4) al teclado.
+/// Si el controlador no responde (timeout), continúa sin bloquear el boot.
+fn init_ps2_keyboard() {
     const TIMEOUT: u32 = 0x8000;
-    for _ in 0..TIMEOUT {
-        if unsafe { inb(0x64) } & 2 == 0 {
-            return true;
+    let mut ok = true;
+    unsafe {
+        // Wait for PS/2 controller input buffer empty
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 { break; }
+            if i == TIMEOUT - 1 { ok = false; }
         }
-    }
-    false
-}
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 keyboard: controller busy, skipping\n");
+            return;
+        }
 
-/// Wait for PS/2 controller to have data available in 0x60
-fn wait_ps2_read() -> bool {
-    const TIMEOUT: u32 = 0x8000;
-    for _ in 0..TIMEOUT {
-        if unsafe { inb(0x64) } & 1 != 0 {
-            return true;
+        // Read current PS/2 controller command byte
+        outb(0x64, 0x20); // Read Command Byte
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 1 != 0 { break; } // wait for output buffer full
+            if i == TIMEOUT - 1 { ok = false; }
+        }
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 keyboard: timeout reading command byte, skipping\n");
+            return;
+        }
+        let cmd = inb(0x60);
+        // Set bit0 (keyboard IRQ1 enable), clear bit4 (keyboard port clock disable)
+        let new_cmd = (cmd | 0x01) & !0x10;
+
+        // Write modified command byte back
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 { break; }
+            if i == TIMEOUT - 1 { ok = false; }
+        }
+        if ok {
+            outb(0x64, 0x60); // Write Command Byte
+            for i in 0..TIMEOUT {
+                if inb(0x64) & 2 == 0 { break; }
+                if i == TIMEOUT - 1 { ok = false; }
+            }
+            if ok {
+                outb(0x60, new_cmd);
+            }
+        }
+        ok = true; // Continue even if command byte update failed
+
+        // Send "Enable Scanning" (0xF4) directly to keyboard via port 0x60
+        for i in 0..TIMEOUT {
+            if inb(0x64) & 2 == 0 { break; }
+            if i == TIMEOUT - 1 { ok = false; }
+        }
+        if !ok {
+            crate::serial::serial_print("[INT] PS/2 keyboard: timeout before F4, skipping\n");
+            return;
+        }
+        outb(0x60, 0xF4); // Enable Scanning
+
+        // Drain ACK byte (0xFA) from output buffer so it doesn't confuse the keyboard handler
+        for _i in 0..TIMEOUT {
+            if inb(0x64) & 1 != 0 {
+                let _ = inb(0x60); // read and discard ACK
+                break;
+            }
         }
     }
-    false
+    crate::serial::serial_print("[INT] PS/2 keyboard init done\n");
 }
 
 /// Inicializar ratón PS/2: habilitar puerto auxiliar y enviar "enable data reporting".
