@@ -15,6 +15,7 @@ members = [
     "sidewind_opengl",
     "libs/ipc",
     "input_test",
+    "gl_demo",
 ]
 exclude = ["libs/ipc_tests"]
 

@@ -342,7 +342,7 @@ pub fn fast_sin(x: f32) -> f32 {
     // Reduce to [-π, π]
     const PI: f32 = core::f32::consts::PI;
     const TAU: f32 = 2.0 * PI;
-    let mut a = x - TAU * libm_roundf(x / TAU);
+    let a = x - TAU * libm_roundf(x / TAU);
     // Horner's method: sin(x) ≈ x - x³/6 + x⁵/120 - x⁷/5040
     let a2 = a * a;
     a * (1.0 - a2 * (1.0/6.0 - a2 * (1.0/120.0 - a2 * (1.0/5040.0))))

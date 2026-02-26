@@ -66,8 +66,8 @@ pub enum SyscallNumber {
     VirglCtxCreate = 42,
     VirglCtxDestroy = 43,
     VirglSubmit3d = 44,
-    VirglCtxAttachResource = 45,
     VirglCtxDetachResource = 46,
+    GetLogs = 49,
     Socket = 100,
     Bind = 101,
     Listen = 102,
@@ -256,6 +256,8 @@ pub extern "C" fn syscall_handler(
         46 => sys_virgl_ctx_detach_resource(arg1, arg2),
         47 => sys_virgl_alloc_backing(arg1),
         48 => sys_virgl_resource_attach_backing(arg1, arg2, arg3),
+        49 => sys_get_logs(arg1, arg2),
+        50 => sys_get_storage_device_count(),
         100 => sys_socket(arg1, arg2, arg3),
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
@@ -295,6 +297,26 @@ pub extern "C" fn syscall_handler(
 
     context.rax = final_ret;
     final_ret
+}
+
+/// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
+fn sys_get_logs(buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 || buf_len > 4096 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(buf_ptr, buf_len) {
+        return u64::MAX;
+    }
+    
+    let mut tmp = [0u8; 1024];
+    let n = crate::progress::get_logs(&mut tmp);
+    let copy_len = core::cmp::min(n, buf_len as usize);
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr as *mut u8, copy_len);
+    }
+    
+    copy_len as u64
 }
 
 /// Length of null-terminated string in user space (max max_len bytes).

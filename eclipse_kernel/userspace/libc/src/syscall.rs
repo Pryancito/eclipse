@@ -83,6 +83,7 @@ pub const SYS_VIRGL_ALLOC_BACKING: u64 = 47;
 pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
 pub const SYS_GET_STORAGE_DEVICE_COUNT: u64 = 50;
+pub const SYS_GET_LOGS: u64 = 49;
 /// Fast path IPC: mensaje entregado en registros, sin buffer en memoria
 pub const SYS_RECEIVE_FAST: u64 = 200;
 
@@ -641,6 +642,11 @@ pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
 /// Get the number of registered block devices
 pub fn get_storage_device_count() -> usize {
     unsafe { syscall0(SYS_GET_STORAGE_DEVICE_COUNT) as usize }
+}
+
+/// Get kernel logs (latest 3 lines) - for HUD.
+pub fn get_logs(buf: &mut [u8]) -> usize {
+    unsafe { syscall2(SYS_GET_LOGS, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
 }
 
 /// PCI device information structure

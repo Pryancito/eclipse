@@ -179,7 +179,7 @@ pub fn rasterize_triangle<const DN: usize, FS: FragmentShader>(
                 let dg = (dst >>  8) & 0xFF;
                 let db =  dst        & 0xFF;
                 let ia = (1.0 - fa) * 255.0;
-                let ar = fa;
+                let _ar = fa;
                 let nr = ((rb as f32 * fa * 255.0 + dr as f32 * ia) / 255.0) as u32;
                 let ng = ((gb as f32 * fa * 255.0 + dg as f32 * ia) / 255.0) as u32;
                 let nb = ((bb as f32 * fa * 255.0 + db as f32 * ia) / 255.0) as u32;

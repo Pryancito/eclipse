@@ -136,6 +136,11 @@ impl SideWindSurface {
         self.width = w;
         self.height = h;
     }
+
+    /// Create a software OpenGL context for this surface.
+    pub fn gl_context(&mut self) -> sidewind_opengl::GlContext {
+        unsafe { sidewind_opengl::GlContext::new(self.vaddr, self.width, self.height) }
+    }
 }
 
 impl Drop for SideWindSurface {

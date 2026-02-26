@@ -177,7 +177,7 @@ build_sidewind_project() {
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test gl_demo"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then
@@ -1336,9 +1336,9 @@ create_bootable_image() {
     local ROOT_IMG="root_temp.img"
     
     # 1. Crear la partición ESP (FAT32) con mtools
-    print_status "Creando partición ESP (512MB) sin root..."
+    print_status "Creando partición ESP (100MB) sin root..."
     rm -f "$ESP_IMG"
-    truncate -s 512M "$ESP_IMG"
+    truncate -s 100M "$ESP_IMG"
     mkfs.fat -F32 -n "ECLIPSE_OS" "$ESP_IMG" > /dev/null
     
     # Crear directorios en la imagen FAT32 usando mtools
@@ -1362,9 +1362,9 @@ EOF
     rm boot_temp.cfg
     
     # 2. Crear la partición EclipseFS
-    print_status "Creando partición EclipseFS (1500MB) sin root..."
+    print_status "Creando partición EclipseFS (500MB) sin root..."
     rm -f "$ROOT_IMG"
-    truncate -s 1500M "$ROOT_IMG"
+    truncate -s 500M "$ROOT_IMG"
     
     if [ -f "mkfs-eclipsefs/target/release/mkfs-eclipsefs" ]; then
         ./mkfs-eclipsefs/target/release/mkfs-eclipsefs -f -L "EclipseOS" -N 10000 "$ROOT_IMG" > /dev/null
@@ -1378,14 +1378,14 @@ EOF
     # 3. Ensamblar la imagen final con tabla GPT
     print_status "Ensamblando imagen final $IMG_FILE..."
     rm -f "$IMG_FILE"
-    truncate -s 700M "$IMG_FILE"
+    truncate -s 530M "$IMG_FILE"
     
     # Usar parted en el archivo local (no requiere sudo para archivos)
     PARTED_CMD="parted"
     "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
     "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 101MiB
     "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 101MiB 601MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 101MiB 501MiB
     
     # Escribir las particiones en los offsets correctos usando dd
     print_status "Escribiendo particiones en la imagen final..."

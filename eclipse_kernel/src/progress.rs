@@ -44,6 +44,56 @@ impl LogBuffer {
 }
 static LOG_BUFFER: Mutex<LogBuffer> = Mutex::new(LogBuffer::new());
 
+// Historia de logs para el HUD (últimas 8 líneas)
+const HISTORY_LINES: usize = 8;
+const HISTORY_LINE_LEN: usize = 64;
+struct LogHistory {
+    lines: [[u8; HISTORY_LINE_LEN]; HISTORY_LINES],
+    cursor: usize,
+}
+impl LogHistory {
+    const fn new() -> Self {
+        Self {
+            lines: [[0u8; HISTORY_LINE_LEN]; HISTORY_LINES],
+            cursor: 0,
+        }
+    }
+    fn push(&mut self, line: &str) {
+        let n = core::cmp::min(line.len(), HISTORY_LINE_LEN);
+        let mut entry = [0u8; HISTORY_LINE_LEN];
+        entry[..n].copy_from_slice(&line.as_bytes()[..n]);
+        self.lines[self.cursor % HISTORY_LINES] = entry;
+        self.cursor += 1;
+    }
+    pub fn get_last_n(&self, n: usize, out: &mut [u8]) -> usize {
+        let count = core::cmp::min(n, core::cmp::min(self.cursor, HISTORY_LINES));
+        let mut written = 0;
+        for i in 0..count {
+            let idx = (self.cursor + HISTORY_LINES - count + i) % HISTORY_LINES;
+            let line_bytes = &self.lines[idx];
+            // Encontrar longitud real (hasta primer 0 o fin)
+            let mut len = 0;
+            while len < HISTORY_LINE_LEN && line_bytes[len] != 0 {
+                len += 1;
+            }
+            if written + len + 1 <= out.len() {
+                out[written..written+len].copy_from_slice(&line_bytes[..len]);
+                written += len;
+                out[written] = b'\n';
+                written += 1;
+            }
+        }
+        written
+    }
+}
+static LOG_HISTORY: Mutex<LogHistory> = Mutex::new(LogHistory::new());
+
+pub fn get_logs(out: &mut [u8]) -> usize {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        LOG_HISTORY.lock().get_last_n(3, out)
+    })
+}
+
 /// Kernel framebuffer wrapper for embedded-graphics DrawTarget
 pub struct KernelFramebuffer {
     ptr: *mut u8,
@@ -208,28 +258,33 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
 
 /// Acumula `msg` en el buffer de línea. Solo renderiza en pantalla cuando llega un '\n'.
 pub fn log(msg: &str) {
-    let mut buf = LOG_BUFFER.lock();
-    let got_newline = buf.push_str(msg);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut buf = LOG_BUFFER.lock();
+        let got_newline = buf.push_str(msg);
 
-    if got_newline.is_some() {
-        // Sin alloc: copiamos el contenido del buffer a un array en el stack
-        const MAX: usize = LOG_BUF_SIZE;
-        let mut tmp = [0u8; MAX];
-        let line_bytes = buf.flush().as_bytes();
-        let n = line_bytes.len().min(MAX);
-        tmp[..n].copy_from_slice(&line_bytes[..n]);
-        let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
+        if got_newline.is_some() {
+            // Sin alloc: copiamos el contenido del buffer a un array en el stack
+            const MAX: usize = LOG_BUF_SIZE;
+            let mut tmp = [0u8; MAX];
+            let line_bytes = buf.flush().as_bytes();
+            let n = line_bytes.len().min(MAX);
+            tmp[..n].copy_from_slice(&line_bytes[..n]);
+            let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
+            
+            // Guardar en la historia para el HUD
+            LOG_HISTORY.lock().push(line);
 
-        // Obtener info del framebuffer y renderizar.
-        // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
-        if let Some((phys, width, height, pitch, source)) = get_fb_info() {
-            buf.clear();
-            drop(buf);
-            render_log_line(line, source, width, height, pitch, phys);
-        } else {
-            buf.clear();
+            // Obtener info del framebuffer y renderizar.
+            // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
+            if let Some((phys, width, height, pitch, source)) = get_fb_info() {
+                buf.clear();
+                drop(buf);
+                render_log_line(line, source, width, height, pitch, phys);
+            } else {
+                buf.clear();
+            }
         }
-    }
+    });
     // Si no hay '\n', el texto queda en el buffer esperando el siguiente fragmento.
 }
 

@@ -1520,7 +1520,6 @@ fn register_hid_device(mut dev: HidEndpoint) {
 
 
 fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
-    serial::serial_print(&alloc::format!("[XHCI] Transfer event: slot={} ep={}\n", slot_id, ep_id));
     unsafe {
         for dev in HID_DEVICES.iter_mut().flatten() {
             if dev.slot_id != slot_id || dev.endpoint_id != ep_id { continue; }

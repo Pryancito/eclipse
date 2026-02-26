@@ -2900,34 +2900,36 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
 
 /// Present display buffer to screen: transfer guest memory to GPU and flush.
 pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
-    // Flush CPU cache so GPU DMA sees userspace writes
-    if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
-        let fb_phys = *DISPLAY_FB_PHYS.lock();
-        if fb_phys != 0 {
-            if let Some((_, _, _, pitch, _)) = get_primary_virtio_display() {
-                let virt = crate::memory::phys_to_virt(fb_phys);
-                let pitch = pitch as u64;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // Flush CPU cache so GPU DMA sees userspace writes
+        if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
+            let fb_phys = *DISPLAY_FB_PHYS.lock();
+            if fb_phys != 0 {
+                if let Some((_, _, _, pitch, _)) = get_primary_virtio_display() {
+                    let virt = crate::memory::phys_to_virt(fb_phys);
+                    let pitch = pitch as u64;
 
-                // Optimized: only flush the dirty rectangle
-                for row in y..(y + h) {
-                    let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
-                    let row_end = row_addr + (w as u64 * 4);
-                    let mut addr = row_addr & !63; // Align to cache line (64 bytes)
-                    while addr < row_end {
-                        unsafe { clflush(addr); }
-                        addr += 64;
+                    // Optimized: only flush the dirty rectangle
+                    for row in y..(y + h) {
+                        let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
+                        let row_end = row_addr + (w as u64 * 4);
+                        let mut addr = row_addr & !63; // Align to cache line (64 bytes)
+                        while addr < row_end {
+                            unsafe { clflush(addr); }
+                            addr += 64;
+                        }
                     }
+                    unsafe { sfence(); }
                 }
-                unsafe { sfence(); }
             }
         }
-    }
-    let mut devices = GPU_DEVICES.lock();
-    let dev = match devices.get_mut(0) {
-        Some(d) => d,
-        None => return false,
-    };
-    dev.transfer_to_host_2d(resource_id, x, y, w, h, 0).is_ok()
-        && dev.resource_flush(resource_id, x, y, w, h).is_ok()
+        let mut devices = GPU_DEVICES.lock();
+        let dev = match devices.get_mut(0) {
+            Some(d) => d,
+            None => return false,
+        };
+        dev.transfer_to_host_2d(resource_id, x, y, w, h, 0).is_ok()
+            && dev.resource_flush(resource_id, x, y, w, h).is_ok()
+    })
 }
 

@@ -647,9 +647,7 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
 
     // Glossy title glow
     if ww > 100 {
-        let title_glow_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
         let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::WHITE);
-        let _ = Text::new("ECLIPSE // TERMINAL", Point::new(wx + 11, wy + 19), title_glow_style).draw(fb);
         let _ = Text::new("ECLIPSE // TERMINAL", Point::new(wx + 10, wy + 18), title_style).draw(fb);
     }
     if ww > 80 {
@@ -693,7 +691,7 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let icon_color = Rgb888::new(100, 200, 255);
     let hex_size = 50;
     let positions = [(center + Point::new(-380, -120), icons::SYSTEM, "SISTEMA", Point::new(-35, 85)), (center + Point::new(-380, 120), icons::APPS, "APLICACIONES", Point::new(-60, 85)), (center + Point::new(380, -120), icons::FILES, "ARCHIVOS", Point::new(-40, 85)), (center + Point::new(380, 120), icons::NETWORK, "RED", Point::new(-15, 85))];
-    let label_style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(180, 220, 255));
+    let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
     for (p, icon, label, label_off) in positions {
         let _ = ui::draw_glowing_hexagon(fb, p, hex_size, icon_color);
         let _ = ui::draw_standard_icon(fb, p, icon);
@@ -710,15 +708,32 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let _ = Line::new(Point::new(255, 65), Point::new(255, 45)).into_styled(hud_line_style).draw(fb);
     let _ = Text::new("APLICACIONES ACTIVAS", Point::new(30, 45), label_style).draw(fb);
 
-    let rx = w - 255;
-    let _ = Rectangle::new(Point::new(rx, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
+    let box_w = 400;
+    let rx = w - box_w - 15;
+    let hud_h = 110;
+    let _ = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(rx, 65), Point::new(rx + 20, 65)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(rx, 65), Point::new(rx, 45)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx + 20, 15 + hud_h)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx, 15 + hud_h - 20)).into_styled(hud_line_style).draw(fb);
+    
+    // Status header
     let dot = if (counter / 15) % 2 == 0 { "*" } else { " " };
-    let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 45), label_style).draw(fb);
-    let _ = Text::new(dot, Point::new(rx + 200, 45), label_style).draw(fb);
+    let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 42), label_style).draw(fb);
+    let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
+
+    // Logs below
+    let mut log_buf = [0u8; 512];
+    let n = eclipse_libc::get_logs(&mut log_buf);
+    if n > 0 {
+        let logs_str = core::str::from_utf8(&log_buf[..n]).unwrap_or("");
+        let mut y_off = 60;
+        let log_text_style = MonoTextStyle::new(&FONT_6X10, colors::WHITE);
+        for line in logs_str.lines() {
+            let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
+            y_off += 12;
+        }
+    }
 
     let taskbar_y = h - 44;
     let taskbar = Taskbar { width: fb.info.width as u32, y: taskbar_y as i32, active_app: None };
