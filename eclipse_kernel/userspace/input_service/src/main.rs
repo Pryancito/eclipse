@@ -511,7 +511,7 @@ pub extern "C" fn _start() -> ! {
             }
             let buttons = (packed & 0xFF) as u8;
             let dx = ((packed >> 8) as u8) as i8 as i32;
-            let dy = -(((packed >> 16) as u8) as i8 as i32);
+            let dy = ((packed >> 16) as u8) as i8 as i32;
 
             // Actualizar posición del cursor y moverlo en el hardware
             if dx != 0 || dy != 0 {

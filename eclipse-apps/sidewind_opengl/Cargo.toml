@@ -1,0 +1,10 @@
+[package]
+name = "sidewind-opengl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sidewind_core = { path = "../sidewind_core" }
+
+[features]
+default = []

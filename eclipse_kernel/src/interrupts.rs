@@ -272,6 +272,34 @@ fn init_ps2_keyboard() {
     crate::serial::serial_print("[INT] PS/2 keyboard init done\n");
 }
 
+/// Esperar a que el controlador PS/2 tenga el buffer de entrada libre (bit 1 de 0x64 = 0).
+/// Retorna true si se liberó antes del timeout.
+fn wait_ps2_write() -> bool {
+    const TIMEOUT: u32 = 0x8000;
+    for _ in 0..TIMEOUT {
+        unsafe {
+            if inb(0x64) & 2 == 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Esperar a que el controlador PS/2 tenga datos en el buffer de salida (bit 0 de 0x64 = 1).
+/// Retorna true si hay datos antes del timeout.
+fn wait_ps2_read() -> bool {
+    const TIMEOUT: u32 = 0x8000;
+    for _ in 0..TIMEOUT {
+        unsafe {
+            if inb(0x64) & 1 != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Inicializar ratón PS/2: habilitar puerto auxiliar y enviar "enable data reporting".
 /// Si el controlador no responde (timeout), continúa sin ratón para no colgar el boot.
 fn init_ps2_mouse() {
@@ -840,31 +868,6 @@ extern "C" fn timer_handler() {
     let mut stats = INTERRUPT_STATS.lock();
     stats.irqs += 1;
     drop(stats);
-    
-    // Heartbeat de depuración cada ~5 s: quién tuvo CPU, último syscall, mensajes descartados (mailbox lleno), recv ok/empty
-    if ticks > 0 && ticks % 5000 == 0 {
-        let cur_pid = crate::process::current_process_id().unwrap_or(0);
-        let last_sys = crate::syscalls::LAST_SYSCALL_NUM.load(Ordering::Relaxed);
-        let dropped = crate::ipc::DROPPED_P2P_MSGS.load(Ordering::Relaxed);
-        let p2p_del = crate::ipc::P2P_DELIVERED.swap(0, Ordering::Relaxed);
-        let recv_ok = crate::syscalls::RECV_OK.swap(0, Ordering::Relaxed);
-        let recv_empty = crate::syscalls::RECV_EMPTY.swap(0, Ordering::Relaxed);
-        let mouse_push = MOUSE_PUSH_COUNT.swap(0, Ordering::Relaxed);
-        let key_push = KEY_PUSH_COUNT.swap(0, Ordering::Relaxed);
-        let usb_poll = crate::usb_hid::USB_POLL_COUNT.swap(0, Ordering::Relaxed);
-        let usb_xfer = crate::usb_hid::USB_TRANSFER_EVENTS.swap(0, Ordering::Relaxed);
-        let runs = crate::scheduler::take_run_counts();
-        crate::serial::serial_printf(format_args!(
-            "[DBG] tick={} cur_pid={} last_sys={} drop={} p2p={} recv_ok={} recv_empty={} mouse={} key={} usb_poll={} usb_xfer={}",
-            ticks, cur_pid, last_sys, dropped, p2p_del, recv_ok, recv_empty, mouse_push, key_push, usb_poll, usb_xfer
-        ));
-        for i in 1..runs.len() {
-            if runs[i] > 0 {
-                crate::serial::serial_printf(format_args!(" {}:{}", i, runs[i]));
-            }
-        }
-        crate::serial::serial_printf(format_args!("\n"));
-    }
     
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
