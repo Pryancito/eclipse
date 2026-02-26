@@ -14,6 +14,8 @@ pub struct SmithayState {
     pub input: InputState,
     pub surfaces: [ExternalSurface; MAX_EXTERNAL_SURFACES],
     pub counter: u64,
+    /// Eventos Input recibidos (para debug: si se congela el ratón, ver si este valor deja de subir).
+    pub input_event_count: u64,
 }
 
 impl SmithayState {
@@ -34,17 +36,19 @@ impl SmithayState {
             input,
             surfaces,
             counter: 0,
+            input_event_count: 0,
         })
     }
 
     pub fn process_events(&mut self) {
-        // Poll and process multiple events per frame to stay responsive
-        const MAX_EVENTS: usize = 64;
+        // Drenar al menos lo que cabe en el mailbox del kernel (256) para no bloquear input
+        const MAX_EVENTS: usize = 256;
         let mut count = 0;
         while count < MAX_EVENTS {
             if let Some(event) = self.backend.poll_event() {
                 match event {
                     CompositorEvent::Input(ev) => {
+                        self.input_event_count += 1;
                         self.input.apply_event(
                             &ev,
                             self.backend.fb.info.width as i32,

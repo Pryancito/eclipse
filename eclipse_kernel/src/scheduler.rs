@@ -1,5 +1,6 @@
 //! Scheduler básico round-robin
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process};
 use spin::Mutex;
 
@@ -19,6 +20,19 @@ static SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats {
     context_switches: 0,
     total_ticks: 0,
 });
+
+/// Cuántas veces se dio CPU a cada PID en la última ventana (se lee y resetea en el heartbeat).
+const MAX_PIDS: usize = 64;
+static RUN_COUNTS: [AtomicU32; MAX_PIDS] = [const { AtomicU32::new(0) }; MAX_PIDS];
+
+/// Devuelve y resetea los conteos de ejecución por PID (para el heartbeat de depuración).
+pub fn take_run_counts() -> [u32; MAX_PIDS] {
+    let mut out = [0u32; MAX_PIDS];
+    for i in 0..MAX_PIDS {
+        out[i] = RUN_COUNTS[i].swap(0, Ordering::Relaxed);
+    }
+    out
+}
 
 /// Agregar proceso a la cola ready
 pub fn enqueue_process(pid: ProcessId) {
@@ -91,10 +105,13 @@ pub fn schedule() {
         
         // Obtener siguiente proceso de la cola
         if let Some(next_pid) = dequeue_process() {
+            if (next_pid as usize) < MAX_PIDS {
+                RUN_COUNTS[next_pid as usize].fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(mut next_process) = get_process(next_pid) {
                 next_process.state = ProcessState::Running;
                 update_process(next_pid, next_process);
-                
+
                 // Hacer context switch
                 if let Some(current_pid) = current_pid {
                     if current_pid != next_pid {

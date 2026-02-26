@@ -5,11 +5,20 @@
 use alloc::format;
 use alloc::string::String;
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::process::{ProcessId, exit_process, current_process_id};
 use crate::scheduler::yield_cpu;
-use crate::ipc::{MessageType, send_message, receive_message, pop_small_message};
+use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_24};
 use crate::serial;
 use spin::Mutex;
+
+/// Debug: último PID y número de syscall (para heartbeat cuando se congela input).
+pub(crate) static LAST_SYSCALL_PID: AtomicU32 = AtomicU32::new(0);
+pub(crate) static LAST_SYSCALL_NUM: AtomicU64 = AtomicU64::new(0);
+
+/// Debug: receive/receive_fast que devolvieron mensaje vs vacío (reseteado cada heartbeat).
+pub(crate) static RECV_OK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 
 /// Números de syscalls
 #[repr(u64)]
@@ -120,6 +129,10 @@ pub extern "C" fn syscall_handler(
     arg5: u64,
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
+    let pid = crate::process::current_process_id().unwrap_or(0);
+    LAST_SYSCALL_PID.store(pid as u32, Ordering::Relaxed);
+    LAST_SYSCALL_NUM.store(syscall_num, Ordering::Relaxed);
+
     // Log Syscall 27 (register_device) to catch corruption.
     // Nota: Para yield (5) y otros, arg1/arg2 son registros del usuario (rdi/rsi);
     // el kernel no los usa. Valores como 0xFFFF8000... indican contenido residual.
@@ -659,6 +672,7 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
     
     if let Some(client_id) = current_process_id() {
         if let Some(msg) = receive_message(client_id) {
+            RECV_OK.fetch_add(1, Ordering::Relaxed);
             // Calcular cuántos bytes copiar al buffer del usuario
             let data_len = (msg.data_size as usize).min(msg.data.len());
             let copy_len = core::cmp::min(size as usize, data_len);
@@ -680,8 +694,8 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
             }
             return msg.data_size as u64;
         }
+        RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
     }
-    
     0 // No hay mensajes
 }
 
@@ -696,25 +710,23 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
 /// Si el siguiente mensaje en el mailbox es > 24 bytes, retorna 0 (usa receive normal).
 fn sys_receive_fast(context: &mut crate::interrupts::SyscallContext) -> u64 {
     if let Some(client_id) = current_process_id() {
-        if let Some(msg) = pop_small_message(client_id) {
-            // Empaquetar data[0..24] en 3 palabras de 64 bits (little-endian)
+        if let Some((data_size, from, data)) = pop_small_message_24(client_id) {
+            RECV_OK.fetch_add(1, Ordering::Relaxed);
+            // Empaquetar data[0..24] en 3 u64 LE (sin Message en stack → menos riesgo de corrupción/#UD)
             let mut w = [0u64; 3];
             for i in 0..3 {
                 let off = i * 8;
-                let end = (off + 8).min(msg.data.len());
-                if off < end {
-                    let mut buf = [0u8; 8];
-                    buf[..end - off].copy_from_slice(&msg.data[off..end]);
-                    w[i] = u64::from_le_bytes(buf);
-                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[off..off + 8]);
+                w[i] = u64::from_le_bytes(buf);
             }
-            // Escribir en el contexto: se restaurarán al hacer iretq
             context.rdi = w[0];
             context.rsi = w[1];
             context.rdx = w[2];
-            context.rcx = msg.from as u64;
-            return msg.data_size as u64;
+            context.rcx = from as u64;
+            return data_size as u64;
         }
+        RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
     }
     0 // Sin mensaje pequeño disponible → usar receive() normal
 }

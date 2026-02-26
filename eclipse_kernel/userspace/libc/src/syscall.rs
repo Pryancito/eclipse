@@ -4,26 +4,31 @@ use core::arch::asm;
 extern crate alloc;
 #[cfg(all(target_env = "gnu", not(test)))]
 use alloc::vec::Vec;
+#[cfg(all(target_env = "gnu", not(test)))]
+use alloc::collections::VecDeque;
 #[cfg(all(target_env = "gnu", test))]
 use std::vec::Vec;
+#[cfg(all(target_env = "gnu", test))]
+use std::collections::VecDeque;
 #[cfg(target_env = "gnu")]
 use spin::Mutex;
 
 #[cfg(target_env = "gnu")]
 lazy_static::lazy_static! {
-    pub static ref MOCK_RECEIVE_QUEUE: Mutex<Vec<(Vec<u8>, u32)>> = Mutex::new(Vec::new());
-    pub static ref MOCK_RECEIVE_FAST_QUEUE: Mutex<Vec<([u8; 24], u32, usize)>> = Mutex::new(Vec::new());
+    /// Cola FIFO: pop_front O(1). Antes era Vec + remove(0) O(n) → 1M mensajes paralizaba.
+    pub static ref MOCK_RECEIVE_QUEUE: Mutex<VecDeque<(Vec<u8>, u32)>> = Mutex::new(VecDeque::new());
+    pub static ref MOCK_RECEIVE_FAST_QUEUE: Mutex<VecDeque<([u8; 24], u32, usize)>> = Mutex::new(VecDeque::new());
     pub static ref MOCK_SEND_LOG: Mutex<Vec<(u32, u32, Vec<u8>)>> = Mutex::new(Vec::new());
 }
 
 #[cfg(target_env = "gnu")]
 pub fn mock_push_receive(data: Vec<u8>, from: u32) {
-    MOCK_RECEIVE_QUEUE.lock().push((data, from));
+    MOCK_RECEIVE_QUEUE.lock().push_back((data, from));
 }
 
 #[cfg(target_env = "gnu")]
 pub fn mock_push_receive_fast(data: [u8; 24], from: u32, size: usize) {
-    MOCK_RECEIVE_FAST_QUEUE.lock().push((data, from, size));
+    MOCK_RECEIVE_FAST_QUEUE.lock().push_back((data, from, size));
 }
 
 #[cfg(target_env = "gnu")]
@@ -345,13 +350,14 @@ pub unsafe fn syscall3(n: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }
         SYS_RECEIVE => {
             let mut q = MOCK_RECEIVE_QUEUE.lock();
-            if q.is_empty() { return 0; }
-            let (data, from) = q.remove(0);
-            let buf = core::slice::from_raw_parts_mut(arg1 as *mut u8, arg2 as usize);
-            let len = core::cmp::Ord::min(data.len(), arg2 as usize);
-            buf[..len].copy_from_slice(&data[..len]);
-            *(arg3 as *mut u64) = from as u64;
-            len as u64
+            if let Some((data, from)) = q.pop_front() {
+                let buf = core::slice::from_raw_parts_mut(arg1 as *mut u8, arg2 as usize);
+                let len = core::cmp::Ord::min(data.len(), arg2 as usize);
+                buf[..len].copy_from_slice(&data[..len]);
+                *(arg3 as *mut u64) = from as u64;
+                return len as u64;
+            }
+            0
         }
         _ => 0
     }
@@ -616,9 +622,7 @@ pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
 
 #[cfg(target_env = "gnu")]
 pub fn receive_fast() -> core::option::Option<([u8; 24], u32, usize)> {
-    let mut q = MOCK_RECEIVE_FAST_QUEUE.lock();
-    if q.is_empty() { return core::option::Option::None; }
-    core::option::Option::Some(q.remove(0))
+    MOCK_RECEIVE_FAST_QUEUE.lock().pop_front()
 }
 
 /// Get the number of registered block devices

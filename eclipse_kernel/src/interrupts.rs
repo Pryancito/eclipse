@@ -805,6 +805,7 @@ unsafe extern "C" fn exception_12() {
 
 extern "C" fn timer_handler() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    let ticks = TIMER_TICKS.load(Ordering::Relaxed);
     let mut stats = INTERRUPT_STATS.lock();
     stats.irqs += 1;
     drop(stats);
@@ -812,8 +813,8 @@ extern "C" fn timer_handler() {
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
     
-    // Poll USB HID events every 8ms as a fallback for controllers that don't fire IRQs
-    if TIMER_TICKS.load(Ordering::Relaxed) % 8 == 0 {
+    // Poll USB HID every 2ms (antes 8ms) para no perder eventos de ratón USB
+    if ticks % 2 == 0 {
         crate::usb_hid::poll();
     }
 
@@ -916,6 +917,9 @@ const MOUSE_BUFFER_SIZE: usize = 128;
 static MOUSE_BUFFER: Mutex<[u32; MOUSE_BUFFER_SIZE]> = Mutex::new([0; MOUSE_BUFFER_SIZE]);
 static MOUSE_HEAD: Mutex<usize> = Mutex::new(0);
 static MOUSE_TAIL: Mutex<usize> = Mutex::new(0);
+/// Paquetes de ratón inyectados (PS/2 + USB) en los últimos 5s (debug: si p2p=0 y mouse_push=0, el kernel no recibe hardware).
+pub(crate) static MOUSE_PUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KEY_PUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Packet assembly state (3-byte standard, 4-byte con rueda)
 static MOUSE_PACKET: Mutex<[u8; 4]> = Mutex::new([0; 4]);
@@ -972,6 +976,7 @@ extern "C" fn mouse_handler() {
                 let mut buf = MOUSE_BUFFER.lock();
                 buf[*head] = packed;
                 *head = next_head;
+                MOUSE_PUSH_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             drop(tail);
             drop(head);
@@ -1013,6 +1018,7 @@ pub fn push_key(scancode: u8) {
             let mut buffer = KEY_BUFFER.lock();
             buffer[*head] = scancode;
             *head = next_head;
+            KEY_PUSH_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     });
 }
@@ -1028,6 +1034,7 @@ pub fn push_mouse_packet(packet: u32) {
             let mut buf = MOUSE_BUFFER.lock();
             buf[*head] = packet;
             *head = next_head;
+            MOUSE_PUSH_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     });
 }

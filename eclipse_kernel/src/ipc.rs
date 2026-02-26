@@ -3,7 +3,12 @@
 //! Implementa comunicación por mensajes entre procesos y servidores
 
 use spin::Mutex;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Mensajes Input/Signal descartados por mailbox lleno (debug: si >0 al congelarse input, aumentar MAILBOX_DEPTH o drenar más).
+pub(crate) static DROPPED_P2P_MSGS: AtomicU64 = AtomicU64::new(0);
+/// Mensajes P2P entregados a un mailbox (reseteado en heartbeat; si recv_ok=0 pero esto >0, se entrega a otro slot).
+pub(crate) static P2P_DELIVERED: AtomicU64 = AtomicU64::new(0);
 
 /// ID de mensaje
 pub type MessageId = u64;
@@ -214,9 +219,10 @@ pub fn pid_to_slot_fast(pid: crate::process::ProcessId) -> Option<usize> {
 }
 
 /// **Ring buffer estático por proceso — SIN heap, seguro en IRQs.**
-/// Capacidad de 32 mensajes por proceso (256 bytes × 32 = 8 KB por slot).
-/// Elimina el riesgo de deadlock con el global allocator en rutas de interrupción.
-const MAILBOX_DEPTH: usize = 32;
+/// Capacidad por proceso: picos de input (ratón/teclado) cuando el compositor está ocupado.
+/// Si se llena, se descartan eventos → ratón/teclado "bloqueados". 256 da margen amplio.
+/// 256 × ~256 bytes ≈ 64 KB por slot.
+const MAILBOX_DEPTH: usize = 256;
 struct ProcessMailbox {
     msgs: [Message; MAILBOX_DEPTH],
     head: usize,
@@ -390,15 +396,18 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     // --- Direct delivery para P2P: bypass de cola global y de IPC_SYSTEM ---
     if dest_slot != 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
         return run_critical(|| {
-            // Sólo adquirimos PID_SLOT_MAP (ya relajado) y PROCESS_MAILBOXES.
-            // IPC_SYSTEM NO se toca — sin contención con process_messages.
             let mut mailboxes = PROCESS_MAILBOXES.lock();
-            // Asignar ID único sin IPC_SYSTEM: usamos un contador atómico local.
             static P2P_ID: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(1);
-            let mut m = msg; // copia local para poder fijar el id
+            let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            mailboxes[dest_slot as usize].push(m)
+            let ok = mailboxes[dest_slot as usize].push(m);
+            if ok {
+                P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED_P2P_MSGS.fetch_add(1, Ordering::Relaxed);
+            }
+            ok
         });
     }
 
@@ -579,6 +588,26 @@ pub fn pop_small_message(pid: ClientId) -> Option<Message> {
             if let Some(front) = mb.peek() {
                 if front.data_size <= 24 {
                     return mb.pop();
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Igual que pop_small_message pero devuelve solo (data_size, from, data[24]) para no poner
+/// un Message completo (~288 bytes) en la pila del syscall y reducir riesgo de overflow/corrupción.
+pub fn pop_small_message_24(pid: ClientId) -> Option<(u32, u32, [u8; 24])> {
+    run_critical(|| {
+        if let Some(slot) = pid_to_slot_fast(pid) {
+            let mut mailboxes = PROCESS_MAILBOXES.lock();
+            let mb = &mut mailboxes[slot];
+            if let Some(front) = mb.peek() {
+                if front.data_size <= 24 {
+                    let msg = mb.pop().unwrap();
+                    let mut data = [0u8; 24];
+                    data[..24].copy_from_slice(&msg.data[..24]);
+                    return Some((msg.data_size, msg.from, data));
                 }
             }
         }

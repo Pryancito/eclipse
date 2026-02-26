@@ -12,6 +12,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
 
 /// Syscall numbers
@@ -138,6 +139,9 @@ struct InputDevice {
 /// Tamaño fijo (InputEvent viene de eclipse_libc)
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
+/// Contador de eventos enviados al display (debug: si se congela input, ver si este deja de subir).
+static DISPLAY_SENT: AtomicU64 = AtomicU64::new(0);
+
 /// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11)
 fn send_event_to_client(pid: u32, ev: &InputEvent) {
     if pid == 0 {
@@ -158,6 +162,10 @@ fn send_event_to_client(pid: u32, ev: &InputEvent) {
     // buf[12..16] = 0; // implicit padding bytes, kept as 0
     buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
     let _ = send(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
+    let n = DISPLAY_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 500 == 0 {
+        println!("[INPUT-SERVICE] sent {} to display", n);
+    }
 }
 
 /// Input event queue
@@ -494,7 +502,13 @@ pub extern "C" fn _start() -> ! {
         }
         
         // Drenar ratón PS/2 real (kernel buffer vía syscall read_mouse_packet)
+        let mut mouse_batch = 0u32;
         while let Some(packed) = read_mouse_packet() {
+            mouse_batch += 1;
+            if mouse_batch >= 8 {
+                yield_cpu();
+                mouse_batch = 0;
+            }
             let buttons = (packed & 0xFF) as u8;
             let dx = ((packed >> 8) as u8) as i8 as i32;
             let dy = -(((packed >> 16) as u8) as i8 as i32);
@@ -585,7 +599,13 @@ pub extern "C" fn _start() -> ! {
         }
 
         // Drenar teclado PS/2 real (kernel buffer vía syscall read_key)
+        let mut kbd_batch = 0u32;
         while let Some(sc) = read_key_scancode() {
+            kbd_batch += 1;
+            if kbd_batch >= 8 {
+                yield_cpu();
+                kbd_batch = 0;
+            }
             let value = if (sc & 0x80) != 0 { 0 } else { 1 }; // break = 0, make = 1
             let code = sc & 0x7F;
             if code == 0 {

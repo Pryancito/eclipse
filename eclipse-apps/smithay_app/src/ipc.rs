@@ -10,6 +10,8 @@ use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE
 pub struct IpcHandler {
     channel: IpcChannel,
     pub message_count: u64,
+    /// Intentos de recv (cada poll_event); si sube pero message_count no, el kernel no nos da mensajes.
+    pub recv_attempts: u64,
 }
 
 impl IpcHandler {
@@ -17,12 +19,14 @@ impl IpcHandler {
         Self {
             channel: IpcChannel::new(),
             message_count: 0,
+            recv_attempts: 0,
         }
     }
 
     /// Recibir y clasificar el siguiente mensaje IPC (no bloqueante).
     /// Fast path (InputEvent) → slow path (SideWind, control) de forma automática.
     pub fn process_messages(&mut self) -> Option<CompositorEvent> {
+        self.recv_attempts += 1;
         match self.channel.recv()? {
             EclipseMessage::Input(ev) => {
                 self.message_count += 1;
@@ -129,8 +133,9 @@ pub fn handle_sidewind_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eclipse_libc::{mock_push_receive, mock_clear};
+    use eclipse_libc::{mock_push_receive, mock_push_receive_fast, mock_clear};
     use eclipse_libc::InputEvent;
+    use eclipse_ipc::prelude::EclipseEncode;
     use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
 
     #[test]
@@ -226,5 +231,52 @@ mod tests {
         
         assert_eq!(window_count, 0);
         assert!(!surfaces[0].active);
+    }
+
+    #[test]
+    fn test_bench_ipc_stress_1m() {
+        use std::time::Instant;
+        mock_clear();
+        let mut handler = IpcHandler::new();
+        
+        let ev = InputEvent {
+            device_id: 1, event_type: 0, code: 1, value: 1, timestamp: 0,
+        };
+        let encoded = ev.encode_fast();
+        let fast_size = core::mem::size_of::<InputEvent>();
+        
+        let start = Instant::now();
+        let total_messages = 1_000_000;
+        let batch_size = 100_000;
+        let mut processed = 0;
+        
+        while processed < total_messages {
+            // Feed batch (fast path = eventos ratón/teclado reales)
+            for _ in 0..batch_size {
+                mock_push_receive_fast(encoded, 0, fast_size);
+            }
+            
+            // Process batch
+            for _ in 0..batch_size {
+                let res = handler.process_messages();
+                if res.is_none() {
+                    panic!("Loop failed");
+                }
+            }
+            processed += batch_size;
+            
+            println!("Processed {}k messages...", processed / 1_000);
+        }
+        
+        let duration = start.elapsed();
+        let mps = total_messages as f64 / duration.as_secs_f64();
+        
+        println!("\n--- 1M IPC STRESS TEST RESULTS ---");
+        println!("Total Messages: {}", total_messages);
+        println!("Total Time: {:?}", duration);
+        println!("Throughput: {:.2} MPS (Messages Per Second)", mps);
+        println!("------------------------------------\n");
+        
+        assert_eq!(handler.message_count, total_messages as u64);
     }
 }

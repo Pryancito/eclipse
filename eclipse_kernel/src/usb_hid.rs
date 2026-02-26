@@ -13,9 +13,47 @@
 //! 4. HID keyboards/mice get their interrupt IN endpoint configured, and the
 //!    USB IRQ handler processes incoming reports, converting them to input events.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 use core::ptr::{read_volatile, write_volatile};
-use crate::memory::{map_mmio_range, alloc_dma_buffer};
+
+#[cfg(not(test))]
+use crate::memory;
+#[cfg(not(test))]
+use crate::interrupts;
+#[cfg(not(test))]
+use crate::serial;
+
+#[cfg(test)]
+mod mock_memory {
+    pub fn map_mmio_range(_phys: u64, _size: usize) -> u64 { 0x1000 }
+    pub fn alloc_dma_buffer(size: usize, _align: usize) -> Option<(*mut u8, u64)> {
+        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        Some((ptr, ptr as u64))
+    }
+    pub fn phys_to_virt(phys: u64) -> u64 { phys }
+}
+#[cfg(test)]
+mod mock_interrupts {
+    use std::sync::Mutex;
+    pub static KEYS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    pub static MOUSE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    
+    pub fn push_key(sc: u8) { KEYS.lock().unwrap().push(sc); }
+    pub fn push_mouse_packet(p: u32) { MOUSE.lock().unwrap().push(p); }
+    pub fn set_irq_handler(_irq: u8, _handler: fn()) -> Result<(), &'static str> { Ok(()) }
+}
+#[cfg(test)]
+mod mock_serial {
+    pub fn serial_print(s: &str) { print!("{}", s); }
+}
+
+#[cfg(test)]
+use self::mock_memory as memory;
+#[cfg(test)]
+use self::mock_interrupts as interrupts;
+#[cfg(test)]
+use self::mock_serial as serial;
 
 // ===========================================================================
 // USB Controller Detection Types
@@ -227,7 +265,7 @@ impl MmioRegion {
         if phys_addr == 0 {
             return Err("Physical address is zero");
         }
-        let virt_addr = map_mmio_range(phys_addr, size);
+        let virt_addr = memory::map_mmio_range(phys_addr, size);
         Ok(Self { base_virt: virt_addr, size })
     }
 
@@ -295,7 +333,7 @@ pub struct DmaAllocation {
 
 impl DmaAllocation {
     pub fn allocate(size: usize, alignment: usize) -> Result<Self, &'static str> {
-        let (ptr, phys) = alloc_dma_buffer(size, alignment)
+        let (ptr, phys) = memory::alloc_dma_buffer(size, alignment)
             .ok_or("DMA buffer allocation failed")?;
         // Intentionally leaked – DMA buffers live for the device lifetime
         Ok(Self { virt_addr: ptr as u64, phys_addr: phys, size, alignment })
@@ -339,6 +377,18 @@ impl DmaAllocation {
 
     pub fn write_u64(&self, offset: usize, value: u64) {
         self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    pub fn read_u32(&self, offset: usize) -> u32 {
+        let mut buf = [0u8; 4];
+        self.read_bytes(offset, &mut buf);
+        u32::from_le_bytes(buf)
+    }
+
+    pub fn read_u64(&self, offset: usize) -> u64 {
+        let mut buf = [0u8; 8];
+        self.read_bytes(offset, &mut buf);
+        u64::from_le_bytes(buf)
     }
 }
 
@@ -395,7 +445,7 @@ impl TrbRing {
         alloc.zero();
 
         if has_link_trb && capacity > 1 {
-            let link = build_link_trb(alloc.phys_addr, true);
+            let link = build_link_trb(alloc.phys_addr, true, true);
             let off = (capacity - 1) * 16;
             alloc.write_u64(off, link.parameter);
             alloc.write_u64(off + 8, (link.status as u64) | ((link.control as u64) << 32));
@@ -452,8 +502,30 @@ impl TrbRing {
         self.allocation.write_u64(off, trb.parameter);
         self.allocation.write_u64(off + 8, (trb.status as u64) | ((trb.control as u64) << 32));
         self.enqueue_index = (self.enqueue_index + 1) % self.usable();
-        if self.enqueue_index == 0 { self.cycle_state = !self.cycle_state; }
+        if self.enqueue_index == 0 {
+            self.cycle_state = !self.cycle_state;
+        }
+
+        // Update Link TRB cycle bit to match the CURRENT lap cycle state.
+        // We do this when we are far from the Link TRB (half-ring) to avoid race conditions
+        // with the xHC which might be fetching the Link TRB at the end of the lap.
+        if self.has_link_trb && self.enqueue_index == self.usable() / 2 {
+            let off = (self.capacity - 1) * 16 + 12; // control is at +12
+            let mut ctrl = self.allocation.read_u32(off);
+            if self.cycle_state { ctrl |= 1; }
+            else { ctrl &= !1; }
+            self.allocation.write_u32(off, ctrl);
+        }
         Ok(())
+    }
+
+    /// Avanzar dequeue en un Transfer Ring cuando el controlador ha completado un TRB (libera slot para re-submit).
+    ///
+    /// OJO: en los transfer rings solo usamos dequeue_index para el cálculo de is_full();
+    /// el productor (host) es el único que gestiona el cycle bit, así que aquí NO se toca
+    /// cycle_state (eso se hace solo en enqueue cuando damos la vuelta al ring).
+    pub fn advance_transfer_dequeue(&mut self) {
+        self.dequeue_index = (self.dequeue_index + 1) % self.usable();
     }
 }
 
@@ -610,9 +682,10 @@ impl InputContext {
 // TRB Builder Functions
 // ===========================================================================
 
-pub fn build_link_trb(next_segment: u64, toggle_cycle: bool) -> Trb {
+pub fn build_link_trb(next_segment: u64, toggle_cycle: bool, cycle: bool) -> Trb {
     let mut ctrl = (TRB_TYPE_LINK as u32) << 10;
     if toggle_cycle { ctrl |= 0x2; }
+    if cycle { ctrl |= 0x1; }
     Trb { parameter: next_segment, status: 0, control: ctrl }
 }
 
@@ -670,6 +743,14 @@ pub fn build_normal_trb(buf_ptr: u64, length: u16, ioc: bool) -> Trb {
 // HID Device Tracking
 // ===========================================================================
 
+#[derive(Clone, Copy)]
+pub enum HidLastReport {
+    Keyboard(HidKeyboardReport),
+    Mouse(HidMouseReport),
+    Tablet(HidTabletReport),
+    None,
+}
+
 /// Info about an active HID device's interrupt IN endpoint.
 pub struct HidEndpoint {
     pub slot_id:      u8,
@@ -678,15 +759,13 @@ pub struct HidEndpoint {
     pub buf_virt:     u64,  // Virtual address of DMA report buffer
     pub buf_phys:     u64,  // Physical address
     pub buf_size:     usize,
+    pub last_report:  HidLastReport,
 }
 
 const MAX_HID_DEVICES: usize = 8;
 static mut HID_DEVICES: [Option<HidEndpoint>; MAX_HID_DEVICES] = [
     None, None, None, None, None, None, None, None,
 ];
-
-static mut LAST_KEYBOARD_REPORT: HidKeyboardReport = HidKeyboardReport { modifiers: 0, reserved: 0, keys: [0; 6] };
-static mut LAST_MOUSE_REPORT: HidMouseReport = HidMouseReport { buttons: 0, x: 0, y: 0, wheel: 0 };
 
 // ===========================================================================
 // XHCI Controller State
@@ -728,7 +807,7 @@ impl XhciControllerState {
 
     /// Allocate DCBAA, command ring, event ring, then reset and start the controller.
     pub fn initialize(&mut self) -> Result<(), &'static str> {
-        crate::serial::serial_print("[XHCI] Initializing rings and structures\n");
+        serial::serial_print("[XHCI] Initializing rings and structures\n");
         let mmio = self.mmio.as_ref().ok_or("MMIO not found")?;
 
         // 1. DCBAA
@@ -740,7 +819,7 @@ impl XhciControllerState {
         let hcsparams2 = mmio.read_capability(0x08);
         let sb_count = ((hcsparams2 >> 27) & 0x1F) | ((hcsparams2 >> 16) & 0x1F);
         if sb_count > 0 {
-            crate::serial::serial_print(&alloc::format!("[XHCI] {} scratchpad buffers\n", sb_count));
+            serial::serial_print(&alloc::format!("[XHCI] {} scratchpad buffers\n", sb_count));
             let sb_array = DmaAllocation::allocate((sb_count as usize) * 8, 64)?;
             sb_array.zero();
             for i in 0..sb_count as usize {
@@ -768,13 +847,13 @@ impl XhciControllerState {
             self.transfer_rings.push(None);
         }
 
-        crate::serial::serial_print("[XHCI] Rings initialized\n");
+        serial::serial_print("[XHCI] Rings initialized\n");
         Ok(())
     }
 
     /// Reset the controller and program all datastructure base addresses, then Run.
     pub fn start_controller(&mut self) -> Result<(), &'static str> {
-        crate::serial::serial_print("[XHCI] Starting controller\n");
+        serial::serial_print("[XHCI] Starting controller\n");
         let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
 
         // Wait for CNR
@@ -798,7 +877,7 @@ impl XhciControllerState {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout after reset"); }
         }
-        crate::serial::serial_print("[XHCI] Reset complete\n");
+        serial::serial_print("[XHCI] Reset complete\n");
 
         // MaxSlotsEnabled
         let cfg = mmio.read_operational(0x38);
@@ -834,7 +913,7 @@ impl XhciControllerState {
         let cmd = mmio.read_operational(0x00) | (1 << 2) | 1; // INTE + R/S
         mmio.write_operational(0x00, cmd);
 
-        crate::serial::serial_print("[XHCI] Controller running\n");
+        serial::serial_print("[XHCI] Controller running\n");
         Ok(())
     }
 
@@ -889,7 +968,7 @@ impl XhciControllerState {
 
     /// Enumerate all ports, reset connected ones, and address devices.
     pub fn enumerate_ports(&mut self) -> Result<(), &'static str> {
-        crate::serial::serial_print("[XHCI] Enumerating ports\n");
+        serial::serial_print("[XHCI] Enumerating ports\n");
         let max_ports = self.max_ports;
 
         for port in 1..=max_ports {
@@ -903,7 +982,7 @@ impl XhciControllerState {
 
             if !is_connected { continue; }
 
-            crate::serial::serial_print(&alloc::format!("[XHCI] Port {} connected\n", port));
+            serial::serial_print(&alloc::format!("[XHCI] Port {} connected\n", port));
 
             // Assert Port Reset
             if let Some(ref mmio) = self.mmio {
@@ -918,7 +997,7 @@ impl XhciControllerState {
                 if (s & (1 << 21)) != 0 || (s & (1 << 4)) == 0 { done = true; break; }
             }
             if !done {
-                crate::serial::serial_print(&alloc::format!("[XHCI] Port {} reset timeout\n", port));
+                serial::serial_print(&alloc::format!("[XHCI] Port {} reset timeout\n", port));
                 continue;
             }
 
@@ -931,20 +1010,20 @@ impl XhciControllerState {
                 (spd, s)
             };
             let _ = new_portsc;
-            crate::serial::serial_print(&alloc::format!("[XHCI] Port {} speed={}\n", port, port_speed));
+            serial::serial_print(&alloc::format!("[XHCI] Port {} speed={}\n", port, port_speed));
 
             // Enable Slot
             let ev = match self.execute_command(build_enable_slot_trb(0)) {
                 Ok(e) => e,
-                Err(e) => { crate::serial::serial_print(&alloc::format!("[XHCI] Enable Slot failed: {}\n", e)); continue; }
+                Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Enable Slot failed: {}\n", e)); continue; }
             };
             let slot_id = ((ev.control >> 24) & 0xFF) as u8;
-            crate::serial::serial_print(&alloc::format!("[XHCI] Slot ID: {}\n", slot_id));
+            serial::serial_print(&alloc::format!("[XHCI] Slot ID: {}\n", slot_id));
 
             // Allocate device context
             let dev_ctx = match DmaAllocation::allocate(1024, 64) {
                 Ok(d) => d,
-                Err(e) => { crate::serial::serial_print(&alloc::format!("[XHCI] Dev ctx alloc failed: {}\n", e)); continue; }
+                Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Dev ctx alloc failed: {}\n", e)); continue; }
             };
             dev_ctx.zero();
             if let Some(ref dcbaa) = self.dcbaa {
@@ -956,7 +1035,7 @@ impl XhciControllerState {
             // Allocate input context
             let input_ctx = match DmaAllocation::allocate(2048, 64) {
                 Ok(ic) => ic,
-                Err(e) => { crate::serial::serial_print(&alloc::format!("[XHCI] Input ctx alloc failed: {}\n", e)); continue; }
+                Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Input ctx alloc failed: {}\n", e)); continue; }
             };
             input_ctx.zero();
             // Add flags: Slot (bit 0) + EP0 (bit 1)
@@ -972,7 +1051,7 @@ impl XhciControllerState {
             // EP0 transfer ring
             let ep0_ring = match TransferRing::new(64, slot_id, 0) {
                 Ok(r) => r,
-                Err(e) => { crate::serial::serial_print(&alloc::format!("[XHCI] TR alloc failed: {}\n", e)); continue; }
+                Err(e) => { serial::serial_print(&alloc::format!("[XHCI] TR alloc failed: {}\n", e)); continue; }
             };
             input_ctx.write_u64(72, ep0_ring.get_address() | 1);
             self.transfer_rings[slot_idx * 32] = Some(ep0_ring);
@@ -980,20 +1059,20 @@ impl XhciControllerState {
             // Address Device
             let addr_ev = match self.execute_command(build_address_device_trb(input_ctx.phys_addr, slot_id, false)) {
                 Ok(e) => e,
-                Err(e) => { crate::serial::serial_print(&alloc::format!("[XHCI] Address Device failed: {}\n", e)); continue; }
+                Err(e) => { serial::serial_print(&alloc::format!("[XHCI] Address Device failed: {}\n", e)); continue; }
             };
             let _ = addr_ev;
-            crate::serial::serial_print(&alloc::format!("[XHCI] Device addressed (slot {})\n", slot_id));
+            serial::serial_print(&alloc::format!("[XHCI] Device addressed (slot {})\n", slot_id));
 
             // Get device descriptor
             if let Err(e) = self.get_device_descriptor(slot_id) {
-                crate::serial::serial_print(&alloc::format!("[XHCI] GetDescriptor failed: {}\n", e));
+                serial::serial_print(&alloc::format!("[XHCI] GetDescriptor failed: {}\n", e));
                 continue;
             }
 
             // Try to set up HID endpoint
             if let Err(e) = self.setup_hid(slot_id) {
-                crate::serial::serial_print(&alloc::format!("[XHCI] HID setup failed (may not be HID): {}\n", e));
+                serial::serial_print(&alloc::format!("[XHCI] HID setup failed (may not be HID): {}\n", e));
             }
         }
         Ok(())
@@ -1022,7 +1101,7 @@ impl XhciControllerState {
 
         let mut raw = [0u8; 18];
         desc_buf.read_bytes(0, &mut raw);
-        crate::serial::serial_print(&alloc::format!(
+        serial::serial_print(&alloc::format!(
             "[XHCI] Device: bcdUSB={:02X}{:02X} class={:02X} VID={:02X}{:02X} PID={:02X}{:02X}\n",
             raw[3], raw[2], raw[4], raw[9], raw[8], raw[11], raw[10]
         ));
@@ -1090,7 +1169,7 @@ impl XhciControllerState {
                 let iface_subclass = cfg_data[offset + 6];
                 let iface_protocol = cfg_data[offset + 7];
 
-                crate::serial::serial_print(&alloc::format!(
+                serial::serial_print(&alloc::format!(
                     "[XHCI] Interface {}: class={:02X} subclass={:02X} protocol={:02X}\n",
                     iface_idx, iface_class, iface_subclass, iface_protocol
                 ));
@@ -1131,7 +1210,7 @@ impl XhciControllerState {
             return Err("No HID interrupt IN endpoint found");
         }
 
-        crate::serial::serial_print(&alloc::format!(
+        serial::serial_print(&alloc::format!(
             "[XHCI] HID slot={} protocol={} ep=0x{:02X} mps={} interval={}\n",
             slot_id, hid_protocol, ep_addr, ep_mps, ep_interval
         ));
@@ -1190,7 +1269,7 @@ impl XhciControllerState {
         let ep_ctx_off = 32 + 32 + (xhci_ep_id as usize - 1) * 32;
 
         // Allocate interrupt IN transfer ring
-        let int_ring = TransferRing::new(64, slot_id, ep_addr)?;
+        let int_ring = TransferRing::new(256, slot_id, ep_addr)?;
         let int_ring_phys = int_ring.get_address();
         cfg_ctx.write_u32(ep_ctx_off + 4, ep_dword2);
         cfg_ctx.write_u64(ep_ctx_off + 8, int_ring_phys | 1); // DCS = 1
@@ -1204,7 +1283,7 @@ impl XhciControllerState {
 
         // Submit Configure Endpoint command
         if let Err(e) = self.execute_command(build_configure_endpoint_trb(cfg_ctx.phys_addr, slot_id)) {
-            crate::serial::serial_print(&alloc::format!("[XHCI] Configure Endpoint failed: {}\n", e));
+            serial::serial_print(&alloc::format!("[XHCI] Configure Endpoint failed: {}\n", e));
             return Err("Configure Endpoint failed");
         }
 
@@ -1234,9 +1313,10 @@ impl XhciControllerState {
             buf_virt: report_buf.phys_addr, // intentionally using phys here for simplicity; virt = HHDM + phys
             buf_phys: report_buf.phys_addr,
             buf_size: report_buf_size,
+            last_report: HidLastReport::None,
         });
 
-        crate::serial::serial_print(&alloc::format!("[XHCI] HID device registered (slot={} proto={})\n", slot_id, hid_protocol));
+        serial::serial_print(&alloc::format!("[XHCI] HID device registered (slot={} proto={})\n", slot_id, hid_protocol));
         Ok(())
     }
 
@@ -1247,10 +1327,9 @@ impl XhciControllerState {
         loop {
             let ev = {
                 let er = &mut self.event_rings[0];
-                match er.ring.peek_event() {
+                match er.ring.pop_event() {
                     Some(e) => {
                         let erdp = er.get_erdp();
-                        er.ring.pop_event();
                         if let Some(ref mmio) = self.mmio {
                             mmio.write_runtime(0x38, (erdp as u32) | 0x08);
                             mmio.write_runtime(0x3C, (erdp >> 32) as u32);
@@ -1263,20 +1342,27 @@ impl XhciControllerState {
 
             let trb_type = ev.get_trb_type();
             if trb_type == 32 {
+                USB_TRANSFER_EVENTS.fetch_add(1, Ordering::Relaxed);
                 // Transfer Event: find which HID device completed
                 let slot_id   = ((ev.control >> 24) & 0xFF) as u8;
                 let ep_id     = ((ev.control >> 16) & 0x1F) as u8;
                 process_hid_transfer_event(slot_id, ep_id);
 
-                // Re-submit the Normal TRB for continuous polling
+                // Re-submit the Normal TRB for continuous polling.
+                // Liberar el slot que el controlador acaba de completar; si no, el ring se llena tras ~63 eventos.
                 let ring_idx = slot_id as usize * 32 + ep_id as usize;
                 if let Some(Some(ref mut tr)) = self.transfer_rings.get_mut(ring_idx) {
+                    tr.ring.advance_transfer_dequeue();
                     let buf_phys = find_hid_buf_phys(slot_id, ep_id);
                     let buf_size = find_hid_buf_size(slot_id, ep_id);
                     if buf_phys != 0 {
                         let normal = build_normal_trb(buf_phys, buf_size as u16, true);
-                        let _ = tr.submit(normal);
-                        if let Some(ref mmio) = self.mmio { mmio.ring_doorbell(slot_id, ep_id); }
+                        if tr.submit(normal).is_ok() {
+                            fence(Ordering::SeqCst);
+                            if let Some(ref mmio) = self.mmio {
+                                mmio.ring_doorbell(slot_id, ep_id);
+                            }
+                        }
                     }
                 }
             }
@@ -1286,10 +1372,11 @@ impl XhciControllerState {
 
 fn port_speed_from_slot(_slot_id: u8) -> u32 { 3 } // Assume High Speed
 
-fn register_hid_device(dev: HidEndpoint) {
+fn register_hid_device(mut dev: HidEndpoint) {
     unsafe {
         for slot in HID_DEVICES.iter_mut() {
             if slot.is_none() {
+                dev.last_report = HidLastReport::None;
                 *slot = Some(dev);
                 return;
             }
@@ -1322,11 +1409,11 @@ fn find_hid_buf_size(slot_id: u8, ep_id: u8) -> usize {
 /// Called when a Transfer Event arrives for a HID device.
 fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
     unsafe {
-        for dev in HID_DEVICES.iter().flatten() {
+        for dev in HID_DEVICES.iter_mut().flatten() {
             if dev.slot_id != slot_id || dev.endpoint_id != ep_id { continue; }
 
             // Read report from buffer (phys addr → virt via HHDM)
-            let virt = crate::memory::phys_to_virt(dev.buf_phys);
+            let virt = memory::phys_to_virt(dev.buf_phys);
 
             // Determine protocol if still unknown (255)
             let mut proto = dev.protocol;
@@ -1338,13 +1425,13 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
 
             if proto == HID_PROTOCOL_KEYBOARD && dev.buf_size >= 8 {
                 let report = core::ptr::read_volatile(virt as *const HidKeyboardReport);
-                process_keyboard_report(&report);
+                process_keyboard_report(dev, &report);
             } else if proto == HID_PROTOCOL_MOUSE && dev.buf_size >= 3 {
                 let report = core::ptr::read_volatile(virt as *const HidMouseReport);
-                process_mouse_report(&report);
+                process_mouse_report(dev, &report);
             } else if proto == HID_PROTOCOL_TABLET && dev.buf_size >= 6 {
                 let report = core::ptr::read_volatile(virt as *const HidTabletReport);
-                process_tablet_report(&report);
+                process_tablet_report(dev, &report);
             }
             return;
         }
@@ -1355,17 +1442,20 @@ fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
 // HID Report Processing – keyboard and mouse
 // ===========================================================================
 
-/// Convert a keyboard HID report to PS/2 Set 1 scancodes and push via push_key().
-fn process_keyboard_report(report: &HidKeyboardReport) {
-    let prev = unsafe { LAST_KEYBOARD_REPORT };
+/// Convert a keyboard HID report to PS/2 Set 1 scancodes and push via interrupts::push_key().
+fn process_keyboard_report(dev: &mut HidEndpoint, report: &HidKeyboardReport) {
+    let prev = match dev.last_report {
+        HidLastReport::Keyboard(r) => r,
+        _ => HidKeyboardReport::default(),
+    };
 
     // Modifier key changes
     for (bit, scancode) in &MODIFIER_SCANCODES {
         let mask = 1u8 << bit;
         let was = (prev.modifiers & mask) != 0;
         let now = (report.modifiers & mask) != 0;
-        if now && !was { crate::interrupts::push_key(*scancode); }
-        else if !now && was { crate::interrupts::push_key(*scancode | 0x80); }
+        if now && !was { interrupts::push_key(*scancode); }
+        else if !now && was { interrupts::push_key(*scancode | 0x80); }
     }
 
     // Key presses (new keys that weren't pressed before)
@@ -1375,7 +1465,7 @@ fn process_keyboard_report(report: &HidKeyboardReport) {
             if prev_hid == hid { continue 'outer_press; } // still held
         }
         let sc = HID_TO_PS2[hid as usize];
-        if sc != 0 { crate::interrupts::push_key(sc); }
+        if sc != 0 { interrupts::push_key(sc); }
     }
 
     // Key releases (keys that were pressed but aren't now)
@@ -1385,20 +1475,20 @@ fn process_keyboard_report(report: &HidKeyboardReport) {
             if hid == prev_hid { continue 'outer_rel; } // still held
         }
         let sc = HID_TO_PS2[prev_hid as usize];
-        if sc != 0 { crate::interrupts::push_key(sc | 0x80); }
+        if sc != 0 { interrupts::push_key(sc | 0x80); }
     }
 
-    unsafe { LAST_KEYBOARD_REPORT = *report; }
+    dev.last_report = HidLastReport::Keyboard(*report);
 }
 
-/// Convert a mouse HID report to a packed mouse packet and push via push_mouse_packet().
+/// Convert a mouse HID report to a packed mouse packet and push via interrupts::push_mouse_packet().
 /// Packet format: buttons | (dx as u8) << 8 | (dy as u8) << 16
-fn process_mouse_report(report: &HidMouseReport) {
+fn process_mouse_report(dev: &mut HidEndpoint, report: &HidMouseReport) {
     let packet: u32 = (report.buttons as u32)
         | ((report.x as u8 as u32) << 8)
         | ((report.y as u8 as u32) << 16);
-    crate::interrupts::push_mouse_packet(packet);
-    unsafe { LAST_MOUSE_REPORT = *report; }
+    interrupts::push_mouse_packet(packet);
+    dev.last_report = HidLastReport::Mouse(*report);
 }
 
 /// Last tablet cursor position (absolute, in tablet units)
@@ -1408,7 +1498,7 @@ static mut TABLET_LAST_Y: u16 = 0xFFFF;
 /// Convert a USB tablet HID absolute report to relative mouse deltas.
 /// The tablet sends 16-bit absolute X/Y in range 0..TABLET_MAX.
 /// We scale to the current framebuffer size and push a relative packet.
-fn process_tablet_report(report: &HidTabletReport) {
+fn process_tablet_report(dev: &mut HidEndpoint, report: &HidTabletReport) {
     let abs_x = report.x() as u32;
     let abs_y = report.y() as u32;
 
@@ -1443,7 +1533,8 @@ fn process_tablet_report(report: &HidTabletReport) {
     let packet: u32 = (report.buttons as u32)
         | ((dx as u8 as u32) << 8)
         | ((dy as u8 as u32) << 16);
-    crate::interrupts::push_mouse_packet(packet);
+    interrupts::push_mouse_packet(packet);
+    dev.last_report = HidLastReport::Tablet(*report);
 }
 
 // ===========================================================================
@@ -1469,12 +1560,18 @@ fn usb_irq_handler() {
 }
 
 pub fn register_usb_irq_handler(irq: u8) -> Result<(), &'static str> {
-    crate::interrupts::set_irq_handler(irq, usb_irq_handler)
+    interrupts::set_irq_handler(irq, usb_irq_handler)
 }
+
+/// Llamadas a poll() en los últimos 5s (heartbeat). Si usb_poll=0, no se está sondeando.
+pub(crate) static USB_POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Transfer events procesados desde el event ring en los últimos 5s. Si usb_xfer=0 y mueves ratón, el device no envía o el ring está vacío.
+pub(crate) static USB_TRANSFER_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Poll the XHCI event ring for pending HID events.
 /// Called from the timer interrupt as a fallback when IRQ-based delivery is unavailable.
 pub fn poll() {
+    USB_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
     unsafe {
         if let Some(ref mut xhci) = XHCI {
             xhci.process_events();
@@ -1487,22 +1584,22 @@ pub fn poll() {
 // ===========================================================================
 
 pub fn init() {
-    crate::serial::serial_print("[USB-HID] Initializing USB HID driver\n");
+    serial::serial_print("[USB-HID] Initializing USB HID driver\n");
 
     // Skip USB HID initialization in QEMU/Hypervisors to avoid conflicts with PS/2
     // which is the default and works more reliably there.
     //if crate::cpu::is_running_under_hypervisor() {
-    //    crate::serial::serial_print("[USB-HID] Hypervisor detected. Skipping USB HID to use PS/2 for better compatibility.\n");
+    //    serial::serial_print("[USB-HID] Hypervisor detected. Skipping USB HID to use PS/2 for better compatibility.\n");
     //    return;
     //}
 
     let controllers = detect_usb_controllers();
     if controllers.is_empty() {
-        crate::serial::serial_print("[USB-HID] No USB controllers found\n");
+        serial::serial_print("[USB-HID] No USB controllers found\n");
         return;
     }
 
-    crate::serial::serial_print(&alloc::format!("[USB-HID] {} USB controller(s) found\n", controllers.len()));
+    serial::serial_print(&alloc::format!("[USB-HID] {} USB controller(s) found\n", controllers.len()));
 
     for ctrl in &controllers {
         match ctrl.controller_type {
@@ -1513,18 +1610,18 @@ pub fn init() {
                     let irq = ctrl.interrupt_line;
                     if irq < 16 {
                         match register_usb_irq_handler(irq) {
-                            Ok(_)  => crate::serial::serial_print(&alloc::format!("[USB-HID] IRQ {} handler registered\n", irq)),
-                            Err(e) => crate::serial::serial_print(&alloc::format!("[USB-HID] IRQ {} registration failed: {}\n", irq, e)),
+                            Ok(_)  => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} handler registered\n", irq)),
+                            Err(e) => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} registration failed: {}\n", irq, e)),
                         }
                     }
                     break; // Only one XHCI controller for now
                 }
             }
-            _ => crate::serial::serial_print(&alloc::format!("[USB-HID] {} not supported\n", ctrl.controller_type.as_str())),
+            _ => serial::serial_print(&alloc::format!("[USB-HID] {} not supported\n", ctrl.controller_type.as_str())),
         }
     }
 
-    crate::serial::serial_print("[USB-HID] Initialization complete\n");
+    serial::serial_print("[USB-HID] Initialization complete\n");
 }
 
 fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
@@ -1552,7 +1649,7 @@ fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
 }
 
 fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
-    crate::serial::serial_print(&alloc::format!(
+    serial::serial_print(&alloc::format!(
         "[USB-HID] Initializing XHCI at {:02X}:{:02X}.{}\n",
         ctrl.bus, ctrl.device, ctrl.function
     ));
@@ -1570,20 +1667,20 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
 
     let bar0 = ctrl.bar0 & !0xF;
     if bar0 == 0 {
-        crate::serial::serial_print("[USB-HID] Invalid BAR0\n");
+        serial::serial_print("[USB-HID] Invalid BAR0\n");
         return UsbControllerState::Error;
     }
 
     let mmio = match XhciMmio::from_bar0(bar0) {
         Ok(m)  => m,
-        Err(e) => { crate::serial::serial_print(&alloc::format!("[USB-HID] MMIO map failed: {}\n", e)); return UsbControllerState::Error; }
+        Err(e) => { serial::serial_print(&alloc::format!("[USB-HID] MMIO map failed: {}\n", e)); return UsbControllerState::Error; }
     };
 
     let hcsparams1 = mmio.read_capability(0x04);
     let max_slots  = (hcsparams1 & 0xFF) as u8;
     let max_ports  = ((hcsparams1 >> 24) & 0xFF) as u8;
 
-    crate::serial::serial_print(&alloc::format!("[XHCI] MaxSlots={} MaxPorts={}\n", max_slots, max_ports));
+    serial::serial_print(&alloc::format!("[XHCI] MaxSlots={} MaxPorts={}\n", max_slots, max_ports));
 
     let mut state = XhciControllerState::new(bar0, mmio);
     state.max_slots = max_slots;
@@ -1595,22 +1692,175 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
     }
 
     if let Err(e) = state.initialize() {
-        crate::serial::serial_print(&alloc::format!("[XHCI] initialize() failed: {}\n", e));
+        serial::serial_print(&alloc::format!("[XHCI] initialize() failed: {}\n", e));
         return UsbControllerState::Error;
     }
 
     if let Err(e) = state.start_controller() {
-        crate::serial::serial_print(&alloc::format!("[XHCI] start_controller() failed: {}\n", e));
+        serial::serial_print(&alloc::format!("[XHCI] start_controller() failed: {}\n", e));
         return UsbControllerState::Error;
     }
 
     if let Err(e) = state.enumerate_ports() {
-        crate::serial::serial_print(&alloc::format!("[XHCI] enumerate_ports() error: {}\n", e));
+        serial::serial_print(&alloc::format!("[XHCI] enumerate_ports() error: {}\n", e));
         // Non-fatal: controller is still running
     }
 
     unsafe { XHCI = Some(state); }
 
-    crate::serial::serial_print("[USB-HID] XHCI controller ready\n");
+    serial::serial_print("[USB-HID] XHCI controller ready\n");
     UsbControllerState::Ready
 }
+
+// ===========================================================================
+// Tests (host-side, sin hardware real)
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifica que podemos reutilizar continuamente un único slot de un TransferRing
+    /// (patrón HID: submit → complete → re-submit) sin que el ring se llene.
+    #[test]
+    fn transfer_ring_single_slot_reuse_does_not_fill() {
+        // Pequeño ring con LINK TRB al final (has_link_trb = true).
+        let mut tr = TransferRing::new(8, 1, 1).expect("TransferRing::new debe funcionar");
+
+        let dummy_trb = Trb {
+            parameter: 0xDEAD_BEEF_DEAD_BEEF,
+            status: 0,
+            control: 0,
+        };
+
+        // Simula muchos ciclos "submit -> complete -> re-submit"
+        for _ in 0..10_000 {
+            tr.submit(dummy_trb).expect("submit en transfer ring no debe fallar");
+            tr.ring.advance_transfer_dequeue();
+            // Si el anillo se llenara por no avanzar bien dequeue/cycle, submit empezaría a fallar.
+        }
+    }
+
+    /// Verifica que un TrbRing puro respeta la relación entre enqueue/advance_transfer_dequeue/is_full.
+    #[test]
+    fn trb_ring_is_full_only_when_expected() {
+        let mut ring = TrbRing::new(8, true).expect("TrbRing::new debe funcionar");
+        let usable = ring.usable();
+
+        let dummy_trb = Trb {
+            parameter: 0x1234_5678_9ABC_DEF0,
+            status: 0,
+            control: 0,
+        };
+
+        // Llenar el ring completamente (menos un slot para diferenciar empty/full) debería dejar is_full() en true.
+        let to_fill = usable - 1;
+        for _ in 0..to_fill {
+            ring.enqueue(dummy_trb).expect("enqueue inicial no debe fallar");
+        }
+        assert!(ring.is_full(), "el ring debería estar lleno tras 'to_fill' enqueues");
+
+        // Simula que el controlador consume un TRB.
+        ring.advance_transfer_dequeue();
+        assert!(
+            !ring.is_full(),
+            "tras avanzar dequeue en un slot, el ring ya no debería estar lleno"
+        );
+
+        // A partir de aquí, si vamos en el patrón submit->advance_transfer_dequeue,
+        // no deberíamos volver a ver errores de 'ring full'.
+        for _ in 0..10_000 {
+            ring.enqueue(dummy_trb).expect("enqueue no debe fallar en patrón reuse");
+            ring.advance_transfer_dequeue();
+        }
+    }
+
+    #[test]
+    fn test_keyboard_report_parsing() {
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let mut dev = HidEndpoint {
+            slot_id: 1, endpoint_id: 1, protocol: HID_PROTOCOL_KEYBOARD,
+            buf_virt: 0, buf_phys: 0, buf_size: 8,
+            last_report: HidLastReport::None,
+        };
+
+        // Press 'A' (HID 0x04 -> PS/2 0x1E)
+        let report = HidKeyboardReport {
+            modifiers: 0, reserved: 0, keys: [0x04, 0, 0, 0, 0, 0],
+        };
+        process_keyboard_report(&mut dev, &report);
+        
+        let keys = mock_interrupts::KEYS.lock().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], 0x1E);
+        drop(keys);
+
+        // Release 'A' (PS/2 0x1E | 0x80 = 0x9E)
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let report_off = HidKeyboardReport::default();
+        process_keyboard_report(&mut dev, &report_off);
+        
+        let keys = mock_interrupts::KEYS.lock().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], 0x9E);
+    }
+
+    #[test]
+    fn test_mouse_report_parsing() {
+        mock_interrupts::MOUSE.lock().unwrap().clear();
+        let mut dev = HidEndpoint {
+            slot_id: 1, endpoint_id: 1, protocol: HID_PROTOCOL_MOUSE,
+            buf_virt: 0, buf_phys: 0, buf_size: 4,
+            last_report: HidLastReport::None,
+        };
+
+        // Mouse move (dx=10, dy=-5, buttons=0x01)
+        let report = HidMouseReport {
+            buttons: 0x01, x: 10, y: -5, wheel: 0,
+        };
+        process_mouse_report(&mut dev, &report);
+
+        let mouse = mock_interrupts::MOUSE.lock().unwrap();
+        assert_eq!(mouse.len(), 1);
+        // Packet: buttons (0x01) | dx (10 << 8) | dy (-5 as u8 as u32 << 16)
+        // 0x01 | 0x0A00 | 0xFB0000 = 0xFB0A01
+        assert_eq!(mouse[0], 0xFB0A01);
+    }
+
+    #[test]
+    fn test_bench_hid_stress_1m() {
+        use std::time::Instant;
+        mock_interrupts::KEYS.lock().unwrap().clear();
+        let mut dev = HidEndpoint {
+            slot_id: 1, endpoint_id: 1, protocol: HID_PROTOCOL_KEYBOARD,
+            buf_virt: 0, buf_phys: 0, buf_size: 8,
+            last_report: HidLastReport::None,
+        };
+
+        let report = HidKeyboardReport {
+            modifiers: 0, reserved: 0, keys: [0x04, 0x05, 0x06, 0x07, 0x08, 0x09],
+        };
+        let report_off = HidKeyboardReport::default();
+
+        let start = Instant::now();
+        let iterations = 500_000; // 500k pairs = 1M reports total
+        
+        for _ in 0..iterations {
+            process_keyboard_report(&mut dev, &report);
+            process_keyboard_report(&mut dev, &report_off);
+        }
+        
+        let duration = start.elapsed();
+        let total_reports = iterations * 2;
+        let mps = total_reports as f64 / duration.as_secs_f64();
+
+        println!("\n--- 1M HID STRESS TEST RESULTS ---");
+        println!("Total Reports: {}", total_reports);
+        println!("Total Time: {:?}", duration);
+        println!("Throughput: {:.2} MPS (Messages Per Second)", mps);
+        println!("----------------------------------\n");
+
+        assert!(mps > 1_000_000.0, "Throughput should be at least 1M MPS");
+    }
+}
+

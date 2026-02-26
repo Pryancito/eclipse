@@ -63,15 +63,20 @@ pub extern "C" fn _start() -> ! {
     if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
 
     loop {
+        // Drenar todo el input pendiente antes de update/render para no llenar el mailbox del kernel
         state.process_events();
-        
+
         state.update();
         state.render();
         state.backend.swap_buffers();
 
+        // Un drenado rápido tras render por si llegaron eventos durante el frame
+        state.process_events();
+
         if state.counter % 1000 == 0 {
             let used = HEAP_PTR.load(Ordering::Relaxed);
-            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs", used, state.backend.ipc.message_count);
+            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs | Input {} ev | recv {}",
+                used, state.backend.ipc.message_count, state.input_event_count, state.backend.ipc.recv_attempts);
         }
 
         if state.counter % 300 == 0 { for _ in 0..10 { yield_cpu(); } }
