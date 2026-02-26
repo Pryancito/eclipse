@@ -353,6 +353,7 @@ fn translate_linux_abi_unique(
         186 => (23, arg1, arg2, arg3, arg4, arg5),       // gettid -> 23
         231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
         262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
+        35 => (25, arg1, arg2, arg3, arg4, arg5),          // nanosleep -> 25
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
@@ -2164,15 +2165,51 @@ fn sys_futex(_uaddr: u64, op: u64, _val: u64, _timeout: u64) -> u64 {
 /// sys_nanosleep - Sleep for specified time
 /// 
 /// Arguments:
-///   req: Pointer to timespec structure (seconds + nanoseconds)
+///   req: Pointer to timespec structure { tv_sec: i64, tv_nsec: i64 }
 /// 
-/// Returns: 0 on success, u64::MAX on error
-fn sys_nanosleep(_req: u64) -> u64 {
-    // For now, just yield CPU a few times to simulate sleep
-    // Real implementation would use timer interrupts
-    for _ in 0..100 {
-        sys_yield();
+/// Returns: 0 on success, u64::MAX on error (EFAULT/EINVAL)
+fn sys_nanosleep(req: u64) -> u64 {
+    // Validate user pointer: timespec is 2 × i64 = 16 bytes
+    if !is_user_pointer(req, 16) {
+        return u64::MAX;
     }
+
+    let (tv_sec, tv_nsec): (i64, i64) = unsafe {
+        let ptr = req as *const i64;
+        (ptr.read(), ptr.add(1).read())
+    };
+
+    // Reject negative or out-of-range values (EINVAL)
+    if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+        return u64::MAX;
+    }
+
+    // Calculate sleep duration in milliseconds (PIT runs at 1000 Hz = 1 tick/ms)
+    let ms = (tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(tv_nsec as u64 / 1_000_000);
+
+    if ms == 0 {
+        // Zero-duration sleep: just yield once to be cooperative
+        yield_cpu();
+        return 0;
+    }
+
+    let current_tick = crate::interrupts::ticks();
+    let wake_tick = current_tick.saturating_add(ms);
+
+    // Mark process as Blocked and register in the sleep queue.
+    // The timer interrupt will re-enqueue it when wake_tick is reached.
+    if let Some(pid) = current_process_id() {
+        if let Some(mut proc) = crate::process::get_process(pid) {
+            proc.state = crate::process::ProcessState::Blocked;
+            crate::process::update_process(pid, proc);
+        }
+        crate::scheduler::add_sleep(pid, wake_tick);
+    }
+
+    // Yield CPU; we will be rescheduled by the timer once the sleep expires.
+    yield_cpu();
     0
 }
 

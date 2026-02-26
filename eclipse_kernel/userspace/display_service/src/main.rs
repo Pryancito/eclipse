@@ -17,7 +17,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send};
+use eclipse_libc::{println, getpid, getppid, send, sleep_ms};
 
 mod logo;
 
@@ -739,13 +739,10 @@ fn init_vesa_driver() -> Result<Framebuffer, &'static str> {
 
 /// Simulate V-Sync wait
 fn wait_for_vsync() {
-    // In a real implementation, this would wait for vertical blank
-    // by reading VGA status register (0x3DA) bit 3 or using VBE 3.0
-    // protected mode interface for V-Sync notification
-    // For now, just yield to simulate timing
-    for _ in 0..10 {
-        yield_cpu();
-    }
+    // Sleep for ~16 ms to target 60 Hz refresh rate.
+    // On real hardware this frees the CPU for other processes instead of
+    // burning cycles with 10 consecutive yield_cpu() calls.
+    sleep_ms(16);
 }
 
 /// 2D Acceleration: Hardware-accelerated block transfer (BitBLT)
@@ -788,10 +785,6 @@ fn accel_fill_rect(fb: &Framebuffer, x: u32, y: u32,
     let bytes_per_pixel = (fb.mode.bpp / 8) as u32;
     let _start_offset = (y * fb.pitch + x * bytes_per_pixel) as usize;
     
-    // Simulate DMA-style fill by yielding
-    // Real implementation would write directly to framebuffer memory
-    yield_cpu();
-    
     Ok(())
 }
 
@@ -807,9 +800,6 @@ fn accel_mem_copy(fb: &Framebuffer, _src: usize, _dst: usize, _size: usize) -> R
     // 1. Use DMA controller if available
     // 2. Or use optimized CPU instructions (rep movsb/movsq)
     // 3. Copy in large blocks for cache efficiency
-    
-    // Simulate DMA transfer
-    yield_cpu();
     
     Ok(())
 }
@@ -1024,46 +1014,25 @@ pub extern "C" fn _start() -> ! {
     }
     
     // Main loop - render frames and handle display events
-    let mut heartbeat_counter = 0u64;
-    
     loop {
-        heartbeat_counter += 1;
-        
-        // Simulate frame rendering with V-Sync and 2D acceleration
-        // In a real implementation, this would:
-        // - Process rendering commands from IPC
-        // - Use 2D acceleration for drawing operations
-        // - Update framebuffer (or back buffer if double buffering)
-        // - Swap buffers on V-Sync for tear-free display
-        // - Handle display mode changes
-        
-        // Simulate rendering at ~60 FPS with V-Sync
-        if heartbeat_counter % 16666 == 0 {  // Approximate 60Hz
-            stats.frames_rendered += 1;
-            stats.vsync_count += 1;
-            
-            // Use 2D acceleration for rendering if available
-            if let Some(ref fb) = framebuffer {
-                if fb.supports_hw_accel {
-                    // Simulate accelerated rendering operations
-                    if heartbeat_counter % 100000 == 0 {
-                        // Occasional fill operation
-                        let _ = accel_fill_rect(fb, 50, 50, 100, 100, colors::RED);
-                        stats.fill_operations += 1;
-                    }
-                    
-                    // Double buffer swap if supported
-                    if fb.back_buffer != 0 {
-                        let _ = swap_buffers(fb);
-                    }
+        // Process rendering commands from IPC (placeholder – real compositor fills this)
+        // and then sleep until the next 60 Hz frame boundary.
+
+        // Use 2D acceleration for rendering if available
+        if let Some(ref fb) = framebuffer {
+            if fb.supports_hw_accel {
+                // Double buffer swap on vsync
+                if fb.back_buffer != 0 {
+                    let _ = swap_buffers(fb);
                 }
             }
-            
-            wait_for_vsync();
         }
         
-        // Periodic status updates with enhanced metrics
-        if heartbeat_counter % 500000 == 0 {
+        stats.frames_rendered += 1;
+        stats.vsync_count += 1;
+
+        // Periodic status updates (every ~5 s = 300 frames at 60 Hz)
+        if stats.frames_rendered % 300 == 0 {
             let driver_name = match active_driver {
                 GraphicsDriver::NVIDIA => "NVIDIA",
                 GraphicsDriver::VESA => "VESA",
@@ -1086,7 +1055,9 @@ pub extern "C" fn _start() -> ! {
                 println!("[DISPLAY-SERVICE]   Errors: {}", stats.driver_errors);
             }
         }
-        
-        yield_cpu();
+
+        // Sleep for ~16 ms to achieve ~60 FPS. This releases the CPU to other
+        // processes instead of spinning in a busy-wait loop.
+        wait_for_vsync();
     }
 }
