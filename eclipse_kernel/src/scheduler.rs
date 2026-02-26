@@ -73,16 +73,80 @@ pub fn tick() {
     let ticks = stats.total_ticks;
     drop(stats);
     
-    // Debug print every 100 ticks
-    // if ticks % 100 == 0 {
-    //    crate::serial::serial_print("SCHEDULER: Tick ");
-    //    crate::serial::serial_print_dec(ticks);
-    //    crate::serial::serial_print("\n");
-    // }
+    // Wake up sleeping processes whose wake_tick has arrived.
+    // Only locks SLEEP_QUEUE (never PROCESS_TABLE) to avoid deadlock with
+    // syscall paths that hold PROCESS_TABLE with interrupts enabled.
+    wake_sleeping_processes(ticks);
     
     // Cada 10 ticks, hacer un context switch
     if ticks % 10 == 0 {
         schedule();
+    }
+}
+
+/// Entry in the sleep queue: a process waiting to be re-scheduled after a delay.
+#[derive(Clone, Copy)]
+struct SleepEntry {
+    pid: ProcessId,
+    wake_tick: u64,
+    valid: bool,
+}
+
+impl SleepEntry {
+    const fn empty() -> Self {
+        Self { pid: 0, wake_tick: 0, valid: false }
+    }
+}
+
+const SLEEP_QUEUE_SIZE: usize = 64;
+static SLEEP_QUEUE: Mutex<[SleepEntry; SLEEP_QUEUE_SIZE]> = Mutex::new([SleepEntry::empty(); SLEEP_QUEUE_SIZE]);
+
+/// Register a process to be re-queued after `wake_tick` timer ticks have elapsed.
+/// Called from sys_nanosleep after setting the process state to Blocked.
+pub fn add_sleep(pid: ProcessId, wake_tick: u64) {
+    let mut added = false;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut q = SLEEP_QUEUE.lock();
+        for entry in q.iter_mut() {
+            if !entry.valid {
+                entry.pid = pid;
+                entry.wake_tick = wake_tick;
+                entry.valid = true;
+                added = true;
+                break;
+            }
+        }
+    });
+    if !added {
+        // Sleep queue full: fall back to immediate enqueue so the process isn't lost.
+        crate::serial::serial_print("[SCHED] WARNING: sleep queue full, waking process immediately\n");
+        enqueue_process(pid);
+    }
+}
+
+/// Check sleep queue and re-enqueue processes whose sleep timer has expired.
+/// This runs in timer interrupt context; it must NOT lock PROCESS_TABLE.
+fn wake_sleeping_processes(current_tick: u64) {
+    // Collect PIDs to wake with the sleep queue lock held, then release it
+    // before calling enqueue_process (which acquires READY_QUEUE locks).
+    let mut pids_to_wake = [0u32; SLEEP_QUEUE_SIZE];
+    let mut count = 0usize;
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut q = SLEEP_QUEUE.lock();
+        for entry in q.iter_mut() {
+            if entry.valid && current_tick >= entry.wake_tick {
+                if count < SLEEP_QUEUE_SIZE {
+                    pids_to_wake[count] = entry.pid;
+                    count += 1;
+                }
+                entry.valid = false;
+            }
+        }
+    });
+
+    for i in 0..count {
+        enqueue_process(pids_to_wake[i]);
     }
 }
 

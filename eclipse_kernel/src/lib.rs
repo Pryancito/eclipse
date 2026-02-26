@@ -37,6 +37,7 @@ pub mod usb_hid;
 mod elf_loader;
 pub mod acpi;
 pub mod apic;
+pub mod sw_cursor;   // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod memory_builtins;
 
 // Re-exportar tipos importantes

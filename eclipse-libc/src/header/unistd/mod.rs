@@ -2,6 +2,7 @@
 use crate::types::*;
 use crate::internal_alloc::{malloc, free};
 use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, mkdir as sys_mkdir, fstat as sys_fstat, Stat as sys_Stat};
+use crate::header::time::nanosleep;
 
 #[no_mangle]
 static mut FORCE_KEEP: i32 = 0;
@@ -137,13 +138,22 @@ pub unsafe extern "C" fn getdtablesize() -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sleep(_seconds: c_uint) -> c_uint {
+pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
+    let req = crate::types::timespec {
+        tv_sec: seconds as time_t,
+        tv_nsec: 0,
+    };
+    nanosleep(&req, core::ptr::null_mut());
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn usleep(_usec: useconds_t) -> c_int {
-    0
+pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
+    let req = crate::types::timespec {
+        tv_sec: (usec / 1_000_000) as time_t,
+        tv_nsec: ((usec % 1_000_000) * 1000) as c_long,
+    };
+    nanosleep(&req, core::ptr::null_mut())
 }
 
 #[no_mangle]

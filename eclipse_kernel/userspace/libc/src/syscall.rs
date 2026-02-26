@@ -413,6 +413,19 @@ pub fn yield_cpu() {
     unsafe { syscall0(SYS_YIELD); }
 }
 
+/// Sleep for the specified number of milliseconds.
+/// Uses SYS_NANOSLEEP (syscall 25) with a timespec {tv_sec: i64, tv_nsec: i64}.
+/// The kernel timer runs at 1000 Hz, so resolution is 1 ms.
+pub fn sleep_ms(ms: u64) {
+    if ms == 0 {
+        yield_cpu();
+        return;
+    }
+    // timespec layout: [tv_sec: i64, tv_nsec: i64]
+    let ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64];
+    unsafe { syscall1(25u64, ts.as_ptr() as u64); }
+}
+
 pub fn getpid() -> u32 {
     unsafe { syscall0(SYS_GETPID) as u32 }
 }

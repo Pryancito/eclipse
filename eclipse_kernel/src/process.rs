@@ -82,6 +82,7 @@ pub struct Process {
     pub fs_base: u64,                     // TLS base (FS_BASE)
     pub gs_base: u64,                     // Kernel/User swap GS base
     pub is_linux: bool,                   // Use Linux ABI translation
+    pub wake_tick: u64,                   // Timer tick at which to wake from Blocked sleep (0 = not sleeping)
 }
 
 impl Process {
@@ -102,6 +103,7 @@ impl Process {
             fs_base: 0,
             gs_base: 0,
             is_linux: false,
+            wake_tick: 0,
         }
     }
 }

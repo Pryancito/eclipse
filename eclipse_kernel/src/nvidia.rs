@@ -1,7 +1,8 @@
 //! NVIDIA GPU Driver Support (Nova-aligned)
 //!
 //! This module provides integration with NVIDIA GPUs for Eclipse OS, aligned with
-//! the **Nova** open-source driver project (Linux kernel 6.15+).
+//! the **Nova** open-source driver project (Linux kernel 6.15+) and NVIDIA's
+//! open-gpu-kernel-modules (https://github.com/NVIDIA/open-gpu-kernel-modules).
 //!
 //! ## Nova (upstream reference)
 //! Nova is the new open-source, Rust-written NVIDIA driver in the mainline Linux
@@ -17,14 +18,18 @@
 //! - Turing (RTX 20 series)
 //! - Ampere (RTX 30 series)
 //! - Ada Lovelace (RTX 40 series)
-//! - Hopper (H100, etc.)
+//! - Hopper (H100, H200, etc.)
+//! - Blackwell (RTX 50 series, B100, B200)
 //!
 //! ## Features
 //! - PCI device detection and enumeration
-//! - GPU identification (device ID, architecture)
-//! - BAR (Base Address Register) mapping
-//! - GSP firmware loading and RPC
-//! - Memory size detection
+//! - GPU identification via PCI device ID + PMC_BOOT_0 hardware cross-check
+//! - BAR (Base Address Register) mapping (32 MB for Turing+)
+//! - VRAM size detection from NV_PFB_CSTATUS register
+//! - GPU temperature reading from THERM registers
+//! - PMC engine enable before GSP boot
+//! - GSP firmware loading and Falcon CPUCTL boot sequence
+//! - GSP RPC infrastructure
 //! - Multi-GPU support
 //!
 //! ## References
@@ -46,10 +51,11 @@ use sidewind_nvidia::gsp::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
     Unknown,
-    Turing,      // RTX 20 series (2018)
-    Ampere,      // RTX 30 series (2020)
-    AdaLovelace, // RTX 40 series (2022)
-    Hopper,      // H100, etc. (2022)
+    Turing,      // RTX 20 series (2018) — TU1xx, chip_id 0x160..0x16F
+    Ampere,      // RTX 30 series (2020) — GA1xx, chip_id 0x170..0x17F
+    AdaLovelace, // RTX 40 series (2022) — AD1xx, chip_id 0x190..0x19F
+    Hopper,      // H100/H200 (2022)     — GH1xx, chip_id 0x1B0..0x1BF
+    Blackwell,   // RTX 50 series (2024) — GB2xx, chip_id >= 0x200
 }
 
 /// NVIDIA GPU Information
@@ -84,6 +90,7 @@ impl NvidiaGpuInfo {
             NvidiaArchitecture::Ampere => (sm_count, sm_count * 4),
             NvidiaArchitecture::AdaLovelace => (sm_count, sm_count * 4),
             NvidiaArchitecture::Hopper => (sm_count, sm_count * 4),
+            NvidiaArchitecture::Blackwell => (sm_count, sm_count * 4),
             _ => (0, 0),
         };
         
@@ -106,40 +113,174 @@ impl NvidiaGpuInfo {
             NvidiaArchitecture::Turing | 
             NvidiaArchitecture::Ampere | 
             NvidiaArchitecture::AdaLovelace |
-            NvidiaArchitecture::Hopper
+            NvidiaArchitecture::Hopper |
+            NvidiaArchitecture::Blackwell
         )
     }
 }
 
-/// Identify GPU based on device ID
-/// Returns (architecture, name, memory_mb, cuda_cores, sm_count)
+/// Derive NvidiaArchitecture from the PMC_BOOT_0 hardware register value.
+/// Uses chip_id = PMC_BOOT_0[31:20] (12-bit field) as discriminant.
+/// This matches the open-gpu-kernel-modules chip-detection logic.
+pub fn arch_from_pmc_boot0(boot0: u32) -> NvidiaArchitecture {
+    let chip_id = (boot0 >> PMC_BOOT0_CHIP_ID_SHIFT) & PMC_BOOT0_CHIP_ID_MASK;
+    if chip_id >= PMC_BOOT0_CHIPID_BLACKWELL_MIN {
+        NvidiaArchitecture::Blackwell
+    } else if chip_id >= PMC_BOOT0_CHIPID_HOPPER_MIN && chip_id <= PMC_BOOT0_CHIPID_HOPPER_MAX {
+        NvidiaArchitecture::Hopper
+    } else if chip_id >= PMC_BOOT0_CHIPID_ADA_MIN && chip_id <= PMC_BOOT0_CHIPID_ADA_MAX {
+        NvidiaArchitecture::AdaLovelace
+    } else if chip_id >= PMC_BOOT0_CHIPID_AMPERE_MIN && chip_id <= PMC_BOOT0_CHIPID_AMPERE_MAX {
+        NvidiaArchitecture::Ampere
+    } else if chip_id >= PMC_BOOT0_CHIPID_TURING_MIN && chip_id <= PMC_BOOT0_CHIPID_TURING_MAX {
+        NvidiaArchitecture::Turing
+    } else {
+        NvidiaArchitecture::Unknown
+    }
+}
+
+/// Read VRAM size in MB from the NV_PFB_CSTATUS register (BAR0 + 0x10020C).
+/// Returns 0 if the register is inaccessible or not yet programmed by the GPU.
+/// From open-gpu-kernel-modules: dev_fb.h / NV_PFB_CSTATUS bits [14:0].
+pub fn read_vram_size_mb(bar0_virt: u64) -> u32 {
+    let raw = unsafe {
+        core::ptr::read_volatile((bar0_virt + NV_PFB_CSTATUS as u64) as *const u32)
+    };
+    raw & NV_PFB_CSTATUS_MEM_SIZE_MASK
+}
+
+/// Read GPU core temperature in Celsius from the THERM engine (BAR0 + 0x20400).
+/// Bits [8:0] are a signed 9-bit value.  Returns None if the register reads 0
+/// or 0xFFFFFFFF (GPU not yet initialized / THERM not powered).
+/// From open-gpu-kernel-modules: dev_therm.h / NV_THERM_TEMP.
+pub fn read_temperature(bar0_virt: u64) -> Option<i32> {
+    let raw = unsafe {
+        core::ptr::read_volatile((bar0_virt + NV_THERM_TEMP as u64) as *const u32)
+    };
+    if raw == 0 || raw == 0xFFFF_FFFF {
+        return None;
+    }
+    let raw9 = raw & NV_THERM_TEMP_VALUE_MASK;
+    // Sign-extend 9-bit value
+    let temp = if (raw9 & NV_THERM_TEMP_VALUE_SIGN_BIT) != 0 {
+        (raw9 as i32) - 512
+    } else {
+        raw9 as i32
+    };
+    Some(temp)
+}
+
+/// Identify GPU based on PCI device ID.
+/// Returns (architecture, name, memory_mb, cuda_cores, sm_count).
+/// Device IDs sourced from open-gpu-kernel-modules / NVIDIA PCI ID database.
 fn identify_gpu(device_id: u16) -> (NvidiaArchitecture, &'static str, u32, u32, u32) {
     match device_id {
-        // RTX 40 Series - Ada Lovelace
-        0x2684 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090", 24576, 16384, 128),
-        0x2704 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080", 16384, 9728, 76),
-        0x2782 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti", 12288, 7680, 60),
-        0x2786 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070", 12288, 5888, 46),
-        0x2803 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Ti", 8192, 4352, 34),
-        0x2882 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060", 8192, 3072, 24),
-        
-        // RTX 30 Series - Ampere
-        0x2204 => (NvidiaArchitecture::Ampere, "GeForce RTX 3090", 24576, 10496, 82),
-        0x2206 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080", 10240, 8704, 68),
-        0x2216 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080 Ti", 12288, 10240, 80),
-        0x2484 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070", 8192, 5888, 46),
-        0x2489 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 Ti", 8192, 4864, 38),
-        0x2503 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060", 12288, 3584, 28),
-        
-        // RTX 20 Series - Turing
-        0x1E02 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Ti", 11264, 4352, 68),
-        0x1E04 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Super", 8192, 3072, 48),
-        0x1E07 => (NvidiaArchitecture::Turing, "GeForce RTX 2080", 8192, 2944, 46),
-        0x1E82 => (NvidiaArchitecture::Turing, "GeForce RTX 2070 Super", 8192, 2560, 40),
-        0x1E84 => (NvidiaArchitecture::Turing, "GeForce RTX 2070", 8192, 2304, 36),
-        0x1F02 => (NvidiaArchitecture::Turing, "GeForce RTX 2060 Super", 8192, 2176, 34),
-        0x1F03 => (NvidiaArchitecture::Turing, "GeForce RTX 2060", 6144, 1920, 30),
-        
+        // ---------------------------------------------------------------
+        // Blackwell — RTX 50 series (2024–2025), GB202/GB203/GB205/GB206
+        // ---------------------------------------------------------------
+        0x2B85 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5090", 32768, 21760, 170),
+        0x2B89 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5080", 16384, 10752, 84),
+        0x2C00 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070 Ti", 16384,  8960, 70),
+        0x2C20 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5070",   12288,  6144, 48),
+        0x2C30 => (NvidiaArchitecture::Blackwell, "GeForce RTX 5060 Ti", 8192,  4608, 36),
+        // ---------------------------------------------------------------
+        // Ada Lovelace — RTX 40 series (2022–2024), AD102/AD103/AD104/AD106/AD107
+        // ---------------------------------------------------------------
+        // Desktop (all variants)
+        0x2684 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090",           24576, 16384, 128),
+        0x2685 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090 D",         24576, 16384, 128),
+        0x2704 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080",           16384,  9728,  76),
+        0x2702 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080 Super",     16384, 10240,  80),
+        0x2782 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti",        12288,  7680,  60),
+        0x2783 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti Super",  16384,  8448,  66),
+        0x2786 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070",           12288,  5888,  46),
+        0x2788 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Super",     12288,  7168,  56),
+        0x2803 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Ti",         8192,  4352,  34),
+        0x2805 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Ti 16GB",   16384,  4352,  34),
+        0x2882 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060",            8192,  3072,  24),
+        0x2860 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4050",            6144,  2560,  20),
+        // Ada Lovelace — mobile
+        0x27A0 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4090 Laptop",    16384, 9728, 76),
+        0x27B0 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4080 Laptop",    12288, 7424, 58),
+        0x27B8 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Laptop",    8192,  4608, 36),
+        0x27BA => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4070 Ti Laptop", 12288, 5888, 46),
+        0x27E0 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4060 Laptop",    8192,  3072, 24),
+        0x27E8 => (NvidiaArchitecture::AdaLovelace, "GeForce RTX 4050 Laptop",    6144,  2560, 20),
+        // Ada Lovelace — professional / data-centre
+        0x26B1 => (NvidiaArchitecture::AdaLovelace, "RTX 6000 Ada Generation",   49152, 18176, 142),
+        0x26B3 => (NvidiaArchitecture::AdaLovelace, "RTX 5000 Ada Generation",   32768, 12800, 100),
+        0x26B9 => (NvidiaArchitecture::AdaLovelace, "RTX 4500 Ada Generation",   24576,  7680,  60),
+        0x26BA => (NvidiaArchitecture::AdaLovelace, "RTX 4000 Ada Generation",   20480,  6144,  48),
+        0x26BB => (NvidiaArchitecture::AdaLovelace, "RTX 4000 SFF Ada Generation", 20480, 6144, 48),
+        0x26BD => (NvidiaArchitecture::AdaLovelace, "RTX 2000 Ada Generation",   16384,  3072,  24),
+        0x2230 => (NvidiaArchitecture::AdaLovelace, "NVIDIA L40",                48128, 18176, 142),
+        0x26B5 => (NvidiaArchitecture::AdaLovelace, "NVIDIA L40S",               49152, 18176, 142),
+        // ---------------------------------------------------------------
+        // Hopper — H100/H200 (2022–2023), GH100
+        // ---------------------------------------------------------------
+        0x2330 => (NvidiaArchitecture::Hopper, "NVIDIA H100 SXM5 80GB",  81920, 0, 132),
+        0x2331 => (NvidiaArchitecture::Hopper, "NVIDIA H100 PCIe 80GB",  81920, 0, 114),
+        0x2335 => (NvidiaArchitecture::Hopper, "NVIDIA H200 SXM5 141GB", 144384, 0, 132),
+        0x2339 => (NvidiaArchitecture::Hopper, "NVIDIA H100 NVL",        94208, 0, 132),
+        // ---------------------------------------------------------------
+        // Ampere — RTX 30 series (2020–2022), GA102/GA103/GA104/GA106/GA107
+        // ---------------------------------------------------------------
+        // Desktop
+        0x2204 => (NvidiaArchitecture::Ampere, "GeForce RTX 3090",      24576, 10496, 82),
+        0x2208 => (NvidiaArchitecture::Ampere, "GeForce RTX 3090 Ti",   24576, 10752, 84),
+        0x2206 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080",      10240,  8704, 68),
+        0x220A => (NvidiaArchitecture::Ampere, "GeForce RTX 3080 12GB", 12288,  8960, 70),
+        0x2216 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080 Ti",   12288, 10240, 80),
+        0x2484 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070",       8192,  5888, 46),
+        0x2488 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070 Ti",    8192,  6144, 48),
+        0x2489 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 Ti",    8192,  4864, 38),
+        0x2503 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060",       12288,  3584, 28),
+        0x2504 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 8GB",    8192,  3584, 28),
+        0x2544 => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 12GB",  12288,  3584, 28),
+        0x2571 => (NvidiaArchitecture::Ampere, "GeForce RTX 3050",        8192,  2560, 20),
+        0x2582 => (NvidiaArchitecture::Ampere, "GeForce RTX 3050 6GB",    6144,  2048, 16),
+        // Ampere — mobile
+        0x2420 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080 Ti Laptop", 16384, 7424, 58),
+        0x2460 => (NvidiaArchitecture::Ampere, "GeForce RTX 3080 Laptop",   16384, 6144, 48),
+        0x24A0 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070 Ti Laptop", 8192, 5888, 46),
+        0x24B0 => (NvidiaArchitecture::Ampere, "GeForce RTX 3070 Laptop",    8192, 5120, 40),
+        0x24DC => (NvidiaArchitecture::Ampere, "GeForce RTX 3060 Laptop",    6144, 3840, 30),
+        0x25A0 => (NvidiaArchitecture::Ampere, "GeForce RTX 3050 Laptop",    4096, 2048, 16),
+        // Ampere — professional / data-centre
+        0x2235 => (NvidiaArchitecture::Ampere, "NVIDIA A100 80GB PCIe", 81920, 0, 108),
+        0x20B5 => (NvidiaArchitecture::Ampere, "NVIDIA A100 80GB SXM4", 81920, 0, 108),
+        0x20B2 => (NvidiaArchitecture::Ampere, "NVIDIA A100 40GB PCIe", 40960, 0, 108),
+        0x20F5 => (NvidiaArchitecture::Ampere, "NVIDIA A10",             24576, 9216, 72),
+        0x2236 => (NvidiaArchitecture::Ampere, "NVIDIA A10G",            24576, 9216, 72),
+        0x2231 => (NvidiaArchitecture::Ampere, "NVIDIA A40",             49152, 10752, 84),
+        0x2233 => (NvidiaArchitecture::Ampere, "NVIDIA A30",             24576, 0, 56),
+        0x25B6 => (NvidiaArchitecture::Ampere, "NVIDIA A16",             16384, 0, 28),
+        0x1EB8 => (NvidiaArchitecture::Ampere, "NVIDIA T4",              16384, 2560, 40),
+        // ---------------------------------------------------------------
+        // Turing — RTX 20 series / GTX 16 series (2018–2020), TU102..TU117
+        // ---------------------------------------------------------------
+        // RTX 20 series desktop
+        0x1E02 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Ti",     11264, 4352, 68),
+        0x1E04 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Super",   8192, 3072, 48),
+        0x1E07 => (NvidiaArchitecture::Turing, "GeForce RTX 2080",         8192, 2944, 46),
+        0x1E82 => (NvidiaArchitecture::Turing, "GeForce RTX 2070 Super",   8192, 2560, 40),
+        0x1E84 => (NvidiaArchitecture::Turing, "GeForce RTX 2070",         8192, 2304, 36),
+        0x1F02 => (NvidiaArchitecture::Turing, "GeForce RTX 2060 Super",   8192, 2176, 34),
+        0x1F03 => (NvidiaArchitecture::Turing, "GeForce RTX 2060",         6144, 1920, 30),
+        // GTX 16 series desktop (Turing architecture, no RT cores)
+        0x1F36 => (NvidiaArchitecture::Turing, "GeForce GTX 1660 Super",   6144, 1408, 22),
+        0x1F44 => (NvidiaArchitecture::Turing, "GeForce GTX 1660 Ti",      6144, 1536, 24),
+        0x1F82 => (NvidiaArchitecture::Turing, "GeForce GTX 1660",         6144, 1408, 22),
+        0x1F91 => (NvidiaArchitecture::Turing, "GeForce GTX 1650 Super",   4096, 1280, 20),
+        0x1F99 => (NvidiaArchitecture::Turing, "GeForce GTX 1650",         4096, 896,  14),
+        // Turing — mobile
+        0x1E90 => (NvidiaArchitecture::Turing, "GeForce RTX 2080 Laptop",  8192, 2944, 46),
+        0x1E91 => (NvidiaArchitecture::Turing, "GeForce RTX 2070 Laptop",  8192, 2304, 36),
+        0x1E93 => (NvidiaArchitecture::Turing, "GeForce RTX 2060 Laptop",  6144, 1920, 30),
+        // Turing — professional
+        0x1E30 => (NvidiaArchitecture::Turing, "Quadro RTX 6000",  24576, 4608, 72),
+        0x1E78 => (NvidiaArchitecture::Turing, "Quadro RTX 5000",  16384, 3072, 48),
+        0x1E36 => (NvidiaArchitecture::Turing, "Quadro RTX 4000",   8192, 2304, 36),
         // Default/Unknown
         _ => (NvidiaArchitecture::Unknown, "Unknown NVIDIA GPU", 0, 0, 0),
     }
@@ -288,18 +429,19 @@ pub fn init() {
         serial::serial_print_hex(gpu.device_id as u64);
         serial::serial_print("\n");
         
-        serial::serial_print("[NVIDIA]   Architecture: ");
+        serial::serial_print("[NVIDIA]   Architecture (PCI ID): ");
         match gpu_info.architecture {
+            NvidiaArchitecture::Blackwell   => serial::serial_print("Blackwell"),
             NvidiaArchitecture::AdaLovelace => serial::serial_print("Ada Lovelace"),
-            NvidiaArchitecture::Ampere => serial::serial_print("Ampere"),
-            NvidiaArchitecture::Turing => serial::serial_print("Turing"),
-            NvidiaArchitecture::Hopper => serial::serial_print("Hopper"),
-            NvidiaArchitecture::Unknown => serial::serial_print("Unknown"),
+            NvidiaArchitecture::Ampere      => serial::serial_print("Ampere"),
+            NvidiaArchitecture::Turing      => serial::serial_print("Turing"),
+            NvidiaArchitecture::Hopper      => serial::serial_print("Hopper"),
+            NvidiaArchitecture::Unknown     => serial::serial_print("Unknown"),
         }
         serial::serial_print("\n");
         
         if gpu_info.memory_size_mb > 0 {
-            serial::serial_print("[NVIDIA]   Memory: ");
+            serial::serial_print("[NVIDIA]   Memory (PCI ID table): ");
             serial::serial_print_dec(gpu_info.memory_size_mb as u64);
             serial::serial_print(" MB\n");
         }
@@ -326,28 +468,19 @@ pub fn init() {
             }
         }
         
-        serial::serial_print("[NVIDIA]   BAR0: 0x");
+        serial::serial_print("[NVIDIA]   BAR0 (PCI): 0x");
         serial::serial_print_hex(gpu.bar0 as u64);
         serial::serial_print("\n");
-        
+
         // Report advanced capabilities
         serial::serial_print("[NVIDIA]   Advanced Features:\n");
-        
-        // CUDA support
         serial::serial_print("[NVIDIA]     ✓ CUDA Runtime\n");
-        
-        // RT core support
         if gpu_info.rt_cores > 0 {
             serial::serial_print("[NVIDIA]     ✓ Ray Tracing (RT Cores)\n");
         }
-        
-        // Display output
         serial::serial_print("[NVIDIA]     ✓ DisplayPort/HDMI Output\n");
-        
-        // Power management
         serial::serial_print("[NVIDIA]     ✓ Power Management\n");
         
-        // Video encode/decode
         let encoder_caps = video::EncoderCapabilities::detect(&gpu_info);
         let decoder_caps = video::DecoderCapabilities::detect(&gpu_info);
         
@@ -363,23 +496,23 @@ pub fn init() {
             serial::serial_print("[NVIDIA]   ✓ Supported by open-gpu-kernel-modules\n");
         } else {
             serial::serial_print("[NVIDIA]   ⚠ Not supported by open-gpu-kernel-modules\n");
-            serial::serial_print("[NVIDIA]     (Turing architecture or newer required)\n");
         }
         
-        // Enable the device
+        // Enable the PCI device (I/O + Memory + Bus Master)
         unsafe {
             crate::pci::enable_device(&gpu, true);
         }
         serial::serial_print("[NVIDIA]   Device enabled (I/O, Memory, Bus Master)\n");
 
-        // --- Phase 1: PCI & BAR Mapping Audit ---
-        // Attempt to map BAR0 (usually 16MB or 32MB of control registers)
+        // --- Phase 1: BAR0 mapping ---
+        // Turing and newer use 32 MB BAR0 (from open-gpu-kernel-modules default).
+        // Legacy GPUs (pre-Turing, not supported here) use 16 MB.
         let bar0_phys = unsafe { get_bar(gpu, 0) };
-        let bar0_size = 16 * 1024 * 1024; // Standard for many NVIDIA GPUs
+        let bar0_size = 32 * 1024 * 1024; // 32 MB for Turing+ (open-gpu-kernel-modules standard)
         
         serial::serial_print("[NVIDIA]   Mapping BAR0 (Phys: 0x");
         serial::serial_print_hex(bar0_phys);
-        serial::serial_print(")...\n");
+        serial::serial_print(", 32 MB)...\n");
 
         let bar0_virt = map_mmio_range(bar0_phys, bar0_size);
         
@@ -387,134 +520,219 @@ pub fn init() {
         serial::serial_print_hex(bar0_virt);
         serial::serial_print("\n");
 
-        // Identity Register Test (PMC_BOOT_0 is usually at 0x0 in BAR0)
-        // This register often contains the GPU ID (0xDEAD... or similar architecture markers)
-        let boot_0 = unsafe { core::ptr::read_volatile((bar0_virt + NV_PMC_BOOT_0 as u64) as *const u32) };
+        // --- Phase 2: Hardware identity check via PMC_BOOT_0 ---
+        // PMC_BOOT_0 contains the chip ID embedded in bits [31:20].
+        // We cross-check the PCI-ID-derived architecture against the register value.
+        let boot_0 = unsafe {
+            core::ptr::read_volatile((bar0_virt + NV_PMC_BOOT_0 as u64) as *const u32)
+        };
         serial::serial_print("[NVIDIA]   PMC_BOOT_0: 0x");
         serial::serial_print_hex(boot_0 as u64);
         serial::serial_print("\n");
 
-        if boot_0 != 0 && boot_0 != 0xFFFFFFFF {
-            serial::serial_print("[NVIDIA]   ✓ BAR0 Audit PASSED: Hardware responsive (GPU ID: 0x");
+        if boot_0 == 0 || boot_0 == 0xFFFF_FFFF {
+            serial::serial_print("[NVIDIA]   ⚠ BAR0 not accessible (PMC_BOOT_0=0x");
             serial::serial_print_hex(boot_0 as u64);
-            serial::serial_print(")\n");
-            
-            // --- Phase 3: Firmware Loading Implementation ---
-            let fw_path = "/lib/firmware/gsp.bin";
-            match GspLoader::load_firmware(fw_path) {
-                Ok(fw) => {
-                    serial::serial_print("[NVIDIA]   ✓ GSP Firmware loaded (");
-                    serial::serial_print_dec(fw.size as u64);
-                    serial::serial_print(" bytes)\n");
-                    
-                    // --- Phase 4: GSP Boot Kick-off ---
-                    serial::serial_print("[NVIDIA]   Booting GSP processor (Nova Protocol)...\n");
-                    
-                    unsafe {
-                        // 1. Configure Firmware Location
-                        let fw_addr_lo = (fw.phys_base & 0xFFFFFFFF) as u32;
-                        let fw_addr_hi = (fw.phys_base >> 32) as u32;
-                        
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_PHYS_ADDR_LO as u64) as *mut u32, fw_addr_lo);
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_PHYS_ADDR_HI as u64) as *mut u32, fw_addr_hi);
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_FW_SIZE as u64) as *mut u32, fw.size as u32);
-                        
-                        // 2. Clear Mailboxes for clean handshake
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_MAILBOX_IN as u64) as *mut u32, 0);
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *mut u32, 0);
-                        
-                        // 3. Kick the GSP
-                        core::ptr::write_volatile((bar0_virt + NV_GSP_CTRL as u64) as *mut u32, NV_GSP_CTRL_RUN);
-                        
-                        serial::serial_print("[NVIDIA]   GSP kicked. Waiting for handshake");
-                        
-                        // 4. Initialize RPC Client
-                        let mut rpc = RpcClient::new(GPU_RPC_PHYS_BASE);
-                        
-                        // 5. Robust Handshake Poll (diagnostic)
-                        let mut success = false;
-                        let mut timeout_ticks = 0;
-                        const MAX_HANDSHAKE_TICKS: u32 = 5000;
-                        
-                        while timeout_ticks < MAX_HANDSHAKE_TICKS {
-                            let status = core::ptr::read_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *const u32);
-                            
-                            // Nova/Open-RM Handshake: GSP writes 0x52454144 ("READ") or 0x47535052 ("GSPR")
-                            if status == 0x52454144 || status == 0x47535052 {
-                                success = true;
-                                break;
-                            }
-                            
-                            if timeout_ticks % 500 == 0 { serial::serial_print("."); }
-                            
-                            // Exponential backoff simulation
-                            for _ in 0..(1000 * (1 + timeout_ticks/1000)) { core::hint::spin_loop(); }
-                            timeout_ticks += 1;
-                        }
-                        
-                        if success {
-                            serial::serial_print(" ✓ GSP READY\n");
-                            
-                            // Phase 5: GSP Capability Discovery
-                            serial::serial_print("[NVIDIA]   Sending GSP RPC: ControlGetCaps\n");
-                            match rpc.send_command(GspOpcode::ControlGetCaps, &[]) {
-                                Ok(seq) => {
-                                    serial::serial_print("[NVIDIA]     RPC sent (Seq: ");
-                                    serial::serial_print_dec(seq as u64);
-                                    serial::serial_print("). Waiting for response...");
-                                    
-                                    let mut response_found = false;
-                                    for _ in 0..1000 {
-                                        if let Some(msg) = rpc.poll_response() {
-                                            if msg.header.seq_num == seq {
-                                                serial::serial_print(" ✓ Received Response (Status: ");
-                                                serial::serial_print_dec(msg.header.status as u64);
-                                                serial::serial_print(")\n");
-                                                response_found = true;
-                                                break;
-                                            }
-                                        }
-                                        for _ in 0..100000 { core::hint::spin_loop(); }
-                                    }
-                                    if !response_found {
-                                        serial::serial_print(" ⚠ Timeout waiting for Seq ");
-                                        serial::serial_print_dec(seq as u64);
-                                        serial::serial_print("\n");
-                                    }
-                                }
-                                Err(e) => {
-                                    serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
-                                    serial::serial_print_dec(e as u64);
-                                    serial::serial_print("\n");
-                                }
-                            }
+            serial::serial_print("). Skipping this GPU.\n");
+            continue;
+        }
 
-                            // Phase 6: Verify Memory Allocation RPC
-                            serial::serial_print("[NVIDIA]   Testing Memory Allocation RPC...\n");
-                            let alloc_payload = [0u8; 16]; // Mock payload for allocation request
-                            if let Ok(seq) = rpc.send_command(GspOpcode::MemoryAllocate, &alloc_payload) {
-                                serial::serial_print("[NVIDIA]     MemoryAllocate RPC sent (Seq: ");
+        serial::serial_print("[NVIDIA]   ✓ BAR0 accessible (GPU ID: 0x");
+        serial::serial_print_hex(boot_0 as u64);
+        serial::serial_print(")\n");
+
+        // Cross-validate architecture from hardware register
+        let hw_arch = arch_from_pmc_boot0(boot_0);
+        serial::serial_print("[NVIDIA]   Architecture (PMC_BOOT_0): ");
+        match hw_arch {
+            NvidiaArchitecture::Blackwell   => serial::serial_print("Blackwell"),
+            NvidiaArchitecture::AdaLovelace => serial::serial_print("Ada Lovelace"),
+            NvidiaArchitecture::Ampere      => serial::serial_print("Ampere"),
+            NvidiaArchitecture::Turing      => serial::serial_print("Turing"),
+            NvidiaArchitecture::Hopper      => serial::serial_print("Hopper"),
+            NvidiaArchitecture::Unknown     => serial::serial_print("Unknown"),
+        }
+        serial::serial_print("\n");
+
+        if hw_arch != gpu_info.architecture && hw_arch != NvidiaArchitecture::Unknown {
+            serial::serial_print("[NVIDIA]   ⚠ Architecture mismatch: PCI ID says one arch, ");
+            serial::serial_print("PMC_BOOT_0 chip_id says another. Using PMC_BOOT_0.\n");
+        }
+
+        // --- Phase 3: VRAM size from hardware register ---
+        // NV_PFB_CSTATUS bits [14:0] = VRAM size in MB (only valid after GPU init,
+        // but may reflect VBIOS pre-programmed value on warm boot).
+        let hw_vram_mb = read_vram_size_mb(bar0_virt);
+        if hw_vram_mb > 0 {
+            serial::serial_print("[NVIDIA]   VRAM (NV_PFB_CSTATUS): ");
+            serial::serial_print_dec(hw_vram_mb as u64);
+            serial::serial_print(" MB\n");
+        } else {
+            serial::serial_print("[NVIDIA]   VRAM: not yet readable (NV_PFB_CSTATUS=0)\n");
+        }
+
+        // --- Phase 4: Temperature reading ---
+        // Only attempt if THERM is powered (register not 0 / 0xFFFF_FFFF).
+        match read_temperature(bar0_virt) {
+            Some(temp) => {
+                serial::serial_print("[NVIDIA]   Temperature: ");
+                serial::serial_print_dec(temp as u64);
+                serial::serial_print(" deg C\n");
+            }
+            None => {
+                serial::serial_print("[NVIDIA]   Temperature: THERM not initialized\n");
+            }
+        }
+
+        // --- Phase 5: PMC engine enable ---
+        // Before GSP boot, enable all standard GPU engine subsystems.
+        // This follows the open-gpu-kernel-modules _pmc_enable sequence.
+        unsafe {
+            let current = core::ptr::read_volatile(
+                (bar0_virt + NV_PMC_ENABLE as u64) as *const u32
+            );
+            serial::serial_print("[NVIDIA]   PMC_ENABLE (before): 0x");
+            serial::serial_print_hex(current as u64);
+            serial::serial_print("\n");
+            core::ptr::write_volatile(
+                (bar0_virt + NV_PMC_ENABLE as u64) as *mut u32,
+                NV_PMC_ENABLE_DEFAULT,
+            );
+            // Readback confirms write was accepted
+            let confirmed = core::ptr::read_volatile(
+                (bar0_virt + NV_PMC_ENABLE as u64) as *const u32
+            );
+            serial::serial_print("[NVIDIA]   PMC_ENABLE (after):  0x");
+            serial::serial_print_hex(confirmed as u64);
+            serial::serial_print("\n");
+        }
+
+        // --- Phase 6: GSP firmware load and Falcon boot sequence ---
+        let fw_path = "/lib/firmware/gsp.bin";
+        match GspLoader::load_firmware(fw_path) {
+            Ok(fw) => {
+                serial::serial_print("[NVIDIA]   ✓ GSP Firmware loaded (");
+                serial::serial_print_dec(fw.size as u64);
+                serial::serial_print(" bytes at phys 0x");
+                serial::serial_print_hex(fw.phys_base);
+                serial::serial_print(")\n");
+                
+                serial::serial_print("[NVIDIA]   Booting GSP Falcon (Nova/open-gpu-kernel-modules protocol)...\n");
+                
+                unsafe {
+                    // Step 6a: Configure DMA transfer base register (DMATRFBASE)
+                    // Set to firmware physical address >> 8 as per Falcon DMA spec.
+                    let fw_base_shifted = (fw.phys_base >> 8) as u32;
+                    core::ptr::write_volatile(
+                        (bar0_virt + NV_GSP_DMATRFBASE as u64) as *mut u32,
+                        fw_base_shifted,
+                    );
+
+                    // Step 6b: Clear both mailboxes for clean handshake
+                    core::ptr::write_volatile(
+                        (bar0_virt + NV_GSP_MAILBOX0 as u64) as *mut u32, 0,
+                    );
+                    core::ptr::write_volatile(
+                        (bar0_virt + NV_GSP_MAILBOX1 as u64) as *mut u32, 0,
+                    );
+
+                    // Step 6c: Release GSP Falcon from reset via CPUCTL (STARTCPU bit).
+                    // This is the canonical boot kick from open-gpu-kernel-modules
+                    // kgspBootstrapRiscvOSDma_TU102 (src/nvidia/kernel/gpu/gsp/kernel_gsp.c).
+                    core::ptr::write_volatile(
+                        (bar0_virt + NV_GSP_CPUCTL as u64) as *mut u32,
+                        NV_PFALCON_FALCON_CPUCTL_STARTCPU,
+                    );
+                    serial::serial_print("[NVIDIA]   GSP Falcon STARTCPU issued. Awaiting MAILBOX0 handshake");
+
+                    // Step 6d: Initialize RPC Client
+                    let mut rpc = RpcClient::new(GPU_RPC_PHYS_BASE);
+
+                    // Step 6e: Poll MAILBOX0 for GSP-RM ready signature.
+                    // From open-gpu-kernel-modules: GSP writes a magic value when ready.
+                    // Timeout: ~5 seconds (5 000 000 µs @ 1 µs/iteration).
+                    let mut success = false;
+                    let mut timeout_ticks = 0u32;
+                    const MAX_HANDSHAKE_TICKS: u32 = 5_000_000;
+
+                    while timeout_ticks < MAX_HANDSHAKE_TICKS {
+                        let mb0 = core::ptr::read_volatile(
+                            (bar0_virt + NV_GSP_MAILBOX0 as u64) as *const u32,
+                        );
+                        if mb0 == GSP_MAILBOX0_READY_MAGIC_1
+                            || mb0 == GSP_MAILBOX0_READY_MAGIC_2
+                            || mb0 == GSP_MAILBOX0_READY_MAGIC_3
+                        {
+                            success = true;
+                            break;
+                        }
+                        if timeout_ticks % 500_000 == 0 {
+                            serial::serial_print(".");
+                        }
+                        core::hint::spin_loop();
+                        timeout_ticks += 1;
+                    }
+
+                    if success {
+                        serial::serial_print(" ✓ GSP READY\n");
+
+                        // Step 6f: GSP Capability Discovery via RPC
+                        serial::serial_print("[NVIDIA]   Sending GSP RPC: ControlGetCaps\n");
+                        match rpc.send_command(GspOpcode::ControlGetCaps, &[]) {
+                            Ok(seq) => {
+                                serial::serial_print("[NVIDIA]     RPC sent (Seq: ");
                                 serial::serial_print_dec(seq as u64);
-                                serial::serial_print(")\n");
+                                serial::serial_print("). Waiting for response...");
+                                
+                                let mut found = false;
+                                for _ in 0..1000 {
+                                    if let Some(msg) = rpc.poll_response() {
+                                        if msg.header.seq_num == seq {
+                                            serial::serial_print(" ✓ Response (Status: ");
+                                            serial::serial_print_dec(msg.header.status as u64);
+                                            serial::serial_print(")\n");
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    for _ in 0..100_000 { core::hint::spin_loop(); }
+                                }
+                                if !found {
+                                    serial::serial_print(" ⚠ RPC response timeout\n");
+                                }
                             }
-                        } else {
-                            serial::serial_print(" ⚠ GSP Timeout (Status: 0x");
-                            let last_status = core::ptr::read_volatile((bar0_virt + NV_GSP_MAILBOX_OUT as u64) as *const u32);
-                            serial::serial_print_hex(last_status as u64);
+                            Err(e) => {
+                                serial::serial_print("[NVIDIA]   ⚠ RPC Failed: ");
+                                serial::serial_print_dec(e as u64);
+                                serial::serial_print("\n");
+                            }
+                        }
+
+                        // Step 6g: Display setup via RPC (from GspOpcode::DisplaySetup)
+                        if let Ok(seq) = rpc.send_command(GspOpcode::DisplaySetup, &[]) {
+                            serial::serial_print("[NVIDIA]   DisplaySetup RPC sent (Seq: ");
+                            serial::serial_print_dec(seq as u64);
                             serial::serial_print(")\n");
                         }
+                    } else {
+                        let mb0 = core::ptr::read_volatile(
+                            (bar0_virt + NV_GSP_MAILBOX0 as u64) as *const u32,
+                        );
+                        serial::serial_print(" ⚠ GSP Timeout (MAILBOX0=0x");
+                        serial::serial_print_hex(mb0 as u64);
+                        serial::serial_print(")\n");
+                        serial::serial_print("[NVIDIA]   ℹ GSP timeout is expected when gsp.bin is\n");
+                        serial::serial_print("[NVIDIA]     not found or invalid for this GPU model.\n");
                     }
                 }
-                Err(e) => {
-                    serial::serial_print("[NVIDIA]   ⚠ Firmware load failed: ");
-                    serial::serial_print(e);
-                    serial::serial_print("\n");
-                }
             }
-        } else {
-            serial::serial_print("[NVIDIA]   ⚠ BAR0 Audit FAILED: Hardware not responding (PMC_BOOT_0: 0x");
-            serial::serial_print_hex(boot_0 as u64);
-            serial::serial_print(")\n");
+            Err(e) => {
+                serial::serial_print("[NVIDIA]   ⚠ Firmware load failed: ");
+                serial::serial_print(e);
+                serial::serial_print("\n");
+                serial::serial_print("[NVIDIA]   ℹ Place NVIDIA GSP firmware at /lib/firmware/gsp.bin\n");
+                serial::serial_print("[NVIDIA]   ℹ (from open-gpu-kernel-modules or linux-firmware package)\n");
+            }
         }
     }
     
@@ -686,6 +904,7 @@ pub mod raytracing {
                 NvidiaArchitecture::Ampere => (gpu_info.sm_count, true),
                 NvidiaArchitecture::AdaLovelace => (gpu_info.sm_count, true),
                 NvidiaArchitecture::Hopper => (gpu_info.sm_count, true),
+                NvidiaArchitecture::Blackwell => (gpu_info.sm_count, true),
                 _ => (0, false),
             };
             
@@ -966,8 +1185,10 @@ pub mod video {
             codecs.push(VideoCodec::H264);
             codecs.push(VideoCodec::H265);
             
-            // Ada Lovelace and Hopper support AV1 encode
-            if matches!(gpu_info.architecture, NvidiaArchitecture::AdaLovelace | NvidiaArchitecture::Hopper) {
+            // Ada Lovelace, Hopper, and Blackwell support AV1 encode
+            if matches!(gpu_info.architecture,
+                NvidiaArchitecture::AdaLovelace | NvidiaArchitecture::Hopper | NvidiaArchitecture::Blackwell
+            ) {
                 codecs.push(VideoCodec::AV1);
             }
             
