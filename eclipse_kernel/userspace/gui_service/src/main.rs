@@ -9,7 +9,7 @@
 #![no_main]
 
 use eclipse_libc::{
-    println, getpid, getppid, sleep_ms, send, open, close, read, O_RDONLY,
+    println, getpid, getppid, yield_cpu, send, open, close, read, O_RDONLY,
     mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
     SEEK_END,
 };
@@ -41,7 +41,7 @@ fn wait_for_filesystem() {
             println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
             return;
         }
-        for _ in 0..50 { sleep_ms(1); }
+        for _ in 0..50 { yield_cpu(); }
     }
 }
 
@@ -115,5 +115,5 @@ pub extern "C" fn _start() -> ! {
     println!("[GUI-SERVICE] Filesystem ready.");
 
     unsafe { let _ = spawn_compositor(); }
-    loop { sleep_ms(10); }
+    loop { yield_cpu(); }
 }
