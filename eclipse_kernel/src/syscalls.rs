@@ -268,13 +268,13 @@ pub extern "C" fn syscall_handler(
         48 => sys_virgl_resource_attach_backing(arg1, arg2, arg3),
         49 => sys_get_logs(arg1, arg2),
         50 => sys_get_storage_device_count(),
+        51 => sys_get_system_stats(arg1),
         100 => sys_socket(arg1, arg2, arg3),
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
         103 => sys_accept(arg1, arg2, arg3),
         104 => sys_connect(arg1, arg2, arg3),
         105 => sys_mkdir(arg1, arg2),
-        50 => sys_get_storage_device_count(),
         106 => sys_fstatat(arg1, arg2, arg3, arg4),
         107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
@@ -307,6 +307,36 @@ pub extern "C" fn syscall_handler(
 
     context.rax = final_ret;
     final_ret
+}
+
+/// sys_get_system_stats - Obtener métricas del sistema (uso de kernel eclipse-apps)
+fn sys_get_system_stats(stats_ptr: u64) -> u64 {
+    if stats_ptr == 0 || !is_user_pointer(stats_ptr, core::mem::size_of::<SystemStats>() as u64) {
+        return u64::MAX;
+    }
+
+    let sched_stats = crate::scheduler::get_stats();
+    
+    // Obtener memory stats si es posible
+    let (total_frames, used_frames) = {
+        // Since there is no direct public memory frames API yet exposed,
+        // we'll leave it as 0, or try to guess. The dashboard will survive. 
+        // Real implementation can hook up `memory::get_frames` when available.
+        (0, 0)
+    };
+
+    let stats = SystemStats {
+        uptime_ticks: sched_stats.total_ticks,
+        idle_ticks: sched_stats.idle_ticks,
+        total_mem_frames: total_frames,
+        used_mem_frames: used_frames,
+    };
+
+    unsafe {
+        *(stats_ptr as *mut SystemStats) = stats;
+    }
+
+    0
 }
 
 /// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
