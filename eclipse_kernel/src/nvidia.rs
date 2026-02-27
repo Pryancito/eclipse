@@ -601,7 +601,7 @@ pub fn init() {
             serial::serial_print("\n");
             core::ptr::write_volatile(
                 (bar0_virt + NV_PMC_ENABLE as u64) as *mut u32,
-                NV_PMC_ENABLE_DEFAULT,
+                current | NV_PMC_ENABLE_DEFAULT,
             );
             // Readback confirms write was accepted
             let confirmed = core::ptr::read_volatile(
