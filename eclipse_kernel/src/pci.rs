@@ -155,9 +155,13 @@ impl PciDevice {
         }
     }
     
-    /// Check if this is a PCI-to-PCI bridge
+    /// Check if this is a PCI-to-PCI bridge.
+    /// Uses header type as the authoritative indicator (Type 1 = bridge per PCI spec),
+    /// in addition to the class/subclass check, to handle non-standard bridge
+    /// subclasses found on some real hardware (e.g. semi-transparent bridges).
     pub fn is_pci_bridge(&self) -> bool {
-        self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI
+        (self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI)
+            || (self.header_type & 0x7F) == 0x01
     }
 
     /// Check if this is a USB controller
@@ -307,11 +311,13 @@ unsafe fn scan_function(bus: u8, device: u8, function: u8) -> Option<PciDevice> 
     let header_type = pci_config_read_u8(bus, device, function, PCI_REG_HEADER_TYPE);
     let mut bar0 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0) as u64;
     
-    // Check if BAR0 is a 64-bit memory BAR
+    // Check if BAR0 is a 64-bit memory BAR (bits 2:1 = 0b10) and combine with BAR1
     if (bar0 & 0x1) == 0 && (bar0 & 0x6) == 0x4 {
         let bar1 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0 + 4) as u64;
         bar0 |= bar1 << 32;
     }
+    // Strip lower flag bits so bar0 holds the actual physical base address
+    bar0 = if (bar0 & 0x1) != 0 { bar0 & !0x3 } else { bar0 & !0xF };
     
     let interrupt_line = pci_config_read_u8(bus, device, function, PCI_REG_INTERRUPT_LINE);
     
@@ -377,6 +383,29 @@ unsafe fn scan_bus(bus: u8) {
     }
 }
 
+/// Supplementary scan of all PCI buses (0-255) to catch devices missed by
+/// bridge traversal on real hardware with unusual PCIe topologies.
+/// Only adds devices not already present in PCI_DEVICES.
+unsafe fn supplementary_scan() {
+    for bus in 0u8..=255 {
+        for device in 0..32u8 {
+            // Quick check: skip empty slots (no device at function 0)
+            let vendor_id = pci_config_read_u16(bus, device, 0, PCI_REG_VENDOR_ID);
+            if vendor_id == PCI_VENDOR_INVALID {
+                continue;
+            }
+            // Skip if any function of this device was already found via bridge traversal
+            let already_known = {
+                let devices = PCI_DEVICES.lock();
+                devices.iter().any(|d| d.bus == bus && d.device == device)
+            };
+            if !already_known {
+                scan_device(bus, device);
+            }
+        }
+    }
+}
+
 /// Initialize PCI subsystem and scan all devices
 pub fn init() {
     use crate::serial;
@@ -387,6 +416,11 @@ pub fn init() {
     unsafe {
         // Scan bus 0 (main bus), which will recursively scan bridges
         scan_bus(0);
+
+        // Supplementary direct scan of all buses to catch NVIDIA GPUs (or other
+        // devices) that may be missed when PCIe bridges have non-standard
+        // configurations on real hardware (e.g. secondary_bus not strictly > primary).
+        supplementary_scan();
         
         let devices = PCI_DEVICES.lock();
         serial::serial_print("[PCI] Found ");
@@ -521,17 +555,24 @@ pub unsafe fn enable_device(dev: &PciDevice, enable_bus_master: bool) {
     pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, command);
 }
 
-/// Get BAR (Base Address Register) value as 64-bit
+/// Get BAR (Base Address Register) value as 64-bit physical address.
+/// The lower bits of a BAR encode flags (memory/IO type, prefetchable) and are
+/// stripped so the returned value is the actual physical base address.
 pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
     let mut bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4)) as u64;
     
-    // Check if it's a 64-bit memory BAR
-    if (bar & 0x1) == 0 && (bar & 0x6) == 0x4 {
-        let next_bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4) + 4) as u64;
-        bar |= next_bar << 32;
+    if (bar & 0x1) != 0 {
+        // I/O space BAR: bits 31:2 = address, bits 1:0 = flags
+        bar & !0x3
+    } else {
+        // Memory space BAR: check if 64-bit (bits 2:1 = 0b10)
+        if (bar & 0x6) == 0x4 {
+            let next_bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4) + 4) as u64;
+            bar |= next_bar << 32;
+        }
+        // Strip the lower 4 flag bits (memory space indicator, type, prefetchable)
+        bar & !0xF
     }
-    
-    bar
 }
 
 /// Find first capability with given ID. Returns offset in config space (0 = not found).
