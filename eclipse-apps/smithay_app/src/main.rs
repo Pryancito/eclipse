@@ -6,7 +6,7 @@ extern crate eclipse_syscall;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use eclipse_libc::{println, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, yield_cpu, sleep_ms};
 
 use smithay_app::state::SmithayState;
 use smithay_app::compositor::{ShellWindow, WindowContent};
@@ -80,7 +80,7 @@ pub extern "C" fn _start() -> ! {
                 used, state.backend.ipc.message_count, state.input_event_count, state.backend.ipc.recv_attempts);
         }
 
-        if state.counter % 300 == 0 { for _ in 0..10 { yield_cpu(); } }
-        else { yield_cpu(); }
+        // Limit frame rate to ~60-80 FPS to avoid 100% CPU usage on busy-loop
+        sleep_ms(12);
     }
 }
