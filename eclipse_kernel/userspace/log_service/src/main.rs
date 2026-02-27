@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, send, sleep_ms, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
+use eclipse_libc::{println, getpid, getppid, send, yield_cpu, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
 
 /// Log buffer for storing messages before filesystem is ready
 /// 
@@ -111,20 +111,21 @@ pub extern "C" fn _start() -> ! {
     }
     
     // Main loop - handle log messages
-    // Each iteration sleeps 10 ms (~100 Hz).
     let mut heartbeat_counter = 0u64;
     let mut log_stats_counter = 0u64;
+    let mut flush_counter = 0u64;
     
     loop {
         heartbeat_counter += 1;
+        flush_counter += 1;
         
-        // Periodically flush log buffer to file every ~10 seconds (1000 × 10 ms)
-        if heartbeat_counter % 1000 == 0 {
+        // Periodically flush log buffer to file (every 1 million iterations)
+        if flush_counter % 1000000 == 0 {
             flush_log_buffer();
         }
         
-        // Process log messages every ~30 seconds (3000 × 10 ms)
-        if heartbeat_counter % 3000 == 0 {
+        // Process log messages (simulated IPC reception)
+        if heartbeat_counter % 500000 == 0 {
             log_stats_counter += 1;
             
             // Report buffer usage every 10 heartbeats
@@ -135,7 +136,6 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        // Sleep 10 ms to avoid busy-waiting and keep CPU usage low
-        sleep_ms(10);
+        yield_cpu();
     }
 }

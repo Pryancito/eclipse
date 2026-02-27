@@ -4,7 +4,7 @@
 #![no_main]
 
 use eclipse_libc::{
-    println, syscall3, sleep_ms, getppid, send
+    println, syscall3, yield_cpu, getppid, send
 };
 
 const SYS_REGISTER_DEVICE: u64 = 27;
@@ -65,6 +65,6 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         // In the future: listen for udev events or scan bus
-        sleep_ms(10);
+        yield_cpu();
     }
 }

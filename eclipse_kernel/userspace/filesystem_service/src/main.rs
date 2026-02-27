@@ -16,7 +16,7 @@ use alloc::format;
 use core::alloc::Layout;
 
 use eclipse_libc::{
-    println, getpid, getppid, sleep_ms, send,
+    println, getpid, getppid, yield_cpu, send,
     open, close, read, lseek, 
     O_RDONLY, SEEK_SET,
     mount, get_storage_device_count
@@ -391,7 +391,7 @@ pub extern "C" fn _start() -> ! {
         // Do NOT signal READY — the rest of the system must not start without a filesystem.
         println!("[FS-SERVICE] Halting — filesystem not mounted.");
         loop {
-            sleep_ms(100);
+            yield_cpu();
         }
     }
 
@@ -401,6 +401,6 @@ pub extern "C" fn _start() -> ! {
         let _ = send(ppid, 255, b"READY");
     }
     loop {
-        sleep_ms(10);
+        yield_cpu();
     }
 }
