@@ -1,12 +1,13 @@
 #![no_std]
+extern crate alloc;
 
-//! sidewind_nvidia - NVIDIA GPU abstraction (Nova-aligned)
-//!
-//! Hardware abstraction layer for GSP-based NVIDIA GPUs, aligned with the
-//! **Nova** driver (Linux kernel: nova-core / nova-drm).
-//!
-//! Provides protocol definitions for GSP (GPU System Processor) RPC and
-//! BAR0 register layouts.
+/// sidewind_nvidia - NVIDIA GPU abstraction (Nova-aligned)
+///
+/// Hardware abstraction layer for GSP-based NVIDIA GPUs, aligned with the
+/// **Nova** driver (Linux kernel: nova-core / nova-drm).
+///
+/// Provides protocol definitions for GSP (GPU System Processor) RPC and
+/// BAR0 register layouts.
 
 pub mod gsp {
     /// GSP Status Codes
@@ -341,3 +342,5 @@ pub mod registers {
     pub const GSP_MAILBOX0_READY_MAGIC_2: u32 = 0x4753_5052; // "GSPR"
     pub const GSP_MAILBOX0_READY_MAGIC_3: u32 = 0xFFFF_2222; // driver ver >= 515
 }
+
+pub mod features;

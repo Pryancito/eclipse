@@ -486,8 +486,9 @@ pub fn init() {
         serial::serial_print("[NVIDIA]     ✓ DisplayPort/HDMI Output\n");
         serial::serial_print("[NVIDIA]     ✓ Power Management\n");
         
-        let encoder_caps = video::EncoderCapabilities::detect(&gpu_info);
-        let decoder_caps = video::DecoderCapabilities::detect(&gpu_info);
+        let arch_is_turing = matches!(gpu_info.architecture, NvidiaArchitecture::Turing);
+        let encoder_caps = video::EncoderCapabilities::detect(arch_is_turing, gpu_info.sm_count);
+        let decoder_caps = video::DecoderCapabilities::detect(arch_is_turing, gpu_info.sm_count);
         
         serial::serial_print("[NVIDIA]     ✓ Video Encode (NVENC): ");
         serial::serial_print_dec(encoder_caps.supported_codecs.len() as u64);
@@ -503,16 +504,26 @@ pub fn init() {
             serial::serial_print("[NVIDIA]   ⚠ Not supported by open-gpu-kernel-modules\n");
         }
         
-        // Enable the PCI device (I/O + Memory + Bus Master)
-        unsafe {
-            crate::pci::enable_device(&gpu, true);
-        }
-        serial::serial_print("[NVIDIA]   Device enabled (I/O, Memory, Bus Master)\n");
-
         // --- Phase 1: BAR0 mapping ---
         // Turing and newer use 32 MB BAR0 (from open-gpu-kernel-modules default).
         // Legacy GPUs (pre-Turing, not supported here) use 16 MB.
         let bar0_phys = unsafe { get_bar(gpu, 0) };
+        
+        if bar0_phys == 0 {
+            serial::serial_print("[NVIDIA]   ⚠ BAR0 is unassigned (0). Skipping GPU to prevent triple-fault.\n");
+            continue;
+        }
+
+        // Enable the PCI device (I/O + Memory + Bus Master)
+        unsafe {
+            crate::pci::enable_device(&gpu, true);
+            // Disable legacy INTx interrupts to prevent IRQ storms
+            let mut command = crate::pci::pci_config_read_u16(gpu.bus, gpu.device, gpu.function, 0x04);
+            command |= 0x0400; // PCI_COMMAND_INTERRUPT_DISABLE
+            crate::pci::pci_config_write_u16(gpu.bus, gpu.device, gpu.function, 0x04, command);
+        }
+        serial::serial_print("[NVIDIA]   Device enabled (I/O, Memory, Bus Master, INTx Disabled)\n");
+
         let bar0_size = 32 * 1024 * 1024; // 32 MB for Turing+ (open-gpu-kernel-modules standard)
         
         serial::serial_print("[NVIDIA]   Mapping BAR0 (Phys: 0x");
@@ -724,6 +735,35 @@ pub fn init() {
                             serial::serial_print("[NVIDIA]   DisplaySetup RPC sent (Seq: ");
                             serial::serial_print_dec(seq as u64);
                             serial::serial_print(")\n");
+                            
+                            // Detect monitors and set them up to show the same thing (mirroring)
+                            let connectors = sidewind_nvidia::features::display::DisplayConnector::detect_all();
+                            serial::serial_print("[NVIDIA]   Detected ");
+                            serial::serial_print_dec(connectors.len() as u64);
+                            serial::serial_print(" monitors\n");
+                            
+                            for (i, connector) in connectors.iter().enumerate() {
+                                serial::serial_print("[NVIDIA]     Monitor ");
+                                serial::serial_print_dec(i as u64);
+                                serial::serial_print(" (");
+                                match connector.connector_type {
+                                    sidewind_nvidia::features::display::ConnectorType::DisplayPort => serial::serial_print("DisplayPort"),
+                                    sidewind_nvidia::features::display::ConnectorType::HDMI => serial::serial_print("HDMI"),
+                                    sidewind_nvidia::features::display::ConnectorType::DVI => serial::serial_print("DVI"),
+                                    sidewind_nvidia::features::display::ConnectorType::VGA => serial::serial_print("VGA"),
+                                    sidewind_nvidia::features::display::ConnectorType::Unknown => serial::serial_print("Unknown"),
+                                }
+                                serial::serial_print("): Mirroring primary surface\n");
+                                
+                                let mode = sidewind_nvidia::features::display::DisplayMode {
+                                    width: connector.max_width,
+                                    height: connector.max_height,
+                                    refresh_rate: 60,
+                                    pixel_clock: 0,
+                                };
+                                let _ = connector.set_mode(mode);
+                            }
+                            serial::serial_print("[NVIDIA]   Display mirroring activated across all monitors\n");
                         }
                     } else {
                         let mb0 = core::ptr::read_volatile(
@@ -758,669 +798,5 @@ pub fn get_nvidia_gpus() -> Vec<NvidiaGpuInfo> {
         .collect()
 }
 
-// ========================================================================
-// Advanced NVIDIA GPU Features
-// ========================================================================
 
-/// CUDA Runtime Support
-pub mod cuda {
-    //! CUDA runtime interface for compute workloads
-    //! 
-    //! Provides kernel launch, memory management, and stream support
-    //! for general-purpose GPU computing.
-    
-    use super::*;
-    
-    /// CUDA context for GPU operations
-    #[derive(Debug, Clone)]
-    pub struct CudaContext {
-        pub gpu_index: usize,
-        pub device_ptr: usize,
-        pub context_flags: u32,
-    }
-    
-    /// CUDA kernel configuration
-    #[derive(Debug, Clone, Copy)]
-    pub struct KernelConfig {
-        pub blocks: (u32, u32, u32),
-        pub threads: (u32, u32, u32),
-        pub shared_memory: usize,
-    }
-    
-    /// CUDA stream for asynchronous operations
-    #[derive(Debug)]
-    pub struct CudaStream {
-        pub stream_id: u32,
-        pub priority: i32,
-    }
-    
-    impl CudaContext {
-        /// Create a new CUDA context for the specified GPU
-        pub fn new(gpu_index: usize) -> Result<Self, &'static str> {
-            serial::serial_print("[CUDA] Creating context for GPU ");
-            serial::serial_print_dec(gpu_index as u64);
-            serial::serial_print("\n");
-            
-            // In a real implementation, this would:
-            // - Initialize CUDA driver API
-            // - Create GPU context
-            // - Allocate context resources
-            
-            Ok(Self {
-                gpu_index,
-                device_ptr: 0, // Would be actual device pointer
-                context_flags: 0,
-            })
-        }
-        
-        /// Allocate device memory
-        pub fn allocate_device_memory(&self, size: usize) -> Result<usize, &'static str> {
-            serial::serial_print("[CUDA] Allocating ");
-            serial::serial_print_dec(size as u64);
-            serial::serial_print(" bytes of device memory\n");
-            
-            // Would allocate actual GPU memory via BAR
-            Ok(0) // Return device pointer
-        }
-        
-        /// Copy data from host to device
-        pub fn copy_host_to_device(&self, _host_ptr: usize, _device_ptr: usize, _size: usize) -> Result<(), &'static str> {
-            serial::serial_print("[CUDA] Copying data to device\n");
-            // Would perform actual DMA transfer
-            Ok(())
-        }
-        
-        /// Copy data from device to host
-        pub fn copy_device_to_host(&self, _device_ptr: usize, _host_ptr: usize, _size: usize) -> Result<(), &'static str> {
-            serial::serial_print("[CUDA] Copying data from device\n");
-            // Would perform actual DMA transfer
-            Ok(())
-        }
-        
-        /// Launch a CUDA kernel
-        pub fn launch_kernel(&self, _kernel_ptr: usize, config: KernelConfig) -> Result<(), &'static str> {
-            serial::serial_print("[CUDA] Launching kernel: blocks=(");
-            serial::serial_print_dec(config.blocks.0 as u64);
-            serial::serial_print(",");
-            serial::serial_print_dec(config.blocks.1 as u64);
-            serial::serial_print(",");
-            serial::serial_print_dec(config.blocks.2 as u64);
-            serial::serial_print("), threads=(");
-            serial::serial_print_dec(config.threads.0 as u64);
-            serial::serial_print(",");
-            serial::serial_print_dec(config.threads.1 as u64);
-            serial::serial_print(",");
-            serial::serial_print_dec(config.threads.2 as u64);
-            serial::serial_print(")\n");
-            
-            // Would submit kernel to GPU command buffer
-            Ok(())
-        }
-    }
-    
-    impl CudaStream {
-        /// Create a new CUDA stream for asynchronous operations
-        pub fn new(priority: i32) -> Result<Self, &'static str> {
-            serial::serial_print("[CUDA] Creating stream with priority ");
-            serial::serial_print_dec(priority as u64);
-            serial::serial_print("\n");
-            
-            Ok(Self {
-                stream_id: 0, // Would be actual stream ID
-                priority,
-            })
-        }
-    }
-}
-
-/// Ray Tracing (RT Core) Support
-pub mod raytracing {
-    //! RT core interface for hardware-accelerated ray tracing
-    //! 
-    //! Provides acceleration structure building, ray tracing pipeline,
-    //! and shader binding table management.
-    
-    use super::*;
-    
-    /// RT core capabilities for a GPU
-    #[derive(Debug, Clone, Copy)]
-    pub struct RtCoreCapabilities {
-        pub rt_cores: u32,
-        pub max_recursion_depth: u32,
-        pub max_ray_generation_threads: u32,
-        pub supports_inline_rt: bool,
-    }
-    
-    /// Acceleration structure for ray tracing
-    #[derive(Debug)]
-    pub struct AccelerationStructure {
-        pub handle: u64,
-        pub memory_size: usize,
-        pub num_geometries: u32,
-    }
-    
-    /// Ray tracing pipeline state
-    #[derive(Debug)]
-    pub struct RtPipeline {
-        pub pipeline_id: u32,
-        pub max_recursion: u32,
-        pub shader_groups: u32,
-    }
-    
-    impl RtCoreCapabilities {
-        /// Detect RT core capabilities for a GPU
-        pub fn detect(gpu_info: &NvidiaGpuInfo) -> Self {
-            let (rt_cores, supports_inline) = match gpu_info.architecture {
-                NvidiaArchitecture::Turing => (gpu_info.sm_count, false),
-                NvidiaArchitecture::Ampere => (gpu_info.sm_count, true),
-                NvidiaArchitecture::AdaLovelace => (gpu_info.sm_count, true),
-                NvidiaArchitecture::Hopper => (gpu_info.sm_count, true),
-                NvidiaArchitecture::Blackwell => (gpu_info.sm_count, true),
-                _ => (0, false),
-            };
-            
-            Self {
-                rt_cores,
-                max_recursion_depth: 31,
-                max_ray_generation_threads: 1024 * 1024,
-                supports_inline_rt: supports_inline,
-            }
-        }
-    }
-    
-    impl AccelerationStructure {
-        /// Build a new acceleration structure
-        pub fn build(_vertices: &[f32], _indices: &[u32]) -> Result<Self, &'static str> {
-            serial::serial_print("[RT] Building acceleration structure\n");
-            
-            // Would build actual RT acceleration structure
-            Ok(Self {
-                handle: 0,
-                memory_size: 0,
-                num_geometries: 0,
-            })
-        }
-    }
-    
-    impl RtPipeline {
-        /// Create a ray tracing pipeline
-        pub fn new(max_recursion: u32) -> Result<Self, &'static str> {
-            serial::serial_print("[RT] Creating ray tracing pipeline (max recursion: ");
-            serial::serial_print_dec(max_recursion as u64);
-            serial::serial_print(")\n");
-            
-            Ok(Self {
-                pipeline_id: 0,
-                max_recursion,
-                shader_groups: 0,
-            })
-        }
-    }
-}
-
-/// Display Output Support (DisplayPort/HDMI)
-pub mod display {
-    //! Display output interface for direct monitor control
-    //! 
-    //! Provides connector detection, mode setting, and display timing
-    //! configuration for DisplayPort and HDMI outputs.
-    
-    use super::*;
-    
-    /// Display connector type
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConnectorType {
-        DisplayPort,
-        HDMI,
-        DVI,
-        VGA,
-        Unknown,
-    }
-    
-    /// Display mode configuration
-    #[derive(Debug, Clone, Copy)]
-    pub struct DisplayMode {
-        pub width: u32,
-        pub height: u32,
-        pub refresh_rate: u32,
-        pub pixel_clock: u32,
-    }
-    
-    /// Display connector information
-    #[derive(Debug, Clone)]
-    pub struct DisplayConnector {
-        pub connector_type: ConnectorType,
-        pub connected: bool,
-        pub edid_available: bool,
-        pub max_width: u32,
-        pub max_height: u32,
-    }
-    
-    impl DisplayConnector {
-        /// Detect connected displays
-        pub fn detect_all() -> Vec<Self> {
-            serial::serial_print("[DISPLAY] Detecting connected displays\n");
-            
-            // Would scan all display outputs
-            // For now, simulate detection
-            let mut connectors = Vec::new();
-            
-            connectors.push(Self {
-                connector_type: ConnectorType::DisplayPort,
-                connected: true,
-                edid_available: true,
-                max_width: 3840,
-                max_height: 2160,
-            });
-            
-            connectors
-        }
-        
-        /// Read EDID from display
-        pub fn read_edid(&self) -> Result<Vec<u8>, &'static str> {
-            serial::serial_print("[DISPLAY] Reading EDID\n");
-            
-            // Would read actual EDID via I2C
-            Ok(Vec::new())
-        }
-        
-        /// Set display mode
-        pub fn set_mode(&self, mode: DisplayMode) -> Result<(), &'static str> {
-            serial::serial_print("[DISPLAY] Setting mode: ");
-            serial::serial_print_dec(mode.width as u64);
-            serial::serial_print("x");
-            serial::serial_print_dec(mode.height as u64);
-            serial::serial_print("@");
-            serial::serial_print_dec(mode.refresh_rate as u64);
-            serial::serial_print("Hz\n");
-            
-            // Would configure display controller
-            Ok(())
-        }
-    }
-}
-
-/// GPU Power Management
-pub mod power {
-    //! Power management interface for GPU efficiency
-    //! 
-    //! Provides power state control, clock frequency management,
-    //! thermal monitoring, and power limit configuration.
-    
-    use super::*;
-    
-    /// GPU power state
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum PowerState {
-        P0,  // Maximum performance
-        P1,  // Balanced
-        P2,  // Power saving
-        P3,  // Idle
-    }
-    
-    /// Clock domain for frequency control
-    #[derive(Debug, Clone, Copy)]
-    pub enum ClockDomain {
-        Graphics,
-        Memory,
-        Video,
-    }
-    
-    /// Power management state
-    #[derive(Debug, Clone)]
-    pub struct PowerManager {
-        pub current_state: PowerState,
-        pub temperature_c: u32,
-        pub power_limit_mw: u32,
-        pub current_power_mw: u32,
-    }
-    
-    impl PowerManager {
-        /// Create a new power manager
-        pub fn new() -> Self {
-            Self {
-                current_state: PowerState::P0,
-                temperature_c: 0,
-                power_limit_mw: 0,
-                current_power_mw: 0,
-            }
-        }
-        
-        /// Set power state
-        pub fn set_power_state(&mut self, state: PowerState) -> Result<(), &'static str> {
-            serial::serial_print("[POWER] Setting power state: ");
-            match state {
-                PowerState::P0 => serial::serial_print("P0 (Max Performance)"),
-                PowerState::P1 => serial::serial_print("P1 (Balanced)"),
-                PowerState::P2 => serial::serial_print("P2 (Power Saving)"),
-                PowerState::P3 => serial::serial_print("P3 (Idle)"),
-            }
-            serial::serial_print("\n");
-            
-            self.current_state = state;
-            Ok(())
-        }
-        
-        /// Read current temperature
-        pub fn read_temperature(&mut self) -> Result<u32, &'static str> {
-            // Would read from GPU thermal sensor
-            self.temperature_c = 45; // Simulated
-            Ok(self.temperature_c)
-        }
-        
-        /// Set clock frequency for a domain
-        pub fn set_clock_frequency(&self, domain: ClockDomain, freq_mhz: u32) -> Result<(), &'static str> {
-            serial::serial_print("[POWER] Setting ");
-            match domain {
-                ClockDomain::Graphics => serial::serial_print("graphics"),
-                ClockDomain::Memory => serial::serial_print("memory"),
-                ClockDomain::Video => serial::serial_print("video"),
-            }
-            serial::serial_print(" clock to ");
-            serial::serial_print_dec(freq_mhz as u64);
-            serial::serial_print(" MHz\n");
-            
-            // Would write to clock control registers
-            Ok(())
-        }
-        
-        /// Set power limit
-        pub fn set_power_limit(&mut self, limit_mw: u32) -> Result<(), &'static str> {
-            serial::serial_print("[POWER] Setting power limit to ");
-            serial::serial_print_dec(limit_mw as u64);
-            serial::serial_print(" mW\n");
-            
-            self.power_limit_mw = limit_mw;
-            Ok(())
-        }
-    }
-}
-
-/// Video Encode/Decode (NVENC/NVDEC)
-pub mod video {
-    //! Video acceleration interface for encoding and decoding
-    //! 
-    //! Provides hardware-accelerated video encoding (NVENC) and
-    //! decoding (NVDEC) for various codecs.
-    
-    use super::*;
-    
-    /// Video codec type
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum VideoCodec {
-        H264,
-        H265,
-        VP9,
-        AV1,
-    }
-    
-    /// Video encoder capabilities
-    #[derive(Debug, Clone)]
-    pub struct EncoderCapabilities {
-        pub supported_codecs: Vec<VideoCodec>,
-        pub max_width: u32,
-        pub max_height: u32,
-        pub max_framerate: u32,
-        pub supports_bframes: bool,
-    }
-    
-    /// Video decoder capabilities
-    #[derive(Debug, Clone)]
-    pub struct DecoderCapabilities {
-        pub supported_codecs: Vec<VideoCodec>,
-        pub max_width: u32,
-        pub max_height: u32,
-        pub supports_film_grain: bool,
-    }
-    
-    /// NVENC encoder instance
-    #[derive(Debug)]
-    pub struct NvencEncoder {
-        pub codec: VideoCodec,
-        pub width: u32,
-        pub height: u32,
-    }
-    
-    /// NVDEC decoder instance
-    #[derive(Debug)]
-    pub struct NvdecDecoder {
-        pub codec: VideoCodec,
-        pub width: u32,
-        pub height: u32,
-    }
-    
-    impl EncoderCapabilities {
-        /// Detect encoder capabilities for a GPU
-        pub fn detect(gpu_info: &NvidiaGpuInfo) -> Self {
-            let mut codecs = Vec::new();
-            codecs.push(VideoCodec::H264);
-            codecs.push(VideoCodec::H265);
-            
-            // Ada Lovelace, Hopper, and Blackwell support AV1 encode
-            if matches!(gpu_info.architecture,
-                NvidiaArchitecture::AdaLovelace | NvidiaArchitecture::Hopper | NvidiaArchitecture::Blackwell
-            ) {
-                codecs.push(VideoCodec::AV1);
-            }
-            
-            Self {
-                supported_codecs: codecs,
-                max_width: 8192,
-                max_height: 8192,
-                max_framerate: 240,
-                supports_bframes: true,
-            }
-        }
-    }
-    
-    impl DecoderCapabilities {
-        /// Detect decoder capabilities for a GPU
-        pub fn detect(gpu_info: &NvidiaGpuInfo) -> Self {
-            let mut codecs = Vec::new();
-            codecs.push(VideoCodec::H264);
-            codecs.push(VideoCodec::H265);
-            codecs.push(VideoCodec::VP9);
-            
-            // Ampere and newer support AV1 decode
-            if !matches!(gpu_info.architecture, NvidiaArchitecture::Turing | NvidiaArchitecture::Unknown) {
-                codecs.push(VideoCodec::AV1);
-            }
-            
-            Self {
-                supported_codecs: codecs,
-                max_width: 8192,
-                max_height: 8192,
-                supports_film_grain: true,
-            }
-        }
-    }
-    
-    impl NvencEncoder {
-        /// Create a new encoder instance
-        pub fn new(codec: VideoCodec, width: u32, height: u32) -> Result<Self, &'static str> {
-            serial::serial_print("[NVENC] Creating encoder: codec=");
-            match codec {
-                VideoCodec::H264 => serial::serial_print("H.264"),
-                VideoCodec::H265 => serial::serial_print("H.265"),
-                VideoCodec::VP9 => serial::serial_print("VP9"),
-                VideoCodec::AV1 => serial::serial_print("AV1"),
-            }
-            serial::serial_print(", resolution=");
-            serial::serial_print_dec(width as u64);
-            serial::serial_print("x");
-            serial::serial_print_dec(height as u64);
-            serial::serial_print("\n");
-            
-            Ok(Self { codec, width, height })
-        }
-        
-        /// Encode a frame
-        pub fn encode_frame(&self, _input_buffer: usize, _output_buffer: usize) -> Result<usize, &'static str> {
-            // Would submit frame to NVENC hardware
-            Ok(0) // Return encoded size
-        }
-    }
-    
-    impl NvdecDecoder {
-        /// Create a new decoder instance
-        pub fn new(codec: VideoCodec, width: u32, height: u32) -> Result<Self, &'static str> {
-            serial::serial_print("[NVDEC] Creating decoder: codec=");
-            match codec {
-                VideoCodec::H264 => serial::serial_print("H.264"),
-                VideoCodec::H265 => serial::serial_print("H.265"),
-                VideoCodec::VP9 => serial::serial_print("VP9"),
-                VideoCodec::AV1 => serial::serial_print("AV1"),
-            }
-            serial::serial_print(", resolution=");
-            serial::serial_print_dec(width as u64);
-            serial::serial_print("x");
-            serial::serial_print_dec(height as u64);
-            serial::serial_print("\n");
-            
-            Ok(Self { codec, width, height })
-        }
-        
-        /// Decode a frame
-        pub fn decode_frame(&self, _input_buffer: usize, _output_buffer: usize) -> Result<(), &'static str> {
-            // Would submit bitstream to NVDEC hardware
-            Ok(())
-        }
-    }
-}  // end pub mod video
-
-// ========================================================================
-// OpenGL Support
-// ========================================================================
-
-/// Software-OpenGL infrastructure exposed to userland.
-///
-/// On Turing/Ampere/Ada GPUs the PGRAPH engine (3D pipeline) is enabled by
-/// bit 13 of `NV_PMC_ENABLE`.  `NV_PMC_ENABLE_DEFAULT` (0x2FFF_FFFF) already
-/// has that bit set, so `nvidia::init()` implicitly enables PGRAPH in Phase 5.
-///
-/// This module provides:
-/// - `GlKernelContext` — tracks per-GPU GL state (BAR0 virt, VRAM info).
-/// - Surface allocation helpers for render-target backing in VRAM.
-/// - Serial diagnostics so the user can confirm GL is ready in the serial log.
-pub mod opengl {
-    use super::*;
-
-    /// PGRAPH engine enable bit (bit 13) — from dev_pmc.h.
-    const PMC_ENABLE_PGRAPH_BIT: u32 = 1 << 13;
-
-    /// VRAM surface alignment: 4 KB.
-    const GL_VRAM_SURFACE_ALIGN: u64 = 4096;
-
-    /// Kernel-side OpenGL context for one NVIDIA GPU.
-    pub struct GlKernelContext {
-        /// Virtual address of the GPU's BAR0 mapping.
-        pub bar0_virt:    u64,
-        /// Physical start of the GPU's VRAM region used for GL surfaces.
-        pub vram_phys:    u64,
-        /// VRAM size in MB (from NV_PFB_CSTATUS or PCI ID table).
-        pub vram_size_mb: u32,
-        /// Bump-pointer for the next VRAM surface allocation (bytes from vram_phys).
-        pub alloc_offset: u64,
-    }
-
-    impl GlKernelContext {
-        /// Initialise the GL kernel context for a single GPU.
-        ///
-        /// Verifies that PGRAPH is enabled in `NV_PMC_ENABLE` and logs
-        /// readiness.  Returns `None` if PGRAPH cannot be enabled.
-        pub fn init(bar0_virt: u64, vram_size_mb: u32) -> Option<Self> {
-            serial::serial_print("[GL] Initializing OpenGL kernel context...\n");
-
-            // ── Verify PGRAPH engine is enabled (bit 13 of PMC_ENABLE) ────────
-            let pmc_en = unsafe {
-                core::ptr::read_volatile(
-                    (bar0_virt + NV_PMC_ENABLE as u64) as *const u32
-                )
-            };
-
-            if pmc_en & PMC_ENABLE_PGRAPH_BIT == 0 {
-                serial::serial_print("[GL] PGRAPH bit not set — enabling...\n");
-                unsafe {
-                    core::ptr::write_volatile(
-                        (bar0_virt + NV_PMC_ENABLE as u64) as *mut u32,
-                        pmc_en | PMC_ENABLE_PGRAPH_BIT,
-                    );
-                }
-            } else {
-                serial::serial_print("[GL] ✓ PGRAPH engine bit active (PMC_ENABLE bit 13 set)\n");
-            }
-
-            serial::serial_print("[GL] GlKernelContext initialized — VRAM: ");
-            serial::serial_print_dec(vram_size_mb as u64);
-            serial::serial_print(" MB\n");
-
-            // Use the memory region right after the firmware area for GL surfaces.
-            let vram_phys = GPU_FW_PHYS_BASE + 64 * 1024 * 1024;
-
-            Some(Self {
-                bar0_virt,
-                vram_phys,
-                vram_size_mb,
-                alloc_offset: 0,
-            })
-        }
-
-        /// Allocate a render surface in VRAM.
-        ///
-        /// Returns the physical **offset** (in bytes) from `vram_phys`.
-        /// Add `vram_phys` to get the full physical address, then map via
-        /// `PHYS_MEM_OFFSET + phys` for CPU access.
-        ///
-        /// Pixels are 32-bit BGRA (`u32`).
-        pub fn alloc_surface(&mut self, width: u32, height: u32) -> Option<u64> {
-            let size = (width as u64) * (height as u64) * 4;
-            let aligned = (size + GL_VRAM_SURFACE_ALIGN - 1) & !(GL_VRAM_SURFACE_ALIGN - 1);
-            let vram_bytes = (self.vram_size_mb as u64) * 1024 * 1024;
-
-            if self.alloc_offset + aligned > vram_bytes {
-                serial::serial_print("[GL] ⚠ VRAM exhausted — cannot allocate surface\n");
-                return None;
-            }
-
-            let offset = self.alloc_offset;
-            self.alloc_offset += aligned;
-
-            serial::serial_print("[GL] OpenGL surface alloc: ");
-            serial::serial_print_dec(width as u64);
-            serial::serial_print("x");
-            serial::serial_print_dec(height as u64);
-            serial::serial_print(" @ phys offset 0x");
-            serial::serial_print_hex(offset);
-            serial::serial_print("\n");
-
-            Some(offset)
-        }
-
-        /// CPU-accessible virtual address for an allocated surface.
-        #[inline]
-        pub fn surface_virt(&self, offset: u64) -> u64 {
-            PHYS_MEM_OFFSET + self.vram_phys + offset
-        }
-    }
-
-    /// Convenience wrapper — called from `nvidia::init()` after BAR0 is mapped.
-    pub fn init_all_gpus(bar0_virt: u64, vram_size_mb: u32) {
-        match GlKernelContext::init(bar0_virt, vram_size_mb) {
-            Some(mut ctx) => {
-                // Allocate a default 1920×1080 primary render surface.
-                if let Some(off) = ctx.alloc_surface(1920, 1080) {
-                    serial::serial_print("[GL] Primary surface phys: 0x");
-                    serial::serial_print_hex(ctx.vram_phys + off);
-                    serial::serial_print("\n");
-                    serial::serial_print("[GL] Primary surface virt: 0x");
-                    serial::serial_print_hex(ctx.surface_virt(off));
-                    serial::serial_print("\n");
-                }
-                serial::serial_print("[GL] ✓ Software OpenGL ready (sidewind_opengl CPU rasterizer)\n");
-            }
-            None => {
-                serial::serial_print("[GL] ⚠ OpenGL context init failed\n");
-            }
-        }
-    }
-}
+pub use sidewind_nvidia::features::*;
