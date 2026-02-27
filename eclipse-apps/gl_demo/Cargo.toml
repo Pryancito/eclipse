@@ -1,0 +1,11 @@
+[package]
+name = "gl_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
+sidewind_sdk = { path = "../sidewind_sdk" }
+sidewind_core = { path = "../sidewind_core" }
+sidewind-opengl = { path = "../sidewind_opengl" }
+micromath = "2.1.0"
