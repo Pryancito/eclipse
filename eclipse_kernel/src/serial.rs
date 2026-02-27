@@ -87,7 +87,7 @@ pub fn read_byte() -> Option<u8> {
 /// Leer un byte del puerto serial (blocking - espera hasta que haya datos)
 pub fn read_byte_blocking() -> u8 {
     while !is_data_available() {
-        core::hint::spin_loop();
+        crate::cpu::pause();
     }
     unsafe { inb(SERIAL_PORT) }
 }
@@ -115,7 +115,7 @@ pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
             timeout = timeout_iterations; // Reset timeout on successful read
         } else {
             timeout -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
     
@@ -143,7 +143,7 @@ fn write_byte(byte: u8) {
     // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
     let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
-        core::hint::spin_loop();
+        crate::cpu::pause();
         timeout -= 1;
     }
     
@@ -208,7 +208,7 @@ impl core::fmt::Write for RawSerialWriter {
 fn write_byte_internal(byte: u8) {
     let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
-        core::hint::spin_loop();
+        crate::cpu::pause();
         timeout -= 1;
     }
     

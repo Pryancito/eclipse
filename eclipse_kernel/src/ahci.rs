@@ -224,7 +224,7 @@ impl AhciPort {
         while self.preg(PORT_CMD) & (CMD_CR | CMD_FR) != 0 {
             if i == 0 { break; }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
         // Clear FRE (disable FIS receive)
         self.pwreg(PORT_CMD, self.preg(PORT_CMD) & !CMD_FRE);
@@ -233,7 +233,7 @@ impl AhciPort {
         while self.preg(PORT_CMD) & CMD_FR != 0 {
             if i == 0 { break; }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
 
@@ -244,7 +244,7 @@ impl AhciPort {
         while self.preg(PORT_CMD) & CMD_CR != 0 {
             if i == 0 { break; }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
         // FRE should already be active from init(); set it anyway just in case.
         self.pwreg(PORT_CMD, self.preg(PORT_CMD) | CMD_FRE | CMD_ST);
@@ -334,7 +334,7 @@ impl AhciPort {
         //    because restricting to Gen1 can cause some SSDs to re-enum
         //    at a lower speed than the OS later expects.
         self.pwreg(PORT_SCTL, (self.preg(PORT_SCTL) & !0x0F) | 0x01); // DET=1
-        for _ in 0..COMRESET_HOLD_ITERATIONS { core::hint::spin_loop(); }
+        for _ in 0..COMRESET_HOLD_ITERATIONS { crate::cpu::pause(); }
         self.pwreg(PORT_SCTL, self.preg(PORT_SCTL) & !0x0F); // DET=0
 
         serial::serial_print("[AHCI]   Waiting for link (DET=3)...\n");
@@ -352,7 +352,7 @@ impl AhciPort {
             }
             if i == 0 { break; }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
 
         if !ready {
@@ -400,7 +400,7 @@ impl AhciPort {
                 break;
             }
             tfd_timeout -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
 
         // 10. Clear errors accumulated during bring-up
@@ -459,7 +459,7 @@ impl AhciPort {
                 return false;
             }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
 
         // Re-check task file error after completion
@@ -501,7 +501,7 @@ impl AhciPort {
                 if tfd & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0 { break; }
                 if w == 0 { break; }
                 w -= 1;
-                core::hint::spin_loop();
+                crate::cpu::pause();
             }
         }
 
@@ -599,7 +599,7 @@ impl AhciPort {
                 if tfd & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0 { break; }
                 if w == 0 { break; }
                 w -= 1;
-                core::hint::spin_loop();
+                crate::cpu::pause();
             }
         }
 
@@ -729,7 +729,7 @@ impl AhciPort {
                 return sig; // Return whatever we have (may be 0)
             }
             retries -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
 }
@@ -873,7 +873,7 @@ fn init_controller(dev: &pci::PciDevice) {
         while hreg(base, HBA_BOHC) & 1 != 0 {
             if t == 0 { break; }
             t -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
         // Step 2: If BIOS Busy (BB, bit 4) is set, wait up to 2 seconds
         // for the BIOS to finish any in-flight operations before we reset.
@@ -883,7 +883,7 @@ fn init_controller(dev: &pci::PciDevice) {
             while hreg(base, HBA_BOHC) & (1 << 4) != 0 {
                 if bb_wait == 0 { break; }
                 bb_wait -= 1;
-                core::hint::spin_loop();
+                crate::cpu::pause();
             }
         }
         let bohc_after = hreg(base, HBA_BOHC);
@@ -906,13 +906,13 @@ fn init_controller(dev: &pci::PciDevice) {
             return;
         }
         timeout -= 1;
-        core::hint::spin_loop();
+        crate::cpu::pause();
     }
     // Re-assert AHCI Enable + global Interrupt Enable (GHC.IE)
     hwreg(base, HBA_GHC, GHC_AE | GHC_IE);
 
     // Let the HBA and PHY layers stabilise (~1 ms initial delay)
-    for _ in 0..HBA_STABILIZE_ITERATIONS { core::hint::spin_loop(); }
+    for _ in 0..HBA_STABILIZE_ITERATIONS { crate::cpu::pause(); }
 
     // ── 6. Read capabilities and port bitmask ────────────────────────────────
     let cap = hreg(base, HBA_CAP);
@@ -945,7 +945,7 @@ fn init_controller(dev: &pci::PciDevice) {
         }
         if any_det || link_wait == 0 { break; }
         link_wait -= 1;
-        core::hint::spin_loop();
+        crate::cpu::pause();
     }
     if link_wait == 0 {
         serial::serial_print("[AHCI] Warning: no port showed DET≠0 within link-wait timeout\n");

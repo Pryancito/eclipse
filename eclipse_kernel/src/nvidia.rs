@@ -675,7 +675,7 @@ pub fn init() {
                         if timeout_ticks % 500_000 == 0 {
                             serial::serial_print(".");
                         }
-                        core::hint::spin_loop();
+                        crate::cpu::pause();
                         timeout_ticks += 1;
                     }
 
@@ -701,7 +701,7 @@ pub fn init() {
                                             break;
                                         }
                                     }
-                                    for _ in 0..100_000 { core::hint::spin_loop(); }
+                                    for _ in 0..100_000 { crate::cpu::pause(); }
                                 }
                                 if !found {
                                     serial::serial_print(" ⚠ RPC response timeout\n");

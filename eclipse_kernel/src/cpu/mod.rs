@@ -239,7 +239,7 @@ fn delay_us(us: u64) {
     // Use very safe value (10000 counts per us = 10GHz)
     let wait_cycles = us * 10000; 
     while rdtsc() - start < wait_cycles {
-        core::hint::spin_loop();
+        crate::cpu::pause();
     }
 }
 
@@ -277,6 +277,100 @@ pub fn is_running_under_hypervisor() -> bool {
         );
     }
     (ecx_val & (1 << 31)) != 0
+}
+
+static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Detectar características avanzadas de la CPU (MONITOR/MWAIT)
+pub fn detect_features() {
+    let mut ecx_val: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ecx_out:e}, ecx",
+            "pop rbx",
+            ecx_out = out(reg) ecx_val,
+            inout("eax") 1 => _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
+    if (ecx_val & (1 << 3)) != 0 {
+        MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
+        serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
+    }
+}
+
+use core::sync::atomic::AtomicBool;
+
+/// Dormir el núcleo de forma eficiente.
+/// Intenta usar MONITOR/MWAIT (Nivel 4) si está disponible, 
+/// de lo contrario usa HLT (Nivel 3).
+pub fn idle() {
+    if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
+        let addr = crate::scheduler::ready_queue_tail_addr();
+        unsafe {
+            // 1. Armar el hardware de monitoreo sobre la cola del scheduler.
+            //    Si alguien escribe en esta dirección, el próximo MWAIT retornará.
+            core::arch::asm!(
+                "monitor",
+                in("rax") addr,
+                in("rcx") 0,
+                in("rdx") 0,
+                options(nomem, nostack, preserves_flags)
+            );
+            
+            // 2. Entrar en estado de bajo consumo.
+            //    Habilitamos interrupciones justo antes para que también puedan despertarnos.
+            x86_64::instructions::interrupts::enable();
+            core::arch::asm!(
+                "mwait",
+                in("rax") 0, // hints
+                in("rcx") 0, // extensions
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    } else {
+        // Fallback: HLT tradicional
+        unsafe {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        }
+    }
+}
+
+/// Nivel 2: Pause.
+/// Indica a la CPU que estamos en un spin-loop para optimizar el consumo
+/// y evitar violaciones de orden de memoria especulativa.
+#[inline]
+pub fn pause() {
+    core::hint::spin_loop();
+}
+
+/// Nivel 4 (Avanzado): Esperar a que una dirección de memoria cambie.
+/// Usa MONITOR/MWAIT si está disponible, de lo contrario cae a pause().
+pub fn wait_for_change(addr: *const u32) {
+    if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
+        unsafe {
+            core::arch::asm!(
+                "monitor",
+                in("rax") addr,
+                in("rcx") 0,
+                in("rdx") 0,
+                options(nomem, nostack, preserves_flags)
+            );
+            core::arch::asm!(
+                "mwait",
+                in("rax") 0,
+                in("rcx") 0,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    } else {
+        pause();
+    }
 }
 
 /// AP Entry point (called from trampoline)
@@ -320,8 +414,6 @@ pub extern "C" fn ap_entry() -> ! {
     crate::apic::init();
     
     loop {
-        unsafe {
-            x86_64::instructions::interrupts::enable_and_hlt();
-        }
+        idle();
     }
 }

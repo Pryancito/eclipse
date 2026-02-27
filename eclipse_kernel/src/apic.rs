@@ -98,7 +98,7 @@ pub fn send_ipi_exact(apic_id: u8, vector: u8, delivery_mode: u8, assert: bool, 
         // Clear Error Status Register before sending
         clear_esr();
         
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         
         let mut icrl = (vector as u32) | ((delivery_mode as u32) << 8);
         if assert { icrl |= 1 << 14; }
@@ -116,7 +116,7 @@ pub fn send_ipi_exact(apic_id: u8, vector: u8, delivery_mode: u8, assert: bool, 
         write_reg(LAPIC_REG_ICRH, (apic_id as u32) << 24);
         write_reg(LAPIC_REG_ICRL, icrl);
         
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         
         // Check for delivery errors (Read ESR twice as per some BIOS implementations)
         let _ = read_esr();
@@ -130,14 +130,14 @@ pub fn send_ipi_exact(apic_id: u8, vector: u8, delivery_mode: u8, assert: bool, 
 pub fn broadcast_init() {
     unsafe {
         clear_esr();
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         
         // Shorthand 3 (All excluding self), Delivery 5 (INIT), Assert 1, Trigger 0 (Edge)
         let icrl = (3 << 18) | (1 << 14) | (5 << 8);
         write_reg(LAPIC_REG_ICRH, 0);
         write_reg(LAPIC_REG_ICRL, icrl);
         
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         let esr = read_esr();
         if esr != 0 {
             crate::serial::serial_printf(format_args!("[APIC] ERROR: ESR after broadcast INIT: {:#x}\n", esr));
@@ -148,14 +148,14 @@ pub fn broadcast_init() {
 pub fn broadcast_sipi(vector: u8) {
     unsafe {
         clear_esr();
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         
         // Shorthand 3 (All excluding self), Delivery 6 (SIPI), Assert 0, Trigger 0 (Edge)
         let icrl = (3 << 18) | (0 << 14) | (6 << 8) | (vector as u32);
         write_reg(LAPIC_REG_ICRH, 0);
         write_reg(LAPIC_REG_ICRL, icrl);
         
-        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
         let esr = read_esr();
         if esr != 0 {
             crate::serial::serial_printf(format_args!("[APIC] ERROR: ESR after broadcast SIPI: {:#x}\n", esr));

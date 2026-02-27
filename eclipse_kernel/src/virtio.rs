@@ -834,7 +834,7 @@ impl VirtIOBlockDeviceInner {
                 
                 // Small delay to let device process the status change
                 for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
-                    core::hint::spin_loop();
+                    crate::cpu::pause();
                 }
                 
                 // Verify status was set correctly
@@ -1066,7 +1066,7 @@ impl VirtIOBlockDeviceInner {
                          // Ack interrupt if PCI (though we shouldn't need to in poll mode ideally, but for legacy cleanup)
                          let _isr = inb(self.io_base + VIRTIO_PCI_ISR_STATUS);
                     }
-                    core::hint::spin_loop();
+                    crate::cpu::pause();
                 }
                 
                 // Get used buffer
@@ -1199,7 +1199,7 @@ impl VirtIOBlockDeviceInner {
             let mut timeout = 100000000;
             while !queue.has_used() && timeout > 0 {
                 timeout -= 1;
-                core::hint::spin_loop();
+                crate::cpu::pause();
             }
             
             if timeout == 0 {
@@ -1321,7 +1321,7 @@ impl VirtIOGpuDevice {
     #[inline]
     unsafe fn gpu_notify_queue(io_base: u16, mmio_base: u64, modern_notify_addr: u64, q_idx: u16) {
         for _ in 0..DEVICE_NOTIFY_DELAY_CYCLES {
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
         if io_base != 0 {
             outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, q_idx);
@@ -1434,7 +1434,7 @@ impl VirtIOGpuDevice {
             if io != 0 {
                 let _ = unsafe { inb(io + VIRTIO_PCI_ISR_STATUS) };
             }
-            core::hint::spin_loop();
+            crate::cpu::pause();
         };
 
         // Invalidate response buffer after device is done
@@ -1505,7 +1505,7 @@ impl VirtIOGpuDevice {
                 return Err("GPU hardware timeout");
             }
             if io != 0 { let _ = unsafe { inb(io + VIRTIO_PCI_ISR_STATUS) }; }
-            core::hint::spin_loop();
+            crate::cpu::pause();
         };
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         for i in (0..resp_size).step_by(64) {
@@ -1517,7 +1517,7 @@ impl VirtIOGpuDevice {
         let mut transfer_timeout = 1000000;
         let mut ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
         while ctrl_type == 0x55555555 && transfer_timeout > 0 {
-            core::hint::spin_loop();
+            crate::cpu::pause();
             unsafe { clflush(ctrl_type_ptr as u64); }
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             ctrl_type = unsafe { core::ptr::read_volatile(ctrl_type_ptr) };
@@ -1588,7 +1588,7 @@ impl VirtIOGpuDevice {
         let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
         outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
         for _ in 0..STATUS_CHANGE_DELAY_CYCLES {
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
         true
     }
@@ -1737,7 +1737,7 @@ impl VirtIOGpuDevice {
 
         // Reset
         common_w8(VIRTIO_PCI_COMMON_STATUS, 0);
-        for _ in 0..100 { core::hint::spin_loop(); }
+        for _ in 0..100 { crate::cpu::pause(); }
         common_w8(VIRTIO_PCI_COMMON_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
         let st = common_r8(VIRTIO_PCI_COMMON_STATUS);
         common_w8(VIRTIO_PCI_COMMON_STATUS, st | VIRTIO_STATUS_DRIVER as u8);
@@ -1923,7 +1923,7 @@ impl VirtIOGpuDevice {
                 return Err("get_display_info timeout");
             }
             timeout -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
 
         let (used_head, _len) = unsafe { queue.get_used().unwrap_or((0, 0)) };

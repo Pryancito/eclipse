@@ -1098,7 +1098,7 @@ impl XhciControllerState {
                     // Timeout ~100ms
                     break;
                 }
-                core::hint::spin_loop();
+                crate::cpu::pause();
             }
             if !done {
                 serial::serial_print(&alloc::format!("[XHCI] Port {} reset timeout\n", port));

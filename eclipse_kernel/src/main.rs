@@ -237,6 +237,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     boot::load_gdt();
     boot::enable_sse();
     memory::init_pat();
+    cpu::detect_features();
 
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
@@ -365,9 +366,7 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
             ipc::process_messages();
         } else {
             // Si no hay mensajes ni otros procesos listos, "dormir" hasta la siguiente interrupción
-            unsafe {
-                x86_64::instructions::interrupts::enable_and_hlt();
-            }
+            crate::cpu::idle();
         }
         
         // Intentar planificar otros procesos (p.ej. tras recibir un mensaje o una interrupción)

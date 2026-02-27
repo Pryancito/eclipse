@@ -1738,6 +1738,9 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     } else if class_code == 0x0C {
         // Serial Bus Controllers (USB, etc.)
         crate::pci::find_usb_controllers()
+    } else if class_code == 0x03 {
+        // Display Controllers (NVIDIA, etc.)
+        crate::pci::find_nvidia_gpus()
     } else if class_code == 0xFF {
         // All devices - not implemented for now
         serial::serial_print("[SYSCALL] pci_enum_devices - all devices not supported yet\n");

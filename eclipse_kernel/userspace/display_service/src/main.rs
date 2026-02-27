@@ -28,6 +28,7 @@ const SYS_READ: u64 = 2;
 const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_FMAP: u64 = 28;
 const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
+const SYS_PCI_ENUM_DEVICES: u64 = 17;
 
 /// Framebuffer constants
 const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
@@ -405,19 +406,35 @@ enum AccelOp {
 
 /// Detect NVIDIA GPU via PCI scan
 fn detect_nvidia_gpu() -> bool {
-    // In a real implementation, this would:
-    // - Scan PCI bus for NVIDIA vendor ID (0x10DE)
-    // - Check for supported device IDs
-    // - Verify GPU is accessible
-    // 
-    // The kernel's nvidia module now provides proper detection
-    // via PCI enumeration. This service would communicate with
-    // the kernel driver via syscalls to check GPU availability.
-    //
-    // For now, this returns false to demonstrate VESA fallback,
-    // but the infrastructure is in place for real detection.
+    // Call PciEnumDevices(0x03) to find Display Controllers
+    let mut buffer = [0u64; 8 * 16]; // Max 16 devices
+    let count: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_PCI_ENUM_DEVICES,
+            in("rdi") 0x03u64, // Display Controller class
+            in("rsi") buffer.as_mut_ptr() as u64,
+            in("rdx") 16u64, // max_devices
+            lateout("rax") count,
+            options(nostack)
+        );
+    }
+
+    if count == u64::MAX || count == 0 {
+        return false;
+    }
+
+    for i in 0..count as usize {
+        let offset = i * 8;
+        let vendor_id = buffer[offset + 3]; // vendor_id is at index 3 in the info block
+        if vendor_id == 0x10DE {
+            let device_id = buffer[offset + 4];
+            println!("[DISPLAY-SERVICE] Found NVIDIA GPU (ID: 0x{:X})", device_id);
+            return true;
+        }
+    }
     
-    // TODO: Add syscall to query kernel NVIDIA driver status
     false
 }
 

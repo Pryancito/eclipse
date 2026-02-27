@@ -219,7 +219,7 @@ QEMU_CMD="$QEMU_CMD -serial stdio"
 # Debugging flags (Unconditional)
 QEMU_CMD="$QEMU_CMD -no-reboot"
 QEMU_CMD="$QEMU_CMD -no-shutdown"
-QEMU_CMD="$QEMU_CMD -d int"
+QEMU_CMD="$QEMU_CMD -d int -full-screen"
 
 # Ejecutar QEMU
 print_info "Comando QEMU:"

@@ -66,6 +66,13 @@ fn dequeue_process() -> Option<ProcessId> {
     })
 }
 
+/// Returns the virtual address of the ready queue tail pointer.
+/// Used for MONITOR/MWAIT idle optimization.
+pub fn ready_queue_tail_addr() -> usize {
+    let tail = QUEUE_TAIL.lock();
+    &*tail as *const usize as usize
+}
+
 /// Tick del scheduler (llamado desde timer interrupt)
 pub fn tick() {
     let mut stats = SCHEDULER_STATS.lock();
@@ -266,7 +273,10 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
 
 /// Yield - ceder CPU voluntariamente
 pub fn yield_cpu() {
+    // Si somos el único proceso listo, evitamos el hot-loop llamando a pause() (Nivel 2)
+    // Esto es especialmente útil en spinlocks de espacio de usuario o drivers.
     schedule();
+    crate::cpu::pause();
 }
 
 /// Dormir el proceso actual (stub - no implementado completamente)

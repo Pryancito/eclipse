@@ -130,7 +130,7 @@ impl AtaDrive {
             if s & STATUS_BSY == 0 && s & STATUS_DRDY != 0 { return Ok(()); }
             if i == 0 { return Err("ATA timeout waiting for DRDY"); }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
 
@@ -143,7 +143,7 @@ impl AtaDrive {
             if s & STATUS_BSY == 0 { return Ok(()); }
             if i == 0 { return Err("ATA timeout waiting for BSY clear"); }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
 
@@ -157,7 +157,7 @@ impl AtaDrive {
             if s & STATUS_DRQ != 0 { return Ok(()); }
             if i == 0 { return Err("ATA timeout waiting for DRQ"); }
             i -= 1;
-            core::hint::spin_loop();
+            crate::cpu::pause();
         }
     }
 
