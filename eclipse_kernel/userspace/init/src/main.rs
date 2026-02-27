@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error};
+use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error, sleep_ms};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -243,23 +243,24 @@ fn start_service(service: &mut Service) {
 
 /// Main loop - monitor services and handle system events
 fn main_loop() -> ! {
-    let mut counter: u64 = 0;
     let mut heartbeat_counter: u64 = 0;
+    // service health check every 1 s (100 × 10 ms)
+    let mut health_tick: u64 = 0;
     let mut ipc_buffer = [0u8; 32];
  
     loop {
-        counter += 1;
-        
+        health_tick += 1;
+
         // Procesar solicitudes IPC ligeras (por ejemplo, petición de PIDs de servicios)
         handle_ipc_requests(&mut ipc_buffer);
 
-        // Check service health every 100000 iterations
-        if counter % 100000 == 0 {
+        // Check service health every ~1 second (100 × 10 ms)
+        if health_tick % 100 == 0 {
             check_services();
         }
         
-        // Print heartbeat every 1000000 iterations
-        if counter % 1000000 == 0 {
+        // Print heartbeat every ~60 seconds (6000 × 10 ms)
+        if health_tick % 6000 == 0 {
             heartbeat_counter += 1;
             println!("[INIT] Heartbeat #{} - System operational", heartbeat_counter);
             print_service_status();
@@ -268,8 +269,8 @@ fn main_loop() -> ! {
         // Handle zombie processes - reap terminated children
         reap_zombies();
         
-        // Yield CPU to other processes
-        yield_cpu();
+        // Sleep 10 ms to avoid busy-waiting and keep CPU usage low
+        sleep_ms(10);
     }
 }
 

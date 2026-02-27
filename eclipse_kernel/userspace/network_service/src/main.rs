@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo, receive};
+use eclipse_libc::{println, getpid, getppid, sleep_ms, send, pci_enum_devices, PciDeviceInfo, receive};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -366,6 +366,7 @@ pub extern "C" fn _start() -> ! {
     }
     
     // Main loop - process network packets
+    // Each iteration sleeps 10 ms (~100 Hz).
     let mut heartbeat_counter = 0u64;
     let mut packets_rx = 0u64;
     let mut packets_tx = 0u64;
@@ -387,24 +388,15 @@ pub extern "C" fn _start() -> ! {
             let _ = send(sender, 0x08, &response);
         }
         
-        // In a real implementation, this would:
-        // - Read packets from network card DMA buffers
-        // - Process through TCP/IP stack layers
-        // - Handle socket operations (accept, connect, send, recv)
-        // - Send outgoing packets via DMA
-        // - Manage TCP connections and state
-        // - Handle ARP, ICMP, DHCP packets
-        // - Process routing decisions
-        
-        // Simulate occasional network traffic
-        if heartbeat_counter % 50000 == 0 {
+        // Simulate occasional network traffic every ~500 ms (50 × 10 ms)
+        if heartbeat_counter % 50 == 0 {
             packets_rx += 10;
             packets_tx += 8;
             bytes_rx += 1500 * 10;  // Average packet size
             bytes_tx += 1500 * 8;
             
             // Simulate connection activity
-            if heartbeat_counter % 200000 == 0 {
+            if heartbeat_counter % 200 == 0 {
                 connections += 1;
             }
 
@@ -415,8 +407,8 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        // Periodic status updates
-        if heartbeat_counter % 500000 == 0 {
+        // Periodic status updates every ~30 seconds (3000 × 10 ms)
+        if heartbeat_counter % 3000 == 0 {
             let interface_status = if ethernet_available && wifi_available {
                 "eth0+wlan0"
             } else if ethernet_available {
@@ -433,6 +425,7 @@ pub extern "C" fn _start() -> ! {
             println!("[NETWORK-SERVICE]   Active connections: {}", connections);
         }
         
-        yield_cpu();
+        // Sleep 10 ms to avoid busy-waiting and keep CPU usage low
+        sleep_ms(10);
     }
 }
