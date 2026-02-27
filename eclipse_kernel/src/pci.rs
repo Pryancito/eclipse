@@ -311,11 +311,13 @@ unsafe fn scan_function(bus: u8, device: u8, function: u8) -> Option<PciDevice> 
     let header_type = pci_config_read_u8(bus, device, function, PCI_REG_HEADER_TYPE);
     let mut bar0 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0) as u64;
     
-    // Check if BAR0 is a 64-bit memory BAR
+    // Check if BAR0 is a 64-bit memory BAR (bits 2:1 = 0b10) and combine with BAR1
     if (bar0 & 0x1) == 0 && (bar0 & 0x6) == 0x4 {
         let bar1 = pci_config_read_u32(bus, device, function, PCI_REG_BAR0 + 4) as u64;
         bar0 |= bar1 << 32;
     }
+    // Strip lower flag bits so bar0 holds the actual physical base address
+    bar0 = if (bar0 & 0x1) != 0 { bar0 & !0x3 } else { bar0 & !0xF };
     
     let interrupt_line = pci_config_read_u8(bus, device, function, PCI_REG_INTERRUPT_LINE);
     
@@ -553,17 +555,24 @@ pub unsafe fn enable_device(dev: &PciDevice, enable_bus_master: bool) {
     pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, command);
 }
 
-/// Get BAR (Base Address Register) value as 64-bit
+/// Get BAR (Base Address Register) value as 64-bit physical address.
+/// The lower bits of a BAR encode flags (memory/IO type, prefetchable) and are
+/// stripped so the returned value is the actual physical base address.
 pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
     let mut bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4)) as u64;
     
-    // Check if it's a 64-bit memory BAR
-    if (bar & 0x1) == 0 && (bar & 0x6) == 0x4 {
-        let next_bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4) + 4) as u64;
-        bar |= next_bar << 32;
+    if (bar & 0x1) != 0 {
+        // I/O space BAR: bits 31:2 = address, bits 1:0 = flags
+        bar & !0x3
+    } else {
+        // Memory space BAR: check if 64-bit (bits 2:1 = 0b10)
+        if (bar & 0x6) == 0x4 {
+            let next_bar = pci_config_read_u32(dev.bus, dev.device, dev.function, PCI_REG_BAR0 + (bar_index * 4) + 4) as u64;
+            bar |= next_bar << 32;
+        }
+        // Strip the lower 4 flag bits (memory space indicator, type, prefetchable)
+        bar & !0xF
     }
-    
-    bar
 }
 
 /// Find first capability with given ID. Returns offset in config space (0 = not found).
