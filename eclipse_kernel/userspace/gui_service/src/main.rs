@@ -114,6 +114,34 @@ pub extern "C" fn _start() -> ! {
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem ready.");
 
-    unsafe { let _ = spawn_compositor(); }
-    loop { yield_cpu(); }
+    let mut restart_count: u32 = 0;
+    loop {
+        let child_pid = unsafe { spawn_compositor() };
+        if child_pid < 0 {
+            println!("[GUI-SERVICE] WARNING: spawn_compositor() failed, retrying after delay...");
+        } else {
+            println!("[GUI-SERVICE] Compositor spawned with PID={}, supervising...", child_pid);
+            // Block until the compositor exits (or crashes). If other children
+            // exit first, keep waiting until we see our compositor's PID.
+            loop {
+                let mut status: i32 = 0;
+                let exited_pid = wait(Some(&mut status));
+                if exited_pid == child_pid || exited_pid < 0 {
+                    break;
+                }
+                yield_cpu();
+            }
+            println!("[GUI-SERVICE] Compositor (PID={}) exited, restarting...", child_pid);
+            restart_count += 1;
+            if MAX_RESTARTS > 0 && restart_count >= MAX_RESTARTS {
+                println!("[GUI-SERVICE] Maximum restarts ({}) reached. Giving up.", MAX_RESTARTS);
+                loop { yield_cpu(); }
+            }
+        }
+
+        // Brief delay before retry/restart
+        for _ in 0..RESTART_DELAY_YIELDS {
+            yield_cpu();
+        }
+    }
 }
