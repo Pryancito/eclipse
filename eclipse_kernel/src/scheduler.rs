@@ -14,11 +14,13 @@ static QUEUE_TAIL: Mutex<usize> = Mutex::new(0);
 pub struct SchedulerStats {
     pub context_switches: u64,
     pub total_ticks: u64,
+    pub idle_ticks: u64,
 }
 
 static SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats {
     context_switches: 0,
     total_ticks: 0,
+    idle_ticks: 0,
 });
 
 /// Cuántas veces se dio CPU a cada PID en la última ventana (se lee y resetea en el heartbeat).
@@ -77,6 +79,12 @@ pub fn ready_queue_tail_addr() -> usize {
 pub fn tick() {
     let mut stats = SCHEDULER_STATS.lock();
     stats.total_ticks += 1;
+    
+    // Si el proceso actual es el kernel (PID 0), es tiempo idle
+    if crate::process::current_process_id() == Some(0) {
+        stats.idle_ticks += 1;
+    }
+    
     let ticks = stats.total_ticks;
     drop(stats);
     
@@ -287,11 +295,14 @@ pub fn sleep(_ticks: u64) {
 
 /// Obtener estadísticas del scheduler
 pub fn get_stats() -> SchedulerStats {
-    let stats = SCHEDULER_STATS.lock();
-    SchedulerStats {
-        context_switches: stats.context_switches,
-        total_ticks: stats.total_ticks,
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let stats = SCHEDULER_STATS.lock();
+        SchedulerStats {
+            context_switches: stats.context_switches,
+            total_ticks: stats.total_ticks,
+            idle_ticks: stats.idle_ticks,
+        }
+    })
 }
 
 /// Inicializar scheduler

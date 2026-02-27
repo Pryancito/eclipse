@@ -36,6 +36,10 @@ impl IpcHandler {
                 self.message_count += 1;
                 Some(CompositorEvent::SideWind(sw, pid))
             }
+            EclipseMessage::NetStatsResponse { rx, tx } => {
+                self.message_count += 1;
+                Some(CompositorEvent::NetStats(rx, tx))
+            }
             // Mensajes de control y raw: ignorar en el compositor (son para el input_service)
             _ => None,
         }
@@ -48,6 +52,10 @@ impl IpcHandler {
 
 pub fn query_input_service_pid() -> Option<u32> {
     eclipse_ipc::services::query_input_service_pid()
+}
+
+pub fn query_network_service_pid() -> Option<u32> {
+    eclipse_ipc::services::query_network_service_pid()
 }
 
 pub fn subscribe_to_input_service(input_pid: u32, self_pid: u32) -> bool {

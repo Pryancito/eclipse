@@ -75,6 +75,7 @@ pub enum SyscallNumber {
     Connect = 104,
     Mkdir = 105,
     GetStorageDeviceCount = 50,
+    GetSystemStats = 51,
 }
 
 /// lseek whence values (POSIX standard)
@@ -97,6 +98,15 @@ pub struct SyscallStats {
     pub open_calls: u64,
     pub close_calls: u64,
     pub lseek_calls: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SystemStats {
+    pub uptime_ticks: u64,
+    pub idle_ticks: u64,
+    pub total_mem_frames: u64,
+    pub used_mem_frames: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {

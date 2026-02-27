@@ -10,7 +10,7 @@ use eclipse_libc::{println, getpid, yield_cpu};
 
 use smithay_app::state::SmithayState;
 use smithay_app::compositor::{ShellWindow, WindowContent};
-use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service};
+use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service, query_network_service_pid};
 
 const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB
 #[repr(align(4096))]
@@ -61,6 +61,7 @@ pub extern "C" fn _start() -> ! {
     });
 
     if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
+    if let Some(net_pid) = query_network_service_pid() { state.network_pid = Some(net_pid); }
 
     loop {
         // Drenar todo el input pendiente antes de update/render para no llenar el mailbox del kernel

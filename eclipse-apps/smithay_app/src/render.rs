@@ -323,7 +323,7 @@ impl OriginDimensions for FramebufferState {
     }
 }
 
-pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
+pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64, cpu: f32, mem: f32, net: f32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
@@ -337,13 +337,29 @@ pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
     let py = (h - p_h) / 2;
     let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
     let _ = main_panel.draw(fb);
-    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: 0.45 + (counter as f32 / 50.0).sin() * 0.1, label: "CARGA CPU" };
+    
+    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };
     let _ = g1.draw(fb);
-    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: 0.72 + (counter as f32 / 80.0).cos() * 0.05, label: "MEMORIA VRAM" };
+    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: mem, label: "MEMORIA RAM" };
     let _ = g2.draw(fb);
-    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: 0.15 + (counter as f32 / 30.0).sin() * 0.05, label: "RED UP" };
+    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: net, label: "RED INT" };
     let _ = g3.draw(fb);
-    let term_lines: &[&str] = &[ "eclipse@os:~$ sysinfo --live", "CPU: 45% | MEM: 72% | NET: 15%", "> system status nominal" ];
+
+    let mut cpu_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}%", (cpu * 100.0) as u32));
+    let mut mem_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut mem_line, format_args!("MEM: {}%", (mem * 100.0) as u32));
+    
+    let mut net_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut net_line, format_args!("NET: {}%", (net * 100.0) as u32));
+    
+    let term_lines: &[&str] = &[ 
+        "eclipse@os:~$ sysinfo --live", 
+        &cpu_line,
+        &mem_line,
+        &net_line,
+        "> system status nominal" 
+    ];
     let term = Terminal { position: main_panel.position + Point::new(30, 240), size: Size::new(p_w as u32 - 60, 130), lines: term_lines };
     let _ = term.draw(fb);
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);

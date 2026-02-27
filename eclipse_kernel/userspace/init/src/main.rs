@@ -309,6 +309,17 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         return;
     }
 
+    // Petición de PID del servicio de red ("GET_NETWORK_PID" = 15 bytes)
+    if len >= 15 && &buffer[..15] == b"GET_NETWORK_PID" {
+        let net_pid = unsafe { SERVICES[6].pid as u32 }; // Servicio "network"
+        let mut response = [0u8; 8];
+        response[0..4].copy_from_slice(b"NETW");
+        response[4..8].copy_from_slice(&net_pid.to_le_bytes());
+        let _ = eclipse_libc::send(sender, 0x08, &response);
+        return;
+    }
+
+
     // Otros mensajes se registran para depuración básica
     println!(
         "[INIT] IPC no reconocido ({} bytes desde PID {})",

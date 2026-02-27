@@ -1,7 +1,7 @@
 //! Constantes y funciones de descubrimiento de servicios de Eclipse OS
 
 use eclipse_libc::{send, receive, yield_cpu};
-use crate::types::{GET_INPUT_PID_MSG, TAG_INPT, build_subscribe_payload};
+use crate::types::{GET_INPUT_PID_MSG, TAG_INPT, GET_NETWORK_PID_MSG, TAG_NETW, build_subscribe_payload};
 
 // ============================================================================
 // Tipos de mensaje (msg_type en sys_send)
@@ -72,4 +72,28 @@ pub fn query_input_service_pid() -> Option<u32> {
 pub fn subscribe_to_input(input_pid: u32, self_pid: u32) -> bool {
     let msg = build_subscribe_payload(self_pid);
     send(input_pid, MSG_TYPE_INPUT, &msg) == 0
+}
+
+/// Preguntar al init el PID real del network_service, con un máximo de intentos configurable.
+pub fn query_network_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
+    if send(INIT_PID, MSG_TYPE_NETWORK, GET_NETWORK_PID_MSG) != 0 {
+        return None;
+    }
+    let mut buffer = [0u8; 64];
+    for _ in 0..max_attempts {
+        let (len, sender_pid) = receive(&mut buffer);
+        if len >= 8 && sender_pid == INIT_PID && buffer[0..4] == *TAG_NETW {
+            let mut pid_bytes = [0u8; 4];
+            pid_bytes.copy_from_slice(&buffer[4..8]);
+            let pid = u32::from_le_bytes(pid_bytes);
+            if pid > 0 { return Some(pid); }
+        }
+        yield_cpu();
+    }
+    None
+}
+
+/// Preguntar al init el PID real del network_service.
+pub fn query_network_service_pid() -> Option<u32> {
+    query_network_service_pid_with_attempts(DEFAULT_INPUT_QUERY_ATTEMPTS)
 }

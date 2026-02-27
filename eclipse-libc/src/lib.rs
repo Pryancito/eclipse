@@ -45,6 +45,7 @@ pub mod header {
     pub mod pwd;
     pub mod grp;
     pub mod ifaddrs;
+    pub mod sys_eclipse;
 }
 
 pub use types::*;
@@ -80,6 +81,7 @@ pub use header::dirent::*;
 pub use header::pwd::*;
 pub use header::grp::*;
 pub use header::ifaddrs::*;
+pub use header::sys_eclipse::*;
 pub const O_RDONLY: c_int = eclipse_syscall::flag::O_RDONLY as c_int;
 pub const O_WRONLY: c_int = eclipse_syscall::flag::O_WRONLY as c_int;
 pub const O_RDWR: c_int = eclipse_syscall::flag::O_RDWR as c_int;
