@@ -869,6 +869,13 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     Some(frame_phys)
 }
 
+/// Returns (total_frames, used_frames) for the userspace physical pool.
+pub fn get_memory_stats() -> (u64, u64) {
+    let total = (ANON_MMAP_PHYS_END - ANON_MMAP_PHYS_START) / 4096;
+    let used = ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096;
+    (total, used)
+}
+
 /// Fixed virtual address for GPU framebuffer (avoids identity-mapping page faults)
 /// 8GB - above typical heap/stack/mmap, in canonical user range
 const GPU_FB_VADDR_BASE: u64 = 0x0000_0002_0000_0000;

@@ -317,13 +317,7 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
 
     let sched_stats = crate::scheduler::get_stats();
     
-    // Obtener memory stats si es posible
-    let (total_frames, used_frames) = {
-        // Since there is no direct public memory frames API yet exposed,
-        // we'll leave it as 0, or try to guess. The dashboard will survive. 
-        // Real implementation can hook up `memory::get_frames` when available.
-        (0, 0)
-    };
+    let (total_frames, used_frames) = crate::memory::get_memory_stats();
 
     let stats = SystemStats {
         uptime_ticks: sched_stats.total_ticks,
