@@ -204,6 +204,9 @@ impl FramebufferState {
                     self.front_addr as *mut u8,
                     size_bytes,
                 );
+                // sfence flushes the Write-Combining buffer so the GOP framebuffer
+                // update is visible to the display controller on real NVIDIA hardware.
+                core::arch::asm!("sfence", options(nostack, preserves_flags));
             }
             true
         } else {
