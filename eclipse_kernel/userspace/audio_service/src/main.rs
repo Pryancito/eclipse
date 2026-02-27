@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
+use eclipse_libc::{println, getpid, getppid, send, sleep_ms, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -320,6 +320,7 @@ pub extern "C" fn _start() -> ! {
     }
     
     // Main loop - process audio streams
+    // Each iteration sleeps 10 ms (~100 Hz).
     let mut heartbeat_counter = 0u64;
     let mut streams_active = 0u64;
     let mut samples_processed = 0u64;
@@ -328,29 +329,20 @@ pub extern "C" fn _start() -> ! {
         heartbeat_counter += 1;
         
         // Simulate audio stream processing only if device is ready
-        if device_ready {
-            // In a real implementation, this would:
-            // - Process DMA buffers
-            // - Handle audio interrupts
-            // - Mix multiple streams
-            // - Apply volume controls
-            // - Send data to hardware
+        // Runs roughly once per second (every ~100 iterations × 10 ms).
+        if device_ready && heartbeat_counter % 100 == 0 {
+            streams_active = 2;  // e.g., music playback + notification
+            samples_processed += 48000;  // 1 second at 48 kHz
             
-            // Simulate occasional audio activity
-            if heartbeat_counter % 100000 == 0 {
-                streams_active = 2;  // e.g., music playback + notification
-                samples_processed += 48000;  // 1 second at 48 kHz
-                
-                // Simulate sending audio data to kernel scheme (if snd: is available)
-                if let Some(fd) = snd_fd {
-                    let dummy_data = [0u8; 1024];
-                    sys_write(fd, &dummy_data);
-                }
+            // Simulate sending audio data to kernel scheme (if snd: is available)
+            if let Some(fd) = snd_fd {
+                let dummy_data = [0u8; 1024];
+                sys_write(fd, &dummy_data);
             }
         }
         
-        // Periodic status updates
-        if heartbeat_counter % 500000 == 0 {
+        // Periodic status updates every ~30 seconds (3000 × 10 ms)
+        if heartbeat_counter % 3000 == 0 {
             if device_ready {
                 let device_name = match device_type {
                     AudioDeviceType::IntelHDA => "Intel HDA",
@@ -365,6 +357,7 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        yield_cpu();
+        // Sleep 10 ms to avoid busy-waiting and keep CPU usage low
+        sleep_ms(10);
     }
 }
