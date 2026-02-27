@@ -155,9 +155,13 @@ impl PciDevice {
         }
     }
     
-    /// Check if this is a PCI-to-PCI bridge
+    /// Check if this is a PCI-to-PCI bridge.
+    /// Uses header type as the authoritative indicator (Type 1 = bridge per PCI spec),
+    /// in addition to the class/subclass check, to handle non-standard bridge
+    /// subclasses found on some real hardware (e.g. semi-transparent bridges).
     pub fn is_pci_bridge(&self) -> bool {
-        self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI
+        (self.class_code == PCI_CLASS_BRIDGE && self.subclass == PCI_SUBCLASS_BRIDGE_PCI)
+            || (self.header_type & 0x7F) == 0x01
     }
 
     /// Check if this is a USB controller
@@ -377,6 +381,29 @@ unsafe fn scan_bus(bus: u8) {
     }
 }
 
+/// Supplementary scan of all PCI buses (0-255) to catch devices missed by
+/// bridge traversal on real hardware with unusual PCIe topologies.
+/// Only adds devices not already present in PCI_DEVICES.
+unsafe fn supplementary_scan() {
+    for bus in 0u8..=255 {
+        for device in 0..32u8 {
+            // Quick check: skip empty slots (no device at function 0)
+            let vendor_id = pci_config_read_u16(bus, device, 0, PCI_REG_VENDOR_ID);
+            if vendor_id == PCI_VENDOR_INVALID {
+                continue;
+            }
+            // Skip if any function of this device was already found via bridge traversal
+            let already_known = {
+                let devices = PCI_DEVICES.lock();
+                devices.iter().any(|d| d.bus == bus && d.device == device)
+            };
+            if !already_known {
+                scan_device(bus, device);
+            }
+        }
+    }
+}
+
 /// Initialize PCI subsystem and scan all devices
 pub fn init() {
     use crate::serial;
@@ -387,6 +414,11 @@ pub fn init() {
     unsafe {
         // Scan bus 0 (main bus), which will recursively scan bridges
         scan_bus(0);
+
+        // Supplementary direct scan of all buses to catch NVIDIA GPUs (or other
+        // devices) that may be missed when PCIe bridges have non-standard
+        // configurations on real hardware (e.g. secondary_bus not strictly > primary).
+        supplementary_scan();
         
         let devices = PCI_DEVICES.lock();
         serial::serial_print("[PCI] Found ");

@@ -1730,6 +1730,13 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
         serial::serial_print("[SYSCALL] pci_enum_devices - invalid parameters\n");
         return u64::MAX;
     }
+
+    // Validate the userspace buffer pointer before writing to it
+    let buf_byte_len = max_devices * 8 * core::mem::size_of::<u64>() as u64;
+    if !is_user_pointer(buffer_ptr, buf_byte_len) {
+        serial::serial_print("[SYSCALL] pci_enum_devices - invalid buffer pointer\n");
+        return u64::MAX;
+    }
     
     // Get devices from PCI subsystem
     let devices = if class_code == 0x04 {
@@ -1779,6 +1786,7 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     
     count as u64
 }
+
 
 /// sys_pci_read_config - Read PCI configuration space
 /// Args:
