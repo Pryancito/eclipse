@@ -76,11 +76,10 @@ pub extern "C" fn _start() -> ! {
 
         if state.counter % 1000 == 0 {
             let used = HEAP_PTR.load(Ordering::Relaxed);
-            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs | Input {} ev | recv {}",
-                used, state.backend.ipc.message_count, state.input_event_count, state.backend.ipc.recv_attempts);
+            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs.",
+                used, state.backend.ipc.message_count);
         }
 
-        // Limit frame rate to ~60-80 FPS to avoid 100% CPU usage on busy-loop
-        sleep_ms(12);
+        yield_cpu();
     }
 }

@@ -22,7 +22,7 @@ use micromath::F32Ext;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, MAX_SURFACE_DIM};
 
 
-pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_9000_0000_0000;
 
 pub const STROKE_COLORS: [Rgb888; 5] = [
     colors::ACCENT_BLUE,

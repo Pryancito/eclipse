@@ -887,7 +887,7 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
     use x86_64::structures::paging::PageTableFlags as Flags;
     use crate::serial;
     
-    if fb_phys_addr == 0 || fb_phys_addr >= 0xFFFF_8000_0000_0000 {
+    if fb_phys_addr == 0 || fb_phys_addr >= PHYS_MEM_OFFSET {
         serial::serial_print("MAP_FB: ERROR - Invalid framebuffer physical address\n");
         return 0;
     }

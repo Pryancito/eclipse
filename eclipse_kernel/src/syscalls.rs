@@ -866,7 +866,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
 }
 
 /// Kernel half: get_service_binary returns pointers in this range
-const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
+const KERNEL_HALF: u64 = 0xFFFF_9000_0000_0000;
 
 /// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
 const LAST_EXEC_ERR_LEN: usize = 80;
@@ -1348,7 +1348,7 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(addr) => {
                     // Convertir dirección kernel a física si aplica (evita crash 0xffff8000...)
-                    let phys_addr: u64 = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                    let phys_addr: u64 = if (addr as u64) >= crate::memory::PHYS_MEM_OFFSET {
                         (addr as u64) - crate::memory::PHYS_MEM_OFFSET
                     } else {
                         addr as u64
@@ -1451,7 +1451,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
     {
         let k = &crate::boot::get_boot_info().framebuffer;
-        let addr = if k.base_address >= 0xFFFF_8000_0000_0000 {
+        let addr = if k.base_address >= crate::memory::PHYS_MEM_OFFSET {
             k.base_address - crate::memory::PHYS_MEM_OFFSET
         } else {
             k.base_address
@@ -1707,7 +1707,7 @@ fn sys_map_framebuffer() -> u64 {
     let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
     
     // NUNCA usar dirección kernel - convertir a física para mapeo
-    let fb_phys = if kernel_fb.base_address >= 0xFFFF_8000_0000_0000 {
+    let fb_phys = if kernel_fb.base_address >= crate::memory::PHYS_MEM_OFFSET {
         kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
     } else {
         kernel_fb.base_address
@@ -2012,7 +2012,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 // Try fmap first (e.g. /dev/fb0 framebuffer): map physical memory directly
                 if let Ok(addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
                     // NEVER pass kernel addresses to map_physical_range - convert to physical
-                    let phys_addr = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                    let phys_addr = if (addr as u64) >= crate::memory::PHYS_MEM_OFFSET {
                         (addr as u64) - crate::memory::PHYS_MEM_OFFSET
                     } else {
                         addr as u64
