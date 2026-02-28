@@ -722,8 +722,6 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let icon_slot_h = h / icon_types.len() as i32;
     let sidebar_y_start = 0;
     
-    // Sidebar Vertical Bar removed as requested
-
     for (i, icon_type) in icon_types.iter().enumerate() {
         let py = sidebar_y_start + (i as i32 * icon_slot_h);
         let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 

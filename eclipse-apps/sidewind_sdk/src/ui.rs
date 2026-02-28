@@ -757,7 +757,7 @@ where
 }
 
 /// Helper to draw a subtle horizontal transparent effect (no vertical lines, no cross)
-pub fn draw_grid<D>(target: &mut D, color: Rgb888, spacing: u32, offset: Point) -> Result<(), D::Error>
+pub fn draw_grid<D>(_target: &mut D, _color: Rgb888, _spacing: u32, _offset: Point) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb888> + OriginDimensions,
 {
@@ -789,7 +789,7 @@ where
     let size = target.size();
     let w = size.width as i32;
     let h = size.height as i32;
-    let vanish_y = 0; 
+    let _vanish_y = 0; 
     let horizon_y = h / 3;
     
     // Vertical converging lines
@@ -891,7 +891,8 @@ where
         
         let bar_w = ((counter as f32 * 0.1 + i as f32).sin().abs() * 30.0) as u32;
         let _ = Rectangle::new(Point::new(x - 35, y), Size::new(bar_w, 4))
-            .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build()).draw(target)?;
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
+            .draw(target)?;
         
         let _ = Circle::with_center(Point::new(x, y + 2), 2).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::WHITE).build()).draw(target)?;
     }
@@ -1468,9 +1469,11 @@ impl Widget for Gauge {
         let label_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
         let _ = Text::new(self.label, self.center + Point::new(-(self.label.len() as i32 * 5), (self.radius + 20) as i32), label_style).draw(target)?;
 
-        let val_pct = (self.value * 100.0) as i32;
-        // Simple numeric display (placeholder for proper formatting)
-        let _ = Text::new("OK", self.center + Point::new(-10, 5), label_style).draw(target)?;
+        let mut lbl = String::<16>::new();
+        let val_pct = (self.value * 100.0) as u32;
+        use core::fmt::Write;
+        let _ = write!(&mut lbl, "{}%", val_pct);
+        let _ = Text::new(lbl.as_str(), self.center + Point::new(-10, 5), label_style).draw(target)?;
 
         Ok(())
     }
@@ -1592,7 +1595,7 @@ impl<'a> Widget for NotificationPanel<'a> {
 }
 
 /// Compute which taskbar slot (0-7) is under cursor, or None. Call when cursor_y is in taskbar area.
-pub fn taskbar_slot_under_cursor(cursor_x: i32, cursor_y: i32, taskbar_width: u32, taskbar_y: i32) -> Option<usize> {
+pub fn taskbar_slot_under_cursor(cursor_x: i32, cursor_y: i32, _taskbar_width: u32, taskbar_y: i32) -> Option<usize> {
     let th = 44i32;
     if cursor_y < taskbar_y || cursor_y >= taskbar_y + th { return None; }
     let slot_w = 106i32;
@@ -1744,7 +1747,6 @@ where
     //     .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_HIGHLIGHT).build())
     //     .draw(target)?;
 
-    // Title / Header based on type
     let accent_base = colors::WHITE;
     let accent = if hover { Rgb888::new(220, 240, 255) } else { accent_base };
 
