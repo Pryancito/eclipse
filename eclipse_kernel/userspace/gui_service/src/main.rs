@@ -15,7 +15,7 @@ use eclipse_libc::{
 };
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
-const MAX_COMPOSITOR_SIZE: usize = 512 * 1024;
+const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
 static mut LOAD_BUF: [u8; MAX_COMPOSITOR_SIZE] = [0; MAX_COMPOSITOR_SIZE];
 
 const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
