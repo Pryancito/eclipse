@@ -52,13 +52,7 @@ pub extern "C" fn _start() -> ! {
     
     state.backend.fb.pre_render_background();
 
-    // Initial demo window
-    state.space.map_window(ShellWindow {
-        x: 100, y: 100, w: 400, h: 300,
-        curr_x: (100 + 400/2) as f32, curr_y: (100 + 300/2) as f32, curr_w: 0.0, curr_h: 0.0,
-        minimized: false, maximized: false, closing: false, stored_rect: (100, 100, 400, 300),
-        workspace: 0, content: WindowContent::InternalDemo,
-    });
+    // Initial demo window removed as requested
 
     if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
     if let Some(net_pid) = query_network_service_pid() { state.network_pid = Some(net_pid); }

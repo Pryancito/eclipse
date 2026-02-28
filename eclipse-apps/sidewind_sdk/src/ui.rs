@@ -658,29 +658,15 @@ where
         y += BAND_H;
     }
 
-    // 2. Nebula blobs - deeper colors
-    let nebula: [(i32, i32, u32, Rgb888); 6] = [
-        (w / 6, h / 3, 240, Rgb888::new(15, 45, 110)),
-        (w * 5 / 6, h / 4, 300, Rgb888::new(12, 60, 130)),
-        (w / 2, h * 3 / 4, 280, Rgb888::new(20, 45, 95)),
-        (cx, cy, 350, Rgb888::new(10, 30, 80)),
-        (w / 4, h * 2 / 3, 200, Rgb888::new(25, 60, 140)),
-        (w * 3 / 4, h * 2 / 3, 180, Rgb888::new(40, 35, 90)),
-    ];
-    for (nx, ny, rad, color) in nebula.iter() {
-        let style = PrimitiveStyleBuilder::new().fill_color(*color).build();
-        let _ = Circle::with_center(Point::new(*nx, *ny), *rad).into_styled(style).draw(target)?;
-    }
-
     // 3. Vignette (darker corners for depth and focus)
-    let vw = (w as f32 * 0.35) as i32;
+    /*let vw = (w as f32 * 0.35) as i32;
     let vh = (h as f32 * 0.35) as i32;
     let vc = Rgb888::new(2, 4, 14);
     let _ = Rectangle::new(Point::new(0, 0), Size::new(vw as u32, vh as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(vc).build()).draw(target)?;
     let _ = Rectangle::new(Point::new(w - vw, 0), Size::new(vw as u32, vh as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(vc).build()).draw(target)?;
     let _ = Rectangle::new(Point::new(0, h - vh), Size::new(vw as u32, vh as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(vc).build()).draw(target)?;
     let _ = Rectangle::new(Point::new(w - vw, h - vh), Size::new(vw as u32, vh as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(vc).build()).draw(target)?;
-
+    */
     Ok(())
 }
 
@@ -689,7 +675,7 @@ pub fn draw_grid<D>(target: &mut D, color: Rgb888, spacing: u32, offset: Point) 
 where
     D: DrawTarget<Color = Rgb888> + OriginDimensions,
 {
-    let size = target.size();
+    /*let size = target.size();
     let w = size.width as i32;
     let h = size.height as i32;
     // Color más tenue para efecto transparente/sutil
@@ -705,6 +691,7 @@ where
         if y < 0 { continue; }
         let _ = Line::new(Point::new(0, y), Point::new(w, y)).into_styled(style).draw(target)?;
     }
+    */
     Ok(())
 }
 
@@ -1380,7 +1367,7 @@ impl Widget for Gauge {
         let bg_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLOW_DIM).stroke_width(2).build();
         let _ = Circle::with_center(self.center, self.radius).into_styled(bg_style).draw(target)?;
         
-        let val_color = if self.value > 0.8 { colors::ACCENT_RED } else { colors::ACCENT_CYAN };
+        let val_color = colors::WHITE;
         
         // Draw segmented ticks
         for i in 0..20 {
@@ -1499,11 +1486,7 @@ impl<'a> Widget for NotificationPanel<'a> {
         
         for (i, n) in self.notifications.iter().enumerate().take(5) {
             let y_off = 70 + (i as i32 * 80);
-            let color = match n.icon_type {
-                1 => colors::ACCENT_YELLOW,
-                2 => colors::ACCENT_RED,
-                _ => colors::ACCENT_BLUE,
-            };
+            let color = colors::WHITE;
             
             // Side indicator
             let _ = Rectangle::new(self.position + Point::new(10, y_off), Size::new(5, 60))
@@ -1639,4 +1622,87 @@ impl Widget for Taskbar {
     fn size(&self) -> Size {
         Size::new(self.width, 44)
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TechCardIconType {
+    ControlPanel,
+    System,
+    Apps,
+    Files,
+    Network,
+}
+
+/// Dibuja un icono de "tarjeta tecnológica" con estilo futurista.
+pub fn draw_tech_card_icon<D>(
+    target: &mut D,
+    position: Point,
+    icon_type: TechCardIconType,
+    hover: bool,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb888>,
+{
+    let w = 120;
+    let h = 130;
+    let rect = Rectangle::new(position, Size::new(w as u32, h as u32));
+    
+    // Main card body (no fill, no stroke as requested)
+    // Only corner brackets will remain as the "frame"
+    
+    // Specular highlight (optional, keep for tech feel unless "no border" includes this)
+    // let _ = Rectangle::new(position + Point::new(4, 1), Size::new(w as u32 - 8, 1))
+    //     .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_HIGHLIGHT).build())
+    //     .draw(target)?;
+
+    // Title / Header based on type
+    let accent_base = colors::WHITE;
+    let accent = if hover { Rgb888::new(220, 240, 255) } else { accent_base };
+
+    let (title, icon_data) = match icon_type {
+        TechCardIconType::ControlPanel => ("I ESCRITORIO", icons::LOGO),
+        TechCardIconType::System => ("I SISTEMA CENTRAL", icons::SYSTEM),
+        TechCardIconType::Apps => ("I APLICACIONES", icons::APPS),
+        TechCardIconType::Files => ("I ARCHIVO DE DATOS", icons::FILES),
+        TechCardIconType::Network => ("I ESTADO DE LA RED", icons::NETWORK),
+    };
+
+    let title_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE);
+    let _ = Text::new(title, position + Point::new(10, 15), title_style).draw(target)?;
+
+    // Corner decorations (brackets)
+    let bracket_len = 12;
+    let bracket_style = PrimitiveStyleBuilder::new().stroke_color(accent).stroke_width(if hover { 2 } else { 1 }).build();
+    let tl = position;
+    let br = position + Point::new(w, h);
+    let _ = Line::new(tl, tl + Point::new(bracket_len, 0)).into_styled(bracket_style).draw(target)?;
+    let _ = Line::new(tl, tl + Point::new(0, bracket_len)).into_styled(bracket_style).draw(target)?;
+    let _ = Line::new(br - Point::new(bracket_len, 1), br - Point::new(1, 1)).into_styled(bracket_style).draw(target)?;
+    let _ = Line::new(br - Point::new(1, bracket_len), br - Point::new(1, 1)).into_styled(bracket_style).draw(target)?;
+
+    // Central Icon
+    let icon_center = position + Point::new(w / 2, 65);
+    // Using 600x600 logo for Control Panel if needed, or normal 64x64 icons
+    if icon_type == TechCardIconType::ControlPanel {
+         let _ = draw_circular_logo_600(target, icon_center, 40, icon_data)?;
+    } else {
+         let _ = draw_circular_icon(target, icon_center, 40, icon_data)?;
+    }
+
+    // Extra decoration lines (tech detail)
+    let line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLOW_DIM).stroke_width(1).build();
+    let _ = Line::new(position + Point::new(10, 110), position + Point::new(w - 10, 110)).into_styled(line_style).draw(target)?;
+    
+    // Small label at bottom of card
+    let bottom_label = match icon_type {
+        TechCardIconType::ControlPanel => "ESCRITORIO",
+        TechCardIconType::System => "SISTEMA CENTRAL",
+        TechCardIconType::Apps => "APLICACIONES",
+        TechCardIconType::Files => "ARCHIVO DE DATOS",
+        TechCardIconType::Network => "ESTADO DE LA RED",
+    };
+    let bottom_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, accent);
+    let _ = Text::new(bottom_label, position + Point::new(10, h - 8), bottom_style).draw(target)?;
+
+    Ok(())
 }
