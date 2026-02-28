@@ -12,8 +12,7 @@ use embedded_graphics::{
 use eclipse_libc::{
     println, get_framebuffer_info, map_framebuffer, FramebufferInfo, 
     get_gpu_display_info, gpu_alloc_display_buffer, gpu_present, 
-    mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_SHARED, O_RDWR,
-    virgl_ctx_create, virgl_ctx_attach_resource, virgl_submit_3d,
+    mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_SHARED, O_RDWR
 };
 use sidewind_sdk::ui::{self, icons, colors, Notification, NotificationPanel, Taskbar, Widget};
 use sidewind_sdk::{font_terminus_12, font_terminus_14, font_terminus_20, font_terminus_24};
@@ -39,14 +38,6 @@ pub struct FramebufferState {
     pub front_addr: usize,  
     pub gpu_resource_id: Option<u32>,  
     pub background_addr: usize, 
-    /// virgl 3-D context ID created at startup when VirtIO GPU is present.
-    /// Enables GPU-side clear and fill commands via `virgl_submit_3d`.
-    pub virgl_ctx_id: Option<u32>,
-    /// Virtual address of the GPU-mapped display buffer (equals the original
-    /// `base_addr` when `gpu_resource_id` is Some). Used to guard GPU commands
-    /// so they are not issued when `base_addr` is temporarily pointing at the
-    /// CPU-side background buffer.
-    gpu_display_addr: usize,
 }
 
 impl FramebufferState {
@@ -78,25 +69,12 @@ impl FramebufferState {
                         return None;
                     }
 
-                    let rid = gpu_info.resource_id;
-                    let gpu_display_addr = gpu_info.vaddr as usize;
-
-                    // Create a virgl 3-D context and attach the display resource to it.
-                    // This enables GPU-side clear/fill commands (VIRGL_CCMD_CLEAR_TEXTURE)
-                    // to be submitted instead of CPU pixel loops.
-                    let virgl_ctx_id = virgl_ctx_create(b"smithay_gpu")
-                        .and_then(|ctx| {
-                            if virgl_ctx_attach_resource(ctx, rid) { Some(ctx) } else { None }
-                        });
-
                     return Some(FramebufferState {
                         info,
-                        base_addr: gpu_display_addr,
+                        base_addr: gpu_info.vaddr as usize,
                         front_addr: 0,
-                        gpu_resource_id: Some(rid),
+                        gpu_resource_id: Some(gpu_info.resource_id),
                         background_addr: bg_buffer as usize,
-                        virgl_ctx_id,
-                        gpu_display_addr,
                     });
                 }
             }
@@ -132,8 +110,6 @@ impl FramebufferState {
             front_addr: fb_base,
             gpu_resource_id: None,
             background_addr: bg_buffer as usize,
-            virgl_ctx_id: None,
-            gpu_display_addr: 0,
         })
     }
 
@@ -154,119 +130,28 @@ impl FramebufferState {
             front_addr: 0,
             gpu_resource_id: None,
             background_addr: 0x2000,
-            virgl_ctx_id: None,
-            gpu_display_addr: 0,
         }
     }
 
-    // ── GPU-accelerated operations ─────────────────────────────────────────────
-
-    /// Offload a full-screen clear to the GPU via `VIRGL_CCMD_CLEAR_TEXTURE` (cmd 42).
-    ///
-    /// `VIRGL_CCMD_CLEAR_TEXTURE` clears a region of a virgl resource without
-    /// requiring a bound FBO, making it the simplest GPU clear path available.
-    ///
-    /// Returns `true` if the GPU command was successfully submitted, `false` if
-    /// GPU acceleration is unavailable and a CPU fallback should be used.
-    ///
-    /// Guard: only submits when `base_addr == gpu_display_addr`, which prevents
-    /// accidental GPU clears when `base_addr` is temporarily pointing at the
-    /// CPU-side background buffer (see `pre_render_background`).
-    pub fn gpu_clear_screen(&self, color_bgra: u32) -> bool {
-        let Some(rid) = self.gpu_resource_id else { return false; };
-        let Some(ctx_id) = self.virgl_ctx_id else { return false; };
-        if self.base_addr != self.gpu_display_addr || self.gpu_display_addr < 0x1000 {
-            return false;
-        }
-        let w = self.info.width;
-        let h = self.info.height;
-        // VIRGL_CCMD_CLEAR_TEXTURE (42 = 0x2A)
-        // Header format: cmd | (obj_type << 8) | (payload_len_dwords << 16)
-        // Payload (9 dwords): resource_handle, level, box{x,y,z,w,h,d}, color_data
-        let cmd: [u32; 10] = [
-            0x2A | (9u32 << 16), // header: cmd=CLEAR_TEXTURE(42), obj=0, len=9
-            rid,                 // resource handle (from gpu_alloc_display_buffer)
-            0,                   // mip level 0
-            0, 0, 0,             // box origin: x=0, y=0, z=0
-            w, h, 1,             // box extent: width, height, depth=1
-            color_bgra,          // clear color as BGRA bytes (little-endian u32)
-        ];
-        // SAFETY: `cmd` is a valid [u32; 10] on the stack; transmuting to bytes
-        // is safe because u32 has no invalid bit patterns.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(cmd.as_ptr() as *const u8, core::mem::size_of_val(&cmd))
-        };
-        virgl_submit_3d(ctx_id, bytes)
-    }
-
-    // ── Optimized CPU fill primitives ──────────────────────────────────────────
-
-    /// Fill a rectangle with `color_bgra` using an optimised row-template strategy:
-    /// the first row is written with a simple loop (compiler-vectorisable), then
-    /// every subsequent row is copied from the first using `copy_nonoverlapping`
-    /// (equivalent to `memcpy`).  This is significantly faster than the previous
-    /// per-pixel `write_volatile` loop for large rectangles.
-    pub fn cpu_fill_rect(&self, x: i32, y: i32, w: u32, h: u32, color_bgra: u32) {
-        if self.base_addr < 0x1000 || w == 0 || h == 0 { return; }
-        let fb_w = self.info.width as i32;
-        let fb_h = self.info.height as i32;
-        let pitch_px = (self.info.pitch / 4).max(self.info.width) as usize;
-
-        // Clamp to display bounds.
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = ((x + w as i32).min(fb_w)) as usize;
-        let y1 = ((y + h as i32).min(fb_h)) as usize;
-        if x0 >= x1 || y0 >= y1 { return; }
-
-        let fill_w = x1 - x0;
-        let ptr = self.base_addr as *mut u32;
-
-        // Fill the first row using a slice so LLVM can auto-vectorise.
-        let row0_slice = unsafe {
-            core::slice::from_raw_parts_mut(ptr.add(y0 * pitch_px + x0), fill_w)
-        };
-        row0_slice.fill(color_bgra);
-        let row0_ptr = row0_slice.as_ptr();
-
-        // Copy the first row into every subsequent row.
-        for row in (y0 + 1)..y1 {
-            let dst = unsafe { ptr.add(row * pitch_px + x0) };
-            unsafe { core::ptr::copy_nonoverlapping(row0_ptr, dst, fill_w); }
-        }
-    }
-
-    /// Write a single pixel.  Used by the particle system.
-    pub fn draw_pixel_raw(&self, x: i32, y: i32, color: Rgb888) {
-        if self.base_addr < 0x1000 { return; }
-        let fw = self.info.width as i32;
-        let fh = self.info.height as i32;
-        if x < 0 || x >= fw || y < 0 || y >= fh { return; }
-        let pitch_px = (self.info.pitch / 4).max(self.info.width) as usize;
-        let raw = 0xFF000000
-            | ((color.r() as u32) << 16)
-            | ((color.g() as u32) << 8)
-            | (color.b() as u32);
-        unsafe { *((self.base_addr as *mut u32).add(y as usize * pitch_px + x as usize)) = raw; }
-    }
-
-    // ── Legacy / unchanged helpers ─────────────────────────────────────────────
-
-    /// Clear the entire back-buffer to `color`.
-    ///
-    /// Tries GPU-side `VIRGL_CCMD_CLEAR_TEXTURE` first (zero CPU pixel work);
-    /// falls back to the optimised CPU row-template path.
     pub fn clear_back_buffer_raw(&self, color: Rgb888) {
         if self.base_addr < 0x1000 { return; }
+        let pitch = self.info.pitch.max(self.info.width * 4);
+        let width_px = self.info.width as usize;
+        let height = self.info.height as usize;
+        let pitch_px = (pitch / 4) as usize;
         let raw = 0xFF000000
             | ((color.r() as u32) << 16)
             | ((color.g() as u32) << 8)
             | (color.b() as u32);
-        if self.gpu_clear_screen(raw) {
-            return;
+        let ptr = self.base_addr as *mut u32;
+        for y in 0..height {
+            let row_start = y * pitch_px;
+            for x in 0..width_px {
+                unsafe {
+                    core::ptr::write_volatile(ptr.add(row_start + x), raw);
+                }
+            }
         }
-        // CPU fallback: fill the full framebuffer using the row-template strategy.
-        self.cpu_fill_rect(0, 0, self.info.width, self.info.height, raw);
     }
 
     pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) {
@@ -364,29 +249,28 @@ impl FramebufferState {
         let pitch_px = (self.info.pitch / 4).max(self.info.width) as i32;
         let dst_ptr = self.base_addr as *mut u32;
         let w_i = w as i32;
-        // Precompute the visible column range once for all rows.
-        let src_x0 = (-x).max(0);
-        let dst_x0 = x.max(0);
-        let dst_x1 = (x + w_i).min(fb_w);
-        if dst_x0 >= dst_x1 { return; }
-        let copy_px = (dst_x1 - dst_x0) as usize;
         for iy in 0..h as i32 {
             let dy = y + iy;
             if dy < 0 || dy >= fb_h { continue; }
-            let src_row_start = (iy * w_i + src_x0) as usize;
-            let bytes_needed = src_row_start.saturating_add(copy_px).saturating_mul(4);
+            let src_row_start = (iy * w_i) as usize;
+            let bytes_needed = (src_row_start + w as usize).saturating_mul(4);
             if bytes_needed > src_size { break; }
-            let row_offset = (dy * pitch_px + dst_x0) as usize;
-            // Always use copy_nonoverlapping (memcpy) for the visible span —
-            // this is faster than per-pixel volatile writes and correct for
-            // WC-mapped GPU memory because the subsequent `present()` call
-            // issues an `sfence` that flushes the write-combining buffer.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.add(src_row_start),
-                    dst_ptr.add(row_offset),
-                    copy_px,
-                );
+            if x >= 0 && x + w_i <= fb_w {
+                let row_offset = (dy * pitch_px + x) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.add(src_row_start), dst_ptr.add(row_offset), w as usize);
+                }
+            } else {
+                for ix in 0..w_i {
+                    let dx = x + ix;
+                    if dx >= 0 && dx < fb_w {
+                        let off = (dy * pitch_px + dx) as usize;
+                        unsafe {
+                            let color = core::ptr::read_volatile(src.add(src_row_start + ix as usize));
+                            core::ptr::write_volatile(dst_ptr.add(off), color);
+                        }
+                    }
+                }
             }
         }
     }
@@ -419,20 +303,19 @@ impl DrawTarget for FramebufferState {
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
         if self.base_addr < 0x1000 { return Ok(()); }
-        let raw_color = 0xFF000000
-            | ((color.r() as u32) << 16)
-            | ((color.g() as u32) << 8)
-            | (color.b() as u32);
-        // Use the GPU-aware, row-template fill helper.
-        // cpu_fill_rect() already clamps to display bounds so no intersection
-        // calculation is needed here.
-        self.cpu_fill_rect(
-            area.top_left.x,
-            area.top_left.y,
-            area.size.width,
-            area.size.height,
-            raw_color,
-        );
+        let width = self.info.width as i32;
+        let height = self.info.height as i32;
+        let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
+        let fb_ptr = self.base_addr as *mut u32;
+        let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
+        if intersection.is_zero_sized() { return Ok(()); }
+        let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+        for y in intersection.top_left.y..intersection.top_left.y + intersection.size.height as i32 {
+            let offset_start = (y as usize * pitch_px as usize) + intersection.top_left.x as usize;
+            for x in 0..intersection.size.width as usize {
+                unsafe { core::ptr::write_volatile(fb_ptr.add(offset_start + x), raw_color); }
+            }
+        }
         Ok(())
     }
 }

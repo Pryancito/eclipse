@@ -6,7 +6,6 @@ members = [
     "sidewind_sdk",
     "sidewind_wayland",
     "sidewind_xwayland",
-    "sidewind_wgpu",
     "demo_client",
     "wayland_handshake",
     "x11_bridge_test",
