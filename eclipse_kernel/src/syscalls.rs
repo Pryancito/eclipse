@@ -1460,6 +1460,8 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         (addr, k.width, k.height, pitch)
     } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
         (phys, w, h, p)
+    } else if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        (phys, w, h, pitch)
     } else {
         return u64::MAX;
     };
@@ -1700,6 +1702,30 @@ fn sys_map_framebuffer() -> u64 {
     // Get framebuffer info
     let fb_info_ptr = crate::boot::get_framebuffer_info();
     if fb_info_ptr == 0 {
+        // Try NVIDIA BAR1 as fallback for real hardware without EFI GOP
+        if let Some((bar1_phys, width, height, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+            let single_frame_size = (pitch as u64) * (height as u64);
+            let mut fb_size = single_frame_size * 2;
+            fb_size = (fb_size + 0xFFF) & !0xFFF;
+            fb_size = fb_size.saturating_add(0x400000);
+            serial::serial_print("MAP_FB: Using NVIDIA BAR1 as framebuffer\n");
+            serial::serial_print("  Phys addr: ");
+            serial::serial_print_hex(bar1_phys);
+            serial::serial_print("\n  Size: ");
+            serial::serial_print_hex(fb_size);
+            serial::serial_print("\n");
+            let current_pid = crate::process::current_process_id();
+            let page_table_phys = crate::process::get_process_page_table(current_pid);
+            if page_table_phys == 0 {
+                serial::serial_print("MAP_FB: ERROR - Could not get process page table\n");
+                return 0;
+            }
+            let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, bar1_phys, fb_size);
+            serial::serial_print("MAP_FB: Done. Returning v=");
+            serial::serial_print_hex(vaddr);
+            serial::serial_print("\n");
+            return vaddr;
+        }
         serial::serial_print("MAP_FB: No framebuffer info available\n");
         return 0;
     }

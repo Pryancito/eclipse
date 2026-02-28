@@ -42,10 +42,30 @@ use crate::serial;
 use crate::filesystem;
 use alloc::vec::Vec;
 use alloc::vec;
+use spin::Mutex;
 
 // Use our shared NVIDIA abstraction crate
 use sidewind_nvidia::registers::*;
 use sidewind_nvidia::gsp::*;
+
+/// Stored NVIDIA framebuffer info for display fallback (BAR1 / linear VRAM aperture).
+/// Populated during nvidia::init() and used by sys_get_framebuffer_info /
+/// sys_map_framebuffer when neither EFI GOP nor VirtIO is available.
+struct NvidiaFbInfo {
+    phys:   u64,
+    width:  u32,
+    height: u32,
+    pitch:  u32,
+}
+
+static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
+
+/// Return (phys, width, height, pitch) of the NVIDIA BAR1 linear aperture,
+/// or None if no NVIDIA GPU was detected / BAR1 is not accessible.
+pub fn get_nvidia_fb_info() -> Option<(u64, u32, u32, u32)> {
+    let guard = NVIDIA_FB_INFO.lock();
+    guard.as_ref().map(|i| (i.phys, i.width, i.height, i.pitch))
+}
 
 /// NVIDIA GPU Architecture Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +593,36 @@ pub fn init() {
         if hw_arch != gpu_info.architecture && hw_arch != NvidiaArchitecture::Unknown {
             serial::serial_print("[NVIDIA]   ⚠ Architecture mismatch: PCI ID says one arch, ");
             serial::serial_print("PMC_BOOT_0 chip_id says another. Using PMC_BOOT_0.\n");
+        }
+
+        // --- Phase 2b: BAR1 (linear VRAM aperture) as display fallback ---
+        // BAR1 is the CPU-visible linear aperture over VRAM on Turing+ GPUs.
+        // We store it once so that sys_get_framebuffer_info / sys_map_framebuffer
+        // can fall back to it when no EFI GOP framebuffer and no VirtIO GPU are
+        // available (i.e. real hardware with discrete NVIDIA graphics).
+        // Only the first GPU with a valid BAR1 is stored.
+        {
+            let bar1_phys = unsafe { get_bar(gpu, 1) };
+            serial::serial_print("[NVIDIA]   BAR1 (VRAM aperture) phys: 0x");
+            serial::serial_print_hex(bar1_phys);
+            serial::serial_print("\n");
+            if bar1_phys != 0 {
+                let mut guard = NVIDIA_FB_INFO.lock();
+                if guard.is_none() {
+                    // Use 1920×1080 as a conservative default resolution.
+                    // The VBIOS programs the actual display mode before the OS boots;
+                    // userspace renderers use the full BAR1 aperture and are not
+                    // constrained to this size – they simply write pixels at the
+                    // correct pitch for whatever mode the hardware is in.  If the
+                    // physical display differs (e.g. 4K), the image will appear in
+                    // the top-left corner until a real mode-set is implemented.
+                    let width  = 1920u32;
+                    let height = 1080u32;
+                    let pitch  = width * 4;
+                    *guard = Some(NvidiaFbInfo { phys: bar1_phys, width, height, pitch });
+                    serial::serial_print("[NVIDIA]   ✓ BAR1 stored as display fallback (1920×1080)\n");
+                }
+            }
         }
 
         // --- Phase 3: VRAM size from hardware register ---
