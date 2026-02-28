@@ -4,7 +4,7 @@ eclipse-os-build/
 eclipse-os.img
 test_disk.img
 test_eclipsefs.img
-
+eclipse_ovmf_vars.fd
 # Rust build artifacts
 */target/
 target/
