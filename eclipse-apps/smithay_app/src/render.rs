@@ -102,24 +102,69 @@ impl FramebufferState {
             }
         }
 
-        let fb_info = get_framebuffer_info()?;
-        let fb_base = map_framebuffer()?;
-        let fb_base = if fb_base as u64 >= PHYS_MEM_OFFSET {
-            (fb_base as u64 - PHYS_MEM_OFFSET) as usize
-        } else {
-            fb_base
+        // Fall back to EFI GOP / NVIDIA BAR1 framebuffer path.
+        // `get_framebuffer_info()` may return Some with zero dimensions on certain
+        // NVIDIA configurations where the EFI GOP mode is not fully populated.
+        let fb_info_opt = get_framebuffer_info();
+        let fb_base_opt = map_framebuffer();
+
+        // If we cannot get a front framebuffer address, we still try to start in
+        // a headless mode (renders to back-buffer only, nothing displayed) so the
+        // compositor event loop runs and input is processed.
+        let fb_base = match fb_base_opt {
+            Some(addr) => {
+                if addr as u64 >= PHYS_MEM_OFFSET {
+                    (addr as u64 - PHYS_MEM_OFFSET) as usize
+                } else {
+                    addr
+                }
+            }
+            None => 0, // headless: present() will be a no-op
         };
 
-        let pitch = if fb_info.pitch > 0 { fb_info.pitch } else { fb_info.width * 4 };
-        let fb_size = (pitch as u64) * (fb_info.height as u64);
+        // Determine display dimensions.  If the framebuffer info has zero
+        // width/height (EFI GOP partially initialised), fall back to 1920×1080
+        // which is a safe default for modern NVIDIA hardware.
+        const DEFAULT_WIDTH:  u32 = 1920;
+        const DEFAULT_HEIGHT: u32 = 1080;
+
+        let (disp_width, disp_height, disp_pitch, fb_addr) = match &fb_info_opt {
+            Some(info) if info.width > 0 && info.height > 0 => {
+                let p = if info.pitch > 0 { info.pitch } else { info.width * 4 };
+                (info.width, info.height, p, fb_base as u64)
+            }
+            _ => {
+                // Zero dimensions or no info: use defaults and ignore the front addr
+                // (renders in RAM only; may still be visible if BAR1 == GOP FB).
+                let p = DEFAULT_WIDTH * 4;
+                (DEFAULT_WIDTH, DEFAULT_HEIGHT, p, fb_base as u64)
+            }
+        };
+
+        let fb_size = (disp_pitch as u64) * (disp_height as u64);
+        if fb_size == 0 {
+            return None;
+        }
+
         let back_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
         if back_buffer == 0 || back_buffer == u64::MAX {
             return None;
         }
 
-        let mut info = fb_info;
-        info.address = fb_base as u64;
+        let info = FramebufferInfo {
+            address: fb_addr,
+            width: disp_width,
+            height: disp_height,
+            pitch: disp_pitch,
+            bpp: 32,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        };
 
         let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if bg_buffer == 0 || bg_buffer == u64::MAX {

@@ -42,6 +42,19 @@ use crate::serial;
 use crate::filesystem;
 use alloc::vec::Vec;
 use alloc::vec;
+use spin::Mutex;
+
+/// NVIDIA display framebuffer information detected during GPU init.
+/// Set when the EFI GOP framebuffer is unavailable so that the display
+/// subsystem can fall back to this physical address (BAR1 base).
+/// Layout: (phys_base, width, height, pitch)
+static NVIDIA_FB_INFO: Mutex<Option<(u64, u32, u32, u32)>> = Mutex::new(None);
+
+/// Return the NVIDIA-detected framebuffer info, if available.
+/// Used by sys_get_framebuffer_info() as a third fallback after EFI GOP and VirtIO.
+pub fn get_nvidia_fb_info() -> Option<(u64, u32, u32, u32)> {
+    *NVIDIA_FB_INFO.lock()
+}
 
 // Use our shared NVIDIA abstraction crate
 use sidewind_nvidia::registers::*;
@@ -557,7 +570,40 @@ pub fn init() {
         serial::serial_print_hex(boot_0 as u64);
         serial::serial_print(")\n");
 
-        // Cross-validate architecture from hardware register
+        // --- Phase 1.5: BAR1 (linear VRAM aperture) detection ---
+        // BAR1 provides CPU-accessible linear access to VRAM.  On EFI systems the
+        // GOP driver maps the framebuffer here, so BAR1 base ≈ GOP framebuffer phys.
+        // Store this only once (first accessible GPU) as a fallback for
+        // sys_get_framebuffer_info() when the bootloader did not capture the GOP fb.
+        {
+            let boot_fb = &crate::boot::get_boot_info().framebuffer;
+            let efi_fb_missing = boot_fb.base_address == 0
+                || boot_fb.base_address == 0xDEAD_BEEF;
+            let not_set_yet = NVIDIA_FB_INFO.lock().is_none();
+            if efi_fb_missing && not_set_yet {
+                let bar1_phys = unsafe { get_bar(gpu, 1) };
+                if bar1_phys != 0 {
+                    // Prefer dimensions reported by the bootloader if they are valid.
+                    // Fall back to 1920×1080 which is the most common NVIDIA default.
+                    let (w, h) = if boot_fb.width > 0 && boot_fb.height > 0 {
+                        (boot_fb.width, boot_fb.height)
+                    } else {
+                        (1920u32, 1080u32)
+                    };
+                    let pitch = w * 4;
+                    serial::serial_print("[NVIDIA]   EFI GOP not captured; using BAR1 (0x");
+                    serial::serial_print_hex(bar1_phys);
+                    serial::serial_print(") as display framebuffer (");
+                    serial::serial_print_dec(w as u64);
+                    serial::serial_print("x");
+                    serial::serial_print_dec(h as u64);
+                    serial::serial_print(")\n");
+                    *NVIDIA_FB_INFO.lock() = Some((bar1_phys, w, h, pitch));
+                }
+            }
+        }
+
+
         let hw_arch = arch_from_pmc_boot0(boot_0);
         serial::serial_print("[NVIDIA]   Architecture (PMC_BOOT_0): ");
         match hw_arch {

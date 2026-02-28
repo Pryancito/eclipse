@@ -1449,6 +1449,8 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
 
     let (fb_address, width, height, pitch) = if crate::boot::get_boot_info().framebuffer.base_address != 0
         && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
+        && crate::boot::get_boot_info().framebuffer.width > 0
+        && crate::boot::get_boot_info().framebuffer.height > 0
     {
         let k = &crate::boot::get_boot_info().framebuffer;
         let addr = if k.base_address >= crate::memory::PHYS_MEM_OFFSET {
@@ -1456,9 +1458,18 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         } else {
             k.base_address
         };
-        let pitch = k.pixels_per_scan_line * 4;
+        let pitch = if k.pixels_per_scan_line > 0 {
+            k.pixels_per_scan_line * 4
+        } else {
+            k.width * 4
+        };
         (addr, k.width, k.height, pitch)
     } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
+        (phys, w, h, p)
+    } else if let Some((phys, w, h, p)) = crate::nvidia::get_nvidia_fb_info() {
+        // NVIDIA hardware: EFI GOP not captured by bootloader; use BAR1 framebuffer
+        // detected during nvidia::init().  The display engine is already configured
+        // by the EFI GOP driver and continues scanning from this physical address.
         (phys, w, h, p)
     } else {
         return u64::MAX;
@@ -1697,26 +1708,46 @@ fn sys_virgl_submit_3d(ctx_id: u64, cmd_ptr: u64, cmd_len: u64) -> u64 {
 /// sys_map_framebuffer - Map framebuffer physical memory into process virtual space
 /// Returns the virtual address where framebuffer is mapped, or 0 on failure
 fn sys_map_framebuffer() -> u64 {
-    // Get framebuffer info
+    // Determine the framebuffer physical address:
+    // 1. EFI GOP from boot info (preferred for real hardware)
+    // 2. NVIDIA BAR1 fallback (when EFI GOP wasn't captured by the bootloader)
+    // 3. VirtIO primary display (QEMU/KVM)
     let fb_info_ptr = crate::boot::get_framebuffer_info();
-    if fb_info_ptr == 0 {
+    let (fb_phys, _fb_width, fb_height, fb_pitch) = if fb_info_ptr != 0 {
+        let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
+        let efi_ok = kernel_fb.base_address != 0
+            && kernel_fb.base_address != 0xDEAD_BEEF
+            && kernel_fb.width > 0
+            && kernel_fb.height > 0;
+        if efi_ok {
+            let phys = if kernel_fb.base_address >= crate::memory::PHYS_MEM_OFFSET {
+                kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
+            } else {
+                kernel_fb.base_address
+            };
+            let pitch = if kernel_fb.pixels_per_scan_line > 0 {
+                kernel_fb.pixels_per_scan_line
+            } else {
+                kernel_fb.width
+            };
+            (phys, kernel_fb.width, kernel_fb.height, pitch)
+        } else if let Some((phys, w, h, p)) = crate::nvidia::get_nvidia_fb_info() {
+            (phys, w, h, p / 4)
+        } else if let Some((phys, w, h, _p, _sz)) = crate::virtio::get_primary_virtio_display() {
+            (phys, w, h, w)
+        } else {
+            serial::serial_print("MAP_FB: No framebuffer source available\n");
+            return 0;
+        }
+    } else {
         serial::serial_print("MAP_FB: No framebuffer info available\n");
         return 0;
-    }
-    
-    let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
-    
-    // NUNCA usar dirección kernel - convertir a física para mapeo
-    let fb_phys = if kernel_fb.base_address >= crate::memory::PHYS_MEM_OFFSET {
-        kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
-    } else {
-        kernel_fb.base_address
     };
     
     // Calculate framebuffer size correctly
     // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
     // Map 2x size to support double buffering in display_service
-    let single_frame_size = (kernel_fb.pixels_per_scan_line * kernel_fb.height * 4) as u64;
+    let single_frame_size = (fb_pitch * fb_height * 4) as u64;
     let mut fb_size = single_frame_size * 2;
     
     // Align to 4KB (page size)
