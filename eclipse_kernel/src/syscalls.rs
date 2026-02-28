@@ -75,6 +75,7 @@ pub enum SyscallNumber {
     Connect = 104,
     Mkdir = 105,
     GetStorageDeviceCount = 50,
+    GetSystemStats = 51,
 }
 
 /// lseek whence values (POSIX standard)
@@ -97,6 +98,15 @@ pub struct SyscallStats {
     pub open_calls: u64,
     pub close_calls: u64,
     pub lseek_calls: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SystemStats {
+    pub uptime_ticks: u64,
+    pub idle_ticks: u64,
+    pub total_mem_frames: u64,
+    pub used_mem_frames: u64,
 }
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
@@ -258,13 +268,13 @@ pub extern "C" fn syscall_handler(
         48 => sys_virgl_resource_attach_backing(arg1, arg2, arg3),
         49 => sys_get_logs(arg1, arg2),
         50 => sys_get_storage_device_count(),
+        51 => sys_get_system_stats(arg1),
         100 => sys_socket(arg1, arg2, arg3),
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
         103 => sys_accept(arg1, arg2, arg3),
         104 => sys_connect(arg1, arg2, arg3),
         105 => sys_mkdir(arg1, arg2),
-        50 => sys_get_storage_device_count(),
         106 => sys_fstatat(arg1, arg2, arg3, arg4),
         107 => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
         108 => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
@@ -297,6 +307,30 @@ pub extern "C" fn syscall_handler(
 
     context.rax = final_ret;
     final_ret
+}
+
+/// sys_get_system_stats - Obtener métricas del sistema (uso de kernel eclipse-apps)
+fn sys_get_system_stats(stats_ptr: u64) -> u64 {
+    if stats_ptr == 0 || !is_user_pointer(stats_ptr, core::mem::size_of::<SystemStats>() as u64) {
+        return u64::MAX;
+    }
+
+    let sched_stats = crate::scheduler::get_stats();
+    
+    let (total_frames, used_frames) = crate::memory::get_memory_stats();
+
+    let stats = SystemStats {
+        uptime_ticks: sched_stats.total_ticks,
+        idle_ticks: sched_stats.idle_ticks,
+        total_mem_frames: total_frames,
+        used_mem_frames: used_frames,
+    };
+
+    unsafe {
+        *(stats_ptr as *mut SystemStats) = stats;
+    }
+
+    0
 }
 
 /// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
@@ -832,7 +866,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
 }
 
 /// Kernel half: get_service_binary returns pointers in this range
-const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
+const KERNEL_HALF: u64 = 0xFFFF_9000_0000_0000;
 
 /// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
 const LAST_EXEC_ERR_LEN: usize = 80;
@@ -1314,7 +1348,7 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(addr) => {
                     // Convertir dirección kernel a física si aplica (evita crash 0xffff8000...)
-                    let phys_addr: u64 = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                    let phys_addr: u64 = if (addr as u64) >= crate::memory::PHYS_MEM_OFFSET {
                         (addr as u64) - crate::memory::PHYS_MEM_OFFSET
                     } else {
                         addr as u64
@@ -1417,7 +1451,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
     {
         let k = &crate::boot::get_boot_info().framebuffer;
-        let addr = if k.base_address >= 0xFFFF_8000_0000_0000 {
+        let addr = if k.base_address >= crate::memory::PHYS_MEM_OFFSET {
             k.base_address - crate::memory::PHYS_MEM_OFFSET
         } else {
             k.base_address
@@ -1426,6 +1460,8 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         (addr, k.width, k.height, pitch)
     } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
         (phys, w, h, p)
+    } else if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        (phys, w, h, pitch)
     } else {
         return u64::MAX;
     };
@@ -1666,6 +1702,30 @@ fn sys_map_framebuffer() -> u64 {
     // Get framebuffer info
     let fb_info_ptr = crate::boot::get_framebuffer_info();
     if fb_info_ptr == 0 {
+        // Try NVIDIA BAR1 as fallback for real hardware without EFI GOP
+        if let Some((bar1_phys, width, height, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+            let single_frame_size = (pitch as u64) * (height as u64);
+            let mut fb_size = single_frame_size * 2;
+            fb_size = (fb_size + 0xFFF) & !0xFFF;
+            fb_size = fb_size.saturating_add(0x400000);
+            serial::serial_print("MAP_FB: Using NVIDIA BAR1 as framebuffer\n");
+            serial::serial_print("  Phys addr: ");
+            serial::serial_print_hex(bar1_phys);
+            serial::serial_print("\n  Size: ");
+            serial::serial_print_hex(fb_size);
+            serial::serial_print("\n");
+            let current_pid = crate::process::current_process_id();
+            let page_table_phys = crate::process::get_process_page_table(current_pid);
+            if page_table_phys == 0 {
+                serial::serial_print("MAP_FB: ERROR - Could not get process page table\n");
+                return 0;
+            }
+            let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, bar1_phys, fb_size);
+            serial::serial_print("MAP_FB: Done. Returning v=");
+            serial::serial_print_hex(vaddr);
+            serial::serial_print("\n");
+            return vaddr;
+        }
         serial::serial_print("MAP_FB: No framebuffer info available\n");
         return 0;
     }
@@ -1673,7 +1733,7 @@ fn sys_map_framebuffer() -> u64 {
     let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
     
     // NUNCA usar dirección kernel - convertir a física para mapeo
-    let fb_phys = if kernel_fb.base_address >= 0xFFFF_8000_0000_0000 {
+    let fb_phys = if kernel_fb.base_address >= crate::memory::PHYS_MEM_OFFSET {
         kernel_fb.base_address - crate::memory::PHYS_MEM_OFFSET
     } else {
         kernel_fb.base_address
@@ -1730,6 +1790,13 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
         serial::serial_print("[SYSCALL] pci_enum_devices - invalid parameters\n");
         return u64::MAX;
     }
+
+    // Validate the userspace buffer pointer before writing to it
+    let buf_byte_len = max_devices * 8 * core::mem::size_of::<u64>() as u64;
+    if !is_user_pointer(buffer_ptr, buf_byte_len) {
+        serial::serial_print("[SYSCALL] pci_enum_devices - invalid buffer pointer\n");
+        return u64::MAX;
+    }
     
     // Get devices from PCI subsystem
     let devices = if class_code == 0x04 {
@@ -1779,6 +1846,7 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     
     count as u64
 }
+
 
 /// sys_pci_read_config - Read PCI configuration space
 /// Args:
@@ -1970,7 +2038,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 // Try fmap first (e.g. /dev/fb0 framebuffer): map physical memory directly
                 if let Ok(addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
                     // NEVER pass kernel addresses to map_physical_range - convert to physical
-                    let phys_addr = if (addr as u64) >= 0xFFFF_8000_0000_0000 {
+                    let phys_addr = if (addr as u64) >= crate::memory::PHYS_MEM_OFFSET {
                         (addr as u64) - crate::memory::PHYS_MEM_OFFSET
                     } else {
                         addr as u64

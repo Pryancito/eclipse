@@ -243,6 +243,7 @@ const DISPLAY_BUFFER_RESOURCE_ID: u32 = 2;
 /// Display buffer phys/size for cache flush before DMA (userspace writes go to CPU cache)
 static DISPLAY_FB_PHYS: Mutex<u64> = Mutex::new(0);
 static DISPLAY_FB_SIZE: Mutex<usize> = Mutex::new(0);
+static DISPLAY_FB_PITCH: Mutex<usize> = Mutex::new(0);
 
 /// Primary VirtIO display (cuando no hay GOP): kernel-owned, display: y display service lo usan
 #[derive(Clone, Copy)]
@@ -2466,19 +2467,47 @@ pub fn init() {
             
             unsafe {
                 crate::pci::enable_device(&dev, true);
-                let bar0 = crate::pci::get_bar(&dev, 0);
                 
-                if (bar0 & 1) != 0 {
-                    let io_base = (bar0 & !0x3) as u16;
-                    if let Some(virt_dev) = VirtIOBlockDevice::new_from_pci_io(io_base) {
+                // Try BAR0 (standard) and potentially others if needed
+                for bar_idx in 0..6u8 {
+                    // Read raw BAR to detect I/O vs MMIO correctly (stripped address in get_bar is ambiguous)
+                    let raw_bar = crate::pci::pci_config_read_u32(dev.bus, dev.device, dev.function, 0x10 + (bar_idx * 4));
+                    if raw_bar == 0 { continue; }
+
+                    let is_io = (raw_bar & 1) != 0;
+                    let bar_addr = crate::pci::get_bar(&dev, bar_idx);
+                    
+                    serial::serial_print("[VirtIO]   Probing BAR");
+                    serial::serial_print_dec(bar_idx as u64);
+                    serial::serial_print("=");
+                    serial::serial_print_hex(bar_addr);
+                    serial::serial_print(if is_io { " (I/O)" } else { " (MMIO)" });
+                    serial::serial_print("\n");
+
+                    let mut block_dev = None;
+                    if is_io {
+                        // Legacy I/O path
+                        let io_base = bar_addr as u16;
+                        if io_base != 0 {
+                            block_dev = VirtIOBlockDevice::new_from_pci_io(io_base);
+                        }
+                    } else {
+                        // Modern MMIO path
+                        if bar_addr != 0 {
+                            let mmio_base = crate::memory::map_mmio_range(bar_addr, 0x1000); // Map 4KB for safety
+                            block_dev = VirtIOBlockDevice::new_from_pci(mmio_base);
+                        }
+                    }
+
+                    if let Some(virt_dev) = block_dev {
                         if virt_dev.init() {
-                            serial::serial_print("[VirtIO] Initialized device at ");
-                            serial::serial_print_hex(io_base as u64);
-                            serial::serial_print("\n");
-                            
+                            serial::serial_print("[VirtIO] Block device initialized successfully\n");
                             let arc_dev = alloc::sync::Arc::new(virt_dev);
                             BLOCK_DEVICES.lock().push(arc_dev.clone());
                             crate::storage::register_device(arc_dev);
+                            break; // Successfully initialized one BAR for this device
+                        } else {
+                            serial::serial_print("[VirtIO] Failed to initialize block device on this BAR\n");
                         }
                     }
                 }
@@ -2501,16 +2530,21 @@ pub fn init() {
 
                 // virtio-vga / virtio-vga-gl may have VGA at BAR0, virtio config at BAR2
                 for bar_idx in [0u8, 2u8] {
-                    let bar = crate::pci::get_bar(&dev, bar_idx);
+                    let raw_bar = crate::pci::pci_config_read_u32(dev.bus, dev.device, dev.function, 0x10 + (bar_idx * 4));
+                    if raw_bar == 0 { continue; }
+
+                    let is_io = (raw_bar & 1) != 0;
+                    let bar_addr = crate::pci::get_bar(&dev, bar_idx);
+
                     serial::serial_print("[VirtIO-GPU] BAR");
                     serial::serial_print_dec(bar_idx as u64);
                     serial::serial_print("=");
-                    serial::serial_print_hex(bar);
-                    serial::serial_print(if (bar & 1) != 0 { " (I/O)" } else { " (MMIO)" });
+                    serial::serial_print_hex(bar_addr);
+                    serial::serial_print(if is_io { " (I/O)" } else { " (MMIO)" });
                     serial::serial_print("\n");
 
-                    if (bar & 1) != 0 {
-                        let io_base = (bar & !0x3) as u16;
+                    if is_io {
+                        let io_base = bar_addr as u16;
                         if io_base == 0 { continue; }
                         let mut gpu = VirtIOGpuDevice::new_from_pci_io(io_base);
                         if gpu.init_legacy_pci() {
@@ -2532,13 +2566,10 @@ pub fn init() {
                             break;
                         }
                     } else {
-                        let bar_phys = bar & 0xFFFFFFFFFFFFFFF0u64;
-                        if bar_phys == 0 || bar_phys == 0xFFFFFFF0 || bar_phys == 0xFFFFFFFFFFFFFFF0 {
-                            continue;
-                        }
+                        if bar_addr == 0 { continue; }
                         // Map MMIO region (VirtIO needs ~0x200 bytes) before accessing
                         const VIRTIO_MMIO_SIZE: usize = 0x200;
-                        let mmio_base = crate::memory::map_mmio_range(bar_phys, VIRTIO_MMIO_SIZE);
+                        let mmio_base = crate::memory::map_mmio_range(bar_addr, VIRTIO_MMIO_SIZE);
                         let mut gpu = VirtIOGpuDevice::new_from_pci_mmio(mmio_base);
                         if gpu.init_mmio() {
                             serial::serial_print("[VirtIO-GPU] Initialized (MMIO BAR");
@@ -2852,6 +2883,7 @@ fn alloc_primary_display_buffer_internal() -> Option<(u64, u32, u32, usize)> {
     }
     *DISPLAY_FB_PHYS.lock() = buf_phys;
     *DISPLAY_FB_SIZE.lock() = size;
+    *DISPLAY_FB_PITCH.lock() = pitch as usize;
     Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch, size))
 }
 
@@ -2895,6 +2927,7 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
     }
     *DISPLAY_FB_PHYS.lock() = buf_phys;
     *DISPLAY_FB_SIZE.lock() = size;
+    *DISPLAY_FB_PITCH.lock() = pitch as usize;
     Some((buf_phys, DISPLAY_BUFFER_RESOURCE_ID, pitch, size))
 }
 
@@ -2904,23 +2937,21 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
         // Flush CPU cache so GPU DMA sees userspace writes
         if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
             let fb_phys = *DISPLAY_FB_PHYS.lock();
-            if fb_phys != 0 {
-                if let Some((_, _, _, pitch, _)) = get_primary_virtio_display() {
-                    let virt = crate::memory::phys_to_virt(fb_phys);
-                    let pitch = pitch as u64;
+            let pitch = *DISPLAY_FB_PITCH.lock() as u64;
+            if fb_phys != 0 && pitch > 0 {
+                let virt = crate::memory::phys_to_virt(fb_phys);
 
-                    // Optimized: only flush the dirty rectangle
-                    for row in y..(y + h) {
-                        let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
-                        let row_end = row_addr + (w as u64 * 4);
-                        let mut addr = row_addr & !63; // Align to cache line (64 bytes)
-                        while addr < row_end {
-                            unsafe { clflush(addr); }
-                            addr += 64;
-                        }
+                // Optimized: only flush the dirty rectangle
+                for row in y..(y + h) {
+                    let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
+                    let row_end = row_addr + (w as u64 * 4);
+                    let mut addr = row_addr & !63; // Align to cache line (64 bytes)
+                    while addr < row_end {
+                        unsafe { clflush(addr); }
+                        addr += 64;
                     }
-                    unsafe { sfence(); }
                 }
+                unsafe { sfence(); }
             }
         }
         let mut devices = GPU_DEVICES.lock();

@@ -147,9 +147,28 @@ build_eclipse_libc() {
         print_success "eclipse-libc compilado exitosamente"
         
         # Instalar en sysroot como libc.a
-        mkdir -p "$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
-        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.a" "$BASE_DIR/$BUILD_DIR/sysroot/usr/lib/libc.a"
-        print_status "Instalado en sysroot: $BASE_DIR/$BUILD_DIR/sysroot/usr/lib/libc.a"
+        local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
+        mkdir -p "$SYSROOT_LIB"
+        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.a" "$SYSROOT_LIB/libc.a"
+        print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a"
+
+        # Debilitar todos los símbolos globales en libc.a para evitar
+        # conflictos de símbolos duplicados cuando se enlaza junto con
+        # libstd (que también define __rust_alloc, etc.)
+        if command -v objcopy &>/dev/null; then
+            objcopy --weaken "$SYSROOT_LIB/libc.a"
+            print_status "Símbolos de libc.a debilitados con objcopy --weaken"
+        elif command -v llvm-objcopy &>/dev/null; then
+            llvm-objcopy --weaken-all "$SYSROOT_LIB/libc.a"
+            print_status "Símbolos de libc.a debilitados con llvm-objcopy"
+        else
+            print_error "objcopy no encontrado; el enlace de eclipsefs-cli puede fallar por símbolos duplicados"
+        fi
+
+        # Crear stub vacío de libgcc_s para satisfacer -lgcc_s sin duplicar símbolos
+        rm -f "$SYSROOT_LIB/libgcc_s.a"
+        ar crs "$SYSROOT_LIB/libgcc_s.a"
+        print_status "Stub vacío libgcc_s.a creado en sysroot"
     else
         print_error "Error al compilar eclipse-libc"
         cd ..
@@ -1560,6 +1579,8 @@ main() {
     build_eclipsefs_lib
     build_mkfs_eclipsefs
     build_populate_eclipsefs
+    prepare_sysroot
+    build_eclipse_libc
     build_eclipsefs_cli
     build_eclipse_init
     build_userspace_services
@@ -1567,8 +1588,6 @@ main() {
     build_bootloader
     build_installer
     build_systemd
-    prepare_sysroot
-    build_eclipse_libc
     build_sidewind_project
     build_userland
     

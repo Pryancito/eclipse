@@ -35,6 +35,7 @@ pub struct BootInfo {
 pub enum FbSource {
     VirtIO,
     Uefi,
+    Nvidia,
 }
 
 /// VirtIO GPU resource ID for display buffer (must match virtio.rs)
@@ -95,7 +96,7 @@ pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
     // 1. GOP framebuffer from bootloader (UEFI) - primary for real hardware
     let fi = unsafe { &BOOT_INFO.as_ref()?.framebuffer };
     if fi.base_address != 0 && fi.base_address != 0xDEADBEEF && fi.width > 0 && fi.height > 0 {
-        let phys = if fi.base_address >= 0xFFFF_8000_0000_0000 {
+        let phys = if fi.base_address >= PHYS_MEM_OFFSET {
             fi.base_address.saturating_sub(PHYS_MEM_OFFSET)
         } else {
             fi.base_address
@@ -107,6 +108,12 @@ pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
     if let Some((phys, w, h, pitch, _size)) = crate::virtio::get_primary_virtio_display() {
         if phys != 0 && w > 0 && h > 0 {
             return Some((phys, w, h, pitch, FbSource::VirtIO));
+        }
+    }
+    // 3. NVIDIA BAR1 (linear VRAM aperture) – real hardware without EFI GOP
+    if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        if phys != 0 && w > 0 && h > 0 {
+            return Some((phys, w, h, pitch, FbSource::Nvidia));
         }
     }
     None

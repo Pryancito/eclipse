@@ -16,6 +16,16 @@ pub struct SmithayState {
     pub counter: u64,
     /// Eventos Input recibidos (para debug: si se congela el ratón, ver si este valor deja de subir).
     pub input_event_count: u64,
+    pub prev_stats: Option<eclipse_libc::SystemStats>,
+    pub last_metrics_update: u64,
+    pub cpu_usage: f32,
+    pub mem_usage: f32,
+    pub network_pid: Option<u32>,
+    pub net_rx: u64,
+    pub net_tx: u64,
+    pub prev_net_rx: u64,
+    pub prev_net_tx: u64,
+    pub net_usage: f32,
 }
 
 impl SmithayState {
@@ -37,6 +47,16 @@ impl SmithayState {
             surfaces,
             counter: 0,
             input_event_count: 0,
+            prev_stats: None,
+            last_metrics_update: 0,
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            network_pid: None,
+            net_rx: 0,
+            net_tx: 0,
+            prev_net_rx: 0,
+            prev_net_tx: 0,
+            net_usage: 0.0,
         })
     }
 
@@ -68,6 +88,10 @@ impl SmithayState {
                             &mut self.input
                         );
                     }
+                    CompositorEvent::NetStats(rx, tx) => {
+                        self.net_rx = rx;
+                        self.net_tx = tx;
+                    }
                     _ => {} // Handle Wayland/X11 if needed
                 }
                 count += 1;
@@ -96,6 +120,49 @@ impl SmithayState {
 
         let target_search_y = if self.input.search_active { 0.0 } else { -(fb_h as f32 / 2.0) };
         self.input.search_curr_y += (target_search_y - self.input.search_curr_y) * 0.15;
+
+        // Actualizar métricas cada 30 ticks (~0.5s si es 60fps)
+        if self.counter % 30 == 0 {
+            let mut current = eclipse_libc::SystemStats {
+                uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
+            };
+            unsafe {
+                if eclipse_libc::get_system_stats(&mut current) == 0 {
+                    if let Some(prev) = self.prev_stats {
+                        let total_delta = current.uptime_ticks.saturating_sub(prev.uptime_ticks);
+                        let idle_delta = current.idle_ticks.saturating_sub(prev.idle_ticks);
+                        
+                        if total_delta > 0 {
+                            let busy_delta = total_delta.saturating_sub(idle_delta);
+                            self.cpu_usage = (busy_delta as f32) / (total_delta as f32);
+                        }
+                    }
+                    
+                    if current.total_mem_frames > 0 {
+                        self.mem_usage = (current.used_mem_frames as f32) / (current.total_mem_frames as f32);
+                    }
+                    
+                    self.prev_stats = Some(current);
+                }
+            }
+            
+            // Stats de red
+            if let Some(pid) = self.network_pid {
+                let _ = eclipse_libc::send(pid, 0x08, eclipse_ipc::types::GET_NET_STATS_MSG); // MSG_TYPE_NETWORK = 0x08
+                
+                let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
+                let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
+                let total_delta = rx_delta + tx_delta;
+                
+                // Simulación sencilla de carga de red (asumiendo max 5MB/s)
+                let max_bytes_per_sec = 5_000_000.0;
+                let bytes_per_sec = (total_delta as f32) * 2.0; // 30 ticks = 0.5s
+                self.net_usage = (bytes_per_sec / max_bytes_per_sec).clamp(0.0, 1.0);
+                
+                self.prev_net_rx = self.net_rx;
+                self.prev_net_tx = self.net_tx;
+            }
+        }
     }
 
     fn handle_requests(&mut self) {
@@ -249,7 +316,7 @@ impl SmithayState {
                     self.input.cursor_y
                 );
             } else {
-                render::draw_dashboard(&mut self.backend.fb, self.counter);
+                render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage);
             }
 
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }

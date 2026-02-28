@@ -83,6 +83,7 @@ pub const SYS_VIRGL_ALLOC_BACKING: u64 = 47;
 pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
 pub const SYS_GET_STORAGE_DEVICE_COUNT: u64 = 50;
+pub const SYS_GET_SYSTEM_STATS: u64 = 51;
 pub const SYS_GET_LOGS: u64 = 49;
 /// Fast path IPC: mensaje entregado en registros, sin buffer en memoria
 pub const SYS_RECEIVE_FAST: u64 = 200;
@@ -644,9 +645,21 @@ pub fn get_storage_device_count() -> usize {
     unsafe { syscall0(SYS_GET_STORAGE_DEVICE_COUNT) as usize }
 }
 
-/// Get kernel logs (latest 3 lines) - for HUD.
 pub fn get_logs(buf: &mut [u8]) -> usize {
     unsafe { syscall2(SYS_GET_LOGS, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SystemStats {
+    pub uptime_ticks: u64,
+    pub idle_ticks: u64,
+    pub total_mem_frames: u64,
+    pub used_mem_frames: u64,
+}
+
+pub unsafe fn get_system_stats(stats: *mut SystemStats) -> i32 {
+    syscall1(SYS_GET_SYSTEM_STATS, stats as u64) as i32
 }
 
 /// PCI device information structure

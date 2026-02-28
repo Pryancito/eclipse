@@ -44,3 +44,4 @@ pub const SYS_ACCEPT: usize = 103;
 pub const SYS_CONNECT: usize = 104;
 pub const SYS_MKDIR: usize = 105;
 pub const SYS_FSTATAT: usize = 106;
+pub const SYS_GET_SYSTEM_STATS: usize = 51;

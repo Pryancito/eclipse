@@ -114,6 +114,9 @@ pub extern "C" fn _start() -> ! {
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem ready.");
 
-    unsafe { let _ = spawn_compositor(); }
-    loop { yield_cpu(); }
+    let _ = unsafe { spawn_compositor() };
+
+    loop {
+        yield_cpu();
+    }
 }

@@ -22,7 +22,7 @@ use micromath::F32Ext;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, MAX_SURFACE_DIM};
 
 
-pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_9000_0000_0000;
 
 pub const STROKE_COLORS: [Rgb888; 5] = [
     colors::ACCENT_BLUE,
@@ -204,6 +204,9 @@ impl FramebufferState {
                     self.front_addr as *mut u8,
                     size_bytes,
                 );
+                // sfence flushes the Write-Combining buffer so the GOP framebuffer
+                // update is visible to the display controller on real NVIDIA hardware.
+                core::arch::asm!("sfence", options(nostack, preserves_flags));
             }
             true
         } else {
@@ -323,7 +326,7 @@ impl OriginDimensions for FramebufferState {
     }
 }
 
-pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
+pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64, cpu: f32, mem: f32, net: f32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
@@ -337,13 +340,29 @@ pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64) {
     let py = (h - p_h) / 2;
     let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
     let _ = main_panel.draw(fb);
-    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: 0.45 + (counter as f32 / 50.0).sin() * 0.1, label: "CARGA CPU" };
+    
+    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };
     let _ = g1.draw(fb);
-    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: 0.72 + (counter as f32 / 80.0).cos() * 0.05, label: "MEMORIA VRAM" };
+    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: mem, label: "MEMORIA RAM" };
     let _ = g2.draw(fb);
-    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: 0.15 + (counter as f32 / 30.0).sin() * 0.05, label: "RED UP" };
+    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: net, label: "RED INT" };
     let _ = g3.draw(fb);
-    let term_lines: &[&str] = &[ "eclipse@os:~$ sysinfo --live", "CPU: 45% | MEM: 72% | NET: 15%", "> system status nominal" ];
+
+    let mut cpu_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}%", (cpu * 100.0) as u32));
+    let mut mem_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut mem_line, format_args!("MEM: {}%", (mem * 100.0) as u32));
+    
+    let mut net_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut net_line, format_args!("NET: {}%", (net * 100.0) as u32));
+    
+    let term_lines: &[&str] = &[ 
+        "eclipse@os:~$ sysinfo --live", 
+        &cpu_line,
+        &mem_line,
+        &net_line,
+        "> system status nominal" 
+    ];
     let term = Terminal { position: main_panel.position + Point::new(30, 240), size: Size::new(p_w as u32 - 60, 130), lines: term_lines };
     let _ = term.draw(fb);
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
@@ -688,25 +707,33 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let _ = ui::draw_grid(fb, Rgb888::new(18, 28, 55), 48, Point::zero());
     let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
     let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
-    let icon_color = Rgb888::new(100, 200, 255);
-    let hex_size = 50;
-    let positions = [(center + Point::new(-380, -120), icons::SYSTEM, "SISTEMA", Point::new(-35, 85)), (center + Point::new(-380, 120), icons::APPS, "APLICACIONES", Point::new(-60, 85)), (center + Point::new(380, -120), icons::FILES, "ARCHIVOS", Point::new(-40, 85)), (center + Point::new(380, 120), icons::NETWORK, "RED", Point::new(-15, 85))];
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-    for (p, icon, label, label_off) in positions {
-        let _ = ui::draw_glowing_hexagon(fb, p, hex_size, icon_color);
-        let _ = ui::draw_standard_icon(fb, p, icon);
-        let _ = Text::new(label, p + label_off, label_style).draw(fb);
+    // Menú Lateral Izquierdo (Icons)
+    let icon_types = [
+        ui::TechCardIconType::ControlPanel,
+        ui::TechCardIconType::System,
+        ui::TechCardIconType::Apps,
+        ui::TechCardIconType::Files,
+        ui::TechCardIconType::Network,
+    ];
+
+    let sidebar_width = (fb.info.width as i32 / 10).clamp(140, 220);
+    let sidebar_x = 0; 
+    let icon_slot_h = h / icon_types.len() as i32;
+    let sidebar_y_start = 0;
+    
+    // Sidebar Vertical Bar removed as requested
+
+    for (i, icon_type) in icon_types.iter().enumerate() {
+        let py = sidebar_y_start + (i as i32 * icon_slot_h);
+        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
+                 && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
+        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
     }
     // HUD Superior
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
     let hud_bg = colors::GLASS_PANEL;
 
-    let _ = Rectangle::new(Point::new(15, 15), Size::new(240, 50)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
-    let _ = Line::new(Point::new(15, 15), Point::new(35, 15)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(15, 15), Point::new(15, 35)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(255, 65), Point::new(235, 65)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(255, 65), Point::new(255, 45)).into_styled(hud_line_style).draw(fb);
-    let _ = Text::new("APLICACIONES ACTIVAS", Point::new(30, 45), label_style).draw(fb);
 
     let box_w = 400;
     let rx = w - box_w - 15;
@@ -735,27 +762,7 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
         }
     }
 
-    let taskbar_y = h - 44;
-    let taskbar = Taskbar { width: fb.info.width as u32, y: taskbar_y as i32, active_app: None };
-    let _ = taskbar.draw(fb);
-
-    let help_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-    let _ = Text::new("SUPER: Dash | SUPER+L: Lock | SUPER+V: Notifs", Point::new(w - 450, h - 15), help_style).draw(fb);
-
-    let mut min_count = 0;
-    for i in 0..window_count {
-        if windows[i].content != WindowContent::None && windows[i].minimized {
-            let p = Point::new(100 + (min_count % 3) * 120, 250 + (min_count / 3) * 150);
-            let _ = ui::draw_glowing_hexagon(fb, p, 35, colors::ACCENT_BLUE);
-            match windows[i].content {
-                WindowContent::External(_) => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::APPS); },
-                _ => { let _ = ui::draw_hexagonal_icon(fb, p, 32, icons::SYSTEM); },
-            }
-            let label = if let WindowContent::External(_) = windows[i].content { "APP" } else { "DEMO" };
-            let _ = Text::new(label, p + Point::new(-15, 60), label_style).draw(fb);
-            min_count += 1;
-        }
-    }
+    // Taskbar and help text removed as requested
 }
 
 pub fn draw_cursor(fb: &mut FramebufferState, pos: Point) {

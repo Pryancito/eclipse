@@ -15,6 +15,11 @@ pub const TAG_INPT: &[u8; 4] = b"INPT";
 pub const TAG_SWND: &[u8; 4] = b"SWND";
 pub const GET_INPUT_PID_MSG: &[u8; 13] = b"GET_INPUT_PID";
 
+pub const TAG_NETW: &[u8; 4] = b"NETW";
+pub const GET_NETWORK_PID_MSG: &[u8; 15] = b"GET_NETWORK_PID";
+pub const TAG_NSTA: &[u8; 4] = b"NSTA";
+pub const GET_NET_STATS_MSG: &[u8; 13] = b"GET_NET_STATS";
+
 /// Construye el payload de suscripción (SUBS + self_pid little-endian).
 pub fn build_subscribe_payload(self_pid: u32) -> [u8; 8] {
     let mut buf = [0u8; 8];
@@ -52,6 +57,18 @@ pub enum EclipseMessage {
 
     /// Respuesta al GetInputPid con el PID real.
     InputPidResponse { pid: u32 },
+
+    /// Control: solicitud del PID del network_service.
+    GetNetworkPid,
+
+    /// Respuesta al GetNetworkPid con el PID real.
+    NetworkPidResponse { pid: u32 },
+
+    /// Control: solicitud de estadisticas de red.
+    GetNetStats,
+
+    /// Respuesta al GetNetStats con rx y tx.
+    NetStatsResponse { rx: u64, tx: u64 },
 
     /// Mensaje desconocido/raw (fallback para extensibilidad futura).
     Raw { data: [u8; MAX_MSG_LEN], len: usize, from: u32 },
@@ -98,6 +115,29 @@ mod impl_parse {
             pid_bytes.copy_from_slice(&buf[4..8]);
             return Some(EclipseMessage::InputPidResponse {
                 pid: u32::from_le_bytes(pid_bytes),
+            });
+        }
+        if len >= 15 && buf[0..15] == *GET_NETWORK_PID_MSG {
+            return Some(EclipseMessage::GetNetworkPid);
+        }
+        if len >= 8 && buf[0..4] == *TAG_NETW {
+            let mut pid_bytes = [0u8; 4];
+            pid_bytes.copy_from_slice(&buf[4..8]);
+            return Some(EclipseMessage::NetworkPidResponse {
+                pid: u32::from_le_bytes(pid_bytes),
+            });
+        }
+        if len >= 13 && buf[0..13] == *GET_NET_STATS_MSG {
+            return Some(EclipseMessage::GetNetStats);
+        }
+        if len >= 20 && buf[0..4] == *TAG_NSTA {
+            let mut rx_bytes = [0u8; 8];
+            let mut tx_bytes = [0u8; 8];
+            rx_bytes.copy_from_slice(&buf[4..12]);
+            tx_bytes.copy_from_slice(&buf[12..20]);
+            return Some(EclipseMessage::NetStatsResponse {
+                rx: u64::from_le_bytes(rx_bytes),
+                tx: u64::from_le_bytes(tx_bytes),
             });
         }
         if len == core::mem::size_of::<InputEvent>() {

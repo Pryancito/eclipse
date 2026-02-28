@@ -133,7 +133,7 @@ pub fn update(new_x: u32, new_y: u32) {
     }
 
     // Resolve physical → kernel virtual address
-    let fb_phys = if fi.base_address >= 0xFFFF_8000_0000_0000 {
+    let fb_phys = if fi.base_address >= PHYS_MEM_OFFSET {
         fi.base_address - PHYS_MEM_OFFSET
     } else {
         fi.base_address

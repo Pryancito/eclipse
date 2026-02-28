@@ -6,11 +6,11 @@ extern crate eclipse_syscall;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use eclipse_libc::{println, getpid, yield_cpu};
+use eclipse_libc::{println, getpid, yield_cpu, sleep_ms};
 
 use smithay_app::state::SmithayState;
 use smithay_app::compositor::{ShellWindow, WindowContent};
-use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service};
+use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service, query_network_service_pid};
 
 const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB
 #[repr(align(4096))]
@@ -52,15 +52,10 @@ pub extern "C" fn _start() -> ! {
     
     state.backend.fb.pre_render_background();
 
-    // Initial demo window
-    state.space.map_window(ShellWindow {
-        x: 100, y: 100, w: 400, h: 300,
-        curr_x: (100 + 400/2) as f32, curr_y: (100 + 300/2) as f32, curr_w: 0.0, curr_h: 0.0,
-        minimized: false, maximized: false, closing: false, stored_rect: (100, 100, 400, 300),
-        workspace: 0, content: WindowContent::InternalDemo,
-    });
+    // Initial demo window removed as requested
 
     if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
+    if let Some(net_pid) = query_network_service_pid() { state.network_pid = Some(net_pid); }
 
     loop {
         // Drenar todo el input pendiente antes de update/render para no llenar el mailbox del kernel
@@ -75,11 +70,10 @@ pub extern "C" fn _start() -> ! {
 
         if state.counter % 1000 == 0 {
             let used = HEAP_PTR.load(Ordering::Relaxed);
-            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs | Input {} ev | recv {}",
-                used, state.backend.ipc.message_count, state.input_event_count, state.backend.ipc.recv_attempts);
+            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs.",
+                used, state.backend.ipc.message_count);
         }
 
-        if state.counter % 300 == 0 { for _ in 0..10 { yield_cpu(); } }
-        else { yield_cpu(); }
+        yield_cpu();
     }
 }

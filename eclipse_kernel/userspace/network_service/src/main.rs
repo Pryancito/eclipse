@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, send, pci_enum_devices, PciDeviceInfo, receive};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -373,8 +373,19 @@ pub extern "C" fn _start() -> ! {
     let mut bytes_tx = 0u64;
     let mut connections = 0u64;
     
+    let mut ipc_buffer = [0u8; 64];
+    
     loop {
         heartbeat_counter += 1;
+        
+        let (len, sender) = receive(&mut ipc_buffer);
+        if len >= 13 && &ipc_buffer[..13] == b"GET_NET_STATS" {
+            let mut response = [0u8; 20];
+            response[0..4].copy_from_slice(b"NSTA");
+            response[4..12].copy_from_slice(&bytes_rx.to_le_bytes());
+            response[12..20].copy_from_slice(&bytes_tx.to_le_bytes());
+            let _ = send(sender, 0x08, &response);
+        }
         
         // In a real implementation, this would:
         // - Read packets from network card DMA buffers
