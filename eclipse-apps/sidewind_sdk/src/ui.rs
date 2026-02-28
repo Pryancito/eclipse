@@ -23,6 +23,12 @@ pub mod icons {
     pub const BTN_MIN: &[u8] = include_bytes!("../assets/btn_min.bin");
     pub const BTN_MAX: &[u8] = include_bytes!("../assets/btn_max.bin");
     pub const LOGO: &[u8] = include_bytes!("../assets/logo.bin");
+
+    pub const SYSTEM_HOVER: &[u8] = include_bytes!("../assets/system_hover.bin");
+    pub const APPS_HOVER: &[u8] = include_bytes!("../assets/apps_hover.bin");
+    pub const FILES_HOVER: &[u8] = include_bytes!("../assets/files_hover.bin");
+    pub const NETWORK_HOVER: &[u8] = include_bytes!("../assets/network_hover.bin");
+    pub const LOGO_HOVER: &[u8] = include_bytes!("../assets/logo_hover.bin");
 }
 
 pub const STANDARD_ICON_SIZE: u32 = 64;
@@ -346,6 +352,86 @@ where
             let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target)?;
         }
     }
+    Ok(())
+}
+
+/// Procedural "Mathematical GIF" for sidebar icons.
+/// Combines wave distortion, orbital tech-pixels, and dynamic scanlines.
+pub fn draw_animated_tech_icon<D>(
+    target: &mut D,
+    center: Point,
+    radius: i32,
+    raw_data: &[u8],
+    counter: u64,
+    is_logo: bool,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb888>,
+{
+    let src_size: i32 = if is_logo { 600 } else { 64 };
+    const TRANSPARENT_THRESH: u8 = 24;
+    
+    let time = counter as f32 * 0.15;
+    
+    // 1. Procedural Wave Distortion & Scaling
+    let scale_mod = 1.0 + 0.03 * (time * 0.5).sin();
+    let current_radius = (radius as f32 * scale_mod) as i32;
+    let current_r2 = current_radius * current_radius;
+
+    for oy in -current_radius..=current_radius {
+        for ox in -current_radius..=current_radius {
+            if ox * ox + oy * oy > current_r2 {
+                continue;
+            }
+            
+            // Mathematical distortion: Wave effect on UV coordinates
+            let wave_x = (oy as f32 * 0.1 + time).sin() * 1.5;
+            let wave_y = (ox as f32 * 0.1 + time * 1.2).cos() * 1.5;
+            
+            let ux = ((ox as f32 + wave_x + current_radius as f32) * src_size as f32) / (2.0 * current_radius as f32);
+            let uy = ((oy as f32 + wave_y + current_radius as f32) * src_size as f32) / (2.0 * current_radius as f32);
+            
+            let sx = (ux as i32).clamp(0, src_size - 1);
+            let sy = (uy as i32).clamp(0, src_size - 1);
+            
+            let idx = (sy as usize * src_size as usize + sx as usize) * 3;
+            if idx + 2 >= raw_data.len() { continue; }
+            
+            let mut r = raw_data[idx];
+            let mut g = raw_data[idx + 1];
+            let mut b = raw_data[idx + 2];
+            
+            if r < TRANSPARENT_THRESH && g < TRANSPARENT_THRESH && b < TRANSPARENT_THRESH {
+                continue;
+            }
+
+            // 2. Mathematical Scanline Effect (moving brightness boost)
+            let scan_y = (time * 20.0) as i32 % (2 * current_radius);
+            let dist_to_scan = (oy + current_radius - scan_y).abs();
+            if dist_to_scan < 3 {
+                let boost = (3 - dist_to_scan) * 30;
+                r = r.saturating_add(boost as u8);
+                g = g.saturating_add(boost as u8);
+                b = b.saturating_add((boost * 2) as u8); // Blueish tint for tech-scan
+            }
+
+            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target)?;
+        }
+    }
+
+    // 3. Technical Orbiters (small glowing pixels in elliptical paths)
+    for i in 0..3 {
+        let orb_time = time * (1.0 + i as f32 * 0.2) + (i as f32 * 2.1);
+        let orb_radius_x = radius as f32 + 5.0 + (i as f32 * 3.0);
+        let orb_radius_y = radius as f32 * 0.7 + (i as f32 * 2.0);
+        
+        let ox = (orb_time.cos() * orb_radius_x) as i32;
+        let oy = (orb_time.sin() * orb_radius_y) as i32;
+        
+        let color = if i == 0 { colors::ACCENT_CYAN } else if i == 1 { colors::ACCENT_VIOLET } else { colors::WHITE };
+        let _ = draw_glowing_circle(target, center + Point::new(ox, oy), 2, color)?;
+    }
+
     Ok(())
 }
 
@@ -1639,12 +1725,15 @@ pub fn draw_tech_card_icon<D>(
     position: Point,
     icon_type: TechCardIconType,
     hover: bool,
+    width: i32,
+    height: i32,
+    counter: u64,
 ) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb888>,
 {
-    let w = 120;
-    let h = 130;
+    let w = width;
+    let h = height;
     let rect = Rectangle::new(position, Size::new(w as u32, h as u32));
     
     // Main card body (no fill, no stroke as requested)
@@ -1660,18 +1749,22 @@ where
     let accent = if hover { Rgb888::new(220, 240, 255) } else { accent_base };
 
     let (title, icon_data) = match icon_type {
-        TechCardIconType::ControlPanel => ("I ESCRITORIO", icons::LOGO),
-        TechCardIconType::System => ("I SISTEMA CENTRAL", icons::SYSTEM),
-        TechCardIconType::Apps => ("I APLICACIONES", icons::APPS),
-        TechCardIconType::Files => ("I ARCHIVO DE DATOS", icons::FILES),
-        TechCardIconType::Network => ("I ESTADO DE LA RED", icons::NETWORK),
+        TechCardIconType::ControlPanel => ("I ESCRITORIO", if hover { icons::LOGO_HOVER } else { icons::LOGO }),
+        TechCardIconType::System => ("I SISTEMA CENTRAL", if hover { icons::SYSTEM_HOVER } else { icons::SYSTEM }),
+        TechCardIconType::Apps => ("I APLICACIONES", if hover { icons::APPS_HOVER } else { icons::APPS }),
+        TechCardIconType::Files => ("I ARCHIVO DE DATOS", if hover { icons::FILES_HOVER } else { icons::FILES }),
+        TechCardIconType::Network => ("I ESTADO DE LA RED", if hover { icons::NETWORK_HOVER } else { icons::NETWORK }),
     };
 
-    let title_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE);
-    let _ = Text::new(title, position + Point::new(10, 15), title_style).draw(target)?;
+    let title_style = if w > 140 {
+        MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::WHITE)
+    } else {
+        MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE)
+    };
+    let _ = Text::new(title, position + Point::new(8, 18), title_style).draw(target)?;
 
     // Corner decorations (brackets)
-    let bracket_len = 12;
+    let bracket_len = (w / 8).max(10);
     let bracket_style = PrimitiveStyleBuilder::new().stroke_color(accent).stroke_width(if hover { 2 } else { 1 }).build();
     let tl = position;
     let br = position + Point::new(w, h);
@@ -1680,18 +1773,21 @@ where
     let _ = Line::new(br - Point::new(bracket_len, 1), br - Point::new(1, 1)).into_styled(bracket_style).draw(target)?;
     let _ = Line::new(br - Point::new(1, bracket_len), br - Point::new(1, 1)).into_styled(bracket_style).draw(target)?;
 
-    // Central Icon
-    let icon_center = position + Point::new(w / 2, 65);
-    // Using 600x600 logo for Control Panel if needed, or normal 64x64 icons
-    if icon_type == TechCardIconType::ControlPanel {
-         let _ = draw_circular_logo_600(target, icon_center, 40, icon_data)?;
+    // Central Icon - AGGRESSIVE SCALING TO 100% WIDTH/HEIGHT
+    let icon_center = position + Point::new(w / 2, h / 2);
+    let icon_radius = ((w / 2) - 8).min((h / 2) - 30).max(30); 
+
+    if hover {
+         let _ = draw_animated_tech_icon(target, icon_center, icon_radius, icon_data, counter, icon_type == TechCardIconType::ControlPanel)?;
     } else {
-         let _ = draw_circular_icon(target, icon_center, 40, icon_data)?;
+        if icon_type == TechCardIconType::ControlPanel {
+             let _ = draw_circular_logo_600(target, icon_center, icon_radius, icon_data)?;
+        } else {
+             let _ = draw_circular_icon(target, icon_center, icon_radius, icon_data)?;
+        }
     }
 
-    // Extra decoration lines (tech detail)
-    let line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLOW_DIM).stroke_width(1).build();
-    let _ = Line::new(position + Point::new(10, 110), position + Point::new(w - 10, 110)).into_styled(line_style).draw(target)?;
+    // Extra decoration lines removed as requested
     
     // Small label at bottom of card
     let bottom_label = match icon_type {
@@ -1701,8 +1797,12 @@ where
         TechCardIconType::Files => "ARCHIVO DE DATOS",
         TechCardIconType::Network => "ESTADO DE LA RED",
     };
-    let bottom_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, accent);
-    let _ = Text::new(bottom_label, position + Point::new(10, h - 8), bottom_style).draw(target)?;
+    let bottom_style = if w > 140 {
+        MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, accent)
+    } else {
+        MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, accent)
+    };
+    let _ = Text::new(bottom_label, position + Point::new(8, h - 10), bottom_style).draw(target)?;
 
     Ok(())
 }

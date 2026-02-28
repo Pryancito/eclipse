@@ -709,9 +709,6 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
     // Menú Lateral Izquierdo (Icons)
-    let sidebar_x = 25;
-    let sidebar_y_start = 120;
-    let spacing = 145;
     let icon_types = [
         ui::TechCardIconType::ControlPanel,
         ui::TechCardIconType::System,
@@ -720,14 +717,18 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
         ui::TechCardIconType::Network,
     ];
 
-    let icon_w = 200; // Ancho aproximado del area de hover
-    let icon_h = 130;
+    let sidebar_width = (fb.info.width as i32 / 10).clamp(140, 220);
+    let sidebar_x = 0; 
+    let icon_slot_h = h / icon_types.len() as i32;
+    let sidebar_y_start = 0;
+    
+    // Sidebar Vertical Bar removed as requested
 
     for (i, icon_type) in icon_types.iter().enumerate() {
-        let py = sidebar_y_start + (i as i32 * spacing);
-        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + icon_w 
-                 && _cursor_y >= py && _cursor_y <= py + icon_h;
-        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover);
+        let py = sidebar_y_start + (i as i32 * icon_slot_h);
+        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
+                 && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
+        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
     }
     // HUD Superior
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
