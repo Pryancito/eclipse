@@ -1712,11 +1712,12 @@ fn sys_map_framebuffer() -> u64 {
     // 1. EFI GOP from boot info (preferred for real hardware)
     // 2. NVIDIA BAR1 fallback (when EFI GOP wasn't captured by the bootloader)
     // 3. VirtIO primary display (QEMU/KVM)
+    // fb_pitch is ALWAYS bytes per scanline across all paths.
     let fb_info_ptr = crate::boot::get_framebuffer_info();
-    let (fb_phys, _fb_width, fb_height, fb_pitch) = if fb_info_ptr != 0 {
+    let (fb_phys, fb_height, fb_pitch_bytes) = if fb_info_ptr != 0 {
         let kernel_fb = unsafe { &*(fb_info_ptr as *const crate::boot::FramebufferInfo) };
         let efi_ok = kernel_fb.base_address != 0
-            && kernel_fb.base_address != 0xDEAD_BEEF
+            && kernel_fb.base_address != 0xDEADBEEF
             && kernel_fb.width > 0
             && kernel_fb.height > 0;
         if efi_ok {
@@ -1725,16 +1726,18 @@ fn sys_map_framebuffer() -> u64 {
             } else {
                 kernel_fb.base_address
             };
-            let pitch = if kernel_fb.pixels_per_scan_line > 0 {
-                kernel_fb.pixels_per_scan_line
+            // pitch in bytes: use pixels_per_scan_line * 4 when available
+            let pitch_bytes = if kernel_fb.pixels_per_scan_line > 0 {
+                kernel_fb.pixels_per_scan_line * 4
             } else {
-                kernel_fb.width
+                kernel_fb.width * 4
             };
-            (phys, kernel_fb.width, kernel_fb.height, pitch)
-        } else if let Some((phys, w, h, p)) = crate::nvidia::get_nvidia_fb_info() {
-            (phys, w, h, p / 4)
+            (phys, kernel_fb.height, pitch_bytes)
+        } else if let Some((phys, _w, h, p)) = crate::nvidia::get_nvidia_fb_info() {
+            // p is already width * 4 (bytes per scanline)
+            (phys, h, p)
         } else if let Some((phys, w, h, _p, _sz)) = crate::virtio::get_primary_virtio_display() {
-            (phys, w, h, w)
+            (phys, h, w * 4)
         } else {
             serial::serial_print("MAP_FB: No framebuffer source available\n");
             return 0;
@@ -1744,11 +1747,9 @@ fn sys_map_framebuffer() -> u64 {
         return 0;
     };
     
-    // Calculate framebuffer size correctly
-    // pixels_per_scan_line * height * 4 bytes per pixel (32bpp)
-    // Map 2x size to support double buffering in display_service
-    let single_frame_size = (fb_pitch * fb_height * 4) as u64;
-    let mut fb_size = single_frame_size * 2;
+    // Calculate framebuffer size: pitch_bytes * height * 2 frames (double-buffered)
+    let single_frame_size = (fb_pitch_bytes as u64).saturating_mul(fb_height as u64);
+    let mut fb_size = single_frame_size.saturating_mul(2);
     
     // Align to 4KB (page size)
     fb_size = (fb_size + 0xFFF) & !0xFFF;

@@ -578,7 +578,7 @@ pub fn init() {
         {
             let boot_fb = &crate::boot::get_boot_info().framebuffer;
             let efi_fb_missing = boot_fb.base_address == 0
-                || boot_fb.base_address == 0xDEAD_BEEF;
+                || boot_fb.base_address == 0xDEADBEEF;
             let not_set_yet = NVIDIA_FB_INFO.lock().is_none();
             if efi_fb_missing && not_set_yet {
                 let bar1_phys = unsafe { get_bar(gpu, 1) };
