@@ -81,6 +81,23 @@ pub fn get_boot_info() -> &'static BootInfo {
     }
 }
 
+/// Return true when the EFI GOP framebuffer reported by the bootloader is usable:
+/// the base address must be a real physical address (not zero or the sentinel
+/// 0xDEADBEEF) and the display dimensions must be non-zero.
+pub fn gop_framebuffer_valid() -> bool {
+    unsafe {
+        if let Some(bi) = &BOOT_INFO {
+            let fi = &bi.framebuffer;
+            fi.base_address != 0
+                && fi.base_address != 0xDEADBEEF
+                && fi.width > 0
+                && fi.height > 0
+        } else {
+            false
+        }
+    }
+}
+
 /// Get framebuffer info pointer (for graphics server/syscalls)
 pub fn get_framebuffer_info() -> u64 {
     unsafe {
@@ -95,7 +112,7 @@ pub fn get_framebuffer_info() -> u64 {
 pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
     // 1. GOP framebuffer from bootloader (UEFI) - primary for real hardware
     let fi = unsafe { &BOOT_INFO.as_ref()?.framebuffer };
-    if fi.base_address != 0 && fi.base_address != 0xDEADBEEF && fi.width > 0 && fi.height > 0 {
+    if gop_framebuffer_valid() {
         let phys = if fi.base_address >= PHYS_MEM_OFFSET {
             fi.base_address.saturating_sub(PHYS_MEM_OFFSET)
         } else {
