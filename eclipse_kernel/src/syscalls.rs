@@ -1570,23 +1570,23 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
         return u64::MAX;
     }
 
-    let (fb_address, width, height, pitch) = if crate::boot::get_boot_info().framebuffer.base_address != 0
-        && crate::boot::get_boot_info().framebuffer.base_address != 0xDEADBEEF
-    {
+    let (fb_address, width, height, pitch) = {
         let k = &crate::boot::get_boot_info().framebuffer;
-        let addr = if k.base_address >= crate::memory::PHYS_MEM_OFFSET {
-            k.base_address - crate::memory::PHYS_MEM_OFFSET
+        if crate::boot::gop_framebuffer_valid() {
+            let addr = if k.base_address >= crate::memory::PHYS_MEM_OFFSET {
+                k.base_address - crate::memory::PHYS_MEM_OFFSET
+            } else {
+                k.base_address
+            };
+            let pitch = k.pixels_per_scan_line * 4;
+            (addr, k.width, k.height, pitch)
+        } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
+            (phys, w, h, p)
+        } else if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+            (phys, w, h, pitch)
         } else {
-            k.base_address
-        };
-        let pitch = k.pixels_per_scan_line * 4;
-        (addr, k.width, k.height, pitch)
-    } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
-        (phys, w, h, p)
-    } else if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
-        (phys, w, h, pitch)
-    } else {
-        return u64::MAX;
+            return u64::MAX;
+        }
     };
 
     unsafe {
@@ -1822,9 +1822,15 @@ fn sys_virgl_submit_3d(ctx_id: u64, cmd_ptr: u64, cmd_len: u64) -> u64 {
 /// sys_map_framebuffer - Map framebuffer physical memory into process virtual space
 /// Returns the virtual address where framebuffer is mapped, or 0 on failure
 fn sys_map_framebuffer() -> u64 {
-    // Get framebuffer info
+    // Check whether the EFI GOP framebuffer from the bootloader is actually valid.
+    // boot::get_framebuffer_info() always returns a non-null pointer to the static
+    // BootInfo struct (even when it was never populated by the bootloader, in which
+    // case base_address == 0xDEADBEEF and dimensions are 0).  We must inspect the
+    // struct contents to decide whether to use EFI GOP or fall back to NVIDIA BAR1.
     let fb_info_ptr = crate::boot::get_framebuffer_info();
-    if fb_info_ptr == 0 {
+    let gop_valid = crate::boot::gop_framebuffer_valid();
+
+    if !gop_valid {
         // Try NVIDIA BAR1 as fallback for real hardware without EFI GOP
         if let Some((bar1_phys, width, height, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             let single_frame_size = (pitch as u64) * (height as u64);

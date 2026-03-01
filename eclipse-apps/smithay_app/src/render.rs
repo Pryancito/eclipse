@@ -26,6 +26,10 @@ use crate::state::{ServiceInfo};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_9000_0000_0000;
 
+/// Fallback display dimensions used when the firmware reports zero width/height.
+const DEFAULT_WIDTH: u32  = 1920;
+const DEFAULT_HEIGHT: u32 = 1080;
+
 pub const STROKE_COLORS: [Rgb888; 5] = [
     colors::ACCENT_BLUE,
     colors::ACCENT_RED,
@@ -83,15 +87,31 @@ impl FramebufferState {
         }
 
         let fb_info = get_framebuffer_info()?;
-        let fb_base = map_framebuffer()?;
-        let fb_base = if fb_base as u64 >= PHYS_MEM_OFFSET {
-            (fb_base as u64 - PHYS_MEM_OFFSET) as usize
-        } else {
-            fb_base
+
+        // map_framebuffer() maps the physical framebuffer into process address space.
+        // If it fails (e.g. early during NVIDIA init), fall back to headless mode:
+        // front_addr = 0 means present() is a no-op and the back-buffer is never
+        // pushed to the display, but the rest of the compositor still runs.
+        let front_addr = match map_framebuffer() {
+            Some(addr) => {
+                if addr as u64 >= PHYS_MEM_OFFSET {
+                    (addr as u64 - PHYS_MEM_OFFSET) as usize
+                } else {
+                    addr
+                }
+            }
+            None => {
+                println!("[SMITHAY] WARNING: map_framebuffer failed, running headless");
+                0
+            }
         };
 
-        let pitch = if fb_info.pitch > 0 { fb_info.pitch } else { fb_info.width * 4 };
-        let fb_size = (pitch as u64) * (fb_info.height as u64);
+        // Use a conservative 1920x1080 default when EFI GOP reports zero dimensions
+        // so that the back-buffer allocation below never uses size 0.
+        let width  = if fb_info.width  > 0 { fb_info.width  } else { DEFAULT_WIDTH };
+        let height = if fb_info.height > 0 { fb_info.height } else { DEFAULT_HEIGHT };
+        let pitch = if fb_info.pitch > 0 { fb_info.pitch } else { width * 4 };
+        let fb_size = (pitch as u64) * (height as u64);
         let back_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
         if back_buffer == 0 || back_buffer == u64::MAX {
@@ -99,7 +119,10 @@ impl FramebufferState {
         }
 
         let mut info = fb_info;
-        info.address = fb_base as u64;
+        info.width  = width;
+        info.height = height;
+        info.pitch  = pitch;
+        info.address = front_addr as u64;
 
         let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if bg_buffer == 0 || bg_buffer == u64::MAX {
@@ -109,7 +132,7 @@ impl FramebufferState {
         Some(FramebufferState {
             info,
             base_addr: back_buffer as usize,
-            front_addr: fb_base,
+            front_addr,
             gpu_resource_id: None,
             background_addr: bg_buffer as usize,
         })
