@@ -83,7 +83,11 @@ pub struct Process {
     pub gs_base: u64,                     // Kernel/User swap GS base
     pub is_linux: bool,                   // Use Linux ABI translation
     pub wake_tick: u64,                   // Timer tick at which to wake from Blocked sleep (0 = not sleeping)
+    pub name: [u8; 16],                   // Process name (truncated to 16 bytes)
+    pub cpu_ticks: u64,                   // Total CPU ticks consumed
+    pub mem_frames: u64,                  // Approximate physical memory usage in frames
 }
+
 
 impl Process {
     pub const fn new() -> Self {
@@ -104,9 +108,13 @@ impl Process {
             gs_base: 0,
             is_linux: false,
             wake_tick: 0,
+            name: [0; 16],
+            cpu_ticks: 0,
+            mem_frames: 0,
         }
     }
 }
+
 
 /// Tabla de procesos
 const MAX_PROCESSES: usize = 64;
@@ -169,6 +177,9 @@ pub fn init_kernel_process() {
     process.time_slice = 10;
     process.kernel_stack_top = kernel_stack_top_aligned;
     process.page_table_phys = crate::memory::get_cr3();
+    let name = b"kernel";
+    let len = core::cmp::min(name.len(), 16);
+    process.name[..len].copy_from_slice(&name[..len]);
     
     // Configurar contexto inicial
     // Cuando el scheduler cambie a PID 0, necesita saber el RSP.
@@ -234,6 +245,7 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                 process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
                 process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
                 process.brk_current = initial_brk;
+                process.mem_frames = (stack_size / 4096) as u64; // Initial stack frames
                 
                 crate::serial::serial_print("[PROC] Created process PID: ");
                 crate::serial::serial_print_dec(pid as u64);
@@ -254,15 +266,16 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
 }
 
 /// Ejecutar un binario ELF como un nuevo proceso
-pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
+pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static str> {
     // 1. Crear el PID
     let pid = next_pid();
+
     
     // 2. Crear las tablas de páginas (address space)
     let cr3 = crate::memory::create_process_paging();
     
     // 3. Cargar el binario ELF
-    let (entry_point, max_vaddr) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    let (entry_point, max_vaddr, segment_frames) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
     let (phdr_va, phnum, phentsize) = crate::elf_loader::get_elf_phdr_info(elf_data)?;
     
     // 4. Configurar el stack de usuario
@@ -272,9 +285,16 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
     
     // 5. Inicializar el proceso en la tabla de procesos (phdr_va/phnum/phentsize for auxv)
     if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr) {
+        if let Some(mut proc) = get_process(pid) {
+            let n = core::cmp::min(name.len(), 16);
+            proc.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+            proc.mem_frames += segment_frames;
+            update_process(pid, proc);
+        }
         crate::fd::fd_init_stdio(pid);
         Ok(pid)
     } else {
+
         Err("Failed to insert process into table")
     }
 }
@@ -525,11 +545,20 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             child.state = ProcessState::Ready;
             child.parent_pid = Some(current_pid);
             
+            // Append "(child)" to name if it fits, or just keep it
+            let mut name = [0u8; 16];
+            let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
+            let copy_len = core::cmp::min(parent_name_len, 16);
+            name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
+            child.name = name;
+            
             // DEEP COPY of parent's address space (code, stack, data)
+
             child.page_table_phys = crate::memory::clone_process_paging(parent.page_table_phys);
             
             // Deep copy of VMA list (Vec clone does deep copy of elements if they are Clone)
             child.vmas = parent.vmas.clone();
+            child.mem_frames = parent.mem_frames;
             
             // Allocate NEW kernel stack for child
             let kernel_stack_size = KERNEL_STACK_SIZE;

@@ -81,8 +81,17 @@ pub fn tick() {
     stats.total_ticks += 1;
     
     // Si el proceso actual es el kernel (PID 0), es tiempo idle
-    if crate::process::current_process_id() == Some(0) {
+    let current_pid = crate::process::current_process_id();
+    if current_pid == Some(0) {
         stats.idle_ticks += 1;
+    } else if let Some(pid) = current_pid {
+        // Incrementar ticks del proceso actual
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[pid as usize].as_mut() {
+                p.cpu_ticks += 1;
+            }
+        });
     }
     
     let ticks = stats.total_ticks;

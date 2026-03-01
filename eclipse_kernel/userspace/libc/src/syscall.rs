@@ -84,7 +84,11 @@ pub const SYS_VIRGL_RESOURCE_ATTACH_BACKING: u64 = 48;
 
 pub const SYS_GET_STORAGE_DEVICE_COUNT: u64 = 50;
 pub const SYS_GET_SYSTEM_STATS: u64 = 51;
+pub const SYS_GET_PROCESS_LIST: u64 = 52;
+pub const SYS_KILL: u64 = 53;
+pub const SYS_SET_PROCESS_NAME: u64 = 54;
 pub const SYS_GET_LOGS: u64 = 49;
+
 /// Fast path IPC: mensaje entregado en registros, sin buffer en memoria
 pub const SYS_RECEIVE_FAST: u64 = 200;
 
@@ -498,9 +502,23 @@ pub fn get_last_exec_error(buf: &mut [u8]) -> usize {
     }
 }
 
-pub fn spawn(elf_buffer: &[u8]) -> i32 {
-    unsafe { syscall2(SYS_SPAWN, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64) as i32 }
+pub fn spawn(elf_buffer: &[u8], name: Option<&str>) -> i32 {
+    let name_ptr = name.map(|s| s.as_ptr() as u64).unwrap_or(0);
+    unsafe { syscall3(SYS_SPAWN, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64, name_ptr) as i32 }
 }
+
+pub fn get_process_list(buf: &mut [ProcessInfo]) -> isize {
+    unsafe { syscall2(SYS_GET_PROCESS_LIST, buf.as_mut_ptr() as u64, buf.len() as u64) as isize }
+}
+
+pub fn kill(pid: u32) -> bool {
+    unsafe { syscall1(SYS_KILL, pid as u64) != u64::MAX }
+}
+
+pub fn set_process_name(name: &str) -> bool {
+    unsafe { syscall2(SYS_SET_PROCESS_NAME, name.as_ptr() as u64, name.len() as u64) != u64::MAX }
+}
+
 
 pub fn wait(status: core::option::Option<&mut i32>) -> i32 {
     let status_ptr = match status {
@@ -657,6 +675,17 @@ pub struct SystemStats {
     pub total_mem_frames: u64,
     pub used_mem_frames: u64,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub state: u32,
+    pub name: [u8; 16],
+    pub cpu_ticks: u64,
+    pub mem_frames: u64,
+}
+
 
 pub unsafe fn get_system_stats(stats: *mut SystemStats) -> i32 {
     syscall1(SYS_GET_SYSTEM_STATS, stats as u64) as i32

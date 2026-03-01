@@ -3,10 +3,21 @@ use crate::space::Space;
 use crate::input::{InputState, CompositorEvent};
 use crate::compositor::{ExternalSurface, MAX_EXTERNAL_SURFACES, ShellWindow};
 use crate::render;
-use eclipse_libc::send;
+use eclipse_libc::{send, ProcessInfo};
 use sidewind_core::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 
+
+
+#[derive(Clone, Copy, Default)]
+pub struct ServiceInfo {
+    pub name: [u8; 16],
+    pub state: u32,
+    pub pid: u32,
+    pub restart_count: u32,
+}
+
 /// SmithayState is the central state of the compositor.
+
 /// It orchestrates the Backend, Space, and Input.
 pub struct SmithayState {
     pub backend: Backend,
@@ -26,7 +37,15 @@ pub struct SmithayState {
     pub prev_net_rx: u64,
     pub prev_net_tx: u64,
     pub net_usage: f32,
+    pub process_list: [ProcessInfo; 64],
+    pub process_count: usize,
+    pub service_list: [ServiceInfo; 32],
+    pub service_count: usize,
+    pub prev_process_ticks: [(u32, u64); 64],
+    pub process_cpu_usage: [f32; 64],
+    pub process_mem_kb: [u64; 64],
 }
+
 
 impl SmithayState {
     pub fn new() -> Option<Self> {
@@ -57,7 +76,15 @@ impl SmithayState {
             prev_net_rx: 0,
             prev_net_tx: 0,
             net_usage: 0.0,
+            process_list: [ProcessInfo::default(); 64],
+            process_count: 0,
+            service_list: [ServiceInfo::default(); 32],
+            service_count: 0,
+            prev_process_ticks: [(0, 0); 64],
+            process_cpu_usage: [0.0; 64],
+            process_mem_kb: [0; 64],
         })
+
     }
 
     pub fn process_events(&mut self) {
@@ -92,7 +119,30 @@ impl SmithayState {
                         self.net_rx = rx;
                         self.net_tx = tx;
                     }
+                    CompositorEvent::ServiceInfo(data) => {
+                        // SVCS (4) + Count (4) + [Name(16) + State(4) + PID(4) + Restarts(4)] * Count
+                        if data.len() >= 8 && &data[0..4] == b"SVCS" {
+                            let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
+                            self.service_count = core::cmp::min(count, 32);
+                            let mut offset = 8;
+                            for i in 0..self.service_count {
+                                if data.len() >= offset + 28 {
+                                    let mut svc = ServiceInfo::default();
+                                    svc.name.copy_from_slice(&data[offset..offset+16]);
+                                    offset += 16;
+                                    svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                    offset += 4;
+                                    svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                    offset += 4;
+                                    svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                    offset += 4;
+                                    self.service_list[i] = svc;
+                                }
+                            }
+                        }
+                    }
                     _ => {} // Handle Wayland/X11 if needed
+
                 }
                 count += 1;
             } else {
@@ -162,8 +212,70 @@ impl SmithayState {
                 self.prev_net_rx = self.net_rx;
                 self.prev_net_tx = self.net_tx;
             }
+            
+            // Actualizar lista de procesos y servicios
+            if self.input.system_central_active {
+                unsafe {
+                    let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
+                    let count = eclipse_libc::get_process_list(&mut self.process_list);
+                    if count >= 0 {
+                        self.process_count = count as usize;
+                        
+                        let current_uptime = current.uptime_ticks;
+                        let total_delta = current_uptime.saturating_sub(prev_uptime);
+
+                        for i in 0..self.process_count {
+                            let p = &self.process_list[i];
+                            
+                            // Calcular CPU %
+                            let mut prev_ticks = 0;
+                            for j in 0..64 {
+                                if self.prev_process_ticks[j].0 == p.pid {
+                                    prev_ticks = self.prev_process_ticks[j].1;
+                                    break;
+                                }
+                            }
+                            
+                            if total_delta > 0 {
+                                let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
+                                self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
+                            } else {
+                                self.process_cpu_usage[i] = 0.0;
+                            }
+                            
+                            // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
+                            self.process_mem_kb[i] = p.mem_frames * 4;
+
+                            // Actualizar histórico de ticks (usamos el mismo índice i para simplificar la búsqueda próxima vez, 
+                            // aunque PIDs roten se buscará por .0 == pid)
+                            // Para ser robustos, si no estaba el PID busscamos slot libre o reciclamos.
+                            let mut found = false;
+                            for j in 0..64 {
+                                if self.prev_process_ticks[j].0 == p.pid {
+                                    self.prev_process_ticks[j].1 = p.cpu_ticks;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                // Buscar slot vacío (PID 0)
+                                for j in 0..64 {
+                                    if self.prev_process_ticks[j].0 == 0 {
+                                        self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Pedir info de servicios a systemd (PID 1)
+                    let _ = eclipse_libc::send(1, 0x41, b"GET_SERVICES_INFO");
+                }
+            }
         }
     }
+
 
     fn handle_requests(&mut self) {
         let fb_w = self.backend.fb.info.width as i32;
@@ -303,7 +415,7 @@ impl SmithayState {
                 self.input.cursor_y
             );
             
-            if !self.input.dashboard_active {
+            if !self.input.dashboard_active && !self.input.system_central_active {
                 render::draw_shell_windows(
                     &mut self.backend.fb, 
                     &self.space.windows, 
@@ -315,9 +427,19 @@ impl SmithayState {
                     self.input.cursor_x, 
                     self.input.cursor_y
                 );
-            } else {
+            } else if self.input.dashboard_active {
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage);
+            } else if self.input.system_central_active {
+                render::draw_system_central(
+                    &mut self.backend.fb, 
+                    self.counter, 
+                    &self.service_list[..self.service_count], 
+                    &self.process_list[..self.process_count],
+                    &self.process_cpu_usage,
+                    &self.process_mem_kb,
+                );
             }
+
 
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }

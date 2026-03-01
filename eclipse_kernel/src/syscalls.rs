@@ -76,7 +76,12 @@ pub enum SyscallNumber {
     Mkdir = 105,
     GetStorageDeviceCount = 50,
     GetSystemStats = 51,
+    GetProcessList = 52,
+    Kill = 53,
+    SetProcessName = 54,
 }
+
+
 
 /// lseek whence values (POSIX standard)
 pub const SEEK_SET: u64 = 0; // Absolute position
@@ -100,14 +105,23 @@ pub struct SyscallStats {
     pub lseek_calls: u64,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct SystemStats {
     pub uptime_ticks: u64,
     pub idle_ticks: u64,
     pub total_mem_frames: u64,
     pub used_mem_frames: u64,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub state: u32, // ProcessState enum as u32
+    pub name: [u8; 16],
+    pub cpu_ticks: u64,
+    pub mem_frames: u64,
+}
+
 
 static SYSCALL_STATS: Mutex<SyscallStats> = Mutex::new(SyscallStats {
     total_calls: 0,
@@ -247,8 +261,9 @@ pub extern "C" fn syscall_handler(
         28 => sys_fmap(arg1, arg2, arg3),
         29 => sys_mount(arg1, arg2),
         30 => sys_fstat(arg1, arg2),
-        31 => sys_spawn(arg1, arg2),
+        31 => sys_spawn(arg1, arg2, arg3),
         32 => sys_arch_prctl(arg1, arg2),
+
         33 => sys_getrandom(arg1, arg2, arg3),
         34 => sys_ioctl(arg1, arg2, arg3),
         35 => sys_get_last_exec_error(arg1, arg2),
@@ -269,7 +284,12 @@ pub extern "C" fn syscall_handler(
         49 => sys_get_logs(arg1, arg2),
         50 => sys_get_storage_device_count(),
         51 => sys_get_system_stats(arg1),
+        52 => sys_get_process_list(arg1, arg2),
+        53 => sys_kill(arg1),
+        54 => sys_set_process_name(arg1, arg2),
         100 => sys_socket(arg1, arg2, arg3),
+
+
         101 => sys_bind(arg1, arg2, arg3),
         102 => sys_listen(arg1, arg2),
         103 => sys_accept(arg1, arg2, arg3),
@@ -309,21 +329,21 @@ pub extern "C" fn syscall_handler(
     final_ret
 }
 
-/// sys_get_system_stats - Obtener métricas del sistema (uso de kernel eclipse-apps)
+
+/// sys_get_system_stats - Obtener estadísticas globales del sistema
 fn sys_get_system_stats(stats_ptr: u64) -> u64 {
     if stats_ptr == 0 || !is_user_pointer(stats_ptr, core::mem::size_of::<SystemStats>() as u64) {
         return u64::MAX;
     }
 
     let sched_stats = crate::scheduler::get_stats();
-    
-    let (total_frames, used_frames) = crate::memory::get_memory_stats();
+    let (total_mem, used_mem) = crate::memory::get_memory_stats();
 
     let stats = SystemStats {
         uptime_ticks: sched_stats.total_ticks,
         idle_ticks: sched_stats.idle_ticks,
-        total_mem_frames: total_frames,
-        used_mem_frames: used_frames,
+        total_mem_frames: total_mem,
+        used_mem_frames: used_mem,
     };
 
     unsafe {
@@ -331,6 +351,92 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
     }
 
     0
+}
+
+/// sys_get_process_list - Listar procesos y su estado (PID, nombre, etc)
+fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
+    if buf_ptr == 0 || max_count == 0 || max_count > 64 {
+        return u64::MAX;
+    }
+    if !is_user_pointer(buf_ptr, max_count * core::mem::size_of::<ProcessInfo>() as u64) {
+        return u64::MAX;
+    }
+
+    let mut count = 0;
+    
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let table = crate::process::PROCESS_TABLE.lock();
+        for slot in table.iter() {
+            if let Some(p) = slot {
+                if count >= max_count as usize { break; }
+                
+                let info = ProcessInfo {
+                    pid: p.id,
+                    state: p.state as u32,
+                    name: p.name,
+                    cpu_ticks: p.cpu_ticks,
+                    mem_frames: p.mem_frames,
+                };
+                
+                unsafe {
+                    *((buf_ptr as *mut ProcessInfo).add(count)) = info;
+                }
+                count += 1;
+            }
+        }
+    });
+    
+    count as u64
+}
+
+/// sys_kill - Terminar un proceso por su PID
+fn sys_kill(pid: u64) -> u64 {
+    serial::serial_print("[SYSCALL] kill() called for PID ");
+    serial::serial_print_dec(pid);
+    serial::serial_print("\n");
+
+    if pid == 0 || pid == 1 {
+        return u64::MAX; // Cannot kill kernel or init
+    }
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    for slot in table.iter_mut() {
+        if let Some(p) = slot {
+            if p.id == pid as u32 {
+                p.state = crate::process::ProcessState::Terminated;
+                crate::ipc::unregister_pid_slot(p.id);
+                return 0;
+            }
+        }
+    }
+
+    u64::MAX
+}
+
+/// sys_set_process_name - Cambiar el nombre del proceso actual
+fn sys_set_process_name(name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 || !is_user_pointer(name_ptr, 1) {
+        return u64::MAX;
+    }
+
+    let mut name_buf = [0u8; 16];
+    let len = core::cmp::min(name_len as usize, 15);
+    for i in 0..len {
+        if !is_user_pointer(name_ptr + i as u64, 1) { break; }
+        let b = unsafe { *( (name_ptr + i as u64) as *const u8 ) };
+        if b == 0 { break; }
+        name_buf[i] = b;
+    }
+
+    if let Some(pid) = crate::process::current_process_id() {
+        if let Some(mut p) = crate::process::get_process(pid) {
+            p.name = name_buf;
+            crate::process::update_process(pid, p);
+            return 0;
+        }
+    }
+
+    u64::MAX
 }
 
 /// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
@@ -950,8 +1056,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     }
 
     // Replace current process with ELF binary
-    match crate::elf_loader::replace_process_image(elf_data.as_slice()) {
-        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize)) => {
+    let current_pid = current_process_id().expect("exec called without current process");
+    match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
+        Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames)) => {
             serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
             serial::serial_print_hex(entry_point);
             serial::serial_print(", brk: ");
@@ -962,6 +1069,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
                     proc.brk_current = max_vaddr;
+                    proc.mem_frames = (0x40000 / 4096) + segment_frames; // stack + segments
                     crate::process::update_process(pid, proc);
                 }
             }
@@ -985,8 +1093,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// sys_spawn - Create a new process from an ELF buffer
 /// arg1: pointer to ELF buffer
 /// arg2: size of ELF buffer
+/// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
-fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
+fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
     serial::serial_print("[SYSCALL] spawn() called with buffer at ");
     serial::serial_print_hex(elf_ptr);
     serial::serial_print(", size: ");
@@ -1002,6 +1111,19 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
         serial::serial_print("[SYSCALL] spawn() security violation: invalid buffer pointer\n");
         return u64::MAX;
     }
+
+    let mut name_buf = [0u8; 16];
+    if name_ptr != 0 && is_user_pointer(name_ptr, 1) {
+        // Read up to 15 bytes (+ null terminator)
+        for i in 0..15 {
+            if !is_user_pointer(name_ptr + i as u64, 1) { break; }
+            let b = unsafe { *( (name_ptr + i as u64) as *const u8 ) };
+            if b == 0 { break; }
+            name_buf[i] = b;
+        }
+    }
+    let name_str = core::str::from_utf8(&name_buf).unwrap_or("unknown");
+    let name_trimmed = name_str.trim_matches(char::from(0));
     
     // Create slice from buffer
     let elf_data = unsafe {
@@ -1009,7 +1131,7 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
     };
     
     // Spawn the new process
-    match crate::process::spawn_process(elf_data) {
+    match crate::process::spawn_process(elf_data, name_trimmed) {
         Ok(pid) => {
             serial::serial_print("[SYSCALL] spawn() success, PID: ");
             serial::serial_print_dec(pid as u64);
@@ -1028,6 +1150,7 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64) -> u64 {
         }
     }
 }
+
 
 /// sys_wait - Wait for child process to terminate
 /// arg1: pointer to status variable (or 0 for non-blocking poll / WNOHANG semantics)

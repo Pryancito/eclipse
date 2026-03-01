@@ -265,7 +265,7 @@ pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char,
                   if !ptr.is_null() {
                        let buf = core::slice::from_raw_parts_mut(ptr as *mut u8, size);
                        if sys_read(fd, buf).is_ok() {
-                            let res = match sys_spawn(buf) {
+                            let res = match sys_spawn(buf, None) {
                                  Ok(pid) => pid as pid_t,
                                  Err(_) => -1,
                             };

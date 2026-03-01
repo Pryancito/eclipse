@@ -49,8 +49,8 @@ const MIN_ENTRY_POINT: u64 = 0x80;
 
 
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado
-/// Devuelve Ok((entry_point, max_vaddr))
-pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
+/// Devuelve Ok((entry_point, max_vaddr, segment_frames))
+pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     // Verificar header ELF
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: File too small");
@@ -201,7 +201,7 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
     // Align max_vaddr to next 4KB page
     let max_vaddr_aligned = (max_vaddr + 0xFFF) & !0xFFF;
     
-    Ok((header.e_entry, max_vaddr_aligned))
+    Ok((header.e_entry, max_vaddr_aligned, (mapped_count as u64) * 512))
 }
 
 /// Preparar el stack de usuario
@@ -232,7 +232,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     // We need a temporary space to get page_table_phys
     let cr3 = crate::memory::create_process_paging();
 
-    let (entry_point, max_vaddr) = match load_elf_into_space(cr3, elf_data) {
+    let (entry_point, max_vaddr, segment_frames) = match load_elf_into_space(cr3, elf_data) {
         Ok(res) => res,
         Err(e) => {
             serial::serial_print("ELF: Load failed: ");
@@ -248,6 +248,15 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     let stack_size = 0x40000;  // 256KB
     
     let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr)?;
+    
+    // Add segment frames to the process (beyond initial stack)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(p) = table[pid as usize].as_mut() {
+            p.mem_frames += segment_frames;
+        }
+    });
+
     crate::fd::fd_init_stdio(pid);
 
     if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
@@ -312,8 +321,9 @@ pub fn get_elf_phdr_info(elf_data: &[u8]) -> Result<(u64, u64, u64), &'static st
 }
 
 /// Replace current process image with ELF binary (for exec())
-/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize)) or Err(message) for userspace to display
-pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64), &'static str> {
+/// Returns Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames))
+/// Reemplazar la imagen del proceso actual con un nuevo ELF (backend de exec)
+pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64, u64), &'static str> {
     // Verify ELF header
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         serial::serial_print("ELF: File too small for exec\n");
@@ -417,9 +427,9 @@ pub fn replace_process_image(elf_data: &[u8]) -> Result<(u64, u64, u64, u64, u64
     let mut mapped_pages: [Option<MappedPage>; 128] = [None; 128];
     let mut mapped_count = 0;
 
-    let (entry_point, max_vaddr) = load_elf_into_space(page_table_phys, elf_data)?;
+    let (entry_point, max_vaddr, segment_frames) = load_elf_into_space(page_table_phys, elf_data)?;
     let (phdr_va, phnum, phentsize) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;
-    Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize))
+    Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames))
 }
 
 /// Jump to entry point in userspace (Ring 3)

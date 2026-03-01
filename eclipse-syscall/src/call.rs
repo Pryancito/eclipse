@@ -56,10 +56,22 @@ pub fn sched_yield() -> Result<()> {
     unsafe { cvt_unit(syscall0(SYS_YIELD)) }
 }
 
-/// Spawn a new process from an ELF buffer
-pub fn spawn(buf: &[u8]) -> Result<usize> {
-    unsafe { cvt(syscall2(SYS_SPAWN, buf.as_ptr() as usize, buf.len())) }
+/// Spawn a new process from an ELF buffer with an optional name
+pub fn spawn(buf: &[u8], name: Option<&str>) -> Result<usize> {
+    let name_ptr = name.map(|s| s.as_ptr() as usize).unwrap_or(0);
+    unsafe { cvt(syscall3(SYS_SPAWN, buf.as_ptr() as usize, buf.len(), name_ptr)) }
 }
+
+/// List processes and their state
+pub fn get_process_list(buf: &mut [crate::ProcessInfo]) -> Result<usize> {
+    unsafe { cvt(syscall2(SYS_GET_PROCESS_LIST, buf.as_mut_ptr() as usize, buf.len())) }
+}
+
+/// Kill a process by PID
+pub fn kill(pid: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall1(SYS_KILL, pid)) }
+}
+
 
 /// mkdir(path, mode)
 pub fn mkdir(path: &str, mode: usize) -> Result<()> {

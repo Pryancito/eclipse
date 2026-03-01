@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error};
+use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -212,6 +212,9 @@ fn start_service(service: &mut Service) {
             core::slice::from_raw_parts(bin_ptr, bin_size)
         };
         
+        // Set process name so it doesn't show as "init" in process list
+        set_process_name(service.name);
+        
         // Execute the service binary
         let _result = exec(service_binary);
         
@@ -316,6 +319,37 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         response[0..4].copy_from_slice(b"NETW");
         response[4..8].copy_from_slice(&net_pid.to_le_bytes());
         let _ = eclipse_libc::send(sender, 0x08, &response);
+        return;
+    }
+
+    // Petición de información de servicios ("GET_SERVICES_INFO" = 17 bytes)
+    if len >= 17 && &buffer[..17] == b"GET_SERVICES_INFO" {
+        let mut reply = [0u8; 256];
+        reply[0..4].copy_from_slice(b"SVCS");
+        let svc_count = unsafe { SERVICES.len() };
+        reply[4..8].copy_from_slice(&(svc_count as u32).to_le_bytes());
+        
+        let mut offset = 8;
+        for i in 0..svc_count {
+            if offset + 28 > 256 { break; }
+            unsafe {
+                let svc = &SERVICES[i];
+                // Name (16 bytes)
+                let name_len = core::cmp::min(svc.name.len(), 16);
+                reply[offset..offset+name_len].copy_from_slice(&svc.name.as_bytes()[..name_len]);
+                offset += 16;
+                // State (4 bytes)
+                reply[offset..offset+4].copy_from_slice(&(svc.state as u32).to_le_bytes());
+                offset += 4;
+                // PID (4 bytes)
+                reply[offset..offset+4].copy_from_slice(&(svc.pid as u32).to_le_bytes());
+                offset += 4;
+                // Restarts (4 bytes)
+                reply[offset..offset+4].copy_from_slice(&(svc.restart_count as u32).to_le_bytes());
+                offset += 4;
+            }
+        }
+        let _ = eclipse_libc::send(sender, 0x41, &reply[..offset]);
         return;
     }
 

@@ -19,6 +19,8 @@ pub const TAG_NETW: &[u8; 4] = b"NETW";
 pub const GET_NETWORK_PID_MSG: &[u8; 15] = b"GET_NETWORK_PID";
 pub const TAG_NSTA: &[u8; 4] = b"NSTA";
 pub const GET_NET_STATS_MSG: &[u8; 13] = b"GET_NET_STATS";
+pub const TAG_SVCS: &[u8; 4] = b"SVCS";
+
 
 /// Construye el payload de suscripción (SUBS + self_pid little-endian).
 pub fn build_subscribe_payload(self_pid: u32) -> [u8; 8] {
@@ -69,6 +71,10 @@ pub enum EclipseMessage {
 
     /// Respuesta al GetNetStats con rx y tx.
     NetStatsResponse { rx: u64, tx: u64 },
+
+    /// Respuesta con información de servicios desde SystemD.
+    ServiceInfoResponse { data: [u8; MAX_MSG_LEN], len: usize },
+
 
     /// Mensaje desconocido/raw (fallback para extensibilidad futura).
     Raw { data: [u8; MAX_MSG_LEN], len: usize, from: u32 },
@@ -140,6 +146,13 @@ mod impl_parse {
                 tx: u64::from_le_bytes(tx_bytes),
             });
         }
+        if len >= 8 && buf[0..4] == *TAG_SVCS {
+            let mut data = [0u8; MAX_MSG_LEN];
+            let copy_len = len.min(MAX_MSG_LEN);
+            data[..copy_len].copy_from_slice(&buf[..copy_len]);
+            return Some(EclipseMessage::ServiceInfoResponse { data, len: copy_len });
+        }
+
         if len == core::mem::size_of::<InputEvent>() {
             let ev = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) };
             return Some(EclipseMessage::Input(ev));

@@ -72,7 +72,8 @@ unsafe fn spawn_compositor() -> i32 {
         if mapped != u64::MAX && mapped != 0 {
             close(fd);
             let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
-            let pid = spawn(binary);
+            let pid = spawn(binary, Some("smithay_app"));
+
             let _ = munmap(mapped, size);
             pid
         } else {
@@ -85,7 +86,8 @@ unsafe fn spawn_compositor() -> i32 {
                 println!("[GUI-SERVICE] ERROR: read failed for {} (got {})", COMPOSITOR_PATH, n);
                 return -1;
             }
-            spawn(unsafe { &LOAD_BUF[..size as usize] })
+            spawn(unsafe { &LOAD_BUF[..size as usize] }, Some("smithay_app"))
+
         }
     };
 

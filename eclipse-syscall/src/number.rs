@@ -45,3 +45,8 @@ pub const SYS_CONNECT: usize = 104;
 pub const SYS_MKDIR: usize = 105;
 pub const SYS_FSTATAT: usize = 106;
 pub const SYS_GET_SYSTEM_STATS: usize = 51;
+pub const SYS_GET_PROCESS_LIST: usize = 52;
+pub const SYS_KILL: usize = 53;
+pub const SYS_SET_PROCESS_NAME: usize = 54;
+
+

@@ -20,6 +20,8 @@ use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
 use micromath::F32Ext;
 
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, MAX_SURFACE_DIM};
+use crate::state::{ServiceInfo};
+
 
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_9000_0000_0000;
@@ -772,4 +774,187 @@ pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
     let color = STROKE_COLORS[color_idx.min(4) as usize];
     let _ = Rectangle::new(Point::new(x, y), Size::new(d, d))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build()).draw(fb);
+}
+pub fn draw_system_central(
+    fb: &mut FramebufferState, 
+    counter: u64, 
+    services: &[ServiceInfo], 
+    processes: &[eclipse_libc::ProcessInfo],
+    process_cpu: &[f32; 64],
+    process_mem: &[u64; 64],
+) {
+    let w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    
+    let sidebar_width = (w / 10).clamp(140, 220);
+    let panel_x = sidebar_width;
+    let panel_w = w - sidebar_width;
+
+    // Background (shifted to not cover sidebar)
+    let _ = Rectangle::new(Point::new(panel_x, 0), Size::new(panel_w as u32, h as u32))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(5, 10, 25)).build())
+        .draw(fb);
+    let _ = ui::draw_grid(fb, Rgb888::new(20, 40, 80), 64, Point::new(panel_x, 0));
+
+    let margin = 20;
+    let half_h = (h - 60) / 2;
+    
+    // Top Half: SERVICES
+    let svc_rect = Rectangle::new(Point::new(panel_x + 20, 20), Size::new(panel_w as u32 - 40, half_h as u32));
+    let _ = ui::draw_glass_card(fb, svc_rect, "SISTEMA CENTRAL // SERVICIOS OPERATIVOS", colors::ACCENT_CYAN);
+    
+    let header_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_CYAN);
+    let text_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE);
+    let row_h = 24;
+    let start_y = 65;
+    
+    // Relative columns within the panel
+    let col_id = panel_x + 40;
+    let col_name = panel_x + 80;
+    let col_state = panel_x + 220;
+    let col_cpu = panel_x + 320;
+    let col_mem = panel_x + 400;
+    let col_restarts = panel_x + 490;
+    let col_options = panel_x + 590;
+
+    // Headers
+    let cols = [("ID", col_id), ("NOMBRE", col_name), ("ESTADO", col_state), ("CPU", col_cpu), ("MEM", col_mem), ("REINICIOS", col_restarts), ("OPCIONES", col_options)];
+    for (name, x) in cols.iter() {
+        let _ = Text::new(name, Point::new(*x, start_y), header_style).draw(fb);
+    }
+    
+    for (i, svc) in services.iter().enumerate() {
+        let y = start_y + 25 + (i as i32 * row_h);
+        if y > half_h + 20 - 20 { break; }
+        
+        // PID
+        let mut pid_str = heapless::String::<10>::new();
+        let _ = core::fmt::write(&mut pid_str, format_args!("{}", svc.pid));
+        let _ = Text::new(&pid_str, Point::new(col_id, y), text_style).draw(fb);
+        
+        // Name
+        let name_str = core::str::from_utf8(&svc.name).unwrap_or("?").trim_matches(char::from(0));
+        let _ = Text::new(name_str, Point::new(col_name, y), text_style).draw(fb);
+        
+        // State
+        let state_str = match svc.state {
+            0 => "Inactive",
+            1 => "Activating",
+            2 => "Active",
+            3 => "Failed",
+            4 => "Stopping",
+            _ => "Unknown",
+        };
+        let state_color = match svc.state {
+            2 => colors::ACCENT_GREEN,
+            3 => colors::ACCENT_RED,
+            _ => colors::ACCENT_YELLOW,
+        };
+        let _ = Text::new(state_str, Point::new(col_state, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, state_color)).draw(fb);
+        
+        // Find metrics for this service
+        let mut svc_cpu = 0.0;
+        let mut svc_mem_kb = 0;
+        for (j, p) in processes.iter().enumerate() {
+            if p.pid == svc.pid {
+                svc_cpu = process_cpu[j];
+                svc_mem_kb = process_mem[j];
+                break;
+            }
+        }
+
+        // CPU
+        let mut cpu_str = heapless::String::<12>::new();
+        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", svc_cpu));
+        let _ = Text::new(&cpu_str, Point::new(col_cpu, y), text_style).draw(fb);
+
+        // MEM
+        let mut mem_str = heapless::String::<16>::new();
+        if svc_mem_kb > 1024 {
+            let _ = core::fmt::write(&mut mem_str, format_args!("{:.1} MB", svc_mem_kb as f32 / 1024.0));
+        } else {
+            let _ = core::fmt::write(&mut mem_str, format_args!("{} KB", svc_mem_kb));
+        }
+        let _ = Text::new(&mem_str, Point::new(col_mem, y), text_style).draw(fb);
+
+        // Restarts
+        let mut rest_str = heapless::String::<10>::new();
+        let _ = core::fmt::write(&mut rest_str, format_args!("{}", svc.restart_count));
+        let _ = Text::new(&rest_str, Point::new(col_restarts, y), text_style).draw(fb);
+        
+        // Options (Mock buttons)
+        let _ = Text::new("[REINICIAR]", Point::new(col_options, y), header_style).draw(fb);
+        let _ = Text::new("[PARAR]", Point::new(col_options + 100, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
+    }
+    
+    // Bottom Half: PROGRAMS
+    let prog_rect = Rectangle::new(Point::new(panel_x + 20, 40 + half_h), Size::new(panel_w as u32 - 40, half_h as u32));
+    let _ = ui::draw_glass_card(fb, prog_rect, "SISTEMA CENTRAL // PROGRAMAS DE USUARIO", colors::ACCENT_GREEN);
+    
+    let start_y_prog = 40 + half_h + 45;
+    // Headers
+    let col_prog_pid = panel_x + 40;
+    let col_prog_name = panel_x + 80;
+    let col_prog_cpu = panel_x + 240;
+    let col_prog_mem = panel_x + 340;
+    let col_prog_red = panel_x + 440;
+    let col_prog_options = panel_x + 590;
+
+    let cols_prog = [("PID", col_prog_pid), ("NOMBRE", col_prog_name), ("CPU", col_prog_cpu), ("MEM", col_prog_mem), ("RED", col_prog_red), ("OPCIONES", col_prog_options)];
+    for (name, x) in cols_prog.iter() {
+        let _ = Text::new(name, Point::new(*x, start_y_prog), header_style).draw(fb);
+    }
+
+    // Filter out services from process list (if they share the same PID range, usually they do)
+    // For now just show all processes that are not systemd or init
+    let mut display_idx = 0;
+    for p in processes {
+        if p.pid <= 1 { continue; }
+        
+        // Skip if it is a service (simplification: if name matches a service name)
+        let p_name = core::str::from_utf8(&p.name).unwrap_or("?").trim_matches(char::from(0));
+        let mut is_service = false;
+        for s in services {
+            let s_name = core::str::from_utf8(&s.name).unwrap_or("?").trim_matches(char::from(0));
+            if p_name == s_name || p.pid == s.pid {
+                is_service = true;
+                break;
+            }
+        }
+        if is_service { continue; }
+
+        let y = start_y_prog + 25 + (display_idx * row_h);
+        if y > h - 20 { break; }
+        
+        // PID
+        let mut pid_str = heapless::String::<10>::new();
+        let _ = core::fmt::write(&mut pid_str, format_args!("{}", p.pid));
+        let _ = Text::new(&pid_str, Point::new(col_prog_pid, y), text_style).draw(fb);
+        
+        // Name
+        let _ = Text::new(p_name, Point::new(col_prog_name, y), text_style).draw(fb);
+        
+        // CPU
+        let mut cpu_str = heapless::String::<12>::new();
+        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", process_cpu[processes.iter().position(|proc| proc.pid == p.pid).unwrap_or(0)]));
+        let _ = Text::new(&cpu_str, Point::new(col_prog_cpu, y), text_style).draw(fb);
+        
+        // MEM
+        let mut mem_str = heapless::String::<16>::new();
+        let mem_kb = process_mem[processes.iter().position(|proc| proc.pid == p.pid).unwrap_or(0)];
+        if mem_kb > 1024 {
+            let _ = core::fmt::write(&mut mem_str, format_args!("{:.1} MB", mem_kb as f32 / 1024.0));
+        } else {
+            let _ = core::fmt::write(&mut mem_str, format_args!("{} KB", mem_kb));
+        }
+        let _ = Text::new(&mem_str, Point::new(col_prog_mem, y), text_style).draw(fb);
+        
+        // RED
+        let _ = Text::new("0 bps", Point::new(col_prog_red, y), text_style).draw(fb);
+        
+        // Options
+        let _ = Text::new("[MATAR]", Point::new(col_prog_options, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
+        
+        display_idx += 1;
+    }
 }

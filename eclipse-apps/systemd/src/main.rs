@@ -22,7 +22,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive, send};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive, send, set_process_name};
 
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
@@ -135,8 +135,10 @@ fn entry_point() -> ! {
     if pid != 1 {
         println!("[WARNING] SystemD should run as PID 1!");
         println!("[WARNING] Current PID: {}", pid);
-        println!();
     }
+    println!("[SYSTEMD] Starting (PID: {})", pid);
+    set_process_name("systemd");
+
     
     // Initialize service registry
     println!("[INIT] Initializing service registry...");
@@ -463,7 +465,7 @@ fn wait_for_service_ready(pid: i32, timeout_cycles: u32) -> bool {
 }
 
 /// Start a specific service
-fn start_service(service: &mut Service, _service_idx: usize) {
+fn start_service(service: &mut Service, service_idx: usize) {
     println!("  [START] {} - {}", service.name, service.description);
     
     service.state = ServiceState::Activating;
@@ -472,28 +474,14 @@ fn start_service(service: &mut Service, _service_idx: usize) {
     let pid = fork();
     
     if pid == 0 {
-        // Child process - execute the service binary
-        println!("    [CHILD] Spawning {} in new process", service.name);
+        // Child process - set name and exec
+        set_process_name(service.name);
+
         
-        // Map service name to service ID for get_service_binary syscall
-        let service_id = match service.name {
-            "log.service" => 0,
-            "devfs.service" => 1,
-            "filesystem.service" => 2,
-            "input.service" => 3,
-            "display.service" => 4,
-            "audio.service" => 5,
-            "network.service" => 6,
-            _ => {
-                println!("    [ERROR] Unknown service: {}", service.name);
-                exit(1);
-            }
+        // Wait a bit or signal readiness? No, just get binary and exec
+        let (bin_ptr, bin_size) = match eclipse_libc::get_service_binary(service_idx as u32) {
+            (ptr, size) => (ptr, size),
         };
-        
-        // Get service binary from kernel
-        // Note: This returns a pointer to kernel memory (RODATA). 
-        // We cannot read it in userspace, but we can pass it back to sys_exec.
-        let (bin_ptr, bin_size) = eclipse_libc::get_service_binary(service_id as u32);
         
         if bin_ptr.is_null() || bin_size == 0 {
              println!("    [CHILD] ERROR: Failed to get binary for service {}", service.name);
@@ -548,8 +536,35 @@ fn main_loop() -> ! {
                 reply[0..4].copy_from_slice(b"INPT");
                 reply[4..8].copy_from_slice(&(input_pid as u32).to_le_bytes());
                 let _ = send(sender, 0x40, &reply);
+            } else if len >= 17 && &buf[0..17] == b"GET_SERVICES_INFO" {
+
+                // Reply with service info
+                // Format: SVCS (4) + Count (4) + [Name(16) + State(4) + PID(4) + Restarts(4)] * Count
+                let mut reply = [0u8; 512];
+                reply[0..4].copy_from_slice(b"SVCS");
+                unsafe {
+                    reply[4..8].copy_from_slice(&(SERVICE_COUNT as u32).to_le_bytes());
+                    let mut offset = 8;
+                    for i in 0..SERVICE_COUNT {
+                        if let Some(ref svc) = SERVICES[i] {
+                            let name_len = core::cmp::min(svc.name.len(), 16);
+                            reply[offset..offset+name_len].copy_from_slice(&svc.name.as_bytes()[..name_len]);
+                            offset += 16;
+                            reply[offset..offset+4].copy_from_slice(&(svc.state as u32).to_le_bytes());
+                            offset += 4;
+                            reply[offset..offset+4].copy_from_slice(&(svc.pid as u32).to_le_bytes());
+                            offset += 4;
+                            reply[offset..offset+4].copy_from_slice(&(svc.restart_count as u32).to_le_bytes());
+                            offset += 4;
+                        } else {
+                            offset += 28; // Skip
+                        }
+                    }
+                    let _ = send(sender, 0x41, &reply[..offset]);
+                }
             }
         }
+
 
         // Every MONITOR_INTERVAL ticks, check service health
         if tick % MONITOR_INTERVAL == 0 {

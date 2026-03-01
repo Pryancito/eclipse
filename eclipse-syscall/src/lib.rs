@@ -8,7 +8,19 @@ pub mod error;
 pub mod flag;
 pub mod call;
 
+#[repr(C)]
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub state: u32,
+    pub name: [u8; 16],
+    pub cpu_ticks: u64,
+    pub mem_frames: u64,
+}
+
 pub use error::{Error, Result};
+
 pub use number::*;
 
 #[cfg(target_arch = "x86_64")]

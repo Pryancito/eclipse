@@ -11,14 +11,16 @@ pub enum CompositorEvent {
     Wayland(heapless::Vec<u8, 256>, u32), // data, sender_pid
     X11(heapless::Vec<u8, 256>, u32), // data, sender_pid
     NetStats(u64, u64), // rx, tx
+    ServiceInfo(heapless::Vec<u8, 256>),
 }
+
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
     Minimize, Restore, ToggleDashboard, ToggleLock, ToggleNotifications, ToggleLauncher,
-    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch,
+    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch, ToggleSystemCentral,
     ArrowUp, ArrowDown, Input(char), Enter, Backspace,
 }
 
@@ -45,7 +47,9 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x26 => KeyAction::ToggleLock,
         0x2F => KeyAction::ToggleNotifications,
         0x1E => KeyAction::ToggleLauncher,
+        0x1F => if (modifiers & 8) != 0 { KeyAction::ToggleSystemCentral } else { KeyAction::None },
         0x4B => KeyAction::SnapLeft,
+
         0x4D => KeyAction::SnapRight,
         0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None },
         0x48 => KeyAction::ArrowUp,
@@ -131,7 +135,10 @@ pub struct InputState {
     pub search_query: heapless::String<32>,
     pub search_selected_idx: usize,
     pub search_curr_y: f32,
+    pub system_central_active: bool,
+    pub system_central_curr_y: f32,
 }
+
 
 impl InputState {
     pub fn new(width: i32, height: i32) -> Self {
@@ -151,7 +158,9 @@ impl InputState {
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
             alt_tab_active: false, search_active: false, search_query: heapless::String::<32>::new(),
             search_selected_idx: 0, search_curr_y: 0.0,
+            system_central_active: false, system_central_curr_y: 0.0,
         }
+
     }
 
     pub fn apply_event(&mut self, ev: &InputEvent, fb_width: i32, fb_height: i32, windows: &mut [ShellWindow], window_count: &mut usize, surfaces: &[ExternalSurface]) {
@@ -246,7 +255,12 @@ impl InputState {
                     KeyAction::ArrowDown => if pressed && self.search_active { self.search_selected_idx += 1; },
                     KeyAction::Backspace => if pressed && self.search_active { self.search_query.pop(); },
                     KeyAction::Enter => if pressed && self.search_active { self.execute_search(); self.search_active = false; },
+                    KeyAction::ToggleSystemCentral => if pressed { 
+                        self.system_central_active = !self.system_central_active; 
+                        if self.system_central_active { self.dashboard_active = false; self.search_active = false; }
+                    },
                     KeyAction::Input(c) => if pressed && self.search_active { if self.search_query.len() < 32 { let _ = self.search_query.push(c); } },
+
                 }
                 if !pressed && ev.code == 0x0F { self.alt_tab_active = false; }
             }
@@ -301,7 +315,53 @@ impl InputState {
                 }
                 if (self.mouse_buttons & 1 != 0) && (old & 1 == 0) {
                     self.launcher_active = false; self.context_menu_active = false;
-                    if self.cursor_y >= fb_height - 40 { if self.cursor_x < 150 { self.launcher_active = true; } }
+                    let sidebar_width = (fb_width / 10).clamp(140, 220);
+                    if self.cursor_x <= sidebar_width {
+                        let icon_slot_h = fb_height / 5; // 5 icons
+                        let slot_idx = self.cursor_y / icon_slot_h;
+                        match slot_idx {
+                            0 => self.request_dashboard = true,
+                            1 => {
+                                self.system_central_active = !self.system_central_active;
+                                if self.system_central_active { self.dashboard_active = false; self.search_active = false; }
+                            },
+                            2 => {
+                                self.launcher_active = !self.launcher_active;
+                                if self.launcher_active { self.dashboard_active = false; self.system_central_active = false; }
+                            },
+                            _ => {}
+                        }
+                    } else if self.system_central_active {
+                        // Handle Kill/Restart buttons in System Central
+                        let sidebar_width = (fb_width / 10).clamp(140, 220);
+                        let col_options = sidebar_width + 490;
+                        let col_prog_options = sidebar_width + 590;
+
+                        // Services area: y=65 to half_h
+                        // Programs area: y=start_y_prog to h-20
+                        let half_h = (fb_height - 60) / 2;
+                        let row_h = 24;
+                        if self.cursor_y >= 65 && self.cursor_y < half_h + 20 {
+                            let idx = (self.cursor_y - 90) / row_h; // start_y(65) + 25
+                            if idx >= 0 && idx < 32 {
+                                if self.cursor_x >= col_options && self.cursor_x < col_options + 90 {
+                                    // Restart Service
+                                    let _ = send(1, 0x42, b"RESTART_SERVICE"); // Mock/Simple trigger
+                                } else if self.cursor_x >= col_options + 100 && self.cursor_x < col_options + 180 {
+                                    // Stop Service
+                                    let _ = send(1, 0x43, b"STOP_SERVICE");
+                                }
+                            }
+                        } else if self.cursor_y >= half_h + 85 {
+                            let idx = (self.cursor_y - (half_h + 110)) / row_h;
+                            if idx >= 0 && idx < 64 {
+                                if self.cursor_x >= col_prog_options && self.cursor_x < col_prog_options + 100 {
+                                    // Kill process
+                                }
+                            }
+                        }
+                    }
+ else if self.cursor_y >= fb_height - 40 { if self.cursor_x < 150 { self.launcher_active = true; } }
                     else if let Some(idx) = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count) {
                         let top = *window_count - 1; if idx != top { windows.swap(idx, top); }
                         self.focused_window = Some(top);

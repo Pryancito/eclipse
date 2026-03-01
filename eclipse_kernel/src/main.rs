@@ -340,7 +340,7 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // Load embedded init
     if !init_loaded {
         serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
-        match process::spawn_process(INIT_BINARY) {
+        match process::spawn_process(INIT_BINARY, "init") {
             Ok(pid) => {
                 serial::serial_print("[KERNEL] Init process loaded with PID: ");
                 serial::serial_print_dec(pid as u64);
