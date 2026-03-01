@@ -86,12 +86,31 @@ impl FramebufferState {
             }
         }
 
-        let fb_info = get_framebuffer_info()?;
+        // get_framebuffer_info() can return None on real hardware when EFI GOP is
+        // invalid, no VirtIO GPU is present, and the NVIDIA BAR1 is not set up yet.
+        // In that case, use default 1920×1080 dimensions and run in headless mode so
+        // that the compositor process always starts rather than silently doing nothing.
+        let fb_info = get_framebuffer_info().unwrap_or_else(|| {
+            println!("[SMITHAY] WARNING: get_framebuffer_info failed, using default 1920x1080 headless");
+            FramebufferInfo {
+                address: 0,
+                width: 0,
+                height: 0,
+                pitch: 0,
+                bpp: 32,
+                red_mask_size: 8,
+                red_mask_shift: 16,
+                green_mask_size: 8,
+                green_mask_shift: 8,
+                blue_mask_size: 8,
+                blue_mask_shift: 0,
+            }
+        });
 
         // map_framebuffer() maps the physical framebuffer into process address space.
-        // If it fails (e.g. early during NVIDIA init), fall back to headless mode:
-        // front_addr = 0 means present() is a no-op and the back-buffer is never
-        // pushed to the display, but the rest of the compositor still runs.
+        // If it fails (e.g. early during NVIDIA init, or no framebuffer info at all),
+        // fall back to headless mode: front_addr = 0 means present() is a no-op and
+        // the back-buffer is never pushed to the display, but the compositor still runs.
         let front_addr = match map_framebuffer() {
             Some(addr) => {
                 if addr as u64 >= PHYS_MEM_OFFSET {

@@ -1001,7 +1001,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     serial::serial_print("\n");
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
         set_last_exec_error(b"exec: invalid parameters");
         serial::serial_print("[SYSCALL] exec() invalid parameters\n");
         return u64::MAX;
@@ -1102,7 +1102,7 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
     serial::serial_print_dec(elf_size);
     serial::serial_print("\n");
     
-    if elf_ptr == 0 || elf_size == 0 || elf_size > 10 * 1024 * 1024 {
+    if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
     }
@@ -1136,6 +1136,15 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
             serial::serial_print("[SYSCALL] spawn() success, PID: ");
             serial::serial_print_dec(pid as u64);
             serial::serial_print("\n");
+
+            // Set parent_pid so the spawning process can wait() for the child.
+            let caller_pid = crate::process::current_process_id();
+            if let Some(cpid) = caller_pid {
+                if let Some(mut child) = crate::process::get_process(pid) {
+                    child.parent_pid = Some(cpid);
+                    crate::process::update_process(pid, child);
+                }
+            }
             
             // Add to scheduler
             crate::scheduler::enqueue_process(pid);
