@@ -928,6 +928,7 @@ impl XhciControllerState {
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout before reset"); }
+            crate::cpu::pause();
         }
 
         // HCRST
@@ -936,6 +937,7 @@ impl XhciControllerState {
         while (mmio.read_operational(0x00) & (1 << 1)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("HCRST timeout"); }
+            crate::cpu::pause();
         }
 
         // CNR clear again
@@ -943,6 +945,7 @@ impl XhciControllerState {
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout after reset"); }
+            crate::cpu::pause();
         }
         serial::serial_print("[XHCI] Reset complete\n");
 
@@ -1050,6 +1053,7 @@ impl XhciControllerState {
                 }
             }
             timeout -= 1;
+            crate::cpu::pause();
         }
         Err("Poll timeout")
     }
