@@ -660,6 +660,23 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     }
     // ---- End Fault Recovery ----
 
+    // ---- Userspace fault: kill the process instead of BSOD ----
+    // If CS[1:0] == 3, the fault originated from ring-3 (userspace) code.
+    // In that case, terminate the faulting process and schedule the next one
+    // so the kernel keeps running and the watchdog can restart the process.
+    if cs & 3 == 3 && pid != 0 {
+        crate::serial::serial_printf(format_args!(
+            "[FAULT] Userspace exception #{} in PID {} at RIP={:#018x} CR2={:#018x} — killing process\n",
+            num, pid, rip, cr2
+        ));
+        crate::process::exit_process();
+        crate::scheduler::schedule();
+        // schedule() performs a context switch when another process is ready and does not
+        // return to this point. If it does return (no other process available), we fall
+        // through to BSOD to avoid resuming the now-terminated process via iretq.
+    }
+    // ---- End Userspace fault handling ----
+
     // Mostrar BSOD en pantalla
     crate::progress::bsod(&crate::progress::BsodInfo {
         exception_num: num,
