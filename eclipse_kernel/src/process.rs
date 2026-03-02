@@ -280,7 +280,7 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     
     // 4. Configurar el stack de usuario
     let stack_base = 0x20000000;
-    let stack_size = 0x40000;
+    let stack_size = 0x100000; // 1MB — enough for deep compositor render call stacks
     let _stack_top = crate::elf_loader::setup_user_stack(cr3, stack_base, stack_size)?;
     
     // 5. Inicializar el proceso en la tabla de procesos (phdr_va/phnum/phentsize for auxv)

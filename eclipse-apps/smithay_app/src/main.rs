@@ -6,7 +6,7 @@ extern crate eclipse_syscall;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use eclipse_libc::{println, getpid, yield_cpu, sleep_ms};
+use eclipse_libc::{println, getpid, yield_cpu, sleep_ms, exit};
 
 use smithay_app::state::SmithayState;
 use smithay_app::compositor::{ShellWindow, WindowContent};
@@ -47,7 +47,7 @@ pub extern "C" fn _start() -> ! {
     
     let mut state = match SmithayState::new() {
         Some(s) => s,
-        None => { println!("[SMITHAY] FATAL: State init failed"); loop { yield_cpu(); } }
+        None => { println!("[SMITHAY] FATAL: State init failed, exiting for watchdog restart"); exit(1); }
     };
     
     state.backend.fb.pre_render_background();
@@ -67,6 +67,11 @@ pub extern "C" fn _start() -> ! {
 
         // Un drenado rápido tras render por si llegaron eventos durante el frame
         state.process_events();
+
+        // Intentar mapear el framebuffer si estamos en modo headless (cada ~5s a ~60fps)
+        if state.counter % 300 == 0 {
+            state.backend.fb.try_remap_framebuffer();
+        }
 
         if state.counter % 1000 == 0 {
             let used = HEAP_PTR.load(Ordering::Relaxed);

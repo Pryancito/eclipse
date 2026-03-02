@@ -198,6 +198,27 @@ impl FramebufferState {
         }
     }
 
+    /// Try to map the framebuffer if we're currently in headless mode (front_addr == 0).
+    /// Called periodically so that if the framebuffer becomes available after startup
+    /// (e.g. after NVIDIA driver initialization completes), the display will start working.
+    pub fn try_remap_framebuffer(&mut self) {
+        if self.front_addr >= 0x1000 {
+            return; // already mapped
+        }
+        if let Some(addr) = map_framebuffer() {
+            let vaddr = if addr as u64 >= PHYS_MEM_OFFSET {
+                (addr as u64 - PHYS_MEM_OFFSET) as usize
+            } else {
+                addr
+            };
+            if vaddr >= 0x1000 {
+                println!("[SMITHAY] Framebuffer mapped at 0x{:X}, switching to display mode", vaddr);
+                self.front_addr = vaddr;
+                self.info.address = vaddr as u64;
+            }
+        }
+    }
+
     pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) {
         if self.base_addr < 0x1000 { return; }
         if let Some(rid) = self.gpu_resource_id {

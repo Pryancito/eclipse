@@ -1069,14 +1069,14 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
                     proc.brk_current = max_vaddr;
-                    proc.mem_frames = (0x40000 / 4096) + segment_frames; // stack + segments
+                    proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
                     crate::process::update_process(pid, proc);
                 }
             }
             
             // This doesn't return - we jump to the new process entry point
             unsafe {
-                let stack_top: u64 = 0x20040000;
+                let stack_top: u64 = 0x20100000; // stack_base(0x20000000) + stack_size(0x100000)
                 crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum, phentsize);
             }
         }
