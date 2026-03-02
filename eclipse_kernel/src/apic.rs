@@ -28,8 +28,13 @@ const LAPIC_REG_TMRDIV: u32 = 0x3E0;
 
 static mut LAPIC_BASE: u64 = 0;
 
+/// Fallback LAPIC timer count per 1ms when calibration cannot measure a
+/// realistic value. Derived from a 100 MHz bus / 16 (divider) = 6.25 MHz,
+/// giving 6250 counts per millisecond.
+const DEFAULT_LAPIC_COUNT_PER_MS: u32 = 6250;
+
 /// Calibrated LAPIC timer counts per 1ms (set by BSP before APs start)
-static LAPIC_TIMER_COUNT_1MS: AtomicU32 = AtomicU32::new(6250);
+static LAPIC_TIMER_COUNT_1MS: AtomicU32 = AtomicU32::new(DEFAULT_LAPIC_COUNT_PER_MS);
 
 /// Calibrate the Local APIC timer using the PIT tick counter as reference.
 /// Must be called on the BSP after interrupts::init() and apic::init().
@@ -52,7 +57,7 @@ pub fn calibrate_timer() {
 
         let remaining = read_reg(LAPIC_REG_TMRCURR);
         let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
-        let count_per_ms = if elapsed > 10 { elapsed / 10 } else { 6250 };
+        let count_per_ms = if elapsed > 10 { elapsed / 10 } else { DEFAULT_LAPIC_COUNT_PER_MS };
 
         // Stop the one-shot timer
         write_reg(LAPIC_REG_TMRINIT, 0);

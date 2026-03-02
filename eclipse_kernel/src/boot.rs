@@ -273,7 +273,10 @@ const GDT_TEMPLATE: Gdt = Gdt {
 /// Per-CPU GDT copies (each has its TSS entry pointing to its own CPU_TSSES slot)
 static mut CPU_GDTS: [Gdt; MAX_SMP_CPUS] = [GDT_TEMPLATE; MAX_SMP_CPUS];
 
-/// Determine which per-CPU slot to use (APIC ID from CPUID leaf 1 EBX[31:24])
+/// Return the per-CPU array index for the current CPU.
+/// The index is derived from the Initial APIC ID (CPUID leaf 1, EBX[31:24])
+/// modulo MAX_SMP_CPUS.  All per-CPU arrays (CPU_DATA, CPU_TSSES, CPU_GDTS)
+/// are indexed with this value.
 fn get_cpu_id() -> usize {
     let ebx: u32;
     unsafe {

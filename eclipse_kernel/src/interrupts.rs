@@ -114,8 +114,9 @@ type IrqHandler = fn();
 /// IRQ handler table for IRQs 0-15 (interrupts 32-47)
 static mut IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
 
-/// IDT vector for Local APIC periodic timer (used by all CPUs for scheduling)
-pub const APIC_TIMER_VECTOR: u8 = 0xFF;
+/// IDT vector for Local APIC periodic timer (used by all CPUs for scheduling).
+/// Must not coincide with the LAPIC spurious interrupt vector (0xFF set in SVR).
+pub const APIC_TIMER_VECTOR: u8 = 0xFE;
 
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
@@ -1571,7 +1572,8 @@ unsafe extern "C" fn syscall_entry() {
         "mov rsp, gs:[0]",
 
         // Build IRETQ stack frame on the kernel stack.
-        // Layout (low→high): RIP, CS, RFLAGS, RSP, SS
+        // Pushes go from top-of-frame to bottom (SS pushed first, RIP last).
+        // After all pushes the frame in memory from low→high is: RIP, CS, RFLAGS, RSP, SS.
         "push 0x23",                  // SS  (user data selector)
         "push qword ptr gs:[8]",      // RSP (saved user stack pointer)
         "push r11",              // RFLAGS (saved by SYSCALL in R11)
