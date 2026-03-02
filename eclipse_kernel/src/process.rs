@@ -586,7 +586,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     let mut table = PROCESS_TABLE.lock();
     let mut next_pid = NEXT_PID.lock();
     
-    for slot in table.iter_mut() {
+    for (slot_idx, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
             let child_pid = *next_pid;
             *next_pid += 1;
@@ -657,6 +657,8 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             child.context.r15 = parent_context.r15;
             
             *slot = Some(child);
+            // Register child PID in O(1) IPC lookup table for direct P2P delivery.
+            crate::ipc::register_pid_slot(child_pid, slot_idx);
             return Some(child_pid);
         }
     }
