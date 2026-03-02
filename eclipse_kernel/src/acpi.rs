@@ -47,7 +47,7 @@ pub struct AcpiInfo {
     pub lapic_addr: u64,
     pub cpu_count: usize,
     pub ioapic_addr: u64,
-    pub apic_ids: [u8; 32], // Support up to 32 CPUs
+    pub apic_ids: [u32; 32], // Support up to 32 CPUs (u32 to support x2APIC IDs > 255)
 }
 
 static mut ACPI_INFO: Option<AcpiInfo> = None;
@@ -139,7 +139,7 @@ pub fn init(rsdp_phys: u64) {
         let mut lapic_phys: u64 = 0;
         let mut ioapic_phys: u64 = 0;
         let mut cpu_count = 0;
-        let mut apic_ids = [0u8; 32];
+        let mut apic_ids = [0u32; 32];
 
         for i in 0..entry_count {
             let table_phys = if is_xsdt {
@@ -166,13 +166,13 @@ pub fn init(rsdp_phys: u64) {
                     let e_len = entry_header.entry_length;
 
                     match e_type {
-                        0 => { // Processor Local APIC
+                        0 => { // Processor Local APIC (xAPIC, 8-bit APIC ID)
                             let processor_id = *current_entry.add(2);
                             let apic_id = *current_entry.add(3);
                             let flags = *(current_entry.add(4) as *const u32);
                             if flags & 1 != 0 { // Enabled
                                 if cpu_count < 32 {
-                                    apic_ids[cpu_count] = apic_id;
+                                    apic_ids[cpu_count] = apic_id as u32;
                                     cpu_count += 1;
                                 }
                                 serial_printf(format_args!("[ACPI]   - CPU {} (APIC ID {})\n", processor_id, apic_id));
@@ -183,6 +183,19 @@ pub fn init(rsdp_phys: u64) {
                             let addr = *(current_entry.add(4) as *const u32);
                             ioapic_phys = addr as u64;
                             serial_printf(format_args!("[ACPI]   - I/O APIC ID {} at {:#x}\n", ioapic_id, ioapic_phys));
+                        }
+                        9 => { // Processor Local x2APIC (32-bit x2APIC ID for large SMP systems)
+                            // Structure: type(1), length(1), reserved(2), x2apic_id(4), flags(4), acpi_proc_uid(4)
+                            let x2apic_id = *(current_entry.add(4) as *const u32);
+                            let flags = *(current_entry.add(8) as *const u32);
+                            let acpi_uid = *(current_entry.add(12) as *const u32);
+                            if flags & 1 != 0 { // Enabled
+                                if cpu_count < 32 {
+                                    apic_ids[cpu_count] = x2apic_id;
+                                    cpu_count += 1;
+                                }
+                                serial_printf(format_args!("[ACPI]   - CPU (x2APIC ID {}, ACPI UID {})\n", x2apic_id, acpi_uid));
+                            }
                         }
                         _ => {}
                     }

@@ -1968,7 +1968,7 @@ fn disable_apic() {
         }
     }
 }
-extern "C" fn reschedule_irq_handler(_context: &ExceptionContext) {
+extern "C" fn reschedule_irq_handler() {
     crate::apic::eoi();
     crate::scheduler::schedule();
 }
