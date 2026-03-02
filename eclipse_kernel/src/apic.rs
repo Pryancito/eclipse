@@ -4,6 +4,7 @@
 
 use crate::memory::phys_to_virt;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // LAPIC Register Offsets
 const LAPIC_REG_ID: u32 = 0x20;
@@ -26,6 +27,55 @@ const LAPIC_REG_TMRCURR: u32 = 0x390;
 const LAPIC_REG_TMRDIV: u32 = 0x3E0;
 
 static mut LAPIC_BASE: u64 = 0;
+
+/// Calibrated LAPIC timer counts per 1ms (set by BSP before APs start)
+static LAPIC_TIMER_COUNT_1MS: AtomicU32 = AtomicU32::new(6250);
+
+/// Calibrate the Local APIC timer using the PIT tick counter as reference.
+/// Must be called on the BSP after interrupts::init() and apic::init().
+pub fn calibrate_timer() {
+    unsafe {
+        if LAPIC_BASE == 0 { return; }
+
+        // Use divider /16
+        write_reg(LAPIC_REG_TMRDIV, 0x03);
+        // Mask the timer and run in one-shot mode to measure frequency
+        write_reg(LAPIC_REG_LVT_TIMER, 0x0001_0000); // masked
+        write_reg(LAPIC_REG_TMRINIT, 0xFFFF_FFFF);
+
+        // Wait 10 PIT ticks (≈10 ms at 1000 Hz); interrupts must already be on
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        let start = crate::interrupts::ticks();
+        while crate::interrupts::ticks() < start + 10 {
+            crate::cpu::pause();
+        }
+
+        let remaining = read_reg(LAPIC_REG_TMRCURR);
+        let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
+        let count_per_ms = if elapsed > 10 { elapsed / 10 } else { 6250 };
+
+        // Stop the one-shot timer
+        write_reg(LAPIC_REG_TMRINIT, 0);
+
+        LAPIC_TIMER_COUNT_1MS.store(count_per_ms, Ordering::SeqCst);
+        crate::serial::serial_printf(format_args!(
+            "[APIC] Timer calibrated: {} counts/ms\n", count_per_ms
+        ));
+    }
+}
+
+/// Start the Local APIC periodic timer on the current CPU.
+/// `vector` is the IDT vector that will fire every ~1 ms.
+/// calibrate_timer() must have been called on the BSP beforehand.
+pub fn init_timer(vector: u8) {
+    let count = LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed);
+    unsafe {
+        write_reg(LAPIC_REG_TMRDIV, 0x03);          // divide by 16
+        // Periodic mode (bit 17), unmasked, vector
+        write_reg(LAPIC_REG_LVT_TIMER, (1 << 17) | (vector as u32));
+        write_reg(LAPIC_REG_TMRINIT, count);         // ~1 ms period
+    }
+}
 
 /// Initialize Local APIC for the current CPU
 pub fn init() {

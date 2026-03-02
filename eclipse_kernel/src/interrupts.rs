@@ -114,6 +114,9 @@ type IrqHandler = fn();
 /// IRQ handler table for IRQs 0-15 (interrupts 32-47)
 static mut IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
 
+/// IDT vector for Local APIC periodic timer (used by all CPUs for scheduling)
+pub const APIC_TIMER_VECTOR: u8 = 0xFF;
+
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
 const IDT_RING_0: u8 = 0b00000000;
@@ -140,6 +143,11 @@ pub fn init() {
         KERNEL_IDT.entries[33].set_handler(irq_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[44].set_handler(irq_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
+        // Local APIC timer (vector 0xFF) – fires on every CPU that calls apic::init_timer()
+        KERNEL_IDT.entries[APIC_TIMER_VECTOR as usize].set_handler(
+            apic_timer_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
+        );
+
         // Configurar syscall handler (int 0x80)
         // Must be callable from Ring 3 (DPL 3) or it will cause #GP
         const IDT_RING_3: u8 = 0b01100000;
@@ -1194,6 +1202,55 @@ pub fn get_stats() -> InterruptStats {
     }
 }
 
+// ============================================================================
+// Local APIC Timer Handler (vector 0xFF) – drives per-CPU scheduling
+// ============================================================================
+
+/// Rust-level handler for the Local APIC periodic timer interrupt.
+/// Sends LAPIC EOI then calls the scheduler so each CPU participates in
+/// process scheduling independently of the BSP's PIT (IRQ 0).
+extern "C" fn apic_timer_handler() {
+    // EOI must be sent before re-enabling interrupts or scheduling, so that
+    // the LAPIC can accept the next timer interrupt.
+    crate::apic::eoi();
+    crate::scheduler::schedule();
+}
+
+/// Naked trampoline for the APIC timer interrupt (saves/restores caller-saved regs).
+#[unsafe(naked)]
+unsafe extern "C" fn apic_timer_irq() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym apic_timer_handler,
+    );
+}
+
+
+
 /// Register a custom IRQ handler for the given IRQ number (0-15)
 /// This allows device drivers to register their interrupt handlers dynamically
 pub fn set_irq_handler(irq_num: u8, handler: fn()) -> Result<(), &'static str> {
@@ -1500,33 +1557,31 @@ unsafe extern "C" fn syscall_entry() {
         // Syscall entry point (via LSTAR)
         // RCX = User RIP
         // R11 = User RFLAGS
-        // RSP = User RSP
+        // RSP = User RSP (still on user stack at this point)
         
-        // Save User RSP to global scratch
-        "mov [rip + {user_rsp}], rsp",
-        
-        // Load Kernel RSP from TSS (offset 4 is rsp0)
-        "mov rsp, [rip + {tss} + 4]",
-        
-        // Build IRETQ stack frame manually
-        // Layout: SS, RSP, RFLAGS, CS, RIP
-        
-        // 1. SS (User Data = 0x23)
-        "push 0x23",
-        
-        // 2. RSP (Saved User RSP)
-        "push [rip + {user_rsp}]",
-        
-        // 3. RFLAGS (Saved in R11)
-        "push r11",
-        
-        // 4. CS (User Code = 0x1B)
-        "push 0x1B",
-        
-        // 5. RIP (Saved in RCX)
-        "push rcx",
-        
-        // Now on Kernel Stack with IRETQ frame.
+        // Switch to per-CPU kernel data via GS.
+        // swapgs exchanges GS.base with IA32_KERNEL_GS_BASE, which was set
+        // to &CPU_DATA[cpu_id] by load_gdt().  After swapgs:
+        //   gs:[0]  = CpuData.rsp0        (kernel RSP for this CPU)
+        //   gs:[8]  = CpuData.scratch_rsp (scratch save area for user RSP)
+        "swapgs",
+
+        // Save user RSP to per-CPU scratch area, then load kernel RSP.
+        "mov gs:[8], rsp",
+        "mov rsp, gs:[0]",
+
+        // Build IRETQ stack frame on the kernel stack.
+        // Layout (low→high): RIP, CS, RFLAGS, RSP, SS
+        "push 0x23",                  // SS  (user data selector)
+        "push qword ptr gs:[8]",      // RSP (saved user stack pointer)
+        "push r11",              // RFLAGS (saved by SYSCALL in R11)
+        "push 0x1B",             // CS  (user code selector)
+        "push rcx",              // RIP (saved by SYSCALL in RCX)
+
+        // Restore user GS now that we are on the kernel stack and no longer
+        // need GS-relative access.
+        "swapgs",
+
         // We push RBP first so we can use it as a reference for the Context structure
         "push rbp",
         "mov rbp, rsp",
@@ -1599,8 +1654,6 @@ unsafe extern "C" fn syscall_entry() {
         
         "iretq",
         
-        user_rsp = sym USER_RSP_SCRATCH,
-        tss = sym crate::boot::TSS,
         handler = sym syscall_handler_rust,
     );
 }

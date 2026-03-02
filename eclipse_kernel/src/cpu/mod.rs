@@ -412,7 +412,25 @@ pub extern "C" fn ap_entry() -> ! {
 
     crate::interrupts::load_idt();
     crate::apic::init();
-    
+
+    // Allocate a dedicated kernel interrupt stack for this AP.
+    // This stack is used by the CPU when transitioning from ring 3 → ring 0
+    // (hardware interrupts, exceptions, SYSCALL) on this AP.
+    let kernel_stack = alloc::vec![0u8; crate::process::KERNEL_STACK_SIZE];
+    let kernel_stack_top = (kernel_stack.as_ptr() as u64 + crate::process::KERNEL_STACK_SIZE as u64) & !0xF;
+    core::mem::forget(kernel_stack); // Leak: AP stack is permanent
+    crate::boot::set_tss_stack(kernel_stack_top);
+
+    // Start the per-AP Local APIC periodic timer so this core receives
+    // scheduling interrupts independently of the BSP's PIT (IRQ 0).
+    crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
+
+    serial_printf(format_args!("[CPU] AP (APIC ID {}) entering scheduler loop\n",
+        crate::apic::get_id()));
+
+    // Enable interrupts; the APIC timer will drive schedule() from here on.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
+
     loop {
         idle();
     }
