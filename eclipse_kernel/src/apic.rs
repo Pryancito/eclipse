@@ -218,6 +218,29 @@ pub fn broadcast_sipi(vector: u8) {
     }
 }
 
+/// Send a TLB shootdown IPI to all CPUs except the calling CPU.
+///
+/// This should be called after modifying page table entries that are visible to
+/// all CPUs (e.g. the shared kernel mapping, or when removing the identity map).
+/// The IPI fires vector `TLB_SHOOTDOWN_VECTOR` on every other logical processor,
+/// causing each one to flush its local TLB.
+pub fn send_tlb_shootdown_ipi() {
+    unsafe {
+        if LAPIC_BASE == 0 { return; }
+        clear_esr();
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+
+        let vector = crate::interrupts::TLB_SHOOTDOWN_VECTOR as u32;
+        // ICR: destination shorthand = All excluding self (3 << 18),
+        //      delivery mode = Fixed (0 << 8), assert (1 << 14), edge trigger.
+        let icrl = (3 << 18) | (1 << 14) | vector;
+        write_reg(LAPIC_REG_ICRH, 0);
+        write_reg(LAPIC_REG_ICRL, icrl);
+
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+    }
+}
+
 unsafe fn clear_esr() {
     write_reg(LAPIC_REG_ESR, 0);
 }

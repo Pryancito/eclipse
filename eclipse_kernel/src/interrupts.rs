@@ -118,6 +118,11 @@ static mut IRQ_HANDLERS: [Option<IrqHandler>; 16] = [None; 16];
 /// Must not coincide with the LAPIC spurious interrupt vector (0xFF set in SVR).
 pub const APIC_TIMER_VECTOR: u8 = 0xFE;
 
+/// IDT vector for inter-processor TLB shootdown.
+/// Fired on all APs when the BSP modifies shared page table entries so each CPU
+/// flushes its local TLB.  Must differ from both the spurious (0xFF) and timer (0xFE) vectors.
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFD;
+
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
 const IDT_RING_0: u8 = 0b00000000;
@@ -144,9 +149,14 @@ pub fn init() {
         KERNEL_IDT.entries[33].set_handler(irq_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[44].set_handler(irq_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         
-        // Local APIC timer (vector 0xFF) – fires on every CPU that calls apic::init_timer()
+        // Local APIC timer (vector 0xFE) – fires on every CPU that calls apic::init_timer()
         KERNEL_IDT.entries[APIC_TIMER_VECTOR as usize].set_handler(
             apic_timer_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
+        );
+
+        // TLB shootdown IPI (vector 0xFD) – sent by BSP to flush TLBs on all APs
+        KERNEL_IDT.entries[TLB_SHOOTDOWN_VECTOR as usize].set_handler(
+            tlb_shootdown_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
         );
 
         // Configurar syscall handler (int 0x80)
@@ -192,6 +202,34 @@ pub fn init() {
     unsafe {
         asm!("sti", options(nomem, nostack));
         crate::serial::serial_print("[INT] Interrupts ENABLED\n");
+    }
+}
+
+/// Initialize per-CPU interrupt infrastructure for an Application Processor (AP).
+///
+/// This must be called on each AP after `boot::load_gdt()` and `interrupts::load_idt()`.
+/// It sets up the SYSCALL/SYSRET MSRs (EFER.SCE, STAR, LSTAR, SFMASK) which are
+/// per-CPU registers and are not shared between cores.
+/// Unlike `init()`, this does NOT re-initialize the PIC, PIT, PS/2 keyboard/mouse,
+/// or PIT timer since those are legacy shared devices managed only by the BSP.
+pub fn init_ap() {
+    unsafe {
+        // Enable SYSCALL/SYSRET (SCE bit in EFER)
+        let efer = rdmsr(MSR_EFER);
+        wrmsr(MSR_EFER, efer | 1);
+
+        // STAR: ring 0 CS selector (bits 47:32) and ring 3 base CS (bits 63:48).
+        // This kernel uses IRETQ (not SYSRET) to return from syscalls, so the
+        // bits-63:48 value is not used in practice.  Mirror the BSP's value for
+        // consistency (identical to the wrmsr in init() above).
+        wrmsr(MSR_STAR, (0x08 << 32) | (0x08 << 48));
+
+        // LSTAR: entry point for the SYSCALL instruction
+        wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+
+        // SFMASK: clear the interrupt flag on syscall entry so the kernel stack
+        // is always set up before the first timer interrupt fires on this CPU.
+        wrmsr(MSR_SFMASK, 0x200);
     }
 }
 
@@ -476,8 +514,18 @@ impl KernelRecoveryPoint {
     }
 }
 
-/// Global recovery point (one per CPU — currently single-CPU kernel).
-pub static mut KERNEL_RECOVERY: KernelRecoveryPoint = KernelRecoveryPoint::new();
+/// Per-CPU kernel recovery points – one slot per logical CPU (indexed by CPU ID).
+/// Having a separate slot per core prevents concurrent kernel fault handlers on
+/// different CPUs from overwriting each other's saved state.
+///
+/// # Safety invariant
+/// Each slot `KERNEL_RECOVERY[i]` is accessed **exclusively** by the CPU whose
+/// `get_cpu_id()` returns `i`.  No two CPUs share a slot, so concurrent writes
+/// by different cores never alias, and per-slot accesses are data-race free.
+/// The `active` field is read/written with `read_volatile`/`write_volatile` to
+/// prevent the compiler from caching or eliding the memory operations.
+pub static mut KERNEL_RECOVERY: [KernelRecoveryPoint; crate::boot::MAX_SMP_CPUS] =
+    [const { KernelRecoveryPoint::new() }; crate::boot::MAX_SMP_CPUS];
 
 /// Set a kernel recovery point. Returns `false` on first call (normal path).
 /// If a fault fires, execution resumes here and returns `true` (error path).
@@ -489,10 +537,11 @@ pub static mut KERNEL_RECOVERY: KernelRecoveryPoint = KernelRecoveryPoint::new()
 #[inline(never)]
 pub unsafe fn set_recovery_point() -> bool {
     let result: u64;
+    let cpu_id = crate::process::get_cpu_id();
     // Pass the struct pointer as an `in(reg)` so the compiler emits a
     // 64-bit address materialisation (mov rXX, imm64 + lea), avoiding
     // R_X86_64_32S relocations that can't reach higher-half addresses.
-    let rec_ptr: u64 = &raw mut KERNEL_RECOVERY as u64;
+    let rec_ptr: u64 = &raw mut KERNEL_RECOVERY[cpu_id] as u64;
     core::arch::asm!(
         // rax already holds rec_ptr (passed as inout)
         // Capture the resume RIP via a forward LEA to label 2:
@@ -523,7 +572,8 @@ pub unsafe fn set_recovery_point() -> bool {
 /// Clear the active recovery point so faults revert to BSOD behaviour.
 #[inline]
 pub unsafe fn clear_recovery_point() {
-    core::ptr::write_volatile(&raw mut KERNEL_RECOVERY.active, 0);
+    let cpu_id = crate::process::get_cpu_id();
+    core::ptr::write_volatile(&raw mut KERNEL_RECOVERY[cpu_id].active, 0);
 }
 
 // ============================================================================
@@ -635,7 +685,7 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
     // Only intercept Page Fault (#PF=14) and General Protection (#GP=13) here,
     // since those are the faults that can arise from probing unmapped MMIO.
     if num == 14 || num == 13 {
-        let active = unsafe { core::ptr::read_volatile(&raw const KERNEL_RECOVERY.active) };
+        let active = unsafe { core::ptr::read_volatile(&raw const KERNEL_RECOVERY[cpu_id].active) };
         if active != 0 {
             crate::serial::serial_printf(format_args!(
                 "[RECOVERY] Fault #{} at RIP={:#018x} CR2={:#018x} — jumping to recovery point\n",
@@ -643,12 +693,12 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
             ));
             // Deactivate the recovery point *before* restoring state so a fault
             // inside the handler itself doesn't loop forever.
-            unsafe { core::ptr::write_volatile(&raw mut KERNEL_RECOVERY.active, 0); }
+            unsafe { core::ptr::write_volatile(&raw mut KERNEL_RECOVERY[cpu_id].active, 0); }
 
             // Restore saved state and return to the saved RIP with RAX=1
             // (signals `set_recovery_point()` returned `true` = error).
             unsafe {
-                let rec_ptr: u64 = &raw const KERNEL_RECOVERY as u64;
+                let rec_ptr: u64 = &raw const KERNEL_RECOVERY[cpu_id] as u64;
                 core::arch::asm!(
                     "mov rsp, [rcx +  8]",  // restore rsp
                     "mov rbp, [rcx + 16]",  // restore rbp
@@ -1247,6 +1297,58 @@ unsafe extern "C" fn apic_timer_irq() {
         "pop rbp",
         "iretq",
         sym apic_timer_handler,
+    );
+}
+
+// ============================================================================
+// TLB Shootdown Handler (vector 0xFD) – IPI from BSP to flush APs' TLBs
+// ============================================================================
+
+/// Rust handler for the TLB shootdown IPI.
+/// Flushes the entire local TLB by reloading CR3, then acknowledges the LAPIC.
+extern "C" fn tlb_shootdown_handler() {
+    // Flush local TLB by reloading CR3
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr3",
+            "mov cr3, rax",
+            out("rax") _,
+            options(nostack, preserves_flags)
+        );
+    }
+    crate::apic::eoi();
+}
+
+/// Naked trampoline for the TLB shootdown IPI (saves/restores caller-saved regs).
+#[unsafe(naked)]
+unsafe extern "C" fn tlb_shootdown_irq() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym tlb_shootdown_handler,
     );
 }
 
