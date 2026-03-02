@@ -57,6 +57,7 @@ pub extern "C" fn _start() -> ! {
     if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
     if let Some(net_pid) = query_network_service_pid() { state.network_pid = Some(net_pid); }
 
+    println!("[SMITHAY] Entering main loop (PID {})", pid);
     loop {
         // Drenar todo el input pendiente antes de update/render para no llenar el mailbox del kernel
         state.process_events();

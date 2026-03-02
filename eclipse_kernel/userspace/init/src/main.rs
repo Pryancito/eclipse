@@ -318,7 +318,10 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"NETW");
         response[4..8].copy_from_slice(&net_pid.to_le_bytes());
-        let _ = eclipse_libc::send(sender, 0x08, &response);
+        // Use MSG_TYPE_INPUT (0x40 = P2P) so the response is delivered directly to
+        // the requester's mailbox instead of being dropped in the global IPC queue.
+        // This matches how the GET_INPUT_PID response is sent (see above).
+        let _ = eclipse_libc::send(sender, 0x40, &response);
         return;
     }
 

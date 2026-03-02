@@ -76,7 +76,9 @@ pub fn subscribe_to_input(input_pid: u32, self_pid: u32) -> bool {
 
 /// Preguntar al init el PID real del network_service, con un máximo de intentos configurable.
 pub fn query_network_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
-    if send(INIT_PID, MSG_TYPE_NETWORK, GET_NETWORK_PID_MSG) != 0 {
+    // Use MSG_TYPE_INPUT so the request is delivered P2P to init's mailbox.
+    // MSG_TYPE_NETWORK is non-P2P and gets dropped in the global IPC queue.
+    if send(INIT_PID, MSG_TYPE_INPUT, GET_NETWORK_PID_MSG) != 0 {
         return None;
     }
     let mut buffer = [0u8; 64];
@@ -86,7 +88,9 @@ pub fn query_network_service_pid_with_attempts(max_attempts: u32) -> Option<u32>
             let mut pid_bytes = [0u8; 4];
             pid_bytes.copy_from_slice(&buffer[4..8]);
             let pid = u32::from_le_bytes(pid_bytes);
-            if pid > 0 { return Some(pid); }
+            // Break the loop regardless of pid value: if pid==0 the service is not
+            // running, so there is no point retrying 10,000 more times.
+            return if pid > 0 { Some(pid) } else { None };
         }
         yield_cpu();
     }
