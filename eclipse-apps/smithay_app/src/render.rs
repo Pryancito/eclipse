@@ -202,7 +202,7 @@ impl FramebufferState {
     /// Called periodically so that if the framebuffer becomes available after startup
     /// (e.g. after NVIDIA driver initialization completes), the display will start working.
     pub fn try_remap_framebuffer(&mut self) {
-        if self.front_addr >= 0x1000 {
+        if self.gpu_resource_id.is_some() || self.front_addr >= 0x1000 {
             return; // already mapped
         }
         if let Some(addr) = map_framebuffer() {
@@ -890,14 +890,22 @@ pub fn draw_system_central(
         let y = start_y + 25 + (i as i32 * row_h);
         if y > half_h + 20 - 20 { break; }
         
+        // Name
+        let name_raw = core::str::from_utf8(&svc.name).unwrap_or("?");
+        let name_str = match name_raw.find('\0') {
+            Some(pos) => &name_raw[..pos],
+            None => name_raw,
+        }.trim();
+        let _ = Text::new(name_str, Point::new(col_name, y), text_style).draw(fb);
+
         // PID
         let mut pid_str = heapless::String::<10>::new();
-        let _ = core::fmt::write(&mut pid_str, format_args!("{}", svc.pid));
+        if svc.state == 0 || (svc.pid == 0 && name_str != "kernel") {
+            let _ = pid_str.push_str("NaN");
+        } else {
+            let _ = core::fmt::write(&mut pid_str, format_args!("{}", svc.pid));
+        }
         let _ = Text::new(&pid_str, Point::new(col_id, y), text_style).draw(fb);
-        
-        // Name
-        let name_str = core::str::from_utf8(&svc.name).unwrap_or("?").trim_matches(char::from(0));
-        let _ = Text::new(name_str, Point::new(col_name, y), text_style).draw(fb);
         
         // State
         let state_str = match svc.state {
@@ -919,7 +927,7 @@ pub fn draw_system_central(
         let mut svc_cpu = 0.0;
         let mut svc_mem_kb = 0;
         for (j, p) in processes.iter().enumerate() {
-            if p.pid == svc.pid {
+            if p.pid == svc.pid && svc.pid != 0 {
                 svc_cpu = process_cpu[j];
                 svc_mem_kb = process_mem[j];
                 break;
@@ -968,18 +976,25 @@ pub fn draw_system_central(
         let _ = Text::new(name, Point::new(*x, start_y_prog), header_style).draw(fb);
     }
 
-    // Filter out services from process list (if they share the same PID range, usually they do)
-    // For now just show all processes that are not systemd or init
+    // Filter out services from process list
     let mut display_idx = 0;
-    for p in processes {
+    for (p_idx, p) in processes.iter().enumerate() {
         if p.pid <= 1 { continue; }
         
-        // Skip if it is a service (simplification: if name matches a service name)
-        let p_name = core::str::from_utf8(&p.name).unwrap_or("?").trim_matches(char::from(0));
+        let p_name_raw = core::str::from_utf8(&p.name).unwrap_or("?");
+        let p_name = match p_name_raw.find('\0') {
+            Some(pos) => &p_name_raw[..pos],
+            None => p_name_raw,
+        }.trim();
+        
         let mut is_service = false;
         for s in services {
-            let s_name = core::str::from_utf8(&s.name).unwrap_or("?").trim_matches(char::from(0));
-            if p_name == s_name || p.pid == s.pid {
+            let s_name_raw = core::str::from_utf8(&s.name).unwrap_or("?");
+            let s_name = match s_name_raw.find('\0') {
+                Some(pos) => &s_name_raw[..pos],
+                None => s_name_raw,
+            }.trim();
+            if (p.pid != 0 && p.pid == s.pid) || p_name == s_name {
                 is_service = true;
                 break;
             }
@@ -998,13 +1013,14 @@ pub fn draw_system_central(
         let _ = Text::new(p_name, Point::new(col_prog_name, y), text_style).draw(fb);
         
         // CPU
+        let cpu_val = process_cpu[p_idx];
         let mut cpu_str = heapless::String::<12>::new();
-        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", process_cpu[processes.iter().position(|proc| proc.pid == p.pid).unwrap_or(0)]));
+        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", cpu_val));
         let _ = Text::new(&cpu_str, Point::new(col_prog_cpu, y), text_style).draw(fb);
         
         // MEM
         let mut mem_str = heapless::String::<16>::new();
-        let mem_kb = process_mem[processes.iter().position(|proc| proc.pid == p.pid).unwrap_or(0)];
+        let mem_kb = process_mem[p_idx];
         if mem_kb > 1024 {
             let _ = core::fmt::write(&mut mem_str, format_args!("{:.1} MB", mem_kb as f32 / 1024.0));
         } else {

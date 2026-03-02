@@ -74,7 +74,7 @@ pub extern "C" fn _start() -> ! {
             state.backend.fb.try_remap_framebuffer();
         }
 
-        if state.counter % 1000 == 0 {
+        if state.counter % 100 == 0 {
             let used = HEAP_PTR.load(Ordering::Relaxed);
             println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs.",
                 used, state.backend.ipc.message_count);

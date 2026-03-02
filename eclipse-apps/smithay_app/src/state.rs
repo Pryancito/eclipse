@@ -120,23 +120,28 @@ impl SmithayState {
                         self.net_tx = tx;
                     }
                     CompositorEvent::ServiceInfo(data) => {
-                        // SVCS (4) + Count (4) + [Name(16) + State(4) + PID(4) + Restarts(4)] * Count
+                        // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
                         if data.len() >= 8 && &data[0..4] == b"SVCS" {
                             let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
-                            self.service_count = core::cmp::min(count, 32);
+                            
+                            let base_idx = 0;
+                            self.service_count = core::cmp::min(count + base_idx, 32);
+                            
                             let mut offset = 8;
-                            for i in 0..self.service_count {
-                                if data.len() >= offset + 28 {
+                            for i in 0..count {
+                                let list_idx = base_idx + i;
+                                if list_idx >= 32 { break; }
+                                if data.len() >= offset + 24 {
                                     let mut svc = ServiceInfo::default();
-                                    svc.name.copy_from_slice(&data[offset..offset+16]);
-                                    offset += 16;
+                                    svc.name[..12].copy_from_slice(&data[offset..offset+12]);
+                                    offset += 12;
                                     svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
                                     offset += 4;
                                     svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
                                     offset += 4;
                                     svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
                                     offset += 4;
-                                    self.service_list[i] = svc;
+                                    self.service_list[list_idx] = svc;
                                 }
                             }
                         }
@@ -191,8 +196,6 @@ impl SmithayState {
                     if current.total_mem_frames > 0 {
                         self.mem_usage = (current.used_mem_frames as f32) / (current.total_mem_frames as f32);
                     }
-                    
-                    self.prev_stats = Some(current);
                 }
             }
             
@@ -270,9 +273,12 @@ impl SmithayState {
                     }
                     
                     // Pedir info de servicios a systemd (PID 1)
-                    let _ = eclipse_libc::send(1, 0x41, b"GET_SERVICES_INFO");
+                    let _ = eclipse_libc::send(1, 0x40, b"GET_SERVICES_INFO");
                 }
             }
+
+            // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
+            self.prev_stats = Some(current);
         }
     }
 

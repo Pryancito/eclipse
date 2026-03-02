@@ -18,7 +18,7 @@ use eclipse_libc::{
 const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
 static mut LOAD_BUF: [u8; MAX_COMPOSITOR_SIZE] = [0; MAX_COMPOSITOR_SIZE];
 
-const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
+const COMPOSITOR_PATH: &str = "/usr/bin/smithay_app";
 /// Yield iterations between restart attempts (~1s of busy-wait)
 const RESTART_DELAY_YIELDS: u32 = 500_000;
 /// Maximum restart attempts (0 = unlimited)

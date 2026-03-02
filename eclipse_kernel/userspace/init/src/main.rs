@@ -45,7 +45,9 @@ impl Service {
 /// 5. Graphics Server (Display) (4)
 /// 6. Audio Server (5)
 /// 7. Network Server (6)
-static mut SERVICES: [Service; 8] = [
+static mut SERVICES: [Service; 10] = [
+    Service::new("kernel"),
+    Service::new("init"),
     Service::new("log"),
     Service::new("devfs"),
     Service::new("filesystem"),
@@ -70,6 +72,14 @@ pub extern "C" fn _start() -> ! {
     println!();
     println!("Init process started with PID: {}", pid);
     println!();
+
+    unsafe {
+        // Initialize kernel and init services which are already running
+        SERVICES[0].state = ServiceState::Running;
+        SERVICES[0].pid = 0;
+        SERVICES[1].state = ServiceState::Running;
+        SERVICES[1].pid = pid as i32;
+    }
     
     // Phase 1: Start essential services (log, devfs). Root is NOT mounted yet.
     println!("[INIT] Phase 1: Starting essential services (log, devfs)...");
@@ -93,14 +103,14 @@ pub extern "C" fn _start() -> ! {
 fn start_essential_services() {
     unsafe {
         // Start log server first - critical for debugging
-        start_service(&mut SERVICES[0]);
+        start_service(&mut SERVICES[2]);
         
         // Wait for log service to be ready
         println!("[INIT] Waiting for LOG service to signal READY...");
         wait_for_ready("log", 5000);
         
         // Start device manager (devfs) - creates /dev nodes
-        start_service(&mut SERVICES[1]);
+        start_service(&mut SERVICES[3]);
         
         // Wait for devfs to be ready
         println!("[INIT] Waiting for DevFS to signal READY...");
@@ -120,23 +130,23 @@ fn start_system_services() {
         //println!("  [FS] Root filesystem ready (mounted by filesystem service).");
 
         // Start input service (depends on filesystem)
-        start_service(&mut SERVICES[3]);
+        start_service(&mut SERVICES[5]);
         wait_for_ready("input", 5000);
         
         // Start display service (depends on input)
-        start_service(&mut SERVICES[4]);
+        start_service(&mut SERVICES[6]);
         wait_for_ready("display", 5000);
 
         // Start audio service (depends on filesystem)
-        start_service(&mut SERVICES[5]);
+        start_service(&mut SERVICES[7]);
         wait_for_ready("audio", 5000);
         
         // Start network service last (most complex)
-        start_service(&mut SERVICES[6]);
+        start_service(&mut SERVICES[8]);
         wait_for_ready("network", 5000);
 
         // Start GUI service (depends on network)
-        start_service(&mut SERVICES[7]);
+        start_service(&mut SERVICES[9]);
         wait_for_ready("gui", 5000);
     }
 }
@@ -295,7 +305,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
     // Petición de PID del servicio de entrada ("GET_INPUT_PID" = 13 bytes)
     if len >= 13 && &buffer[..13] == b"GET_INPUT_PID" {
-        let input_pid = unsafe { SERVICES[3].pid as u32 }; // Servicio "input"
+        let input_pid = unsafe { SERVICES[5].pid as u32 }; // Servicio "input"
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"INPT");
         response[4..8].copy_from_slice(&input_pid.to_le_bytes());
@@ -305,7 +315,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
     // Petición de PID del servicio de pantalla ("GET_DISPLAY_PID" = 15 bytes)
     if len >= 15 && &buffer[..15] == b"GET_DISPLAY_PID" {
-        let display_pid = unsafe { SERVICES[4].pid as u32 }; // Servicio "display" (Smithay)
+        let display_pid = unsafe { SERVICES[6].pid as u32 }; // Servicio "display" (Smithay)
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"DSPL");
         response[4..8].copy_from_slice(&display_pid.to_le_bytes());
@@ -315,7 +325,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
     // Petición de PID del servicio de red ("GET_NETWORK_PID" = 15 bytes)
     if len >= 15 && &buffer[..15] == b"GET_NETWORK_PID" {
-        let net_pid = unsafe { SERVICES[6].pid as u32 }; // Servicio "network"
+        let net_pid = unsafe { SERVICES[8].pid as u32 }; // Servicio "network"
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"NETW");
         response[4..8].copy_from_slice(&net_pid.to_le_bytes());
@@ -326,34 +336,30 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         return;
     }
 
-    // Petición de información de servicios ("GET_SERVICES_INFO" = 17 bytes)
+    // Petición de información de servicios ("GET_SERVICES_INFO")
     if len >= 17 && &buffer[..17] == b"GET_SERVICES_INFO" {
-        let mut reply = [0u8; 256];
+        let mut reply = [0u8; 512]; // Aumentado para soportar más servicios
         reply[0..4].copy_from_slice(b"SVCS");
         let svc_count = unsafe { SERVICES.len() };
         reply[4..8].copy_from_slice(&(svc_count as u32).to_le_bytes());
         
         let mut offset = 8;
-        for i in 0..svc_count {
-            if offset + 28 > 256 { break; }
-            unsafe {
-                let svc = &SERVICES[i];
-                // Name (16 bytes)
-                let name_len = core::cmp::min(svc.name.len(), 16);
-                reply[offset..offset+name_len].copy_from_slice(&svc.name.as_bytes()[..name_len]);
-                offset += 16;
-                // State (4 bytes)
-                reply[offset..offset+4].copy_from_slice(&(svc.state as u32).to_le_bytes());
-                offset += 4;
-                // PID (4 bytes)
-                reply[offset..offset+4].copy_from_slice(&(svc.pid as u32).to_le_bytes());
-                offset += 4;
-                // Restarts (4 bytes)
-                reply[offset..offset+4].copy_from_slice(&(svc.restart_count as u32).to_le_bytes());
-                offset += 4;
-            }
+        // Format: [name: 12 bytes][state: u32][pid: u32][restart_count: u32] = 24 bytes per service
+        // Reduced from 16-byte name to 12 to fit within the 256-byte IPC message limit
+        for s in unsafe { &SERVICES } {
+            if offset + 24 > 256 { break; }
+            let name_bytes = s.name.as_bytes();
+            let name_len = name_bytes.len().min(12);
+            reply[offset..offset + name_len].copy_from_slice(&name_bytes[..name_len]);
+            offset += 12;
+            reply[offset..offset + 4].copy_from_slice(&(s.state as u32).to_le_bytes());
+            offset += 4;
+            reply[offset..offset + 4].copy_from_slice(&(s.pid as u32).to_le_bytes());
+            offset += 4;
+            reply[offset..offset + 4].copy_from_slice(&s.restart_count.to_le_bytes());
+            offset += 4;
         }
-        let _ = eclipse_libc::send(sender, 0x41, &reply[..offset]);
+        let _ = eclipse_libc::send(sender, 0x40, &reply[..offset]);
         return;
     }
 

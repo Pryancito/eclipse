@@ -168,7 +168,7 @@ else
 fi
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
-QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"
+QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot -full-screen"
 
 # Configuración de display
 # -vga none: nuestra VirtIO es la única pantalla (Smithay visible)

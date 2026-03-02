@@ -503,7 +503,15 @@ pub fn get_last_exec_error(buf: &mut [u8]) -> usize {
 }
 
 pub fn spawn(elf_buffer: &[u8], name: Option<&str>) -> i32 {
-    let name_ptr = name.map(|s| s.as_ptr() as u64).unwrap_or(0);
+    let mut name_buf = [0u8; 16];
+    let name_ptr = match name {
+        Some(s) => {
+            let len = s.len().min(15);
+            name_buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+            name_buf.as_ptr() as u64
+        }
+        None => 0,
+    };
     unsafe { syscall3(SYS_SPAWN, elf_buffer.as_ptr() as u64, elf_buffer.len() as u64, name_ptr) as i32 }
 }
 
