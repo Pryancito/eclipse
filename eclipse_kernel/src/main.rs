@@ -259,6 +259,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Calibrate the LAPIC timer against the PIT on the BSP so all CPUs
     // can use the same count when they call apic::init_timer() later.
     apic::calibrate_timer();
+    // Start LAPIC periodic timer on BSP for SMP. Drives system tick when PIT delivery
+    // is unreliable. Keep PIT unmasked so we have a fallback (both can fire).
+    apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
     progress::bar(70);
     
     // Init DevFS before other subsystems
