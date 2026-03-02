@@ -374,8 +374,13 @@ pub fn remove_identity_mapping() {
     let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
     pml4.entries[0] = PageTableEntry::new();
     
-    // Flush TLB to ensure the change takes effect
+    // Flush local TLB first
     flush_tlb();
+
+    // Notify all APs to flush their TLBs too so none of them continues to
+    // use the now-removed identity mapping.  This is safe to call even before
+    // any APs are up (LAPIC_BASE == 0 → no-op).
+    crate::apic::send_tlb_shootdown_ipi();
 }
 
 /// Force physical address 0 to be mapped at virtual address 0 (Identity)

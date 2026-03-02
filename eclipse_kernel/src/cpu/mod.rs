@@ -390,9 +390,7 @@ pub extern "C" fn ap_entry() -> ! {
         );
     }
     
-    // Signal readiness immediately
-    AP_READY.fetch_add(1, Ordering::SeqCst);
-    
+    // 1. Load per-CPU GDT and set up IA32_KERNEL_GS_BASE for syscall_entry
     crate::boot::load_gdt();
     
     // Trace '[[GDTOK]]'
@@ -410,10 +408,22 @@ pub extern "C" fn ap_entry() -> ! {
         );
     }
 
+    // 2. Load the shared IDT (populated by the BSP in interrupts::init())
     crate::interrupts::load_idt();
+
+    // 3. Enable the Local APIC for this AP
     crate::apic::init();
 
-    // Allocate a dedicated kernel interrupt stack for this AP.
+    // 4. Enable SSE (per-CPU CR0/CR4 bits; must mirror boot::enable_sse() on BSP)
+    crate::boot::enable_sse();
+
+    // 5. Program the Page Attribute Table MSR (IA32_PAT) – this is a per-CPU MSR
+    crate::memory::init_pat();
+
+    // 6. Enable SYSCALL/SYSRET and set up STAR/LSTAR/SFMASK – per-CPU MSRs
+    crate::interrupts::init_ap();
+
+    // 7. Allocate a dedicated kernel interrupt stack for this AP.
     // This stack is used by the CPU when transitioning from ring 3 → ring 0
     // (hardware interrupts, exceptions, SYSCALL) on this AP.
     let kernel_stack = alloc::vec![0u8; crate::process::KERNEL_STACK_SIZE];
@@ -421,11 +431,16 @@ pub extern "C" fn ap_entry() -> ! {
     core::mem::forget(kernel_stack); // Leak: AP stack is permanent
     crate::boot::set_tss_stack(kernel_stack_top);
 
-    // Start the per-AP Local APIC periodic timer so this core receives
+    // 8. Start the per-AP Local APIC periodic timer so this core receives
     // scheduling interrupts independently of the BSP's PIT (IRQ 0).
     crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
 
-    serial_printf(format_args!("[CPU] AP (APIC ID {}) entering scheduler loop\n",
+    // 9. Signal the BSP that this AP is fully initialized.
+    // This MUST happen after all per-CPU hardware setup so that the BSP
+    // does not proceed to start the next AP before this one is ready.
+    AP_READY.fetch_add(1, Ordering::SeqCst);
+
+    serial_printf(format_args!("[CPU] AP (APIC ID {}) fully initialized, entering scheduler loop\n",
         crate::apic::get_id()));
 
     // Enable interrupts; the APIC timer will drive schedule() from here on.
