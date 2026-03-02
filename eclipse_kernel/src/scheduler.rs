@@ -257,7 +257,7 @@ pub fn schedule() {
                 {
                     let mut table = crate::process::PROCESS_TABLE.lock();
                     if let Some(process) = table[pid as usize].as_mut() {
-                        if process.state == ProcessState::Running && process.current_cpu == Some(cpu_id as u32) {
+                        if process.state == ProcessState::Running && process.current_cpu == cpu_id as u32 {
                             should_requeue = true;
                         }
                     }
@@ -283,12 +283,12 @@ pub fn schedule() {
                 if let Some(next_process) = table[next_pid as usize].as_mut() {
                     // Si por algún motivo aún tiene dueño (el core anterior todavía no terminó el switch_context),
                     // lo devolvemos a la cola y buscamos otro. Esto previene el "Double Run".
-                    if next_process.current_cpu.is_some() && next_process.current_cpu != Some(cpu_id as u32) {
+                    if next_process.current_cpu != crate::process::NO_CPU && next_process.current_cpu != cpu_id as u32 {
                         should_requeue = true;
                         false
                     } else {
                         next_process.state = ProcessState::Running;
-                        next_process.current_cpu = Some(cpu_id as u32);
+                        next_process.current_cpu = cpu_id as u32;
                         true
                     }
                 } else {
@@ -310,7 +310,8 @@ pub fn schedule() {
                         perform_context_switch(cur, next_pid);
                     }
                     None => {
-                        set_current_process(Some(next_pid));
+                        // AP transitioning from idle to first user process.
+                        // Don't set current_process here; perform_context_switch_to will do it.
                         if cpu_id < MAX_CPUS {
                             // Guardar el contexto idle de este AP para poder volver más tarde.
                             // Safety: cada CPU escribe únicamente su propia ranura [cpu_id].
@@ -336,41 +337,44 @@ pub fn schedule() {
             if is_blocked {
                 let blocked_pid = current_pid.unwrap();
 
-                // Release CPU ownership so any core can pick this process
-                // up when it wakes from the sleep queue.
-                {
-                    let mut table = crate::process::PROCESS_TABLE.lock();
-                    if let Some(p) = table[blocked_pid as usize].as_mut() {
-                        p.current_cpu = None;
-                    }
-                }
-
                 if cpu_id == 0 {
                     // BSP: volver al proceso kernel (PID 0) que actúa como idle.
-                    set_current_process(Some(0));
+                    // Update PID 0 process state. current_process_id() still returns
+                    // blocked_pid here so perform_context_switch_to can correctly compute
+                    // the clear_addr for blocked_pid.current_cpu.
                     {
                         let mut table = crate::process::PROCESS_TABLE.lock();
                         if let Some(p0) = table[0].as_mut() {
                             p0.state = ProcessState::Running;
-                            p0.current_cpu = Some(0);
+                            p0.current_cpu = 0;
                         }
                     }
+                    // perform_context_switch_to (called from perform_context_switch) will:
+                    // 1. compute clear_addr = &blocked_pid.current_cpu (current_process_id() = blocked_pid)
+                    // 2. call set_current_process(Some(0))
+                    // 3. call switch_context which atomically clears blocked_pid.current_cpu
                     perform_context_switch(blocked_pid, 0);
                 } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
                     // AP: restaurar el contexto idle guardado.
+                    // Obtain the context pointer and current_cpu address together under one lock,
+                    // then release before calling switch_context.
                     set_current_process(None);
-                    let from_ptr = {
+                    let (from_ptr, clear_ptr) = {
                         let mut table = crate::process::PROCESS_TABLE.lock();
                         match table[blocked_pid as usize].as_mut() {
                             Some(p) => {
-                                &mut p.context as *mut crate::process::Context
+                                let ctx_ptr = &mut p.context as *mut crate::process::Context;
+                                let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
+                                (ctx_ptr, cpu_ptr)
                             },
                             None => return,
                         }
                     };
                     let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
                     unsafe {
-                        crate::process::switch_context(&mut *from_ptr, to_ctx, 0);
+                        // clear_ptr points to blocked_pid.current_cpu; switch_context will
+                        // atomically set it to NO_CPU after saving the context.
+                        crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
                     }
                 }
                 // Si el contexto idle del AP aún no es válido (ap_entry() todavía no
@@ -400,7 +404,9 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
         let mut stats = SCHEDULER_STATS.lock();
         stats.context_switches += 1;
         drop(stats);
-        set_current_process(Some(to_pid));
+        // Note: set_current_process is called inside perform_context_switch_to,
+        // AFTER computing the from-process ownership pointer, so current_process_id()
+        // still returns from_pid when clear_addr is calculated.
         perform_context_switch_to(unsafe { &mut *from_ptr }, to_pid);
     });
 }
@@ -446,23 +452,35 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
         }
     };
     
-    // Clear ownership of the OLD process right before switching to the new one.
-    // The current core is now committed to the new process.
-    if let Some(from_pid) = current_process_id() {
+    // Obtain the address of from_pid.current_cpu BEFORE updating current_process_id,
+    // so current_process_id() still returns from_pid here. switch_context will atomically
+    // write NO_CPU to this address right after saving from's context, eliminating the race
+    // between clearing ownership and saving the context.
+    let clear_addr: u64 = if let Some(from_pid) = current_process_id() {
         if from_pid != to_pid {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[from_pid as usize].as_mut() {
-                if p.current_cpu == Some(crate::process::get_cpu_id() as u32) {
-                    p.current_cpu = None;
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[from_pid as usize].as_ref() {
+                if p.current_cpu == crate::process::get_cpu_id() as u32 {
+                    &p.current_cpu as *const u32 as u64
+                } else {
+                    0
                 }
+            } else {
+                0
             }
+        } else {
+            0
         }
-    }
+    } else {
+        0
+    };
 
-    // Perform raw context switch
+    // Now commit to the new process: update per-CPU current_pid, then perform the raw
+    // context switch. switch_context atomically writes NO_CPU to clear_addr immediately
+    // after saving the from-context, before restoring the to-context.
     unsafe {
         crate::process::set_current_process(Some(to_pid));
-        crate::process::switch_context(from_ctx, &*to_ptr, next_cr3);
+        crate::process::switch_context(from_ctx, &*to_ptr, next_cr3, clear_addr);
     }
 }
 

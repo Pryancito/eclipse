@@ -187,7 +187,7 @@ pub fn start_aps() {
         AP_READY.store(0, Ordering::SeqCst);
         
         for i in 0..acpi.cpu_count as usize {
-            let target_apic_id = acpi.apic_ids[i];
+            let target_apic_id: u32 = acpi.apic_ids[i];
             if target_apic_id == bsp_id { continue; }
 
             serial_printf(format_args!("[CPU] Starting AP {} (APIC ID {})...\n", i, target_apic_id));
@@ -197,6 +197,10 @@ pub fn start_aps() {
             let ptr = alloc::alloc::alloc_zeroed(layout);
             let ap_stack = ptr as u64 + 16384;
             *copy_stack = ap_stack;
+
+            // Memory fence: ensure trampoline data (cr3/stack/entry) is fully visible
+            // to the AP before the SIPI fires and the AP starts executing.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
             // Record current ready count BEFORE starting the AP
             let expected_ready = AP_READY.load(Ordering::SeqCst) + 1;

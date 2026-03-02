@@ -86,8 +86,11 @@ pub struct Process {
     pub name: [u8; 16],                   // Process name (truncated to 16 bytes)
     pub cpu_ticks: u64,                   // Total CPU ticks consumed
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
-    pub current_cpu: Option<u32>,         // CPU currently executing this process (SMP safety)
+    pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
 }
+
+/// Sentinel value for current_cpu meaning "not owned by any CPU"
+pub const NO_CPU: u32 = u32::MAX;
 
 
 impl Process {
@@ -112,7 +115,7 @@ impl Process {
             name: [0; 16],
             cpu_ticks: 0,
             mem_frames: 0,
-            current_cpu: None,
+            current_cpu: NO_CPU,
         }
     }
 }
@@ -166,7 +169,7 @@ pub fn init_kernel_process() {
     let mut process = Process::new();
     process.id = 0;
     process.state = ProcessState::Running;
-    process.current_cpu = Some(0);
+    process.current_cpu = 0; // BSP is CPU 0
     process.priority = 0; // Prioridad más baja
     process.time_slice = 10;
     process.kernel_stack_top = kernel_stack_top_aligned;
@@ -404,13 +407,18 @@ pub fn update_process(pid: ProcessId, mut new_process: Process) {
 /// 
 /// Esta función guarda el contexto del proceso actual y carga el contexto del siguiente proceso
 /// Optionally switches CR3 (Control Register 3) if next_cr3 is not 0.
+/// If clear_addr is non-zero, writes NO_CPU (0xFFFFFFFF) as a u32 to that address
+/// immediately after saving the 'from' context, before restoring 'to'. This atomically
+/// releases CPU ownership of the 'from' process the moment its context is fully saved,
+/// eliminating the race between clearing current_cpu and context save.
 /// 
 /// # Safety
 /// Esta función es unsafe porque manipula directamente registros de CPU
 #[no_mangle]
-pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_cr3: u64) {
+pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_cr3: u64, clear_addr: u64) {
     asm!(
         // Guardar contexto actual (usando rdi = from)
+        // Note: rcx = clear_addr (4th argument in SysV ABI)
         "mov [rdi + 0x00], rax",
         "mov [rdi + 0x08], rbx",
         "mov [rdi + 0x10], rcx",
@@ -441,6 +449,15 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
         "pop rax",
         "mov [rdi + 0x88], rax",
         
+        // Atomic ownership release: clear the from-process current_cpu (write NO_CPU = 0xFFFFFFFF)
+        // now that the full context is saved. rcx still holds the original clear_addr argument.
+        // This eliminates the race between clearing current_cpu and actually saving the context.
+        "test rcx, rcx",
+        "jz 4f",
+        "mov eax, 0xFFFFFFFF",
+        "mov dword ptr [rcx], eax",
+        "4:",
+
         // ==========================================
         // Restaurar contexto nuevo (usando rsi = to)
         // ==========================================
@@ -486,6 +503,7 @@ pub unsafe extern "C" fn switch_context(from: &mut Context, to: &Context, next_c
         in("rdi") from,
         in("rsi") to,
         in("rdx") next_cr3,
+        in("rcx") clear_addr,
     );
 }
 
@@ -576,7 +594,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             let mut child = parent.clone(); // Copy parent's state
             child.id = child_pid;
             child.state = ProcessState::Blocked;
-            child.current_cpu = None; // Reset ownership for child
+            child.current_cpu = NO_CPU; // Reset ownership for child
             child.parent_pid = Some(current_pid);
             
             // Append "(child)" to name if it fits, or just keep it
