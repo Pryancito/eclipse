@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
+use eclipse_libc::{println, getpid, sleep_ms, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -160,7 +160,7 @@ fn wait_for_ready(name: &str, timeout_ms: u32) {
             }
         }
         
-        yield_cpu();
+        sleep_ms(10);
         attempts += 1;
         
         if attempts % 100 == 0 {
@@ -271,8 +271,9 @@ fn main_loop() -> ! {
         // Handle zombie processes - reap terminated children
         reap_zombies();
         
-        // Yield CPU to other processes
-        yield_cpu();
+        // Sleep briefly to avoid a busy-loop; this blocks init for 1 ms
+        // so the kernel can HLT and CPU usage drops from ~100% to near 0%.
+        sleep_ms(1);
     }
 }
 
