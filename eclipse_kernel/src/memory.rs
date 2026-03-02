@@ -51,9 +51,15 @@ static mut HEAP: KernelHeap = KernelHeap {
     memory: [0; HEAP_SIZE],
 };
 
+use spin::Mutex;
+
 #[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// Global lock for page table modifications to prevent races in SMP.
+/// Must always be used with interrupts disabled to avoid deadlocks.
+pub static PAGING_LOCK: Mutex<()> = Mutex::new(());
 
 /// Inicializar el sistema de memoria
 pub fn init() {
@@ -369,66 +375,63 @@ use x86_64::PhysAddr;
 /// Remove the identity mapping (PML4[0]) from the current page table.
 /// This enforces strict Higher Half only execution for the kernel.
 pub fn remove_identity_mapping() {
-    let cr3 = get_cr3();
-    let pml4_virt = phys_to_virt(cr3);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
-    pml4.entries[0] = PageTableEntry::new();
-    
-    // Flush local TLB first
-    flush_tlb();
-
-    // Notify all APs to flush their TLBs too so none of them continues to
-    // use the now-removed identity mapping.  This is safe to call even before
-    // any APs are up (LAPIC_BASE == 0 → no-op).
-    crate::apic::send_tlb_shootdown_ipi();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let pml4_phys = get_cr3();
+        let pml4_virt = phys_to_virt(pml4_phys);
+        let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+        
+        // Use recursive mapping if possible or higher half direct map
+        pml4.entries[0].set_entry(0, 0); // No Present, No Read/Write
+        
+        x86_64::instructions::tlb::flush_all();
+        
+        crate::serial::serial_print("[MEM] PML4[0] (identity map) removed\n");
+    });
 }
 
 /// Force physical address 0 to be mapped at virtual address 0 (Identity)
 pub fn map_physical_low_memory() {
-    let cr3 = get_cr3();
-    let pml4_virt = phys_to_virt(cr3);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
-    
-    if !pml4.entries[0].present() {
-        return;
-    }
-    
-    let pdpt_phys = pml4.entries[0].get_addr();
-    let pdpt_virt = phys_to_virt(pdpt_phys);
-    let pdpt = unsafe { &mut *(pdpt_virt as *mut PageTable) };
-    
-    if !pdpt.entries[0].present() || pdpt.entries[0].is_huge() {
-        return;
-    }
-    
-    let pd_phys = pdpt.entries[0].get_addr();
-    let pd_virt = phys_to_virt(pd_phys);
-    let pd = unsafe { &mut *(pd_virt as *mut PageTable) };
-    
-    // Map the first 2MB to physical 0 (ignore kernel_phys_base shift)
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
-    pd.entries[0].set_addr(0, flags);
-    
-    crate::serial::serial_print("[MEM] Low memory (0..2MiB) mapped to physical 0 (True Identity)\n");
-    flush_tlb();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let pml4_phys = get_cr3();
+        let pml4_virt = phys_to_virt(pml4_phys);
+        let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
+        
+        // PDPT address from existing PML4[288] (higher half physical map)
+        let phys_map_idx = ((PHYS_MEM_OFFSET >> 39) & 0x1FF) as usize; // 288
+        let pml4_phys_map = pml4.entries[phys_map_idx].get_addr();
+        pml4.entries[0].set_addr(pml4_phys_map, (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                                            x86_64::structures::paging::PageTableFlags::WRITABLE).bits());
+        
+        x86_64::instructions::tlb::flush_all();
+        crate::serial::serial_print("[MEM] PML4[0] (identity map) restored\n");
+    });
 }
 
 /// Temporarily restore or remove identity mapping (PML4[0])
 /// This is used during AP startup to allow cores to transition to long mode.
 pub fn set_identity_map(enabled: bool) {
-    let cr3 = get_cr3();
-    let pml4_virt = phys_to_virt(cr3);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
-    
-    if enabled {
-        // Copy the Direct Map entry (PML4[288]) to PML4[0]
-        pml4.entries[0] = pml4.entries[288];
-    } else {
-        // Remove identity map
-        pml4.entries[0] = PageTableEntry::new();
-    }
-    
-    flush_tlb();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let pml4_phys = get_cr3();
+        let pml4 = unsafe { &mut *(phys_to_virt(pml4_phys) as *mut PageTable) };
+
+        if enabled {
+            // Restore identity mapping from physical map (index 288)
+            let phys_map_idx = ((PHYS_MEM_OFFSET >> 39) & 0x1FF) as usize; // 288
+            let pml4_phys_map = pml4.entries[phys_map_idx].get_addr();
+            pml4.entries[0].set_addr(
+                pml4_phys_map,
+                (x86_64::structures::paging::PageTableFlags::PRESENT
+                    | x86_64::structures::paging::PageTableFlags::WRITABLE)
+                    .bits(),
+            );
+        } else {
+            pml4.entries[0].set_addr(0, 0);
+        }
+        x86_64::instructions::tlb::flush_all();
+    });
 }
 
 fn flush_tlb() {
@@ -594,179 +597,174 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
 
 /// Map a 4KB page in a process's page table
 pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    let pml4_virt = phys_to_virt(pml4_phys);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
-    
-    /*
-    crate::serial::serial_print("[Map4KB] pml4_phys=");
-    crate::serial::serial_print_hex(pml4_phys);
-    crate::serial::serial_print(" pml4_virt=");
-    crate::serial::serial_print_hex(pml4_virt);
-    crate::serial::serial_print("\n");
-    */
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
-    
-    unsafe {
-        // 1. PML4 -> PDPT
-        let pml4_entry = &mut pml4.entries[pml4_idx];
-        if !pml4_entry.present() {
-            let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
-            core::ptr::write_bytes(pdpt_ptr, 0, 4096);
-            pml4_entry.set_addr(pdpt_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
-                                          x86_64::structures::paging::PageTableFlags::WRITABLE | 
-                                          x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-        }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let pml4_virt = phys_to_virt(pml4_phys);
+        let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
         
-        let pdpt_virt = PHYS_MEM_OFFSET + pml4_entry.get_addr();
-        let pdpt = &mut *(pdpt_virt as *mut PageTable);
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+        let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
         
-        // 2. PDPT -> PD
-        let pdpt_entry = &mut pdpt.entries[pdpt_idx];
-        if pdpt_entry.present() && pdpt_entry.is_huge() {
-             // Handle 1GB huge page (currently just a warning and fallback)
-             crate::serial::serial_print("WARNING: map_user_page_4kb encountered 1GB HUGE PAGE\n");
-             return;
-        }
-        if !pdpt_entry.present() {
-            let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
-            core::ptr::write_bytes(pd_ptr, 0, 4096);
-            pdpt_entry.set_addr(pd_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
-                                         x86_64::structures::paging::PageTableFlags::WRITABLE | 
-                                         x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-        }
-        
-        let pd_virt = PHYS_MEM_OFFSET + pdpt_entry.get_addr();
-        let pd = &mut *(pd_virt as *mut PageTable);
-        
-        // 3. PD -> PT
-        let pd_entry = &mut pd.entries[pd_idx];
-        if pd_entry.present() && pd_entry.is_huge() {
-             // Handle 2MB huge page
-             crate::serial::serial_print("WARNING: map_user_page_4kb encountered 2MB HUGE PAGE\n");
-             return;
-        }
-        if !pd_entry.present() {
-            let (pt_ptr, pt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PT");
-            core::ptr::write_bytes(pt_ptr, 0, 4096);
-            pd_entry.set_addr(pt_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
-                                       x86_64::structures::paging::PageTableFlags::WRITABLE | 
-                                       x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-        }
-        
-        let pt_virt = PHYS_MEM_OFFSET + pd_entry.get_addr();
-        let pt = &mut *(pt_virt as *mut PageTable);
-        
-        // 4. PT -> Page
-        let pt_entry = &mut pt.entries[pt_idx];
-        let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
-        leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
-        leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-        leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+        unsafe {
+            // 1. PML4 -> PDPT
+            let pml4_entry = &mut pml4.entries[pml4_idx];
+            if !pml4_entry.present() {
+                let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
+                core::ptr::write_bytes(pdpt_ptr, 0, 4096);
+                pml4_entry.set_addr(pdpt_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                                            x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                                            x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
+            }
+            
+            let pdpt_virt = PHYS_MEM_OFFSET + pml4_entry.get_addr();
+            let pdpt = &mut *(pdpt_virt as *mut PageTable);
+            
+            // 2. PDPT -> PD
+            let pdpt_entry = &mut pdpt.entries[pdpt_idx];
+            if pdpt_entry.present() && pdpt_entry.is_huge() {
+                return;
+            }
+            if !pdpt_entry.present() {
+                let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
+                core::ptr::write_bytes(pd_ptr, 0, 4096);
+                pdpt_entry.set_addr(pd_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                                            x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                                            x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
+            }
+            
+            let pd_virt = PHYS_MEM_OFFSET + pdpt_entry.get_addr();
+            let pd = &mut *(pd_virt as *mut PageTable);
+            
+            // 3. PD -> PT
+            let pd_entry = &mut pd.entries[pd_idx];
+            if pd_entry.present() && pd_entry.is_huge() {
+                return;
+            }
+            if !pd_entry.present() {
+                let (pt_ptr, pt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PT");
+                core::ptr::write_bytes(pt_ptr, 0, 4096);
+                pd_entry.set_addr(pt_phys, (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                                            x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                                            x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
+            }
+            
+            let pt_virt = PHYS_MEM_OFFSET + pd_entry.get_addr();
+            let pt = &mut *(pt_virt as *mut PageTable);
+            
+            // 4. PT -> Page
+            let pt_entry = &mut pt.entries[pt_idx];
+            let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
+            leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
+            leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
+            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
 
-        pt_entry.set_addr(paddr, leaf_flags.bits());
-    }
+            pt_entry.set_addr(paddr, leaf_flags.bits());
+        }
+    });
 }
 
 /// Map a 2MB page in a process's page table
 pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    let pml4_virt = phys_to_virt(pml4_phys);
-    let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
-    
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
-    
-    unsafe {
-        // 1. Walk/Create PDPT
-        let pml4_entry = &mut pml4.entries[pml4_idx];
-        if !pml4_entry.present() {
-            let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
-            core::ptr::write_bytes(pdpt_ptr, 0, 4096);
-            pml4_entry.set_addr(
-                pdpt_phys, 
-                (x86_64::structures::paging::PageTableFlags::PRESENT | 
-                x86_64::structures::paging::PageTableFlags::WRITABLE | 
-                x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
-            );
-        } else {
-             // Ensure existing entry has USER permission AND Execute permission (Clear NX)
-             let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pml4_entry.get_flags());
-             flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-             flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
-             pml4_entry.set_addr(pml4_entry.get_addr(), flags.bits());
-        }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let pml4_virt = phys_to_virt(pml4_phys);
+        let pml4 = unsafe { &mut *(pml4_virt as *mut PageTable) };
         
-        // Use Higher Half Direct Map explicitly
-        let pdpt_virt = PHYS_MEM_OFFSET + pml4_entry.get_addr();
-        let pdpt = &mut *(pdpt_virt as *mut PageTable);
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
         
-        // 2. Walk/Create PD
-        let pdpt_entry = &mut pdpt.entries[pdpt_idx];
-        
-        // DEBUG: Check for Huge Page in PDPT
-        if x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags())
-            .contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) 
-        {
-            crate::serial::serial_print("WARNING: PDPT Entry is HUGE PAGE (1GB). Splitting needed!\n");
-        }
-        
-        if !pdpt_entry.present() {
-            let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
-            core::ptr::write_bytes(pd_ptr, 0, 4096);
-            pdpt_entry.set_addr(
-                pd_phys, 
-                (x86_64::structures::paging::PageTableFlags::PRESENT | 
-                x86_64::structures::paging::PageTableFlags::WRITABLE | 
-                x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
-            );
-        } else {
-             // Ensure existing entry has USER permission AND Execute permission
-             let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags());
-             flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-             flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
-             pdpt_entry.set_addr(pdpt_entry.get_addr(), flags.bits());
-        }
-        
-        // Use Higher Half Direct Map explicitly
-        let pd_virt = PHYS_MEM_OFFSET + pdpt_entry.get_addr();
-        let pd = &mut *(pd_virt as *mut PageTable);
-        
-        // 3. Map Page (2MB)
-        let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
-        leaf_flags.insert(x86_64::structures::paging::PageTableFlags::HUGE_PAGE);
-        leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
-        leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-        leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
-        
-        pd.entries[pd_idx].set_addr(paddr, leaf_flags.bits());
-        
-        crate::serial::serial_print("[Paging] Mapped User Page: v=");
-        crate::serial::serial_print_hex(vaddr);
-        crate::serial::serial_print(" -> p=");
-        crate::serial::serial_print_hex(paddr);
-        crate::serial::serial_print(" bits=");
-        crate::serial::serial_print_hex(leaf_flags.bits());
-        crate::serial::serial_print(" indices: ");
-        crate::serial::serial_print_dec(pml4_idx as u64);
-        crate::serial::serial_print(",");
-        crate::serial::serial_print_dec(pdpt_idx as u64);
-        crate::serial::serial_print(",");
-        crate::serial::serial_print_dec(pd_idx as u64);
-        crate::serial::serial_print("\n");
-        
-        // RE-VERIFY immediately via memory access
-        let entry_check = pd.entries[pd_idx].get_addr();
-        if entry_check != paddr {
-            crate::serial::serial_print("CRITICAL: Page table write failure! Expected p=");
+        unsafe {
+            // 1. Walk/Create PDPT
+            let pml4_entry = &mut pml4.entries[pml4_idx];
+            if !pml4_entry.present() {
+                let (pdpt_ptr, pdpt_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PDPT");
+                core::ptr::write_bytes(pdpt_ptr, 0, 4096);
+                pml4_entry.set_addr(
+                    pdpt_phys, 
+                    (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                    x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                    x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
+                );
+            } else {
+                 // Ensure existing entry has USER permission AND Execute permission (Clear NX)
+                 let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pml4_entry.get_flags());
+                 flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
+                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+                 pml4_entry.set_addr(pml4_entry.get_addr(), flags.bits());
+            }
+            
+            // Use Higher Half Direct Map explicitly
+            let pdpt_virt = PHYS_MEM_OFFSET + pml4_entry.get_addr();
+            let pdpt = &mut *(pdpt_virt as *mut PageTable);
+            
+            // 2. Walk/Create PD
+            let pdpt_entry = &mut pdpt.entries[pdpt_idx];
+            
+            // DEBUG: Check for Huge Page in PDPT
+            if x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags())
+                .contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE) 
+            {
+                crate::serial::serial_print("WARNING: PDPT Entry is HUGE PAGE (1GB). Splitting needed!\n");
+            }
+            
+            if !pdpt_entry.present() {
+                let (pd_ptr, pd_phys) = alloc_dma_buffer(4096, 4096).expect("Failed alloc PD");
+                core::ptr::write_bytes(pd_ptr, 0, 4096);
+                pdpt_entry.set_addr(
+                    pd_phys, 
+                    (x86_64::structures::paging::PageTableFlags::PRESENT | 
+                    x86_64::structures::paging::PageTableFlags::WRITABLE | 
+                    x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
+                );
+            } else {
+                 // Ensure existing entry has USER permission AND Execute permission
+                 let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags());
+                 flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
+                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+                 pdpt_entry.set_addr(pdpt_entry.get_addr(), flags.bits());
+            }
+            
+            // Use Higher Half Direct Map explicitly
+            let pd_virt = PHYS_MEM_OFFSET + pdpt_entry.get_addr();
+            let pd = &mut *(pd_virt as *mut PageTable);
+            
+            // 3. Map Page (2MB)
+            let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
+            leaf_flags.insert(x86_64::structures::paging::PageTableFlags::HUGE_PAGE);
+            leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
+            leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
+            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+            
+            pd.entries[pd_idx].set_addr(paddr, leaf_flags.bits());
+            
+            crate::serial::serial_print("[Paging] Mapped User Page: v=");
+            crate::serial::serial_print_hex(vaddr);
+            crate::serial::serial_print(" -> p=");
             crate::serial::serial_print_hex(paddr);
-            crate::serial::serial_print(" but read p=");
-            crate::serial::serial_print_hex(entry_check);
+            crate::serial::serial_print(" bits=");
+            crate::serial::serial_print_hex(leaf_flags.bits());
+            crate::serial::serial_print(" indices: ");
+            crate::serial::serial_print_dec(pml4_idx as u64);
+            crate::serial::serial_print(",");
+            crate::serial::serial_print_dec(pdpt_idx as u64);
+            crate::serial::serial_print(",");
+            crate::serial::serial_print_dec(pd_idx as u64);
             crate::serial::serial_print("\n");
+            
+            // RE-VERIFY immediately via memory access
+            let entry_check = pd.entries[pd_idx].get_addr();
+            if entry_check != paddr {
+                crate::serial::serial_print("CRITICAL: Page table write failure! Expected p=");
+                crate::serial::serial_print_hex(paddr);
+                crate::serial::serial_print(" but read p=");
+                crate::serial::serial_print_hex(entry_check);
+                crate::serial::serial_print("\n");
+            }
         }
-    }
+    });
     
     x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(vaddr));
 }
@@ -980,52 +978,55 @@ fn mmio_map_kernel_range(cr3: u64, paddr: u64, length: u64, vaddr: u64, flags: u
 
 /// Map a single 4KB kernel MMIO page (no USER_ACCESSIBLE on any level).
 fn mmio_map_kernel_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
-    // Intermediate entries: Present + Writable (no User, no huge).
-    const INTER: u64 = PAGE_PRESENT | PAGE_WRITABLE;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        // Intermediate entries: Present + Writable (no User, no huge).
+        const INTER: u64 = PAGE_PRESENT | PAGE_WRITABLE;
 
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+        let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
 
-    unsafe {
-        // PML4
-        let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
-        let pml4_e = &mut pml4.entries[pml4_idx];
-        if !pml4_e.present() {
-            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
-                core::ptr::write_bytes(ptr, 0, 4096);
-                pml4_e.set_entry(phys, INTER);
-            } else { return; }
+        unsafe {
+            // PML4
+            let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
+            let pml4_e = &mut pml4.entries[pml4_idx];
+            if !pml4_e.present() {
+                if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                    core::ptr::write_bytes(ptr, 0, 4096);
+                    pml4_e.set_entry(phys, INTER);
+                } else { return; }
+            }
+            let pdpt_phys = pml4_e.get_addr();
+
+            // PDPT
+            let pdpt = &mut *(phys_to_virt(pdpt_phys) as *mut PageTable);
+            let pdpt_e = &mut pdpt.entries[pdpt_idx];
+            if pdpt_e.is_huge() { return; }
+            if !pdpt_e.present() {
+                if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                    core::ptr::write_bytes(ptr, 0, 4096);
+                    pdpt_e.set_entry(phys, INTER);
+                } else { return; }
+            }
+            let pd_phys = pdpt_e.get_addr();
+
+            // PD
+            let pd = &mut *(phys_to_virt(pd_phys) as *mut PageTable);
+            let pd_e = &mut pd.entries[pd_idx];
+            if pd_e.is_huge() { return; }
+            if !pd_e.present() {
+                if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
+                    core::ptr::write_bytes(ptr, 0, 4096);
+                    pd_e.set_entry(phys, INTER);
+                } else { return; }
+            }
+            let pt_phys = pd_e.get_addr();
+
+            // PT (leaf)
+            let pt = &mut *(phys_to_virt(pt_phys) as *mut PageTable);
+            pt.entries[pt_idx].set_entry(paddr, flags);
         }
-        let pdpt_phys = pml4_e.get_addr();
-
-        // PDPT
-        let pdpt = &mut *(phys_to_virt(pdpt_phys) as *mut PageTable);
-        let pdpt_e = &mut pdpt.entries[pdpt_idx];
-        if !pdpt_e.present() {
-            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
-                core::ptr::write_bytes(ptr, 0, 4096);
-                pdpt_e.set_entry(phys, INTER);
-            } else { return; }
-        }
-        if pdpt_e.is_huge() { return; }
-        let pd_phys = pdpt_e.get_addr();
-
-        // PD
-        let pd = &mut *(phys_to_virt(pd_phys) as *mut PageTable);
-        let pd_e = &mut pd.entries[pd_idx];
-        if !pd_e.present() {
-            if let Some((ptr, phys)) = alloc_dma_buffer(4096, 4096) {
-                core::ptr::write_bytes(ptr, 0, 4096);
-                pd_e.set_entry(phys, INTER);
-            } else { return; }
-        }
-        if pd_e.is_huge() { return; }
-        let pt_phys = pd_e.get_addr();
-
-        // PT (leaf)
-        let pt = &mut *(phys_to_virt(pt_phys) as *mut PageTable);
-        pt.entries[pt_idx].set_entry(paddr, flags);
-    }
+    });
 }

@@ -244,6 +244,10 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     memory::init_paging(kernel_phys_base);
     progress::bar(60);
     
+    serial::serial_print("Initializing memory system...\n");
+    memory::init();
+    progress::bar(65);
+
     interrupts::init();
     
     // Stage 4.5: ACPI and APIC discovery
@@ -255,10 +259,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Calibrate the LAPIC timer against the PIT on the BSP so all CPUs
     // can use the same count when they call apic::init_timer() later.
     apic::calibrate_timer();
-    progress::bar(65);
-    
-    serial::serial_print("Initializing memory system...\n");
-    memory::init();
     progress::bar(70);
     
     // Init DevFS before other subsystems
@@ -266,10 +266,14 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     
     serial::serial_print("Starting secondary CPUs...\n");
     cpu::start_aps();
+    serial::serial_print("DEBUG: AP discovery complete. Calling progress::bar(75)...\n");
     progress::bar(75);
+    serial::serial_print("DEBUG: progress::bar(75) done. Calling memory::remove_identity_mapping()...\n");
 
     // Stage 3: Strict User/Kernel Separation - Moved after AP startup
+    serial::serial_print("DEBUG: Removing identity mapping...\n");
     memory::remove_identity_mapping();
+    serial::serial_print("DEBUG: memory::remove_identity_mapping() done.\n");
     progress::bar(80);
     serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
      

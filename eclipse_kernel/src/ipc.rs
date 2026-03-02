@@ -187,23 +187,27 @@ static PID_SLOT_MAP: Mutex<[u8; PID_MAP_SIZE]> = Mutex::new([0xFF; PID_MAP_SIZE]
 /// Llamar desde `create_process_with_pid` al insertar en PROCESS_TABLE.
 pub fn register_pid_slot(pid: crate::process::ProcessId, slot: usize) {
     let idx = pid as usize % PID_MAP_SIZE;
-    PID_SLOT_MAP.lock()[idx] = slot as u8;
+    run_critical(|| {
+        PID_SLOT_MAP.lock()[idx] = slot as u8;
+    });
 }
 
 /// Eliminar un PID de la tabla inversa al terminar un proceso.
 /// Llamar desde `exit_process` antes de limpiar el mailbox.
 pub fn unregister_pid_slot(pid: crate::process::ProcessId) {
     let idx = pid as usize % PID_MAP_SIZE;
-    // .lock() garantiza consistencia: si falla silenciosamente, el PID huérfano
-    // contaminaría el mapa y los mensajes irían al slot de un proceso muerto.
-    PID_SLOT_MAP.lock()[idx] = 0xFF;
+    run_critical(|| {
+        PID_SLOT_MAP.lock()[idx] = 0xFF;
+    });
 }
 
 /// Lookup O(1): PID → slot index usando la tabla inversa.
 /// Fallback O(N) sobre PROCESS_TABLE solo si la tabla dice 0xFF (proceso muy nuevo o raza).
 pub fn pid_to_slot_fast(pid: crate::process::ProcessId) -> Option<usize> {
     let idx = pid as usize % PID_MAP_SIZE;
-    let slot = PID_SLOT_MAP.lock()[idx];
+    let slot = run_critical(|| {
+        PID_SLOT_MAP.lock()[idx]
+    });
     if slot != 0xFF {
         return Some(slot as usize);
     }

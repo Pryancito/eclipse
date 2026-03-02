@@ -58,14 +58,38 @@ pub fn take_run_counts() -> [u32; MAX_PIDS] {
 /// Agregar proceso a la cola ready
 pub fn enqueue_process(pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // DEDUPLICACIÓN: No encolar si ya está en la cola física (Ready).
+        {
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[pid as usize].as_ref() {
+                if p.state == ProcessState::Ready {
+                    return;
+                }
+            }
+        }
+
         let mut queue = READY_QUEUE.lock();
         let head = QUEUE_HEAD.lock();
         let mut tail = QUEUE_TAIL.lock();
         
         let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
         if next_tail != *head {
+            // Actualizar estado a Ready ANTES de meter en la cola física.
+            // Al estar bajo ReadyQueue lock + Interrupts disabled, es atómico respecto al scheduler.
+            {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(p) = table[pid as usize].as_mut() {
+                    p.state = ProcessState::Ready;
+                    // NO LIMPIAR p.current_cpu aquí.
+                    // El core que intenta planificarlo de nuevo debe esperar a que el dueño original suelte la propiedad.
+                }
+            }
+            
             queue[*tail] = Some(pid);
             *tail = next_tail;
+            
+            // Notificar a otras CPUs de un nuevo proceso listo.
+            crate::apic::broadcast_reschedule_ipi();
         }
     });
 }
@@ -229,12 +253,19 @@ pub fn schedule() {
         // y meterlo en la cola ready. PID 0 NUNCA se encola globalmente.
         if let Some(pid) = current_pid {
             if pid != 0 {
-                if let Some(mut process) = get_process(pid) {
-                    if process.state == ProcessState::Running {
-                        process.state = ProcessState::Ready;
-                        update_process(pid, process);
-                        enqueue_process(pid);
+                let mut should_requeue = false;
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(process) = table[pid as usize].as_mut() {
+                        if process.state == ProcessState::Running && process.current_cpu == Some(cpu_id as u32) {
+                            should_requeue = true;
+                        }
                     }
+                }
+
+                if should_requeue {
+                    // Lo metemos en la cola; el core que lo saque ignorará el PID si `current_cpu` sigue siendo Some(A).
+                    enqueue_process(pid);
                 }
             }
         }
@@ -244,9 +275,32 @@ pub fn schedule() {
             if (next_pid as usize) < MAX_PIDS {
                 RUN_COUNTS[next_pid as usize].fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(mut next_process) = get_process(next_pid) {
-                next_process.state = ProcessState::Running;
-                update_process(next_pid, next_process);
+            
+            // ATOMIC OWNERSHIP: Marcar como Running y asignar CPU_ID bajo el lock de la tabla.
+            let mut should_requeue = false;
+            let next_process_exists = {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(next_process) = table[next_pid as usize].as_mut() {
+                    // Si por algún motivo aún tiene dueño (el core anterior todavía no terminó el switch_context),
+                    // lo devolvemos a la cola y buscamos otro. Esto previene el "Double Run".
+                    if next_process.current_cpu.is_some() && next_process.current_cpu != Some(cpu_id as u32) {
+                        should_requeue = true;
+                        false
+                    } else {
+                        next_process.state = ProcessState::Running;
+                        next_process.current_cpu = Some(cpu_id as u32);
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if should_requeue {
+                enqueue_process(next_pid);
+            }
+
+            if next_process_exists {
 
                 match current_pid {
                     Some(cur) if cur == next_pid => {
@@ -256,10 +310,6 @@ pub fn schedule() {
                         perform_context_switch(cur, next_pid);
                     }
                     None => {
-                        // AP sin proceso actual: guardar contexto idle y saltar al proceso.
-                        crate::serial::serial_printf(format_args!(
-                            "[Sched] Core {} picking first process PID {}\n",
-                            cpu_id, next_pid));
                         set_current_process(Some(next_pid));
                         if cpu_id < MAX_CPUS {
                             // Guardar el contexto idle de este AP para poder volver más tarde.
@@ -286,28 +336,35 @@ pub fn schedule() {
             if is_blocked {
                 let blocked_pid = current_pid.unwrap();
 
+                // Release CPU ownership so any core can pick this process
+                // up when it wakes from the sleep queue.
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(p) = table[blocked_pid as usize].as_mut() {
+                        p.current_cpu = None;
+                    }
+                }
+
                 if cpu_id == 0 {
                     // BSP: volver al proceso kernel (PID 0) que actúa como idle.
                     set_current_process(Some(0));
-                    if let Some(mut p0) = get_process(0) {
-                        p0.state = ProcessState::Running;
-                        update_process(0, p0);
+                    {
+                        let mut table = crate::process::PROCESS_TABLE.lock();
+                        if let Some(p0) = table[0].as_mut() {
+                            p0.state = ProcessState::Running;
+                            p0.current_cpu = Some(0);
+                        }
                     }
                     perform_context_switch(blocked_pid, 0);
                 } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
-                    // AP: restaurar el contexto idle guardado la primera vez que el AP
-                    // tomó un proceso usuario. Esto devuelve la ejecución al bucle idle.
-                    //
-                    // Safety: cada CPU escribe y lee únicamente su propia ranura
-                    // (indexada por cpu_id), por lo que no hay carreras entre CPUs.
-                    // El from_ptr apunta al contexto en PROCESS_TABLE; aunque el lock se
-                    // libera antes de switch_context, ningún otro hilo modificará ese
-                    // proceso (está Blocked) antes de que se complete la transferencia.
+                    // AP: restaurar el contexto idle guardado.
                     set_current_process(None);
                     let from_ptr = {
                         let mut table = crate::process::PROCESS_TABLE.lock();
                         match table[blocked_pid as usize].as_mut() {
-                            Some(p) => &mut p.context as *mut crate::process::Context,
+                            Some(p) => {
+                                &mut p.context as *mut crate::process::Context
+                            },
                             None => return,
                         }
                     };
@@ -380,7 +437,6 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     }
     
     // Switch address space if necessary
-    // The kernel is mapped identically in all address spaces, so CR3 switching is safe
     let next_cr3 = {
         let current_cr3 = crate::memory::get_cr3();
         if to_page_table != 0 && to_page_table != current_cr3 {
@@ -390,6 +446,19 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
         }
     };
     
+    // Clear ownership of the OLD process right before switching to the new one.
+    // The current core is now committed to the new process.
+    if let Some(from_pid) = current_process_id() {
+        if from_pid != to_pid {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[from_pid as usize].as_mut() {
+                if p.current_cpu == Some(crate::process::get_cpu_id() as u32) {
+                    p.current_cpu = None;
+                }
+            }
+        }
+    }
+
     // Perform raw context switch
     unsafe {
         crate::process::set_current_process(Some(to_pid));

@@ -86,6 +86,7 @@ pub struct Process {
     pub name: [u8; 16],                   // Process name (truncated to 16 bytes)
     pub cpu_ticks: u64,                   // Total CPU ticks consumed
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
+    pub current_cpu: Option<u32>,         // CPU currently executing this process (SMP safety)
 }
 
 
@@ -93,7 +94,7 @@ impl Process {
     pub const fn new() -> Self {
         Self {
             id: 0,
-            state: ProcessState::Ready,
+            state: ProcessState::Blocked,
             context: Context::new(),
             stack_base: 0,
             stack_size: 0,
@@ -111,6 +112,7 @@ impl Process {
             name: [0; 16],
             cpu_ticks: 0,
             mem_frames: 0,
+            current_cpu: None,
         }
     }
 }
@@ -124,27 +126,18 @@ static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 /// Máximo número de CPUs soportadas
 const MAX_CPUS: usize = 16;
 /// Proceso actual por cada CPU
-static CURRENT_PROCESS: Mutex<[Option<ProcessId>; MAX_CPUS]> = Mutex::new([None; MAX_CPUS]);
 
-/// Obtener ID de la CPU actual (usando Local APIC ID vía CPUID)
+/// Obtener ID de la CPU actual (O(1) vía GS segment)
 pub fn get_cpu_id() -> usize {
-    let cpuid_ebx: u32;
+    let cpu_id: u32;
     unsafe {
         asm!(
-            "push rbx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) cpuid_ebx,
-            inout("eax") 1 => _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, preserves_flags)
+            "mov {0:e}, gs:[16]",
+            out(reg) cpu_id,
+            options(nomem, nostack, preserves_flags)
         );
     }
-    // Initial Local APIC ID is in EBX bits 24-31
-    let apic_id = (cpuid_ebx >> 24) as usize;
-    apic_id % MAX_CPUS
+    cpu_id as usize
 }
 
 pub fn next_pid() -> ProcessId {
@@ -173,6 +166,7 @@ pub fn init_kernel_process() {
     let mut process = Process::new();
     process.id = 0;
     process.state = ProcessState::Running;
+    process.current_cpu = Some(0);
     process.priority = 0; // Prioridad más baja
     process.time_slice = 10;
     process.kernel_stack_top = kernel_stack_top_aligned;
@@ -191,7 +185,7 @@ pub fn init_kernel_process() {
     table[0] = Some(process);
     
     // Establecer como actual en la CPU que inicializa
-    CURRENT_PROCESS.lock()[get_cpu_id()] = Some(0);
+    set_current_process(Some(0));
 }
 
 /// Crear un nuevo proceso (bajo nivel). phdr_va/phnum/phentsize for auxv (AT_PHDR/AT_PHNUM/AT_PHENT).
@@ -224,7 +218,6 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
             if slot.is_none() {
                 let mut process = Process::new();
                 process.id = pid;
-                process.state = ProcessState::Ready;
                 process.stack_base = stack_base;
                 process.stack_size = stack_size;
                 process.priority = 5; // Prioridad media por defecto
@@ -299,14 +292,33 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
     }
 }
 
-/// Obtener proceso actual
+/// Obtener proceso actual (O(1) vía GS segment, sin lock)
 pub fn current_process_id() -> Option<ProcessId> {
-    CURRENT_PROCESS.lock()[get_cpu_id()]
+    let pid: u32;
+    unsafe {
+        asm!(
+            "mov {0:e}, gs:[20]",
+            out(reg) pid,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if pid == 0xFFFF_FFFF {
+        None
+    } else {
+        Some(pid)
+    }
 }
 
-/// Establecer proceso actual
+/// Establecer proceso actual (O(1) vía GS segment, sin lock)
 pub fn set_current_process(pid: Option<ProcessId>) {
-    CURRENT_PROCESS.lock()[get_cpu_id()] = pid;
+    let val = pid.unwrap_or(0xFFFF_FFFF);
+    unsafe {
+        asm!(
+            "mov gs:[20], {0:e}",
+            in(reg) val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 /// Obtener proceso por ID
@@ -352,14 +364,35 @@ pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
     0
 }
 
-/// Actualizar proceso
-pub fn update_process(pid: ProcessId, process: Process) {
+/// Actualizar proceso (seguro para SMP)
+pub fn update_process(pid: ProcessId, mut new_process: Process) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = PROCESS_TABLE.lock();
+        if (pid as usize) < table.len() {
+            if let Some(p) = table[pid as usize].as_mut() {
+                // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
+                // Solo permitimos que update_process cambie metadatos.
+                // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
+                // mantenemos los valores de la tabla real.
+                let real_cpu = p.current_cpu;
+                let real_state = p.state;
+                
+                *p = new_process;
+                
+                p.current_cpu = real_cpu;
+                p.state = real_state;
+                return;
+            }
+        }
+        // Fallback: búsqueda lineal por si el PID no coincide con el índice de slot
         for slot in table.iter_mut() {
             if let Some(p) = slot {
                 if p.id == pid {
-                    *p = process;
+                    let real_cpu = p.current_cpu;
+                    let real_state = p.state;
+                    *p = new_process;
+                    p.current_cpu = real_cpu;
+                    p.state = real_state;
                     return;
                 }
             }
@@ -542,7 +575,8 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
             
             let mut child = parent.clone(); // Copy parent's state
             child.id = child_pid;
-            child.state = ProcessState::Ready;
+            child.state = ProcessState::Blocked;
+            child.current_cpu = None; // Reset ownership for child
             child.parent_pid = Some(current_pid);
             
             // Append "(child)" to name if it fits, or just keep it

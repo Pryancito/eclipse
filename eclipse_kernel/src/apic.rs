@@ -86,7 +86,10 @@ pub fn init_timer(vector: u8) {
 pub fn init() {
     let lapic_phys = crate::acpi::get_info().lapic_addr;
     unsafe {
-        LAPIC_BASE = phys_to_virt(lapic_phys);
+        // Use explicit MMIO mapping instead of phys_to_virt which might not cover MMIO holes
+        if LAPIC_BASE == 0 {
+            LAPIC_BASE = crate::memory::map_mmio_range(lapic_phys, 4096);
+        }
         
         let low: u32;
         let high: u32;
@@ -97,6 +100,11 @@ pub fn init() {
         // 1. Enable LAPIC by setting bit 8 in Spurious Interrupt Vector Register
         // Also set the spurious interrupt vector to 0xFF (reserved)
         write_reg(LAPIC_REG_SVR, read_reg(LAPIC_REG_SVR) | 0x100 | 0xFF);
+        
+        // 1.5 Ensure LINT0 is configured as ExtINT (Delivery mode 7) and Unmasked.
+        // This is crucial on real hardware so that legacy 8259 PIC interrupts 
+        // (like IRQ0 PIT) can still reach the BSP.
+        write_reg(LAPIC_REG_LVT_LINT0, 0x00000700);
         
         // 2. Clear Task Priority Register to allow all interrupts
         write_reg(LAPIC_REG_TPR, 0);
@@ -227,10 +235,32 @@ pub fn broadcast_sipi(vector: u8) {
 pub fn send_tlb_shootdown_ipi() {
     unsafe {
         if LAPIC_BASE == 0 { return; }
+        crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Start\n"));
         clear_esr();
         while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
 
         let vector = crate::interrupts::TLB_SHOOTDOWN_VECTOR as u32;
+        // ICR: destination shorthand = All excluding self (3 << 18),
+        //      delivery mode = Fixed (0 << 8), assert (1 << 14), edge trigger.
+        let icrl = (3 << 18) | (1 << 14) | vector;
+        write_reg(LAPIC_REG_ICRH, 0);
+        write_reg(LAPIC_REG_ICRL, icrl);
+
+        crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Waiting for delivery...\n"));
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+        crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Delivered\n"));
+    }
+}
+
+/// Send a reschedule IPI to all other CPUs.
+/// Called by the scheduler when a new process is ready, to notify idle cores.
+pub fn broadcast_reschedule_ipi() {
+    unsafe {
+        if LAPIC_BASE == 0 { return; }
+        clear_esr();
+        while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+
+        let vector = crate::interrupts::RESCHEDULE_IPI_VECTOR as u32;
         // ICR: destination shorthand = All excluding self (3 << 18),
         //      delivery mode = Fixed (0 << 8), assert (1 << 14), edge trigger.
         let icrl = (3 << 18) | (1 << 14) | vector;

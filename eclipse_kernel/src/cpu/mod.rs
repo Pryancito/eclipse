@@ -133,19 +133,25 @@ pub fn start_aps() {
             return;
         }
 
-        serial_printf(format_args!("[CPU] Using verified identity map to write trampoline to physical {:#x}\n", 
-            trampoline_phys));
-        
+        serial_printf(format_args!("[CPU] Writing trampoline: virt=0x1000, size={}\n", size));
         core::ptr::copy_nonoverlapping(src_ptr, trampoline_virt as *mut u8, size as usize);
         
+        let hh_virt = crate::memory::phys_to_virt(0x1000);
+        let hh_val = unsafe { core::ptr::read_volatile(hh_virt as *const u64) };
+        let virt_val = unsafe { core::ptr::read_volatile(trampoline_virt as *const u64) };
+        
+        serial_printf(format_args!("[CPU] Sanity Check: Virtual 0x1000 reads {:#x}, Physical 0x1000 (via HHDM) reads {:#x}\n", 
+            virt_val, hh_val));
+
+        if virt_val != hh_val {
+            serial_printf(format_args!("[CPU] CRITICAL: Virtual 0x1000 is NOT mapped to physical 0x1000! APs will fail.\n"));
+        }
+
         // Marker at 0x7000 (also in the forced map)
         let ptr_a = 0x7000 as *mut u32;
         core::ptr::write_volatile(ptr_a, 0);
 
-        // Verification Read via HHDM (now that phys_to_virt is fixed)
-        let hh_virt = crate::memory::phys_to_virt(0x1000);
-        let hh_val = core::ptr::read_volatile(hh_virt as *const u64);
-        serial_printf(format_args!("[CPU] Verified physical {:#x} via HHDM: {:#x}\n", trampoline_phys, hh_val));
+
 
 
 
@@ -244,16 +250,7 @@ fn delay_us(us: u64) {
 }
 
 fn delay_ms(ms: u64) {
-    let start = crate::interrupts::ticks();
-    
-    // Ensure interrupts are enabled so we receive the PIT ticks
-    unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
-    
-    // Wait for at least `ms` ticks to elapse
-    while crate::interrupts::ticks() < start + ms {
-        // Use hlt to pause execution until the next interrupt fires
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)); }
-    }
+    delay_us(ms * 1000);
 }
 
 

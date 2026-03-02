@@ -562,6 +562,11 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             "mov ax, 0x23",
             "mov ds, ax",
             "mov es, ax",
+            
+            // CRITICAL: Al igual que en fork_child_trampoline, el kernel GS base 
+            // debe protegerse en IA32_KERNEL_GS_BASE antes de tocar el selector GS.
+            "swapgs",
+            
             "xor ax, ax",
             "mov fs, ax",
             "mov gs, ax",

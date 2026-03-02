@@ -13,7 +13,7 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use eclipse_libc::{println, getpid, getppid, yield_cpu, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, sleep_ms, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
 
 /// Syscall numbers
 const SYS_OPEN: u64 = 11;
@@ -646,20 +646,20 @@ pub extern "C" fn _start() -> ! {
         // No simulate occasional input events - removes fake jumpiness
         
         // Process events from queue (simulate consumption)
-        if heartbeat_counter % 50000 == 0 {
+        if heartbeat_counter % 250 == 0 {
             while let Some(_event) = event_queue.pop() {
                 // In real implementation: dispatch to consumers
             }
         }
         
-        // Periodic status updates
-        if heartbeat_counter % 500000 == 0 {
+        // Periodic status updates (~5 s = 2500 iterations * 2 ms)
+        if heartbeat_counter % 2500 == 0 {
             println!("[INPUT-SERVICE] Operational - Total events: {}", total_events);
             println!("[INPUT-SERVICE]   Keyboard: {}, Mouse: {}, Tablet: {}", 
                      keyboard_events, mouse_events, tablet_events);
             println!("[INPUT-SERVICE]   Queue: {}/256 events", event_queue.count);
         }
         
-        yield_cpu();
+        sleep_ms(2);
     }
 }

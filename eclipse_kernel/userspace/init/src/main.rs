@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, sleep_ms, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
+use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -151,33 +151,37 @@ fn start_system_services() {
     }
 }
 
-/// Wait for a service to signal READY via IPC
+/// Wait for a service to signal READY via IPC.
+/// Uses a tight poll with yield_cpu + periodic sleep_ms to balance
+/// responsiveness with CPU efficiency on SMP.
 fn wait_for_ready(name: &str, timeout_ms: u32) {
     let mut buffer = [0u8; 32];
-    let mut attempts = 0;
-    let max_attempts = timeout_ms / 10; // Yield every 10ms approx
-    
+    let mut attempts = 0u32;
+    let max_attempts = timeout_ms; // 1 attempt per ms
+
     while attempts < max_attempts {
-        let (len, sender) = eclipse_libc::receive(&mut buffer);
-        if len > 0 {
-            if len >= 5 && &buffer[..5] == b"READY" {
-                println!("[INIT] Service '{}' is READY (received from PID {})", name, sender);
-                return;
-            } else {
-                // If we got another message (like GET_INPUT_PID), process it so we don't block the system
-                println!("[INIT] Handling concurrent IPC request during wait for '{}' ({} bytes from PID {}) [DEBUG-UNIQUE]", name, len, sender);
-                process_single_ipc_request(&buffer, len, sender);
+        // Poll mailbox several times per ms to catch messages quickly
+        for _ in 0..50 {
+            let (len, sender) = eclipse_libc::receive(&mut buffer);
+            if len > 0 {
+                if len >= 5 && &buffer[..5] == b"READY" {
+                    println!("[INIT] Service '{}' is READY (received from PID {})", name, sender);
+                    return;
+                } else {
+                    process_single_ipc_request(&buffer, len, sender);
+                }
             }
+            yield_cpu();
         }
-        
-        sleep_ms(10);
+
+        sleep_ms(1);
         attempts += 1;
-        
-        if attempts % 100 == 0 {
-            println!("[INIT] Still waiting for '{}' ({}%)...", name, (attempts * 100) / max_attempts);
+
+        if attempts % 1000 == 0 {
+            println!("[INIT] Still waiting for '{}' ({}%)...", name, (attempts as u64 * 100) / max_attempts as u64);
         }
     }
-    
+
     println!("[INIT] WARNING: Timeout waiting for service '{}' to signal READY", name);
 }
 

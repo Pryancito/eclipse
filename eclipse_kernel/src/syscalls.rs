@@ -2433,10 +2433,14 @@ fn sys_nanosleep(req: u64) -> u64 {
 
     // Mark process as Blocked and register in the sleep queue.
     // The timer interrupt will re-enqueue it when wake_tick is reached.
+    // NOTE: We set the state directly in PROCESS_TABLE because update_process()
+    // intentionally preserves the original state (to protect against races).
     if let Some(pid) = current_process_id() {
-        if let Some(mut proc) = crate::process::get_process(pid) {
-            proc.state = crate::process::ProcessState::Blocked;
-            crate::process::update_process(pid, proc);
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[pid as usize].as_mut() {
+                p.state = crate::process::ProcessState::Blocked;
+            }
         }
         crate::scheduler::add_sleep(pid, wake_tick);
     }

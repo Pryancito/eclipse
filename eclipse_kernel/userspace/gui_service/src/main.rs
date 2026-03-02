@@ -9,7 +9,7 @@
 #![no_main]
 
 use eclipse_libc::{
-    println, getpid, getppid, yield_cpu, send, open, close, read, O_RDONLY,
+    println, getpid, getppid, sleep_ms, send, open, close, read, O_RDONLY,
     mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
     SEEK_END,
 };
@@ -19,8 +19,6 @@ const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
 static mut LOAD_BUF: [u8; MAX_COMPOSITOR_SIZE] = [0; MAX_COMPOSITOR_SIZE];
 
 const COMPOSITOR_PATH: &str = "/usr/bin/smithay_app";
-/// Yield iterations between restart attempts (~1s of busy-wait)
-const RESTART_DELAY_YIELDS: u32 = 500_000;
 /// Maximum restart attempts (0 = unlimited)
 const MAX_RESTARTS: u32 = 0;
 
@@ -41,7 +39,7 @@ fn wait_for_filesystem() {
             println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
             return;
         }
-        for _ in 0..50 { yield_cpu(); }
+        sleep_ms(10);
     }
 }
 
@@ -135,12 +133,11 @@ pub extern "C" fn _start() -> ! {
 
         if MAX_RESTARTS > 0 && restarts >= MAX_RESTARTS {
             println!("[GUI-SERVICE] Max restarts ({}) reached, stopping.", MAX_RESTARTS);
-            loop { yield_cpu(); }
+            loop { sleep_ms(1000); }
         }
 
         restarts += 1;
-        // Brief delay before restart attempt
-        for _ in 0..RESTART_DELAY_YIELDS { yield_cpu(); }
+        sleep_ms(1000);
         println!("[GUI-SERVICE] Restarting compositor (attempt {})...", restarts);
     }
 }

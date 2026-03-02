@@ -123,6 +123,11 @@ pub const APIC_TIMER_VECTOR: u8 = 0xFE;
 /// flushes its local TLB.  Must differ from both the spurious (0xFF) and timer (0xFE) vectors.
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFD;
 
+/// IDT vector for rescheduling IPI.
+/// Sent by a CPU when it enqueues a process to notify other CPUs (e.g. idle ones)
+/// that they should call schedule() to pick up the new task.
+pub const RESCHEDULE_IPI_VECTOR: u8 = 0xFC;
+
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
 const IDT_RING_0: u8 = 0b00000000;
@@ -157,6 +162,11 @@ pub fn init() {
         // TLB shootdown IPI (vector 0xFD) – sent by BSP to flush TLBs on all APs
         KERNEL_IDT.entries[TLB_SHOOTDOWN_VECTOR as usize].set_handler(
             tlb_shootdown_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
+        );
+
+        // Reschedule IPI (vector 0xFC) – sent to notify cores of new ready processes
+        KERNEL_IDT.entries[RESCHEDULE_IPI_VECTOR as usize].set_handler(
+            reschedule_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
         );
 
         // Configurar syscall handler (int 0x80)
@@ -759,11 +769,18 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
 #[unsafe(naked)]
 unsafe extern "C" fn common_exception_handler() {
     core::arch::naked_asm!(
-        // Stack tiene: [num, error_code, iretq_frame...]
+        // Stack has: [num, error_code, iretq_frame...]
+        // iretq_frame is: [rip, cs, rflags, rsp, ss]
         "push rbp",
         "mov rbp, rsp",
-        
-        // Guardar GPRs
+
+        // Check CS (at [rbp + 32]) for CPL (last 2 bits)
+        "test qword ptr [rbp + 32], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
+        // Save GPRs
         "push rax",
         "push rbx",
         "push rcx",
@@ -779,17 +796,16 @@ unsafe extern "C" fn common_exception_handler() {
         "push r14",
         "push r15",
         
-        // RSP apunta a r15. Offset 0.
-        "mov rdi, rsp", // Argumento 1: &ExceptionContext
+        // RSP points to r15. Offset 0.
+        "mov rdi, rsp", // Argument 1: &ExceptionContext
         
         "and rsp, -16",
         "call {}",
         
         "mov rsp, rbp",
-        "sub rsp, 112", // Offset de R15 (14 registros x 8 bytes)
+        "sub rsp, 112", // Offset of R15 (14 registers x 8 bytes)
         
         "pop r15",
-
         "pop r14",
         "pop r13",
         "pop r12",
@@ -803,9 +819,15 @@ unsafe extern "C" fn common_exception_handler() {
         "pop rcx",
         "pop rbx",
         "pop rax",
+
+        // Restore user GS if we are returning to userspace
+        "test qword ptr [rbp + 32], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
         
         "pop rbp",
-        "add rsp, 16", // Limpiar num y error_code
+        "add rsp, 16", // Clean up num and error_code
         "iretq",
         sym exception_handler,
     );
@@ -966,6 +988,13 @@ unsafe extern "C" fn irq_0() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -986,6 +1015,13 @@ unsafe extern "C" fn irq_0() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1185,6 +1221,13 @@ unsafe extern "C" fn irq_1() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1205,6 +1248,13 @@ unsafe extern "C" fn irq_1() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1217,6 +1267,13 @@ unsafe extern "C" fn irq_12() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1237,6 +1294,13 @@ unsafe extern "C" fn irq_12() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1273,6 +1337,13 @@ unsafe extern "C" fn apic_timer_irq() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL (last 2 bits)
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1293,6 +1364,13 @@ unsafe extern "C" fn apic_timer_irq() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1325,6 +1403,13 @@ unsafe extern "C" fn tlb_shootdown_irq() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1345,6 +1430,13 @@ unsafe extern "C" fn tlb_shootdown_irq() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1416,6 +1508,13 @@ unsafe extern "C" fn irq_9() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1436,12 +1535,21 @@ unsafe extern "C" fn irq_9() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
         sym irq_9_handler,
     );
 }
+
+// Deleted duplicate irq_1 handlers here
 
 extern "C" fn irq_10_handler() {
     unsafe {
@@ -1460,6 +1568,13 @@ unsafe extern "C" fn irq_10() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1480,12 +1595,21 @@ unsafe extern "C" fn irq_10() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
         sym irq_10_handler,
     );
 }
+
+// Deleted duplicate irq_12 handlers here
 
 extern "C" fn irq_11_handler() {
     unsafe {
@@ -1506,6 +1630,13 @@ unsafe extern "C" fn irq_11() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
         "and rsp, -16",
         "push rax",
         "push rcx",
@@ -1526,6 +1657,13 @@ unsafe extern "C" fn irq_11() {
         "pop rdx",
         "pop rcx",
         "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
         "mov rsp, rbp",
         "pop rbp",
         "iretq",
@@ -1580,6 +1718,12 @@ unsafe extern "C" fn syscall_int80() {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
         
         // Guardar registros GP (antes de alinear stack para tener offsets fijos desde RBP)
         "push rax", // [rbp - 8]
@@ -1648,6 +1792,12 @@ unsafe extern "C" fn syscall_int80() {
         "pop rax",  // Ahora rax tiene el valor de retorno
         
         "pop rbp",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rsp + 8], 3", // CS is now at [rsp + 8] because rbp was popped
+        "jz 2f",
+        "swapgs",
+        "2:",
         
         "iretq",
         sym syscall_handler_rust,
@@ -1777,6 +1927,13 @@ pub unsafe extern "C" fn fork_child_trampoline() -> ! {
         "mov ax, 0x23", // USER_DATA_SELECTOR
         "mov ds, ax",
         "mov es, ax",
+        
+        // CRITICAL: Salvaguardar Kernel GS base antes de limpiar el selector GS!
+        // swapgs mueve el Active GS Base a IA32_KERNEL_GS_BASE, y trae el User GS Base (0).
+        // Si no hacemos esto, el mov gs, ax machacaría el Active GS (kernel) dejándolo en 0,
+        // perdiendo la referencia a CpuData para el próximo syscall en este core.
+        "swapgs",
+        
         "mov fs, ax",
         "mov gs, ax",
         "pop rax",
@@ -1810,4 +1967,54 @@ fn disable_apic() {
              crate::serial::serial_print("[INT] APIC was already disabled\n");
         }
     }
+}
+extern "C" fn reschedule_irq_handler(_context: &ExceptionContext) {
+    crate::apic::eoi();
+    crate::scheduler::schedule();
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn reschedule_irq() {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+
+        // Check CS (at [rbp + 16]) for CPL
+        "test qword ptr [rbp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+
+        "and rsp, -16",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+
+        // Restore user GS if return to userspace
+        "test qword ptr [rbp + 16], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+
+        "mov rsp, rbp",
+        "pop rbp",
+        "iretq",
+        sym reschedule_irq_handler,
+    );
 }

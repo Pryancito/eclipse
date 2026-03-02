@@ -196,11 +196,18 @@ pub const MAX_SMP_CPUS: usize = 16;
 pub struct CpuData {
     pub rsp0: u64,        // offset 0
     pub scratch_rsp: u64, // offset 8
+    pub cpu_id: u32,      // offset 16
+    pub current_pid: u32, // offset 20 (0xFFFFFFFF = None)
 }
 
 impl CpuData {
     const fn new() -> Self {
-        Self { rsp0: 0, scratch_rsp: 0 }
+        Self { 
+            rsp0: 0, 
+            scratch_rsp: 0, 
+            cpu_id: 0, 
+            current_pid: 0xFFFF_FFFF 
+        }
     }
 }
 
@@ -295,6 +302,20 @@ fn get_cpu_id() -> usize {
     ((ebx >> 24) as usize) % MAX_SMP_CPUS
 }
 
+/// Faster version of get_cpu_id using the GS segment.
+/// ONLY safe to call after load_gdt() has initialized the GS base!
+fn get_cpu_id_gs() -> usize {
+    let cpu_id: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {0:e}, gs:[16]",
+            out(reg) cpu_id,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    cpu_id as usize
+}
+
 /// Cargar la GDT y TSS
 pub fn load_gdt() {
     let cpu_id = get_cpu_id();
@@ -367,15 +388,31 @@ pub fn load_gdt() {
             options(nomem, nostack, preserves_flags)
         );
         
-        // Set MSR_KERNEL_GS_BASE (0xC0000102) to point to this CPU's CpuData.
-        // swapgs in syscall_entry exchanges GS.base with this value so the
-        // kernel can access per-CPU data (rsp0, scratch_rsp) via GS.
-        let cpu_data_ptr = &raw const CPU_DATA[cpu_id] as u64;
+        // Set GS.base to point to this CPU's CpuData.
+        // We set BOTH IA32_GS_BASE (active) and IA32_KERNEL_GS_BASE (swap)
+        // so that the kernel can access per-CPU data (gs:[16] etc) immediately
+        // and also handle swapgs correctly during syscall/interrupt entry.
+        let cpu_data = &raw mut CPU_DATA[cpu_id];
+        (*cpu_data).cpu_id = cpu_id as u32;
+        (*cpu_data).current_pid = 0xFFFF_FFFF; // None initially
+
+        let cpu_data_ptr = cpu_data as u64;
         let gs_low = cpu_data_ptr as u32;
         let gs_high = (cpu_data_ptr >> 32) as u32;
+        
+        // 1. Set IA32_KERNEL_GS_BASE (0xC0000102) - used by swapgs to bring in kernel base
         asm!(
             "wrmsr",
-            in("ecx") 0xC0000102u32, // IA32_KERNEL_GS_BASE
+            in("ecx") 0xC0000102u32, 
+            in("eax") gs_low,
+            in("edx") gs_high,
+            options(nomem, nostack, preserves_flags),
+        );
+
+        // 2. Set IA32_GS_BASE (0xC0000101) - the active GS base for the current (kernel) mode
+        asm!(
+            "wrmsr",
+            in("ecx") 0xC0000101u32,
             in("eax") gs_low,
             in("edx") gs_high,
             options(nomem, nostack, preserves_flags),
@@ -387,12 +424,10 @@ pub fn load_gdt() {
 /// Must be called on context switch so that ring-3 → ring-0 transitions
 /// (interrupts, SYSCALL) land on the correct per-CPU kernel stack.
 pub fn set_tss_stack(stack_top: u64) {
-    let cpu_id = get_cpu_id();
+    let cpu_id = get_cpu_id_gs();
     unsafe {
         CPU_TSSES[cpu_id].rsp0 = stack_top;
         CPU_DATA[cpu_id].rsp0 = stack_top;
-        // Keep legacy TSS in sync for any code that still reads it
-        TSS.rsp0 = stack_top;
     }
 }
 

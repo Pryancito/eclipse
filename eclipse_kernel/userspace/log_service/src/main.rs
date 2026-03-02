@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, send, yield_cpu, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
+use eclipse_libc::{println, getpid, getppid, send, sleep_ms, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
 
 /// Log buffer for storing messages before filesystem is ready
 /// 
@@ -119,16 +119,15 @@ pub extern "C" fn _start() -> ! {
         heartbeat_counter += 1;
         flush_counter += 1;
         
-        // Periodically flush log buffer to file (every 1 million iterations)
-        if flush_counter % 1000000 == 0 {
+        // Flush log buffer to file every ~10 s (1000 iterations * 10 ms)
+        if flush_counter % 1000 == 0 {
             flush_log_buffer();
         }
         
-        // Process log messages (simulated IPC reception)
-        if heartbeat_counter % 500000 == 0 {
+        // Status report every ~5 s (500 iterations * 10 ms)
+        if heartbeat_counter % 500 == 0 {
             log_stats_counter += 1;
             
-            // Report buffer usage every 10 heartbeats
             if log_stats_counter % 10 == 0 {
                 log_message("[LOG-SERVICE] Operational - Monitoring buffer");
             } else {
@@ -136,6 +135,6 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        yield_cpu();
+        sleep_ms(10);
     }
 }
