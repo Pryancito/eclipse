@@ -185,7 +185,33 @@ impl TaskStateSegment {
     }
 }
 
-/// TSS estática
+/// Maximum number of CPUs supported (indexed by APIC ID % MAX_SMP_CPUS)
+pub const MAX_SMP_CPUS: usize = 16;
+
+/// Per-CPU data accessible via GS segment during SYSCALL handling.
+/// Field offsets are part of the ABI used in syscall_entry (interrupts.rs):
+///   offset 0  – kernel RSP0 (loaded into RSP on syscall entry)
+///   offset 8  – scratch area for user RSP saved on syscall entry
+#[repr(C)]
+pub struct CpuData {
+    pub rsp0: u64,        // offset 0
+    pub scratch_rsp: u64, // offset 8
+}
+
+impl CpuData {
+    const fn new() -> Self {
+        Self { rsp0: 0, scratch_rsp: 0 }
+    }
+}
+
+/// Per-CPU data array (GS base points to CPU_DATA[cpu_id] during kernel execution)
+pub static mut CPU_DATA: [CpuData; MAX_SMP_CPUS] = [const { CpuData::new() }; MAX_SMP_CPUS];
+
+/// Per-CPU Task State Segments
+pub static mut CPU_TSSES: [TaskStateSegment; MAX_SMP_CPUS] =
+    [const { TaskStateSegment::new() }; MAX_SMP_CPUS];
+
+/// BSP-only legacy TSS (kept for backward compatibility; per-CPU code uses CPU_TSSES)
 pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 /// Entrada de la GDT
@@ -215,14 +241,15 @@ impl GdtEntry {
 
 /// Global Descriptor Table
 #[repr(C, align(16))]
+#[derive(Clone, Copy)]
 struct Gdt {
     entries: [GdtEntry; 8],
     tss_system: GdtEntry, // User system segment (TSS low)
     tss_ignore: GdtEntry, // User system segment (TSS high)
 }
 
-/// GDT estática
-static mut GDT: Gdt = Gdt {
+/// GDT template (segment descriptors; TSS entry is filled in per-CPU by load_gdt)
+const GDT_TEMPLATE: Gdt = Gdt {
     entries: [
         // 0x00: Null descriptor
         GdtEntry::new(0, 0, 0, 0),
@@ -243,17 +270,43 @@ static mut GDT: Gdt = Gdt {
     tss_ignore: GdtEntry::new(0, 0, 0, 0),
 };
 
+/// Per-CPU GDT copies (each has its TSS entry pointing to its own CPU_TSSES slot)
+static mut CPU_GDTS: [Gdt; MAX_SMP_CPUS] = [GDT_TEMPLATE; MAX_SMP_CPUS];
+
+/// Return the per-CPU array index for the current CPU.
+/// The index is derived from the Initial APIC ID (CPUID leaf 1, EBX[31:24])
+/// modulo MAX_SMP_CPUS.  All per-CPU arrays (CPU_DATA, CPU_TSSES, CPU_GDTS)
+/// are indexed with this value.
+fn get_cpu_id() -> usize {
+    let ebx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            inout("eax") 1u32 => _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, preserves_flags),
+        );
+    }
+    ((ebx >> 24) as usize) % MAX_SMP_CPUS
+}
+
 /// Cargar la GDT y TSS
 pub fn load_gdt() {
+    let cpu_id = get_cpu_id();
     unsafe {
-        // Setup TSS entry in GDT
-        let tss_base = &TSS as *const _ as u64;
+        // Build per-CPU TSS descriptor entry
+        let tss_base = &CPU_TSSES[cpu_id] as *const _ as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u32;
         
         // 0x40: TSS Descriptor (16 bytes)
         // System Segment (0), Type 9 (Available TSS), DPL 0, P 1
         // Access byte: 0b10001001 = 0x89
-        GDT.tss_system = GdtEntry::new(tss_base as u32, tss_limit, 0x89, 0x00);
+        CPU_GDTS[cpu_id].tss_system = GdtEntry::new(tss_base as u32, tss_limit, 0x89, 0x00);
         
         // Upper 32 bits of base address
         let upper_base = (tss_base >> 32) as u32;
@@ -271,7 +324,7 @@ pub fn load_gdt() {
         // Bytes 0-3: Base 32-63
         // Bytes 4-7: Reserved (zero)
         
-        GDT.tss_ignore = GdtEntry {
+        CPU_GDTS[cpu_id].tss_ignore = GdtEntry {
             limit_low: (upper_base & 0xFFFF) as u16,
             base_low: ((upper_base >> 16) & 0xFFFF) as u16,
             base_middle: 0,
@@ -282,7 +335,7 @@ pub fn load_gdt() {
 
         let descriptor = GdtDescriptor {
             size: (core::mem::size_of::<Gdt>() - 1) as u16,
-            offset: &GDT as *const _ as u64,
+            offset: &CPU_GDTS[cpu_id] as *const _ as u64,
         };
         
         asm!(
@@ -313,12 +366,32 @@ pub fn load_gdt() {
             "ltr ax",
             options(nomem, nostack, preserves_flags)
         );
+        
+        // Set MSR_KERNEL_GS_BASE (0xC0000102) to point to this CPU's CpuData.
+        // swapgs in syscall_entry exchanges GS.base with this value so the
+        // kernel can access per-CPU data (rsp0, scratch_rsp) via GS.
+        let cpu_data_ptr = &raw const CPU_DATA[cpu_id] as u64;
+        let gs_low = cpu_data_ptr as u32;
+        let gs_high = (cpu_data_ptr >> 32) as u32;
+        asm!(
+            "wrmsr",
+            in("ecx") 0xC0000102u32, // IA32_KERNEL_GS_BASE
+            in("eax") gs_low,
+            in("edx") gs_high,
+            options(nomem, nostack, preserves_flags),
+        );
     }
 }
 
-/// Set the kernel stack pointer in the TSS (RSP0)
+/// Set the kernel stack pointer for the current CPU's TSS and CpuData.
+/// Must be called on context switch so that ring-3 → ring-0 transitions
+/// (interrupts, SYSCALL) land on the correct per-CPU kernel stack.
 pub fn set_tss_stack(stack_top: u64) {
+    let cpu_id = get_cpu_id();
     unsafe {
+        CPU_TSSES[cpu_id].rsp0 = stack_top;
+        CPU_DATA[cpu_id].rsp0 = stack_top;
+        // Keep legacy TSS in sync for any code that still reads it
         TSS.rsp0 = stack_top;
     }
 }

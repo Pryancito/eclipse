@@ -252,6 +252,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     
     serial::serial_print("Initializing Local APIC...\n");
     apic::init();
+    // Calibrate the LAPIC timer against the PIT on the BSP so all CPUs
+    // can use the same count when they call apic::init_timer() later.
+    apic::calibrate_timer();
     progress::bar(65);
     
     serial::serial_print("Initializing memory system...\n");
