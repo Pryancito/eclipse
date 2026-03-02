@@ -270,13 +270,13 @@ fn main_loop() -> ! {
         // Procesar solicitudes IPC ligeras (por ejemplo, petición de PIDs de servicios)
         handle_ipc_requests(&mut ipc_buffer);
 
-        // Check service health every 100000 iterations
-        if counter % 100000 == 0 {
+        // Check service health every 1000 iterations (~1 s with 1 ms sleep)
+        if counter % 1000 == 0 {
             check_services();
         }
         
-        // Print heartbeat every 1000000 iterations
-        if counter % 1000000 == 0 {
+        // Print heartbeat every 10000 iterations (~10 s with 1 ms sleep)
+        if counter % 10000 == 0 {
             heartbeat_counter += 1;
             println!("[INIT] Heartbeat #{} - System operational", heartbeat_counter);
             print_service_status();
@@ -295,12 +295,16 @@ fn main_loop() -> ! {
 /// Actualmente soporta:
 /// - "GET_INPUT_PID": devuelve el PID del servicio de entrada en un mensaje "INPT" + u32 LE.
 fn handle_ipc_requests(buffer: &mut [u8; 32]) {
-    let (len, sender) = eclipse_libc::receive(buffer);
-    if len == 0 || sender == 0 {
-        return;
-    }
+    // Drain all pending IPC messages in one pass so that with SMP multiple
+    // processes queuing messages simultaneously are all handled without delay.
+    loop {
+        let (len, sender) = eclipse_libc::receive(buffer);
+        if len == 0 || sender == 0 {
+            break;
+        }
 
-    process_single_ipc_request(buffer, len, sender);
+        process_single_ipc_request(buffer, len, sender);
+    }
 }
 
 /// Helper function to process a single IPC request.

@@ -384,7 +384,7 @@ pub extern "C" fn _start() -> ! {
             response[0..4].copy_from_slice(b"NSTA");
             response[4..12].copy_from_slice(&bytes_rx.to_le_bytes());
             response[12..20].copy_from_slice(&bytes_tx.to_le_bytes());
-            let _ = send(sender, 0x08, &response);
+            let _ = send(sender, 0x40, &response);
         }
         
         // Simulate occasional network traffic (~0.5 s = 50 iterations * 10 ms)
