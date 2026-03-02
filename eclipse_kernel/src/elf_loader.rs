@@ -536,38 +536,36 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
         write_volatile(stack_ptr.offset(16), 0x0FEDCBA9_87654321u64);
     }
 
-    // Frame iretq: CPU hace pop en orden RIP, CS, RFLAGS, RSP, SS.
-    // Construir en static para que el compilador no pueda corromper ni optimizar el RIP.
-    use core::ptr::addr_of_mut;
-    static mut IRET_FRAME: [u64; 5] = [0, 0x1b, 0x202, 0, 0x23]; // RIP, CS, RFLAGS, RSP, SS
-    unsafe {
-        let f = addr_of_mut!(IRET_FRAME);
-        (*f)[0] = entry_point;
-        (*f)[3] = adjusted_stack;
-    }
-    let frame_ptr = unsafe { core::ptr::addr_of!(IRET_FRAME) };
-
-    // Copiar frame al stack del kernel y iretq
+    // Construir el frame iretq directamente en el stack del kernel (por-CPU).
+    // Evitamos un static mut compartido que causaría una carrera SMP cuando
+    // dos CPUs ejecutan jump_to_userspace simultáneamente (exec concurrente).
+    //
+    // Diseño del frame en memoria (iretq hace pop de abajo arriba):
+    //   [RSP+0]:  RIP       = entry_point  (primero en ser procesado por iretq)
+    //   [RSP+8]:  CS        = 0x1b         (user code segment, DPL3)
+    //   [RSP+16]: RFLAGS    = 0x202        (IF=1, bit reservado)
+    //   [RSP+24]: RSP       = adjusted_stack
+    //   [RSP+32]: SS        = 0x23         (user data segment, DPL3)
+    //
+    // Para construir este layout, hacemos PUSH en orden inverso al de pop
+    // (SS primero → queda en la dirección más alta; RIP último → en la más baja).
     unsafe {
         asm!(
             "cli",
-            "sub rsp, 40",
-            "mov rax, [rdi]",
-            "mov [rsp], rax",
-            "mov rax, [rdi + 8]",
-            "mov [rsp + 8], rax",
-            "mov rax, [rdi + 16]",
-            "mov [rsp + 16], rax",
-            "mov rax, [rdi + 24]",
-            "mov [rsp + 24], rax",
-            "mov rax, [rdi + 32]",
-            "mov [rsp + 32], rax",
+            // Construir frame en el stack del kernel (privado por CPU)
+            "push {ss}",    // SS   = 0x23
+            "push {usp}",   // RSP  = adjusted_stack
+            "push {rfl}",   // RFLAGS = 0x202
+            "push {cs}",    // CS   = 0x1b
+            "push {rip}",   // RIP  = entry_point
+            // Cargar selectores de segmento de usuario
             "mov ax, 0x23",
             "mov ds, ax",
             "mov es, ax",
             "xor ax, ax",
             "mov fs, ax",
             "mov gs, ax",
+            // Limpiar todos los registros GP antes de entrar a userspace
             "xor rax, rax",
             "xor rbx, rbx",
             "xor rcx, rcx",
@@ -584,7 +582,11 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
             "xor r15, r15",
             "xor rbp, rbp",
             "iretq",
-            in("rdi") frame_ptr,
+            rip = in(reg) entry_point,
+            cs  = in(reg) 0x1bu64,
+            rfl = in(reg) 0x202u64,
+            usp = in(reg) adjusted_stack,
+            ss  = in(reg) 0x23u64,
             options(noreturn)
         );
     }

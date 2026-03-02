@@ -1,14 +1,33 @@
-//! Scheduler básico round-robin
+//! Scheduler básico round-robin con soporte SMP completo
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process};
 use spin::Mutex;
 
-/// Cola de procesos ready
-const READY_QUEUE_SIZE: usize = 64;
+/// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
+const MAX_CPUS: usize = 16;
+
+/// Cola de procesos ready (ampliada para SMP)
+const READY_QUEUE_SIZE: usize = 512;
 static READY_QUEUE: Mutex<[Option<ProcessId>; READY_QUEUE_SIZE]> = Mutex::new([None; READY_QUEUE_SIZE]);
 static QUEUE_HEAD: Mutex<usize> = Mutex::new(0);
 static QUEUE_TAIL: Mutex<usize> = Mutex::new(0);
+
+/// Contextos idle por CPU para APs.
+/// CPU 0 (BSP) utiliza el contexto del proceso kernel (PID 0) como idle.
+/// CPUs 1..MAX_CPUS guardan aquí su contexto idle inicial para poder volver
+/// al bucle idle cuando no hay ningún proceso usuario listo.
+///
+/// Safety: cada elemento [i] es accedido exclusivamente por la CPU i (indexada
+/// por cpu_id = APIC ID % MAX_CPUS). No se requiere sincronización adicional
+/// porque dos CPUs distintas nunca acceden al mismo índice simultáneamente.
+/// Este patrón es idéntico al usado en boot.rs para CPU_DATA/CPU_TSSES/CPU_GDTS.
+static mut AP_IDLE_CONTEXTS: [crate::process::Context; MAX_CPUS] =
+    [const { crate::process::Context::new() }; MAX_CPUS];
+
+/// Indica si el contexto idle del AP ya fue guardado al menos una vez.
+static AP_IDLE_CONTEXT_VALID: [AtomicBool; MAX_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_CPUS];
 
 /// Estadísticas del scheduler
 pub struct SchedulerStats {
@@ -122,22 +141,39 @@ impl SleepEntry {
     }
 }
 
-const SLEEP_QUEUE_SIZE: usize = 64;
+/// Cola de sleep ampliada para soportar múltiples CPUs sin desbordamientos.
+const SLEEP_QUEUE_SIZE: usize = 256;
 static SLEEP_QUEUE: Mutex<[SleepEntry; SLEEP_QUEUE_SIZE]> = Mutex::new([SleepEntry::empty(); SLEEP_QUEUE_SIZE]);
 
 /// Register a process to be re-queued after `wake_tick` timer ticks have elapsed.
 /// Called from sys_nanosleep after setting the process state to Blocked.
+/// Si el PID ya está en la cola, solo actualiza el wake_tick si es más tarde,
+/// evitando añadir la misma entrada múltiples veces (deduplicación SMP).
 pub fn add_sleep(pid: ProcessId, wake_tick: u64) {
     let mut added = false;
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut q = SLEEP_QUEUE.lock();
+        // Primera pasada: comprobar si el PID ya está en la cola (deduplicación).
         for entry in q.iter_mut() {
-            if !entry.valid {
-                entry.pid = pid;
-                entry.wake_tick = wake_tick;
-                entry.valid = true;
+            if entry.valid && entry.pid == pid {
+                // Ya está durmiendo; ampliar el plazo si la nueva petición es más tardía.
+                if wake_tick > entry.wake_tick {
+                    entry.wake_tick = wake_tick;
+                }
                 added = true;
                 break;
+            }
+        }
+        // Segunda pasada: buscar un slot vacío si el PID no estaba ya en la cola.
+        if !added {
+            for entry in q.iter_mut() {
+                if !entry.valid {
+                    entry.pid = pid;
+                    entry.wake_tick = wake_tick;
+                    entry.valid = true;
+                    added = true;
+                    break;
+                }
             }
         }
     });
@@ -174,24 +210,36 @@ fn wake_sleeping_processes(current_tick: u64) {
     }
 }
 
-/// Función principal de scheduling
+/// Función principal de scheduling con soporte SMP completo.
+///
+/// Invariantes SMP:
+/// - PID 0 (kernel/idle del BSP) NUNCA se mete en la cola global de ready.
+///   Actúa como idle privado del BSP; los APs nunca lo ejecutan.
+/// - Cada AP tiene su propio contexto idle en AP_IDLE_CONTEXTS[cpu_id].
+///   Al cambiar de "sin proceso" a un proceso usuario se guarda el contexto
+///   idle; al volver (proceso bloqueado y cola vacía) se restaura.
+/// - Cuando el proceso actual está bloqueado y no hay siguiente proceso:
+///   BSP vuelve a PID 0; AP vuelve a su contexto idle.
 pub fn schedule() {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // Obtener proceso actual
+        let cpu_id = crate::process::get_cpu_id();
         let current_pid = current_process_id();
-        
-        // Si hay un proceso actual en ejecución, guardarlo en la cola
+
+        // Paso 1: Si hay un proceso usuario en ejecución (Running), preemptarlo
+        // y meterlo en la cola ready. PID 0 NUNCA se encola globalmente.
         if let Some(pid) = current_pid {
-            if let Some(mut process) = get_process(pid) {
-                if process.state == ProcessState::Running {
-                    process.state = ProcessState::Ready;
-                    update_process(pid, process);
-                    enqueue_process(pid);
+            if pid != 0 {
+                if let Some(mut process) = get_process(pid) {
+                    if process.state == ProcessState::Running {
+                        process.state = ProcessState::Ready;
+                        update_process(pid, process);
+                        enqueue_process(pid);
+                    }
                 }
             }
         }
-        
-        // Obtener siguiente proceso de la cola
+
+        // Paso 2: Obtener el siguiente proceso de la cola.
         if let Some(next_pid) = dequeue_process() {
             if (next_pid as usize) < MAX_PIDS {
                 RUN_COUNTS[next_pid as usize].fetch_add(1, Ordering::Relaxed);
@@ -200,21 +248,82 @@ pub fn schedule() {
                 next_process.state = ProcessState::Running;
                 update_process(next_pid, next_process);
 
-                // Hacer context switch
-                if let Some(current_pid) = current_pid {
-                    if current_pid != next_pid {
-                        perform_context_switch(current_pid, next_pid);
+                match current_pid {
+                    Some(cur) if cur == next_pid => {
+                        // Mismo proceso (único en cola), continúa sin cambio de contexto.
                     }
-                } else {
-                    crate::serial::serial_printf(format_args!("[Sched] Core {} picking first process PID {}\n", 
-                        crate::process::get_cpu_id(), next_pid));
-                    set_current_process(Some(next_pid));
-                    // Initial switch to first process if none was running
-                    // We need a dummy context to switch from
-                    let mut dummy = crate::process::Context::new();
-                    perform_context_switch_to(&mut dummy, next_pid);
+                    Some(cur) => {
+                        perform_context_switch(cur, next_pid);
+                    }
+                    None => {
+                        // AP sin proceso actual: guardar contexto idle y saltar al proceso.
+                        crate::serial::serial_printf(format_args!(
+                            "[Sched] Core {} picking first process PID {}\n",
+                            cpu_id, next_pid));
+                        set_current_process(Some(next_pid));
+                        if cpu_id < MAX_CPUS {
+                            // Guardar el contexto idle de este AP para poder volver más tarde.
+                            // Safety: cada CPU escribe únicamente su propia ranura [cpu_id].
+                            let idle_ctx = unsafe { &mut AP_IDLE_CONTEXTS[cpu_id] };
+                            AP_IDLE_CONTEXT_VALID[cpu_id].store(true, Ordering::SeqCst);
+                            perform_context_switch_to(idle_ctx, next_pid);
+                        } else {
+                            // cpu_id fuera de rango: fallback al dummy original.
+                            let mut dummy = crate::process::Context::new();
+                            perform_context_switch_to(&mut dummy, next_pid);
+                        }
+                    }
                 }
             }
+        } else {
+            // Paso 3: No hay proceso listo. Si el proceso actual está bloqueado
+            // debemos cambiar a un contexto idle para no continuar ejecutándolo.
+            let is_blocked = current_pid
+                .and_then(|pid| get_process(pid))
+                .map(|p| p.state == ProcessState::Blocked)
+                .unwrap_or(false);
+
+            if is_blocked {
+                let blocked_pid = current_pid.unwrap();
+
+                if cpu_id == 0 {
+                    // BSP: volver al proceso kernel (PID 0) que actúa como idle.
+                    set_current_process(Some(0));
+                    if let Some(mut p0) = get_process(0) {
+                        p0.state = ProcessState::Running;
+                        update_process(0, p0);
+                    }
+                    perform_context_switch(blocked_pid, 0);
+                } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
+                    // AP: restaurar el contexto idle guardado la primera vez que el AP
+                    // tomó un proceso usuario. Esto devuelve la ejecución al bucle idle.
+                    //
+                    // Safety: cada CPU escribe y lee únicamente su propia ranura
+                    // (indexada por cpu_id), por lo que no hay carreras entre CPUs.
+                    // El from_ptr apunta al contexto en PROCESS_TABLE; aunque el lock se
+                    // libera antes de switch_context, ningún otro hilo modificará ese
+                    // proceso (está Blocked) antes de que se complete la transferencia.
+                    set_current_process(None);
+                    let from_ptr = {
+                        let mut table = crate::process::PROCESS_TABLE.lock();
+                        match table[blocked_pid as usize].as_mut() {
+                            Some(p) => &mut p.context as *mut crate::process::Context,
+                            None => return,
+                        }
+                    };
+                    let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
+                    unsafe {
+                        crate::process::switch_context(&mut *from_ptr, to_ctx, 0);
+                    }
+                }
+                // Si el contexto idle del AP aún no es válido (ap_entry() todavía no
+                // completó la primera transferencia a un proceso usuario) o cpu_id está
+                // fuera de rango, se retorna sin cambio. La deduplicación en add_sleep
+                // impide el bucle de saturación, y el AP entrará en idle normalmente
+                // en el próximo tick del APIC timer.
+            }
+            // Si no está bloqueado (yield normal sin otros procesos), el proceso
+            // actual simplemente continúa (se usa como idle implícito).
         }
     });
 }
