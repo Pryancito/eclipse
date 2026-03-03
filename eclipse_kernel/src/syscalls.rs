@@ -1039,6 +1039,14 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         copy
     } else {
         serial::serial_print("[SYSCALL] exec: Copying from user space\n");
+        // Validate the user-supplied pointer before touching it.  Without this check
+        // a process could pass a kernel-range address (< KERNEL_HALF) to sys_exec and
+        // have the kernel copy arbitrary kernel memory into the ELF buffer.
+        if !is_user_pointer(elf_ptr, elf_size) {
+            set_last_exec_error(b"exec: invalid ELF buffer pointer");
+            serial::serial_print("[SYSCALL] exec() security violation: non-user ELF pointer\n");
+            return u64::MAX;
+        }
         let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
         let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
         copy.extend_from_slice(src);

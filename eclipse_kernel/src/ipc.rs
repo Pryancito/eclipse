@@ -422,12 +422,25 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     // --- Direct delivery para P2P: bypass de cola global y de IPC_SYSTEM ---
     if dest_slot != 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
         return run_critical(|| {
-            let mut mailboxes = PROCESS_MAILBOXES.lock();
+            // Re-verify the PID→slot mapping inside the critical section to close the TOCTOU
+            // window: the target process could exit (and a new process take the same slot)
+            // between the outer pid_to_slot_fast() call and this push.
+            // Lock order: PID_SLOT_MAP → PROCESS_MAILBOXES (consistent with all other paths).
+            let live_slot = {
+                let map = PID_SLOT_MAP.lock();
+                let idx = to as usize % PID_MAP_SIZE;
+                let e = map[idx];
+                if e.pid == to && e.slot != 0xFF { e.slot } else { 0xFF }
+            };
+            if live_slot == 0xFF {
+                return false; // Target process has exited since we computed dest_slot
+            }
             static P2P_ID: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            let ok = mailboxes[dest_slot as usize].push(m);
+            m.dest_slot = live_slot; // use re-verified slot
+            let ok = PROCESS_MAILBOXES.lock()[live_slot as usize].push(m);
             if ok {
                 P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
             } else {

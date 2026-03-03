@@ -305,6 +305,10 @@ pub fn schedule() {
                     if next_process.current_cpu != crate::process::NO_CPU && next_process.current_cpu != cpu_id as u32 {
                         should_requeue = true;
                         false
+                    } else if next_process.state == ProcessState::Terminated {
+                        // Process was killed (via sys_kill) while still in the ready queue.
+                        // Promoting it to Running would resume a dead process — drop it instead.
+                        false
                     } else {
                         next_process.state = ProcessState::Running;
                         next_process.current_cpu = cpu_id as u32;

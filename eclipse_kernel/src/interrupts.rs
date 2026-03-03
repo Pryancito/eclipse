@@ -143,6 +143,10 @@ pub fn init() {
         KERNEL_IDT.entries[4].set_handler(exception_4 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[6].set_handler(exception_6 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[8].set_handler(exception_8 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        // Use IST 1 so the #DF handler runs on a dedicated 8 KB stack (set in load_gdt).
+        // Without IST a double-fault caused by a stack overflow would immediately triple-fault
+        // because the CPU would try to push the exception frame onto the same bad stack.
+        KERNEL_IDT.entries[8].ist = 1;
         KERNEL_IDT.entries[10].set_handler(exception_10 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[11].set_handler(exception_11 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[12].set_handler(exception_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
