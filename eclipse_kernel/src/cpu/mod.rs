@@ -65,6 +65,11 @@ long_mode_64:
     mov es, ax
     mov ss, ax
     
+    # Reload CR3 with the full 64-bit physical address (the 32-bit mov above may have
+    # truncated it on systems where the PML4 is above 4 GiB).
+    mov rax, [0x1000 + T_CR3]
+    mov cr3, rax
+    
     mov rsp, [0x1000 + T_STACK]
     mov rax, [0x1000 + T_ENTRY]
     jmp rax
@@ -219,27 +224,28 @@ pub fn start_aps() {
             // Send INIT-SIPI sequence
             serial_printf(format_args!("[CPU] sending INIT to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0, 5, true, false);
-            delay_ms(10);
+            wait_ms(10);
             serial_printf(format_args!("[CPU] sending SIPI to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             
             // Give it 1ms to see if it starts on the first SIPI
-            delay_ms(1);
+            wait_ms(1);
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
                 serial_printf(format_args!("[CPU] sending second SIPI to AP {}...\n", target_apic_id));
                 // Send second SIPI if not ready
                 crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             }
             
-            // Wait briefly for this AP to signal readiness before starting the next one
-            // 100ms is more than enough for an AP to wake up and signal readiness.
-            let mut sub_timeout = 100;
-            while AP_READY.load(Ordering::SeqCst) < expected_ready && sub_timeout > 0 {
-                delay_ms(1);
-                sub_timeout -= 1;
+            // Wait for this AP to signal readiness before starting the next one.
+            // 1000ms gives slow real hardware enough time to boot.
+            let timeout_tick = crate::interrupts::ticks() + 1000;
+            while AP_READY.load(Ordering::SeqCst) < expected_ready
+                && crate::interrupts::ticks() < timeout_tick
+            {
+                wait_ms(1);
             }
             
-            if sub_timeout == 0 {
+            if AP_READY.load(Ordering::SeqCst) < expected_ready {
                 serial_printf(format_args!("[CPU] WARNING: AP {} (APIC ID {}) failed to start (timeout)\n", i, target_apic_id));
             } else {
                 serial_printf(format_args!("[CPU] AP {} (APIC ID {}) started successfully\n", i, target_apic_id));
@@ -269,6 +275,39 @@ fn delay_us(us: u64) {
 
 fn delay_ms(ms: u64) {
     delay_us(ms * 1000);
+}
+
+/// Wait at least `ms` milliseconds using interrupt ticks (APIC/PIT timer) as the
+/// primary clock source.  Falls back to RDTSC if the tick counter is not advancing
+/// (e.g., interrupts disabled or timer not yet configured), so this function never
+/// hangs even on miscalibrated hardware.
+///
+/// This is the preferred delay for the AP startup sequence because it is immune to
+/// TSC calibration errors that would make `delay_ms` either too short or appear to
+/// hang on real hardware.
+fn wait_ms(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let start_tick = crate::interrupts::ticks();
+    let target_tick = start_tick.saturating_add(ms);
+
+    // RDTSC-based ceiling: wait at most 3× the expected time so we can exit even if
+    // the tick counter is frozen (e.g., when called very early before timer init).
+    // With a correctly calibrated TSC the fallback fires at 3×ms real milliseconds;
+    // with the default 10 000 counts/µs it fires at 30×ms on a 1 GHz machine, still
+    // finite and bounded.
+    let tsc_start = rdtsc();
+    let tsc_ceiling = ms.saturating_mul(3).saturating_mul(1000)
+        .saturating_mul(TSC_COUNTS_PER_US.load(Ordering::Relaxed));
+
+    while crate::interrupts::ticks() < target_tick {
+        // RDTSC fallback so we never spin forever.
+        if tsc_ceiling > 0 && rdtsc().wrapping_sub(tsc_start) >= tsc_ceiling {
+            break;
+        }
+        crate::cpu::pause();
+    }
 }
 
 
