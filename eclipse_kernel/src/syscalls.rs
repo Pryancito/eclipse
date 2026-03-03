@@ -987,8 +987,10 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     }
 }
 
-/// Kernel half: get_service_binary returns pointers in this range
-const KERNEL_HALF: u64 = 0xFFFF_9000_0000_0000;
+/// Kernel half: get_service_binary returns pointers in this range.
+/// The kernel image itself is linked at KERNEL_OFFSET (0xFFFF_8000_0000_0000),
+/// so service binaries embedded in .rodata live at addresses starting there.
+const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 
 /// Último mensaje de fallo de exec (para que userspace pueda mostrarlo sin serial)
 const LAST_EXEC_ERR_LEN: usize = 80;
@@ -1086,9 +1088,22 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                 }
             }
             
-            // This doesn't return - we jump to the new process entry point
+            // This doesn't return - we jump to the new process entry point.
+            // Map a fresh 1 MB user stack for the exec'd binary.
+            // A forked child only inherits the parent's 256 KB stack (up to 0x20040000),
+            // but jump_to_userspace places the initial RSP near USER_STACK_TOP.
+            const USER_STACK_BASE: u64 = 0x2000_0000;
+            const USER_STACK_SIZE: usize = 0x10_0000; // 1 MB
+            let cr3 = crate::memory::get_cr3();
+            if let Err(e) = crate::elf_loader::setup_user_stack(cr3, USER_STACK_BASE, USER_STACK_SIZE) {
+                set_last_exec_error(b"exec: failed to allocate user stack");
+                serial::serial_print("[SYSCALL] exec() failed to allocate user stack: ");
+                serial::serial_print(e);
+                serial::serial_print("\n");
+                return u64::MAX;
+            }
             unsafe {
-                let stack_top: u64 = 0x20100000; // stack_base(0x20000000) + stack_size(0x100000)
+                let stack_top: u64 = USER_STACK_BASE + USER_STACK_SIZE as u64;
                 crate::elf_loader::jump_to_userspace(entry_point, stack_top, phdr_va, phnum, phentsize);
             }
         }
