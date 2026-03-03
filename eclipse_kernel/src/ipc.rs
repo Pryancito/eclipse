@@ -439,7 +439,9 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
                 core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            m.dest_slot = live_slot; // use re-verified slot
+            // Update dest_slot to the re-verified slot so that process_messages()
+            // (which re-routes any stale global-queue entries) uses the correct index.
+            m.dest_slot = live_slot;
             let ok = PROCESS_MAILBOXES.lock()[live_slot as usize].push(m);
             if ok {
                 P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);

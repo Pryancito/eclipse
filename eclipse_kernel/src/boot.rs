@@ -225,7 +225,8 @@ pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 /// Using static storage avoids a heap dependency during early per-CPU setup
 /// (load_gdt() may be called before the heap is initialised on some boot paths).
 /// 8 KB per CPU is enough for the minimal #DF handler.
-static mut DF_STACKS: [[u8; 8192]; MAX_SMP_CPUS] = [[0u8; 8192]; MAX_SMP_CPUS];
+const DF_STACK_SIZE: usize = 8192;
+static mut DF_STACKS: [[u8; DF_STACK_SIZE]; MAX_SMP_CPUS] = [[0u8; DF_STACK_SIZE]; MAX_SMP_CPUS];
 
 /// Entrada de la GDT
 #[repr(C, packed)]
@@ -398,7 +399,7 @@ pub fn load_gdt() {
         // by a kernel stack overflow (the most common trigger) lands on a known-good
         // stack instead of triple-faulting immediately.
         // The KERNEL_IDT entry[8].ist was set to 1 in interrupts::init().
-        let df_stack_top = DF_STACKS[cpu_id].as_ptr() as u64 + 8192;
+        let df_stack_top = DF_STACKS[cpu_id].as_ptr() as u64 + DF_STACK_SIZE as u64;
         CPU_TSSES[cpu_id].ist1 = df_stack_top & !0xF; // 16-byte aligned
         
         // Set GS.base to point to this CPU's CpuData.
