@@ -694,10 +694,12 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
                     x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                 // Ensure existing entry has USER permission AND Execute permission (Clear NX)
+                 // Ensure existing entry has USER permission.
+                 // Do NOT remove NO_EXECUTE from intermediate entries — doing so would silently
+                 // widen the executable region to the entire 512 GB PML4 subtree, undermining
+                 // any future defensive hardening that sets NX on intermediate entries.
                  let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pml4_entry.get_flags());
                  flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
                  pml4_entry.set_addr(pml4_entry.get_addr(), flags.bits());
             }
             
@@ -725,10 +727,10 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
                     x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                 // Ensure existing entry has USER permission AND Execute permission
+                 // Ensure existing entry has USER permission.
+                 // Do NOT remove NO_EXECUTE from intermediate entries.
                  let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags());
                  flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
                  pdpt_entry.set_addr(pdpt_entry.get_addr(), flags.bits());
             }
             

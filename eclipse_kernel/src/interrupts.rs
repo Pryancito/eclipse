@@ -139,6 +139,11 @@ pub fn init() {
         // Configurar handlers de excepciones (0-31)
         KERNEL_IDT.entries[0].set_handler(exception_0 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[1].set_handler(exception_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        // NMI (Non-Maskable Interrupt, vector 2).  Without a registered handler the CPU looks up
+        // IDT[2] and finds Present=0, which causes a #NP (vector 11) with error code 0x12 —
+        // masking the real NMI source and printing a spurious BSOD.  Install a minimal stub that
+        // routes through the common exception handler so NMIs are at least logged.
+        KERNEL_IDT.entries[2].set_handler(exception_2 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[3].set_handler(exception_3 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[4].set_handler(exception_4 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[6].set_handler(exception_6 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
@@ -859,6 +864,17 @@ unsafe extern "C" fn exception_1() {
     core::arch::naked_asm!(
         "push 0", // Dummy error code
         "push 1", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
+    );
+}
+
+// NMI (#NMI)
+#[unsafe(naked)]
+unsafe extern "C" fn exception_2() {
+    core::arch::naked_asm!(
+        "push 0", // Dummy error code
+        "push 2", // Exception num
         "jmp {}",
         sym common_exception_handler,
     );
