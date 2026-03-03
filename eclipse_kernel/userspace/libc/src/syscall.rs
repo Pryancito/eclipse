@@ -87,6 +87,7 @@ pub const SYS_GET_SYSTEM_STATS: u64 = 51;
 pub const SYS_GET_PROCESS_LIST: u64 = 52;
 pub const SYS_KILL: u64 = 53;
 pub const SYS_SET_PROCESS_NAME: u64 = 54;
+pub const SYS_SPAWN_SERVICE: u64 = 55;
 pub const SYS_GET_LOGS: u64 = 49;
 
 /// Fast path IPC: mensaje entregado en registros, sin buffer en memoria
@@ -485,6 +486,22 @@ pub fn kill(pid: u32) -> bool {
 
 pub fn set_process_name(name: &str) -> bool {
     unsafe { syscall2(SYS_SET_PROCESS_NAME, name.as_ptr() as u64, name.len() as u64) != u64::MAX }
+}
+
+/// Spawn a service process by ID directly from the kernel-embedded binary.
+/// service_id: 0=log, 1=devfs, 2=filesystem, 3=input, 4=display, 5=audio, 6=network, 7=gui
+/// name: process name (shown in process list)
+/// Returns the new process PID on success, -1 on error.
+pub fn spawn_service(service_id: u32, name: &str) -> i32 {
+    let result = unsafe {
+        syscall3(
+            SYS_SPAWN_SERVICE,
+            service_id as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    };
+    if result == u64::MAX { -1 } else { result as i32 }
 }
 
 

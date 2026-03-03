@@ -287,6 +287,7 @@ pub extern "C" fn syscall_handler(
         52 => sys_get_process_list(arg1, arg2),
         53 => sys_kill(arg1),
         54 => sys_set_process_name(arg1, arg2),
+        55 => sys_spawn_service(arg1, arg2, arg3),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -443,6 +444,89 @@ fn sys_set_process_name(name_ptr: u64, name_len: u64) -> u64 {
     }
 
     u64::MAX
+}
+
+/// sys_spawn_service - Spawn a system service process by embedded binary ID.
+/// arg1: service_id (0 = log, 1 = devfs, 2 = filesystem, 3 = input, 4 = display,
+///                   5 = audio, 6 = network, 7 = gui)
+/// arg2: pointer to name string in user space (optional, 0 = derive from service_id)
+/// arg3: name length
+/// Returns: PID of new service process on success, u64::MAX on error.
+///
+/// This is the preferred way for init to start services. It avoids the fork+exec
+/// overhead and directly creates a clean process from the embedded kernel binary.
+fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
+    serial::serial_print("[SYSCALL] spawn_service(");
+    serial::serial_print_dec(service_id);
+    serial::serial_print(")\n");
+
+    let elf_slice: &[u8] = match service_id {
+        0 => crate::binaries::LOG_SERVICE_BINARY,
+        1 => crate::binaries::DEVFS_SERVICE_BINARY,
+        2 => crate::binaries::FILESYSTEM_SERVICE_BINARY,
+        3 => crate::binaries::INPUT_SERVICE_BINARY,
+        4 => crate::binaries::DISPLAY_SERVICE_BINARY,
+        5 => crate::binaries::AUDIO_SERVICE_BINARY,
+        6 => crate::binaries::NETWORK_SERVICE_BINARY,
+        7 => crate::binaries::GUI_SERVICE_BINARY,
+        _ => {
+            serial::serial_print("[SYSCALL] spawn_service: invalid service_id\n");
+            return u64::MAX;
+        }
+    };
+
+    // Read the optional name from user space
+    let mut name_buf = [0u8; 16];
+    if name_ptr != 0 && name_len > 0 {
+        let copy_len = (name_len as usize).min(15);
+        if is_user_pointer(name_ptr, copy_len as u64) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(name_ptr as *const u8, name_buf.as_mut_ptr(), copy_len);
+            }
+        }
+    }
+    let name_str = core::str::from_utf8(&name_buf).unwrap_or("");
+    let name_trimmed = if name_str.trim_matches('\0').is_empty() {
+        match service_id {
+            0 => "log",
+            1 => "devfs",
+            2 => "filesystem",
+            3 => "input",
+            4 => "display",
+            5 => "audio",
+            6 => "network",
+            7 => "gui",
+            _ => "service",
+        }
+    } else {
+        name_str.trim_matches('\0')
+    };
+
+    match crate::process::spawn_process(elf_slice, name_trimmed) {
+        Ok(pid) => {
+            // Set parent_pid so init can wait() for the child
+            if let Some(caller_pid) = current_process_id() {
+                if let Some(mut child) = crate::process::get_process(pid) {
+                    child.parent_pid = Some(caller_pid);
+                    crate::process::update_process(pid, child);
+                }
+            }
+
+            crate::scheduler::enqueue_process(pid);
+
+            serial::serial_print("[SYSCALL] spawn_service: spawned PID ");
+            serial::serial_print_dec(pid as u64);
+            serial::serial_print("\n");
+
+            pid as u64
+        }
+        Err(e) => {
+            serial::serial_print("[SYSCALL] spawn_service failed: ");
+            serial::serial_print(e);
+            serial::serial_print("\n");
+            u64::MAX
+        }
+    }
 }
 
 /// sys_get_logs - Obtener los últimos logs del kernel (para el HUD del compositor)
