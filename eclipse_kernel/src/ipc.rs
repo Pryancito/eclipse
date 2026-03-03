@@ -177,18 +177,33 @@ static IPC_SYSTEM: Mutex<IpcSystem> = Mutex::new(IpcSystem::new());
 
 /// **Tabla inversa PID → slot index (O(1)).**
 ///
-/// `PID_SLOT_MAP[pid % PID_MAP_SIZE] = slot as u8` (0xFF = vacío).
-/// Con max 64 procesos activos y tamaño 256, la probabilidad de colisión es 0
-/// (dos PIDs distintos activos con mismo residuo es imposible con ≤64 y mapa ≥128).
+/// Each entry stores the full (pid, slot) pair so that stale entries from
+/// recycled PIDs are distinguishable.  When a new process is created with
+/// the same `pid % PID_MAP_SIZE` as an older (now terminated) PID, the
+/// old entry is simply overwritten.  A lookup first confirms that the
+/// stored `pid` field matches the requested PID before trusting the slot.
+///
+/// Without the pid field a collision (PID A and PID B both hash to the
+/// same index) would silently route IPC messages for PID A to whatever
+/// slot PID B registered — a silent data corruption bug that manifests
+/// after ~256 process lifecycle events.
 const PID_MAP_SIZE: usize = 256;
-static PID_SLOT_MAP: Mutex<[u8; PID_MAP_SIZE]> = Mutex::new([0xFF; PID_MAP_SIZE]);
+
+#[derive(Clone, Copy)]
+struct PidSlotEntry {
+    pid: u32,
+    slot: u8,
+}
+
+const EMPTY_PSE: PidSlotEntry = PidSlotEntry { pid: u32::MAX, slot: 0xFF };
+static PID_SLOT_MAP: Mutex<[PidSlotEntry; PID_MAP_SIZE]> = Mutex::new([EMPTY_PSE; PID_MAP_SIZE]);
 
 /// Registrar un PID en la tabla inversa al crear un proceso.
 /// Llamar desde `create_process_with_pid` al insertar en PROCESS_TABLE.
 pub fn register_pid_slot(pid: crate::process::ProcessId, slot: usize) {
     let idx = pid as usize % PID_MAP_SIZE;
     run_critical(|| {
-        PID_SLOT_MAP.lock()[idx] = slot as u8;
+        PID_SLOT_MAP.lock()[idx] = PidSlotEntry { pid, slot: slot as u8 };
     });
 }
 
@@ -197,21 +212,28 @@ pub fn register_pid_slot(pid: crate::process::ProcessId, slot: usize) {
 pub fn unregister_pid_slot(pid: crate::process::ProcessId) {
     let idx = pid as usize % PID_MAP_SIZE;
     run_critical(|| {
-        PID_SLOT_MAP.lock()[idx] = 0xFF;
+        let mut map = PID_SLOT_MAP.lock();
+        // Only clear if this exact PID owns the entry; a newer PID may have
+        // already claimed the same hash bucket (hash collision / PID reuse).
+        if map[idx].pid == pid {
+            map[idx] = EMPTY_PSE;
+        }
     });
 }
 
-/// Lookup O(1): PID → slot index usando la tabla inversa.
-/// Fallback O(N) sobre PROCESS_TABLE solo si la tabla dice 0xFF (proceso muy nuevo o raza).
+/// Lookup O(1): PID → slot index via the inverse map.
+/// Falls back to O(N) linear scan over PROCESS_TABLE only if the entry is
+/// empty or belongs to a different PID (hash collision / stale entry).
 pub fn pid_to_slot_fast(pid: crate::process::ProcessId) -> Option<usize> {
     let idx = pid as usize % PID_MAP_SIZE;
-    let slot = run_critical(|| {
+    let entry = run_critical(|| {
         PID_SLOT_MAP.lock()[idx]
     });
-    if slot != 0xFF {
-        return Some(slot as usize);
+    // Validate that the stored pid matches (detects hash collisions / stale entries).
+    if entry.pid == pid && entry.slot != 0xFF {
+        return Some(entry.slot as usize);
     }
-    // Fallback: la entrada puede estar vacía por startup race — usar pid_to_slot O(N)
+    // Fallback: entry empty or belongs to a different PID — use O(N) scan.
     #[cfg(not(test))]
     {
         crate::process::pid_to_slot(pid)
@@ -400,12 +422,27 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     // --- Direct delivery para P2P: bypass de cola global y de IPC_SYSTEM ---
     if dest_slot != 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
         return run_critical(|| {
-            let mut mailboxes = PROCESS_MAILBOXES.lock();
+            // Re-verify the PID→slot mapping inside the critical section to close the TOCTOU
+            // window: the target process could exit (and a new process take the same slot)
+            // between the outer pid_to_slot_fast() call and this push.
+            // Lock order: PID_SLOT_MAP → PROCESS_MAILBOXES (consistent with all other paths).
+            let live_slot = {
+                let map = PID_SLOT_MAP.lock();
+                let idx = to as usize % PID_MAP_SIZE;
+                let e = map[idx];
+                if e.pid == to && e.slot != 0xFF { e.slot } else { 0xFF }
+            };
+            if live_slot == 0xFF {
+                return false; // Target process has exited since we computed dest_slot
+            }
             static P2P_ID: core::sync::atomic::AtomicU64 =
                 core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            let ok = mailboxes[dest_slot as usize].push(m);
+            // Update dest_slot to the re-verified slot so that process_messages()
+            // (which re-routes any stale global-queue entries) uses the correct index.
+            m.dest_slot = live_slot;
+            let ok = PROCESS_MAILBOXES.lock()[live_slot as usize].push(m);
             if ok {
                 P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
             } else {

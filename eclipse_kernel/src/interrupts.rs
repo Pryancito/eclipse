@@ -139,10 +139,19 @@ pub fn init() {
         // Configurar handlers de excepciones (0-31)
         KERNEL_IDT.entries[0].set_handler(exception_0 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[1].set_handler(exception_1 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        // NMI (Non-Maskable Interrupt, vector 2).  Without a registered handler the CPU looks up
+        // IDT[2] and finds Present=0, which causes a #NP (vector 11) with error code 0x12 —
+        // masking the real NMI source and printing a spurious BSOD.  Install a minimal stub that
+        // routes through the common exception handler so NMIs are at least logged.
+        KERNEL_IDT.entries[2].set_handler(exception_2 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[3].set_handler(exception_3 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[4].set_handler(exception_4 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[6].set_handler(exception_6 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[8].set_handler(exception_8 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
+        // Use IST 1 so the #DF handler runs on a dedicated 8 KB stack (set in load_gdt).
+        // Without IST a double-fault caused by a stack overflow would immediately triple-fault
+        // because the CPU would try to push the exception frame onto the same bad stack.
+        KERNEL_IDT.entries[8].ist = 1;
         KERNEL_IDT.entries[10].set_handler(exception_10 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[11].set_handler(exception_11 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
         KERNEL_IDT.entries[12].set_handler(exception_12 as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE);
@@ -685,14 +694,17 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
         rfl, cs, ss
     ));
     
-    // Stack dump (first 64 bytes)
-    if rsp >= 0xFFFF800000000000 || (rsp < 0x0000800000000000 && rsp > 0) {
+    // Stack dump (first 64 bytes) — kernel RSP only.
+    // Dumping a *user* RSP here is unsafe: if the RSP points to an unmapped page (e.g.
+    // a stack-overflow fault) the read_volatile below generates a nested #PF inside the
+    // exception handler.  A nested #PF of the same class escalates to a Double Fault,
+    // losing the original exception context and making post-mortem analysis impossible.
+    // Kernel RSP is always mapped (lives in kernel stacks), so the dump is safe there.
+    if rsp >= 0xFFFF800000000000 {
         crate::serial::serial_printf(format_args!("  Stack Dump at {:#018x}:\n", rsp));
         unsafe {
             let stack_ptr = rsp as *const u64;
             for i in 0..8 {
-                // Try to prevent crash during dump if RSP is totally invalid
-                // This is a very basic check.
                 let val = core::ptr::read_volatile(stack_ptr.add(i));
                 crate::serial::serial_printf(format_args!("    [+{:#02x}]: {:#018x}\n", i * 8, val));
             }
@@ -867,6 +879,17 @@ unsafe extern "C" fn exception_1() {
     );
 }
 
+// NMI (#NMI)
+#[unsafe(naked)]
+unsafe extern "C" fn exception_2() {
+    core::arch::naked_asm!(
+        "push 0", // Dummy error code
+        "push 2", // Exception num
+        "jmp {}",
+        sym common_exception_handler,
+    );
+}
+
 // Breakpoint (#BP)
 #[unsafe(naked)]
 unsafe extern "C" fn exception_3() {
@@ -1015,7 +1038,12 @@ unsafe extern "C" fn irq_0() {
         "push r9",
         "push r10",
         "push r11",
+        // SysV AMD64 ABI: RSP must be 16-byte aligned BEFORE the CALL instruction.
+        // After `and rsp, -16` (→ Y, Y%16==0) and 9 pushes (72 bytes), RSP = Y-72.
+        // 72 % 16 == 8, so RSP%16==8 — WRONG.  One extra sub fixes it: Y-80, 80%16==0.
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1248,7 +1276,9 @@ unsafe extern "C" fn irq_1() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1294,7 +1324,9 @@ unsafe extern "C" fn irq_12() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1375,7 +1407,9 @@ unsafe extern "C" fn apic_timer_irq() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1441,7 +1475,9 @@ unsafe extern "C" fn tlb_shootdown_irq() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1546,7 +1582,9 @@ unsafe extern "C" fn irq_9() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1606,7 +1644,9 @@ unsafe extern "C" fn irq_10() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1668,7 +1708,9 @@ unsafe extern "C" fn irq_11() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1853,9 +1895,10 @@ unsafe extern "C" fn syscall_entry() {
         "push 0x1B",             // CS  (user code selector)
         "push rcx",              // RIP (saved by SYSCALL in RCX)
 
-        // Restore user GS now that we are on the kernel stack and no longer
-        // need GS-relative access.
-        "swapgs",
+        // NOTE: do NOT swapgs here.  The handler (syscall_handler_rust) uses
+        // gs-relative reads (gs:[0]/gs:[8]/gs:[20]) for current_process_id(),
+        // get_cpu_id(), and set_tss_stack().  The kernel GS must remain active
+        // until the iretq at the end.
 
         // We push RBP first so we can use it as a reference for the Context structure
         "push rbp",
@@ -1926,7 +1969,12 @@ unsafe extern "C" fn syscall_entry() {
         "pop rax",
         
         "pop rbp",
-        
+
+        // Restore user GS before returning to ring 3.
+        // At this point the kernel GS (CpuData) is active; swapgs swaps it back
+        // to the user GS (0 for our processes) so userspace sees a clean GS.
+        "swapgs",
+
         "iretq",
         
         handler = sym syscall_handler_rust,
@@ -2016,7 +2064,9 @@ unsafe extern "C" fn reschedule_irq() {
         "push r9",
         "push r10",
         "push r11",
+        "sub rsp, 8",
         "call {}",
+        "add rsp, 8",
         "pop r11",
         "pop r10",
         "pop r9",

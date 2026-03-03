@@ -185,8 +185,18 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
                         let in_file_offset = (intersect_start - vaddr_start) as usize;
                         let in_page_offset = (intersect_start - page_vaddr_start) as usize;
 
+                        // Bounds-check the source range against the ELF slice BEFORE reading it.
+                        // A crafted ELF with p_offset + p_filesz > elf_data.len() would otherwise
+                        // cause copy_nonoverlapping to read past the end of the allocation, leaking
+                        // kernel heap metadata into the user process's address space.
+                        let file_src_start = file_start_offset as usize + in_file_offset;
+                        let file_src_end = file_src_start.saturating_add(copy_size);
+                        if file_src_end > elf_data.len() {
+                            return Err("ELF: segment data extends past end of file");
+                        }
+
                         unsafe {
-                            let src = elf_data.as_ptr().add(file_start_offset as usize + in_file_offset);
+                            let src = elf_data.as_ptr().add(file_src_start);
                             let dst = target_kernel_ptr.add(in_page_offset);
                             core::ptr::copy_nonoverlapping(src, dst, copy_size);
                         }

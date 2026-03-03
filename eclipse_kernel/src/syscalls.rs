@@ -399,18 +399,24 @@ fn sys_kill(pid: u64) -> u64 {
         return u64::MAX; // Cannot kill kernel or init
     }
 
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(p) = slot {
-            if p.id == pid as u32 {
-                p.state = crate::process::ProcessState::Terminated;
-                crate::ipc::unregister_pid_slot(p.id);
-                return 0;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            if let Some(p) = slot {
+                if p.id == pid as u32 {
+                    p.state = crate::process::ProcessState::Terminated;
+                    // Remove from IPC lookup table so no new messages are routed here.
+                    crate::ipc::unregister_pid_slot(p.id);
+                    // Clear the IPC mailbox so that if this slot index is ever reused
+                    // for a new process it starts with an empty mailbox (consistent with
+                    // exit_process() which calls clear_mailbox_slot() on normal exit).
+                    crate::ipc::clear_mailbox_slot(slot_idx);
+                    return 0;
+                }
             }
         }
-    }
-
-    u64::MAX
+        u64::MAX
+    })
 }
 
 /// sys_set_process_name - Cambiar el nombre del proceso actual
@@ -516,6 +522,10 @@ fn translate_linux_abi_unique(
         231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
         262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
         35 => (25, arg1, arg2, arg3, arg4, arg5),          // nanosleep -> 25
+        318 => (33, arg1, arg2, arg3, arg4, arg5),         // getrandom -> sys_getrandom (33)
+        56 => (22, arg1, arg2, arg3, arg4, arg5),          // clone  -> sys_clone (22)
+        57 => (7,  arg1, arg2, arg3, arg4, arg5),          // fork   -> sys_fork  (7)
+        61 => (9,  arg1, arg2, arg3, arg4, arg5),          // wait4  -> sys_wait  (9)
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
@@ -566,6 +576,12 @@ fn sys_exit(exit_code: u64) -> u64 {
     serial::serial_print_hex(exit_code);
     serial::serial_print("\n");
     
+    // Store the exit code in the PCB so sys_wait() can report it to the parent.
+    if let Some(mut proc) = crate::process::get_process(pid) {
+        proc.exit_code = exit_code;
+        crate::process::update_process(pid, proc);
+    }
+
     exit_process();
     yield_cpu();
     0
@@ -1023,6 +1039,16 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         }
         copy
     } else {
+        serial::serial_print("[SYSCALL] exec: Copying from user space\n");
+        // Validate the user-supplied pointer before touching it.  Without this check
+        // a process could pass a canonical kernel-space address (>= 0xFFFF_8000_0000_0000)
+        // that also happens to be below KERNEL_HALF (e.g. very high but not higher-half)
+        // and have the kernel copy arbitrary memory into the ELF buffer.
+        if !is_user_pointer(elf_ptr, elf_size) {
+            set_last_exec_error(b"exec: invalid ELF buffer pointer");
+            serial::serial_print("[SYSCALL] exec() security violation: non-user ELF pointer\n");
+            return u64::MAX;
+        }
         let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
         let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
         copy.extend_from_slice(src);
@@ -1049,6 +1075,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
+                    // Discard VMAs from the old image so that mmap's gap-search loop
+                    // does not see phantom occupied ranges from the previous binary.
+                    // Accumulating them across exec() calls also causes unbounded
+                    // kernel-heap growth.
+                    proc.vmas.clear();
                     proc.brk_current = max_vaddr;
                     proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
                     crate::process::update_process(pid, proc);
@@ -1181,6 +1212,17 @@ fn sys_wait(status_ptr: u64) -> u64 {
                         // re-receiving the same PID.
                         // Note: full resource cleanup (kernel stack, page tables, FDs)
                         // is deferred; the process entry stays as Terminated in the table.
+
+                        // Write the child's exit status to *status_ptr using the standard
+                        // WEXITSTATUS encoding expected by POSIX wait(): the exit code
+                        // occupies bits [15:8] (i.e. exit_code << 8); bits [7:0] are 0
+                        // to indicate normal termination (not a signal).
+                        // Use write_unaligned to tolerate potentially unaligned status_ptr.
+                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                            let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
+                            unsafe { core::ptr::write_unaligned(status_ptr as *mut u32, wait_status); }
+                        }
+
                         proc.parent_pid = None;
                         process::update_process(*pid, proc);
                         return *pid as u64;
@@ -1383,9 +1425,16 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
                 serial::serial_print("\n");
                 fd as u64
             }
-            None => u64::MAX,
+            None => {
+                // FD table is full (MAX_FD_PER_PROCESS entries in use).
+                // Release the scheme resource so it isn't permanently leaked.
+                let _ = crate::scheme::close(scheme_id, resource_id);
+                u64::MAX
+            }
         }
     } else {
+        // No current process — release the scheme resource to avoid a leak.
+        let _ = crate::scheme::close(scheme_id, resource_id);
         u64::MAX
     }
 }
@@ -2077,7 +2126,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     // fd == -1 (any common representation) means anonymous mapping (Linux behavior)
     let force_anonymous = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32;
 
-    // Align length to page size (4KB)
+    // Align length to page size (4KB), guarding against integer overflow.
+    // A length >= u64::MAX - 0xFFE would wrap to 0 in release mode, silently
+    // producing zero pages.  Also cap the maximum mapping to 512 GiB which is
+    // well inside user-space and prevents VMARegion::end from entering kernel space.
+    if length > 0x0000_7FFF_FFFF_FFFF {
+        return u64::MAX;
+    }
     let aligned_length = (length + 0xFFF) & !0xFFF;
     let num_pages = aligned_length / 4096;
 
@@ -2128,8 +2183,17 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         }
     }
     
-    // Validate target address
-    if target_addr < 0x100000 || target_addr > 0x0000_7FFF_FFFF_F000 {
+    // Validate target address and that the mapping end stays within user space.
+    // target_addr + aligned_length must not overflow or enter kernel address space
+    // (kernel starts at 0x0000_8000_0000_0000 on this layout).
+    let map_end = match target_addr.checked_add(aligned_length) {
+        Some(e) if e <= 0x0000_7FFF_FFFF_F000 => e,
+        _ => {
+            serial::serial_print("[SYSCALL] mmap: mapping would exceed user address space\n");
+            return u64::MAX;
+        }
+    };
+    if target_addr < 0x100000 {
         serial::serial_print("[SYSCALL] mmap: invalid target address\n");
         return u64::MAX;
     }
@@ -2165,7 +2229,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                     memory::map_physical_range(page_table_phys, phys_addr, aligned_length, target_addr, pt_flags.bits());
                     let vma = VMARegion {
                         start: target_addr,
-                        end: target_addr + aligned_length,
+                        end: map_end,
                         flags: flags,
                         file_backed: true,
                     };
@@ -2237,7 +2301,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
 
         let vma = VMARegion {
             start: target_addr,
-            end: target_addr + aligned_length,
+            end: map_end,
             flags: flags,
             file_backed: is_file_backed,
         };
@@ -2286,16 +2350,15 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
         
         let map_end = addr + length;
         
-        // We need to know which pages to physically free.
-        // In a real OS, page tables tell us. Here, we blindly traverse the range.
-        
-        // TODO: Actually free physical pages!
-        // This requires walking the page table, resolving phys addr, and freeing dma buffer.
-        // memory::unmap_user_range(...) helper needed.
-        
-        // For now, we leave physical pages leakes (bad!) or handled by process exit cleaner.
-        // But we technically "unmap" them from valid tracking struct.
-        
+        // Clear the page-table entries for the unmapped range so that hardware
+        // accesses to the region generate a #PF rather than silently succeeding.
+        // This enforces POSIX munmap() semantics (access → SIGSEGV) and prevents
+        // information leaks through pages the caller believes have been unmapped.
+        let page_table_phys = proc.page_table_phys;
+        if page_table_phys != 0 {
+            memory::unmap_user_range(page_table_phys, addr, length);
+        }
+
         let initial_len = proc.vmas.len();
         proc.vmas.retain(|vma| {
             // Remove if there is overlap
@@ -2390,7 +2453,10 @@ fn sys_nanosleep(req: u64) -> u64 {
 
     let (tv_sec, tv_nsec): (i64, i64) = unsafe {
         let ptr = req as *const i64;
-        (ptr.read(), ptr.add(1).read())
+        // Use read_unaligned: the user-supplied pointer may not be 8-byte aligned.
+        // On x86_64 the hardware tolerates unaligned loads, but ptr.read() is
+        // defined to require alignment (Rust/LLVM UB if misaligned).
+        (ptr.read_unaligned(), ptr.add(1).read_unaligned())
     };
 
     // Reject negative or out-of-range values (EINVAL)
@@ -2417,12 +2483,18 @@ fn sys_nanosleep(req: u64) -> u64 {
     // NOTE: We set the state directly in PROCESS_TABLE because update_process()
     // intentionally preserves the original state (to protect against races).
     if let Some(pid) = current_process_id() {
-        {
+        // PROCESS_TABLE is indexed by slot, not by PID value.  After slot reuse,
+        // a process can have PID ≥ 64, so table[pid as usize] would be out-of-bounds.
+        // Use pid_to_slot_fast() to obtain the correct slot index.
+        let slot = crate::ipc::pid_to_slot_fast(pid);
+        x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_mut() {
-                p.state = crate::process::ProcessState::Blocked;
+            if let Some(slot_idx) = slot {
+                if let Some(p) = table[slot_idx].as_mut() {
+                    p.state = crate::process::ProcessState::Blocked;
+                }
             }
-        }
+        });
         crate::scheduler::add_sleep(pid, wake_tick);
     }
 
@@ -2471,21 +2543,41 @@ fn sys_brk(addr: u64) -> u64 {
             // brk is the end of the heap.
             // Current page-aligned end is the next page boundary of brk_current.
             let old_brk_page_end = (proc.brk_current + 4095) & !4095;
-            let new_brk_page_end = (addr + 4095) & !4095;
             
             if addr > proc.brk_current {
-                // Growing heap - map new pages
+                // Growing heap - map new pages.
+                // Guard against the heap growing into the user stack region.
+                // Stack occupies [0x20000000, 0x20100000); reject anything at or above 0x20000000.
+                const USER_STACK_BASE: u64 = 0x2000_0000;
+                if addr >= USER_STACK_BASE {
+                    // Return the unchanged break pointer (Linux brk() semantics on failure).
+                    return proc.brk_current;
+                }
+                // Guard against integer overflow in the page-end calculation.
+                let new_brk_page_end = match addr.checked_add(4095) {
+                    Some(v) => v & !4095,
+                    None => return proc.brk_current,
+                };
+
                 let page_table_phys = proc.page_table_phys;
                 let mut current_page = old_brk_page_end;
                 
                 while current_page < new_brk_page_end {
-                    // Allocate and map a page
-                    if let Some((frame_ptr, frame_phys)) = memory::alloc_dma_buffer(4096, 4096) {
-                        // Zero the page
-                        unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                    // Allocate from the dedicated user-space physical frame pool instead of
+                    // alloc_dma_buffer (kernel heap).  alloc_dma_buffer can place frames
+                    // adjacent to kernel stacks, causing corruption under memory pressure.
+                    if let Some(frame_phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                        let frame_virt = memory::phys_to_virt(frame_phys) as *mut u8;
+                        // Zero the page via the kernel direct-map virtual address.
+                        unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
                         
-                        // Map it as user writable
-                        let flags = memory::PAGE_USER | memory::PAGE_WRITABLE;
+                        // Map as user-writable, non-executable (W^X: heap is data, not code).
+                        // NO_EXECUTE is intentionally set here; sys_mmap uses the same pattern
+                        // for PROT_READ|PROT_WRITE mappings without PROT_EXEC.
+                        let flags = (x86_64::structures::paging::PageTableFlags::PRESENT
+                            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
+                            | x86_64::structures::paging::PageTableFlags::WRITABLE
+                            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE).bits();
                         memory::map_user_page_4kb(page_table_phys, current_page, frame_phys, flags);
                         
                         current_page += 4096;
@@ -2518,6 +2610,9 @@ fn sys_brk(addr: u64) -> u64 {
 
 fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if stat_ptr == 0 { return u64::MAX; }
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+        return u64::MAX;
+    }
     
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
@@ -2939,6 +3034,7 @@ fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
     serial::serial_print(")\n");
 
     if addr == 0 || addrlen < 2 { return u64::MAX; }
+    if !is_user_pointer(addr, addrlen) { return u64::MAX; }
     let family = unsafe { *(addr as *const u16) };
     
     if family == 1 { // AF_UNIX
@@ -2981,6 +3077,9 @@ fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u
 
 fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     if path_ptr == 0 || stat_ptr == 0 { return u64::MAX; }
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+        return u64::MAX;
+    }
     
     let path_len = strlen_user_unique(path_ptr, 4096);
     if path_len == 0 { return u64::MAX; }

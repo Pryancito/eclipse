@@ -98,12 +98,26 @@ impl FdTable {
     }
 }
 
-/// Global file descriptor tables (one per process)
+/// Global file descriptor tables (one per process slot)
+///
+/// **Important:** This array is indexed by PROCESS_TABLE *slot index* (0..MAX_FD_PROCESSES),
+/// NOT by the raw PID value.  PIDs are monotonically increasing (they never wrap) so using
+/// `pid as usize` as the index would silently fail for any process with PID >= 64.
+/// Use `pid_to_fd_idx(pid)` (below) to obtain the correct slot index.
 pub static FD_TABLES: Mutex<[FdTable; MAX_FD_PROCESSES]> = Mutex::new([FdTable::new(); MAX_FD_PROCESSES]);
+
+/// Translate a PID to the corresponding FD_TABLES slot index.
+///
+/// FD_TABLES shares the same slot numbering as PROCESS_TABLE (0..MAX_FD_PROCESSES).
+/// Since PIDs are monotonically increasing, we must not use the raw PID value as an
+/// array index — we must resolve it to the reusable slot index via the IPC PID→slot map.
+pub fn pid_to_fd_idx(pid: ProcessId) -> Option<usize> {
+    crate::ipc::pid_to_slot_fast(pid)
+}
 
 /// Get the FD table for a process
 pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable; MAX_FD_PROCESSES]>> {
-    if (pid as usize) < MAX_FD_PROCESSES {
+    if pid_to_fd_idx(pid).is_some() {
         Some(FD_TABLES.lock())
     } else {
         None
@@ -112,48 +126,40 @@ pub fn get_fd_table(pid: ProcessId) -> Option<spin::MutexGuard<'static, [FdTable
 
 /// Open a file for a process using a scheme and resource
 pub fn fd_open(pid: ProcessId, scheme_id: usize, resource_id: usize, flags: u32) -> Option<usize> {
+    let pid_idx = pid_to_fd_idx(pid)?;
     let mut tables = FD_TABLES.lock();
-    let pid_idx = pid as usize;
-    if pid_idx < MAX_FD_PROCESSES {
-        tables[pid_idx].allocate(scheme_id, resource_id, flags)
-    } else {
-        None
-    }
+    tables[pid_idx].allocate(scheme_id, resource_id, flags)
 }
 
 /// Get file descriptor for a process
 pub fn fd_get(pid: ProcessId, fd: usize) -> Option<FileDescriptor> {
+    let pid_idx = pid_to_fd_idx(pid)?;
     let tables = FD_TABLES.lock();
-    let pid_idx = pid as usize;
-    if pid_idx < MAX_FD_PROCESSES {
-        tables[pid_idx].get(fd).cloned()
-    } else {
-        None
-    }
+    tables[pid_idx].get(fd).cloned()
 }
 
 /// Update file descriptor offset
 pub fn fd_update_offset(pid: ProcessId, fd: usize, new_offset: u64) -> bool {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
     let mut tables = FD_TABLES.lock();
-    let pid_idx = pid as usize;
-    if pid_idx < MAX_FD_PROCESSES {
-        if let Some(fd_entry) = tables[pid_idx].get_mut(fd) {
-            fd_entry.offset = new_offset;
-            return true;
-        }
+    if let Some(fd_entry) = tables[pid_idx].get_mut(fd) {
+        fd_entry.offset = new_offset;
+        return true;
     }
     false
 }
 
 /// Close a file descriptor for a process
 pub fn fd_close(pid: ProcessId, fd: usize) -> bool {
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return false,
+    };
     let mut tables = FD_TABLES.lock();
-    let pid_idx = pid as usize;
-    if pid_idx < MAX_FD_PROCESSES {
-        tables[pid_idx].close(fd)
-    } else {
-        false
-    }
+    tables[pid_idx].close(fd)
 }
 
 /// Initialize FD system
@@ -163,44 +169,51 @@ pub fn init() {
 
 /// Clone parent's fd table to child (call from fork). Child gets same open fds as parent.
 pub fn fd_clone_for_fork(parent_pid: ProcessId, child_pid: ProcessId) {
+    // Resolve slots before acquiring FD_TABLES to avoid lock-order issues.
+    let parent_idx = match pid_to_fd_idx(parent_pid) {
+        Some(i) => i,
+        None => return,
+    };
+    let child_idx = match pid_to_fd_idx(child_pid) {
+        Some(i) => i,
+        None => return,
+    };
     let mut tables = FD_TABLES.lock();
-    let parent_idx = parent_pid as usize;
-    let child_idx = child_pid as usize;
-    if parent_idx < MAX_FD_PROCESSES && child_idx < MAX_FD_PROCESSES {
-        tables[child_idx] = tables[parent_idx];
-    }
+    tables[child_idx] = tables[parent_idx];
 }
 
 /// Initialize standard I/O for a process
 pub fn fd_init_stdio(pid: ProcessId) {
+    // Resolve the slot before touching FD_TABLES so high-PID processes get proper stdio.
+    let pid_idx = match pid_to_fd_idx(pid) {
+        Some(i) => i,
+        None => return,
+    };
     if let Ok((scheme_id, resource_id)) = crate::scheme::open("log:", 0, 0) {
         let mut tables = FD_TABLES.lock();
-        let pid_idx = pid as usize;
-        if pid_idx < MAX_FD_PROCESSES {
-            // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
-            tables[pid_idx].fds[0] = FileDescriptor {
-                in_use: true,
-                scheme_id,
-                resource_id,
-                offset: 0,
-                flags: 0,
-            };
-            // FD 1: stdout
-            tables[pid_idx].fds[1] = FileDescriptor {
-                in_use: true,
-                scheme_id,
-                resource_id,
-                offset: 0,
-                flags: 0,
-            };
-            // FD 2: stderr
-            tables[pid_idx].fds[2] = FileDescriptor {
-                in_use: true,
-                scheme_id,
-                resource_id,
-                offset: 0,
-                flags: 0,
-            };
-        }
+        // FD 0: stdin (same as log for now; read returns EIO so apps get error, not "FD not found")
+        tables[pid_idx].fds[0] = FileDescriptor {
+            in_use: true,
+            scheme_id,
+            resource_id,
+            offset: 0,
+            flags: 0,
+        };
+        // FD 1: stdout
+        tables[pid_idx].fds[1] = FileDescriptor {
+            in_use: true,
+            scheme_id,
+            resource_id,
+            offset: 0,
+            flags: 0,
+        };
+        // FD 2: stderr
+        tables[pid_idx].fds[2] = FileDescriptor {
+            in_use: true,
+            scheme_id,
+            resource_id,
+            offset: 0,
+            flags: 0,
+        };
     }
 }

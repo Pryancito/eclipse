@@ -2,7 +2,7 @@
 //! 
 //! This service provides centralized logging via:
 //! - Serial port output (for real-time debugging)
-//! - File logging to /var/log/system.log (when filesystem is available)
+//! - File logging to /tmp/system.log (in-memory virtual filesystem, always writable)
 //! 
 //! It must start first so other services have a place to send their logs.
 
@@ -46,7 +46,7 @@ fn log_message(msg: &str) {
     log_to_buffer(msg);
     log_to_buffer("\n");
     
-    // 3. Write buffered logs to /var/log/system.log
+    // 3. Write buffered logs to /tmp/system.log
     // Flush buffer when it reaches a threshold or periodically
     unsafe {
         if LOG_BUFFER_POS > 3072 {  // Flush when 75% full
@@ -55,7 +55,7 @@ fn log_message(msg: &str) {
     }
 }
 
-/// Flush the log buffer to /var/log/system.log
+/// Flush the log buffer to /tmp/system.log
 fn flush_log_buffer() {
     unsafe {
         if LOG_BUFFER_POS == 0 {
@@ -63,7 +63,7 @@ fn flush_log_buffer() {
         }
         
         // Open the log file using the file: scheme explicitly
-        let fd = open("file:/var/log/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
+        let fd = open("file:/tmp/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
         if fd >= 0 {
             // Write buffered data to file
             let written = write(fd as u32, &LOG_BUFFER[..LOG_BUFFER_POS]);
@@ -83,7 +83,7 @@ pub extern "C" fn _start() -> ! {
     
     log_message("+--------------------------------------------------------------+");
     log_message("|              LOG SERVER / CONSOLE SERVICE                    |");
-    log_message("|         Serial Output + File Logging (/var/log/)             |");
+    log_message("|         Serial Output + File Logging (/tmp/system.log)       |");
     log_message("+--------------------------------------------------------------+");
     
     log_message("[LOG-SERVICE] Starting...");
@@ -94,7 +94,7 @@ pub extern "C" fn _start() -> ! {
     
     log_message("[LOG-SERVICE] Serial port configured for output");
     log_message("[LOG-SERVICE] Log buffer allocated (4KB)");
-    log_message("[LOG-SERVICE] Target log file: /var/log/system.log");
+    log_message("[LOG-SERVICE] Target log file: /tmp/system.log");
     log_message("[LOG-SERVICE] Ready to accept log messages from other services");
     
     // Notify init (parent) that we are ready

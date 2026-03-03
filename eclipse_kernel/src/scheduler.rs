@@ -56,41 +56,64 @@ pub fn take_run_counts() -> [u32; MAX_PIDS] {
 }
 
 /// Agregar proceso a la cola ready
+///
+/// LOCKING: Acquires READY_QUEUE → PROCESS_TABLE (in that order).
+/// Callers must NOT hold either lock.  The check-and-set of process state
+/// is performed as a single atomic operation while READY_QUEUE is already
+/// held, eliminating the TOCTOU race that existed when the two PROCESS_TABLE
+/// acquisitions were separate (a second CPU could pass the dedup check before
+/// the first one set the state to Ready, inserting the same PID twice).
 pub fn enqueue_process(pid: ProcessId) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        // DEDUPLICACIÓN: No encolar si ya está en la cola física (Ready).
-        {
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_ref() {
-                if p.state == ProcessState::Ready {
-                    return;
-                }
-            }
-        }
+    // Resolve the PID to its PROCESS_TABLE slot index.  After slot reuse, a
+    // process can have PID ≥ MAX_PROCESSES (64) while occupying a recycled slot
+    // index ≤ 63.  Using the raw PID as an index would be out-of-bounds; using
+    // pid_to_slot_fast() gives the correct slot regardless of the PID value.
+    let slot = match crate::ipc::pid_to_slot_fast(pid) {
+        Some(s) => s,
+        None => return, // PID not registered in table — drop silently.
+    };
 
+    x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = READY_QUEUE.lock();
         let head = QUEUE_HEAD.lock();
         let mut tail = QUEUE_TAIL.lock();
-        
+
         let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-        if next_tail != *head {
-            // Actualizar estado a Ready ANTES de meter en la cola física.
-            // Al estar bajo ReadyQueue lock + Interrupts disabled, es atómico respecto al scheduler.
-            {
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(p) = table[pid as usize].as_mut() {
-                    p.state = ProcessState::Ready;
-                    // NO LIMPIAR p.current_cpu aquí.
-                    // El core que intenta planificarlo de nuevo debe esperar a que el dueño original suelte la propiedad.
-                }
-            }
-            
-            queue[*tail] = Some(pid);
-            *tail = next_tail;
-            
-            // Notificar a otras CPUs de un nuevo proceso listo.
-            crate::apic::broadcast_reschedule_ipi();
+        if next_tail == *head {
+            // Queue full — drop the enqueue request rather than spinning.
+            return;
         }
+
+        // Single atomic check-and-set while READY_QUEUE is held.
+        // This prevents two CPUs from both passing the dedup check and
+        // both inserting the same PID into the queue.
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[slot].as_mut() {
+                // Verify the slot still belongs to this PID (slot may have been reused).
+                if p.id != pid { return; }
+                // Dedup: already in the ready queue or running — skip.
+                if p.state == ProcessState::Ready {
+                    return;
+                }
+                // Do not enqueue terminated processes.
+                if p.state == ProcessState::Terminated {
+                    return;
+                }
+                // Blocked → Ready  or  Running → Ready (preemption from schedule()).
+                p.state = ProcessState::Ready;
+                // NOTE: current_cpu is intentionally NOT cleared here.
+                // The owning CPU will clear it atomically in switch_context().
+            } else {
+                return; // Process not in table.
+            }
+        }
+
+        queue[*tail] = Some(pid);
+        *tail = next_tail;
+
+        // Notify other CPUs that a new process is ready.
+        crate::apic::broadcast_reschedule_ipi();
     });
 }
 
@@ -128,13 +151,19 @@ pub fn tick() {
     if current_pid == Some(0) {
         stats.idle_ticks += 1;
     } else if let Some(pid) = current_pid {
-        // Incrementar ticks del proceso actual
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_mut() {
-                p.cpu_ticks += 1;
-            }
-        });
+        // Increment CPU tick counter for the current process.
+        // Use pid_to_slot_fast to get the correct slot — after slot reuse the PID
+        // can exceed MAX_PROCESSES (64) so table[pid as usize] would be OOB.
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(p) = table[slot].as_mut() {
+                    if p.id == pid {
+                        p.cpu_ticks += 1;
+                    }
+                }
+            });
+        }
     }
     
     let ticks = stats.total_ticks;
@@ -256,9 +285,13 @@ pub fn schedule() {
                 let mut should_requeue = false;
                 {
                     let mut table = crate::process::PROCESS_TABLE.lock();
-                    if let Some(process) = table[pid as usize].as_mut() {
-                        if process.state == ProcessState::Running && process.current_cpu == cpu_id as u32 {
-                            should_requeue = true;
+                    // Use pid_to_slot_fast: after slot reuse, pid can exceed 63 so
+                    // table[pid as usize] would panic with an OOB index.
+                    if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+                        if let Some(process) = table[slot].as_mut() {
+                            if process.id == pid && process.state == ProcessState::Running && process.current_cpu == cpu_id as u32 {
+                                should_requeue = true;
+                            }
                         }
                     }
                 }
@@ -280,16 +313,29 @@ pub fn schedule() {
             let mut should_requeue = false;
             let next_process_exists = {
                 let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(next_process) = table[next_pid as usize].as_mut() {
-                    // Si por algún motivo aún tiene dueño (el core anterior todavía no terminó el switch_context),
-                    // lo devolvemos a la cola y buscamos otro. Esto previene el "Double Run".
-                    if next_process.current_cpu != crate::process::NO_CPU && next_process.current_cpu != cpu_id as u32 {
-                        should_requeue = true;
-                        false
+                // Use pid_to_slot_fast: next_pid from the queue is a real PID value that may
+                // exceed 63 after slot reuse, making table[next_pid as usize] out-of-bounds.
+                if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
+                    if let Some(next_process) = table[slot].as_mut() {
+                        if next_process.id != next_pid {
+                            // Slot was reused for a different process — discard stale queue entry.
+                            false
+                        } else if next_process.current_cpu != crate::process::NO_CPU && next_process.current_cpu != cpu_id as u32 {
+                            // Si por algún motivo aún tiene dueño (el core anterior todavía no terminó el switch_context),
+                            // lo devolvemos a la cola y buscamos otro. Esto previene el "Double Run".
+                            should_requeue = true;
+                            false
+                        } else if next_process.state == ProcessState::Terminated {
+                            // Process was killed (via sys_kill) while still in the ready queue.
+                            // Promoting it to Running would resume a dead process — drop it instead.
+                            false
+                        } else {
+                            next_process.state = ProcessState::Running;
+                            next_process.current_cpu = cpu_id as u32;
+                            true
+                        }
                     } else {
-                        next_process.state = ProcessState::Running;
-                        next_process.current_cpu = cpu_id as u32;
-                        true
+                        false
                     }
                 } else {
                     false
@@ -297,7 +343,29 @@ pub fn schedule() {
             };
 
             if should_requeue {
-                enqueue_process(next_pid);
+                // The process has state=Ready (set by enqueue_process when it was first
+                // queued) but was dequeued by this CPU and cannot be run because
+                // current_cpu belongs to another CPU.  Re-insert it directly into the
+                // ring buffer without going through enqueue_process(): that function's
+                // dedup guard (`if p.state == Ready { return; }`) would fire and silently
+                // drop the process, causing permanent starvation.
+                // We hold READY_QUEUE+QUEUE_TAIL+QUEUE_HEAD in a single critical section,
+                // consistent with enqueue_process's lock order, so there is no TOCTOU
+                // window between the state check and the insertion.
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    let mut queue = READY_QUEUE.lock();
+                    let head = *QUEUE_HEAD.lock();
+                    let mut tail = QUEUE_TAIL.lock();
+                    let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
+                    if next_tail != head {
+                        // State is already Ready — no change needed.
+                        queue[*tail] = Some(next_pid);
+                        *tail = next_tail;
+                    }
+                    // If the queue is full, skip re-insertion.  The process retains
+                    // state=Ready; the next timer tick will dequeue another entry and
+                    // a subsequent should_requeue attempt will succeed.
+                });
             }
 
             if next_process_exists {
@@ -361,13 +429,18 @@ pub fn schedule() {
                     set_current_process(None);
                     let (from_ptr, clear_ptr) = {
                         let mut table = crate::process::PROCESS_TABLE.lock();
-                        match table[blocked_pid as usize].as_mut() {
-                            Some(p) => {
+                        // Use pid_to_slot_fast: blocked_pid may exceed 63 after slot reuse.
+                        let slot = match crate::ipc::pid_to_slot_fast(blocked_pid) {
+                            Some(s) => s,
+                            None => return,
+                        };
+                        match table[slot].as_mut() {
+                            Some(p) if p.id == blocked_pid => {
                                 let ctx_ptr = &mut p.context as *mut crate::process::Context;
                                 let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
                                 (ctx_ptr, cpu_ptr)
                             },
-                            None => return,
+                            _ => return,
                         }
                     };
                     let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
@@ -392,11 +465,20 @@ pub fn schedule() {
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = crate::process::PROCESS_TABLE.lock();
-        let from_ptr = match table[from_pid as usize].as_mut() {
-            Some(p) => &mut p.context as *mut crate::process::Context,
-            None => return, // Process exited, skip switch
+        // Use pid_to_slot_fast: PIDs may exceed 63 after slot reuse.
+        let from_slot = match crate::ipc::pid_to_slot_fast(from_pid) {
+            Some(s) => s,
+            None => return,
         };
-        let to_exists = table[to_pid as usize].is_some();
+        let from_ptr = match table[from_slot].as_mut() {
+            Some(p) if p.id == from_pid => &mut p.context as *mut crate::process::Context,
+            _ => return, // Process exited, skip switch
+        };
+        let to_slot = match crate::ipc::pid_to_slot_fast(to_pid) {
+            Some(s) => s,
+            None => return,
+        };
+        let to_exists = table[to_slot].as_ref().map_or(false, |p| p.id == to_pid);
         drop(table);
         if !to_exists {
             return;
@@ -414,10 +496,21 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
 fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: ProcessId) {
     let (to_ptr, to_kernel_stack, to_page_table, to_fs_base) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
-        let to_process = match table[to_pid as usize].as_mut() {
-            Some(p) => p,
+        // Use pid_to_slot_fast: to_pid may exceed 63 after slot reuse.
+        let to_slot = match crate::ipc::pid_to_slot_fast(to_pid) {
+            Some(s) => s,
             None => return,
         };
+        let to_process = match table[to_slot].as_mut() {
+            Some(p) if p.id == to_pid => p,
+            _ => return,
+        };
+        // If to_pid was killed (via sys_kill) between when it was dequeued and now,
+        // switching to it would resume a terminated process.  Bail out — the scheduler
+        // will be called again on the next timer tick and will skip the terminated PID.
+        if to_process.state == ProcessState::Terminated {
+            return;
+        }
         (
             &to_process.context as *const crate::process::Context,
             to_process.kernel_stack_top,
@@ -458,10 +551,15 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     // between clearing ownership and saving the context.
     let clear_addr: u64 = if let Some(from_pid) = current_process_id() {
         if from_pid != to_pid {
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[from_pid as usize].as_ref() {
-                if p.current_cpu == crate::process::get_cpu_id() as u32 {
-                    &p.current_cpu as *const u32 as u64
+            // Use pid_to_slot_fast: from_pid may exceed 63 after slot reuse.
+            if let Some(slot) = crate::ipc::pid_to_slot_fast(from_pid) {
+                let table = crate::process::PROCESS_TABLE.lock();
+                if let Some(p) = table[slot].as_ref() {
+                    if p.id == from_pid && p.current_cpu == crate::process::get_cpu_id() as u32 {
+                        &p.current_cpu as *const u32 as u64
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 }

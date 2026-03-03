@@ -652,7 +652,12 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+            // NOTE: NO_EXECUTE is intentionally NOT removed here.
+            // Callers that want non-executable pages (e.g. sys_mmap with PROT_READ|PROT_WRITE
+            // but no PROT_EXEC) pass PageTableFlags::NO_EXECUTE in `flags`. Stripping it would
+            // make every user page executable regardless of the requested protection, breaking
+            // the W^X contract and making heap/stack pages exploitable as shellcode targets.
+            // Callers that want executable pages simply do not set NO_EXECUTE in `flags`.
 
             pt_entry.set_addr(paddr, leaf_flags.bits());
 
@@ -687,10 +692,12 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
                     x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                 // Ensure existing entry has USER permission AND Execute permission (Clear NX)
+                 // Ensure existing entry has USER permission.
+                 // Do NOT remove NO_EXECUTE from intermediate entries — doing so would silently
+                 // widen the executable region to the entire 512 GB PML4 subtree, undermining
+                 // any future defensive hardening that sets NX on intermediate entries.
                  let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pml4_entry.get_flags());
                  flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
                  pml4_entry.set_addr(pml4_entry.get_addr(), flags.bits());
             }
             
@@ -718,10 +725,10 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
                     x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits()
                 );
             } else {
-                 // Ensure existing entry has USER permission AND Execute permission
+                 // Ensure existing entry has USER permission.
+                 // Do NOT remove NO_EXECUTE from intermediate entries.
                  let mut flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(pdpt_entry.get_flags());
                  flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-                 flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
                  pdpt_entry.set_addr(pdpt_entry.get_addr(), flags.bits());
             }
             
@@ -734,7 +741,9 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::HUGE_PAGE);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+            // NOTE: NO_EXECUTE is intentionally NOT removed for the leaf PDE.
+            // See map_user_page_4kb() for the rationale.  Callers that want
+            // non-executable 2MB pages (rare but valid) pass NO_EXECUTE in flags.
             
             pd.entries[pd_idx].set_addr(paddr, leaf_flags.bits());
             
@@ -873,7 +882,8 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
 /// Returns (total_frames, used_frames) for the userspace physical pool.
 pub fn get_memory_stats() -> (u64, u64) {
     let total = (ANON_MMAP_PHYS_END - ANON_MMAP_PHYS_START) / 4096;
-    let used = ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096;
+    // Cap at total so the counter never reports used > total after the pool is exhausted.
+    let used = (ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096).min(total);
     (total, used)
 }
 
@@ -921,6 +931,55 @@ pub fn map_physical_range(page_table_phys: u64, paddr: u64, length: u64, vaddr: 
         let page_offset = i * 0x1000;
         map_user_page_4kb(page_table_phys, vaddr + page_offset, paddr + page_offset, flags);
     }
+}
+
+/// Unmap a virtual address range in a process's page table by zeroing the PTEs
+/// and flushing the TLB for each page.  This enforces POSIX munmap() semantics:
+/// any access to the range after this call generates a #PF.
+///
+/// Physical frames are NOT freed here (the bump allocator has no free-list);
+/// they are reclaimed only when the whole process exits and its page tables are
+/// torn down.  This is acceptable because sys_brk only ever grows the heap.
+pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
+    if length == 0 { return; }
+    let aligned_start = vaddr & !0xFFF;
+    let aligned_end   = (vaddr + length + 0xFFF) & !0xFFF;
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        let mut page = aligned_start;
+        while page < aligned_end {
+            let pml4_idx = ((page >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((page >> 30) & 0x1FF) as usize;
+            let pd_idx   = ((page >> 21) & 0x1FF) as usize;
+            let pt_idx   = ((page >> 12) & 0x1FF) as usize;
+
+            unsafe {
+                let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
+                if !pml4.entries[pml4_idx].present() { page += 4096; continue; }
+
+                let pdpt = &mut *(phys_to_virt(pml4.entries[pml4_idx].get_addr()) as *mut PageTable);
+                if !pdpt.entries[pdpt_idx].present() { page += 4096; continue; }
+
+                let pd = &mut *(phys_to_virt(pdpt.entries[pdpt_idx].get_addr()) as *mut PageTable);
+                if !pd.entries[pd_idx].present() { page += 4096; continue; }
+
+                if pd.entries[pd_idx].is_huge() {
+                    // 2MB huge page: zero the PD entry and skip the whole 2MB region.
+                    pd.entries[pd_idx].set_entry(0, 0);
+                    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page));
+                    page += 2 * 1024 * 1024;
+                    continue;
+                }
+
+                let pt = &mut *(phys_to_virt(pd.entries[pd_idx].get_addr()) as *mut PageTable);
+                pt.entries[pt_idx].set_entry(0, 0);
+                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page));
+            }
+
+            page += 4096;
+        }
+    });
 }
 
 /// Map a physical MMIO range into the kernel's virtual address space.

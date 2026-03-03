@@ -87,6 +87,7 @@ pub struct Process {
     pub cpu_ticks: u64,                   // Total CPU ticks consumed
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
     pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
+    pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -116,13 +117,14 @@ impl Process {
             cpu_ticks: 0,
             mem_frames: 0,
             current_cpu: NO_CPU,
+            exit_code: 0,
         }
     }
 }
 
 
 /// Tabla de procesos
-const MAX_PROCESSES: usize = 64;
+pub const MAX_PROCESSES: usize = 64;
 pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 
@@ -217,8 +219,21 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
         let mut table = PROCESS_TABLE.lock();
         
         // Buscar slot libre (enumerate para conocer el índice del slot)
+        // Accept both empty slots and slots whose previous occupant has Terminated,
+        // so that the 64-entry table can be reused across process lifetimes.
+        // Without this, after 63 processes exit the table fills up permanently.
         for (slot_idx, slot) in table.iter_mut().enumerate() {
-            if slot.is_none() {
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    // Only evict a Terminated slot once no CPU is still using its context.
+                    // perform_context_switch() holds a raw pointer into the slot's context
+                    // until switch_context() atomically clears current_cpu.  Evicting the
+                    // slot before that point causes the new process's context to be
+                    // overwritten by the old CPU's register save.
+                    && p.current_cpu == crate::process::NO_CPU);
+            if slot_available {
+                *slot = None; // evict Terminated entry before writing new process
                 let mut process = Process::new();
                 process.id = pid;
                 process.stack_base = stack_base;
@@ -373,18 +388,25 @@ pub fn update_process(pid: ProcessId, mut new_process: Process) {
         let mut table = PROCESS_TABLE.lock();
         if (pid as usize) < table.len() {
             if let Some(p) = table[pid as usize].as_mut() {
-                // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
-                // Solo permitimos que update_process cambie metadatos.
-                // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
-                // mantenemos los valores de la tabla real.
-                let real_cpu = p.current_cpu;
-                let real_state = p.state;
-                
-                *p = new_process;
-                
-                p.current_cpu = real_cpu;
-                p.state = real_state;
-                return;
+                // After slot reuse, table[pid] may hold a *different* process whose PID
+                // happens to equal the slot index (e.g. slot 5 now holds PID 70).
+                // Overwriting it without checking p.id == pid would corrupt the new
+                // process's PCB with stale data from the old one.  Fall through to the
+                // linear scan when the slot is occupied by a different process.
+                if p.id == pid {
+                    // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
+                    // Solo permitimos que update_process cambie metadatos.
+                    // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
+                    // mantenemos los valores de la tabla real.
+                    let real_cpu = p.current_cpu;
+                    let real_state = p.state;
+                    
+                    *p = new_process;
+                    
+                    p.current_cpu = real_cpu;
+                    p.state = real_state;
+                    return;
+                }
             }
         }
         // Fallback: búsqueda lineal por si el PID no coincide con el índice de slot
@@ -517,7 +539,13 @@ pub fn exit_process() {
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut tables = crate::fd::FD_TABLES.lock();
-            let pid_idx = pid as usize;
+            // Use the slot index (not the raw PID) to index FD_TABLES.
+            // pid_to_slot_fast is safe to call here: the process is still in PROCESS_TABLE
+            // (we haven't marked it Terminated yet) so the slot lookup will succeed.
+            let pid_idx = match crate::ipc::pid_to_slot_fast(pid) {
+                Some(i) => i,
+                None => return,
+            };
             if pid_idx < crate::fd::MAX_FD_PROCESSES {
                 for fd in 0..crate::fd::MAX_FDS_PER_PROCESS {
                     if tables[pid_idx].fds[fd].in_use {
@@ -563,103 +591,122 @@ pub fn exit_process() {
 
 /// Listar todos los procesos
 pub fn list_processes() -> [(ProcessId, ProcessState); MAX_PROCESSES] {
-    let table = PROCESS_TABLE.lock();
-    let mut result = [(0, ProcessState::Terminated); MAX_PROCESSES];
-    
-    for (i, slot) in table.iter().enumerate() {
-        if let Some(p) = slot {
-            result[i] = (p.id, p.state);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let table = PROCESS_TABLE.lock();
+        let mut result = [(0, ProcessState::Terminated); MAX_PROCESSES];
+
+        for (i, slot) in table.iter().enumerate() {
+            if let Some(p) = slot {
+                result[i] = (p.id, p.state);
+            }
         }
-    }
-    
-    result
+
+        result
+    })
 }
 
 /// Fork current process - create child process
 /// Returns: Some(child_pid) on success, None on error
+///
+/// SMP note: the expensive clone_process_paging() and fd_clone_for_fork()
+/// are performed BEFORE acquiring PROCESS_TABLE, so the lock is held only
+/// for a brief insertion.  This prevents long scheduler stalls on other
+/// CPUs that need PROCESS_TABLE during a fork.
 pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
-    // Get current process
     let current_pid = current_process_id()?;
+    // Clone of parent released immediately — no lock held for the expensive work below.
     let parent = get_process(current_pid)?;
-    
-    // Create child process
-    let mut table = PROCESS_TABLE.lock();
-    let mut next_pid = NEXT_PID.lock();
-    
-    for slot in table.iter_mut() {
-        if slot.is_none() {
-            let child_pid = *next_pid;
-            *next_pid += 1;
-            
-            let mut child = parent.clone(); // Copy parent's state
-            child.id = child_pid;
-            child.state = ProcessState::Blocked;
-            child.current_cpu = NO_CPU; // Reset ownership for child
-            child.parent_pid = Some(current_pid);
-            
-            // Append "(child)" to name if it fits, or just keep it
-            let mut name = [0u8; 16];
-            let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
-            let copy_len = core::cmp::min(parent_name_len, 16);
-            name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
-            child.name = name;
-            
-            // DEEP COPY of parent's address space (code, stack, data)
 
-            child.page_table_phys = crate::memory::clone_process_paging(parent.page_table_phys);
-            
-            // Deep copy of VMA list (Vec clone does deep copy of elements if they are Clone)
-            child.vmas = parent.vmas.clone();
-            child.mem_frames = parent.mem_frames;
-            
-            // Allocate NEW kernel stack for child
-            let kernel_stack_size = KERNEL_STACK_SIZE;
-            let kernel_stack = alloc::vec![0u8; kernel_stack_size];
-            let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
-            let kernel_stack_top_aligned = kernel_stack_top & !0xF;
-            core::mem::forget(kernel_stack); // Leak for now
-            
-            child.kernel_stack_top = kernel_stack_top_aligned;
-            
-            // PUSH IRETQ frame onto child's kernel stack
-            // We use the same user-space stack address as the parent
-            let mut kstack_ptr = kernel_stack_top_aligned as *mut u64;
-            unsafe {
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x23; // SS
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rsp; // Same RSP
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rflags;
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = 0x1b; // CS
-                kstack_ptr = kstack_ptr.offset(-1); *kstack_ptr = parent_context.rip;
+    // ── Phase 1: Expensive work BEFORE acquiring any kernel-global lock ──────
+
+    // Deep copy of the parent's user address space.
+    let child_cr3 = crate::memory::clone_process_paging(parent.page_table_phys);
+
+    // Allocate a fresh kernel stack for the child.
+    let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
+    let kernel_stack_top = kernel_stack.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+    core::mem::forget(kernel_stack); // Leak intentionally (no proper dealloc yet)
+
+    // Build the IRETQ frame on the child's kernel stack.
+    // layout (low→high in memory): RIP, CS, RFLAGS, RSP, SS
+    let kstack_ptr = unsafe {
+        let mut p = kernel_stack_top_aligned as *mut u64;
+        p = p.offset(-1); *p = 0x23;                  // SS  (user data)
+        p = p.offset(-1); *p = parent_context.rsp;    // RSP (user stack)
+        p = p.offset(-1); *p = parent_context.rflags; // RFLAGS
+        p = p.offset(-1); *p = 0x1b;                  // CS  (user code)
+        p = p.offset(-1); *p = parent_context.rip;    // RIP
+        p
+    };
+
+    // ── Phase 2: Brief critical section — insert child into PROCESS_TABLE ───
+
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        let mut next_pid = NEXT_PID.lock();
+
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            // Accept both empty slots and slots whose previous occupant has Terminated
+            // (and has been fully released by the owning CPU).  Without this, fork()
+            // fails permanently once the table fills with a mix of live and Terminated
+            // processes — the same condition already handled by create_process_with_pid.
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    && p.current_cpu == NO_CPU);
+            if slot_available {
+                *slot = None; // evict Terminated entry before writing the child
+                let child_pid = *next_pid;
+                *next_pid += 1;
+
+                let mut child = parent.clone(); // Copies parent's metadata + vmas
+                child.id = child_pid;
+                child.state = ProcessState::Blocked;
+                child.current_cpu = NO_CPU;
+                child.parent_pid = Some(current_pid);
+                child.page_table_phys = child_cr3;
+                child.kernel_stack_top = kernel_stack_top_aligned;
+
+                // Keep parent name (child will overwrite it with set_process_name if needed)
+                let mut name = [0u8; 16];
+                let parent_name_len = parent.name.iter().position(|&b| b == 0).unwrap_or(16);
+                let copy_len = core::cmp::min(parent_name_len, 16);
+                name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
+                child.name = name;
+
+                // Set up context so the child resumes via fork_child_trampoline.
+                child.context.rip = crate::interrupts::fork_child_trampoline as *const () as u64;
+                child.context.rsp = kstack_ptr as u64;
+                child.context.rax = 0; // fork() returns 0 in the child
+                child.context.rbx = parent_context.rbx;
+                child.context.rcx = parent_context.rcx;
+                child.context.rdx = parent_context.rdx;
+                child.context.rsi = parent_context.rsi;
+                child.context.rdi = parent_context.rdi;
+                child.context.rbp = parent_context.rbp;
+                child.context.r8  = parent_context.r8;
+                child.context.r9  = parent_context.r9;
+                child.context.r10 = parent_context.r10;
+                child.context.r11 = parent_context.r11;
+                child.context.r12 = parent_context.r12;
+                child.context.r13 = parent_context.r13;
+                child.context.r14 = parent_context.r14;
+                child.context.r15 = parent_context.r15;
+
+                *slot = Some(child);
+                // Register in O(1) IPC lookup table before releasing the lock.
+                crate::ipc::register_pid_slot(child_pid, slot_idx);
+                return Some((child_pid, slot_idx));
             }
-            
-            // Clone parent's fd table so child has stdin/stdout/stderr and any open files
-            crate::fd::fd_clone_for_fork(current_pid, child_pid);
-            
-            // Set up context for child to start via trampoline
-            child.context.rip = crate::interrupts::fork_child_trampoline as u64;
-            child.context.rsp = kstack_ptr as u64;
-            child.context.rax = 0; // Return value for child
-            
-            // Copy all GP registers from parent_context
-            child.context.rbx = parent_context.rbx;
-            child.context.rcx = parent_context.rcx;
-            child.context.rdx = parent_context.rdx;
-            child.context.rsi = parent_context.rsi;
-            child.context.rdi = parent_context.rdi;
-            child.context.rbp = parent_context.rbp;
-            child.context.r8 = parent_context.r8;
-            child.context.r9 = parent_context.r9;
-            child.context.r10 = parent_context.r10;
-            child.context.r11 = parent_context.r11;
-            child.context.r12 = parent_context.r12;
-            child.context.r13 = parent_context.r13;
-            child.context.r14 = parent_context.r14;
-            child.context.r15 = parent_context.r15;
-            
-            *slot = Some(child);
-            return Some(child_pid);
         }
-    }
-    
-    None
+        None
+    });
+
+    let (child_pid, _slot_idx) = result?;
+
+    // ── Phase 3: Clone FDs under FD_TABLES lock only (no PROCESS_TABLE) ────
+    crate::fd::fd_clone_for_fork(current_pid, child_pid);
+
+    Some(child_pid)
 }

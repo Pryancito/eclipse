@@ -221,6 +221,13 @@ pub static mut CPU_TSSES: [TaskStateSegment; MAX_SMP_CPUS] =
 /// BSP-only legacy TSS (kept for backward compatibility; per-CPU code uses CPU_TSSES)
 pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// Per-CPU dedicated stacks for the double-fault handler (IST 1).
+/// Using static storage avoids a heap dependency during early per-CPU setup
+/// (load_gdt() may be called before the heap is initialised on some boot paths).
+/// 8 KB per CPU is enough for the minimal #DF handler.
+const DF_STACK_SIZE: usize = 8192;
+static mut DF_STACKS: [[u8; DF_STACK_SIZE]; MAX_SMP_CPUS] = [[0u8; DF_STACK_SIZE]; MAX_SMP_CPUS];
+
 /// Entrada de la GDT
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -387,6 +394,13 @@ pub fn load_gdt() {
             "ltr ax",
             options(nomem, nostack, preserves_flags)
         );
+
+        // Populate IST 1 with a dedicated double-fault stack so that a #DF caused
+        // by a kernel stack overflow (the most common trigger) lands on a known-good
+        // stack instead of triple-faulting immediately.
+        // The KERNEL_IDT entry[8].ist was set to 1 in interrupts::init().
+        let df_stack_top = DF_STACKS[cpu_id].as_ptr() as u64 + DF_STACK_SIZE as u64;
+        CPU_TSSES[cpu_id].ist1 = df_stack_top & !0xF; // 16-byte aligned
         
         // Set GS.base to point to this CPU's CpuData.
         // We set BOTH IA32_GS_BASE (active) and IA32_KERNEL_GS_BASE (swap)
