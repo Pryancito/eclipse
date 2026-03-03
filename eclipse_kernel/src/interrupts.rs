@@ -679,14 +679,17 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
         rfl, cs, ss
     ));
     
-    // Stack dump (first 64 bytes)
-    if rsp >= 0xFFFF800000000000 || (rsp < 0x0000800000000000 && rsp > 0) {
+    // Stack dump (first 64 bytes) — kernel RSP only.
+    // Dumping a *user* RSP here is unsafe: if the RSP points to an unmapped page (e.g.
+    // a stack-overflow fault) the read_volatile below generates a nested #PF inside the
+    // exception handler.  A nested #PF of the same class escalates to a Double Fault,
+    // losing the original exception context and making post-mortem analysis impossible.
+    // Kernel RSP is always mapped (lives in kernel stacks), so the dump is safe there.
+    if rsp >= 0xFFFF800000000000 {
         crate::serial::serial_printf(format_args!("  Stack Dump at {:#018x}:\n", rsp));
         unsafe {
             let stack_ptr = rsp as *const u64;
             for i in 0..8 {
-                // Try to prevent crash during dump if RSP is totally invalid
-                // This is a very basic check.
                 let val = core::ptr::read_volatile(stack_ptr.add(i));
                 crate::serial::serial_printf(format_args!("    [+{:#02x}]: {:#018x}\n", i * 8, val));
             }

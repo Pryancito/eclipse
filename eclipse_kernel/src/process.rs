@@ -517,7 +517,13 @@ pub fn exit_process() {
 
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut tables = crate::fd::FD_TABLES.lock();
-            let pid_idx = pid as usize;
+            // Use the slot index (not the raw PID) to index FD_TABLES.
+            // pid_to_slot_fast is safe to call here: the process is still in PROCESS_TABLE
+            // (we haven't marked it Terminated yet) so the slot lookup will succeed.
+            let pid_idx = match crate::ipc::pid_to_slot_fast(pid) {
+                Some(i) => i,
+                None => return,
+            };
             if pid_idx < crate::fd::MAX_FD_PROCESSES {
                 for fd in 0..crate::fd::MAX_FDS_PER_PROCESS {
                     if tables[pid_idx].fds[fd].in_use {

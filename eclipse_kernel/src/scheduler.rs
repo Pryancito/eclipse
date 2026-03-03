@@ -441,6 +441,12 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
             Some(p) => p,
             None => return,
         };
+        // If to_pid was killed (via sys_kill) between when it was dequeued and now,
+        // switching to it would resume a terminated process.  Bail out — the scheduler
+        // will be called again on the next timer tick and will skip the terminated PID.
+        if to_process.state == ProcessState::Terminated {
+            return;
+        }
         (
             &to_process.context as *const crate::process::Context,
             to_process.kernel_stack_top,

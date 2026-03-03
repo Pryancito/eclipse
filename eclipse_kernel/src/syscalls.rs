@@ -522,6 +522,7 @@ fn translate_linux_abi_unique(
         231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
         262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
         35 => (25, arg1, arg2, arg3, arg4, arg5),          // nanosleep -> 25
+        318 => (33, arg1, arg2, arg3, arg4, arg5),         // getrandom -> sys_getrandom (33)
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
