@@ -1832,9 +1832,10 @@ unsafe extern "C" fn syscall_entry() {
         "push 0x1B",             // CS  (user code selector)
         "push rcx",              // RIP (saved by SYSCALL in RCX)
 
-        // Restore user GS now that we are on the kernel stack and no longer
-        // need GS-relative access.
-        "swapgs",
+        // NOTE: do NOT swapgs here.  The handler (syscall_handler_rust) uses
+        // gs-relative reads (gs:[0]/gs:[8]/gs:[20]) for current_process_id(),
+        // get_cpu_id(), and set_tss_stack().  The kernel GS must remain active
+        // until the iretq at the end.
 
         // We push RBP first so we can use it as a reference for the Context structure
         "push rbp",
@@ -1905,7 +1906,12 @@ unsafe extern "C" fn syscall_entry() {
         "pop rax",
         
         "pop rbp",
-        
+
+        // Restore user GS before returning to ring 3.
+        // At this point the kernel GS (CpuData) is active; swapgs swaps it back
+        // to the user GS (0 for our processes) so userspace sees a clean GS.
+        "swapgs",
+
         "iretq",
         
         handler = sym syscall_handler_rust,

@@ -56,41 +56,58 @@ pub fn take_run_counts() -> [u32; MAX_PIDS] {
 }
 
 /// Agregar proceso a la cola ready
+///
+/// LOCKING: Acquires READY_QUEUE → PROCESS_TABLE (in that order).
+/// Callers must NOT hold either lock.  The check-and-set of process state
+/// is performed as a single atomic operation while READY_QUEUE is already
+/// held, eliminating the TOCTOU race that existed when the two PROCESS_TABLE
+/// acquisitions were separate (a second CPU could pass the dedup check before
+/// the first one set the state to Ready, inserting the same PID twice).
 pub fn enqueue_process(pid: ProcessId) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        // DEDUPLICACIÓN: No encolar si ya está en la cola física (Ready).
-        {
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_ref() {
-                if p.state == ProcessState::Ready {
-                    return;
-                }
-            }
-        }
+    // Guard against PID values that exceed the process table bounds.
+    if pid as usize >= crate::process::MAX_PROCESSES {
+        return;
+    }
 
+    x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = READY_QUEUE.lock();
         let head = QUEUE_HEAD.lock();
         let mut tail = QUEUE_TAIL.lock();
-        
+
         let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-        if next_tail != *head {
-            // Actualizar estado a Ready ANTES de meter en la cola física.
-            // Al estar bajo ReadyQueue lock + Interrupts disabled, es atómico respecto al scheduler.
-            {
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(p) = table[pid as usize].as_mut() {
-                    p.state = ProcessState::Ready;
-                    // NO LIMPIAR p.current_cpu aquí.
-                    // El core que intenta planificarlo de nuevo debe esperar a que el dueño original suelte la propiedad.
-                }
-            }
-            
-            queue[*tail] = Some(pid);
-            *tail = next_tail;
-            
-            // Notificar a otras CPUs de un nuevo proceso listo.
-            crate::apic::broadcast_reschedule_ipi();
+        if next_tail == *head {
+            // Queue full — drop the enqueue request rather than spinning.
+            return;
         }
+
+        // Single atomic check-and-set while READY_QUEUE is held.
+        // This prevents two CPUs from both passing the dedup check and
+        // both inserting the same PID into the queue.
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[pid as usize].as_mut() {
+                // Dedup: already in the ready queue or running — skip.
+                if p.state == ProcessState::Ready {
+                    return;
+                }
+                // Do not enqueue terminated processes.
+                if p.state == ProcessState::Terminated {
+                    return;
+                }
+                // Blocked → Ready  or  Running → Ready (preemption from schedule()).
+                p.state = ProcessState::Ready;
+                // NOTE: current_cpu is intentionally NOT cleared here.
+                // The owning CPU will clear it atomically in switch_context().
+            } else {
+                return; // Process not in table.
+            }
+        }
+
+        queue[*tail] = Some(pid);
+        *tail = next_tail;
+
+        // Notify other CPUs that a new process is ready.
+        crate::apic::broadcast_reschedule_ipi();
     });
 }
 
@@ -129,12 +146,14 @@ pub fn tick() {
         stats.idle_ticks += 1;
     } else if let Some(pid) = current_pid {
         // Incrementar ticks del proceso actual
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_mut() {
-                p.cpu_ticks += 1;
-            }
-        });
+        if (pid as usize) < crate::process::MAX_PROCESSES {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(p) = table[pid as usize].as_mut() {
+                    p.cpu_ticks += 1;
+                }
+            });
+        }
     }
     
     let ticks = stats.total_ticks;
