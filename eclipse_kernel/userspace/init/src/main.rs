@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, fork, exec, wait, exit, get_service_binary, get_last_exec_error, set_process_name};
+use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, wait, spawn_service};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -191,68 +191,35 @@ fn start_service(service: &mut Service) {
     
     service.state = ServiceState::Starting;
     
-    // Fork a new process for the service
-    let pid = fork();
-    
-    if pid == 0 {
-        // Child process - execute the service
-        
-        // Determine which service binary to load
-        let service_id = match service.name {
-            "log" => 0,
-            "devfs" => 1,
-            "filesystem" => 2,
-            "input" => 3,
-            "display" => 4,
-            "audio" => 5,
-            "network" => 6,
-            "gui" => 7,
-            _ => {
-                println!("  [CHILD] ERROR: Unknown service: {}", service.name);
-                exit(1);
-            }
-        };
-        
-        // Get service binary from kernel
-        let (bin_ptr, bin_size) = get_service_binary(service_id);
-        
-        if bin_ptr.is_null() || bin_size == 0 {
-            println!("  [CHILD] ERROR: Failed to get service binary for: {} (ID {})", service.name, service_id);
-            exit(1);
+    // Determine which service binary to load
+    let service_id = match service.name {
+        "log"        => 0u32,
+        "devfs"      => 1,
+        "filesystem" => 2,
+        "input"      => 3,
+        "display"    => 4,
+        "audio"      => 5,
+        "network"    => 6,
+        "gui"        => 7,
+        _ => {
+            println!("  [ERROR] Unknown service: {}", service.name);
+            service.state = ServiceState::Failed;
+            return;
         }
-        
-        // Create slice from pointer
-        let service_binary = unsafe {
-            core::slice::from_raw_parts(bin_ptr, bin_size)
-        };
-        
-        // Set process name so it doesn't show as "init" in process list
-        set_process_name(service.name);
-        
-        // Execute the service binary
-        let _result = exec(service_binary);
-        
-        // If exec succeeds, it should not return
-        println!("  [CHILD] ERROR: exec() failed for service: {}", service.name);
-        
-        // Try to get failure reason from kernel
-        let mut errbuf = [0u8; 80];
-        let n = get_last_exec_error(&mut errbuf);
-        if n > 0 {
-            if let Ok(s) = core::str::from_utf8(&errbuf[..n]) {
-                println!("  [CHILD] Failure reason: {}", s);
-            }
-        }
-        
-        exit(1);
-    } else if pid > 0 {
-        // Parent process - track the service
+    };
+
+    // Spawn the service directly from the kernel-embedded binary.
+    // This is simpler and more reliable than fork+exec because it avoids
+    // cloning the init address space and avoids passing kernel-space ELF
+    // pointers across the exec boundary.
+    let pid = spawn_service(service_id, service.name);
+
+    if pid > 0 {
         service.pid = pid;
         service.state = ServiceState::Running;
         println!("  [SERVICE] {} started with PID: {}", service.name, pid);
     } else {
-        // Fork failed
-        println!("  [ERROR] Failed to fork service: {}", service.name);
+        println!("  [ERROR] Failed to spawn service: {}", service.name);
         service.state = ServiceState::Failed;
         service.pid = 0;
     }
