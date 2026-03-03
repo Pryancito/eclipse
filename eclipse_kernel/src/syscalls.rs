@@ -1443,9 +1443,16 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
                 serial::serial_print("\n");
                 fd as u64
             }
-            None => u64::MAX,
+            None => {
+                // FD table is full (MAX_FD_PER_PROCESS entries in use).
+                // Release the scheme resource so it isn't permanently leaked.
+                let _ = crate::scheme::close(scheme_id, resource_id);
+                u64::MAX
+            }
         }
     } else {
+        // No current process — release the scheme resource to avoid a leak.
+        let _ = crate::scheme::close(scheme_id, resource_id);
         u64::MAX
     }
 }
@@ -2137,7 +2144,13 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     // fd == -1 (any common representation) means anonymous mapping (Linux behavior)
     let force_anonymous = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32;
 
-    // Align length to page size (4KB)
+    // Align length to page size (4KB), guarding against integer overflow.
+    // A length >= u64::MAX - 0xFFE would wrap to 0 in release mode, silently
+    // producing zero pages.  Also cap the maximum mapping to 512 GiB which is
+    // well inside user-space and prevents VMARegion::end from entering kernel space.
+    if length > 0x0000_7FFF_FFFF_FFFF {
+        return u64::MAX;
+    }
     let aligned_length = (length + 0xFFF) & !0xFFF;
     let num_pages = aligned_length / 4096;
 
@@ -2188,8 +2201,17 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         }
     }
     
-    // Validate target address
-    if target_addr < 0x100000 || target_addr > 0x0000_7FFF_FFFF_F000 {
+    // Validate target address and that the mapping end stays within user space.
+    // target_addr + aligned_length must not overflow or enter kernel address space
+    // (kernel starts at 0x0000_8000_0000_0000 on this layout).
+    let map_end = match target_addr.checked_add(aligned_length) {
+        Some(e) if e <= 0x0000_7FFF_FFFF_F000 => e,
+        _ => {
+            serial::serial_print("[SYSCALL] mmap: mapping would exceed user address space\n");
+            return u64::MAX;
+        }
+    };
+    if target_addr < 0x100000 {
         serial::serial_print("[SYSCALL] mmap: invalid target address\n");
         return u64::MAX;
     }
@@ -2225,7 +2247,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                     memory::map_physical_range(page_table_phys, phys_addr, aligned_length, target_addr, pt_flags.bits());
                     let vma = VMARegion {
                         start: target_addr,
-                        end: target_addr + aligned_length,
+                        end: map_end,
                         flags: flags,
                         file_backed: true,
                     };
@@ -2297,7 +2319,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
 
         let vma = VMARegion {
             start: target_addr,
-            end: target_addr + aligned_length,
+            end: map_end,
             flags: flags,
             file_backed: is_file_backed,
         };
@@ -2449,7 +2471,10 @@ fn sys_nanosleep(req: u64) -> u64 {
 
     let (tv_sec, tv_nsec): (i64, i64) = unsafe {
         let ptr = req as *const i64;
-        (ptr.read(), ptr.add(1).read())
+        // Use read_unaligned: the user-supplied pointer may not be 8-byte aligned.
+        // On x86_64 the hardware tolerates unaligned loads, but ptr.read() is
+        // defined to require alignment (Rust/LLVM UB if misaligned).
+        (ptr.read_unaligned(), ptr.add(1).read_unaligned())
     };
 
     // Reject negative or out-of-range values (EINVAL)
