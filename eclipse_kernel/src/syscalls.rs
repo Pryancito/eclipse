@@ -523,6 +523,9 @@ fn translate_linux_abi_unique(
         262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
         35 => (25, arg1, arg2, arg3, arg4, arg5),          // nanosleep -> 25
         318 => (33, arg1, arg2, arg3, arg4, arg5),         // getrandom -> sys_getrandom (33)
+        56 => (22, arg1, arg2, arg3, arg4, arg5),          // clone  -> sys_clone (22)
+        57 => (7,  arg1, arg2, arg3, arg4, arg5),          // fork   -> sys_fork  (7)
+        61 => (9,  arg1, arg2, arg3, arg4, arg5),          // wait4  -> sys_wait  (9)
         _ => return None,
     };
     Some((eclipse_num, a1, a2, a3, a4, a5))
@@ -2506,18 +2509,33 @@ fn sys_brk(addr: u64) -> u64 {
             // brk is the end of the heap.
             // Current page-aligned end is the next page boundary of brk_current.
             let old_brk_page_end = (proc.brk_current + 4095) & !4095;
-            let new_brk_page_end = (addr + 4095) & !4095;
             
             if addr > proc.brk_current {
-                // Growing heap - map new pages
+                // Growing heap - map new pages.
+                // Guard against the heap growing into the user stack region.
+                // Stack occupies [0x20000000, 0x20100000); reject anything at or above 0x20000000.
+                const USER_STACK_BASE: u64 = 0x2000_0000;
+                if addr >= USER_STACK_BASE {
+                    // Return the unchanged break pointer (Linux brk() semantics on failure).
+                    return proc.brk_current;
+                }
+                // Guard against integer overflow in the page-end calculation.
+                let new_brk_page_end = match addr.checked_add(4095) {
+                    Some(v) => v & !4095,
+                    None => return proc.brk_current,
+                };
+
                 let page_table_phys = proc.page_table_phys;
                 let mut current_page = old_brk_page_end;
                 
                 while current_page < new_brk_page_end {
-                    // Allocate and map a page
-                    if let Some((frame_ptr, frame_phys)) = memory::alloc_dma_buffer(4096, 4096) {
-                        // Zero the page
-                        unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
+                    // Allocate from the dedicated user-space physical frame pool instead of
+                    // alloc_dma_buffer (kernel heap).  alloc_dma_buffer can place frames
+                    // adjacent to kernel stacks, causing corruption under memory pressure.
+                    if let Some(frame_phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                        let frame_virt = memory::phys_to_virt(frame_phys) as *mut u8;
+                        // Zero the page via the kernel direct-map virtual address.
+                        unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
                         
                         // Map it as user writable
                         let flags = memory::PAGE_USER | memory::PAGE_WRITABLE;

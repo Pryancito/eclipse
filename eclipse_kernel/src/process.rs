@@ -217,8 +217,14 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
         let mut table = PROCESS_TABLE.lock();
         
         // Buscar slot libre (enumerate para conocer el índice del slot)
+        // Accept both empty slots and slots whose previous occupant has Terminated,
+        // so that the 64-entry table can be reused across process lifetimes.
+        // Without this, after 63 processes exit the table fills up permanently.
         for (slot_idx, slot) in table.iter_mut().enumerate() {
-            if slot.is_none() {
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if p.state == ProcessState::Terminated);
+            if slot_available {
+                *slot = None; // evict Terminated entry before writing new process
                 let mut process = Process::new();
                 process.id = pid;
                 process.stack_base = stack_base;
