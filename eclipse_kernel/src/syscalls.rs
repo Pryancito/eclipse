@@ -399,18 +399,24 @@ fn sys_kill(pid: u64) -> u64 {
         return u64::MAX; // Cannot kill kernel or init
     }
 
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    for slot in table.iter_mut() {
-        if let Some(p) = slot {
-            if p.id == pid as u32 {
-                p.state = crate::process::ProcessState::Terminated;
-                crate::ipc::unregister_pid_slot(p.id);
-                return 0;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        for (slot_idx, slot) in table.iter_mut().enumerate() {
+            if let Some(p) = slot {
+                if p.id == pid as u32 {
+                    p.state = crate::process::ProcessState::Terminated;
+                    // Remove from IPC lookup table so no new messages are routed here.
+                    crate::ipc::unregister_pid_slot(p.id);
+                    // Clear the IPC mailbox so that if this slot index is ever reused
+                    // for a new process it starts with an empty mailbox (consistent with
+                    // exit_process() which calls clear_mailbox_slot() on normal exit).
+                    crate::ipc::clear_mailbox_slot(slot_idx);
+                    return 0;
+                }
             }
         }
-    }
-
-    u64::MAX
+        u64::MAX
+    })
 }
 
 /// sys_set_process_name - Cambiar el nombre del proceso actual
@@ -1040,8 +1046,9 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     } else {
         serial::serial_print("[SYSCALL] exec: Copying from user space\n");
         // Validate the user-supplied pointer before touching it.  Without this check
-        // a process could pass a kernel-range address (< KERNEL_HALF) to sys_exec and
-        // have the kernel copy arbitrary kernel memory into the ELF buffer.
+        // a process could pass a canonical kernel-space address (>= 0xFFFF_8000_0000_0000)
+        // that also happens to be below KERNEL_HALF (e.g. very high but not higher-half)
+        // and have the kernel copy arbitrary memory into the ELF buffer.
         if !is_user_pointer(elf_ptr, elf_size) {
             set_last_exec_error(b"exec: invalid ELF buffer pointer");
             serial::serial_print("[SYSCALL] exec() security violation: non-user ELF pointer\n");
@@ -2444,12 +2451,12 @@ fn sys_nanosleep(req: u64) -> u64 {
     // NOTE: We set the state directly in PROCESS_TABLE because update_process()
     // intentionally preserves the original state (to protect against races).
     if let Some(pid) = current_process_id() {
-        {
+        x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(p) = table[pid as usize].as_mut() {
                 p.state = crate::process::ProcessState::Blocked;
             }
-        }
+        });
         crate::scheduler::add_sleep(pid, wake_tick);
     }
 

@@ -658,7 +658,12 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             let mut leaf_flags = x86_64::structures::paging::PageTableFlags::from_bits_truncate(flags);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+            // NOTE: NO_EXECUTE is intentionally NOT removed here.
+            // Callers that want non-executable pages (e.g. sys_mmap with PROT_READ|PROT_WRITE
+            // but no PROT_EXEC) pass PageTableFlags::NO_EXECUTE in `flags`. Stripping it would
+            // make every user page executable regardless of the requested protection, breaking
+            // the W^X contract and making heap/stack pages exploitable as shellcode targets.
+            // Callers that want executable pages simply do not set NO_EXECUTE in `flags`.
 
             pt_entry.set_addr(paddr, leaf_flags.bits());
         }
@@ -736,7 +741,9 @@ pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::HUGE_PAGE);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::PRESENT);
             leaf_flags.insert(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE);
-            leaf_flags.remove(x86_64::structures::paging::PageTableFlags::NO_EXECUTE);
+            // NOTE: NO_EXECUTE is intentionally NOT removed for the leaf PDE.
+            // See map_user_page_4kb() for the rationale.  Callers that want
+            // non-executable 2MB pages (rare but valid) pass NO_EXECUTE in flags.
             
             pd.entries[pd_idx].set_addr(paddr, leaf_flags.bits());
             
