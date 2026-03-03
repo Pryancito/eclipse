@@ -884,7 +884,8 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
 /// Returns (total_frames, used_frames) for the userspace physical pool.
 pub fn get_memory_stats() -> (u64, u64) {
     let total = (ANON_MMAP_PHYS_END - ANON_MMAP_PHYS_START) / 4096;
-    let used = ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096;
+    // Cap at total so the counter never reports used > total after the pool is exhausted.
+    let used = (ANON_MMAP_NEXT.load(Ordering::Relaxed) / 4096).min(total);
     (total, used)
 }
 

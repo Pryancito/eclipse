@@ -222,7 +222,14 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
         // Without this, after 63 processes exit the table fills up permanently.
         for (slot_idx, slot) in table.iter_mut().enumerate() {
             let slot_available = slot.is_none()
-                || matches!(slot, Some(ref p) if p.state == ProcessState::Terminated);
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    // Only evict a Terminated slot once no CPU is still using its context.
+                    // perform_context_switch() holds a raw pointer into the slot's context
+                    // until switch_context() atomically clears current_cpu.  Evicting the
+                    // slot before that point causes the new process's context to be
+                    // overwritten by the old CPU's register save.
+                    && p.current_cpu == crate::process::NO_CPU);
             if slot_available {
                 *slot = None; // evict Terminated entry before writing new process
                 let mut process = Process::new();

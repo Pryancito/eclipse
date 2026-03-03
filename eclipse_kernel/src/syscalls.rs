@@ -1087,6 +1087,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
+                    // Discard VMAs from the old image so that mmap's gap-search loop
+                    // does not see phantom occupied ranges from the previous binary.
+                    // Accumulating them across exec() calls also causes unbounded
+                    // kernel-heap growth.
+                    proc.vmas.clear();
                     proc.brk_current = max_vaddr;
                     proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
                     crate::process::update_process(pid, proc);

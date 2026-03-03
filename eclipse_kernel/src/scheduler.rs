@@ -320,7 +320,29 @@ pub fn schedule() {
             };
 
             if should_requeue {
-                enqueue_process(next_pid);
+                // The process has state=Ready (set by enqueue_process when it was first
+                // queued) but was dequeued by this CPU and cannot be run because
+                // current_cpu belongs to another CPU.  Re-insert it directly into the
+                // ring buffer without going through enqueue_process(): that function's
+                // dedup guard (`if p.state == Ready { return; }`) would fire and silently
+                // drop the process, causing permanent starvation.
+                // We hold READY_QUEUE+QUEUE_TAIL+QUEUE_HEAD in a single critical section,
+                // consistent with enqueue_process's lock order, so there is no TOCTOU
+                // window between the state check and the insertion.
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    let mut queue = READY_QUEUE.lock();
+                    let head = *QUEUE_HEAD.lock();
+                    let mut tail = QUEUE_TAIL.lock();
+                    let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
+                    if next_tail != head {
+                        // State is already Ready — no change needed.
+                        queue[*tail] = Some(next_pid);
+                        *tail = next_tail;
+                    }
+                    // If the queue is full, skip re-insertion.  The process retains
+                    // state=Ready; the next timer tick will dequeue another entry and
+                    // a subsequent should_requeue attempt will succeed.
+                });
             }
 
             if next_process_exists {
