@@ -496,7 +496,6 @@ pub fn create_process_paging() -> u64 {
 /// Clone an existing process's page table (deep copy of user-space mappings)
 /// Returns the physical address of the child's PML4
 pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
-    crate::serial::serial_printf(format_args!("[Paging] Cloning Address Space: Parent CR3={:#x}\n", parent_pml4_phys));
     // 1. Create new skeleton page table (Copies Kernel Mappings)
     let child_pml4_phys = create_process_paging();
     
@@ -514,7 +513,6 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
             let p_pdpt_phys = p_pml4.entries[0].get_addr();
             let p_pdpt = &*(phys_to_virt(p_pdpt_phys) as *const PageTable);
             
-            let mut pd_cloned = 0;
             for i in 0..512 {
                 if !p_pdpt.entries[i].present() { continue; }
                 
@@ -573,25 +571,21 @@ pub fn clone_process_paging(parent_pml4_phys: u64) -> u64 {
                                 
                                 new_pd.entries[j].set_addr(new_pt_phys, pd_flags.bits());
                             }
-                            pd_cloned += 1;
                         } else {
                             new_pd.entries[j] = p_pd.entries[j].clone();
                         }
                     }
                     
                     new_pdpt.entries[i].set_addr(new_pd_phys, flags.bits());
-                    crate::serial::serial_printf(format_args!("[Paging] Cloned PD {} into User PDPT entry {}\n", pd_cloned, i));
                 } else {
                     new_pdpt.entries[i] = p_pdpt.entries[i].clone();
                 }
             }
             
             c_pml4.entries[0].set_addr(new_pdpt_phys, (x86_64::structures::paging::PageTableFlags::from_bits_truncate(p_pml4.entries[0].get_flags()) | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits());
-            crate::serial::serial_printf(format_args!("[Paging] Address Space Clone Complete (Child PML4[0] set)\n"));
         }
     }
 
-    crate::serial::serial_printf(format_args!("[Paging] Cloning Complete: Child CR3={:#x}\n", child_pml4_phys));
     child_pml4_phys
 }
 
@@ -666,6 +660,10 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             // Callers that want executable pages simply do not set NO_EXECUTE in `flags`.
 
             pt_entry.set_addr(paddr, leaf_flags.bits());
+
+            if pml4_phys == get_cr3() {
+                core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+            }
         }
     });
 }

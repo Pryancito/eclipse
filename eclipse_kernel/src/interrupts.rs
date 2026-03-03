@@ -437,6 +437,15 @@ fn init_pic() {
     }
 }
 
+/// Mask PIT (IRQ 0) so LAPIC timer drives the system tick on BSP.
+/// Call after apic::init_timer() on BSP to avoid double ticks.
+pub fn mask_pit_irq() {
+    unsafe {
+        let mask = inb(0x21);
+        outb(0x21, mask | 1);
+    }
+}
+
 /// Desenmascarar IRQ 12 (ratón PS/2). Llamar tras scheduler::init().
 pub fn unmask_mouse_irq() {
     unsafe {
@@ -626,16 +635,17 @@ pub struct ExceptionContext {
 }
 
 extern "C" fn exception_handler(context: &ExceptionContext) {
+    // CR2 MUST be read before ANY operation that could trigger a nested fault
+    let cr2: u64;
+    let cr3: u64;
+    unsafe { 
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); 
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); 
+    }
+
     let mut stats = INTERRUPT_STATS.lock();
     stats.exceptions += 1;
     drop(stats);
-    
-    let cr3: u64;
-    let cr2: u64;
-    unsafe { 
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); 
-        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); 
-    }
 
     let cpu_id = crate::process::get_cpu_id();
     let pid = crate::process::current_process_id().unwrap_or(0);
@@ -1354,13 +1364,24 @@ pub fn get_stats() -> InterruptStats {
 // ============================================================================
 
 /// Rust-level handler for the Local APIC periodic timer interrupt.
-/// Sends LAPIC EOI then calls the scheduler so each CPU participates in
-/// process scheduling independently of the BSP's PIT (IRQ 0).
+/// On BSP (cpu 0): runs full system tick (TIMER_TICKS, process_messages, wake_sleeping, schedule).
+/// On APs: only calls schedule(). The BSP drives the global heartbeat so sleep/wake and IPC
+/// work correctly on SMP even when PIT (IRQ 0) delivery is unreliable.
 extern "C" fn apic_timer_handler() {
-    // EOI must be sent before re-enabling interrupts or scheduling, so that
-    // the LAPIC can accept the next timer interrupt.
     crate::apic::eoi();
-    crate::scheduler::schedule();
+    let cpu_id = crate::process::get_cpu_id();
+    if cpu_id == 0 {
+        // BSP: run full tick (same logic as PIT timer_handler)
+        TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+        let ticks = TIMER_TICKS.load(Ordering::Relaxed);
+        if ticks % 2 == 0 {
+            crate::usb_hid::poll();
+        }
+        crate::ipc::process_messages();
+        crate::scheduler::tick();
+    } else {
+        crate::scheduler::schedule();
+    }
 }
 
 /// Naked trampoline for the APIC timer interrupt (saves/restores caller-saved regs).

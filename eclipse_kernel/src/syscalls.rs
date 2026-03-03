@@ -1010,11 +1010,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     stats.exec_calls += 1;
     drop(stats);
     
-    serial::serial_print("[SYSCALL] exec() called with buffer at ");
-    serial::serial_print_hex(elf_ptr);
-    serial::serial_print(", size: ");
-    serial::serial_print_dec(elf_size);
-    serial::serial_print("\n");
     set_last_exec_error(b"exec: (no reason)"); // fallback if we return -1 without setting below
 
     if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
@@ -1027,18 +1022,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     // may not have that range mapped. Copy the ELF using kernel CR3 so we read valid data.
     let kernel_cr3 = crate::memory::get_kernel_cr3();
     
-    serial::serial_print("[SYSCALL] exec: Preparing ELF copy (size=");
-    serial::serial_print_dec(elf_size);
-    serial::serial_print(", ptr=");
-    serial::serial_print_hex(elf_ptr);
-    serial::serial_print(")\n");
-
     if elf_ptr >= KERNEL_HALF && kernel_cr3 == 0 {
         serial::serial_print("[SYSCALL] exec: WARNING: kernel CR3 not set, copy may be invalid\n");
     }
 
     let elf_data: alloc::vec::Vec<u8> = if elf_ptr >= KERNEL_HALF && kernel_cr3 != 0 {
-        serial::serial_print("[SYSCALL] exec: Copying from kernel space using kernel CR3\n");
         let current_cr3 = crate::memory::get_cr3();
         unsafe {
             crate::memory::set_cr3(kernel_cr3);
@@ -1049,9 +1037,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         unsafe {
             crate::memory::set_cr3(current_cr3);
         }
-        serial::serial_print("[SYSCALL] exec: Kernel space copy complete (size=");
-        serial::serial_print_dec(copy.len() as u64);
-        serial::serial_print(")\n");
         copy
     } else {
         serial::serial_print("[SYSCALL] exec: Copying from user space\n");
@@ -1067,9 +1052,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         let src = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_size as usize) };
         let mut copy = alloc::vec::Vec::with_capacity(elf_size as usize);
         copy.extend_from_slice(src);
-        serial::serial_print("[SYSCALL] exec: User space copy complete (size=");
-        serial::serial_print_dec(copy.len() as u64);
-        serial::serial_print(")\n");
         copy
     };
 

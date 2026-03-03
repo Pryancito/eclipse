@@ -359,23 +359,6 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u6
     serial::serial_print("ELF: Valid exec binary, entry: ");
     serial::serial_print_hex(header.e_entry);
     serial::serial_print("\n");
-    
-    // DIAGNOSTIC: Print first 16 bytes of ELF buffer
-    serial::serial_print("ELF: First 16 bytes: ");
-    for i in 0..16 {
-        serial::serial_print_hex(elf_data[i] as u64);
-        serial::serial_print(" ");
-    }
-    serial::serial_print("\n");
-    
-    // DIAGNOSTIC: Print e_entry raw bytes
-    serial::serial_print("ELF: e_entry bytes: ");
-    let entry_bytes = unsafe { core::slice::from_raw_parts(&header.e_entry as *const u64 as *const u8, 8) };
-    for i in 0..8 {
-        serial::serial_print_hex(entry_bytes[i] as u64);
-        serial::serial_print(" ");
-    }
-    serial::serial_print("\n");
 
     let ph_offset = header.e_phoff as usize;
     let ph_count = header.e_phnum as usize;
@@ -451,18 +434,6 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u6
 /// It MUST be called with a valid userspace entry point and stack top.
 /// CR3 should already be set to the correct process address space before calling this.
 pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phdr_va: u64, phnum: u64, phentsize: u64) -> ! {
-    // FORCE PRINT to ensure we reached this point
-    serial::serial_print("ELF: JUMPING TO USERSPACE NOW!\n");
-    serial::serial_print("  Entry: ");
-    serial::serial_print_hex(entry_point);
-    serial::serial_print("  Stack: ");
-    serial::serial_print_hex(stack_top);
-    serial::serial_print("  phdr_va: ");
-    serial::serial_print_hex(phdr_va);
-    serial::serial_print("  phnum: ");
-    serial::serial_print_dec(phnum);
-    serial::serial_print("\n");
-
     // Verify entry point is in user space
     if entry_point >= USER_ADDR_MAX {
         serial::serial_print("ERROR: Entry point in kernel space!\n");
@@ -511,15 +482,13 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     let base_stack = (stack_top - 144) & !0xF;
     let adjusted_stack = base_stack - 8;
 
-    // Ensure we're using the current process's CR3 so the write lands in user space (not kernel view)
+    // Always reload CR3 to flush the TLB. exec remaps code pages via
+    // map_user_page_4kb but the TLB may still cache the old fork'd PTEs.
+    // A CR3 write flushes all non-global TLB entries.
     if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
             let want_cr3 = proc.page_table_phys;
-            let cur_cr3 = memory::get_cr3();
-            if want_cr3 != 0 && want_cr3 != cur_cr3 {
-                serial::serial_print("ELF: Setting CR3 to process before writing auxv\n");
-                unsafe { memory::set_cr3(want_cr3); }
-            }
+            unsafe { memory::set_cr3(want_cr3); }
         }
     }
 
