@@ -386,18 +386,25 @@ pub fn update_process(pid: ProcessId, mut new_process: Process) {
         let mut table = PROCESS_TABLE.lock();
         if (pid as usize) < table.len() {
             if let Some(p) = table[pid as usize].as_mut() {
-                // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
-                // Solo permitimos que update_process cambie metadatos.
-                // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
-                // mantenemos los valores de la tabla real.
-                let real_cpu = p.current_cpu;
-                let real_state = p.state;
-                
-                *p = new_process;
-                
-                p.current_cpu = real_cpu;
-                p.state = real_state;
-                return;
+                // After slot reuse, table[pid] may hold a *different* process whose PID
+                // happens to equal the slot index (e.g. slot 5 now holds PID 70).
+                // Overwriting it without checking p.id == pid would corrupt the new
+                // process's PCB with stale data from the old one.  Fall through to the
+                // linear scan when the slot is occupied by a different process.
+                if p.id == pid {
+                    // PRESERVAR ESTADO ATÓMICO: Ownership y State actual son sagrados.
+                    // Solo permitimos que update_process cambie metadatos.
+                    // Si el proceso cambió de dueño o estado mientras el llamador lo editaba,
+                    // mantenemos los valores de la tabla real.
+                    let real_cpu = p.current_cpu;
+                    let real_state = p.state;
+                    
+                    *p = new_process;
+                    
+                    p.current_cpu = real_cpu;
+                    p.state = real_state;
+                    return;
+                }
             }
         }
         // Fallback: búsqueda lineal por si el PID no coincide con el índice de slot
@@ -638,7 +645,16 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
         let mut next_pid = NEXT_PID.lock();
 
         for (slot_idx, slot) in table.iter_mut().enumerate() {
-            if slot.is_none() {
+            // Accept both empty slots and slots whose previous occupant has Terminated
+            // (and has been fully released by the owning CPU).  Without this, fork()
+            // fails permanently once the table fills with a mix of live and Terminated
+            // processes — the same condition already handled by create_process_with_pid.
+            let slot_available = slot.is_none()
+                || matches!(slot, Some(ref p) if
+                    p.state == ProcessState::Terminated
+                    && p.current_cpu == NO_CPU);
+            if slot_available {
+                *slot = None; // evict Terminated entry before writing the child
                 let child_pid = *next_pid;
                 *next_pid += 1;
 

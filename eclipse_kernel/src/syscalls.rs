@@ -2460,10 +2460,16 @@ fn sys_nanosleep(req: u64) -> u64 {
     // NOTE: We set the state directly in PROCESS_TABLE because update_process()
     // intentionally preserves the original state (to protect against races).
     if let Some(pid) = current_process_id() {
+        // PROCESS_TABLE is indexed by slot, not by PID value.  After slot reuse,
+        // a process can have PID ≥ 64, so table[pid as usize] would be out-of-bounds.
+        // Use pid_to_slot_fast() to obtain the correct slot index.
+        let slot = crate::ipc::pid_to_slot_fast(pid);
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table[pid as usize].as_mut() {
-                p.state = crate::process::ProcessState::Blocked;
+            if let Some(slot_idx) = slot {
+                if let Some(p) = table[slot_idx].as_mut() {
+                    p.state = crate::process::ProcessState::Blocked;
+                }
             }
         });
         crate::scheduler::add_sleep(pid, wake_tick);
@@ -2576,6 +2582,9 @@ fn sys_brk(addr: u64) -> u64 {
 
 fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if stat_ptr == 0 { return u64::MAX; }
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+        return u64::MAX;
+    }
     
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
@@ -2997,6 +3006,7 @@ fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
     serial::serial_print(")\n");
 
     if addr == 0 || addrlen < 2 { return u64::MAX; }
+    if !is_user_pointer(addr, addrlen) { return u64::MAX; }
     let family = unsafe { *(addr as *const u16) };
     
     if family == 1 { // AF_UNIX
@@ -3039,6 +3049,9 @@ fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, _optval: u64, _optlen: u
 
 fn sys_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     if path_ptr == 0 || stat_ptr == 0 { return u64::MAX; }
+    if !is_user_pointer(stat_ptr, core::mem::size_of::<crate::scheme::Stat>() as u64) {
+        return u64::MAX;
+    }
     
     let path_len = strlen_user_unique(path_ptr, 4096);
     if path_len == 0 { return u64::MAX; }
