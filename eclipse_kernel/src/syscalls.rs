@@ -576,6 +576,12 @@ fn sys_exit(exit_code: u64) -> u64 {
     serial::serial_print_hex(exit_code);
     serial::serial_print("\n");
     
+    // Store the exit code in the PCB so sys_wait() can report it to the parent.
+    if let Some(mut proc) = crate::process::get_process(pid) {
+        proc.exit_code = exit_code;
+        crate::process::update_process(pid, proc);
+    }
+
     exit_process();
     yield_cpu();
     0
@@ -1224,6 +1230,17 @@ fn sys_wait(status_ptr: u64) -> u64 {
                         // re-receiving the same PID.
                         // Note: full resource cleanup (kernel stack, page tables, FDs)
                         // is deferred; the process entry stays as Terminated in the table.
+
+                        // Write the child's exit status to *status_ptr using the standard
+                        // WEXITSTATUS encoding expected by POSIX wait(): the exit code
+                        // occupies bits [15:8] (i.e. exit_code << 8); bits [7:0] are 0
+                        // to indicate normal termination (not a signal).
+                        // Use write_unaligned to tolerate potentially unaligned status_ptr.
+                        if status_ptr != 0 && is_user_pointer(status_ptr, 4) {
+                            let wait_status = ((proc.exit_code as u32) & 0xFF) << 8;
+                            unsafe { core::ptr::write_unaligned(status_ptr as *mut u32, wait_status); }
+                        }
+
                         proc.parent_pid = None;
                         process::update_process(*pid, proc);
                         return *pid as u64;
@@ -2329,16 +2346,15 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
         
         let map_end = addr + length;
         
-        // We need to know which pages to physically free.
-        // In a real OS, page tables tell us. Here, we blindly traverse the range.
-        
-        // TODO: Actually free physical pages!
-        // This requires walking the page table, resolving phys addr, and freeing dma buffer.
-        // memory::unmap_user_range(...) helper needed.
-        
-        // For now, we leave physical pages leakes (bad!) or handled by process exit cleaner.
-        // But we technically "unmap" them from valid tracking struct.
-        
+        // Clear the page-table entries for the unmapped range so that hardware
+        // accesses to the region generate a #PF rather than silently succeeding.
+        // This enforces POSIX munmap() semantics (access → SIGSEGV) and prevents
+        // information leaks through pages the caller believes have been unmapped.
+        let page_table_phys = proc.page_table_phys;
+        if page_table_phys != 0 {
+            memory::unmap_user_range(page_table_phys, addr, length);
+        }
+
         let initial_len = proc.vmas.len();
         proc.vmas.retain(|vma| {
             // Remove if there is overlap
@@ -2548,8 +2564,13 @@ fn sys_brk(addr: u64) -> u64 {
                         // Zero the page via the kernel direct-map virtual address.
                         unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
                         
-                        // Map it as user writable
-                        let flags = memory::PAGE_USER | memory::PAGE_WRITABLE;
+                        // Map as user-writable, non-executable (W^X: heap is data, not code).
+                        // NO_EXECUTE is intentionally set here; sys_mmap uses the same pattern
+                        // for PROT_READ|PROT_WRITE mappings without PROT_EXEC.
+                        let flags = (x86_64::structures::paging::PageTableFlags::PRESENT
+                            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
+                            | x86_64::structures::paging::PageTableFlags::WRITABLE
+                            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE).bits();
                         memory::map_user_page_4kb(page_table_phys, current_page, frame_phys, flags);
                         
                         current_page += 4096;

@@ -87,6 +87,7 @@ pub struct Process {
     pub cpu_ticks: u64,                   // Total CPU ticks consumed
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
     pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
+    pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -116,6 +117,7 @@ impl Process {
             cpu_ticks: 0,
             mem_frames: 0,
             current_cpu: NO_CPU,
+            exit_code: 0,
         }
     }
 }
