@@ -30,7 +30,7 @@ const SERIAL_PORT: u16 = 0x3F8; // COM1
 /// Estado del puerto serial
 static mut SERIAL_INITIALIZED: bool = false;
 /// Lock para acceso al hardware del puerto serial (multicore stability)
-static SERIAL_PORT_LOCK: Mutex<()> = Mutex::new(());
+static SERIAL_PORT_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
 
 /// Inicializar el puerto serial
 pub fn init() {
@@ -141,7 +141,7 @@ pub fn serial_print_char(c: char) {
 fn write_byte(byte: u8) {
     // Esperar a que el buffer de transmisión esté vacío con un timeout de seguridad
     // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
-    let mut timeout = 1_000_000;
+    let mut timeout = 10_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;
@@ -206,7 +206,7 @@ impl core::fmt::Write for RawSerialWriter {
 }
 
 fn write_byte_internal(byte: u8) {
-    let mut timeout = 1_000_000;
+    let mut timeout = 10_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;

@@ -355,7 +355,7 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
 
 /// sys_get_process_list - Listar procesos y su estado (PID, nombre, etc)
 fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
-    if buf_ptr == 0 || max_count == 0 || max_count > 64 {
+    if buf_ptr == 0 || max_count == 0 || max_count > 256 {
         return u64::MAX;
     }
     if !is_user_pointer(buf_ptr, max_count * core::mem::size_of::<ProcessInfo>() as u64) {

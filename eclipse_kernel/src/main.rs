@@ -43,6 +43,7 @@ mod usb_hid; // USB HID (stub)
 mod acpi;    // ACPI discovery
 mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
+mod sync;    // Synchronization primitives
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
@@ -366,10 +367,10 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
             }
         }
     }
-    
-    progress::bar(100);
-    serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
 
+    serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
+    progress::bar(100);
+    
     loop {
         // Procesar mensajes IPC mientras haya pendientes
         if crate::ipc::has_pending_messages() {

@@ -259,33 +259,34 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
 /// Acumula `msg` en el buffer de línea. Solo renderiza en pantalla cuando llega un '\n'.
 pub fn log(msg: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut buf = LOG_BUFFER.lock();
-        let got_newline = buf.push_str(msg);
+        if let Some(mut buf) = LOG_BUFFER.try_lock() {
+            let got_newline = buf.push_str(msg);
 
-        if got_newline.is_some() {
-            // Sin alloc: copiamos el contenido del buffer a un array en el stack
-            const MAX: usize = LOG_BUF_SIZE;
-            let mut tmp = [0u8; MAX];
-            let line_bytes = buf.flush().as_bytes();
-            let n = line_bytes.len().min(MAX);
-            tmp[..n].copy_from_slice(&line_bytes[..n]);
-            let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
-            
-            // Guardar en la historia para el HUD
-            LOG_HISTORY.lock().push(line);
+            if got_newline.is_some() {
+                // Sin alloc: copiamos el contenido del buffer a un array en el stack
+                const MAX: usize = LOG_BUF_SIZE;
+                let mut tmp = [0u8; MAX];
+                let line_bytes = buf.flush().as_bytes();
+                let n = line_bytes.len().min(MAX);
+                tmp[..n].copy_from_slice(&line_bytes[..n]);
+                let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
+                
+                // Guardar en la historia para el HUD
+                LOG_HISTORY.lock().push(line);
 
-            // Obtener info del framebuffer y renderizar.
-            // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
-            if let Some((phys, width, height, pitch, source)) = get_fb_info() {
-                buf.clear();
-                drop(buf);
-                render_log_line(line, source, width, height, pitch, phys);
-            } else {
-                buf.clear();
+                // Obtener info del framebuffer y renderizar.
+                // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
+                if let Some((phys, width, height, pitch, source)) = get_fb_info() {
+                    buf.clear();
+                    drop(buf);
+                    render_log_line(line, source, width, height, pitch, phys);
+                } else {
+                    buf.clear();
+                }
             }
         }
     });
-    // Si no hay '\n', el texto queda en el buffer esperando el siguiente fragmento.
+    // Si no hay '\n' o el lock está ocupado, el texto se pierde o espera en el buffer.
 }
 
 // ============================================================================
@@ -362,6 +363,13 @@ fn fmt_hex(v: u64, out: &mut [u8; 18]) {
 /// Solo usa buffers de pila — sin alloc ni fmt!.
 pub fn bsod(info: &BsodInfo) {
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+    
+    // Safety check: Verificar que la dirección física del FB no sea nula y esté
+    // dentro de un rango razonable para evitar un Triple Fault si phys_to_virt falla.
+    if phys == 0 || phys > 0x0000_0100_0000_0000 { // Límite heurístico de 1TB
+        return;
+    }
+
     let virt = crate::memory::phys_to_virt(phys) as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
@@ -486,3 +494,4 @@ pub fn bsod(info: &BsodInfo) {
         let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, width, height);
     }
 }
+

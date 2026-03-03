@@ -51,11 +51,43 @@ static mut HEAP: KernelHeap = KernelHeap {
     memory: [0; HEAP_SIZE],
 };
 
+use core::alloc::{GlobalAlloc, Layout};
 use spin::Mutex;
+
+/// Wrapper for the global allocator that disables interrupts during allocations.
+/// This prevents deadlocks if an interrupt handler attempts to allocate memory
+/// while the interrupted code already held the allocator lock.
+pub struct InterruptSafeAllocator(LockedHeap);
+
+unsafe impl GlobalAlloc for InterruptSafeAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            self.0.alloc(layout)
+        })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            self.0.dealloc(ptr, layout)
+        })
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            self.0.alloc_zeroed(layout)
+        })
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            self.0.realloc(ptr, layout, new_size)
+        })
+    }
+}
 
 #[cfg(not(test))]
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: InterruptSafeAllocator = InterruptSafeAllocator(LockedHeap::empty());
 
 /// Global lock for page table modifications to prevent races in SMP.
 /// Must always be used with interrupts disabled to avoid deadlocks.
@@ -85,15 +117,15 @@ pub fn init() {
         
         #[cfg(not(test))]
         {
-            // Get raw pointer to ALLOCATOR and dereference explicitly
+            // Get raw pointer to the inner LockedHeap and initialize it
             let allocator_ptr = &raw const ALLOCATOR;
             let allocator_ref = unsafe { &*allocator_ptr };
-            let mut allocator = allocator_ref.lock();
+            let mut inner = allocator_ref.0.lock();
             
             // Initialize allocator with Higher Half address
-            allocator.init(heap_start_high as *mut u8, HEAP_SIZE);
+            inner.init(heap_start_high as *mut u8, HEAP_SIZE);
             
-            crate::serial::serial_print("[MEM] Allocator initialized\n");
+            crate::serial::serial_print("[MEM] Allocator initialized (Interrupt-safe)\n");
         }
         #[cfg(test)]
         {

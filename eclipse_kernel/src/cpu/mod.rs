@@ -91,7 +91,7 @@ t_entry: .quad 0
 trampoline_end:
 "#);
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 extern "C" {
     /// Linker-defined start of trampoline section
@@ -107,6 +107,11 @@ extern "C" {
 }
 
 static AP_READY: AtomicUsize = AtomicUsize::new(0);
+static TSC_COUNTS_PER_US: AtomicU64 = AtomicU64::new(10000); // Default to 10GHz (safe upper bound)
+
+pub fn update_tsc_frequency(counts_per_us: u64) {
+    TSC_COUNTS_PER_US.store(counts_per_us, Ordering::SeqCst);
+}
 
 pub fn start_aps() {
     let acpi = crate::acpi::get_info();
@@ -195,8 +200,14 @@ pub fn start_aps() {
             // Allocate unique stack for this AP
             let layout = alloc::alloc::Layout::from_size_align(16384, 16).unwrap();
             let ptr = alloc::alloc::alloc_zeroed(layout);
+            if ptr.is_null() {
+                serial_printf(format_args!("[CPU] ERROR: Failed to allocate stack for AP {}\n", target_apic_id));
+                continue;
+            }
             let ap_stack = ptr as u64 + 16384;
             *copy_stack = ap_stack;
+            
+            serial_printf(format_args!("[CPU] AP {} stack allocated at {:p}\n", target_apic_id, ptr));
 
             // Memory fence: ensure trampoline data (cr3/stack/entry) is fully visible
             // to the AP before the SIPI fires and the AP starts executing.
@@ -206,19 +217,23 @@ pub fn start_aps() {
             let expected_ready = AP_READY.load(Ordering::SeqCst) + 1;
 
             // Send INIT-SIPI sequence
+            serial_printf(format_args!("[CPU] sending INIT to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0, 5, true, false);
             delay_ms(10);
+            serial_printf(format_args!("[CPU] sending SIPI to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             
             // Give it 1ms to see if it starts on the first SIPI
             delay_ms(1);
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
+                serial_printf(format_args!("[CPU] sending second SIPI to AP {}...\n", target_apic_id));
                 // Send second SIPI if not ready
                 crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             }
             
             // Wait briefly for this AP to signal readiness before starting the next one
-            let mut sub_timeout = 1000;
+            // 100ms is more than enough for an AP to wake up and signal readiness.
+            let mut sub_timeout = 100;
             while AP_READY.load(Ordering::SeqCst) < expected_ready && sub_timeout > 0 {
                 delay_ms(1);
                 sub_timeout -= 1;
@@ -237,7 +252,7 @@ pub fn start_aps() {
     }
 }
 
-fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     let low: u32;
     let high: u32;
     unsafe { core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)); }
@@ -246,8 +261,7 @@ fn rdtsc() -> u64 {
 
 fn delay_us(us: u64) {
     let start = rdtsc();
-    // Use very safe value (10000 counts per us = 10GHz)
-    let wait_cycles = us * 10000; 
+    let wait_cycles = us * TSC_COUNTS_PER_US.load(Ordering::Relaxed); 
     while rdtsc() - start < wait_cycles {
         crate::cpu::pause();
     }
@@ -436,6 +450,28 @@ pub extern "C" fn ap_entry() -> ! {
     // scheduling interrupts independently of the BSP's PIT (IRQ 0).
     crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
 
+    // 8.5 Switch to the permanent kernel stack.
+    // This removes the dependency on the initial 16KB trampoline stack.
+    // Note: We use naked assembly here because switching RSP mid-function is extremely dangerous in Rust.
+    // We'll jump to a new "safe" loop after the switch.
+    
+    serial_printf(format_args!("[CPU] AP (APIC ID {}) switching to permanent stack...\n", crate::apic::get_id()));
+    
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {0}",
+            "mov rbp, 0",
+            "jmp {1}",
+            in(reg) kernel_stack_top,
+            in(reg) ap_main_loop as u64,
+            options(noreturn)
+        );
+    }
+}
+
+/// The permanent main loop for Application Processors.
+/// Runs on the dedicated kernel stack.
+extern "C" fn ap_main_loop() -> ! {
     // 9. Signal the BSP that this AP is fully initialized.
     // This MUST happen after all per-CPU hardware setup so that the BSP
     // does not proceed to start the next AP before this one is ready.

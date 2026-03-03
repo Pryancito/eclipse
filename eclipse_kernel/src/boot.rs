@@ -186,7 +186,7 @@ impl TaskStateSegment {
 }
 
 /// Maximum number of CPUs supported (indexed by APIC ID % MAX_SMP_CPUS)
-pub const MAX_SMP_CPUS: usize = 16;
+pub const MAX_SMP_CPUS: usize = 128;
 
 /// Per-CPU data accessible via GS segment during SYSCALL handling.
 /// Field offsets are part of the ABI used in syscall_entry (interrupts.rs):
@@ -291,7 +291,7 @@ static mut CPU_GDTS: [Gdt; MAX_SMP_CPUS] = [GDT_TEMPLATE; MAX_SMP_CPUS];
 /// The index is derived from the Initial APIC ID (CPUID leaf 1, EBX[31:24])
 /// modulo MAX_SMP_CPUS.  All per-CPU arrays (CPU_DATA, CPU_TSSES, CPU_GDTS)
 /// are indexed with this value.
-fn get_cpu_id() -> usize {
+pub fn get_cpu_id() -> usize {
     let ebx: u32;
     unsafe {
         core::arch::asm!(

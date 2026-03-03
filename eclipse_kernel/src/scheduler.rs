@@ -5,7 +5,7 @@ use crate::process::{ProcessId, ProcessState, get_process, update_process, curre
 use spin::Mutex;
 
 /// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
-const MAX_CPUS: usize = 16;
+const MAX_CPUS: usize = 128;
 
 /// Cola de procesos ready (ampliada para SMP)
 const READY_QUEUE_SIZE: usize = 512;
@@ -43,7 +43,7 @@ static SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats {
 });
 
 /// Cuántas veces se dio CPU a cada PID en la última ventana (se lee y resetea en el heartbeat).
-const MAX_PIDS: usize = 64;
+const MAX_PIDS: usize = 256;
 static RUN_COUNTS: [AtomicU32; MAX_PIDS] = [const { AtomicU32::new(0) }; MAX_PIDS];
 
 /// Devuelve y resetea los conteos de ejecución por PID (para el heartbeat de depuración).
@@ -65,7 +65,7 @@ pub fn take_run_counts() -> [u32; MAX_PIDS] {
 /// the first one set the state to Ready, inserting the same PID twice).
 pub fn enqueue_process(pid: ProcessId) {
     // Resolve the PID to its PROCESS_TABLE slot index.  After slot reuse, a
-    // process can have PID ≥ MAX_PROCESSES (64) while occupying a recycled slot
+    // process can have PID ≥ MAX_PROCESSES (256) while occupying a recycled slot
     // index ≤ 63.  Using the raw PID as an index would be out-of-bounds; using
     // pid_to_slot_fast() gives the correct slot regardless of the PID value.
     let slot = match crate::ipc::pid_to_slot_fast(pid) {
@@ -153,7 +153,7 @@ pub fn tick() {
     } else if let Some(pid) = current_pid {
         // Increment CPU tick counter for the current process.
         // Use pid_to_slot_fast to get the correct slot — after slot reuse the PID
-        // can exceed MAX_PROCESSES (64) so table[pid as usize] would be OOB.
+        // can exceed MAX_PROCESSES (256) so table[pid as usize] would be OOB.
         if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
             x86_64::instructions::interrupts::without_interrupts(|| {
                 let mut table = crate::process::PROCESS_TABLE.lock();
@@ -314,7 +314,7 @@ pub fn schedule() {
             let next_process_exists = {
                 let mut table = crate::process::PROCESS_TABLE.lock();
                 // Use pid_to_slot_fast: next_pid from the queue is a real PID value that may
-                // exceed 63 after slot reuse, making table[next_pid as usize] out-of-bounds.
+                // can exceed 255 after slot reuse, making table[next_pid as usize] out-of-bounds.
                 if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
                     if let Some(next_process) = table[slot].as_mut() {
                         if next_process.id != next_pid {

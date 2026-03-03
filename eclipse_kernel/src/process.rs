@@ -124,12 +124,12 @@ impl Process {
 
 
 /// Tabla de procesos
-pub const MAX_PROCESSES: usize = 64;
+pub const MAX_PROCESSES: usize = 256;
 pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 
 /// Máximo número de CPUs soportadas
-const MAX_CPUS: usize = 16;
+const MAX_CPUS: usize = 128;
 /// Proceso actual por cada CPU
 
 /// Obtener ID de la CPU actual (O(1) vía GS segment)
@@ -220,7 +220,7 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
         
         // Buscar slot libre (enumerate para conocer el índice del slot)
         // Accept both empty slots and slots whose previous occupant has Terminated,
-        // so that the 64-entry table can be reused across process lifetimes.
+        // so that the 256-entry table can be reused across process lifetimes.
         // Without this, after 63 processes exit the table fills up permanently.
         for (slot_idx, slot) in table.iter_mut().enumerate() {
             let slot_available = slot.is_none()

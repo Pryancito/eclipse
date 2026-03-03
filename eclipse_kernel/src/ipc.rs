@@ -283,9 +283,9 @@ impl ProcessMailbox {
 }
 
 /// Buzones de mensajes por proceso — ring buffers estáticos, sin heap.
-/// Indexados por SLOT INDEX en PROCESS_TABLE (0-63).
+/// Indexados por SLOT INDEX en PROCESS_TABLE (0-255).
 const EMPTY_MAILBOX: ProcessMailbox = ProcessMailbox::new();
-static PROCESS_MAILBOXES: Mutex<[ProcessMailbox; 64]> = Mutex::new([EMPTY_MAILBOX; 64]);
+static PROCESS_MAILBOXES: Mutex<[ProcessMailbox; 256]> = Mutex::new([EMPTY_MAILBOX; 256]);
 
 /// Helper to run a closure with interrupts disabled.
 /// In tests, it just runs the closure to avoid x86_64 instruction dependency.
@@ -473,7 +473,7 @@ pub fn process_messages() {
     // causing the mouse IRQ to be delayed long enough to lose PS/2 bytes.
     // Fix: extract each message under IPC_SYSTEM alone, release it, then deliver
     // P2P messages to the mailbox under PROCESS_MAILBOXES alone.
-    for _ in 0..64 {
+    for _ in 0..256 {
         // Phase 1: Extract one message from the global queue (IPC_SYSTEM only).
         // Returns: Some(Some((pid, msg))) = P2P for mailbox delivery
         //          Some(None)             = message delivered to server (or dropped)
@@ -613,7 +613,7 @@ pub fn receive_message(pid: ClientId) -> Option<Message> {
 
 /// Limpiar el buzón de un slot al terminar el proceso.
 pub fn clear_mailbox_slot(slot_idx: usize) {
-    if slot_idx < 64 {
+    if slot_idx < 256 {
         run_critical(|| {
             PROCESS_MAILBOXES.lock()[slot_idx].clear();
         });

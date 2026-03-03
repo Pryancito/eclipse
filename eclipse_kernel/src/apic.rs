@@ -59,14 +59,27 @@ pub fn calibrate_timer() {
 
         // Wait 10 PIT ticks (≈10 ms at 1000 Hz); interrupts must already be on
         core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        let start_tsc = crate::cpu::rdtsc();
         let start = crate::interrupts::ticks();
         while crate::interrupts::ticks() < start + 10 {
             crate::cpu::pause();
         }
+        let end_tsc = crate::cpu::rdtsc();
 
         let remaining = read_reg(LAPIC_REG_TMRCURR);
         let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
         let count_per_ms = if elapsed > 10 { elapsed / 10 } else { DEFAULT_LAPIC_COUNT_PER_MS };
+
+        let tsc_elapsed = end_tsc - start_tsc;
+        let tsc_per_ms = tsc_elapsed / 10;
+        let tsc_counts_per_us = tsc_per_ms / 1000;
+
+        if tsc_counts_per_us > 0 {
+            crate::cpu::update_tsc_frequency(tsc_counts_per_us);
+            crate::serial::serial_printf(format_args!(
+                "[APIC] TSC calibrated: {} counts/us\n", tsc_counts_per_us
+            ));
+        }
 
         // Stop the one-shot timer
         write_reg(LAPIC_REG_TMRINIT, 0);
@@ -119,11 +132,19 @@ pub fn init() {
         // Also set the spurious interrupt vector to 0xFF (reserved)
         write_reg(LAPIC_REG_SVR, read_reg(LAPIC_REG_SVR) | 0x100 | 0xFF);
 
+        let is_bsp = (low & (1 << 8)) != 0;
+
         // 1.5 Ensure LINT0 is configured as ExtINT (Delivery mode 7) and Unmasked.
         // This is crucial on real hardware so that legacy 8259 PIC interrupts
         // (like IRQ0 PIT) can still reach the BSP.
         // In x2APIC mode this write goes through MSR 0x835.
-        write_reg(LAPIC_REG_LVT_LINT0, 0x00000700);
+        // CRITICAL: We MUST only do this on the BSP! APs should NOT receive PIC interrupts!
+        if is_bsp {
+            write_reg(LAPIC_REG_LVT_LINT0, 0x00000700);
+        } else {
+            // Mask LINT0 on APs
+            write_reg(LAPIC_REG_LVT_LINT0, 0x00010000);
+        }
 
         // 2. Clear Task Priority Register to allow all interrupts
         write_reg(LAPIC_REG_TPR, 0);
@@ -212,7 +233,8 @@ pub fn send_ipi_exact(apic_id: u32, vector: u8, delivery_mode: u8, assert: bool,
     unsafe {
         let x2apic = IS_X2APIC.load(Ordering::Relaxed);
 
-        // Clear Error Status Register before sending
+        // Clear Error Status Register before sending.
+        // In x2APIC mode, ESR is read-only; clear_esr() handles this correctly.
         clear_esr();
 
         let mut icrl = (vector as u32) | ((delivery_mode as u32) << 8);
@@ -224,26 +246,17 @@ pub fn send_ipi_exact(apic_id: u32, vector: u8, delivery_mode: u8, assert: bool,
             icrl &= !(1 << 14);
         }
 
-        crate::serial::serial_printf(format_args!("[APIC] IPI to {}: Vector={:#x}, Mode={}, Assert={}, Level={} -> ICR={:#010x}:{:08x} (x2APIC={})\n",
-            apic_id, vector, delivery_mode, assert, level_trigger, apic_id, icrl, x2apic));
-
         if x2apic {
-            // x2APIC: single 64-bit MSR write, no delivery pending polling needed.
-            // SIPI delivery (mode 6) is officially "reserved" in x2APIC mode per Intel SDM
-            // Vol 3A §10.12.9, but many platforms implement it anyway. On systems where
-            // SIPI via x2APIC ICR64 does not work, the AP will time out and a warning is
-            // printed by the caller (start_aps). A proper fix for those platforms would
-            // require the ACPI MADT Mailbox or Spin Table wakeup protocol.
+            // x2APIC: single 64-bit MSR write. No delivery pending polling needed (Reserved).
             write_icr64(apic_id, icrl);
         } else {
             // xAPIC: write high register first, then low to trigger delivery
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
             write_reg(LAPIC_REG_ICRH, apic_id << 24);
             write_reg(LAPIC_REG_ICRL, icrl);
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
 
             // Check for delivery errors
-            let _ = read_esr();
             let esr = read_esr();
             if esr != 0 {
                 crate::serial::serial_printf(format_args!("[APIC] ERROR: ESR after IPI to {}: {:#x}\n", apic_id, esr));
@@ -261,10 +274,10 @@ pub fn broadcast_init() {
         if IS_X2APIC.load(Ordering::Relaxed) {
             write_icr64(0, icrl);
         } else {
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
             write_reg(LAPIC_REG_ICRH, 0);
             write_reg(LAPIC_REG_ICRL, icrl);
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
             let esr = read_esr();
             if esr != 0 {
                 crate::serial::serial_printf(format_args!("[APIC] ERROR: ESR after broadcast INIT: {:#x}\n", esr));
@@ -288,10 +301,10 @@ pub fn broadcast_sipi(vector: u8) {
             // mechanism (e.g. ACPI Mailbox / Spin Table) would need additional support.
             write_icr64(0, icrl);
         } else {
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
             write_reg(LAPIC_REG_ICRH, 0);
             write_reg(LAPIC_REG_ICRL, icrl);
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
             let esr = read_esr();
             if esr != 0 {
                 crate::serial::serial_printf(format_args!("[APIC] ERROR: ESR after broadcast SIPI: {:#x}\n", esr));
@@ -318,7 +331,7 @@ pub fn send_tlb_shootdown_ipi() {
             write_reg(LAPIC_REG_ICRH, 0);
             write_reg(LAPIC_REG_ICRL, icrl);
             crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Waiting for delivery...\n"));
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
         }
         crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Delivered\n"));
     }
@@ -341,16 +354,44 @@ pub fn broadcast_reschedule_ipi() {
         } else {
             write_reg(LAPIC_REG_ICRH, 0);
             write_reg(LAPIC_REG_ICRL, icrl);
-            while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 { crate::cpu::pause(); }
+            wait_icr_idle();
         }
     }
 }
 
 unsafe fn clear_esr() {
-    write_reg(LAPIC_REG_ESR, 0);
+    if !IS_X2APIC.load(Ordering::Relaxed) {
+        // xAPIC: Must write to ESR to clear/update it before read
+        write_reg(LAPIC_REG_ESR, 0);
+    }
 }
 
 unsafe fn read_esr() -> u32 {
-    write_reg(LAPIC_REG_ESR, 0); // Must write before read to update
-    read_reg(LAPIC_REG_ESR)
+    if IS_X2APIC.load(Ordering::Relaxed) {
+        // x2APIC: ESR is read-only (MSR 0x828)
+        read_reg(LAPIC_REG_ESR)
+    } else {
+        // xAPIC: Must write before read to update
+        write_reg(LAPIC_REG_ESR, 0);
+        read_reg(LAPIC_REG_ESR)
+    }
+}
+
+/// Wait until the Delivery Status bit in the ICR is cleared or until a timeout.
+unsafe fn wait_icr_idle() {
+    if IS_X2APIC.load(Ordering::Relaxed) {
+        // x2APIC: Bit 12 (Delivery Status) is reserved and undefined.
+        // Software does not need to poll this bit.
+        return;
+    }
+
+    let mut timeout = 100_000;
+    while read_reg(LAPIC_REG_ICRL) & (1 << 12) != 0 {
+        crate::cpu::pause();
+        timeout -= 1;
+        if timeout == 0 {
+            crate::serial::serial_print("[APIC] WARNING: ICR busy timeout!\n");
+            break;
+        }
+    }
 }

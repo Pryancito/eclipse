@@ -11,7 +11,7 @@ use crate::process::ProcessId;
 pub const MAX_FDS_PER_PROCESS: usize = 64;
 
 /// Maximum number of processes (matching scheduler limit)
-pub const MAX_FD_PROCESSES: usize = 64;
+pub const MAX_FD_PROCESSES: usize = 256;
 
 /// File descriptor entry
 #[derive(Clone, Debug, Copy)]

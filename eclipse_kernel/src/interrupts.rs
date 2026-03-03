@@ -1945,6 +1945,10 @@ unsafe extern "C" fn syscall_entry() {
         "mov rsp, rbp", // Restore stack to just after RBP push
         "sub rsp, 112", // Move to start of GPRs (r15)
         
+        // El resultado está en RAX. Queremos que el RAX pusheado sea este resultado
+        // Offset de RAX desde RBP es -8.
+        "mov [rbp - 8], rax",
+        
         // CRITICAL: Restore user data segments BEFORE popping registers
         "mov ax, 0x23",  // USER_DATA_SELECTOR
         "mov ds, ax",
