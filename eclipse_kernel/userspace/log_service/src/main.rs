@@ -9,31 +9,30 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, send, sleep_ms, open, write, close, O_WRONLY, O_CREAT, O_APPEND};
+use eclipse_libc::{println, getpid, getppid, send, sleep_ms, open, write, close, O_WRONLY, O_CREAT, O_APPEND, Spinlock};
 
 /// Log buffer for storing messages before filesystem is ready
-/// 
-/// # Safety
-/// These static mutable variables are safe because:
-/// - Log service runs as a single-threaded process (PID 1 or 2)
-/// - No concurrent access within the service
-/// - Future: When IPC log messages are added, wrap in Mutex for thread safety
 const LOG_BUFFER_SIZE: usize = 4096;
-static mut LOG_BUFFER: [u8; LOG_BUFFER_SIZE] = [0; LOG_BUFFER_SIZE];
-static mut LOG_BUFFER_POS: usize = 0;
 
-/// Add a log message to the buffer
-fn log_to_buffer(msg: &str) {
-    unsafe {
-        let bytes = msg.as_bytes();
-        let available = LOG_BUFFER_SIZE - LOG_BUFFER_POS;
-        let to_copy = bytes.len().min(available);
-        
-        if to_copy > 0 {
-            LOG_BUFFER[LOG_BUFFER_POS..LOG_BUFFER_POS + to_copy]
-                .copy_from_slice(&bytes[..to_copy]);
-            LOG_BUFFER_POS += to_copy;
-        }
+struct LogBuffer {
+    buf: [u8; LOG_BUFFER_SIZE],
+    pos: usize,
+}
+
+/// Global log buffer protected by a spinlock for SMP thread safety.
+static LOG_STATE: Spinlock<LogBuffer> = Spinlock::new(LogBuffer {
+    buf: [0; LOG_BUFFER_SIZE],
+    pos: 0,
+});
+
+/// Append `msg` into the provided (already-locked) log buffer.
+fn log_to_buffer(state: &mut LogBuffer, msg: &str) {
+    let bytes = msg.as_bytes();
+    let available = LOG_BUFFER_SIZE - state.pos;
+    let to_copy = bytes.len().min(available);
+    if to_copy > 0 {
+        state.buf[state.pos..state.pos + to_copy].copy_from_slice(&bytes[..to_copy]);
+        state.pos += to_copy;
     }
 }
 
@@ -41,39 +40,28 @@ fn log_to_buffer(msg: &str) {
 fn log_message(msg: &str) {
     // 1. Write to serial port (immediate output for debugging)
     println!("{}", msg);
-    
-    // 2. Buffer the message for batched file writes
-    log_to_buffer(msg);
-    log_to_buffer("\n");
-    
-    // 3. Write buffered logs to /tmp/system.log
-    // Flush buffer when it reaches a threshold or periodically
-    unsafe {
-        if LOG_BUFFER_POS > 3072 {  // Flush when 75% full
-            flush_log_buffer();
-        }
+
+    // 2. Buffer the message and flush if 75% full – all under the spinlock.
+    let mut state = LOG_STATE.lock();
+    log_to_buffer(&mut state, msg);
+    log_to_buffer(&mut state, "\n");
+    if state.pos > 3072 {
+        flush_log_buffer(&mut state);
     }
 }
 
-/// Flush the log buffer to /tmp/system.log
-fn flush_log_buffer() {
-    unsafe {
-        if LOG_BUFFER_POS == 0 {
-            return; // Nothing to flush
+/// Flush the log buffer to /tmp/system.log (caller must hold the lock).
+fn flush_log_buffer(state: &mut LogBuffer) {
+    if state.pos == 0 {
+        return;
+    }
+    let fd = open("file:/tmp/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
+    if fd >= 0 {
+        let written = write(fd as u32, &state.buf[..state.pos]);
+        if written > 0 {
+            state.pos = 0;
         }
-        
-        // Open the log file using the file: scheme explicitly
-        let fd = open("file:/tmp/system.log", O_WRONLY | O_CREAT | O_APPEND, 0o644);
-        if fd >= 0 {
-            // Write buffered data to file
-            let written = write(fd as u32, &LOG_BUFFER[..LOG_BUFFER_POS]);
-            if written > 0 {
-                // Successfully written
-                LOG_BUFFER_POS = 0; // Reset buffer
-            }
-            // Close the file
-            close(fd);
-        }
+        close(fd);
     }
 }
 
@@ -121,7 +109,8 @@ pub extern "C" fn _start() -> ! {
         
         // Flush log buffer to file every ~10 s (1000 iterations * 10 ms)
         if flush_counter % 1000 == 0 {
-            flush_log_buffer();
+            let mut state = LOG_STATE.lock();
+            flush_log_buffer(&mut state);
         }
         
         // Status report every ~5 s (500 iterations * 10 ms)
