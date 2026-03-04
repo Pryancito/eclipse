@@ -47,7 +47,27 @@ mod sync;    // Synchronization primitives
 
 #[cfg(not(test))]
 #[global_allocator]
-static GLOBAL_ALLOC: &memory::InterruptSafeAllocator = &memory::ALLOCATOR;
+static GLOBAL_ALLOC: KernelAllocator = KernelAllocator;
+
+struct KernelAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        memory::ALLOCATOR.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        memory::ALLOCATOR.dealloc(ptr, layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+        memory::ALLOCATOR.alloc_zeroed(layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+        memory::ALLOCATOR.realloc(ptr, layout, new_size)
+    }
+}
 
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
@@ -259,6 +279,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Start LAPIC periodic timer on BSP for SMP. Drives system tick when PIT delivery
     // is unreliable. Keep PIT unmasked so we have a fallback (both can fire).
     apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
+    // Mask PIT (IRQ 0) on the BSP so only the LAPIC timer drives the system tick.
+    // This avoids "double-ticking" when both interrupts are enabled.
+    crate::interrupts::mask_pit_irq();
     progress::bar(70);
     
     // Init DevFS before other subsystems

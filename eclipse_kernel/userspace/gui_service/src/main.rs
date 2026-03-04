@@ -19,7 +19,7 @@ const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
 static LOAD_BUF: Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
-const COMPOSITOR_PATH: &str = "/usr/bin/smithay_app";
+const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
 /// Maximum restart attempts (0 = unlimited)
 const MAX_RESTARTS: u32 = 0;
 
@@ -69,6 +69,7 @@ unsafe fn spawn_compositor() -> i32 {
     let child_pid = {
         let mapped = mmap(0, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
         if mapped != u64::MAX && mapped != 0 {
+            println!("[GUI-SERVICE] Mapped compositor at {:#x}", mapped);
             close(fd);
             let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
             let pid = spawn(binary, Some("smithay_app"));

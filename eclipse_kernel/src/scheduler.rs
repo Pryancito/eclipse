@@ -29,6 +29,9 @@ static mut AP_IDLE_CONTEXTS: [crate::process::Context; MAX_CPUS] =
 static AP_IDLE_CONTEXT_VALID: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Quantum restante por CPU (en ms/ticks). Se inicializa en 10.
+static mut CPU_QUANTUM: [u32; MAX_CPUS] = [10; MAX_CPUS];
+
 /// Estadísticas del scheduler
 pub struct SchedulerStats {
     pub context_switches: u64,
@@ -180,10 +183,23 @@ pub fn tick() {
     // Only locks SLEEP_QUEUE (never PROCESS_TABLE) to avoid deadlock with
     // syscall paths that hold PROCESS_TABLE with interrupts enabled.
     wake_sleeping_processes(ticks);
-    
-    // Cada 10 ticks, hacer un context switch
-    if ticks % 10 == 0 {
-        schedule();
+}
+
+/// Tick local por CPU (manejado por el timer de cada LAPIC).
+/// Implementa el quantum de 10ms para el scheduler.
+pub fn local_tick() {
+    let cpu_id = crate::process::get_cpu_id();
+    if cpu_id >= MAX_CPUS { return; }
+
+    unsafe {
+        if CPU_QUANTUM[cpu_id] > 0 {
+            CPU_QUANTUM[cpu_id] -= 1;
+        }
+
+        if CPU_QUANTUM[cpu_id] == 0 {
+            CPU_QUANTUM[cpu_id] = 10; // Reset quantum
+            schedule();
+        }
     }
 }
 
@@ -577,7 +593,7 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     unsafe {
         crate::process::set_current_process(Some(to_pid));
         if to_pid != 0 {
-            crate::serial::serial_printf(format_args!("[SCHED] C{} switching to PID {}\n", crate::process::get_cpu_id(), to_pid));
+            //crate::serial::serial_printf(format_args!("[SCHED] C{} switching to PID {}\n", crate::process::get_cpu_id(), to_pid));
         }
         crate::process::switch_context(from_ctx, &*to_ptr, next_cr3, clear_addr);
     }

@@ -13,33 +13,30 @@ pub const BLOCK_SIZE: usize = 4096;
 /// Maximum record size to prevent OOM (16 MiB)
 pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
+/// Global lock for filesystem operations to prevent SMP race conditions.
+/// This protects the static `FS` state and ensures atomicity of `lseek` + `read/write` sequences.
+static FILESYSTEM_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
+
 /// Read a block from the underlying block device using the scheme system
 fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+    // The caller of this internal helper should already hold FILESYSTEM_LOCK
+    // if it's coordinating multiple related I/O ops, but for safety we also lock here.
+    let _lock = FILESYSTEM_LOCK.lock();
     unsafe {
         if !FS.mounted && FS.disk_resource_id == 0 && FS.disk_scheme_id == 0 {
             // During mount, we might not have a handle yet.
-            // For now, use the old way during early bootstrap or a dummy handle.
-            // Actually, we should open the handle IN mount().
         }
 
         let offset = block_num * 4096;
         if let Err(e) = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0) {
-            serial::serial_print("[FS-DEBUG] read_block lseek failed: block=");
-            serial::serial_print_dec(block_num);
-            serial::serial_print(" err=");
-            serial::serial_print_dec(e as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[FS-DEBUG] read_block lseek failed: block={} err={}\n", block_num, e));
             return Err("Disk seek error");
         }
         
         match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
             Ok(_) => Ok(()),
             Err(e) => {
-                serial::serial_print("[FS-DEBUG] read_block read failed: block=");
-                serial::serial_print_dec(block_num);
-                serial::serial_print(" err=");
-                serial::serial_print_dec(e as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[FS-DEBUG] read_block read failed: block={} err={}\n", block_num, e));
                 Err("Disk read error")
             }
         }
@@ -48,6 +45,7 @@ fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'sta
 
 /// Write a block to the underlying block device using the scheme system
 fn write_block_to_device(block_num: u64, buffer: &[u8]) -> Result<(), &'static str> {
+    let _lock = FILESYSTEM_LOCK.lock();
     unsafe {
         let offset = block_num * 4096;
         let _ = crate::scheme::lseek(FS.disk_scheme_id, FS.disk_resource_id, offset as isize, 0)
@@ -88,6 +86,7 @@ impl Filesystem {
     pub const PARTITION_OFFSET_BLOCKS_DEFAULT: u64 = 25856;
     pub const PARTITION_OFFSET_BLOCKS_PART:    u64 = 0;
     pub fn mount(device_path: &str) -> Result<(), &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
         // Determine partition offset:
         //   disk:NpM  → DiskScheme already seeks to the partition start → offset = 0
         //   disk:N@O  → DiskScheme already seeks to block O → offset = 0
@@ -259,6 +258,7 @@ impl Filesystem {
     /// Read file content by inode with offset
     /// Does NOT buffer the entire file. Reads directly for the requested range.
     pub fn read_file_by_inode_at(inode: u32, buffer: &mut [u8], offset: u64) -> Result<usize, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
         let entry = Self::read_inode_entry(inode).map_err(|e| {
             serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_inode_entry failed inode=");
             serial::serial_print_dec(inode as u64);
@@ -387,6 +387,7 @@ impl Filesystem {
     /// 
     /// Returns: Number of bytes written
     pub fn write_file_by_inode(inode: u32, data: &[u8], offset: u64) -> Result<usize, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
         let entry = Self::read_inode_entry(inode)?;
         
         // Read the full node record first
@@ -569,6 +570,7 @@ impl Filesystem {
 
     /// Returns the content length from the CONTENT TLV
     pub fn get_file_size(inode: u32) -> Result<u64, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             let _ = FS.header.as_ref().ok_or("FS not mounted")?;
         }
@@ -685,13 +687,12 @@ impl Filesystem {
 
     /// Lookup functionality
     pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
             let _ = FS.header.as_ref().ok_or("FS not mounted")?;
         }
         
-        serial::serial_print("[FS] lookup_path('");
-        serial::serial_print(path);
-        serial::serial_print("')\n");
+        serial::serial_printf(format_args!("[FS] lookup_path('{}')\n", path));
 
         if path == "/" {
             return Ok(1); // Root
@@ -722,11 +723,7 @@ impl Filesystem {
         let mut current_inode = 1;
         
         for part in parts {
-            serial::serial_print("[FS] Looking up '");
-            serial::serial_print(part);
-            serial::serial_print("' in inode ");
-            serial::serial_print_dec(current_inode as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[FS] Looking up '{}' in inode {}\n", part, current_inode));
 
             // Read directory inode
              // Reuse read logic but we need the raw record to find children
@@ -749,9 +746,7 @@ impl Filesystem {
                 block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
              ]) as usize;
             
-            serial::serial_print("[FS] Dir record size: ");
-            serial::serial_print_dec(record_size as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[FS] Dir record size: {}\n", record_size));
 
             if record_size < 8 {
                 // This might be a padding byte or end of directory marker if 0, 
@@ -783,17 +778,13 @@ impl Filesystem {
             
             // Search in record
             // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
+            // Searching in record
+            // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
             if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
-                serial::serial_print("[FS] Found '");
-                serial::serial_print(part);
-                serial::serial_print("' -> inode ");
-                serial::serial_print_dec(inode as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[FS] Found '{}' -> inode {}\n", part, inode));
                 current_inode = inode;
             } else {
-                serial::serial_print("[FS] Child '");
-                serial::serial_print(part);
-                serial::serial_print("' not found in directory\n");
+                serial::serial_printf(format_args!("[FS] Child '{}' not found in directory\n", part));
                 return Err("File not found");
             }
         }

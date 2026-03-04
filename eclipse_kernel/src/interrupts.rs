@@ -1370,18 +1370,26 @@ pub fn get_stats() -> InterruptStats {
 extern "C" fn apic_timer_handler() {
     crate::apic::eoi();
     let cpu_id = crate::process::get_cpu_id();
+
+    // Global heartbeat (only on BSP)
     if cpu_id == 0 {
-        // BSP: run full tick (same logic as PIT timer_handler)
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
         let ticks = TIMER_TICKS.load(Ordering::Relaxed);
+        
+        // Poll USB HID every 2ms
         if ticks % 2 == 0 {
             crate::usb_hid::poll();
         }
+        
+        // Process global IPC messages
         crate::ipc::process_messages();
+        
+        // Update global scheduler stats and wake sleeping processes
         crate::scheduler::tick();
-    } else {
-        crate::scheduler::schedule();
     }
+
+    // Per-CPU scheduling tick (handles 10ms quantum before calling schedule())
+    crate::scheduler::local_tick();
 }
 
 /// Naked trampoline for the APIC timer interrupt (saves/restores caller-saved regs).

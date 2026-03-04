@@ -1193,11 +1193,7 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    serial::serial_print("[SYSCALL] spawn() called with buffer at ");
-    serial::serial_print_hex(elf_ptr);
-    serial::serial_print(", size: ");
-    serial::serial_print_dec(elf_size);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("[SYSCALL] spawn() called with buffer at {:#x}, size: {}\n", elf_ptr, elf_size));
     
     if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
@@ -1230,9 +1226,7 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
     // Spawn the new process
     match crate::process::spawn_process(elf_data, name_trimmed) {
         Ok(pid) => {
-            serial::serial_print("[SYSCALL] spawn() success, PID: ");
-            serial::serial_print_dec(pid as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] spawn() success, PID: {}\n", pid));
 
             // Set parent_pid so the spawning process can wait() for the child.
             let caller_pid = crate::process::current_process_id();
