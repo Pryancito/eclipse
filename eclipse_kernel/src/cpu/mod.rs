@@ -341,7 +341,7 @@ pub fn detect_features() {
         );
     }
     // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
-    if (result.ecx & (1 << 3)) != 0 {
+    if (ecx_val & (1 << 3)) != 0 {
         MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
         serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
     }
