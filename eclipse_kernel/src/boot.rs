@@ -205,7 +205,7 @@ impl CpuData {
         Self { 
             rsp0: 0, 
             scratch_rsp: 0, 
-            cpu_id: 0, 
+            cpu_id: 0xFFFF_FFFF, 
             current_pid: 0xFFFF_FFFF 
         }
     }
@@ -292,21 +292,34 @@ static mut CPU_GDTS: [Gdt; MAX_SMP_CPUS] = [GDT_TEMPLATE; MAX_SMP_CPUS];
 /// modulo MAX_SMP_CPUS.  All per-CPU arrays (CPU_DATA, CPU_TSSES, CPU_GDTS)
 /// are indexed with this value.
 pub fn get_cpu_id() -> usize {
-    let ebx: u32;
     unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) ebx,
-            inout("eax") 1u32 => _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, preserves_flags),
-        );
+        // Read IA32_APIC_BASE MSR (0x1B) to check for x2APIC mode (bit 10)
+        let mut low: u32;
+        let mut high: u32;
+        core::arch::asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+        
+        let x2apic = (low & (1 << 10)) != 0;
+        let id: u32;
+        
+        if x2apic {
+            // x2APIC mode: read ID from MSR 0x802
+            core::arch::asm!("rdmsr", in("ecx") 0x802u32, out("eax") id, out("edx") high, options(nomem, nostack, preserves_flags));
+            id as usize % MAX_SMP_CPUS
+        } else {
+            // standard xAPIC: get physical base from MSR (bits 12..51), but 0xFEE00000 is default.
+            // We use the LAPIC register at offset 0x20.
+            // CAUTION: The register is 32-bit, bits 31..24 contain the ID (classic xAPIC).
+            let lapic_phys = (low & 0xFFFFF000) as u64; 
+            // In our kernel, we use map_mmio_range, but for early ID, we can try to use 
+            // the same address if it's already mapped, or use the 1:1 physical mapping if available.
+            // Since this is ONLY for load_gdt, and paging is already on, let's use the HHDM.
+            
+            let lapic_virt = crate::memory::phys_to_virt(lapic_phys);
+            let ptr = (lapic_virt + 0x20) as *const u32;
+            let val = core::ptr::read_volatile(ptr);
+            ((val >> 24) & 0xFF) as usize % MAX_SMP_CPUS
+        }
     }
-    ((ebx >> 24) as usize) % MAX_SMP_CPUS
 }
 
 /// Faster version of get_cpu_id using the GS segment.

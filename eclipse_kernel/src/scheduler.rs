@@ -92,10 +92,17 @@ pub fn enqueue_process(pid: ProcessId) {
             if let Some(p) = table[slot].as_mut() {
                 // Verify the slot still belongs to this PID (slot may have been reused).
                 if p.id != pid { return; }
-                // Dedup: already in the ready queue or running — skip.
+                // Dedup: already in the ready queue or running on ANOTHER CPU — skip.
+                // If it's already Ready, it's already in the queue.
+                // If it's Running on another CPU, it's already active, no need to enqueue.
+                // If it's Running on the current CPU, we allow it (for preemption in schedule()).
                 if p.state == ProcessState::Ready {
                     return;
                 }
+                if p.state == ProcessState::Running && p.current_cpu != crate::process::get_cpu_id() as u32 {
+                    return;
+                }
+
                 // Do not enqueue terminated processes.
                 if p.state == ProcessState::Terminated {
                     return;
@@ -407,9 +414,6 @@ pub fn schedule() {
 
                 if cpu_id == 0 {
                     // BSP: volver al proceso kernel (PID 0) que actúa como idle.
-                    // Update PID 0 process state. current_process_id() still returns
-                    // blocked_pid here so perform_context_switch_to can correctly compute
-                    // the clear_addr for blocked_pid.current_cpu.
                     {
                         let mut table = crate::process::PROCESS_TABLE.lock();
                         if let Some(p0) = table[0].as_mut() {
@@ -417,19 +421,12 @@ pub fn schedule() {
                             p0.current_cpu = 0;
                         }
                     }
-                    // perform_context_switch_to (called from perform_context_switch) will:
-                    // 1. compute clear_addr = &blocked_pid.current_cpu (current_process_id() = blocked_pid)
-                    // 2. call set_current_process(Some(0))
-                    // 3. call switch_context which atomically clears blocked_pid.current_cpu
                     perform_context_switch(blocked_pid, 0);
                 } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
                     // AP: restaurar el contexto idle guardado.
-                    // Obtain the context pointer and current_cpu address together under one lock,
-                    // then release before calling switch_context.
                     set_current_process(None);
                     let (from_ptr, clear_ptr) = {
                         let mut table = crate::process::PROCESS_TABLE.lock();
-                        // Use pid_to_slot_fast: blocked_pid may exceed 63 after slot reuse.
                         let slot = match crate::ipc::pid_to_slot_fast(blocked_pid) {
                             Some(s) => s,
                             None => return,
@@ -445,16 +442,9 @@ pub fn schedule() {
                     };
                     let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
                     unsafe {
-                        // clear_ptr points to blocked_pid.current_cpu; switch_context will
-                        // atomically set it to NO_CPU after saving the context.
                         crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
                     }
                 }
-                // Si el contexto idle del AP aún no es válido (ap_entry() todavía no
-                // completó la primera transferencia a un proceso usuario) o cpu_id está
-                // fuera de rango, se retorna sin cambio. La deduplicación en add_sleep
-                // impide el bucle de saturación, y el AP entrará en idle normalmente
-                // en el próximo tick del APIC timer.
             }
             // Si no está bloqueado (yield normal sin otros procesos), el proceso
             // actual simplemente continúa (se usa como idle implícito).

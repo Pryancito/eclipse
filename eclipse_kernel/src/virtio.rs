@@ -528,7 +528,7 @@ impl Virtqueue {
     /// Allocate a descriptor from the Free List
     unsafe fn alloc_desc(&mut self) -> Option<u16> {
         if self.num_free == 0 || self.free_head == 0xFFFF {
-            crate::serial::serial_print("[VirtIO-VQ] alloc_desc: queue full\n");
+            // crate::serial::serial_print("[VirtIO-VQ] alloc_desc: queue full\n");
             return None;
         }
 
@@ -1456,12 +1456,14 @@ impl VirtIOGpuDevice {
         let ctrl_type = unsafe { core::ptr::read_volatile((resp_ptr as *const u8).add(ctrl_type_offset) as *const u32) };
 
         if ctrl_type != VIRTIO_GPU_RESP_OK_NODATA {
+            /*
             let cmd_type = unsafe { core::ptr::read_volatile(self.req_buf_ptr as *const u32) };
             crate::serial::serial_print("[VirtIO-GPU] Command ");
             crate::serial::serial_print_hex(cmd_type as u64);
             crate::serial::serial_print(" failed. Response: ");
             crate::serial::serial_print_hex(ctrl_type as u64);
             crate::serial::serial_print("\n");
+            */
             return Err("unexpected response");
         }
         Ok(())
@@ -2612,10 +2614,13 @@ pub fn init() {
         }
     }
 
+    let block_count = BLOCK_DEVICES.lock().len();
     serial::serial_print("[VirtIO] Total block devices: ");
-    serial::serial_print_dec(BLOCK_DEVICES.lock().len() as u64);
+    serial::serial_print_dec(block_count as u64);
+    
+    let gpu_count = GPU_DEVICES.lock().len();
     serial::serial_print(", GPU devices: ");
-    serial::serial_print_dec(GPU_DEVICES.lock().len() as u64);
+    serial::serial_print_dec(gpu_count as u64);
     serial::serial_print("\n");
 
     // Si no hay GOP (boot framebuffer), asignar display primario VirtIO para display: scheme

@@ -1095,75 +1095,73 @@ pub struct FileSystemScheme;
 
 impl Scheme for FileSystemScheme {
     fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
-        let mounted = is_mounted();
-        if !mounted {
-            serial::serial_print("[FS-SCHEME] open() failed: filesystem NOT mounted\n");
-            return Err(scheme_error::EIO);
-        }
         
-        serial::serial_print("[FS-SCHEME] open(");
-        serial::serial_print(path);
-        serial::serial_print(")\n");
+        serial::serial_printf(format_args!("[FS-SCHEME] open({})\n", path));
 
         // Clean path to remove leading slash if present
         let clean_path = if path.starts_with('/') { &path[1..] } else { path };
 
-        if clean_path == "dev/fb0" {
-             let mut open_files = OPEN_FILES_SCHEME.lock();
-             for (i, slot) in open_files.iter_mut().enumerate() {
-                 if slot.is_none() {
-                     *slot = Some(OpenFile::Framebuffer);
-                     return Ok(i);
-                 }
-             }
-             let id = open_files.len();
-             open_files.push(Some(OpenFile::Framebuffer));
-             return Ok(id);
-        }
-
-        match Filesystem::lookup_path(clean_path) {
-            Ok(inode) => {
+        match clean_path {
+            p if p == "dev/fb0" => {
                 let mut open_files = OPEN_FILES_SCHEME.lock();
                 for (i, slot) in open_files.iter_mut().enumerate() {
                     if slot.is_none() {
-                        *slot = Some(OpenFile::Real { inode, offset: 0 });
+                        *slot = Some(OpenFile::Framebuffer);
                         return Ok(i);
                     }
                 }
                 let id = open_files.len();
-                open_files.push(Some(OpenFile::Real { inode, offset: 0 }));
+                open_files.push(Some(OpenFile::Framebuffer));
                 Ok(id)
-            }
-            Err(_) => {
+            },
+            p if p == "tmp" || p.starts_with("tmp/") => {
                 let key = String::from(clean_path);
-                let is_tmp = clean_path.starts_with("tmp/") || clean_path == "tmp";
-                
-                if is_tmp {
-                    let mut vtmp = VIRTUAL_TMP.lock();
-                    // O_CREAT: create file if it doesn't exist
-                    if (flags & O_CREAT) != 0 {
-                        if (flags & O_EXCL) != 0 && vtmp.contains_key(&key) {
-                            return Err(scheme_error::EEXIST);
-                        }
-                        vtmp.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
+                let mut vtmp = VIRTUAL_TMP.lock();
+                // O_CREAT: create file if it doesn't exist
+                if (flags & O_CREAT) != 0 {
+                    if (flags & O_EXCL) != 0 && vtmp.contains_key(&key) {
+                        return Err(scheme_error::EEXIST);
                     }
+                    vtmp.entry(key.clone()).or_insert_with(alloc::vec::Vec::new);
+                }
 
-                    if vtmp.contains_key(&key) {
-                        drop(vtmp);
+                if vtmp.contains_key(&key) {
+                    drop(vtmp);
+                    let mut open_files = OPEN_FILES_SCHEME.lock();
+                    for (i, slot) in open_files.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                            return Ok(i);
+                        }
+                    }
+                    let id = open_files.len();
+                    open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
+                    Ok(id)
+                } else {
+                    Err(scheme_error::ENOENT)
+                }
+            },
+            _ => {
+                // Real filesystem path - requires mount
+                if !is_mounted() {
+                    serial::serial_print("[FS-SCHEME] open() failed: physical path requires mount\n");
+                    return Err(scheme_error::EIO);
+                }
+                match Filesystem::lookup_path(clean_path) {
+                    Ok(inode) => {
                         let mut open_files = OPEN_FILES_SCHEME.lock();
                         for (i, slot) in open_files.iter_mut().enumerate() {
                             if slot.is_none() {
-                                *slot = Some(OpenFile::Virtual { path: key, offset: 0 });
+                                *slot = Some(OpenFile::Real { inode, offset: 0 });
                                 return Ok(i);
                             }
                         }
                         let id = open_files.len();
-                        open_files.push(Some(OpenFile::Virtual { path: key, offset: 0 }));
-                        return Ok(id);
+                        open_files.push(Some(OpenFile::Real { inode, offset: 0 }));
+                        Ok(id)
                     }
+                    Err(_) => Err(scheme_error::ENOENT)
                 }
-                
-                Err(scheme_error::ENOENT)
             }
         }
     }

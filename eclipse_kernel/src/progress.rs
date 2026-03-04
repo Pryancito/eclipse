@@ -6,6 +6,7 @@ use embedded_graphics::{
     mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyle, MonoTextStyleBuilder},
 };
 use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 // Buffer estático para acumular líneas de log hasta recibir '\n'
@@ -42,7 +43,7 @@ impl LogBuffer {
         self.len = 0;
     }
 }
-static LOG_BUFFER: Mutex<LogBuffer> = Mutex::new(LogBuffer::new());
+static LOG_BUFFER: crate::sync::ReentrantMutex<LogBuffer> = crate::sync::ReentrantMutex::new(LogBuffer::new());
 
 // Historia de logs para el HUD (últimas 8 líneas)
 const HISTORY_LINES: usize = 8;
@@ -86,11 +87,42 @@ impl LogHistory {
         written
     }
 }
-static LOG_HISTORY: Mutex<LogHistory> = Mutex::new(LogHistory::new());
+static LOG_HISTORY: crate::sync::ReentrantMutex<LogHistory> = crate::sync::ReentrantMutex::new(LogHistory::new());
+
+/// Global lock for video hardware access (framebuffer memory + VirtIO present calls).
+/// Prevents multiple cores from writing to the same pixels or saturating the VirtIO queue.
+static VIDEO_HARDWARE_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
+static MAPPED_FB_VIRT: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the dedicated WC framebuffer mapping.
+/// Should be called AFTER memory::init() so the heap is available for page tables.
+pub fn init() {
+    if let Some((phys, _, height, pitch, _)) = get_fb_info() {
+        let size = (pitch as usize) * (height as usize);
+        crate::serial::serial_print("[PROGRESS] Mapping dedicated FB: phys=");
+        crate::serial::serial_print_hex(phys);
+        crate::serial::serial_print(" size=");
+        crate::serial::serial_print_dec(size as u64);
+        crate::serial::serial_print("\n");
+        let virt = crate::memory::map_framebuffer_kernel(phys, size);
+        if virt != 0 {
+            MAPPED_FB_VIRT.store(virt, Ordering::SeqCst);
+            crate::serial::serial_print("[PROGRESS] FB mapped at ");
+            crate::serial::serial_print_hex(virt);
+            crate::serial::serial_print("\n");
+        } else {
+            crate::serial::serial_print("[PROGRESS] ERROR: Failed to map FB!\n");
+        }
+    }
+}
 
 pub fn get_logs(out: &mut [u8]) -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        LOG_HISTORY.lock().get_last_n(3, out)
+        if let Some(history) = LOG_HISTORY.try_lock() {
+            history.get_last_n(3, out)
+        } else {
+            0
+        }
     })
 }
 
@@ -147,7 +179,8 @@ impl DrawTarget for KernelFramebuffer {
 
 pub fn bar(progress: u32) {
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
-    let virt = crate::memory::phys_to_virt(phys) as *mut u8;
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
     
     let progress = progress.min(100);
@@ -216,7 +249,8 @@ pub fn bar(progress: u32) {
 
 /// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
 fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
-    let virt = crate::memory::phys_to_virt(phys) as *mut u8;
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
     let bar_width = 400u32;
@@ -258,35 +292,41 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
 
 /// Acumula `msg` en el buffer de línea. Solo renderiza en pantalla cuando llega un '\n'.
 pub fn log(msg: &str) {
+    // Desactivar interrupciones localmente es VITAL en SMP para evitar
+    // que este core sea interrumpido mientras sostiene un lock crítico.
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(mut buf) = LOG_BUFFER.try_lock() {
             let got_newline = buf.push_str(msg);
 
             if got_newline.is_some() {
-                // Sin alloc: copiamos el contenido del buffer a un array en el stack
+                // Trabajamos sobre una copia local para liberar el lock del buffer rápido
                 const MAX: usize = LOG_BUF_SIZE;
                 let mut tmp = [0u8; MAX];
                 let line_bytes = buf.flush().as_bytes();
                 let n = line_bytes.len().min(MAX);
                 tmp[..n].copy_from_slice(&line_bytes[..n]);
+                buf.clear();
+                drop(buf); // Liberamos el lock del buffer de entrada (evita bloqueos si el renderizado tarda)
+
                 let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
                 
-                // Guardar en la historia para el HUD
-                LOG_HISTORY.lock().push(line);
+                // Actualizar historia (con su propio lock)
+                if let Some(mut history) = LOG_HISTORY.try_lock() {
+                    history.push(line);
+                }
 
                 // Obtener info del framebuffer y renderizar.
-                // get_fb_info() no usa LOG_BUFFER, así que no hay deadlock.
                 if let Some((phys, width, height, pitch, source)) = get_fb_info() {
-                    buf.clear();
-                    drop(buf);
-                    render_log_line(line, source, width, height, pitch, phys);
-                } else {
-                    buf.clear();
+                    // --- PUNTO CRÍTICO SMP ---
+                    // Necesitamos un lock global de renderizado para que dos cores
+                    // no escriban al mismo tiempo en la memoria de video.
+                    if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
+                        render_log_line(line, source, width, height, pitch, phys);
+                    }
                 }
             }
         }
     });
-    // Si no hay '\n' o el lock está ocupado, el texto se pierde o espera en el buffer.
 }
 
 // ============================================================================
@@ -370,7 +410,8 @@ pub fn bsod(info: &BsodInfo) {
         return;
     }
 
-    let virt = crate::memory::phys_to_virt(phys) as *mut u8;
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
     // 1. Limpiar pantalla: azul BSOD (#0078D7)
@@ -495,3 +536,11 @@ pub fn bsod(info: &BsodInfo) {
     }
 }
 
+
+/// Forcedly unlock all logging mutexes.
+/// Danger: should ONLY be used in fork_child_setup to clear inherited locks.
+pub unsafe fn force_unlock_all() {
+    LOG_BUFFER.force_unlock();
+    LOG_HISTORY.force_unlock();
+    VIDEO_HARDWARE_LOCK.force_unlock();
+}

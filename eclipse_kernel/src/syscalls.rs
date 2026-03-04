@@ -302,16 +302,14 @@ pub extern "C" fn syscall_handler(
         109 => sys_unlink(arg1),
         200 => sys_receive_fast(context), // Fast path: datos en registros, sin buffer
         _ => {
-            serial::serial_print("[SYSCALL] Unknown syscall: ");
-            serial::serial_print_dec(syscall_num);
-            if is_linux {
-                serial::serial_print(" (Linux translated)");
-            }
-            serial::serial_print(" from process ");
-            serial::serial_print_dec(crate::process::current_process_id().unwrap_or(0) as u64);
-            serial::serial_print(" on CPU ");
-            serial::serial_print_dec(crate::process::get_cpu_id() as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!(
+                "[SYSCALL] Unknown syscall: {}{}{} from process {} on CPU {}\n",
+                syscall_num,
+                if is_linux { " (Linux translated)" } else { "" },
+                "", // Padding if needed
+                crate::process::current_process_id().unwrap_or(0),
+                crate::process::get_cpu_id()
+            ));
             u64::MAX
         }
     };
@@ -456,9 +454,7 @@ fn sys_set_process_name(name_ptr: u64, name_len: u64) -> u64 {
 /// This is the preferred way for init to start services. It avoids the fork+exec
 /// overhead and directly creates a clean process from the embedded kernel binary.
 fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
-    serial::serial_print("[SYSCALL] spawn_service(");
-    serial::serial_print_dec(service_id);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] spawn_service({})\n", service_id));
 
     let elf_slice: &[u8] = match service_id {
         0 => crate::binaries::LOG_SERVICE_BINARY,
@@ -514,16 +510,12 @@ fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
 
             crate::scheduler::enqueue_process(pid);
 
-            serial::serial_print("[SYSCALL] spawn_service: spawned PID ");
-            serial::serial_print_dec(pid as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] spawn_service: spawned PID {}\n", pid));
 
             pid as u64
         }
         Err(e) => {
-            serial::serial_print("[SYSCALL] spawn_service failed: ");
-            serial::serial_print(e);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] spawn_service failed: {}\n", e));
             u64::MAX
         }
     }
@@ -632,13 +624,10 @@ fn is_user_pointer(ptr: u64, len: u64) -> bool {
     
     // Check upper bound (Canonical lower half)
     if end > 0x0000_8000_0000_0000 {
-        serial::serial_print("[SYSCALL] is_user_pointer failed: ");
-        serial::serial_print_hex(ptr);
-        serial::serial_print(" len ");
-        serial::serial_print_dec(len);
-        serial::serial_print(" end ");
-        serial::serial_print_hex(end);
-        serial::serial_print("\n");
+        serial::serial_printf(format_args!(
+            "[SYSCALL] is_user_pointer failed: {:#X} len {} end {:#X}\n",
+            ptr, len, end
+        ));
         return false;
     }
     
@@ -753,13 +742,10 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     if let Some(pid) = current_process_id() {
         let is_linux = crate::process::get_process(pid).map(|p| p.is_linux).unwrap_or(false);
         if is_linux && len > 64 {
-             serial::serial_print("[DEBUG-READ] PID ");
-             serial::serial_print_dec(pid as u64);
-             serial::serial_print(" fd=");
-             serial::serial_print_dec(fd);
-             serial::serial_print(" len=");
-             serial::serial_print_dec(len);
-             serial::serial_print("\n");
+             serial::serial_printf(format_args!(
+                 "[DEBUG-READ] PID {} fd={} len={}\n",
+                 pid, fd, len
+             ));
         }
 
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
@@ -768,16 +754,12 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
                     Ok(bytes_read) => {
                         if is_linux && len > 64 {
-                            serial::serial_print("[DEBUG-READ]   -> read ");
-                            serial::serial_print_dec(bytes_read as u64);
-                            serial::serial_print(" bytes\n");
+                            serial::serial_printf(format_args!("[DEBUG-READ]   -> read {} bytes\n", bytes_read));
                         }
                         return bytes_read as u64
                     },
                     Err(e) => {
-                        serial::serial_print("[SYSCALL] read() scheme error: ");
-                        serial::serial_print_dec(e as u64);
-                        serial::serial_print("\n");
+                        serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
                         return u64::MAX;
                     }
                 }
@@ -1358,9 +1340,7 @@ fn sys_wait(status_ptr: u64) -> u64 {
 /// 6 = network_service (Network Server)
 /// 7 = gui_service (GUI Launcher)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
-    serial::serial_print("[SYSCALL] get_service_binary(");
-    serial::serial_print_dec(service_id);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] get_service_binary({})\n", service_id));
     
     // Validate pointers
     if out_ptr == 0 || out_size == 0 {
@@ -1395,11 +1375,10 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         *(out_size as *mut u64) = bin_size;
     }
     
-    serial::serial_print("[SYSCALL] Service binary: ptr=");
-    serial::serial_print_hex(bin_ptr);
-    serial::serial_print(", size=");
-    serial::serial_print_dec(bin_size);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!(
+        "[SYSCALL] Service binary: ptr={:#X}, size={}\n",
+        bin_ptr, bin_size
+    ));
     
     0 // Success
 }
@@ -1477,9 +1456,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         core::str::from_utf8(slice).unwrap_or("")
     };
     
-    serial::serial_print("[SYSCALL] open(\"");
-    serial::serial_print(path);
-    serial::serial_print("\")\n");
+    serial::serial_printf(format_args!("[SYSCALL] open(\"{}\")\n", path));
 
     // Route through scheme system
     // /dev/xxx -> dev:xxx (framebuffer, etc.); other /paths -> file:path
@@ -1488,9 +1465,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(&dev_path, flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_print("[SYSCALL] open() dev failed: error ");
-                serial::serial_print_dec(e as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[SYSCALL] open() dev failed: error {}\n", e));
                 return u64::MAX;
             }
         }
@@ -1519,9 +1494,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     if let Some(pid) = current_process_id() {
         match crate::fd::fd_open(pid, scheme_id, resource_id, flags as u32) {
             Some(fd) => {
-                serial::serial_print("[SYSCALL] open() -> FD ");
-                serial::serial_print_dec(fd as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[SYSCALL] open() -> FD {}\n", fd));
                 fd as u64
             }
             None => {
@@ -2585,16 +2558,21 @@ fn sys_nanosleep(req: u64) -> u64 {
         // PROCESS_TABLE is indexed by slot, not by PID value.  After slot reuse,
         // a process can have PID ≥ 64, so table[pid as usize] would be out-of-bounds.
         // Use pid_to_slot_fast() to obtain the correct slot index.
-        let slot = crate::ipc::pid_to_slot_fast(pid);
         x86_64::instructions::interrupts::without_interrupts(|| {
+            let slot = crate::ipc::pid_to_slot_fast(pid);
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(slot_idx) = slot {
                 if let Some(p) = table[slot_idx].as_mut() {
-                    p.state = crate::process::ProcessState::Blocked;
+                    // Safety check: ensure we are still targeting the correct PID
+                    if p.id == pid {
+                         p.state = crate::process::ProcessState::Blocked;
+                    }
                 }
             }
+            // Add to sleep queue while still in the interrupt-disabled section
+            // to prevent preemption between marking as Blocked and enqueuing.
+            crate::scheduler::add_sleep(pid, wake_tick);
         });
-        crate::scheduler::add_sleep(pid, wake_tick);
     }
 
     // Yield CPU; we will be rescheduled by the timer once the sleep expires.

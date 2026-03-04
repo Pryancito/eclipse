@@ -58,16 +58,7 @@ static mut BOOT_STACK: BootStack = BootStack { stack: [0; 65536] };
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial::serial_print("at ");
-    if let Some(location) = info.location() {
-        serial::serial_print(location.file());
-        serial::serial_print(":");
-        serial::serial_print_dec(location.line() as u64);
-    }
-    serial::serial_print("\n  Message: ");
-    let mut writer = crate::serial::SerialWriter;
-    let _ = core::fmt::write(&mut writer, format_args!("{}", info.message()));
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("\n[KERNEL] PANIC on CPU {}: {}\n", crate::process::get_cpu_id(), info));
     loop {
         unsafe { core::arch::asm!("hlt") };
     }
@@ -247,6 +238,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     
     serial::serial_print("Initializing memory system...\n");
     memory::init();
+    progress::init();
     progress::bar(65);
 
     interrupts::init();
@@ -353,22 +345,18 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
         match process::spawn_process(INIT_BINARY, "init") {
             Ok(pid) => {
-                serial::serial_print("[KERNEL] Init process loaded with PID: ");
-                serial::serial_print_dec(pid as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[KERNEL] Init process loaded with PID: {}\n", pid));
                 progress::bar(95);
                 scheduler::enqueue_process(pid);
                 serial::serial_print("[KERNEL] Init process scheduled for execution\n");
             },
             Err(e) => {
-                serial::serial_print("[KERNEL] Failed to spawn init process: ");
-                serial::serial_print(e);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[KERNEL] Failed to spawn init process: {}\n", e));
             }
         }
     }
 
-    serial::serial_print("\n[KERNEL] System initialization complete!\n\n");
+    serial::serial_printf(format_args!("\n[KERNEL] System initialization complete!\n\n"));
     progress::bar(100);
     
     loop {

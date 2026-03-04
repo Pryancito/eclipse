@@ -258,13 +258,10 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                 process.brk_current = initial_brk;
                 process.mem_frames = (stack_size / 4096) as u64; // Initial stack frames
                 
-                crate::serial::serial_print("[PROC] Created process PID: ");
-                crate::serial::serial_print_dec(pid as u64);
-                crate::serial::serial_print(" slot: ");
-                crate::serial::serial_print_dec(slot_idx as u64);
-                crate::serial::serial_print(" CR3: ");
-                crate::serial::serial_print_hex(process.page_table_phys);
-                crate::serial::serial_print("\n");
+                crate::serial::serial_printf(format_args!(
+                    "[PROC] Created process PID: {} slot: {} CR3: {:#018X}\n",
+                    pid, slot_idx, process.page_table_phys
+                ));
 
                 *slot = Some(process);
                 // Registrar en tabla inversa PID → slot O(1) para IPC
@@ -675,8 +672,8 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 name[..copy_len].copy_from_slice(&parent.name[..copy_len]);
                 child.name = name;
 
-                // Set up context so the child resumes via fork_child_trampoline.
-                child.context.rip = crate::interrupts::fork_child_trampoline as *const () as u64;
+                // Set up context so the child resumes via fork_child_setup (which clears locks).
+                child.context.rip = crate::interrupts::fork_child_setup as *const () as u64;
                 child.context.rsp = kstack_ptr as u64;
                 child.context.rax = 0; // fork() returns 0 in the child
                 child.context.rbx = parent_context.rbx;

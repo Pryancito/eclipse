@@ -224,14 +224,13 @@ pub fn start_aps() {
             // Send INIT-SIPI sequence
             serial_printf(format_args!("[CPU] sending INIT to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0, 5, true, false);
-            wait_ms(10);
+            delay_ms(10);
             serial_printf(format_args!("[CPU] sending SIPI to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             
             // Give it 1ms to see if it starts on the first SIPI
-            wait_ms(1);
+            delay_ms(1);
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
-                serial_printf(format_args!("[CPU] sending second SIPI to AP {}...\n", target_apic_id));
                 // Send second SIPI if not ready
                 crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             }
@@ -242,7 +241,7 @@ pub fn start_aps() {
             while AP_READY.load(Ordering::SeqCst) < expected_ready
                 && crate::interrupts::ticks() < timeout_tick
             {
-                wait_ms(1);
+                delay_ms(1);
             }
             
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
@@ -316,21 +315,9 @@ use crate::serial::serial_printf;
 /// Detectar si estamos ejecutando bajo un hipervisor (QEMU/KVM, etc.).
 /// Usa CPUID leaf 1, ECX[31] = Hypervisor Present.
 pub fn is_running_under_hypervisor() -> bool {
-    let mut ecx_val: u32;
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ecx_out:e}, ecx",
-            "pop rbx",
-            ecx_out = out(reg) ecx_val,
-            inout("eax") 1 => _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    (ecx_val & (1 << 31)) != 0
+    // Usa CPUID leaf 1, ECX[31] = Hypervisor Present.
+    let result = unsafe { core::arch::x86_64::__cpuid(1) };
+    (result.ecx & (1 << 31)) != 0
 }
 
 static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -354,7 +341,7 @@ pub fn detect_features() {
         );
     }
     // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
-    if (ecx_val & (1 << 3)) != 0 {
+    if (result.ecx & (1 << 3)) != 0 {
         MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
         serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
     }
@@ -525,6 +512,7 @@ extern "C" fn ap_main_loop() -> ! {
     unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
 
     loop {
-        idle();
+        crate::cpu::idle();
+        crate::scheduler::schedule();
     }
 }
