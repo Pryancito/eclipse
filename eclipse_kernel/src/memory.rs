@@ -215,19 +215,45 @@ pub const PAGE_PAT_HUGE: u64 = 1 << 12; // PAT for Huge pages
 /// Customized PAT:
 /// PA1: WC (01) -> PWT=1, PCD=0, PAT=0
 pub fn init_pat() {
-    let mut pat: u64;
     unsafe {
-        // Read IA32_PAT MSR (0x277)
-        core::arch::asm!("rdmsr", in("ecx") 0x277u32, out("eax") pat, out("edx") _);
-        
-        // Preserve PA0 (WB), set PA1 to WC (01)
-        // PAT is 8 entries of 8 bits each.
-        // PA1 is bits 8-15.
+        // Read IA32_PAT MSR (0x277). rdmsr returns the 64-bit value as EDX:EAX.
+        let pat_lo: u32;
+        let pat_hi: u32;
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") 0x277u32,
+            out("eax") pat_lo,
+            out("edx") pat_hi,
+        );
+
+        // Combine high:low into the full 64-bit PAT value so that PA4-PA7 are preserved.
+        let mut pat = (pat_hi as u64) << 32 | (pat_lo as u64);
+
+        // Set PA1 to WC (01). PA1 is bits 8-15.
         pat &= !(0xFF << 8);
         pat |= 0x01 << 8;
-        
-        // Write back IA32_PAT
-        core::arch::asm!("wrmsr", in("ecx") 0x277u32, in("eax") pat as u32, in("edx") (pat >> 32) as u32);
+
+        // Per Intel SDM Vol 3 §11.12.4: flush caches and TLBs before/after writing PAT
+        // to avoid undefined behavior from inconsistent memory type attributes.
+        // Step 1: flush all caches.
+        core::arch::asm!("wbinvd");
+
+        // Step 2: flush TLBs by reloading CR3.  Any write to CR3 invalidates
+        // all non-global TLB entries; the value written is the current CR3.
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        core::arch::asm!("mov cr3, {}", in(reg) cr3);
+
+        // Step 3: write the new PAT MSR value.
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0x277u32,
+            in("eax") pat as u32,
+            in("edx") (pat >> 32) as u32,
+        );
+
+        // Step 4: flush TLBs again after the PAT change.
+        core::arch::asm!("mov cr3, {}", in(reg) cr3);
     }
     crate::serial::serial_print("[MEM] PAT initialized (PA1=WC)\n");
 }

@@ -337,18 +337,20 @@ static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Detectar características avanzadas de la CPU (MONITOR/MWAIT)
 pub fn detect_features() {
-    let mut ecx_val: u32;
+    // CPUID clobbers RBX (callee-saved); push/pop it around the instruction
+    // so the compiler does not have to spill it separately.
+    // Capture the ECX result directly with out("ecx") to avoid the need for
+    // an intermediate mov that could conflict with the rbx save/restore.
+    let ecx_val: u32;
     unsafe {
         core::arch::asm!(
             "push rbx",
             "cpuid",
-            "mov {ecx_out:e}, ecx",
             "pop rbx",
-            ecx_out = out(reg) ecx_val,
-            inout("eax") 1 => _,
-            out("ecx") _,
+            inout("eax") 1u32 => _,
+            out("ecx") ecx_val,
             out("edx") _,
-            options(nomem, nostack, preserves_flags)
+            options(preserves_flags)
         );
     }
     // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
