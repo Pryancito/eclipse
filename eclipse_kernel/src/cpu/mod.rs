@@ -221,27 +221,45 @@ pub fn start_aps() {
             // Record current ready count BEFORE starting the AP
             let expected_ready = AP_READY.load(Ordering::SeqCst) + 1;
 
-            // Send INIT-SIPI sequence
+            // Send INIT-SIPI sequence.
+            // Use wait_ms() (tick + TSC dual-clock) instead of delay_ms() (TSC-only)
+            // so the delays are accurate even when TSC calibration is approximate.
             serial_printf(format_args!("[CPU] sending INIT to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0, 5, true, false);
-            delay_ms(10);
+            wait_ms(10);
             serial_printf(format_args!("[CPU] sending SIPI to AP {}...\n", target_apic_id));
             crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             
             // Give it 1ms to see if it starts on the first SIPI
-            delay_ms(1);
+            wait_ms(1);
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
                 // Send second SIPI if not ready
                 crate::apic::send_ipi_exact(target_apic_id, 0x01, 6, false, false);
             }
             
             // Wait for this AP to signal readiness before starting the next one.
-            // 1000ms gives slow real hardware enough time to boot.
+            // Use BOTH a tick-based deadline (accurate when TIMER_TICKS advances)
+            // AND a TSC-based ceiling (fallback for hardware where ticks may freeze).
+            // This prevents an infinite hang regardless of timer state.
             let timeout_tick = crate::interrupts::ticks() + 1000;
-            while AP_READY.load(Ordering::SeqCst) < expected_ready
-                && crate::interrupts::ticks() < timeout_tick
-            {
-                delay_ms(1);
+            let tsc_counts_per_us = TSC_COUNTS_PER_US.load(Ordering::Relaxed);
+            // Guarantee a minimum ceiling equivalent to ≥ 1 second at ≤ 5 GHz TSC,
+            // so a miscalibrated (very small) tsc_counts_per_us does not cause a
+            // premature timeout that truncates AP startup on slow real hardware.
+            const MIN_TSC_CEILING: u64 = 5_000_000_000; // 5 × 10^9 cycles ≥ 1 s at 5 GHz
+            let tsc_ceiling = tsc_counts_per_us
+                .saturating_mul(1_000)   // counts per ms
+                .saturating_mul(1_000)   // total for 1000 ms
+                .max(MIN_TSC_CEILING);
+            let tsc_start = rdtsc();
+            while AP_READY.load(Ordering::SeqCst) < expected_ready {
+                if crate::interrupts::ticks() >= timeout_tick {
+                    break;
+                }
+                if rdtsc().wrapping_sub(tsc_start) >= tsc_ceiling {
+                    break;
+                }
+                crate::cpu::pause();
             }
             
             if AP_READY.load(Ordering::SeqCst) < expected_ready {

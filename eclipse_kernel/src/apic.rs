@@ -36,6 +36,9 @@ const APIC_BASE_X2APIC: u64 = 1 << 10;
 static mut LAPIC_BASE: u64 = 0;
 /// True when the CPU is running in x2APIC mode (MSR-based register access)
 static IS_X2APIC: AtomicBool = AtomicBool::new(false);
+/// True on the Bootstrap Processor (IA32_APIC_BASE MSR bit 8).
+/// Set once during apic::init() on the BSP and never changed.
+static IS_BSP: AtomicBool = AtomicBool::new(false);
 
 /// Fallback LAPIC timer count per 1ms when calibration cannot measure a
 /// realistic value. Derived from a 100 MHz bus / 16 (divider) = 6.25 MHz,
@@ -134,6 +137,13 @@ pub fn init() {
 
         let is_bsp = (low & (1 << 8)) != 0;
 
+        // Record whether this is the BSP so that interrupt handlers can use
+        // is_bsp() instead of relying on `cpu_id == 0`, which fails on systems
+        // where the Bootstrap Processor has a non-zero LAPIC ID.
+        if is_bsp {
+            IS_BSP.store(true, Ordering::SeqCst);
+        }
+
         // 1.5 Ensure LINT0 is configured as ExtINT (Delivery mode 7) and Unmasked.
         // This is crucial on real hardware so that legacy 8259 PIC interrupts
         // (like IRQ0 PIT) can still reach the BSP.
@@ -162,6 +172,15 @@ pub fn eoi() {
     unsafe {
         write_reg(LAPIC_REG_EOI, 0);
     }
+}
+
+/// Returns true if the calling CPU is the Bootstrap Processor.
+/// Determined once during apic::init() from IA32_APIC_BASE MSR bit 8.
+/// More reliable than checking `cpu_id == 0` because the BSP is not
+/// guaranteed to have APIC ID 0 on all real-hardware platforms.
+#[inline]
+pub fn is_bsp() -> bool {
+    IS_BSP.load(Ordering::Relaxed)
 }
 
 /// Get the Local APIC ID of the current CPU (32-bit to support x2APIC IDs)

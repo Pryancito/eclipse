@@ -1364,15 +1364,18 @@ pub fn get_stats() -> InterruptStats {
 // ============================================================================
 
 /// Rust-level handler for the Local APIC periodic timer interrupt.
-/// On BSP (cpu 0): runs full system tick (TIMER_TICKS, process_messages, wake_sleeping, schedule).
+/// On BSP: runs full system tick (TIMER_TICKS, process_messages, wake_sleeping, schedule).
 /// On APs: only calls schedule(). The BSP drives the global heartbeat so sleep/wake and IPC
 /// work correctly on SMP even when PIT (IRQ 0) delivery is unreliable.
 extern "C" fn apic_timer_handler() {
     crate::apic::eoi();
-    let cpu_id = crate::process::get_cpu_id();
 
-    // Global heartbeat (only on BSP)
-    if cpu_id == 0 {
+    // Use is_bsp() (derived from IA32_APIC_BASE MSR bit 8) rather than
+    // `cpu_id == 0` to identify the BSP.  On some real-hardware platforms
+    // the Bootstrap Processor has a non-zero LAPIC ID, so cpu_id == 0 would
+    // silently skip the global heartbeat and cause TIMER_TICKS to freeze,
+    // making every ticks()-based timeout spin forever.
+    if crate::apic::is_bsp() {
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
         let ticks = TIMER_TICKS.load(Ordering::Relaxed);
         
