@@ -237,18 +237,51 @@ pub fn init_pat() {
         pat &= !(0xFF << 8);
         pat |= 0x01 << 8;
 
-        // Per Intel SDM Vol 3 §11.12.4: flush caches and TLBs before/after writing PAT
-        // to avoid undefined behavior from inconsistent memory type attributes.
-        // Step 1: flush all caches.
-        core::arch::asm!("wbinvd");
+        // Full PAT change procedure per Intel SDM Vol 3A §11.12.4.
+        // This matches the "case 1" procedure (conservative path) to handle any
+        // existing WT/WC/UC- mappings that may be present in the TLBs or caches.
+        // Skipping steps can cause undefined behavior on real hardware.
 
-        // Step 2: flush TLBs by reloading CR3.  Any write to CR3 invalidates
-        // all non-global TLB entries; the value written is the current CR3.
+        // Bit positions used below.
+        const CR4_PGE: u64 = 1u64 << 7;  // CR4: Page Global Enable
+        const CR0_CD:  u64 = 1u64 << 30; // CR0: Cache Disable
+        const CR0_NW:  u64 = 1u64 << 29; // CR0: Not Write-through
+        const RFLAGS_IF: u64 = 1u64 << 9; // RFLAGS: Interrupt Flag
+
+        // Step 1: Save RFLAGS and disable interrupts to prevent an interrupt handler
+        // from seeing an inconsistent PAT state during the update window.
+        let rflags: u64;
+        // pushfq writes to the stack; do not mark as nomem.
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(preserves_flags));
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+
+        // Step 2: Read and save CR4.  Clear the PGE bit (bit 7) to flush ALL TLB
+        // entries, including global ones that a plain CR3 reload would not evict.
+        let cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4);
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_PGE);
+
+        // Step 3: Read and save CR3 for the TLB flush below.
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3);
+
+        // Step 4: Flush all caches (WBINVD writes back dirty lines and invalidates).
+        core::arch::asm!("wbinvd");
+
+        // Step 5: Flush non-global TLBs by reloading CR3.
+        // (Global TLBs were already flushed by clearing CR4.PGE in step 2.)
         core::arch::asm!("mov cr3, {}", in(reg) cr3);
 
-        // Step 3: write the new PAT MSR value.
+        // Step 6: Disable caching globally (CR0.CD=1, CR0.NW=0) so that speculative
+        // memory accesses cannot observe stale PAT-derived memory types while the MSR
+        // is being updated.
+        let cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        // CD=1 disables cache fills; NW=0 enables write-through (required with CD=1).
+        let cr0_cd = (cr0 | CR0_CD) & !CR0_NW;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0_cd);
+
+        // Step 7: Write the new PAT MSR value.
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0x277u32,
@@ -256,8 +289,23 @@ pub fn init_pat() {
             in("edx") (pat >> 32) as u32,
         );
 
-        // Step 4: flush TLBs again after the PAT change.
+        // Step 8: Flush caches again so that any lines cached under old PAT attributes
+        // are evicted before normal (cached) operation resumes.
+        core::arch::asm!("wbinvd");
+
+        // Step 9: Re-enable caching by restoring original CR0 (clears CD and NW).
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
+        // Step 10: Flush TLBs again after restoring cached operation.
         core::arch::asm!("mov cr3, {}", in(reg) cr3);
+
+        // Step 11: Restore CR4.PGE so global TLB entries can be cached again.
+        core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+        // Step 12: Restore interrupt flag if it was set before we disabled interrupts.
+        if rflags & RFLAGS_IF != 0 {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
     }
     crate::serial::serial_print("[MEM] PAT initialized (PA1=WC)\n");
 }
