@@ -87,11 +87,18 @@ pub fn read_byte() -> Option<u8> {
 
 /// Leer un byte del puerto serial (blocking - espera hasta que haya datos)
 pub fn read_byte_blocking() -> u8 {
-    let _lock = SERIAL_PORT_LOCK.lock();
-    while !is_data_available() {
-        crate::cpu::pause();
+    // Spin *outside* the lock so other CPUs can still transmit while we wait.
+    // Once data is detected, claim it under the lock (re-check to handle races).
+    loop {
+        while !is_data_available() {
+            crate::cpu::pause();
+        }
+        let _lock = SERIAL_PORT_LOCK.lock();
+        if is_data_available() {
+            return unsafe { inb(SERIAL_PORT) };
+        }
+        // Another CPU grabbed the byte; retry the outer loop.
     }
-    unsafe { inb(SERIAL_PORT) }
 }
 
 /// Leer múltiples bytes del serial hasta llenar el buffer o timeout
@@ -100,17 +107,19 @@ pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
     if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
         return 0;
     }
-    
+
+    // Hold the lock for the entire read so bytes are not interleaved between CPUs.
+    let _lock = SERIAL_PORT_LOCK.lock();
     let mut count = 0;
     let mut timeout = timeout_iterations;
-    
+
     for byte in buffer.iter_mut() {
         if timeout == 0 {
             break;
         }
-        
-        if let Some(b) = read_byte() {
-            *byte = b;
+
+        if is_data_available() {
+            *byte = unsafe { inb(SERIAL_PORT) };
             count += 1;
             timeout = timeout_iterations; // Reset timeout on successful read
         } else {
@@ -118,16 +127,18 @@ pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
             crate::cpu::pause();
         }
     }
-    
+
     count
 }
 
 /// Escribir un byte al puerto serial (versión pública)
 pub fn serial_print_byte(byte: u8) {
-    if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
-        return;
-    }
-    write_byte(byte);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+        write_byte(byte);
+    });
 }
 
 /// Escribir un caracter al puerto serial
