@@ -54,7 +54,9 @@ pub fn query_input_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
             let mut pid_bytes = [0u8; 4];
             pid_bytes.copy_from_slice(&buffer[4..8]);
             let pid = u32::from_le_bytes(pid_bytes);
-            if pid > 0 { return Some(pid); }
+            // Si el init responde con pid==0 el servicio no está en marcha; salir
+            // inmediatamente en lugar de esperar max_attempts iteraciones más.
+            return if pid > 0 { Some(pid) } else { None };
         }
         yield_cpu();
     }
