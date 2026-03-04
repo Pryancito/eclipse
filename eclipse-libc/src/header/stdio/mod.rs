@@ -13,6 +13,10 @@ const MODE_READ: c_int = 1;
 const MODE_WRITE: c_int = 2;
 const MODE_APPEND: c_int = 4;
 
+/// FILE spinlock states.
+const FILE_LOCK_UNLOCKED: i32 = 0;
+const FILE_LOCK_LOCKED: i32 = 1;
+
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub type FILE = c_void;
 
@@ -105,7 +109,7 @@ mod target {
     unsafe fn file_lock_acquire(stream: *mut FILE) {
         loop {
             if (*stream).lock
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange_weak(FILE_LOCK_UNLOCKED, FILE_LOCK_LOCKED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 return;
@@ -116,7 +120,7 @@ mod target {
 
     /// Release the per-FILE spinlock.
     unsafe fn file_lock_release(stream: *mut FILE) {
-        (*stream).lock.store(0, Ordering::Release);
+        (*stream).lock.store(FILE_LOCK_UNLOCKED, Ordering::Release);
     }
 
     /// Internal unlocked flush – caller must hold the FILE lock.
@@ -898,7 +902,7 @@ mod target {
             return -1;
         }
         match (*stream).lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(FILE_LOCK_UNLOCKED, FILE_LOCK_LOCKED, Ordering::Acquire, Ordering::Relaxed)
         {
             Ok(_) => 0,
             Err(_) => -1,

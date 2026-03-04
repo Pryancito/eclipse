@@ -2,6 +2,10 @@
 use crate::types::*;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+/// Spinlock states for pthread_mutex_t and FILE locks.
+const MUTEX_UNLOCKED: i32 = 0;
+const MUTEX_LOCKED: i32 = 1;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct pthread_t {
@@ -105,7 +109,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
     if mutex.is_null() { return crate::header::errno::EINVAL; }
     loop {
         if (*mutex).lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(MUTEX_UNLOCKED, MUTEX_LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
             return 0;
@@ -121,7 +125,7 @@ extern "C" { pub fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int; }
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
     match (*mutex).lock
-        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .compare_exchange(MUTEX_UNLOCKED, MUTEX_LOCKED, Ordering::Acquire, Ordering::Relaxed)
     {
         Ok(_) => 0,
         Err(_) => crate::header::errno::EBUSY,
@@ -134,9 +138,7 @@ extern "C" { pub fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int;
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
-    (*mutex).lock.store(0, Ordering::Release);
-    // Wake any futex waiters (for cond_wait that may be sleeping on the mutex)
-    let _ = eclipse_syscall::call::futex_wake(&(*mutex).lock, 1);
+    (*mutex).lock.store(MUTEX_UNLOCKED, Ordering::Release);
     0
 }
 #[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
