@@ -195,6 +195,13 @@ pub fn init_kernel_process() {
     process.name[..len].copy_from_slice(&name[..len]);
     
     table[0] = Some(process);
+    drop(table);
+    // Register PID 0 in the inverse slot map so that pid_to_slot_fast(0) returns
+    // Some(0) immediately without falling back to the O(N) PROCESS_TABLE scan.
+    // Without this, perform_context_switch(0, X) deadlocks on single-CPU systems:
+    // it holds PROCESS_TABLE.lock() and then the O(N) fallback tries to acquire it
+    // again, spinning forever.
+    crate::ipc::register_pid_slot(0, 0);
     set_current_process(Some(0));
 }
 
