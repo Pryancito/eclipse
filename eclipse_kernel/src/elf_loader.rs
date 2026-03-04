@@ -476,18 +476,17 @@ pub unsafe extern "C" fn jump_to_userspace(entry_point: u64, stack_top: u64, phd
     const AT_RANDOM: u64 = 25;
     const AT_NULL: u64 = 0;
     // System V ABI for x86-64 at program entry specifies RSP is 16-byte aligned (RSP % 16 == 0).
-    // HOWEVER, if the entry point is a standard C function (extern "C" fn), the compiler
-    // assumes it was CALLed and expects RSP % 16 == 8. 
-    // We adjust it to satisfy most compilers while keeping argc/argv/auxv at the base.
-    let base_stack = (stack_top - 144) & !0xF;
-    let adjusted_stack = base_stack - 8;
+    // Previous code was subtracting 8, which is only for function calls, not process entry.
+    let adjusted_stack = (stack_top - 144) & !0xF;
+
+    crate::serial::serial_printf(format_args!("[ELF] PID 1 jumping to userspace at {:#x} with RSP {:#x}\n", entry_point, adjusted_stack));
 
     // Always reload CR3 to flush the TLB. exec remaps code pages via
     // map_user_page_4kb but the TLB may still cache the old fork'd PTEs.
     // A CR3 write flushes all non-global TLB entries.
     if let Some(pid) = current_process_id() {
         if let Some(proc) = get_process(pid) {
-            let want_cr3 = proc.page_table_phys;
+            let want_cr3 = proc.resources.lock().page_table_phys;
             unsafe { memory::set_cr3(want_cr3); }
         }
     }

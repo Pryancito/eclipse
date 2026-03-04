@@ -390,13 +390,17 @@ pub fn schedule() {
                         if cpu_id < MAX_CPUS {
                             // Guardar el contexto idle de este AP para poder volver más tarde.
                             // Safety: cada CPU escribe únicamente su propia ranura [cpu_id].
-                            let idle_ctx = unsafe { &mut AP_IDLE_CONTEXTS[cpu_id] };
-                            AP_IDLE_CONTEXT_VALID[cpu_id].store(true, Ordering::SeqCst);
-                            perform_context_switch_to(idle_ctx, next_pid);
+                            x86_64::instructions::interrupts::without_interrupts(|| {
+                                let idle_ctx = unsafe { &mut AP_IDLE_CONTEXTS[cpu_id] };
+                                AP_IDLE_CONTEXT_VALID[cpu_id].store(true, Ordering::SeqCst);
+                                perform_context_switch_to(idle_ctx, next_pid);
+                            });
                         } else {
                             // cpu_id fuera de rango: fallback al dummy original.
-                            let mut dummy = crate::process::Context::new();
-                            perform_context_switch_to(&mut dummy, next_pid);
+                            x86_64::instructions::interrupts::without_interrupts(|| {
+                                let mut dummy = crate::process::Context::new();
+                                perform_context_switch_to(&mut dummy, next_pid);
+                            });
                         }
                     }
                 }
@@ -414,36 +418,40 @@ pub fn schedule() {
 
                 if cpu_id == 0 {
                     // BSP: volver al proceso kernel (PID 0) que actúa como idle.
-                    {
-                        let mut table = crate::process::PROCESS_TABLE.lock();
-                        if let Some(p0) = table[0].as_mut() {
-                            p0.state = ProcessState::Running;
-                            p0.current_cpu = 0;
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        {
+                            let mut table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(p0) = table[0].as_mut() {
+                                p0.state = ProcessState::Running;
+                                p0.current_cpu = 0;
+                            }
                         }
-                    }
-                    perform_context_switch(blocked_pid, 0);
+                        perform_context_switch(blocked_pid, 0);
+                    });
                 } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
                     // AP: restaurar el contexto idle guardado.
-                    set_current_process(None);
-                    let (from_ptr, clear_ptr) = {
-                        let mut table = crate::process::PROCESS_TABLE.lock();
-                        let slot = match crate::ipc::pid_to_slot_fast(blocked_pid) {
-                            Some(s) => s,
-                            None => return,
+                    x86_64::instructions::interrupts::without_interrupts(|| {
+                        set_current_process(None);
+                        let (from_ptr, clear_ptr) = {
+                            let mut table = crate::process::PROCESS_TABLE.lock();
+                            let slot = match crate::ipc::pid_to_slot_fast(blocked_pid) {
+                                Some(s) => s,
+                                None => return,
+                            };
+                            match table[slot].as_mut() {
+                                Some(p) if p.id == blocked_pid => {
+                                    let ctx_ptr = &mut p.context as *mut crate::process::Context;
+                                    let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
+                                    (ctx_ptr, cpu_ptr)
+                                },
+                                _ => return,
+                            }
                         };
-                        match table[slot].as_mut() {
-                            Some(p) if p.id == blocked_pid => {
-                                let ctx_ptr = &mut p.context as *mut crate::process::Context;
-                                let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
-                                (ctx_ptr, cpu_ptr)
-                            },
-                            _ => return,
+                        let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
+                        unsafe {
+                            crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
                         }
-                    };
-                    let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
-                    unsafe {
-                        crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
-                    }
+                    });
                 }
             }
             // Si no está bloqueado (yield normal sin otros procesos), el proceso
@@ -501,12 +509,12 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
         if to_process.state == ProcessState::Terminated {
             return;
         }
-        (
-            &to_process.context as *const crate::process::Context,
-            to_process.kernel_stack_top,
-            to_process.page_table_phys,
-            to_process.fs_base
-        )
+        let to_ctx_ptr = &to_process.context as *const crate::process::Context;
+        let to_kernel_stack = to_process.kernel_stack_top;
+        let to_page_table = to_process.resources.lock().page_table_phys;
+        let to_fs_base = to_process.fs_base;
+        
+        (to_ctx_ptr, to_kernel_stack, to_page_table, to_fs_base)
     };
     
     // Update TSS RSP0
@@ -568,6 +576,9 @@ fn perform_context_switch_to(from_ctx: &mut crate::process::Context, to_pid: Pro
     // after saving the from-context, before restoring the to-context.
     unsafe {
         crate::process::set_current_process(Some(to_pid));
+        if to_pid != 0 {
+            crate::serial::serial_printf(format_args!("[SCHED] C{} switching to PID {}\n", crate::process::get_cpu_id(), to_pid));
+        }
         crate::process::switch_context(from_ctx, &*to_ptr, next_cr3, clear_addr);
     }
 }

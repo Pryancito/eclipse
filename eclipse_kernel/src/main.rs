@@ -45,6 +45,10 @@ mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod sync;    // Synchronization primitives
 
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOC: &memory::InterruptSafeAllocator = &memory::ALLOCATOR;
+
 /// Stack de arranque (16KB)
 /// Used to ensure we run on a Higher Half stack immediately after boot
 #[repr(align(16))]
@@ -356,7 +360,8 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         }
     }
 
-    serial::serial_printf(format_args!("\n[KERNEL] System initialization complete!\n\n"));
+    let cpu_id = crate::process::get_cpu_id();
+    serial::serial_printf(format_args!("\n[C{}] [KERNEL] System initialization complete!\n\n", cpu_id));
     progress::bar(100);
     
     loop {

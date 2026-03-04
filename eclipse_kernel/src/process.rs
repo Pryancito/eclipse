@@ -2,6 +2,8 @@
 
 use core::arch::asm;
 use spin::Mutex;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// ID de proceso
 pub type ProcessId = u32;
@@ -52,6 +54,25 @@ pub struct Context {
     pub rflags: u64, // 0x88
 }
 
+/// Contexto de recursos compartidos entre hilos (proceso lógico)
+pub struct ProcessResources {
+    pub page_table_phys: u64,          // Physical address of the PML4
+    pub vmas: Vec<VMARegion>,          // Memory mappings
+    pub brk_current: u64,              // Current program break (heap end)
+    pub fd_table_idx: usize,           // Index into FD_TABLES
+}
+
+impl ProcessResources {
+    pub fn new(page_table_phys: u64, fd_table_idx: usize) -> Self {
+        Self {
+            page_table_phys,
+            vmas: Vec::new(),
+            brk_current: 0,
+            fd_table_idx,
+        }
+    }
+}
+
 impl Context {
     pub const fn new() -> Self {
         Self {
@@ -76,9 +97,7 @@ pub struct Process {
     pub time_slice: u32,
     pub parent_pid: Option<ProcessId>, // Parent process ID for fork()
     pub kernel_stack_top: u64,         // Top of the kernel stack (RSP0)
-    pub page_table_phys: u64,          // Physical address of the PML4
-    pub vmas: alloc::vec::Vec<VMARegion>, // Memory mappings
-    pub brk_current: u64,                 // Current program break (heap end)
+    pub resources: Arc<Mutex<ProcessResources>>, // Shared resources (VM, FDs, etc)
     pub fs_base: u64,                     // TLS base (FS_BASE)
     pub gs_base: u64,                     // Kernel/User swap GS base
     pub is_linux: bool,                   // Use Linux ABI translation
@@ -95,7 +114,7 @@ pub const NO_CPU: u32 = u32::MAX;
 
 
 impl Process {
-    pub const fn new() -> Self {
+    pub fn new(resources: Arc<Mutex<ProcessResources>>) -> Self {
         Self {
             id: 0,
             state: ProcessState::Blocked,
@@ -106,9 +125,7 @@ impl Process {
             time_slice: 0,
             parent_pid: None,
             kernel_stack_top: 0,
-            page_table_phys: 0,
-            vmas: alloc::vec::Vec::new(),
-            brk_current: 0,
+            resources,
             fs_base: 0,
             gs_base: 0,
             is_linux: false,
@@ -156,40 +173,28 @@ pub fn next_pid() -> ProcessId {
 // Inicializar el proceso kernel (PID 0)
 pub fn init_kernel_process() {
     let mut table = PROCESS_TABLE.lock();
-    // No tocamos NEXT_PID, dejamos que empiece en 1
     
-    // Allocate kernel stack for PID 0 (Idle/Kernel task)
-    // Even though it runs on the boot stack initially, we need a valid TSS RSP0 
-    // for when it's scheduled back in, just in case.
     let kernel_stack_size = KERNEL_STACK_SIZE;
     let kernel_stack = alloc::vec![0u8; kernel_stack_size];
     let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
-    core::mem::forget(kernel_stack); // Leak
+    core::mem::forget(kernel_stack);
     
     let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-    let mut process = Process::new();
+    let cr3 = crate::memory::get_cr3();
+    let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, 0)));
+    let mut process = Process::new(resources);
     process.id = 0;
     process.state = ProcessState::Running;
-    process.current_cpu = 0; // BSP is CPU 0
-    process.priority = 0; // Prioridad más baja
+    process.current_cpu = 0;
+    process.priority = 0;
     process.time_slice = 10;
     process.kernel_stack_top = kernel_stack_top_aligned;
-    process.page_table_phys = crate::memory::get_cr3();
     let name = b"kernel";
     let len = core::cmp::min(name.len(), 16);
     process.name[..len].copy_from_slice(&name[..len]);
     
-    // Configurar contexto inicial
-    // Cuando el scheduler cambie a PID 0, necesita saber el RSP.
-    // PERO, PID 0 ya está "corriendo". Su contexto real se guarda
-    // cuando llamamos a switch_context(0, X).
-    // Así que solo necesitamos kernel_stack_top para el TSS.
-    
-    // Insertar en la tabla (slot 0)
     table[0] = Some(process);
-    
-    // Establecer como actual en la CPU que inicializa
     set_current_process(Some(0));
 }
 
@@ -233,34 +238,39 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
                     // overwritten by the old CPU's register save.
                     && p.current_cpu == crate::process::NO_CPU);
             if slot_available {
-                *slot = None; // evict Terminated entry before writing new process
-                let mut process = Process::new();
+                *slot = None; 
+                
+                // Allocate a unique FD table index for the new process resources
+                // For simplicity, we use same slot_idx as the fd_table_idx initially.
+                let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, slot_idx)));
+                {
+                    let mut r = resources.lock();
+                    r.brk_current = initial_brk;
+                }
+
+                let mut process = Process::new(resources);
                 process.id = pid;
                 process.stack_base = stack_base;
                 process.stack_size = stack_size;
-                process.priority = 5; // Prioridad media por defecto
-                process.time_slice = 10; // 10 ticks
-                process.page_table_phys = cr3;
+                process.priority = 5; 
+                process.time_slice = 10; 
                 
-                // ALIGN STACK to 16 bytes to ensure SSE/Function calls work correctly in trampoline
                 let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-                // Configurar contexto inicial (jump_to_userspace(entry, stack_top, phdr_va, phnum, phentsize))
                 process.context.rip = crate::elf_loader::jump_to_userspace as *const () as u64;
-                process.context.rdi = entry_point;                            // arg1
-                process.context.rsi = stack_base + stack_size as u64;         // arg2 stack_top
-                process.context.rdx = phdr_va;                                // arg3 for auxv AT_PHDR
-                process.context.rcx = phnum;                                  // arg4 for auxv AT_PHNUM
-                process.context.r8 = phentsize;                               // arg5 for auxv AT_PHENT
-                process.context.rsp = kernel_stack_top_aligned;               // Stack del kernel para el trampolín
-                process.context.rflags = 0x002; // IF disabled (until iretq enables it for userspace)
-                process.kernel_stack_top = kernel_stack_top_aligned; // Use aligned stack top for TSS too
-                process.brk_current = initial_brk;
-                process.mem_frames = (stack_size / 4096) as u64; // Initial stack frames
+                process.context.rdi = entry_point;                            
+                process.context.rsi = stack_base + stack_size as u64;         
+                process.context.rdx = phdr_va;                                
+                process.context.rcx = phnum;                                  
+                process.context.r8 = phentsize;                               
+                process.context.rsp = kernel_stack_top_aligned;               
+                process.context.rflags = 0x002; 
+                process.kernel_stack_top = kernel_stack_top_aligned; 
+                process.mem_frames = (stack_size / 4096) as u64; 
                 
                 crate::serial::serial_printf(format_args!(
                     "[PROC] Created process PID: {} slot: {} CR3: {:#018X}\n",
-                    pid, slot_idx, process.page_table_phys
+                    pid, slot_idx, cr3
                 ));
 
                 *slot = Some(process);
@@ -373,7 +383,7 @@ pub fn pid_to_slot(pid: ProcessId) -> Option<usize> {
 pub fn get_process_page_table(pid: Option<ProcessId>) -> u64 {
     if let Some(pid) = pid {
         if let Some(process) = get_process(pid) {
-            return process.page_table_phys;
+            return process.resources.lock().page_table_phys;
         }
     }
     0
@@ -617,7 +627,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
     // ── Phase 1: Expensive work BEFORE acquiring any kernel-global lock ──────
 
     // Deep copy of the parent's user address space.
-    let child_cr3 = crate::memory::clone_process_paging(parent.page_table_phys);
+    let child_cr3 = crate::memory::clone_process_paging(parent.resources.lock().page_table_phys);
 
     // Allocate a fresh kernel stack for the child.
     let kernel_stack = alloc::vec![0u8; KERNEL_STACK_SIZE];
@@ -657,13 +667,33 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 let child_pid = *next_pid;
                 *next_pid += 1;
 
-                let mut child = parent.clone(); // Copies parent's metadata + vmas
+                // Clone of resources for fork()
+                let child_resources = {
+                    let p = parent.resources.lock();
+                    Arc::new(Mutex::new(ProcessResources {
+                        page_table_phys: child_cr3,
+                        vmas: p.vmas.clone(),
+                        brk_current: p.brk_current,
+                        fd_table_idx: slot_idx, // Use the new slot index for isolated FD table copy
+                    }))
+                };
+
+                let mut child = Process::new(child_resources);
                 child.id = child_pid;
                 child.state = ProcessState::Blocked;
                 child.current_cpu = NO_CPU;
                 child.parent_pid = Some(current_pid);
-                child.page_table_phys = child_cr3;
                 child.kernel_stack_top = kernel_stack_top_aligned;
+                
+                // Inherit missing fields (CRITICAL for TLS/Libc stability)
+                child.fs_base = parent.fs_base;
+                child.gs_base = parent.gs_base;
+                child.is_linux = parent.is_linux;
+                child.priority = parent.priority;
+                child.time_slice = parent.time_slice;
+                child.stack_base = parent.stack_base;
+                child.stack_size = parent.stack_size;
+                child.mem_frames = parent.mem_frames;
 
                 // Keep parent name (child will overwrite it with set_process_name if needed)
                 let mut name = [0u8; 16];
