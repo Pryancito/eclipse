@@ -297,7 +297,10 @@ impl InputState {
                 let btn = ev.code as u8;
                 let pressed = ev.value != 0;
                 let old = self.mouse_buttons;
-                if pressed { self.mouse_buttons |= 1 << btn; } else { self.mouse_buttons &= !(1 << btn); }
+                // Guard against button indices >= 8 to prevent shift overflow on u8.
+                if btn < 8 {
+                    if pressed { self.mouse_buttons |= 1 << btn; } else { self.mouse_buttons &= !(1 << btn); }
+                }
                 // Forward mouse button events to the focused external window client
                 if let Some(f_idx) = self.focused_window {
                     if let WindowContent::External(s_idx) = windows[f_idx].content {
