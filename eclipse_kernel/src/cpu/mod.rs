@@ -340,6 +340,7 @@ pub fn detect_features() {
             options(preserves_flags)
         );
     }
+    let result = unsafe { core::arch::x86_64::__cpuid(1) };
     // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
     if (result.ecx & (1 << 3)) != 0 {
         MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
