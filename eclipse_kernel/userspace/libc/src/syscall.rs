@@ -72,6 +72,7 @@ pub const SYS_READ_MOUSE_PACKET: u64 = 37;
 pub const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
 pub const SYS_SET_CURSOR_POSITION: u64 = 39;
 pub const SYS_GPU_ALLOC_DISPLAY_BUFFER: u64 = 40;
+pub const SYS_GPU_COMMAND: u64 = 56;
 /// 250 = gpu_present (avoid conflict with Linux socket=41)
 pub const SYS_GPU_PRESENT: u64 = 250;
 pub const SYS_VIRGL_CTX_CREATE: u64 = 42;
@@ -135,6 +136,24 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> core::option::Option
         core::option::Option::Some(out)
     } else {
         core::option::Option::None
+    }
+}
+
+/// Send a generic command to the GPU backend
+pub fn gpu_command(kind: usize, command: usize, payload: &[u8]) -> core::result::Result<usize, ()> {
+    let r = unsafe {
+        syscall4(
+            SYS_GPU_COMMAND,
+            kind as u64,
+            command as u64,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+        )
+    };
+    if r == u64::MAX {
+        core::result::Result::Err(())
+    } else {
+        core::result::Result::Ok(r as usize)
     }
 }
 

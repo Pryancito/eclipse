@@ -197,3 +197,16 @@ pub fn futex_wake(uaddr: *const core::sync::atomic::AtomicI32, count: u32) -> Re
     unsafe { cvt(syscall3(SYS_FUTEX, uaddr as usize, FUTEX_WAKE, count as usize)) }
 }
 
+/// Send a generic command to the GPU backend (VirtIO or NVIDIA)
+pub fn gpu_command(kind: usize, command: usize, payload: &[u8]) -> Result<usize> {
+    unsafe {
+        cvt(syscall4(
+            SYS_GPU_COMMAND,
+            kind,
+            command,
+            payload.as_ptr() as usize,
+            payload.len(),
+        ))
+    }
+}
+

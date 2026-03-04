@@ -44,6 +44,7 @@ pub struct FramebufferState {
     pub front_addr: usize,  
     pub gpu_resource_id: Option<u32>,  
     pub background_addr: usize, 
+    pub gpu: Option<sidewind_sdk::gpu::GpuDevice>,
 }
 
 impl FramebufferState {
@@ -81,6 +82,7 @@ impl FramebufferState {
                         front_addr: 0,
                         gpu_resource_id: Some(gpu_info.resource_id),
                         background_addr: bg_buffer as usize,
+                        gpu: Some(sidewind_sdk::gpu::GpuDevice::new()),
                     });
                 }
             }
@@ -154,6 +156,7 @@ impl FramebufferState {
             front_addr,
             gpu_resource_id: None,
             background_addr: bg_buffer as usize,
+            gpu: None,
         })
     }
 
@@ -855,8 +858,8 @@ pub fn draw_system_central(
     counter: u64, 
     services: &[ServiceInfo], 
     processes: &[eclipse_libc::ProcessInfo],
-    process_cpu: &[f32; 64],
-    process_mem: &[u64; 64],
+    process_cpu: &[f32; 32],
+    process_mem: &[u64; 32],
 ) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
@@ -1056,5 +1059,25 @@ pub fn draw_system_central(
         let _ = Text::new("[MATAR]", Point::new(col_prog_options, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
         
         display_idx += 1;
+    }
+}
+
+/// Test hardware-accelerated rendering using the new Gpu API
+pub fn gpu_test_render(fb: &FramebufferState, counter: u64) {
+    if let Some(gpu) = &fb.gpu {
+        // Run every 60 frames to show a slow, non-blocking hardware operation
+        if counter % 60 == 0 {
+            let mut encoder = sidewind_sdk::gpu::GpuCommandEncoder::new(gpu);
+            
+            // Draw a color-changing square in the top-left corner
+            let color = match (counter / 60) % 3 {
+                0 => 0x00FF0000, // Red
+                1 => 0x0000FF00, // Green
+                _ => 0x000000FF, // Blue
+            };
+
+            let _ = encoder.fill_rect(50, 50, 200, 200, color);
+            println!("[SMITHAY] GPU: Hardware-accelerated fill submitted (counter={})", counter);
+        }
     }
 }

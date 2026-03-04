@@ -17,6 +17,9 @@ pub mod font_terminus_18;
 pub mod font_terminus_20;
 pub mod font_terminus_24;
 pub mod ui;
+pub mod gpu;
+
+pub use gpu::{GpuDevice, GpuBackend, GpuCommandEncoder, SurfaceGpuExt};
 
 use eclipse_libc::{send, receive, mmap, munmap, open, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, yield_cpu};
 use eclipse_ipc::prelude::IpcChannel;

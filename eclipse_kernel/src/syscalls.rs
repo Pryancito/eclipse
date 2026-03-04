@@ -67,7 +67,9 @@ pub enum SyscallNumber {
     VirglCtxCreate = 42,
     VirglCtxDestroy = 43,
     VirglSubmit3d = 44,
+    VirglCtxAttachResource = 45,
     VirglCtxDetachResource = 46,
+    GpuCommand = 56,
     GetLogs = 49,
     Socket = 100,
     Bind = 101,
@@ -289,6 +291,7 @@ pub extern "C" fn syscall_handler(
         53 => sys_kill(arg1),
         54 => sys_set_process_name(arg1, arg2),
         55 => sys_spawn_service(arg1, arg2, arg3),
+        56 => sys_gpu_command(arg1, arg2, arg3, arg4),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -1925,6 +1928,31 @@ fn sys_virgl_submit_3d(ctx_id: u64, cmd_ptr: u64, cmd_len: u64) -> u64 {
         0
     } else {
         u64::MAX
+    }
+}
+
+/// sys_gpu_command - Generic GPU command dispatcher
+/// arg1: kind (0=VirtIO, 1=NVIDIA)
+/// arg2: command (backend-specific)
+/// arg3: payload_ptr
+/// arg4: payload_len
+fn sys_gpu_command(kind: u64, command: u64, payload_ptr: u64, payload_len: u64) -> u64 {
+    match kind {
+        0 => {
+            // Backend: VirtIO-GPU
+            match command {
+                0 => sys_virgl_submit_3d(0, payload_ptr, payload_len), // Default context 0
+                _ => u64::MAX,
+            }
+        }
+        1 => {
+            // Backend: NVIDIA
+            // For now, placeholders for the unified API.
+            // Hardware acceleration logic will be added here using Graphics2dEngine or GSP.
+            serial::serial_print("[SYSCALL] NVIDIA GPU command (placeholder)\n");
+            0
+        }
+        _ => u64::MAX,
     }
 }
 

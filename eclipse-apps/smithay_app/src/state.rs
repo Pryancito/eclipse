@@ -37,13 +37,13 @@ pub struct SmithayState {
     pub prev_net_rx: u64,
     pub prev_net_tx: u64,
     pub net_usage: f32,
-    pub process_list: [ProcessInfo; 64],
+    pub process_list: [ProcessInfo; 32],
     pub process_count: usize,
     pub service_list: [ServiceInfo; 32],
     pub service_count: usize,
-    pub prev_process_ticks: [(u32, u64); 64],
-    pub process_cpu_usage: [f32; 64],
-    pub process_mem_kb: [u64; 64],
+    pub prev_process_ticks: [(u32, u64); 32],
+    pub process_cpu_usage: [f32; 32],
+    pub process_mem_kb: [u64; 32],
 }
 
 
@@ -76,13 +76,13 @@ impl SmithayState {
             prev_net_rx: 0,
             prev_net_tx: 0,
             net_usage: 0.0,
-            process_list: [ProcessInfo::default(); 64],
+            process_list: [ProcessInfo::default(); 32],
             process_count: 0,
             service_list: [ServiceInfo::default(); 32],
             service_count: 0,
-            prev_process_ticks: [(0, 0); 64],
-            process_cpu_usage: [0.0; 64],
-            process_mem_kb: [0; 64],
+            prev_process_ticks: [(0, 0); 32],
+            process_cpu_usage: [0.0; 32],
+            process_mem_kb: [0; 32],
         })
 
     }
@@ -235,7 +235,7 @@ impl SmithayState {
                             
                             // Calcular CPU %
                             let mut prev_ticks = 0;
-                            for j in 0..64 {
+                            for j in 0..32 {
                                 if self.prev_process_ticks[j].0 == p.pid {
                                     prev_ticks = self.prev_process_ticks[j].1;
                                     break;
@@ -256,7 +256,7 @@ impl SmithayState {
                             // aunque PIDs roten se buscará por .0 == pid)
                             // Para ser robustos, si no estaba el PID busscamos slot libre o reciclamos.
                             let mut found = false;
-                            for j in 0..64 {
+                            for j in 0..32 {
                                 if self.prev_process_ticks[j].0 == p.pid {
                                     self.prev_process_ticks[j].1 = p.cpu_ticks;
                                     found = true;
@@ -265,7 +265,7 @@ impl SmithayState {
                             }
                             if !found {
                                 // Buscar slot vacío (PID 0)
-                                for j in 0..64 {
+                                for j in 0..32 {
                                     if self.prev_process_ticks[j].0 == 0 {
                                         self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
                                         break;
@@ -424,6 +424,9 @@ impl SmithayState {
                 self.input.cursor_y
             );
             
+            // Prototype hardware acceleration
+            render::gpu_test_render(&self.backend.fb, self.counter);
+
             if !self.input.dashboard_active && !self.input.system_central_active {
                 render::draw_shell_windows(
                     &mut self.backend.fb, 

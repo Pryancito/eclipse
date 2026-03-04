@@ -213,7 +213,7 @@ fi
 QEMU_CMD="$QEMU_CMD -no-shutdown"
 
 # Puerto de monitor QEMU (para debugging)
-#QEMU_CMD="$QEMU_CMD -serial file:qemu_serial.log"
+QEMU_CMD="$QEMU_CMD -serial file:qemu_serial.log"
 #QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
 
 # Debugging flags (Unconditional)
