@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, wait, spawn_service};
+use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, wait, spawn_service, Spinlock};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -36,7 +36,7 @@ impl Service {
     }
 }
 
-/// System services
+/// System services protected by a spinlock for thread-safe SMP access.
 /// Launch order (as per requirements):
 /// 1. Log Server / Console (0)
 /// 2. Device Manager (devfs) (1)
@@ -45,7 +45,7 @@ impl Service {
 /// 5. Graphics Server (Display) (4)
 /// 6. Audio Server (5)
 /// 7. Network Server (6)
-static mut SERVICES: [Service; 10] = [
+static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("kernel"),
     Service::new("init"),
     Service::new("log"),
@@ -56,7 +56,7 @@ static mut SERVICES: [Service; 10] = [
     Service::new("audio"),
     Service::new("network"),
     Service::new("gui"),
-];
+]);
 
 
 
@@ -73,12 +73,13 @@ pub extern "C" fn _start() -> ! {
     println!("Init process started with PID: {}", pid);
     println!();
 
-    unsafe {
+    {
+        let mut svc = SERVICES.lock();
         // Initialize kernel and init services which are already running
-        SERVICES[0].state = ServiceState::Running;
-        SERVICES[0].pid = 0;
-        SERVICES[1].state = ServiceState::Running;
-        SERVICES[1].pid = pid as i32;
+        svc[0].state = ServiceState::Running;
+        svc[0].pid = 0;
+        svc[1].state = ServiceState::Running;
+        svc[1].pid = pid as i32;
     }
     
     // Phase 1: Start essential services (log, devfs). Root is NOT mounted yet.
@@ -101,54 +102,63 @@ pub extern "C" fn _start() -> ! {
 
 /// Start essential services
 fn start_essential_services() {
-    unsafe {
-        // Start log server first - critical for debugging
-        start_service(&mut SERVICES[2]);
-        
-        // Wait for log service to be ready
-        println!("[INIT] Waiting for LOG service to signal READY...");
-        wait_for_ready("log", 5000);
-        
-        // Start device manager (devfs) - creates /dev nodes
-        start_service(&mut SERVICES[3]);
-        
-        // Wait for devfs to be ready
-        println!("[INIT] Waiting for DevFS to signal READY...");
-        wait_for_ready("devfs", 5000);
+    // Start log server first - critical for debugging
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[2]);
     }
+    
+    // Wait for log service to be ready
+    println!("[INIT] Waiting for LOG service to signal READY...");
+    wait_for_ready("log", 5000);
+    
+    // Start device manager (devfs) - creates /dev nodes
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[3]);
+    }
+    
+    // Wait for devfs to be ready
+    println!("[INIT] Waiting for DevFS to signal READY...");
+    wait_for_ready("devfs", 5000);
 }
 
 /// Start system services
 fn start_system_services() {
-    unsafe {
-        // Start filesystem service (depends on devfs)
-        //start_service(&mut SERVICES[2]);
-        
-        // Wait for filesystem service to mount the disk
-        //println!("[INIT] Waiting for Filesystem service to signal READY...");
-        //wait_for_ready("filesystem", 10000); // Give it more time
-        //println!("  [FS] Root filesystem ready (mounted by filesystem service).");
-
-        // Start input service (depends on filesystem)
-        start_service(&mut SERVICES[5]);
-        wait_for_ready("input", 5000);
-        
-        // Start display service (depends on input)
-        start_service(&mut SERVICES[6]);
-        wait_for_ready("display", 5000);
-
-        // Start audio service (depends on filesystem)
-        start_service(&mut SERVICES[7]);
-        wait_for_ready("audio", 5000);
-        
-        // Start network service last (most complex)
-        start_service(&mut SERVICES[8]);
-        wait_for_ready("network", 5000);
-
-        // Start GUI service (depends on network)
-        start_service(&mut SERVICES[9]);
-        wait_for_ready("gui", 5000);
+    // Start input service (depends on filesystem)
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[5]);
     }
+    wait_for_ready("input", 5000);
+    
+    // Start display service (depends on input)
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[6]);
+    }
+    wait_for_ready("display", 5000);
+
+    // Start audio service (depends on filesystem)
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[7]);
+    }
+    wait_for_ready("audio", 5000);
+    
+    // Start network service last (most complex)
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[8]);
+    }
+    wait_for_ready("network", 5000);
+
+    // Start GUI service (depends on network)
+    {
+        let mut svc = SERVICES.lock();
+        start_service(&mut svc[9]);
+    }
+    wait_for_ready("gui", 5000);
 }
 
 /// Wait for a service to signal READY via IPC.
@@ -185,7 +195,7 @@ fn wait_for_ready(name: &str, timeout_ms: u32) {
     println!("[INIT] WARNING: Timeout waiting for service '{}' to signal READY", name);
 }
 
-/// Start a service
+/// Start a service (must be called with the SERVICES lock held)
 fn start_service(service: &mut Service) {
     println!("  [SERVICE] Starting {}...", service.name);
     
@@ -212,6 +222,9 @@ fn start_service(service: &mut Service) {
     // This is simpler and more reliable than fork+exec because it avoids
     // cloning the init address space and avoids passing kernel-space ELF
     // pointers across the exec boundary.
+    //
+    // NOTE: The SERVICES lock is held by the caller while we call spawn_service.
+    // The spawn_service syscall does not re-enter init's IPC path, so this is safe.
     let pid = spawn_service(service_id, service.name);
 
     if pid > 0 {
@@ -280,17 +293,19 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
     // Petición de PID del servicio de entrada ("GET_INPUT_PID" = 13 bytes)
     if len >= 13 && &buffer[..13] == b"GET_INPUT_PID" {
-        let input_pid = unsafe { SERVICES[5].pid as u32 }; // Servicio "input"
+        let input_pid = SERVICES.lock()[5].pid as u32; // Servicio "input"
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"INPT");
         response[4..8].copy_from_slice(&input_pid.to_le_bytes());
+        // Use MSG_TYPE_INPUT (0x40 = P2P) so the response is delivered directly to
+        // the requester's mailbox instead of being dropped in the global IPC queue.
         let _ = eclipse_libc::send(sender, 0x40, &response);
         return;
     }
 
     // Petición de PID del servicio de pantalla ("GET_DISPLAY_PID" = 15 bytes)
     if len >= 15 && &buffer[..15] == b"GET_DISPLAY_PID" {
-        let display_pid = unsafe { SERVICES[6].pid as u32 }; // Servicio "display" (Smithay)
+        let display_pid = SERVICES.lock()[6].pid as u32; // Servicio "display" (Smithay)
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"DSPL");
         response[4..8].copy_from_slice(&display_pid.to_le_bytes());
@@ -300,13 +315,12 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
     // Petición de PID del servicio de red ("GET_NETWORK_PID" = 15 bytes)
     if len >= 15 && &buffer[..15] == b"GET_NETWORK_PID" {
-        let net_pid = unsafe { SERVICES[8].pid as u32 }; // Servicio "network"
+        let net_pid = SERVICES.lock()[8].pid as u32; // Servicio "network"
         let mut response = [0u8; 8];
         response[0..4].copy_from_slice(b"NETW");
         response[4..8].copy_from_slice(&net_pid.to_le_bytes());
         // Use MSG_TYPE_INPUT (0x40 = P2P) so the response is delivered directly to
         // the requester's mailbox instead of being dropped in the global IPC queue.
-        // This matches how the GET_INPUT_PID response is sent (see above).
         let _ = eclipse_libc::send(sender, 0x40, &response);
         return;
     }
@@ -315,24 +329,27 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
     if len >= 17 && &buffer[..17] == b"GET_SERVICES_INFO" {
         let mut reply = [0u8; 512]; // Aumentado para soportar más servicios
         reply[0..4].copy_from_slice(b"SVCS");
-        let svc_count = unsafe { SERVICES.len() };
-        reply[4..8].copy_from_slice(&(svc_count as u32).to_le_bytes());
-        
         let mut offset = 8;
-        // Format: [name: 12 bytes][state: u32][pid: u32][restart_count: u32] = 24 bytes per service
-        // Reduced from 16-byte name to 12 to fit within the 256-byte IPC message limit
-        for s in unsafe { &SERVICES } {
-            if offset + 24 > 256 { break; }
-            let name_bytes = s.name.as_bytes();
-            let name_len = name_bytes.len().min(12);
-            reply[offset..offset + name_len].copy_from_slice(&name_bytes[..name_len]);
-            offset += 12;
-            reply[offset..offset + 4].copy_from_slice(&(s.state as u32).to_le_bytes());
-            offset += 4;
-            reply[offset..offset + 4].copy_from_slice(&(s.pid as u32).to_le_bytes());
-            offset += 4;
-            reply[offset..offset + 4].copy_from_slice(&s.restart_count.to_le_bytes());
-            offset += 4;
+        let svc_count;
+        {
+            let svc = SERVICES.lock();
+            svc_count = svc.len();
+            reply[4..8].copy_from_slice(&(svc_count as u32).to_le_bytes());
+            // Format: [name: 12 bytes][state: u32][pid: u32][restart_count: u32] = 24 bytes per service
+            // Reduced from 16-byte name to 12 to fit within the 256-byte IPC message limit
+            for s in svc.iter() {
+                if offset + 24 > 256 { break; }
+                let name_bytes = s.name.as_bytes();
+                let name_len = name_bytes.len().min(12);
+                reply[offset..offset + name_len].copy_from_slice(&name_bytes[..name_len]);
+                offset += 12;
+                reply[offset..offset + 4].copy_from_slice(&(s.state as u32).to_le_bytes());
+                offset += 4;
+                reply[offset..offset + 4].copy_from_slice(&(s.pid as u32).to_le_bytes());
+                offset += 4;
+                reply[offset..offset + 4].copy_from_slice(&s.restart_count.to_le_bytes());
+                offset += 4;
+            }
         }
         let _ = eclipse_libc::send(sender, 0x40, &reply[..offset]);
         return;
@@ -348,19 +365,34 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
 
 /// Check service health
 fn check_services() {
-    unsafe {
-        for service in SERVICES.iter_mut() {
-            if service.state == ServiceState::Running {
-                // Process is tracked via PID, wait() will detect if it terminates
-            } else if service.state == ServiceState::Failed {
-                // Implement restart policy
-                if service.restart_count < 3 {
-                    println!("[INIT] Restarting failed service: {} (attempt {})", 
-                             service.name, service.restart_count + 1);
-                    start_service(service);
-                    service.restart_count += 1;
-                }
+    // Collect the indices of services that need restarting without holding the lock
+    // across the spawn_service syscall (which may take time and would prevent other
+    // CPUs from reading SERVICES during that window).
+    let mut restart_indices: [usize; 10] = [usize::MAX; 10];
+    let mut n_restart = 0;
+    {
+        let svc = SERVICES.lock();
+        for (i, service) in svc.iter().enumerate() {
+            if service.state == ServiceState::Failed && service.restart_count < 3 {
+                restart_indices[n_restart] = i;
+                n_restart += 1;
             }
+        }
+    }
+
+    // Now restart each failed service, acquiring the lock only briefly for the update.
+    for &idx in &restart_indices[..n_restart] {
+        let name = SERVICES.lock()[idx].name;
+        println!("[INIT] Restarting failed service: {} (attempt {})",
+                 name,
+                 SERVICES.lock()[idx].restart_count + 1);
+        // Acquire the lock, borrow the service entry, and call start_service.
+        // start_service internally calls spawn_service (a kernel syscall that does
+        // not re-enter init's IPC path), so it is safe to hold the lock here.
+        {
+            let mut svc = SERVICES.lock();
+            start_service(&mut svc[idx]);
+            svc[idx].restart_count += 1;
         }
     }
 }
@@ -377,15 +409,14 @@ fn reap_zombies() {
         }
         
         // Find which service this PID belonged to
-        unsafe {
-            for service in SERVICES.iter_mut() {
-                if service.pid == terminated_pid && service.state == ServiceState::Running {
-                    println!("[INIT] Service {} (PID {}) has terminated", 
-                             service.name, terminated_pid);
-                    service.state = ServiceState::Failed;
-                    service.pid = 0;
-                    break;
-                }
+        let mut svc = SERVICES.lock();
+        for service in svc.iter_mut() {
+            if service.pid == terminated_pid && service.state == ServiceState::Running {
+                println!("[INIT] Service {} (PID {}) has terminated", 
+                         service.name, terminated_pid);
+                service.state = ServiceState::Failed;
+                service.pid = 0;
+                break;
             }
         }
     }
@@ -393,22 +424,21 @@ fn reap_zombies() {
 
 /// Print service status
 fn print_service_status() {
-    unsafe {
-        println!("[INIT] Service Status:");
-        for service in SERVICES.iter() {
-            let status = match service.state {
-                ServiceState::Stopped => "stopped",
-                ServiceState::Starting => "starting",
-                ServiceState::Running => "running",
-                ServiceState::Failed => "failed",
-            };
-            if service.pid > 0 {
-                println!("  - {}: {} (PID: {}, restarts: {})", 
-                         service.name, status, service.pid, service.restart_count);
-            } else {
-                println!("  - {}: {} (restarts: {})", 
-                         service.name, status, service.restart_count);
-            }
+    let svc = SERVICES.lock();
+    println!("[INIT] Service Status:");
+    for service in svc.iter() {
+        let status = match service.state {
+            ServiceState::Stopped => "stopped",
+            ServiceState::Starting => "starting",
+            ServiceState::Running => "running",
+            ServiceState::Failed => "failed",
+        };
+        if service.pid > 0 {
+            println!("  - {}: {} (PID: {}, restarts: {})", 
+                     service.name, status, service.pid, service.restart_count);
+        } else {
+            println!("  - {}: {} (restarts: {})", 
+                     service.name, status, service.restart_count);
         }
     }
 }
