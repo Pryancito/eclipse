@@ -293,31 +293,26 @@ static mut CPU_GDTS: [Gdt; MAX_SMP_CPUS] = [GDT_TEMPLATE; MAX_SMP_CPUS];
 /// are indexed with this value.
 pub fn get_cpu_id() -> usize {
     unsafe {
-        // Read IA32_APIC_BASE MSR (0x1B) to check for x2APIC mode (bit 10)
+        // Use CPUID leaf 1 to get the initial Local APIC ID.
+        // This is safe to call even before the Local APIC is fully initialized or mapped.
+        // Intel SDM Vol 2A: CPUID EBX bits 31-24 contain the Initial Local APIC ID.
+        let result = core::arch::x86_64::__cpuid(1);
+        let id = (result.ebx >> 24) & 0xFF;
+        
+        // On modern systems (x2APIC), the 8-bit ID from leaf 1 might be truncated.
+        // Check if x2APIC is supported and enabled (MSR 0x1B bit 10).
         let mut low: u32;
         let mut high: u32;
         core::arch::asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
         
-        let x2apic = (low & (1 << 10)) != 0;
-        let id: u32;
-        
-        if x2apic {
-            // x2APIC mode: read ID from MSR 0x802
-            core::arch::asm!("rdmsr", in("ecx") 0x802u32, out("eax") id, out("edx") high, options(nomem, nostack, preserves_flags));
-            id as usize % MAX_SMP_CPUS
+        let x2apic_enabled = (low & (1 << 10)) != 0;
+        if x2apic_enabled {
+            // Read full 32-bit x2APIC ID from MSR 0x802
+            let id32: u32;
+            core::arch::asm!("rdmsr", in("ecx") 0x802u32, out("eax") id32, out("edx") high, options(nomem, nostack, preserves_flags));
+            id32 as usize % MAX_SMP_CPUS
         } else {
-            // standard xAPIC: get physical base from MSR (bits 12..51), but 0xFEE00000 is default.
-            // We use the LAPIC register at offset 0x20.
-            // CAUTION: The register is 32-bit, bits 31..24 contain the ID (classic xAPIC).
-            let lapic_phys = (low & 0xFFFFF000) as u64; 
-            // In our kernel, we use map_mmio_range, but for early ID, we can try to use 
-            // the same address if it's already mapped, or use the 1:1 physical mapping if available.
-            // Since this is ONLY for load_gdt, and paging is already on, let's use the HHDM.
-            
-            let lapic_virt = crate::memory::phys_to_virt(lapic_phys);
-            let ptr = (lapic_virt + 0x20) as *const u32;
-            let val = core::ptr::read_volatile(ptr);
-            ((val >> 24) & 0xFF) as usize % MAX_SMP_CPUS
+            id as usize % MAX_SMP_CPUS
         }
     }
 }

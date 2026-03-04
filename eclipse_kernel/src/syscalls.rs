@@ -2558,15 +2558,18 @@ fn sys_nanosleep(req: u64) -> u64 {
         // Use pid_to_slot_fast() to obtain the correct slot index.
         x86_64::instructions::interrupts::without_interrupts(|| {
             let slot = crate::ipc::pid_to_slot_fast(pid);
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(slot_idx) = slot {
-                if let Some(p) = table[slot_idx].as_mut() {
-                    // Safety check: ensure we are still targeting the correct PID
-                    if p.id == pid {
-                         p.state = crate::process::ProcessState::Blocked;
+            {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(slot_idx) = slot {
+                    if let Some(p) = table[slot_idx].as_mut() {
+                        // Safety check: ensure we are still targeting the correct PID
+                        if p.id == pid {
+                             p.state = crate::process::ProcessState::Blocked;
+                        }
                     }
                 }
-            }
+            } // Release PROCESS_TABLE lock before add_sleep to avoid deadlock
+            
             // Add to sleep queue while still in the interrupt-disabled section
             // to prevent preemption between marking as Blocked and enqueuing.
             crate::scheduler::add_sleep(pid, wake_tick);

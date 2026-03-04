@@ -324,6 +324,7 @@ static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Detectar características avanzadas de la CPU (MONITOR/MWAIT)
 pub fn detect_features() {
+    serial_printf(format_args!("[CPU] detect_features entry\n"));
     // Usamos el intrínseco directamente. Rust se encarga de RBX y la seguridad.
     let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
 

@@ -67,9 +67,9 @@ impl<T> ReentrantMutex<T> {
         
         // Sanity check: if gs is not set up (long mode transition/early AP),
         // it will read 0xFFFF_FFFF (uninitialized value in CPU_DATA).
-        // Fallback to the slow but reliable LAPIC ID to avoid lock owner collisions.
+        // Fallback to the reliable (but slower) get_cpu_id to avoid lock owner collisions.
         if id == 0xFFFF_FFFF {
-            return crate::apic::get_id() as i32;
+            return crate::boot::get_cpu_id() as i32;
         }
         
         id as i32
