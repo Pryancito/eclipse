@@ -25,31 +25,48 @@ impl IpcHandler {
 
     /// Recibir y clasificar el siguiente mensaje IPC (no bloqueante).
     /// Fast path (InputEvent) → slow path (SideWind, control) de forma automática.
+    ///
+    /// Cuando se recibe un mensaje de control o desconocido (Raw, INPT, NETW, etc.)
+    /// se descarta y se reintenta en lugar de devolver None. Esto evita que el
+    /// bucle de `process_events` se rompa prematuramente al encontrar mensajes de
+    /// arranque residuales (p. ej. respuestas INPT/NETW del init) o respuestas de
+    /// estadísticas de red (NSTA) de 20 bytes que llegan por el fast path.
     pub fn process_messages(&mut self) -> Option<CompositorEvent> {
-        self.recv_attempts += 1;
-        match self.channel.recv()? {
-            EclipseMessage::Input(ev) => {
-                self.message_count += 1;
-                Some(CompositorEvent::Input(ev))
+        // Intentar hasta MAX_SKIP mensajes no reconocidos por llamada antes de rendirnos.
+        // 32 es suficiente para drenar los mensajes de arranque residuales (INPT, NETW) y
+        // respuestas periódicas de stats (NSTA) que normalmente no superan unos pocos por frame.
+        // Limitar el número de intentos evita bucles infinitos si llegara una ráfaga de mensajes
+        // no reconocidos de un proceso incorrecto.
+        const MAX_SKIP: usize = 32;
+        for _ in 0..MAX_SKIP {
+            self.recv_attempts += 1;
+            match self.channel.recv() {
+                None => return None, // Buzón vacío: salir
+                Some(EclipseMessage::Input(ev)) => {
+                    self.message_count += 1;
+                    return Some(CompositorEvent::Input(ev));
+                }
+                Some(EclipseMessage::SideWind(sw, pid)) => {
+                    self.message_count += 1;
+                    return Some(CompositorEvent::SideWind(sw, pid));
+                }
+                Some(EclipseMessage::NetStatsResponse { rx, tx }) => {
+                    self.message_count += 1;
+                    return Some(CompositorEvent::NetStats(rx, tx));
+                }
+                Some(EclipseMessage::ServiceInfoResponse { data, len }) => {
+                    self.message_count += 1;
+                    let mut heap_data = heapless::Vec::<u8, 256>::new();
+                    let _ = heap_data.extend_from_slice(&data[..len.min(256)]);
+                    return Some(CompositorEvent::ServiceInfo(heap_data));
+                }
+                // Mensajes de control y raw: consumir y reintentar en lugar de devolver None.
+                // Devolver None aquí causaría que process_events rompa su bucle aunque haya
+                // eventos válidos pendientes en el buzón.
+                Some(_) => continue,
             }
-            EclipseMessage::SideWind(sw, pid) => {
-                self.message_count += 1;
-                Some(CompositorEvent::SideWind(sw, pid))
-            }
-            EclipseMessage::NetStatsResponse { rx, tx } => {
-                self.message_count += 1;
-                Some(CompositorEvent::NetStats(rx, tx))
-            }
-            EclipseMessage::ServiceInfoResponse { data, len } => {
-                self.message_count += 1;
-                let mut heap_data = heapless::Vec::<u8, 256>::new();
-                let _ = heap_data.extend_from_slice(&data[..len.min(256)]);
-                Some(CompositorEvent::ServiceInfo(heap_data))
-            }
-
-            // Mensajes de control y raw: ignorar en el compositor (son para el input_service)
-            _ => None,
         }
+        None
     }
 }
 
@@ -246,6 +263,44 @@ mod tests {
         
         assert_eq!(window_count, 0);
         assert!(!surfaces[0].active);
+    }
+
+    /// Verifica que los mensajes no reconocidos (p.ej. respuestas INPT/NETW del arranque)
+    /// son descartados automáticamente y el bucle continúa hasta encontrar un evento válido.
+    /// Regresión para el bug de congelación: `_ => None` rompía process_events prematuramente.
+    #[test]
+    fn test_unrecognized_messages_skipped() {
+        mock_clear();
+        let mut handler = IpcHandler::new();
+
+        // Simular una respuesta INPT residual del arranque (8 bytes, no reconocida por compositor)
+        let mut inpt_msg = vec![0u8; 8];
+        inpt_msg[0..4].copy_from_slice(b"INPT");
+        inpt_msg[4..8].copy_from_slice(&5u32.to_le_bytes());
+        mock_push_receive(inpt_msg, 1); // desde init (PID 1)
+
+        // Evento de entrada válido a continuación
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 0,
+            code: 30,
+            value: 1,
+            timestamp: 12345,
+        };
+        let data = unsafe { core::slice::from_raw_parts(&ev as *const _ as *const u8, core::mem::size_of::<InputEvent>()) };
+        mock_push_receive(data.to_vec(), 500);
+
+        // process_messages debe saltarse el INPT y devolver el InputEvent válido
+        let result = handler.process_messages();
+        assert!(result.is_some(), "process_messages debe devolver el InputEvent aunque haya un INPT previo");
+        match result.unwrap() {
+            CompositorEvent::Input(recv_ev) => {
+                assert_eq!(recv_ev.code, 30);
+                assert_eq!(recv_ev.value, 1);
+            }
+            _ => panic!("Se esperaba un CompositorEvent::Input"),
+        }
+        assert_eq!(handler.message_count, 1, "Solo 1 mensaje reconocido esperado");
     }
 
     #[test]
