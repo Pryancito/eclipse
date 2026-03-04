@@ -178,12 +178,19 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
-    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+    // Only render once the framebuffer has been explicitly mapped by progress::init().
+    // Using the phys_to_virt HHDM fallback before that point can hang real hardware:
+    // on systems with a discrete GPU the framebuffer BAR lives above the HHDM limit
+    // and the write would cause a triple fault (no IDT installed at this stage).
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
+    if mapped == 0 {
+        return;
+    }
+
+    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
+    let Some((_phys, width, height, pitch, source)) = get_fb_info() else { return };
+    let virt = mapped as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
-    
     let progress = progress.min(100);
 
     let bar_width = 400;
@@ -249,11 +256,16 @@ pub fn bar(progress: u32) {
 }
 
 /// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
-fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
+/// Only called after MAPPED_FB_VIRT has been set by progress::init().
+fn render_log_line(line: &str, _source: FbSource, _width: u32, _height: u32, _pitch: u32, _phys: u64) {
     let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+    let Some((_phys, width, height, pitch, source)) = get_fb_info() else { return };
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
+    // Caller (log()) already checks mapped != 0; guard again for safety.
+    if mapped == 0 {
+        return;
+    }
+    let virt = mapped as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
     let bar_width = 400u32;
@@ -319,13 +331,22 @@ pub fn log(msg: &str) {
                     history.push(line);
                 }
 
-                // Obtener info del framebuffer y renderizar.
-                if let Some((phys, width, height, pitch, source)) = get_fb_info() {
-                    // --- PUNTO CRÍTICO SMP ---
-                    // Necesitamos un lock global de renderizado para que dos cores
-                    // no escriban al mismo tiempo en la memoria de video.
-                    if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
-                        render_log_line(line, source, width, height, pitch, phys);
+                // Only render to the framebuffer once it has been explicitly mapped
+                // by progress::init().  Before that point the only available address
+                // is phys_to_virt(fb_phys), which uses the HHDM.  On real hardware
+                // with a discrete GPU the framebuffer BAR can be above the HHDM
+                // limit (e.g. 256 GB), so accessing it would fault.  With no IDT
+                // installed at this stage the fault would triple-fault and freeze
+                // the machine – matching the reported hang at the PAT message.
+                let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+                if mapped != 0 {
+                    if let Some((phys, width, height, pitch, source)) = get_fb_info() {
+                        // --- PUNTO CRÍTICO SMP ---
+                        // Necesitamos un lock global de renderizado para que dos cores
+                        // no escriban al mismo tiempo en la memoria de video.
+                        if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
+                            render_log_line(line, source, width, height, pitch, phys);
+                        }
                     }
                 }
             }
