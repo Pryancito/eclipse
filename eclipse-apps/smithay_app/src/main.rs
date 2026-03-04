@@ -38,16 +38,24 @@ unsafe impl GlobalAlloc for StaticAllocator {
 #[global_allocator]
 static ALLOCATOR: StaticAllocator = StaticAllocator;
 
+static mut STATE: Option<SmithayState> = None;
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     unsafe { core::arch::asm!("and rsp, -16", options(nomem, nostack, preserves_flags)); }
     
-    println!("[SMITHAY] Initializing Smithay Architecture...");
+    println!("[SMITHAY] Initializing Smithay Architecture (Static)...");
     let pid = getpid();
     
-    let mut state = match SmithayState::new() {
-        Some(s) => s,
-        None => { println!("[SMITHAY] FATAL: State init failed, exiting for watchdog restart"); exit(1); }
+    unsafe {
+        STATE = SmithayState::new();
+    }
+    
+    let state = unsafe {
+        match STATE.as_mut() {
+            Some(s) => s,
+            None => { println!("[SMITHAY] FATAL: State init failed"); exit(1); }
+        }
     };
     
     state.backend.fb.pre_render_background();
@@ -80,6 +88,7 @@ pub extern "C" fn _start() -> ! {
                 used, state.backend.ipc.message_count);
         }
 
-        yield_cpu();
+        // Target high frame rate while keeping CPU relief
+        sleep_ms(5);
     }
 }

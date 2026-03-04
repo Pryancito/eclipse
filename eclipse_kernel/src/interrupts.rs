@@ -643,9 +643,9 @@ extern "C" fn exception_handler(context: &ExceptionContext) {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); 
     }
 
-    let mut stats = INTERRUPT_STATS.lock();
-    stats.exceptions += 1;
-    drop(stats);
+    if let Some(mut stats) = INTERRUPT_STATS.try_lock() {
+        stats.exceptions += 1;
+    }
 
     let cpu_id = crate::process::get_cpu_id();
     let pid = crate::process::current_process_id().unwrap_or(0);
@@ -996,9 +996,9 @@ unsafe extern "C" fn exception_12() {
 extern "C" fn timer_handler() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     let ticks = TIMER_TICKS.load(Ordering::Relaxed);
-    let mut stats = INTERRUPT_STATS.lock();
-    stats.irqs += 1;
-    drop(stats);
+    if let Some(mut stats) = INTERRUPT_STATS.try_lock() {
+        stats.irqs += 1;
+    }
     
     // Send EOI first to allow other interrupts (or this one if re-enabled) to fire
     send_eoi(0);
@@ -1100,9 +1100,9 @@ extern "C" fn keyboard_handler() {
     drop(tail);
     drop(head);
     
-    let mut stats = INTERRUPT_STATS.lock();
-    stats.irqs += 1;
-    drop(stats);
+    if let Some(mut stats) = INTERRUPT_STATS.try_lock() {
+        stats.irqs += 1;
+    }
     
     send_eoi(1);
 }
@@ -1198,9 +1198,10 @@ extern "C" fn mouse_handler() {
         }
     }
 
-    let mut stats = INTERRUPT_STATS.lock();
-    stats.irqs += 1;
-    drop(stats);
+    let mut stats = INTERRUPT_STATS.try_lock();
+    if let Some(mut s) = stats {
+        s.irqs += 1;
+    }
 
     send_eoi(12);
 }
@@ -1368,6 +1369,15 @@ pub fn get_stats() -> InterruptStats {
 /// On APs: only calls schedule(). The BSP drives the global heartbeat so sleep/wake and IPC
 /// work correctly on SMP even when PIT (IRQ 0) delivery is unreliable.
 extern "C" fn apic_timer_handler() {
+    // 1. Re-trigger the timer if in non-periodic mode
+    let mode = crate::apic::get_timer_mode();
+    if mode == crate::apic::ApicTimerMode::OneShot {
+        crate::apic::set_timer_oneshot(crate::apic::get_timer_count_1ms());
+    } else if mode == crate::apic::ApicTimerMode::TSCDeadline {
+        let tsc_per_ms = crate::cpu::get_tsc_frequency() * 1000;
+        crate::apic::set_timer_tsc(crate::cpu::rdtsc() + tsc_per_ms);
+    }
+
     crate::apic::eoi();
 
     // Use is_bsp() (derived from IA32_APIC_BASE MSR bit 8) rather than

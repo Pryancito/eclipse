@@ -113,9 +113,18 @@ extern "C" {
 
 static AP_READY: AtomicUsize = AtomicUsize::new(0);
 static TSC_COUNTS_PER_US: AtomicU64 = AtomicU64::new(10000); // Default to 10GHz (safe upper bound)
+static TSC_DEADLINE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn update_tsc_frequency(counts_per_us: u64) {
     TSC_COUNTS_PER_US.store(counts_per_us, Ordering::SeqCst);
+}
+
+pub fn get_tsc_frequency() -> u64 {
+    TSC_COUNTS_PER_US.load(Ordering::Relaxed)
+}
+
+pub fn has_tsc_deadline() -> bool {
+    TSC_DEADLINE_SUPPORTED.load(Ordering::Relaxed)
 }
 
 pub fn start_aps() {
@@ -350,6 +359,12 @@ pub fn detect_features() {
     if (leaf1.ecx & (1 << 3)) != 0 {
         MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
         serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
+    }
+
+    // Bit 24 of ECX: TSC-Deadline
+    if (leaf1.ecx & (1 << 24)) != 0 {
+        TSC_DEADLINE_SUPPORTED.store(true, Ordering::SeqCst);
+        serial_printf(format_args!("[CPU] TSC-Deadline support detected\n"));
     }
 
     // Ya que estás aquí, deberías detectar RDRAND para entropía en SMP

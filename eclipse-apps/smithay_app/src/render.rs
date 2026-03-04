@@ -285,10 +285,9 @@ impl FramebufferState {
         self.base_addr = self.background_addr;
         self.clear_back_buffer_raw(colors::COSMIC_DEEP);
         let _ = ui::draw_cosmic_background(self);
-        let logo_r = ((self.info.width.min(self.info.height) as i32) / 2 - 120).min(280).max(120);
-        let cx = (self.info.width as f32 / 2.0).round() as i32;
-        let cy = (self.info.height as f32 / 2.0).round() as i32;
-        let _ = ui::draw_eclipse_logo(self, Point::new(cx, cy), 0, logo_r);
+        let mut star_seed = 0xACE1u32;
+        let _ = ui::draw_starfield_cosmic(self, &mut star_seed, Point::zero());
+        let _ = ui::draw_grid(self, Rgb888::new(18, 28, 55), 48, Point::zero());
         self.base_addr = old_base;
     }
 
@@ -306,8 +305,13 @@ impl FramebufferState {
     }
 
     pub fn blit_buffer(&mut self, x: i32, y: i32, w: u32, h: u32, src: *const u32, src_size: usize) {
-        if self.base_addr < 0x1000 { return; }
-        if src.is_null() { return; }
+        if self.base_addr < 0x1000 {
+            // Defensive: logging very rarely to avoid spamming
+            return;
+        }
+        if src.is_null() || (src as usize) < 0x1000 {
+            return;
+        }
         if w == 0 || h == 0 { return; }
         let fb_w = self.info.width as i32;
         let fb_h = self.info.height as i32;
@@ -765,11 +769,11 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
 pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    let _ = ui::draw_cosmic_background(fb);
-    let mut star_seed = 0xACE1u32;
-    let _ = ui::draw_starfield_cosmic(fb, &mut star_seed, Point::zero());
+
+    // Use pre-rendered background to save CPU
+    fb.blit_background();
+
     let center = Point::new(w / 2, h / 2);
-    let _ = ui::draw_grid(fb, Rgb888::new(18, 28, 55), 48, Point::zero());
     let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
     let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
@@ -812,16 +816,24 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 42), label_style).draw(fb);
     let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
 
-    // Logs below
-    let mut log_buf = [0u8; 512];
-    let n = eclipse_libc::get_logs(&mut log_buf);
-    if n > 0 {
-        let logs_str = core::str::from_utf8(&log_buf[..n]).unwrap_or("");
-        let mut y_off = 60;
-        let log_text_style = MonoTextStyle::new(&FONT_6X10, colors::WHITE);
-        for line in logs_str.lines() {
-            let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
-            y_off += 12;
+    // Logs below - throttle to once every 10 frames to save syscall overhead
+    static mut LOG_BUF: [u8; 512] = [0u8; 512];
+    static mut LOG_LEN: usize = 0;
+    if counter % 10 == 0 {
+        unsafe {
+            LOG_LEN = eclipse_libc::get_logs(&mut LOG_BUF);
+        }
+    }
+
+    unsafe {
+        if LOG_LEN > 0 {
+            let logs_str = core::str::from_utf8(&LOG_BUF[..LOG_LEN]).unwrap_or("");
+            let mut y_off = 60;
+            let log_text_style = MonoTextStyle::new(&FONT_6X10, colors::WHITE);
+            for line in logs_str.lines() {
+                let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
+                y_off += 12;
+            }
         }
     }
 
@@ -901,7 +913,7 @@ pub fn draw_system_central(
         // PID
         let mut pid_str = heapless::String::<10>::new();
         if svc.state == 0 || (svc.pid == 0 && name_str != "kernel") {
-            let _ = pid_str.push_str("NaN");
+            let _ = pid_str.push_str("---");
         } else {
             let _ = core::fmt::write(&mut pid_str, format_args!("{}", svc.pid));
         }
@@ -927,10 +939,13 @@ pub fn draw_system_central(
         let mut svc_cpu = 0.0;
         let mut svc_mem_kb = 0;
         for (j, p) in processes.iter().enumerate() {
-            if p.pid == svc.pid && svc.pid != 0 {
-                svc_cpu = process_cpu[j];
-                svc_mem_kb = process_mem[j];
-                break;
+            // Strict safety: check both index and pid
+            if j < process_cpu.len() && j < process_mem.len() {
+                if p.pid == svc.pid && svc.pid != 0 {
+                    svc_cpu = process_cpu[j];
+                    svc_mem_kb = process_mem[j];
+                    break;
+                }
             }
         }
 
@@ -1013,14 +1028,20 @@ pub fn draw_system_central(
         let _ = Text::new(p_name, Point::new(col_prog_name, y), text_style).draw(fb);
         
         // CPU
-        let cpu_val = process_cpu[p_idx];
+        let mut cpu_val = 0.0;
+        if p_idx < process_cpu.len() {
+            cpu_val = process_cpu[p_idx];
+        }
         let mut cpu_str = heapless::String::<12>::new();
         let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", cpu_val));
         let _ = Text::new(&cpu_str, Point::new(col_prog_cpu, y), text_style).draw(fb);
         
         // MEM
         let mut mem_str = heapless::String::<16>::new();
-        let mem_kb = process_mem[p_idx];
+        let mut mem_kb = 0;
+        if p_idx < process_mem.len() {
+            mem_kb = process_mem[p_idx];
+        }
         if mem_kb > 1024 {
             let _ = core::fmt::write(&mut mem_str, format_args!("{:.1} MB", mem_kb as f32 / 1024.0));
         } else {

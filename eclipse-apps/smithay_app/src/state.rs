@@ -88,8 +88,8 @@ impl SmithayState {
     }
 
     pub fn process_events(&mut self) {
-        // Drenar al menos lo que cabe en el mailbox del kernel (256) para no bloquear input
-        const MAX_EVENTS: usize = 256;
+        // Reduced to 32 to save stack space if needed
+        const MAX_EVENTS: usize = 32;
         let mut count = 0;
         while count < MAX_EVENTS {
             if let Some(event) = self.backend.poll_event() {
@@ -217,6 +217,9 @@ impl SmithayState {
             }
             
             // Actualizar lista de procesos y servicios
+            if self.counter % 60 == 0 {
+                let _ = eclipse_libc::write(1, b"[DEBUG] update: polling services...\n");
+            }
             if self.input.system_central_active {
                 unsafe {
                     let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);

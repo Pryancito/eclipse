@@ -4,7 +4,7 @@
 //! Supports both xAPIC (MMIO) and x2APIC (MSR) modes.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 // LAPIC Register Offsets
 const LAPIC_REG_ID: u32 = 0x20;
@@ -32,6 +32,18 @@ const X2APIC_MSR_ICR: u32 = 0x830;
 const MSR_APIC_BASE: u32 = 0x1B;
 /// Bit 10 of IA32_APIC_BASE: x2APIC mode enable
 const APIC_BASE_X2APIC: u64 = 1 << 10;
+
+/// TSC-Deadline Mode MSR
+const MSR_IA32_TSC_DEADLINE: u32 = 0x6E0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ApicTimerMode {
+    Periodic,
+    OneShot,
+    TSCDeadline,
+}
+
+static TIMER_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0); // 0=Periodic, 1=OneShot, 2=TSCDeadline
 
 static mut LAPIC_BASE: u64 = 0;
 /// True when the CPU is running in x2APIC mode (MSR-based register access)
@@ -94,17 +106,59 @@ pub fn calibrate_timer() {
     }
 }
 
-/// Start the Local APIC periodic timer on the current CPU.
-/// `vector` is the IDT vector that will fire every ~1 ms.
-/// calibrate_timer() must have been called on the BSP beforehand.
+/// Start the Local APIC timer on the current CPU choosing the best mode.
+/// `vector` is the IDT vector that will fire.
 pub fn init_timer(vector: u8) {
     let count = LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed);
+    let has_tsc_deadline = crate::cpu::has_tsc_deadline();
+    
     unsafe {
-        write_reg(LAPIC_REG_TMRDIV, 0x03);          // divide by 16
-        // Periodic mode (bit 17), unmasked, vector
-        write_reg(LAPIC_REG_LVT_TIMER, (1 << 17) | (vector as u32));
-        write_reg(LAPIC_REG_TMRINIT, count);         // ~1 ms period
+        write_reg(LAPIC_REG_TMRDIV, 0x03); // divide by 16
+
+        if has_tsc_deadline {
+            TIMER_MODE.store(2, Ordering::SeqCst);
+            // TSC-Deadline mode is bit 18 set, bit 17 clear
+            write_reg(LAPIC_REG_LVT_TIMER, (2 << 17) | (vector as u32));
+            
+            // Trigger first deadline (1ms from now)
+            let tsc_per_ms = crate::cpu::get_tsc_frequency() * 1000;
+            set_timer_tsc(crate::cpu::rdtsc() + tsc_per_ms);
+        } else {
+            // Use One-shot (bit 17=0, 18=0) or Periodic (bit 17=1)
+            // For now let's stick to One-shot if we want robustness, or Periodic if we want simplicity.
+            // Redox recommends One-shot.
+            TIMER_MODE.store(1, Ordering::SeqCst);
+            write_reg(LAPIC_REG_LVT_TIMER, (vector as u32)); // One-shot
+            write_reg(LAPIC_REG_TMRINIT, count);
+        }
     }
+}
+
+pub fn get_timer_mode() -> ApicTimerMode {
+    match TIMER_MODE.load(Ordering::Relaxed) {
+        1 => ApicTimerMode::OneShot,
+        2 => ApicTimerMode::TSCDeadline,
+        _ => ApicTimerMode::Periodic,
+    }
+}
+
+pub fn set_timer_oneshot(count: u32) {
+    unsafe {
+        write_reg(LAPIC_REG_TMRINIT, count);
+    }
+}
+
+pub fn set_timer_tsc(deadline: u64) {
+    unsafe {
+        let low = (deadline & 0xFFFFFFFF) as u32;
+        let high = (deadline >> 32) as u32;
+        core::arch::asm!("wrmsr", in("ecx") MSR_IA32_TSC_DEADLINE, in("eax") low, in("edx") high,
+            options(nomem, nostack, preserves_flags));
+    }
+}
+
+pub fn get_timer_count_1ms() -> u32 {
+    LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed)
 }
 
 /// Initialize Local APIC for the current CPU.

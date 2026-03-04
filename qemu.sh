@@ -41,7 +41,7 @@ fi
 # Variables de configuración
 DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si se especifica DISK=/dev/nvme0n1
 MEMORY="8G"
-CPUS="1"
+CPUS="4"
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
 # Por defecto usamos dispositivos de entrada SOLO USB (teclado + ratón HID)
 # PS2_MOUSE=1 activa el modo PS/2 legacy (sin USB HID)
@@ -213,7 +213,7 @@ fi
 QEMU_CMD="$QEMU_CMD -no-shutdown"
 
 # Puerto de monitor QEMU (para debugging)
-QEMU_CMD="$QEMU_CMD -serial stdio"
+#QEMU_CMD="$QEMU_CMD -serial file:qemu_serial.log"
 #QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
 
 # Debugging flags (Unconditional)
