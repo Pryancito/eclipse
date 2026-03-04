@@ -22,7 +22,7 @@
 //! - Configurable baud rates
 //! - Hardware flow control (RTS/CTS)
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::arch::asm;
 use core::fmt::Write;
 
@@ -87,6 +87,7 @@ pub fn read_byte() -> Option<u8> {
 
 /// Leer un byte del puerto serial (blocking - espera hasta que haya datos)
 pub fn read_byte_blocking() -> u8 {
+    let _lock = SERIAL_PORT_LOCK.lock();
     while !is_data_available() {
         crate::cpu::pause();
     }
@@ -136,6 +137,7 @@ pub fn serial_print_char(c: char) {
 
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
+    let _lock = SERIAL_PORT_LOCK.lock();
     // Esperar a que el buffer de transmisión esté vacío con un timeout de seguridad
     // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
     let mut timeout = 10_000;
@@ -195,8 +197,12 @@ pub fn serial_printf(args: core::fmt::Arguments) {
     });
 }
 
-/// Registro de si cada CPU está al inicio de una línea (AtomicBool para SMP safety)
-static CPU_AT_LINE_START: [AtomicBool; 128] = [const { AtomicBool::new(true) }; 128];
+/// Registro de si cada CPU necesita un prefijo (AtomicBool para SMP safety)
+static CPU_NEEDS_PREFIX: [AtomicBool; 128] = [const { AtomicBool::new(true) }; 128];
+
+/// Seguimiento global de qué CPU escribió por última vez y estado de la línea física
+static GLOBAL_LAST_CPU: AtomicI32 = AtomicI32::new(-1);
+static GLOBAL_AT_LINE_START: AtomicBool = AtomicBool::new(true);
 
 /// Writer que añade prefijo [Cn] al inicio de cada línea y delega al hardware.
 /// Se usa dentro de un lock ya adquirido.
@@ -210,6 +216,15 @@ impl PrefixedWriter {
     }
 
     fn write_prefix(&mut self) {
+        // --- COHERENCIA GLOBAL ---
+        // Si otra CPU dejó la línea a medias, forzamos un \n antes de nuestro prefijo
+        let last_cpu = GLOBAL_LAST_CPU.load(Ordering::Acquire);
+        if last_cpu != -1 && last_cpu != self.cpu_id && !GLOBAL_AT_LINE_START.load(Ordering::Acquire) {
+            write_byte_internal(b'\n');
+            GLOBAL_AT_LINE_START.store(true, Ordering::Release);
+        }
+        GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
+
         write_byte_internal(b'[');
         write_byte_internal(b'C');
         // Simple 0-9 for now (common in QEMU -smp 4/8)
@@ -221,6 +236,7 @@ impl PrefixedWriter {
         write_byte_internal(id_byte);
         write_byte_internal(b']');
         write_byte_internal(b' ');
+        GLOBAL_AT_LINE_START.store(false, Ordering::Release);
     }
 }
 
@@ -229,15 +245,20 @@ impl core::fmt::Write for PrefixedWriter {
         let cpu_idx = (self.cpu_id as usize).min(127);
         
         for byte in s.bytes() {
-            if CPU_AT_LINE_START[cpu_idx].load(Ordering::Relaxed) && byte != b'\n' {
+            if CPU_NEEDS_PREFIX[cpu_idx].load(Ordering::Relaxed) && byte != b'\n' {
                 self.write_prefix();
-                CPU_AT_LINE_START[cpu_idx].store(false, Ordering::Relaxed);
+                CPU_NEEDS_PREFIX[cpu_idx].store(false, Ordering::Relaxed);
             }
             
             write_byte_internal(byte);
             
             if byte == b'\n' {
-                CPU_AT_LINE_START[cpu_idx].store(true, Ordering::Relaxed);
+                CPU_NEEDS_PREFIX[cpu_idx].store(true, Ordering::Relaxed);
+                GLOBAL_AT_LINE_START.store(true, Ordering::Release);
+                GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
+            } else {
+                GLOBAL_AT_LINE_START.store(false, Ordering::Release);
+                GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
             }
         }
         Ok(())

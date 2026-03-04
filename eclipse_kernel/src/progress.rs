@@ -178,6 +178,7 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
+    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
     let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
@@ -402,6 +403,21 @@ fn fmt_hex(v: u64, out: &mut [u8; 18]) {
 /// Pinta una pantalla BSOD completa con la información de la excepción.
 /// Solo usa buffers de pila — sin alloc ni fmt!.
 pub fn bsod(info: &BsodInfo) {
+    // En un BSOD, intentamos obtener el lock del hardware. 
+    // Si no podemos (porque el core que crasheó ya lo tenía o hay deadlock), lo forzamos.
+    let mut acquired = false;
+    for _ in 0..1000 {
+        if VIDEO_HARDWARE_LOCK.try_lock().is_some() {
+            acquired = true;
+            break;
+        }
+        crate::cpu::pause();
+    }
+    if !acquired {
+        unsafe { VIDEO_HARDWARE_LOCK.force_unlock(); }
+        let _ = VIDEO_HARDWARE_LOCK.lock();
+    }
+
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
     
     // Safety check: Verificar que la dirección física del FB no sea nula y esté
