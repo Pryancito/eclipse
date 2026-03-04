@@ -1,17 +1,13 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use eclipse_libc::{println, getpid, sigaction, kill, exit, yield_cpu, SIGUSR1};
 
-static mut SIGNAL_RECEIVED: bool = false;
+static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn handle_sigusr1(signum: u32) {
-    // We can't use println safely here if it uses locks that the main thread might hold,
-    // but in this simple test it should be fine.
-    // However, the kernel-side signal delivery print should show up too.
-    unsafe {
-        SIGNAL_RECEIVED = true;
-    }
+extern "C" fn handle_sigusr1(_signum: u32) {
+    SIGNAL_RECEIVED.store(true, Ordering::Release);
 }
 
 #[no_mangle]
@@ -31,20 +27,16 @@ pub extern "C" fn _start() -> ! {
     // Signal delivery happens on return from syscall (e.g. yield_cpu or println).
     for _ in 0..10 {
         yield_cpu();
-        unsafe {
-            if SIGNAL_RECEIVED {
-                break;
-            }
+        if SIGNAL_RECEIVED.load(Ordering::Acquire) {
+            break;
         }
     }
 
-    unsafe {
-        if SIGNAL_RECEIVED {
-            println!("SUCCESS: Signal handler was executed!");
-            exit(0);
-        } else {
-            println!("FAILURE: Signal handler was NOT executed.");
-            exit(1);
-        }
+    if SIGNAL_RECEIVED.load(Ordering::Acquire) {
+        println!("SUCCESS: Signal handler was executed!");
+        exit(0);
+    } else {
+        println!("FAILURE: Signal handler was NOT executed.");
+        exit(1);
     }
 }

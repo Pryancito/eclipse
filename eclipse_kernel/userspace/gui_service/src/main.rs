@@ -11,12 +11,13 @@
 use eclipse_libc::{
     println, getpid, getppid, sleep_ms, send, open, close, read, O_RDONLY,
     mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
-    SEEK_END,
+    SEEK_END, Spinlock,
 };
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
 const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
-static mut LOAD_BUF: [u8; MAX_COMPOSITOR_SIZE] = [0; MAX_COMPOSITOR_SIZE];
+/// Spinlock-protected load buffer for thread-safe SMP access.
+static LOAD_BUF: Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
 const COMPOSITOR_PATH: &str = "/usr/bin/smithay_app";
 /// Maximum restart attempts (0 = unlimited)
@@ -77,14 +78,19 @@ unsafe fn spawn_compositor() -> i32 {
         } else {
             // mmap failed (e.g. file scheme). Fallback: load via read().
             let _ = lseek(fd, 0, 0); // SEEK_SET to start
-            let buf = unsafe { &mut LOAD_BUF[..size.min(MAX_COMPOSITOR_SIZE as u64) as usize] };
-            let n = read(fd as u32, buf);
-            close(fd);
+            let mut load_guard = LOAD_BUF.lock();
+            let read_size = size.min(MAX_COMPOSITOR_SIZE as u64) as usize;
+            let n = {
+                let buf = &mut load_guard[..read_size];
+                let result = read(fd as u32, buf);
+                close(fd);
+                result
+            };
             if n < 0 || n as u64 != size {
                 println!("[GUI-SERVICE] ERROR: read failed for {} (got {})", COMPOSITOR_PATH, n);
                 return -1;
             }
-            spawn(unsafe { &LOAD_BUF[..size as usize] }, Some("smithay_app"))
+            spawn(&load_guard[..size as usize], Some("smithay_app"))
 
         }
     };
