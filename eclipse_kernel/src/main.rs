@@ -388,6 +388,9 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     progress::bar(100);
     
     loop {
+        // Heartbeat IPC (solo un núcleo lo imprimirá cada 5s)
+        ipc::p2p_heartbeat();
+
         // Procesar mensajes IPC mientras haya pendientes
         if crate::ipc::has_pending_messages() {
             ipc::process_messages();

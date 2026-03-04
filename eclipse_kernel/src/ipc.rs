@@ -452,7 +452,15 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
         });
     }
 
-    // --- Cola global para mensajes de servidor ---
+    // --- Cola global para mensajes de servidor (o fallback P2P si dest_slot=0xFF) ---
+    if dest_slot == 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
+        #[cfg(not(test))]
+        crate::serial::serial_printf(format_args!(
+            "[IPC] P2P msg type {:?} for PID {} fell back to global queue\n",
+            msg_type, to
+        ));
+    }
+
     run_critical(|| {
         let mut ipc = IPC_SYSTEM.lock();
         msg.id = ipc.message_id_counter.fetch_add(1, Ordering::SeqCst) as u64;
@@ -491,7 +499,15 @@ pub fn process_messages() {
                 let is_p2p = msg.msg_type == MessageType::Signal
                     || msg.msg_type == MessageType::Input;
                 if is_p2p {
-                    let slot = msg.dest_slot; // O(1): ya calculado en send_message
+                    let mut slot = msg.dest_slot; // O(1): ya calculado en send_message
+                    
+                    // Fallback para P2P que cayó a cola global (colisión o PID aún no registrado)
+                    if slot == 0xFF {
+                        if let Some(s) = crate::process::pid_to_slot(msg.to) {
+                            slot = s as u8;
+                        }
+                    }
+
                     ipc.global_message_queue[head] = None;
                     ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
                     if slot != 0xFF {
@@ -545,9 +561,19 @@ pub fn process_messages() {
         match p2p {
             None => break,
             Some(None) => {} // server delivery or dropped
-            Some(Some((_slot, _msg))) => {
-                // P2P messages now go via direct delivery in send_message.
-                // This branch is dead code but kept for safety.
+            Some(Some((slot, msg))) => {
+                // Phase 2: Deliver to process mailbox (PROCESS_MAILBOXES only).
+                let ok = PROCESS_MAILBOXES.lock()[slot].push(msg);
+                if ok {
+                    P2P_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    DROPPED_P2P_MSGS.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(not(test))]
+                    crate::serial::serial_printf(format_args!(
+                        "[IPC] P2P Mailbox {} full, dropped msg type {:?}\n",
+                        slot, msg.msg_type
+                    ));
+                }
             }
         }
     }
@@ -582,6 +608,26 @@ pub fn get_stats() -> (u32, u32, u64) {
         
         (active_servers, active_clients, ipc.total_messages)
     })
+}
+
+static LAST_IPC_LOG: AtomicU64 = AtomicU64::new(0);
+
+/// Emitir un log de estado del IPC cada 5 segundos (heartbeat).
+/// Llamado desde el bucle idle de los núcleos.
+pub fn p2p_heartbeat() {
+    let now = crate::interrupts::ticks();
+    let last = LAST_IPC_LOG.load(Ordering::Relaxed);
+    if now >= last + 5000 {
+        if LAST_IPC_LOG.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let delivered = P2P_DELIVERED.load(Ordering::Relaxed);
+            let dropped = DROPPED_P2P_MSGS.load(Ordering::Relaxed);
+            let (sv, cl, total) = get_stats();
+            crate::serial::serial_printf(format_args!(
+                "[IPC] Heartbeat: Delivered P2P: {}, Dropped P2P: {}, Total Msgs: {}, Sv: {}, Cl: {}\n",
+                delivered, dropped, total, sv, cl
+            ));
+        }
+    }
 }
 
 /// Recibir mensaje para un proceso (O(1)).

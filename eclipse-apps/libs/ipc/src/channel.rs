@@ -44,8 +44,13 @@ impl IpcChannel {
                 self.message_count += 1;
                 return Some(msg);
             }
-            // Mensaje pequeño no reconocido: no llamar a receive() para no consumir el siguiente.
-            return None;
+            
+            // Mensaje pequeño no reconocido (p. ej. señal desconocida):
+            // Fallback a Raw para no perder el mensaje de la cola.
+            let mut raw_data = [0u8; 256];
+            raw_data[..24].copy_from_slice(&data);
+            self.message_count += 1;
+            return Some(EclipseMessage::Raw { data: raw_data, len, from });
         }
 
         // --- Slow path ---

@@ -505,6 +505,7 @@ extern "C" fn ap_main_loop() -> ! {
     unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
 
     loop {
+        crate::ipc::p2p_heartbeat();
         crate::cpu::idle();
         crate::scheduler::schedule();
     }

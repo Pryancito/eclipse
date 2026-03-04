@@ -11,7 +11,7 @@
 use eclipse_libc::{
     println, getpid, getppid, sleep_ms, send, open, close, read, O_RDONLY,
     mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
-    SEEK_END, Spinlock,
+    SEEK_END, Spinlock, exec
 };
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)

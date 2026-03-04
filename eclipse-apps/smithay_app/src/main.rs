@@ -69,8 +69,8 @@ pub extern "C" fn _start() -> ! {
         // Un drenado rápido tras render por si llegaron eventos durante el frame
         state.process_events();
 
-        // Intentar mapear el framebuffer si estamos en modo headless (cada ~5s a ~60fps)
-        if state.counter % 300 == 0 {
+        // Intentar mapear el framebuffer si estamos en modo headless (cada ~1s a ~60fps)
+        if state.counter % 60 == 0 {
             state.backend.fb.try_remap_framebuffer();
         }
 
@@ -80,6 +80,7 @@ pub extern "C" fn _start() -> ! {
                 used, state.backend.ipc.message_count);
         }
 
-        yield_cpu();
+        state.counter += 1;
+        sleep_ms(2);
     }
 }
