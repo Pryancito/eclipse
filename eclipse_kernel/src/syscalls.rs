@@ -2160,7 +2160,7 @@ fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
 /// 
 /// Returns: Address of mapped region, or u64::MAX on error
 fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
-    use crate::process::{self, VMARegion, ProcessId};
+    use crate::process::{self, VMARegion};
     use crate::memory;
     use crate::serial;
 
@@ -2173,6 +2173,18 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     let current_pid = match process::current_process_id() {
         Some(pid) => pid,
         None => return u64::MAX,
+    };
+
+    // Resolve file descriptor before acquiring process resources.
+    // A file-backed mapping populates each page with content from the open file.
+    // MAP_ANONYMOUS (0x20) means the mapping is not backed by a file.
+    // The fd limit matches the per-process FD table size.
+    const MMAP_MAP_ANONYMOUS: u64 = 0x20;
+    const MMAP_MAX_FD: u64 = crate::fd::MAX_FDS_PER_PROCESS as u64;
+    let fd_entry = if (flags & MMAP_MAP_ANONYMOUS) == 0 && fd < MMAP_MAX_FD {
+        crate::fd::fd_get(current_pid, fd as usize)
+    } else {
+        None
     };
 
     if let Some(mut proc) = process::get_process(current_pid) {
@@ -2201,12 +2213,53 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
             target_addr = candidate;
         }
 
-        // Map pages (simplified: always anonymous for now to fix duplication/bugs)
-        // If it was file backed, we would do more, but let's first get the framework stable.
+        // Map pages with real physical frames.  For file-backed mappings each
+        // frame is populated with the corresponding file content via the scheme
+        // layer so that the caller can use the mapped region as a contiguous
+        // ELF/data buffer without a separate read() step.
         let mut current = target_addr;
         let end = target_addr + aligned_length;
+        let file_len = length as usize;
+        let mut file_offset: usize = 0;
         while current < end {
-            memory::map_user_page_4kb(page_table_phys, current, 0, prot);
+            if let Some(frame_phys) = memory::alloc_phys_frame_for_anon_mmap() {
+                // Zero the frame via the higher-half direct mapping.
+                let frame_virt = memory::PHYS_MEM_OFFSET + frame_phys;
+                unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
+
+                // For file-backed mappings read the next 4 KB of file data.
+                if let Some(ref fde) = fd_entry {
+                    let remaining = file_len.saturating_sub(file_offset);
+                    if remaining > 0 {
+                        let to_read = remaining.min(4096);
+                        // SAFETY: `frame_virt` is the kernel HHDM address of a freshly
+                        // allocated physical frame.  The frame is not aliased (it was just
+                        // returned by alloc_phys_frame_for_anon_mmap) and the HHDM covers
+                        // the entire physical memory, so the pointer is valid for `to_read`
+                        // bytes.
+                        let frame_slice = unsafe {
+                            core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
+                        };
+                        match crate::scheme::read(fde.scheme_id, fde.resource_id, frame_slice) {
+                            Ok(n) => { file_offset += n; }
+                            Err(e) => {
+                                serial::serial_printf(format_args!(
+                                    "[SYSCALL] mmap: file read error at offset {}: {}\n",
+                                    file_offset, e
+                                ));
+                                // Advance by the bytes we attempted so subsequent pages
+                                // do not attempt to read the same range.
+                                file_offset += to_read;
+                            }
+                        }
+                    }
+                }
+
+                memory::map_user_page_4kb(page_table_phys, current, frame_phys, prot);
+            } else {
+                serial::serial_print("[SYSCALL] mmap: physical frame pool exhausted\n");
+                memory::map_user_page_4kb(page_table_phys, current, 0, prot);
+            }
             current += 4096;
         }
 
@@ -2214,7 +2267,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
             start: target_addr,
             end: target_addr + aligned_length,
             flags: prot,
-            file_backed: false,
+            file_backed: fd_entry.is_some(),
         });
         
         proc.mem_frames += num_pages;
@@ -2250,6 +2303,7 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
 fn sys_brk(addr: u64) -> u64 {
     use crate::process;
     use crate::memory;
+    use crate::serial;
     if let Some(pid) = process::current_process_id() {
         if let Some(mut proc) = process::get_process(pid) {
             let mut r = proc.resources.lock();
@@ -2263,7 +2317,18 @@ fn sys_brk(addr: u64) -> u64 {
             if new_page_end > old_page_end {
                 let mut curr = old_page_end;
                 while curr < new_page_end {
-                    memory::map_user_page_4kb(r.page_table_phys, curr, 0, 0x7);
+                    match memory::alloc_phys_frame_for_anon_mmap() {
+                        Some(frame_phys) => {
+                            // Zero the new heap page before handing it to userspace.
+                            let frame_virt = memory::PHYS_MEM_OFFSET + frame_phys;
+                            unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
+                            memory::map_user_page_4kb(r.page_table_phys, curr, frame_phys, 0x7);
+                        }
+                        None => {
+                            serial::serial_print("[SYSCALL] brk: physical frame pool exhausted\n");
+                            return u64::MAX;
+                        }
+                    }
                     curr += 4096;
                 }
                 proc.mem_frames += (new_page_end - old_page_end) / 4096;
