@@ -403,20 +403,22 @@ fn fmt_hex(v: u64, out: &mut [u8; 18]) {
 /// Pinta una pantalla BSOD completa con la información de la excepción.
 /// Solo usa buffers de pila — sin alloc ni fmt!.
 pub fn bsod(info: &BsodInfo) {
-    // En un BSOD, intentamos obtener el lock del hardware. 
+    // En un BSOD, intentamos obtener el lock del hardware.
     // Si no podemos (porque el core que crasheó ya lo tenía o hay deadlock), lo forzamos.
-    let mut acquired = false;
+    // IMPORTANT: keep the guard alive for the entire function so rendering is serialised.
+    let mut guard = None;
     for _ in 0..1000 {
-        if VIDEO_HARDWARE_LOCK.try_lock().is_some() {
-            acquired = true;
+        if let Some(g) = VIDEO_HARDWARE_LOCK.try_lock() {
+            guard = Some(g);
             break;
         }
         crate::cpu::pause();
     }
-    if !acquired {
+    if guard.is_none() {
         unsafe { VIDEO_HARDWARE_LOCK.force_unlock(); }
-        let _ = VIDEO_HARDWARE_LOCK.lock();
+        guard = Some(VIDEO_HARDWARE_LOCK.lock());
     }
+    let _lock_guard = guard; // Hold for the remainder of bsod() to serialise FB access.
 
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
     
