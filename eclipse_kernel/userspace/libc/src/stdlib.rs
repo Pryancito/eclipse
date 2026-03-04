@@ -2,6 +2,74 @@
 //! Símbolos C (no_mangle + extern "C") para que el linker resuelva las referencias
 //! que emite el compilador al optimizar copias/zeroing de memoria.
 
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::ops::{Deref, DerefMut};
+
+/// A simple spinlock that can hold any value `T`.
+///
+/// Suitable for both single-core and SMP use: the owner spins (with a
+/// `core::hint::spin_loop()` pause hint) until the lock is free.
+///
+/// `Spinlock<T>` is `Send + Sync` whenever `T: Send`, so it can safely live
+/// in `static` storage and be accessed from any CPU.
+pub struct Spinlock<T> {
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for Spinlock<T> {}
+unsafe impl<T: Send> Sync for Spinlock<T> {}
+
+impl<T> Spinlock<T> {
+    /// Create a new, unlocked `Spinlock` containing `value`.
+    pub const fn new(value: T) -> Self {
+        Spinlock {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    /// Acquire the lock, spinning until it is available.
+    /// Returns a `SpinlockGuard` that automatically releases the lock on drop.
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
+        loop {
+            if self.locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        SpinlockGuard { lock: self }
+    }
+}
+
+/// RAII guard returned by [`Spinlock::lock`].
+pub struct SpinlockGuard<'a, T> {
+    lock: &'a Spinlock<T>,
+}
+
+impl<'a, T> Deref for SpinlockGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for SpinlockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for SpinlockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
 /// Símbolo C requerido por el linker en target no-GNU (x86_64-unknown-eclipse).
 #[cfg(not(target_env = "gnu"))]
 #[no_mangle]

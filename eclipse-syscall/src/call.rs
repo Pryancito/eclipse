@@ -179,3 +179,21 @@ pub fn connect(fd: usize, addr_ptr: usize, addr_len: usize) -> Result<()> {
     unsafe { cvt_unit(syscall3(SYS_CONNECT, fd, addr_ptr, addr_len)) }
 }
 
+/// gettid() - get thread ID
+pub fn gettid() -> usize {
+    unsafe { syscall0(SYS_GETTID) }
+}
+
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
+
+/// futex_wait(uaddr, val) - wait on a futex if *uaddr == val
+pub fn futex_wait(uaddr: *const core::sync::atomic::AtomicI32, val: i32) -> Result<()> {
+    unsafe { cvt_unit(syscall3(SYS_FUTEX, uaddr as usize, FUTEX_WAIT, val as usize)) }
+}
+
+/// futex_wake(uaddr, count) - wake up to `count` waiters on a futex
+pub fn futex_wake(uaddr: *const core::sync::atomic::AtomicI32, count: u32) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_FUTEX, uaddr as usize, FUTEX_WAKE, count as usize)) }
+}
+

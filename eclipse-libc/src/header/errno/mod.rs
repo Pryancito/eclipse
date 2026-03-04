@@ -1,7 +1,8 @@
 //! errno.h - Error numbers
 use crate::types::*;
 
-// Global errno variable
+// Per-thread errno variable
+#[thread_local]
 static mut ERRNO: c_int = 0;
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]

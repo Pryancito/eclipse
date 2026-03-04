@@ -4,6 +4,7 @@ use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_c
 use eclipse_syscall::flag::{O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
 use eclipse_syscall::number::{SYS_OPEN, SYS_LSEEK};
 use core::ptr;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 pub const EOF: c_int = -1;
 
@@ -11,6 +12,10 @@ pub const BUFSIZ: usize = 1024;
 const MODE_READ: c_int = 1;
 const MODE_WRITE: c_int = 2;
 const MODE_APPEND: c_int = 4;
+
+/// FILE spinlock states.
+const FILE_LOCK_UNLOCKED: i32 = 0;
+const FILE_LOCK_LOCKED: i32 = 1;
 
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub type FILE = c_void;
@@ -24,24 +29,28 @@ pub struct FILE {
     buf_pos: usize,
     buf_size: usize,
     buf_capacity: usize,
+    lock: AtomicI32,
 }
 
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
 static mut STDIN_STRUCT: FILE = FILE {
     fd: 0, flags: MODE_READ,
     buffer: ptr::null_mut(), buf_pos: 0, buf_size: 0, buf_capacity: 0,
+    lock: AtomicI32::new(0),
 };
 
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
 static mut STDOUT_STRUCT: FILE = FILE {
     fd: 1, flags: MODE_WRITE,
     buffer: ptr::null_mut(), buf_pos: 0, buf_size: 0, buf_capacity: 0,
+    lock: AtomicI32::new(0),
 };
 
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
 static mut STDERR_STRUCT: FILE = FILE {
     fd: 2, flags: MODE_WRITE,
     buffer: ptr::null_mut(), buf_pos: 0, buf_size: 0, buf_capacity: 0,
+    lock: AtomicI32::new(0),
 };
 
 #[no_mangle]
@@ -96,6 +105,37 @@ mod target {
     use crate::c_str::strlen;
     use crate::header::string::{strcpy, strncpy};
 
+    /// Acquire the per-FILE spinlock (non-recursive).
+    unsafe fn file_lock_acquire(stream: *mut FILE) {
+        loop {
+            if (*stream).lock
+                .compare_exchange_weak(FILE_LOCK_UNLOCKED, FILE_LOCK_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Release the per-FILE spinlock.
+    unsafe fn file_lock_release(stream: *mut FILE) {
+        (*stream).lock.store(FILE_LOCK_UNLOCKED, Ordering::Release);
+    }
+
+    /// Internal unlocked flush – caller must hold the FILE lock.
+    unsafe fn fflush_nolock(stream: *mut FILE) -> c_int {
+        if ((*stream).flags & MODE_WRITE) != 0 && (*stream).buf_pos > 0 {
+            let buffer_slice = core::slice::from_raw_parts((*stream).buffer, (*stream).buf_pos);
+            match sys_write((*stream).fd as usize, buffer_slice) {
+                Ok(_) => { (*stream).buf_pos = 0; 0 }
+                Err(_) => -1,
+            }
+        } else {
+            0
+        }
+    }
+
     unsafe fn parse_mode(mode: *const c_char) -> (c_int, usize) {
         let p = mode;
         let file_flags;
@@ -148,6 +188,7 @@ mod target {
         (*file).buf_pos = 0;
         (*file).buf_size = 0;
         (*file).buf_capacity = BUFSIZ;
+        ptr::addr_of_mut!((*file).lock).write(AtomicI32::new(0));
         
         file
     }
@@ -181,6 +222,7 @@ mod target {
         (*file).buf_pos = 0;
         (*file).buf_size = 0;
         (*file).buf_capacity = BUFSIZ;
+        ptr::addr_of_mut!((*file).lock).write(AtomicI32::new(0));
 
         file
     }
@@ -192,10 +234,15 @@ mod target {
         }
         /* No cerrar ni liberar stdin/stdout/stderr (estáticos); TinyX/OsInit los llama */
         if stream == stdin || stream == stdout || stream == stderr {
-            let _ = fflush(stream);
+            file_lock_acquire(stream);
+            let _ = fflush_nolock(stream);
+            file_lock_release(stream);
             return 0;
         }
-        fflush(stream);
+        file_lock_acquire(stream);
+        let _ = fflush_nolock(stream);
+        // Release the lock before freeing (no other thread should access a closed stream)
+        file_lock_release(stream);
         let result = match sys_close((*stream).fd as usize) {
             Ok(_) => 0,
             Err(_) => -1,
@@ -212,20 +259,10 @@ mod target {
         if stream.is_null() {
             return 0;
         }
-        
-        if ((*stream).flags & MODE_WRITE) != 0 && (*stream).buf_pos > 0 {
-            let buffer_slice = core::slice::from_raw_parts((*stream).buffer, (*stream).buf_pos);
-            
-            match sys_write((*stream).fd as usize, buffer_slice) {
-                Ok(_) => {
-                    (*stream).buf_pos = 0;
-                    0
-                }
-                Err(_) => -1,
-            }
-        } else {
-            0
-        }
+        file_lock_acquire(stream);
+        let ret = fflush_nolock(stream);
+        file_lock_release(stream);
+        ret
     }
 
     #[no_mangle]
@@ -239,36 +276,42 @@ mod target {
         let total_size = size * nmemb;
         let data = core::slice::from_raw_parts(ptr as *const u8, total_size);
         
-        if (*stream).buffer.is_null() || total_size > (*stream).buf_capacity {
-            return match sys_write((*stream).fd as usize, data) {
+        file_lock_acquire(stream);
+
+        let result = if (*stream).buffer.is_null() || total_size > (*stream).buf_capacity {
+            match sys_write((*stream).fd as usize, data) {
                 Ok(n) => n / size,
                 Err(_) => 0,
-            };
-        }
-        
-        let mut written = 0;
-        while written < total_size {
-            let remaining = total_size - written;
-            let space = (*stream).buf_capacity - (*stream).buf_pos;
-            let to_write = remaining.min(space);
-            
-            ptr::copy_nonoverlapping(
-                data.as_ptr().add(written),
-                (*stream).buffer.add((*stream).buf_pos),
-                to_write
-            );
-            
-            (*stream).buf_pos += to_write;
-            written += to_write;
-            
-            if (*stream).buf_pos >= (*stream).buf_capacity {
-                if fflush(stream) != 0 {
-                    return written / size;
+            }
+        } else {
+            let mut written = 0;
+            let mut ok = true;
+            while written < total_size {
+                let remaining = total_size - written;
+                let space = (*stream).buf_capacity - (*stream).buf_pos;
+                let to_write = remaining.min(space);
+                
+                ptr::copy_nonoverlapping(
+                    data.as_ptr().add(written),
+                    (*stream).buffer.add((*stream).buf_pos),
+                    to_write
+                );
+                
+                (*stream).buf_pos += to_write;
+                written += to_write;
+                
+                if (*stream).buf_pos >= (*stream).buf_capacity {
+                    if fflush_nolock(stream) != 0 {
+                        ok = false;
+                        break;
+                    }
                 }
             }
-        }
-        
-        nmemb
+            if ok { nmemb } else { written / size }
+        };
+
+        file_lock_release(stream);
+        result
     }
 
     #[no_mangle]
@@ -282,10 +325,13 @@ mod target {
         let total_size = size * nmemb;
         let data = core::slice::from_raw_parts_mut(ptr as *mut u8, total_size);
         
-        match sys_read((*stream).fd as usize, data) {
+        file_lock_acquire(stream);
+        let result = match sys_read((*stream).fd as usize, data) {
             Ok(n) => n / size,
             Err(_) => 0,
-        }
+        };
+        file_lock_release(stream);
+        result
     }
 
     #[no_mangle]
@@ -357,9 +403,11 @@ mod target {
             return -1;
         }
         
+        file_lock_acquire(stream);
+
         // Flush write buffer if needed
         if (*stream).flags & MODE_WRITE != 0 {
-            fflush(stream);
+            fflush_nolock(stream);
         }
         
         // Call lseek syscall
@@ -370,15 +418,13 @@ mod target {
             whence as usize
         );
         
-        if result as isize == -1 {
-            return -1;
-        }
-        
         // Clear read buffer
         (*stream).buf_pos = 0;
         (*stream).buf_size = 0;
+
+        file_lock_release(stream);
         
-        0
+        if result as isize == -1 { -1 } else { 0 }
     }
 
     #[no_mangle]
@@ -830,6 +876,37 @@ mod target {
     #[no_mangle]
     pub unsafe extern "C" fn __isoc23_sscanf(s: *const c_char, format: *const c_char, args: ...) -> c_int {
         sscanf(s, format, args)
+    }
+
+    /// Lock the FILE stream for exclusive access by the calling thread.
+    #[no_mangle]
+    pub unsafe extern "C" fn flockfile(stream: *mut FILE) {
+        if !stream.is_null() {
+            file_lock_acquire(stream);
+        }
+    }
+
+    /// Unlock the FILE stream previously locked by flockfile.
+    #[no_mangle]
+    pub unsafe extern "C" fn funlockfile(stream: *mut FILE) {
+        if !stream.is_null() {
+            file_lock_release(stream);
+        }
+    }
+
+    /// Try to lock the FILE stream without blocking.
+    /// Returns 0 if the lock was acquired, non-zero otherwise.
+    #[no_mangle]
+    pub unsafe extern "C" fn ftrylockfile(stream: *mut FILE) -> c_int {
+        if stream.is_null() {
+            return -1;
+        }
+        match (*stream).lock
+            .compare_exchange(FILE_LOCK_UNLOCKED, FILE_LOCK_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
     }
 }
 

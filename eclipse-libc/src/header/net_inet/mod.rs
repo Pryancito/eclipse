@@ -18,7 +18,8 @@ pub struct sockaddr_in {
 
 #[no_mangle]
 pub unsafe extern "C" fn inet_ntoa(_in: in_addr) -> *mut c_char {
-    // Stub: return a static string
+    // Thread-local buffer: avoids races between concurrent callers
+    #[thread_local]
     static mut BUF: [c_char; 16] = [0; 16];
     // "0.0.0.0"
     BUF[0] = b'0' as c_char;

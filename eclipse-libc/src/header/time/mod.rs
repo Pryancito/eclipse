@@ -1,5 +1,6 @@
 //! time.h - Time functions
 use crate::types::*;
+use core::sync::atomic::{AtomicI64, Ordering};
 
 #[allow(non_camel_case_types)]
 pub type clock_t = c_long;
@@ -23,7 +24,7 @@ pub struct tm {
 pub const CLOCK_REALTIME: clockid_t = 0;
 pub const CLOCK_MONOTONIC: clockid_t = 1;
 
-static mut TIME_COUNTER: time_t = 0;
+static TIME_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 #[no_mangle]
 pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) -> c_int {
@@ -31,7 +32,7 @@ pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) ->
         return -1;
     }
     // Simple implementation
-    (*tp).tv_sec = TIME_COUNTER;
+    (*tp).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
     (*tp).tv_nsec = 0;
     0
 }
@@ -53,7 +54,7 @@ pub unsafe extern "C" fn localtime_r(timer: *const time_t, result: *mut tm) -> *
 #[no_mangle]
 pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_int {
     if !_tv.is_null() {
-        (*_tv).tv_sec = TIME_COUNTER;
+        (*_tv).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
         (*_tv).tv_usec = 0;
     }
     0
@@ -77,16 +78,16 @@ pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) ->
 
 #[no_mangle]
 pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
-    TIME_COUNTER += 1;
+    let t = TIME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     if !tloc.is_null() {
-        *tloc = TIME_COUNTER;
+        *tloc = t as time_t;
     }
-    TIME_COUNTER
+    t as time_t
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn clock() -> clock_t {
-    TIME_COUNTER * 1000
+    (TIME_COUNTER.load(Ordering::Relaxed) * 1000) as clock_t
 }
 
 #[no_mangle]
@@ -143,6 +144,7 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
 
 #[no_mangle]
 pub unsafe extern "C" fn ctime(_timep: *const time_t) -> *mut c_char {
+    #[thread_local]
     static mut BUF: [c_char; 26] = [0; 26];
     let s = b"Mon Jan 01 00:00:00 1970\n\0";
     for i in 0..s.len() {
