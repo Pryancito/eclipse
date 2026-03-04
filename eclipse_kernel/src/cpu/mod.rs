@@ -333,7 +333,7 @@ pub fn detect_features() {
         serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
     }
 
-    // Bit 30 de ECX: RDRAND
+    // Ya que estás aquí, deberías detectar RDRAND para entropía en SMP
     if (leaf1.ecx & (1 << 30)) != 0 {
         // RDRAND_SUPPORTED.store(true, Ordering::SeqCst);
     }
