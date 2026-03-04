@@ -2,6 +2,7 @@
 #![feature(c_variadic)]
 #![feature(linkage)]
 #![feature(alloc_error_handler)]
+#![feature(thread_local)]
 
 core::arch::global_asm!(include_str!("posix_stubs.s"));
 

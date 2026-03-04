@@ -130,19 +130,24 @@ pub unsafe extern "C" fn __ctype_b_loc() -> *mut *const u16 {
 
 static mut CTYPE_TOLOWER_TABLE: [i32; 384] = [0; 384];
 static mut CTYPE_TOLOWER_PTR: *const i32 = core::ptr::null();
+static CTYPE_TOLOWER_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[no_mangle]
 pub unsafe extern "C" fn __ctype_tolower_loc() -> *mut *const i32 {
-    if CTYPE_TOLOWER_PTR.is_null() {
+    // The initialization is idempotent (same values every time), so concurrent
+    // initializations are safe at the data level.  We use an AtomicBool as a
+    // publication fence so that readers see a fully-written table.
+    if !CTYPE_TOLOWER_INIT.load(core::sync::atomic::Ordering::Acquire) {
         for i in 0..384 {
             let c = (i as i32) - 128;
-            if c >= b'A' as i32 && c <= b'Z' as i32 {
-                CTYPE_TOLOWER_TABLE[i] = c + 32;
+            CTYPE_TOLOWER_TABLE[i] = if c >= b'A' as i32 && c <= b'Z' as i32 {
+                c + 32
             } else {
-                CTYPE_TOLOWER_TABLE[i] = c;
-            }
+                c
+            };
         }
         CTYPE_TOLOWER_PTR = &CTYPE_TOLOWER_TABLE[128] as *const i32;
+        CTYPE_TOLOWER_INIT.store(true, core::sync::atomic::Ordering::Release);
     }
     &raw mut CTYPE_TOLOWER_PTR as *mut *const i32
 }

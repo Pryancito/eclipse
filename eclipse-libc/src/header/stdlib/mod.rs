@@ -295,6 +295,7 @@ pub unsafe extern "C" fn llabs(n: c_longlong) -> c_longlong {
     if n < 0 { -n } else { n }
 }
 
+#[thread_local]
 static mut RAND_SEED: u32 = 1;
 
 #[no_mangle]
