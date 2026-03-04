@@ -170,8 +170,15 @@ mod tests {
     use eclipse_ipc::prelude::EclipseEncode;
     use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
 
+    /// Global mutex to serialize all tests that touch the shared mock queues.
+    /// The mock implementation (`MOCK_RECEIVE_QUEUE`, `MOCK_RECEIVE_FAST_QUEUE`) is
+    /// process-wide state. Without serialization, parallel test threads corrupt each
+    /// other's pushes/pops, causing spurious assertion failures.
+    static MOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_ipc_input_routing() {
+        let _guard = MOCK_LOCK.lock().unwrap();
         mock_clear();
         let mut handler = IpcHandler::new();
         
@@ -198,6 +205,7 @@ mod tests {
 
     #[test]
     fn test_ipc_sidewind_routing() {
+        let _guard = MOCK_LOCK.lock().unwrap();
         mock_clear();
         let mut handler = IpcHandler::new();
         
@@ -270,6 +278,7 @@ mod tests {
     /// Regresión para el bug de congelación: `_ => None` rompía process_events prematuramente.
     #[test]
     fn test_unrecognized_messages_skipped() {
+        let _guard = MOCK_LOCK.lock().unwrap();
         mock_clear();
         let mut handler = IpcHandler::new();
 
@@ -306,6 +315,7 @@ mod tests {
     #[test]
     fn test_bench_ipc_stress_1m() {
         use std::time::Instant;
+        let _guard = MOCK_LOCK.lock().unwrap();
         mock_clear();
         let mut handler = IpcHandler::new();
         

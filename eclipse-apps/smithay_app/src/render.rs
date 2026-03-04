@@ -177,6 +177,7 @@ impl FramebufferState {
             front_addr: 0,
             gpu_resource_id: None,
             background_addr: 0x2000,
+            gpu: None,
         }
     }
 

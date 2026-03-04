@@ -123,14 +123,10 @@ impl SmithayState {
                         // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
                         if data.len() >= 8 && &data[0..4] == b"SVCS" {
                             let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
-                            
-                            let base_idx = 0;
-                            self.service_count = core::cmp::min(count + base_idx, 32);
-                            
+                            let mut parsed = 0usize;
                             let mut offset = 8;
                             for i in 0..count {
-                                let list_idx = base_idx + i;
-                                if list_idx >= 32 { break; }
+                                if i >= 32 { break; }
                                 if data.len() >= offset + 24 {
                                     let mut svc = ServiceInfo::default();
                                     svc.name[..12].copy_from_slice(&data[offset..offset+12]);
@@ -141,9 +137,13 @@ impl SmithayState {
                                     offset += 4;
                                     svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
                                     offset += 4;
-                                    self.service_list[list_idx] = svc;
+                                    self.service_list[i] = svc;
+                                    parsed += 1;
                                 }
                             }
+                            // Only update count after successful parsing so a truncated
+                            // packet does not expose stale entries from a previous frame.
+                            self.service_count = parsed;
                         }
                     }
                     _ => {} // Handle Wayland/X11 if needed
@@ -217,9 +217,6 @@ impl SmithayState {
             }
             
             // Actualizar lista de procesos y servicios
-            if self.counter % 60 == 0 {
-                let _ = eclipse_libc::write(1, b"[DEBUG] update: polling services...\n");
-            }
             if self.input.system_central_active {
                 unsafe {
                     let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
@@ -229,6 +226,16 @@ impl SmithayState {
                         
                         let current_uptime = current.uptime_ticks;
                         let total_delta = current_uptime.saturating_sub(prev_uptime);
+
+                        // Evict tick entries whose PID no longer appears in the active list.
+                        // Use the process_list slice directly to avoid a separate copy.
+                        let active = &self.process_list[..self.process_count];
+                        for j in 0..32 {
+                            let stored_pid = self.prev_process_ticks[j].0;
+                            if stored_pid != 0 && !active.iter().any(|p| p.pid == stored_pid) {
+                                self.prev_process_ticks[j] = (0, 0);
+                            }
+                        }
 
                         for i in 0..self.process_count {
                             let p = &self.process_list[i];
@@ -252,9 +259,7 @@ impl SmithayState {
                             // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
                             self.process_mem_kb[i] = p.mem_frames * 4;
 
-                            // Actualizar histórico de ticks (usamos el mismo índice i para simplificar la búsqueda próxima vez, 
-                            // aunque PIDs roten se buscará por .0 == pid)
-                            // Para ser robustos, si no estaba el PID busscamos slot libre o reciclamos.
+                            // Actualizar histórico de ticks.
                             let mut found = false;
                             for j in 0..32 {
                                 if self.prev_process_ticks[j].0 == p.pid {
