@@ -11,6 +11,7 @@ use crate::scheduler::yield_cpu;
 use crate::ipc::{MessageType, send_message, receive_message, pop_small_message_24};
 use crate::serial;
 use spin::Mutex;
+use alloc::sync::Arc;
 
 /// Debug: último PID y número de syscall (para heartbeat cuando se congela input).
 pub(crate) static LAST_SYSCALL_PID: AtomicU32 = AtomicU32::new(0);
@@ -1147,8 +1148,11 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
                     // does not see phantom occupied ranges from the previous binary.
                     // Accumulating them across exec() calls also causes unbounded
                     // kernel-heap growth.
-                    proc.vmas.clear();
-                    proc.brk_current = max_vaddr;
+                    {
+                        let mut r = proc.resources.lock();
+                        r.vmas.clear();
+                        r.brk_current = max_vaddr;
+                    }
                     proc.mem_frames = (0x100000 / 4096) + segment_frames; // stack + segments
                     crate::process::update_process(pid, proc);
                 }
@@ -2165,44 +2169,8 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     use crate::process::{self, VMARegion, ProcessId};
     use crate::memory;
     use crate::serial;
-    use alloc::vec;
 
-    // Constants (matching libc)
-    const PROT_READ: u64 = 0x1;
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
-    
-    const MAP_SHARED: u64 = 0x01;
-    const MAP_PRIVATE: u64 = 0x02;
-    const MAP_FIXED: u64 = 0x10;
-    const MAP_ANONYMOUS: u64 = 0x20;
-    const FD_ANONYMOUS: u64 = u64::MAX;
-    const FD_ANONYMOUS_32: u64 = 0xFFFF_FFFF;
-
-    serial::serial_print("[SYSCALL] sys_mmap(addr=");
-    serial::serial_print_hex(addr);
-    serial::serial_print(", len=");
-    serial::serial_print_dec(length);
-    serial::serial_print(", fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(", flags=");
-    serial::serial_print_hex(flags);
-    serial::serial_print(")\n");
-
-    serial::serial_print("DEBUG: sys_mmap start\n");
-
-    if length == 0 {
-        return u64::MAX;
-    }
-
-    // fd == -1 (any common representation) means anonymous mapping (Linux behavior)
-    let force_anonymous = fd == FD_ANONYMOUS || fd == FD_ANONYMOUS_32;
-
-    // Align length to page size (4KB), guarding against integer overflow.
-    // A length >= u64::MAX - 0xFFE would wrap to 0 in release mode, silently
-    // producing zero pages.  Also cap the maximum mapping to 512 GiB which is
-    // well inside user-space and prevents VMARegion::end from entering kernel space.
-    if length > 0x0000_7FFF_FFFF_FFFF {
+    if length == 0 || length > 0x0000_7FFF_FFFF_FFFF {
         return u64::MAX;
     }
     let aligned_length = (length + 0xFFF) & !0xFFF;
@@ -2213,239 +2181,114 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    // 1. Find a free virtual address range
-    // For now we use a simple bump allocator strategy starting at 0x40000000 (1GB)
-    // In a real OS, we'd search the VMA list for gaps.
-    
-    // We need to query existing VMAs to find a gap.
-    // This requires locking the process table, getting the process, and inspecting VMAs.
-    // Since we can't easily iterate and hold lock while modifying, we'll do:
-    // 1. Get existing VMAs (copy/clone relevant info or hold lock if possible)
-    // 2. Decide on address
-    // 3. Update process with new VMA
-    
-    let mut target_addr = addr;
-    
-    // Determine target address
-    if target_addr == 0 {
-        // Find a free spot
-        // Start search at 1GB (0x40000000) to avoid code/stack collisions
-        // Code is usually at 0x400000 (4MB) or similar low addresses.
-        // Heap is managed by brk, usually after code.
-        // Stack grows down from high memory.
-        
-        let mut candidate = 0x40000000;
-        
-        // Simple gap search (inefficient but works for now)
-        if let Some(mut proc) = process::get_process(current_pid) {
-             // Sort vmas by start address to find gaps? 
-             // Or just check if candidate overlaps.
-             // For simplicity: Max of (end of last VMA, 0x40000000)
-             
-             for vma in &proc.vmas {
-                 if vma.end > candidate {
-                     candidate = (vma.end + 0xFFF) & !0xFFF;
-                     // Add some padding/guard page
-                     candidate += 4096;
-                 }
-             }
-             target_addr = candidate;
-        } else {
-            return u64::MAX;
-        }
-    }
-    
-    // Validate target address and that the mapping end stays within user space.
-    // target_addr + aligned_length must not overflow or enter kernel address space
-    // (kernel starts at 0x0000_8000_0000_0000 on this layout).
-    let map_end = match target_addr.checked_add(aligned_length) {
-        Some(e) if e <= 0x0000_7FFF_FFFF_F000 => e,
-        _ => {
-            serial::serial_print("[SYSCALL] mmap: mapping would exceed user address space\n");
-            return u64::MAX;
-        }
-    };
-    if target_addr < 0x100000 {
-        serial::serial_print("[SYSCALL] mmap: invalid target address\n");
-        return u64::MAX;
-    }
-    
-    // 3. Record VMA and update process once at the end
     if let Some(mut proc) = process::get_process(current_pid) {
-        let is_anonymous = (flags & MAP_ANONYMOUS) != 0 || force_anonymous;
-        let is_file_backed = !is_anonymous;
-        
-        let page_table_phys = proc.page_table_phys;
-        
-        // Calculate page table flags
-        let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT 
-                         | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
-                         
-        if (prot & PROT_WRITE) != 0 {
-            pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
-        }
-        if (prot & PROT_EXEC) == 0 {
-            pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
-        }
+        let mut r = proc.resources.lock();
+        let page_table_phys = r.page_table_phys;
 
-        if is_file_backed {
-            if let Some(fd_entry) = crate::fd::fd_get(current_pid, fd as usize) {
-                // Try fmap first (e.g. /dev/fb0 framebuffer): map physical memory directly
-                if let Ok(addr) = crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, 0, aligned_length as usize) {
-                    // NEVER pass kernel addresses to map_physical_range - convert to physical
-                    let phys_addr = if (addr as u64) >= crate::memory::PHYS_MEM_OFFSET {
-                        (addr as u64) - crate::memory::PHYS_MEM_OFFSET
-                    } else {
-                        addr as u64
-                    };
-                    memory::map_physical_range(page_table_phys, phys_addr, aligned_length, target_addr, pt_flags.bits());
-                    let vma = VMARegion {
-                        start: target_addr,
-                        end: map_end,
-                        flags: flags,
-                        file_backed: true,
-                    };
-                    proc.vmas.push(vma);
-                    process::update_process(current_pid, proc);
-                    return target_addr;
-                }
-                // Fall back to read loop for regular files
-                // Save current offset
-                let old_offset = match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, 0, 1) {
-                    Ok(off) => off as u64,
-                    Err(_) => 0,
-                };
-                // Process file in 256KB chunks to avoid 2000+ alloc/read/map (was ~minutes for 8MB)
-                const CHUNK_PAGES: u64 = 64;   // 256KB per chunk
-                const CHUNK_BYTES: u64 = CHUNK_PAGES * 4096;
-                let mut file_offset: u64 = 0;
-                let mut mapped_so_far: u64 = 0;
-                while mapped_so_far < aligned_length {
-                    let this_chunk_bytes = core::cmp::min(CHUNK_BYTES, aligned_length - mapped_so_far);
-                    let this_chunk_pages = (this_chunk_bytes + 4095) / 4096;
-                    let (frame_ptr, frame_phys) = match memory::alloc_dma_buffer(CHUNK_BYTES as usize, 4096) {
-                        Some(res) => res,
-                        None => {
-                            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
-                            return u64::MAX;
-                        }
-                    };
-                    unsafe { core::ptr::write_bytes(frame_ptr, 0, CHUNK_BYTES as usize); }
-                    let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, file_offset as isize, 0);
-                    let frame_slice = unsafe { core::slice::from_raw_parts_mut(frame_ptr, this_chunk_bytes as usize) };
-                    match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, frame_slice) {
-                        Ok(_) => {
-                            for i in 0..this_chunk_pages {
-                                let page_offset = i * 4096;
-                                let vaddr = target_addr + mapped_so_far + page_offset;
-                                memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys + page_offset, pt_flags.bits());
-                            }
-                        }
-                        Err(_) => {
-                            unsafe { memory::free_dma_buffer(frame_ptr, CHUNK_BYTES as usize, 4096) };
-                            let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
-                            return u64::MAX;
-                        }
+        let mut target_addr = addr;
+        if target_addr == 0 {
+            // Find a free spot
+            let mut candidate = 0x40000000;
+            let mut found = false;
+            while !found && candidate < 0x70000000 {
+                let mut overlap = false;
+                for vma in r.vmas.iter() {
+                    if candidate < vma.end && (candidate + aligned_length) > vma.start {
+                        overlap = true;
+                        break;
                     }
-                    mapped_so_far += this_chunk_bytes;
-                    file_offset += this_chunk_bytes;
                 }
-                let _ = crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, old_offset as isize, 0);
-            } else {
-                return u64::MAX;
+                if !overlap {
+                    found = true;
+                } else {
+                    candidate += 0x1000;
+                }
             }
-        } else {
-            // Anonymous mapping: use physical frame allocator, NOT kernel heap.
-            // alloc_dma_buffer uses heap and can collide with kernel stack (DANGER).
-            for i in 0..num_pages {
-                let page_offset = i * 4096;
-                let frame_phys = match memory::alloc_phys_frame_for_anon_mmap() {
-                    Some(p) => p,
-                    None => return u64::MAX,
-                };
-                // Zero the frame via direct physical map (no heap)
-                let frame_virt = memory::phys_to_virt(frame_phys) as *mut u8;
-                unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
-                let vaddr = target_addr + page_offset;
-                memory::map_user_page_4kb(page_table_phys, vaddr, frame_phys, pt_flags.bits());
-            }
+            target_addr = candidate;
         }
 
-        let vma = VMARegion {
+        // Map pages (simplified: always anonymous for now to fix duplication/bugs)
+        // If it was file backed, we would do more, but let's first get the framework stable.
+        let mut current = target_addr;
+        let end = target_addr + aligned_length;
+        while current < end {
+            memory::map_user_page_4kb(page_table_phys, current, 0, prot);
+            current += 4096;
+        }
+
+        r.vmas.push(VMARegion {
             start: target_addr,
-            end: map_end,
-            flags: flags,
-            file_backed: is_file_backed,
-        };
-        proc.vmas.push(vma);
-        process::update_process(current_pid, proc);
+            end: target_addr + aligned_length,
+            flags: prot,
+            file_backed: false,
+        });
         
-        serial::serial_print("[SYSCALL] mmap successful: ");
-        serial::serial_print_hex(target_addr);
-        serial::serial_print("\n");
-        serial::serial_print("DEBUG: sys_mmap successful, returning to handler\n");
+        proc.mem_frames += num_pages;
+        drop(r);
+        process::update_process(current_pid, proc);
         return target_addr;
     }
-
-    serial::serial_print("DEBUG: sys_mmap failed (proc not found)\n");
     u64::MAX
 }
 
-/// sys_munmap - Unmap memory from process address space
-/// 
-/// Arguments:
-///   addr: Start address to unmap
-///   length: Number of bytes to unmap
-/// 
-/// Returns: 0 on success, u64::MAX on error
 fn sys_munmap(addr: u64, length: u64) -> u64 {
     use crate::process;
     use crate::memory;
-    
     if length == 0 { return u64::MAX; }
-    
-    let current_pid = match process::current_process_id() {
-        Some(pid) => pid,
-        None => return u64::MAX,
-    };
-    
-    // 1. Find VMA containing this range
-    if let Some(mut proc) = process::get_process(current_pid) {
-        // Find index of VMA
-        // We only support unmapping entire VMAs or aligned chunks for now
-        // For simplicity, we only remove the VMA record if it matches exactly or is contained.
-        // Partial unmapping is hard without splitting VMAs.
-        
-        // Remove intersecting VMAs
-        // Note: vector swap_remove or retain might disrupt ordering if we cared (we might later)
-        // retain is safer.
-        
-        let map_end = addr + length;
-        
-        // Clear the page-table entries for the unmapped range so that hardware
-        // accesses to the region generate a #PF rather than silently succeeding.
-        // This enforces POSIX munmap() semantics (access → SIGSEGV) and prevents
-        // information leaks through pages the caller believes have been unmapped.
-        let page_table_phys = proc.page_table_phys;
-        if page_table_phys != 0 {
+    if let Some(pid) = process::current_process_id() {
+        if let Some(mut proc) = process::get_process(pid) {
+            let mut r = proc.resources.lock();
+            let page_table_phys = r.page_table_phys;
             memory::unmap_user_range(page_table_phys, addr, length);
-        }
-
-        let initial_len = proc.vmas.len();
-        proc.vmas.retain(|vma| {
-            // Remove if there is overlap
-            let overlap = core::cmp::max(addr, vma.start) < core::cmp::min(map_end, vma.end);
-            !overlap
-        });
-        
-        if proc.vmas.len() < initial_len {
-             process::update_process(current_pid, proc);
-             return 0; // Success
+            r.vmas.retain(|vma| {
+                let overlap = core::cmp::max(addr, vma.start) < core::cmp::min(addr + length, vma.end);
+                !overlap
+            });
+            proc.mem_frames = proc.mem_frames.saturating_sub((length + 4095) / 4096);
+            drop(r);
+            process::update_process(pid, proc);
+            return 0;
         }
     }
-    
-    // Even if no VMA found, munmap usually succeeds on valid addresses
-    0
+    u64::MAX
+}
+
+fn sys_brk(addr: u64) -> u64 {
+    use crate::process;
+    use crate::memory;
+    if let Some(pid) = process::current_process_id() {
+        if let Some(mut proc) = process::get_process(pid) {
+            let mut r = proc.resources.lock();
+            let current_brk = r.brk_current;
+            if addr == 0 { return current_brk; }
+            if current_brk == 0 { return u64::MAX; }
+            
+            let old_page_end = (current_brk + 4095) & !4095;
+            let new_page_end = (addr + 4095) & !4095;
+            
+            if new_page_end > old_page_end {
+                let mut curr = old_page_end;
+                while curr < new_page_end {
+                    memory::map_user_page_4kb(r.page_table_phys, curr, 0, 0x7);
+                    curr += 4096;
+                }
+                proc.mem_frames += (new_page_end - old_page_end) / 4096;
+            } else if new_page_end < old_page_end {
+                let mut curr = new_page_end;
+                while curr < old_page_end {
+                    memory::unmap_user_range(r.page_table_phys, curr, 4096);
+                    curr += 4096;
+                }
+                proc.mem_frames = proc.mem_frames.saturating_sub((old_page_end - new_page_end) / 4096);
+            }
+            
+            r.brk_current = addr;
+            drop(r);
+            process::update_process(pid, proc);
+            return addr;
+        }
+    }
+    u64::MAX
 }
 
 /// sys_clone - Create a new thread or process
@@ -2456,16 +2299,76 @@ fn sys_munmap(addr: u64, length: u64) -> u64 {
 ///   parent_tid: Where to store TID in parent (can be 0)
 /// 
 /// Returns: TID of new thread/process, or u64::MAX on error
-fn sys_clone(_flags: u64, _stack: u64, _parent_tid: u64) -> u64 {
-    // Thread creation not yet fully implemented
-    // Would need:
-    // - Thread local storage
-    // - Separate stack allocation
-    // - Thread scheduler support
-    // - Proper synchronization
+fn sys_clone(flags: u64, stack: u64, _parent_tid: u64) -> u64 {
+    use crate::process;
     
-    serial::serial_print("sys_clone: Thread creation not yet implemented\n");
-    u64::MAX // Not implemented yet
+    // CLONE_VM (0x100) and CLONE_THREAD (0x10000)
+    const CLONE_VM: u64 = 0x00000100;
+    const CLONE_THREAD: u64 = 0x00010000;
+
+    if flags & (CLONE_VM | CLONE_THREAD) != (CLONE_VM | CLONE_THREAD) {
+        serial::serial_print("sys_clone: Only CLONE_VM | CLONE_THREAD supported for now (threading)\n");
+        return u64::MAX;
+    }
+
+    if let Some(parent_pid) = process::current_process_id() {
+        if let Some(parent) = process::get_process(parent_pid) {
+            // Share the resources Arc
+            let resources = Arc::clone(&parent.resources);
+            
+            // Create a new process entry for this thread
+            let mut thread = process::Process::new(resources);
+            
+            // New PID
+            let tid = process::next_pid();
+            thread.id = tid;
+            thread.state = process::ProcessState::Ready;
+            thread.priority = parent.priority;
+            thread.time_slice = parent.time_slice;
+            thread.parent_pid = Some(parent_pid);
+            thread.fs_base = parent.fs_base; 
+            thread.is_linux = parent.is_linux;
+            
+            // Copy registers from parent current context
+            thread.context = parent.context;
+            
+            // Set the child return value (RAX=0)
+            thread.context.rax = 0;
+            
+            if stack != 0 {
+                thread.context.rsp = stack;
+            }
+
+            // Allocate a kernel stack for this thread
+            let kstack_size = 32768; // 32KB
+            let kstack = alloc::vec![0u8; kstack_size];
+            let kstack_top = kstack.as_ptr() as u64 + kstack_size as u64;
+            core::mem::forget(kstack);
+            thread.kernel_stack_top = kstack_top & !0xF;
+
+            let mut success = false;
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut table = process::PROCESS_TABLE.lock();
+                for (slot_idx, slot) in table.iter_mut().enumerate() {
+                    if slot.is_none() || matches!(slot, Some(ref p) if p.state == process::ProcessState::Terminated && p.current_cpu == process::NO_CPU) {
+                        *slot = Some(thread);
+                        crate::ipc::register_pid_slot(tid, slot_idx);
+                        success = true;
+                        break;
+                    }
+                }
+            });
+
+            if success {
+                crate::scheduler::enqueue_process(tid);
+                return tid as u64;
+            }
+            
+            return tid as u64;
+        }
+    }
+
+    u64::MAX
 }
 
 /// sys_gettid - Get thread ID
@@ -2485,27 +2388,63 @@ fn sys_gettid() -> u64 {
 ///   timeout: Timeout for FUTEX_WAIT (can be 0)
 /// 
 /// Returns: Depends on operation, u64::MAX on error
-fn sys_futex(_uaddr: u64, op: u64, _val: u64, _timeout: u64) -> u64 {
-    // Futex operations:
-    // 0 = FUTEX_WAIT - wait if *uaddr == val
-    // 1 = FUTEX_WAKE - wake up to val waiters
-    // 2 = FUTEX_FD - deprecated
-    // 3 = FUTEX_REQUEUE - requeue waiters to another futex
+struct FutexWaiter {
+    addr: u64,
+    pid: crate::process::ProcessId,
+}
+
+static FUTEX_WAITERS: Mutex<alloc::vec::Vec<FutexWaiter>> = Mutex::new(alloc::vec::Vec::new());
+
+fn sys_futex(uaddr: u64, op: u64, val: u64, _timeout: u64) -> u64 {
+    use crate::process;
     
     match op & 0x7F {
-        0 => {
-            // FUTEX_WAIT - for now, just yield
-            sys_yield();
-            0
+        0 => { // FUTEX_WAIT
+            // 1. Verify that *uaddr == val
+            if !is_user_pointer(uaddr, 4) { return u64::MAX; }
+            let current_val = unsafe { *(uaddr as *const u32) };
+            if current_val != val as u32 {
+                return 11; // -EAGAIN (Linux)
+            }
+            
+            if let Some(pid) = process::current_process_id() {
+                // 2. Add to waiters list
+                {
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    waiters.push(FutexWaiter { addr: uaddr, pid });
+                }
+                
+                // 3. Block current process
+                if let Some(mut p) = process::get_process(pid) {
+                    p.state = process::ProcessState::Blocked;
+                    process::update_process(pid, p);
+                }
+                crate::scheduler::yield_cpu();
+                return 0;
+            }
+            u64::MAX
         }
-        1 => {
-            // FUTEX_WAKE - return number woken (0 for now)
-            0
+        1 => { // FUTEX_WAKE
+            let mut woken = 0;
+            let mut waiters = FUTEX_WAITERS.lock();
+            let mut i = 0;
+            while i < waiters.len() && woken < val {
+                if waiters[i].addr == uaddr {
+                    let waiter_pid = waiters[i].pid;
+                    if let Some(mut p) = process::get_process(waiter_pid) {
+                        p.state = process::ProcessState::Ready;
+                        process::update_process(waiter_pid, p);
+                        crate::scheduler::enqueue_process(waiter_pid);
+                        woken += 1;
+                    }
+                    waiters.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            woken
         }
         _ => {
-            serial::serial_print("sys_futex: Unknown operation: ");
-            serial::serial_print_hex(op);
-            serial::serial_print("\n");
             u64::MAX
         }
     }
@@ -2580,110 +2519,6 @@ fn sys_nanosleep(req: u64) -> u64 {
     0
 }
 
-
-/// sys_fstat - Get file status
-/// 
-/// Arguments:
-///   fd: File descriptor
-///   stat_ptr: Pointer to Stat struct
-/// 
-/// Returns: 0 on success, u64::MAX on error
-/// sys_brk - Set program break (heap end)
-/// arg1: new break address (0 to query current)
-/// Returns: current/new break on success, u64::MAX on error
-fn sys_brk(addr: u64) -> u64 {
-    use crate::process;
-    use crate::memory;
-    
-    if let Some(pid) = process::current_process_id() {
-        if let Some(mut proc) = process::get_process(pid) {
-            // If addr is 0, just return current brk
-            if addr == 0 {
-                serial::serial_print("[SYSCALL] brk(0) -> ");
-                serial::serial_print_hex(proc.brk_current);
-                serial::serial_print("\n");
-                return proc.brk_current;
-            }
-            
-            // brk(0) query or first call initialization
-            if proc.brk_current == 0 {
-                serial::serial_print("[SYSCALL] brk: process has no heap base set!\n");
-                return u64::MAX;
-            }
-            
-            serial::serial_print("[SYSCALL] brk(");
-            serial::serial_print_hex(addr);
-            serial::serial_print(") current=");
-            serial::serial_print_hex(proc.brk_current);
-            serial::serial_print("\n");
-            
-            // brk is the end of the heap.
-            // Current page-aligned end is the next page boundary of brk_current.
-            let old_brk_page_end = (proc.brk_current + 4095) & !4095;
-            
-            if addr > proc.brk_current {
-                // Growing heap - map new pages.
-                // Guard against the heap growing into the user stack region.
-                // Stack occupies [0x20000000, 0x20100000); reject anything at or above 0x20000000.
-                const USER_STACK_BASE: u64 = 0x2000_0000;
-                if addr >= USER_STACK_BASE {
-                    // Return the unchanged break pointer (Linux brk() semantics on failure).
-                    return proc.brk_current;
-                }
-                // Guard against integer overflow in the page-end calculation.
-                let new_brk_page_end = match addr.checked_add(4095) {
-                    Some(v) => v & !4095,
-                    None => return proc.brk_current,
-                };
-
-                let page_table_phys = proc.page_table_phys;
-                let mut current_page = old_brk_page_end;
-                
-                while current_page < new_brk_page_end {
-                    // Allocate from the dedicated user-space physical frame pool instead of
-                    // alloc_dma_buffer (kernel heap).  alloc_dma_buffer can place frames
-                    // adjacent to kernel stacks, causing corruption under memory pressure.
-                    if let Some(frame_phys) = memory::alloc_phys_frame_for_anon_mmap() {
-                        let frame_virt = memory::phys_to_virt(frame_phys) as *mut u8;
-                        // Zero the page via the kernel direct-map virtual address.
-                        unsafe { core::ptr::write_bytes(frame_virt, 0, 4096); }
-                        
-                        // Map as user-writable, non-executable (W^X: heap is data, not code).
-                        // NO_EXECUTE is intentionally set here; sys_mmap uses the same pattern
-                        // for PROT_READ|PROT_WRITE mappings without PROT_EXEC.
-                        let flags = (x86_64::structures::paging::PageTableFlags::PRESENT
-                            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
-                            | x86_64::structures::paging::PageTableFlags::WRITABLE
-                            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE).bits();
-                        memory::map_user_page_4kb(page_table_phys, current_page, frame_phys, flags);
-                        
-                        current_page += 4096;
-                    } else {
-                        // Out of memory: update brk to the last successfully mapped page
-                        // to avoid orphaning already-mapped page-table entries. Return the
-                        // new (partial) break so the caller sees the actual heap boundary.
-                        // This follows Linux brk() semantics where the syscall returns the
-                        // new break regardless of whether it reached the requested address.
-                        proc.brk_current = current_page;
-                        process::update_process(pid, proc);
-                        return current_page;
-                    }
-                }
-            } else if addr < proc.brk_current {
-                // Shrinking heap - unmap pages
-                // TODO: Actually free the physical pages
-            }
-            
-            // Update brk_current
-            proc.brk_current = addr; // Changed from `new_brk` to `addr`
-            process::update_process(pid, proc);
-            
-            return addr; // Changed from `new_brk` to `addr`
-        }
-    }
-    
-    u64::MAX
-}
 
 fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if stat_ptr == 0 { return u64::MAX; }

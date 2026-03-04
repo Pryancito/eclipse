@@ -112,7 +112,10 @@ pub static FD_TABLES: Mutex<[FdTable; MAX_FD_PROCESSES]> = Mutex::new([FdTable::
 /// Since PIDs are monotonically increasing, we must not use the raw PID value as an
 /// array index — we must resolve it to the reusable slot index via the IPC PID→slot map.
 pub fn pid_to_fd_idx(pid: ProcessId) -> Option<usize> {
-    crate::ipc::pid_to_slot_fast(pid)
+    if let Some(p) = crate::process::get_process(pid) {
+        return Some(p.resources.lock().fd_table_idx);
+    }
+    None
 }
 
 /// Get the FD table for a process

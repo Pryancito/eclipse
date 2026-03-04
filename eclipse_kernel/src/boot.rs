@@ -324,7 +324,7 @@ pub fn get_cpu_id() -> usize {
 
 /// Faster version of get_cpu_id using the GS segment.
 /// ONLY safe to call after load_gdt() has initialized the GS base!
-fn get_cpu_id_gs() -> usize {
+pub fn get_cpu_id_gs() -> usize {
     let cpu_id: u32;
     unsafe {
         core::arch::asm!(

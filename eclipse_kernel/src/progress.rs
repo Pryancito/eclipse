@@ -5,7 +5,7 @@ use embedded_graphics::{
     text::Text,
     mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyle, MonoTextStyleBuilder},
 };
-use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID};
+use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID, MAX_SMP_CPUS, get_cpu_id_gs};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -43,7 +43,7 @@ impl LogBuffer {
         self.len = 0;
     }
 }
-static LOG_BUFFER: crate::sync::ReentrantMutex<LogBuffer> = crate::sync::ReentrantMutex::new(LogBuffer::new());
+static LOG_BUFFERS: [crate::sync::ReentrantMutex<LogBuffer>; MAX_SMP_CPUS] = [const { crate::sync::ReentrantMutex::new(LogBuffer::new()) }; MAX_SMP_CPUS];
 
 // Historia de logs para el HUD (últimas 8 líneas)
 const HISTORY_LINES: usize = 8;
@@ -296,8 +296,9 @@ pub fn log(msg: &str) {
     // Desactivar interrupciones localmente es VITAL en SMP para evitar
     // que este core sea interrumpido mientras sostiene un lock crítico.
     x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(mut buf) = LOG_BUFFER.try_lock() {
-            let got_newline = buf.push_str(msg);
+        let cpu_id = get_cpu_id_gs();
+        if let Some(mut buf) = LOG_BUFFERS[cpu_id].try_lock() {
+            let got_newline: Option<usize> = buf.push_str(msg);
 
             if got_newline.is_some() {
                 // Trabajamos sobre una copia local para liberar el lock del buffer rápido
@@ -558,7 +559,9 @@ pub fn bsod(info: &BsodInfo) {
 /// Forcedly unlock all logging mutexes.
 /// Danger: should ONLY be used in fork_child_setup to clear inherited locks.
 pub unsafe fn force_unlock_all() {
-    LOG_BUFFER.force_unlock();
+    for i in 0..MAX_SMP_CPUS {
+        LOG_BUFFERS[i].force_unlock();
+    }
     LOG_HISTORY.force_unlock();
     VIDEO_HARDWARE_LOCK.force_unlock();
 }

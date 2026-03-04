@@ -61,7 +61,7 @@ use spin::Mutex;
 /// Wrapper for the global allocator that disables interrupts during allocations.
 /// This prevents deadlocks if an interrupt handler attempts to allocate memory
 /// while the interrupted code already held the allocator lock.
-pub struct InterruptSafeAllocator(LockedHeap);
+pub struct InterruptSafeAllocator(pub LockedHeap);
 
 unsafe impl GlobalAlloc for InterruptSafeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -90,8 +90,8 @@ unsafe impl GlobalAlloc for InterruptSafeAllocator {
 }
 
 #[cfg(not(test))]
-#[global_allocator]
-static ALLOCATOR: InterruptSafeAllocator = InterruptSafeAllocator(LockedHeap::empty());
+// #[global_allocator]
+pub static ALLOCATOR: InterruptSafeAllocator = InterruptSafeAllocator(LockedHeap::empty());
 
 /// Global lock for page table modifications to prevent races in SMP.
 /// Must always be used with interrupts disabled to avoid deadlocks.

@@ -1,16 +1,19 @@
 //! Synchronization primitives for the Eclipse kernel.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A spinlock-based reentrant mutex that allows the same CPU to re-acquire it.
 /// Uses the per-CPU `cpu_id` stored in GS:[16] to identify the owning CPU.
+/// 
+/// The state is stored in a single AtomicU64 to ensure atomic updates of both
+/// owner and depth.
+/// Layout: [ 32 bits: owner (i32) | 32 bits: depth (u32) ]
 pub struct ReentrantMutex<T> {
-    /// -1 = unlocked, otherwise the cpu_id (cast to i32) of the holding CPU.
-    owner: AtomicI32,
-    /// Recursion depth for the owning CPU.
-    depth: AtomicU32,
+    state: AtomicU64,
     data: core::cell::UnsafeCell<T>,
 }
+
+const NO_CPU: i32 = -1;
 
 unsafe impl<T: Send> Send for ReentrantMutex<T> {}
 unsafe impl<T: Send> Sync for ReentrantMutex<T> {}
@@ -35,10 +38,20 @@ impl<T> core::ops::DerefMut for ReentrantMutexGuard<'_, T> {
 impl<T> ReentrantMutex<T> {
     pub const fn new(val: T) -> Self {
         Self {
-            owner: AtomicI32::new(-2),
-            depth: AtomicU32::new(0),
+            // Initial state: NO_CPU (-1) and depth 0
+            state: AtomicU64::new(((NO_CPU as u64) << 32) | 0),
             data: core::cell::UnsafeCell::new(val),
         }
+    }
+
+    #[inline]
+    fn pack(owner: i32, depth: u32) -> u64 {
+        ((owner as u32 as u64) << 32) | (depth as u64)
+    }
+
+    #[inline]
+    fn unpack(state: u64) -> (i32, u32) {
+        ((state >> 32) as i32, (state & 0xFFFFFFFF) as u32)
     }
 
     /// Get the current CPU's id for ownership tracking.
@@ -53,7 +66,7 @@ impl<T> ReentrantMutex<T> {
         }
         
         // Sanity check: if gs is not set up (long mode transition/early AP),
-        // it will read 0xFFFFFFFF (uninitialized value in CPU_DATA).
+        // it will read 0xFFFF_FFFF (uninitialized value in CPU_DATA).
         // Fallback to the slow but reliable LAPIC ID to avoid lock owner collisions.
         if id == 0xFFFF_FFFF {
             return crate::apic::get_id() as i32;
@@ -64,57 +77,71 @@ impl<T> ReentrantMutex<T> {
 
     pub fn lock(&self) -> ReentrantMutexGuard<'_, T> {
         let me = Self::current_cpu();
-        if self.owner.load(Ordering::Acquire) == me {
-            // Same CPU re-entering: just increment depth.
-            self.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // Spin until we can acquire ownership.
-            while self.owner.compare_exchange_weak(
-                -2, me, Ordering::Acquire, Ordering::Relaxed,
-            ).is_err() {
-                core::hint::spin_loop();
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (owner, depth) = Self::unpack(current);
+
+            if owner == me {
+                // Same CPU re-entering: increment depth atomically.
+                let next = Self::pack(me, depth + 1);
+                if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return ReentrantMutexGuard { lock: self };
+                }
+            } else if owner == NO_CPU {
+                // Try to acquire ownership.
+                let next = Self::pack(me, 1);
+                if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return ReentrantMutexGuard { lock: self };
+                }
             }
-            // Now we ARE the owner. Increment depth to 1.
-            // Using fetch_add here is safer than store(1) to handle interrupts 
-            // that might have occurred between CAS and this line.
-            self.depth.fetch_add(1, Ordering::Relaxed);
+            
+            // Spin until available or re-entrant.
+            core::hint::spin_loop();
         }
-        ReentrantMutexGuard { lock: self }
     }
 
     pub fn try_lock(&self) -> Option<ReentrantMutexGuard<'_, T>> {
         let me = Self::current_cpu();
-        if self.owner.load(Ordering::Acquire) == me {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            Some(ReentrantMutexGuard { lock: self })
-        } else {
-            if self.owner.compare_exchange_weak(
-                -2, me, Ordering::Acquire, Ordering::Relaxed,
-            ).is_ok() {
-                self.depth.fetch_add(1, Ordering::Relaxed);
-                Some(ReentrantMutexGuard { lock: self })
-            } else {
-                None
+        let current = self.state.load(Ordering::Acquire);
+        let (owner, depth) = Self::unpack(current);
+
+        if owner == me {
+            let next = Self::pack(me, depth + 1);
+            if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return Some(ReentrantMutexGuard { lock: self });
+            }
+        } else if owner == NO_CPU {
+            let next = Self::pack(me, 1);
+            if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return Some(ReentrantMutexGuard { lock: self });
             }
         }
+        None
     }
 
     /// Forcedly unlock the mutex.
-    /// Danger: should ONLY be used in fork_child_trampoline to clear inherited locks.
+    /// Danger: should ONLY be used in restricted setup paths to clear inherited locks.
     pub unsafe fn force_unlock(&self) {
-        self.depth.store(0, Ordering::Relaxed);
-        self.owner.store(-2, Ordering::Release);
+        self.state.store(Self::pack(NO_CPU, 0), Ordering::Release);
     }
 }
 
 impl<T> Drop for ReentrantMutexGuard<'_, T> {
     fn drop(&mut self) {
-        let d = self.lock.depth.load(Ordering::Relaxed);
-        if d <= 1 {
-            self.lock.depth.store(0, Ordering::Relaxed);
-            self.lock.owner.store(-2, Ordering::Release);
-        } else {
-            self.lock.depth.fetch_sub(1, Ordering::Relaxed);
+        loop {
+            let current = self.lock.state.load(Ordering::Acquire);
+            let (owner, depth) = ReentrantMutex::<T>::unpack(current);
+            
+            let next = if depth <= 1 {
+                ReentrantMutex::<T>::pack(NO_CPU, 0)
+            } else {
+                ReentrantMutex::<T>::pack(owner, depth - 1)
+            };
+
+            if self.lock.state.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed).is_ok() {
+                break;
+            }
+            core::hint::spin_loop();
         }
     }
 }

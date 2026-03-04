@@ -7,6 +7,7 @@
 #![no_main]
 
 use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, wait, spawn_service, Spinlock};
+use eclipse_libc::{fork, exec, get_service_binary, get_last_exec_error, exit};
 
 /// Service state
 #[derive(Clone, Copy, PartialEq)]
@@ -110,7 +111,7 @@ fn start_essential_services() {
     
     // Wait for log service to be ready
     println!("[INIT] Waiting for LOG service to signal READY...");
-    wait_for_ready("log", 5000);
+    wait_for_ready("log", 1500);
     
     // Start device manager (devfs) - creates /dev nodes
     {
@@ -120,46 +121,23 @@ fn start_essential_services() {
     
     // Wait for devfs to be ready
     println!("[INIT] Waiting for DevFS to signal READY...");
-    wait_for_ready("devfs", 5000);
+    wait_for_ready("devfs", 1500);
 }
 
 /// Start system services
 fn start_system_services() {
-    // Start input service (depends on filesystem)
-    {
-        let mut svc = SERVICES.lock();
-        start_service(&mut svc[5]);
+    // Start remaining services in order: input, display, audio, network, gui
+    for i in 5..=9 {
+        let name = {
+            let mut svc = SERVICES.lock();
+            start_service(&mut svc[i]);
+            svc[i].name
+        };
+        wait_for_ready(name, 1500);
     }
-    wait_for_ready("input", 5000);
-    
-    // Start display service (depends on input)
-    {
-        let mut svc = SERVICES.lock();
-        start_service(&mut svc[6]);
-    }
-    wait_for_ready("display", 5000);
-
-    // Start audio service (depends on filesystem)
-    {
-        let mut svc = SERVICES.lock();
-        start_service(&mut svc[7]);
-    }
-    wait_for_ready("audio", 5000);
-    
-    // Start network service last (most complex)
-    {
-        let mut svc = SERVICES.lock();
-        start_service(&mut svc[8]);
-    }
-    wait_for_ready("network", 5000);
-
-    // Start GUI service (depends on network)
-    {
-        let mut svc = SERVICES.lock();
-        start_service(&mut svc[9]);
-    }
-    wait_for_ready("gui", 5000);
 }
+
+///
 
 /// Wait for a service to signal READY via IPC.
 /// Uses a tight poll with yield_cpu + periodic sleep_ms to balance
@@ -201,38 +179,65 @@ fn start_service(service: &mut Service) {
     
     service.state = ServiceState::Starting;
     
-    // Determine which service binary to load
-    let service_id = match service.name {
-        "log"        => 0u32,
-        "devfs"      => 1,
-        "filesystem" => 2,
-        "input"      => 3,
-        "display"    => 4,
-        "audio"      => 5,
-        "network"    => 6,
-        "gui"        => 7,
-        _ => {
-            println!("  [ERROR] Unknown service: {}", service.name);
-            service.state = ServiceState::Failed;
-            return;
+    // Fork a new process for the service
+    let pid = fork();
+    
+    if pid == 0 {
+        // Child process - execute the service
+        
+        // Determine which service binary to load
+        let service_id = match service.name {
+            "log" => 0,
+            "devfs" => 1,
+            "filesystem" => 2,
+            "input" => 3,
+            "display" => 4,
+            "audio" => 5,
+            "network" => 6,
+            "gui" => 7,
+            _ => {
+                println!("  [CHILD] ERROR: Unknown service: {}", service.name);
+                exit(1);
+            }
+        };
+        
+        // Get service binary from kernel
+        let (bin_ptr, bin_size) = get_service_binary(service_id);
+        
+        if bin_ptr.is_null() || bin_size == 0 {
+            println!("  [CHILD] ERROR: Failed to get service binary for: {} (ID {})", service.name, service_id);
+            exit(1);
         }
-    };
-
-    // Spawn the service directly from the kernel-embedded binary.
-    // This is simpler and more reliable than fork+exec because it avoids
-    // cloning the init address space and avoids passing kernel-space ELF
-    // pointers across the exec boundary.
-    //
-    // NOTE: The SERVICES lock is held by the caller while we call spawn_service.
-    // The spawn_service syscall does not re-enter init's IPC path, so this is safe.
-    let pid = spawn_service(service_id, service.name);
-
-    if pid > 0 {
+        
+        // Create slice from pointer
+        let service_binary = unsafe {
+            core::slice::from_raw_parts(bin_ptr, bin_size)
+        };
+        
+        // Execute the service binary
+        let _result = exec(service_binary);
+        
+        // If exec succeeds, it should not return
+        println!("  [CHILD] ERROR: exec() failed for service: {}", service.name);
+        
+        // Try to get failure reason from kernel
+        let mut errbuf = [0u8; 80];
+        let n = get_last_exec_error(&mut errbuf);
+        if n > 0 {
+            if let Ok(s) = core::str::from_utf8(&errbuf[..n]) {
+                println!("  [CHILD] Failure reason: {}", s);
+            }
+        }
+        
+        exit(1);
+    } else if pid > 0 {
+        // Parent process - track the service
         service.pid = pid;
         service.state = ServiceState::Running;
         println!("  [SERVICE] {} started with PID: {}", service.name, pid);
     } else {
-        println!("  [ERROR] Failed to spawn service: {}", service.name);
+        // Fork failed
+        println!("  [ERROR] Failed to fork service: {}", service.name);
         service.state = ServiceState::Failed;
         service.pid = 0;
     }

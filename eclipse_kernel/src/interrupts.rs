@@ -1990,13 +1990,14 @@ unsafe extern "C" fn syscall_entry() {
 /// Esta función se encarga de restaurar el contexto de usuario y saltar 
 /// a Ring 3 usando los valores guardados en el PCB durante el fork.
 /// Wrapper for fork_child_trampoline that clears inherited locks.
+#[unsafe(naked)]
 pub unsafe extern "C" fn fork_child_setup() -> ! {
-    // Clear inherited locks
-    crate::serial::force_unlock_serial();
-    crate::progress::force_unlock_all();
-    
-    // Continue to trampoline
-    fork_child_trampoline();
+    core::arch::naked_asm!(
+        // Jump to trampoline for the final iretq.
+        // In SMP, we don't clear locks here as they may be held by other cores.
+        "jmp {trampoline}",
+        trampoline = sym fork_child_trampoline,
+    );
 }
 
 #[unsafe(naked)]
