@@ -1,6 +1,6 @@
 //! Scheduler básico round-robin con soporte SMP completo
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::process::{ProcessId, ProcessState, get_process, update_process, current_process_id, set_current_process};
 use spin::Mutex;
 
@@ -32,18 +32,16 @@ static AP_IDLE_CONTEXT_VALID: [AtomicBool; MAX_CPUS] =
 /// Quantum restante por CPU (en ms/ticks). Se inicializa en 10.
 static mut CPU_QUANTUM: [u32; MAX_CPUS] = [10; MAX_CPUS];
 
-/// Estadísticas del scheduler
+/// Estadísticas del scheduler (atómicas para SMP)
 pub struct SchedulerStats {
     pub context_switches: u64,
     pub total_ticks: u64,
     pub idle_ticks: u64,
 }
 
-static SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats {
-    context_switches: 0,
-    total_ticks: 0,
-    idle_ticks: 0,
-});
+static STATS_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static STATS_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
+static STATS_IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Cuántas veces se dio CPU a cada PID en la última ventana (se lee y resetea en el heartbeat).
 const MAX_PIDS: usize = 256;
@@ -151,19 +149,28 @@ pub fn ready_queue_tail_addr() -> usize {
     &*tail as *const usize as usize
 }
 
-/// Tick del scheduler (llamado desde timer interrupt)
+/// Tick del scheduler (llamado desde timer interrupt - solo en el BSP)
 pub fn tick() {
-    let mut stats = SCHEDULER_STATS.lock();
-    stats.total_ticks += 1;
+    // Solo tareas globales: despertar procesos que duermen.
+    // Usamos el contador global de tiempo (uptime real ms) para el timeout.
+    let global_ticks = crate::interrupts::ticks();
+    wake_sleeping_processes(global_ticks);
+}
+
+/// Tick local por CPU (manejado por el timer de cada LAPIC).
+/// Implementa el quantum de 10ms para el scheduler.
+pub fn local_tick() {
+    let cpu_id = crate::process::get_cpu_id();
+    if cpu_id >= MAX_CPUS { return; }
+
+    // Actualizar estadísticas de este CPU (atómico - sin lock global de stats)
+    STATS_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
     
-    // Si el proceso actual es el kernel (PID 0), es tiempo idle
     let current_pid = crate::process::current_process_id();
     if current_pid == Some(0) {
-        stats.idle_ticks += 1;
+        STATS_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
     } else if let Some(pid) = current_pid {
-        // Increment CPU tick counter for the current process.
-        // Use pid_to_slot_fast to get the correct slot — after slot reuse the PID
-        // can exceed MAX_PROCESSES (256) so table[pid as usize] would be OOB.
+        // Incrementar ticks del proceso actual (requiere lock PROCESS_TABLE breve)
         if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
             x86_64::instructions::interrupts::without_interrupts(|| {
                 let mut table = crate::process::PROCESS_TABLE.lock();
@@ -175,21 +182,6 @@ pub fn tick() {
             });
         }
     }
-    
-    let ticks = stats.total_ticks;
-    drop(stats);
-    
-    // Wake up sleeping processes whose wake_tick has arrived.
-    // Only locks SLEEP_QUEUE (never PROCESS_TABLE) to avoid deadlock with
-    // syscall paths that hold PROCESS_TABLE with interrupts enabled.
-    wake_sleeping_processes(ticks);
-}
-
-/// Tick local por CPU (manejado por el timer de cada LAPIC).
-/// Implementa el quantum de 10ms para el scheduler.
-pub fn local_tick() {
-    let cpu_id = crate::process::get_cpu_id();
-    if cpu_id >= MAX_CPUS { return; }
 
     unsafe {
         if CPU_QUANTUM[cpu_id] > 0 {
@@ -497,9 +489,7 @@ fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
         if !to_exists {
             return;
         }
-        let mut stats = SCHEDULER_STATS.lock();
-        stats.context_switches += 1;
-        drop(stats);
+        STATS_CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         // Note: set_current_process is called inside perform_context_switch_to,
         // AFTER computing the from-process ownership pointer, so current_process_id()
         // still returns from_pid when clear_addr is calculated.
@@ -615,14 +605,11 @@ pub fn sleep(_ticks: u64) {
 
 /// Obtener estadísticas del scheduler
 pub fn get_stats() -> SchedulerStats {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let stats = SCHEDULER_STATS.lock();
-        SchedulerStats {
-            context_switches: stats.context_switches,
-            total_ticks: stats.total_ticks,
-            idle_ticks: stats.idle_ticks,
-        }
-    })
+    SchedulerStats {
+        context_switches: STATS_CONTEXT_SWITCHES.load(Ordering::Relaxed),
+        total_ticks: STATS_TOTAL_TICKS.load(Ordering::Relaxed),
+        idle_ticks: STATS_IDLE_TICKS.load(Ordering::Relaxed),
+    }
 }
 
 /// Inicializar scheduler

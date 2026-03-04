@@ -250,6 +250,8 @@ pub fn bar(progress: u32) {
 
 /// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
 fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
+    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
+    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
     let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
     let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);

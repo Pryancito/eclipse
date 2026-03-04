@@ -92,6 +92,36 @@ mod impl_parse {
             let ev = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const InputEvent) };
             return Some(EclipseMessage::Input(ev));
         }
+        
+        // Handle small control/response messages that arrive via fast path (<= 24 bytes)
+        if len >= 8 {
+            if data[0..4] == *TAG_INPT {
+                let mut pid_bytes = [0u8; 4];
+                pid_bytes.copy_from_slice(&data[4..8]);
+                return Some(EclipseMessage::InputPidResponse {
+                    pid: u32::from_le_bytes(pid_bytes),
+                });
+            }
+            if data[0..4] == *TAG_NETW {
+                let mut pid_bytes = [0u8; 4];
+                pid_bytes.copy_from_slice(&data[4..8]);
+                return Some(EclipseMessage::NetworkPidResponse {
+                    pid: u32::from_le_bytes(pid_bytes),
+                });
+            }
+        }
+        
+        if len >= 20 && data[0..4] == *TAG_NSTA {
+            let mut rx_bytes = [0u8; 8];
+            let mut tx_bytes = [0u8; 8];
+            rx_bytes.copy_from_slice(&data[4..12]);
+            tx_bytes.copy_from_slice(&data[12..20]);
+            return Some(EclipseMessage::NetStatsResponse {
+                rx: u64::from_le_bytes(rx_bytes),
+                tx: u64::from_le_bytes(tx_bytes),
+            });
+        }
+
         None
     }
 
