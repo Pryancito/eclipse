@@ -324,28 +324,20 @@ static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Detectar características avanzadas de la CPU (MONITOR/MWAIT)
 pub fn detect_features() {
-    // CPUID clobbers RBX (callee-saved); push/pop it around the instruction
-    // so the compiler does not have to spill it separately.
-    // Capture the ECX result directly with out("ecx") to avoid the need for
-    // an intermediate mov that could conflict with the rbx save/restore.
-    let ecx_val: u32;
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 1u32 => _,
-            out("ecx") ecx_val,
-            out("edx") _,
-            options(preserves_flags)
-        );
-    }
-    let result = unsafe { core::arch::x86_64::__cpuid(1) };
-    // Bit 3 de ECX en leaf 1 indica soporte de MONITOR/MWAIT
-    if (result.ecx & (1 << 3)) != 0 {
+    // Usamos el intrínseco directamente. Rust se encarga de RBX y la seguridad.
+    let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+
+    // Bit 3 de ECX: MONITOR/MWAIT
+    if (leaf1.ecx & (1 << 3)) != 0 {
         MONITOR_MWAIT_SUPPORTED.store(true, Ordering::SeqCst);
         serial_printf(format_args!("[CPU] MONITOR/MWAIT support detected\n"));
     }
+
+    // Ya que estás aquí, deberías detectar RDRAND para entropía en SMP
+    if (leaf1.ecx & (1 << 30)) != 0 {
+        // RDRAND_SUPPORTED.store(true, Ordering::SeqCst);
+    }
+    serial_printf(format_args!("[CPU] Features detected\n"));
 }
 
 use core::sync::atomic::AtomicBool;
