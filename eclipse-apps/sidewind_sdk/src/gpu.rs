@@ -45,9 +45,10 @@ impl GpuDevice {
 
     /// Submit a command buffer to the GPU.
     pub fn submit(&self, command_id: usize, payload: &[u8]) -> GpuResult<()> {
-        match gpu_command(self.backend as usize, command_id, payload) {
-            Ok(0) => Ok(()),
-            _ => Err(GpuError::CommandFailed),
+        if gpu_command(self.backend as usize, command_id, payload) == 0 {
+            Ok(())
+        } else {
+            Err(GpuError::CommandFailed)
         }
     }
 }

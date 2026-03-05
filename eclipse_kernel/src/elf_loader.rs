@@ -92,14 +92,6 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
         return Err("ELF: Entry point not in executable segment");
     }
 
-    // Keep track of mapped 2MB regions to handle segments sharing the same page
-    #[derive(Clone, Copy)]
-    struct MappedPage {
-        vaddr_base: u64,
-        kernel_ptr: *mut u8,
-        phys_addr: u64,
-    }
-    let mut mapped_pages: [Option<MappedPage>; 64] = [None; 64];
     let mut mapped_count = 0;
     let mut max_vaddr: u64 = 0;
 
@@ -118,65 +110,44 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
                 max_vaddr = vaddr_end;
             }
 
-            // Align start and end to 2MB boundaries
-            let page_start = vaddr_start & !0x1FFFFF;
-            let page_end = (vaddr_end + 0x1FFFFF) & !0x1FFFFF;
+            // Align start and end to 4KB boundaries
+            let page_start = vaddr_start & !0xFFF;
+            let page_end = (vaddr_end + 0xFFF) & !0xFFF;
 
             let mut current_vaddr = page_start;
             while current_vaddr < page_end {
-                // Find or create mapped page
-                let mut current_page: Option<MappedPage> = None;
-                for j in 0..mapped_count {
-                    if let Some(mp) = mapped_pages[j] {
-                        if mp.vaddr_base == current_vaddr {
-                            current_page = Some(mp);
-                            break;
-                        }
-                    }
-                }
-                
-                let target_kernel_ptr = if let Some(mp) = current_page {
-                    mp.kernel_ptr
-                } else {
-                    if mapped_count >= mapped_pages.len() {
-                        return Err("ELF: Too many segments/pages (limit 16)");
-                    }
 
-                    // Allocate new 2MB block
-                    if let Some((kptr, phys)) = crate::memory::alloc_dma_buffer(0x200000, 0x200000) {
-                        // Zero the block
-                        unsafe { core::ptr::write_bytes(kptr, 0, 0x200000); }
-                        
-                        let mp = MappedPage {
-                            vaddr_base: current_vaddr,
-                            kernel_ptr: kptr,
-                            phys_addr: phys,
-                        };
-                        mapped_pages[mapped_count] = Some(mp);
-                        mapped_count += 1;
-                        
-                        // Map it in 4KB pages
-                        for i in 0..512 {
-                            let offset = (i as u64) * 0x1000;
-                            crate::memory::map_user_page_4kb(
-                                page_table_phys, 
-                                current_vaddr + offset, 
-                                phys + offset, 
-                                crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
-                            );
-                        }
-                        kptr
-                    } else {
-                        return Err("Failed to allocate segment 2MB page");
-                    }
+                // Check if this virtual page is already mapped (from a prior overlapping
+                // PT_LOAD segment). If so, reuse the existing physical frame; if not,
+                // allocate a fresh zeroed page.
+                let (phys, allocated_new) = if let Some(existing_phys) = crate::memory::get_user_page_phys(page_table_phys, current_vaddr) {
+                    (existing_phys, false)
+                } else if let Some(new_phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
+                    (new_phys, true)
+                } else {
+                    return Err("Failed to allocate 4KB anonymous frame for segment");
                 };
 
-                // Copy part of the segment data that falls into this 2MB page
+                let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
+                if allocated_new {
+                    // Zero the new block
+                    unsafe { core::ptr::write_bytes(kptr, 0, 0x1000); }
+                    mapped_count += 1;
+                    // Map it into the page table
+                    crate::memory::map_user_page_4kb(
+                        page_table_phys,
+                        current_vaddr,
+                        phys,
+                        crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
+                    );
+                } // end if allocated_new
+
+                // Always copy the file data portion that overlaps this page,
+                // whether the page was newly allocated or reused.
                 if file_size > 0 {
                     let page_vaddr_start = current_vaddr;
-                    let page_vaddr_end = current_vaddr + 0x200000;
+                    let page_vaddr_end = current_vaddr + 0x1000;
 
-                    // Range intersection [vaddr_start, vaddr_start + file_size) AND [page_vaddr_start, page_vaddr_end)
                     let intersect_start = core::cmp::max(vaddr_start, page_vaddr_start);
                     let intersect_end = core::cmp::min(vaddr_start + file_size, page_vaddr_end);
 
@@ -185,10 +156,6 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
                         let in_file_offset = (intersect_start - vaddr_start) as usize;
                         let in_page_offset = (intersect_start - page_vaddr_start) as usize;
 
-                        // Bounds-check the source range against the ELF slice BEFORE reading it.
-                        // A crafted ELF with p_offset + p_filesz > elf_data.len() would otherwise
-                        // cause copy_nonoverlapping to read past the end of the allocation, leaking
-                        // kernel heap metadata into the user process's address space.
                         let file_src_start = file_start_offset as usize + in_file_offset;
                         let file_src_end = file_src_start.saturating_add(copy_size);
                         if file_src_end > elf_data.len() {
@@ -197,13 +164,13 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
 
                         unsafe {
                             let src = elf_data.as_ptr().add(file_src_start);
-                            let dst = target_kernel_ptr.add(in_page_offset);
+                            let dst = kptr.add(in_page_offset);
                             core::ptr::copy_nonoverlapping(src, dst, copy_size);
                         }
                     }
                 }
 
-                current_vaddr += 0x200000;
+                current_vaddr += 0x1000;
             }
         }
     }
@@ -216,30 +183,31 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
 
 /// Preparar el stack de usuario
 pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize) -> Result<u64, &'static str> {
-    // Allocate and map user stack
-    if let Some((_ptr, phys)) = crate::memory::alloc_dma_buffer(stack_size, 0x200000) {
-        // We map the 2MB block using 4KB pages for consistency and safety
-        // CRITICAL: Must include PAGE_USER flag so Ring 3 can access the stack
-        for i in 0..(stack_size / 4096) {
+    for i in 0..(stack_size / 4096) {
+        if let Some(phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
             let offset = (i as u64) * 0x1000;
             crate::memory::map_user_page_4kb(
                 page_table_phys, 
                 stack_base + offset, 
-                phys + offset, 
+                phys, 
                 crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
             );
+        } else {
+            return Err("Failed to allocate 4KB anonymous frame for user stack");
         }
-        
-        // crate::memory::walk_page_table(page_table_phys, stack_base);
-        Ok(stack_base + stack_size as u64)
-    } else {
-        Err("Failed to allocate user stack")
     }
+    
+    // crate::memory::walk_page_table(page_table_phys, stack_base);
+    Ok(stack_base + stack_size as u64)
 }
 
 /// Cargar binario ELF en memoria y crear proceso
 pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
-    // We need a temporary space to get page_table_phys
+    // Create the page table for this process ONCE and reuse it throughout.
+    // CRITICAL: We must pass this same cr3 to create_process_with_pid.
+    // Previously load_elf called create_process which allocated a *second* fresh
+    // cr3, causing the process to run in an empty address space while the ELF
+    // segments lived in the discarded first cr3 → execution of zero bytes → crash.
     let cr3 = crate::memory::create_process_paging();
 
     let (entry_point, max_vaddr, segment_frames) = match load_elf_into_space(cr3, elf_data) {
@@ -256,10 +224,26 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     // Default user stack at 512MB
     let stack_base = 0x20000000; // 512MB
     let stack_size = 0x40000;  // 256KB
-    
-    let pid = create_process(entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr)?;
-    
-    // Add segment frames to the process (beyond initial stack)
+
+    // Map the user stack into the SAME cr3 before creating the process entry.
+    if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
+        serial::serial_print("ELF: Stack setup failed: ");
+        serial::serial_print(e);
+        serial::serial_print("\n");
+        return None;
+    }
+
+    // Allocate a pid and register the process, reusing the cr3 we already set up.
+    let pid = crate::process::next_pid();
+    if !crate::process::create_process_with_pid(
+        pid, cr3, entry_point, stack_base, stack_size,
+        phdr_va, phnum, phentsize, max_vaddr,
+    ) {
+        serial::serial_print("ELF: create_process_with_pid failed\n");
+        return None;
+    }
+
+    // Add segment frames to the process accounting.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(p) = table[pid as usize].as_mut() {
@@ -268,13 +252,6 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
     });
 
     crate::fd::fd_init_stdio(pid);
-
-    if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {
-        serial::serial_print("ELF: Stack setup failed: ");
-        serial::serial_print(e);
-        serial::serial_print("\n");
-        return None;
-    }
 
     Some(pid)
 }
@@ -410,15 +387,7 @@ pub fn replace_process_image(pid: ProcessId, elf_data: &[u8]) -> Result<(u64, u6
     
     let page_table_phys = crate::memory::get_cr3();
 
-    // Keep track of mapped 2MB regions
-    #[derive(Clone, Copy)]
-    struct MappedPage {
-        vaddr_base: u64,
-        kernel_ptr: *mut u8,
-        phys_addr: u64,
-    }
-    let mut mapped_pages: [Option<MappedPage>; 128] = [None; 128];
-    let mut mapped_count = 0;
+
 
     let (entry_point, max_vaddr, segment_frames) = load_elf_into_space(page_table_phys, elf_data)?;
     let (phdr_va, phnum, phentsize) = get_elf_phdr_info(elf_data).map_err(|_| "ELF: phdr info")?;

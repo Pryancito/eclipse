@@ -2,7 +2,7 @@
 
 use eclipse_std::prelude::*;
 
-fn main() -> i32 {
+fn main() {
     println!("Hello from Eclipse OS!");
     println!("This app uses eclipse_std for familiar syntax");
     
@@ -16,8 +16,4 @@ fn main() -> i32 {
         numbers.push(i);
     }
     println!("Numbers: {:?}", numbers);
-    
-    0
 }
-
-eclipse_main!(main);

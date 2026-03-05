@@ -778,6 +778,38 @@ pub fn map_user_page_4kb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
     });
 }
 
+
+/// Walk a process page table and return the physical address of a mapped 4KB page.
+/// Returns None if the page is not mapped or is a huge page (2MB/1GB).
+pub fn get_user_page_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    let pml4_virt = phys_to_virt(pml4_phys);
+    let pml4 = unsafe { &*(pml4_virt as *const PageTable) };
+
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4_entry = &pml4.entries[pml4_idx];
+        if !pml4_entry.present() { return None; }
+
+        let pdpt = &*(phys_to_virt(pml4_entry.get_addr()) as *const PageTable);
+        let pdpt_entry = &pdpt.entries[pdpt_idx];
+        if !pdpt_entry.present() || pdpt_entry.is_huge() { return None; }
+
+        let pd = &*(phys_to_virt(pdpt_entry.get_addr()) as *const PageTable);
+        let pd_entry = &pd.entries[pd_idx];
+        if !pd_entry.present() || pd_entry.is_huge() { return None; }
+
+        let pt = &*(phys_to_virt(pd_entry.get_addr()) as *const PageTable);
+        let pt_entry = &pt.entries[pt_idx];
+        if !pt_entry.present() { return None; }
+
+        Some(pt_entry.get_addr())
+    }
+}
+
 /// Map a 2MB page in a process's page table
 pub fn map_user_page_2mb(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -1000,6 +1032,37 @@ pub fn get_memory_stats() -> (u64, u64) {
 /// Fixed virtual address for GPU framebuffer (avoids identity-mapping page faults)
 /// 8GB - above typical heap/stack/mmap, in canonical user range
 const GPU_FB_VADDR_BASE: u64 = 0x0000_0002_0000_0000;
+
+/// Map general shared memory physical memory into process page tables
+/// Uses Write-Back (WB) caching via PAT index 0 (PWT=0, PCD=0)
+/// Returns virtual address where mapping is created, or 0 on failure
+pub fn map_shared_memory_for_process(page_table_phys: u64, phys_addr: u64, size: u64) -> u64 {
+    use x86_64::structures::paging::PageTableFlags as Flags;
+    use crate::serial;
+    
+    if phys_addr == 0 || phys_addr >= PHYS_MEM_OFFSET {
+        serial::serial_print("MAP_SHARED: ERROR - Invalid physical address\n");
+        return 0;
+    }
+    
+    // Align size to 4KB
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+    
+    // Use the same canonical user range as FB but offset if needed, or let vaddr be chosen.
+    // For simplicity, we currently use a fixed range for "external buffers".
+    let virt_addr = GPU_FB_VADDR_BASE + 0x100000000; // 12GB range for generic shared mem
+
+    // WB flags: PWT=0, PCD=0 (maps to PAT Index 0 which is WB)
+    let pt_flags = (Flags::PRESENT | Flags::WRITABLE | Flags::USER_ACCESSIBLE).bits();
+    
+    serial::serial_print("MAP_SHARED: Mapping at vaddr=");
+    serial::serial_print_hex(virt_addr);
+    serial::serial_print("\n");
+    
+    map_physical_range(page_table_phys, phys_addr, aligned_size, virt_addr, pt_flags);
+    
+    virt_addr
+}
 
 /// Map framebuffer physical memory into process page tables
 /// Uses fixed vaddr + 4KB pages (same path as mmap) to avoid Page Fault 14 on identity mapping

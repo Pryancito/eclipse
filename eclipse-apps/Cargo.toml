@@ -30,10 +30,11 @@ sidewind_xwayland = { path = "sidewind_xwayland" }
 
 [profile.release]
 panic = "abort"
-lto = true
-opt-level = "z"
+lto = "off"
+opt-level = "s"
 codegen-units = 1
 strip = false
+debug = true
 
 [profile.dev]
 opt-level = "s"

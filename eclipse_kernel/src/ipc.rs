@@ -401,13 +401,10 @@ pub fn register_client(name: &[u8], server_id: ServerId, permissions: u32) -> Op
 /// ProcessMailbox del proceso destino, sin pasar por la cola global.
 /// Para mensajes de servidor (Graphics, System, etc.): cola global como antes.
 pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &[u8]) -> bool {
-    // O(1): precalcular slot antes de cualquier lock
-    let dest_slot = match msg_type {
-        MessageType::Signal | MessageType::Input => {
-            pid_to_slot_fast(to).map(|s| s as u8).unwrap_or(0xFF)
-        }
-        _ => 0xFF,
-    };
+    // O(1): precalcular slot antes de cualquier lock.
+    // Ahora intentamos entrega P2P para CUALQUIER tipo de mensaje si el destino es un PID válido.
+    // Esto permite que procesos como 'init' reciban mensajes de sistema/usuario sin ser servidores registrados.
+    let dest_slot = pid_to_slot_fast(to).map(|s| s as u8).unwrap_or(0xFF);
 
     // Construir mensaje (sin ningún lock aún)
     let mut msg = Message::new();
@@ -419,13 +416,11 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     msg.data[..data_len].copy_from_slice(&data[..data_len]);
     msg.data_size = data_len as u32;
 
-    // --- Direct delivery para P2P: bypass de cola global y de IPC_SYSTEM ---
-    if dest_slot != 0xFF && (msg_type == MessageType::Signal || msg_type == MessageType::Input) {
+    // --- Direct delivery para P2P / Process Mailbox: bypass de cola global ---
+    // Si conocemos el slot del proceso, enviamos directamente a su buzón.
+    if dest_slot != 0xFF {
         return run_critical(|| {
-            // Re-verify the PID→slot mapping inside the critical section to close the TOCTOU
-            // window: the target process could exit (and a new process take the same slot)
-            // between the outer pid_to_slot_fast() call and this push.
-            // Lock order: PID_SLOT_MAP → PROCESS_MAILBOXES (consistent with all other paths).
+            // Re-verify inside critical section to close TOCTOU window
             let live_slot = {
                 let map = PID_SLOT_MAP.lock();
                 let idx = to as usize % PID_MAP_SIZE;
@@ -433,14 +428,11 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
                 if e.pid == to && e.slot != 0xFF { e.slot } else { 0xFF }
             };
             if live_slot == 0xFF {
-                return false; // Target process has exited since we computed dest_slot
+                return false;
             }
-            static P2P_ID: core::sync::atomic::AtomicU64 =
-                core::sync::atomic::AtomicU64::new(1);
+            static P2P_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
             let mut m = msg;
             m.id = P2P_ID.fetch_add(1, Ordering::Relaxed);
-            // Update dest_slot to the re-verified slot so that process_messages()
-            // (which re-routes any stale global-queue entries) uses the correct index.
             m.dest_slot = live_slot;
             let ok = PROCESS_MAILBOXES.lock()[live_slot as usize].push(m);
             if ok {
@@ -612,12 +604,12 @@ pub fn get_stats() -> (u32, u32, u64) {
 
 static LAST_IPC_LOG: AtomicU64 = AtomicU64::new(0);
 
-/// Emitir un log de estado del IPC cada 5 segundos (heartbeat).
+/// Emitir un log de estado del IPC cada ~60 s (heartbeat) para no inundar el serial.
 /// Llamado desde el bucle idle de los núcleos.
 pub fn p2p_heartbeat() {
     let now = crate::interrupts::ticks();
     let last = LAST_IPC_LOG.load(Ordering::Relaxed);
-    if now >= last + 5000 {
+    if now >= last + 60000 {
         if LAST_IPC_LOG.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             let delivered = P2P_DELIVERED.load(Ordering::Relaxed);
             let dropped = DROPPED_P2P_MSGS.load(Ordering::Relaxed);

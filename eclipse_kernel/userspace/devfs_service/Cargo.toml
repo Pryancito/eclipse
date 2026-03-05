@@ -2,9 +2,11 @@
 name = "devfs_service"
 version = "0.1.0"
 edition = "2021"
+resolver = "2"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc-internal", path = "../libc" }
+std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
+eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 [[bin]]
 name = "devfs_service"

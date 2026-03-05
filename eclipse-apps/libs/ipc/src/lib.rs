@@ -20,12 +20,19 @@
 #![cfg_attr(not(target_env = "gnu"), no_std)]
 
 pub mod channel;
+#[cfg(feature = "async")]
+pub mod async_channel;
 pub mod protocol;
 pub mod services;
 pub mod types;
 
+extern crate eclipse_libc;
+
 #[cfg(feature = "testable")]
 pub use types::{parse_fast, parse_slow};
+
+#[cfg(feature = "async")]
+pub use crate::async_channel::block_on;
 
 pub mod prelude {
     pub use crate::channel::IpcChannel;
@@ -39,4 +46,7 @@ pub mod prelude {
     };
     pub use crate::types::{EclipseMessage, MAX_MSG_LEN};
     pub use crate::protocol::EclipseEncode;
+
+    #[cfg(feature = "async")]
+    pub use crate::async_channel::{block_on, RecvFuture};
 }

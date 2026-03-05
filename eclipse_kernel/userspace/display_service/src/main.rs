@@ -14,10 +14,11 @@
 //! 
 //! It must start after the input service to handle display events.
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate alloc;
 
-use eclipse_libc::{println, getpid, getppid, send, sleep_ms};
+use std::prelude::*;
 
 mod logo;
 
@@ -260,7 +261,7 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
     println!("[DISPLAY-SERVICE]   Physical address: 0x{:X}", fb_info.address);
     println!("[DISPLAY-SERVICE]   Virtual mapping: 0x{:X}", fb_base);
     println!("[DISPLAY-SERVICE]   Resolution: {}x{}", fb_info.width, fb_info.height);
-    println!("[DISPLAY-SERVICE]   Color depth: {}-bit", fb_info.bpp);
+    println!("[DISPLAY-SERVICE]   Color depth: {}-bit", fb_info.bpp as u32);
     println!("[DISPLAY-SERVICE]   Pitch: {} bytes/scanline", fb_info.pitch);
     
     if register_device("fb0", DeviceType::Display) {
@@ -768,7 +769,7 @@ fn wait_for_vsync() {
     // Sleep for ~16 ms to target 60 Hz refresh rate.
     // On real hardware this frees the CPU for other processes instead of
     // burning cycles with 10 consecutive yield_cpu() calls.
-    sleep_ms(16);
+    std::libc::sleep_ms(16);
 }
 
 /// 2D Acceleration: Hardware-accelerated block transfer (BitBLT)
@@ -885,8 +886,8 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let pid = getpid();
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { std::libc::getpid() };
     
     println!("+--------------------------------------------------------------+");
     println!("|              GRAPHICS / DISPLAY SERVICE                      |");
@@ -1039,15 +1040,27 @@ pub extern "C" fn _start() -> ! {
 
     println!("[DISPLAY-SERVICE] Display service ready");
     println!("[DISPLAY-SERVICE] Ready to accept rendering requests...");
-    let ppid = getppid();
+    let ppid = unsafe { std::libc::getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
-    
-    // Main loop - render frames and handle display events
+
+    let mut ipc_buffer = [0u8; 128];
+
     loop {
-        // Process rendering commands from IPC (placeholder – real compositor fills this)
-        // and then sleep until the next 60 Hz frame boundary.
+        loop {
+            let (len, sender) = std::libc::receive_ipc(&mut ipc_buffer);
+            if len == 0 || sender == 0 {
+                break;
+            }
+            
+            // Placeholder: Process rendering request
+            if len >= 4 {
+                // If we receive a "DRAW" command, we could increment stats or trigger blits
+                // println!("[DISPLAY-SERVICE] IPC Request: {} bytes from PID {}", len, sender);
+                stats.blit_operations += 1;
+            }
+        }
 
         // Use 2D acceleration for rendering if available
         if let Some(ref fb) = framebuffer {
@@ -1062,26 +1075,15 @@ pub extern "C" fn _start() -> ! {
         stats.frames_rendered += 1;
         stats.vsync_count += 1;
 
-        // Periodic status updates (every ~5 s = 300 frames at 60 Hz)
-        if stats.frames_rendered % 300 == 0 {
+        // Periodic status every ~30 s (1800 frames at 60 Hz); single line to avoid serial flood
+        if stats.frames_rendered > 0 && stats.frames_rendered % 1800 == 0 {
             let driver_name = match active_driver {
                 GraphicsDriver::NVIDIA => "NVIDIA",
                 GraphicsDriver::VESA => "VESA",
                 GraphicsDriver::None => "NONE",
             };
-            println!("[DISPLAY-SERVICE] Status - Driver: {}, Frames: {}, V-Syncs: {}", 
-                     driver_name, stats.frames_rendered, stats.vsync_count);
-            
-            if let Some(ref fb) = framebuffer {
-                println!("[DISPLAY-SERVICE]   Display: {}x{}@{}bpp @ {}Hz", 
-                         fb.mode.width, fb.mode.height, fb.mode.bpp, fb.mode.refresh_rate);
-                
-                if fb.supports_hw_accel {
-                    println!("[DISPLAY-SERVICE]   2D Accel: Blits={}, Fills={}, Copies={}", 
-                             stats.blit_operations, stats.fill_operations, stats.copy_operations);
-                }
-            }
-            
+            println!("[DISPLAY-SERVICE] Operational - Heartbeat #{} ({} frames, {})",
+                     stats.frames_rendered / 1800, stats.frames_rendered, driver_name);
             if stats.driver_errors > 0 {
                 println!("[DISPLAY-SERVICE]   Errors: {}", stats.driver_errors);
             }

@@ -1,40 +1,14 @@
 //! Filesystem Service - Manages filesystem operations and VFS
-//! 
-//! This service provides the Virtual Filesystem (VFS) layer for Eclipse OS.
-//! It uses the eclipsefs-lib to parse the filesystem structure from /dev/vda.
 
-#![no_std]
 #![no_main]
-#![feature(alloc_error_handler)]
-
+extern crate std;
 extern crate alloc;
 
-use alloc::vec::Vec;
+use std::prelude::*;
 use alloc::vec;
-use alloc::string::String;
-use alloc::format;
-use core::alloc::Layout;
-
-use eclipse_libc::{
-    println, getpid, getppid, sleep_ms, send,
-    open, close, read, lseek, 
-    O_RDONLY, SEEK_SET,
-    mount, get_storage_device_count
-};
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags};
-use linked_list_allocator::LockedHeap;
 
-// Heap size (1 MB)
-const HEAP_SIZE: usize = 1024 * 1024;
-static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
-
-#[alloc_error_handler]
-fn alloc_error_handler(layout: Layout) -> ! {
-    panic!("allocation error: {:?}", layout)
-}
+const SEEK_SET: i32 = 0;
 
 /// Block size
 const BLOCK_SIZE: usize = 4096;
@@ -61,34 +35,31 @@ struct BlockDevice {
 
 impl BlockDevice {
     fn new(path: &str) -> Result<Self, &'static str> {
-        let fd = open(path, O_RDONLY, 0);
+        let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
         if fd < 0 {
             return Err("Failed to open device");
         }
         Ok(Self { fd })
     }
-    
+
     fn read_block(&self, block_num: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
         if buffer.len() != BLOCK_SIZE {
             return Err("Buffer must be BLOCK_SIZE");
         }
-        
         let offset = block_num * BLOCK_SIZE as u64;
-        if lseek(self.fd, offset as i64, SEEK_SET) < 0 {
+        if std::libc::eclipse_lseek(self.fd, offset as i64, SEEK_SET) < 0 {
             return Err("Seek failed");
         }
-        
-        if read(self.fd as u32, buffer) != BLOCK_SIZE as isize {
-             return Err("Read failed");
+        if std::libc::eclipse_read(self.fd as u32, buffer) != BLOCK_SIZE as isize {
+            return Err("Read failed");
         }
-        
         Ok(())
     }
 }
 
 impl Drop for BlockDevice {
     fn drop(&mut self) {
-        close(self.fd);
+        unsafe { std::libc::eclipse_close(self.fd); }
     }
 }
 
@@ -311,14 +282,9 @@ fn find_eclipsefs_in_gpt(device: &BlockDevice) -> Option<(u64, usize)> {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // Initialize Allocator
-    unsafe {
-        ALLOCATOR.lock().init(HEAP_MEM.as_mut_ptr(), HEAP_SIZE);
-    }
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { std::libc::getpid() };
 
-    let pid = getpid();
-    
     println!("+--------------------------------------------------------------+");
     println!("|              FILESYSTEM SERVICE (VFS)                        |");
     println!("+--------------------------------------------------------------+");
@@ -327,8 +293,8 @@ pub extern "C" fn _start() -> ! {
 
     let mut found = false;
     println!("[FS-SERVICE] Probing for root filesystem...");
-    
-    let device_count = get_storage_device_count();
+
+    let device_count = std::libc::get_storage_device_count();
     println!("[FS-SERVICE] Found {} storage device(s)", device_count);
     if device_count == 0 {
         println!("[FS-SERVICE] CRITICAL: AHCI/NVMe registered zero block devices.");
@@ -337,15 +303,15 @@ pub extern "C" fn _start() -> ! {
 
     for i in 0..device_count {
         let device_name = format!("disk:{}", i);
-        println!("[FS-SERVICE] Probing {}...", device_name);
+        println!("[FS-SERVICE] Probing {}...", device_name.as_str());
         
         match BlockDevice::new(&device_name) {
             Ok(device) => {
-                println!("[FS-SERVICE]   {} opened, scanning for EclipseFS...", device_name);
+                println!("[FS-SERVICE]   {} opened, scanning for EclipseFS...", device_name.as_str());
                 match EclipseFS::mount(&device) {
                     Ok((fs, partition_offset, part_idx)) => {
                         println!("[FS-SERVICE] Valid filesystem found on {} at block {} ({} MiB)!",
-                            device_name, partition_offset,
+                            device_name.as_str(), partition_offset,
                             (partition_offset * BLOCK_SIZE as u64) / (1024 * 1024));
                         
                         // Construct the specific mount path for the kernel
@@ -359,8 +325,8 @@ pub extern "C" fn _start() -> ! {
                             fs.header.version >> 16, fs.header.version & 0xFFFF);
 
                         // Notify kernel to mount root with this specific device string
-                        println!("[FS-SERVICE] Notifying kernel to mount {} as root...", mount_path);
-                        if mount(&mount_path) == 0 {
+                        println!("[FS-SERVICE] Notifying kernel to mount {} as root...", mount_path.as_str());
+                        if std::libc::mount(&mount_path) == 0 {
                             println!("[FS-SERVICE] Kernel root mount successful!");
 
                             // List root directory from our side to verify
@@ -371,16 +337,16 @@ pub extern "C" fn _start() -> ! {
                             found = true;
                             break;
                         } else {
-                            println!("[FS-SERVICE] Kernel root mount FAILED for {}!", device_name);
+                            println!("[FS-SERVICE] Kernel root mount FAILED for {}!", device_name.as_str());
                         }
                     },
                     Err(e) => {
-                        println!("[FS-SERVICE]   {} — {}", device_name, e);
+                        println!("[FS-SERVICE]   {} — {}", device_name.as_str(), e);
                     }
                 }
             },
             Err(e) => {
-                println!("[FS-SERVICE]   {} — could not open device ({})", device_name, e);
+                println!("[FS-SERVICE]   {} — could not open device ({})", device_name.as_str(), e);
             }
         }
     }
@@ -391,16 +357,21 @@ pub extern "C" fn _start() -> ! {
         // Do NOT signal READY — the rest of the system must not start without a filesystem.
         println!("[FS-SERVICE] Halting — filesystem not mounted.");
         loop {
-            sleep_ms(100);
+            std::libc::sleep_ms(100);
         }
     }
 
     println!("[FS-SERVICE] Entering main loop...");
-    let ppid = getppid();
+    let ppid = unsafe { std::libc::getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
+    let mut heartbeat_counter = 0u64;
     loop {
-        sleep_ms(100);
+        heartbeat_counter += 1;
+        if heartbeat_counter % 300 == 0 {
+            println!("[FS-SERVICE] Operational - Heartbeat #{}", heartbeat_counter / 300);
+        }
+        std::libc::sleep_ms(100);
     }
 }

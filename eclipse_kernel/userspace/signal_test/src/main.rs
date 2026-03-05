@@ -24,9 +24,9 @@ pub extern "C" fn _start() -> ! {
 
     println!("Waiting for signal...");
     // Give some time for the signal to be delivered.
-    // Signal delivery happens on return from syscall (e.g. yield_cpu or println).
+    // Signal delivery happens on return from syscall (e.g. yield_cpu or sleep_ms).
     for _ in 0..10 {
-        yield_cpu();
+        sleep_ms(1);
         if SIGNAL_RECEIVED.load(Ordering::Acquire) {
             break;
         }

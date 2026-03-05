@@ -1,27 +1,21 @@
 //! Eclipse STD v2.0 - Standard Library for Eclipse OS
 //!
 //! This library provides a comprehensive std-like interface for Eclipse OS applications
-//! using eclipse-libc (76 POSIX functions) for full functionality.
-//!
-//! # Features
-//!
-//! - File I/O using FILE streams
-//! - Threading using pthread
-//! - Synchronization (Mutex, Condvar)
-//! - Collections (Vec, String, HashMap via alloc)
-//! - println!/eprintln! macros
-//! - main() function support
+//! using eclipse-libc-posix for full functionality.
 
 #![no_std]
 #![feature(alloc_error_handler)]
+#![feature(prelude_import)]
 
 pub extern crate alloc;
-pub extern crate libc;
+pub extern crate libc; // This is eclipse-libc-posix from Cargo.toml
 
 use core::panic::PanicInfo;
 
 pub use core::fmt;
 pub mod ffi {
+    pub use core::ffi::*;
+    pub use crate::libc::{c_char, c_int, c_long, c_void, size_t, pid_t, FILE};
     pub use crate::env::{OsStr, OsString};
 }
 
@@ -29,6 +23,7 @@ pub use core::ptr;
 pub mod heap;
 #[macro_use]
 pub mod macros;
+pub mod rt;
 
 pub mod io;
 pub mod fs;
@@ -52,24 +47,38 @@ pub mod collections {
 
 pub mod prelude {
     //! Prelude - common imports for Eclipse OS applications
-    pub use core::prelude::v1::*;
-    pub use crate::heap::init_heap;
-    pub use crate::{print, println, eprint, eprintln};
-    pub use crate::eclipse_main;
-    pub use alloc::string::{String, ToString};
-    pub use alloc::vec::Vec;
-    pub use alloc::format;
-    pub use alloc::boxed::Box;
-    
-    pub use crate::io::{Read, Write, stdin, stdout, stderr};
-    pub use crate::fs::{self, File};
-    pub use crate::path::{self, Path, PathBuf};
-    pub use crate::process::{self, Command, Child};
-    pub use crate::net;
-    pub use crate::time;
-    pub use crate::thread;
-    pub use crate::sync::{Mutex, Condvar};
-    pub use alloc::borrow::{ToOwned, Borrow};
+    pub mod v1 {
+        pub use core::prelude::v1::*;
+        pub use core::cmp::{PartialEq, PartialOrd, Eq, Ord};
+        pub use core::convert::{TryInto, TryFrom};
+        pub use core::iter::IntoIterator;
+        pub use core::option::Option::{self, Some, None};
+        pub use core::result::Result::{self, Ok, Err};
+        pub use core::matches;
+        
+        pub use crate::heap::init_heap;
+        pub use crate::{print, println, eprint, eprintln};
+        pub use crate::rt::argc;
+        pub use alloc::string::{String, ToString};
+        pub use alloc::vec::Vec;
+        pub use alloc::format;
+        pub use alloc::boxed::Box;
+        
+        pub use crate::io::{Read, Write, stdin, stdout, stderr};
+        pub use crate::fs::{self, File};
+        pub use crate::path::{self, Path, PathBuf};
+        pub use crate::process::{self, Command, Child};
+        pub use crate::net;
+        pub use crate::time;
+        pub use crate::thread;
+        pub use crate::sync::{Mutex, Condvar};
+        pub use alloc::borrow::{ToOwned, Borrow};
+    }
+    #[prelude_import]
+    pub use self::v1::*;
+    pub use self::v1 as rust_2015;
+    pub use self::v1 as rust_2018;
+    pub use self::v1 as rust_2021;
 }
 
 // Re-export core macros to be available via std::...
@@ -81,33 +90,65 @@ pub fn init_runtime() {
 }
 
 /// Main wrapper that calls user's main function
-pub fn main_wrapper<F>(user_main: F) -> !
+pub fn main_wrapper<F, R>(user_main: F) -> !
 where
-    F: FnOnce() -> i32 + core::panic::UnwindSafe,
+    F: FnOnce() -> R,
+    R: Termination,
 {
-    // Initialize runtime
+    // Initialize runtime (heap, etc)
     init_runtime();
     
+    // Notify init (PID 1) that we are READY and ALIVE
+    // Note: We use our re-exported libc here
+    unsafe {
+        let _ = crate::libc::send(1, b"READY\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
+        let _ = crate::libc::send(1, b"HEART\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
+    }
+    
     // Call user's main function
-    let exit_code = user_main();
+    let res = user_main();
+    let exit_code = res.report();
     
     // Exit the application
-    eclipse_syscall::call::exit(exit_code);
+    unsafe {
+        crate::libc::exit(exit_code as i32);
+    }
+    
+    loop {}
 }
 
+pub trait Termination {
+    fn report(self) -> i32;
+}
+
+impl Termination for () {
+    fn report(self) -> i32 { 0 }
+}
+
+impl Termination for i32 {
+    fn report(self) -> i32 { self }
+}
+
+impl<T, E> Termination for Result<T, E> {
+    fn report(self) -> i32 {
+        if self.is_ok() { 0 } else { 1 }
+    }
+}
+
+/// El punto de entrada real (crt0) está en `rt::_start`: lee argc del stack,
+/// inicializa heap, notifica a init y llama a la `main()` del usuario, luego exit(code).
+/// La aplicación debe definir `#[no_mangle] pub extern "Rust" fn main() -> i32`.
+
 /// Macro to create a main entry point for Eclipse OS applications
+/// This hides the need for #![no_main] and pub extern "C" fn _start()
+#[deprecated(note = "Standard fn main() is now supported without #![no_main]. This macro is obsolete.")]
 #[macro_export]
-macro_rules! eclipse_main {
+macro_rules! main {
     ($main_fn:ident) => {
-        #[cfg(not(any(target_os = "linux", unix)))]
         #[no_mangle]
         pub extern "C" fn _start() -> ! {
-            $crate::main_wrapper($main_fn)
-        }
-
-        #[cfg(any(target_os = "linux", unix))]
-        #[no_mangle]
-        pub extern "C" fn main(_argc: isize, _argv: *const *const u8) -> ! {
+            // Stack alignment for x86_64
+            unsafe { core::arch::asm!("and rsp, -16", options(nomem, nostack, preserves_flags)); }
             $crate::main_wrapper($main_fn)
         }
     };
@@ -117,33 +158,30 @@ macro_rules! eclipse_main {
 #[cfg(feature = "panic-handler")]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    eprintln!("\n!!! PANIC !!!");
+    crate::eprintln!("\n!!! ECLIPSE APP PANIC !!!");
     if let Some(location) = info.location() {
-        eprintln!("Location: {}:{}:{}", 
+        crate::eprintln!("Location: {}:{}:{}", 
             location.file(), location.line(), location.column());
     }
-    let message = info.message();
-    eprintln!("Message: {}", message);
     
     // Exit with error code
     unsafe {
-        eclipse_syscall::call::exit(1);
+        crate::libc::exit(1);
     }
+    loop {}
 }
 
 /// Alloc error handler
 #[cfg(feature = "alloc-error-handler")]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    eprintln!("\n!!! ALLOCATION ERROR !!!");
-    eprintln!("Failed to allocate {} bytes with alignment {}", 
+    crate::eprintln!("\n!!! ALLOCATION ERROR !!!");
+    crate::eprintln!("Failed to allocate {} bytes with alignment {}", 
         layout.size(), layout.align());
     
     unsafe {
-        eclipse_syscall::call::exit(2);
+        crate::libc::exit(2);
     }
+    loop {}
 }
 
-// Re-export macros - they are already exported via #[macro_export]
-// but we want them to be available via std::print! etc.
-// pub use crate::{print, println, eprint, eprintln};

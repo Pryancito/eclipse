@@ -129,27 +129,27 @@ prepare_sysroot() {
     print_status "Skipping dummy library creation..."
 }
 
-# Función para compilar eclipse-libc
+# Función para compilar eclipse-relibc (C library in Rust for Eclipse OS)
 build_eclipse_libc() {
-    print_step "Compilando eclipse-libc..."
+    print_step "Compilando eclipse-relibc..."
     
-    if [ ! -d "eclipse-libc" ]; then
-        print_status "Directorio eclipse-libc no encontrado, saltando..."
+    if [ ! -d "eclipse-relibc" ]; then
+        print_status "Directorio eclipse-relibc no encontrado, saltando..."
         return 0
     fi
     
-    cd eclipse-libc
+    cd eclipse-relibc
     
-    print_status "Compilando eclipse-libc..."
+    print_status "Compilando eclipse-relibc..."
     RUSTFLAGS="-Zunstable-options --cfg eclipse_target $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=core,alloc
     
     if [ $? -eq 0 ]; then
-        print_success "eclipse-libc compilado exitosamente"
+        print_success "eclipse-relibc compilado exitosamente"
         
         # Instalar en sysroot como libc.a
         local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
         mkdir -p "$SYSROOT_LIB"
-        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.a" "$SYSROOT_LIB/libc.a"
+        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.rlib" "$SYSROOT_LIB/libc.a"
         print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a"
 
         # Debilitar todos los símbolos globales en libc.a para evitar
@@ -170,7 +170,7 @@ build_eclipse_libc() {
         ar crs "$SYSROOT_LIB/libgcc_s.a"
         print_status "Stub vacío libgcc_s.a creado en sysroot"
     else
-        print_error "Error al compilar eclipse-libc"
+        print_error "Error al compilar eclipse-relibc"
         cd ..
         return 1
     fi
@@ -386,11 +386,12 @@ build_userspace_services() {
             return 1
         fi
         
-        # Compilar el servicio usando build-std (requerido por config.toml)
-        cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
+        # Todos los servicios usan eclipse_std (target x86_64-unknown-eclipse, fn main)
+        RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
+        local build_ok=$?
+        local service_path="target/x86_64-unknown-eclipse/release/$service"
         
-        if [ $? -eq 0 ]; then
-            local service_path="target/x86_64-unknown-none/release/$service"
+        if [ "$build_ok" -eq 0 ]; then
             if [ -f "$service_path" ]; then
                 local service_size=$(du -h "$service_path" | cut -f1)
                 print_status "$service generado: $service_size"
@@ -1397,21 +1398,21 @@ EOF
     # 3. Ensamblar la imagen final con tabla GPT
     print_status "Ensamblando imagen final $IMG_FILE..."
     rm -f "$IMG_FILE"
-    truncate -s 530M "$IMG_FILE"
+    truncate -s 512M "$IMG_FILE"
     
     # Usar parted en el archivo local (no requiere sudo para archivos)
     PARTED_CMD="parted"
     "$PARTED_CMD" "$IMG_FILE" --script mklabel gpt
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 101MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart ESP fat32 1MiB 64MiB
     "$PARTED_CMD" "$IMG_FILE" --script set 1 esp on
-    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 101MiB 501MiB
+    "$PARTED_CMD" "$IMG_FILE" --script mkpart primary ext4 65MiB 465MiB
     
     # Escribir las particiones en los offsets correctos usando dd
     print_status "Escribiendo particiones en la imagen final..."
     # Offset 1MiB = seek 1 con bs=1M
     dd if="$ESP_IMG" of="$IMG_FILE" bs=1M seek=1 conv=notrunc status=none
-    # Offset 101MiB = seek 101 con bs=1M
-    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=101 conv=notrunc status=none
+    # Offset 65MiB = seek 65 con bs=1M
+    dd if="$ROOT_IMG" of="$IMG_FILE" bs=1M seek=65 conv=notrunc status=none
     
     # Limpieza de archivos temporales
     rm -f "$ESP_IMG" "$ROOT_IMG"

@@ -1,11 +1,10 @@
 //! I/O Module - File and stream I/O using eclipse-libc
 //!
 //! Provides std-like I/O interfaces built on top of eclipse-libc's FILE streams.
-use libc::*;
+use crate::libc::*;
 use core::prelude::v1::*;
 
 use core::ptr;
-use libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 
@@ -51,7 +50,7 @@ impl Error {
         Error { kind }
     }
     
-    pub fn from_raw_os_error(code: i32) -> Self {
+    pub fn from_raw_os_error(_code: i32) -> Self {
         // Simple mapping for now
         Error { kind: ErrorKind::Other }
     }

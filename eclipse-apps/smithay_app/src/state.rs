@@ -1,12 +1,14 @@
 use crate::backend::Backend;
 use crate::space::Space;
 use crate::input::{InputState, CompositorEvent};
-use crate::compositor::{ExternalSurface, MAX_EXTERNAL_SURFACES, ShellWindow};
-use crate::render;
-use eclipse_libc::{send, ProcessInfo};
+use crate::compositor::{ExternalSurface, MAX_EXTERNAL_SURFACES, ShellWindow, WindowContent};
+use crate::{render, compositor};
+use std::prelude::v1::*;
+use std::libc::{eclipse_send, ProcessInfo, SystemStats};
 use sidewind_core::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
-
-
+use core::convert::TryInto;
+use core::default::Default;
+use core::iter::Iterator;
 
 #[derive(Clone, Copy, Default)]
 pub struct ServiceInfo {
@@ -14,6 +16,17 @@ pub struct ServiceInfo {
     pub state: u32,
     pub pid: u32,
     pub restart_count: u32,
+}
+
+impl ServiceInfo {
+    pub const fn new() -> Self {
+        Self {
+            name: [0; 16],
+            state: 0,
+            pid: 0,
+            restart_count: 0,
+        }
+    }
 }
 
 /// SmithayState is the central state of the compositor.
@@ -27,7 +40,7 @@ pub struct SmithayState {
     pub counter: u64,
     /// Eventos Input recibidos (para debug: si se congela el ratón, ver si este valor deja de subir).
     pub input_event_count: u64,
-    pub prev_stats: Option<eclipse_libc::SystemStats>,
+    pub prev_stats: Option<std::libc::SystemStats>,
     pub last_metrics_update: u64,
     pub cpu_usage: f32,
     pub mem_usage: f32,
@@ -76,9 +89,9 @@ impl SmithayState {
             prev_net_rx: 0,
             prev_net_tx: 0,
             net_usage: 0.0,
-            process_list: [ProcessInfo::default(); 32],
+            process_list: [const { ProcessInfo::new() }; 32],
             process_count: 0,
-            service_list: [ServiceInfo::default(); 32],
+            service_list: [const { ServiceInfo::new() }; 32],
             service_count: 0,
             prev_process_ticks: [(0, 0); 32],
             process_cpu_usage: [0.0; 32],
@@ -87,73 +100,73 @@ impl SmithayState {
 
     }
 
-    pub fn process_events(&mut self) {
-        // Reduced to 32 to save stack space if needed
-        const MAX_EVENTS: usize = 32;
-        let mut count = 0;
-        while count < MAX_EVENTS {
-            if let Some(event) = self.backend.poll_event() {
-                match event {
-                    CompositorEvent::Input(ev) => {
-                        self.input_event_count += 1;
-                        self.input.apply_event(
-                            &ev,
-                            self.backend.fb.info.width as i32,
-                            self.backend.fb.info.height as i32,
-                            &mut self.space.windows,
-                            &mut self.space.window_count,
-                            &self.surfaces,
-                        );
-                    }
-                    CompositorEvent::SideWind(sw, sender_pid) => {
-                        crate::ipc::handle_sidewind_message(
-                            sw, 
-                            sender_pid, 
-                            &mut self.surfaces, 
-                            &mut self.space.windows, 
-                            &mut self.space.window_count, 
-                            &mut self.input
-                        );
-                    }
-                    CompositorEvent::NetStats(rx, tx) => {
-                        self.net_rx = rx;
-                        self.net_tx = tx;
-                    }
-                    CompositorEvent::ServiceInfo(data) => {
-                        // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
-                        if data.len() >= 8 && &data[0..4] == b"SVCS" {
-                            let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
-                            let mut parsed = 0usize;
-                            let mut offset = 8;
-                            for i in 0..count {
-                                if i >= 32 { break; }
-                                if data.len() >= offset + 24 {
-                                    let mut svc = ServiceInfo::default();
-                                    svc.name[..12].copy_from_slice(&data[offset..offset+12]);
-                                    offset += 12;
-                                    svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                    offset += 4;
-                                    svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                    offset += 4;
-                                    svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                    offset += 4;
-                                    self.service_list[i] = svc;
-                                    parsed += 1;
-                                }
-                            }
-                            // Only update count after successful parsing so a truncated
-                            // packet does not expose stale entries from a previous frame.
-                            self.service_count = parsed;
-                        }
-                    }
-                    _ => {} // Handle Wayland/X11 if needed
-
+    pub fn handle_ipc(&mut self) {
+        // Cap events per frame at 64 to prevent the drain loop from starving the render path
+        // when mouse events flood in faster than we can process them (the main cause of hangs).
+        let mut events_processed = 0usize;
+        while events_processed < 64 {
+            match self.backend.poll_event() {
+                None => break,
+                Some(event) => {
+                    events_processed += 1;
+                    match event {
+                CompositorEvent::Input(ev) => {
+                    self.input_event_count += 1;
+                    self.input.apply_event(
+                        &ev,
+                        self.backend.fb.info.width as i32,
+                        self.backend.fb.info.height as i32,
+                        &mut self.space.windows,
+                        &mut self.space.window_count,
+                        &self.surfaces,
+                    );
                 }
-                count += 1;
-            } else {
-                break;
-            }
-        }
+                CompositorEvent::SideWind(sw, sender_pid) => {
+                    crate::ipc::handle_sidewind_message(
+                        sw, 
+                        sender_pid, 
+                        &mut self.surfaces, 
+                        &mut self.space.windows, 
+                        &mut self.space.window_count, 
+                        &mut self.input
+                    );
+                }
+                CompositorEvent::NetStats(rx, tx) => {
+                    self.net_rx = rx;
+                    self.net_tx = tx;
+                }
+                CompositorEvent::ServiceInfo(data) => {
+                    // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
+                    if data.len() >= 8 && &data[0..4] == b"SVCS" {
+                        let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
+                        let mut parsed = 0usize;
+                        let mut offset = 8;
+                        for i in 0..count {
+                            if i >= 32 { break; }
+                            if data.len() >= offset + 24 {
+                                let mut svc = ServiceInfo::new();
+                                svc.name[..12].copy_from_slice(&data[offset..offset+12]);
+                                offset += 12;
+                                svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                offset += 4;
+                                svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                offset += 4;
+                                svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                                offset += 4;
+                                self.service_list[i] = svc;
+                                parsed += 1;
+                            }
+                        }
+                        // Only update count after successful parsing so a truncated
+                        // packet does not expose stale entries from a previous frame.
+                        self.service_count = parsed;
+                    }
+                }
+                _ => {} // Handle Wayland/X11 if needed
+                    } // end match event
+                } // end Some(event)
+            } // end match poll_event
+        } // end while
     }
 
     pub fn update(&mut self) {
@@ -178,11 +191,11 @@ impl SmithayState {
 
         // Actualizar métricas cada 30 ticks (~0.5s si es 60fps)
         if self.counter % 30 == 0 {
-            let mut current = eclipse_libc::SystemStats {
+            let mut current = SystemStats {
                 uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
             };
             unsafe {
-                if eclipse_libc::get_system_stats(&mut current) == 0 {
+                if std::libc::get_system_stats(&mut current) == 0 {
                     if let Some(prev) = self.prev_stats {
                         let total_delta = current.uptime_ticks.saturating_sub(prev.uptime_ticks);
                         let idle_delta = current.idle_ticks.saturating_sub(prev.idle_ticks);
@@ -201,7 +214,9 @@ impl SmithayState {
             
             // Stats de red
             if let Some(pid) = self.network_pid {
-                let _ = eclipse_libc::send(pid, 0x08, eclipse_ipc::types::GET_NET_STATS_MSG); // MSG_TYPE_NETWORK = 0x08
+                unsafe {
+                    let _ = std::libc::eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0); // MSG_TYPE_NETWORK = 0x08
+                }
                 
                 let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
                 let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
@@ -218,70 +233,70 @@ impl SmithayState {
             
             // Actualizar lista de procesos y servicios
             if self.input.system_central_active {
-                unsafe {
-                    let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
-                    let count = eclipse_libc::get_process_list(&mut self.process_list);
-                    if count >= 0 {
-                        self.process_count = count as usize;
-                        
-                        let current_uptime = current.uptime_ticks;
-                        let total_delta = current_uptime.saturating_sub(prev_uptime);
+                let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
+                let count = unsafe { std::libc::get_process_list(self.process_list.as_mut_ptr(), 32) };
+                if count >= 0 {
+                    self.process_count = count as usize;
+                    
+                    let current_uptime = current.uptime_ticks;
+                    let total_delta = current_uptime.saturating_sub(prev_uptime);
 
-                        // Evict tick entries whose PID no longer appears in the active list.
-                        // Use the process_list slice directly to avoid a separate copy.
-                        let active = &self.process_list[..self.process_count];
+                    // Evict tick entries whose PID no longer appears in the active list.
+                    // Use the process_list slice directly to avoid a separate copy.
+                    let active = &self.process_list[..self.process_count];
+                    for j in 0..32 {
+                        let stored_pid = self.prev_process_ticks[j].0;
+                        if stored_pid != 0 && !active.iter().any(|p| p.pid == stored_pid) {
+                            self.prev_process_ticks[j] = (0, 0);
+                        }
+                    }
+
+                    for i in 0..self.process_count {
+                        let p = &self.process_list[i];
+                        
+                        // Calcular CPU %
+                        let mut prev_ticks = 0;
                         for j in 0..32 {
-                            let stored_pid = self.prev_process_ticks[j].0;
-                            if stored_pid != 0 && !active.iter().any(|p| p.pid == stored_pid) {
-                                self.prev_process_ticks[j] = (0, 0);
+                            if self.prev_process_ticks[j].0 == p.pid {
+                                prev_ticks = self.prev_process_ticks[j].1;
+                                break;
                             }
                         }
+                        
+                        if total_delta > 0 {
+                            let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
+                            self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
+                        } else {
+                            self.process_cpu_usage[i] = 0.0;
+                        }
+                        
+                        // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
+                        self.process_mem_kb[i] = p.mem_frames * 4;
 
-                        for i in 0..self.process_count {
-                            let p = &self.process_list[i];
-                            
-                            // Calcular CPU %
-                            let mut prev_ticks = 0;
+                        // Actualizar histórico de ticks.
+                        let mut found = false;
+                        for j in 0..32 {
+                            if self.prev_process_ticks[j].0 == p.pid {
+                                self.prev_process_ticks[j].1 = p.cpu_ticks;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            // Buscar slot vacío (PID 0)
                             for j in 0..32 {
-                                if self.prev_process_ticks[j].0 == p.pid {
-                                    prev_ticks = self.prev_process_ticks[j].1;
+                                if self.prev_process_ticks[j].0 == 0 {
+                                    self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
                                     break;
-                                }
-                            }
-                            
-                            if total_delta > 0 {
-                                let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
-                                self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
-                            } else {
-                                self.process_cpu_usage[i] = 0.0;
-                            }
-                            
-                            // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
-                            self.process_mem_kb[i] = p.mem_frames * 4;
-
-                            // Actualizar histórico de ticks.
-                            let mut found = false;
-                            for j in 0..32 {
-                                if self.prev_process_ticks[j].0 == p.pid {
-                                    self.prev_process_ticks[j].1 = p.cpu_ticks;
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                // Buscar slot vacío (PID 0)
-                                for j in 0..32 {
-                                    if self.prev_process_ticks[j].0 == 0 {
-                                        self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
-                                        break;
-                                    }
                                 }
                             }
                         }
                     }
-                    
-                    // Pedir info de servicios a systemd (PID 1)
-                    let _ = eclipse_libc::send(1, 0x40, b"GET_SERVICES_INFO");
+                }
+                
+                // Pedir info de servicios a systemd (PID 1)
+                unsafe {
+                    let _ = std::libc::eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0);
                 }
             }
 
@@ -364,7 +379,7 @@ impl SmithayState {
                                 event_type: SWND_EVENT_TYPE_RESIZE, 
                                 data1: win.w, data2: win.h - ShellWindow::TITLE_H, data3: 0 
                             };
-                            let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                            let _ = unsafe { eclipse_send(pid, 0x00000040, &se as *const _ as *const core::ffi::c_void, core::mem::size_of::<SideWindEvent>(), 0) };
                         }
                     }
                 }
@@ -374,7 +389,13 @@ impl SmithayState {
 
         // Restore
         if self.input.request_restore {
-            if let Some(idx) = (0..self.space.window_count).rev().find(|&i| self.space.windows[i].content != crate::compositor::WindowContent::None && self.space.windows[i].minimized) {
+            if let Some(idx) = (0..self.space.window_count)
+                .rev()
+                .find(|&i| {
+                    !matches!(self.space.windows[i].content, crate::compositor::WindowContent::None)
+                        && self.space.windows[i].minimized
+                })
+            {
                 self.space.windows[idx].minimized = false;
                 self.space.raise_window(idx);
                 self.input.focused_window = Some(self.space.window_count - 1);
@@ -442,10 +463,11 @@ impl SmithayState {
                     self.input.workspace_offset, 
                     self.input.current_workspace,
                     self.input.cursor_x, 
-                    self.input.cursor_y
+                    self.input.cursor_y,
+                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0)
                 );
             } else if self.input.dashboard_active {
-                render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage);
+                render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
             } else if self.input.system_central_active {
                 render::draw_system_central(
                     &mut self.backend.fb, 
@@ -454,6 +476,7 @@ impl SmithayState {
                     &self.process_list[..self.process_count],
                     &self.process_cpu_usage,
                     &self.process_mem_kb,
+                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0)
                 );
             }
 

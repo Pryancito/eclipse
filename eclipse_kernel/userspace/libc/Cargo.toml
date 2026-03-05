@@ -1,18 +1,28 @@
 [package]
-name = "eclipse-libc-internal"
-version = "0.1.0"
+name = "eclipse-libc"
+version = "0.2.0"
 edition = "2021"
 
-[lib]
-name = "eclipse_libc_internal"
-crate-type = ["staticlib", "rlib"]
-
 [dependencies]
-lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
-spin = "0.9.8"
+eclipse-syscall = { path = "../../../eclipse-syscall" }
+
+[features]
+default = ["std", "allocator", "panic-handler"]
+allocator = []
+panic-handler = []
+std = []
+extra_traits = []
+use_std = []
+align = []
+const-extern-fn = []
+
+[lib]
+name = "eclipse_libc"
+path = "src/lib.rs"
+crate-type = ["rlib"]
 
 [profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"
-codegen-units = 1
+lto = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(eclipse_target)'] }

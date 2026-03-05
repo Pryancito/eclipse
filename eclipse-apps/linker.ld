@@ -20,12 +20,13 @@ SECTIONS
 
     .data : ALIGN(4K)
     {
-        *(.data .data.*)
+        *(.data .data.* .ldata .ldata.* .sdata .sdata.*)
     }
 
     .bss : ALIGN(4K)
     {
-        *(.bss .bss.*)
+        KEEP(*(.keep.heap))
+        *(.bss .bss.* .lbss .lbss.* .sbss .sbss.*)
         *(COMMON)
     }
 

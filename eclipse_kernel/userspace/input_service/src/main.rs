@@ -9,46 +9,21 @@
 //! - USB tablets and touchpads
 //! - Gaming peripherals (high DPI mice, mechanical keyboards)
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use eclipse_libc::{println, getpid, getppid, yield_cpu, sleep_ms, send, receive, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
-
-/// Syscall numbers
-const SYS_OPEN: u64 = 11;
-const SYS_WRITE: u64 = 1;
+use std::prelude::*;
+use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
 
 fn sys_open(path: &str) -> Option<usize> {
-    let mut fd: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr() as u64,
-            in("rsi") path.len() as u64,
-            in("rdx") 0u64,
-            lateout("rax") fd,
-            options(nostack)
-        );
-    }
-    if (fd as isize) < 0 { None } else { Some(fd) }
+    let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+    if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    let mut written: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_WRITE,
-            in("rdi") fd as u64,
-            in("rsi") buf.as_ptr() as u64,
-            in("rdx") buf.len() as u64,
-            lateout("rax") written,
-            options(nostack)
-        );
-    }
-    written
+    std::libc::eclipse_write(fd as u32, buf) as usize
 }
 
 /// Input device types
@@ -161,7 +136,7 @@ fn send_event_to_client(pid: u32, ev: &InputEvent) {
     buf[8..12].copy_from_slice(&ev.value.to_le_bytes());
     // buf[12..16] = 0; // implicit padding bytes, kept as 0
     buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
-    let _ = send(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
+    let _ = send_ipc(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
     let n = DISPLAY_SENT.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 500 == 0 {
         println!("[INPUT-SERVICE] sent {} to display", n);
@@ -246,9 +221,9 @@ fn detect_usb_controllers() -> usize {
             
             println!("[INPUT-SERVICE]   Found USB Controller:");
             println!("[INPUT-SERVICE]     PCI: {:02x}:{:02x}.{}", 
-                     dev.bus, dev.device, dev.function);
+                     dev.bus as u32, dev.device as u32, dev.function as u32);
             println!("[INPUT-SERVICE]     Vendor: 0x{:04x}, Device: 0x{:04x}",
-                     dev.vendor_id, dev.device_id);
+                     dev.vendor_id as u32, dev.device_id as u32);
             
             // Determine controller type from programming interface
             // Note: This would need to read the programming interface byte
@@ -383,8 +358,8 @@ fn create_device_nodes() {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let pid = getpid();
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");
     println!("|                    INPUT SERVICE                             |");
@@ -432,9 +407,9 @@ pub extern "C" fn _start() -> ! {
     
     // Report initialization status
     println!("[INPUT-SERVICE] Input service ready");
-    let ppid = getppid();
+    let ppid = unsafe { getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
     println!("[INPUT-SERVICE] Device summary:");
     println!("[INPUT-SERVICE]   USB controllers: {}", usb_controller_count);
@@ -455,7 +430,7 @@ pub extern "C" fn _start() -> ! {
     let mut prev_mouse_buttons: u8 = 0;
 
     // Cursor position (absolute, clamped to screen bounds)
-    let (screen_width, screen_height) = get_framebuffer_info()
+    let (screen_width, screen_height) = unsafe { get_framebuffer_info() }
         .map(|fb| (fb.width as i32, fb.height as i32))
         .unwrap_or((1024, 768));
     let mut cursor_x: i32 = screen_width / 2;
@@ -476,7 +451,7 @@ pub extern "C" fn _start() -> ! {
         // Procesar mensajes IPC de control (por ejemplo, registro de cliente de display)
         {
             let mut buf = [0u8; 32];
-            let (len, sender_pid) = receive(&mut buf);
+            let (len, sender_pid) = std::libc::receive_ipc(&mut buf);
             if len >= 8 && &buf[0..4] == b"SUBS" {
                 let mut id_bytes = [0u8; 4];
                 id_bytes.copy_from_slice(&buf[4..8]);
@@ -506,7 +481,7 @@ pub extern "C" fn _start() -> ! {
         while let Some(packed) = read_mouse_packet() {
             mouse_batch += 1;
             if mouse_batch >= 8 {
-                yield_cpu();
+                unsafe { yield_cpu(); }
                 mouse_batch = 0;
             }
             let buttons = (packed & 0xFF) as u8;
@@ -520,29 +495,18 @@ pub extern "C" fn _start() -> ! {
                 set_cursor_position(cursor_x as u32, cursor_y as u32);
             }
 
-            // Eventos de movimiento (X, Y)
-            if dx != 0 {
+            // Eventos de movimiento: coalescer dx+dy en UN solo mensaje (code=0xFFFF,
+            // value = (dy as i16 as i32) << 16 | (dx as i16 as u16 as i32)).
+            // Esto reduce a la mitad el número de mensajes IPC por paquete de ratón,
+            // evitando que el mailbox de smithay (256 slots) se llene durante movimientos
+            // rápidos del ratón, lo que causaba el cuelgue.
+            if dx != 0 || dy != 0 {
+                let packed_value = ((dy as i16 as i32) << 16) | (dx as i16 as u16 as i32);
                 let ev = InputEvent {
                     device_id: 1,
                     event_type: 1,
-                    code: 0,
-                    value: dx,
-                    timestamp: heartbeat_counter,
-                };
-                mouse_events += 1;
-                total_events += 1;
-                for i in 0..display_client_count {
-                    let pid = display_clients[i];
-                    send_event_to_client(pid, &ev);
-                }
-                let _ = event_queue.push(ev);
-            }
-            if dy != 0 {
-                let ev = InputEvent {
-                    device_id: 1,
-                    event_type: 1,
-                    code: 1,
-                    value: dy,
+                    code: 0xFFFF, // código especial: movimiento coalesced dx+dy
+                    value: packed_value,
                     timestamp: heartbeat_counter,
                 };
                 mouse_events += 1;
@@ -608,7 +572,7 @@ pub extern "C" fn _start() -> ! {
             }
             kbd_batch += 1;
             if kbd_batch >= 8 {
-                yield_cpu();
+                unsafe { yield_cpu(); }
                 kbd_batch = 0;
             }
             let value = if (sc & 0x80) != 0 { 0 } else { 1 }; // break = 0, make = 1
@@ -652,14 +616,17 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        // Periodic status updates (~5 s = 2500 iterations * 2 ms)
-        if heartbeat_counter % 2500 == 0 {
-            println!("[INPUT-SERVICE] Operational - Total events: {}", total_events);
-            println!("[INPUT-SERVICE]   Keyboard: {}, Mouse: {}, Tablet: {}", 
-                     keyboard_events, mouse_events, tablet_events);
-            println!("[INPUT-SERVICE]   Queue: {}/256 events", event_queue.count);
+        // Periodic status every ~30 s (15000 * 2 ms) to avoid serial flood
+        if heartbeat_counter > 0 && heartbeat_counter % 15000 == 0 {
+            println!("[INPUT-SERVICE] Operational - Heartbeat #{} (events: {}, queue: {}/256)",
+                     heartbeat_counter / 15000, total_events, event_queue.count);
+        }
+
+        if heartbeat_counter % 1000 == 0 {
+            // Watchdog heartbeat to init (PID 1)
+            let _ = std::libc::send_ipc(1, 0x40, b"HEART");
         }
         
-        sleep_ms(2);
+        std::libc::sleep_ms(2);
     }
 }

@@ -5,32 +5,18 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
+extern crate eclipse_libc;
 use eclipse_libc::{println, yield_cpu};
 use sidewind_sdk::{discover_composer, SideWindSurface};
 use sidewind_opengl::{Mat4, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, Pipeline};
-
-const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB for demo
-#[repr(align(4096))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0u8; HEAP_SIZE]);
-static HEAP_PTR: AtomicUsize = AtomicUsize::new(0);
-
-struct StaticAllocator;
-unsafe impl GlobalAlloc for StaticAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let size = layout.size();
-        let current = HEAP_PTR.load(Ordering::SeqCst);
-        let aligned = (current + align - 1) & !(align - 1);
-        if aligned + size > HEAP_SIZE { return core::ptr::null_mut(); }
-        HEAP_PTR.store(aligned + size, Ordering::SeqCst);
-        HEAP.0.as_mut_ptr().add(aligned)
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
-#[global_allocator]
-static ALLOCATOR: StaticAllocator = StaticAllocator;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -41,14 +27,14 @@ pub extern "C" fn _start() -> ! {
             println!("[GL-DEMO] Discovered compositor at PID {}", pid);
             break pid;
         }
-        yield_cpu();
+        eclipse_libc::sleep_ms(100);
     };
 
     let mut surface = match SideWindSurface::new(composer_pid, 100, 100, 640, 480, "gl_demo") {
         Some(s) => s,
         None => {
             println!("[GL-DEMO] Failed to create surface, idling");
-            loop { yield_cpu(); }
+            loop { eclipse_libc::sleep_ms(1000); }
         }
     };
 
@@ -177,6 +163,6 @@ pub extern "C" fn _start() -> ! {
             angle_x += 0.005;
         }
 
-        yield_cpu();
+        eclipse_libc::sleep_ms(16);
     }
 }

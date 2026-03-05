@@ -112,6 +112,7 @@ extern "C" {
 }
 
 static AP_READY: AtomicUsize = AtomicUsize::new(0);
+pub static SYSTEM_BOOT_COMPLETE: AtomicBool = AtomicBool::new(false);
 static TSC_COUNTS_PER_US: AtomicU64 = AtomicU64::new(10000); // Default to 10GHz (safe upper bound)
 static TSC_DEADLINE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -190,10 +191,6 @@ pub fn start_aps() {
         *copy_cr3 = cr3;
         *copy_entry = ap_entry as *const () as u64;
 
-        let layout = alloc::alloc::Layout::from_size_align(16384, 16).unwrap();
-        let ptr = alloc::alloc::alloc_zeroed(layout);
-        let ap_stack = ptr as u64 + 16384;
-        *copy_stack = ap_stack;
         *copy_cr3 = cr3;
         *copy_entry = ap_entry as *const () as u64;
         
@@ -211,14 +208,15 @@ pub fn start_aps() {
 
             serial_printf(format_args!("[CPU] Starting AP {} (APIC ID {})...\n", i, target_apic_id));
             
-            // Allocate unique stack for this AP
-            let layout = alloc::alloc::Layout::from_size_align(16384, 16).unwrap();
+            // Allocate unique permanent kernel stack for this AP (32KB as per process::KERNEL_STACK_SIZE)
+            let stack_size = crate::process::KERNEL_STACK_SIZE;
+            let layout = alloc::alloc::Layout::from_size_align(stack_size, 16).unwrap();
             let ptr = alloc::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 serial_printf(format_args!("[CPU] ERROR: Failed to allocate stack for AP {}\n", target_apic_id));
                 continue;
             }
-            let ap_stack = ptr as u64 + 16384;
+            let ap_stack = ptr as u64 + stack_size as u64;
             *copy_stack = ap_stack;
             
             serial_printf(format_args!("[CPU] AP {} stack allocated at {:p}\n", target_apic_id, ptr));
@@ -493,53 +491,44 @@ pub extern "C" fn ap_entry() -> ! {
     // 6. Enable SYSCALL/SYSRET and set up STAR/LSTAR/SFMASK – per-CPU MSRs
     crate::interrupts::init_ap();
 
-    // 7. Allocate a dedicated kernel interrupt stack for this AP.
-    // This stack is used by the CPU when transitioning from ring 3 → ring 0
-    // (hardware interrupts, exceptions, SYSCALL) on this AP.
-    let kernel_stack = alloc::vec![0u8; crate::process::KERNEL_STACK_SIZE];
-    let kernel_stack_top = (kernel_stack.as_ptr() as u64 + crate::process::KERNEL_STACK_SIZE as u64) & !0xF;
-    core::mem::forget(kernel_stack); // Leak: AP stack is permanent
-    crate::boot::set_tss_stack(kernel_stack_top);
+    // 7. Initialize TSS with the current stack (allocated by BSP)
+    // We are already running on the permanent stack allocated by start_aps().
+    let mut current_rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) current_rsp);
+    }
+    crate::boot::set_tss_stack(current_rsp);
 
-    // 8. Start the per-AP Local APIC periodic timer so this core receives
-    // scheduling interrupts independently of the BSP's PIT (IRQ 0).
+    // 8. Start the per-AP Local APIC timer.
+    // Add a unique jitter (e.g. cpu_id * 10 ticks) to prevent bus flood.
+    let cpu_id = crate::apic::get_id();
+    wait_ms((cpu_id as u64 % 8) * 2); // Small jitter before starting timer
     crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
 
-    // 8.5 Switch to the permanent kernel stack.
-    // This removes the dependency on the initial 16KB trampoline stack.
-    // Note: We use naked assembly here because switching RSP mid-function is extremely dangerous in Rust.
-    // We'll jump to a new "safe" loop after the switch.
+    serial_printf(format_args!("[CPU] AP (APIC ID {}) ready, switching to main loop\n", cpu_id));
     
-    serial_printf(format_args!("[CPU] AP (APIC ID {}) switching to permanent stack...\n", crate::apic::get_id()));
-    
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {0}",
-            "mov rbp, 0",
-            "jmp {1}",
-            in(reg) kernel_stack_top,
-            in(reg) ap_main_loop as u64,
-            options(noreturn)
-        );
-    }
+    ap_main_loop();
 }
 
 /// The permanent main loop for Application Processors.
 /// Runs on the dedicated kernel stack.
 extern "C" fn ap_main_loop() -> ! {
     // 9. Signal the BSP that this AP is fully initialized.
-    // This MUST happen after all per-CPU hardware setup so that the BSP
-    // does not proceed to start the next AP before this one is ready.
     AP_READY.fetch_add(1, Ordering::SeqCst);
 
-    serial_printf(format_args!("[CPU] AP (APIC ID {}) fully initialized, entering scheduler loop\n",
+    // 10. Wait for the BSP to signal that global system initialization is complete.
+    // This prevents APs from starting the scheduler before all drivers/services are ready.
+    while !SYSTEM_BOOT_COMPLETE.load(Ordering::SeqCst) {
+        crate::cpu::pause();
+    }
+
+    serial_printf(format_args!("[CPU] AP (APIC ID {}) system ready, starting scheduler\n",
         crate::apic::get_id()));
 
     // Enable interrupts; the APIC timer will drive schedule() from here on.
     unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
 
     loop {
-        crate::ipc::p2p_heartbeat();
         crate::cpu::idle();
         crate::scheduler::schedule();
     }

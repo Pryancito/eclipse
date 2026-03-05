@@ -5,9 +5,10 @@ edition = "2021"
 
 [dependencies]
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { package = "eclipse-libc-posix", path = "../../eclipse-libc" }
+libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 
 [features]
+default = ["panic-handler", "alloc-error-handler"]
 panic-handler = []
 alloc-error-handler = []
 [lib]

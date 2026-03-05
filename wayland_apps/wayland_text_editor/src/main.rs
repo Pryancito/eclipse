@@ -25,14 +25,7 @@ fn init_heap() {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // En aplicaciones Wayland, no podemos acceder a serial del kernel
-    // Solo loop infinito en caso de panic
-    loop {
-        unsafe { core::arch::asm!("nop"); }
-    }
-}
+
 
 /// Estructura para manejar la aplicación de editor de texto Wayland
 pub struct WaylandTextEditor {
@@ -126,6 +119,6 @@ pub extern "C" fn _start() -> ! {
 
     // Loop infinito (en una aplicación real, esto sería el event loop)
     loop {
-        unsafe { core::arch::asm!("nop"); }
+        eclipse_libc::sleep_ms(16);
     }
 }

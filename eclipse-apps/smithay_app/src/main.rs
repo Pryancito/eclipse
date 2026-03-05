@@ -1,94 +1,119 @@
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
-
+#![no_main]
+extern crate std;
 extern crate alloc;
 extern crate eclipse_syscall;
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicUsize, Ordering};
-use eclipse_libc::{println, getpid, yield_cpu, sleep_ms, exit};
+pub mod compositor;
+pub mod render;
+pub mod input;
+pub mod ipc;
+pub mod space;
+pub mod backend;
+pub mod state;
 
-use smithay_app::state::SmithayState;
-use smithay_app::compositor::{ShellWindow, WindowContent};
-use smithay_app::ipc::{query_input_service_pid, subscribe_to_input_service, query_network_service_pid};
-
-const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB
-#[repr(align(4096))]
-struct Heap([u8; HEAP_SIZE]);
-static mut HEAP: Heap = Heap([0u8; HEAP_SIZE]);
-static HEAP_PTR: AtomicUsize = AtomicUsize::new(0);
-
-struct StaticAllocator;
-unsafe impl GlobalAlloc for StaticAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let size = layout.size();
-        loop {
-            let current = HEAP_PTR.load(Ordering::SeqCst);
-            let aligned = (current + align - 1) & !(align - 1);
-            if aligned + size > HEAP_SIZE { return core::ptr::null_mut(); }
-            if HEAP_PTR.compare_exchange(current, aligned + size, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                return HEAP.0.as_mut_ptr().add(aligned);
-            }
-        }
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
-#[global_allocator]
-static ALLOCATOR: StaticAllocator = StaticAllocator;
-
-static mut STATE: Option<SmithayState> = None;
+use std::prelude::*;
+use crate::state::SmithayState;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    unsafe { core::arch::asm!("and rsp, -16", options(nomem, nostack, preserves_flags)); }
+pub extern "Rust" fn main() -> i32 {
+    println!("[SMITHAY] Starting via Eclipse Runtime...");
     
-    println!("[SMITHAY] Initializing Smithay Architecture (Static)...");
-    let pid = getpid();
+    let mut state = SmithayState::new().expect("Failed to initialize Smithay State");
     
-    unsafe {
-        STATE = SmithayState::new();
-    }
+    let input_pid = query_input_service_pid().expect("Failed to find input service");
+    println!("[SMITHAY] Found input service at PID {}", input_pid);
     
-    let state = unsafe {
-        match STATE.as_mut() {
-            Some(s) => s,
-            None => { println!("[SMITHAY] FATAL: State init failed"); exit(1); }
-        }
-    };
-    
-    state.backend.fb.pre_render_background();
+    let my_pid = unsafe { std::libc::getpid() as u32 };
+    subscribe_to_inputs(input_pid, my_pid);
+    println!("[SMITHAY] Subscribed to input events");
 
-    // Initial demo window removed as requested
-
-    if let Some(in_pid) = query_input_service_pid() { subscribe_to_input_service(in_pid, pid); }
-    if let Some(net_pid) = query_network_service_pid() { state.network_pid = Some(net_pid); }
-
-    println!("[SMITHAY] Entering main loop (PID {})", pid);
+    println!("[SMITHAY] Entering main loop");
+    
     loop {
-        // Drenar todo el input pendiente antes de update/render para no llenar el mailbox del kernel
-        state.process_events();
-
-        state.update();
+        state.counter += 1;
+        
+        if state.counter == 1 {
+            state.backend.fb.pre_render_background();
+        }
+        
+        if state.counter % 60 == 1 {
+             println!("[SMITHAY] Rendering frame {}...", state.counter);
+        }
         state.render();
+        // Imprescindible: enviar el back buffer a pantalla (GOP o GPU). Sin esto no se dibuja nada.
         state.backend.swap_buffers();
-
-        // Un drenado rápido tras render por si llegaron eventos durante el frame
-        state.process_events();
-
-        // Intentar mapear el framebuffer si estamos en modo headless (cada ~5s a ~60fps)
-        if state.counter % 300 == 0 {
+        
+        if state.counter % 60 == 1 {
+             println!("[SMITHAY] Handling IPC...");
+        }
+        state.handle_ipc();
+        
+        // Si arrancamos en headless, intentar mapear framebuffer cuando esté disponible
+        if state.counter % 120 == 0 {
             state.backend.fb.try_remap_framebuffer();
         }
 
-        if state.counter % 1000 == 0 {
-            let used = HEAP_PTR.load(Ordering::Relaxed);
-            println!("[SMITHAY] Stats: HEAP {}/8MB | IPC {} msgs.",
-                used, state.backend.ipc.message_count);
+        if state.counter % 400 == 0 {
+            println!("[SMITHAY] Sending CUAPPA heartbeat to init...");
+            unsafe {
+                let _ = std::libc::eclipse_send(1, 0, b"HEART\0".as_ptr() as *const core::ffi::c_void, 6, 0);
+            }
         }
 
-        // Target high frame rate while keeping CPU relief
-        sleep_ms(5);
+        if state.counter % 1000 == 0 {
+            println!("[SMITHAY] Stable loop iteration {}", state.counter);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+}
+
+fn query_input_service_pid() -> Option<u32> {
+    let mut buf = [0u8; 8];
+    // Request input PID from init (PID 1)
+    // Retry up to 10 times to give init time to process the request
+    for i in 0..50 {
+        unsafe {
+            // Use 0x40 (MessageType::Input) for P2P delivery guarantee
+            let _ = std::libc::eclipse_send(1, 0x40, b"GET_INPUT_PID\0".as_ptr() as *const core::ffi::c_void, 14, 0);
+            
+            // Wait a bit for the response
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            
+            // Drain mailbox to find the INPT message
+            let mut found_msg = false;
+            loop {
+                let mut from: u32 = 0;
+                let len = std::libc::receive(buf.as_mut_ptr(), 8, &mut from);
+                if len == 0 || from == 0 {
+                    break;
+                }
+                
+                if len >= 8 && &buf[..4] == b"INPT" {
+                    let pid = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
+                    println!("[SMITHAY] Received input service PID {} from init", pid);
+                    return Some(pid);
+                } else if len > 0 {
+                    println!("[SMITHAY] Received other IPC msg (len {}, from {})", len, from);
+                    found_msg = true;
+                }
+            }
+            
+            if i % 5 == 0 {
+                println!("[SMITHAY] Waiting for input service PID (attempt {}, msg_found={})...", i, found_msg);
+            }
+        }
+        // Wait before retrying
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    None
+}
+
+fn subscribe_to_inputs(input_pid: u32, my_pid: u32) {
+    let mut msg = [0u8; 8];
+    msg[..4].copy_from_slice(b"SUBS");
+    msg[4..8].copy_from_slice(&my_pid.to_le_bytes());
+    unsafe {
+        let _ = std::libc::eclipse_send(input_pid as u32, 0, msg.as_ptr() as *const core::ffi::c_void, 8, 0);
     }
 }

@@ -1,7 +1,7 @@
 //! Standard I/O - stdin, stdout, stderr
 
 use super::{Read, Write, Result, Error, ErrorKind};
-use libc::*;
+use crate::libc::*;
 
 /// Standard input
 pub struct Stdin {

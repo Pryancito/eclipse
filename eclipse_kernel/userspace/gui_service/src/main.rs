@@ -5,34 +5,27 @@
 //! 2. Launch smithay_app from disk.
 //! 3. Supervise it: if it crashes, wait a moment and relaunch (watchdog).
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate alloc;
 
-use eclipse_libc::{
-    println, getpid, getppid, sleep_ms, send, open, close, read, O_RDONLY,
-    mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE, fstat, lseek, Stat, wait, spawn,
-    SEEK_END, Spinlock, exec
-};
+use std::prelude::*;
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
 const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
-static LOAD_BUF: Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
+static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 
 const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
-/// Maximum restart attempts (0 = unlimited)
-const MAX_RESTARTS: u32 = 0;
 
 /// Wait for filesystem to be mounted.
-/// On real SATA/AHCI hardware the disk may take several seconds to initialise,
-/// so we use a generous timeout (≈30 s worth of yields).
 fn wait_for_filesystem() {
     const MAX_ATTEMPTS: u32 = 3000;
     let mut attempts = 0;
     loop {
-        let fd = open("file:/", O_RDONLY, 0);
+        let fd = std::libc::eclipse_open("file:/", std::libc::O_RDONLY, 0);
         if fd >= 0 {
-            close(fd);
+            unsafe { std::libc::eclipse_close(fd); }
             return;
         }
         attempts += 1;
@@ -40,59 +33,64 @@ fn wait_for_filesystem() {
             println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
             return;
         }
-        sleep_ms(10);
+        std::libc::sleep_ms(10);
     }
 }
 
 /// Load and spawn smithay_app. Returns the child PID or -1 on failure.
 unsafe fn spawn_compositor() -> i32 {
-    let fd = open(COMPOSITOR_PATH, O_RDONLY, 0);
+    use std::libc::{eclipse_open, eclipse_close, eclipse_read, eclipse_spawn, fstat, lseek, mmap, munmap, stat};
+    const SEEK_END: i32 = 2;
+    let fd = eclipse_open(COMPOSITOR_PATH, std::libc::O_RDONLY, 0);
     if fd < 0 {
         println!("[GUI-SERVICE] ERROR: Cannot open {}", COMPOSITOR_PATH);
         return -1;
     }
 
-    let mut st: Stat = core::mem::zeroed();
-    let size = if fstat(fd, &mut st) >= 0 && st.size > 0 {
-        st.size as u64
+    let mut st: stat = core::mem::zeroed();
+    let size = if fstat(fd, &mut st) >= 0 && st.st_size > 0 {
+        st.st_size as u64
     } else {
-        // Fallback: fstat may return size=0 (EclipseFS fstat bug). Use lseek(SEEK_END).
         let sz = lseek(fd, 0, SEEK_END);
         if sz <= 0 {
             println!("[GUI-SERVICE] ERROR: fstat and lseek(SEEK_END) failed for {}", COMPOSITOR_PATH);
-            close(fd);
+            eclipse_close(fd);
             return -1;
         }
-        let _ = lseek(fd, 0, 0); // Reset to start for mmap
+        let _ = lseek(fd, 0, 0);
         sz as u64
     };
     let child_pid = {
-        let mapped = mmap(0, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
-        if mapped != u64::MAX && mapped != 0 {
-            println!("[GUI-SERVICE] Mapped compositor at {:#x}", mapped);
-            close(fd);
+        let mapped = mmap(
+            core::ptr::null_mut(),
+            size as usize,
+            std::libc::PROT_READ | std::libc::PROT_EXEC,
+            std::libc::MAP_PRIVATE,
+            fd,
+            0,
+        );
+        if !mapped.is_null() && (mapped as isize) > 0 {
+            println!("[GUI-SERVICE] Mapped compositor at {:p}", mapped);
+            eclipse_close(fd);
             let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
-            let pid = spawn(binary, Some("smithay_app"));
-
-            let _ = munmap(mapped, size);
+            let pid = eclipse_spawn(binary, Some("smithay_app"));
+            let _ = munmap(mapped, size as usize);
             pid
         } else {
-            // mmap failed (e.g. file scheme). Fallback: load via read().
-            let _ = lseek(fd, 0, 0); // SEEK_SET to start
+            let _ = lseek(fd, 0, 0);
             let mut load_guard = LOAD_BUF.lock();
             let read_size = size.min(MAX_COMPOSITOR_SIZE as u64) as usize;
             let n = {
                 let buf = &mut load_guard[..read_size];
-                let result = read(fd as u32, buf);
-                close(fd);
+                let result = std::libc::eclipse_read(fd as u32, buf);
+                eclipse_close(fd);
                 result
             };
             if n < 0 || n as u64 != size {
                 println!("[GUI-SERVICE] ERROR: read failed for {} (got {})", COMPOSITOR_PATH, n);
                 return -1;
             }
-            spawn(&load_guard[..size as usize], Some("smithay_app"))
-
+            eclipse_spawn(&load_guard[..size as usize], Some("smithay_app"))
         }
     };
 
@@ -100,51 +98,26 @@ unsafe fn spawn_compositor() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let pid = getpid();
-
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { std::libc::getpid() };
     println!("+--------------------------------------------------------------+");
     println!("|         GUI SERVICE - Sidewind Compositor Supervisor         |");
     println!("+--------------------------------------------------------------+");
-    let ppid = getppid();
+    let ppid = unsafe { std::libc::getppid() };
     println!("[GUI-SERVICE] PID={}, PPID={}", pid, ppid);
 
-    // Notify parent (systemd/init) that we are ready
     if ppid > 0 {
         println!("[GUI-SERVICE] Sending READY to init (PID {})...", ppid);
-        let _ = send(ppid, 255, b"READY");
+        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     } else {
         println!("[GUI-SERVICE] WARNING: No parent process found to signal READY!");
     }
 
-    // Wait for filesystem before loading compositor from disk
     wait_for_filesystem();
     println!("[GUI-SERVICE] Filesystem ready.");
 
-    // Watchdog loop: spawn the compositor and restart it if it exits.
-    // On real hardware the first launch may fail (framebuffer not ready yet),
-    // so a brief delay followed by a retry is essential.
-    let mut restarts: u32 = 0;
+    let _child_pid = unsafe { spawn_compositor() };
     loop {
-        let child_pid = unsafe { spawn_compositor() };
-
-        if child_pid > 0 {
-            println!("[GUI-SERVICE] Compositor started with PID {}, waiting...", child_pid);
-            // Wait for the compositor child process to exit (blocking)
-            let mut status: i32 = 0;
-            let _ = wait(Some(&mut status));
-            println!("[GUI-SERVICE] Compositor exited (restarts={})", restarts);
-        } else {
-            println!("[GUI-SERVICE] spawn_compositor() failed (restarts={})", restarts);
-        }
-
-        if MAX_RESTARTS > 0 && restarts >= MAX_RESTARTS {
-            println!("[GUI-SERVICE] Max restarts ({}) reached, stopping.", MAX_RESTARTS);
-            loop { sleep_ms(1000); }
-        }
-
-        restarts += 1;
-        sleep_ms(1000);
-        println!("[GUI-SERVICE] Restarting compositor (attempt {})...", restarts);
+        std::libc::sleep_ms(1000);
     }
 }

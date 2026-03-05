@@ -33,9 +33,15 @@ pub const SYS_ARCH_PRCTL: usize = 32;
 pub const SYS_GETRANDOM: usize = 33;
 pub const SYS_IOCTL: usize = 34;
 pub const SYS_GET_LAST_EXEC_ERROR: usize = 35;
+pub const SYS_RECEIVE_FAST: usize = 200;
 pub const SYS_GET_GPU_DISPLAY_INFO: usize = 38;
 pub const SYS_SET_CURSOR_POSITION: usize = 39;
+pub const SYS_GPU_ALLOC_DISPLAY_BUFFER: usize = 40;
+pub const SYS_GET_LOGS: usize = 49;
 pub const SYS_GPU_COMMAND: usize = 56;
+pub const SYS_GPU_PRESENT: usize = 250;
+pub const SYS_READ_KEY: usize = 36;
+pub const SYS_READ_MOUSE_PACKET: usize = 37;
 
 // Socket syscalls (100+)
 pub const SYS_SOCKET: usize = 100;
@@ -49,5 +55,9 @@ pub const SYS_GET_SYSTEM_STATS: usize = 51;
 pub const SYS_GET_PROCESS_LIST: usize = 52;
 pub const SYS_KILL: usize = 53;
 pub const SYS_SET_PROCESS_NAME: usize = 54;
-
-
+pub const SYS_SPAWN_SERVICE: usize = 55;
+pub const SYS_GET_STORAGE_DEVICE_COUNT: usize = 50;
+pub const SYS_PCI_ENUM_DEVICES: usize = 17;
+pub const SYS_PCI_READ_CONFIG: usize = 18;
+pub const SYS_PCI_WRITE_CONFIG: usize = 19;
+pub const SYS_SIGACTION: usize = 60;

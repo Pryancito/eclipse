@@ -1,9 +1,16 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, send, receive, yield_cpu};
+use eclipse_libc::{c_uint, println, eclipse_send as send, receive, sleep_ms};
 use sidewind_sdk::discover_composer;
 use sidewind_core::MSG_TYPE_WAYLAND;
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -14,7 +21,7 @@ pub extern "C" fn _start() -> ! {
             println!("[WAYLAND-TEST] Discovered compositor at PID {}", pid);
             break pid;
         }
-        yield_cpu();
+        sleep_ms(100);
     };
 
     // 1. Send wl_display::get_registry(new_id = 2)
@@ -26,20 +33,21 @@ pub extern "C" fn _start() -> ! {
     msg[8..12].copy_from_slice(&registry_id.to_le_bytes());
 
     println!("[WAYLAND-TEST] Sending wl_display.get_registry...");
-    let _ = send(composer_pid, MSG_TYPE_WAYLAND, &msg);
+    unsafe { let _ = send(composer_pid, MSG_TYPE_WAYLAND, msg.as_ptr() as *const core::ffi::c_void, msg.len(), 0); }
 
     // 2. Wait for wl_registry::global event
     // Expected: object_id(2), size(?), opcode(0), name(1), iface("wl_compositor"), version(4)
     println!("[WAYLAND-TEST] Waiting for wl_registry.global event...");
     loop {
         let mut buffer = [0u8; 256];
-        let (len, sender) = receive(&mut buffer);
+        let mut sender: u32 = 0;
+        let len = unsafe { receive(buffer.as_mut_ptr(), buffer.len(), &mut sender) };
         if len > 0 && sender == composer_pid {
             let obj_id = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
             let size_op = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
             let opcode = (size_op & 0xFFFF) as u16;
             
-            println!("[WAYLAND-TEST] Received message: obj={}, op={}", obj_id, opcode);
+            println!("[WAYLAND-TEST] Received message: obj={}, op={}", obj_id, opcode as c_uint);
             
             if obj_id == registry_id && opcode == 0 {
                 // Parse global event
@@ -54,9 +62,9 @@ pub extern "C" fn _start() -> ! {
                 break;
             }
         }
-        yield_cpu();
+        sleep_ms(10);
     }
 
     println!("[WAYLAND-TEST] Handshake complete.");
-    loop { yield_cpu(); }
+    loop { sleep_ms(100); }
 }

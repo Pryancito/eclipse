@@ -3,6 +3,9 @@ pub const MAX_WINDOWS_COUNT: usize = 16;
 pub const MAX_SURFACE_DIM: u32 = 8192;
 pub const MAX_SURFACE_BYTES: u64 = 128 * 1024 * 1024;
 
+use std::prelude::*;
+use core::iter::Iterator;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowContent {
     None,

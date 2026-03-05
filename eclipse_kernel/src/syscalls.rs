@@ -938,10 +938,10 @@ fn sys_receive(buffer_ptr: u64, size: u64, sender_pid_ptr: u64) -> u64 {
 
                 // Escribir el PID del remitente si se solicitó
                 if sender_pid_ptr != 0 {
-                    *(sender_pid_ptr as *mut u64) = msg.from as u64;
+                    *(sender_pid_ptr as *mut u32) = msg.from;
                 }
             }
-            return msg.data_size as u64;
+            return copy_len as u64;
         }
         RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
     }
@@ -1589,7 +1589,7 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
                         addr as u64
                     };
                     let page_table = crate::process::get_process_page_table(crate::process::current_process_id());
-                    let vaddr = crate::memory::map_framebuffer_for_process(
+                    let vaddr = crate::memory::map_shared_memory_for_process(
                         page_table,
                         phys_addr,
                         len as u64
@@ -1779,6 +1779,10 @@ fn sys_gpu_alloc_display_buffer(width: u64, height: u64, out_ptr: u64) -> u64 {
     if vaddr == 0 {
         return u64::MAX;
     }
+    crate::serial::serial_printf(format_args!(
+        "[GPU-ALLOC] phys={:#018X} vaddr={:#018X} resource={} pitch={} size={}\n",
+        phys_addr, vaddr, resource_id, pitch, size
+    ));
     unsafe {
         let buf = out_ptr as *mut u8;
         core::ptr::write_unaligned(buf as *mut u64, vaddr);

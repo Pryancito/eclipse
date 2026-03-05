@@ -19,6 +19,18 @@ pub struct ProcessInfo {
     pub mem_frames: u64,
 }
 
+impl ProcessInfo {
+    pub const fn new() -> Self {
+        Self {
+            pid: 0,
+            state: 0,
+            name: [0; 16],
+            cpu_ticks: 0,
+            mem_frames: 0,
+        }
+    }
+}
+
 pub use error::{Error, Result};
 
 pub use number::*;

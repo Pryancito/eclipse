@@ -1,8 +1,13 @@
+use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
-use eclipse_libc::{InputEvent, send};
-use sidewind_core::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_MOVE, SWND_EVENT_TYPE_MOUSE_BUTTON, SWND_EVENT_TYPE_RESIZE};
-use sidewind_sdk::ui::{Notification};
-use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM};
+use std::libc::{InputEvent, eclipse_send};
+use sidewind_core::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON};
+use sidewind_sdk::ui::Notification;
+use crate::compositor::{
+    ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
+};
+use core::cmp;
+use micromath::F32Ext;
 
 #[derive(Clone)]
 pub enum CompositorEvent {
@@ -195,13 +200,13 @@ impl InputState {
                             if let WindowContent::External(s_idx) = windows[f_idx].content {
                                 if (s_idx as usize) < surfaces.len() {
                                     let pid = surfaces[s_idx as usize].pid;
-                                    let se = SideWindEvent { 
-                                        event_type: SWND_EVENT_TYPE_KEY, 
-                                        data1: ev.code as i32, 
-                                        data2: ev.value as i32, 
-                                        data3: self.modifiers as i32 
+                                    let se = SideWindEvent {
+                                        event_type: sidewind_core::SWND_EVENT_TYPE_KEY,
+                                        data1: ev.code as i32,
+                                        data2: ev.value as i32,
+                                        data3: self.modifiers as i32
                                     };
-                                    let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                                    let _ = unsafe { eclipse_send(pid as u32, 0x40, &se as *const _ as *const core::ffi::c_void, core::mem::size_of::<SideWindEvent>(), 0) };
                                 }
                             }
                         }
@@ -266,7 +271,28 @@ impl InputState {
             }
             1 => { // Mouse move
                 let d = (ev.value * self.mouse_sensitivity) / 100;
-                if ev.code == 0 {
+                if ev.code == 0xFFFF {
+                    // Coalesced dx+dy event: dx = lower i16, dy = upper i16
+                    let dx = (ev.value as i16) as i32;
+                    let dy = ((ev.value >> 16) as i16) as i32;
+                    let ddx = (dx * self.mouse_sensitivity) / 100;
+                    let ddy = (dy * self.mouse_sensitivity) / 100;
+                    self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
+                    let dy_effective = if self.invert_y { -ddy } else { ddy };
+                    self.cursor_y = (self.cursor_y + dy_effective).clamp(0, (fb_height - 1).max(0));
+                    if let Some(idx) = self.dragging_window {
+                        if idx < *window_count {
+                            windows[idx].x = (windows[idx].x + ddx).clamp(0, (fb_width - windows[idx].w).max(0));
+                            windows[idx].y = (windows[idx].y + dy_effective).clamp(0, (fb_height - windows[idx].h).max(0));
+                        }
+                    }
+                    if let Some(idx) = self.resizing_window {
+                        if idx < *window_count {
+                            windows[idx].w = (self.cursor_x - windows[idx].x + 8).max(50).min(MAX_SURFACE_DIM as i32);
+                            windows[idx].h = (self.cursor_y - windows[idx].y + 8).max(ShellWindow::TITLE_H + 20).min(MAX_SURFACE_DIM as i32);
+                        }
+                    }
+                } else if ev.code == 0 {
                     self.cursor_x = (self.cursor_x + d).clamp(0, (fb_width - 1).max(0));
                     if let Some(idx) = self.dragging_window { 
                         if idx < *window_count {
@@ -312,7 +338,7 @@ impl InputState {
                                 data2: ev.value,
                                 data3: 0,
                             };
-                            let _ = send(pid, 0x00000040, unsafe { core::slice::from_raw_parts(&se as *const _ as *const u8, core::mem::size_of::<SideWindEvent>()) });
+                            let _ = unsafe { eclipse_send(pid as u32, 0x40, &se as *const _ as *const core::ffi::c_void, core::mem::size_of::<SideWindEvent>(), 0) };
                         }
                     }
                 }
@@ -349,10 +375,10 @@ impl InputState {
                             if idx >= 0 && idx < 32 {
                                 if self.cursor_x >= col_options && self.cursor_x < col_options + 90 {
                                     // Restart Service
-                                    let _ = send(1, 0x42, b"RESTART_SERVICE"); // Mock/Simple trigger
+                                    let _ = unsafe { eclipse_send(1, 0, b"RESTART_SERVICE".as_ptr() as *const core::ffi::c_void, 15, 0) }; // Mock/Simple trigger
                                 } else if self.cursor_x >= col_options + 100 && self.cursor_x < col_options + 180 {
                                     // Stop Service
-                                    let _ = send(1, 0x43, b"STOP_SERVICE");
+                                    let _ = unsafe { eclipse_send(1, 0, b"STOP_SERVICE".as_ptr() as *const core::ffi::c_void, 12, 0) };
                                 }
                             }
                         } else if self.cursor_y >= half_h + 85 {

@@ -1,4 +1,6 @@
+use std::prelude::v1::*;
 use crate::compositor::{ShellWindow, WindowContent, MAX_WINDOWS_COUNT, ExternalSurface};
+use core::iter::Iterator;
 
 /// A Space represents a set of windows arranged in a 2D coordinate system.
 /// This is inspired by Smithay's Space abstraction.
@@ -31,8 +33,10 @@ impl Space {
 
     pub fn unmap_window(&mut self, index: usize) {
         if index < self.window_count {
+            // Shift windows down by swapping within the active slice to avoid moves.
+            let slice = &mut self.windows[..self.window_count];
             for i in index..(self.window_count - 1) {
-                self.windows[i] = self.windows[i + 1];
+                slice.swap(i, i + 1);
             }
             self.window_count -= 1;
             // Clear the last slot
@@ -50,7 +54,7 @@ impl Space {
     pub fn window_under_cursor(&self, px: i32, py: i32) -> Option<usize> {
         for i in (0..self.window_count).rev() {
             let w = &self.windows[i];
-            if w.content != WindowContent::None && !w.minimized && w.contains(px, py) {
+            if !matches!(w.content, WindowContent::None) && !w.minimized && w.contains(px, py) {
                 return Some(i);
             }
         }
@@ -61,7 +65,7 @@ impl Space {
         let mut min_count_anim = 0;
         let mut i = 0;
         while i < self.window_count {
-            if self.windows[i].content == WindowContent::None {
+            if matches!(self.windows[i].content, WindowContent::None) {
                 i += 1;
                 continue;
             }

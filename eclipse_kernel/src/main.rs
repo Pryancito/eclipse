@@ -102,6 +102,11 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
+    // Ensure interrupts are disabled immediately upon entering the kernel.
+    // UEFI may leave them enabled, and calling init_pat() will restore the IF
+    // flag, causing a triple-fault if an interrupt fires before the IDT is ready.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
+
     // DIAGNÓSTICO: RED SQUARE (30,0) al entrar en el kernel
     // El framebuffer info está al inicio de BootInfo
     unsafe {
@@ -237,6 +242,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 /// Entry point in Higher Half with clean stack
 extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
+    // Redundant but safe: ensure interrupts stay disabled after stack switch.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
     serial::serial_print("[KERNEL] kernel_bootstrap entry\n");
     let cpu_id = crate::process::get_cpu_id();
     serial::serial_printf(format_args!("\n\n!!! KERNEL BOOT START v3 !!! CPU ID: {} (Raw APIC info in get_cpu_id)\n\n", cpu_id));
@@ -286,7 +293,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     
     // Init DevFS before other subsystems
     filesystem::init_devfs();
-    
+    progress::bar(71);
     serial::serial_print("Starting secondary CPUs...\n");
     cpu::start_aps();
     serial::serial_print("DEBUG: AP discovery complete. Calling progress::bar(75)...\n");
@@ -345,7 +352,8 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     filesystem::init();
     progress::bar(90);
     
-    serial::serial_print("[INIT] Initialization Complete. Entering kernel_main.\n");
+    serial::serial_print("[INIT] Initialization Complete. Signaling APs.\n");
+    crate::cpu::SYSTEM_BOOT_COMPLETE.store(true, core::sync::atomic::Ordering::SeqCst);
     
     // Final Stage: Jump to main loop
     kernel_main(boot_info);

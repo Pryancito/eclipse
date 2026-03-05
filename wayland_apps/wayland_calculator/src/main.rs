@@ -31,10 +31,7 @@ fn init_allocator() {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+
 
 /// Operaciones matemáticas disponibles
 #[derive(Debug, Clone, Copy)]
@@ -263,5 +260,7 @@ pub extern "C" fn main() -> ! {
     }
     
     // Bucle infinito
-    loop {}
+    loop {
+        eclipse_libc::sleep_ms(16);
+    }
 }

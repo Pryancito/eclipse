@@ -2,53 +2,30 @@
 
 ## Overview
 
-`eclipse_std` is a compatibility layer that allows Eclipse OS applications to use a `std`-like interface with `main()` functions, while maintaining compatibility with the microkernel's `no_std` architecture.
+`eclipse_std` is a compatibility layer that allows Eclipse OS applications to use a std-like interface (`println!`, `String`, `Vec`, etc.) while the target remains `no_std`. Proporciona el **runtime (crt0)**: el símbolo `_start` que el kernel usa como entry point del ELF, inicializa heap y llama a tu `main() -> i32`, y finalmente hace la syscall `exit(code)`.
 
 ## Quick Start
 
-### Using eclipse_std in your application
-
 ```rust
-use eclipse_std::prelude::*;
+#![no_main]
+extern crate std;  // std = eclipse_std in Cargo.toml
+use std::prelude::*;
 
-fn main() -> i32 {
+#[no_mangle]
+pub extern "Rust" fn main() -> i32 {
     println!("Hello from Eclipse OS!");
-    
-    // You can use:
-    // - String and Vec (via alloc)
-    // - println!/eprintln! macros
-    // - Box, format!, etc.
-    
     let name = String::from("Eclipse OS");
-    let mut numbers = Vec::new();
-    numbers.push(1);
-    numbers.push(2);
-    numbers.push(3);
-    
-    println!("Running on: {}", name);
-    println!("Numbers: {:?}", numbers);
-    
-    0  // Return exit code
+    let numbers = vec![1, 2, 3];
+    println!("Running on: {} - {:?}", name, numbers);
+    0  // código de salida (syscall exit)
 }
-
-eclipse_main!(main);
 ```
 
 ### Cargo.toml
 
 ```toml
-[package]
-name = "my-app"
-version = "0.1.0"
-edition = "2021"
-
 [dependencies]
-eclipse_std = { path = "../eclipse_std" }
-
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"
+std = { package = "eclipse_std", path = "../eclipse_std" }
 ```
 
 ## Features
@@ -73,15 +50,17 @@ User Application (with main)
    Eclipse Kernel
 ```
 
-### How it Works
+### Flujo crt0 (runtime)
 
-1. You write a normal `main() -> i32` function
-2. The `eclipse_main!` macro generates the required `_start` entry point
-3. `_start` calls `main_wrapper` which:
-   - Initializes the heap
-   - Sets up panic handler
-   - Calls your `main()` function
-   - Exits with the return code
+1. **Kernel**: `execve("/bin/app")` → carga ELF → salta a `_start` (símbolo en eclipse_std).
+2. **eclipse_std::rt::_start** (crt0):
+   - Lee `argc` del stack (layout System V ABI puesto por el kernel).
+   - Alinea RSP (x86-64).
+   - Inicializa heap (Box/Vec).
+   - Envía READY/HEART a init (PID 1).
+   - Llama a tu `main() -> i32`.
+   - `exit(código)` (syscall al kernel).
+3. Si `main()` hace **panic**, el panic handler de eclipse_std llama a `exit(1)` (no se vuelve a _start).
 
 ## Example: Converting smithay_app
 

@@ -1,0 +1,34 @@
+# eclipse-relibc: C Library in Rust for Eclipse OS
+# Estilo relibc (Redox) — implementación POSIX/libc sobre el microkernel Eclipse.
+
+[package]
+name = "eclipse-libc"
+version = "0.3.0"
+edition = "2021"
+description = "C Library in Rust for Eclipse OS (relibc-style)"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+eclipse-syscall = { path = "../eclipse-syscall" }
+
+[features]
+default = ["std", "allocator", "panic-handler"]
+allocator = []
+panic-handler = []
+std = []
+extra_traits = []
+use_std = []
+align = []
+const-extern-fn = []
+
+[lib]
+name = "eclipse_libc"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[profile.release]
+lto = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(eclipse_target)'] }

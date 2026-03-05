@@ -8,45 +8,20 @@
 //! 
 //! This is typically one of the last services to start.
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate alloc;
 
-use eclipse_libc::{println, getpid, getppid, sleep_ms, send, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
-
-/// Syscall numbers
-const SYS_OPEN: u64 = 11;
-const SYS_WRITE: u64 = 1;
+use std::prelude::*;
+use std::libc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 fn sys_open(path: &str) -> Option<usize> {
-    let mut fd: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr() as u64,
-            in("rsi") path.len() as u64,
-            in("rdx") 0u64,
-            lateout("rax") fd,
-            options(nostack)
-        );
-    }
-    if (fd as isize) < 0 { None } else { Some(fd) }
+    let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+    if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    let mut written: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_WRITE,
-            in("rdi") fd as u64,
-            in("rsi") buf.as_ptr() as u64,
-            in("rdx") buf.len() as u64,
-            lateout("rax") written,
-            options(nostack)
-        );
-    }
-    written
+    std::libc::eclipse_write(fd as u32, buf) as usize
 }
 
 /// Audio device types
@@ -93,11 +68,11 @@ fn detect_audio_devices() -> (Option<AudioDevice>, usize) {
         let dev = devices_buffer[i];
         
         println!("[AUDIO-SERVICE] Device {}: Bus={}, Device={}, Function={}",
-                 i, dev.bus, dev.device, dev.function);
+                 i as u32, dev.bus as u32, dev.device as u32, dev.function as u32);
         println!("[AUDIO-SERVICE]   Vendor=0x{:04x}, Device=0x{:04x}",
-                 dev.vendor_id, dev.device_id);
+                 dev.vendor_id as u32, dev.device_id as u32);
         println!("[AUDIO-SERVICE]   Class=0x{:02x}, Subclass=0x{:02x}",
-                 dev.class_code, dev.subclass);
+                 dev.class_code as u32, dev.subclass as u32);
         
         // Check device type
         let device_type = match dev.subclass {
@@ -131,7 +106,7 @@ fn detect_audio_devices() -> (Option<AudioDevice>, usize) {
 fn init_intel_hda_driver(device: &AudioDevice) -> bool {
     println!("[AUDIO-SERVICE] Initializing Intel HDA driver...");
     println!("[AUDIO-SERVICE]   PCI Location: Bus {}, Device {}, Function {}",
-             device.pci_info.bus, device.pci_info.device, device.pci_info.function);
+             device.pci_info.bus as u32, device.pci_info.device as u32, device.pci_info.function as u32);
     
     // Read vendor and device ID to identify specific controller
     let vendor_id = device.pci_info.vendor_id;
@@ -142,7 +117,7 @@ fn init_intel_hda_driver(device: &AudioDevice) -> bool {
         0x8086 => println!("Intel Corporation"),
         0x1022 => println!("AMD"),
         0x10DE => println!("NVIDIA"),
-        _ => println!("Unknown vendor (0x{:04x})", vendor_id),
+        _ => println!("Unknown vendor (0x{:04x})", vendor_id as u32),
     }
     
     // Read BAR0 (Base Address Register 0) - contains MMIO base address
@@ -201,13 +176,13 @@ fn init_intel_hda_driver(device: &AudioDevice) -> bool {
 fn init_ac97_driver(device: &AudioDevice) -> bool {
     println!("[AUDIO-SERVICE] Initializing AC97 Audio driver...");
     println!("[AUDIO-SERVICE]   PCI Location: Bus {}, Device {}, Function {}",
-             device.pci_info.bus, device.pci_info.device, device.pci_info.function);
+             device.pci_info.bus as u32, device.pci_info.device as u32, device.pci_info.function as u32);
     
     let vendor_id = device.pci_info.vendor_id;
     let device_id = device.pci_info.device_id;
     
     println!("[AUDIO-SERVICE]   Controller: Vendor=0x{:04x}, Device=0x{:04x}",
-             vendor_id, device_id);
+             vendor_id as u32, device_id as u32);
     
     // Read BAR0 and BAR1 for AC97 (uses both I/O and memory space)
     let bar0 = device.pci_info.bar0;
@@ -236,8 +211,8 @@ fn init_audio_mixer() {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let pid = getpid();
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");
     println!("|                     AUDIO SERVICE                            |");
@@ -295,9 +270,9 @@ pub extern "C" fn _start() -> ! {
 
     // Report final status and signal READY to init
     println!("[AUDIO-SERVICE] Audio service ready");
-    let ppid = getppid();
+    let ppid = unsafe { getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = send_ipc(ppid as u32, 255, b"READY");
     }
     
     if device_ready {
@@ -319,18 +294,31 @@ pub extern "C" fn _start() -> ! {
         println!("[AUDIO-SERVICE] Running in degraded mode (no audio output)");
     }
     
-    // Main loop - process audio streams
+    let mut ipc_buffer = [0u8; 64];
     let mut heartbeat_counter = 0u64;
     let mut streams_active = 0u64;
     let mut samples_processed = 0u64;
-    
+
     loop {
         heartbeat_counter += 1;
         
+        // Drain any pending audio commands/data from other processes
+        loop {
+            let (len, sender) = std::libc::receive_ipc(&mut ipc_buffer);
+            if len == 0 || sender == 0 {
+                break;
+            }
+            
+            // Placeholder: Process audio command (e.g. "VOL+", "PLAY", etc.)
+            if len >= 4 {
+                println!("[AUDIO-SERVICE] IPC Request: {} bytes from PID {}", len, sender);
+            }
+        }
+
         // Simulate audio stream processing only if device is ready
         if device_ready {
-            // Simulate occasional audio activity (~1 s = 100 iterations * 10 ms)
-            if heartbeat_counter % 100 == 0 {
+            // Simulate occasional audio activity (~1 s = 1000 iterations * 1 ms)
+            if heartbeat_counter % 1000 == 0 {
                 streams_active = 2;
                 samples_processed += 48000;
                 
@@ -341,22 +329,21 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        // Status updates every ~5 s (500 iterations * 10 ms)
-        if heartbeat_counter % 500 == 0 {
+        // Status updates every ~5 s (5000 iterations * 1 ms)
+        if heartbeat_counter > 0 && heartbeat_counter % 30000 == 0 {
             if device_ready {
                 let device_name = match device_type {
                     AudioDeviceType::IntelHDA => "Intel HDA",
                     AudioDeviceType::AC97 => "AC97",
                     AudioDeviceType::None => "none",
                 };
-                
-                println!("[AUDIO-SERVICE] Operational - Device: {}, Active streams: {}, Samples: {}", 
-                         device_name, streams_active, samples_processed);
+                println!("[AUDIO-SERVICE] Operational - Heartbeat #{} ({} streams: {})",
+                         heartbeat_counter / 30000, device_name, streams_active);
             } else {
                 println!("[AUDIO-SERVICE] Operational - No audio device (degraded mode)");
             }
         }
         
-        sleep_ms(10);
+        std::libc::sleep_ms(1);
     }
 }

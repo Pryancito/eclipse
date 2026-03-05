@@ -10,6 +10,9 @@
     "vendor": "unknown",
     "linker-flavor": "gnu-lld",
     "linker": "rust-lld",
+    "pre-link-args": {
+        "gnu-lld": ["--entry=_start"]
+    },
     "executables": true,
     "panic-strategy": "abort",
     "features": "+sse,+sse2",
@@ -17,6 +20,7 @@
     "position-independent-executables": true,
     "has-rpath": false,
     "no-default-libraries": true,
+    "has-thread-local": true,
     "target-family": [
         "unix"
     ]

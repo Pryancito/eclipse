@@ -6,9 +6,9 @@ authors = ["Eclipse OS Team"]
 description = "Aplicación de test para el Sistema de Entrada Unificado"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 sidewind_sdk = { path = "../sidewind_sdk" }
-eclipse_ipc = { path = "../libs/ipc" }
+eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 micromath = "2.1.0"
 
 [profile.release]

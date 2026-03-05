@@ -1,0 +1,135 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/moebius/eclipse/eclipse-apps/libs/ipc/Cargo.toml
+workspace: /home/moebius/eclipse/eclipse-apps/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/moebius/eclipse/eclipse-apps/input_test/Cargo.toml
+workspace: /home/moebius/eclipse/eclipse-apps/Cargo.toml
+warning: unused variable: `stat`
+   --> /home/moebius/eclipse/eclipse-syscall/src/call.rs:118:43
+    |
+118 | ...e, path: &str, stat: &mut Stat, flags: us...
+    |                   ^^^^ help: if this is intentional, prefix it with an underscore: `_stat`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse-syscall` (lib) generated 1 warning (run `cargo fix --lib -p eclipse-syscall` to apply 1 suggestion)
+   Compiling eclipse-libc v0.2.0 (/home/moebius/eclipse/eclipse_kernel/userspace/libc)
+warning: missing pattern for `...` argument
+  --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/unistd/mod.rs:69:80
+   |
+69 | ...g0: *const c_char, ...) -> c_int {
+   |                       ^^^
+   |
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #145544 <https://github.com/rust-lang/rust/issues/145544>
+   = note: `#[warn(varargs_without_pattern)]` (part of `#[warn(future_incompatible)]`) on by default
+help: name the argument, or use `_` to continue ignoring it
+   |
+69 |     pub unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char, _: ...) -> c_int {
+   |                                                                                ++
+
+warning: avoid using `.intel_syntax`, Intel syntax is the default
+  --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/lib.rs:20:25
+   |
+20 | ..._asm!(include_str!("posix_stubs.s"));
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(bad_asm_style)]` on by default
+
+warning: unused imports: `strcpy` and `strncpy`
+   --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/stdio/mod.rs:106:33
+    |
+106 | ...er::string::{strcpy, strncpy};
+    |                 ^^^^^^  ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::header::string::strlen`
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/stdlib/mod.rs:4:5
+  |
+4 | use crate::header::string::strlen;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Ordering`
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/pthread/mod.rs:3:37
+  |
+3 | use core::sync::atomic::{AtomicI32, Ordering};
+  |                                     ^^^^^^^^
+
+warning: unused import: `mkdir as sys_mkdir`
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/unistd/mod.rs:4:185
+  |
+4 | ... sys_spawn, mkdir as sys_mkdir, fstat as sy...
+  |                ^^^^^^^^^^^^^^^^^^
+
+warning: type `tcflag_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/termios/mod.rs:4:10
+  |
+4 | pub type tcflag_t = c_uint;
+  |          ^^^^^^^^ help: convert the identifier to upper camel case: `TcflagT`
+  |
+  = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `cc_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/termios/mod.rs:5:10
+  |
+5 | pub type cc_t = c_uchar;
+  |          ^^^^ help: convert the identifier to upper camel case: `CcT`
+
+warning: type `speed_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/termios/mod.rs:6:10
+  |
+6 | pub type speed_t = c_uint;
+  |          ^^^^^^^ help: convert the identifier to upper camel case: `SpeedT`
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_SET` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_SET` in the value namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_CUR` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_CUR` in the value namespace is also re-exported here
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_END` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_END` in the value namespace is also re-exported here
+
+error: `#[panic_handler]` function required, but not found
+
+warning: unreachable expression
+   --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/unistd/mod.rs:162:5
+    |
+161 |     let _ = sys_exit(status);
+    |             ---------------- any code following this expression is unreachable
+162 |     loop {}
+    |     ^^^^^^^ unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> /home/moebius/eclipse/eclipse_kernel/userspace/libc/src/header/ctype/mod.rs:124:38
+    |
+124 | ...6 = unsafe { &CTYPE_B_TABLE[128] as *cons...
+    |        ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse-libc` (lib) generated 14 warnings
+error: could not compile `eclipse-libc` (lib) due to 1 previous error; 14 warnings emitted

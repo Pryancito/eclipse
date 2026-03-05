@@ -4,18 +4,14 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 
-[lib]
-name = "smithay_app"
-path = "src/lib.rs"
-
 [dependencies]
-eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
-eclipse_ipc = { path = "../libs/ipc", features = ["testable"] }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind_core = { path = "../sidewind_core" }
 sidewind_wayland = { path = "../sidewind_wayland" }
 sidewind_xwayland = { package = "sidewind-xwayland", path = "../sidewind_xwayland" }
 sidewind_sdk = { path = "../sidewind_sdk" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
+std = { package = "eclipse_std", path = "../eclipse_std" }
 heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
@@ -23,4 +19,3 @@ micromath = "2.1.0"
 [[bin]]
 name = "smithay_app"
 path = "src/main.rs"
-

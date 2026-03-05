@@ -1,6 +1,6 @@
 //! Constantes y funciones de descubrimiento de servicios de Eclipse OS
 
-use eclipse_libc::{send, receive, yield_cpu};
+use eclipse_libc::{receive, eclipse_send as send, yield_cpu};
 use crate::types::{GET_INPUT_PID_MSG, TAG_INPT, GET_NETWORK_PID_MSG, TAG_NETW, build_subscribe_payload};
 
 // ============================================================================
@@ -44,13 +44,14 @@ pub const DEFAULT_INPUT_QUERY_ATTEMPTS: u32 = 10_000;
 /// El init implementa el protocolo GET_INPUT_PID → "INPT"+u32.
 /// En cada intento sin respuesta se hace `yield_cpu()`.
 pub fn query_input_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
-    if send(INIT_PID, MSG_TYPE_INPUT, GET_INPUT_PID_MSG) != 0 {
+    if unsafe { send(INIT_PID, MSG_TYPE_INPUT, GET_INPUT_PID_MSG.as_ptr() as *const core::ffi::c_void, GET_INPUT_PID_MSG.len(), 0) != 0 } {
         return None;
     }
     let mut buffer = [0u8; 64];
     for _ in 0..max_attempts {
-        let (len, sender_pid) = receive(&mut buffer);
-        if len >= 8 && sender_pid == INIT_PID && buffer[0..4] == *TAG_INPT {
+        let mut from: u32 = 0;
+        let len = unsafe { receive(buffer.as_mut_ptr(), 64, &mut from) };
+        if len >= 8 && from == INIT_PID && buffer[0..4] == *TAG_INPT {
             let mut pid_bytes = [0u8; 4];
             pid_bytes.copy_from_slice(&buffer[4..8]);
             let pid = u32::from_le_bytes(pid_bytes);
@@ -58,7 +59,7 @@ pub fn query_input_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
             // inmediatamente en lugar de esperar max_attempts iteraciones más.
             return if pid > 0 { Some(pid) } else { None };
         }
-        yield_cpu();
+        unsafe { yield_cpu() };
     }
     None
 }
@@ -73,20 +74,21 @@ pub fn query_input_service_pid() -> Option<u32> {
 /// Suscribirse al input_service para recibir InputEvents.
 pub fn subscribe_to_input(input_pid: u32, self_pid: u32) -> bool {
     let msg = build_subscribe_payload(self_pid);
-    send(input_pid, MSG_TYPE_INPUT, &msg) == 0
+    unsafe { send(input_pid, MSG_TYPE_INPUT, msg.as_ptr() as *const core::ffi::c_void, msg.len(), 0) == 0 }
 }
 
 /// Preguntar al init el PID real del network_service, con un máximo de intentos configurable.
 pub fn query_network_service_pid_with_attempts(max_attempts: u32) -> Option<u32> {
     // Use MSG_TYPE_INPUT so the request is delivered P2P to init's mailbox.
     // MSG_TYPE_NETWORK is non-P2P and gets dropped in the global IPC queue.
-    if send(INIT_PID, MSG_TYPE_INPUT, GET_NETWORK_PID_MSG) != 0 {
+    if unsafe { send(INIT_PID, MSG_TYPE_INPUT, GET_NETWORK_PID_MSG.as_ptr() as *const core::ffi::c_void, GET_NETWORK_PID_MSG.len(), 0) != 0 } {
         return None;
     }
     let mut buffer = [0u8; 64];
     for _ in 0..max_attempts {
-        let (len, sender_pid) = receive(&mut buffer);
-        if len >= 8 && sender_pid == INIT_PID && buffer[0..4] == *TAG_NETW {
+        let mut from: u32 = 0;
+        let len = unsafe { receive(buffer.as_mut_ptr(), 64, &mut from) };
+        if len >= 8 && from == INIT_PID && buffer[0..4] == *TAG_NETW {
             let mut pid_bytes = [0u8; 4];
             pid_bytes.copy_from_slice(&buffer[4..8]);
             let pid = u32::from_le_bytes(pid_bytes);
@@ -94,7 +96,7 @@ pub fn query_network_service_pid_with_attempts(max_attempts: u32) -> Option<u32>
             // running, so there is no point retrying 10,000 more times.
             return if pid > 0 { Some(pid) } else { None };
         }
-        yield_cpu();
+        unsafe { yield_cpu() };
     }
     None
 }

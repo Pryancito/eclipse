@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 heapless = "0.8"
 linked_list_allocator = "0.10"
+eclipse_libc = { package = "eclipse-libc", path = "../../eclipse-relibc" }
 
 [[bin]]
 name = "text_editor"

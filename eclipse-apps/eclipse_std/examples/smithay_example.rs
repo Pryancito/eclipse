@@ -3,7 +3,7 @@
 use eclipse_std::prelude::*;
 use eclipse_libc::{getpid, yield_cpu};
 
-fn main() -> i32 {
+fn main() {
     let pid = getpid();
     
     println!("╔════════════════════════════════════════════════╗");
@@ -38,5 +38,3 @@ fn main() -> i32 {
         yield_cpu();
     }
 }
-
-eclipse_main!(main);

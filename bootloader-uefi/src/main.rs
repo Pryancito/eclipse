@@ -109,15 +109,13 @@ fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
         // Kernel anterior (compatibilidad)
         uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
+        uefi::cstr16!("\\boot\\eclipse_kernel"),
     ];
     for p in candidates.iter() {
         if let Ok(file) = root.open(p, FileMode::Read, FileAttribute::empty()) {
             if let Some(reg) = file.into_regular_file() {
                 unsafe {
-                    serial_write_str("BL: Encontrado kernel en path: ");
-                    // We can't easily print cstr16 to serial_write_str without conversion
-                    // but we can at least signal it found one.
-                    serial_write_str("CANDIDATO\r\n");
+                    serial_write_str("BL: Encontrado kernel\r\n");
                 }
                 return Ok(reg);
             }
@@ -1430,7 +1428,38 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     {
         let bs = system_table.boot_services();
         progress::bar(20, &framebuffer_info);
-        let kernel_data = include_bytes!("../../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel");
+        let mut kernel_data: &[u8] = &[];
+        let mut allocated_buffer: Option<u64> = None;
+        let mut kernel_file_size = 0;
+        
+        if let Ok(mut root) = open_root_fs(bs, handle) {
+            if let Ok(mut file) = open_kernel_file(&mut root) {
+                if let Ok(size) = read_file_size(&mut file) {
+                    kernel_file_size = size;
+                    let pages = (size + 0xFFF) / 0x1000;
+                    if let Ok(addr) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+                        allocated_buffer = Some(addr);
+                        let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, size) };
+                        let _ = file.set_position(0);
+                        let mut total_read = 0;
+                        while total_read < size {
+                            if let Ok(n) = file.read(&mut buf[total_read..]) {
+                                if n == 0 { break; }
+                                total_read += n;
+                            } else {
+                                break;
+                            }
+                        }
+                        kernel_data = buf;
+                    }
+                }
+            }
+        }
+        
+        if kernel_data.is_empty() {
+             unsafe { serial_write_str("BL: Error al leer el archivo del kernel dsde FS\r\n"); }
+             loop { unsafe { core::hint::spin_loop(); } }
+        }
 
         match load_kernel_from_data(bs, kernel_data) {
             Ok((entry_point_phys, entry_point_virt, kernel_phys_base, total_len)) => {

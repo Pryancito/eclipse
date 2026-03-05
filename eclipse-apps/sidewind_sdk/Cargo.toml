@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc-internal", path = "../../eclipse_kernel/userspace/libc" }
-eclipse_ipc = { path = "../libs/ipc" }
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
+eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
 heapless = "0.8"

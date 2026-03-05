@@ -8,45 +8,20 @@
 //! 
 //! It must start after the service registry is ready.
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate alloc;
 
-use eclipse_libc::{println, getpid, getppid, sleep_ms, send, pci_enum_devices, PciDeviceInfo, receive};
-
-/// Syscall numbers
-const SYS_OPEN: u64 = 11;
-const SYS_WRITE: u64 = 1;
+use std::prelude::*;
+use std::libc::{getpid, getppid, sleep_ms, send_ipc, receive_ipc, pci_enum_devices, PciDeviceInfo};
 
 fn sys_open(path: &str) -> Option<usize> {
-    let mut fd: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr() as u64,
-            in("rsi") path.len() as u64,
-            in("rdx") 0u64,
-            lateout("rax") fd,
-            options(nostack)
-        );
-    }
-    if (fd as isize) < 0 { None } else { Some(fd) }
+    let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
+    if fd < 0 { None } else { Some(fd as usize) }
 }
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
-    let mut written: usize;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_WRITE,
-            in("rdi") fd as u64,
-            in("rsi") buf.as_ptr() as u64,
-            in("rdx") buf.len() as u64,
-            lateout("rax") written,
-            options(nostack)
-        );
-    }
-    written
+    std::libc::eclipse_write(fd as u32, buf) as usize
 }
 
 /// Network interface types
@@ -110,9 +85,9 @@ fn detect_network_cards() -> (Option<NetworkCard>, Option<NetworkCard>) {
         let dev = devices_buffer[i];
         
         println!("[NETWORK-SERVICE] Device {}: Bus={}, Device={}, Function={}",
-                 i, dev.bus, dev.device, dev.function);
+                 i as u32, dev.bus as u32, dev.device as u32, dev.function as u32);
         println!("[NETWORK-SERVICE]   Vendor=0x{:04x}, Device=0x{:04x}",
-                 dev.vendor_id, dev.device_id);
+                 dev.vendor_id as u32, dev.device_id as u32);
         
         // Determine if Ethernet or WiFi based on vendor/device ID
         let (is_ethernet, is_wifi, name) = identify_network_card(dev.vendor_id, dev.device_id);
@@ -195,14 +170,14 @@ fn identify_network_card(vendor_id: u16, device_id: u16) -> (bool, bool, &'stati
 fn init_ethernet_driver(card: &NetworkCard) -> bool {
     println!("[NETWORK-SERVICE] Initializing Ethernet driver...");
     println!("[NETWORK-SERVICE]   PCI Location: {:02x}:{:02x}.{}",
-             card.pci_bus, card.pci_device, card.pci_function);
+             card.pci_bus as u32, card.pci_device as u32, card.pci_function as u32);
     println!("[NETWORK-SERVICE]   Vendor: 0x{:04x}, Device: 0x{:04x}",
-             card.vendor_id, card.device_id);
+             card.vendor_id as u32, card.device_id as u32);
     
     // Generate MAC address
     println!("[NETWORK-SERVICE]   MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-             card.mac_address[0], card.mac_address[1], card.mac_address[2],
-             card.mac_address[3], card.mac_address[4], card.mac_address[5]);
+             card.mac_address[0] as u32, card.mac_address[1] as u32, card.mac_address[2] as u32,
+             card.mac_address[3] as u32, card.mac_address[4] as u32, card.mac_address[5] as u32);
     
     println!("[NETWORK-SERVICE]   Loading driver module");
     println!("[NETWORK-SERVICE]   Setting up RX/TX rings");
@@ -219,13 +194,13 @@ fn init_ethernet_driver(card: &NetworkCard) -> bool {
 fn init_wifi_driver(card: &NetworkCard) -> bool {
     println!("[NETWORK-SERVICE] Initializing WiFi driver...");
     println!("[NETWORK-SERVICE]   PCI Location: {:02x}:{:02x}.{}",
-             card.pci_bus, card.pci_device, card.pci_function);
+             card.pci_bus as u32, card.pci_device as u32, card.pci_function as u32);
     println!("[NETWORK-SERVICE]   Vendor: 0x{:04x}, Device: 0x{:04x}",
-             card.vendor_id, card.device_id);
+             card.vendor_id as u32, card.device_id as u32);
     
     println!("[NETWORK-SERVICE]   MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-             card.mac_address[0], card.mac_address[1], card.mac_address[2],
-             card.mac_address[3], card.mac_address[4], card.mac_address[5]);
+             card.mac_address[0] as u32, card.mac_address[1] as u32, card.mac_address[2] as u32,
+             card.mac_address[3] as u32, card.mac_address[4] as u32, card.mac_address[5] as u32);
     
     println!("[NETWORK-SERVICE]   Loading firmware");
     println!("[NETWORK-SERVICE]   Scanning for networks...");
@@ -269,8 +244,8 @@ fn configure_interface_dhcp(interface: &str) {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let pid = getpid();
+pub extern "Rust" fn main() -> i32 {
+    let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");
     println!("|                   NETWORK SERVICE                            |");
@@ -360,9 +335,9 @@ pub extern "C" fn _start() -> ! {
     }
     
     println!("[NETWORK-SERVICE] Ready to process network traffic...");
-    let ppid = getppid();
+    let ppid = unsafe { getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = send_ipc(ppid as u32, 255, b"READY");
     }
     
     // Main loop - process network packets
@@ -378,23 +353,30 @@ pub extern "C" fn _start() -> ! {
     loop {
         heartbeat_counter += 1;
         
-        let (len, sender) = receive(&mut ipc_buffer);
-        if len >= 13 && &ipc_buffer[..13] == b"GET_NET_STATS" {
-            let mut response = [0u8; 20];
-            response[0..4].copy_from_slice(b"NSTA");
-            response[4..12].copy_from_slice(&bytes_rx.to_le_bytes());
-            response[12..20].copy_from_slice(&bytes_tx.to_le_bytes());
-            let _ = send(sender, 0x40, &response);
+        // Drain any pending IPC requests (from other services or apps)
+        loop {
+            let (len, sender) = receive_ipc(&mut ipc_buffer);
+            if len == 0 || sender == 0 {
+                break;
+            }
+            
+            if len >= 13 && &ipc_buffer[..13] == b"GET_NET_STATS" {
+                let mut response = [0u8; 20];
+                response[0..4].copy_from_slice(b"NSTA");
+                response[4..12].copy_from_slice(&bytes_rx.to_le_bytes());
+                response[12..20].copy_from_slice(&bytes_tx.to_le_bytes());
+                let _ = send_ipc(sender, 0x40, &response);
+            }
         }
         
-        // Simulate occasional network traffic (~0.5 s = 50 iterations * 10 ms)
-        if heartbeat_counter % 50 == 0 {
+        // Simulate occasional network traffic (~0.5 s = 500 iterations * 1 ms)
+        if heartbeat_counter % 500 == 0 {
             packets_rx += 10;
             packets_tx += 8;
             bytes_rx += 1500 * 10;
             bytes_tx += 1500 * 8;
             
-            if heartbeat_counter % 200 == 0 {
+            if heartbeat_counter % 2000 == 0 {
                 connections += 1;
             }
 
@@ -404,24 +386,16 @@ pub extern "C" fn _start() -> ! {
             }
         }
         
-        // Status updates every ~5 s (500 iterations * 10 ms)
-        if heartbeat_counter % 500 == 0 {
-            let interface_status = if ethernet_available && wifi_available {
-                "eth0+wlan0"
-            } else if ethernet_available {
-                "eth0"
-            } else if wifi_available {
-                "wlan0"
-            } else {
-                "none"
-            };
-            
-            println!("[NETWORK-SERVICE] Operational - Interfaces: {}", interface_status);
-            println!("[NETWORK-SERVICE]   RX: {} packets ({} bytes)", packets_rx, bytes_rx);
-            println!("[NETWORK-SERVICE]   TX: {} packets ({} bytes)", packets_tx, bytes_tx);
-            println!("[NETWORK-SERVICE]   Active connections: {}", connections);
+        // Status every ~30 s (30000 * 1 ms) to avoid serial flood
+        if heartbeat_counter > 0 && heartbeat_counter % 30000 == 0 {
+            let iface = if ethernet_available && wifi_available { "eth0+wlan0" }
+                else if ethernet_available { "eth0" }
+                else if wifi_available { "wlan0" }
+                else { "none" };
+            println!("[NETWORK-SERVICE] Operational - Heartbeat #{} ({} RX:{} TX:{})",
+                     heartbeat_counter / 30000, iface, packets_rx, packets_tx);
         }
         
-        sleep_ms(10);
+        std::libc::sleep_ms(1);
     }
 }

@@ -22,22 +22,29 @@
 #![no_std]
 #![no_main]
 
-use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive, send, set_process_name};
+use eclipse_libc::{println, getpid, getppid, yield_cpu, fork, wait, exit, receive, eclipse_send as send, set_process_name};
 
 /// Maximum number of services that can be managed
 const MAX_SERVICES: usize = 32;
 
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}
+
 /// Enable debug output for service startup (set to false for production)
 const DEBUG_SERVICE_STARTUP: bool = true;
 
-/// Service initialization delay (in yield iterations)
-const SERVICE_INIT_DELAY: u32 = 10000;
+/// Service initialization delay (in sleep iterations)
+const SERVICE_INIT_DELAY: u32 = 100;
 
-/// Service health check interval (in loop ticks)
-const MONITOR_INTERVAL: u64 = 100000;
+/// Service health check interval (in loop ticks, 1 tick ≈ 10ms)
+const MONITOR_INTERVAL: u64 = 500;
 
-/// Heartbeat print interval (in loop ticks)
-const HEARTBEAT_INTERVAL: u64 = 1000000;
+/// Heartbeat print interval (in loop ticks, 1 tick ≈ 10ms)
+const HEARTBEAT_INTERVAL: u64 = 500;
 
 /// Service state
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -124,7 +131,7 @@ static mut SERVICE_COUNT: usize = 0;
 
 /// Entry point logic
 fn entry_point() -> ! {
-    let pid = getpid();
+    let pid = unsafe { getpid() };
     
     // Display banner
     print_banner();
@@ -137,7 +144,7 @@ fn entry_point() -> ! {
         println!("[WARNING] Current PID: {}", pid);
     }
     println!("[SYSTEMD] Starting (PID: {})", pid);
-    set_process_name("systemd");
+    unsafe { set_process_name("systemd\0".as_ptr() as *const core::ffi::c_char) };
 
     
     // Initialize service registry
@@ -349,10 +356,8 @@ fn start_system_services() {
             
             for i in 0..SERVICE_COUNT {
                 if let Some(ref mut service) = SERVICES[i] {
-                    if DEBUG_SERVICE_STARTUP {
                         println!("  [DEBUG] Checking service {} state={:?} has_deps={}", 
-                                 service.name, service.state, !service.dependencies.is_empty());
-                    }
+                                 service.name, service.state, !service.dependencies.is_empty() as core::ffi::c_int);
                     if !service.dependencies.is_empty() && service.state == ServiceState::Inactive {
                         // Check if dependencies are met
                         if check_dependencies(service) {
@@ -417,18 +422,22 @@ fn check_dependencies(service: &Service) -> bool {
 
 /// Wait for a specific service to signal it is ready via IPC
 /// Returns true if ready, false if timeout
-fn wait_for_service_ready(pid: i32, timeout_cycles: u32) -> bool {
+fn wait_for_service_ready(pid: i32, _timeout_cycles: u32) -> bool {
     // Buffer for receiving IPC messages
     let mut buffer = [0u8; 32];
     
+    // Wait up to 5 seconds (5000 * 1ms sleep)
+    let max_polls = 5000;
+    
     // We poll for messages in a loop with yield
-    for cycle in 0..timeout_cycles {
+    for cycle in 0..max_polls {
         if DEBUG_SERVICE_STARTUP {
              println!("    [IPC] Cycle {}", cycle);
         }
 
         // Check for messages
-        let (len, sender) = receive(&mut buffer);
+        let mut sender: u32 = 0;
+        let len = unsafe { receive(buffer.as_mut_ptr(), buffer.len(), &mut sender) };
         
         if len > 0 {
              if DEBUG_SERVICE_STARTUP {
@@ -451,13 +460,11 @@ fn wait_for_service_ready(pid: i32, timeout_cycles: u32) -> bool {
             }
         }
         
-        // No message or wrong sender, yield and retry
-        println!("    [IPC] Yielding...");
-        yield_cpu();
-        println!("    [IPC] Back from yield");
+        // No message or wrong sender, sleep briefly and retry
+        eclipse_libc::sleep_ms(1);
         
-        if DEBUG_SERVICE_STARTUP && (cycle % 100 == 0) {
-            println!("    [IPC] Still waiting for PID {}... (cycle {})", pid, cycle);
+        if DEBUG_SERVICE_STARTUP && (cycle % 1000 == 0) {
+            println!("    [IPC] Still waiting for PID {}... (ms: {})", pid, cycle);
         }
     }
     
@@ -471,21 +478,19 @@ fn start_service(service: &mut Service, service_idx: usize) {
     service.state = ServiceState::Activating;
     
     // Fork a new process for the service
-    let pid = fork();
+    let pid = unsafe { fork() };
     
     if pid == 0 {
         // Child process - set name and exec
-        set_process_name(service.name);
+        unsafe { set_process_name(service.name.as_ptr() as *const core::ffi::c_char) };
 
         
         // Wait a bit or signal readiness? No, just get binary and exec
-        let (bin_ptr, bin_size) = match eclipse_libc::get_service_binary(service_idx as u32) {
-            (ptr, size) => (ptr, size),
-        };
+        let (bin_ptr, bin_size) = eclipse_libc::get_service_binary(service_idx as u32);
         
         if bin_ptr.is_null() || bin_size == 0 {
              println!("    [CHILD] ERROR: Failed to get binary for service {}", service.name);
-             exit(1);
+             unsafe { exit(1) };
         }
         
         println!("    [CHILD] Got binary for {} at {:p}, size: {}", service.name, bin_ptr, bin_size);
@@ -499,7 +504,7 @@ fn start_service(service: &mut Service, service_idx: usize) {
         
         // If we are here, exec failed
         println!("    [CHILD] ERROR: exec() failed with code {}", ret);
-        exit(1);
+        unsafe { exit(1) };
     } else if pid > 0 {
         // Parent process - track the service
         service.pid = pid;
@@ -523,7 +528,8 @@ fn main_loop() -> ! {
         // Handle incoming IPC queries (e.g. GET_INPUT_PID from smithay_app)
         {
             let mut buf = [0u8; 32];
-            let (len, sender) = receive(&mut buf);
+            let mut sender: u32 = 0;
+            let (len, sender) = unsafe { (receive(buf.as_mut_ptr(), buf.len(), &mut sender), sender) };
             if len >= 13 && &buf[0..13] == b"GET_INPUT_PID" {
                 // Find input.service (index 3 in the services array)
                 let input_pid: i32 = unsafe {
@@ -535,7 +541,7 @@ fn main_loop() -> ! {
                 let mut reply = [0u8; 8];
                 reply[0..4].copy_from_slice(b"INPT");
                 reply[4..8].copy_from_slice(&(input_pid as u32).to_le_bytes());
-                let _ = send(sender, 0x40, &reply);
+                let _ = unsafe { send(sender, 0x40, reply.as_ptr() as *const core::ffi::c_void, reply.len(), 0) };
             } else if len >= 17 && &buf[0..17] == b"GET_SERVICES_INFO" {
 
                 // Reply with service info
@@ -560,7 +566,8 @@ fn main_loop() -> ! {
                             offset += 28; // Skip
                         }
                     }
-                    let _ = send(sender, 0x41, &reply[..offset]);
+                    let slice = &reply[..offset];
+                    let _ = unsafe { send(sender, 0x41, slice.as_ptr() as *const core::ffi::c_void, slice.len(), 0) };
                 }
             }
         }
@@ -575,7 +582,7 @@ fn main_loop() -> ! {
         if tick % HEARTBEAT_INTERVAL == 0 {
             heartbeat_counter += 1;
             println!();
-            println!("[HEARTBEAT #{}] SystemD operational", heartbeat_counter);
+            println!("[SYSTEMD] Operational - Heartbeat #{}", heartbeat_counter);
             print_service_status();
             println!();
         }
@@ -583,8 +590,9 @@ fn main_loop() -> ! {
         // Reap zombie processes
         reap_zombies();
         
-        // Yield CPU to other processes
-        yield_cpu();
+        // Sleep for 10ms to avoid a busy-loop; this blocks init for 10 ms
+        // so the kernel can HLT and CPU usage drops from ~100% to near 0%.
+        eclipse_libc::sleep_ms(10);
     }
 }
 
@@ -628,7 +636,7 @@ fn handle_failed_service(service: &mut Service, service_idx: usize) {
 /// Reap zombie processes and update service states
 fn reap_zombies() {
     loop {
-        let terminated_pid = wait(None);
+        let terminated_pid = unsafe { wait(core::ptr::null_mut()) };
         
         if terminated_pid <= 0 {
             break;

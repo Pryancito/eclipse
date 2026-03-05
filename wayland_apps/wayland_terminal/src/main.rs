@@ -31,14 +31,7 @@ fn init_allocator() {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // En aplicaciones Wayland, no podemos acceder a serial del kernel
-    // Solo loop infinito en caso de panic
-    loop {
-        unsafe { core::arch::asm!("nop"); }
-    }
-}
+
 
 
 
@@ -255,6 +248,7 @@ pub extern "C" fn wayland_terminal_main() {
         
         // Simular procesamiento de eventos
         // En una implementación real, aquí se procesarían eventos del compositor
+        eclipse_libc::sleep_ms(16);
     }
 }
 

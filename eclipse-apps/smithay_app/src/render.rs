@@ -1,25 +1,21 @@
-extern crate alloc;
-use alloc::vec::Vec;
-use core::alloc::Layout;
-use embedded_graphics::{
-    pixelcolor::{Rgb888, RgbColor},
-    prelude::*,
-    primitives::{Rectangle, Circle, Line, Polyline, PrimitiveStyleBuilder, Arc},
-    text::Text,
-    mono_font::MonoTextStyle,
-    image::ImageRaw,
-};
-use eclipse_libc::{
-    println, get_framebuffer_info, map_framebuffer, FramebufferInfo, 
-    get_gpu_display_info, gpu_alloc_display_buffer, gpu_present, 
-    mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_SHARED, O_RDWR
-};
-use sidewind_sdk::ui::{self, icons, colors, Notification, NotificationPanel, Taskbar, Widget};
-use sidewind_sdk::{font_terminus_12, font_terminus_14, font_terminus_20, font_terminus_24};
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
+use std::prelude::v1::*;
 use micromath::F32Ext;
-
-use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton, MAX_SURFACE_DIM};
+use std::libc::{
+    get_framebuffer_info, map_framebuffer, FramebufferInfo, 
+    get_gpu_display_info, gpu_alloc_display_buffer, gpu_present, 
+    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+    ProcessInfo
+};
+use sidewind_sdk::ui::{self, icons, colors, Notification, NotificationPanel, Widget, Panel, Gauge, Terminal};
+use sidewind_sdk::{font_terminus_12, font_terminus_14, font_terminus_20};
+use sidewind_sdk::gpu::{GpuDevice};
+use embedded_graphics::prelude::*;
+use embedded_graphics::pixelcolor::Rgb888;
+use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line, PrimitiveStyle};
+use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle};
+use embedded_graphics::text::Text;
+use core::convert::TryInto;
+use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::{ServiceInfo};
 
 
@@ -52,11 +48,11 @@ impl FramebufferState {
         println!("[SMITHAY] Initializing display...");
 
         let mut dims = [0u32, 0u32];
-        let has_gpu = get_gpu_display_info(&mut dims);
+        let has_gpu = unsafe { get_gpu_display_info(&mut dims) };
         if has_gpu && dims[0] > 0 && dims[1] > 0 {
-            let gpu_opt = gpu_alloc_display_buffer(dims[0], dims[1]);
+            let gpu_opt = unsafe { gpu_alloc_display_buffer(dims[0], dims[1]) };
             if let Some(gpu_info) = gpu_opt {
-                if gpu_info.vaddr >= 0x1000 {
+                if gpu_info.vaddr != 0 {
                     let info = FramebufferInfo {
                         address: 0,
                         width: dims[0],
@@ -71,8 +67,8 @@ impl FramebufferState {
                         blue_mask_shift: 0,
                     };
                     let fb_size = (info.pitch as u64) * (info.height as u64);
-                    let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    if bg_buffer == 0 || bg_buffer == u64::MAX {
+                    let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+                    if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
                         return None;
                     }
 
@@ -92,7 +88,7 @@ impl FramebufferState {
         // invalid, no VirtIO GPU is present, and the NVIDIA BAR1 is not set up yet.
         // In that case, use default 1920×1080 dimensions and run in headless mode so
         // that the compositor process always starts rather than silently doing nothing.
-        let fb_info = get_framebuffer_info().unwrap_or_else(|| {
+        let fb_info = unsafe { get_framebuffer_info() }.unwrap_or_else(|| {
             println!("[SMITHAY] WARNING: get_framebuffer_info failed, using default 1920x1080 headless");
             FramebufferInfo {
                 address: 0,
@@ -113,14 +109,8 @@ impl FramebufferState {
         // If it fails (e.g. early during NVIDIA init, or no framebuffer info at all),
         // fall back to headless mode: front_addr = 0 means present() is a no-op and
         // the back-buffer is never pushed to the display, but the compositor still runs.
-        let front_addr = match map_framebuffer() {
-            Some(addr) => {
-                if addr as u64 >= PHYS_MEM_OFFSET {
-                    (addr as u64 - PHYS_MEM_OFFSET) as usize
-                } else {
-                    addr
-                }
-            }
+        let front_addr = match unsafe { map_framebuffer() } {
+            Some(addr) => addr,
             None => {
                 println!("[SMITHAY] WARNING: map_framebuffer failed, running headless");
                 0
@@ -133,9 +123,9 @@ impl FramebufferState {
         let height = if fb_info.height > 0 { fb_info.height } else { DEFAULT_HEIGHT };
         let pitch = if fb_info.pitch > 0 { fb_info.pitch } else { width * 4 };
         let fb_size = (pitch as u64) * (height as u64);
-        let back_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        let back_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
 
-        if back_buffer == 0 || back_buffer == u64::MAX {
+        if back_buffer.is_null() || back_buffer as usize == usize::MAX {
             return None;
         }
 
@@ -145,8 +135,8 @@ impl FramebufferState {
         info.pitch  = pitch;
         info.address = front_addr as u64;
 
-        let bg_buffer = mmap(0, fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if bg_buffer == 0 || bg_buffer == u64::MAX {
+        let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
             return None;
         }
 
@@ -173,20 +163,22 @@ impl FramebufferState {
                 green_mask_size: 8, green_mask_shift: 8,
                 blue_mask_size: 8, blue_mask_shift: 0,
             },
-            base_addr: 0x1000,
+            base_addr: 0,
             front_addr: 0,
             gpu_resource_id: None,
-            background_addr: 0x2000,
+            background_addr: 0,
             gpu: None,
         }
     }
 
     pub fn clear_back_buffer_raw(&self, color: Rgb888) {
-        if self.base_addr < 0x1000 { return; }
-        let pitch = self.info.pitch.max(self.info.width * 4);
+        if self.base_addr == 0 { return; }
+        
         let width_px = self.info.width as usize;
         let height = self.info.height as usize;
-        let pitch_px = (pitch / 4) as usize;
+        let pitch_px = (self.info.pitch / 4).max(self.info.width) as usize;
+        let max_pixels = pitch_px.saturating_mul(height);
+        
         let raw = 0xFF000000
             | ((color.r() as u32) << 16)
             | ((color.g() as u32) << 8)
@@ -195,8 +187,11 @@ impl FramebufferState {
         for y in 0..height {
             let row_start = y * pitch_px;
             for x in 0..width_px {
-                unsafe {
-                    core::ptr::write_volatile(ptr.add(row_start + x), raw);
+                let offset = row_start + x;
+                if offset < max_pixels {
+                    unsafe {
+                        core::ptr::write_volatile(ptr.add(offset), raw);
+                    }
                 }
             }
         }
@@ -206,16 +201,16 @@ impl FramebufferState {
     /// Called periodically so that if the framebuffer becomes available after startup
     /// (e.g. after NVIDIA driver initialization completes), the display will start working.
     pub fn try_remap_framebuffer(&mut self) {
-        if self.gpu_resource_id.is_some() || self.front_addr >= 0x1000 {
+        if self.gpu_resource_id.is_some() || self.front_addr != 0 {
             return; // already mapped
         }
-        if let Some(addr) = map_framebuffer() {
+        if let Some(addr) = unsafe { map_framebuffer() } {
             let vaddr = if addr as u64 >= PHYS_MEM_OFFSET {
                 (addr as u64 - PHYS_MEM_OFFSET) as usize
             } else {
                 addr
             };
-            if vaddr >= 0x1000 {
+            if vaddr != 0 {
                 println!("[SMITHAY] Framebuffer mapped at 0x{:X}, switching to display mode", vaddr);
                 self.front_addr = vaddr;
                 self.info.address = vaddr as u64;
@@ -224,7 +219,7 @@ impl FramebufferState {
     }
 
     pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) {
-        if self.base_addr < 0x1000 { return; }
+        if self.base_addr == 0 { return; }
         if let Some(rid) = self.gpu_resource_id {
             let fb_w = self.info.width as i32;
             let fb_h = self.info.height as i32;
@@ -233,7 +228,7 @@ impl FramebufferState {
             let rw = w.clamp(0, fb_w - rx);
             let rh = h.clamp(0, fb_h - ry);
             if rw > 0 && rh > 0 {
-                let _ = gpu_present(rid, rx as u32, ry as u32, rw as u32, rh as u32);
+                let _ = unsafe { gpu_present(rid, rx as u32, ry as u32, rw as u32, rh as u32) };
             }
         }
     }
@@ -242,29 +237,34 @@ impl FramebufferState {
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
-        if self.base_addr < 0x1000 { return; }
+        let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
+        if self.base_addr == 0 { return; }
         let ptr = self.base_addr as *mut u32;
         for py in (cy - half)..=(cy + half) {
             if py >= 0 && py < height {
                 let offset = (py * pitch_px + cx) as usize;
-                unsafe { core::ptr::write_volatile(ptr.add(offset), raw_color); }
+                if offset < max_pixels {
+                    unsafe { core::ptr::write_volatile(ptr.add(offset), raw_color); }
+                }
             }
         }
         for px in (cx - half)..=(cx + half) {
             if px >= 0 && px < width {
                 let offset = (cy * pitch_px + px) as usize;
-                unsafe { core::ptr::write_volatile(ptr.add(offset), raw_color); }
+                if offset < max_pixels {
+                    unsafe { core::ptr::write_volatile(ptr.add(offset), raw_color); }
+                }
             }
         }
     }
 
     pub fn present(&self) -> bool {
-        if self.base_addr < 0x1000 { return true; }
+        if self.base_addr == 0 { return true; }
         let w = self.info.width;
         let h = self.info.height;
         if let Some(rid) = self.gpu_resource_id {
-            gpu_present(rid, 0, 0, w, h)
-        } else if self.front_addr >= 0x1000 {
+            unsafe { gpu_present(rid, 0, 0, w, h) }
+        } else if self.front_addr != 0 {
             let pitch = self.info.pitch.max(self.info.width * 4);
             let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
             unsafe {
@@ -284,7 +284,7 @@ impl FramebufferState {
     }
 
     pub fn pre_render_background(&mut self) {
-        if self.background_addr < 0x1000 { return; }
+        if self.background_addr == 0 { return; }
         let old_base = self.base_addr;
         self.base_addr = self.background_addr;
         self.clear_back_buffer_raw(colors::COSMIC_DEEP);
@@ -296,7 +296,7 @@ impl FramebufferState {
     }
 
     pub fn blit_background(&self) {
-        if self.base_addr < 0x1000 || self.background_addr < 0x1000 { return; }
+        if self.base_addr == 0 || self.background_addr == 0 { return; }
         let pitch = self.info.pitch.max(self.info.width * 4);
         let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
         unsafe {
@@ -309,17 +309,18 @@ impl FramebufferState {
     }
 
     pub fn blit_buffer(&mut self, x: i32, y: i32, w: u32, h: u32, src: *const u32, src_size: usize) {
-        if self.base_addr < 0x1000 {
+        if self.base_addr == 0 {
             // Defensive: logging very rarely to avoid spamming
             return;
         }
-        if src.is_null() || (src as usize) < 0x1000 {
+        if src.is_null() || (src as usize) == 0 {
             return;
         }
         if w == 0 || h == 0 { return; }
         let fb_w = self.info.width as i32;
         let fb_h = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(self.info.width) as i32;
+        let max_pixels = (pitch_px as usize).saturating_mul(fb_h as usize);
         let dst_ptr = self.base_addr as *mut u32;
         let w_i = w as i32;
         for iy in 0..h as i32 {
@@ -330,17 +331,21 @@ impl FramebufferState {
             if bytes_needed > src_size { break; }
             if x >= 0 && x + w_i <= fb_w {
                 let row_offset = (dy * pitch_px + x) as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src.add(src_row_start), dst_ptr.add(row_offset), w as usize);
+                if row_offset + (w as usize) <= max_pixels {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src.add(src_row_start), dst_ptr.add(row_offset), w as usize);
+                    }
                 }
             } else {
                 for ix in 0..w_i {
                     let dx = x + ix;
                     if dx >= 0 && dx < fb_w {
                         let off = (dy * pitch_px + dx) as usize;
-                        unsafe {
-                            let color = core::ptr::read_volatile(src.add(src_row_start + ix as usize));
-                            core::ptr::write_volatile(dst_ptr.add(off), color);
+                        if off < max_pixels {
+                            unsafe {
+                                let color = core::ptr::read_volatile(src.add(src_row_start + ix as usize));
+                                core::ptr::write_volatile(dst_ptr.add(off), color);
+                            }
                         }
                     }
                 }
@@ -357,7 +362,7 @@ impl DrawTarget for FramebufferState {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
-        if self.base_addr < 0x1000 { return Ok(()); }
+        if self.base_addr == 0 { return Ok(()); }
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
@@ -366,27 +371,37 @@ impl DrawTarget for FramebufferState {
         for Pixel(coord, color) in pixels.into_iter() {
             if coord.x >= 0 && coord.x < width && coord.y >= 0 && coord.y < height {
                 let offset = (coord.y as usize).saturating_mul(pitch_px as usize).saturating_add(coord.x as usize);
-                if offset >= max_pixels { continue; }
-                let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
-                unsafe { core::ptr::write_volatile(fb_ptr.add(offset), raw_color); }
+                if offset < max_pixels {
+                    let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+                    unsafe { core::ptr::write_volatile(fb_ptr.add(offset), raw_color); }
+                }
             }
         }
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        if self.base_addr < 0x1000 { return Ok(()); }
+        if self.base_addr == 0 { return Ok(()); }
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
+        let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
         let fb_ptr = self.base_addr as *mut u32;
+        
         let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
         if intersection.is_zero_sized() { return Ok(()); }
+        
         let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+        
         for y in intersection.top_left.y..intersection.top_left.y + intersection.size.height as i32 {
-            let offset_start = (y as usize * pitch_px as usize) + intersection.top_left.x as usize;
-            for x in 0..intersection.size.width as usize {
-                unsafe { core::ptr::write_volatile(fb_ptr.add(offset_start + x), raw_color); }
+            if y < 0 || y >= height { continue; }
+            let offset_start = (y * pitch_px) as isize;
+            for x in intersection.top_left.x..intersection.top_left.x + intersection.size.width as i32 {
+                if x < 0 || x >= width { continue; }
+                let offset = (offset_start + x as isize) as usize;
+                if offset < max_pixels {
+                    unsafe { core::ptr::write_volatile(fb_ptr.add(offset), raw_color); }
+                }
             }
         }
         Ok(())
@@ -399,7 +414,10 @@ impl OriginDimensions for FramebufferState {
     }
 }
 
-pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64, cpu: f32, mem: f32, net: f32) {
+pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f32, net: f32, uptime_ticks: u64) {
+    let cpu = if cpu.is_nan() { 0.0 } else { cpu };
+    let mem = if mem.is_nan() { 0.0 } else { mem };
+    let net = if net.is_nan() { 0.0 } else { net };
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
@@ -429,14 +447,19 @@ pub fn draw_dashboard(fb: &mut FramebufferState, counter: u64, cpu: f32, mem: f3
     let mut net_line = heapless::String::<32>::new();
     let _ = core::fmt::write(&mut net_line, format_args!("NET: {}%", (net * 100.0) as u32));
     
+    let mut uptime_line = heapless::String::<32>::new();
+    let uptime_secs = uptime_ticks / 1000;
+    let _ = core::fmt::write(&mut uptime_line, format_args!("UPTIME: {}h {}m", uptime_secs / 3600, (uptime_secs / 60) % 60));
+
     let term_lines: &[&str] = &[ 
         "eclipse@os:~$ sysinfo --live", 
         &cpu_line,
         &mem_line,
         &net_line,
+        &uptime_line,
         "> system status nominal" 
     ];
-    let term = Terminal { position: main_panel.position + Point::new(30, 240), size: Size::new(p_w as u32 - 60, 130), lines: term_lines };
+    let term = Terminal { position: main_panel.position + Point::new(30, 220), size: Size::new(p_w as u32 - 60, 150), lines: term_lines };
     let _ = term.draw(fb);
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
     let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 100), label_style).draw(fb);
@@ -588,7 +611,7 @@ pub fn draw_quick_settings(fb: &mut FramebufferState) {
     let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 90), bar_size, 0.92, colors::GLOW_HI);
 }
 
-pub fn draw_alt_tab_hud(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
+pub fn draw_alt_tab_hud(fb: &mut FramebufferState, _windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     let panel_w = 600;
@@ -645,13 +668,13 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
     None
 }
 
-pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32) {
+pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
     
     for (i, w) in windows.iter().take(window_count).enumerate().rev() {
-        if w.content == WindowContent::None { continue; }
+        if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
         let wy = w.curr_y as i32;
         let ww = w.curr_w as i32;
@@ -665,17 +688,17 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
         }
     }
     for (i, w) in windows.iter().take(window_count).enumerate() {
-        if w.content == WindowContent::None { continue; }
+        if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
         if effective_x + w.curr_w as i32 <= 0 || effective_x >= fb_w { continue; }
         if w.minimized && w.curr_w < 50.0 { continue; }
         let focused = Some(i) == focused_window;
-        let btn_hover = if hovered_win_idx == Some(i) { hovered_button } else { None };
-        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover);
+        let btn_hover = if hovered_win_idx == Some(i) { hovered_button.clone() } else { None };
+        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks);
     }
 }
 
-pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>) -> Result<(), ()> {
+pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
     draw_window_decoration_at(fb, w, is_focused, x, button_hover);
     if w.curr_w > 100.0 {
         match w.content {
@@ -699,7 +722,10 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                 let _ = Text::new("> eclipse --version", Point::new(cx + 10, cy + 22), prompt).draw(fb);
                 let _ = Text::new("Eclipse OS 0.1.0 // kernel 6.x", Point::new(cx + 10, cy + 42), text).draw(fb);
                 let _ = Text::new("> status --active", Point::new(cx + 10, cy + 62), prompt).draw(fb);
-                let _ = Text::new("TOTAL SERVICES: 42 // UPTIME: 1h 24m", Point::new(cx + 10, cy + 82), text).draw(fb);
+                let mut uptime_line = heapless::String::<64>::new();
+                let uptime_secs = uptime_ticks / 1000;
+                let _ = core::fmt::write(&mut uptime_line, format_args!("TOTAL SERVICES: 42 // UPTIME: {}h {}m", uptime_secs / 3600, (uptime_secs / 60) % 60));
+                let _ = Text::new(&uptime_line, Point::new(cx + 10, cy + 82), text).draw(fb);
                 let _ = Text::new("> _", Point::new(cx + 10, cy + 102), prompt).draw(fb);
             }
             WindowContent::External(idx) => {
@@ -748,9 +774,27 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
         let close_x = wx + ww - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
         let max_x = close_x - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
         let min_x = max_x - ui::BUTTON_ICON_SIZE as i32 - btn_margin;
-        let _ = ui::draw_button_icon_with_hover(fb, Point::new(close_x, btn_y), icons::BTN_CLOSE, button_hover == Some(WindowButton::Close), colors::ACCENT_RED);
-        let _ = ui::draw_button_icon_with_hover(fb, Point::new(max_x, btn_y), icons::BTN_MAX, button_hover == Some(WindowButton::Maximize), accent);
-        let _ = ui::draw_button_icon_with_hover(fb, Point::new(min_x, btn_y), icons::BTN_MIN, button_hover == Some(WindowButton::Minimize), accent);
+        let _ = ui::draw_button_icon_with_hover(
+            fb,
+            Point::new(close_x, btn_y),
+            icons::BTN_CLOSE,
+            matches!(button_hover, Some(WindowButton::Close)),
+            colors::ACCENT_RED,
+        );
+        let _ = ui::draw_button_icon_with_hover(
+            fb,
+            Point::new(max_x, btn_y),
+            icons::BTN_MAX,
+            matches!(button_hover, Some(WindowButton::Maximize)),
+            accent,
+        );
+        let _ = ui::draw_button_icon_with_hover(
+            fb,
+            Point::new(min_x, btn_y),
+            icons::BTN_MIN,
+            matches!(button_hover, Some(WindowButton::Minimize)),
+            accent,
+        );
     }
     let handle_style = PrimitiveStyleBuilder::new().stroke_color(accent).stroke_width(1).build();
     let _ = Rectangle::new(
@@ -770,7 +814,7 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     }
 }
 
-pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32) {
+pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
 
@@ -825,15 +869,18 @@ pub fn draw_static_ui(fb: &mut FramebufferState, windows: &[ShellWindow], window
     static mut LOG_LEN: usize = 0;
     if counter % 10 == 0 {
         unsafe {
-            LOG_LEN = eclipse_libc::get_logs(&mut LOG_BUF);
+            *(&raw mut LOG_LEN) = std::libc::get_logs((&raw mut LOG_BUF) as *mut u8, 512);
         }
     }
 
     unsafe {
-        if LOG_LEN > 0 {
-            let logs_str = core::str::from_utf8(&LOG_BUF[..LOG_LEN]).unwrap_or("");
+        let len = *(&raw mut LOG_LEN);
+        if len > 0 {
+            let buf_ptr = &raw mut LOG_BUF;
+            let slice = core::slice::from_raw_parts(buf_ptr as *const u8, len);
+            let logs_str = core::str::from_utf8(slice).unwrap_or("");
             let mut y_off = 60;
-            let log_text_style = MonoTextStyle::new(&FONT_6X10, colors::WHITE);
+            let log_text_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
             for line in logs_str.lines() {
                 let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
                 y_off += 12;
@@ -856,11 +903,12 @@ pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
 }
 pub fn draw_system_central(
     fb: &mut FramebufferState, 
-    counter: u64, 
+    _counter: u64, 
     services: &[ServiceInfo], 
-    processes: &[eclipse_libc::ProcessInfo],
+    processes: &[std::libc::ProcessInfo],
     process_cpu: &[f32; 32],
     process_mem: &[u64; 32],
+    uptime_ticks: u64,
 ) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
@@ -875,12 +923,15 @@ pub fn draw_system_central(
         .draw(fb);
     let _ = ui::draw_grid(fb, Rgb888::new(20, 40, 80), 64, Point::new(panel_x, 0));
 
-    let margin = 20;
+    let _margin = 20;
     let half_h = (h - 60) / 2;
     
     // Top Half: SERVICES
+    let uptime_secs = uptime_ticks / 1000;
+    let mut title_buf = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut title_buf, format_args!("SISTEMA CENTRAL // SERVICIOS [UPTIME: {}h {}m]", uptime_secs / 3600, (uptime_secs / 60) % 60));
     let svc_rect = Rectangle::new(Point::new(panel_x + 20, 20), Size::new(panel_w as u32 - 40, half_h as u32));
-    let _ = ui::draw_glass_card(fb, svc_rect, "SISTEMA CENTRAL // SERVICIOS OPERATIVOS", colors::ACCENT_CYAN);
+    let _ = ui::draw_glass_card(fb, svc_rect, &title_buf, colors::ACCENT_CYAN);
     
     let header_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_CYAN);
     let text_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE);
@@ -940,7 +991,7 @@ pub fn draw_system_central(
         let _ = Text::new(state_str, Point::new(col_state, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, state_color)).draw(fb);
         
         // Find metrics for this service
-        let mut svc_cpu = 0.0;
+        let mut svc_cpu: f32 = 0.0;
         let mut svc_mem_kb = 0;
         for (j, p) in processes.iter().enumerate() {
             // Strict safety: check both index and pid
@@ -955,7 +1006,8 @@ pub fn draw_system_central(
 
         // CPU
         let mut cpu_str = heapless::String::<12>::new();
-        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", svc_cpu));
+        let svc_cpu_f = if svc_cpu.is_nan() { 0.0 } else { svc_cpu };
+        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", svc_cpu_f));
         let _ = Text::new(&cpu_str, Point::new(col_cpu, y), text_style).draw(fb);
 
         // MEM
@@ -1032,12 +1084,13 @@ pub fn draw_system_central(
         let _ = Text::new(p_name, Point::new(col_prog_name, y), text_style).draw(fb);
         
         // CPU
-        let mut cpu_val = 0.0;
+        let mut cpu_val: f32 = 0.0;
         if p_idx < process_cpu.len() {
             cpu_val = process_cpu[p_idx];
         }
         let mut cpu_str = heapless::String::<12>::new();
-        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", cpu_val));
+        let cpu_val_f = if cpu_val.is_nan() { 0.0 } else { cpu_val };
+        let _ = core::fmt::write(&mut cpu_str, format_args!("{:.1}%", cpu_val_f));
         let _ = Text::new(&cpu_str, Point::new(col_prog_cpu, y), text_style).draw(fb);
         
         // MEM

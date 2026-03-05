@@ -2,7 +2,7 @@
 //! Gestiona automáticamente fast path (≤24 bytes, registros) y slow path (buffer).
 
 use core::cmp::Ord;
-use eclipse_libc::{receive, receive_fast, send, yield_cpu};
+use eclipse_libc::{receive, receive_fast, eclipse_send as send, yield_cpu};
 use sidewind_core::SideWindMessage;
 use crate::types::{EclipseMessage, MAX_MSG_LEN, parse_fast, parse_slow, build_subscribe_payload, build_input_pid_response_payload};
 
@@ -54,7 +54,8 @@ impl IpcChannel {
         }
 
         // --- Slow path ---
-        let (len, from) = receive(&mut self.slow_buf);
+        let mut from: u32 = 0;
+        let len = unsafe { receive(self.slow_buf.as_mut_ptr(), MAX_MSG_LEN, &mut from) };
         if len > 0 {
             if let Some(msg) = parse_slow(&self.slow_buf, len.min(MAX_MSG_LEN), from) {
                 self.message_count += 1;
@@ -63,6 +64,15 @@ impl IpcChannel {
         }
 
         None
+    }
+
+    /// Recibir un mensaje de forma asíncrona (devuelve un `Future`).
+    ///
+    /// Requiere la feature `async`. Puedes usar `eclipse_ipc::block_on(&mut fut)` para
+    /// esperar al mensaje sin un executor, o `.await` si tu runtime lo soporta.
+    #[cfg(feature = "async")]
+    pub fn recv_async(&mut self) -> crate::async_channel::RecvFuture<'_> {
+        crate::async_channel::RecvFuture { channel: self }
     }
 
     /// Recibir un mensaje esperando hasta `max_attempts` intentos (cada uno: recv + yield).
@@ -74,7 +84,7 @@ impl IpcChannel {
             if let Some(msg) = self.recv() {
                 return Some(msg);
             }
-            yield_cpu();
+            unsafe { yield_cpu() };
         }
         None
     }
@@ -82,7 +92,7 @@ impl IpcChannel {
     /// Enviar bytes crudos a un PID/servidor.
     /// Retorna `true` si el envío fue aceptado por el kernel.
     pub fn send_raw(dest_pid: u32, msg_type: u32, data: &[u8]) -> bool {
-        send(dest_pid, msg_type, data) == 0
+        unsafe { send(dest_pid, msg_type, data.as_ptr() as *const core::ffi::c_void, data.len(), 0) == 0 }
     }
 
     /// Enviar un mensaje de suscripción a un PID.

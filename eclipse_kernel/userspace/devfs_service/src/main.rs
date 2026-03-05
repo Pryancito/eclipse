@@ -1,13 +1,12 @@
-// devfs_service main.rs - Device Manager
+// devfs_service - Device Manager
 
-#![no_std]
 #![no_main]
+extern crate std;
+extern crate eclipse_syscall;
 
-use eclipse_libc::{
-    println, syscall3, sleep_ms, getppid, send
-};
+use std::prelude::*;
 
-const SYS_REGISTER_DEVICE: u64 = 27;
+const SYS_REGISTER_DEVICE: usize = 27;
 
 #[allow(dead_code)]
 #[repr(u64)]
@@ -24,47 +23,44 @@ enum DeviceType {
 
 fn register_device(name: &str, type_id: DeviceType) -> bool {
     unsafe {
-        syscall3(
+        eclipse_syscall::syscall3(
             SYS_REGISTER_DEVICE,
-            name.as_ptr() as u64,
-            name.len() as u64,
-            type_id as u64,
+            name.as_ptr() as usize,
+            name.len(),
+            type_id as usize,
         ) == 0
     }
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "Rust" fn main() -> i32 {
     println!("[DevFS] Starting Device Manager Service...");
 
-    // Register standard devices
     if register_device("null", DeviceType::Char) {
         println!("[DevFS] Registered /dev/null");
     }
-    
     if register_device("zero", DeviceType::Char) {
         println!("[DevFS] Registered /dev/zero");
     }
-
     if register_device("console", DeviceType::Char) {
         println!("[DevFS] Registered /dev/console");
     }
-    
-    // Register Block Devices (e.g. vda)
-    // In a real system, we'd scan PCI/VirtIO, but for now we hardcode vda
-    // since the kernel knows how to handle it via read_device(315)
     if register_device("vda", DeviceType::Block) {
         println!("[DevFS] Registered /dev/vda");
     }
 
     println!("[DevFS] Initialization complete. Entering main loop.");
-    let ppid = getppid();
+    let ppid = unsafe { std::libc::getppid() };
     if ppid > 0 {
-        let _ = send(ppid, 255, b"READY");
+        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
 
+    let mut heartbeat_counter = 0u64;
     loop {
-        // In the future: listen for udev events or scan bus
-        sleep_ms(100);
+        heartbeat_counter += 1;
+        if heartbeat_counter % 300 == 0 {
+            println!("[DevFS] Operational - Heartbeat #{}", heartbeat_counter / 300);
+        }
+        std::libc::sleep_ms(100);
     }
 }

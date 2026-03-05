@@ -2,7 +2,7 @@
 //!
 //! Provides std-like Command and Child interfaces for spawning and managing processes.
 
-use libc::*;
+use crate::libc::*;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 use crate::io::{Result, Error, ErrorKind};
@@ -44,12 +44,12 @@ impl Command {
     /// Executes the command as a child process, returning a handle to it.
     pub fn spawn(&mut self) -> Result<Child> {
         // Eclipse OS currently spawns from an ELF buffer
-        let buf = fs::read(&self.program)?;
+        let _buf = fs::read(&self.program)?;
         
         unsafe {
             // TODO: Construct proper argv/envp
-            let pid = libc::spawn(
-                self.program.as_ptr() as *const i8,
+            let pid = crate::libc::spawn(
+                self.program.as_ptr() as *const c_char,
                 core::ptr::null(),
                 core::ptr::null()
             );
