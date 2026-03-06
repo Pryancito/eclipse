@@ -79,6 +79,14 @@ impl Backend {
     pub fn swap_buffers(&mut self) {
         let _ = self.fb.present();
     }
+
+    /// Returns true if the `input:` scheme was successfully opened and can be
+    /// used to read hardware input events directly.  When false, the compositor
+    /// should fall back to subscribing for IPC input events from the
+    /// input_service instead.
+    pub fn input_scheme_available(&self) -> bool {
+        self.input_fd.is_some()
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ pub mod backend;
 pub mod state;
 
 use crate::state::SmithayState;
-use crate::ipc::query_input_service_pid;
+use crate::ipc::{query_input_service_pid, subscribe_to_input};
 
 /// Umbral en ticks: si un frame tarda más, se loguea (diagnóstico de trompicones).
 #[cfg(feature = "trace-frames")]
@@ -28,7 +28,36 @@ pub extern "Rust" fn main() -> i32 {
 
     let mut state = SmithayState::new().expect("Failed to initialize Smithay State");
 
-    let _input_pid = query_input_service_pid().expect("Failed to find input service");
+    // Obtain the input service PID from init. This is a best-effort lookup:
+    // if init is still starting up or the input service has not been spawned
+    // yet, query_input_service_pid() returns None and the compositor continues
+    // without subscribing, relying on the "input:" scheme instead.
+    //
+    // If the "input:" scheme failed to open (input_fd == None), subscribing to
+    // the input_service via IPC is the only way to receive hardware events, so
+    // we always attempt the subscription in that case.
+    match query_input_service_pid() {
+        Some(input_pid) => {
+            // Only subscribe via IPC when the direct "input:" scheme is not
+            // available.  Subscribing while also reading the scheme would
+            // deliver every hardware event twice (once from the scheme queue,
+            // once from the IPC mailbox) causing duplicate cursor moves and
+            // key presses.
+            if !state.backend.input_scheme_available() {
+                // eclipse_std does not implement std::process::id(); use the
+                // POSIX getpid() FFI wrapper which is always safe on this OS.
+                let self_pid = unsafe { std::libc::getpid() as u32 };
+                if subscribe_to_input(input_pid, self_pid) {
+                    println!("[SMITHAY] Subscribed to input service (PID {}) via IPC", input_pid);
+                } else {
+                    println!("[SMITHAY] Warning: subscription to input service PID {} failed", input_pid);
+                }
+            }
+        }
+        None => {
+            println!("[SMITHAY] Warning: input service PID not available, input events may not work");
+        }
+    }
 
     #[cfg(feature = "trace-frames")]
     let mut stats_before = std::libc::SystemStats {
