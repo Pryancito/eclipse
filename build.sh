@@ -330,7 +330,7 @@ build_tinyx_for_eclipse_os() {
 
 # Función para compilar el proceso init (embedded)
 build_eclipse_init() {
-    print_step "Compilando init process (embedded)..."
+    print_step "Compilando eclipse-init..."
     
     # Asegurar que rust-src está instalado
     print_status "Verificando rust-src component..."
@@ -348,6 +348,12 @@ build_eclipse_init() {
         if [ -f "$init_path" ]; then
             local init_size=$(du -h "$init_path" | cut -f1)
             print_status "Init process generado: $init_path ($init_size)"
+
+            # Instalar en el rootfs que luego se mete en EclipseFS
+            mkdir -p "../../../$BUILD_DIR/sbin"
+            cp "$init_path" "../../../$BUILD_DIR/sbin/eclipse-init"
+            chmod +x "../../../$BUILD_DIR/sbin/eclipse-init"
+            print_status "eclipse-init instalado en /sbin/eclipse-init (rootfs staging)"
         fi
     else
         print_error "Error al compilar eclipse-init"
@@ -395,6 +401,12 @@ build_userspace_services() {
             if [ -f "$service_path" ]; then
                 local service_size=$(du -h "$service_path" | cut -f1)
                 print_status "$service generado: $service_size"
+
+                # Instalar también en /sbin dentro del rootfs staging (como con eclipse-init)
+                mkdir -p "$BASE_DIR/$BUILD_DIR/sbin"
+                cp "$service_path" "$BASE_DIR/$BUILD_DIR/sbin/$service"
+                chmod +x "$BASE_DIR/$BUILD_DIR/sbin/$service"
+                print_status "$service instalado en /sbin/$service (rootfs staging)"
             fi
         else
             print_error "Error al compilar $service"

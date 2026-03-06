@@ -164,37 +164,40 @@ pub fn next_pid() -> ProcessId {
 
 // Inicializar el proceso kernel (PID 0)
 pub fn init_kernel_process() {
-    let mut table = PROCESS_TABLE.lock();
-    
-    let kernel_stack_size = KERNEL_STACK_SIZE;
-    let kernel_stack = alloc::vec![0u8; kernel_stack_size];
-    let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
-    core::mem::forget(kernel_stack);
-    
-    let kernel_stack_top_aligned = kernel_stack_top & !0xF;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        
+        let kernel_stack_size = KERNEL_STACK_SIZE;
+        let kernel_stack = alloc::vec![0u8; kernel_stack_size];
+        let kernel_stack_top = kernel_stack.as_ptr() as u64 + kernel_stack_size as u64;
+        core::mem::forget(kernel_stack);
+        
+        let kernel_stack_top_aligned = kernel_stack_top & !0xF;
 
-    let cr3 = crate::memory::get_cr3();
-    let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, 0)));
-    let mut process = Process::new(resources);
-    process.id = 0;
-    process.state = ProcessState::Running;
-    process.current_cpu = 0;
-    process.priority = 0;
-    process.time_slice = 10;
-    process.kernel_stack_top = kernel_stack_top_aligned;
-    let name = b"kernel";
-    let len = core::cmp::min(name.len(), 16);
-    process.name[..len].copy_from_slice(&name[..len]);
-    
-    table[0] = Some(process);
-    drop(table);
-    // Register PID 0 in the inverse slot map so that pid_to_slot_fast(0) returns
-    // Some(0) immediately without falling back to the O(N) PROCESS_TABLE scan.
-    // Without this, perform_context_switch(0, X) deadlocks on single-CPU systems:
-    // it holds PROCESS_TABLE.lock() and then the O(N) fallback tries to acquire it
-    // again, spinning forever.
-    crate::ipc::register_pid_slot(0, 0);
-    set_current_process(Some(0));
+        let cr3 = crate::memory::get_cr3();
+        let resources = Arc::new(Mutex::new(ProcessResources::new(cr3, 0)));
+        let mut process = Process::new(resources);
+        process.id = 0;
+        process.state = ProcessState::Running;
+        process.current_cpu = 0;
+        process.priority = 0;
+        process.time_slice = 10;
+        process.kernel_stack_top = kernel_stack_top_aligned;
+        let name = b"kernel";
+        let len = core::cmp::min(name.len(), 16);
+        process.name[..len].copy_from_slice(&name[..len]);
+        
+        table[0] = Some(process);
+        drop(table);
+        
+        // Register PID 0 in the inverse slot map so that pid_to_slot_fast(0) returns
+        // Some(0) immediately without falling back to the O(N) PROCESS_TABLE scan.
+        // Without this, perform_context_switch(0, X) deadlocks on single-CPU systems:
+        // it holds PROCESS_TABLE.lock() and then the O(N) fallback tries to acquire it
+        // again, spinning forever.
+        crate::ipc::register_pid_slot(0, 0);
+        set_current_process(Some(0));
+    });
 }
 
 /// Crear un nuevo proceso (bajo nivel). phdr_va/phnum/phentsize for auxv (AT_PHDR/AT_PHNUM/AT_PHENT).

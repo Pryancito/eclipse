@@ -33,7 +33,7 @@ fn flush_log_buffer(state: &mut LogBuffer) {
     if state.pos == 0 {
         return;
     }
-    let fd = std::libc::eclipse_open("file:/tmp/system.log", std::libc::O_WRONLY | std::libc::O_CREAT | std::libc::O_APPEND, 0o644);
+    let fd = -1; //std::libc::eclipse_open("file:/tmp/system.log", std::libc::O_WRONLY | std::libc::O_CREAT | std::libc::O_APPEND, 0o644);
     if fd >= 0 {
         let written = std::libc::eclipse_write(fd as u32, &state.buf[..state.pos]);
         if written > 0 {

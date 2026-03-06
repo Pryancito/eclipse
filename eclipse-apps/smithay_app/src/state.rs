@@ -57,6 +57,7 @@ pub struct SmithayState {
     pub prev_process_ticks: [(u32, u64); 32],
     pub process_cpu_usage: [f32; 32],
     pub process_mem_kb: [u64; 32],
+    pub dirty: bool,
 }
 
 
@@ -96,6 +97,7 @@ impl SmithayState {
             prev_process_ticks: [(0, 0); 32],
             process_cpu_usage: [0.0; 32],
             process_mem_kb: [0; 32],
+            dirty: true,
         })
 
     }
@@ -112,6 +114,7 @@ impl SmithayState {
                     &mut self.space.window_count,
                     &self.surfaces,
                 );
+                self.dirty = true;
             }
             CompositorEvent::SideWind(sw, sender_pid) => {
                 crate::ipc::handle_sidewind_message(
@@ -122,10 +125,12 @@ impl SmithayState {
                     &mut self.space.window_count, 
                     &mut self.input
                 );
+                self.dirty = true;
             }
             CompositorEvent::NetStats(rx, tx) => {
                 self.net_rx = rx;
                 self.net_tx = tx;
+                self.dirty = true;
             }
             CompositorEvent::ServiceInfo(data) => {
                 // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
@@ -151,6 +156,7 @@ impl SmithayState {
                     }
                     self.service_count = parsed;
                 }
+                self.dirty = true;
             }
             _ => {} // Handle Wayland/X11 if needed
         }
@@ -169,10 +175,10 @@ impl SmithayState {
         }
     }
 
-    pub fn update(&mut self) {
+    pub fn update(&mut self) -> bool {
         self.counter = self.counter.wrapping_add(1);
         self.handle_requests();
-        self.space.update_animations(&mut self.surfaces);
+        let busy = self.space.update_animations(&mut self.surfaces);
         
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
@@ -189,9 +195,9 @@ impl SmithayState {
         let target_search_y = if self.input.search_active { 0.0 } else { -(fb_h as f32 / 2.0) };
         self.input.search_curr_y += (target_search_y - self.input.search_curr_y) * 0.15;
 
-        // Métricas solo cuando hace falta (dashboard/system central) o cada 60 ticks para CPU/mem básica
+        // Métricas solo cuando hace falta (dashboard/system central) o cada 120 ticks para CPU/mem básica
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
-        if need_metrics && self.counter % 15 == 0 || !need_metrics && self.counter % 60 == 0 {
+        if (need_metrics && self.counter % 30 == 0) || (!need_metrics && self.counter % 120 == 0) {
             let mut current = SystemStats {
                 uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
             };
@@ -302,7 +308,10 @@ impl SmithayState {
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
             self.prev_stats = Some(current);
+            self.dirty = true;
         }
+
+        busy || self.dirty
     }
 
 
@@ -327,6 +336,7 @@ impl SmithayState {
             self.space.map_window(win);
             self.input.focused_window = Some(idx);
             self.input.request_new_window = false;
+            self.dirty = true;
         } else if self.input.request_new_window {
             self.input.request_new_window = false;
         }
@@ -341,6 +351,7 @@ impl SmithayState {
             self.input.focused_window = None;
             self.input.dragging_window = None;
             self.input.request_close_window = false;
+            self.dirty = true;
         }
 
         // Minimize
@@ -353,6 +364,7 @@ impl SmithayState {
                 }
             }
             self.input.request_minimize = false;
+            self.dirty = true;
         }
 
         // Maximize
@@ -385,6 +397,7 @@ impl SmithayState {
                 }
             }
             self.input.request_maximize = false;
+            self.dirty = true;
         }
 
         // Restore
@@ -401,6 +414,7 @@ impl SmithayState {
                 self.input.focused_window = Some(self.space.window_count - 1);
             }
             self.input.request_restore = false;
+            self.dirty = true;
         }
 
         // Cycle Focus
@@ -413,6 +427,7 @@ impl SmithayState {
                 }
             }
             self.input.request_cycle_forward = false;
+            self.dirty = true;
         }
         if self.input.request_cycle_backward {
             if self.space.window_count > 1 {
@@ -423,12 +438,14 @@ impl SmithayState {
                 }
             }
             self.input.request_cycle_backward = false;
+            self.dirty = true;
         }
 
         // Dashboard
         if self.input.request_dashboard {
             self.input.dashboard_active = !self.input.dashboard_active;
             self.input.request_dashboard = false;
+            self.dirty = true;
         }
 
         // Center Cursor

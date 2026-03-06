@@ -1136,21 +1136,19 @@ pub fn draw_system_central(
 }
 
 /// Test hardware-accelerated rendering using the new Gpu API
-pub fn gpu_test_render(fb: &FramebufferState, counter: u64) {
-    if let Some(gpu) = &fb.gpu {
-        // Run every 60 frames to show a slow, non-blocking hardware operation
-        if counter % 60 == 0 {
-            let mut encoder = sidewind::gpu::GpuCommandEncoder::new(gpu);
-            
-            // Draw a color-changing square in the top-left corner
-            let color = match (counter / 60) % 3 {
-                0 => 0x00FF0000, // Red
-                1 => 0x0000FF00, // Green
-                _ => 0x000000FF, // Blue
+pub fn gpu_test_render(fb: &FramebufferState, _counter: u64) {
+    if let Some(_gpu) = &fb.gpu {
+        // Disabled to avoid stalls and serial latency in main loop
+        /*
+        if _counter % 60 == 0 {
+            let mut encoder = sidewind::gpu::GpuCommandEncoder::new(_gpu);
+            let color = match (_counter / 60) % 3 {
+                0 => 0x00FF0000, 
+                1 => 0x0000FF00, 
+                _ => 0x000000FF, 
             };
-
             let _ = encoder.fill_rect(50, 50, 200, 200, color);
-            println!("[SMITHAY] GPU: Hardware-accelerated fill submitted (counter={})", counter);
         }
+        */
     }
 }

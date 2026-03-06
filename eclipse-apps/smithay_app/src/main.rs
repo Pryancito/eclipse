@@ -38,54 +38,40 @@ pub extern "Rust" fn main() -> i32 {
         used_mem_frames: 0,
     };
 
+    let mut last_render = std::time::Instant::now();
+    let frame_budget = std::time::Duration::from_millis(16); // ~60 FPS
+
     loop {
-        #[cfg(feature = "trace-frames")]
-        {
-            unsafe {
-                let _ = std::libc::get_system_stats(&mut stats_before);
-            }
+        // 1. Process all pending IPC messages (low latency polling)
+        state.handle_ipc();
+
+        // 2. Update logic and check if we need to redraw
+        let is_busy = state.update();
+
+        // 3. Render if something changed OR if too much time passed (keep-alive)
+        let elapsed_since_render = last_render.elapsed();
+        if is_busy || state.dirty || elapsed_since_render >= frame_budget {
+            state.render();
+            state.backend.swap_buffers();
+            state.dirty = false;
+            last_render = std::time::Instant::now();
         }
 
-        // Poll events from the backend (IPC + Framebuffer)
-        while let Some(event) = state.backend.poll_event() {
-            state.handle_event(event);
+        // 4. Yield/Sleep to prevent 100% CPU but stay responsive
+        if !is_busy && !state.dirty {
+            // Sleep short to check IPC frequently (1ms = 1000Hz polling)
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        } else {
+            // If we just rendered or are animating, don't sleep, just yield once
+            std::thread::yield_now();
         }
-
-        // Update state logic (animations, window management)
-        state.update();
-
-        // Render current state to backbuffer
-        state.render();
-
-        // Swap backbuffer to front
-        state.backend.swap_buffers();
 
         #[cfg(feature = "trace-frames")]
         {
-            let mut stats_after = std::libc::SystemStats {
-                uptime_ticks: 0,
-                idle_ticks: 0,
-                total_mem_frames: 0,
-                used_mem_frames: 0,
-            };
-            unsafe {
-                let _ = std::libc::get_system_stats(&mut stats_after);
-            }
-            let delta = stats_after.uptime_ticks.saturating_sub(stats_before.uptime_ticks);
-            if delta > TRACE_FRAME_THRESHOLD_TICKS {
-                println!(
-                    "[SMITHAY] frame slow: {} ticks (counter={} recv_attempts={} messages={})",
-                    delta,
-                    state.counter,
-                    state.backend.ipc.recv_attempts,
-                    state.backend.ipc.message_count
-                );
-            }
             if state.counter > 0 && state.counter % TRACE_HEARTBEAT_EVERY == 0 {
                 println!(
-                    "[SMITHAY] heartbeat counter={} recv_attempts={} messages={}",
+                    "[SMITHAY] heartbeat counter={} messages={}",
                     state.counter,
-                    state.backend.ipc.recv_attempts,
                     state.backend.ipc.message_count
                 );
             }

@@ -918,7 +918,9 @@ impl core::fmt::Write for StdoutWriter {
         unsafe {
             #[cfg(not(any(test, feature = "host-testing")))]
             {
-                let _ = sys_write(1, s.as_bytes());
+                // Eclipse target: no escribir a FD=1 (serial).
+                // Se deja como no-op para reducir spam en serial.
+                let _ = s;
             }
             #[cfg(any(test, feature = "host-testing"))]
             {

@@ -359,9 +359,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     kernel_main(boot_info);
 }
 
-/// Init process binary embedded in kernel
-pub static INIT_BINARY: &[u8] = include_bytes!("../userspace/init/target/x86_64-unknown-none/release/eclipse-init");
-
 /// Función principal del kernel
 pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // Framebuffer info is now handled centrally by boot::get_framebuffer_info()
@@ -371,22 +368,46 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // Save kernel CR3 immediately (before any process runs) for exec() of service binaries
     crate::memory::save_kernel_cr3();
 
-    // Mount is now handled by userspace filesystem_service via SYS_MOUNT
-    serial::serial_print("[KERNEL] Waiting for userspace to mount root filesystem...\n");
-    let mut init_loaded = false;
-    
-    // Load embedded init
-    if !init_loaded {
-        serial::serial_print("\n[KERNEL] Loading init process from embedded binary...\n");
-        match process::spawn_process(INIT_BINARY, "init") {
-            Ok(pid) => {
-                serial::serial_printf(format_args!("[KERNEL] Init process loaded with PID: {}\n", pid));
-                progress::bar(95);
-                scheduler::enqueue_process(pid);
-                serial::serial_print("[KERNEL] Init process scheduled for execution\n");
-            },
-            Err(e) => {
-                serial::serial_printf(format_args!("[KERNEL] Failed to spawn init process: {}\n", e));
+    serial::serial_print("[KERNEL] Loading init process from disk (/sbin/eclipse-init)...\n");
+
+    // Cargar /sbin/eclipse-init usando la API existente de filesystem::read_file
+    const MAX_INIT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB para el binario de init
+    let mut init_buf = alloc::vec![0u8; MAX_INIT_SIZE];
+    match filesystem::read_file("/sbin/eclipse-init", &mut init_buf) {
+        Ok(n) => {
+            if n == 0 {
+                serial::serial_print("[KERNEL] ERROR: /sbin/eclipse-init is empty\n");
+                loop {
+                    crate::cpu::idle();
+                }
+            }
+            init_buf.truncate(n);
+            serial::serial_printf(format_args!(
+                "[KERNEL] Loaded /sbin/eclipse-init ({} bytes)\n",
+                n
+            ));
+            match process::spawn_process(&init_buf, "init") {
+                Ok(pid) => {
+                    serial::serial_printf(format_args!("[KERNEL] Init process loaded with PID: {}\n", pid));
+                    progress::bar(95);
+                    scheduler::enqueue_process(pid);
+                    serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+                }
+                Err(e) => {
+                    serial::serial_printf(format_args!("[KERNEL] Failed to spawn init process: {}\n", e));
+                    loop {
+                        crate::cpu::idle();
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            serial::serial_printf(format_args!(
+                "[KERNEL] ERROR: cannot read /sbin/eclipse-init: {}\n",
+                e
+            ));
+            loop {
+                crate::cpu::idle();
             }
         }
     }

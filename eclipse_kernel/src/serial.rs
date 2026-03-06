@@ -149,7 +149,8 @@ pub fn serial_print_char(c: char) {
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
     let _lock = SERIAL_PORT_LOCK.lock();
-    let mut timeout = 1_000_000;
+    // Reduce timeout to avoid long hangs on failing hardware
+    let mut timeout = 100_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;
@@ -160,6 +161,8 @@ fn write_byte(byte: u8) {
             outb(SERIAL_PORT, byte);
             io_wait();
         }
+    } else {
+        // Optional: record serial timeout if it happens too often
     }
 }
 
@@ -294,7 +297,8 @@ impl core::fmt::Write for PrefixedWriter {
 }
 
 fn write_byte_internal(byte: u8) {
-    let mut timeout = 1_000_000;
+    // Reduce timeout to avoid long hangs on failing hardware
+    let mut timeout = 100_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;

@@ -370,6 +370,55 @@ impl Filesystem {
         Self::read_file_by_inode_at(inode, buffer, 0)
     }
 
+    /// Obtener la longitud (en bytes) del TLV `CONTENT` de un inode.
+    ///
+    /// Útil para cargar binarios completos (p.ej. servicios en /sbin) sin
+    /// depender de binarios embebidos en el kernel.
+    pub fn content_len_by_inode(inode: u32) -> Result<usize, &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        let entry = Self::read_inode_entry(inode)?;
+
+        // Leer el primer bloque del record para obtener record_size y escanear TLVs.
+        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
+        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        let mut block_buffer = vec![0u8; BLOCK_SIZE];
+        read_block_from_device(block_num, &mut block_buffer)?;
+
+        if offset_in_block + 8 > BLOCK_SIZE {
+            return Err("Node header crosses block boundary");
+        }
+
+        let record_size = u32::from_le_bytes([
+            block_buffer[offset_in_block + 4],
+            block_buffer[offset_in_block + 5],
+            block_buffer[offset_in_block + 6],
+            block_buffer[offset_in_block + 7],
+        ]) as usize;
+
+        // Escaneo robusto: leer dos bloques contiguos para TLVs que crucen límite.
+        let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
+        scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
+        let _ = read_block_from_device(block_num + 1, &mut scan_buf[BLOCK_SIZE..]);
+
+        let record_data = &scan_buf[offset_in_block..];
+        let mut tlv_pos = 8usize;
+        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
+            let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
+            let length = u32::from_le_bytes([
+                record_data[tlv_pos + 2],
+                record_data[tlv_pos + 3],
+                record_data[tlv_pos + 4],
+                record_data[tlv_pos + 5],
+            ]) as usize;
+            if tag == tlv_tags::CONTENT {
+                return Ok(length);
+            }
+            tlv_pos += 6 + length;
+        }
+
+        Err("CONTENT TLV not found")
+    }
+
     /// Write data to file by inode
     /// 
     /// This is a simplified implementation that writes data to an existing file
@@ -914,6 +963,22 @@ pub fn read_file(path: &str, buffer: &mut [u8]) -> Result<usize, &'static str> {
     let inode = Filesystem::lookup_path(path)?;
     // 2. Read file
     Filesystem::read_file_by_inode(inode, buffer)
+}
+
+/// Leer un fichero completo asignando un buffer del tamaño exacto del TLV `CONTENT`.
+pub fn read_file_alloc(path: &str) -> Result<Vec<u8>, &'static str> {
+    let inode = Filesystem::lookup_path(path)?;
+    let len = Filesystem::content_len_by_inode(inode)?;
+    if len == 0 {
+        return Err("Empty file");
+    }
+    if len > MAX_RECORD_SIZE {
+        return Err("File too large (exceeds MAX_RECORD_SIZE)");
+    }
+    let mut buf = vec![0u8; len];
+    let n = Filesystem::read_file_by_inode_at(inode, &mut buf, 0)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// Check if filesystem is mounted

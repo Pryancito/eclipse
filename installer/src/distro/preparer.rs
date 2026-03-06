@@ -48,6 +48,17 @@ impl DistroPreparer {
     fn copy_binaries(&self) -> Result<()> {
         let binaries = vec![
             ("../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel", "boot/eclipse_kernel"),
+            // Init real de Eclipse OS: el kernel lo carga desde /sbin/eclipse-init
+            ("../eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init", "sbin/eclipse-init"),
+            // Servicios de userspace (cargados desde /sbin por el kernel/init)
+            ("../eclipse_kernel/userspace/log_service/target/x86_64-unknown-eclipse/release/log_service", "sbin/log_service"),
+            ("../eclipse_kernel/userspace/devfs_service/target/x86_64-unknown-eclipse/release/devfs_service", "sbin/devfs_service"),
+            ("../eclipse_kernel/userspace/filesystem_service/target/x86_64-unknown-eclipse/release/filesystem_service", "sbin/filesystem_service"),
+            ("../eclipse_kernel/userspace/input_service/target/x86_64-unknown-eclipse/release/input_service", "sbin/input_service"),
+            ("../eclipse_kernel/userspace/display_service/target/x86_64-unknown-eclipse/release/display_service", "sbin/display_service"),
+            ("../eclipse_kernel/userspace/audio_service/target/x86_64-unknown-eclipse/release/audio_service", "sbin/audio_service"),
+            ("../eclipse_kernel/userspace/network_service/target/x86_64-unknown-eclipse/release/network_service", "sbin/network_service"),
+            ("../eclipse_kernel/userspace/gui_service/target/x86_64-unknown-eclipse/release/gui_service", "sbin/gui_service"),
             ("../eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "usr/sbin/eclipse-systemd"),
             ("../eclipse-apps/systemd/target/x86_64-unknown-none/release/eclipse-systemd", "sbin/init"),
             ("../eclipse-apps/target/x86_64-unknown-eclipse/release/smithay_app", "usr/bin/smithay_app"),

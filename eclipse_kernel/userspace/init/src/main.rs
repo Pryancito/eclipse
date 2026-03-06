@@ -138,7 +138,7 @@ fn start_essential_service(service_id: u32) -> u32 {
 fn start_system_services() {
     // Start remaining services in order: filesystem, input, display, audio, network, gui
     // Indices 4 to 9 in SERVICES match IDs 2 to 7 in sys_spawn_service
-    for i in 4..=9 {
+    for i in 5..=9 {
         let (name, pid) = {
             let mut svc = SERVICES.lock();
             let service_id = (i - 2) as u32; // Map index to sys_spawn_service ID

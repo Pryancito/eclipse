@@ -67,9 +67,10 @@ impl Space {
         None
     }
 
-    pub fn update_animations(&mut self, surfaces: &mut [ExternalSurface]) {
+    pub fn update_animations(&mut self, surfaces: &mut [ExternalSurface]) -> bool {
         let mut min_count_anim = 0;
         let mut i = 0;
+        let mut busy = false;
         while i < self.window_count {
             if matches!(self.windows[i].content, WindowContent::None) {
                 i += 1;
@@ -88,10 +89,24 @@ impl Space {
             };
 
             let lerp = if self.windows[i].closing { 0.32 } else { 0.22 };
-            self.windows[i].curr_x += (tx - self.windows[i].curr_x) * lerp;
-            self.windows[i].curr_y += (ty - self.windows[i].curr_y) * lerp;
-            self.windows[i].curr_w += (tw - self.windows[i].curr_w) * lerp;
-            self.windows[i].curr_h += (th - self.windows[i].curr_h) * lerp;
+            
+            let dx = (tx - self.windows[i].curr_x).abs();
+            let dy = (ty - self.windows[i].curr_y).abs();
+            let dw = (tw - self.windows[i].curr_w).abs();
+            let dh = (th - self.windows[i].curr_h).abs();
+
+            if dx > 0.1 || dy > 0.1 || dw > 0.1 || dh > 0.1 {
+                busy = true;
+                self.windows[i].curr_x += (tx - self.windows[i].curr_x) * lerp;
+                self.windows[i].curr_y += (ty - self.windows[i].curr_y) * lerp;
+                self.windows[i].curr_w += (tw - self.windows[i].curr_w) * lerp;
+                self.windows[i].curr_h += (th - self.windows[i].curr_h) * lerp;
+            } else {
+                self.windows[i].curr_x = tx;
+                self.windows[i].curr_y = ty;
+                self.windows[i].curr_w = tw;
+                self.windows[i].curr_h = th;
+            }
 
             if self.windows[i].closing && self.windows[i].curr_w < 5.0 {
                 self.unmap_window(i, surfaces);
@@ -99,6 +114,7 @@ impl Space {
                 i += 1;
             }
         }
+        busy
     }
 }
 

@@ -26,19 +26,48 @@ impl Duration {
     pub fn as_nanos(&self) -> u128 {
         (self.secs as u128 * 1_000_000_000) + self.nanos as u128
     }
+
+    pub fn as_millis(&self) -> u64 {
+        (self.secs * 1000) + (self.nanos / 1_000_000) as u64
+    }
+}
+
+impl core::ops::Sub for Duration {
+    type Output = Duration;
+
+    fn sub(self, rhs: Duration) -> Duration {
+        let self_nanos = self.as_nanos();
+        let rhs_nanos = rhs.as_nanos();
+        let res_nanos = self_nanos.saturating_sub(rhs_nanos);
+        Duration {
+            secs: (res_nanos / 1_000_000_000) as u64,
+            nanos: (res_nanos % 1_000_000_000) as u32,
+        }
+    }
 }
 
 /// A measurement of a monotonically increasing clock.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Instant {
-    // TODO: Use eclipse-libc clock() or time()
+    ticks: u64,
 }
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant {}
+        let mut stats = SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+        };
+        unsafe {
+            let _ = get_system_stats(&mut stats);
+        }
+        Instant { ticks: stats.uptime_ticks }
     }
     
     pub fn elapsed(&self) -> Duration {
-        Duration::from_secs(0)
+        let now = Instant::now();
+        Duration::from_millis(now.ticks.saturating_sub(self.ticks))
     }
 }

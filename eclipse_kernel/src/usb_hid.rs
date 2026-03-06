@@ -914,7 +914,7 @@ impl XhciControllerState {
             self.transfer_rings.push(None);
         }
 
-        serial::serial_print("[XHCI] Rings initialized\n");
+        serial::serial_print("[XHCI] Rings and structures initialized successfully\n");
         Ok(())
     }
 

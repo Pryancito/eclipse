@@ -457,20 +457,64 @@ fn sys_set_process_name(name_ptr: u64, name_len: u64) -> u64 {
 ///
 /// This is the preferred way for init to start services. It avoids the fork+exec
 /// overhead and directly creates a clean process from the embedded kernel binary.
+use alloc::vec::Vec;
+
+// Cache de binarios de servicios leídos desde el filesystem (/sbin/*).
+static mut SERVICE_LOG_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_DEVFS_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_FS_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_INPUT_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_DISPLAY_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_AUDIO_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_NET_BIN: Option<Vec<u8>> = None;
+static mut SERVICE_GUI_BIN: Option<Vec<u8>> = None;
+
+fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
+    unsafe {
+        let (slot, path) = match service_id {
+            0 => (&mut SERVICE_LOG_BIN, "/sbin/log_service"),
+            1 => (&mut SERVICE_DEVFS_BIN, "/sbin/devfs_service"),
+            2 => (&mut SERVICE_FS_BIN, "/sbin/filesystem_service"),
+            3 => (&mut SERVICE_INPUT_BIN, "/sbin/input_service"),
+            4 => (&mut SERVICE_DISPLAY_BIN, "/sbin/display_service"),
+            5 => (&mut SERVICE_AUDIO_BIN, "/sbin/audio_service"),
+            6 => (&mut SERVICE_NET_BIN, "/sbin/network_service"),
+            7 => (&mut SERVICE_GUI_BIN, "/sbin/gui_service"),
+            _ => return None,
+        };
+
+        if slot.is_none() {
+            match crate::filesystem::read_file_alloc(path) {
+                Ok(buf) => {
+                    serial::serial_printf(format_args!(
+                        "[SYSCALL] Loaded service {} from disk ({} bytes)\n",
+                        path,
+                        buf.len()
+                    ));
+                    *slot = Some(buf);
+                }
+                Err(e) => {
+                    serial::serial_printf(format_args!(
+                        "[SYSCALL] ERROR loading service {}: {}\n",
+                        path,
+                        e
+                    ));
+                    return None;
+                }
+            }
+        }
+
+        slot.as_ref().map(|v| v.as_slice())
+    }
+}
+
 fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
     serial::serial_printf(format_args!("[SYSCALL] spawn_service({})\n", service_id));
 
-    let elf_slice: &[u8] = match service_id {
-        0 => crate::binaries::LOG_SERVICE_BINARY,
-        1 => crate::binaries::DEVFS_SERVICE_BINARY,
-        2 => crate::binaries::FILESYSTEM_SERVICE_BINARY,
-        3 => crate::binaries::INPUT_SERVICE_BINARY,
-        4 => crate::binaries::DISPLAY_SERVICE_BINARY,
-        5 => crate::binaries::AUDIO_SERVICE_BINARY,
-        6 => crate::binaries::NETWORK_SERVICE_BINARY,
-        7 => crate::binaries::GUI_SERVICE_BINARY,
-        _ => {
-            serial::serial_print("[SYSCALL] spawn_service: invalid service_id\n");
+    let elf_slice: &[u8] = match get_service_slice(service_id) {
+        Some(s) => s,
+        None => {
+            serial::serial_print("[SYSCALL] spawn_service: invalid service_id or failed to load from disk\n");
             return u64::MAX;
         }
     };
@@ -1354,21 +1398,16 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
          return u64::MAX;
     }
     
-    // Get service binary based on ID (new init startup order)
-    let (bin_ptr, bin_size) = match service_id {
-        0 => (crate::binaries::LOG_SERVICE_BINARY.as_ptr() as u64, crate::binaries::LOG_SERVICE_BINARY.len() as u64),
-        1 => (crate::binaries::DEVFS_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DEVFS_SERVICE_BINARY.len() as u64),
-        2 => (crate::binaries::FILESYSTEM_SERVICE_BINARY.as_ptr() as u64, crate::binaries::FILESYSTEM_SERVICE_BINARY.len() as u64),
-        3 => (crate::binaries::INPUT_SERVICE_BINARY.as_ptr() as u64, crate::binaries::INPUT_SERVICE_BINARY.len() as u64),
-        4 => (crate::binaries::DISPLAY_SERVICE_BINARY.as_ptr() as u64, crate::binaries::DISPLAY_SERVICE_BINARY.len() as u64),
-        5 => (crate::binaries::AUDIO_SERVICE_BINARY.as_ptr() as u64, crate::binaries::AUDIO_SERVICE_BINARY.len() as u64),
-        6 => (crate::binaries::NETWORK_SERVICE_BINARY.as_ptr() as u64, crate::binaries::NETWORK_SERVICE_BINARY.len() as u64),
-        7 => (crate::binaries::GUI_SERVICE_BINARY.as_ptr() as u64, crate::binaries::GUI_SERVICE_BINARY.len() as u64),
-        _ => {
-            serial::serial_print("[SYSCALL] Invalid service ID\n");
+    // Get service binary based on ID, cargándolo desde /sbin si es necesario.
+    let slice = match get_service_slice(service_id) {
+        Some(s) => s,
+        None => {
+            serial::serial_print("[SYSCALL] Invalid service ID or failed to load from disk\n");
             return u64::MAX;
         }
     };
+    let bin_ptr = slice.as_ptr() as u64;
+    let bin_size = slice.len() as u64;
     
     // Write pointer and size to user-provided addresses
     unsafe {
