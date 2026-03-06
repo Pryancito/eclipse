@@ -1,9 +1,10 @@
 use std::prelude::v1::*;
 use micromath::F32Ext;
 use std::libc::{
-    get_framebuffer_info, map_framebuffer, FramebufferInfo, 
-    get_gpu_display_info, gpu_alloc_display_buffer, gpu_present, 
-    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS
+    get_framebuffer_info, map_framebuffer, FramebufferInfo,
+    get_gpu_display_info, gpu_alloc_display_buffer, gpu_present,
+    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+    eclipse_open, eclipse_close, eclipse_fmap, O_RDONLY,
 };
 use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
@@ -44,6 +45,66 @@ impl FramebufferState {
     pub fn init() -> Option<Self> {
         println!("[SMITHAY] Initializing display...");
 
+        // ── Step 1: try /dev/fb0 (safest userspace path) ──────────────────────
+        let fb0_fd = eclipse_open("/dev/fb0", O_RDONLY, 0);
+        if fb0_fd >= 0 {
+            println!("[SMITHAY] /dev/fb0 opened (fd={})", fb0_fd);
+            let fb_info = unsafe { get_framebuffer_info() }.unwrap_or_else(|| {
+                println!("[SMITHAY] WARNING: get_framebuffer_info failed, using default 1920x1080 headless");
+                FramebufferInfo {
+                    address: 0,
+                    width: 0,
+                    height: 0,
+                    pitch: 0,
+                    bpp: 32,
+                    red_mask_size: 8,
+                    red_mask_shift: 16,
+                    green_mask_size: 8,
+                    green_mask_shift: 8,
+                    blue_mask_size: 8,
+                    blue_mask_shift: 0,
+                }
+            });
+
+            let width  = if fb_info.width  > 0 { fb_info.width  } else { DEFAULT_WIDTH };
+            let height = if fb_info.height > 0 { fb_info.height } else { DEFAULT_HEIGHT };
+            let pitch  = if fb_info.pitch  > 0 { fb_info.pitch  } else { width * 4 };
+            let fb_size = (pitch as usize).saturating_mul(height as usize);
+
+            if let Some(front_addr) = eclipse_fmap(fb0_fd, 0, fb_size) {
+                eclipse_close(fb0_fd);
+                println!("[SMITHAY] /dev/fb0 mapped at 0x{:X} ({}x{})", front_addr, width, height);
+
+                let back_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+                if !back_buffer.is_null() && back_buffer as usize != usize::MAX {
+                    let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+                    if !bg_buffer.is_null() && bg_buffer as usize != usize::MAX {
+                        let gpu = Some(sidewind::gpu::GpuDevice::for_backend(sidewind::gpu::GpuBackend::Nvidia));
+                        let mut info = fb_info;
+                        info.width  = width;
+                        info.height = height;
+                        info.pitch  = pitch;
+                        info.address = front_addr as u64;
+                        return Some(FramebufferState {
+                            info,
+                            base_addr: back_buffer as usize,
+                            front_addr,
+                            gpu_resource_id: None,
+                            background_addr: bg_buffer as usize,
+                            gpu,
+                        });
+                    }
+                }
+                println!("[SMITHAY] WARNING: back-buffer mmap failed after /dev/fb0 mapping");
+            } else {
+                eclipse_close(fb0_fd);
+                println!("[SMITHAY] WARNING: /dev/fb0 fmap failed, trying other backends");
+            }
+        } else {
+            println!("[SMITHAY] /dev/fb0 not available, trying other backends");
+        }
+
+        // ── Step 2: VirtIO GPU ─────────────────────────────────────────────────
         let mut dims = [0u32, 0u32];
         let has_gpu = unsafe { get_gpu_display_info(&mut dims) };
         if has_gpu && dims[0] > 0 && dims[1] > 0 {

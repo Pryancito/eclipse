@@ -372,6 +372,25 @@ pub fn eclipse_close(fd: i32) -> i32 {
     unsafe { eclipse_syscall::syscall1(eclipse_syscall::number::SYS_CLOSE, fd as usize) as i32 }
 }
 
+/// Map a file-descriptor resource into process address space via SYS_FMAP (28).
+/// Returns `Some(virtual_address)` on success or `None` on failure.
+#[inline]
+pub fn eclipse_fmap(fd: i32, offset: usize, len: usize) -> core::option::Option<usize> {
+    let res = unsafe {
+        eclipse_syscall::syscall3(
+            eclipse_syscall::number::SYS_FMAP,
+            fd as usize,
+            offset,
+            len,
+        )
+    };
+    if res == 0 || res == core::usize::MAX {
+        core::option::Option::None
+    } else {
+        core::option::Option::Some(res)
+    }
+}
+
 
 
 pub fn get_service_binary(service_id: u32) -> (*const u8, usize) {
