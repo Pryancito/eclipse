@@ -151,15 +151,7 @@ const MAX_CPUS: usize = 128;
 
 /// Obtener ID de la CPU actual (O(1) vía GS segment)
 pub fn get_cpu_id() -> usize {
-    let cpu_id: u32;
-    unsafe {
-        asm!(
-            "mov {0:e}, gs:[16]",
-            out(reg) cpu_id,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    cpu_id as usize
+    crate::boot::get_cpu_id_gs()
 }
 
 pub fn next_pid() -> ProcessId {
@@ -292,23 +284,25 @@ pub fn create_process_with_pid(pid: ProcessId, cr3: u64, entry_point: u64, stack
 
 /// Ejecutar un binario ELF como un nuevo proceso
 pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static str> {
-    // 1. Crear el PID
+    crate::serial::serial_printf(format_args!("[spawn] ENTERED for process: {}\n", name));
     let pid = next_pid();
 
-    
-    // 2. Crear las tablas de páginas (address space)
+    crate::serial::serial_print("[spawn] calling create_process_paging\n");
     let cr3 = crate::memory::create_process_paging();
-    
-    // 3. Cargar el binario ELF
+    crate::serial::serial_printf(format_args!("[spawn] create_process_paging returned cr3=0x{:x}\n", cr3));
+
+    crate::serial::serial_print("[spawn] calling load_elf_into_space\n");
     let (entry_point, max_vaddr, segment_frames) = crate::elf_loader::load_elf_into_space(cr3, elf_data)?;
+    crate::serial::serial_printf(format_args!("[spawn] load_elf_into_space done entry=0x{:x}\n", entry_point));
     let (phdr_va, phnum, phentsize) = crate::elf_loader::get_elf_phdr_info(elf_data)?;
-    
-    // 4. Configurar el stack de usuario
+
+    crate::serial::serial_print("[spawn] calling setup_user_stack\n");
     let stack_base = 0x20000000;
     let stack_size = 0x100000; // 1MB — enough for deep compositor render call stacks
     let _stack_top = crate::elf_loader::setup_user_stack(cr3, stack_base, stack_size)?;
-    
-    // 5. Inicializar el proceso en la tabla de procesos (phdr_va/phnum/phentsize for auxv)
+    crate::serial::serial_print("[spawn] setup_user_stack done\n");
+
+    crate::serial::serial_print("[spawn] calling create_process_with_pid\n");
     if create_process_with_pid(pid, cr3, entry_point, stack_base, stack_size, phdr_va, phnum, phentsize, max_vaddr) {
         if let Some(mut proc) = get_process(pid) {
             let n = core::cmp::min(name.len(), 16);
@@ -317,9 +311,10 @@ pub fn spawn_process(elf_data: &[u8], name: &str) -> Result<ProcessId, &'static 
             update_process(pid, proc);
         }
         crate::fd::fd_init_stdio(pid);
+        crate::serial::serial_printf(format_args!("[spawn] SUCCESS for process: {}\n", name));
         Ok(pid)
     } else {
-
+        crate::serial::serial_printf(format_args!("[spawn] FAILED to insert process into table: {}\n", name));
         Err("Failed to insert process into table")
     }
 }

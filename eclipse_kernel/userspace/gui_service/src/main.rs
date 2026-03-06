@@ -12,7 +12,7 @@ extern crate alloc;
 use std::prelude::*;
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
-const MAX_COMPOSITOR_SIZE: usize = 8 * 1024 * 1024;
+const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
 /// Spinlock-protected load buffer for thread-safe SMP access.
 static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spinlock::new([0; MAX_COMPOSITOR_SIZE]);
 

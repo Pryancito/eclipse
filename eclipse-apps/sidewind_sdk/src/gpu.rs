@@ -95,10 +95,25 @@ impl<'a> GpuCommandEncoder<'a> {
         }
     }
 
-    /// Blit a region from one buffer to another
+    /// Blit (copy) a rectangle within the framebuffer. NVIDIA: command 1, payload 24 bytes.
     pub fn blit(&mut self, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32, w: u32, h: u32) -> GpuResult<()> {
-        // Similar to fill_rect but uses Blit command
-        Ok(())
+        match self.device.backend {
+            GpuBackend::Nvidia => {
+                let mut p = [0u8; 24];
+                p[0..4].copy_from_slice(&src_x.to_le_bytes());
+                p[4..8].copy_from_slice(&src_y.to_le_bytes());
+                p[8..12].copy_from_slice(&dst_x.to_le_bytes());
+                p[12..16].copy_from_slice(&dst_y.to_le_bytes());
+                p[16..20].copy_from_slice(&w.to_le_bytes());
+                p[20..24].copy_from_slice(&h.to_le_bytes());
+                self.device.submit(1, &p)
+            }
+            GpuBackend::VirtioGpu => {
+                // VirtIO 2D: could use resource transfer or VirGL; placeholder
+                Ok(())
+            }
+            _ => Err(GpuError::BackendNotSupported),
+        }
     }
 }
 

@@ -30,41 +30,28 @@ pub extern "Rust" fn main() -> i32 {
     println!("[SMITHAY] Entering main loop");
     
     loop {
-        state.counter += 1;
-        
+        state.update();
+
         if state.counter == 1 {
             state.backend.fb.pre_render_background();
         }
-        
-        if state.counter % 60 == 1 {
-             println!("[SMITHAY] Rendering frame {}...", state.counter);
-        }
+
         state.render();
-        // Imprescindible: enviar el back buffer a pantalla (GOP o GPU). Sin esto no se dibuja nada.
         state.backend.swap_buffers();
-        
-        if state.counter % 60 == 1 {
-             println!("[SMITHAY] Handling IPC...");
-        }
         state.handle_ipc();
-        
-        // Si arrancamos en headless, intentar mapear framebuffer cuando esté disponible
+
         if state.counter % 120 == 0 {
             state.backend.fb.try_remap_framebuffer();
         }
 
         if state.counter % 400 == 0 {
-            println!("[SMITHAY] Sending CUAPPA heartbeat to init...");
             unsafe {
                 let _ = std::libc::eclipse_send(1, 0, b"HEART\0".as_ptr() as *const core::ffi::c_void, 6, 0);
             }
         }
 
-        if state.counter % 1000 == 0 {
-            println!("[SMITHAY] Stable loop iteration {}", state.counter);
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        // ~60 FPS: 16ms. Reducido a 8ms para mayor fluidez cuando el render es rápido.
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
 

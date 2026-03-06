@@ -189,8 +189,9 @@ impl SmithayState {
         let target_search_y = if self.input.search_active { 0.0 } else { -(fb_h as f32 / 2.0) };
         self.input.search_curr_y += (target_search_y - self.input.search_curr_y) * 0.15;
 
-        // Actualizar métricas cada 30 ticks (~0.5s si es 60fps)
-        if self.counter % 30 == 0 {
+        // Métricas solo cuando hace falta (dashboard/system central) o cada 60 ticks para CPU/mem básica
+        let need_metrics = self.input.dashboard_active || self.input.system_central_active;
+        if need_metrics && self.counter % 15 == 0 || !need_metrics && self.counter % 60 == 0 {
             let mut current = SystemStats {
                 uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
             };
@@ -212,7 +213,7 @@ impl SmithayState {
                 }
             }
             
-            // Stats de red
+            if need_metrics {
             if let Some(pid) = self.network_pid {
                 unsafe {
                     let _ = std::libc::eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0); // MSG_TYPE_NETWORK = 0x08
@@ -222,16 +223,15 @@ impl SmithayState {
                 let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
                 let total_delta = rx_delta + tx_delta;
                 
-                // Simulación sencilla de carga de red (asumiendo max 5MB/s)
                 let max_bytes_per_sec = 5_000_000.0;
-                let bytes_per_sec = (total_delta as f32) * 2.0; // 30 ticks = 0.5s
+                let bytes_per_sec = (total_delta as f32) * 2.0;
                 self.net_usage = (bytes_per_sec / max_bytes_per_sec).clamp(0.0, 1.0);
                 
                 self.prev_net_rx = self.net_rx;
                 self.prev_net_tx = self.net_tx;
             }
+            }
             
-            // Actualizar lista de procesos y servicios
             if self.input.system_central_active {
                 let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
                 let count = unsafe { std::libc::get_process_list(self.process_list.as_mut_ptr(), 32) };

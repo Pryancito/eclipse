@@ -1950,11 +1950,21 @@ fn sys_gpu_command(kind: u64, command: u64, payload_ptr: u64, payload_len: u64) 
             }
         }
         1 => {
-            // Backend: NVIDIA
-            // For now, placeholders for the unified API.
-            // Hardware acceleration logic will be added here using Graphics2dEngine or GSP.
-            serial::serial_print("[SYSCALL] NVIDIA GPU command (placeholder)\n");
-            0
+            // Backend: NVIDIA — command 0 = fill_rect (x, y, w, h, color), 20 bytes
+            const MAX_PAYLOAD: usize = 64;
+            let len = payload_len as usize;
+            if len == 0 || len > MAX_PAYLOAD || payload_ptr == 0 || !is_user_pointer(payload_ptr, len as u64) {
+                return u64::MAX;
+            }
+            let mut buf = [0u8; MAX_PAYLOAD];
+            unsafe {
+                core::ptr::copy_nonoverlapping(payload_ptr as *const u8, buf.as_mut_ptr(), len);
+            }
+            match command {
+                0 => if crate::nvidia::fill_rect(&buf[..len]) { 0 } else { u64::MAX },
+                1 => if crate::nvidia::blit_rect(&buf[..len]) { 0 } else { u64::MAX },
+                _ => u64::MAX,
+            }
         }
         _ => u64::MAX,
     }

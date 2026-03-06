@@ -197,7 +197,8 @@ impl InputState {
                 match action {
                     KeyAction::None => {
                         if let Some(f_idx) = self.focused_window {
-                            if let WindowContent::External(s_idx) = windows[f_idx].content {
+                            if f_idx < *window_count {
+                                if let WindowContent::External(s_idx) = windows[f_idx].content {
                                 if (s_idx as usize) < surfaces.len() {
                                     let pid = surfaces[s_idx as usize].pid;
                                     let se = SideWindEvent {
@@ -208,6 +209,7 @@ impl InputState {
                                     };
                                     let _ = unsafe { eclipse_send(pid as u32, 0x40, &se as *const _ as *const core::ffi::c_void, core::mem::size_of::<SideWindEvent>(), 0) };
                                 }
+                            }
                             }
                         }
                     }
@@ -329,7 +331,8 @@ impl InputState {
                 }
                 // Forward mouse button events to the focused external window client
                 if let Some(f_idx) = self.focused_window {
-                    if let WindowContent::External(s_idx) = windows[f_idx].content {
+                    if f_idx < *window_count {
+                        if let WindowContent::External(s_idx) = windows[f_idx].content {
                         if (s_idx as usize) < surfaces.len() {
                             let pid = surfaces[s_idx as usize].pid;
                             let se = SideWindEvent {
@@ -340,6 +343,7 @@ impl InputState {
                             };
                             let _ = unsafe { eclipse_send(pid as u32, 0x40, &se as *const _ as *const core::ffi::c_void, core::mem::size_of::<SideWindEvent>(), 0) };
                         }
+                    }
                     }
                 }
                 if (self.mouse_buttons & 1 != 0) && (old & 1 == 0) {

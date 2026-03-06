@@ -106,11 +106,13 @@ impl FramebufferState {
         });
 
         // map_framebuffer() maps the physical framebuffer into process address space.
-        // If it fails (e.g. early during NVIDIA init, or no framebuffer info at all),
-        // fall back to headless mode: front_addr = 0 means present() is a no-op and
-        // the back-buffer is never pushed to the display, but the compositor still runs.
+        // On real NVIDIA hardware (no VirtIO, no EFI GOP) this maps BAR1 linear aperture.
+        // If it fails (e.g. early during NVIDIA init), run headless until try_remap_framebuffer succeeds.
         let front_addr = match unsafe { map_framebuffer() } {
-            Some(addr) => addr,
+            Some(addr) => {
+                println!("[SMITHAY] Using linear framebuffer (NVIDIA BAR1 or GOP)");
+                addr
+            }
             None => {
                 println!("[SMITHAY] WARNING: map_framebuffer failed, running headless");
                 0
@@ -129,16 +131,19 @@ impl FramebufferState {
             return None;
         }
 
+        let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
+            return None;
+        }
+
+        // Use NVIDIA backend when we have a linear framebuffer (BAR1 or GOP); enables gpu_command(1, ...) for 2D ops.
+        let gpu = Some(sidewind_sdk::gpu::GpuDevice::for_backend(sidewind_sdk::gpu::GpuBackend::Nvidia));
+
         let mut info = fb_info;
         info.width  = width;
         info.height = height;
         info.pitch  = pitch;
         info.address = front_addr as u64;
-
-        let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-        if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
-            return None;
-        }
 
         Some(FramebufferState {
             info,
@@ -146,7 +151,7 @@ impl FramebufferState {
             front_addr,
             gpu_resource_id: None,
             background_addr: bg_buffer as usize,
-            gpu: None,
+            gpu,
         })
     }
 
@@ -169,6 +174,25 @@ impl FramebufferState {
             background_addr: 0,
             gpu: None,
         }
+    }
+
+    /// Clear the full screen. Uses GPU fill_rect when in GPU direct mode (NVIDIA BAR1), else CPU.
+    pub fn clear_screen(&self, color: Rgb888) {
+        let raw = 0xFF_00_00_00
+            | ((color.r() as u32) << 16)
+            | ((color.g() as u32) << 8)
+            | (color.b() as u32);
+        let w = self.info.width;
+        let h = self.info.height;
+        if let Some(ref gpu) = self.gpu {
+            if gpu.backend() == sidewind_sdk::gpu::GpuBackend::Nvidia && self.base_addr == self.front_addr && self.front_addr != 0 {
+                let mut enc = sidewind_sdk::gpu::GpuCommandEncoder::new(gpu);
+                if enc.fill_rect(0, 0, w, h, raw).is_ok() {
+                    return;
+                }
+            }
+        }
+        self.clear_back_buffer_raw(color);
     }
 
     pub fn clear_back_buffer_raw(&self, color: Rgb888) {
@@ -273,8 +297,6 @@ impl FramebufferState {
                     self.front_addr as *mut u8,
                     size_bytes,
                 );
-                // sfence flushes the Write-Combining buffer so the GOP framebuffer
-                // update is visible to the display controller on real NVIDIA hardware.
                 core::arch::asm!("sfence", options(nostack, preserves_flags));
             }
             true
@@ -818,7 +840,6 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
 
-    // Use pre-rendered background to save CPU
     fb.blit_background();
 
     let center = Point::new(w / 2, h / 2);

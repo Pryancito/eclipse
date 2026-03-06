@@ -149,9 +149,7 @@ pub fn serial_print_char(c: char) {
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
     let _lock = SERIAL_PORT_LOCK.lock();
-    // Esperar a que el buffer de transmisión esté vacío con un timeout de seguridad
-    // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
-    let mut timeout = 10_000;
+    let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;
@@ -160,6 +158,7 @@ fn write_byte(byte: u8) {
     if timeout > 0 {
         unsafe {
             outb(SERIAL_PORT, byte);
+            io_wait();
         }
     }
 }
@@ -185,6 +184,9 @@ pub fn serial_print(s: &str) {
 /// Imprimir con formato de forma sincronizada y atómica
 pub fn serial_printf(args: core::fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut screen_log_buf = [0u8; 128];
+        let mut screen_log_len = 0;
+
         {
             let _lock = SERIAL_PORT_LOCK.lock();
             if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
@@ -194,16 +196,31 @@ pub fn serial_printf(args: core::fmt::Arguments) {
             let me = crate::sync::ReentrantMutex::<()>::current_cpu();
             let mut writer = PrefixedWriter::new(me);
             let _ = core::fmt::write(&mut writer, args);
+
+            // También capturamos para el log de pantalla si hay espacio
+            struct StubWriter<'a> {
+                buf: &'a mut [u8],
+                len: &'a mut usize,
+            }
+            impl core::fmt::Write for StubWriter<'_> {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    let bytes = s.as_bytes();
+                    let space = self.buf.len() - *self.len;
+                    let to_copy = core::cmp::min(bytes.len(), space);
+                    self.buf[*self.len..*self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
+                    *self.len += to_copy;
+                    Ok(())
+                }
+            }
+            let mut sw = StubWriter { buf: &mut screen_log_buf, len: &mut screen_log_len };
+            let _ = core::fmt::write(&mut sw, args);
         }
         
         // Registrar en pantalla fuera del lock serial
-        // Nota: el Formatted message puede ser complejo, pero para el log de pantalla
-        // buscamos solo la cadena resultante simplificada.
-        if let Some(s) = args.as_str() {
-            crate::progress::log(s);
-        } else {
-             // Si tiene argumentos variables, progress-log no los verá a menos que formateemos a buffer.
-             // Pero los logs críticos suelen ser constantes o pasar por serial_print.
+        if screen_log_len > 0 {
+            if let Ok(s) = core::str::from_utf8(&screen_log_buf[..screen_log_len]) {
+                crate::progress::log(s);
+            }
         }
     });
 }
@@ -277,7 +294,7 @@ impl core::fmt::Write for PrefixedWriter {
 }
 
 fn write_byte_internal(byte: u8) {
-    let mut timeout = 10_000;
+    let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
         crate::cpu::pause();
         timeout -= 1;
@@ -286,6 +303,7 @@ fn write_byte_internal(byte: u8) {
     if timeout > 0 {
         unsafe {
             outb(SERIAL_PORT, byte);
+            io_wait();
         }
     }
 }
@@ -339,6 +357,13 @@ unsafe fn outb(port: u16, value: u8) {
         in("al") value,
         options(nomem, nostack, preserves_flags)
     );
+}
+
+/// Pequeño retardo para dar tiempo al hardware de I/O
+#[inline]
+unsafe fn io_wait() {
+    // Escribir a un puerto no utilizado (costumbre de Linux/BSD)
+    outb(0x80, 0);
 }
 
 /// Leer de un puerto de I/O

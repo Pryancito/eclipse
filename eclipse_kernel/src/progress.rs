@@ -311,6 +311,11 @@ pub fn log(msg: &str) {
     // que este core sea interrumpido mientras sostiene un lock crítico.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let cpu_id = get_cpu_id_gs();
+        if cpu_id >= MAX_SMP_CPUS {
+            // Early boot or misconfiguration - fallback to serial only
+            return;
+        }
+        
         if let Some(mut buf) = LOG_BUFFERS[cpu_id].try_lock() {
             let got_newline: Option<usize> = buf.push_str(msg);
 

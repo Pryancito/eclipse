@@ -557,25 +557,50 @@ fn flush_tlb() {
 }
 
 /// Create a new isolated page table for a process
-
 /// Returns the physical address of the PML4
 pub fn create_process_paging() -> u64 {
+    crate::serial::serial_print("[create_paging] ENTERED\n");
     unsafe {
-        // Use alloc_dma_buffer to avoid stack overflow with Box::new(PageTable::new())
-        let (pml4_ptr, pml4_phys) = alloc_dma_buffer(4096, 4096).expect("Failed to allocate PML4");
+        crate::serial::serial_print("[create_paging] calling alloc_dma_buffer for PML4\n");
+        let (pml4_ptr, pml4_phys) = match alloc_dma_buffer(4096, 4096) {
+            Some(res) => res,
+            None => {
+                crate::serial::serial_print("[create_paging] FATAL: alloc_dma_buffer failed\n");
+                panic!("Failed to allocate PML4");
+            }
+        };
+        crate::serial::serial_print("[create_paging] PML4 allocated: ptr=");
+        crate::serial::serial_print_hex(pml4_ptr as u64);
+        crate::serial::serial_print(", phys=");
+        crate::serial::serial_print_hex(pml4_phys);
+        crate::serial::serial_print("\n");
         
         // Zero out the new PML4
         core::ptr::write_bytes(pml4_ptr, 0, 4096);
         let pml4 = &mut *(pml4_ptr as *mut PageTable);
+        crate::serial::serial_print("[create_paging] PML4 zeroed OK\n");
         
         // Get current PML4 to copy kernel mappings
         let (current_pml4_phys, _) = Cr3::read();
         let current_pml4_phys_u64 = current_pml4_phys.start_address().as_u64();
+        crate::serial::serial_print("[create_paging] current CR3: ");
+        crate::serial::serial_print_hex(current_pml4_phys_u64);
+        crate::serial::serial_print("\n");
         
         // CRITICAL: Use direct PHYS_MEM_OFFSET mapping, NOT phys_to_virt
         // phys_to_virt applies kernel_phys_base offset which is WRONG for CR3
         // CR3 points to a page table that's in the direct physical map
         let current_pml4_virt = PHYS_MEM_OFFSET + current_pml4_phys_u64;
+        crate::serial::serial_print("[create_paging] current PML4 virt: ");
+        crate::serial::serial_print_hex(current_pml4_virt);
+        crate::serial::serial_print("\n");
+
+        // Let's verify we can read it
+        crate::serial::serial_print("[create_paging] verifying current PML4 readability...\n");
+        let entry0 = core::ptr::read_volatile(current_pml4_virt as *const u64);
+        crate::serial::serial_print("[create_paging] current PML4[0] raw: ");
+        crate::serial::serial_print_hex(entry0);
+        crate::serial::serial_print("\n");
         
         let current_pml4 = &*(current_pml4_virt as *const PageTable);
 
@@ -584,6 +609,7 @@ pub fn create_process_paging() -> u64 {
         for i in 0..512 {
             pml4.entries[i] = current_pml4.entries[i].clone();
         }
+        crate::serial::serial_print("[create_paging] kernel mappings copied\n");
         
         // 2. Clear PML4[0] to remove identity map/user space from the template
         // User space will be mapped explicitly via ELF loader.
@@ -598,7 +624,8 @@ pub fn create_process_paging() -> u64 {
              (x86_64::structures::paging::PageTableFlags::PRESENT | 
              x86_64::structures::paging::PageTableFlags::WRITABLE).bits()
         );
-        
+
+        crate::serial::serial_print("[create_paging] done\n");
         pml4_phys
     }
 }
@@ -974,12 +1001,15 @@ pub fn alloc_dma_buffer(size: usize, align: usize) -> Option<(*mut u8, u64)> {
         let ptr = alloc(layout);
         
         if ptr.is_null() {
+            crate::serial::serial_print("[MEM] alloc_dma_buffer: FAILED (null)\n");
             return None;
         }
         
         // Calculate physical address
         let virt = ptr as u64;
         let phys = virt_to_phys(virt);
+        
+        // crate::serial::serial_printf(format_args!("[MEM] alloc_dma_buffer: size={} virt=0x{:x} phys=0x{:x}\n", size, virt, phys));
         
         Some((ptr, phys))
     }

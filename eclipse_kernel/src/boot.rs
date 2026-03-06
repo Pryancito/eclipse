@@ -320,13 +320,21 @@ pub fn get_cpu_id() -> usize {
 /// Faster version of get_cpu_id using the GS segment.
 /// ONLY safe to call after load_gdt() has initialized the GS base!
 pub fn get_cpu_id_gs() -> usize {
-    let cpu_id: u32;
+    let mut cpu_id: u32;
     unsafe {
+        // Try to read CPU ID from GS:[16]
         core::arch::asm!(
             "mov {0:e}, gs:[16]",
             out(reg) cpu_id,
             options(nomem, nostack, preserves_flags)
         );
+        
+        // If GS is not yet initialized (base=0 or pointing to uninitialized memory),
+        // we might read 0xFFFF_FFFF (our sentinel) or even 0 if memory is zeroed.
+        // On real hardware, an uninitialized GS base often leads to 0 or 0xFFFFFFFF.
+        if cpu_id == 0xFFFF_FFFF || cpu_id >= MAX_SMP_CPUS as u32 {
+            return get_cpu_id();
+        }
     }
     cpu_id as usize
 }

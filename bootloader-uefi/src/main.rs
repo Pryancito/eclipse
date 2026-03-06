@@ -101,13 +101,6 @@ fn open_kernel_file(root: &mut Directory) -> uefi::Result<RegularFile> {
     // Ampliar rutas candidatas para localizar el kernel en la ESP
     // NOTA: Agregamos eclipse_microkernel como primera opción
     let candidates = [
-        // Nuevo microkernel
-        uefi::cstr16!("eclipse_microkernel"),
-        uefi::cstr16!("\\eclipse_microkernel"),
-        uefi::cstr16!("\\EFI\\BOOT\\eclipse_microkernel"),
-        uefi::cstr16!("\\boot\\eclipse_microkernel"),
-        // Kernel anterior (compatibilidad)
-        uefi::cstr16!("eclipse_kernel"),
         uefi::cstr16!("\\eclipse_kernel"),
         uefi::cstr16!("\\boot\\eclipse_kernel"),
     ];
@@ -1432,6 +1425,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let mut allocated_buffer: Option<u64> = None;
         let mut kernel_file_size = 0;
         
+        let mut fail_reason: Option<&str> = None;
         if let Ok(mut root) = open_root_fs(bs, handle) {
             if let Ok(mut file) = open_kernel_file(&mut root) {
                 if let Ok(size) = read_file_size(&mut file) {
@@ -1450,15 +1444,34 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                                 break;
                             }
                         }
-                        kernel_data = buf;
+                        if total_read == 0 {
+                            fail_reason = Some("BL: Lectura del archivo kernel devolvio 0 bytes\r\n");
+                            kernel_data = &[];
+                        } else {
+                            kernel_data = buf;
+                        }
+                    } else {
+                        fail_reason = Some("BL: No se pudo asignar memoria para el kernel\r\n");
                     }
+                } else {
+                    fail_reason = Some("BL: No se pudo obtener tamano del archivo kernel\r\n");
                 }
+            } else {
+                fail_reason = Some("BL: No se encontro \\eclipse_kernel ni \\boot\\eclipse_kernel\r\n");
             }
+        } else {
+            fail_reason = Some("BL: No se pudo abrir el volumen FS del dispositivo de arranque\r\n");
         }
         
         if kernel_data.is_empty() {
-             unsafe { serial_write_str("BL: Error al leer el archivo del kernel dsde FS\r\n"); }
-             loop { unsafe { core::hint::spin_loop(); } }
+            unsafe {
+                serial_write_str("BL: Error al leer el archivo del kernel desde FS\r\n");
+                if let Some(msg) = fail_reason {
+                    serial_write_str(msg);
+                }
+                serial_write_str("BL: Coloca eclipse_kernel en la raiz (\\eclipse_kernel) o en \\boot\\eclipse_kernel de la particion EFI donde esta el .efi\r\n");
+            }
+            loop { unsafe { core::hint::spin_loop(); } }
         }
 
         match load_kernel_from_data(bs, kernel_data) {

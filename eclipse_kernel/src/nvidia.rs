@@ -37,7 +37,7 @@
 //! - open-gpu-kernel-modules: https://github.com/NVIDIA/open-gpu-kernel-modules
 
 use crate::pci::{PciDevice, find_nvidia_gpus, get_bar};
-use crate::memory::{map_mmio_range, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
+use crate::memory::{map_mmio_range, map_framebuffer_kernel, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
 use crate::serial;
 use crate::filesystem;
 use alloc::vec::Vec;
@@ -59,6 +59,128 @@ struct NvidiaFbInfo {
 }
 
 static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
+
+/// Kernel mapping of BAR1 framebuffer (size mapped) so we only map once.
+static NVIDIA_BAR1_MAPPED_SIZE: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Fill a rectangle on the NVIDIA BAR1 framebuffer (used by sys_gpu_command(1, 0, ...)).
+/// Payload: x (u32), y (u32), w (u32), h (u32), color (u32) = 20 bytes, little-endian.
+/// Maps BAR1 in kernel on first use and writes pixels (32bpp ARGB).
+pub fn fill_rect(payload: &[u8]) -> bool {
+    if payload.len() < 20 {
+        return false;
+    }
+    let (phys, width, height, pitch) = match get_nvidia_fb_info() {
+        Some(t) => t,
+        None => return false,
+    };
+    let x = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+    let y = u32::from_le_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+    let w = u32::from_le_bytes(payload[8..12].try_into().unwrap_or([0; 4]));
+    let h = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4]));
+    let color = u32::from_le_bytes(payload[16..20].try_into().unwrap_or([0; 4]));
+
+    let x = x.min(width);
+    let y = y.min(height);
+    let w = w.saturating_sub(0).min(width.saturating_sub(x));
+    let h = h.saturating_sub(0).min(height.saturating_sub(y));
+    if w == 0 || h == 0 {
+        return true;
+    }
+
+    let size = (pitch as usize).saturating_mul(height as usize);
+    {
+        let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
+        if guard.is_none() {
+            map_framebuffer_kernel(phys, size);
+            *guard = Some(size);
+        }
+    }
+
+    let vaddr = crate::memory::FB_VADDR_BASE + phys;
+    let pitch_usize = pitch as usize;
+    let ptr = (vaddr as *mut u32);
+    let pitch_u32 = (pitch_usize / 4).max(1);
+    for py in 0..h {
+        let row_start = (y + py) as usize * pitch_u32 + (x as usize);
+        for px in 0..w {
+            unsafe {
+                core::ptr::write_volatile(ptr.add(row_start + px as usize), color);
+            }
+        }
+    }
+    true
+}
+
+/// Blit (copy) a rectangle within the NVIDIA BAR1 framebuffer (sys_gpu_command(1, 1, ...)).
+/// Payload: src_x, src_y, dst_x, dst_y, w, h (6×u32 = 24 bytes), little-endian.
+/// Overlapping regions are handled by copying in reverse row order when dst_y > src_y.
+pub fn blit_rect(payload: &[u8]) -> bool {
+    if payload.len() < 24 {
+        return false;
+    }
+    let (phys, width, height, pitch) = match get_nvidia_fb_info() {
+        Some(t) => t,
+        None => return false,
+    };
+    let src_x = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+    let src_y = u32::from_le_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+    let dst_x = u32::from_le_bytes(payload[8..12].try_into().unwrap_or([0; 4]));
+    let dst_y = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4]));
+    let w = u32::from_le_bytes(payload[16..20].try_into().unwrap_or([0; 4]));
+    let h = u32::from_le_bytes(payload[20..24].try_into().unwrap_or([0; 4]));
+
+    let w = w.min(width.saturating_sub(src_x)).min(width.saturating_sub(dst_x));
+    let h = h.min(height.saturating_sub(src_y)).min(height.saturating_sub(dst_y));
+    if w == 0 || h == 0 {
+        return true;
+    }
+
+    let size = (pitch as usize).saturating_mul(height as usize);
+    {
+        let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
+        if guard.is_none() {
+            map_framebuffer_kernel(phys, size);
+            *guard = Some(size);
+        }
+    }
+
+    let vaddr = crate::memory::FB_VADDR_BASE + phys;
+    let pitch_u32 = ((pitch as usize) / 4).max(1);
+    let ptr = (vaddr as *mut u32);
+
+    let same_row_overlap = dst_y == src_y && dst_x > src_x && dst_x < src_x + w;
+    let overlap_down = dst_y > src_y && dst_y < src_y + h;
+
+    if same_row_overlap {
+        for py in 0..h {
+            let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
+            let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+            unsafe {
+                for i in (0..w as usize).rev() {
+                    core::ptr::write(ptr.add(dst_row + i), core::ptr::read(ptr.add(src_row + i)));
+                }
+            }
+        }
+    } else if overlap_down {
+        for py in (0..h).rev() {
+            let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
+            let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+            unsafe {
+                core::ptr::copy(ptr.add(src_row), ptr.add(dst_row), w as usize);
+            }
+        }
+    } else {
+        for py in 0..h {
+            let src_row = (src_y + py) as usize * pitch_u32 + (src_x as usize);
+            let dst_row = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+            unsafe {
+                core::ptr::copy(ptr.add(src_row), ptr.add(dst_row), w as usize);
+            }
+        }
+    }
+    true
+}
 
 /// Return (phys, width, height, pitch) of the NVIDIA BAR1 linear aperture,
 /// or None if no NVIDIA GPU was detected / BAR1 is not accessible.

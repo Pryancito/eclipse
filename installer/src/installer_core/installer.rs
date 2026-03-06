@@ -61,7 +61,7 @@ impl EclipseInstaller {
         println!("\n[5/5] Configurando arranque UEFI...");
         {
             let efi_mount = self.mount_manager.mount_efi(&efi_part)?;
-            self.uefi_manager.install_bootloader(efi_mount)?;
+            self.uefi_manager.install_bootloader(efi_mount, self.preparer.get_sysroot_path())?;
             self.uefi_manager.create_uefi_config(efi_mount)?;
             self.mount_manager.unmount_all()?;
         }

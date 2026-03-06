@@ -51,7 +51,7 @@ const MIN_ENTRY_POINT: u64 = 0x80;
 /// Cargar los segmentos del ELF en el espacio de direcciones especificado
 /// Devuelve Ok((entry_point, max_vaddr, segment_frames))
 pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    // Verificar header ELF
+    serial::serial_printf(format_args!("[load_elf] start len={} cr3=0x{:x}\n", elf_data.len(), page_table_phys));
     if elf_data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("ELF: File too small");
     }
@@ -101,6 +101,8 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
         let ph = unsafe { &*(elf_data[ph_offset_entry..].as_ptr() as *const Elf64ProgramHeader) };
         
         if ph.p_type == PT_LOAD {
+            serial::serial_printf(format_args!("[load_elf] loading segment {}: vaddr=0x{:x} filesz=0x{:x} memsz=0x{:x}\n", 
+                i, ph.p_vaddr, ph.p_filesz, ph.p_memsz));
             let vaddr_start = ph.p_vaddr;
             let vaddr_end = vaddr_start + ph.p_memsz;
             let file_size = ph.p_filesz;
@@ -116,21 +118,20 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
 
             let mut current_vaddr = page_start;
             while current_vaddr < page_end {
-
-                // Check if this virtual page is already mapped (from a prior overlapping
-                // PT_LOAD segment). If so, reuse the existing physical frame; if not,
-                // allocate a fresh zeroed page.
+                // Check if this virtual page is already mapped 
                 let (phys, allocated_new) = if let Some(existing_phys) = crate::memory::get_user_page_phys(page_table_phys, current_vaddr) {
                     (existing_phys, false)
                 } else if let Some(new_phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
                     (new_phys, true)
                 } else {
+                    serial::serial_printf(format_args!("[load_elf] ERROR: allocation failed at 0x{:x}\n", current_vaddr));
                     return Err("Failed to allocate 4KB anonymous frame for segment");
                 };
 
                 let kptr = crate::memory::phys_to_virt(phys) as *mut u8;
                 if allocated_new {
                     // Zero the new block
+                    // serial::serial_printf(format_args!("[load_elf] mapped 0x{:x} -> 0x{:x}\n", current_vaddr, phys));
                     unsafe { core::ptr::write_bytes(kptr, 0, 0x1000); }
                     mapped_count += 1;
                     // Map it into the page table
@@ -140,10 +141,9 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
                         phys,
                         crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
                     );
-                } // end if allocated_new
+                } 
 
-                // Always copy the file data portion that overlaps this page,
-                // whether the page was newly allocated or reused.
+                // Always copy the file data portion that overlaps this page
                 if file_size > 0 {
                     let page_vaddr_start = current_vaddr;
                     let page_vaddr_end = current_vaddr + 0x1000;
@@ -177,12 +177,13 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
     
     // Align max_vaddr to next 4KB page
     let max_vaddr_aligned = (max_vaddr + 0xFFF) & !0xFFF;
-    
+    serial::serial_printf(format_args!("[load_elf] successfully loaded: entry=0x{:x} max_v=0x{:x} mapped_pages={}\n", header.e_entry, max_vaddr_aligned, mapped_count));
     Ok((header.e_entry, max_vaddr_aligned, (mapped_count as u64) * 512))
 }
 
 /// Preparar el stack de usuario
 pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize) -> Result<u64, &'static str> {
+    serial::serial_printf(format_args!("[setup_stack] start base=0x{:x} size={} pages={}\n", stack_base, stack_size, stack_size / 4096));
     for i in 0..(stack_size / 4096) {
         if let Some(phys) = crate::memory::alloc_phys_frame_for_anon_mmap() {
             let offset = (i as u64) * 0x1000;
@@ -193,11 +194,11 @@ pub fn setup_user_stack(page_table_phys: u64, stack_base: u64, stack_size: usize
                 crate::memory::PAGE_WRITABLE | crate::memory::PAGE_USER
             );
         } else {
+            serial::serial_printf(format_args!("[setup_stack] alloc failed at page {}\n", i));
             return Err("Failed to allocate 4KB anonymous frame for user stack");
         }
     }
-    
-    // crate::memory::walk_page_table(page_table_phys, stack_base);
+    serial::serial_print("[setup_stack] done\n");
     Ok(stack_base + stack_size as u64)
 }
 

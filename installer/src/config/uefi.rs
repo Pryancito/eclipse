@@ -1,21 +1,36 @@
 use std::fs;
 use std::path::Path;
-use anyhow::Result;
+use anyhow::{Result, Context};
 
 pub struct UefiManager;
 
 impl UefiManager {
-    pub fn install_bootloader(&self, mount_point: &Path) -> Result<()> {
+    /// Instala bootloader y kernel en la partición EFI montada.
+    /// `sysroot`: directorio ya preparado por el preparer (contiene boot/eclipse_kernel). Se usa como origen del kernel.
+    pub fn install_bootloader(&self, mount_point: &Path, sysroot: &Path) -> Result<()> {
+        // 1) Copiar kernel a /boot/ de la EFI primero (el bootloader busca \boot\eclipse_kernel)
+        println!("       📦 Copiando kernel a EFI/boot...");
+        let efi_boot_dir = mount_point.join("boot");
+        fs::create_dir_all(&efi_boot_dir).context("crear directorio boot en EFI")?;
+        let kernel_src = sysroot.join("boot").join("eclipse_kernel");
+        if !kernel_src.exists() {
+            return Err(anyhow::anyhow!(
+                "eclipse_kernel no encontrado en sysroot: {:?}. Compila el kernel antes de instalar.",
+                kernel_src
+            ));
+        }
+        let kernel_dest = efi_boot_dir.join("eclipse_kernel");
+        fs::copy(&kernel_src, &kernel_dest).context("copiar eclipse_kernel a EFI/boot")?;
+        println!("         ✓ eclipse_kernel copiado a /boot/ de la particion EFI");
+
+        // 2) Bootloader UEFI
         println!("       🚀 Instalando bootloader UEFI...");
         let boot_dir = mount_point.join("EFI/BOOT");
         let eclipse_dir = mount_point.join("EFI/eclipse");
-        
         fs::create_dir_all(&boot_dir)?;
         fs::create_dir_all(&eclipse_dir)?;
-        
         let src = crate::paths::resolve_path("../bootloader-uefi/target/x86_64-unknown-uefi/release/eclipse-bootloader.efi");
         let debug_src = crate::paths::resolve_path("../bootloader-uefi/target/x86_64-unknown-uefi/debug/eclipse-bootloader.efi");
-        
         let bootloader_src = if src.exists() {
             src
         } else if debug_src.exists() {
@@ -24,11 +39,10 @@ impl UefiManager {
         } else {
             return Err(anyhow::anyhow!("Bootloader not found at {:?} or {:?}", src, debug_src));
         };
-
         fs::copy(&bootloader_src, boot_dir.join("BOOTX64.EFI"))?;
         fs::copy(&bootloader_src, eclipse_dir.join("eclipse-bootloader.efi"))?;
         println!("         ✓ Bootloader copiado");
-        
+
         Ok(())
     }
 

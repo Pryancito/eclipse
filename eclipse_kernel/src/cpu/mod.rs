@@ -190,9 +190,6 @@ pub fn start_aps() {
 
         *copy_cr3 = cr3;
         *copy_entry = ap_entry as *const () as u64;
-
-        *copy_cr3 = cr3;
-        *copy_entry = ap_entry as *const () as u64;
         
         // 3. Identity mapping is already active (provided by bootloader)
         // crate::memory::set_identity_map(true);
@@ -259,6 +256,7 @@ pub fn start_aps() {
                 .saturating_mul(1_000)   // total for 1000 ms
                 .max(MIN_TSC_CEILING);
             let tsc_start = rdtsc();
+            serial_printf(format_args!("[CPU] Waiting for AP {} to signal readiness (expected: {})...\n", target_apic_id, expected_ready));
             while AP_READY.load(Ordering::SeqCst) < expected_ready {
                 if crate::interrupts::ticks() >= timeout_tick {
                     break;
@@ -270,9 +268,13 @@ pub fn start_aps() {
             }
             
             if AP_READY.load(Ordering::SeqCst) < expected_ready {
-                serial_printf(format_args!("[CPU] WARNING: AP {} (APIC ID {}) failed to start (timeout)\n", i, target_apic_id));
+                let elapsed_ticks = crate::interrupts::ticks().saturating_sub(timeout_tick - 1000);
+                let elapsed_tsc = rdtsc().wrapping_sub(tsc_start);
+                serial_printf(format_args!("[CPU] WARNING: AP {} (APIC ID {}) failed to start after {} ticks, {} TSC cycles (timeout)\n", i, target_apic_id, elapsed_ticks, elapsed_tsc));
             } else {
-                serial_printf(format_args!("[CPU] AP {} (APIC ID {}) started successfully\n", i, target_apic_id));
+                let elapsed_ticks = crate::interrupts::ticks().saturating_sub(timeout_tick - 1000);
+                let elapsed_tsc = rdtsc().wrapping_sub(tsc_start);
+                serial_printf(format_args!("[CPU] AP {} (APIC ID {}) started successfully in {} ticks ({} TSC cycles)\n", i, target_apic_id, elapsed_ticks, elapsed_tsc));
             }
         }
         
@@ -478,15 +480,60 @@ pub extern "C" fn ap_entry() -> ! {
 
     // 2. Load the shared IDT (populated by the BSP in interrupts::init())
     crate::interrupts::load_idt();
+    
+    // Trace '[[IDTOK]]'
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 0x5B", "out dx, al", "out dx, al",
+            "mov al, 0x49", "out dx, al", // 'I'
+            "mov al, 0x44", "out dx, al", // 'D'
+            "mov al, 0x54", "out dx, al", // 'T'
+            "mov al, 0x4F", "out dx, al", // 'O'
+            "mov al, 0x4B", "out dx, al", // 'K'
+            "mov al, 0x5D", "out dx, al", "out dx, al",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     // 3. Enable the Local APIC for this AP
     crate::apic::init();
+    
+    // Trace '[[APCOK]]'
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 0x5B", "out dx, al", "out dx, al",
+            "mov al, 0x41", "out dx, al", // 'A'
+            "mov al, 0x50", "out dx, al", // 'P'
+            "mov al, 0x43", "out dx, al", // 'C'
+            "mov al, 0x4F", "out dx, al", // 'O'
+            "mov al, 0x4B", "out dx, al", // 'K'
+            "mov al, 0x5D", "out dx, al", "out dx, al",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     // 4. Enable SSE (per-CPU CR0/CR4 bits; must mirror boot::enable_sse() on BSP)
     crate::boot::enable_sse();
 
     // 5. Program the Page Attribute Table MSR (IA32_PAT) – this is a per-CPU MSR
     crate::memory::init_pat();
+    
+    // Trace '[[PATOK]]'
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 0x5B", "out dx, al", "out dx, al",
+            "mov al, 0x50", "out dx, al", // 'P'
+            "mov al, 0x41", "out dx, al", // 'A'
+            "mov al, 0x54", "out dx, al", // 'T'
+            "mov al, 0x4F", "out dx, al", // 'O'
+            "mov al, 0x4B", "out dx, al", // 'K'
+            "mov al, 0x5D", "out dx, al", "out dx, al",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     // 6. Enable SYSCALL/SYSRET and set up STAR/LSTAR/SFMASK – per-CPU MSRs
     crate::interrupts::init_ap();
@@ -504,6 +551,21 @@ pub extern "C" fn ap_entry() -> ! {
     let cpu_id = crate::apic::get_id();
     wait_ms((cpu_id as u64 % 8) * 2); // Small jitter before starting timer
     crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
+
+    // Trace '[[TMROK]]'
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 0x5B", "out dx, al", "out dx, al",
+            "mov al, 0x54", "out dx, al", // 'T'
+            "mov al, 0x4D", "out dx, al", // 'M'
+            "mov al, 0x52", "out dx, al", // 'R'
+            "mov al, 0x4F", "out dx, al", // 'O'
+            "mov al, 0x4B", "out dx, al", // 'K'
+            "mov al, 0x5D", "out dx, al", "out dx, al",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     serial_printf(format_args!("[CPU] AP (APIC ID {}) ready, switching to main loop\n", cpu_id));
     
