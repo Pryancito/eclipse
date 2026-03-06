@@ -310,3 +310,41 @@ pub mod objects {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{WaylandConnection, WaylandHeader, decode_args, WaylandArg};
+
+    #[test]
+    fn test_stress_wayland_header() {
+        const ITERS: u32 = 100_000;
+        for i in 0..ITERS {
+            let h = WaylandHeader::new((i % 256) as u32, (i % 256) as u16, 12);
+            assert_eq!(h.size(), 12);
+            assert_eq!(h.opcode(), (i % 256) as u16);
+        }
+    }
+
+    #[test]
+    fn test_stress_send_event() {
+        const ITERS: u32 = 20_000;
+        let mut conn = WaylandConnection::new();
+        for i in 0..ITERS {
+            let args = (i as u32).to_le_bytes();
+            conn.send_event(2, (i % 64) as u16, &args);
+        }
+        assert_eq!(conn.pending_events.len(), ITERS as usize);
+    }
+
+    #[test]
+    fn test_stress_decode_args_u() {
+        const ITERS: u32 = 50_000;
+        let data = [0x78, 0x56, 0x34, 0x12]; // one u32 little-endian
+        for _ in 0..ITERS {
+            let (decoded, _) = decode_args("u", &data);
+            if let Some(WaylandArg::Uint(u)) = decoded.get(0) {
+                assert_eq!(*u, 0x12345678);
+            }
+        }
+    }
+}

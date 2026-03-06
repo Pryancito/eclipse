@@ -194,7 +194,7 @@ mod impl_parse {
     }
 }
 
-#[cfg(feature = "testable")]
+#[cfg(any(test, feature = "testable"))]
 pub use impl_parse::{parse_fast, parse_slow};
-#[cfg(not(feature = "testable"))]
+#[cfg(not(any(test, feature = "testable")))]
 pub(crate) use impl_parse::{parse_fast, parse_slow};

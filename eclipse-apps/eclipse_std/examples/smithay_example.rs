@@ -1,10 +1,10 @@
 //! Smithay App example using eclipse_std
 
 use eclipse_std::prelude::*;
-use eclipse_libc::{getpid, yield_cpu};
+use libc::{getpid, yield_cpu};
 
 fn main() {
-    let pid = getpid();
+    let pid = unsafe { getpid() };
     
     println!("╔════════════════════════════════════════════════╗");
     println!("║      SMITHAY COMPOSITOR (eclipse_std)          ║");
@@ -13,7 +13,7 @@ fn main() {
     
     // Can now use String and Vec!
     let compositor_name = String::from("Smithay Compositor");
-    let mut client_list = Vec::new();
+    let mut client_list: Vec<String> = Vec::new();
     
     println!("[SMITHAY] {}", compositor_name);
     println!("[SMITHAY] Clients connected: {}", client_list.len());
@@ -22,7 +22,7 @@ fn main() {
     for i in 0..5 {
         println!("[SMITHAY] Initialization step {}/5", i + 1);
         for _ in 0..1000 {
-            yield_cpu();
+            unsafe { yield_cpu(); }
         }
     }
     
@@ -35,6 +35,6 @@ fn main() {
         if counter % 1000000 == 0 {
             println!("[SMITHAY] [Status] Active - iterations: {}", counter);
         }
-        yield_cpu();
+        unsafe { yield_cpu(); }
     }
 }

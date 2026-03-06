@@ -53,25 +53,28 @@ static mut STDERR_STRUCT: FILE = FILE {
     lock: AtomicI32::new(0),
 };
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub static mut stdin: *mut FILE = &raw mut STDIN_STRUCT as *mut FILE;
 
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub static mut stdout: *mut FILE = &raw mut STDOUT_STRUCT as *mut FILE;
 
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub static mut stderr: *mut FILE = &raw mut STDERR_STRUCT as *mut FILE;
 
-#[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(any(test, feature = "host-testing", not(any(target_os = "none", target_os = "linux", eclipse_target))))]
 extern "C" {
     pub static mut stdin: *mut FILE;
     pub static mut stdout: *mut FILE;
     pub static mut stderr: *mut FILE;
 }
 
-#[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(any(test, feature = "host-testing", not(any(target_os = "none", target_os = "linux", eclipse_target))))]
 mod host {
     use super::*;
     
@@ -96,10 +99,10 @@ mod host {
     }
 }
 
-#[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(any(test, feature = "host-testing", not(any(target_os = "none", target_os = "linux", eclipse_target))))]
 pub use self::host::*;
 
-#[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 mod target {
     use super::*;
     use crate::c_str::strlen;
@@ -906,28 +909,38 @@ mod target {
             Err(_) => -1,
         }
     }
+}
 
-    pub struct StdoutWriter;
+pub struct StdoutWriter;
 
-    impl core::fmt::Write for StdoutWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            unsafe {
+impl core::fmt::Write for StdoutWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        unsafe {
+            #[cfg(not(any(test, feature = "host-testing")))]
+            {
                 let _ = sys_write(1, s.as_bytes());
             }
-            Ok(())
+            #[cfg(any(test, feature = "host-testing"))]
+            {
+                use crate::header::unistd::write;
+                let _ = write(1, s.as_ptr() as *const crate::types::c_void, s.len());
+            }
         }
-    }
-
-    pub fn _print(args: core::fmt::Arguments) {
-        use core::fmt::Write;
-        let mut writer = StdoutWriter;
-        let _ = writer.write_fmt(args);
+        Ok(())
     }
 }
 
+pub fn _print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let mut writer = StdoutWriter;
+    let _ = writer.write_fmt(args);
+}
+
 #[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub use self::target::*;
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setlinebuf(_stream: *mut FILE) {
     // Stub

@@ -12,6 +12,14 @@ eclipse-syscall = { path = "../../../eclipse-syscall" }
 name = "input_service"
 path = "src/main.rs"
 
+[[bin]]
+name = "input_service_tests"
+path = "src/test_runner.rs"
+required-features = ["test"]
+
+[features]
+test = []
+
 [profile.release]
 panic = "abort"
 lto = true

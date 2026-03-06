@@ -9,6 +9,7 @@ use crate::math::floor_f32;
 ///
 /// Construct with concrete sizes:
 /// ```no_run
+/// use sidewind_opengl::Texture2D;
 /// let tex: Texture2D<1920, 1080, {1920 * 1080 * 4}> = Texture2D::new();
 /// ```
 pub struct Texture2D<const W: usize, const H: usize, const N: usize> {

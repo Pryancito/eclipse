@@ -3,7 +3,6 @@ pub const MAX_WINDOWS_COUNT: usize = 16;
 pub const MAX_SURFACE_DIM: u32 = 8192;
 pub const MAX_SURFACE_BYTES: u64 = 128 * 1024 * 1024;
 
-use std::prelude::*;
 use core::iter::Iterator;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,6 +36,19 @@ pub struct ShellWindow {
     pub stored_rect: (i32, i32, i32, i32),
     pub workspace: u8,
     pub content: WindowContent,
+}
+
+impl Default for ShellWindow {
+    fn default() -> Self {
+        Self {
+            x: 0, y: 0, w: 0, h: 0,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (0, 0, 0, 0),
+            workspace: 0,
+            content: WindowContent::None,
+        }
+    }
 }
 
 impl ShellWindow {
@@ -85,6 +97,26 @@ pub struct ExternalSurface {
     pub active: bool,
 }
 
+impl Default for ExternalSurface {
+    fn default() -> Self {
+        Self {
+            id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false,
+        }
+    }
+}
+
+impl ExternalSurface {
+    pub fn unmap(&mut self) {
+        if self.vaddr != 0 && self.vaddr != 0x1000 {
+            unsafe {
+                std::libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
+            }
+        }
+        self.vaddr = 0;
+        self.active = false;
+    }
+}
+
 pub fn focus_under_cursor(px: i32, py: i32, windows: &[ShellWindow], count: usize) -> Option<usize> {
     for i in (0..count).rev() {
         let w = &windows[i];
@@ -106,4 +138,193 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
         i = (i.wrapping_add(step)) % count;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_contains() {
+        let win = ShellWindow {
+            x: 10, y: 10, w: 100, h: 100,
+            curr_x: 10.0, curr_y: 10.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (10, 10, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        assert!(win.contains(50, 50));
+        assert!(win.contains(10, 10));
+        assert!(win.contains(109, 109));
+        assert!(!win.contains(9, 50));
+        assert!(!win.contains(110, 50));
+    }
+
+    #[test]
+    fn test_title_bar_contains() {
+        let win = ShellWindow {
+            x: 10, y: 10, w: 100, h: 100,
+            curr_x: 10.0, curr_y: 10.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (10, 10, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        assert!(win.title_bar_contains(50, 20));
+        assert!(!win.title_bar_contains(50, 50));
+    }
+
+    #[test]
+    fn test_check_button_click() {
+        let win = ShellWindow {
+            x: 100, y: 100, w: 200, h: 100,
+            curr_x: 100.0, curr_y: 100.0, curr_w: 200.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (100, 100, 200, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        // Close button: self.x + self.w - btn_size - btn_margin = 100 + 200 - 16 - 5 = 279
+        // Title bar height: 26. btn_y = y + (26 - 16)/2 = 100 + 5 = 105. btn_size=16. y range [105, 121)
+        assert_eq!(win.check_button_click(285, 110), WindowButton::Close);
+        assert_eq!(win.check_button_click(264, 110), WindowButton::Maximize);
+        assert_eq!(win.check_button_click(243, 110), WindowButton::Minimize);
+        assert_eq!(win.check_button_click(150, 110), WindowButton::None);
+    }
+
+    #[test]
+    fn test_contains_boundary() {
+        let win = ShellWindow {
+            x: 10, y: 20, w: 100, h: 50,
+            curr_x: 10.0, curr_y: 20.0, curr_w: 100.0, curr_h: 50.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (10, 20, 100, 50), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        assert!(win.contains(10, 20));
+        assert!(win.contains(109, 69));
+        assert!(!win.contains(110, 69));
+        assert!(!win.contains(10, 70));
+    }
+
+    #[test]
+    fn test_focus_under_cursor_empty() {
+        let windows: [ShellWindow; 2] = [
+            ShellWindow { content: WindowContent::None, ..Default::default() },
+            ShellWindow { content: WindowContent::None, ..Default::default() },
+        ];
+        assert_eq!(focus_under_cursor(50, 50, &windows, 0), None);
+    }
+
+    #[test]
+    fn test_focus_under_cursor_stacked() {
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 200, h: 200,
+                curr_x: 0.0, curr_y: 0.0, curr_w: 200.0, curr_h: 200.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (0, 0, 200, 200), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+            ShellWindow {
+                x: 50, y: 50, w: 100, h: 100,
+                curr_x: 50.0, curr_y: 50.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (50, 50, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+        ];
+        assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(1));
+        assert_eq!(focus_under_cursor(25, 25, &windows, 2), Some(0));
+    }
+
+    #[test]
+    fn test_next_visible_empty() {
+        let windows: [ShellWindow; 1] = [ShellWindow::default()];
+        assert_eq!(next_visible(0, true, &windows, 0), None);
+    }
+
+    #[test]
+    fn test_next_visible_skips_minimized() {
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 100, h: 100,
+                curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: true, maximized: false, closing: false,
+                stored_rect: (0, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+            ShellWindow {
+                x: 200, y: 0, w: 100, h: 100,
+                curr_x: 200.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (200, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+        ];
+        assert_eq!(next_visible(0, true, &windows, 2), Some(1));
+        assert_eq!(next_visible(1, false, &windows, 2), Some(1));
+    }
+
+    #[test]
+    fn test_next_visible_all_minimized_returns_none() {
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 100, h: 100,
+                curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: true, maximized: false, closing: false,
+                stored_rect: (0, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+            ShellWindow {
+                x: 200, y: 0, w: 100, h: 100,
+                curr_x: 200.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: true, maximized: false, closing: false,
+                stored_rect: (200, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+        ];
+        assert_eq!(next_visible(0, true, &windows, 2), None);
+    }
+
+    #[test]
+    fn test_next_visible_single_window() {
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 100, h: 100,
+                curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (0, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+        ];
+        assert_eq!(next_visible(0, true, &windows, 1), Some(0));
+        assert_eq!(next_visible(0, false, &windows, 1), Some(0));
+    }
+
+    /// Stress: focus_under_cursor y next_visible muchas veces con varias ventanas.
+    #[test]
+    fn test_stress_focus_and_next_visible() {
+        let windows = [
+            ShellWindow {
+                x: 0, y: 0, w: 100, h: 100,
+                curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (0, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+            ShellWindow {
+                x: 100, y: 0, w: 100, h: 100,
+                curr_x: 100.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+                minimized: false, maximized: false, closing: false,
+                stored_rect: (100, 0, 100, 100), workspace: 0,
+                content: WindowContent::InternalDemo,
+            },
+        ];
+        const ITERS: u32 = 50_000;
+        for _ in 0..ITERS {
+            assert_eq!(focus_under_cursor(50, 50, &windows, 2), Some(0));
+            assert_eq!(focus_under_cursor(150, 50, &windows, 2), Some(1));
+            assert_eq!(next_visible(0, true, &windows, 2), Some(1));
+            assert_eq!(next_visible(0, false, &windows, 2), Some(1));
+        }
+    }
 }

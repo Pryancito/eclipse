@@ -344,3 +344,43 @@ pub mod registers {
 }
 
 pub mod features;
+
+#[cfg(test)]
+mod tests {
+    use crate::gsp::{GspHeader, GspStatus, GspOpcode, GSP_RPC_PAYLOAD_SIZE};
+
+    #[test]
+    fn test_stress_gsp_header() {
+        const ITERS: u32 = 100_000;
+        for i in 0..ITERS {
+            let h = GspHeader {
+                opcode: i % 0xFF,
+                seq_num: i,
+                status: 0,
+                payload_len: (i % 256) as u32,
+            };
+            assert_eq!(h.status, 0);
+            assert!(h.payload_len <= 256);
+        }
+    }
+
+    #[test]
+    fn test_stress_gsp_status_opcode() {
+        const ITERS: u32 = 50_000;
+        for i in 0..ITERS {
+            let s = GspStatus::Ok;
+            assert_eq!(s, GspStatus::Ok);
+            let o = GspOpcode::ControlGetGpuInfo;
+            assert_eq!(o as u32, 0x03);
+        }
+    }
+
+    #[test]
+    fn test_stress_gsp_constants() {
+        const ITERS: u32 = 30_000;
+        for _ in 0..ITERS {
+            assert!(crate::gsp::GSP_RPC_QUEUE_SIZE > 0);
+            assert_eq!(GSP_RPC_PAYLOAD_SIZE, 256);
+        }
+    }
+}

@@ -155,7 +155,7 @@ macro_rules! main {
 }
 
 /// Panic handler for Eclipse OS applications
-#[cfg(feature = "panic-handler")]
+#[cfg(all(feature = "panic-handler", not(feature = "no-panic-handler"), not(test)))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     crate::eprintln!("\n!!! ECLIPSE APP PANIC !!!");
@@ -172,7 +172,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 /// Alloc error handler
-#[cfg(feature = "alloc-error-handler")]
+#[cfg(all(feature = "alloc-error-handler", not(feature = "no-panic-handler"), not(test)))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     crate::eprintln!("\n!!! ALLOCATION ERROR !!!");

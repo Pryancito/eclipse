@@ -1,6 +1,7 @@
 //! locale.h - Localization
 use crate::types::*;
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> *mut c_char {
     // Stub implementation: always return "C" or NULL
@@ -11,6 +12,7 @@ pub unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> 
     b"C\0".as_ptr() as *mut c_char
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn localeconv() -> *mut c_void {
     // Stub: return NULL or pointer to static lconv

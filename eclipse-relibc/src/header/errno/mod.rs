@@ -6,6 +6,7 @@ use crate::types::*;
 static mut ERRNO: c_int = 0;
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe fn __errno_location() -> *mut c_int {
     &raw mut ERRNO as *mut c_int
@@ -55,6 +56,7 @@ pub const ENOSYS: c_int = 35;
 pub const EWOULDBLOCK: c_int = EAGAIN;
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: size_t) -> c_int {
     let msg = strerror(errnum);
@@ -72,6 +74,7 @@ extern "C" {
 }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn perror(s: *const c_char) {
     use crate::header::stdio::stderr;
@@ -104,6 +107,7 @@ extern "C" {
 }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strerror(errnum: c_int) -> *const c_char {
     let msg: &[u8] = match errnum {

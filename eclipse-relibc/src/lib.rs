@@ -16,6 +16,7 @@ macro_rules! println {
     ($fmt:expr, $($arg:tt)*) => ($crate::print!(core::concat!($fmt, "\n"), $($arg)*));
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 core::arch::global_asm!(include_str!("posix_stubs.s"));
 
 extern crate alloc;
@@ -113,7 +114,7 @@ pub const SYS_getrandom: c_int = eclipse_syscall::number::SYS_GETRANDOM as c_int
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub const SYS_getrandom: c_int = 318;
 
-#[cfg(any(target_os = "none", target_os = "linux", eclipse_target))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[no_mangle]
 pub unsafe extern "C" fn syscall(num: c_long, arg1: c_long, arg2: c_long, arg3: c_long) -> c_long {
     eclipse_syscall::syscall3(num as usize, arg1 as usize, arg2 as usize, arg3 as usize) as c_long
@@ -124,31 +125,40 @@ extern "C" {
     pub fn syscall(num: c_long, ...) -> c_long;
 }
 
-#[cfg(all(not(test), feature = "allocator", any(target_os = "none", target_os = "linux", eclipse_target)))]
+#[cfg(all(not(any(test, feature = "host-testing")), feature = "allocator", not(feature = "no-allocator"), any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[global_allocator]
 static ALLOCATOR: internal_alloc::Allocator = internal_alloc::Allocator;
 
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetRegionStart() -> usize { 0 }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetGR() { }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetIP() { }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetTextRelBase() -> usize { 0 }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetDataRelBase() -> usize { 0 }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetLanguageSpecificData() -> *const u8 { core::ptr::null() }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetIPInfo() -> usize { 0 }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __gcc_personality_v0() { }
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_Resume() { }
 
-#[cfg(all(not(test), feature = "panic-handler"))]
+#[cfg(all(not(any(test, feature = "host-testing")), feature = "panic-handler"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     use crate::header::unistd::_exit;

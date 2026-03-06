@@ -10,10 +10,24 @@ description = "Biblioteca IPC tipada no_std para Eclipse OS"
 testable = []
 # Habilita recv_async(), RecvFuture y block_on para uso con async/await o ejecutores.
 async = []
+host-testing = ["eclipse-libcstd/host-testing"]
 
 [dependencies]
 eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", default-features = false }
+eclipse-libcstd = { package = "eclipse_std", path = "../../eclipse_std" }
 sidewind_core = { path = "../../sidewind_core" }
+
+# Al ejecutar `cargo test`, Cargo une features: así eclipse-libc recibe host-testing,
+# no registra su global_allocator (mmap Eclipse) y se usa el allocator del sistema.
+[dev-dependencies]
+eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", default-features = false, features = ["host-testing"] }
+
+# Binario test_runner movido a example para evitar conflicto std vs no_std.
+# Ejecutar: cargo run -p eclipse_ipc --example test_runner --features testable,host-testing
+[[example]]
+name = "test_runner"
+path = "examples/test_runner.rs"
+required-features = ["testable", "host-testing"]
 
 [profile.release]
 panic = "abort"

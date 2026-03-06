@@ -11,6 +11,9 @@ libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-featur
 default = ["panic-handler", "alloc-error-handler"]
 panic-handler = []
 alloc-error-handler = []
+no-panic-handler = []
+no-allocator = ["libc/no-allocator"]
+host-testing = ["libc/host-testing", "no-panic-handler", "no-allocator"]
 [lib]
 name = "eclipse_std"
 path = "src/lib.rs"

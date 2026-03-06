@@ -8,6 +8,7 @@ pub struct rlimit {
     pub rlim_max: c_int,
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getrlimit(_resource: c_int, rlp: *mut rlimit) -> c_int {
     if !rlp.is_null() {
@@ -17,16 +18,19 @@ pub unsafe extern "C" fn getrlimit(_resource: c_int, rlp: *mut rlimit) -> c_int 
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setrlimit(_resource: c_int, _rlp: *const rlimit) -> c_int {
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getpriority(_which: c_int, _who: c_int) -> c_int {
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setpriority(_which: c_int, _who: c_int, _prio: c_int) -> c_int {
     0

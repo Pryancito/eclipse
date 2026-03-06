@@ -26,23 +26,27 @@ pub struct shmid_ds {
     pub shm_nattch: c_ulong,
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn shmget(_key: key_t, _size: size_t, _shmflg: c_int) -> c_int {
     // Stub: always fail
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn shmat(_shmid: c_int, _shmaddr: *const c_void, _shmflg: c_int) -> *mut c_void {
     // Stub: always fail
     !0 as *mut c_void // (void*) -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn shmdt(_shmaddr: *const c_void) -> c_int {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn shmctl(_shmid: c_int, _cmd: c_int, _buf: *mut shmid_ds) -> c_int {
     -1

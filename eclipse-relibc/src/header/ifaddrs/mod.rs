@@ -14,6 +14,7 @@ pub struct ifaddrs {
     pub ifa_data: *mut c_void,
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
     if ifap.is_null() { return -1; }
@@ -42,6 +43,7 @@ pub unsafe extern "C" fn getifaddrs(ifap: *mut *mut ifaddrs) -> c_int {
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn freeifaddrs(_ifa: *mut ifaddrs) {
     // Stub

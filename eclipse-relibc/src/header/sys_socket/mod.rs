@@ -11,6 +11,18 @@ pub struct sockaddr {
 }
 
 
+#[cfg(any(test, feature = "host-testing"))]
+extern "C" {
+    pub fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int;
+    pub fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int;
+    pub fn listen(sockfd: c_int, backlog: c_int) -> c_int;
+    pub fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int;
+    pub fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int;
+    pub fn send(sockfd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t;
+    pub fn recv(sockfd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t;
+}
+
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int {
     match sys_socket(domain as usize, type_ as usize, protocol as usize) {
@@ -19,6 +31,7 @@ pub unsafe extern "C" fn socket(domain: c_int, type_: c_int, protocol: c_int) ->
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
     match sys_bind(sockfd as usize, addr as usize, addrlen as usize) {
@@ -27,6 +40,7 @@ pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: soc
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn listen(sockfd: c_int, backlog: c_int) -> c_int {
     match sys_listen(sockfd as usize, backlog as usize) {
@@ -35,6 +49,7 @@ pub unsafe extern "C" fn listen(sockfd: c_int, backlog: c_int) -> c_int {
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
     // Note: addr and addrlen can be null. Our sys_accept wrapper handles it if we pass them.
@@ -44,6 +59,7 @@ pub unsafe extern "C" fn accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mu
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
     match sys_connect(sockfd as usize, addr as usize, addrlen as usize) {
@@ -52,36 +68,43 @@ pub unsafe extern "C" fn connect(sockfd: c_int, addr: *const sockaddr, addrlen: 
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn shutdown(_sockfd: c_int, _how: c_int) -> c_int {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn send(_sockfd: c_int, _buf: *const c_void, _len: size_t, _flags: c_int) -> ssize_t {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn recv(_sockfd: c_int, _buf: *mut c_void, _len: size_t, _flags: c_int) -> ssize_t {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getsockname(_sockfd: c_int, _addr: *mut sockaddr, _addrlen: *mut socklen_t) -> c_int {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getpeername(_sockfd: c_int, _addr: *mut sockaddr, _addrlen: *mut socklen_t) -> c_int {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn setsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *const c_void, _optlen: socklen_t) -> c_int {
     -1
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn getsockopt(_sockfd: c_int, _level: c_int, _optname: c_int, _optval: *mut c_void, _optlen: *mut socklen_t) -> c_int {
     -1

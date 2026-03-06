@@ -1,0 +1,12 @@
+pub const FONT_TERMINUS_12: ::embedded_graphics::mono_font::MonoFont = ::embedded_graphics::mono_font::MonoFont {
+    image: ::embedded_graphics::image::ImageRaw::new(
+        include_bytes!("font_terminus_12.data"),
+        96u32,
+    ),
+    glyph_mapping: &::embedded_graphics::mono_font::mapping::ASCII,
+    character_size: ::embedded_graphics::geometry::Size::new(6u32, 12u32),
+    character_spacing: 0u32,
+    baseline: 9u32,
+    underline: ::embedded_graphics::mono_font::DecorationDimensions::new(11u32, 1u32),
+    strikethrough: ::embedded_graphics::mono_font::DecorationDimensions::new(6u32, 1u32),
+};

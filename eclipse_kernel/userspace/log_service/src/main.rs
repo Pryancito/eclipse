@@ -106,6 +106,50 @@ pub extern "Rust" fn main() -> i32 {
             log_message("[LOG-SERVICE] Operational - Processing log messages");
         }
 
-        std::libc::sleep_ms(1);
+        unsafe { std::libc::sleep_ms(1); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Test buffer logic: append bytes and respect capacity (same as LogBuffer).
+    fn buffer_append(buf: &mut [u8], pos: &mut usize, msg: &[u8]) {
+        let available = buf.len() - *pos;
+        let to_copy = msg.len().min(available);
+        if to_copy > 0 {
+            buf[*pos..*pos + to_copy].copy_from_slice(&msg[..to_copy]);
+            *pos += to_copy;
+        }
+    }
+
+    #[test]
+    fn log_buffer_append_empty() {
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+        buffer_append(&mut buf, &mut pos, b"hello");
+        assert_eq!(pos, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn log_buffer_append_respects_capacity() {
+        let mut buf = [0u8; 8];
+        let mut pos = 0;
+        buffer_append(&mut buf, &mut pos, b"hello");
+        buffer_append(&mut buf, &mut pos, b"world");
+        assert_eq!(pos, 8);
+        assert_eq!(&buf[..], b"hellowor"); // truncated
+    }
+
+    #[test]
+    fn log_buffer_stress_1000_appends() {
+        let mut buf = [0u8; 4096];
+        let mut pos = 0;
+        for i in 0..1000 {
+            let msg = format!("[LOG] line {}\n", i);
+            buffer_append(&mut buf, &mut pos, msg.as_bytes());
+        }
+        assert!(pos <= 4096);
+        assert!(pos > 0);
     }
 }

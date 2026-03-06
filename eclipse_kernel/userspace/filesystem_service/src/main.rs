@@ -357,7 +357,7 @@ pub extern "Rust" fn main() -> i32 {
         // Do NOT signal READY — the rest of the system must not start without a filesystem.
         println!("[FS-SERVICE] Halting — filesystem not mounted.");
         loop {
-            std::libc::sleep_ms(100);
+            unsafe { std::libc::sleep_ms(100); }
         }
     }
 
@@ -372,6 +372,40 @@ pub extern "Rust" fn main() -> i32 {
         if heartbeat_counter % 300 == 0 {
             println!("[FS-SERVICE] Operational - Heartbeat #{}", heartbeat_counter / 300);
         }
-        std::libc::sleep_ms(100);
+        unsafe { std::libc::sleep_ms(100); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eclipsefs_lib::format::EclipseFSHeader;
+
+    #[test]
+    fn eclipsefs_magic_and_block_size() {
+        assert_eq!(ECLIPSEFS_MAGIC, b"ECLIPSEFS");
+        assert_eq!(BLOCK_SIZE, 4096);
+    }
+
+    #[test]
+    fn eclipsefs_header_from_bytes_valid() {
+        // Build minimal valid header (magic + version + offsets + inodes + checksums + times + flags)
+        let mut buf = vec![0u8; 256];
+        buf[0..9].copy_from_slice(ECLIPSEFS_MAGIC);
+        buf[9..13].copy_from_slice(&(0x00020000u32).to_le_bytes()); // version
+        buf[13..21].copy_from_slice(&(4096u64).to_le_bytes());       // inode_table_offset
+        buf[21..29].copy_from_slice(&(256u64).to_le_bytes());        // inode_table_size
+        buf[29..33].copy_from_slice(&(10u32).to_le_bytes());         // total_inodes
+        // rest can be zero
+        let header = EclipseFSHeader::from_bytes(&buf);
+        assert!(header.is_ok());
+        let h = header.unwrap();
+        assert_eq!(&h.magic[..9], b"ECLIPSEFS");
+        assert_eq!(h.total_inodes, 10);
+    }
+
+    #[test]
+    fn fallback_offsets_non_empty() {
+        assert!(!FALLBACK_OFFSETS.is_empty());
     }
 }

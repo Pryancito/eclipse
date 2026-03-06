@@ -15,6 +15,7 @@
 //! use sidewind_opengl::{GlContext, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT};
 //!
 //! // fb_ptr comes from the kernel BAR or shared-memory framebuffer.
+//! let fb_ptr = core::ptr::null_mut::<u32>();
 //! let mut gl = unsafe { GlContext::new(fb_ptr, 1920, 1080) };
 //! gl.set_clear_color(0.1, 0.1, 0.15, 1.0);
 //! gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

@@ -9,6 +9,7 @@ pub struct pollfd {
     pub revents: c_short,
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn poll(_fds: *mut pollfd, _nfds: nfds_t, _timeout: c_int) -> c_int {
     0

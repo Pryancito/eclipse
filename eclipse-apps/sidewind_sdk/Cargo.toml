@@ -11,3 +11,9 @@ embedded-graphics = "0.8.1"
 heapless = "0.8"
 micromath = "2.1.0"
 sidewind-opengl = { path = "../sidewind_opengl" }
+
+[features]
+host-testing = ["eclipse-libc/host-testing"]
+
+[dev-dependencies]
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }

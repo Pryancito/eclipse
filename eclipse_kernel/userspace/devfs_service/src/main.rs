@@ -61,6 +61,18 @@ pub extern "Rust" fn main() -> i32 {
         if heartbeat_counter % 300 == 0 {
             println!("[DevFS] Operational - Heartbeat #{}", heartbeat_counter / 300);
         }
-        std::libc::sleep_ms(100);
+        unsafe { std::libc::sleep_ms(100); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_type_display_enum() {
+        assert_eq!(DeviceType::Block as u64, 0);
+        assert_eq!(DeviceType::Char as u64, 1);
+        assert_eq!(DeviceType::Display as u64, 5);
     }
 }

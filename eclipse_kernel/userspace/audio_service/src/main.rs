@@ -344,6 +344,17 @@ pub extern "Rust" fn main() -> i32 {
             }
         }
         
-        std::libc::sleep_ms(1);
+        unsafe { std::libc::sleep_ms(1); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_device_type_variants() {
+        assert_ne!(AudioDeviceType::None, AudioDeviceType::IntelHDA);
+        assert_ne!(AudioDeviceType::IntelHDA, AudioDeviceType::AC97);
     }
 }

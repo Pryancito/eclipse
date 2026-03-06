@@ -441,6 +441,7 @@ fn detect_nvidia_gpu() -> bool {
 
 /// Enumerate available VESA modes (VBE 2.0+)
 /// Returns list of supported video modes
+#[cfg_attr(test, allow(dead_code))]
 fn enumerate_vesa_modes() -> [Option<VesaModeInfo>; 16] {
     let mut modes = [None; 16];
     let mut idx = 0;
@@ -544,6 +545,7 @@ fn enumerate_vesa_modes() -> [Option<VesaModeInfo>; 16] {
 
 /// Select best VESA mode based on available modes
 /// Prefers: higher resolution > higher color depth > double buffer support
+#[cfg_attr(test, allow(dead_code))]
 fn select_best_vesa_mode(modes: &[Option<VesaModeInfo>; 16]) -> Option<VesaModeInfo> {
     let mut best_mode: Option<VesaModeInfo> = None;
     let mut best_score = 0u32;
@@ -769,7 +771,7 @@ fn wait_for_vsync() {
     // Sleep for ~16 ms to target 60 Hz refresh rate.
     // On real hardware this frees the CPU for other processes instead of
     // burning cycles with 10 consecutive yield_cpu() calls.
-    std::libc::sleep_ms(16);
+    unsafe { std::libc::sleep_ms(16); }
 }
 
 /// 2D Acceleration: Hardware-accelerated block transfer (BitBLT)
@@ -1092,5 +1094,35 @@ pub extern "Rust" fn main() -> i32 {
         // Sleep for ~16 ms to achieve ~60 FPS. This releases the CPU to other
         // processes instead of spinning in a busy-wait loop.
         wait_for_vsync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerate_vesa_modes_returns_valid_modes() {
+        let modes = enumerate_vesa_modes();
+        let count = modes.iter().filter(|m| m.is_some()).count();
+        assert!(count >= 4, "expected at least 4 VESA modes");
+    }
+
+    #[test]
+    fn select_best_vesa_mode_prefers_high_res() {
+        let modes = enumerate_vesa_modes();
+        let best = select_best_vesa_mode(&modes);
+        let best = best.expect("at least one mode");
+        assert!(best.width >= 640 && best.height >= 480);
+        assert!(best.bpp >= 16);
+    }
+
+    #[test]
+    fn select_best_vesa_mode_stress_10k() {
+        let modes = enumerate_vesa_modes();
+        for _ in 0..10_000 {
+            let best = select_best_vesa_mode(&modes);
+            assert!(best.is_some());
+        }
     }
 }

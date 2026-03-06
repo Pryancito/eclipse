@@ -4,6 +4,7 @@
 //! entre procesos en Eclipse OS. Construida sobre `eclipse_libc`.
 //!
 //! # Ejemplo
+//!
 //! ```no_run
 //! use eclipse_ipc::prelude::*;
 //!
@@ -16,11 +17,9 @@
 //!     }
 //! }
 //! ```
-
 #![cfg_attr(not(target_env = "gnu"), no_std)]
 
 pub mod channel;
-#[cfg(feature = "async")]
 pub mod async_channel;
 pub mod protocol;
 pub mod services;
@@ -50,3 +49,6 @@ pub mod prelude {
     #[cfg(feature = "async")]
     pub use crate::async_channel::{block_on, RecvFuture};
 }
+
+#[cfg(any(test, feature = "testable"))]
+pub mod tests;

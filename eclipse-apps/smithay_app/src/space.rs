@@ -31,12 +31,18 @@ impl Space {
         }
     }
 
-    pub fn unmap_window(&mut self, index: usize) {
+    pub fn unmap_window(&mut self, index: usize, surfaces: &mut [ExternalSurface]) {
         if index < self.window_count {
-            // Shift windows down by swapping within the active slice to avoid moves.
-            let slice = &mut self.windows[..self.window_count];
+            // If this is an external surface, we should try to unmap it
+            if let WindowContent::External(s_idx) = self.windows[index].content {
+                if (s_idx as usize) < surfaces.len() {
+                    surfaces[s_idx as usize].unmap();
+                }
+            }
+
+            // Shift windows down
             for i in index..(self.window_count - 1) {
-                slice.swap(i, i + 1);
+                self.windows[i] = self.windows[i + 1];
             }
             self.window_count -= 1;
             // Clear the last slot
@@ -88,17 +94,151 @@ impl Space {
             self.windows[i].curr_h += (th - self.windows[i].curr_h) * lerp;
 
             if self.windows[i].closing && self.windows[i].curr_w < 5.0 {
-                if let WindowContent::External(s_idx) = self.windows[i].content {
-                    if (s_idx as usize) < surfaces.len() {
-                        // The actual munmap should happen in the backend/compositor level, 
-                        // but for now we follow the existing pattern.
-                        surfaces[s_idx as usize].active = false;
-                    }
-                }
-                self.unmap_window(i);
+                self.unmap_window(i, surfaces);
             } else {
                 i += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_space_map_unmap() {
+        let mut space = Space::new();
+        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; crate::compositor::MAX_EXTERNAL_SURFACES];
+        
+        let win = ShellWindow {
+            x: 0, y: 0, w: 100, h: 100,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (0, 0, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        
+        space.map_window(win);
+        assert_eq!(space.window_count, 1);
+        
+        space.unmap_window(0, &mut surfaces);
+        assert_eq!(space.window_count, 0);
+    }
+
+    #[test]
+    fn test_space_raise_window() {
+        let mut space = Space::new();
+        let win1 = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo };
+        let win2 = ShellWindow { x: 2, y: 2, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo };
+        
+        space.map_window(win1);
+        space.map_window(win2);
+        
+        assert_eq!(space.windows[0].x, 1);
+        assert_eq!(space.windows[1].x, 2);
+        
+        space.raise_window(0);
+        assert_eq!(space.windows[0].x, 2);
+        assert_eq!(space.windows[1].x, 1);
+    }
+
+    #[test]
+    fn test_window_under_cursor() {
+        let mut space = Space::new();
+        let win = ShellWindow {
+            x: 10, y: 10, w: 100, h: 100,
+            curr_x: 10.0, curr_y: 10.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (10, 10, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        space.map_window(win);
+        
+        assert_eq!(space.window_under_cursor(50, 50), Some(0));
+        assert_eq!(space.window_under_cursor(5, 5), None);
+    }
+
+    #[test]
+    fn test_window_under_cursor_skips_minimized() {
+        let mut space = Space::new();
+        let win = ShellWindow {
+            x: 10, y: 10, w: 100, h: 100,
+            curr_x: 10.0, curr_y: 10.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: true, maximized: false, closing: false,
+            stored_rect: (10, 10, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        space.map_window(win);
+        assert_eq!(space.window_under_cursor(50, 50), None);
+    }
+
+    #[test]
+    fn test_raise_window_last_is_noop() {
+        let mut space = Space::new();
+        let win = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo };
+        space.map_window(win);
+        space.raise_window(0);
+        assert_eq!(space.window_count, 1);
+        assert_eq!(space.windows[0].x, 1);
+    }
+
+    #[test]
+    fn test_unmap_invalid_index() {
+        let mut space = Space::new();
+        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; crate::compositor::MAX_EXTERNAL_SURFACES];
+        space.map_window(ShellWindow { x: 0, y: 0, w: 100, h: 100, curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,100,100), workspace: 0, content: WindowContent::InternalDemo });
+        space.unmap_window(5, &mut surfaces);
+        assert_eq!(space.window_count, 1);
+    }
+
+    #[test]
+    fn test_map_window_at_capacity() {
+        let mut space = Space::new();
+        let win = ShellWindow { x: 0, y: 0, w: 1, h: 1, curr_x: 0.0, curr_y: 0.0, curr_w: 1.0, curr_h: 1.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,1,1), workspace: 0, content: WindowContent::InternalDemo };
+        for _ in 0..crate::compositor::MAX_WINDOWS_COUNT {
+            space.map_window(win);
+        }
+        assert_eq!(space.window_count, crate::compositor::MAX_WINDOWS_COUNT);
+        space.map_window(win);
+        assert_eq!(space.window_count, crate::compositor::MAX_WINDOWS_COUNT);
+    }
+
+    /// Stress: ciclos map → unmap repetidos para detectar corrupción o fugas.
+    #[test]
+    fn test_stress_map_unmap_cycle() {
+        const CYCLES: u32 = 5_000;
+        let mut space = Space::new();
+        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; crate::compositor::MAX_EXTERNAL_SURFACES];
+        let win = ShellWindow {
+            x: 0, y: 0, w: 100, h: 100,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (0, 0, 100, 100), workspace: 0,
+            content: WindowContent::InternalDemo,
+        };
+        for _ in 0..CYCLES {
+            space.map_window(win);
+            assert_eq!(space.window_count, 1);
+            space.unmap_window(0, &mut surfaces);
+            assert_eq!(space.window_count, 0);
+        }
+    }
+
+    /// Stress: raise_window en rotación entre varias ventanas.
+    #[test]
+    fn test_stress_raise_rotation() {
+        let mut space = Space::new();
+        let win = ShellWindow { x: 0, y: 0, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 10.0, curr_h: 10.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,10,10), workspace: 0, content: WindowContent::InternalDemo };
+        for _ in 0..4 {
+            space.map_window(win);
+        }
+        const ITERS: u32 = 10_000;
+        for _ in 0..ITERS {
+            space.raise_window(0);
+            space.raise_window(1);
+            space.raise_window(2);
+        }
+        assert_eq!(space.window_count, 4);
     }
 }

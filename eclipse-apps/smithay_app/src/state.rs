@@ -2,10 +2,10 @@ use crate::backend::Backend;
 use crate::space::Space;
 use crate::input::{InputState, CompositorEvent};
 use crate::compositor::{ExternalSurface, MAX_EXTERNAL_SURFACES, ShellWindow, WindowContent};
-use crate::{render, compositor};
+use crate::{render};
 use std::prelude::v1::*;
 use std::libc::{eclipse_send, ProcessInfo, SystemStats};
-use sidewind_core::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
+use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
 use core::default::Default;
 use core::iter::Iterator;
@@ -100,73 +100,73 @@ impl SmithayState {
 
     }
 
+    pub fn handle_event(&mut self, event: CompositorEvent) {
+        match event {
+            CompositorEvent::Input(ev) => {
+                self.input_event_count += 1;
+                self.input.apply_event(
+                    &ev,
+                    self.backend.fb.info.width as i32,
+                    self.backend.fb.info.height as i32,
+                    &mut self.space.windows,
+                    &mut self.space.window_count,
+                    &self.surfaces,
+                );
+            }
+            CompositorEvent::SideWind(sw, sender_pid) => {
+                crate::ipc::handle_sidewind_message(
+                    sw, 
+                    sender_pid, 
+                    &mut self.surfaces, 
+                    &mut self.space.windows, 
+                    &mut self.space.window_count, 
+                    &mut self.input
+                );
+            }
+            CompositorEvent::NetStats(rx, tx) => {
+                self.net_rx = rx;
+                self.net_tx = tx;
+            }
+            CompositorEvent::ServiceInfo(data) => {
+                // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
+                if data.len() >= 8 && &data[0..4] == b"SVCS" {
+                    let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
+                    let mut parsed = 0usize;
+                    let mut offset = 8;
+                    for i in 0..count {
+                        if i >= 32 { break; }
+                        if data.len() >= offset + 24 {
+                            let mut svc = ServiceInfo::new();
+                            svc.name[..12].copy_from_slice(&data[offset..offset+12]);
+                            offset += 12;
+                            svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                            offset += 4;
+                            svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                            offset += 4;
+                            svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
+                            offset += 4;
+                            self.service_list[i] = svc;
+                            parsed += 1;
+                        }
+                    }
+                    self.service_count = parsed;
+                }
+            }
+            _ => {} // Handle Wayland/X11 if needed
+        }
+    }
+
     pub fn handle_ipc(&mut self) {
-        // Cap events per frame at 64 to prevent the drain loop from starving the render path
-        // when mouse events flood in faster than we can process them (the main cause of hangs).
         let mut events_processed = 0usize;
         while events_processed < 64 {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
                     events_processed += 1;
-                    match event {
-                CompositorEvent::Input(ev) => {
-                    self.input_event_count += 1;
-                    self.input.apply_event(
-                        &ev,
-                        self.backend.fb.info.width as i32,
-                        self.backend.fb.info.height as i32,
-                        &mut self.space.windows,
-                        &mut self.space.window_count,
-                        &self.surfaces,
-                    );
+                    self.handle_event(event);
                 }
-                CompositorEvent::SideWind(sw, sender_pid) => {
-                    crate::ipc::handle_sidewind_message(
-                        sw, 
-                        sender_pid, 
-                        &mut self.surfaces, 
-                        &mut self.space.windows, 
-                        &mut self.space.window_count, 
-                        &mut self.input
-                    );
-                }
-                CompositorEvent::NetStats(rx, tx) => {
-                    self.net_rx = rx;
-                    self.net_tx = tx;
-                }
-                CompositorEvent::ServiceInfo(data) => {
-                    // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
-                    if data.len() >= 8 && &data[0..4] == b"SVCS" {
-                        let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
-                        let mut parsed = 0usize;
-                        let mut offset = 8;
-                        for i in 0..count {
-                            if i >= 32 { break; }
-                            if data.len() >= offset + 24 {
-                                let mut svc = ServiceInfo::new();
-                                svc.name[..12].copy_from_slice(&data[offset..offset+12]);
-                                offset += 12;
-                                svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                offset += 4;
-                                svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                offset += 4;
-                                svc.restart_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
-                                offset += 4;
-                                self.service_list[i] = svc;
-                                parsed += 1;
-                            }
-                        }
-                        // Only update count after successful parsing so a truncated
-                        // packet does not expose stale entries from a previous frame.
-                        self.service_count = parsed;
-                    }
-                }
-                _ => {} // Handle Wayland/X11 if needed
-                    } // end match event
-                } // end Some(event)
-            } // end match poll_event
-        } // end while
+            }
+        }
     }
 
     pub fn update(&mut self) {
@@ -577,5 +577,28 @@ mod tests {
         
         assert!(state.space.windows[0].minimized);
         assert_eq!(state.input.focused_window, None);
+    }
+
+    #[test]
+    fn test_close_request() {
+        let mut state = SmithayState::new().unwrap();
+        state.space.map_window(ShellWindow {
+            x: 50, y: 50, w: 200, h: 150,
+            curr_x: 50.0, curr_y: 50.0, curr_w: 200.0, curr_h: 150.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (50, 50, 200, 150), workspace: 0,
+            content: WindowContent::InternalDemo,
+        });
+        state.input.focused_window = Some(0);
+        state.input.request_close_window = true;
+        state.update();
+        assert!(state.space.windows[0].closing);
+    }
+
+    #[test]
+    fn test_service_info_new() {
+        let info = ServiceInfo::new();
+        assert_eq!(info.state, 0);
+        assert_eq!(info.pid, 0);
     }
 }

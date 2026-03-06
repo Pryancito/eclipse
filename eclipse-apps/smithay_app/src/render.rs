@@ -3,18 +3,15 @@ use micromath::F32Ext;
 use std::libc::{
     get_framebuffer_info, map_framebuffer, FramebufferInfo, 
     get_gpu_display_info, gpu_alloc_display_buffer, gpu_present, 
-    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
-    ProcessInfo
+    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS
 };
-use sidewind_sdk::ui::{self, icons, colors, Notification, NotificationPanel, Widget, Panel, Gauge, Terminal};
-use sidewind_sdk::{font_terminus_12, font_terminus_14, font_terminus_20};
-use sidewind_sdk::gpu::{GpuDevice};
+use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
+use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line, PrimitiveStyle};
+use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line};
 use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle};
 use embedded_graphics::text::Text;
-use core::convert::TryInto;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::{ServiceInfo};
 
@@ -40,7 +37,7 @@ pub struct FramebufferState {
     pub front_addr: usize,  
     pub gpu_resource_id: Option<u32>,  
     pub background_addr: usize, 
-    pub gpu: Option<sidewind_sdk::gpu::GpuDevice>,
+    pub gpu: Option<sidewind::gpu::GpuDevice>,
 }
 
 impl FramebufferState {
@@ -78,7 +75,7 @@ impl FramebufferState {
                         front_addr: 0,
                         gpu_resource_id: Some(gpu_info.resource_id),
                         background_addr: bg_buffer as usize,
-                        gpu: Some(sidewind_sdk::gpu::GpuDevice::new()),
+                        gpu: Some(sidewind::gpu::GpuDevice::new()),
                     });
                 }
             }
@@ -137,7 +134,7 @@ impl FramebufferState {
         }
 
         // Use NVIDIA backend when we have a linear framebuffer (BAR1 or GOP); enables gpu_command(1, ...) for 2D ops.
-        let gpu = Some(sidewind_sdk::gpu::GpuDevice::for_backend(sidewind_sdk::gpu::GpuBackend::Nvidia));
+        let gpu = Some(sidewind::gpu::GpuDevice::for_backend(sidewind::gpu::GpuBackend::Nvidia));
 
         let mut info = fb_info;
         info.width  = width;
@@ -185,8 +182,8 @@ impl FramebufferState {
         let w = self.info.width;
         let h = self.info.height;
         if let Some(ref gpu) = self.gpu {
-            if gpu.backend() == sidewind_sdk::gpu::GpuBackend::Nvidia && self.base_addr == self.front_addr && self.front_addr != 0 {
-                let mut enc = sidewind_sdk::gpu::GpuCommandEncoder::new(gpu);
+            if gpu.backend() == sidewind::gpu::GpuBackend::Nvidia && self.base_addr == self.front_addr && self.front_addr != 0 {
+                let mut enc = sidewind::gpu::GpuCommandEncoder::new(gpu);
                 if enc.fill_rect(0, 0, w, h, raw).is_ok() {
                     return;
                 }
@@ -446,7 +443,7 @@ pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f
         .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
         .draw(fb);
     let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
-    use sidewind_sdk::ui::{Panel, Gauge, Terminal, Widget};
+    use sidewind::ui::{Panel, Gauge, Terminal, Widget};
     let p_w = 600;
     let p_h = 400;
     let px = (w - p_w) / 2;
@@ -528,7 +525,7 @@ pub fn draw_notifications(fb: &mut FramebufferState, notifications: &[Option<Not
         // En lugar de Vec, usamos un slice de las primeras 'count' notificaciones
         // Pero NotificationPanel.notifications requiere un &[Notification].
         // Refactorizamos: iterar y dibujar manualmente o usar un buffer intermedio.
-        // Dado que sidewind_sdk es opaco, intentamos usar un slice directo si es posible.
+        // Dado que sidewind es opaco, intentamos usar un slice directo si es posible.
         // Pero active es Option<Notification>. 
         // Simplificación: iterar directamente los items válidos.
         
@@ -753,7 +750,8 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
             WindowContent::External(idx) => {
                 if (idx as usize) < surfaces.len() && surfaces[idx as usize].active {
                     let s = &surfaces[idx as usize];
-                    if s.vaddr != 0 && s.buffer_size != 0 {
+                    // Security: Ensure vaddr is valid and not the old placeholder 0x1000
+                    if s.vaddr != 0 && s.vaddr != 0x1000 && s.buffer_size != 0 {
                         let wx = x;
                         let wy = w.curr_y as i32;
                         let ww = (w.curr_w as i32).max(0);
@@ -1142,7 +1140,7 @@ pub fn gpu_test_render(fb: &FramebufferState, counter: u64) {
     if let Some(gpu) = &fb.gpu {
         // Run every 60 frames to show a slow, non-blocking hardware operation
         if counter % 60 == 0 {
-            let mut encoder = sidewind_sdk::gpu::GpuCommandEncoder::new(gpu);
+            let mut encoder = sidewind::gpu::GpuCommandEncoder::new(gpu);
             
             // Draw a color-changing square in the top-left corner
             let color = match (counter / 60) % 3 {

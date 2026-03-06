@@ -42,6 +42,7 @@ pub fn init_runtime() {
 /// 5. Sale con el código de retorno de main (syscall exit).
 ///
 /// Si `main()` hace panic, el panic_handler llama a exit(1) y no se vuelve aquí.
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
     // 1. Leer argc del stack (layout del kernel: [RSP+0] = argc)

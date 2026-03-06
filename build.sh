@@ -196,7 +196,7 @@ build_sidewind_project() {
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test gl_demo"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test gl_demo test_runner"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then

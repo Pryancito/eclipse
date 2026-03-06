@@ -4,6 +4,7 @@ use core::ptr;
 
 // Memory operations
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: size_t) -> *mut c_void {
     if n > 0 {
@@ -17,6 +18,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: size_t
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: size_t) -> *mut c_void {
     if n > 0 {
@@ -43,6 +45,7 @@ pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: size_
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut c_void, c: c_int, n: size_t) -> *mut c_void {
     if n > 0 {
@@ -56,41 +59,49 @@ pub unsafe extern "C" fn memset(s: *mut c_void, c: c_int, n: size_t) -> *mut c_v
     s
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __memcpy_chk(dest: *mut c_void, src: *const c_void, n: size_t, _destlen: size_t) -> *mut c_void {
     memcpy(dest, src, n)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __memset_chk(s: *mut c_void, c: c_int, n: size_t, _destlen: size_t) -> *mut c_void {
     memset(s, c, n)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __memmove_chk(dest: *mut c_void, src: *const c_void, n: size_t, _destlen: size_t) -> *mut c_void {
     memmove(dest, src, n)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __strcpy_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
     strcpy(dest, src)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __strcat_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
     strcat(dest, src)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __strncpy_chk(dest: *mut c_char, src: *const c_char, n: size_t, _destlen: size_t) -> *mut c_char {
     strncpy(dest, src, n)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn __stpcpy_chk(dest: *mut c_char, src: *const c_char, _destlen: size_t) -> *mut c_char {
     stpcpy(dest, src)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn bcmp(s1: *const c_void, s2: *const c_void, n: size_t) -> c_int {
     let s1 = s1 as *const u8;
@@ -103,6 +114,7 @@ pub unsafe extern "C" fn bcmp(s1: *const c_void, s2: *const c_void, n: size_t) -
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn ffs(i: c_int) -> c_int {
     if i == 0 {
@@ -112,6 +124,7 @@ pub unsafe extern "C" fn ffs(i: c_int) -> c_int {
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(s1: *const c_void, s2: *const c_void, n: size_t) -> c_int {
     let p1 = s1 as *const u8;
@@ -129,11 +142,24 @@ pub unsafe extern "C" fn memcmp(s1: *const c_void, s2: *const c_void, n: size_t)
 
 // String operations
 
+#[cfg(any(test, feature = "host-testing"))]
+extern "C" {
+    pub fn strlen(s: *const c_char) -> size_t;
+    pub fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c_char;
+    pub fn strncpy(dest: *mut c_char, src: *const c_char, n: size_t) -> *mut c_char;
+    pub fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int;
+    pub fn strncmp(s1: *const c_char, s2: *const c_char, n: size_t) -> c_int;
+    pub fn strcat(dest: *mut c_char, src: *const c_char) -> *mut c_char;
+    pub fn strdup(s: *const c_char) -> *mut c_char;
+}
+
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strlen(s: *const c_char) -> size_t {
     crate::c_str::strlen(s)
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int {
     let mut i = 0;
@@ -151,6 +177,7 @@ pub unsafe extern "C" fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int {
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strncmp(s1: *const c_char, s2: *const c_char, n: size_t) -> c_int {
     for i in 0..n {
@@ -170,6 +197,7 @@ pub unsafe extern "C" fn strncmp(s1: *const c_char, s2: *const c_char, n: size_t
     0
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c_char {
     let mut i = 0;
@@ -184,6 +212,7 @@ pub unsafe extern "C" fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn stpcpy(dest: *mut c_char, src: *const c_char) -> *mut c_char {
     let mut i = 0;
@@ -197,6 +226,7 @@ pub unsafe extern "C" fn stpcpy(dest: *mut c_char, src: *const c_char) -> *mut c
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strncpy(dest: *mut c_char, src: *const c_char, n: size_t) -> *mut c_char {
     let mut i = 0;
@@ -216,6 +246,7 @@ pub unsafe extern "C" fn strncpy(dest: *mut c_char, src: *const c_char, n: size_
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strcat(dest: *mut c_char, src: *const c_char) -> *mut c_char {
     let dest_len = strlen(dest);
@@ -223,6 +254,7 @@ pub unsafe extern "C" fn strcat(dest: *mut c_char, src: *const c_char) -> *mut c
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strncat(dest: *mut c_char, src: *const c_char, n: size_t) -> *mut c_char {
     let dest_len = strlen(dest);
@@ -239,6 +271,7 @@ pub unsafe extern "C" fn strncat(dest: *mut c_char, src: *const c_char, n: size_
     dest
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_char {
     let target = c as c_char;
@@ -255,6 +288,7 @@ pub unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_char {
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strrchr(s: *const c_char, c: c_int) -> *mut c_char {
     let target = c as c_char;
@@ -273,6 +307,7 @@ pub unsafe extern "C" fn strrchr(s: *const c_char, c: c_int) -> *mut c_char {
     ptr::null_mut()
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strstr(haystack: *const c_char, needle: *const c_char) -> *mut c_char {
     let needle_len = strlen(needle);
@@ -293,6 +328,7 @@ pub unsafe extern "C" fn strstr(haystack: *const c_char, needle: *const c_char) 
     ptr::null_mut()
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
     use crate::internal_alloc::malloc;
@@ -306,6 +342,7 @@ pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
     new_str
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: size_t) -> *mut c_void {
     let p = s as *const u8;
@@ -318,6 +355,7 @@ pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: size_t) -> *mut c
     ptr::null_mut()
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strnlen(s: *const c_char, maxlen: size_t) -> size_t {
     let mut i = 0;
@@ -327,6 +365,7 @@ pub unsafe extern "C" fn strnlen(s: *const c_char, maxlen: size_t) -> size_t {
     i
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strcasecmp(s1: *const c_char, s2: *const c_char) -> c_int {
     let mut i = 0;
@@ -347,6 +386,7 @@ pub unsafe extern "C" fn strcasecmp(s1: *const c_char, s2: *const c_char) -> c_i
     }
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn strncasecmp(s1: *const c_char, s2: *const c_char, n: size_t) -> c_int {
     if n == 0 { return 0; }

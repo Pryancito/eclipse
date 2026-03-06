@@ -195,7 +195,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
             }
             unsafe { yield_cpu(); }
         }
-        sleep_ms(1);
+        unsafe {sleep_ms(1);}
         attempts += 1;
     }
 
@@ -330,7 +330,7 @@ fn main_loop() -> ! {
         
         // Sleep briefly to avoid a busy-loop; this blocks init for 1 ms
         // so the kernel can HLT and CPU usage drops from ~100% to near 0%.
-        sleep_ms(1);
+        unsafe {sleep_ms(1);}
     }
 }
 

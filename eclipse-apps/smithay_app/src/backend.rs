@@ -1,7 +1,7 @@
 use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
-use core::option::Option::{self, Some, None};
+use core::option::Option::{self, Some};
 
 /// Backend represents the hardware/OS interface.
 /// It encapsulates the Framebuffer and IPC capabilities.

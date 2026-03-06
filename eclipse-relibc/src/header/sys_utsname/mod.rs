@@ -11,6 +11,7 @@ pub struct utsname {
     pub machine: [c_char; 65],
 }
 
+#[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
 pub unsafe extern "C" fn uname(buf: *mut utsname) -> c_int {
     if buf.is_null() {

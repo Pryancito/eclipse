@@ -28,72 +28,48 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[no_mangle]
-pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
-    if size == 0 {
-        return ptr::null_mut();
+#[cfg(all(not(any(test, feature = "host-testing")), any(not(any(target_os = "linux", unix)), eclipse_target)))]
+mod imp {
+    use super::*;
+    #[no_mangle]
+    pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
+        if size == 0 { return ptr::null_mut(); }
+        let layout = Layout::from_size_align_unchecked(size, ALIGNMENT);
+        Allocator.alloc(layout) as *mut c_void
     }
-    let layout = Layout::from_size_align_unchecked(size, ALIGNMENT);
-    Allocator.alloc(layout) as *mut c_void
+
+    #[no_mangle]
+    pub unsafe extern "C" fn free(_ptr: *mut c_void) {}
+
+    #[no_mangle]
+    pub unsafe extern "C" fn calloc(nmemb: size_t, size: size_t) -> *mut c_void {
+        let total = nmemb.saturating_mul(size);
+        if total == 0 { return ptr::null_mut(); }
+        let ptr = malloc(total);
+        if !ptr.is_null() { ptr::write_bytes(ptr as *mut u8, 0, total); }
+        ptr
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: size_t) -> *mut c_void {
+        if ptr.is_null() { return malloc(new_size); }
+        if new_size == 0 { free(ptr); return ptr::null_mut(); }
+        let new_ptr = malloc(new_size);
+        if !new_ptr.is_null() {
+            ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, new_size);
+            free(ptr);
+        }
+        new_ptr
+    }
 }
 
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
+#[cfg(all(not(any(test, feature = "host-testing")), any(not(any(target_os = "linux", unix)), eclipse_target)))]
+pub use imp::*;
+
+#[cfg(any(any(test, feature = "host-testing"), all(any(target_os = "linux", unix), not(eclipse_target))))]
 extern "C" {
     pub fn malloc(size: size_t) -> *mut c_void;
-}
-
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[no_mangle]
-pub unsafe extern "C" fn free(_ptr: *mut c_void) {
-    // TODO: implement
-}
-
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
-extern "C" {
     pub fn free(ptr: *mut c_void);
-}
-
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[no_mangle]
-pub unsafe extern "C" fn calloc(nmemb: size_t, size: size_t) -> *mut c_void {
-    let total = nmemb.saturating_mul(size);
-    if total == 0 {
-        return ptr::null_mut();
-    }
-    let ptr = malloc(total);
-    if !ptr.is_null() {
-        ptr::write_bytes(ptr as *mut u8, 0, total);
-    }
-    ptr
-}
-
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
-extern "C" {
     pub fn calloc(nmemb: size_t, size: size_t) -> *mut c_void;
-}
-
-#[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[no_mangle]
-pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: size_t) -> *mut c_void {
-    if ptr.is_null() {
-        return malloc(new_size);
-    }
-    if new_size == 0 {
-        free(ptr);
-        return ptr::null_mut();
-    }
-    // TODO: optimize
-    let new_ptr = malloc(new_size);
-    if !new_ptr.is_null() {
-        // This is a simplified version - we don't know old size
-        ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, new_size);
-        free(ptr);
-    }
-    new_ptr
-}
-
-#[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
-extern "C" {
-    pub fn realloc(ptr: *mut c_void, new_size: size_t) -> *mut c_void;
+    pub fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
 }

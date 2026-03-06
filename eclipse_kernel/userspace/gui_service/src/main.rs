@@ -33,7 +33,7 @@ fn wait_for_filesystem() {
             println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
             return;
         }
-        std::libc::sleep_ms(10);
+        unsafe { std::libc::sleep_ms(10); }
     }
 }
 
@@ -118,6 +118,17 @@ pub extern "Rust" fn main() -> i32 {
 
     let _child_pid = unsafe { spawn_compositor() };
     loop {
-        std::libc::sleep_ms(1000);
+        unsafe { std::libc::sleep_ms(1000); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compositor_path_absolute() {
+        assert!(COMPOSITOR_PATH.starts_with("file:/"));
+        assert!(COMPOSITOR_PATH.contains("smithay_app"));
     }
 }

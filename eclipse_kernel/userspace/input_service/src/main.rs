@@ -9,13 +9,14 @@
 //! - USB tablets and touchpads
 //! - Gaming peripherals (high DPI mice, mechanical keyboards)
 
-#![no_main]
+#![cfg_attr(not(feature = "test"), no_main)]
 extern crate std;
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::prelude::*;
 use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
+use input_service::EventQueue;
 
 fn sys_open(path: &str) -> Option<usize> {
     let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
@@ -140,53 +141,6 @@ fn send_event_to_client(pid: u32, ev: &InputEvent) {
     let n = DISPLAY_SENT.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 500 == 0 {
         println!("[INPUT-SERVICE] sent {} to display", n);
-    }
-}
-
-/// Input event queue
-struct EventQueue {
-    events: [InputEvent; 256],
-    head: usize,
-    tail: usize,
-    count: usize,
-}
-
-impl EventQueue {
-    fn new() -> Self {
-        EventQueue {
-            events: [InputEvent {
-                device_id: 0,
-                event_type: 0,
-                code: 0,
-                value: 0,
-                timestamp: 0,
-            }; 256],
-            head: 0,
-            tail: 0,
-            count: 0,
-        }
-    }
-    
-    fn push(&mut self, event: InputEvent) -> bool {
-        if self.count >= 256 {
-            return false;  // Queue full
-        }
-        
-        self.events[self.tail] = event;
-        self.tail = (self.tail + 1) % 256;
-        self.count += 1;
-        true
-    }
-    
-    fn pop(&mut self) -> Option<InputEvent> {
-        if self.count == 0 {
-            return None;
-        }
-        
-        let event = self.events[self.head];
-        self.head = (self.head + 1) % 256;
-        self.count -= 1;
-        Some(event)
     }
 }
 
@@ -619,7 +573,7 @@ pub extern "Rust" fn main() -> i32 {
         // Periodic status every ~30 s (15000 * 2 ms) to avoid serial flood
         if heartbeat_counter > 0 && heartbeat_counter % 15000 == 0 {
             println!("[INPUT-SERVICE] Operational - Heartbeat #{} (events: {}, queue: {}/256)",
-                     heartbeat_counter / 15000, total_events, event_queue.count);
+                     heartbeat_counter / 15000, total_events, event_queue.count());
         }
 
         if heartbeat_counter % 1000 == 0 {
@@ -627,6 +581,7 @@ pub extern "Rust" fn main() -> i32 {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
         }
         
-        std::libc::sleep_ms(2);
+        unsafe { std::libc::sleep_ms(2); }
     }
 }
+

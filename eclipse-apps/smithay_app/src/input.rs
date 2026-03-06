@@ -1,13 +1,12 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
 use std::libc::{InputEvent, eclipse_send};
-use sidewind_core::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_KEY, SWND_EVENT_TYPE_MOUSE_BUTTON};
-use sidewind_sdk::ui::Notification;
+use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
+use sidewind::ui::Notification;
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
-use core::cmp;
-use micromath::F32Ext;
+
 
 #[derive(Clone)]
 pub enum CompositorEvent {
@@ -20,7 +19,7 @@ pub enum CompositorEvent {
 }
 
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
@@ -202,7 +201,7 @@ impl InputState {
                                 if (s_idx as usize) < surfaces.len() {
                                     let pid = surfaces[s_idx as usize].pid;
                                     let se = SideWindEvent {
-                                        event_type: sidewind_core::SWND_EVENT_TYPE_KEY,
+                                        event_type: sidewind::SWND_EVENT_TYPE_KEY,
                                         data1: ev.code as i32,
                                         data2: ev.value as i32,
                                         data3: self.modifiers as i32
@@ -421,5 +420,127 @@ impl InputState {
     pub fn execute_search(&mut self) {
         if self.search_query == "term" { self.request_new_window = true; }
         else if self.search_query == "lock" { self.lock_active = true; }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scancode_to_action() {
+        assert_eq!(scancode_to_action(0x01, 0), KeyAction::CloseWindow);
+        assert_eq!(scancode_to_action(0x32, 0), KeyAction::Minimize);
+        // Test with Super (modifier 8)
+        assert_eq!(scancode_to_action(0x39, 8), KeyAction::ToggleSearch);
+        assert_eq!(scancode_to_action(0x02, 8), KeyAction::SwitchWorkspace(0));
+    }
+
+    #[test]
+    fn test_scancode_to_char() {
+        assert_eq!(scancode_to_char(0x1E, false), Some('a'));
+        assert_eq!(scancode_to_char(0x1E, true), Some('A'));
+        assert_eq!(scancode_to_char(0x39, false), Some(' '));
+        assert_eq!(scancode_to_char(0x02, false), Some('1'));
+    }
+
+    #[test]
+    fn test_input_state_mouse_move() {
+        let mut state = InputState::new(100, 100);
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 1, // Mouse move
+            code: 0,      // x
+            value: 10,
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 100, 100, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.cursor_x, 60); // 50 (center) + 10
+    }
+
+    #[test]
+    fn test_input_state_modifiers() {
+        let mut state = InputState::new(100, 100);
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 0, // Keyboard
+            code: 0x2A,   // Left Shift
+            value: 1,      // Pressed
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 100, 100, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.modifiers & 1, 1);
+
+        let ev_release = InputEvent {
+            device_id: 1,
+            event_type: 0,
+            code: 0x2A,
+            value: 0, // Released
+            timestamp: 0,
+        };
+        state.apply_event(&ev_release, 100, 100, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.modifiers & 1, 0);
+    }
+
+    #[test]
+    fn test_scancode_to_action_more() {
+        assert_eq!(scancode_to_action(0x4B, 0), KeyAction::SnapLeft);
+        assert_eq!(scancode_to_action(0x4D, 0), KeyAction::SnapRight);
+        assert_eq!(scancode_to_action(0x04, 0), KeyAction::SetColor(2));
+        assert_eq!(scancode_to_action(0x2E, 0), KeyAction::Clear);
+        assert_eq!(scancode_to_action(0x31, 0), KeyAction::NewWindow);
+        assert_eq!(scancode_to_action(0x48, 0), KeyAction::ArrowUp);
+        assert_eq!(scancode_to_action(0x50, 0), KeyAction::ArrowDown);
+    }
+
+    #[test]
+    fn test_scancode_to_char_more() {
+        assert_eq!(scancode_to_char(0x2C, false), Some('z'));
+        assert_eq!(scancode_to_char(0x2C, true), Some('Z'));
+        assert_eq!(scancode_to_char(0xFF, false), None);
+    }
+
+    #[test]
+    fn test_input_state_new() {
+        let state = InputState::new(800, 600);
+        assert_eq!(state.cursor_x, 400);
+        assert_eq!(state.cursor_y, 300);
+        assert_eq!(state.stroke_color, 0);
+        assert_eq!(state.focused_window, None);
+        assert!(!state.search_active);
+    }
+
+    #[test]
+    fn test_execute_search_term() {
+        let mut state = InputState::new(100, 100);
+        let _ = state.search_query.push_str("term");
+        state.execute_search();
+        assert!(state.request_new_window);
+    }
+
+    #[test]
+    fn test_execute_search_lock() {
+        let mut state = InputState::new(100, 100);
+        let _ = state.search_query.push_str("lock");
+        state.execute_search();
+        assert!(state.lock_active);
+    }
+
+    /// Stress: scancode_to_action y scancode_to_char en bucle.
+    #[test]
+    fn test_stress_scancode_tables() {
+        const ITERS: u32 = 30_000;
+        let codes = [0x01u16, 0x02, 0x1E, 0x32, 0x39, 0x48, 0x4B, 0x4D, 0x50];
+        for i in 0..ITERS {
+            let code = codes[(i as usize) % codes.len()];
+            let _ = scancode_to_action(code, 0);
+            let _ = scancode_to_action(code, 8);
+            let _ = scancode_to_char(code, false);
+            let _ = scancode_to_char(code, true);
+        }
     }
 }

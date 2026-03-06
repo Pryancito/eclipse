@@ -5,5 +5,17 @@ edition = "2021"
 
 [dependencies]
 eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
-sidewind_sdk = { path = "../sidewind_sdk" }
-sidewind_core = { path = "../sidewind_core" }
+sidewind = { path = "../sidewind" }
+std = { package = "eclipse_std", path = "../eclipse_std", optional = true }
+
+[lib]
+name = "wayland_handshake"
+path = "src/lib.rs"
+
+[[example]]
+name = "wayland_handshake"
+path = "examples/wayland_handshake.rs"
+required-features = ["std"]
+
+[features]
+host-testing = ["eclipse-libc/host-testing", "sidewind/host-testing", "std/host-testing"]

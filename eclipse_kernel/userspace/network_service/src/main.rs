@@ -396,6 +396,24 @@ pub extern "Rust" fn main() -> i32 {
                      heartbeat_counter / 30000, iface, packets_rx, packets_tx);
         }
         
-        std::libc::sleep_ms(1);
+        unsafe { std::libc::sleep_ms(1); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_card_new_default() {
+        let card = NetworkCard::new();
+        assert_eq!(card.interface_type, InterfaceType::None);
+        assert_eq!(card.vendor_id, 0);
+        assert_eq!(card.device_id, 0);
+    }
+
+    #[test]
+    fn interface_type_debug() {
+        assert_eq!(format!("{:?}", InterfaceType::Ethernet), "Ethernet");
     }
 }

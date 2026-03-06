@@ -74,3 +74,31 @@ impl XwmState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomCache, XwmState};
+
+    #[test]
+    fn test_stress_atom_cache() {
+        const ITERS: u32 = 30_000;
+        let mut cache = AtomCache::new();
+        let names = ["WM_NAME", "WM_CLASS", "UTF8_STRING", "WM_PROTOCOLS", "WM_DELETE_WINDOW"];
+        for i in 0..ITERS {
+            let name = names[(i as usize) % names.len()];
+            let atom = cache.intern(name);
+            let back = cache.get_name(atom).unwrap();
+            assert_eq!(back, name);
+        }
+    }
+
+    #[test]
+    fn test_stress_xwm_handle_map_request() {
+        const ITERS: u32 = 50_000;
+        let mut state = XwmState::new();
+        for i in 0..ITERS {
+            state.handle_map_request((i % 1024) as u32);
+        }
+        assert!(state.windows.len() <= 1024);
+    }
+}
