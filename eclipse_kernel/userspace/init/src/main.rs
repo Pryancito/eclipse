@@ -64,7 +64,9 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("display", false),
     Service::new("audio", false),
     Service::new("network", false),
-    Service::new("gui", true),
+    // gui_service is a one-shot launcher: it starts smithay_app and then exits.
+    // Don't enable heartbeat watchdog for it.
+    Service::new("gui", false),
 ]);
 
 
@@ -157,6 +159,18 @@ fn start_system_services() {
         if pid > 0 {
             let timeout = if name == "filesystem" { 15000 } else { 5000 };
             wait_for_ready(pid, name, timeout);
+            // gui_service es un lanzador one-shot: después de enviar READY lanza smithay_app y sale.
+            // Para que no aparezca como proceso pesado en System Central, limpiamos su PID y estado.
+            if name == "gui" {
+                let mut svc = SERVICES.lock();
+                for s in svc.iter_mut() {
+                    if s.name == "gui" {
+                        s.pid = 0;
+                        s.state = ServiceState::Stopped;
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -534,9 +548,15 @@ fn reap_zombies() {
         let mut svc = SERVICES.lock();
         for service in svc.iter_mut() {
             if service.pid == terminated_pid && service.state == ServiceState::Running {
-                println!("[INIT] Service {} (PID {}) has terminated", 
-                         service.name, terminated_pid);
-                service.state = ServiceState::Failed;
+                if service.name == "gui" {
+                    // One-shot: gui_service exiting is expected once it has launched smithay_app.
+                    println!("[INIT] Service {} (PID {}) has completed (one-shot)", service.name, terminated_pid);
+                    service.state = ServiceState::Stopped;
+                } else {
+                    println!("[INIT] Service {} (PID {}) has terminated", 
+                             service.name, terminated_pid);
+                    service.state = ServiceState::Failed;
+                }
                 service.pid = 0;
                 break;
             }

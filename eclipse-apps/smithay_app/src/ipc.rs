@@ -30,13 +30,17 @@ impl IpcHandler {
     }
 
     /// Recibir y clasificar el siguiente mensaje IPC (no bloqueante).
+    /// Procesa hasta un máximo de mensajes por llamada para evitar bloqueos por flood.
     pub fn process_messages(&mut self) -> Option<CompositorEvent> {
         #[cfg(test)]
         if !self.mock_events.is_empty() {
             return Some(self.mock_events.remove(0));
         }
 
-        loop {
+        // Procesar hasta 16 mensajes seguidos si son ignorados por el compositor,
+        // para dar oportunidad al renderizado y no morir en un bucle infinito
+        // si recibimos basura o un flood de eventos desconocidos.
+        for _ in 0..16 {
             self.recv_attempts += 1;
             #[cfg(not(test))]
             let recv_res = self.channel.recv();
@@ -63,9 +67,15 @@ impl IpcHandler {
                     let _ = heap_data.extend_from_slice(&data[..len.min(256)]);
                     return Some(CompositorEvent::ServiceInfo(heap_data));
                 }
-                Some(_) => continue,
+                Some(_) => {
+                    // Mensaje no reconocido o no procesado por el compositor:
+                    // Continuamos el bucle interno para intentar sacar el siguiente.
+                    continue;
+                }
             }
         }
+        
+        None // Límite de intentos alcanzado, volver en la próxima iteración del main loop
     }
 }
 

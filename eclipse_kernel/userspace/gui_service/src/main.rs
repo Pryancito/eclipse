@@ -1,9 +1,9 @@
-//! GUI Service - Launches and supervises the Sidewind compositor (smithay_app)
+//! GUI Service - Launches the Sidewind compositor (smithay_app)
 //!
 //! Responsibilities:
 //! 1. Wait for filesystem to be ready.
 //! 2. Launch smithay_app from disk.
-//! 3. Supervise it: if it crashes, wait a moment and relaunch (watchdog).
+//! 3. Exit after successful launch (one-shot supervisor).
 
 #![no_main]
 extern crate std;
@@ -18,28 +18,10 @@ static LOAD_BUF: std::libc::Spinlock<[u8; MAX_COMPOSITOR_SIZE]> = std::libc::Spi
 
 const COMPOSITOR_PATH: &str = "file:/usr/bin/smithay_app";
 
-/// Wait for filesystem to be mounted.
-fn wait_for_filesystem() {
-    const MAX_ATTEMPTS: u32 = 3000;
-    let mut attempts = 0;
-    loop {
-        let fd = std::libc::eclipse_open("file:/", std::libc::O_RDONLY, 0);
-        if fd >= 0 {
-            unsafe { std::libc::eclipse_close(fd); }
-            return;
-        }
-        attempts += 1;
-        if attempts >= MAX_ATTEMPTS {
-            println!("[GUI-SERVICE] WARNING: Filesystem not ready after {} attempts, continuing anyway", attempts);
-            return;
-        }
-        unsafe { std::libc::sleep_ms(10); }
-    }
-}
-
 /// Load and spawn smithay_app. Returns the child PID or -1 on failure.
 unsafe fn spawn_compositor() -> i32 {
-    use std::libc::{eclipse_open, eclipse_close, eclipse_read, eclipse_spawn, fstat, lseek, mmap, munmap, stat};
+    use std::libc::{eclipse_open, eclipse_close, eclipse_read, eclipse_spawn, lseek, mmap, munmap, PROT_READ, PROT_EXEC, MAP_PRIVATE};
+    const SEEK_SET: i32 = 0;
     const SEEK_END: i32 = 2;
     let fd = eclipse_open(COMPOSITOR_PATH, std::libc::O_RDONLY, 0);
     if fd < 0 {
@@ -47,61 +29,58 @@ unsafe fn spawn_compositor() -> i32 {
         return -1;
     }
 
-    let mut st: stat = core::mem::zeroed();
-    let size = if fstat(fd, &mut st) >= 0 && st.st_size > 0 {
-        st.st_size as u64
-    } else {
-        let sz = lseek(fd, 0, SEEK_END);
-        if sz <= 0 {
-            println!("[GUI-SERVICE] ERROR: fstat and lseek(SEEK_END) failed for {}", COMPOSITOR_PATH);
-            eclipse_close(fd);
-            return -1;
-        }
-        let _ = lseek(fd, 0, 0);
-        sz as u64
-    };
-    let child_pid = {
+    // Obtener tamaño del archivo usando lseek.
+    let sz = lseek(fd, 0, SEEK_END);
+    if sz <= 0 {
+        println!("[GUI-SERVICE] ERROR: lseek(SEEK_END) failed for {}", COMPOSITOR_PATH);
+        eclipse_close(fd);
+        return -1;
+    }
+    let _ = lseek(fd, 0, SEEK_SET);
+    let size = sz as usize;
+    let pid = {
         let mapped = mmap(
             core::ptr::null_mut(),
-            size as usize,
-            std::libc::PROT_READ | std::libc::PROT_EXEC,
-            std::libc::MAP_PRIVATE,
+            size,
+            PROT_READ | PROT_EXEC,
+            MAP_PRIVATE,
             fd,
             0,
         );
         if !mapped.is_null() && (mapped as isize) > 0 {
             println!("[GUI-SERVICE] Mapped compositor at {:p}", mapped);
             eclipse_close(fd);
-            let binary = core::slice::from_raw_parts(mapped as *const u8, size as usize);
+            let binary = core::slice::from_raw_parts(mapped as *const u8, size);
             let pid = eclipse_spawn(binary, Some("smithay_app"));
-            let _ = munmap(mapped, size as usize);
+            let _ = munmap(mapped, size);
             pid
         } else {
-            let _ = lseek(fd, 0, 0);
+            // mmap falló, intentamos lectura manual al buffer protegido.
+            let _ = lseek(fd, 0, SEEK_SET);
             let mut load_guard = LOAD_BUF.lock();
-            let read_size = size.min(MAX_COMPOSITOR_SIZE as u64) as usize;
+            let read_size = size.min(MAX_COMPOSITOR_SIZE);
             let n = {
                 let buf = &mut load_guard[..read_size];
-                let result = std::libc::eclipse_read(fd as u32, buf);
+                let result = eclipse_read(fd as u32, buf);
                 eclipse_close(fd);
                 result
             };
-            if n < 0 || n as u64 != size {
+            if n < 0 || n as usize != size {
                 println!("[GUI-SERVICE] ERROR: read failed for {} (got {})", COMPOSITOR_PATH, n);
                 return -1;
             }
-            eclipse_spawn(&load_guard[..size as usize], Some("smithay_app"))
+            eclipse_spawn(&load_guard[..size], Some("smithay_app"))
         }
     };
 
-    child_pid
+    pid as i32
 }
 
 #[no_mangle]
 pub extern "Rust" fn main() -> i32 {
     let pid = unsafe { std::libc::getpid() };
     println!("+--------------------------------------------------------------+");
-    println!("|         GUI SERVICE - Sidewind Compositor Supervisor         |");
+    println!("|           GUI SERVICE - Sidewind Compositor Launcher         |");
     println!("+--------------------------------------------------------------+");
     let ppid = unsafe { std::libc::getppid() };
     println!("[GUI-SERVICE] PID={}, PPID={}", pid, ppid);
@@ -113,10 +92,14 @@ pub extern "Rust" fn main() -> i32 {
         println!("[GUI-SERVICE] WARNING: No parent process found to signal READY!");
     }
 
-    wait_for_filesystem();
-    println!("[GUI-SERVICE] Filesystem ready.");
-
-    let _child_pid = unsafe { spawn_compositor() };
+    // Proceso one-shot: intenta lanzar smithay_app y sale.
+    let child_pid = unsafe { spawn_compositor() };
+    if child_pid > 0 {
+        println!("[GUI-SERVICE] smithay_app started with PID {}", child_pid);
+        println!("[GUI-SERVICE] Launcher done; exiting.");
+    } else {
+        println!("[GUI-SERVICE] ERROR: Failed to start smithay_app");
+    }
     loop {
         unsafe { std::libc::sleep_ms(1000); }
     }

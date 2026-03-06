@@ -18,6 +18,24 @@ use std::prelude::*;
 use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
 use input_service::EventQueue;
 
+const SYS_REGISTER_DEVICE: usize = eclipse_syscall::number::SYS_REGISTER_DEVICE;
+
+#[repr(u64)]
+enum DeviceType {
+    Input = 3, // Matches kernel DeviceType::Input
+}
+
+fn register_device(name: &str, type_id: DeviceType) -> bool {
+    unsafe {
+        eclipse_syscall::syscall3(
+            SYS_REGISTER_DEVICE,
+            name.as_ptr() as usize,
+            name.len(),
+            type_id as usize,
+        ) == 0
+    }
+}
+
 fn sys_open(path: &str) -> Option<usize> {
     let fd = std::libc::eclipse_open(path, std::libc::O_RDONLY, 0);
     if fd < 0 { None } else { Some(fd as usize) }
@@ -25,6 +43,18 @@ fn sys_open(path: &str) -> Option<usize> {
 
 fn sys_write(fd: usize, buf: &[u8]) -> usize {
     std::libc::eclipse_write(fd as u32, buf) as usize
+}
+
+fn write_input_event_to_scheme(input_fd: Option<usize>, ev: &InputEvent) {
+    if let Some(fd) = input_fd {
+        let buf = unsafe {
+            core::slice::from_raw_parts(
+                ev as *const _ as *const u8,
+                core::mem::size_of::<InputEvent>(),
+            )
+        };
+        let _ = sys_write(fd, buf);
+    }
 }
 
 /// Input device types
@@ -365,6 +395,10 @@ pub extern "Rust" fn main() -> i32 {
     if ppid > 0 {
         let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
+
+    let _ = register_device("input:keyboard", DeviceType::Input);
+    let _ = register_device("input:mouse", DeviceType::Input);
+
     println!("[INPUT-SERVICE] Device summary:");
     println!("[INPUT-SERVICE]   USB controllers: {}", usb_controller_count);
     println!("[INPUT-SERVICE]   PS/2 keyboard: {}", if ps2_kbd_present { "Yes" } else { "No" });
@@ -469,6 +503,7 @@ pub extern "Rust" fn main() -> i32 {
                     let pid = display_clients[i];
                     send_event_to_client(pid, &ev);
                 }
+                write_input_event_to_scheme(input_fd, &ev);
                 let _ = event_queue.push(ev);
             }
 
@@ -491,6 +526,7 @@ pub extern "Rust" fn main() -> i32 {
                         let pid = display_clients[i];
                         send_event_to_client(pid, &ev);
                     }
+                    write_input_event_to_scheme(input_fd, &ev);
                     let _ = event_queue.push(ev);
                 }
             }
@@ -512,6 +548,7 @@ pub extern "Rust" fn main() -> i32 {
                     let pid = display_clients[i];
                     send_event_to_client(pid, &ev);
                 }
+                write_input_event_to_scheme(input_fd, &ev);
                 let _ = event_queue.push(ev);
             }
         }
@@ -552,12 +589,7 @@ pub extern "Rust" fn main() -> i32 {
                 let pid = display_clients[i];
                 send_event_to_client(pid, &kbd_event);
             }
-            if let Some(fd) = input_fd {
-                let buf = unsafe {
-                    core::slice::from_raw_parts(&kbd_event as *const _ as *const u8, core::mem::size_of::<InputEvent>())
-                };
-                sys_write(fd, buf);
-            }
+            write_input_event_to_scheme(input_fd, &kbd_event);
             let _ = event_queue.push(kbd_event);
         }
 
@@ -581,7 +613,7 @@ pub extern "Rust" fn main() -> i32 {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
         }
         
-        unsafe { std::libc::sleep_ms(2); }
+        unsafe { std::libc::sleep_ms(1); }
     }
 }
 

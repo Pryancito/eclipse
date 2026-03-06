@@ -5,6 +5,7 @@ use std::libc::{
     get_gpu_display_info, gpu_alloc_display_buffer, gpu_present,
     mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
     eclipse_open, eclipse_close, eclipse_fmap, O_RDONLY,
+    exit,
 };
 use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
@@ -18,7 +19,7 @@ use crate::state::{ServiceInfo};
 
 
 
-pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_9000_0000_0000;
+pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Fallback display dimensions used when the firmware reports zero width/height.
 const DEFAULT_WIDTH: u32  = 1920;
@@ -99,9 +100,11 @@ impl FramebufferState {
             } else {
                 eclipse_close(fb0_fd);
                 println!("[SMITHAY] WARNING: /dev/fb0 fmap failed, trying other backends");
+                unsafe { exit(0); }
             }
         } else {
             println!("[SMITHAY] /dev/fb0 not available, trying other backends");
+            unsafe { exit(0); }
         }
 
         // ── Step 2: VirtIO GPU ─────────────────────────────────────────────────

@@ -278,7 +278,41 @@ impl Scheme for DisplayScheme {
 
 // --- Input Scheme ---
 
-pub struct InputScheme;
+pub struct InputScheme {
+    queue: Mutex<VecDeque<u8>>,
+}
+
+impl InputScheme {
+    // Cola acotada: evita que un lector atascado consuma memoria sin límite.
+    const MAX_QUEUE_BYTES: usize = 256 * 1024;
+    // Layout compatible con userspace `std::libc::InputEvent` (ver tests en `ipc.rs`).
+    const INPUT_EVENT_SIZE: usize = 24;
+
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn trim_overflow(queue: &mut VecDeque<u8>, incoming_len: usize) {
+        if incoming_len >= Self::MAX_QUEUE_BYTES {
+            queue.clear();
+            return;
+        }
+
+        let needed = queue.len().saturating_add(incoming_len);
+        if needed <= Self::MAX_QUEUE_BYTES {
+            return;
+        }
+
+        // Tirar bytes antiguos para hacer espacio, manteniendo alineación por evento.
+        let mut drop_bytes = needed - Self::MAX_QUEUE_BYTES;
+        drop_bytes -= drop_bytes % Self::INPUT_EVENT_SIZE;
+        for _ in 0..drop_bytes {
+            let _ = queue.pop_front();
+        }
+    }
+}
 
 impl Scheme for InputScheme {
     fn open(&self, _path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
@@ -286,11 +320,43 @@ impl Scheme for InputScheme {
     }
 
     fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
-        Ok(0) // Will be populated with input events
+        if _buffer.len() < Self::INPUT_EVENT_SIZE {
+            return Ok(0);
+        }
+
+        let mut q = self.queue.lock();
+        if q.is_empty() {
+            return Ok(0);
+        }
+
+        let max = core::cmp::min(_buffer.len(), q.len());
+        let to_copy = max - (max % Self::INPUT_EVENT_SIZE);
+        if to_copy == 0 {
+            return Ok(0);
+        }
+
+        for i in 0..to_copy {
+            _buffer[i] = q.pop_front().unwrap_or(0);
+        }
+
+        Ok(to_copy)
     }
 
     fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
-        Ok(buf.len())
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Solo aceptamos registros completos; mantener alineación simplifica al lector.
+        let aligned_len = buf.len() - (buf.len() % Self::INPUT_EVENT_SIZE);
+        if aligned_len == 0 {
+            return Ok(0);
+        }
+
+        let mut q = self.queue.lock();
+        Self::trim_overflow(&mut q, aligned_len);
+        q.extend(&buf[..aligned_len]);
+        Ok(aligned_len)
     }
 
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
@@ -370,6 +436,7 @@ use alloc::sync::Arc;
 use spin::Mutex;
 
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -519,7 +586,7 @@ pub fn get_socket_scheme() -> Option<Arc<SocketScheme>> {
 pub fn init() {
     init_servers();
     crate::scheme::register_scheme("display", Arc::new(DisplayScheme));
-    crate::scheme::register_scheme("input", Arc::new(InputScheme));
+    crate::scheme::register_scheme("input", Arc::new(InputScheme::new()));
     crate::scheme::register_scheme("snd", Arc::new(AudioScheme));
     crate::scheme::register_scheme("net", Arc::new(NetworkScheme));
     
