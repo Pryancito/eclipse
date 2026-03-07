@@ -1,6 +1,11 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
+#[cfg(not(target_os = "linux"))]
 use eclipse_libc::{InputEvent, eclipse_send};
+#[cfg(target_os = "linux")]
+use eclipse_syscall::InputEvent;
+#[cfg(target_os = "linux")]
+unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use sidewind::ui::Notification;
 use crate::compositor::{

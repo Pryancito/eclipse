@@ -10,6 +10,25 @@ pub mod call;
 pub use call::*;
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InputEvent {
+    pub device_id: u32,
+    pub event_type: u8, // 0=key, 1=mouse_move, 2=mouse_button, 3=mouse_scroll
+    pub code: u16,
+    pub value: i32,
+    pub timestamp: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemStats {
+    pub uptime_ticks: u64,
+    pub idle_ticks: u64,
+    pub total_mem_frames: u64,
+    pub used_mem_frames: u64,
+}
+
+#[repr(C)]
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessInfo {

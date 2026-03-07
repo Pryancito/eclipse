@@ -1,6 +1,6 @@
 //! Tipos de mensajes tipados para el IPC de Eclipse OS
 
-use eclipse_libc::InputEvent;
+use eclipse_syscall::InputEvent;
 use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
 
 /// Tamaño máximo de un mensaje IPC (buffer y Raw). Única constante para no desincronizar.

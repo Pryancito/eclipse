@@ -1,6 +1,6 @@
 //! Trait de codificación para mensajes de fast path (≤24 bytes en registros)
 
-use eclipse_libc::InputEvent;
+use eclipse_syscall::InputEvent;
 
 /// Trait que deben implementar los mensajes que quieran usar el fast path IPC.
 /// El fast path pasa los datos directamente en registros CPU (rdi/rsi/rdx),

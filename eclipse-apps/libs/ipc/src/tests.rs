@@ -8,7 +8,7 @@ pub mod tests {
     use crate::protocol::EclipseEncode;
     use crate::channel::IpcChannel;
     use crate::services::{INIT_PID, MSG_TYPE_INPUT, DEFAULT_INPUT_QUERY_ATTEMPTS};
-    use eclipse_libc::InputEvent;
+    use eclipse_syscall::InputEvent;
     use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
 
     // =========================================================================

@@ -12,10 +12,13 @@ testable = []
 async = []
 host-testing = ["eclipse-libcstd/host-testing"]
 
-[dependencies]
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", default-features = false }
 eclipse-libcstd = { package = "eclipse_std", path = "../../eclipse_std" }
+
+[dependencies]
 sidewind_core = { path = "../../sidewind_core" }
+eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 # Al ejecutar `cargo test`, Cargo une features: así eclipse-libc recibe host-testing,
 # no registra su global_allocator (mmap Eclipse) y se usa el allocator del sistema.

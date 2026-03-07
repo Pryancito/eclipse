@@ -5,13 +5,19 @@ edition = "2021"
 description = "Stack unificada de ventanas, IPC, OpenGL, Wayland y X11 para el compositor Eclipse OS"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
 eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
 heapless = "0.8"
 micromath = "2.1.0"
 bitflags = "2.4"
+eclipse-syscall = { path = "../../eclipse-syscall" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
 
 [features]
 default = []

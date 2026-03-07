@@ -25,7 +25,18 @@ pub mod protocol;
 pub mod services;
 pub mod types;
 
+#[cfg(not(target_os = "linux"))]
 extern crate eclipse_libc;
+
+#[cfg(target_os = "linux")]
+pub mod eclipse_libc {
+    use eclipse_syscall::InputEvent;
+
+    pub unsafe fn receive(_buf: *mut u8, _len: usize, _from: *mut u32) -> usize { 0 }
+    pub fn receive_fast() -> Option<([u8; 24], u32, usize)> { None }
+    pub unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
+    pub unsafe fn yield_cpu() {}
+}
 
 #[cfg(feature = "testable")]
 pub use types::{parse_fast, parse_slow};

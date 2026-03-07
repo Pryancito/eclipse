@@ -12,17 +12,7 @@ extern crate std;
 #[cfg(not(target_os = "linux"))]
 extern crate eclipse_syscall;
 
-pub mod backend;
-pub mod compositor;
-pub mod damage;
-pub mod input;
-pub mod ipc;
-pub mod render;
-pub mod state;
-
-// Compositor Wayland con Smithay (solo cuando target es Linux)
-#[cfg(target_os = "linux")]
-mod smithay_wayland;
+use smithay_app::smithay_wayland;
 
 // ---- Entry point Linux: Smithay Wayland ----
 #[cfg(target_os = "linux")]
@@ -38,8 +28,8 @@ fn main() {
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "Rust" fn main() -> i32 {
-    use crate::state::SmithayState;
-    use crate::ipc::{query_input_service_pid, subscribe_to_input};
+    use smithay_app::state::SmithayState;
+    use smithay_app::ipc::{query_input_service_pid, subscribe_to_input};
 
     println!("[SMITHAY] Starting via Eclipse Runtime...");
 
@@ -110,7 +100,7 @@ pub extern "Rust" fn main() -> i32 {
 #[cfg(test)]
 #[cfg(not(target_os = "linux"))]
 mod tests {
-    use crate::state::SmithayState;
+    use smithay_app::state::SmithayState;
 
     #[test]
     fn main_loop_iterations_complete_without_hanging() {

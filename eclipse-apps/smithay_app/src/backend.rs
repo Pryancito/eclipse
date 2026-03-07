@@ -2,7 +2,12 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
-use eclipse_libc::{eclipse_open, eclipse_read, InputEvent, O_RDONLY};
+#[cfg(not(target_os = "linux"))]
+use eclipse_libc::{eclipse_open as open, eclipse_read as read, InputEvent, O_RDONLY};
+#[cfg(target_os = "linux")]
+use eclipse_syscall::InputEvent;
+#[cfg(target_os = "linux")]
+use libc::{open, read, O_RDONLY};
 #[cfg(test)]
 use alloc::collections::VecDeque;
 
@@ -27,7 +32,7 @@ impl Backend {
 
         #[cfg(not(test))]
         let input_fd = {
-            let fd = eclipse_open("input:", O_RDONLY, 0);
+            let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY, 0) };
             if fd >= 0 { Some(fd) } else { None }
         };
         #[cfg(test)]
@@ -59,7 +64,7 @@ impl Backend {
         {
             let fd = self.input_fd?;
             let mut buf = [0u8; core::mem::size_of::<InputEvent>()];
-            let n = eclipse_read(fd as u32, &mut buf);
+            let n = unsafe { read(fd as u32 as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
             if n < 0 {
                 return None;
             }

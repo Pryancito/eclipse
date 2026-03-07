@@ -1,4 +1,7 @@
+#[cfg(not(target_os = "linux"))]
 use eclipse_libc::gpu_command;
+#[cfg(target_os = "linux")]
+pub unsafe fn gpu_command(_kind: usize, _command: usize, _payload: &[u8]) -> isize { -1 }
 use core::fmt::Debug;
 
 /// SideWind GPU Backend Types
@@ -45,7 +48,7 @@ impl GpuDevice {
 
     /// Submit a command buffer to the GPU.
     pub fn submit(&self, command_id: usize, payload: &[u8]) -> GpuResult<()> {
-        if gpu_command(self.backend as usize, command_id, payload) == 0 {
+        if unsafe { gpu_command(self.backend as usize, command_id, payload) } == 0 {
             Ok(())
         } else {
             Err(GpuError::CommandFailed)

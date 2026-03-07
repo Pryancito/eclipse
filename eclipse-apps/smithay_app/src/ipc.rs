@@ -7,7 +7,10 @@ pub use eclipse_ipc::prelude::*;
 use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
+#[cfg(not(target_os = "linux"))]
 use eclipse_libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
+#[cfg(target_os = "linux")]
+use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
 
 /// Resultado de damage granular para SideWind: (x, y, w, h, workspace).
 pub struct SideWindDamageResult {
@@ -237,7 +240,7 @@ pub fn handle_sidewind_message(
 mod tests {
     use super::*;
     use sidewind::{SideWindMessage, SIDEWIND_TAG};
-    use eclipse_libc::InputEvent;
+    use eclipse_syscall::InputEvent;
 
     #[test]
     fn test_ipc_handler_mock_events() {

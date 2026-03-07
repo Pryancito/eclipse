@@ -7,8 +7,11 @@
 extern crate alloc;
 
 pub mod opengl;
+#[cfg(not(target_os = "linux"))]
 pub mod wayland;
+#[cfg(not(target_os = "linux"))]
 pub mod xwayland;
+#[cfg(not(target_os = "linux"))]
 pub mod nvidia;
 
 pub mod font_terminus_12;
@@ -23,10 +26,24 @@ pub mod gpu;
 pub use gpu::{GpuBackend, GpuCommandEncoder, GpuDevice, SurfaceGpuExt};
 
 use eclipse_ipc::prelude::IpcChannel;
+#[cfg(not(target_os = "linux"))]
 use eclipse_libc::{
     close, eclipse_send as send, mmap, munmap, open, receive, yield_cpu, MAP_SHARED, O_RDWR,
     PROT_READ, PROT_WRITE,
 };
+
+#[cfg(target_os = "linux")]
+use libc::{
+    close, mmap, munmap, open, MAP_SHARED, O_RDWR,
+    PROT_READ, PROT_WRITE,
+};
+
+#[cfg(target_os = "linux")]
+pub unsafe fn send(_target: u32, _msg_type: u32, _data: *const core::ffi::c_void, _len: usize, _flags: i32) -> isize { -1 }
+#[cfg(target_os = "linux")]
+pub unsafe fn receive(_buffer: *mut u8, _len: usize, _sender_pid: *mut u32) -> usize { 0 }
+#[cfg(target_os = "linux")]
+pub unsafe fn yield_cpu() { core::hint::spin_loop(); }
 /// Re-export del módulo core para compatibilidad.
 pub use sidewind_core::{
     SideWindEvent, SideWindMessage, SIDEWIND_TAG, SIDEWIND_VERSION, MSG_TYPE_GRAPHICS,

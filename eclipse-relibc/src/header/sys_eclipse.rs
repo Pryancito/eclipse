@@ -1,14 +1,6 @@
 //! sys/eclipse.rs - Eclipse OS specific extensions
+pub use eclipse_syscall::{SystemStats, InputEvent};
 use crate::types::*;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct SystemStats {
-    pub uptime_ticks: u64,
-    pub idle_ticks: u64,
-    pub total_mem_frames: u64,
-    pub used_mem_frames: u64,
-}
 
 #[cfg(not(any(test, feature = "host-testing")))]
 pub use eclipse_syscall::ProcessInfo;
@@ -164,16 +156,6 @@ pub unsafe extern "C" fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h
 #[cfg(any(test, feature = "host-testing"))]
 #[no_mangle]
 pub unsafe extern "C" fn gpu_present(_resource_id: u32, _x: u32, _y: u32, _w: u32, _h: u32) -> bool { false }
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct InputEvent {
-    pub device_id: u32,
-    pub event_type: u8,  // 0=key, 1=mouse_move, 2=mouse_button, 3=mouse_scroll
-    pub code: u16,
-    pub value: i32,
-    pub timestamp: u64,
-}
 
 #[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]

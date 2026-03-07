@@ -4,7 +4,7 @@ use eclipse_libc::{
     FramebufferInfo,
 };
 #[cfg(target_os = "linux")]
-// use libc::{mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+use libc::{mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
@@ -15,6 +15,9 @@ pub struct FramebufferInfo {
     pub pitch: u32,
     pub bpp: u8,
 }
+
+#[cfg(target_os = "linux")]
+fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
 use micromath::F32Ext;
 use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
@@ -290,7 +293,7 @@ impl DrawTarget for FramebufferState {
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
         let fb_ptr = self.back_addr as *mut u32;
         
-        let intersection = area.intersection(&Rectangle::new(Point::zero(), Size::new(w as u32, h as u32)));
+        let intersection = area.intersection(&Rectangle::new(Point::zero(), Size::new(width as u32, height as u32)));
         if intersection.is_zero_sized() { return Ok(()); }
         
         let raw_color = 0xFF_00_00_00 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
@@ -916,7 +919,11 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
 
     if counter % 10 == 0 {
-        *log_len = unsafe { eclipse_libc::get_logs(log_buf.as_mut_ptr(), 512) };
+        #[cfg(not(target_os = "linux"))]
+        let len = unsafe { eclipse_libc::get_logs(log_buf.as_mut_ptr(), 512) };
+        #[cfg(target_os = "linux")]
+        let len = get_logs(log_buf.as_mut_ptr(), 512);
+        *log_len = len;
     }
 
     const MAX_LOG_LINES: usize = 8;
@@ -947,7 +954,10 @@ pub fn draw_system_central(
     fb: &mut FramebufferState, 
     _counter: u64, 
     services: &[ServiceInfo], 
+    #[cfg(not(target_os = "linux"))]
     processes: &[eclipse_libc::ProcessInfo],
+    #[cfg(target_os = "linux")]
+    processes: &[eclipse_syscall::ProcessInfo],
     process_cpu: &[f32; 32],
     process_mem: &[u64; 32],
     uptime_ticks: u64,

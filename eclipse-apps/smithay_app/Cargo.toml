@@ -13,10 +13,16 @@ name = "smithay_app"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "smithay_app"
+path = "src/lib.rs"
+
 [dependencies]
 heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
+bitflags = "2.4"
+eclipse-syscall = { path = "../../eclipse-syscall" }
 # Dependencias solo para target Eclipse (no linux).
 # No usamos la crate smithay ni wayland-server aquí: requieren std.
 # El compositor Eclipse usa patrones portados (backend, compositor, damage, etc.).
@@ -31,9 +37,9 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+libc = "0.2"
 
 [features]
 default = []
