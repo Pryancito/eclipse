@@ -1,242 +1,326 @@
-//! Compositor de pantalla para Linux (host).
+//! Compositor Wayland con Smithay — solo se compila para target Linux (host).
+//! Mismo binario que en Eclipse; el backend se elige por target.
 //!
-//! Usa winit + softbuffer (buffer de píxeles en software) en lugar de
-//! smithay + EGL/OpenGL.  Ventajas:
-//!   - No carga libGL / libEGL ni drivers de GPU en el arranque.
-//!   - Crea muchos menos VMAs, evitando el fallo de sigaltstack guard page
-//!     ("failed to set up alternative stack guard page: Cannot allocate memory")
-//!     que se producía con la versión smithay+GlesRenderer.
-//!   - Muestra el framebuffer Eclipse real dibujado con la CPU.
+//! # Por qué crasheaba antes
+//!
+//! Con `debug = true` + `strip = false` en el perfil de release el binario
+//! crecía a ~75 MB.  Un binario tan grande tiene muchos segmentos ELF LOAD
+//! que el kernel mapea como VMAs separadas al cargar el proceso.  Antes de
+//! que `main()` se ejecute, el runtime de Rust llama a `mprotect()` para
+//! instalar el guard-page del alternate signal stack.  Si en ese momento el
+//! proceso ya tiene demasiadas VMAs (cerca del límite `vm.max_map_count`),
+//! `mprotect()` falla con ENOMEM y el proceso aborta con:
+//!
+//!   "failed to set up alternative stack guard page: Cannot allocate memory"
+//!
+//! **La solución** (ya aplicada en `eclipse-apps/Cargo.toml`) es compilar
+//! con `debug = false` y `strip = "symbols"`.  Esto reduce el binario a
+//! ~4 MB y elimina el exceso de VMAs, resolviendo el crash sin necesidad de
+//! eliminar smithay.
 
-use std::num::NonZeroU32;
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+use smithay::backend::renderer::element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement};
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
+use smithay::backend::renderer::{Color32F, Frame, Renderer};
+use smithay::backend::winit::{self, WinitEvent};
+use smithay::input::keyboard::FilterResult;
+use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::wayland_server::protocol::wl_seat;
+use smithay::reexports::wayland_server::Display;
+use smithay::utils::{Rectangle, Serial, Transform};
+use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::compositor::{
+    with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
+    SurfaceAttributes, TraversalAction,
+};
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+};
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
+use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::protocol::wl_buffer;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Client, ListeningSocket};
+use smithay::reexports::winit::platform::pump_events::PumpStatus;
 
-const DEFAULT_W: u32 = 1280;
-const DEFAULT_H: u32 = 720;
+smithay::delegate_compositor!(App);
+smithay::delegate_data_device!(App);
+smithay::delegate_seat!(App);
+smithay::delegate_shm!(App);
+smithay::delegate_xdg_shell!(App);
 
-// --- Software framebuffer render ----------------------------------------
-
-/// Render a simple "Eclipse OS compositor (Linux test mode)" screen into
-/// the 32-bit XRGB pixel buffer.
-fn render_frame(buf: &mut [u32], width: u32, height: u32, tick: u64) {
-    let w = width as usize;
-    let h = height as usize;
-
-    // Background: dark cosmic blue gradient
-    for y in 0..h {
-        for x in 0..w {
-            let r = (2u32).saturating_add((x as u32 * 10) / width);
-            let g = (2u32).saturating_add((y as u32 * 8) / height);
-            let b = (16u32).saturating_add((y as u32 * 20) / height);
-            buf[y * w + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    // Grid lines (perspective-style)
-    let grid_spacing: usize = 64;
-    let scroll = (tick % 128) as usize;
-    for y in (0..h).step_by(grid_spacing) {
-        let ys = (y + scroll) % h;
-        for x in 0..w {
-            let idx = ys * w + x;
-            buf[idx] = blend_pixel(buf[idx], 0xFF1A2855, 80);
-        }
-    }
-    for x in (0..w).step_by(grid_spacing) {
-        for y in 0..h {
-            let idx = y * w + x;
-            buf[idx] = blend_pixel(buf[idx], 0xFF1A2855, 80);
-        }
-    }
-
-    // Sidebar (left panel) — clamp sb_w so it's always strictly < w.
-    let sb_w = ((width / 8).clamp(60, 200) as usize).min(w.saturating_sub(1));
-    for y in 0..h {
-        for x in 0..sb_w {
-            buf[y * w + x] = 0xFF080F20;
-        }
-    }
-    // Sidebar border (only if there's room to the right of sb_w)
-    if sb_w < w {
-        for y in 0..h {
-            buf[y * w + sb_w] = 0xFF0050A0;
-        }
-    }
-
-    // Pulsing circle (logo placeholder): compute pulse once, outside the pixel loops.
-    let cx = (w / 2) as i32;
-    let cy = (h / 2) as i32;
-    let r_max = (width.min(height) / 3) as i32;
-    let pulse = ((tick % 120) as f64 / 120.0 * std::f64::consts::TAU).sin();
-    let r = (r_max as f64 * (0.9 + pulse * 0.05)) as i32;
-
-    for dy in -r..=r {
-        for dx in -r..=r {
-            let d2 = dx * dx + dy * dy;
-            if d2 > r * r { continue; }
-            let dist = (d2 as f64).sqrt();
-            let rim_start = (r - 4) as f64;
-            if dist < rim_start { continue; }
-
-            let px = (cx + dx) as usize;
-            let py = (cy + dy) as usize;
-            if px >= w || py >= h { continue; }
-
-            // Cyan ring color
-            let alpha = ((r as f64 - dist) * 60.0) as u32;
-            let alpha = alpha.min(255);
-            let rim_color = 0xFF00D4FF;
-            buf[py * w + px] = blend_pixel(buf[py * w + px], rim_color, alpha);
-        }
-    }
-
-    // HUD text representation (simple colored bars since we have no font)
-    draw_text_bar(buf, w, h, sb_w + 20, 20, "ECLIPSE OS COMPOSITOR", 0xFF00D4FF, tick);
-    draw_text_bar(buf, w, h, sb_w + 20, 50, "Linux Test Mode (softbuffer)", 0xFFFFFFFF, 0);
-    draw_text_bar(buf, w, h, sb_w + 20, 80, "Presiona ESC para salir", 0xFF888888, 0);
+impl BufferHandler for App {
+    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
-/// Blend src over dst with `alpha` (0=transparent, 255=opaque).
-#[inline]
-fn blend_pixel(dst: u32, src: u32, alpha: u32) -> u32 {
-    let ia = 255 - alpha;
-    let r = ((src >> 16 & 0xFF) * alpha + (dst >> 16 & 0xFF) * ia) / 255;
-    let g = ((src >> 8 & 0xFF) * alpha + (dst >> 8 & 0xFF) * ia) / 255;
-    let b = ((src & 0xFF) * alpha + (dst & 0xFF) * ia) / 255;
-    0xFF000000 | (r << 16) | (g << 8) | b
+impl XdgShellHandler for App {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+        });
+        surface.send_configure();
+    }
+
+    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+
+    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+
+    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {}
 }
 
-/// Draw a coloured label as a simple bar (pixel-level, no font needed).
-fn draw_text_bar(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, _label: &str, color: u32, tick: u64) {
-    let bar_h = 10usize;
-    let bar_w = 200usize;
-    let blink = (tick / 30) % 2 == 0;
-    // When not blinking: halve each RGB component (divide by 2) while keeping alpha=FF.
-    // `(color >> 1) & 0x7F7F7F` shifts right by 1 (halves) and masks out the sign bit of each byte.
-    let draw_color = if blink { color } else { ((color >> 1) & 0x7F7F7F) | 0xFF000000 };
-    for dy in 0..bar_h {
-        for dx in 0..bar_w {
-            let px = x + dx;
-            let py = y + dy;
-            if px >= w || py >= h { continue; }
-            buf[py * w + px] = blend_pixel(buf[py * w + px], draw_color, 200);
-        }
+impl SelectionHandler for App {
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for App {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
     }
 }
 
-// --- winit ApplicationHandler -------------------------------------------
+impl ClientDndGrabHandler for App {}
+impl ServerDndGrabHandler for App {
+    fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<App>) {}
+}
+
+impl CompositorHandler for App {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+
+    fn commit(&mut self, surface: &WlSurface) {
+        on_commit_buffer_handler::<Self>(surface);
+    }
+}
+
+impl ShmHandler for App {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+impl SeatHandler for App {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<App> {
+        &mut self.seat_state
+    }
+
+    fn focus_changed(&mut self, _seat: &Seat<App>, _focused: Option<&WlSurface>) {}
+    fn cursor_image(&mut self, _seat: &Seat<App>, _image: smithay::input::pointer::CursorImageStatus) {}
+}
 
 struct App {
-    window: Option<Arc<Window>>,
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    context: Option<softbuffer::Context<Arc<Window>>>,
-    tick: u64,
+    compositor_state: CompositorState,
+    xdg_shell_state: XdgShellState,
+    shm_state: ShmState,
+    seat_state: SeatState<App>,
+    data_device_state: DataDeviceState,
+    seat: Seat<App>,
 }
 
-impl App {
-    fn new() -> Self {
-        Self { window: None, surface: None, context: None, tick: 0 }
-    }
+/// Count the current number of virtual memory areas (VMAs) for this process
+/// by reading /proc/self/maps.  Used for startup diagnostics.
+fn count_vmas() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() { return; }
-
-        let attrs = Window::default_attributes()
-            .with_title("Eclipse OS — Compositor (Linux test mode)")
-            .with_inner_size(LogicalSize::new(DEFAULT_W, DEFAULT_H));
-
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                eprintln!("[smithay_app] create_window failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let context = match softbuffer::Context::new(window.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[smithay_app] softbuffer::Context::new failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let surface = match softbuffer::Surface::new(&context, window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[smithay_app] softbuffer::Surface::new failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        self.context = Some(context);
-        self.surface = Some(surface);
-        self.window = Some(window);
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::Escape), state: ElementState::Pressed, .. },
-                ..
-            } => {
-                event_loop.exit();
-            }
-            WindowEvent::RedrawRequested => {
-                let Some(window) = &self.window else { return };
-                let Some(surface) = &mut self.surface else { return };
-
-                let size = window.inner_size();
-                let (width, height) = (size.width, size.height);
-                // Both checked for zero before creating NonZeroU32 — safe to unwrap.
-                let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
-                    return;
-                };
-                if surface.resize(w_nz, h_nz).is_err() { return; }
-
-                if let Ok(mut buf) = surface.buffer_mut() {
-                    render_frame(&mut buf, width, height, self.tick);
-                    self.tick += 1;
-                    let _ = buf.present();
-                }
-                window.request_redraw();
-            }
-            WindowEvent::Resized(_) => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-// --- Public entry point --------------------------------------------------
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    println!("[smithay_app] Iniciando en modo Linux (softbuffer, sin EGL/GL).");
-    println!("[smithay_app] Presiona ESC o cierra la ventana para salir.");
+    // Diagnóstico de inicio: mostrar cuántas VMAs tiene el proceso al arrancar.
+    // Si este número se acerca a `vm.max_map_count` (normalmente 65536), el
+    // siguiente mprotect() puede fallar con ENOMEM.
+    let vmas_at_start = count_vmas();
+    let max_map_count = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(65536);
+    eprintln!(
+        "[smithay_app] Inicio: VMAs={} / max_map_count={} ({}%)",
+        vmas_at_start,
+        max_map_count,
+        vmas_at_start * 100 / max_map_count.max(1)
+    );
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().init();
+    }
 
-    let mut app = App::new();
-    event_loop.run_app(&mut app)?;
+    let mut display: Display<App> = Display::new()?;
+    let dh = display.handle();
 
-    Ok(())
+    let compositor_state = CompositorState::new::<App>(&dh);
+    let shm_state = ShmState::new::<App>(&dh, vec![]);
+    let mut seat_state = SeatState::new();
+    let seat = seat_state.new_wl_seat(&dh, "winit");
+
+    let mut state = App {
+        compositor_state,
+        xdg_shell_state: XdgShellState::new::<App>(&dh),
+        shm_state,
+        seat_state,
+        data_device_state: DataDeviceState::new::<App>(&dh),
+        seat,
+    };
+
+    let listener = ListeningSocket::bind("wayland-5")
+        .map_err(|e| format!("No se pudo crear el socket Wayland 'wayland-5': {e}"))?;
+    let mut _clients = Vec::new();
+
+    let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
+
+    let start_time = std::time::Instant::now();
+
+    let keyboard = state
+        .seat
+        .add_keyboard(Default::default(), 200, 200)
+        .map_err(|e| format!("Error al inicializar teclado Wayland: {e}"))?;
+
+    // set_var es seguro aquí: smithay usa un solo hilo en este punto del arranque.
+    std::env::set_var("WAYLAND_DISPLAY", "wayland-5");
+
+    // Intentar lanzar weston-terminal como cliente de prueba; el fallo es ignorable
+    // porque el compositor funciona sin él (el usuario puede conectar otros clientes).
+    if let Err(e) = std::process::Command::new("weston-terminal").spawn() {
+        eprintln!("[smithay_app] weston-terminal no disponible (ignorado): {e}");
+    }
+
+    // Log VMAs again after GL/Wayland init to show how many were added.
+    eprintln!(
+        "[smithay_app] Tras init GL/Wayland: VMAs={}",
+        count_vmas()
+    );
+
+    loop {
+        let status = winit.dispatch_new_events(|event| match event {
+            WinitEvent::Resized { .. } => {}
+            WinitEvent::Input(event) => match event {
+                InputEvent::Keyboard { event } => {
+                    keyboard.input::<(), _>(
+                        &mut state,
+                        event.key_code(),
+                        event.state(),
+                        0.into(),
+                        0,
+                        |_, _, _| FilterResult::Forward,
+                    );
+                }
+                InputEvent::PointerMotionAbsolute { .. } => {
+                    if let Some(surface) = state.xdg_shell_state.toplevel_surfaces().iter().next().cloned() {
+                        let surface = surface.wl_surface().clone();
+                        keyboard.set_focus(&mut state, Some(surface), 0.into());
+                    }
+                }
+                _ => {}
+            },
+            _ => (),
+        });
+
+        match status {
+            PumpStatus::Continue => (),
+            PumpStatus::Exit(_) => return Ok(()),
+        }
+
+        let size = backend.window_size();
+        let damage = Rectangle::from_size(size);
+        {
+            let (mut renderer, mut framebuffer) = backend.bind()?;
+            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .flat_map(|surface| {
+                    render_elements_from_surface_tree::<GlesRenderer, _>(
+                        &mut renderer,
+                        surface.wl_surface(),
+                        (0, 0),
+                        1.0,
+                        1.0,
+                        Kind::Unspecified,
+                    )
+                })
+                .collect();
+
+            let mut frame = renderer
+                // Transform::Flipped180: winit presenta el buffer con Y invertido
+                // respecto a la convención OpenGL; el flip compensa esa diferencia.
+                .render(&mut framebuffer, size, Transform::Flipped180)?;
+            frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage])?;
+            draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
+            let _ = frame.finish()?;
+
+            for surface in state.xdg_shell_state.toplevel_surfaces() {
+                send_frames_surface_tree(surface.wl_surface(), start_time.elapsed().as_millis() as u32);
+            }
+
+            if let Some(stream) = listener.accept()? {
+                let client = display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::default()))
+                    .unwrap();
+                _clients.push(client);
+            }
+
+            display.dispatch_clients(&mut state)?;
+            display.flush_clients()?;
+        }
+
+        backend.submit(Some(&[damage]))?;
+    }
+}
+
+fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_surf, states, &()| {
+            for callback in states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .frame_callbacks
+                .drain(..)
+            {
+                callback.done(time);
+            }
+        },
+        |_, _, &()| true,
+    );
+}
+
+#[derive(Default)]
+struct ClientState {
+    compositor_state: CompositorClientState,
+}
+
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: ClientId) {
+        println!("initialized");
+    }
+
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
+        println!("disconnected");
+    }
 }

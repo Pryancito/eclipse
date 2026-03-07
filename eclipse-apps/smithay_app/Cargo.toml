@@ -25,12 +25,10 @@ heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
 
-# Dependencias solo para target Linux (host) — ventana software sin EGL/GL
-# Usar softbuffer (pixel buffer puro) en lugar de smithay+EGL para evitar
-# el agotamiento de VMAs (max_map_count) que causa el fallo del sigaltstack.
+# Dependencias solo para target Linux (host) — compositor Wayland con Smithay
 [target.'cfg(target_os = "linux")'.dependencies]
-winit = { version = "0.30", features = ["rwh_06"] }
-softbuffer = "0.4"
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
