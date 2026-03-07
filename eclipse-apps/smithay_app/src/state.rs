@@ -118,7 +118,10 @@ impl SmithayState {
     }
 
     pub fn new() -> Option<Self> {
-        let backend = Backend::new()?;
+        let mut backend = Backend::new()?;
+        // Render the static cosmic background once into the background buffer so that
+        // blit_background / blit_background_damaged have valid content to copy from.
+        backend.fb.pre_render_background();
         let space = Space::new();
         let input = InputState::new(
             backend.fb.info.width as i32,
@@ -354,6 +357,32 @@ impl SmithayState {
             busy = true;
         } else {
             self.input.search_curr_y = target_search_y;
+        }
+
+        // Drive desktop logo and sidebar animations every frame when in normal desktop mode.
+        // The logo and sidebar tech-card icons use `counter` for animation; without marking
+        // their regions as damaged each frame they would only update on forced 500 ms redraws.
+        if !self.input.dashboard_active && !self.input.system_central_active && !self.input.lock_active {
+            // Logo: draw_eclipse_logo renders rings out to ~280 px radius; use 300 px margin.
+            let logo_damage_r = 300i32;
+            let cx = fb_w / 2;
+            let cy = fb_h / 2;
+            let lx = (cx - logo_damage_r).max(0);
+            let ly = (cy - logo_damage_r).max(0);
+            let lw = ((logo_damage_r * 2).min(fb_w - lx)) as u32;
+            let lh = ((logo_damage_r * 2).min(fb_h - ly)) as u32;
+            self.damage_rect(Rectangle::new(Point::new(lx, ly), Size::new(lw, lh)));
+            // Sidebar (left panel with animated tech-card icons)
+            let sidebar_w = (fb_w / 10).clamp(140, 220) as u32;
+            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(sidebar_w, fb_h as u32)));
+            // HUD top-right status box (blinking dot + kernel logs)
+            let hud_x = (fb_w - 415).max(0);
+            self.damage_rect(Rectangle::new(Point::new(hud_x, 15), Size::new(400, 110)));
+            busy = true;
+        } else if self.input.lock_active {
+            // Lock screen is fully animated (logo + clock); mark full screen damaged every frame.
+            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+            busy = true;
         }
 
         // Métricas basadas en tiempo real (Instant) en lugar de contadores de bucle
@@ -690,9 +719,16 @@ impl SmithayState {
         // Merge overlapping rects (estilo cosmic-comp) para reducir blits
         merge_overlapping_rects(&mut total_damage);
 
-        // Overlays full-screen: asegurar damage completo para present correcto
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
+        // When total_damage is empty (first frame, forced periodic render, or idle state)
+        // perform a full-screen redraw so that all static/animated UI elements are visible.
+        // push() cannot fail here: total_damage is empty (len=0) and capacity is MAX_DAMAGE_RECTS=8.
+        if total_damage.is_empty() {
+            let _ = total_damage.push(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+        }
+
+        // Overlays full-screen: asegurar damage completo para present correcto
         if self.input.dashboard_active || self.input.system_central_active {
             total_damage.clear();
             let _ = total_damage.push(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));

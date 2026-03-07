@@ -354,7 +354,6 @@ impl DrawTarget for FramebufferState {
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
-        let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
         let fb_ptr = self.back_addr as *mut u32;
         
         let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
@@ -362,15 +361,16 @@ impl DrawTarget for FramebufferState {
         
         let raw_color = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
         
-        for y in intersection.top_left.y..intersection.top_left.y + intersection.size.height as i32 {
-            if y < 0 || y >= height { continue; }
-            let offset_start = (y * pitch_px) as isize;
-            for x in intersection.top_left.x..intersection.top_left.x + intersection.size.width as i32 {
-                if x < 0 || x >= width { continue; }
-                let offset = (offset_start + x as isize) as usize;
-                if offset < max_pixels {
-                    unsafe { core::ptr::write_volatile(fb_ptr.add(offset), raw_color); }
-                }
+        let x_start = intersection.top_left.x;
+        let x_end = x_start + intersection.size.width as i32;
+        let y_start = intersection.top_left.y;
+        let y_end = y_start + intersection.size.height as i32;
+        let row_width = (x_end - x_start) as usize;
+
+        for y in y_start..y_end {
+            let row_base = (y * pitch_px + x_start) as usize;
+            for i in 0..row_width {
+                unsafe { core::ptr::write_volatile(fb_ptr.add(row_base + i), raw_color); }
             }
         }
         Ok(())
@@ -837,12 +837,10 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
 pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64, damage: &[Rectangle]) -> Result<(), ()> {
     let _window_rect = Rectangle::new(Point::new(x, w.curr_y as i32), Size::new(w.curr_w as u32, w.curr_h as u32));
     
-    // We only draw decorations if they are in damage
-    // For simplicity, we draw the decoration if the window header intersects damage
-    let header_rect = Rectangle::new(Point::new(x, w.curr_y as i32), Size::new(w.curr_w as u32, ShellWindow::TITLE_H as u32));
-    if intersects_any(&header_rect, damage) {
-        draw_window_decoration_at(fb, w, is_focused, x, button_hover);
-    }
+    // Draw window decoration (blur, shadow, glass card, title bar, buttons) whenever
+    // any part of the window is in damage.  `damage` is already the visible subset
+    // of damage that overlaps this window, so it is always non-empty here.
+    draw_window_decoration_at(fb, w, is_focused, x, button_hover);
 
     if w.curr_w > 100.0 {
         match w.content {
