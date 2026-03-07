@@ -1,22 +1,26 @@
 //! Compositor Wayland con Smithay — solo se compila para target Linux (host).
 //! Mismo binario que en Eclipse; el backend se elige por target.
 //!
-//! # Por qué crasheaba antes
+//! # Por qué crasheaba antes ("failed to set up alternative stack guard page")
 //!
 //! Con `debug = true` + `strip = false` en el perfil de release el binario
-//! crecía a ~75 MB.  Un binario tan grande tiene muchos segmentos ELF LOAD
-//! que el kernel mapea como VMAs separadas al cargar el proceso.  Antes de
-//! que `main()` se ejecute, el runtime de Rust llama a `mprotect()` para
-//! instalar el guard-page del alternate signal stack.  Si en ese momento el
-//! proceso ya tiene demasiadas VMAs (cerca del límite `vm.max_map_count`),
+//! crecía a ~75 MB.  Un binario tan grande tiene cientos de segmentos ELF
+//! PT_LOAD que el kernel mapea como VMAs separadas al cargar el proceso.
+//! Antes de que `main()` se ejecute, el runtime de Rust llama a `mprotect()`
+//! para instalar el guard-page del alternate signal stack.  Si en ese momento
+//! el proceso ya tiene demasiadas VMAs (cerca del límite `vm.max_map_count`),
 //! `mprotect()` falla con ENOMEM y el proceso aborta con:
 //!
 //!   "failed to set up alternative stack guard page: Cannot allocate memory"
 //!
-//! **La solución** (ya aplicada en `eclipse-apps/Cargo.toml`) es compilar
-//! con `debug = false` y `strip = "symbols"`.  Esto reduce el binario a
-//! ~4 MB y elimina el exceso de VMAs, resolviendo el crash sin necesidad de
-//! eliminar smithay.
+//! **La solución** está en `eclipse-apps/Cargo.toml` (raíz del workspace):
+//! compilar con `debug = false` y `strip = "symbols"`.  Esto reduce el binario
+//! a ~3.5 MB con solo 4 segmentos PT_LOAD y ~4 bibliotecas dinámicas NEEDED,
+//! lo que resulta en ~20–25 VMAs al arrancar — muy por debajo del límite.
+//!
+//! **IMPORTANTE:** Las opciones de perfil deben estar en `eclipse-apps/Cargo.toml`,
+//! NO en `smithay_app/Cargo.toml`.  Cargo ignora silenciosamente las secciones
+//! `[profile.*]` definidas en paquetes miembro de un workspace.
 
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
