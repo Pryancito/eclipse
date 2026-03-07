@@ -35,6 +35,14 @@ mod smithay_wayland;
 // ---- Entry point Linux: Smithay Wayland ----
 #[cfg(target_os = "linux")]
 fn main() {
+    // Reducción de VMAs en tiempo de ejecución: limitar las arenas de malloc de glibc.
+    // Por defecto glibc crea hasta 8×nCPU arenas; cada arena reserva VMAs propias.
+    // En sistemas con muchos núcleos esto puede añadir cientos de VMAs adicionales que
+    // consumen el presupuesto de vm.max_map_count antes de que GL/Wayland terminen de
+    // inicializarse.  Fijar MALLOC_ARENA_MAX=1 fuerza una sola arena y elimina esa
+    // presión.  Debe llamarse ANTES de cualquier creación de hilo para que sea seguro.
+    std::env::set_var("MALLOC_ARENA_MAX", "1");
+
     if let Err(e) = smithay_wayland::run() {
         eprintln!("smithay_app (wayland): {}", e);
         std::process::exit(1);
