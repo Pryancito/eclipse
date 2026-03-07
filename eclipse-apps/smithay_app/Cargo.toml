@@ -1,3 +1,7 @@
+# Un solo binario (smithay_app): backend según target.
+# - target linux (host): compositor Wayland con Smithay + winit.
+# - target no-linux (eclipse): compositor Eclipse (DRM, SideWind, IPC).
+
 [package]
 name = "smithay_app"
 version = "0.1.0"
@@ -11,23 +15,26 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
+# Dependencias solo para target Eclipse (no linux)
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+std = { package = "eclipse_std", path = "../eclipse_std" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-std = { package = "eclipse_std", path = "../eclipse_std" }
-smithay = { version = "0.7", optional = true, default-features = false, features = ["desktop", "renderer_pixman"] }
 heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
 
+# Dependencias solo para target Linux (host) — compositor Wayland con Smithay
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [features]
 default = []
 host-testing = ["std/host-testing"]
-smithay = ["std/std_compat", "dep:smithay"]
-# Log frames that take >100 ticks and heartbeat cada 600 frames (diagnóstico de trompicones)
 trace-frames = []
 
-# Para `cargo test`: une features y activa host-testing en std, evitando conflicto con libstd.
 [dev-dependencies]
 std = { package = "eclipse_std", path = "../eclipse_std", features = ["host-testing"] }
 

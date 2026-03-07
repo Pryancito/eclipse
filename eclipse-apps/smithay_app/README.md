@@ -1,8 +1,13 @@
-# Smithay App - Xwayland Compositor for Eclipse OS
+# Smithay App - Compositor para Eclipse OS
 
 ## Overview
 
-Smithay App is a Wayland compositor with Xwayland support designed specifically for Eclipse OS. It provides a graphical environment that supports both Wayland and X11 applications using the native Eclipse OS IPC system and direct framebuffer access via `/dev/fb0`.
+Smithay App es **un solo binario** (como xfwl4) con dos backends según el target de compilación:
+
+- **Target Linux (host)**: compositor Wayland con la librería [Smithay](https://github.com/Smithay/smithay) + winit (OpenGL). Útil para desarrollar y probar clientes Wayland.
+- **Target Eclipse**: compositor propio (embedded-graphics, SideWind, DRM/KMS, IPC) para Eclipse OS.
+
+Un mismo crate, un mismo nombre de ejecutable; el backend se elige por `--target`.
 
 > **📘 Technical Documentation**: For detailed information about the `no_std` and `no_main` configuration and how smithay_app is loaded by initd, see [TECHNICAL.md](TECHNICAL.md).
 >
@@ -47,16 +52,21 @@ The compositor provides X11 compatibility through:
 
 ## Building
 
-The application is built using Rust nightly with the `x86_64-unknown-none` target:
+Un mismo binario, dos formas de compilar:
 
+**Compositor Wayland (Smithay) en Linux (host):**
 ```bash
-cd eclipse-apps/smithay_app
-cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
+cd eclipse-apps
+cargo build -p smithay_app --target x86_64-unknown-linux-gnu
+# Ejecutable: target/x86_64-unknown-linux-gnu/debug/smithay_app
+# Socket Wayland: wayland-5 (ej. WAYLAND_DISPLAY=wayland-5 weston-terminal)
 ```
 
-The resulting binary is located at:
-```
-target/x86_64-unknown-none/release/smithay_app
+**Compositor Eclipse (DRM, SideWind) para el target Eclipse:**
+```bash
+cd eclipse-apps
+cargo build -p smithay_app --target x86_64-unknown-eclipse
+# El binario se despliega como compositor en Eclipse OS.
 ```
 
 ## Running
@@ -106,7 +116,9 @@ When running, the compositor displays status information:
 
 ## Dependencies
 
-- `eclipse-libc`: Eclipse OS standard library providing syscall wrappers
+- `eclipse_std` / `eclipse-libc`: standard library y syscalls de Eclipse OS
+- `eclipse_ipc`, `sidewind`, `embedded-graphics`: compositor actual
+- `smithay` (opcional, feature `smithay`): reservado para una futura integración del compositor Wayland real
 
 ## System Requirements
 
@@ -116,9 +128,9 @@ When running, the compositor displays status information:
 
 ## Future Enhancements
 
+- **Integrar la librería Smithay** como backend Wayland real (hoy es compositor propio).
 - Full Wayland protocol implementation
-- Window management (compositing, stacking, focus)
-- Input event handling (keyboard, mouse)
+- Xwayland / X11 compatibility layer
 - Multiple display support
 - 3D acceleration via DRI
 - Client connection management
