@@ -137,93 +137,7 @@ struct App {
     seat: Seat<App>,
 }
 
-/// Count the current number of virtual memory areas (VMAs) for this process
-/// by reading /proc/self/maps.  Used for startup diagnostics.
-fn count_vmas() -> usize {
-    std::fs::read_to_string("/proc/self/maps")
-        .map(|s| s.lines().count())
-        .unwrap_or(0)
-}
-
-/// Número estimado de VMAs adicionales que smithay+libGL/EGL necesita al inicializarse.
-/// El driver de la GPU (radv, iris, nvidia, etc.) abre varias bibliotecas via dlopen;
-/// cada segmento de esas .so añade VMAs.  400 es un margen conservador.
-const GL_VMAS_ESTIMATE: usize = 400;
-
-/// Intenta aumentar vm.max_map_count escribiendo en /proc/sys/vm/max_map_count.
-/// Solo funciona si el proceso se ejecuta como root o tiene CAP_SYS_ADMIN.
-/// Devuelve true si tuvo éxito.
-fn try_raise_max_map_count(target: usize) -> bool {
-    std::fs::write(
-        "/proc/sys/vm/max_map_count",
-        target.to_string().as_bytes(),
-    )
-    .is_ok()
-}
-
-/// Comprueba que haya suficientes VMAs libres para la inicialización de GL.
-/// Si no hay suficiente espacio, intenta aumentar vm.max_map_count automáticamente.
-/// Si no tiene permisos, devuelve un error con el comando sysctl para que el usuario
-/// lo ejecute manualmente.
-fn ensure_vma_headroom(current: usize, max: usize) -> Result<(), String> {
-    // Margen de seguridad extra sobre la estimación de GL
-    const SAFETY_MARGIN: usize = 200;
-    // Margen adicional por encima de `needed` al fijar el nuevo max_map_count
-    const EXTRA_HEADROOM_MARGIN: usize = 1000;
-
-    let needed = current + GL_VMAS_ESTIMATE + SAFETY_MARGIN;
-
-    if needed <= max {
-        // Hay suficiente espacio: no se necesita ninguna acción.
-        return Ok(());
-    }
-
-    // Espacio insuficiente — intentar auto-corregir
-    let new_max = needed + EXTRA_HEADROOM_MARGIN;
-    eprintln!(
-        "[smithay_app] ADVERTENCIA: VMAs insuficientes ({} actuales + ~{} para GL = {} necesarias, límite = {})",
-        current, GL_VMAS_ESTIMATE, needed, max
-    );
-
-    if try_raise_max_map_count(new_max) {
-        eprintln!(
-            "[smithay_app] vm.max_map_count aumentado automáticamente a {} (OK).",
-            new_max
-        );
-        Ok(())
-    } else {
-        Err(format!(
-            "VMAs insuficientes ({} actuales, ~{} usará GL, límite {}, libres tras GL: {}). \
-             Ejecuta como root:\n  sudo sysctl -w vm.max_map_count={}",
-            current,
-            GL_VMAS_ESTIMATE,
-            max,
-            (max as isize - current as isize - GL_VMAS_ESTIMATE as isize).max(0),
-            new_max
-        ))
-    }
-}
-
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Diagnóstico de inicio: mostrar cuántas VMAs tiene el proceso al arrancar.
-    // Si este número se acerca a `vm.max_map_count` (normalmente 65536), el
-    // siguiente mprotect() puede fallar con ENOMEM.
-    let vmas_at_start = count_vmas();
-    let max_map_count = std::fs::read_to_string("/proc/sys/vm/max_map_count")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(65536);
-    eprintln!(
-        "[smithay_app] Inicio: VMAs={} / max_map_count={} ({}% ocupado)",
-        vmas_at_start,
-        max_map_count,
-        vmas_at_start * 100 / max_map_count.max(1)
-    );
-
-    // Verificar que hay suficientes VMAs libres para GL/Wayland.
-    // Si no, intentar aumentar el límite automáticamente o fallar con instrucciones claras.
-    ensure_vma_headroom(vmas_at_start, max_map_count)?;
-
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     } else {
@@ -268,14 +182,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = std::process::Command::new("weston-terminal").spawn() {
         eprintln!("[smithay_app] weston-terminal no disponible (ignorado): {e}");
     }
-
-    // Log VMAs again after GL/Wayland init to show how many were added by GL.
-    let vmas_after_gl = count_vmas();
-    eprintln!(
-        "[smithay_app] Tras init GL/Wayland: VMAs={} (+{} vs inicio)",
-        vmas_after_gl,
-        vmas_after_gl.saturating_sub(vmas_at_start)
-    );
 
     loop {
         let status = winit.dispatch_new_events(|event| match event {
