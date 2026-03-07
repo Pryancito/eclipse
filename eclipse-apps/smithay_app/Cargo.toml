@@ -12,6 +12,7 @@
 name = "smithay_app"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 [lib]
 name = "smithay_app"
@@ -27,16 +28,16 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 # No usamos la crate smithay ni wayland-server aquí: requieren std.
 # El compositor Eclipse usa patrones portados (backend, compositor, damage, etc.).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-std = { package = "eclipse_std", path = "../eclipse_std" }
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
+eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+eclipse_libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["allocator"] }
 
 # Dependencias solo para target Linux (host) — compositor Wayland con Smithay
 [target.'cfg(target_os = "linux")'.dependencies]
-smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
+# tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 libc = "0.2"
@@ -44,6 +45,26 @@ libc = "0.2"
 [features]
 default = []
 trace-frames = []
+
+# [[bin]]
+# name = "bin_ui_test"
+# path = "src/bin/bin_ui_test.rs"
+
+# [[bin]]
+# name = "bin_dependency_test_2"
+# path = "src/bin/bin_dependency_test_2.rs"
+
+# [[bin]]
+# name = "bin_dependency_test_3"
+# path = "src/bin/bin_dependency_test_3.rs"
+
+# [[bin]]
+# name = "repro"
+# path = "src/bin/repro.rs"
+
+# [[bin]]
+# name = "minimalist_test"
+# path = "src/bin/minimalist_test.rs"
 
 [[bin]]
 name = "smithay_app"

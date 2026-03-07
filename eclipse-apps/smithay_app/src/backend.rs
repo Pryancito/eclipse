@@ -2,8 +2,10 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
+use core::matches;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{eclipse_open as open, eclipse_read as read, InputEvent, O_RDONLY};
+use libc::{open, read, InputEvent, O_RDONLY,
+    get_system_stats, get_process_list};
 #[cfg(target_os = "linux")]
 use eclipse_syscall::InputEvent;
 #[cfg(target_os = "linux")]
@@ -32,6 +34,9 @@ impl Backend {
 
         #[cfg(not(test))]
         let input_fd = {
+            #[cfg(not(target_os = "linux"))]
+            let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY, 0) };
+            #[cfg(target_os = "linux")]
             let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY, 0) };
             if fd >= 0 { Some(fd) } else { None }
         };
@@ -64,7 +69,10 @@ impl Backend {
         {
             let fd = self.input_fd?;
             let mut buf = [0u8; core::mem::size_of::<InputEvent>()];
-            let n = unsafe { read(fd as u32 as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+            #[cfg(not(target_os = "linux"))]
+            let n = unsafe { read(fd as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+            #[cfg(target_os = "linux")]
+            let n = unsafe { read(fd as i32, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
             if n < 0 {
                 return None;
             }

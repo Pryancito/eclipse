@@ -1,14 +1,13 @@
 #![no_std]
 #![no_main]
 
-extern crate eclipse_std as std;
+extern crate std;
 
 use std::prelude::*;
 use std::println;
 
-std::eclipse_main!(test_main);
-
-fn test_main() -> i32 {
+#[no_mangle]
+pub extern "Rust" fn main() -> i32 {
     println!("--- Eclipse OS std Verification ---");
     
     // Test File I/O

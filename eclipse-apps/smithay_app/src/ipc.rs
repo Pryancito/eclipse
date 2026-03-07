@@ -1,14 +1,15 @@
 //! Handler IPC del compositor.
 //! Usa `eclipse_ipc` como API unificada: fast path y slow path son transparentes.
 
-// use std::prelude::*;
+use std::prelude::v1::*;
 pub use eclipse_ipc::prelude::*;
 // use eclipse_ipc::types::EclipseMessage; // Removed as per instruction, but will need to be qualified below
 use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
+use core::matches;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
+use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
 #[cfg(target_os = "linux")]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
 
@@ -136,7 +137,11 @@ pub fn handle_sidewind_message(
                     path[5+name_len] = 0; // Null terminator for C string
 
                     // 2. Open and mmap the surface buffer
+                    #[cfg(not(target_os = "linux"))]
                     let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR, 0) };
+                    #[cfg(target_os = "linux")]
+                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR, 0) };
+
                     if fd < 0 {
                         println!("[SMITHAY] Error: Failed to open SHM file {:?}", unsafe { core::str::from_utf8_unchecked(&path[..5+name_len]) });
                         return damage;

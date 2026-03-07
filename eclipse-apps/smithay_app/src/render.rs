@@ -1,5 +1,7 @@
+use std::prelude::v1::*;
+use core::matches;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{
+use libc::{
     mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
     FramebufferInfo,
 };

@@ -6,8 +6,9 @@ use crate::ipc::handle_sidewind_message;
 use crate::render;
 use crate::damage::{rect_contains, union_rects, merge_overlapping_rects};
 use std::prelude::v1::*;
+use core::matches;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{eclipse_send, ProcessInfo, SystemStats};
+use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
 #[cfg(target_os = "linux")]
 use eclipse_syscall::{ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
@@ -379,9 +380,7 @@ impl SmithayState {
             
             if need_metrics {
             if let Some(pid) = self.network_pid {
-                unsafe {
-                    let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0) }; // MSG_TYPE_NETWORK = 0x08
-                }
+                let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0) }; // MSG_TYPE_NETWORK = 0x08
                 
                 let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
                 let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
@@ -459,9 +458,7 @@ impl SmithayState {
                 }
                 
                 // Pedir info de servicios a systemd (PID 1)
-                unsafe {
-                    let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
-                }
+                let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
             }
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos

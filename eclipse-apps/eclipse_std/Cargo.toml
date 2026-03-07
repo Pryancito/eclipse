@@ -18,6 +18,6 @@ host-testing = ["libc/host-testing", "no-panic-handler", "no-allocator"]
 # no define alloc_error_handler ni panic_handler; std los aporta. Útil para builds Linux.
 std_compat = ["no-panic-handler"]
 [lib]
-name = "eclipse_std"
+name = "std"
 path = "src/lib.rs"
 

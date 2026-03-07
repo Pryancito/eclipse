@@ -25,7 +25,7 @@
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
-use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{InputEvent, KeyboardKeyEvent, AbsolutePositionEvent};
 use smithay::backend::renderer::element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement};
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Kind, Id};
@@ -38,7 +38,7 @@ use smithay::input::keyboard::FilterResult;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{Rectangle, Serial, Transform, Point, Physical};
+use smithay::utils::{Rectangle, Serial, Transform, Point, Physical, Scale};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
@@ -146,12 +146,25 @@ impl App {
     pub fn draw_desktop(&mut self) {
         self.counter = self.counter.wrapping_add(1);
         
-        // Clear background with stars/grid like in Eclipse
-        self.desktop_fb.clear_back_buffer_raw(sidewind::ui::colors::COSMIC_DEEP);
-        let _ = sidewind::ui::draw_cosmic_background(&mut self.desktop_fb);
-        let mut star_seed = 0xACE1u32;
-        let _ = sidewind::ui::draw_starfield_cosmic(&mut self.desktop_fb, &mut star_seed, EgPoint::zero());
-        let _ = sidewind::ui::draw_grid(&mut self.desktop_fb, sidewind::ui::colors::COSMIC_DEEP, 48, EgPoint::zero());
+        // Full frame damage for now as we are doing the whole desktop
+        let fb_w = self.desktop_fb.info.width as i32;
+        let fb_h = self.desktop_fb.info.height as i32;
+        let damage = [embedded_graphics::primitives::Rectangle::new(
+            embedded_graphics::geometry::Point::new(0, 0),
+            embedded_graphics::geometry::Size::new(fb_w as u32, fb_h as u32),
+        )];
+
+        crate::render::draw_static_ui(
+            &mut self.desktop_fb,
+            &[], // No shell windows for the background texture
+            0,
+            self.counter,
+            self.cursor_x,
+            self.cursor_y,
+            &damage,
+            &mut self.log_buf,
+            &mut self.log_len,
+        );
 
         if self.dashboard_active {
             crate::render::draw_dashboard(
@@ -206,6 +219,12 @@ struct App {
 
     /// Textura cacheada del desktop para evitar re-importar ~8MB cada frame.
     desktop_texture_cache: Option<GlesTexture>,
+
+    pub log_buf: [u8; 512],
+    pub log_len: usize,
+
+    pub cursor_x: i32,
+    pub cursor_y: i32,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -244,6 +263,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         net_usage: 0.0,
         counter: 0,
         desktop_texture_cache: None,
+        log_buf: [0; 512],
+        log_len: 0,
+        cursor_x: 0,
+        cursor_y: 0,
     });
 
     let listener = ListeningSocket::bind("wayland-5")
@@ -295,7 +318,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         |_, _, _| FilterResult::Forward,
                     );
                 }
-                InputEvent::PointerMotionAbsolute { .. } => {
+                InputEvent::PointerMotionAbsolute { event, .. } => {
+                    let size = backend.window_size();
+                    let logical_size = smithay::utils::Size::from((size.w, size.h));
+                    let pos = event.position_transformed(logical_size);
+                    state.cursor_x = pos.x as i32;
+                    state.cursor_y = pos.y as i32;
+
                     if let Some(surface) = state.xdg_shell_state.toplevel_surfaces().iter().next().cloned() {
                         let surface = surface.wl_surface().clone();
                         keyboard.set_focus(&mut state, Some(surface), 0.into());
@@ -313,6 +342,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
+
+        // 1. Draw UI elements into the desktop software framebuffer
+        state.draw_desktop();
+
         {
             let (mut renderer, mut framebuffer) = backend.bind()?;
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
@@ -377,7 +410,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // respecto a la convención OpenGL; el flip compensa esa diferencia.
                 .render(&mut framebuffer, size, Transform::Flipped180)?;
             frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage])?;
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
+
+            // Draw background first, then Wayland windows on top
+            draw_render_elements::<GlesRenderer, Scale<f64>, TextureRenderElement<GlesTexture>>(&mut frame, Scale::from(1.0), &[desktop_element], &[damage])?;
+            draw_render_elements::<GlesRenderer, Scale<f64>, WaylandSurfaceRenderElement<GlesRenderer>>(&mut frame, Scale::from(1.0), &elements, &[damage])?;
+
             let _ = frame.finish()?;
 
             for surface in state.xdg_shell_state.toplevel_surfaces() {

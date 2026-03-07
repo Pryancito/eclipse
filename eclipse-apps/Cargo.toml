@@ -9,6 +9,7 @@ members = [
     "x11_bridge_test",
     "eclipse_std",
     "libs/ipc",
+    "std_test",
 ]
 exclude = ["libs/ipc_tests"]
 
@@ -38,3 +39,7 @@ strip = "symbols"
 [profile.dev]
 opt-level = "s"
 panic = "abort"
+
+[patch.crates-io]
+std = { package = "eclipse_std", path = "eclipse_std" }
+libc = { package = "eclipse-libc", path = "../eclipse-relibc" }
