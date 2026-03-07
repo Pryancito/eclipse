@@ -56,16 +56,18 @@ fn render_frame(buf: &mut [u32], width: u32, height: u32, tick: u64) {
         }
     }
 
-    // Sidebar (left panel)
-    let sb_w = (width / 8).clamp(120, 200) as usize;
+    // Sidebar (left panel) — clamp sb_w so it's always strictly < w.
+    let sb_w = ((width / 8).clamp(60, 200) as usize).min(w.saturating_sub(1));
     for y in 0..h {
         for x in 0..sb_w {
             buf[y * w + x] = 0xFF080F20;
         }
     }
-    // Sidebar border
-    for y in 0..h {
-        buf[y * w + sb_w] = 0xFF0050A0;
+    // Sidebar border (only if there's room to the right of sb_w)
+    if sb_w < w {
+        for y in 0..h {
+            buf[y * w + sb_w] = 0xFF0050A0;
+        }
     }
 
     // Pulsing circle (logo placeholder): compute pulse once, outside the pixel loops.
