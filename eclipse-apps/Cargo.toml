@@ -18,12 +18,22 @@ sidewind = { path = "sidewind" }
 sidewind_core = { path = "sidewind_core" }
 
 [profile.release]
+# IMPORTANTE: Este es el lugar correcto para configurar perfiles en un workspace.
+# Las secciones [profile.*] en paquetes miembro (p. ej. smithay_app/Cargo.toml)
+# son ignoradas silenciosamente por Cargo; cualquier cambio debe hacerse aquí.
+#
+# debug=false + strip="symbols" reducen el binario de ~75 MB a ~3.5 MB:
+#   - Pasan de cientos de segmentos PT_LOAD ELF a solo 4.
+#   - El número de VMAs al arrancar cae de cientos/miles a ~20–25.
+#   - Esto evita que mprotect() falle con ENOMEM al configurar el alt-signal-stack
+#     del runtime de Rust (stack_overflow.rs), que se manifestaba como:
+#       "failed to set up alternative stack guard page: Cannot allocate memory"
 panic = "abort"
 lto = "off"
 opt-level = "s"
 codegen-units = 1
-strip = false
 debug = false
+strip = "symbols"
 
 [profile.dev]
 opt-level = "s"

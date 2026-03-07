@@ -1,18 +1,17 @@
 # Un solo binario (smithay_app): backend según target.
 # - target linux (host): compositor Wayland con Smithay + winit.
 # - target no-linux (eclipse): compositor Eclipse (DRM, SideWind, IPC).
+#
+# IMPORTANTE: Los ajustes de perfil (debug, strip, lto, opt-level, panic, …)
+# deben definirse en el Cargo.toml de la RAÍZ del workspace
+# (eclipse-apps/Cargo.toml), no aquí.  Cargo ignora silenciosamente las
+# secciones [profile.*] definidas en paquetes miembro de un workspace.
+# Editar este archivo para cambiar perfiles NO tendrá efecto.
 
 [package]
 name = "smithay_app"
 version = "0.1.0"
 edition = "2021"
-resolver = "2"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
 
 [dependencies]
 heapless = "0.8"

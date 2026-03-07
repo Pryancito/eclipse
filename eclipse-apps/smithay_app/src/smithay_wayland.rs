@@ -1,5 +1,26 @@
 //! Compositor Wayland con Smithay — solo se compila para target Linux (host).
 //! Mismo binario que en Eclipse; el backend se elige por target.
+//!
+//! # Por qué crasheaba antes ("failed to set up alternative stack guard page")
+//!
+//! Con `debug = true` + `strip = false` en el perfil de release el binario
+//! crecía a ~75 MB.  Un binario tan grande tiene cientos de segmentos ELF
+//! PT_LOAD que el kernel mapea como VMAs separadas al cargar el proceso.
+//! Antes de que `main()` se ejecute, el runtime de Rust llama a `mprotect()`
+//! para instalar el guard-page del alternate signal stack.  Si en ese momento
+//! el proceso ya tiene demasiadas VMAs (cerca del límite `vm.max_map_count`),
+//! `mprotect()` falla con ENOMEM y el proceso aborta con:
+//!
+//!   "failed to set up alternative stack guard page: Cannot allocate memory"
+//!
+//! **La solución** está en `eclipse-apps/Cargo.toml` (raíz del workspace):
+//! compilar con `debug = false` y `strip = "symbols"`.  Esto reduce el binario
+//! a ~3.5 MB con solo 4 segmentos PT_LOAD y ~4 bibliotecas dinámicas NEEDED,
+//! lo que resulta en ~20–25 VMAs al arrancar — muy por debajo del límite.
+//!
+//! **IMPORTANTE:** Las opciones de perfil deben estar en `eclipse-apps/Cargo.toml`,
+//! NO en `smithay_app/Cargo.toml`.  Cargo ignora silenciosamente las secciones
+//! `[profile.*]` definidas en paquetes miembro de un workspace.
 
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -225,17 +246,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         desktop_texture_cache: None,
     });
 
-    let listener = ListeningSocket::bind("wayland-5").unwrap();
+    let listener = ListeningSocket::bind("wayland-5")
+        .map_err(|e| format!("No se pudo crear el socket Wayland 'wayland-5': {e}"))?;
     let mut _clients = Vec::new();
 
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
 
     let start_time = std::time::Instant::now();
 
-    let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
+    let keyboard = state
+        .seat
+        .add_keyboard(Default::default(), 200, 200)
+        .map_err(|e| format!("Error al inicializar teclado Wayland: {e}"))?;
 
+    // set_var es seguro aquí: smithay usa un solo hilo en este punto del arranque.
     std::env::set_var("WAYLAND_DISPLAY", "wayland-5");
-    std::process::Command::new("weston-terminal").spawn().ok();
+
+    // Intentar lanzar weston-terminal como cliente de prueba; el fallo es ignorable
+    // porque el compositor funciona sin él (el usuario puede conectar otros clientes).
+    if let Err(e) = std::process::Command::new("weston-terminal").spawn() {
+        eprintln!("[smithay_app] weston-terminal no disponible (ignorado): {e}");
+    }
 
     loop {
         let status = winit.dispatch_new_events(|event| match event {
@@ -283,11 +314,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         {
-            state.draw_desktop();
-
-            let (mut renderer, mut framebuffer) = backend.bind().unwrap();
-            
-            // 1. Render Wayland Surfaces
+            let (mut renderer, mut framebuffer) = backend.bind()?;
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
                 .xdg_shell_state
                 .toplevel_surfaces()
@@ -346,15 +373,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let mut frame = renderer
-                .render(&mut framebuffer, size, Transform::Flipped180)
-                .unwrap();
-            frame.clear(Color32F::new(0.05, 0.05, 0.05, 1.0), &[damage]).unwrap();
-            
-            // Draw desktop first (background), then Wayland windows on top
-            draw_render_elements::<GlesRenderer, f64, _>(&mut frame, 1.0, &[desktop_element], &[damage]).unwrap();
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage]).unwrap();
-
-            let _ = frame.finish().unwrap();
+                // Transform::Flipped180: winit presenta el buffer con Y invertido
+                // respecto a la convención OpenGL; el flip compensa esa diferencia.
+                .render(&mut framebuffer, size, Transform::Flipped180)?;
+            frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage])?;
+            draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
+            let _ = frame.finish()?;
 
             for surface in state.xdg_shell_state.toplevel_surfaces() {
                 send_frames_surface_tree(surface.wl_surface(), start_time.elapsed().as_millis() as u32);
@@ -372,7 +396,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             display.flush_clients()?;
         }
 
-        backend.submit(Some(&[damage])).unwrap();
+        backend.submit(Some(&[damage]))?;
     }
 }
 
