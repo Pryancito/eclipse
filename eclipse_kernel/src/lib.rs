@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod boot;
 pub mod memory;
 pub mod interrupts;
+pub mod drm;
 pub mod serial;
 pub mod ipc;
 pub mod process;

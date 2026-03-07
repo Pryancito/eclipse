@@ -1,7 +1,6 @@
 //! Path Module - Basic path handling for Eclipse OS
 
 use ::alloc::string::String;
-use ::alloc::vec::Vec;
 use ::alloc::borrow::ToOwned;
 use core::fmt;
 use core::ops::Deref;

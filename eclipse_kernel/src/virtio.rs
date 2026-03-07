@@ -240,6 +240,65 @@ const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const CURSOR_RESOURCE_ID: u32 = 0x40;
 const DISPLAY_BUFFER_RESOURCE_ID: u32 = 2;
 
+pub struct VirtioDrmDriver;
+
+impl crate::drm::DrmDriver for VirtioDrmDriver {
+    fn name(&self) -> &'static str { "virtio-gpu" }
+    fn get_caps(&self) -> crate::drm::DrmCaps {
+        let display = PRIMARY_VIRTIO_DISPLAY.lock();
+        if let Some(d) = display.as_ref() {
+            crate::drm::DrmCaps {
+                has_3d: true,
+                has_cursor: true,
+                max_width: d.width,
+                max_height: d.height,
+            }
+        } else {
+            crate::drm::DrmCaps { has_3d: false, has_cursor: false, max_width: 0, max_height: 0 }
+        }
+    }
+    fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
+        unsafe {
+            let (ptr, phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
+            // El ID sera asignado por drm::alloc_buffer
+            Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys })
+        }
+    }
+    fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+        let mut devices = GPU_DEVICES.lock();
+        if let Some(gpu) = devices.first_mut() {
+            let size = (pitch as usize) * (height as usize);
+            // Obtenemos la info del GemHandle para la phys_addr
+            let handle = crate::drm::get_handle(handle_id)?;
+            
+            // VirtIO usa el resource_id para identificar el buffer. 
+            // Usamos el handle_id (secuencial) como resource_id.
+            if gpu.resource_create_2d(handle_id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, width, height).is_ok() {
+                if gpu.resource_attach_backing(handle_id, &[(handle.phys_addr, size as u32)]).is_ok() {
+                    return Some(handle_id);
+                }
+            }
+        }
+        None
+    }
+    fn page_flip(&self, fb_id: u32) -> bool {
+        let fb = if let Some(fb) = crate::drm::get_fb(fb_id) { fb } else { return false; };
+        
+        // fb_id es el Sequential DRM ID, que coincide con el resource_id de VirtIO
+        let mut devices = GPU_DEVICES.lock();
+        if let Some(gpu) = devices.first_mut() {
+            // Set scanout to this resource before presenting
+            let _ = gpu.set_scanout(0, fb_id, 0, 0, fb.width, fb.height);
+            drop(devices);
+            return gpu_present(fb_id, 0, 0, fb.width, fb.height);
+        }
+        false
+    }
+    fn set_cursor(&self, x: u32, y: u32) -> bool {
+        set_cursor_position(x, y)
+    }
+}
+
 /// Display buffer phys/size for cache flush before DMA (userspace writes go to CPU cache)
 static DISPLAY_FB_PHYS: Mutex<u64> = Mutex::new(0);
 static DISPLAY_FB_SIZE: Mutex<usize> = Mutex::new(0);
@@ -865,6 +924,9 @@ impl VirtIOBlockDeviceInner {
         
         // Reset device
         write_volatile(&mut (*regs).status, 0);
+
+        // Register as DRM driver
+        crate::drm::register_driver(alloc::sync::Arc::new(VirtioDrmDriver));
         
         // Set ACKNOWLEDGE status bit
         write_volatile(&mut (*regs).status, VIRTIO_STATUS_ACKNOWLEDGE);
@@ -2550,12 +2612,6 @@ pub fn init() {
                         if io_base == 0 { continue; }
                         let mut gpu = VirtIOGpuDevice::new_from_pci_io(io_base);
                         if gpu.init_legacy_pci() {
-                            serial::serial_print("[VirtIO-GPU] Initialized (I/O BAR");
-                            serial::serial_print_dec(bar_idx as u64);
-                            serial::serial_print(") at port ");
-                            serial::serial_print_hex(io_base as u64);
-                            if gpu.virgl_supported { serial::serial_print(" [Virgl 3D]"); }
-                            serial::serial_print("\n");
                             if let Ok((w, h)) = gpu.get_display_info() {
                                 serial::serial_print("[VirtIO-GPU] Display: ");
                                 serial::serial_print_dec(w as u64);
@@ -2644,6 +2700,9 @@ pub fn init() {
         }
     }
 
+    if gpu_count > 0 {
+        crate::drm::register_driver(alloc::sync::Arc::new(VirtioDrmDriver));
+    }
 }
 
 /// Global wrapper to read a block from the first available VirtIO device
@@ -2940,24 +2999,28 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
 pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
         // Flush CPU cache so GPU DMA sees userspace writes
-        if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
-            let fb_phys = *DISPLAY_FB_PHYS.lock();
-            let pitch = *DISPLAY_FB_PITCH.lock() as u64;
-            if fb_phys != 0 && pitch > 0 {
-                let virt = crate::memory::phys_to_virt(fb_phys);
+        let (fb_phys, pitch) = if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
+            (*DISPLAY_FB_PHYS.lock(), *DISPLAY_FB_PITCH.lock() as u64)
+        } else if let Some(fb) = crate::drm::get_fb(resource_id) {
+            (fb.phys_addr, fb.pitch as u64)
+        } else {
+            (0, 0)
+        };
 
-                // Optimized: only flush the dirty rectangle
-                for row in y..(y + h) {
-                    let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
-                    let row_end = row_addr + (w as u64 * 4);
-                    let mut addr = row_addr & !63; // Align to cache line (64 bytes)
-                    while addr < row_end {
-                        unsafe { clflush(addr); }
-                        addr += 64;
-                    }
+        if fb_phys != 0 && pitch > 0 {
+            let virt = crate::memory::phys_to_virt(fb_phys);
+
+            // Optimized: only flush the dirty rectangle
+            for row in y..(y + h) {
+                let row_addr = virt + (row as u64 * pitch) + (x as u64 * 4);
+                let row_end = row_addr + (w as u64 * 4);
+                let mut addr = row_addr & !63; // Align to cache line (64 bytes)
+                while addr < row_end {
+                    unsafe { clflush(addr); }
+                    addr += 64;
                 }
-                unsafe { sfence(); }
             }
+            unsafe { sfence(); }
         }
         let mut devices = GPU_DEVICES.lock();
         let dev = match devices.get_mut(0) {

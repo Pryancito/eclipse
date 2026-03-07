@@ -125,10 +125,6 @@ extern "C" {
     pub fn syscall(num: c_long, ...) -> c_long;
 }
 
-#[cfg(all(not(any(test, feature = "host-testing")), feature = "allocator", not(feature = "no-allocator"), any(target_os = "none", target_os = "linux", eclipse_target)))]
-#[global_allocator]
-static ALLOCATOR: internal_alloc::Allocator = internal_alloc::Allocator;
-
 
 #[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]

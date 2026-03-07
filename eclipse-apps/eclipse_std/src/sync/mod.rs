@@ -1,7 +1,6 @@
 //! Synchronization Module - Mutex and Condvar using eclipse-libc pthread
 
 use core::cell::UnsafeCell;
-use crate::libc::*;
 
 /// Mutual exclusion primitive
 pub struct Mutex<T: ?Sized> {

@@ -16,6 +16,8 @@ pub enum CompositorEvent {
     X11(heapless::Vec<u8, 256>, u32), // data, sender_pid
     NetStats(u64, u64), // rx, tx
     ServiceInfo(heapless::Vec<u8, 256>),
+    /// Línea de log del kernel para el HUD (cuando el logo ya está dibujado).
+    KernelLog(heapless::Vec<u8, 252>),
 }
 
 
@@ -23,8 +25,9 @@ pub enum CompositorEvent {
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
-    Minimize, Restore, ToggleDashboard, ToggleLock, ToggleNotifications, ToggleLauncher,
+    Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleNotifications, ToggleLauncher,
     SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch, ToggleSystemCentral,
+    ToggleTiling,
     ArrowUp, ArrowDown, Input(char), Enter, Backspace,
 }
 
@@ -56,7 +59,8 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
 
         0x4D => KeyAction::SnapRight,
         0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None },
-        0x48 => KeyAction::ArrowUp,
+        0x14 => if (modifiers & 8) != 0 { KeyAction::ToggleTiling } else { KeyAction::None },
+        0x48 => if (modifiers & 8) != 0 { KeyAction::Maximize } else { KeyAction::ArrowUp },
         0x50 => KeyAction::ArrowDown,
         0x1C => KeyAction::Enter,
         0x0E => KeyAction::Backspace,
@@ -134,6 +138,8 @@ pub struct InputState {
     pub launcher_curr_y: f32,
     pub current_workspace: u8,
     pub workspace_offset: f32,
+    pub tiling_active: bool,
+    pub request_toggle_tiling: bool,
     pub alt_tab_active: bool,
     pub search_active: bool,
     pub search_query: heapless::String<32>,
@@ -160,6 +166,7 @@ impl InputState {
             launcher_active: false, quick_settings_active: false, context_menu_active: false,
             context_menu_pos: Point::new(0, 0), notif_curr_x: width as f32,
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
+            tiling_active: false, request_toggle_tiling: false,
             alt_tab_active: false, search_active: false, search_query: heapless::String::<32>::new(),
             search_selected_idx: 0, search_curr_y: 0.0,
             system_central_active: false, system_central_curr_y: 0.0,
@@ -226,6 +233,7 @@ impl InputState {
                     KeyAction::SensitivityMinus => if pressed { self.mouse_sensitivity = (self.mouse_sensitivity - 25).max(50); },
                     KeyAction::InvertY => if pressed { self.invert_y = !self.invert_y; },
                     KeyAction::Minimize => if pressed { self.request_minimize = true; },
+                    KeyAction::Maximize => if pressed { self.request_maximize = true; },
                     KeyAction::Restore => if pressed { self.request_restore = true; },
                     KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
                     KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
@@ -265,6 +273,7 @@ impl InputState {
                         self.system_central_active = !self.system_central_active; 
                         if self.system_central_active { self.dashboard_active = false; self.search_active = false; }
                     },
+                    KeyAction::ToggleTiling => if pressed { self.request_toggle_tiling = true; },
                     KeyAction::Input(c) => if pressed && self.search_active { if self.search_query.len() < 32 { let _ = self.search_query.push(c); } },
 
                 }
@@ -402,7 +411,13 @@ impl InputState {
                             WindowButton::Close => self.request_close_window = true,
                             WindowButton::Minimize => self.request_minimize = true,
                             WindowButton::Maximize => self.request_maximize = true,
-                            WindowButton::None => { self.dragging_window = Some(top); self.drag_offset_x = self.cursor_x - windows[top].x; self.drag_offset_y = self.cursor_y - windows[top].y; }
+                            WindowButton::None => {
+                                if !self.tiling_active {
+                                    self.dragging_window = Some(top);
+                                    self.drag_offset_x = self.cursor_x - windows[top].x;
+                                    self.drag_offset_y = self.cursor_y - windows[top].y;
+                                }
+                            }
                         }
                     } else { self.focused_window = None; }
                 } else if (self.mouse_buttons & 2 != 0) && (old & 2 == 0) {

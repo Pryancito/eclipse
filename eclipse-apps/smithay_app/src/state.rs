@@ -1,14 +1,18 @@
 use crate::backend::Backend;
-use crate::space::Space;
+use crate::compositor::Space;
+use crate::damage::{merge_overlapping_rects, rect_contains, union_rects};
 use crate::input::{InputState, CompositorEvent};
-use crate::compositor::{ExternalSurface, MAX_EXTERNAL_SURFACES, ShellWindow, WindowContent};
-use crate::{render};
+use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
+use crate::ipc::handle_sidewind_message;
+use crate::render;
 use std::prelude::v1::*;
 use std::libc::{eclipse_send, ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
 use core::default::Default;
 use core::iter::Iterator;
+use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::geometry::{Point, Size};
 
 #[derive(Clone, Copy, Default)]
 pub struct ServiceInfo {
@@ -41,7 +45,7 @@ pub struct SmithayState {
     /// Eventos Input recibidos (para debug: si se congela el ratón, ver si este valor deja de subir).
     pub input_event_count: u64,
     pub prev_stats: Option<std::libc::SystemStats>,
-    pub last_metrics_update: u64,
+    pub last_metrics_update: std::time::Instant,
     pub cpu_usage: f32,
     pub mem_usage: f32,
     pub network_pid: Option<u32>,
@@ -58,10 +62,61 @@ pub struct SmithayState {
     pub process_cpu_usage: [f32; 32],
     pub process_mem_kb: [u64; 32],
     pub dirty: bool,
+    pub damage: heapless::Vec<Rectangle, 16>,
+    pub prev_damage: heapless::Vec<Rectangle, 16>,
+    pub prev_prev_damage: heapless::Vec<Rectangle, 16>,
 }
 
-
 impl SmithayState {
+    pub fn damage_rect(&mut self, rect: Rectangle) {
+        // Merge proactivamente cuando nos acercamos al límite para liberar espacio
+        if self.damage.len() >= 12 {
+            merge_overlapping_rects(&mut self.damage);
+        }
+        if self.damage.push(rect).is_err() {
+            // If full, merge all into one bounding box of the whole screen to be safe
+            // but for now let's just merge with the last one if possible or just stop adding.
+            // A better strategy is to union with the entire damage list into one rect.
+            if !self.damage.is_empty() {
+                let mut union = self.damage[0];
+                for i in 1..self.damage.len() {
+                    union = union_rects(union, self.damage[i]);
+                }
+                union = union_rects(union, rect);
+                self.damage.clear();
+                let _ = self.damage.push(union);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Notifica a clientes externos (SideWind) el nuevo tamaño tras layout/tiling.
+    fn notify_external_resize(&self) {
+        for i in 0..self.space.window_count {
+            if let crate::compositor::WindowContent::External(s_idx) = self.space.windows[i].content {
+                if (s_idx as usize) < self.surfaces.len() {
+                    let pid = self.surfaces[s_idx as usize].pid;
+                    let win = &self.space.windows[i];
+                    let se = SideWindEvent {
+                        event_type: SWND_EVENT_TYPE_RESIZE,
+                        data1: win.w,
+                        data2: win.h.saturating_sub(ShellWindow::TITLE_H),
+                        data3: 0,
+                    };
+                    let _ = unsafe {
+                        eclipse_send(
+                            pid,
+                            0x00000040,
+                            &se as *const _ as *const core::ffi::c_void,
+                            core::mem::size_of::<SideWindEvent>(),
+                            0,
+                        )
+                    };
+                }
+            }
+        }
+    }
+
     pub fn new() -> Option<Self> {
         let backend = Backend::new()?;
         let space = Space::new();
@@ -70,7 +125,7 @@ impl SmithayState {
             backend.fb.info.height as i32,
         );
         let surfaces = [const { ExternalSurface {
-            id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false
+            id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false, ready_to_flip: false
         } }; MAX_EXTERNAL_SURFACES];
 
         Some(Self {
@@ -81,7 +136,7 @@ impl SmithayState {
             counter: 0,
             input_event_count: 0,
             prev_stats: None,
-            last_metrics_update: 0,
+            last_metrics_update: std::time::Instant::now(),
             cpu_usage: 0.0,
             mem_usage: 0.0,
             network_pid: None,
@@ -98,11 +153,17 @@ impl SmithayState {
             process_cpu_usage: [0.0; 32],
             process_mem_kb: [0; 32],
             dirty: true,
+            damage: heapless::Vec::new(),
+            prev_damage: heapless::Vec::new(),
+            prev_prev_damage: heapless::Vec::new(),
         })
 
     }
 
     pub fn handle_event(&mut self, event: CompositorEvent) {
+        let old_cursor_x = self.input.cursor_x;
+        let old_cursor_y = self.input.cursor_y;
+
         match event {
             CompositorEvent::Input(ev) => {
                 self.input_event_count += 1;
@@ -114,26 +175,60 @@ impl SmithayState {
                     &mut self.space.window_count,
                     &self.surfaces,
                 );
+                
+                // Damage old and new cursor position
+                self.damage_rect(Rectangle::new(Point::new(old_cursor_x - 16, old_cursor_y - 16), Size::new(64, 64)));
+                self.damage_rect(Rectangle::new(Point::new(self.input.cursor_x - 16, self.input.cursor_y - 16), Size::new(64, 64)));
+                
+                // If we are dragging a window, damage the whole screen to be safe or the window area
+                // For now, if anything but move happened, we might need more.
+                // Move is the most common.
                 self.dirty = true;
             }
             CompositorEvent::SideWind(sw, sender_pid) => {
-                crate::ipc::handle_sidewind_message(
+                let fb_w = self.backend.fb.info.width as i32;
+                let fb_h = self.backend.fb.info.height as i32;
+                let damage_result = handle_sidewind_message(
                     sw, 
                     sender_pid, 
                     &mut self.surfaces, 
                     &mut self.space.windows, 
                     &mut self.space.window_count, 
-                    &mut self.input
+                    &mut self.input,
+                    fb_w,
+                    fb_h,
                 );
+                let ws_off = self.input.workspace_offset as i32;
+                if damage_result.rects.is_empty() {
+                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(self.backend.fb.info.width, self.backend.fb.info.height)));
+                } else {
+                    for (x, y, w, h, workspace) in &damage_result.rects {
+                        let eff_x = *x + (*workspace as i32 * fb_w) - ws_off;
+                        self.damage_rect(Rectangle::new(Point::new(eff_x, *y), Size::new(*w, *h)));
+                    }
+                }
                 self.dirty = true;
             }
             CompositorEvent::NetStats(rx, tx) => {
                 self.net_rx = rx;
                 self.net_tx = tx;
+                let fb_w = self.backend.fb.info.width;
+                let fb_h = self.backend.fb.info.height;
+                if self.input.dashboard_active {
+                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w, fb_h)));
+                } else {
+                    // Solo HUD (box métricas top-right): box_w=400, hud_h=110
+                    let hud_x = (fb_w as i32 - 415).max(0);
+                    self.damage_rect(Rectangle::new(Point::new(hud_x, 15), Size::new(400, 110)));
+                }
+                self.dirty = true;
+            }
+            CompositorEvent::KernelLog(line) => {
+                // Líneas de log del kernel para el HUD (logo ya dibujado). Reservado para dibujar en HUD.
+                let _ = line;
                 self.dirty = true;
             }
             CompositorEvent::ServiceInfo(data) => {
-                // SVCS (4) + Count (4) + [Name(12) + State(4) + PID(4) + Restarts(4)] * Count
                 if data.len() >= 8 && &data[0..4] == b"SVCS" {
                     let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
                     let mut parsed = 0usize;
@@ -155,6 +250,11 @@ impl SmithayState {
                         }
                     }
                     self.service_count = parsed;
+                }
+                let fb_w = self.backend.fb.info.width;
+                let fb_h = self.backend.fb.info.height;
+                if self.input.system_central_active {
+                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w, fb_h)));
                 }
                 self.dirty = true;
             }
@@ -178,26 +278,92 @@ impl SmithayState {
     pub fn update(&mut self) -> bool {
         self.counter = self.counter.wrapping_add(1);
         self.handle_requests();
-        let busy = self.space.update_animations(&mut self.surfaces);
+        let window_count_before = self.space.window_count;
+        // Optimize animation tracking by using a bitmask of changed windows
+        let animating_mask = self.space.update_animations(&mut self.surfaces);
+        let mut busy = animating_mask != 0;
+        
+        // Record damage only for windows that actually moved
+        for i in 0..self.space.window_count {
+            if (animating_mask & (1 << i)) != 0 {
+                // Record BOTH previous and current rendered rects
+                // The space doesn't know the exact PREVIOUS curr_rect, 
+                // so we damage the current one, and the previous one was already 
+                // damaged in the previous update call or is caught by global workspace shifts.
+                // Actually, let's just use the current rect for now and refine if ghosting occurs.
+                self.damage_rect(self.space.windows[i].curr_rect());
+            }
+        }
         
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
 
+        // Re-apply tiled layout if a window was closed
+        if self.input.tiling_active && self.space.window_count < window_count_before {
+            self.input.focused_window = if self.space.window_count > 0 {
+                Some(self.space.window_count - 1)
+            } else {
+                None
+            };
+            self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
+            self.notify_external_resize();
+        }
+
+        // Handle global busy states (workspace shifts, etc.)
+        if self.space.window_count == 0 && animating_mask != 0 {
+            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+        }
+        
+        const EPSILON: f32 = 0.5;
+
         let target_notif_x = if self.input.notifications_active { (fb_w - 300) as f32 } else { fb_w as f32 };
-        self.input.notif_curr_x += (target_notif_x - self.input.notif_curr_x) * 0.2;
+        let diff_notif = target_notif_x - self.input.notif_curr_x;
+        if diff_notif.abs() > EPSILON {
+            self.input.notif_curr_x += diff_notif * 0.2;
+            self.damage_rect(Rectangle::new(Point::new(fb_w - 300, 0), Size::new(300, fb_h as u32)));
+            busy = true;
+        } else {
+            self.input.notif_curr_x = target_notif_x;
+        }
 
         let target_launcher_y = if self.input.launcher_active { (fb_h - 370) as f32 } else { fb_h as f32 };
-        self.input.launcher_curr_y += (target_launcher_y - self.input.launcher_curr_y) * 0.2;
+        let diff_launcher = target_launcher_y - self.input.launcher_curr_y;
+        if diff_launcher.abs() > EPSILON {
+            self.input.launcher_curr_y += diff_launcher * 0.2;
+            self.damage_rect(Rectangle::new(Point::new(0, fb_h - 370), Size::new(fb_w as u32, 370)));
+            busy = true;
+        } else {
+            self.input.launcher_curr_y = target_launcher_y;
+        }
 
         let target_ws_offset = (self.input.current_workspace as f32) * (fb_w as f32);
-        self.input.workspace_offset += (target_ws_offset - self.input.workspace_offset) * 0.15;
+        let diff_ws = target_ws_offset - self.input.workspace_offset;
+        if diff_ws.abs() > EPSILON {
+            self.input.workspace_offset += diff_ws * 0.15;
+            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+            busy = true;
+        } else {
+            self.input.workspace_offset = target_ws_offset;
+        }
 
         let target_search_y = if self.input.search_active { 0.0 } else { -(fb_h as f32 / 2.0) };
-        self.input.search_curr_y += (target_search_y - self.input.search_curr_y) * 0.15;
+        let diff_search = target_search_y - self.input.search_curr_y;
+        if diff_search.abs() > EPSILON {
+            self.input.search_curr_y += diff_search * 0.15;
+            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32 / 2)));
+            busy = true;
+        } else {
+            self.input.search_curr_y = target_search_y;
+        }
 
-        // Métricas solo cuando hace falta (dashboard/system central) o cada 120 ticks para CPU/mem básica
+        // Métricas basadas en tiempo real (Instant) en lugar de contadores de bucle
+        let now = std::time::Instant::now();
+        let metrics_elapsed = self.last_metrics_update.elapsed();
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
-        if (need_metrics && self.counter % 30 == 0) || (!need_metrics && self.counter % 120 == 0) {
+        let metrics_interval = if need_metrics { 500u64 } else { 3000u64 };
+
+        if metrics_elapsed.as_millis() as u64 >= metrics_interval {
+            self.last_metrics_update = now;
             let mut current = SystemStats {
                 uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
             };
@@ -319,6 +485,18 @@ impl SmithayState {
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
 
+        // Toggle tiling (cosmic-comp style master+stack)
+        if self.input.request_toggle_tiling {
+            self.input.tiling_active = !self.input.tiling_active;
+            self.input.request_toggle_tiling = false;
+            if self.input.tiling_active {
+                self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
+                self.notify_external_resize();
+                self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+            }
+            self.dirty = true;
+        }
+
         // Create new window
         if self.input.request_new_window && self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
             let idx = self.space.window_count;
@@ -336,6 +514,10 @@ impl SmithayState {
             self.space.map_window(win);
             self.input.focused_window = Some(idx);
             self.input.request_new_window = false;
+            if self.input.tiling_active {
+                self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
+                self.notify_external_resize();
+            }
             self.dirty = true;
         } else if self.input.request_new_window {
             self.input.request_new_window = false;
@@ -424,6 +606,10 @@ impl SmithayState {
                 if let Some(next) = crate::compositor::next_visible(current, true, &self.space.windows, self.space.window_count) {
                     self.space.raise_window(next);
                     self.input.focused_window = Some(self.space.window_count - 1);
+                    if self.input.tiling_active {
+                        self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
+                        self.notify_external_resize();
+                    }
                 }
             }
             self.input.request_cycle_forward = false;
@@ -435,16 +621,23 @@ impl SmithayState {
                 if let Some(prev) = crate::compositor::next_visible(current, false, &self.space.windows, self.space.window_count) {
                     self.space.raise_window(prev);
                     self.input.focused_window = Some(self.space.window_count - 1);
+                    if self.input.tiling_active {
+                        self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
+                        self.notify_external_resize();
+                    }
                 }
             }
             self.input.request_cycle_backward = false;
             self.dirty = true;
         }
 
-        // Dashboard
+        // Dashboard / System Central: damage full screen al abrir overlay
         if self.input.request_dashboard {
             self.input.dashboard_active = !self.input.dashboard_active;
             self.input.request_dashboard = false;
+            if self.input.dashboard_active {
+                self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+            }
             self.dirty = true;
         }
 
@@ -457,6 +650,54 @@ impl SmithayState {
     }
 
     pub fn render(&mut self) {
+        // Buffer Age / Multiple Frame Damage: combinar damage + prev_damage
+        // Límite 8 rects para reducir copias; si excede, unificar en uno
+        const MAX_DAMAGE_RECTS: usize = 8;
+        let mut total_damage = heapless::Vec::<Rectangle, MAX_DAMAGE_RECTS>::new();
+        for d in &self.damage {
+            if total_damage.push(*d).is_err() {
+                break;
+            }
+        }
+        for d in &self.prev_damage {
+            if total_damage.len() >= MAX_DAMAGE_RECTS { break; }
+            let mut skip = false;
+            for t in &total_damage {
+                if rect_contains(*t, *d) { skip = true; break; }
+            }
+            if !skip {
+                if total_damage.push(*d).is_err() { break; }
+            }
+        }
+        for d in &self.prev_prev_damage {
+            if total_damage.len() >= MAX_DAMAGE_RECTS { break; }
+            let mut skip = false;
+            for t in &total_damage {
+                if rect_contains(*t, *d) { skip = true; break; }
+            }
+            if !skip {
+                if total_damage.push(*d).is_err() { break; }
+            }
+        }
+        if total_damage.len() >= MAX_DAMAGE_RECTS {
+            let mut union = total_damage[0];
+            for i in 1..total_damage.len() {
+                union = union_rects(union, total_damage[i]);
+            }
+            total_damage.clear();
+            let _ = total_damage.push(union);
+        }
+        // Merge overlapping rects (estilo cosmic-comp) para reducir blits
+        merge_overlapping_rects(&mut total_damage);
+
+        // Overlays full-screen: asegurar damage completo para present correcto
+        let fb_w = self.backend.fb.info.width as i32;
+        let fb_h = self.backend.fb.info.height as i32;
+        if self.input.dashboard_active || self.input.system_central_active {
+            total_damage.clear();
+            let _ = total_damage.push(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+        }
+
         if !self.input.lock_active {
             render::draw_static_ui(
                 &mut self.backend.fb, 
@@ -464,7 +705,8 @@ impl SmithayState {
                 self.space.window_count, 
                 self.counter, 
                 self.input.cursor_x, 
-                self.input.cursor_y
+                self.input.cursor_y,
+                &total_damage,
             );
             
             // Prototype hardware acceleration
@@ -481,7 +723,8 @@ impl SmithayState {
                     self.input.current_workspace,
                     self.input.cursor_x, 
                     self.input.cursor_y,
-                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0)
+                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0),
+                    &total_damage,
                 );
             } else if self.input.dashboard_active {
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
@@ -527,6 +770,18 @@ impl SmithayState {
         }
 
         render::draw_cursor(&mut self.backend.fb, embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y));
+
+        if self.input.lock_active {
+            self.backend.fb.present();
+        } else {
+            self.backend.fb.present_damaged(&total_damage);
+        }
+
+        // Damage rotation: t-2 <- t-1 <- t
+        self.prev_prev_damage = self.prev_damage.clone();
+        self.prev_damage = self.damage.clone();
+        self.damage.clear();
+        self.dirty = false;
     }
 }
 

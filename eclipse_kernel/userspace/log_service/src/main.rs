@@ -43,6 +43,12 @@ fn flush_log_buffer(state: &mut LogBuffer) {
     }
 }
 
+/// Write a line to stdout without allocating (avoids format! and allocator in early boot).
+fn write_line(bytes: &[u8]) {
+    let _ = eclipse_syscall::call::write(1, bytes);
+    let _ = eclipse_syscall::call::write(1, b"\n");
+}
+
 fn log_message(msg: &str) {
     println!("{}", msg);
     let mut state = LOG_STATE.lock();
@@ -57,12 +63,13 @@ fn log_message(msg: &str) {
 pub extern "Rust" fn main() -> i32 {
     let pid = unsafe { std::libc::getpid() };
 
-    log_message("+--------------------------------------------------------------+");
-    log_message("|              LOG SERVER / CONSOLE SERVICE                    |");
-    log_message("|         Serial Output + File Logging (/tmp/system.log)       |");
-    log_message("+--------------------------------------------------------------+");
+    write_line(b"+--------------------------------------------------------------+");
+    write_line(b"|              LOG SERVER / CONSOLE SERVICE                    |");
+    write_line(b"|         Serial Output + File Logging (/tmp/system.log)       |");
+    write_line(b"+--------------------------------------------------------------+");
+    write_line(b"[LOG-SERVICE] Starting...");
 
-    log_message("[LOG-SERVICE] Starting...");
+    log_message("[LOG-SERVICE] Initializing logging subsystem...");
     log_message("[LOG-SERVICE] Initializing logging subsystem...");
     println!("[LOG-SERVICE] Running with PID: {}", pid);
     log_message("[LOG-SERVICE] Serial port configured for output");

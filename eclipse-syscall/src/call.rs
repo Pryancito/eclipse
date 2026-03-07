@@ -51,6 +51,34 @@ pub fn getpid() -> usize {
     unsafe { syscall0(SYS_GETPID) }
 }
 
+pub fn stop_progress() -> Result<usize> {
+    unsafe { cvt(syscall0(SYS_STOP_PROGRESS)) }
+}
+
+pub fn drm_page_flip(fb_id: u32) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_DRM_PAGE_FLIP, fb_id as usize)) }
+}
+
+pub fn drm_get_caps() -> Result<crate::DrmCaps> {
+    let mut caps = crate::DrmCaps { has_3d: false, has_cursor: false, max_width: 0, max_height: 0 };
+    unsafe {
+        cvt(syscall1(SYS_DRM_GET_CAPS, &mut caps as *mut _ as usize))?;
+    }
+    Ok(caps)
+}
+
+pub fn drm_alloc_buffer(size: usize) -> Result<u32> {
+    unsafe { cvt(syscall1(SYS_DRM_ALLOC_BUFFER, size)).map(|v| v as u32) }
+}
+
+pub fn drm_create_fb(gem_handle: u32, width: u32, height: u32, pitch: u32) -> Result<u32> {
+    unsafe { cvt(syscall4(SYS_DRM_CREATE_FB, gem_handle as usize, width as usize, height as usize, pitch as usize)).map(|v| v as u32) }
+}
+
+pub fn drm_map_handle(handle_id: u32) -> Result<usize> {
+    unsafe { cvt(syscall1(SYS_DRM_MAP_HANDLE, handle_id as usize)) }
+}
+
 /// Yield the CPU (cooperative scheduling hint)
 pub fn sched_yield() -> Result<()> {
     unsafe { cvt_unit(syscall0(SYS_YIELD)) }
@@ -182,6 +210,18 @@ pub fn connect(fd: usize, addr_ptr: usize, addr_len: usize) -> Result<()> {
 /// gettid() - get thread ID
 pub fn gettid() -> usize {
     unsafe { syscall0(SYS_GETTID) }
+}
+
+/// sched_setaffinity(pid, cpu_id) - set CPU affinity for process
+/// pid=0 means current process. cpu_id=u32::MAX means any CPU (clear affinity).
+pub fn sched_setaffinity(pid: usize, cpu_id: u32) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_SCHED_SETAFFINITY, pid, cpu_id as usize)) }
+}
+
+/// register_log_hud(pid) - Registrar PID que recibirá líneas de log del kernel por IPC (HUD).
+/// pid=0 para desregistrar. Llamar desde smithay_app cuando esté listo para mostrar el HUD.
+pub fn register_log_hud(pid: u32) -> Result<()> {
+    unsafe { cvt_unit(syscall1(SYS_REGISTER_LOG_HUD, pid as usize)) }
 }
 
 const FUTEX_WAIT: usize = 0;

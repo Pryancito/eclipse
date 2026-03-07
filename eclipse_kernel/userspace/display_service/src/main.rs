@@ -30,6 +30,7 @@ const SYS_GET_FRAMEBUFFER_INFO: u64 = 15;
 const SYS_FMAP: u64 = 28;
 const SYS_GET_GPU_DISPLAY_INFO: u64 = 38;
 const SYS_PCI_ENUM_DEVICES: u64 = 17;
+const SYS_STOP_PROGRESS: u64 = 57;
 
 /// Framebuffer constants
 const BYTES_PER_PIXEL: usize = 4;  // 32-bit ARGB format
@@ -248,6 +249,16 @@ fn draw_logo_via_dev_fb0(fb: &Framebuffer) -> bool {
         }
     };
     println!("[DISPLAY-SERVICE] Drawing logo via /dev/fb0 (fd={}, vaddr=0x{:X}, {}x{})", fd, vaddr, fb.mode.width, fb.mode.height);
+    
+    // Stop kernel boot logs exactly when we start drawing the logo
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") SYS_STOP_PROGRESS,
+            options(nostack)
+        );
+    }
+
     logo::draw(vaddr, fb.pitch, fb.mode.bpp, fb.mode.width, fb.mode.height);
     close_fd(fd);
     true

@@ -1,11 +1,8 @@
 use std::prelude::v1::*;
 use micromath::F32Ext;
 use std::libc::{
-    get_framebuffer_info, map_framebuffer, FramebufferInfo,
-    get_gpu_display_info, gpu_alloc_display_buffer, gpu_present,
     mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
-    eclipse_open, eclipse_close, eclipse_fmap, O_RDONLY,
-    exit,
+    FramebufferInfo,
 };
 use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
@@ -35,184 +32,70 @@ pub const STROKE_COLORS: [Rgb888; 5] = [
 
 pub struct FramebufferState {
     pub info: FramebufferInfo,
-    pub base_addr: usize,   
-    pub front_addr: usize,  
-    pub gpu_resource_id: Option<u32>,  
-    pub background_addr: usize, 
+    pub back_fb_id: u32,
+    pub front_fb_id: u32,
+    pub back_addr: usize,
+    pub front_addr: usize,
+    pub background_addr: usize,
     pub gpu: Option<sidewind::gpu::GpuDevice>,
 }
 
 impl FramebufferState {
     pub fn init() -> Option<Self> {
-        println!("[SMITHAY] Initializing display...");
+        println!("[SMITHAY] Initializing display via DRM...");
 
-        // ── Step 1: try /dev/fb0 (safest userspace path) ──────────────────────
-        let fb0_fd = eclipse_open("/dev/fb0", O_RDONLY, 0);
-        if fb0_fd >= 0 {
-            println!("[SMITHAY] /dev/fb0 opened (fd={})", fb0_fd);
-            let fb_info = unsafe { get_framebuffer_info() }.unwrap_or_else(|| {
-                println!("[SMITHAY] WARNING: get_framebuffer_info failed, using default 1920x1080 headless");
-                FramebufferInfo {
-                    address: 0,
-                    width: 0,
-                    height: 0,
-                    pitch: 0,
-                    bpp: 32,
-                    red_mask_size: 8,
-                    red_mask_shift: 16,
-                    green_mask_size: 8,
-                    green_mask_shift: 8,
-                    blue_mask_size: 8,
-                    blue_mask_shift: 0,
-                }
-            });
+        use eclipse_syscall as syscall;
 
-            let width  = if fb_info.width  > 0 { fb_info.width  } else { DEFAULT_WIDTH };
-            let height = if fb_info.height > 0 { fb_info.height } else { DEFAULT_HEIGHT };
-            let pitch  = if fb_info.pitch  > 0 { fb_info.pitch  } else { width * 4 };
-            let fb_size = (pitch as usize).saturating_mul(height as usize);
+        // 1. Get DRM capabilities
+        let caps = syscall::drm_get_caps().ok()?;
+        println!("[SMITHAY] DRM Caps: {}x{}, 3D={}", caps.max_width, caps.max_height, caps.has_3d);
 
-            if let Some(front_addr) = eclipse_fmap(fb0_fd, 0, fb_size) {
-                eclipse_close(fb0_fd);
-                println!("[SMITHAY] /dev/fb0 mapped at 0x{:X} ({}x{})", front_addr, width, height);
+        let width = if caps.max_width > 0 { caps.max_width } else { DEFAULT_WIDTH };
+        let height = if caps.max_height > 0 { caps.max_height } else { DEFAULT_HEIGHT };
+        let pitch = width * 4;
+        let fb_size = (pitch as usize) * (height as usize);
+        println!("[SMITHAY] Allocating buffers: {}x{} pitch={}, size={} bytes", width, height, pitch, fb_size);
 
-                let back_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-                if !back_buffer.is_null() && back_buffer as usize != usize::MAX {
-                    let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-                    if !bg_buffer.is_null() && bg_buffer as usize != usize::MAX {
-                        let gpu = Some(sidewind::gpu::GpuDevice::for_backend(sidewind::gpu::GpuBackend::Nvidia));
-                        let mut info = fb_info;
-                        info.width  = width;
-                        info.height = height;
-                        info.pitch  = pitch;
-                        info.address = front_addr as u64;
-                        return Some(FramebufferState {
-                            info,
-                            base_addr: back_buffer as usize,
-                            front_addr,
-                            gpu_resource_id: None,
-                            background_addr: bg_buffer as usize,
-                            gpu,
-                        });
-                    }
-                }
-                println!("[SMITHAY] WARNING: back-buffer mmap failed after /dev/fb0 mapping");
-            } else {
-                eclipse_close(fb0_fd);
-                println!("[SMITHAY] WARNING: /dev/fb0 fmap failed, trying other backends");
-                unsafe { exit(0); }
-            }
-        } else {
-            println!("[SMITHAY] /dev/fb0 not available, trying other backends");
-            unsafe { exit(0); }
-        }
+        // 2. Allocate two buffers for double buffering
+        let handle1 = syscall::drm_alloc_buffer(fb_size).ok()?;
+        let handle2 = syscall::drm_alloc_buffer(fb_size).ok()?;
 
-        // ── Step 2: VirtIO GPU ─────────────────────────────────────────────────
-        let mut dims = [0u32, 0u32];
-        let has_gpu = unsafe { get_gpu_display_info(&mut dims) };
-        if has_gpu && dims[0] > 0 && dims[1] > 0 {
-            let gpu_opt = unsafe { gpu_alloc_display_buffer(dims[0], dims[1]) };
-            if let Some(gpu_info) = gpu_opt {
-                if gpu_info.vaddr != 0 {
-                    let info = FramebufferInfo {
-                        address: 0,
-                        width: dims[0],
-                        height: dims[1],
-                        pitch: if gpu_info.pitch > 0 { gpu_info.pitch } else { dims[0] * 4 },
-                        bpp: 32,
-                        red_mask_size: 8,
-                        red_mask_shift: 16,
-                        green_mask_size: 8,
-                        green_mask_shift: 8,
-                        blue_mask_size: 8,
-                        blue_mask_shift: 0,
-                    };
-                    let fb_size = (info.pitch as u64) * (info.height as u64);
-                    let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-                    if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
-                        return None;
-                    }
+        // 3. Create Framebuffers
+        let fb1_id = syscall::drm_create_fb(handle1, width, height, pitch).ok()?;
+        let fb2_id = syscall::drm_create_fb(handle2, width, height, pitch).ok()?;
 
-                    return Some(FramebufferState {
-                        info,
-                        base_addr: gpu_info.vaddr as usize,
-                        front_addr: 0,
-                        gpu_resource_id: Some(gpu_info.resource_id),
-                        background_addr: bg_buffer as usize,
-                        gpu: Some(sidewind::gpu::GpuDevice::new()),
-                    });
-                }
-            }
-        }
+        // 4. Map both buffers into userspace
+        let addr1 = syscall::drm_map_handle(handle1).ok()?;
+        let addr2 = syscall::drm_map_handle(handle2).ok()?;
 
-        // get_framebuffer_info() can return None on real hardware when EFI GOP is
-        // invalid, no VirtIO GPU is present, and the NVIDIA BAR1 is not set up yet.
-        // In that case, use default 1920×1080 dimensions and run in headless mode so
-        // that the compositor process always starts rather than silently doing nothing.
-        let fb_info = unsafe { get_framebuffer_info() }.unwrap_or_else(|| {
-            println!("[SMITHAY] WARNING: get_framebuffer_info failed, using default 1920x1080 headless");
-            FramebufferInfo {
-                address: 0,
-                width: 0,
-                height: 0,
-                pitch: 0,
-                bpp: 32,
-                red_mask_size: 8,
-                red_mask_shift: 16,
-                green_mask_size: 8,
-                green_mask_shift: 8,
-                blue_mask_size: 8,
-                blue_mask_shift: 0,
-            }
-        });
+        println!("[SMITHAY] DRM FBs created: {} and {}. Mapped at 0x{:X} and 0x{:X}", 
+                 fb1_id, fb2_id, addr1, addr2);
 
-        // map_framebuffer() maps the physical framebuffer into process address space.
-        // On real NVIDIA hardware (no VirtIO, no EFI GOP) this maps BAR1 linear aperture.
-        // If it fails (e.g. early during NVIDIA init), run headless until try_remap_framebuffer succeeds.
-        let front_addr = match unsafe { map_framebuffer() } {
-            Some(addr) => {
-                println!("[SMITHAY] Using linear framebuffer (NVIDIA BAR1 or GOP)");
-                addr
-            }
-            None => {
-                println!("[SMITHAY] WARNING: map_framebuffer failed, running headless");
-                0
-            }
+        // 5. Initial page flip to sync kernel state
+        let _ = syscall::drm_page_flip(fb1_id);
+
+        let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        let background_addr = if bg_buffer.is_null() || bg_buffer as usize == usize::MAX { 0 } else { bg_buffer as usize };
+
+        let info = FramebufferInfo {
+            address: addr1 as u64,
+            width,
+            height,
+            pitch,
+            bpp: 32,
+            red_mask_size: 8, red_mask_shift: 16,
+            green_mask_size: 8, green_mask_shift: 8,
+            blue_mask_size: 8, blue_mask_shift: 0,
         };
-
-        // Use a conservative 1920x1080 default when EFI GOP reports zero dimensions
-        // so that the back-buffer allocation below never uses size 0.
-        let width  = if fb_info.width  > 0 { fb_info.width  } else { DEFAULT_WIDTH };
-        let height = if fb_info.height > 0 { fb_info.height } else { DEFAULT_HEIGHT };
-        let pitch = if fb_info.pitch > 0 { fb_info.pitch } else { width * 4 };
-        let fb_size = (pitch as u64) * (height as u64);
-        let back_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-
-        if back_buffer.is_null() || back_buffer as usize == usize::MAX {
-            return None;
-        }
-
-        let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size as usize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-        if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
-            return None;
-        }
-
-        // Use NVIDIA backend when we have a linear framebuffer (BAR1 or GOP); enables gpu_command(1, ...) for 2D ops.
-        let gpu = Some(sidewind::gpu::GpuDevice::for_backend(sidewind::gpu::GpuBackend::Nvidia));
-
-        let mut info = fb_info;
-        info.width  = width;
-        info.height = height;
-        info.pitch  = pitch;
-        info.address = front_addr as u64;
 
         Some(FramebufferState {
             info,
-            base_addr: back_buffer as usize,
-            front_addr,
-            gpu_resource_id: None,
-            background_addr: bg_buffer as usize,
-            gpu,
+            back_fb_id: fb2_id,
+            front_fb_id: fb1_id,
+            back_addr: addr2,
+            front_addr: addr1,
+            background_addr,
+            gpu: Some(sidewind::gpu::GpuDevice::new()),
         })
     }
 
@@ -229,9 +112,10 @@ impl FramebufferState {
                 green_mask_size: 8, green_mask_shift: 8,
                 blue_mask_size: 8, blue_mask_shift: 0,
             },
-            base_addr: 0,
+            back_fb_id: 0,
+            front_fb_id: 0,
+            back_addr: 0,
             front_addr: 0,
-            gpu_resource_id: None,
             background_addr: 0,
             gpu: None,
         }
@@ -246,7 +130,7 @@ impl FramebufferState {
         let w = self.info.width;
         let h = self.info.height;
         if let Some(ref gpu) = self.gpu {
-            if gpu.backend() == sidewind::gpu::GpuBackend::Nvidia && self.base_addr == self.front_addr && self.front_addr != 0 {
+            if gpu.backend() == sidewind::gpu::GpuBackend::Nvidia && self.back_addr != 0 {
                 let mut enc = sidewind::gpu::GpuCommandEncoder::new(gpu);
                 if enc.fill_rect(0, 0, w, h, raw).is_ok() {
                     return;
@@ -257,7 +141,7 @@ impl FramebufferState {
     }
 
     pub fn clear_back_buffer_raw(&self, color: Rgb888) {
-        if self.base_addr == 0 { return; }
+        if self.back_addr == 0 { return; }
         
         let width_px = self.info.width as usize;
         let height = self.info.height as usize;
@@ -268,7 +152,11 @@ impl FramebufferState {
             | ((color.r() as u32) << 16)
             | ((color.g() as u32) << 8)
             | (color.b() as u32);
-        let ptr = self.base_addr as *mut u32;
+        let ptr = self.back_addr as *mut u32;
+        // Debug: Log buffer access on first frame or if suspicious
+        if height > 0 && width_px > 0 {
+             // println!("[SMITHAY] Clearing buffer at 0x{:X}, size={}x{}, pitch={}", self.back_addr, width_px, height, pitch_px);
+        }
         for y in 0..height {
             let row_start = y * pitch_px;
             for x in 0..width_px {
@@ -286,36 +174,11 @@ impl FramebufferState {
     /// Called periodically so that if the framebuffer becomes available after startup
     /// (e.g. after NVIDIA driver initialization completes), the display will start working.
     pub fn try_remap_framebuffer(&mut self) {
-        if self.gpu_resource_id.is_some() || self.front_addr != 0 {
-            return; // already mapped
-        }
-        if let Some(addr) = unsafe { map_framebuffer() } {
-            let vaddr = if addr as u64 >= PHYS_MEM_OFFSET {
-                (addr as u64 - PHYS_MEM_OFFSET) as usize
-            } else {
-                addr
-            };
-            if vaddr != 0 {
-                println!("[SMITHAY] Framebuffer mapped at 0x{:X}, switching to display mode", vaddr);
-                self.front_addr = vaddr;
-                self.info.address = vaddr as u64;
-            }
-        }
+        // No-op for DRM, handled in init
     }
 
-    pub fn present_rect(&self, x: i32, y: i32, w: i32, h: i32) {
-        if self.base_addr == 0 { return; }
-        if let Some(rid) = self.gpu_resource_id {
-            let fb_w = self.info.width as i32;
-            let fb_h = self.info.height as i32;
-            let rx = x.clamp(0, fb_w);
-            let ry = y.clamp(0, fb_h);
-            let rw = w.clamp(0, fb_w - rx);
-            let rh = h.clamp(0, fb_h - ry);
-            if rw > 0 && rh > 0 {
-                let _ = unsafe { gpu_present(rid, rx as u32, ry as u32, rw as u32, rh as u32) };
-            }
-        }
+    pub fn present_rect(&self, _x: i32, _y: i32, _w: i32, _h: i32) {
+        // No-op for DRM zero-copy (full flip)
     }
 
     pub fn draw_cross_raw(&mut self, cx: i32, cy: i32, half: i32, raw_color: u32) {
@@ -323,8 +186,8 @@ impl FramebufferState {
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
         let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
-        if self.base_addr == 0 { return; }
-        let ptr = self.base_addr as *mut u32;
+        if self.back_addr == 0 { return; }
+        let ptr = self.back_addr as *mut u32;
         for py in (cy - half)..=(cy + half) {
             if py >= 0 && py < height {
                 let offset = (py * pitch_px + cx) as usize;
@@ -343,56 +206,79 @@ impl FramebufferState {
         }
     }
 
-    pub fn present(&self) -> bool {
-        if self.base_addr == 0 { return true; }
-        let w = self.info.width;
-        let h = self.info.height;
-        if let Some(rid) = self.gpu_resource_id {
-            unsafe { gpu_present(rid, 0, 0, w, h) }
-        } else if self.front_addr != 0 {
-            let pitch = self.info.pitch.max(self.info.width * 4);
-            let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.base_addr as *const u8,
-                    self.front_addr as *mut u8,
-                    size_bytes,
-                );
-                core::arch::asm!("sfence", options(nostack, preserves_flags));
-            }
+    pub fn present(&mut self) -> bool {
+        if self.back_addr == 0 { return true; }
+        
+        let res = eclipse_syscall::drm_page_flip(self.back_fb_id);
+        if res.is_ok() {
+            // Swap handles for the next frame
+            core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
+            core::mem::swap(&mut self.back_addr, &mut self.front_addr);
             true
         } else {
-            true
+            false
         }
+    }
+
+    pub fn present_damaged(&mut self, _rects: &[Rectangle]) -> bool {
+        self.present() // Full flip for zero-copy
     }
 
     pub fn pre_render_background(&mut self) {
         if self.background_addr == 0 { return; }
-        let old_base = self.base_addr;
-        self.base_addr = self.background_addr;
+        let old_base = self.back_addr;
+        self.back_addr = self.background_addr;
         self.clear_back_buffer_raw(colors::COSMIC_DEEP);
         let _ = ui::draw_cosmic_background(self);
         let mut star_seed = 0xACE1u32;
         let _ = ui::draw_starfield_cosmic(self, &mut star_seed, Point::zero());
         let _ = ui::draw_grid(self, Rgb888::new(18, 28, 55), 48, Point::zero());
-        self.base_addr = old_base;
+        self.back_addr = old_base;
     }
 
     pub fn blit_background(&self) {
-        if self.base_addr == 0 || self.background_addr == 0 { return; }
+        if self.back_addr == 0 || self.background_addr == 0 { return; }
         let pitch = self.info.pitch.max(self.info.width * 4);
         let size_bytes = (pitch as usize).saturating_mul(self.info.height as usize);
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self.background_addr as *const u8,
-                self.base_addr as *mut u8,
+                self.back_addr as *mut u8,
                 size_bytes,
             );
         }
     }
 
+    pub fn blit_background_damaged(&self, rects: &[Rectangle]) {
+        if self.back_addr == 0 || self.background_addr == 0 || rects.is_empty() { return; }
+        
+        let pitch = self.info.pitch.max(self.info.width * 4) as usize;
+        let fb_w = self.info.width as i32;
+        let fb_h = self.info.height as i32;
+
+        for r in rects {
+            let rx = r.top_left.x.max(0);
+            let ry = r.top_left.y.max(0);
+            let rw = (r.size.width as i32).min(fb_w - rx);
+            let rh = (r.size.height as i32).min(fb_h - ry);
+
+            if rw <= 0 || rh <= 0 { continue; }
+
+            for y in ry..ry + rh {
+                let offset = (y as usize * pitch) + (rx as usize * 4);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (self.background_addr + offset) as *const u8,
+                        (self.back_addr + offset) as *mut u8,
+                        rw as usize * 4,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn blit_buffer(&mut self, x: i32, y: i32, w: u32, h: u32, src: *const u32, src_size: usize) {
-        if self.base_addr == 0 {
+        if self.back_addr == 0 {
             // Defensive: logging very rarely to avoid spamming
             return;
         }
@@ -404,7 +290,7 @@ impl FramebufferState {
         let fb_h = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(self.info.width) as i32;
         let max_pixels = (pitch_px as usize).saturating_mul(fb_h as usize);
-        let dst_ptr = self.base_addr as *mut u32;
+        let dst_ptr = self.back_addr as *mut u32;
         let w_i = w as i32;
         for iy in 0..h as i32 {
             let dy = y + iy;
@@ -445,12 +331,12 @@ impl DrawTarget for FramebufferState {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
-        if self.base_addr == 0 { return Ok(()); }
+        if self.back_addr == 0 { return Ok(()); }
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
         let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
-        let fb_ptr = self.base_addr as *mut u32;
+        let fb_ptr = self.back_addr as *mut u32;
         for Pixel(coord, color) in pixels.into_iter() {
             if coord.x >= 0 && coord.x < width && coord.y >= 0 && coord.y < height {
                 let offset = (coord.y as usize).saturating_mul(pitch_px as usize).saturating_add(coord.x as usize);
@@ -464,12 +350,12 @@ impl DrawTarget for FramebufferState {
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        if self.base_addr == 0 { return Ok(()); }
+        if self.back_addr == 0 { return Ok(()); }
         let width = self.info.width as i32;
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
         let max_pixels = (pitch_px as usize).saturating_mul(height as usize);
-        let fb_ptr = self.base_addr as *mut u32;
+        let fb_ptr = self.back_addr as *mut u32;
         
         let intersection = area.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
         if intersection.is_zero_sized() { return Ok(()); }
@@ -497,6 +383,112 @@ impl OriginDimensions for FramebufferState {
     }
 }
 
+impl FramebufferState {
+    pub fn blur_rect(&mut self, rect: Rectangle, radius: i32) {
+        if self.back_addr == 0 || radius <= 0 { return; }
+        let width = self.info.width as i32;
+        let height = self.info.height as i32;
+        let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
+        let fb_ptr = self.back_addr as *mut u32;
+
+        let inter = rect.intersection(&Rectangle::new(Point::new(0, 0), Size::new(width as u32, height as u32)));
+        if inter.is_zero_sized() { return; }
+
+        let rx = inter.top_left.x;
+        let ry = inter.top_left.y;
+        let rw = inter.size.width as i32;
+        let rh = inter.size.height as i32;
+
+        for y in ry..ry + rh {
+            for x in rx..rx + rw {
+                let mut r = 0u32;
+                let mut g = 0u32;
+                let mut b = 0u32;
+                let mut count = 0u32;
+
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        if nx >= rx && nx < rx + rw && ny >= ry && ny < ry + rh {
+                            let off = (ny * pitch_px + nx) as usize;
+                            let color = unsafe { core::ptr::read_volatile(fb_ptr.add(off)) };
+                            r += (color >> 16) & 0xFF;
+                            g += (color >> 8) & 0xFF;
+                            b += color & 0xFF;
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    let avg_r = r / count;
+                    let avg_g = g / count;
+                    let avg_b = b / count;
+                    let new_color = 0xFF000000 | (avg_r << 16) | (avg_g << 8) | avg_b;
+                    let off = (y * pitch_px + x) as usize;
+                    unsafe { core::ptr::write_volatile(fb_ptr.add(off), new_color); }
+                }
+            }
+        }
+    }
+
+    pub fn draw_sdf_shadow(&mut self, rect: Rectangle, radius: i32) {
+        self.draw_sdf_effect(rect, radius, Rgb888::new(0, 0, 0), 120, 8.0)
+    }
+
+    pub fn draw_sdf_glow(&mut self, rect: Rectangle, radius: i32, color: Rgb888) {
+        self.draw_sdf_effect(rect, radius, color, 180, 8.0)
+    }
+
+    fn draw_sdf_effect(&mut self, rect: Rectangle, radius: i32, color: Rgb888, intensity: u32, corner_radius: f32) {
+        if self.back_addr == 0 || radius <= 0 { return; }
+        // ... (existing bounds check) ...
+        let fb_w = self.info.width as i32;
+        let fb_h = self.info.height as i32;
+        let pitch_px = (self.info.pitch / 4).max(self.info.width) as i32;
+        let fb_ptr = self.back_addr as *mut u32;
+
+        let shadow_rect = Rectangle::new(
+            rect.top_left - Point::new(radius, radius),
+            Size::new(rect.size.width + radius as u32 * 2, rect.size.height + radius as u32 * 2)
+        );
+        let intersection = shadow_rect.intersection(&Rectangle::new(Point::zero(), Size::new(fb_w as u32, fb_h as u32)));
+        if intersection.is_zero_sized() { return; }
+
+        let half_w = rect.size.width as f32 / 2.0 - corner_radius;
+        let half_h = rect.size.height as f32 / 2.0 - corner_radius;
+        let cx = rect.top_left.x as f32 + rect.size.width as f32 / 2.0;
+        let cy = rect.top_left.y as f32 + rect.size.height as f32 / 2.0;
+
+        for y in intersection.top_left.y..intersection.top_left.y + intersection.size.height as i32 {
+            for x in intersection.top_left.x..intersection.top_left.x + intersection.size.width as i32 {
+                let dx = (x as f32 - cx).abs() - half_w;
+                let dy = (y as f32 - cy).abs() - half_h;
+                let dist = dx.max(0.0).hypot(dy.max(0.0)) + dx.min(0.0).max(dy.min(0.0)) - corner_radius;
+                
+                if dist > 0.0 && dist < radius as f32 {
+                    let alpha = 1.0 - (dist / radius as f32);
+                    let alpha_scaled = (alpha * alpha * intensity as f32) as u32; 
+                    if alpha_scaled > 0 {
+                        let off = (y * pitch_px + x) as usize;
+                        let bg = unsafe { core::ptr::read_volatile(fb_ptr.add(off)) };
+                        let r_bg = (bg >> 16) & 0xFF;
+                        let g_bg = (bg >> 8) & 0xFF;
+                        let b_bg = bg & 0xFF;
+                        
+                        let r = (r_bg * (255 - alpha_scaled) + (color.r() as u32) * alpha_scaled) / 255;
+                        let g = (g_bg * (255 - alpha_scaled) + (color.g() as u32) * alpha_scaled) / 255;
+                        let b = (b_bg * (255 - alpha_scaled) + (color.b() as u32) * alpha_scaled) / 255;
+                        
+                        let final_color = 0xFF000000 | (r << 16) | (g << 8) | b;
+                        unsafe { core::ptr::write_volatile(fb_ptr.add(off), final_color); }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f32, net: f32, uptime_ticks: u64) {
     let cpu = if cpu.is_nan() { 0.0 } else { cpu };
     let mem = if mem.is_nan() { 0.0 } else { mem };
@@ -513,6 +505,10 @@ pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f
     let px = (w - p_w) / 2;
     let py = (h - p_h) / 2;
     let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
+    
+    // Frosted Glass effect for Dashboard (Using explicit rect)
+    fb.blur_rect(Rectangle::new(main_panel.position, main_panel.size), 4);
+    
     let _ = main_panel.draw(fb);
     
     let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };
@@ -750,12 +746,29 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
     if cursor_x >= min_x && cursor_x < min_x + btn_size { return Some(WindowButton::Minimize); }
     None
 }
+fn intersects_any(rect: &Rectangle, damage: &[Rectangle]) -> bool {
+    for d in damage {
+        // Simple intersection check
+        let x1 = d.top_left.x; let y1 = d.top_left.y;
+        let x2 = x1 + d.size.width as i32; let y2 = y1 + d.size.height as i32;
+        let x3 = rect.top_left.x; let y3 = rect.top_left.y;
+        let x4 = x3 + rect.size.width as i32; let y4 = y3 + rect.size.height as i32;
+        
+        if x1 < x4 && x2 > x3 && y1 < y4 && y2 > y3 {
+            return true;
+        }
+    }
+    false
+}
 
-pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64) {
+pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64, damage_rects: &[Rectangle]) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
     
+    // broad-phase occlusion culling stack
+    let _occluding_rects = heapless::Vec::<Rectangle, 16>::new();
+
     for (i, w) in windows.iter().take(window_count).enumerate().rev() {
         if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
@@ -764,25 +777,73 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
         let wh = w.curr_h as i32;
         if effective_x + ww <= 0 || effective_x >= fb_w { continue; }
         if w.minimized && ww < 50 { continue; }
+
         if cursor_x >= effective_x && cursor_x < effective_x + ww && cursor_y >= wy && cursor_y < wy + wh {
-            hovered_button = window_button_hover_at(cursor_x, cursor_y, effective_x, wy, ww);
-            hovered_win_idx = Some(i);
-            break;
+            if hovered_win_idx.is_none() {
+                hovered_button = window_button_hover_at(cursor_x, cursor_y, effective_x, wy, ww);
+                hovered_win_idx = Some(i);
+            }
         }
     }
+
+    // Render loop from bottom to top (back to front)
     for (i, w) in windows.iter().take(window_count).enumerate() {
         if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
-        if effective_x + w.curr_w as i32 <= 0 || effective_x >= fb_w { continue; }
-        if w.minimized && w.curr_w < 50.0 { continue; }
+        let wy = w.curr_y as i32;
+        let ww = w.curr_w as i32;
+        let wh = w.curr_h as i32;
+        
+        if effective_x + ww <= 0 || effective_x >= fb_w { continue; }
+        if w.minimized && ww < 50 { continue; }
+
+        let window_rect = Rectangle::new(Point::new(effective_x, wy), Size::new(ww as u32, wh as u32));
+
+        // Robust Occlusion Culling: Calculate visible damaged areas
+        let mut visible_damage = heapless::Vec::<Rectangle, 16>::new();
+        for &dr in damage_rects {
+            if let Some(inter) = crate::damage::rect_intersection(window_rect, dr) {
+                let _ = visible_damage.push(inter);
+            }
+        }
+        if visible_damage.is_empty() { continue; }
+
+        // Subtract every opaque window above
+        for j in i + 1..window_count {
+            let upper = &windows[j];
+            if upper.is_opaque(surfaces) {
+                let ux = upper.curr_x as i32 + (upper.workspace as i32 * fb_w) - ws_offset as i32;
+                let upper_rect = Rectangle::new(Point::new(ux, upper.curr_y as i32), Size::new(upper.curr_w as u32, upper.curr_h as u32));
+                
+                let mut next_pass = heapless::Vec::<Rectangle, 16>::new();
+                for &vr in &visible_damage {
+                    let sub = crate::damage::subtract_rect(vr, upper_rect);
+                    for s in sub {
+                        if next_pass.len() < 16 { let _ = next_pass.push(s); }
+                    }
+                }
+                visible_damage = next_pass;
+                if visible_damage.is_empty() { break; }
+            }
+        }
+        if visible_damage.is_empty() { continue; }
+
         let focused = Some(i) == focused_window;
         let btn_hover = if hovered_win_idx == Some(i) { hovered_button.clone() } else { None };
-        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks);
+        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks, &visible_damage);
     }
 }
 
-pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
-    draw_window_decoration_at(fb, w, is_focused, x, button_hover);
+pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64, damage: &[Rectangle]) -> Result<(), ()> {
+    let _window_rect = Rectangle::new(Point::new(x, w.curr_y as i32), Size::new(w.curr_w as u32, w.curr_h as u32));
+    
+    // We only draw decorations if they are in damage
+    // For simplicity, we draw the decoration if the window header intersects damage
+    let header_rect = Rectangle::new(Point::new(x, w.curr_y as i32), Size::new(w.curr_w as u32, ShellWindow::TITLE_H as u32));
+    if intersects_any(&header_rect, damage) {
+        draw_window_decoration_at(fb, w, is_focused, x, button_hover);
+    }
+
     if w.curr_w > 100.0 {
         match w.content {
             WindowContent::InternalDemo => {
@@ -825,7 +886,23 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                         if content_w > 0 && content_h > 0 {
                             let needed = (content_w as usize).saturating_mul(content_h as usize).saturating_mul(4);
                             if needed <= s.buffer_size {
-                                fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
+                                let content_rect = Rectangle::new(Point::new(wx + 5, wy + ShellWindow::TITLE_H + 5), Size::new(content_w, content_h));
+                                
+                                // Precise damage blitting: only blit intersections with damage rects
+                                for d in damage {
+                                    let overlap = d.intersection(&content_rect);
+                                    if overlap.size.width > 0 && overlap.size.height > 0 {
+                                        // Calculate sub-rect coordinates relative to window content
+                                        let _sub_x = overlap.top_left.x - content_rect.top_left.x;
+                                        let _sub_y = overlap.top_left.y - content_rect.top_left.y;
+                                        
+                                        let _src_ptr = (s.vaddr as *const u32).wrapping_add((_sub_y as usize * content_w as usize) + _sub_x as usize);
+                                        
+                                        // FOR NOW: just blit once if there is ANY overlap, it's already an improvement over full screen.
+                                        fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -844,7 +921,17 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     let wh = w.curr_h as i32;
     let rect = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, wh as u32));
     let accent = if is_focused { colors::ACCENT_CYAN } else { colors::GLOW_DIM };
-    let _ = ui::draw_window_shadow(fb, rect);
+    
+    // Blur background under window (Frosted Glass)
+    fb.blur_rect(rect, 3);
+    
+    // SDF Shadow or Glow
+    if is_focused {
+        fb.draw_sdf_glow(rect, 20, colors::ACCENT_CYAN);
+    } else {
+        fb.draw_sdf_shadow(rect, 15);
+    }
+
     let _ = ui::draw_glass_card(fb, rect, "ECLIPSE // TERMINAL", accent);
 
     // Glossy title glow
@@ -898,15 +985,24 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     }
 }
 
-pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32) {
+pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32, damage: &[Rectangle]) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
 
-    fb.blit_background();
+    if damage.is_empty() {
+        fb.blit_background();
+    } else {
+        fb.blit_background_damaged(damage);
+    }
+
 
     let center = Point::new(w / 2, h / 2);
     let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
-    let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
+    let logo_rect = Rectangle::new(Point::new(center.x - logo_r, center.y - logo_r), Size::new(logo_r as u32 * 2, logo_r as u32 * 2));
+    if intersects_any(&logo_rect, damage) {
+        let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
+    }
+
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
     // Menú Lateral Izquierdo (Icons)
     let icon_types = [
@@ -924,9 +1020,12 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     
     for (i, icon_type) in icon_types.iter().enumerate() {
         let py = sidebar_y_start + (i as i32 * icon_slot_h);
-        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
-                 && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
-        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
+        let icon_rect = Rectangle::new(Point::new(sidebar_x, py), Size::new(sidebar_width as u32, icon_slot_h as u32));
+        if intersects_any(&icon_rect, damage) {
+            let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
+                     && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
+            let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
+        }
     }
     // HUD Superior
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
@@ -936,6 +1035,9 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let box_w = 400;
     let rx = w - box_w - 15;
     let hud_h = 110;
+    let hud_rect = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32));
+    if !intersects_any(&hud_rect, damage) { return; }
+
     let _ = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);

@@ -1,10 +1,16 @@
 //! Eclipse STD v2.0 - Standard Library for Eclipse OS
 //!
-//! This library provides a comprehensive std-like interface for Eclipse OS applications
-//! using eclipse-libc-posix for full functionality.
+//! Provides a std-like interface compatible con la API de Rust std, usando
+//! eclipse-libc para syscalls de Eclipse OS.
+//!
+//! ## Modo std_compat
+//!
+//! Con la feature `std_compat`, eclipse_std omite `#[panic_handler]` y
+//! `#[alloc_error_handler]`, permitiendo coexistir con libstd (p.ej. al usar
+//! Smithay en builds Linux). En ese caso, std aporta los lang items.
 
 #![no_std]
-#![feature(alloc_error_handler)]
+#![cfg_attr(not(feature = "std_compat"), feature(alloc_error_handler))]
 #![feature(prelude_import)]
 
 pub extern crate alloc;
@@ -154,8 +160,14 @@ macro_rules! main {
     };
 }
 
-/// Panic handler for Eclipse OS applications
-#[cfg(all(feature = "panic-handler", not(feature = "no-panic-handler"), not(test)))]
+/// Panic handler for Eclipse OS applications.
+/// Omitido en std_compat: std real proporciona el handler.
+#[cfg(all(
+    feature = "panic-handler",
+    not(feature = "no-panic-handler"),
+    not(feature = "std_compat"),
+    not(test)
+))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     crate::eprintln!("\n!!! ECLIPSE APP PANIC !!!");
@@ -171,8 +183,14 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-/// Alloc error handler
-#[cfg(all(feature = "alloc-error-handler", not(feature = "no-panic-handler"), not(test)))]
+/// Alloc error handler.
+/// Omitido en std_compat: std real proporciona el handler.
+#[cfg(all(
+    feature = "alloc-error-handler",
+    not(feature = "no-panic-handler"),
+    not(feature = "std_compat"),
+    not(test)
+))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     crate::eprintln!("\n!!! ALLOCATION ERROR !!!");

@@ -1,0 +1,656 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/moebius/eclipse/eclipse-apps/smithay_app/Cargo.toml
+workspace: /home/moebius/eclipse/eclipse-apps/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/moebius/eclipse/eclipse-apps/libs/ipc/Cargo.toml
+workspace: /home/moebius/eclipse/eclipse-apps/Cargo.toml
+    Checking eclipse-syscall v0.1.0 (/home/moebius/eclipse/eclipse-syscall)
+warning: unused variable: `stat`
+   --> /home/moebius/eclipse/eclipse-syscall/src/call.rs:146:43
+    |
+146 | ... path: &str, stat: &mut Stat, flags...
+    |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_stat`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `eclipse-syscall` (lib) generated 1 warning (run `cargo fix --lib -p eclipse-syscall` to apply 1 suggestion)
+    Checking eclipse-libc v0.3.0 (/home/moebius/eclipse/eclipse-relibc)
+warning: missing pattern for `...` argument
+  --> /home/moebius/eclipse/eclipse-relibc/src/header/unistd/mod.rs:96:80
+   |
+96 | ... *const c_char, ...) -> c_int {
+   |                    ^^^
+   |
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #145544 <https://github.com/rust-lang/rust/issues/145544>
+   = note: `#[warn(varargs_without_pattern)]` (part of `#[warn(future_incompatible)]`) on by default
+help: name the argument, or use `_` to continue ignoring it
+   |
+96 |     pub unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char, _: ...) -> c_int {
+   |                                                                                ++
+
+warning: avoid using `.intel_syntax`, Intel syntax is the default
+  --> /home/moebius/eclipse/eclipse-relibc/src/lib.rs:20:25
+   |
+20 | ...m!(include_str!("posix_stubs.s"));
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(bad_asm_style)]` on by default
+
+warning: unused imports: `strcpy` and `strncpy`
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/stdio/mod.rs:109:33
+    |
+109 | ...:string::{strcpy, strncpy};
+    |              ^^^^^^  ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::header::string::strlen`
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/stdlib/mod.rs:4:5
+  |
+4 | use crate::header::string::strlen;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Ordering`
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/pthread/mod.rs:3:37
+  |
+3 | ...::{AtomicI32, Ordering};
+  |                  ^^^^^^^^
+
+warning: unused import: `mkdir as sys_mkdir`
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/unistd/mod.rs:4:185
+  |
+4 | ...s_spawn, mkdir as sys_mkdir, fstat as...
+  |             ^^^^^^^^^^^^^^^^^^
+
+warning: type `tcflag_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/termios/mod.rs:4:10
+  |
+4 | pub type tcflag_t = c_uint;
+  |          ^^^^^^^^ help: convert the identifier to upper camel case: `TcflagT`
+  |
+  = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `cc_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/termios/mod.rs:5:10
+  |
+5 | pub type cc_t = c_uchar;
+  |          ^^^^ help: convert the identifier to upper camel case: `CcT`
+
+warning: type `speed_t` should have an upper camel case name
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/termios/mod.rs:6:10
+  |
+6 | pub type speed_t = c_uint;
+  |          ^^^^^^^ help: convert the identifier to upper camel case: `SpeedT`
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse-relibc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_SET` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_SET` in the value namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse-relibc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_CUR` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_CUR` in the value namespace is also re-exported here
+
+warning: ambiguous glob re-exports
+  --> /home/moebius/eclipse/eclipse-relibc/src/lib.rs:65:9
+   |
+65 | pub use types::*;
+   |         ^^^^^^^^ the name `SEEK_END` in the value namespace is first re-exported here
+...
+98 | pub use header::sys_eclipse::*;
+   |         ---------------------- but the name `SEEK_END` in the value namespace is also re-exported here
+
+warning: unreachable expression
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/unistd/mod.rs:200:5
+    |
+199 |     let _ = sys_exit(status);
+    |             ---------------- any code following this expression is unreachable
+200 |     loop {}
+    |     ^^^^^^^ unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/stdio/mod.rs:918:9
+    |
+918 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/ctype/mod.rs:133:38
+    |
+133 | ...onst u16 = unsafe { &CTYPE_B_TABLE[...
+    |               ^^^^^^ unnecessary `unsafe` block
+
+warning: constant `ALIGNMENT` is never used
+ --> /home/moebius/eclipse/eclipse-relibc/src/internal_alloc.rs:8:7
+  |
+8 | const ALIGNMENT: usize = 16;
+  |       ^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `CountingWriter` is never constructed
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/stdio/mod.rs:592:12
+    |
+592 |     struct CountingWriter {
+    |            ^^^^^^^^^^^^^^
+
+warning: constant `MUTEX_UNLOCKED` is never used
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/pthread/mod.rs:6:7
+  |
+6 | const MUTEX_UNLOCKED: i32 = 0;
+  |       ^^^^^^^^^^^^^^
+
+warning: constant `MUTEX_LOCKED` is never used
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/pthread/mod.rs:7:7
+  |
+7 | const MUTEX_LOCKED: i32 = 1;
+  |       ^^^^^^^^^^^^
+
+warning: static `ERRNO` is never used
+ --> /home/moebius/eclipse/eclipse-relibc/src/header/errno/mod.rs:6:12
+  |
+6 | static mut ERRNO: c_int = 0;
+  |            ^^^^^
+
+warning: constant `SYS_getrandom` should have an upper case name
+   --> /home/moebius/eclipse/eclipse-relibc/src/lib.rs:113:11
+    |
+113 | pub const SYS_getrandom: c_int = eclip...
+    |           ^^^^^^^^^^^^^ help: convert the identifier to upper case: `SYS_GETRANDOM`
+    |
+    = note: `#[warn(non_upper_case_globals)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: creating a mutable reference to mutable static
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/time/mod.rs:175:5
+    |
+175 |     BUF.as_mut_ptr()
+    |     ^^^^^^^^^^^^^^^^ mutable reference to mutable static
+    |
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+    = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+    = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: unnecessary transmute
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/math/mod.rs:115:16
+    |
+115 | ... = core::mem::transmute::<f64, u64>(x);
+    |       --------------------------------^^^
+    |       |
+    |       help: replace this with: `f64::to_bits`
+    |
+    = note: `#[warn(unnecessary_transmutes)]` on by default
+
+warning: unnecessary transmute
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/math/mod.rs:133:5
+    |
+133 |     core::mem::transmute::<u64, f64>(res_bits)
+    |     --------------------------------^^^^^^^^^^
+    |     |
+    |     help: replace this with: `f64::from_bits`
+
+warning: creating a mutable reference to mutable static
+  --> /home/moebius/eclipse/eclipse-relibc/src/header/net_inet/mod.rs:34:5
+   |
+34 |     BUF.as_mut_ptr()
+   |     ^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+
+warning: `extern` fn uses type `Option<FramebufferInfo>`, which is not FFI-safe
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/sys_eclipse.rs:104:52
+    |
+104 | ...-> core::option::Option<FramebufferInfo> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
+    |
+    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
+    = note: enum has no representation hint
+    = note: `#[warn(improper_ctypes_definitions)]` on by default
+
+warning: `extern` fn uses type `Option<usize>`, which is not FFI-safe
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/sys_eclipse.rs:116:47
+    |
+116 | ...-> core::option::Option<usize> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
+    |
+    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
+    = note: enum has no representation hint
+
+warning: `extern` fn uses type `Option<GpuDisplayBufferInfo>`, which is not FFI-safe
+   --> /home/moebius/eclipse/eclipse-relibc/src/header/sys_eclipse.rs:147:79
+    |
+147 | ...-> core::option::Option<GpuDisplayBufferInfo> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
+    |
+    = help: consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
+    = note: enum has no representation hint
+
+warning: `eclipse-libc` (lib) generated 28 warnings (run `cargo fix --lib -p eclipse-libc` to apply 7 suggestions)
+    Checking eclipse_std v0.2.0 (/home/moebius/eclipse/eclipse-apps/eclipse_std)
+warning: the feature `prelude_import` is internal to the compiler or standard library
+  --> eclipse_std/src/lib.rs:14:12
+   |
+14 | #![feature(prelude_import)]
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: using it is strongly discouraged
+   = note: `#[warn(internal_features)]` on by default
+
+warning: unused import: `self::v1::*`
+  --> eclipse_std/src/lib.rs:84:13
+   |
+84 |     pub use self::v1::*;
+   |             ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable expression
+   --> eclipse_std/src/lib.rs:123:5
+    |
+120 |         crate::libc::exit(exit_code as i32);
+    |         ----------------------------------- any code following this expression is unreachable
+...
+123 |     loop {}
+    |     ^^^^^^^ unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable expression
+   --> eclipse_std/src/lib.rs:183:5
+    |
+181 |         crate::libc::exit(1);
+    |         -------------------- any code following this expression is unreachable
+182 |     }
+183 |     loop {}
+    |     ^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> eclipse_std/src/lib.rs:203:5
+    |
+201 |         crate::libc::exit(2);
+    |         -------------------- any code following this expression is unreachable
+202 |     }
+203 |     loop {}
+    |     ^^^^^^^ unreachable expression
+
+warning: associated function `new` is never used
+  --> eclipse_std/src/heap.rs:15:14
+   |
+14 | impl BumpAllocator {
+   | ------------------ associated function in this implementation
+15 |     const fn new() -> Self {
+   |              ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `0` is never read
+  --> eclipse_std/src/net/mod.rs:14:21
+   |
+14 | pub struct Ipv4Addr([u8; 4]);
+   |            -------- ^^^^^^^
+   |            |
+   |            field in this struct
+   |
+   = help: consider removing this field
+
+warning: field `0` is never read
+  --> eclipse_std/src/net/mod.rs:17:21
+   |
+17 | pub struct Ipv6Addr([u16; 8]);
+   |            -------- ^^^^^^^^
+   |            |
+   |            field in this struct
+   |
+   = help: consider removing this field
+
+warning: creating a mutable reference to mutable static
+  --> eclipse_std/src/heap.rs:37:28
+   |
+37 | ...turn HEAP_MEMORY.as_mut_ptr().add(al...
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ mutable reference to mutable static
+   |
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> eclipse_std/src/sync/mod.rs:24:17
+   |
+24 |     pub fn lock(&self) -> MutexGuard<T> {
+   |                 ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                 |
+   |                 the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+24 |     pub fn lock(&self) -> MutexGuard<'_, T> {
+   |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> eclipse_std/src/sync/mod.rs:35:21
+   |
+35 | ...ck(&self) -> core::result::Result<MutexGuard<T>, (...
+   |       ^^^^^                          ^^^^^^^^^^^^^ the same lifetime is hidden here
+   |       |
+   |       the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+35 |     pub fn try_lock(&self) -> core::result::Result<MutexGuard<'_, T>, ()> {
+   |                                                               +++
+
+warning: `eclipse_std` (lib) generated 11 warnings (run `cargo fix --lib -p eclipse_std` to apply 3 suggestions)
+    Checking eclipse_ipc v0.1.0 (/home/moebius/eclipse/eclipse-apps/libs/ipc)
+warning: unused imports: `EclipseMessage`, `GET_INPUT_PID_MSG`, `GET_NETWORK_PID_MSG`, `GET_NET_STATS_MSG`, `MAX_MSG_LEN`, `TAG_INPT`, `TAG_NETW`, `TAG_NSTA`, `TAG_SUBS`, `TAG_SVCS`, `TAG_SWND`, `build_input_pid_response_payload`, `build_subscribe_payload`, `parse_fast`, and `parse_slow`
+ --> libs/ipc/src/tests.rs:4:9
+  |
+4 | ...   EclipseMessage, parse_fast, parse_slow, build_subscribe_payload,
+  |       ^^^^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^
+5 | ...   build_input_pid_response_payload, MAX_MSG_LEN, TAG_INPT, TAG_NETW, TAG_NSTA, TAG_SUBS,
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+6 | ...   TAG_SVCS, GET_INPUT_PID_MSG, GET_NETWORK_PID_MSG, GET_NET_STATS_MSG, TAG_SWND,
+  |       ^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::protocol::EclipseEncode`
+ --> libs/ipc/src/tests.rs:8:9
+  |
+8 |     use crate::protocol::EclipseEncode;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::channel::IpcChannel`
+ --> libs/ipc/src/tests.rs:9:9
+  |
+9 |     use crate::channel::IpcChannel;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DEFAULT_INPUT_QUERY_ATTEMPTS`, `INIT_PID`, and `MSG_TYPE_INPUT`
+  --> libs/ipc/src/tests.rs:10:27
+   |
+10 | ...::{INIT_PID, MSG_TYPE_INPUT, DEFAULT_INPUT_QUERY_ATTEMPTS};
+   |       ^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `eclipse_libc::InputEvent`
+  --> libs/ipc/src/tests.rs:11:9
+   |
+11 |     use eclipse_libc::InputEvent;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SIDEWIND_TAG` and `SideWindMessage`
+  --> libs/ipc/src/tests.rs:12:25
+   |
+12 | ...::{SideWindMessage, SIDEWIND_TAG};
+   |       ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: `eclipse_ipc` (lib) generated 6 warnings (run `cargo fix --lib -p eclipse_ipc` to apply 6 suggestions)
+    Checking sidewind v0.1.0 (/home/moebius/eclipse/eclipse-apps/sidewind)
+warning: unnecessary parentheses around assigned value
+   --> sidewind/src/ui.rs:923:21
+    |
+923 | ...ase = (counter as f32 * 0.02);
+    |          ^                     ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+923 -     let rot_phase = (counter as f32 * 0.02);
+923 +     let rot_phase = counter as f32 * 0.02 ;
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> sidewind/src/ui.rs:967:19
+    |
+967 |     let arc_rot = (counter as f32 * 0.5);
+    |                   ^                    ^
+    |
+help: remove these parentheses
+    |
+967 -     let arc_rot = (counter as f32 * 0.5);
+967 +     let arc_rot = counter as f32 * 0.5 ;
+    |
+
+warning: unnecessary parentheses around assigned value
+   --> sidewind/src/ui.rs:985:21
+    |
+985 | ...ase = (counter as f32 * 0.01);
+    |          ^                     ^
+    |
+help: remove these parentheses
+    |
+985 -     let rot_phase = (counter as f32 * 0.01);
+985 +     let rot_phase = counter as f32 * 0.01 ;
+    |
+
+warning: the `#![no_std]` attribute can only be used at the crate root
+ --> sidewind/src/wayland.rs:1:1
+  |
+1 | #![no_std]
+  | ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `#![no_std]` attribute can only be used at the crate root
+ --> sidewind/src/xwayland.rs:1:1
+  |
+1 | #![no_std]
+  | ^^^^^^^^^^
+
+warning: the `#![no_std]` attribute can only be used at the crate root
+ --> sidewind/src/nvidia/mod.rs:1:1
+  |
+1 | #![no_std]
+  | ^^^^^^^^^^
+
+warning: unused variable: `rect`
+    --> sidewind/src/ui.rs:1740:9
+     |
+1740 |     let rect = Rectangle::new(positio...
+     |         ^^^^ help: if this is intentional, prefix it with an underscore: `_rect`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `callback_id` is never read
+   --> sidewind/src/wayland.rs:234:9
+    |
+233 |     pub struct WlDisplay {
+    |                --------- field in this struct
+234 |         callback_id: u32,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `buffer` and `offset` are never read
+  --> sidewind/src/gpu.rs:59:5
+   |
+57 | pub struct GpuCommandEncoder<'a> {
+   |            ----------------- fields in this struct
+58 |     device: &'a GpuDevice,
+59 |     buffer: [u8; 32], // Small static b...
+   |     ^^^^^^
+60 |     offset: usize,
+   |     ^^^^^^
+
+warning: `sidewind` (lib) generated 9 warnings (run `cargo fix --lib -p sidewind` to apply 4 suggestions)
+    Checking smithay_app v0.1.0 (/home/moebius/eclipse/eclipse-apps/smithay_app)
+error[E0425]: cannot find function `drm_get_caps` in crate `syscall`
+  --> smithay_app/src/render.rs:53:29
+   |
+53 | ...syscall::drm_get_caps().ok()?;
+   |             ^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_get_caps;
+   |
+help: if you import `drm_get_caps`, refer to it directly
+   |
+53 -         let caps = syscall::drm_get_caps().ok()?;
+53 +         let caps = drm_get_caps().ok()?;
+   |
+
+error[E0425]: cannot find function `drm_alloc_buffer` in crate `syscall`
+  --> smithay_app/src/render.rs:62:32
+   |
+62 | ...scall::drm_alloc_buffer(fb_size).ok()?;
+   |           ^^^^^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_alloc_buffer;
+   |
+help: if you import `drm_alloc_buffer`, refer to it directly
+   |
+62 -         let handle1 = syscall::drm_alloc_buffer(fb_size).ok()?;
+62 +         let handle1 = drm_alloc_buffer(fb_size).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_alloc_buffer` in crate `syscall`
+  --> smithay_app/src/render.rs:63:32
+   |
+63 | ...scall::drm_alloc_buffer(fb_size).ok()?;
+   |           ^^^^^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_alloc_buffer;
+   |
+help: if you import `drm_alloc_buffer`, refer to it directly
+   |
+63 -         let handle2 = syscall::drm_alloc_buffer(fb_size).ok()?;
+63 +         let handle2 = drm_alloc_buffer(fb_size).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_create_fb` in crate `syscall`
+  --> smithay_app/src/render.rs:66:31
+   |
+66 | ...syscall::drm_create_fb(handle1, widt...
+   |             ^^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_create_fb;
+   |
+help: if you import `drm_create_fb`, refer to it directly
+   |
+66 -         let fb1_id = syscall::drm_create_fb(handle1, width, height, pitch).ok()?;
+66 +         let fb1_id = drm_create_fb(handle1, width, height, pitch).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_create_fb` in crate `syscall`
+  --> smithay_app/src/render.rs:67:31
+   |
+67 | ...syscall::drm_create_fb(handle2, widt...
+   |             ^^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_create_fb;
+   |
+help: if you import `drm_create_fb`, refer to it directly
+   |
+67 -         let fb2_id = syscall::drm_create_fb(handle2, width, height, pitch).ok()?;
+67 +         let fb2_id = drm_create_fb(handle2, width, height, pitch).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_map_fb` in crate `syscall`
+  --> smithay_app/src/render.rs:70:30
+   |
+70 | ...= syscall::drm_map_fb(fb1_id).ok()?;
+   |               ^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_map_fb;
+   |
+help: if you import `drm_map_fb`, refer to it directly
+   |
+70 -         let addr1 = syscall::drm_map_fb(fb1_id).ok()?;
+70 +         let addr1 = drm_map_fb(fb1_id).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_map_fb` in crate `syscall`
+  --> smithay_app/src/render.rs:71:30
+   |
+71 | ...= syscall::drm_map_fb(fb2_id).ok()?;
+   |               ^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_map_fb;
+   |
+help: if you import `drm_map_fb`, refer to it directly
+   |
+71 -         let addr2 = syscall::drm_map_fb(fb2_id).ok()?;
+71 +         let addr2 = drm_map_fb(fb2_id).ok()?;
+   |
+
+error[E0425]: cannot find function `drm_page_flip` in crate `syscall`
+  --> smithay_app/src/render.rs:77:26
+   |
+77 | ...syscall::drm_page_flip(fb1_id);
+   |             ^^^^^^^^^^^^^ not found in `syscall`
+   |
+help: consider importing this function
+   |
+ 1 + use eclipse_syscall::call::drm_page_flip;
+   |
+help: if you import `drm_page_flip`, refer to it directly
+   |
+77 -         let _ = syscall::drm_page_flip(fb1_id);
+77 +         let _ = drm_page_flip(fb1_id);
+   |
+
+error[E0425]: cannot find function `drm_page_flip` in crate `eclipse_syscall`
+   --> smithay_app/src/render.rs:210:36
+    |
+210 | ...syscall::drm_page_flip(self.back_fb...
+    |             ^^^^^^^^^^^^^ not found in `eclipse_syscall`
+    |
+help: consider importing this function
+    |
+  1 + use eclipse_syscall::call::drm_page_flip;
+    |
+help: if you import `drm_page_flip`, refer to it directly
+    |
+210 -         let res = eclipse_syscall::drm_page_flip(self.back_fb_id);
+210 +         let res = drm_page_flip(self.back_fb_id);
+    |
+
+warning: unused imports: `O_RDONLY`, `eclipse_close`, `eclipse_fmap`, `eclipse_open`, `exit`, `get_framebuffer_info`, `get_gpu_display_info`, `gpu_alloc_display_buffer`, `gpu_present`, and `map_framebuffer`
+ --> smithay_app/src/render.rs:4:5
+  |
+4 |     get_framebuffer_info, map_framebuffer, FramebufferInfo,
+  |     ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+5 |     get_gpu_display_info, gpu_alloc_display_buffer, gpu_present,
+  |     ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^
+6 |     mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+7 |     eclipse_open, eclipse_close, eclipse_fmap, O_RDONLY,
+  |     ^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^
+8 |     exit,
+  |     ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `smithay_app` (bin "smithay_app") generated 1 warning
+error: could not compile `smithay_app` (bin "smithay_app") due to 9 previous errors; 1 warning emitted

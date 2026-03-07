@@ -20,6 +20,8 @@ pub const GET_NETWORK_PID_MSG: &[u8; 15] = b"GET_NETWORK_PID";
 pub const TAG_NSTA: &[u8; 4] = b"NSTA";
 pub const GET_NET_STATS_MSG: &[u8; 13] = b"GET_NET_STATS";
 pub const TAG_SVCS: &[u8; 4] = b"SVCS";
+/// Línea de log del kernel (HUD). Enviada con from=0 cuando el logo ya está dibujado.
+pub const TAG_KLOG: &[u8; 4] = b"KLOG";
 
 
 /// Construye el payload de suscripción (SUBS + self_pid little-endian).
@@ -75,6 +77,8 @@ pub enum EclipseMessage {
     /// Respuesta con información de servicios desde SystemD.
     ServiceInfoResponse { data: [u8; MAX_MSG_LEN], len: usize },
 
+    /// Línea de log del kernel para el HUD (from=0, prefijo KLOG). Llega cuando el logo ya está dibujado.
+    Log { line: [u8; 252], len: usize },
 
     /// Mensaje desconocido/raw (fallback para extensibilidad futura).
     Raw { data: [u8; MAX_MSG_LEN], len: usize, from: u32 },
@@ -181,6 +185,12 @@ mod impl_parse {
             let copy_len = len.min(MAX_MSG_LEN);
             data[..copy_len].copy_from_slice(&buf[..copy_len]);
             return Some(EclipseMessage::ServiceInfoResponse { data, len: copy_len });
+        }
+        if from == 0 && len >= 4 && buf[0..4] == *TAG_KLOG {
+            let mut line = [0u8; 252];
+            let line_len = (len - 4).min(252);
+            line[..line_len].copy_from_slice(&buf[4..4 + line_len]);
+            return Some(EclipseMessage::Log { line, len: line_len });
         }
 
         if len == core::mem::size_of::<InputEvent>() {

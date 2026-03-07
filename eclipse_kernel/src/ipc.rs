@@ -37,6 +37,8 @@ pub enum MessageType {
     Security = 0x00000100,
     User = 0x00000200,
     Signal = 0x00000400, // Process-to-Process signal (not for Kernel Servers)
+    /// Línea de log del kernel enviada al HUD (compositor/smithay) cuando el logo ya está dibujado.
+    Log = 0x00000800,
 }
 
 /// Mensaje del microkernel

@@ -107,6 +107,7 @@ pub struct Process {
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
     pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
     pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
+    pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -135,6 +136,7 @@ impl Process {
             mem_frames: 0,
             current_cpu: NO_CPU,
             exit_code: 0,
+            cpu_affinity: None,
         }
     }
 }
@@ -699,6 +701,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.stack_base = parent.stack_base;
                 child.stack_size = parent.stack_size;
                 child.mem_frames = parent.mem_frames;
+                child.cpu_affinity = parent.cpu_affinity;
 
                 // Keep parent name (child will overwrite it with set_process_name if needed)
                 let mut name = [0u8; 16];

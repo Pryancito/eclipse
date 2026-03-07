@@ -5,7 +5,7 @@ use crate::process::{ProcessId, ProcessState, get_process, update_process, curre
 use spin::Mutex;
 
 /// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
-const MAX_CPUS: usize = 128;
+pub const MAX_CPUS: usize = 128;
 
 /// Cola de procesos ready (ampliada para SMP)
 const READY_QUEUE_SIZE: usize = 512;
@@ -125,20 +125,62 @@ pub fn enqueue_process(pid: ProcessId) {
     });
 }
 
-/// Sacar siguiente proceso de la cola ready
-fn dequeue_process() -> Option<ProcessId> {
+/// Sacar siguiente proceso de la cola ready que cumpla afinidad para esta CPU.
+/// Si un proceso tiene cpu_affinity = Some(n), solo la CPU n puede ejecutarlo.
+/// Si cpu_affinity = None, cualquier CPU puede ejecutarlo.
+fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut queue = READY_QUEUE.lock();
         let mut head = QUEUE_HEAD.lock();
-        let tail = *QUEUE_TAIL.lock();
+        let mut tail = QUEUE_TAIL.lock();
         
-        if *head == tail {
-            return None;
+        let mut checked = 0;
+        let initial_head = *head;
+        
+        while checked < READY_QUEUE_SIZE {
+            if *head == *tail {
+                return None;
+            }
+            
+            let pid_opt = queue[*head].take();
+            *head = (*head + 1) % READY_QUEUE_SIZE;
+            checked += 1;
+            
+            if let Some(pid) = pid_opt {
+                let matches_affinity = {
+                    let table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+                        if let Some(p) = table[slot].as_ref() {
+                            p.id == pid && match p.cpu_affinity {
+                                None => true,
+                                Some(aff) => aff == cpu_id as u32,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                
+                if matches_affinity {
+                    return Some(pid);
+                }
+                
+                // No coincide afinidad: devolver al final de la cola
+                let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
+                if next_tail == *head {
+                    // Cola llena - dejar el proceso fuera sería incorrecto.
+                    // Reinsertar en head (deshacer el take) y abortar búsqueda.
+                    *head = (*head + READY_QUEUE_SIZE - 1) % READY_QUEUE_SIZE;
+                    queue[*head] = Some(pid);
+                    return None;
+                }
+                queue[*tail] = Some(pid);
+                *tail = next_tail;
+            }
         }
-        
-        let pid = queue[*head].take();
-        *head = (*head + 1) % READY_QUEUE_SIZE;
-        pid
+        None
     })
 }
 
@@ -318,8 +360,8 @@ pub fn schedule() {
             }
         }
 
-        // Paso 2: Obtener el siguiente proceso de la cola.
-        if let Some(next_pid) = dequeue_process() {
+        // Paso 2: Obtener el siguiente proceso de la cola (respetando afinidad).
+        if let Some(next_pid) = dequeue_for_cpu(cpu_id) {
             if (next_pid as usize) < MAX_PIDS {
                 RUN_COUNTS[next_pid as usize].fetch_add(1, Ordering::Relaxed);
             }

@@ -51,6 +51,7 @@ use sidewind_nvidia::gsp::*;
 /// Stored NVIDIA framebuffer info for display fallback (BAR1 / linear VRAM aperture).
 /// Populated during nvidia::init() and used by sys_get_framebuffer_info /
 /// sys_map_framebuffer when neither EFI GOP nor VirtIO is available.
+#[derive(Clone, Copy)]
 struct NvidiaFbInfo {
     phys:   u64,
     width:  u32,
@@ -62,6 +63,45 @@ static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
 
 /// Kernel mapping of BAR1 framebuffer (size mapped) so we only map once.
 static NVIDIA_BAR1_MAPPED_SIZE: Mutex<Option<usize>> = Mutex::new(None);
+
+pub struct NvidiaDrmDriver;
+
+impl crate::drm::DrmDriver for NvidiaDrmDriver {
+    fn name(&self) -> &'static str { "nvidia-nova" }
+    fn get_caps(&self) -> crate::drm::DrmCaps {
+        let fb = NVIDIA_FB_INFO.lock();
+        if let Some(f) = fb.as_ref() {
+            crate::drm::DrmCaps {
+                has_3d: true,
+                has_cursor: true,
+                max_width: f.width,
+                max_height: f.height,
+            }
+        } else {
+            crate::drm::DrmCaps { has_3d: false, has_cursor: false, max_width: 0, max_height: 0 }
+        }
+    }
+    fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
+        unsafe {
+            let (_ptr, phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
+            Some(crate::drm::GemHandle { id: phys as u32, size, phys_addr: phys })
+        }
+    }
+    fn create_fb(&self, handle_id: u32, _width: u32, _height: u32, _pitch: u32) -> Option<u32> {
+        // Simple case: just treat the handle as the FB ID.
+        // On real NVIDIA hardware, we'd notify GSP here.
+        Some(handle_id)
+    }
+    fn page_flip(&self, _fb_id: u32) -> bool {
+        // Placeholder for hardware page flip.
+        // For now, if we're not using hardware flipping, the backend
+        // will still do its CPU blit if it has a front_addr.
+        true
+    }
+    fn set_cursor(&self, _x: u32, _y: u32) -> bool {
+        false
+    }
+}
 
 /// Fill a rectangle on the NVIDIA BAR1 framebuffer (used by sys_gpu_command(1, 0, ...)).
 /// Payload: x (u32), y (u32), w (u32), h (u32), color (u32) = 20 bytes, little-endian.
@@ -794,6 +834,9 @@ pub fn init() {
             serial::serial_print_hex(confirmed as u64);
             serial::serial_print("\n");
         }
+
+        // Register with DRM subsystem
+        crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
 
         // --- Phase 6: OpenGL context initialization ---
         // PGRAPH (bit 13) is already active via NV_PMC_ENABLE_DEFAULT.

@@ -82,6 +82,9 @@ pub enum SyscallNumber {
     GetProcessList = 52,
     Kill = 53,
     SetProcessName = 54,
+    StopProgress = 57,
+    RegisterLogHud = 67,
+    DrmPageFlip = 60,
 }
 
 
@@ -291,7 +294,14 @@ pub extern "C" fn syscall_handler(
         53 => sys_kill(arg1),
         54 => sys_set_process_name(arg1, arg2),
         55 => sys_spawn_service(arg1, arg2, arg3),
-        56 => sys_gpu_command(arg1, arg2, arg3, arg4),
+        57 => sys_stop_progress(),
+        61 => sys_drm_page_flip(arg1),
+        62 => sys_drm_get_caps(arg1),
+        63 => sys_drm_alloc_buffer(arg1),
+        64 => sys_drm_create_fb(arg1, arg2, arg3, arg4),
+        65 => sys_drm_map_handle(arg1),
+        66 => sys_sched_setaffinity(arg1, arg2),
+        67 => sys_register_log_hud(arg1),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -587,6 +597,176 @@ fn sys_get_logs(buf_ptr: u64, buf_len: u64) -> u64 {
     }
     
     copy_len as u64
+}
+
+/// sys_stop_progress - Desactivar logs y barra de progreso del kernel
+fn sys_stop_progress() -> u64 {
+    crate::progress::stop_logging();
+    0
+}
+
+/// sys_register_log_hud - Registrar PID que recibirá líneas de log por IPC (p. ej. smithay_app).
+/// pid=0 para desregistrar. Llamar cuando el compositor esté listo para mostrar el HUD.
+fn sys_register_log_hud(pid: u64) -> u64 {
+    crate::progress::set_log_hud_pid(pid as u32);
+    0
+}
+
+/// sys_drm_page_flip - Perform an atomic page flip (KMS)
+/// arg1: fb_id
+/// Returns 0 on success, u64::MAX on failure
+fn sys_drm_page_flip(fb_id: u64) -> u64 {
+    if crate::drm::page_flip(fb_id as u32) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_drm_get_caps - Get DRM capabilities
+fn sys_drm_get_caps(caps_ptr: u64) -> u64 {
+    if caps_ptr == 0 || !is_user_pointer(caps_ptr, core::mem::size_of::<crate::drm::DrmCaps>() as u64) {
+        return u64::MAX;
+    }
+    if let Some(caps) = crate::drm::get_caps() {
+        unsafe {
+             core::ptr::copy_nonoverlapping(&caps as *const _ as *const u8, caps_ptr as *mut u8, core::mem::size_of::<crate::drm::DrmCaps>());
+        }
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_drm_alloc_buffer - Allocate a GEM buffer
+fn sys_drm_alloc_buffer(size: u64) -> u64 {
+    if let Some(handle) = crate::drm::alloc_buffer(size as usize) {
+        handle.id as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_drm_create_fb - Create a DRM framebuffer
+fn sys_drm_create_fb(handle: u64, width: u64, height: u64, pitch: u64) -> u64 {
+    if let Some(fb_id) = crate::drm::create_fb(handle as u32, width as u32, height as u32, pitch as u32) {
+        fb_id as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// sys_drm_map_fb - Map a DRM framebuffer into userspace
+fn sys_drm_map_handle(handle_id: u64) -> u64 {
+    let handle = match crate::drm::get_handle(handle_id as u32) {
+        Some(h) => h,
+        None => return u64::MAX,
+    };
+    
+    let current_pid = match crate::process::current_process_id() {
+        Some(pid) => pid,
+        None => return u64::MAX,
+    };
+    
+    if let Some(mut proc) = crate::process::get_process(current_pid) {
+        let mut r = proc.resources.lock();
+        
+        let aligned_length = (handle.size + 0xFFF) & !0xFFF;
+        
+        // Find a free VMA spot (0x40000000 to 0x70000000)
+        let mut target_addr: u64 = 0;
+        let mut candidate = 0x40000000u64;
+        let mut found = false;
+        while !found && candidate < 0x70000000 {
+            let mut overlap = false;
+            for vma in r.vmas.iter() {
+                if candidate < vma.end && (candidate + aligned_length as u64) > vma.start {
+                    overlap = true;
+                    break;
+                }
+            }
+            if !overlap {
+                found = true;
+                target_addr = candidate;
+            } else {
+                candidate += 0x1000;
+            }
+        }
+        
+        if !found {
+            return u64::MAX;
+        }
+        
+        // Map the physical frames of the GEM handle directly to the found userspace address.
+        use x86_64::structures::paging::PageTableFlags;
+        let flags = (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE).bits();
+        
+        crate::memory::map_physical_range(
+            r.page_table_phys,
+            handle.phys_addr,
+            aligned_length as u64,
+            target_addr,
+            flags
+        );
+        
+        serial::serial_printf(format_args!("[SYSCALL] drm_map_handle: pid={} handle={} addr={:#x} length={}\n", current_pid, handle_id, target_addr, aligned_length));
+
+        // Record the VMA
+        r.vmas.push(crate::process::VMARegion {
+            start: target_addr,
+            end: target_addr + aligned_length as u64,
+            flags: flags, 
+            file_backed: false,
+        });
+        
+        proc.mem_frames += (aligned_length as u64 + 4095) / 4096;
+        drop(r);
+        crate::process::update_process(current_pid, proc);
+        
+        return target_addr;
+    }
+    
+    u64::MAX
+}
+
+/// sys_sched_setaffinity - Fijar afinidad de CPU para un proceso
+/// pid=0 significa el proceso actual. cpu_id=u32::MAX significa cualquier CPU (quitar afinidad).
+fn sys_sched_setaffinity(pid: u64, cpu_id: u64) -> u64 {
+    use crate::process::NO_CPU;
+    use crate::scheduler::MAX_CPUS;
+
+    let target_pid = if pid == 0 {
+        match crate::process::current_process_id() {
+            Some(p) => p,
+            None => return u64::MAX,
+        }
+    } else {
+        pid as u32
+    };
+
+    let affinity = if cpu_id == u64::from(NO_CPU) || cpu_id >= MAX_CPUS as u64 {
+        None
+    } else {
+        Some(cpu_id as u32)
+    };
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(target_pid) {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table[slot].as_mut() {
+                if p.id == target_pid {
+                    p.cpu_affinity = affinity;
+                    serial::serial_printf(format_args!(
+                        "[SYSCALL] sched_setaffinity: PID {} -> CPU {:?}\n",
+                        target_pid,
+                        affinity
+                    ));
+                    return 0u64;
+                }
+            }
+        }
+        u64::MAX
+    })
 }
 
 /// Length of null-terminated string in user space (max max_len bytes).
@@ -2252,7 +2432,10 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     let num_pages = aligned_length / 4096;
 
     let current_pid = match process::current_process_id() {
-        Some(pid) => pid,
+        Some(pid) => {
+            serial::serial_printf(format_args!("[SYSCALL] mmap: pid={} addr={:#x} length={} prot={} flags={}\n", pid, addr, length, prot, flags));
+            pid
+        },
         None => return u64::MAX,
     };
 
@@ -2386,6 +2569,7 @@ fn sys_brk(addr: u64) -> u64 {
     use crate::memory;
     use crate::serial;
     if let Some(pid) = process::current_process_id() {
+        serial::serial_printf(format_args!("[SYSCALL] brk: pid={} addr={:#x}\n", pid, addr));
         if let Some(mut proc) = process::get_process(pid) {
             let mut r = proc.resources.lock();
             let current_brk = r.brk_current;

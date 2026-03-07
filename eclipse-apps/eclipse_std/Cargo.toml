@@ -14,6 +14,9 @@ alloc-error-handler = []
 no-panic-handler = []
 no-allocator = ["libc/no-allocator"]
 host-testing = ["libc/host-testing", "no-panic-handler", "no-allocator"]
+# Compatibilidad con std real: cuando eclipse_std coexiste con libstd (p.ej. Smithay en Linux),
+# no define alloc_error_handler ni panic_handler; std los aporta. Útil para builds Linux.
+std_compat = ["no-panic-handler"]
 [lib]
 name = "eclipse_std"
 path = "src/lib.rs"

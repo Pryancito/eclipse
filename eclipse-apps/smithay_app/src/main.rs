@@ -3,12 +3,12 @@ extern crate std;
 extern crate alloc;
 extern crate eclipse_syscall;
 
+pub mod backend;
 pub mod compositor;
-pub mod render;
+pub mod damage;
 pub mod input;
 pub mod ipc;
-pub mod space;
-pub mod backend;
+pub mod render;
 pub mod state;
 
 use crate::state::SmithayState;
@@ -59,6 +59,14 @@ pub extern "Rust" fn main() -> i32 {
         }
     }
 
+    // Registrar este proceso como destinatario de líneas de log del kernel (HUD).
+    // Cuando display_service dibuja el logo llama sys_stop_progress; a partir de ahí
+    // las líneas de serial/progress se envían por IPC aquí en lugar de dibujarse en el kernel FB.
+    let self_pid = unsafe { std::libc::getpid() as u32 };
+    if let Err(_) = eclipse_syscall::call::register_log_hud(self_pid) {
+        println!("[SMITHAY] Warning: register_log_hud failed (kernel may not support it yet)");
+    }
+
     #[cfg(feature = "trace-frames")]
     let mut stats_before = std::libc::SystemStats {
         uptime_ticks: 0,
@@ -68,7 +76,6 @@ pub extern "Rust" fn main() -> i32 {
     };
 
     let mut last_render = std::time::Instant::now();
-    let frame_budget = std::time::Duration::from_millis(16); // ~60 FPS
 
     loop {
         // 1. Process all pending IPC messages (low latency polling)
@@ -79,20 +86,23 @@ pub extern "Rust" fn main() -> i32 {
 
         // 3. Render if something changed OR if too much time passed (keep-alive)
         let elapsed_since_render = last_render.elapsed();
-        if is_busy || state.dirty || elapsed_since_render >= frame_budget {
+        if is_busy || state.dirty || elapsed_since_render >= std::time::Duration::from_millis(500) {
             state.render();
-            state.backend.swap_buffers();
+            // render() ya hace present_damaged internamente; no hacer present de nuevo
             state.dirty = false;
             last_render = std::time::Instant::now();
         }
 
-        // 4. Yield/Sleep to prevent 100% CPU but stay responsive
+        // 4. Sleep to maintain ~60 FPS and prevent 100% CPU usage
+        let frame_target = std::time::Duration::from_millis(16); // ~60 FPS
+        let elapsed = last_render.elapsed();
+        
         if !is_busy && !state.dirty {
-            // Sleep short to check IPC frequently (1ms = 1000Hz polling)
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        } else {
-            // If we just rendered or are animating, don't sleep, just yield once
-            std::thread::yield_now();
+            // Idle: Sleep a bit longer to save CPU, but short enough to stay snappy
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        } else if elapsed < frame_target {
+            // Animating/Busy: Cap at 60 FPS
+            std::thread::sleep(frame_target - elapsed);
         }
 
         #[cfg(feature = "trace-frames")]

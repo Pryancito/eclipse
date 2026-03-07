@@ -27,6 +27,7 @@ mod syscalls;
 mod servers;
 mod elf_loader;
 mod pci;
+mod drm;
 mod nvidia;
 mod virtio;
 mod filesystem;
@@ -328,6 +329,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     serial::serial_print("[INIT] Initializing PCI...\n");
     pci::init();
     progress::bar(87);
+    
+    serial::serial_print("[INIT] Initializing DRM...\n");
+    drm::init();
     
     serial::serial_print("[INIT] Initializing USB HID...\n");
     usb_hid::init();

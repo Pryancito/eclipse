@@ -7,6 +7,7 @@ pub mod number;
 pub mod error;
 pub mod flag;
 pub mod call;
+pub use call::*;
 
 #[repr(C)]
 
@@ -31,7 +32,18 @@ impl ProcessInfo {
     }
 }
 
-pub use error::{Error, Result};
+pub use crate::error::{Error, Result};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrmCaps {
+    pub has_3d: bool,
+    pub has_cursor: bool,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+/// Information about a running process
 
 pub use number::*;
 

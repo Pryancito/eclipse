@@ -17,7 +17,7 @@
 //!     }
 //! }
 //! ```
-#![cfg_attr(not(target_env = "gnu"), no_std)]
+#![no_std]
 
 pub mod channel;
 pub mod async_channel;

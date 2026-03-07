@@ -1,6 +1,6 @@
 //! Standard I/O - stdin, stdout, stderr
 
-use super::{Read, Write, Result, Error, ErrorKind};
+use super::{Read, Write, Result};
 use crate::libc::*;
 
 /// Standard input

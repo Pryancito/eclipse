@@ -5,14 +5,9 @@
 macro_rules! print {
     ($($arg:tt)*) => {
         {
-            // Eclipse target: no escribir a FD=1 (serial).
-            // En host-testing mantenemos output para depuración.
-            #[cfg(feature = "host-testing")]
-            {
-                use $crate::alloc::format;
-                let s = format!($($arg)*);
-                let _ = eclipse_syscall::call::write(1, s.as_bytes());
-            }
+            use $crate::alloc::format;
+            let s = format!($($arg)*);
+            let _ = eclipse_syscall::call::write(1, s.as_bytes());
         }
     };
 }
@@ -22,21 +17,15 @@ macro_rules! print {
 macro_rules! println {
     () => {
         {
-            #[cfg(feature = "host-testing")]
-            {
-                let _ = eclipse_syscall::call::write(1, b"\n");
-            }
+            let _ = eclipse_syscall::call::write(1, b"\n");
         }
     };
     ($($arg:tt)*) => {
         {
-            #[cfg(feature = "host-testing")]
-            {
-                use $crate::alloc::format;
-                let mut s = format!($($arg)*);
-                s.push('\n');
-                let _ = eclipse_syscall::call::write(1, s.as_bytes());
-            }
+            use $crate::alloc::format;
+            let mut s = format!($($arg)*);
+            s.push('\n');
+            let _ = eclipse_syscall::call::write(1, s.as_bytes());
         }
     };
 }

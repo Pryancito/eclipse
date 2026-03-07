@@ -6,7 +6,7 @@ use embedded_graphics::{
     mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyle, MonoTextStyleBuilder},
 };
 use crate::boot::{get_fb_info, FbSource, VIRTIO_DISPLAY_RESOURCE_ID, MAX_SMP_CPUS, get_cpu_id_gs};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 // Buffer estático para acumular líneas de log hasta recibir '\n'
@@ -93,6 +93,9 @@ static LOG_HISTORY: crate::sync::ReentrantMutex<LogHistory> = crate::sync::Reent
 /// Prevents multiple cores from writing to the same pixels or saturating the VirtIO queue.
 static VIDEO_HARDWARE_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
 static MAPPED_FB_VIRT: AtomicU64 = AtomicU64::new(0);
+static LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
+/// PID del proceso HUD (p. ej. smithay_app) que recibe líneas de log por IPC cuando el kernel ya no dibuja en FB.
+static LOG_HUD_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Initialize the dedicated WC framebuffer mapping.
 /// Should be called AFTER memory::init() so the heap is available for page tables.
@@ -178,6 +181,10 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
+    if !LOGGING_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+
     // Only render once the framebuffer has been explicitly mapped by progress::init().
     // Using the phys_to_virt HHDM fallback before that point can hang real hardware:
     // on systems with a discrete GPU the framebuffer BAR lives above the HHDM limit
@@ -305,58 +312,68 @@ fn render_log_line(line: &str, _source: FbSource, _width: u32, _height: u32, _pi
     }
 }
 
-/// Acumula `msg` en el buffer de línea. Solo renderiza en pantalla cuando llega un '\n'.
+/// Acumula `msg` en el buffer de línea. Con '\n' completa la línea: actualiza historia,
+/// opcionalmente renderiza en FB (si LOGGING_ENABLED) y/o envía por IPC al HUD (si LOG_HUD_PID).
 pub fn log(msg: &str) {
     // Desactivar interrupciones localmente es VITAL en SMP para evitar
     // que este core sea interrumpido mientras sostiene un lock crítico.
     x86_64::instructions::interrupts::without_interrupts(|| {
         let cpu_id = get_cpu_id_gs();
         if cpu_id >= MAX_SMP_CPUS {
-            // Early boot or misconfiguration - fallback to serial only
             return;
         }
-        
+
         if let Some(mut buf) = LOG_BUFFERS[cpu_id].try_lock() {
             let got_newline: Option<usize> = buf.push_str(msg);
 
             if got_newline.is_some() {
-                // Trabajamos sobre una copia local para liberar el lock del buffer rápido
                 const MAX: usize = LOG_BUF_SIZE;
                 let mut tmp = [0u8; MAX];
                 let line_bytes = buf.flush().as_bytes();
                 let n = line_bytes.len().min(MAX);
                 tmp[..n].copy_from_slice(&line_bytes[..n]);
                 buf.clear();
-                drop(buf); // Liberamos el lock del buffer de entrada (evita bloqueos si el renderizado tarda)
+                drop(buf);
 
                 let line = core::str::from_utf8(&tmp[..n]).unwrap_or("");
-                
-                // Actualizar historia (con su propio lock)
+
                 if let Some(mut history) = LOG_HISTORY.try_lock() {
                     history.push(line);
                 }
 
-                // Only render to the framebuffer once it has been explicitly mapped
-                // by progress::init().  Before that point the only available address
-                // is phys_to_virt(fb_phys), which uses the HHDM.  On real hardware
-                // with a discrete GPU the framebuffer BAR can be above the HHDM
-                // limit (e.g. 256 GB), so accessing it would fault.  With no IDT
-                // installed at this stage the fault would triple-fault and freeze
-                // the machine – matching the reported hang at the PAT message.
+                let logging_enabled = LOGGING_ENABLED.load(Ordering::SeqCst);
                 let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-                if mapped != 0 {
+                if logging_enabled && mapped != 0 {
                     if let Some((phys, width, height, pitch, source)) = get_fb_info() {
-                        // --- PUNTO CRÍTICO SMP ---
-                        // Necesitamos un lock global de renderizado para que dos cores
-                        // no escriban al mismo tiempo en la memoria de video.
                         if let Some(_hw_lock) = VIDEO_HARDWARE_LOCK.try_lock() {
                             render_log_line(line, source, width, height, pitch, phys);
                         }
                     }
                 }
+
+                // Cuando el log ya no se dibuja (logo dibujado), las líneas se envían al HUD por IPC.
+                let hud_pid = LOG_HUD_PID.load(Ordering::SeqCst);
+                if hud_pid != 0 {
+                    const KLOG_TAG: &[u8; 4] = b"KLOG";
+                    let mut payload = [0u8; 256];
+                    payload[..4].copy_from_slice(KLOG_TAG);
+                    let n = line.len().min(252);
+                    payload[4..4 + n].copy_from_slice(line.as_bytes());
+                    let _ = crate::ipc::send_message(0, hud_pid, crate::ipc::MessageType::Log, &payload[..4 + n]);
+                }
             }
         }
     });
+}
+
+pub fn stop_logging() {
+    LOGGING_ENABLED.store(false, Ordering::SeqCst);
+}
+
+/// Registrar el PID que recibirá las líneas de log por IPC (p. ej. smithay_app para el HUD).
+/// Llamar con 0 para desregistrar.
+pub fn set_log_hud_pid(pid: u32) {
+    LOG_HUD_PID.store(pid, Ordering::SeqCst);
 }
 
 // ============================================================================

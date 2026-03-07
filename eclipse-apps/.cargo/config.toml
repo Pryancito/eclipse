@@ -1,2 +1,2 @@
 [target.x86_64-unknown-eclipse]
-rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
+rustflags = ["--cfg", "eclipse_target", "-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
