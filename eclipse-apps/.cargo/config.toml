@@ -1,2 +1,7 @@
+[unstable]
+# build-std NO debe estar aquí: aplicaría a todas las compilaciones (incl. host) y
+# causaría "duplicate lang item" (host usa std con su propio core/alloc).
+# Para Eclipse: pasar -Z build-std=core,alloc en la línea de comandos (build_eclipse.sh).
+
 [target.x86_64-unknown-eclipse]
 rustflags = ["--cfg", "eclipse_target", "-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "parse_stack_sizes",
     "smithay_app",
     "sidewind",
     "sidewind_core",
@@ -22,7 +23,7 @@ lto = "off"
 opt-level = "s"
 codegen-units = 1
 strip = false
-debug = true
+debug = false
 
 [profile.dev]
 opt-level = "s"

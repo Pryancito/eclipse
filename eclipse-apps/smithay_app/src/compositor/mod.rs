@@ -134,7 +134,7 @@ impl ExternalSurface {
     pub fn unmap(&mut self) {
         if self.vaddr != 0 && self.vaddr != 0x1000 {
             unsafe {
-                std::libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
+                eclipse_libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
             }
         }
         self.vaddr = 0;

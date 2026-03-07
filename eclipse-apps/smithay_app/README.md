@@ -57,19 +57,52 @@ Un mismo binario, dos formas de compilar:
 **Compositor Wayland (Smithay) en Linux (host):**
 ```bash
 cd eclipse-apps
-cargo build -p smithay_app --target x86_64-unknown-linux-gnu
-# Ejecutable: target/x86_64-unknown-linux-gnu/debug/smithay_app
+cargo build -p smithay_app --target x86_64-unknown-linux-gnu --release
+# Ejecutable: target/x86_64-unknown-linux-gnu/release/smithay_app
+# Ejecutar con: ./smithay_app/run_linux.sh  (evita ENOMEM en sigaltstack)
 # Socket Wayland: wayland-5 (ej. WAYLAND_DISPLAY=wayland-5 weston-terminal)
 ```
 
-**Compositor Eclipse (DRM, SideWind) para el target Eclipse:**
+**Compositor Eclipse (DRM, SideWind) para Eclipse OS:**
 ```bash
 cd eclipse-apps
-cargo build -p smithay_app --target x86_64-unknown-eclipse
-# El binario se despliega como compositor en Eclipse OS.
+./smithay_app/build_eclipse.sh
+# Binario: target/x86_64-unknown-eclipse/release/smithay_app
 ```
 
+O manualmente (usa **core,alloc** — NUNCA std — porque x86_64-unknown-eclipse tiene os="none"):
+```bash
+# 1. eclipse-relibc primero
+cd eclipse-relibc
+cargo +nightly build --release --target ../x86_64-unknown-eclipse.json -Z unstable-options -Z build-std=core,alloc
+cp target/x86_64-unknown-eclipse/release/libeclipse_libc.rlib target/x86_64-unknown-eclipse/release/libc.a
+
+# 2. smithay_app
+cd ../eclipse-apps
+cargo +nightly build -p smithay_app --target ../x86_64-unknown-eclipse.json -Z unstable-options -Z build-std=core,alloc --release
+```
+El script `build.sh` en la raíz del repo automatiza estos pasos para la build completa.
+
 ## Running
+
+### Linux (compositor Wayland / Smithay)
+
+Si aparece `failed to set up alternative stack guard page: Cannot allocate memory (os error 12)`, es un límite de memoria del sistema. Usa el script:
+
+```bash
+cd eclipse-apps
+cargo build -p smithay_app --target x86_64-unknown-linux-gnu --release
+./smithay_app/run_linux.sh target/x86_64-unknown-linux-gnu/release/smithay_app
+```
+
+O antes de ejecutar manualmente:
+```bash
+ulimit -v unlimited
+ulimit -s 65536
+./target/x86_64-unknown-linux-gnu/release/smithay_app
+```
+
+### Eclipse OS
 
 The compositor is typically launched by the `gui_service` during system initialization. It can also be started manually:
 
@@ -113,6 +146,11 @@ When running, the compositor displays status information:
 [SMITHAY] Waiting for Wayland and X11 clients...
 [SMITHAY] [Status] Active | Messages: X | Wayland: 0 | X11: 0
 ```
+
+## Troubleshooting
+
+**Error: `none of the predicates in this cfg_select evaluated to true` (en std/src/sys/alloc/mod.rs):**  
+Estás usando `-Z build-std=std` o similar. Para Eclipse OS **no** debes compilar el `std` real de Rust; `x86_64-unknown-eclipse` tiene `os: "none"` y la std no soporta bare-metal. Usa solo `-Z build-std=core,alloc` y deja que `eclipse_std` reemplace a `std` (ya está configurado en Cargo.toml).
 
 ## Dependencies
 

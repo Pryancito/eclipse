@@ -1,6 +1,6 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
-use std::libc::{InputEvent, eclipse_send};
+use eclipse_libc::{InputEvent, eclipse_send};
 use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use sidewind::ui::Notification;
 use crate::compositor::{
@@ -174,6 +174,7 @@ impl InputState {
 
     }
 
+    #[inline(never)]
     pub fn apply_event(&mut self, ev: &InputEvent, fb_width: i32, fb_height: i32, windows: &mut [ShellWindow], window_count: &mut usize, surfaces: &[ExternalSurface]) {
         match ev.event_type {
             0 => { // Keyboard

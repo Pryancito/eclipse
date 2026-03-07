@@ -2,7 +2,7 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
-use std::libc::{eclipse_open, eclipse_read, InputEvent, O_RDONLY};
+use eclipse_libc::{eclipse_open, eclipse_read, InputEvent, O_RDONLY};
 #[cfg(test)]
 use alloc::collections::VecDeque;
 
