@@ -21,8 +21,11 @@ panic = "abort"
 lto = "off"
 opt-level = "s"
 codegen-units = 1
-strip = false
-debug = true
+# Eliminados debug=true y strip=false: reducen el binario de ~75 MB a ~2.6 MB
+# y evitan la presión de memoria que causaba:
+#   "failed to set up alternative stack guard page: Cannot allocate memory"
+debug = false
+strip = "symbols"
 
 [profile.dev]
 opt-level = "s"
