@@ -14,28 +14,30 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Dependencias solo para target Eclipse (no linux)
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-std = { package = "eclipse_std", path = "../eclipse_std" }
-eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
-sidewind = { path = "../sidewind" }
-eclipse-syscall = { path = "../../eclipse-syscall" }
 heapless = "0.8"
 embedded-graphics = "0.8.1"
 micromath = "2.1.0"
+# Dependencias solo para target Eclipse (no linux).
+# No usamos la crate smithay ni wayland-server aquí: requieren std.
+# El compositor Eclipse usa patrones portados (backend, compositor, damage, etc.).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+std = { package = "eclipse_std", path = "../eclipse_std" }
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
+sidewind = { path = "../sidewind" }
+eclipse-syscall = { path = "../../eclipse-syscall" }
 
 # Dependencias solo para target Linux (host) — compositor Wayland con Smithay
 [target.'cfg(target_os = "linux")'.dependencies]
-smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend"] }
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
+sidewind = { path = "../sidewind" }
+eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 
 [features]
 default = []
-host-testing = ["std/host-testing"]
 trace-frames = []
-
-[dev-dependencies]
-std = { package = "eclipse_std", path = "../eclipse_std", features = ["host-testing"] }
 
 [[bin]]
 name = "smithay_app"

@@ -141,7 +141,7 @@ impl Space {
         for i in (index + 1)..self.window_count {
             let other = &self.windows[i];
             if other.is_opaque(surfaces) {
-                if crate::damage::rect_contains(other.curr_rect(), rect) {
+                if crate::damage::rect_contains(&other.curr_rect(), &rect) {
                     return true;
                 }
             }

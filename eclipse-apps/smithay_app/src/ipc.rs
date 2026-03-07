@@ -7,7 +7,7 @@ pub use eclipse_ipc::prelude::*;
 use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
-use std::libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
+use eclipse_libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
 
 /// Resultado de damage granular para SideWind: (x, y, w, h, workspace).
 pub struct SideWindDamageResult {
@@ -97,7 +97,7 @@ impl IpcHandler {
 }
 
 pub fn handle_sidewind_message(
-    msg: sidewind::SideWindMessage,
+    msg: &sidewind::SideWindMessage,
     sender_pid: u32,
     surfaces: &mut [ExternalSurface],
     windows: &mut [ShellWindow],
@@ -237,7 +237,7 @@ pub fn handle_sidewind_message(
 mod tests {
     use super::*;
     use sidewind::{SideWindMessage, SIDEWIND_TAG};
-    use std::libc::InputEvent;
+    use eclipse_libc::InputEvent;
 
     #[test]
     fn test_ipc_handler_mock_events() {
@@ -270,7 +270,7 @@ mod tests {
             name: [0; 32],
         };
         
-        handle_sidewind_message(msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        handle_sidewind_message(&msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
         assert_eq!(window_count, 0);
     }
 
@@ -287,7 +287,7 @@ mod tests {
             x: 100, y: 100, w: 100, h: 0,
             name: [0; 32],
         };
-        handle_sidewind_message(msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        handle_sidewind_message(&msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
         assert_eq!(window_count, 0);
     }
 
@@ -304,7 +304,7 @@ mod tests {
             x: 0, y: 0, w: 0, h: 0,
             name: [0; 32],
         };
-        handle_sidewind_message(msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
+        handle_sidewind_message(&msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
         assert_eq!(window_count, 0);
     }
 }

@@ -189,8 +189,9 @@ build_sidewind_project() {
     cd "$BASE_DIR/eclipse-apps"
     
     # Compilar todo el workspace usando el target personalizado de Eclipse
+    # parse_stack_sizes es herramienta host (usa stack-sizes/anyhow/byteorder con std) - excluir del build Eclipse
     print_status "Compilando workspace Sidewind para target Eclipse..."
-    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release
+    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes
     
     if [ $? -eq 0 ]; then
         print_success "Proyecto Sidewind compilado exitosamente"
@@ -483,16 +484,15 @@ build_installer() {
     
     cd installer
     
-    # Compilar el instalador
+    # Instalador es herramienta host (Linux), usa std. NO usar x86_64-unknown-eclipse.
     print_status "Compilando instalador..."
-    SYSROOT_LDFLAGS="-C link-arg=-L$BASE_DIR/$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib"
-    RUSTFLAGS="-Zunstable-options --cfg eclipse_target $SYSROOT_LDFLAGS $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=std,panic_abort
+    cargo build --release
     
     if [ $? -eq 0 ]; then
         print_success "Instalador compilado exitosamente"
         
         # Mostrar información del instalador compilado
-        local installer_path="target/x86_64-unknown-linux-musl/release/eclipse-installer"
+        local installer_path="target/release/eclipse-installer"
         if [ -f "$installer_path" ]; then
             local installer_size=$(du -h "$installer_path" | cut -f1)
             print_status "Instalador generado: $installer_path ($installer_size)"
@@ -1565,9 +1565,9 @@ build_eclipsefs_cli() {
     
     cd eclipsefs-cli
     
+    # eclipsefs-cli es herramienta host (Linux), usa std. NO usar x86_64-unknown-eclipse.
     print_status "Compilando eclipsefs CLI tool..."
-    SYSROOT_LDFLAGS="-C link-arg=-L$BASE_DIR/$BUILD_DIR/sysroot/usr/lib -C link-arg=-nostdlib"
-    RUSTFLAGS="-Zunstable-options -C relocation-model=pic $SYSROOT_LDFLAGS $RUSTFLAGS" cargo +nightly -Z unstable-options build --release --target "$ECLIPSE_TARGET" -Z build-std=std,panic_abort
+    cargo build --release
     
     if [ $? -eq 0 ]; then
         print_success "eclipsefs-cli compilado exitosamente"

@@ -27,16 +27,18 @@ use std::sync::Arc;
 
 use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
 use smithay::backend::renderer::element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement};
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
+use smithay::backend::renderer::element::{Kind, Id};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Color32F, Frame, Renderer};
+use smithay::backend::renderer::{Color32F, Frame, Renderer, ImportMem};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::input::keyboard::FilterResult;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{Rectangle, Serial, Transform};
+use smithay::utils::{Rectangle, Serial, Transform, Point, Physical};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
@@ -54,6 +56,11 @@ use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, ListeningSocket};
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
+
+use embedded_graphics::geometry::Point as EgPoint;
+use crate::render::FramebufferState;
+// use crate::compositor::{ShellWindow, WindowContent};
+// use crate::input::KeyAction;
 
 smithay::delegate_compositor!(App);
 smithay::delegate_data_device!(App);
@@ -105,7 +112,10 @@ impl CompositorHandler for App {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        &client
+            .get_data::<ClientState>()
+            .expect("ClientState missing: client not inserted via our accept()")
+            .compositor_state
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -132,6 +142,44 @@ impl SeatHandler for App {
     fn cursor_image(&mut self, _seat: &Seat<App>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
 
+impl App {
+    pub fn draw_desktop(&mut self) {
+        self.counter = self.counter.wrapping_add(1);
+        
+        // Clear background with stars/grid like in Eclipse
+        self.desktop_fb.clear_back_buffer_raw(sidewind::ui::colors::COSMIC_DEEP);
+        let _ = sidewind::ui::draw_cosmic_background(&mut self.desktop_fb);
+        let mut star_seed = 0xACE1u32;
+        let _ = sidewind::ui::draw_starfield_cosmic(&mut self.desktop_fb, &mut star_seed, EgPoint::zero());
+        let _ = sidewind::ui::draw_grid(&mut self.desktop_fb, sidewind::ui::colors::COSMIC_DEEP, 48, EgPoint::zero());
+
+        if self.dashboard_active {
+            crate::render::draw_dashboard(
+                &mut self.desktop_fb, 
+                self.counter, 
+                self.cpu_usage, 
+                self.mem_usage, 
+                self.net_usage, 
+                0 // TODO: Uptime
+            );
+        }
+
+        if self.launcher_active {
+            crate::render::draw_launcher(&mut self.desktop_fb, 710.0); // Fixed position for now
+        }
+
+        if self.notifications_active {
+            // Mock notifications
+            let notifications = [Some(sidewind::ui::Notification {
+                title: "LINUX HOST",
+                body: "Escritorio portado con éxito.",
+                icon_type: 0,
+            }), None, None, None, None];
+            crate::render::draw_notifications(&mut self.desktop_fb, &notifications, 1620.0);
+        }
+    }
+}
+
 struct App {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -139,6 +187,25 @@ struct App {
     seat_state: SeatState<App>,
     data_device_state: DataDeviceState,
     seat: Seat<App>,
+
+    // Desktop Desktop components
+    desktop_fb: FramebufferState,
+    dashboard_active: bool,
+    launcher_active: bool,
+    notifications_active: bool,
+    tiling_active: bool,
+    search_active: bool,
+    search_query: std::string::String,
+    
+    // Performance metrics
+    cpu_usage: f32,
+    mem_usage: f32,
+    net_usage: f32,
+    
+    counter: u64,
+
+    /// Textura cacheada del desktop para evitar re-importar ~8MB cada frame.
+    desktop_texture_cache: Option<GlesTexture>,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,14 +223,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut seat_state = SeatState::new();
     let seat = seat_state.new_wl_seat(&dh, "winit");
 
-    let mut state = App {
+    let desktop_fb = FramebufferState::init_software(1920, 1080).expect("Failed to init software FB");
+
+    let mut state = Box::new(App {
         compositor_state,
         xdg_shell_state: XdgShellState::new::<App>(&dh),
         shm_state,
         seat_state,
         data_device_state: DataDeviceState::new::<App>(&dh),
         seat,
-    };
+        desktop_fb,
+        dashboard_active: false,
+        launcher_active: false,
+        notifications_active: false,
+        tiling_active: false,
+        search_active: false,
+        search_query: std::string::String::new(),
+        cpu_usage: 0.0,
+        mem_usage: 0.0,
+        net_usage: 0.0,
+        counter: 0,
+        desktop_texture_cache: None,
+    });
 
     let listener = ListeningSocket::bind("wayland-5")
         .map_err(|e| format!("No se pudo crear el socket Wayland 'wayland-5': {e}"))?;
@@ -192,9 +273,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             WinitEvent::Resized { .. } => {}
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
+                    let scancode = event.key_code();
+                    let pressed = event.state() == smithay::backend::input::KeyState::Pressed;
+                    
+                    let scancode_u32 = u32::from(scancode);
+                    if pressed {
+                        match scancode_u32 {
+                            0x5B => state.dashboard_active = !state.dashboard_active, // Super
+                            0x1E => if state.dashboard_active { state.launcher_active = !state.launcher_active }, // A
+                            0x2F => state.notifications_active = !state.notifications_active, // V
+                            _ => {}
+                        }
+                    }
+
                     keyboard.input::<(), _>(
                         &mut state,
-                        event.key_code(),
+                        scancode,
                         event.state(),
                         0.into(),
                         0,
@@ -236,6 +330,47 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 })
                 .collect();
+
+            // 2. Import o actualizar textura del desktop (cache para evitar 8MB upload cada frame)
+            let width = state.desktop_fb.info.width as i32;
+            let height = state.desktop_fb.info.height as i32;
+            let fb_size = (state.desktop_fb.info.pitch * state.desktop_fb.info.height) as usize;
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    state.desktop_fb.back_addr as *const u8,
+                    fb_size
+                )
+            };
+            let desktop_texture = match &mut state.desktop_texture_cache {
+                Some(cached) => {
+                    let region = Rectangle::new(Point::from((0, 0)), smithay::utils::Size::from((width, height)));
+                    let _ = renderer.update_memory(cached, data, region);
+                    cached.clone()
+                }
+                None => {
+                    let tex = renderer.import_memory(
+                        data,
+                        Fourcc::Argb8888,
+                        (width, height).into(),
+                        false,
+                    ).unwrap();
+                    state.desktop_texture_cache = Some(tex.clone());
+                    tex
+                }
+            };
+            let desktop_element = TextureRenderElement::from_static_texture(
+                Id::new(),
+                renderer.context_id(),
+                Point::<f64, Physical>::from((0.0, 0.0)),
+                desktop_texture,
+                1,
+                Transform::Normal,
+                Some(1.0f32),
+                None,
+                None,
+                None,
+                Default::default(),
+            );
 
             let mut frame = renderer
                 // Transform::Flipped180: winit presenta el buffer con Y invertido

@@ -12,20 +12,12 @@ extern crate std;
 #[cfg(not(target_os = "linux"))]
 extern crate eclipse_syscall;
 
-// Módulos del compositor Eclipse (solo cuando no es Linux)
-#[cfg(not(target_os = "linux"))]
 pub mod backend;
-#[cfg(not(target_os = "linux"))]
 pub mod compositor;
-#[cfg(not(target_os = "linux"))]
 pub mod damage;
-#[cfg(not(target_os = "linux"))]
 pub mod input;
-#[cfg(not(target_os = "linux"))]
 pub mod ipc;
-#[cfg(not(target_os = "linux"))]
 pub mod render;
-#[cfg(not(target_os = "linux"))]
 pub mod state;
 
 // Compositor Wayland con Smithay (solo cuando target es Linux)
@@ -36,7 +28,7 @@ mod smithay_wayland;
 #[cfg(target_os = "linux")]
 fn main() {
     if let Err(e) = smithay_wayland::run() {
-        eprintln!("smithay_app (wayland): {}", e);
+        eprintln!("[SMITHAY] Error: {}", e);
         std::process::exit(1);
     }
 }
@@ -51,12 +43,14 @@ pub extern "Rust" fn main() -> i32 {
 
     println!("[SMITHAY] Starting via Eclipse Runtime...");
 
+    // Stack allocation: evita fallo del heap allocator (GPF CR2=0 en Box::new).
+    // La pila de userspace es 1MB; SmithayState cabe. Si hace falta heap después, mmap directo funciona.
     let mut state = SmithayState::new().expect("Failed to initialize Smithay State");
 
     match query_input_service_pid() {
         Some(input_pid) => {
             if !state.backend.input_scheme_available() {
-                let self_pid = unsafe { std::libc::getpid() as u32 };
+                let self_pid = unsafe { eclipse_libc::getpid() as u32 };
                 if subscribe_to_input(input_pid, self_pid) {
                     println!("[SMITHAY] Subscribed to input service (PID {}) via IPC", input_pid);
                 } else {
@@ -69,13 +63,13 @@ pub extern "Rust" fn main() -> i32 {
         }
     }
 
-    let self_pid = unsafe { std::libc::getpid() as u32 };
-    if let Err(_) = eclipse_syscall::call::register_log_hud(self_pid) {
+    let self_pid = unsafe { eclipse_libc::getpid() as u32 };
+    if eclipse_syscall::call::register_log_hud(self_pid).is_err() {
         println!("[SMITHAY] Warning: register_log_hud failed (kernel may not support it yet)");
     }
 
     #[cfg(feature = "trace-frames")]
-    let _stats_before = std::libc::SystemStats {
+    let _stats_before = eclipse_libc::SystemStats {
         uptime_ticks: 0,
         idle_ticks: 0,
         total_mem_frames: 0,
@@ -124,7 +118,7 @@ mod tests {
         const N: u64 = 500;
         for _ in 0..N {
             while let Some(_event) = state.backend.poll_event() {
-                state.handle_event(_event);
+                state.handle_event(&_event);
             }
             state.update();
             state.render();

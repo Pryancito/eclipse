@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "parse_stack_sizes",
     "smithay_app",
     "sidewind",
     "sidewind_core",

@@ -1,45 +1,46 @@
 //! Heap allocator for eclipse-relibc
-//!
-//! Uses chunk-based allocation to avoid mmap-per-malloc: we request large chunks
-//! (64KB) via mmap and sub-allocate from them. Small allocations are served from
-//! the chunk heap with a free list for reuse. Large allocations (>= 32KB) use
-//! direct mmap/munmap.
+//! 
+//! Optimización: Se utiliza un esquema de "Chunks" con un puntero de avance (bump pointer)
+//! para evitar mmaps constantes, manteniendo la estabilidad del sistema.
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use eclipse_syscall::call::{mmap, munmap};
 use eclipse_syscall::flag::*;
 use crate::types::*;
 
-/// On allocation failure, trigger the alloc_error_handler instead of returning null
-/// so we get a clear message and exit instead of crashing with CR2=0.
-#[inline(never)]
-fn oom(layout: Layout) -> ! {
-    alloc::alloc::handle_alloc_error(layout);
-}
-
+// --- Constantes de Configuración ---
 const ALIGNMENT: usize = 16;
-const MIN_BLOCK: usize = 16; // header(8) + free list next(8)
-const CHUNK_SIZE: usize = 64 * 1024; // 64KB per mmap chunk
-const LARGE_THRESHOLD: usize = 32 * 1024; // >= 32KB: direct mmap/munmap
+const CHUNK_SIZE: usize = 64 * 1024; // 64KB
+const LARGE_THRESHOLD: usize = 32 * 1024; // 32KB
 const PAGE_SIZE: usize = 4096;
 
-// Block header: 8 bytes before user pointer store block size (includes header)
-fn block_size_with_header(size: usize) -> usize {
-    let s = size.max(1);
-    (s + 8 + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+// --- Utilidades de Alineación ---
+#[inline]
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
 }
 
+#[inline]
 fn round_up_page(size: usize) -> usize {
-    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    align_up(size, PAGE_SIZE)
+}
+
+/// Estructura de control para un bloque de memoria
+/// [SIZE (usize)][USER DATA...]
+#[repr(C)]
+struct BlockHeader {
+    size: usize,
 }
 
 pub struct Allocator {
-    /// Free list head: pointer to first free block. Each free block stores [size:8][next:8].
-    free_list: AtomicPtr<u8>,
+    // Para simplificar y evitar Page Faults por concurrencia en el freelist,
+    // usaremos un esquema de asignación por chunks simple (Bump allocation).
+    current_chunk: AtomicPtr<u8>,
+    remaining: AtomicUsize,
 }
 
-/// Single allocator for C malloc/free and Rust's global allocator (when allocator feature).
 #[cfg(all(not(any(test, feature = "host-testing")), any(not(any(target_os = "linux", unix)), eclipse_target)))]
 #[cfg_attr(all(feature = "allocator", not(feature = "no-allocator")), global_allocator)]
 static ALLOCATOR: Allocator = Allocator::new();
@@ -47,151 +48,119 @@ static ALLOCATOR: Allocator = Allocator::new();
 impl Allocator {
     pub const fn new() -> Self {
         Self {
-            free_list: AtomicPtr::new(ptr::null_mut()),
+            current_chunk: AtomicPtr::new(ptr::null_mut()),
+            remaining: AtomicUsize::new(0),
         }
     }
 
-    fn lock_free_list(&self) -> *mut u8 {
-        self.free_list.swap(ptr::null_mut(), Ordering::Acquire)
-    }
-
-    fn unlock_free_list(&self, head: *mut u8) {
-        self.free_list.store(head, Ordering::Release);
-    }
-
-    /// Allocate from free list. Free block layout: [size: 8][next: 8]
-    /// Caller has taken the list via lock_free_list; caller must unlock with the remainder.
-    unsafe fn alloc_from_freelist(&self, mut head: *mut u8, need: usize) -> (*mut u8, *mut u8, *mut u8) {
-        let mut prev: *mut u8 = ptr::null_mut();
-        while !head.is_null() {
-            let block = head;
-            let size = (block as *const usize).read();
-            let next = (block.add(8) as *const *mut u8).read();
-
-            if size >= need {
-                let new_head = if prev.is_null() { next } else { head };
-                if !prev.is_null() {
-                    (prev.add(8) as *mut *mut u8).write(next);
-                }
-                return (block.add(8), block, new_head);
-            }
-            prev = head;
-            head = next;
-        }
-        (ptr::null_mut(), ptr::null_mut(), head)
+    #[inline(never)]
+    fn oom(&self, layout: Layout) -> ! {
+        // En un entorno de sistema, un panic es mejor que un retorno nulo silencioso
+        // si el resto del código no está preparado para Option<*mut u8>
+        panic!("Out of Memory: size {} alignment {}", layout.size(), layout.align());
     }
 }
 
-// Free list layout: we store size at block_start (8 bytes before user area).
-// For free blocks the "user" area starts with next pointer. So:
-// Free block: [size: usize][next: *mut u8] - we need 16 bytes
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Defensive: if the global allocator static was not linked/relocated (e.g. address 0),
-        // avoid dereferencing self to prevent CR2=0 fault.
-        if (self as *const Self).is_null() {
-            oom(layout);
-        }
         let size = layout.size();
-        if size == 0 {
-            return ptr::null_mut();
-        }
+        if size == 0 { return ptr::null_mut(); }
 
-        let need = block_size_with_header(size);
+        // Calculamos el tamaño total necesario incluyendo el header y alineación
+        let header_size = core::mem::size_of::<BlockHeader>();
+        let total_size = align_up(size + header_size, ALIGNMENT);
 
-        // Large allocation: direct mmap, store size in first 8 bytes
-        if need >= LARGE_THRESHOLD {
-            let map_size = round_up_page(need + 8);
+        // --- Caso 1: Asignación Grande (Directa a mmap) ---
+        if total_size >= LARGE_THRESHOLD {
+            let map_size = round_up_page(total_size);
             match mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) {
                 Ok(addr) => {
-                    let block = addr as *mut u8;
-                    (block as *mut usize).write(map_size);
-                    return block.add(8);
+                    let header = addr as *mut BlockHeader;
+                    (*header).size = map_size; // Guardamos el tamaño total para munmap
+                    return (addr as *mut u8).add(header_size);
                 }
-                Err(_) => oom(layout),
+                Err(_) => self.oom(layout),
             }
         }
 
+        // --- Caso 2: Asignación Pequeña (Uso de Chunks) ---
+        // Intentamos obtener memoria del chunk actual de forma atómica
         loop {
-            // Always allocate a new chunk instead of reusing the free list.
-            // This avoids reading from free-list pointers that might be invalid if the
-            // allocator state was ever shared or not properly process-local.
-            let map_size = round_up_page(CHUNK_SIZE);
-            let chunk = match mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) {
-                Ok(addr) => addr as *mut u8,
-                Err(_) => oom(layout),
-            };
+            let curr_rem = self.remaining.load(Ordering::Acquire);
+            let curr_ptr = self.current_chunk.load(Ordering::Acquire);
 
-            let first_size = need;
-            let remainder = map_size - first_size;
-            if remainder >= MIN_BLOCK {
-                // Put remainder in free list for reuse (dealloc will still use it).
-                let free_block = chunk.add(first_size);
-                (free_block as *mut usize).write(remainder);
-                (free_block.add(8) as *mut *mut u8).write(ptr::null_mut());
-                let head = self.free_list.swap(ptr::null_mut(), Ordering::Acquire);
-                (free_block.add(8) as *mut *mut u8).write(head);
-                self.free_list.store(free_block, Ordering::Release);
+            if !curr_ptr.is_null() && curr_rem >= total_size {
+                // Hay espacio: Intentamos "reservar" el espacio moviendo el puntero
+                let next_ptr = curr_ptr.add(total_size);
+                let next_rem = curr_rem - total_size;
+
+                // CAS para asegurar que ningún otro hilo nos robó el espacio
+                if self.current_chunk.compare_exchange(curr_ptr, next_ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    self.remaining.store(next_rem, Ordering::Release);
+                    
+                    let header = curr_ptr as *mut BlockHeader;
+                    (*header).size = total_size;
+                    return curr_ptr.add(header_size);
+                }
+                continue; // Reintentar si falló el CAS
             }
 
-            (chunk as *mut usize).write(first_size);
-            return chunk.add(8);
+            // No hay espacio o no hay chunk: Mapear uno nuevo
+            let map_size = round_up_page(CHUNK_SIZE);
+            match mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) {
+                Ok(addr) => {
+                    // Establecemos el nuevo chunk. El remanente es map_size - lo que usamos ahora.
+                    self.current_chunk.store((addr as *mut u8).add(total_size), Ordering::Release);
+                    self.remaining.store(map_size - total_size, Ordering::Release);
+
+                    let header = addr as *mut BlockHeader;
+                    (*header).size = total_size;
+                    return (addr as *mut u8).add(header_size);
+                }
+                Err(_) => self.oom(layout),
+            }
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
-        let block = ptr.sub(8);
-        let size = (block as *const usize).read();
+        if ptr.is_null() { return; }
 
+        let header_ptr = ptr.sub(core::mem::size_of::<BlockHeader>()) as *mut BlockHeader;
+        let size = (*header_ptr).size;
+
+        // Si es una asignación grande, devolvemos al sistema inmediatamente
         if size >= LARGE_THRESHOLD {
-            // For large blocks, we store the mmap size directly
-            let _ = munmap(block as usize, size);
-            return;
+            let _ = munmap(header_ptr as usize, size);
         }
-
-        (block.add(8) as *mut *mut u8).write(self.free_list.load(Ordering::Relaxed));
-        while self.free_list.compare_exchange_weak(
-            (block.add(8) as *const *mut u8).read(),
-            block,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ).is_err() {
-            (block.add(8) as *mut *mut u8).write(self.free_list.load(Ordering::Relaxed));
-        }
+        
+        // Si es pequeña, en este modelo de "Bump Allocation" no podemos devolver
+        // fragmentos individuales al chunk sin una freelist compleja.
+        // Se queda mapeado para evitar el overhead de mmaps/munmaps constantes.
     }
 }
 
+// --- Implementación de funciones C (malloc, free, etc.) ---
 #[cfg(all(not(any(test, feature = "host-testing")), any(not(any(target_os = "linux", unix)), eclipse_target)))]
 mod imp {
     use super::*;
-    use crate::types::*;
+
     #[no_mangle]
     pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
-        if size == 0 {
-            return ptr::null_mut();
-        }
         let layout = Layout::from_size_align_unchecked(size as usize, ALIGNMENT);
         ALLOCATOR.alloc(layout) as *mut c_void
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn free(ptr: *mut c_void) {
-        if ptr.is_null() {
-            return;
+        if !ptr.is_null() {
+            let layout = Layout::from_size_align_unchecked(0, ALIGNMENT);
+            ALLOCATOR.dealloc(ptr as *mut u8, layout);
         }
-        let layout = Layout::from_size_align_unchecked(0, ALIGNMENT);
-        ALLOCATOR.dealloc(ptr as *mut u8, layout);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn calloc(nmemb: size_t, size: size_t) -> *mut c_void {
         let total = nmemb.saturating_mul(size);
-        if total == 0 {
-            return ptr::null_mut();
-        }
         let ptr = malloc(total);
         if !ptr.is_null() {
             ptr::write_bytes(ptr as *mut u8, 0, total as usize);
@@ -201,35 +170,62 @@ mod imp {
 
     #[no_mangle]
     pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: size_t) -> *mut c_void {
-        if ptr.is_null() {
-            return malloc(new_size);
-        }
-        if new_size == 0 {
-            free(ptr);
-            return ptr::null_mut();
-        }
-        let block = (ptr as *mut u8).sub(8);
-        let old_size = (block as *const usize).read();
-        let old_user_size = old_size.saturating_sub(8);
-        if new_size as usize <= old_user_size {
+        if ptr.is_null() { return malloc(new_size); }
+        if new_size == 0 { free(ptr); return ptr::null_mut(); }
+
+        let header = (ptr as *mut u8).sub(core::mem::size_of::<BlockHeader>()) as *mut BlockHeader;
+        let old_total_size = (*header).size;
+        let old_user_size = old_total_size - core::mem::size_of::<BlockHeader>();
+
+        if (new_size as usize) <= old_user_size {
             return ptr;
         }
+
         let new_ptr = malloc(new_size);
         if !new_ptr.is_null() {
-            ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, old_user_size.min(new_size as usize));
+            ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, old_user_size);
             free(ptr);
         }
         new_ptr
     }
 }
 
+// Eclipse: usar nuestro allocator; host (tests / Linux sin eclipse_target): usar libc del sistema
 #[cfg(all(not(any(test, feature = "host-testing")), any(not(any(target_os = "linux", unix)), eclipse_target)))]
 pub use imp::{malloc, free, calloc, realloc};
 
 #[cfg(any(any(test, feature = "host-testing"), all(any(target_os = "linux", unix), not(eclipse_target))))]
-extern "C" {
-    pub fn malloc(size: size_t) -> *mut c_void;
-    pub fn free(ptr: *mut c_void);
-    pub fn calloc(nmemb: size_t, size: size_t) -> *mut c_void;
-    pub fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
+mod imp {
+    use super::*;
+
+    extern "C" {
+        #[link_name = "malloc"]
+        fn sys_malloc(size: size_t) -> *mut c_void;
+        #[link_name = "free"]
+        fn sys_free(ptr: *mut c_void);
+        #[link_name = "calloc"]
+        fn sys_calloc(nmemb: size_t, size: size_t) -> *mut c_void;
+        #[link_name = "realloc"]
+        fn sys_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
+    }
+
+    #[allow(dead_code)]
+    pub unsafe fn malloc(size: size_t) -> *mut c_void {
+        sys_malloc(size)
+    }
+    #[allow(dead_code)]
+    pub unsafe fn free(ptr: *mut c_void) {
+        sys_free(ptr)
+    }
+    #[allow(dead_code)]
+    pub unsafe fn calloc(nmemb: size_t, size: size_t) -> *mut c_void {
+        sys_calloc(nmemb, size)
+    }
+    #[allow(dead_code)]
+    pub unsafe fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
+        sys_realloc(ptr, size)
+    }
 }
+
+#[cfg(any(any(test, feature = "host-testing"), all(any(target_os = "linux", unix), not(eclipse_target))))]
+pub use imp::{malloc, free, calloc, realloc};

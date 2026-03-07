@@ -1,18 +1,18 @@
 use crate::backend::Backend;
 use crate::compositor::Space;
-use crate::damage::{merge_overlapping_rects, rect_contains, union_rects};
 use crate::input::{InputState, CompositorEvent};
 use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
 use std::prelude::v1::*;
-use std::libc::{eclipse_send, ProcessInfo, SystemStats};
+use eclipse_libc::{eclipse_send, ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
 use core::default::Default;
 use core::iter::Iterator;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
+use heapless::Vec as HVec;
 
 #[derive(Clone, Copy, Default)]
 pub struct ServiceInfo {
@@ -44,7 +44,7 @@ pub struct SmithayState {
     pub counter: u64,
     /// Eventos Input recibidos (para debug: si se congela el ratón, ver si este valor deja de subir).
     pub input_event_count: u64,
-    pub prev_stats: Option<std::libc::SystemStats>,
+    pub prev_stats: Option<eclipse_libc::SystemStats>,
     pub last_metrics_update: std::time::Instant,
     pub cpu_usage: f32,
     pub mem_usage: f32,
@@ -62,34 +62,12 @@ pub struct SmithayState {
     pub process_cpu_usage: [f32; 32],
     pub process_mem_kb: [u64; 32],
     pub dirty: bool,
-    pub damage: heapless::Vec<Rectangle, 16>,
-    pub prev_damage: heapless::Vec<Rectangle, 16>,
-    pub prev_prev_damage: heapless::Vec<Rectangle, 16>,
+    /// Buffer para logs del kernel (evita static mut en draw_static_ui).
+    pub log_buf: [u8; 512],
+    pub log_len: usize,
 }
 
 impl SmithayState {
-    pub fn damage_rect(&mut self, rect: Rectangle) {
-        // Merge proactivamente cuando nos acercamos al límite para liberar espacio
-        if self.damage.len() >= 12 {
-            merge_overlapping_rects(&mut self.damage);
-        }
-        if self.damage.push(rect).is_err() {
-            // If full, merge all into one bounding box of the whole screen to be safe
-            // but for now let's just merge with the last one if possible or just stop adding.
-            // A better strategy is to union with the entire damage list into one rect.
-            if !self.damage.is_empty() {
-                let mut union = self.damage[0];
-                for i in 1..self.damage.len() {
-                    union = union_rects(union, self.damage[i]);
-                }
-                union = union_rects(union, rect);
-                self.damage.clear();
-                let _ = self.damage.push(union);
-            }
-        }
-        self.dirty = true;
-    }
-
     /// Notifica a clientes externos (SideWind) el nuevo tamaño tras layout/tiling.
     fn notify_external_resize(&self) {
         for i in 0..self.space.window_count {
@@ -156,22 +134,18 @@ impl SmithayState {
             process_cpu_usage: [0.0; 32],
             process_mem_kb: [0; 32],
             dirty: true,
-            damage: heapless::Vec::new(),
-            prev_damage: heapless::Vec::new(),
-            prev_prev_damage: heapless::Vec::new(),
+            log_buf: [0u8; 512],
+            log_len: 0,
         })
 
     }
 
-    pub fn handle_event(&mut self, event: CompositorEvent) {
-        let old_cursor_x = self.input.cursor_x;
-        let old_cursor_y = self.input.cursor_y;
-
+    pub fn handle_event(&mut self, event: &CompositorEvent) {
         match event {
             CompositorEvent::Input(ev) => {
                 self.input_event_count += 1;
                 self.input.apply_event(
-                    &ev,
+                    ev,
                     self.backend.fb.info.width as i32,
                     self.backend.fb.info.height as i32,
                     &mut self.space.windows,
@@ -179,11 +153,7 @@ impl SmithayState {
                     &self.surfaces,
                 );
                 
-                // Damage old and new cursor position
-                self.damage_rect(Rectangle::new(Point::new(old_cursor_x - 16, old_cursor_y - 16), Size::new(64, 64)));
-                self.damage_rect(Rectangle::new(Point::new(self.input.cursor_x - 16, self.input.cursor_y - 16), Size::new(64, 64)));
-                
-                // If we are dragging a window, damage the whole screen to be safe or the window area
+                // If we are dragging a window or cursor moved, full redraw
                 // For now, if anything but move happened, we might need more.
                 // Move is the most common.
                 self.dirty = true;
@@ -193,7 +163,7 @@ impl SmithayState {
                 let fb_h = self.backend.fb.info.height as i32;
                 let damage_result = handle_sidewind_message(
                     sw, 
-                    sender_pid, 
+                    *sender_pid, 
                     &mut self.surfaces, 
                     &mut self.space.windows, 
                     &mut self.space.window_count, 
@@ -201,29 +171,12 @@ impl SmithayState {
                     fb_w,
                     fb_h,
                 );
-                let ws_off = self.input.workspace_offset as i32;
-                if damage_result.rects.is_empty() {
-                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(self.backend.fb.info.width, self.backend.fb.info.height)));
-                } else {
-                    for (x, y, w, h, workspace) in &damage_result.rects {
-                        let eff_x = *x + (*workspace as i32 * fb_w) - ws_off;
-                        self.damage_rect(Rectangle::new(Point::new(eff_x, *y), Size::new(*w, *h)));
-                    }
-                }
+                let _ = damage_result; // Damage tracking desactivado: siempre full redraw
                 self.dirty = true;
             }
             CompositorEvent::NetStats(rx, tx) => {
-                self.net_rx = rx;
-                self.net_tx = tx;
-                let fb_w = self.backend.fb.info.width;
-                let fb_h = self.backend.fb.info.height;
-                if self.input.dashboard_active {
-                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w, fb_h)));
-                } else {
-                    // Solo HUD (box métricas top-right): box_w=400, hud_h=110
-                    let hud_x = (fb_w as i32 - 415).max(0);
-                    self.damage_rect(Rectangle::new(Point::new(hud_x, 15), Size::new(400, 110)));
-                }
+                self.net_rx = *rx;
+                self.net_tx = *tx;
                 self.dirty = true;
             }
             CompositorEvent::KernelLog(line) => {
@@ -254,11 +207,6 @@ impl SmithayState {
                     }
                     self.service_count = parsed;
                 }
-                let fb_w = self.backend.fb.info.width;
-                let fb_h = self.backend.fb.info.height;
-                if self.input.system_central_active {
-                    self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w, fb_h)));
-                }
                 self.dirty = true;
             }
             _ => {} // Handle Wayland/X11 if needed
@@ -272,12 +220,13 @@ impl SmithayState {
                 None => break,
                 Some(event) => {
                     events_processed += 1;
-                    self.handle_event(event);
+                    self.handle_event(&event);
                 }
             }
         }
     }
 
+    #[inline(never)]
     pub fn update(&mut self) -> bool {
         self.counter = self.counter.wrapping_add(1);
         self.handle_requests();
@@ -286,17 +235,7 @@ impl SmithayState {
         let animating_mask = self.space.update_animations(&mut self.surfaces);
         let mut busy = animating_mask != 0;
         
-        // Record damage only for windows that actually moved
-        for i in 0..self.space.window_count {
-            if (animating_mask & (1 << i)) != 0 {
-                // Record BOTH previous and current rendered rects
-                // The space doesn't know the exact PREVIOUS curr_rect, 
-                // so we damage the current one, and the previous one was already 
-                // damaged in the previous update call or is caught by global workspace shifts.
-                // Actually, let's just use the current rect for now and refine if ghosting occurs.
-                self.damage_rect(self.space.windows[i].curr_rect());
-            }
-        }
+        // Damage tracking desactivado: animaciones marcan dirty para full redraw
         
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
@@ -312,10 +251,7 @@ impl SmithayState {
             self.notify_external_resize();
         }
 
-        // Handle global busy states (workspace shifts, etc.)
-        if self.space.window_count == 0 && animating_mask != 0 {
-            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
-        }
+        // Handle global busy states (workspace shifts, etc.) - dirty ya marcado si busy
         
         const EPSILON: f32 = 0.5;
 
@@ -323,7 +259,6 @@ impl SmithayState {
         let diff_notif = target_notif_x - self.input.notif_curr_x;
         if diff_notif.abs() > EPSILON {
             self.input.notif_curr_x += diff_notif * 0.2;
-            self.damage_rect(Rectangle::new(Point::new(fb_w - 300, 0), Size::new(300, fb_h as u32)));
             busy = true;
         } else {
             self.input.notif_curr_x = target_notif_x;
@@ -333,7 +268,6 @@ impl SmithayState {
         let diff_launcher = target_launcher_y - self.input.launcher_curr_y;
         if diff_launcher.abs() > EPSILON {
             self.input.launcher_curr_y += diff_launcher * 0.2;
-            self.damage_rect(Rectangle::new(Point::new(0, fb_h - 370), Size::new(fb_w as u32, 370)));
             busy = true;
         } else {
             self.input.launcher_curr_y = target_launcher_y;
@@ -343,7 +277,6 @@ impl SmithayState {
         let diff_ws = target_ws_offset - self.input.workspace_offset;
         if diff_ws.abs() > EPSILON {
             self.input.workspace_offset += diff_ws * 0.15;
-            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
             busy = true;
         } else {
             self.input.workspace_offset = target_ws_offset;
@@ -353,7 +286,6 @@ impl SmithayState {
         let diff_search = target_search_y - self.input.search_curr_y;
         if diff_search.abs() > EPSILON {
             self.input.search_curr_y += diff_search * 0.15;
-            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32 / 2)));
             busy = true;
         } else {
             self.input.search_curr_y = target_search_y;
@@ -397,7 +329,7 @@ impl SmithayState {
                 uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
             };
             unsafe {
-                if std::libc::get_system_stats(&mut current) == 0 {
+                if eclipse_libc::get_system_stats(&mut current) == 0 {
                     if let Some(prev) = self.prev_stats {
                         let total_delta = current.uptime_ticks.saturating_sub(prev.uptime_ticks);
                         let idle_delta = current.idle_ticks.saturating_sub(prev.idle_ticks);
@@ -417,7 +349,7 @@ impl SmithayState {
             if need_metrics {
             if let Some(pid) = self.network_pid {
                 unsafe {
-                    let _ = std::libc::eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0); // MSG_TYPE_NETWORK = 0x08
+                    let _ = eclipse_libc::eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0); // MSG_TYPE_NETWORK = 0x08
                 }
                 
                 let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
@@ -435,7 +367,7 @@ impl SmithayState {
             
             if self.input.system_central_active {
                 let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
-                let count = unsafe { std::libc::get_process_list(self.process_list.as_mut_ptr(), 32) };
+                let count = unsafe { eclipse_libc::get_process_list(self.process_list.as_mut_ptr(), 32) };
                 if count >= 0 {
                     self.process_count = count as usize;
                     
@@ -497,7 +429,7 @@ impl SmithayState {
                 
                 // Pedir info de servicios a systemd (PID 1)
                 unsafe {
-                    let _ = std::libc::eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0);
+                    let _ = eclipse_libc::eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0);
                 }
             }
 
@@ -510,6 +442,7 @@ impl SmithayState {
     }
 
 
+    #[inline(never)]
     fn handle_requests(&mut self) {
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
@@ -521,7 +454,6 @@ impl SmithayState {
             if self.input.tiling_active {
                 self.space.apply_tiled_layout(fb_w, fb_h, self.input.focused_window);
                 self.notify_external_resize();
-                self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
             }
             self.dirty = true;
         }
@@ -665,7 +597,6 @@ impl SmithayState {
             self.input.dashboard_active = !self.input.dashboard_active;
             self.input.request_dashboard = false;
             if self.input.dashboard_active {
-                self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
             }
             self.dirty = true;
         }
@@ -678,6 +609,7 @@ impl SmithayState {
         }
     }
 
+    #[inline(never)]
     pub fn render(&mut self) {
         // Buffer Age / Multiple Frame Damage: combinar damage + prev_damage
         // Límite 8 rects para reducir copias; si excede, unificar en uno
@@ -742,7 +674,9 @@ impl SmithayState {
                 self.counter, 
                 self.input.cursor_x, 
                 self.input.cursor_y,
-                &total_damage,
+                &full_rect,
+                &mut self.log_buf,
+                &mut self.log_len,
             );
             
             // Prototype hardware acceleration
@@ -760,7 +694,7 @@ impl SmithayState {
                     self.input.cursor_x, 
                     self.input.cursor_y,
                     self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0),
-                    &total_damage,
+                    &full_rect,
                 );
             } else if self.input.dashboard_active {
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
@@ -810,13 +744,9 @@ impl SmithayState {
         if self.input.lock_active {
             self.backend.fb.present();
         } else {
-            self.backend.fb.present_damaged(&total_damage);
+            self.backend.fb.present_damaged(&full_rect);
         }
 
-        // Damage rotation: t-2 <- t-1 <- t
-        self.prev_prev_damage = self.prev_damage.clone();
-        self.prev_damage = self.damage.clone();
-        self.damage.clear();
         self.dirty = false;
     }
 }
