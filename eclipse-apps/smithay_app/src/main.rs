@@ -2,7 +2,7 @@
 //! - Linux (host): compositor Wayland con Smithay + winit.
 //! - Eclipse: compositor propio (DRM, SideWind, IPC).
 
-#![no_std]
+#![cfg_attr(not(target_os = "linux"), no_std)]
 
 #[cfg(not(target_os = "linux"))]
 extern crate alloc;

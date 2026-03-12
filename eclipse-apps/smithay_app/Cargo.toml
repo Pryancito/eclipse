@@ -41,6 +41,8 @@ eclipse_libc = { package = "eclipse-libc", path = "../../eclipse-relibc", defaul
 sidewind = { path = "../sidewind" }
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
 
 [features]
 default = []

@@ -17,7 +17,7 @@ align = []
 const-extern-fn = []
 
 [lib]
-name = "eclipse_libc"
+name = "libc"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 

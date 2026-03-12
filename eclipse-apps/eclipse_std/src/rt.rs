@@ -59,8 +59,9 @@ pub unsafe extern "C" fn _start() -> ! {
 
     // 4. Llamar a la main() del usuario (definida en la aplicación)
     // El compilador genera una función "main" (estilo C) que llama a lang_start.
-    // Pasamos argc y un argv dummy (null) por ahora.
-    let exit_code = main(argc as isize, core::ptr::null());
+    // Pasamos argc y el puntero a argv que está justo después en el stack.
+    let argv_ptr = (rsp_val + 8) as *const *const u8;
+    let exit_code = main(argc as isize, argv_ptr);
 
     // 5. Devolver control al kernel con el código de salida (nunca retorna)
     crate::libc::exit(exit_code);

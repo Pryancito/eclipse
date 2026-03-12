@@ -34,8 +34,8 @@ use crate::state::ServiceInfo;
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-const DEFAULT_WIDTH: u32  = 1920;
-const DEFAULT_HEIGHT: u32 = 1080;
+const DEFAULT_WIDTH: u32  = 1280;
+const DEFAULT_HEIGHT: u32 = 800;
 
 const SIDEBAR_ICON_TYPES: [ui::TechCardIconType; 5] = [
     ui::TechCardIconType::ControlPanel,
