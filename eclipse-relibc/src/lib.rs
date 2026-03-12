@@ -154,7 +154,15 @@ pub unsafe extern "C" fn __gcc_personality_v0() { }
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_Resume() { }
 
-#[cfg(all(not(any(test, feature = "host-testing")), feature = "panic-handler"))]
+// Handler de pánico propio solo para binarios "puros" de Eclipse OS
+// (sin `std`): kernel/userspace con `target_os = "none"` o `--cfg eclipse_target`.
+// En binarios host con `std`, el runtime de Rust ya define `panic_impl`,
+// así que aquí lo desactivamos para evitar el duplicado.
+#[cfg(all(
+    not(any(test, feature = "host-testing")),
+    feature = "panic-handler",
+    eclipse_target,
+))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     use crate::header::unistd::_exit;

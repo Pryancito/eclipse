@@ -598,12 +598,6 @@ fn main() {
                 // In real implementation: dispatch to consumers
             }
         }
-        
-        // Periodic status every ~30 s (15000 * 2 ms) to avoid serial flood
-        if heartbeat_counter > 0 && heartbeat_counter % 15000 == 0 {
-            println!("[INPUT-SERVICE] Operational - Heartbeat #{} (events: {}, queue: {}/256)",
-                     heartbeat_counter / 15000, total_events, event_queue.count());
-        }
 
         if heartbeat_counter % 1000 == 0 {
             // Watchdog heartbeat to init (PID 1)

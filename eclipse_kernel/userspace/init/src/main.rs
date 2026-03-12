@@ -328,15 +328,6 @@ fn main_loop() -> ! {
             }
         }
         
-        // Heartbeat ~30 s; short line every 30 s, full status every 60 s to avoid serial flood
-        if counter > 0 && counter % 30000 == 0 {
-            heartbeat_counter += 1;
-            println!("[INIT] Operational - Heartbeat #{}", heartbeat_counter);
-            if heartbeat_counter % 2 == 0 {
-                print_service_status();
-            }
-        }
-        
         // Handle zombie processes - reap terminated children
         reap_zombies();
         
@@ -561,25 +552,3 @@ fn reap_zombies() {
         }
     }
 }
-
-/// Print service status
-fn print_service_status() {
-    let svc = SERVICES.lock();
-    println!("[INIT] Service Status:");
-    for service in svc.iter() {
-        let status = match service.state {
-            ServiceState::Stopped => "stopped",
-            ServiceState::Starting => "starting",
-            ServiceState::Running => "running",
-            ServiceState::Failed => "failed",
-        };
-        if service.pid > 0 {
-            println!("  - {}: {} (PID: {}, restarts: {})", 
-                     service.name, status, service.pid, service.restart_count);
-        } else {
-            println!("  - {}: {} (restarts: {})", 
-                     service.name, status, service.restart_count);
-        }
-    }
-}
-

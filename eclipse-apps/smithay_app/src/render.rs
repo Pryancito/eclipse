@@ -808,14 +808,7 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     let wh = w.curr_h as i32;
     let rect = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, wh as u32));
     let accent = if is_focused { colors::ACCENT_CYAN } else { colors::GLOW_DIM };
-    
-    fb.blur_rect(&rect, 3);
-    
-    if is_focused {
-        fb.draw_sdf_glow(&rect, 20, colors::ACCENT_CYAN);
-    } else {
-        fb.draw_sdf_shadow(&rect, 15);
-    }
+    // Sin blur/SDF para estabilidad y menor uso de memoria (mismo estilo que smithay_wayland)
 
     let _ = ui::draw_glass_card(fb, rect, "ECLIPSE // TERMINAL", accent);
 
@@ -865,6 +858,22 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
         let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww - c_len, wy)).into_styled(corner_style).draw(fb);
         let _ = Line::new(Point::new(wx + ww, wy), Point::new(wx + ww, wy + c_len)).into_styled(corner_style).draw(fb);
     }
+}
+
+/// Shell de escritorio compartido: background, logo, sidebar, HUD.
+/// Usado por smithay_wayland y Eclipse para unificar el pipeline.
+pub fn draw_desktop_shell(
+    fb: &mut FramebufferState,
+    windows: &[ShellWindow],
+    window_count: usize,
+    counter: u64,
+    cursor_x: i32,
+    cursor_y: i32,
+    damage: &[Rectangle],
+    log_buf: &mut [u8; 512],
+    log_len: &mut usize,
+) {
+    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, damage, log_buf, log_len);
 }
 
 pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32, damage: &[Rectangle], log_buf: &mut [u8; 512], log_len: &mut usize) {

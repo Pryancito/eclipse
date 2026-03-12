@@ -50,12 +50,7 @@ fn main() {
         let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
 
-    let mut heartbeat_counter = 0u64;
     loop {
-        heartbeat_counter += 1;
-        if heartbeat_counter % 300 == 0 {
-            println!("[DevFS] Operational - Heartbeat #{}", heartbeat_counter / 300);
-        }
         unsafe { std::libc::sleep_ms(100); }
     }
 }

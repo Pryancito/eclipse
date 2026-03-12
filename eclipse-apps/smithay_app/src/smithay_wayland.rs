@@ -154,9 +154,9 @@ impl App {
             embedded_graphics::geometry::Size::new(fb_w as u32, fb_h as u32),
         )];
 
-        crate::render::draw_static_ui(
+        crate::render::draw_desktop_shell(
             &mut self.desktop_fb,
-            &[], // No shell windows for the background texture
+            &[],
             0,
             self.counter,
             self.cursor_x,

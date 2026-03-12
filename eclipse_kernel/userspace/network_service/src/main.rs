@@ -381,16 +381,6 @@ fn main() {
             }
         }
         
-        // Status every ~30 s (30000 * 1 ms) to avoid serial flood
-        if heartbeat_counter > 0 && heartbeat_counter % 30000 == 0 {
-            let iface = if ethernet_available && wifi_available { "eth0+wlan0" }
-                else if ethernet_available { "eth0" }
-                else if wifi_available { "wlan0" }
-                else { "none" };
-            println!("[NETWORK-SERVICE] Operational - Heartbeat #{} ({} RX:{} TX:{})",
-                     heartbeat_counter / 30000, iface, packets_rx, packets_tx);
-        }
-        
         unsafe { std::libc::sleep_ms(1); }
     }
 }

@@ -83,12 +83,10 @@ pub extern "Rust" fn main() {
         log_message("[LOG-SERVICE] WARNING: No parent PID (ppid=0), cannot signal READY");
     }
 
-    let mut heartbeat_counter = 0u64;
     let mut flush_counter = 0u64;
     let mut ipc_buffer = [0u8; 256];
 
     loop {
-        heartbeat_counter += 1;
         flush_counter += 1;
 
         loop {
@@ -104,10 +102,6 @@ pub extern "Rust" fn main() {
         if flush_counter % 10000 == 0 {
             let mut state = LOG_STATE.lock();
             flush_log_buffer(&mut state);
-        }
-
-        if heartbeat_counter % 60000 == 0 && heartbeat_counter > 0 {
-            log_message("[LOG-SERVICE] Operational - Processing log messages");
         }
 
         unsafe { std::libc::sleep_ms(1); }

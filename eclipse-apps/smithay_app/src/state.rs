@@ -697,7 +697,7 @@ impl SmithayState {
         }
 
         if !self.input.lock_active {
-            render::draw_static_ui(
+            render::draw_desktop_shell(
                 &mut self.backend.fb, 
                 &self.space.windows, 
                 self.space.window_count, 

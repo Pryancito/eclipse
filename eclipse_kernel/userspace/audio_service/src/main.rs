@@ -324,21 +324,6 @@ fn main() {
             }
         }
         
-        // Status updates every ~5 s (5000 iterations * 1 ms)
-        if heartbeat_counter > 0 && heartbeat_counter % 30000 == 0 {
-            if device_ready {
-                let device_name = match device_type {
-                    AudioDeviceType::IntelHDA => "Intel HDA",
-                    AudioDeviceType::AC97 => "AC97",
-                    AudioDeviceType::None => "none",
-                };
-                println!("[AUDIO-SERVICE] Operational - Heartbeat #{} ({} streams: {})",
-                         heartbeat_counter / 30000, device_name, streams_active);
-            } else {
-                println!("[AUDIO-SERVICE] Operational - No audio device (degraded mode)");
-            }
-        }
-        
         unsafe { std::libc::sleep_ms(1); }
     }
 }

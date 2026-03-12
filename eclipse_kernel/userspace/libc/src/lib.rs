@@ -124,7 +124,11 @@ extern "C" {
     pub fn syscall(num: c_long, ...) -> c_long;
 }
 
-#[cfg(all(not(test), feature = "allocator", any(target_os = "none", target_os = "linux", eclipse_target)))]
+// Este allocator global se usa solo en procesos de usuario "puros" del kernel,
+// compilados con `--cfg eclipse_target`. Para binarios genéricos de Eclipse OS
+// (como `smithay_app`), el allocator global lo proporciona `eclipse-relibc`,
+// evitando conflictos de múltiples `#[global_allocator]` en el mismo binario.
+#[cfg(all(not(test), feature = "allocator", eclipse_target))]
 #[global_allocator]
 static ALLOCATOR: internal_alloc::Allocator = internal_alloc::Allocator;
 

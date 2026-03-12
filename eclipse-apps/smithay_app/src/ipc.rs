@@ -66,7 +66,24 @@ impl IpcHandler {
                 None => return None, // Buzón vacío: salir
                 Some(EclipseMessage::Input(ev)) => {
                     self.message_count += 1;
-                    return Some(CompositorEvent::Input(ev));
+                    // En Eclipse OS (`target_os = "none"`) el tipo del fast-path (`eclipse_syscall::InputEvent`)
+                    // difiere del usado en `CompositorEvent::Input` (definido en `eclipse_libc`). Las dos
+                    // structs tienen la misma representación, así que copiamos campo a campo.
+                    #[cfg(target_os = "none")]
+                    let ev_converted = {
+                        use crate::libc::InputEvent as LibcInputEvent;
+                        LibcInputEvent {
+                            device_id: ev.device_id,
+                            event_type: ev.event_type,
+                            code: ev.code,
+                            value: ev.value,
+                            timestamp: ev.timestamp,
+                        }
+                    };
+                    #[cfg(not(target_os = "none"))]
+                    let ev_converted = ev;
+
+                    return Some(CompositorEvent::Input(ev_converted));
                 }
                 Some(EclipseMessage::SideWind(sw, pid)) => {
                     self.message_count += 1;

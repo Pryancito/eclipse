@@ -1085,13 +1085,6 @@ fn main() {
 
         // Periodic status every ~30 s (1800 frames at 60 Hz); single line to avoid serial flood
         if stats.frames_rendered > 0 && stats.frames_rendered % 1800 == 0 {
-            let driver_name = match active_driver {
-                GraphicsDriver::NVIDIA => "NVIDIA",
-                GraphicsDriver::VESA => "VESA",
-                GraphicsDriver::None => "NONE",
-            };
-            println!("[DISPLAY-SERVICE] Operational - Heartbeat #{} ({} frames, {})",
-                     stats.frames_rendered / 1800, stats.frames_rendered, driver_name);
             if stats.driver_errors > 0 {
                 println!("[DISPLAY-SERVICE]   Errors: {}", stats.driver_errors);
             }
