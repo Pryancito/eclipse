@@ -58,13 +58,15 @@ pub unsafe extern "C" fn _start() -> ! {
     init_runtime();
 
     // 4. Llamar a la main() del usuario (definida en la aplicación)
-    let exit_code = main();
+    // El compilador genera una función "main" (estilo C) que llama a lang_start.
+    // Pasamos argc y un argv dummy (null) por ahora.
+    let exit_code = main(argc as isize, core::ptr::null());
 
     // 5. Devolver control al kernel con el código de salida (nunca retorna)
     crate::libc::exit(exit_code);
 }
 
-// Símbolo que define la aplicación; el linker lo resuelve con la fn main() del binario.
-extern "Rust" {
-    fn main() -> i32;
+// Símbolo que define la aplicación; el linker lo resuelve con la fn main() generada por el compilador.
+extern "C" {
+    fn main(argc: isize, argv: *const *const u8) -> i32;
 }

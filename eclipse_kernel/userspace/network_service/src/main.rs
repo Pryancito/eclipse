@@ -8,11 +8,7 @@
 //! 
 //! It must start after the service registry is ready.
 
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 use std::libc::{getpid, getppid, sleep_ms, send_ipc, receive_ipc, pci_enum_devices, PciDeviceInfo};
 
 fn sys_open(path: &str) -> Option<usize> {
@@ -243,8 +239,7 @@ fn configure_interface_dhcp(interface: &str) {
     println!("[NETWORK-SERVICE]     Lease Time: 86400 seconds (24 hours)");
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");

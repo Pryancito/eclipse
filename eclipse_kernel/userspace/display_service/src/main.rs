@@ -14,11 +14,7 @@
 //! 
 //! It must start after the input service to handle display events.
 
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 
 mod logo;
 
@@ -898,8 +894,7 @@ fn clear_screen(fb: &Framebuffer, color: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { std::libc::getpid() };
     
     println!("+--------------------------------------------------------------+");

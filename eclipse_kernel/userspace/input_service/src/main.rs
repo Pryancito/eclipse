@@ -9,9 +9,7 @@
 //! - USB tablets and touchpads
 //! - Gaming peripherals (high DPI mice, mechanical keyboards)
 
-#![cfg_attr(not(feature = "test"), no_main)]
-extern crate std;
-extern crate alloc;
+use std::prelude::v1::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::prelude::*;
@@ -341,8 +339,7 @@ fn create_device_nodes() {
     println!("[INPUT-SERVICE]   /dev/input/gaming - Gaming peripherals interface");
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");

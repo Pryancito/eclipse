@@ -5,11 +5,7 @@
 //! 2. Launch smithay_app from disk.
 //! 3. Exit after successful launch (one-shot supervisor).
 
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 
 /// Buffer to load compositor when mmap fails (e.g. file: scheme read path issues)
 const MAX_COMPOSITOR_SIZE: usize = 16 * 1024 * 1024;
@@ -76,8 +72,7 @@ unsafe fn spawn_compositor() -> i32 {
     pid as i32
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { std::libc::getpid() };
     println!("+--------------------------------------------------------------+");
     println!("|           GUI SERVICE - Sidewind Compositor Launcher         |");

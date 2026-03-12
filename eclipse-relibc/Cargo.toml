@@ -3,7 +3,8 @@
 
 [package]
 name = "eclipse-libc"
-version = "0.3.0"
+# 0.2.999 para satisfacer libc "0.2" de drm-sys y otras crates vía [patch.crates-io]
+version = "0.2.999"
 edition = "2021"
 description = "C Library in Rust for Eclipse OS (relibc-style)"
 readme = "README.md"
@@ -25,7 +26,8 @@ align = []
 const-extern-fn = []
 
 [lib]
-name = "eclipse_libc"
+# name = "libc" para reemplazar libc vía [patch.crates-io] y que libc::O_RDWR etc. funcionen
+name = "libc"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 

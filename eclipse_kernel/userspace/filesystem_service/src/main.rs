@@ -1,11 +1,7 @@
 //! Filesystem Service - Manages filesystem operations and VFS
-
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
-use alloc::vec;
+ 
+use std::prelude::v1::*;
+use std::vec;
 use eclipsefs_lib::format::{EclipseFSHeader, InodeTableEntry, tlv_tags};
 
 const SEEK_SET: i32 = 0;
@@ -281,8 +277,7 @@ fn find_eclipsefs_in_gpt(device: &BlockDevice) -> Option<(u64, usize)> {
     None
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { std::libc::getpid() };
 
     println!("+--------------------------------------------------------------+");

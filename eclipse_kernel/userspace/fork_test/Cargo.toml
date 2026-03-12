@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", features = ["panic-handler"] }
+std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
+eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", default-features = false }
+eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 [profile.release]
 panic = "abort"

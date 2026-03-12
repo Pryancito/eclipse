@@ -1,10 +1,7 @@
+#![no_main]
 //! Log Service / Console - Central logging for all system services
 
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 
 /// Log buffer for storing messages before filesystem is ready
 const LOG_BUFFER_SIZE: usize = 4096;
@@ -60,7 +57,7 @@ fn log_message(msg: &str) {
 }
 
 #[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+pub extern "Rust" fn main() {
     let pid = unsafe { std::libc::getpid() };
 
     write_line(b"+--------------------------------------------------------------+");

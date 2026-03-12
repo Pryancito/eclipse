@@ -1,13 +1,11 @@
 #![no_std]
-#![no_main]
 
 extern crate std;
 
 use std::prelude::*;
 use std::println;
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     println!("--- Eclipse OS std Verification ---");
     
     // Test File I/O
@@ -31,5 +29,4 @@ pub extern "Rust" fn main() -> i32 {
     println!("Sleep finished.");
     
     println!("Verification Complete!");
-    0
 }

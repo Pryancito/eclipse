@@ -12,9 +12,11 @@
 #![no_std]
 #![cfg_attr(not(feature = "std_compat"), feature(alloc_error_handler))]
 #![feature(prelude_import)]
+#![feature(lang_items)]
 
 pub extern crate alloc;
 pub extern crate libc; // This is eclipse-libc-posix from Cargo.toml
+pub use alloc::vec as vec;
 
 use core::panic::PanicInfo;
 
@@ -139,6 +141,18 @@ impl<T, E> Termination for Result<T, E> {
     fn report(self) -> i32 {
         if self.is_ok() { 0 } else { 1 }
     }
+}
+
+#[lang = "start"]
+fn lang_start<T: Termination + 'static>(
+    main: fn() -> T,
+    _argc: isize,
+    _argv: *const *const u8,
+    _sigpipe: u8,
+) -> isize {
+    // This is called by the compiler-generated main function.
+    // For now we just call main and ignore argc/argv/sigpipe (they are handled in rt.rs)
+    main().report() as isize
 }
 
 /// El punto de entrada real (crt0) está en `rt::_start`: lee argc del stack,

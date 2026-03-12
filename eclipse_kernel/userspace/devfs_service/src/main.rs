@@ -1,10 +1,6 @@
 // devfs_service - Device Manager
 
-#![no_main]
-extern crate std;
-extern crate eclipse_syscall;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 
 const SYS_REGISTER_DEVICE: usize = 27;
 
@@ -32,8 +28,7 @@ fn register_device(name: &str, type_id: DeviceType) -> bool {
     }
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     println!("[DevFS] Starting Device Manager Service...");
 
     if register_device("null", DeviceType::Char) {

@@ -1,9 +1,8 @@
 //! Un solo binario: backend según target (como xfwl4).
-#![no_std]
 //! - Linux (host): compositor Wayland con Smithay + winit.
 //! - Eclipse: compositor propio (DRM, SideWind, IPC).
 
-#![cfg_attr(all(not(test), not(target_os = "linux")), no_main)]
+#![no_std]
 
 #[cfg(not(target_os = "linux"))]
 extern crate alloc;
@@ -32,8 +31,7 @@ use smithay_app::libc;
 // ---- Entry point Eclipse: compositor propio ----
 #[cfg(not(target_os = "linux"))]
 #[cfg(not(test))]
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     use smithay_app::state::SmithayState;
     use smithay_app::ipc::{query_input_service_pid, subscribe_to_input};
     use core::matches;

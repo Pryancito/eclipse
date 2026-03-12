@@ -8,11 +8,7 @@
 //! 
 //! This is typically one of the last services to start.
 
-#![no_main]
-extern crate std;
-extern crate alloc;
-
-use std::prelude::*;
+use std::prelude::v1::*;
 use std::libc::{getpid, getppid, sleep_ms, send_ipc, pci_enum_devices, PciDeviceInfo, pci_read_config_u32};
 
 fn sys_open(path: &str) -> Option<usize> {
@@ -210,8 +206,7 @@ fn init_audio_mixer() {
     println!("[AUDIO-SERVICE]   Audio mixer ready");
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() -> i32 {
+fn main() {
     let pid = unsafe { getpid() };
     
     println!("+--------------------------------------------------------------+");

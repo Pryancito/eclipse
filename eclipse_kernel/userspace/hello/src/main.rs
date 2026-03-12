@@ -1,13 +1,10 @@
 //! Hello World - Primer programa en userspace de Eclipse OS
-#![no_std]
-#![no_main]
 
-use eclipse_libc::{println, exit, getpid, sleep_ms};
+use std::prelude::v1::*;
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn main() {
     // Obtener PID
-    let pid = unsafe { getpid() };
+    let pid = unsafe { std::libc::getpid() };
     
     // Imprimir mensaje
     println!("Hello from userspace!");
@@ -17,9 +14,8 @@ pub extern "C" fn _start() -> ! {
     // Yield CPU some times
     for i in 0..5 {
         println!("Loop iteration: {}", i);
-        sleep_ms(1);
+        unsafe { std::libc::sleep_ms(1); }
     }
     
     println!("Goodbye from userspace!");
-    unsafe { exit(0); }
 }

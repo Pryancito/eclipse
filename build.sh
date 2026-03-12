@@ -149,7 +149,7 @@ build_eclipse_libc() {
         # Instalar en sysroot como libc.a
         local SYSROOT_LIB="$BASE_DIR/$BUILD_DIR/sysroot/usr/lib"
         mkdir -p "$SYSROOT_LIB"
-        cp "target/$ECLIPSE_TARGET_NAME/release/libeclipse_libc.rlib" "$SYSROOT_LIB/libc.a"
+        cp "target/$ECLIPSE_TARGET_NAME/release/liblibc.rlib" "$SYSROOT_LIB/libc.a"
         print_status "Instalado en sysroot: $SYSROOT_LIB/libc.a"
 
         # Debilitar todos los símbolos globales en libc.a para evitar
@@ -191,13 +191,13 @@ build_sidewind_project() {
     # Compilar todo el workspace usando el target personalizado de Eclipse
     # parse_stack_sizes es herramienta host (usa stack-sizes/anyhow/byteorder con std) - excluir del build Eclipse
     print_status "Compilando workspace Sidewind para target Eclipse..."
-    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes
+    cargo +nightly build --workspace --target ../x86_64-unknown-eclipse.json -Z build-std=core,alloc --release --exclude parse_stack_sizes --exclude smithay
     
     if [ $? -eq 0 ]; then
         print_success "Proyecto Sidewind compilado exitosamente"
         
         # Lista de binarios a instalar
-        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test gl_demo test_runner"
+        local BINS="smithay_app demo_client wayland_handshake x11_bridge_test"
         
         for bin in $BINS; do
             if [ -f "target/x86_64-unknown-eclipse/release/$bin" ]; then

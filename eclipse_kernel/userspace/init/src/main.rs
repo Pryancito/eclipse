@@ -3,10 +3,9 @@
 //! Este es el primer proceso de userspace que arranca el kernel.
 //! Gestiona el montaje del sistema de archivos y los servicios del sistema.
 
-#![no_std]
-#![no_main]
-
-use eclipse_libc::{println, getpid, sleep_ms, yield_cpu, wait, spawn_service, Spinlock};
+extern crate std;
+use std::prelude::v1::*;
+use eclipse_libc::{getpid, sleep_ms, yield_cpu, wait, Spinlock};
 use eclipse_libc::{fork, exec, get_service_binary, get_last_exec_error, exit};
 
 /// Service state
@@ -71,8 +70,7 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
 
 
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn main() {
     let pid = unsafe { getpid() };
     
     // Usamos solo ASCII aquí para evitar posibles problemas con el formateo
