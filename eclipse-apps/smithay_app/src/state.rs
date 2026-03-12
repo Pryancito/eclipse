@@ -745,22 +745,11 @@ impl SmithayState {
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
             
             render::draw_launcher(&mut self.backend.fb, self.input.launcher_curr_y);
-            render::draw_notifications(&mut self.backend.fb, &self.input.notifications, self.input.notif_curr_x);
             
             if self.input.alt_tab_active { 
                 render::draw_alt_tab_hud(&mut self.backend.fb, &self.space.windows, self.space.window_count, self.input.focused_window); 
             }
             
-            if self.input.search_active || self.input.search_curr_y > -(self.backend.fb.info.height as f32 / 2.0) + 5.0 {
-                render::draw_search_hud(
-                    &mut self.backend.fb, 
-                    &self.input.search_query, 
-                    self.input.search_selected_idx, 
-                    self.counter, 
-                    self.input.search_curr_y
-                );
-            }
-
             // Desktop "Stroke" drawing
             if self.input.mouse_buttons & 1 != 0 && self.input.dragging_window.is_none() {
                 render::draw_stroke(&mut self.backend.fb, self.input.cursor_x, self.input.cursor_y, self.input.stroke_color);

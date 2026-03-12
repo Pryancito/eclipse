@@ -22,7 +22,7 @@ pub struct FramebufferInfo {
 fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
 use micromath::F32Ext;
-use sidewind::ui::{self, icons, colors, Notification, NotificationPanel, Widget};
+use sidewind::ui::{self, icons, colors, Widget};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -471,79 +471,6 @@ pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
     let _ = core::fmt::write(&mut time_str, format_args!("{:02}:{:02}:{:02}", hrs, mins, secs));
     let time_pos = center + Point::new(-45, -280);
     let _ = Text::new(&time_str, time_pos, MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE)).draw(fb);
-}
-
-pub fn draw_notifications(fb: &mut FramebufferState, notifications: &[Option<Notification>], curr_x: f32) {
-    let h = fb.info.height as i32;
-    let mut active = [Option::<Notification>::None; 5];
-    let mut count = 0;
-    for n in notifications {
-        if let Some(val) = n {
-            if count < 5 {
-                active[count] = Some(*val);
-                count += 1;
-            }
-        }
-    }
-    
-    if count > 0 {
-        let mut valid_objs = [Notification { 
-            title: "", body: "", 
-            icon_type: 0
-        }; 5];
-        
-        let mut valid_count = 0;
-        for i in 0..count {
-            if let Some(n) = active[i] {
-                valid_objs[valid_count] = n;
-                valid_count += 1;
-            }
-        }
-
-        let panel = NotificationPanel { 
-            position: Point::new(curr_x as i32, 80), 
-            size: Size::new(300, h as u32 - 160), 
-            notifications: &valid_objs[..valid_count] 
-        };
-        let _ = panel.draw(fb);
-    }
-}
-
-pub fn draw_search_hud(fb: &mut FramebufferState, query: &str, selected_idx: usize, counter: u64, curr_y: f32) {
-    let w = fb.info.width as i32;
-    let h = fb.info.height as i32;
-    let panel_w = 600;
-    let panel_h = 70;
-    let px = (w - panel_w) / 2;
-    let py = (h / 4) + curr_y as i32;
-    let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_PANEL).stroke_color(colors::GLOW_HI).stroke_width(2).build())
-        .draw(fb);
-    let _ = Rectangle::new(Point::new(px + 2, py + 2), Size::new((panel_w - 4) as u32, 2)).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_HIGHLIGHT).build()).draw(fb);
-    let _ = Rectangle::new(Point::new(px - 3, py - 3), Size::new(panel_w as u32 + 6, panel_h as u32 + 6)).into_styled(PrimitiveStyleBuilder::new().stroke_color(Rgb888::new(30, 100, 200)).stroke_width(2).build()).draw(fb);
-    let _ = ui::draw_glowing_hexagon(fb, Point::new(px + 40, py + 35), 18, colors::ACCENT_CYAN);
-    let text_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
-    let mut display_query = heapless::String::<64>::new();
-    let _ = display_query.push_str("> ");
-    let _ = display_query.push_str(query);
-    if (counter / 30) % 2 == 0 { let _ = display_query.push('_'); }
-    let _ = Text::new(&display_query, Point::new(px + 80, py + 45), text_style).draw(fb);
-    if query.is_empty() {
-        let hint_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::GLOW_DIM);
-        let _ = Text::new("ESCRIBA EL NOMBRE DE UNA APLICACION O COMANDO...", Point::new(px + 80, py + 42), hint_style).draw(fb);
-    } else {
-        let results = ["EJECUTAR TERMINAL", "SISTEMA: WORKSPACE 1", "SISTEMA: WORKSPACE 2", "ANALISIS DIAGNOSTICO", "BLOQUEAR ESTACION"];
-        for i in 0..results.len() {
-            let ry = py + panel_h + 10 + (i as i32 * 45);
-            let is_selected = i == selected_idx % results.len();
-            let bg_color = if is_selected { colors::GLOW_MID } else { colors::GLASS_PANEL };
-            let text_color = if is_selected { colors::WHITE } else { colors::GLOW_MID };
-            let _ = Rectangle::new(Point::new(px, ry), Size::new(panel_w as u32, 40))
-                .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).stroke_color(colors::GLOW_DIM).stroke_width(1).build()).draw(fb);
-            let _ = Text::new(results[i], Point::new(px + 20, ry + 26), MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, text_color)).draw(fb);
-            if is_selected { let _ = Rectangle::new(Point::new(px - 10, ry + 5), Size::new(4, 30)).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::ACCENT_CYAN).build()).draw(fb); }
-        }
-    }
 }
 
 pub fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {

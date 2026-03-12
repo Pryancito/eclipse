@@ -181,15 +181,6 @@ impl App {
             crate::render::draw_launcher(&mut self.desktop_fb, 710.0); // Fixed position for now
         }
 
-        if self.notifications_active {
-            // Mock notifications
-            let notifications = [Some(sidewind::ui::Notification {
-                title: "LINUX HOST",
-                body: "Escritorio portado con éxito.",
-                icon_type: 0,
-            }), None, None, None, None];
-            crate::render::draw_notifications(&mut self.desktop_fb, &notifications, 1620.0);
-        }
     }
 }
 
