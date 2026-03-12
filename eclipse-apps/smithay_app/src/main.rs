@@ -73,7 +73,22 @@ fn main() {
 
     let mut last_render = std::time::Instant::now();
 
+    // Diagnostics thresholds and accumulators — only active under the
+    // `trace-frames` Cargo feature (zero overhead in default builds).
+    #[cfg(feature = "trace-frames")]
+    const SLOW_FRAME_THRESHOLD_MS: u64 = 500;
+    #[cfg(feature = "trace-frames")]
+    const HIGH_MEM_THRESHOLD: f32 = 0.85;
+    #[cfg(feature = "trace-frames")]
+    const MEM_WARNING_INTERVAL: u64 = 60;
+
+    #[cfg(feature = "trace-frames")]
+    let mut max_frame_ms: u64 = 0;
+
     loop {
+        #[cfg(feature = "trace-frames")]
+        let frame_start = std::time::Instant::now();
+
         state.handle_ipc();
         let is_busy = state.update();
         let elapsed_since_render = last_render.elapsed();
@@ -83,6 +98,45 @@ fn main() {
             last_render = std::time::Instant::now();
         }
 
+        // ── Diagnostics ────────────────────────────────────────────────────────
+        #[cfg(feature = "trace-frames")]
+        {
+            let frame_ms = frame_start.elapsed().as_millis() as u64;
+            if frame_ms > max_frame_ms {
+                max_frame_ms = frame_ms;
+            }
+
+            // Warn about individual slow frames that may indicate a hang.
+            if frame_ms > SLOW_FRAME_THRESHOLD_MS {
+                println!(
+                    "[SMITHAY] SLOW_FRAME {}ms counter={} inputs={} messages={} attempts={} windows={}",
+                    frame_ms,
+                    state.counter,
+                    state.input_event_count,
+                    state.backend.ipc.message_count,
+                    state.backend.ipc.recv_attempts,
+                    state.space.window_count,
+                );
+            }
+
+            // Warn about memory pressure. Use a single fold to compute both the
+            // active surface count and total mapped MB in one pass.
+            if state.mem_usage > HIGH_MEM_THRESHOLD && state.counter % MEM_WARNING_INTERVAL == 0 {
+                let (active_surfaces, mapped_mb) = state.surfaces.iter()
+                    .filter(|s| s.active)
+                    .fold((0usize, 0f32), |(count, mb), s| {
+                        (count + 1, mb + s.buffer_size as f32 / (1024.0 * 1024.0))
+                    });
+                println!(
+                    "[SMITHAY] HIGH_MEM {:.1}% surfaces={} mapped={:.1}MB",
+                    state.mem_usage * 100.0,
+                    active_surfaces,
+                    mapped_mb,
+                );
+            }
+        }
+        // ── End diagnostics ────────────────────────────────────────────────────
+
         let frame_target = std::time::Duration::from_millis(16);
         let elapsed = last_render.elapsed();
         if !is_busy && !state.dirty {
@@ -91,13 +145,30 @@ fn main() {
             std::thread::sleep(frame_target - elapsed);
         }
 
+        // Periodic heartbeat — emitted every ~10 s (600 iterations at ~16 ms/frame).
+        // Use a single fold to compute active surface count and mapped MB in one pass.
         #[cfg(feature = "trace-frames")]
         if state.counter > 0 && state.counter % 600 == 0 {
+            let (active_surfaces, mapped_mb) = state.surfaces.iter()
+                .filter(|s| s.active)
+                .fold((0usize, 0f32), |(count, mb), s| {
+                    (count + 1, mb + s.buffer_size as f32 / (1024.0 * 1024.0))
+                });
             println!(
-                "[SMITHAY] heartbeat counter={} messages={}",
+                "[SMITHAY] heartbeat counter={} messages={} attempts={} inputs={} \
+                 mem={:.1}% cpu={:.1}% windows={} surfaces={} mapped={:.1}MB max_frame={}ms",
                 state.counter,
-                state.backend.ipc.message_count
+                state.backend.ipc.message_count,
+                state.backend.ipc.recv_attempts,
+                state.input_event_count,
+                state.mem_usage * 100.0,
+                state.cpu_usage * 100.0,
+                state.space.window_count,
+                active_surfaces,
+                mapped_mb,
+                max_frame_ms,
             );
+            max_frame_ms = 0;
         }
     }
 }
