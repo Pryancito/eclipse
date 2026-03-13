@@ -9,7 +9,7 @@ use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
 use core::matches;
 #[cfg(not(target_os = "linux"))]
-use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
+use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
 #[cfg(target_os = "linux")]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
 
@@ -155,7 +155,7 @@ pub fn handle_sidewind_message(
 
                     // 2. Open and mmap the surface buffer
                     #[cfg(not(target_os = "linux"))]
-                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR, 0) };
+                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
                     #[cfg(target_os = "linux")]
                     let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR, 0) };
 
