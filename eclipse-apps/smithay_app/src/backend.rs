@@ -2,7 +2,6 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
-use core::matches;
 #[cfg(not(target_os = "linux"))]
 use libc::{open, read, InputEvent, O_RDONLY,
     get_system_stats, get_process_list};

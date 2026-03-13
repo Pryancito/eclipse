@@ -57,7 +57,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, ListeningSocket};
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
 
-use embedded_graphics::geometry::Point as EgPoint;
 use crate::render::FramebufferState;
 // use crate::compositor::{ShellWindow, WindowContent};
 // use crate::input::KeyAction;
@@ -197,8 +196,11 @@ struct App {
     dashboard_active: bool,
     launcher_active: bool,
     notifications_active: bool,
+    #[allow(dead_code)]
     tiling_active: bool,
+    #[allow(dead_code)]
     search_active: bool,
+    #[allow(dead_code)]
     search_query: std::string::String,
     
     // Performance metrics
