@@ -4,7 +4,7 @@ use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
 use core::matches;
 #[cfg(not(target_os = "linux"))]
-use libc::{open, read, InputEvent, O_RDONLY,
+use libc::{open, read, InputEvent, O_RDONLY, O_NONBLOCK,
     get_system_stats, get_process_list};
 #[cfg(target_os = "linux")]
 use eclipse_syscall::InputEvent;
@@ -34,8 +34,10 @@ impl Backend {
 
         #[cfg(not(test))]
         let input_fd = {
+            // O_NONBLOCK: evita que read() bloquee cuando no hay eventos; el main loop debe
+            // seguir procesando IPC, update y render en lugar de quedar colgado esperando input.
             #[cfg(not(target_os = "linux"))]
-            let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY, 0) };
+            let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY | O_NONBLOCK, 0) };
             #[cfg(target_os = "linux")]
             let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY, 0) };
             if fd >= 0 { Some(fd) } else { None }
