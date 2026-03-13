@@ -17,14 +17,13 @@ use core::default::Default;
 use core::iter::Iterator;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
-use heapless::Vec as HVec;
 
 #[cfg(target_os = "linux")]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 #[cfg(target_os = "linux")]
-fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
+unsafe fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
 #[cfg(target_os = "linux")]
-fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> usize { 0 }
+unsafe fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> isize { 0 }
 
 #[derive(Clone, Copy, Default)]
 pub struct ServiceInfo {
@@ -134,10 +133,6 @@ impl SmithayState {
             backend.fb.info.width as i32,
             backend.fb.info.height as i32,
         );
-        let surfaces = [const { ExternalSurface {
-            id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false, ready_to_flip: false
-        } }; MAX_EXTERNAL_SURFACES];
-
         Some(Self {
             backend,
             space,

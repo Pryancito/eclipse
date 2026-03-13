@@ -6,9 +6,6 @@ use libc::{
     FramebufferInfo,
 };
 #[cfg(target_os = "linux")]
-use libc::{mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
-
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FramebufferInfo {
     pub address: u64,
@@ -21,8 +18,7 @@ pub struct FramebufferInfo {
 #[cfg(target_os = "linux")]
 fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
-use micromath::F32Ext;
-use sidewind::ui::{self, icons, colors, Widget};
+use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -34,7 +30,9 @@ use crate::state::ServiceInfo;
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
+#[cfg(not(target_os = "linux"))]
 const DEFAULT_WIDTH: u32  = 1280;
+#[cfg(not(target_os = "linux"))]
 const DEFAULT_HEIGHT: u32 = 800;
 
 const SIDEBAR_ICON_TYPES: [ui::TechCardIconType; 5] = [
