@@ -374,27 +374,27 @@ pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
 
    
     // Cargar init desde /sbin/eclipse-init (root debe estar montado).
-    const MAX_INIT_SIZE: usize = 2 * 1024 * 1024; // 2 MiB para el binario de init
-    let mut init_buf = alloc::vec![0u8; MAX_INIT_SIZE];
-    let init_slice: &[u8] = match (filesystem::is_mounted(), filesystem::read_file("/sbin/eclipse-init", &mut init_buf)) {
-        (false, _) => {
-            serial::serial_print("[KERNEL] ERROR: Root not mounted, cannot load /sbin/eclipse-init\n");
-            loop { crate::cpu::idle(); }
-        }
-        (_, Err(e)) => {
+    // Use read_file_alloc so the entire binary is allocated at the exact size
+    // reported by the filesystem, avoiding truncation for binaries > 2 MiB.
+    if !filesystem::is_mounted() {
+        serial::serial_print("[KERNEL] ERROR: Root not mounted, cannot load /sbin/eclipse-init\n");
+        loop { crate::cpu::idle(); }
+    }
+    let init_data: alloc::vec::Vec<u8> = match filesystem::read_file_alloc("/sbin/eclipse-init") {
+        Err(e) => {
             serial::serial_printf(format_args!("[KERNEL] ERROR: Cannot read /sbin/eclipse-init: {}\n", e));
             loop { crate::cpu::idle(); }
         }
-        (_, Ok(0)) => {
+        Ok(data) if data.is_empty() => {
             serial::serial_print("[KERNEL] ERROR: /sbin/eclipse-init is empty\n");
             loop { crate::cpu::idle(); }
         }
-        (_, Ok(n)) => {
-            init_buf.truncate(n);
-            serial::serial_printf(format_args!("[KERNEL] Loaded /sbin/eclipse-init ({} bytes)\n", n));
-            init_buf.as_slice()
+        Ok(data) => {
+            serial::serial_printf(format_args!("[KERNEL] Loaded /sbin/eclipse-init ({} bytes)\n", data.len()));
+            data
         }
     };
+    let init_slice: &[u8] = &init_data;
 
     match process::spawn_process(init_slice, "init") {
         Ok(pid) => {
