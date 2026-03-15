@@ -461,9 +461,17 @@ fn main() {
             }
         }
         
-        // Drenar ratón PS/2 real (kernel buffer vía syscall read_mouse_packet)
+        // Drenar ratón PS/2 real (kernel buffer vía syscall read_mouse_packet).
+        // Límite por iteración para no bloquear el bucle y poder enviar heartbeat al init.
+        const MAX_MOUSE_PER_ITER: u32 = 64;
         let mut mouse_batch = 0u32;
-        while let Some(packed) = read_mouse_packet() {
+        let mut mouse_drained = 0u32;
+        while mouse_drained < MAX_MOUSE_PER_ITER {
+            let packed = match read_mouse_packet() {
+                Some(p) => p,
+                None => break,
+            };
+            mouse_drained += 1;
             mouse_batch += 1;
             if mouse_batch >= 8 {
                 unsafe { yield_cpu(); }
@@ -550,10 +558,18 @@ fn main() {
             }
         }
 
-        // Drenar teclado PS/2 real (kernel buffer vía syscall read_key)
+        // Drenar teclado PS/2 real (kernel buffer vía syscall read_key).
+        // Límite por iteración para no bloquear el bucle y poder enviar heartbeat al init.
+        const MAX_KBD_PER_ITER: u32 = 64;
         let mut kbd_batch = 0u32;
+        let mut kbd_drained = 0u32;
         let mut has_e0 = false;
-        while let Some(sc) = read_key_scancode() {
+        while kbd_drained < MAX_KBD_PER_ITER {
+            let sc = match read_key_scancode() {
+                Some(s) => s,
+                None => break,
+            };
+            kbd_drained += 1;
             if sc == 0xE0 {
                 has_e0 = true;
                 continue;
@@ -599,8 +615,9 @@ fn main() {
             }
         }
 
-        if heartbeat_counter % 1000 == 0 {
-            // Watchdog heartbeat to init (PID 1)
+        // Watchdog heartbeat to init (PID 1): cada 200 iteraciones para no ser
+        // marcado HUNG si el bucle tarda (p. ej. drenando muchos eventos en QEMU).
+        if heartbeat_counter % 200 == 0 {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
         }
         

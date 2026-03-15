@@ -4,7 +4,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Userspace programs load at 0x10000000 (4MB) */
+    /* Userspace programs load at 0x10000000 (256MB) */
     . = 0x10000000;
 
     .text : ALIGN(4K)

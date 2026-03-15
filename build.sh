@@ -340,12 +340,12 @@ build_eclipse_init() {
     cd eclipse_kernel/userspace/init
     
     print_status "Compilando eclipse-init..."
-    cargo +nightly build --release --target x86_64-unknown-none -Zbuild-std=core,alloc
+    RUSTFLAGS="--cfg eclipse_target ${RUSTFLAGS:-}" cargo +nightly build --release --target ../../../x86_64-unknown-eclipse.json -Zbuild-std=core,alloc
     
     if [ $? -eq 0 ]; then
         print_success "eclipse-init compilado exitosamente"
         
-        local init_path="target/x86_64-unknown-none/release/eclipse-init"
+        local init_path="target/x86_64-unknown-eclipse/release/eclipse-init"
         if [ -f "$init_path" ]; then
             local init_size=$(du -h "$init_path" | cut -f1)
             print_status "Init process generado: $init_path ($init_size)"
@@ -1442,7 +1442,7 @@ show_build_summary() {
     echo "Binarios compilados:"
     echo "Componentes compilados:"
     echo "  Librería EclipseFS: eclipsefs-lib/target/debug/libeclipsefs_lib.rlib"
-    echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init"
+    echo "  Init Process: eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init"
     echo "  Kernel Eclipse OS: target/$KERNEL_TARGET/release/eclipse_kernel"
     echo "  Bootloader UEFI: bootloader-uefi/target/$UEFI_TARGET/release/eclipse-bootloader.efi"
     echo "  Instalador: installer/target/x86_64-unknown-linux-musl/release/eclipse-installer"

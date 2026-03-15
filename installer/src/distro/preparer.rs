@@ -49,7 +49,7 @@ impl DistroPreparer {
         let binaries = vec![
             ("../eclipse_kernel/target/x86_64-unknown-none/release/eclipse_kernel", "boot/eclipse_kernel"),
             // Init real de Eclipse OS: el kernel lo carga desde /sbin/eclipse-init
-            ("../eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init", "sbin/eclipse-init"),
+            ("../eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init", "sbin/eclipse-init"),
             // Servicios de userspace (cargados desde /sbin por el kernel/init)
             ("../eclipse_kernel/userspace/log_service/target/x86_64-unknown-eclipse/release/log_service", "sbin/log_service"),
             ("../eclipse_kernel/userspace/devfs_service/target/x86_64-unknown-eclipse/release/devfs_service", "sbin/devfs_service"),

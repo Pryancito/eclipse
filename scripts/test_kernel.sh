@@ -113,7 +113,7 @@ else
 fi
 
 test_start "Init binary exists"
-if [ -f "eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init" ]; then
+if [ -f "eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init" ]; then
     test_pass
 else
     test_fail "Init binary not found"
@@ -159,7 +159,7 @@ else
 fi
 
 test_start "Init binary reasonable size"
-INIT_SIZE=$(stat -f%z "eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init" 2>/dev/null || stat -c%s "eclipse_kernel/userspace/init/target/x86_64-unknown-none/release/eclipse-init" 2>/dev/null || echo "0")
+INIT_SIZE=$(stat -f%z "eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init" 2>/dev/null || stat -c%s "eclipse_kernel/userspace/init/target/x86_64-unknown-eclipse/release/eclipse-init" 2>/dev/null || echo "0")
 if [ "$INIT_SIZE" -gt 5000 ] && [ "$INIT_SIZE" -lt 50000 ]; then
     test_pass
 else
