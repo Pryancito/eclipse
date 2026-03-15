@@ -30,7 +30,10 @@ const HBA_BOHC: usize = 0x28;  // BIOS/OS Handoff Control
 
 // GHC bits
 const GHC_AE: u32 = 1 << 31;  // AHCI Enable
-const GHC_IE: u32 = 1 << 1;   // Interrupt Enable (global)
+/// GHC.IE would enable PCI interrupt generation, but we use polling mode and
+/// intentionally do NOT set this bit to prevent IRQ storms on real hardware.
+#[allow(dead_code)]
+const GHC_IE: u32 = 1 << 1;   // Interrupt Enable (global) — NOT used (polling mode)
 const GHC_HR: u32 = 1 << 0;   // HBA Reset
 
 // ── Per-port register offsets (from port base = ABAR + 0x100 + port*0x80) ────
@@ -340,10 +343,12 @@ impl AhciPort {
         serial::serial_print("[AHCI]   Waiting for link (DET=3)...\n");
         // 9. Wait for DET=3 (device present, PHY comms up).
         //    On real hardware after COMRESET the PHY re-negotiates the link;
-        //    this can legitimately take 100–500 ms.  Use 500_000_000 spins
-        //    (~1.5 s on a 3 GHz CPU) to be safe.
+        //    this typically takes 50–300 ms for SSDs and HDDs.
+        //    50_000_000 spins (~250 ms on a 3 GHz CPU) is sufficient for all
+        //    standard SATA devices.  Reducing from 500 M avoids wasting ~2.5 s
+        //    per empty port when all implemented ports are probed.
         let mut ready = false;
-        let mut i = 500_000_000u32;
+        let mut i = 50_000_000u32;
         loop {
             let ssts = self.preg(PORT_SSTS);
             if ssts & 0x0F == 3 {
@@ -848,6 +853,16 @@ fn init_controller(dev: &pci::PciDevice) {
     // ── 2. Enable PCI Bus-Master DMA and Memory decode ───────────────────────
     unsafe { pci::enable_device(dev, true); }
 
+    // Disable legacy INTx interrupts on the PCI level so the AHCI controller
+    // never fires an IRQ line.  We always use polling mode, not interrupts.
+    // Without this, the HBA asserts INTx after every DMA completion; since no
+    // IDT handler is registered for the SATA IRQ vector on real hardware this
+    // can cause IRQ storms or #NP exceptions that hang the kernel.
+    unsafe {
+        let cmd = pci::pci_config_read_u16(dev.bus, dev.device, dev.function, 0x04);
+        pci::pci_config_write_u16(dev.bus, dev.device, dev.function, 0x04, cmd | 0x0400);
+    }
+
     // ── 3. Map AHCI MMIO region into the kernel virtual address space ────────
     // AHCI register space: 0x100 (global) + 32 ports × 0x80 = 0x1100 bytes.
     // We map 8 KiB to be safe.
@@ -908,8 +923,12 @@ fn init_controller(dev: &pci::PciDevice) {
         timeout -= 1;
         crate::cpu::pause();
     }
-    // Re-assert AHCI Enable + global Interrupt Enable (GHC.IE)
-    hwreg(base, HBA_GHC, GHC_AE | GHC_IE);
+    // Re-assert AHCI Enable. GHC.IE is intentionally NOT set: we use
+    // polling mode and setting the global interrupt-enable bit would cause
+    // the HBA to signal a PCI interrupt after every DMA completion.  Without
+    // a registered handler that vector results in an IRQ storm or a #NP
+    // exception on real hardware, hanging the kernel.
+    hwreg(base, HBA_GHC, GHC_AE);
 
     // Let the HBA and PHY layers stabilise (~1 ms initial delay)
     for _ in 0..HBA_STABILIZE_ITERATIONS { crate::cpu::pause(); }
@@ -972,13 +991,15 @@ fn init_controller(dev: &pci::PciDevice) {
         serial::serial_print_dec(det as u64);
         serial::serial_print("\n");
 
-        // DET=0 → no device; DET=4 → port disabled
-        if det == 0 || det == 4 {
+        // DET=4 → port explicitly disabled by the controller; skip.
+        // DET=0 → no link seen yet, but link negotiation may still be in
+        // progress on some ports that were slower than the one that triggered
+        // the global link-wait exit.  Allow these ports to go through
+        // COMRESET so they get a fair chance to bring up the link.
+        if det == 4 {
             serial::serial_print("[AHCI] Port ");
             serial::serial_print_dec(port_idx as u64);
-            serial::serial_print(": no device (DET=");
-            serial::serial_print_dec(det as u64);
-            serial::serial_print(") — skipping\n");
+            serial::serial_print(": port disabled (DET=4) — skipping\n");
             continue;
         }
 
