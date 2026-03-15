@@ -187,7 +187,6 @@ struct App {
     desktop_fb: FramebufferState,
     dashboard_active: bool,
     launcher_active: bool,
-    notifications_active: bool,
     tiling_active: bool,
     search_active: bool,
     search_query: std::string::String,
@@ -236,7 +235,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         desktop_fb,
         dashboard_active: false,
         launcher_active: false,
-        notifications_active: false,
         tiling_active: false,
         search_active: false,
         search_query: std::string::String::new(),
@@ -286,7 +284,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         match scancode_u32 {
                             0x5B => state.dashboard_active = !state.dashboard_active, // Super
                             0x1E => if state.dashboard_active { state.launcher_active = !state.launcher_active }, // A
-                            0x2F => state.notifications_active = !state.notifications_active, // V
                             _ => {}
                         }
                     }

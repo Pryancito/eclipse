@@ -73,14 +73,15 @@ fn main() {
         used_mem_frames: 0,
     };
 
-    let mut last_render = std::time::Instant::now();
-
     // Main loop: procesa eventos IPC, actualiza estado, renderiza si es necesario (dirty, busy, o vsync ~16ms).
     loop {
         // Procesa eventos IPC o del backend
         state.handle_ipc();
-        state.update();
-        state.render();
+        if state.update() {
+            state.render();
+        }
+        // Throttle para evitar saturar la CPU; 16ms ≈ 60 FPS.
+        // El kernel de Eclipse permite sleep() sin bloquear otros procesos.
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }

@@ -7,7 +7,6 @@ use eclipse_syscall::InputEvent;
 #[cfg(target_os = "linux")]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
-use sidewind::ui::Notification;
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
@@ -30,7 +29,7 @@ pub enum CompositorEvent {
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
-    Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleNotifications, ToggleLauncher,
+    Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
     SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch, ToggleSystemCentral,
     ToggleTiling,
     ArrowUp, ArrowDown, Input(char), Enter, Backspace,
@@ -57,7 +56,6 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x32 => KeyAction::Minimize,
         0x5B => KeyAction::ToggleDashboard,
         0x26 => KeyAction::ToggleLock,
-        0x2F => KeyAction::ToggleNotifications,
         0x1E => KeyAction::ToggleLauncher,
         0x1F => if (modifiers & 8) != 0 { KeyAction::ToggleSystemCentral } else { KeyAction::None },
         0x4B => KeyAction::SnapLeft,
@@ -133,13 +131,10 @@ pub struct InputState {
     pub request_dashboard: bool,
     pub dashboard_active: bool,
     pub lock_active: bool,
-    pub notifications_active: bool,
-    pub notifications: [Option<Notification>; 5],
     pub launcher_active: bool,
     pub quick_settings_active: bool,
     pub context_menu_active: bool,
     pub context_menu_pos: Point,
-    pub notif_curr_x: f32,
     pub launcher_curr_y: f32,
     pub current_workspace: u8,
     pub workspace_offset: f32,
@@ -166,10 +161,9 @@ impl InputState {
             request_minimize: false, request_maximize: false, request_restore: false,
             dragging_window: None, resizing_window: None, drag_offset_x: 0, drag_offset_y: 0,
             focused_window: None, modifiers: 0, request_dashboard: false,
-            dashboard_active: false, lock_active: false, notifications_active: false,
-            notifications: [ Some(Notification { title: "SISTEMA", body: "Núcleos óptimos.", icon_type: 0 }), Some(Notification { title: "SEGURIDAD", body: "Encriptación activa.", icon_type: 0 }), None, None, None ],
+            dashboard_active: false, lock_active: false,
             launcher_active: false, quick_settings_active: false, context_menu_active: false,
-            context_menu_pos: Point::new(0, 0), notif_curr_x: width as f32,
+            context_menu_pos: Point::new(0, 0),
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
             tiling_active: false, request_toggle_tiling: false,
             alt_tab_active: false, search_active: false, search_query: heapless::String::<32>::new(),
@@ -243,7 +237,6 @@ impl InputState {
                     KeyAction::Restore => if pressed { self.request_restore = true; },
                     KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
                     KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
-                    KeyAction::ToggleNotifications => if pressed && (self.modifiers & 8 != 0) { self.notifications_active = !self.notifications_active; },
                     KeyAction::ToggleLauncher => if pressed && (self.modifiers & 8 != 0) { self.launcher_active = !self.launcher_active; },
                     KeyAction::ToggleSearch => if pressed { 
                         self.search_active = !self.search_active; 

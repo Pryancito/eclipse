@@ -460,34 +460,6 @@ pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
     let _ = Text::new(&time_str, time_pos, MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE)).draw(fb);
 }
 
-pub fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {
-    let ly = curr_y as i32;
-    let rect = Rectangle::new(Point::new(10, ly), Size::new(340, 340));
-    let _ = ui::draw_glass_card(fb, rect, "EJECUTAR // SERVICIOS", colors::ACCENT_CYAN);
-
-    let bracket_style = PrimitiveStyleBuilder::new().stroke_color(colors::ACCENT_CYAN).stroke_width(1).build();
-    let tl = rect.top_left;
-    let br = rect.top_left + Point::new(rect.size.width as i32, rect.size.height as i32);
-    let _ = Line::new(tl, tl + Point::new(35, 0)).into_styled(bracket_style).draw(fb);
-    let _ = Line::new(tl, tl + Point::new(0, 35)).into_styled(bracket_style).draw(fb);
-    let _ = Line::new(br - Point::new(36, 1), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
-    let _ = Line::new(br - Point::new(1, 36), br - Point::new(1, 1)).into_styled(bracket_style).draw(fb);
-
-    let title_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
-    let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
-    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(31, ly + 39), title_glow).draw(fb);
-    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(30, ly + 38), title_style).draw(fb);
-
-    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
-    let items = [("Terminal", icons::SYSTEM), ("Archivos", icons::FILES), ("Red", icons::NETWORK), ("Ajustes", icons::APPS)];
-    for (i, (name, icon)) in items.iter().enumerate() {
-        let py = ly + 75 + (i as i32 * 62);
-        let _ = ui::draw_glowing_hexagon(fb, Point::new(50, py + 20), 22, colors::ACCENT_CYAN);
-        let _ = ui::draw_standard_icon(fb, Point::new(50, py + 20), *icon);
-        let _ = Text::new(name, Point::new(85, py + 28), item_style).draw(fb);
-    }
-}
-
 pub fn draw_quick_settings(fb: &mut FramebufferState) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
@@ -500,32 +472,6 @@ pub fn draw_quick_settings(fb: &mut FramebufferState) {
     let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 130), bar_size, 0.6, colors::ACCENT_CYAN);
     let _ = Text::new("ENRG", Point::new(w - 240, h - 95), text_style).draw(fb);
     let _ = ui::draw_technical_bar(fb, Point::new(w - 240, h - 90), bar_size, 0.92, colors::GLOW_HI);
-}
-
-pub fn draw_alt_tab_hud(fb: &mut FramebufferState, _windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
-    let w = fb.info.width as i32;
-    let h = fb.info.height as i32;
-    let panel_w = 600;
-    let panel_h = 50;
-    let px = w / 2 - panel_w / 2;
-    let py = h / 2 - 250;
-    let rect = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32));
-    let _ = ui::draw_glass_card(fb, rect, "SEARCH // EXECUTE", colors::ACCENT_CYAN);
-    let _ = ui::draw_glowing_hexagon(fb, Point::new(px + 40, py + 25), 18, colors::ACCENT_CYAN);
-    let title_glow = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::new(40, 120, 180));
-    let title_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
-    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
-    let focus_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
-    let title_pos = Point::new(w / 2 - 130, py + 35);
-    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos + Point::new(1, 1), title_glow).draw(fb);
-    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos, title_style).draw(fb);
-    for i in 0..window_count {
-        let iy = h / 2 - panel_h / 2 + 70 + (i as i32 * 30);
-        let style = if Some(i) == focused { focus_style } else { item_style };
-        let prefix = if Some(i) == focused { "> " } else { "  " };
-        let _ = Text::new(prefix, Point::new(w / 2 - 180, iy), style).draw(fb);
-        let _ = Text::new("Shell Window", Point::new(w / 2 - 150, iy), style).draw(fb);
-    }
 }
 
 pub fn draw_context_menu(fb: &mut FramebufferState, pos: Point) {
@@ -780,13 +726,8 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 42), label_style).draw(fb);
     let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
 
-    if counter % 10 == 0 {
-        #[cfg(not(target_os = "linux"))]
-        let len = unsafe { eclipse_libc::get_logs(log_buf.as_mut_ptr(), 512) };
-        #[cfg(target_os = "linux")]
-        let len = get_logs(log_buf.as_mut_ptr(), 512);
-        *log_len = len;
-    }
+    // Logs are now updated via IPC events in SmithayState::handle_event,
+    // so we don't need to poll get_logs() syscall here anymore.
 
     const MAX_LOG_LINES: usize = 8;
     if *log_len > 0 && *log_len <= log_buf.len() {

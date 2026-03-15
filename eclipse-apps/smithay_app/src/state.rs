@@ -191,8 +191,21 @@ impl SmithayState {
                 self.dirty = true;
             }
             CompositorEvent::KernelLog(line) => {
-                // Líneas de log del kernel para el HUD (logo ya dibujado). Reservado para dibujar en HUD.
-                let _ = line;
+                // Store log line directly in the buffer for the HUD
+                let line_bytes = &line[..line.len()];
+                let new_len = line_bytes.len();
+                
+                if self.log_len + new_len + 1 > 512 {
+                    // Primitive: clear and restart if full to avoid complex shifting for now
+                    self.log_len = 0;
+                }
+                
+                let start = self.log_len;
+                self.log_buf[start..start + new_len].copy_from_slice(line_bytes);
+                self.log_len += new_len;
+                self.log_buf[self.log_len] = b'\n';
+                self.log_len += 1;
+                
                 self.dirty = true;
             }
             CompositorEvent::ServiceInfo(data) => {
@@ -269,14 +282,6 @@ impl SmithayState {
         // Handle global busy states (workspace shifts, etc.) - dirty ya marcado si busy
         const EPSILON: f32 = 0.5;
 
-        let target_notif_x = if self.input.notifications_active { (fb_w - 300) as f32 } else { fb_w as f32 };
-        let diff_notif = target_notif_x - self.input.notif_curr_x;
-        if diff_notif.abs() > EPSILON {
-            self.input.notif_curr_x += diff_notif * 0.2;
-            busy = true;
-        } else {
-            self.input.notif_curr_x = target_notif_x;
-        }
 
         let target_launcher_y = if self.input.launcher_active { (fb_h - 370) as f32 } else { fb_h as f32 };
         let diff_launcher = target_launcher_y - self.input.launcher_curr_y;
@@ -659,12 +664,6 @@ impl SmithayState {
 
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
-            
-            render::draw_launcher(&mut self.backend.fb, self.input.launcher_curr_y);
-            
-            if self.input.alt_tab_active { 
-                render::draw_alt_tab_hud(&mut self.backend.fb, &self.space.windows, self.space.window_count, self.input.focused_window); 
-            }
         } else {
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
