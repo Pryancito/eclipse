@@ -129,25 +129,6 @@ impl Space {
             &super::tiling::TilingConfig::default(),
         );
     }
-
-    pub fn is_occluded(&self, index: usize, surfaces: &[ExternalSurface]) -> bool {
-        if index >= self.window_count { return false; }
-        let win = &self.windows[index];
-        if win.minimized || win.closing || matches!(win.content, WindowContent::None) {
-            return false; 
-        }
-        
-        let rect = win.curr_rect();
-        for i in (index + 1)..self.window_count {
-            let other = &self.windows[i];
-            if other.is_opaque(surfaces) {
-                if crate::damage::rect_contains(&other.curr_rect(), &rect) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
 }
 
 #[cfg(test)]

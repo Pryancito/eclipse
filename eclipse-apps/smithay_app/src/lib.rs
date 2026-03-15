@@ -9,7 +9,6 @@ pub extern crate eclipse_libc as libc;
 
 pub mod backend;
 pub mod compositor;
-pub mod damage;
 pub mod input;
 pub mod ipc;
 pub mod render;

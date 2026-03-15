@@ -42,6 +42,7 @@ fi
 DISK="${DISK:-eclipse_os.img}"  # Usar eclipse.img por defecto, /dev/nvme0n1 si se especifica DISK=/dev/nvme0n1
 MEMORY="16G"
 CPUS="6"
+USE_KVM="${USE_KVM:-1}"         # 1=activar KVM si está disponible, 0=forzar TCG (sin -enable-kvm)
 USE_XHCI="${USE_XHCI:-1}"  # 1=XHCI (USB 3.0), 0=UHCI/EHCI (legacy)
 # Por defecto usamos dispositivos de entrada SOLO USB (teclado + ratón HID)
 # PS2_MOUSE=1 activa el modo PS/2 legacy (sin USB HID)
@@ -149,6 +150,23 @@ fi
 # Comando QEMU base
 QEMU_CMD="qemu-system-x86_64"
 
+# Aceleración KVM opcional (solo si el host la soporta y no estamos en WSL)
+if [ "$USE_KVM" = "1" ]; then
+    if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        # Detectar WSL (KVM suele no estar disponible o dar problemas)
+        if ! grep -qi "microsoft" /proc/version 2>/dev/null; then
+            print_info "KVM disponible: usando -enable-kvm y -cpu host"
+            QEMU_CMD="$QEMU_CMD -enable-kvm"
+        else
+            print_warning "Entorno similar a WSL detectado; KVM desactivado (USE_KVM=0 para silenciar)"
+        fi
+    else
+        print_warning "KVM no disponible (sin /dev/kvm RW); ejecutando en modo TCG (sin -enable-kvm)"
+    fi
+else
+    print_info "KVM desactivado explícitamente (USE_KVM=0); ejecutando en modo TCG puro"
+fi
+
 # Agregar UEFI si está disponible
 if [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ]; then
     QEMU_CMD="$QEMU_CMD -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
@@ -168,7 +186,7 @@ else
 fi
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
-QEMU_CMD="$QEMU_CMD -enable-kvm -no-reboot"
+QEMU_CMD="$QEMU_CMD -no-reboot"
 
 # Configuración de display
 # -vga none: nuestra VirtIO es la única pantalla (Smithay visible)
@@ -216,10 +234,12 @@ QEMU_CMD="$QEMU_CMD -no-shutdown"
 QEMU_CMD="$QEMU_CMD -serial stdio"
 #QEMU_CMD="$QEMU_CMD -monitor telnet:127.0.0.1:5555,server,nowait"
 
-# Debugging flags (Unconditional)
-QEMU_CMD="$QEMU_CMD -no-reboot"
-QEMU_CMD="$QEMU_CMD -no-shutdown"
-QEMU_CMD="$QEMU_CMD -d int"
+# Flags de debugging opcionales
+#   DEBUG_QEMU=1 ./qemu.sh     -> activa -d int (log de interrupciones, muy lento sin KVM)
+if [ "${DEBUG_QEMU:-0}" = "1" ]; then
+    print_warning "DEBUG_QEMU=1: activando '-d int' (esto puede ser MUY lento sin KVM)"
+    QEMU_CMD="$QEMU_CMD -d int"
+fi
 
 # Ejecutar QEMU
 print_info "Comando QEMU:"

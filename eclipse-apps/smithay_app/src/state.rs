@@ -4,7 +4,6 @@ use crate::input::{InputState, CompositorEvent};
 use crate::compositor::{ExternalSurface, ShellWindow, MAX_EXTERNAL_SURFACES};
 use crate::ipc::handle_sidewind_message;
 use crate::render;
-use crate::damage::{rect_contains, union_rects, merge_overlapping_rects};
 use std::prelude::v1::*;
 use core::matches;
 #[cfg(not(target_os = "linux"))]
@@ -77,9 +76,6 @@ pub struct SmithayState {
     /// Buffer para logs del kernel (evita static mut en draw_static_ui).
     pub log_buf: [u8; 512],
     pub log_len: usize,
-    pub damage: heapless::Vec<Rectangle, 8>,
-    pub prev_damage: heapless::Vec<Rectangle, 8>,
-    pub prev_prev_damage: heapless::Vec<Rectangle, 8>,
 }
 
 impl SmithayState {
@@ -110,19 +106,6 @@ impl SmithayState {
         }
     }
 
-    pub fn damage_rect(&mut self, rect: Rectangle) {
-        if self.damage.push(rect).is_err() {
-            // Si el buffer está lleno, unificamos todo el damage actual en un solo rect
-            // (o simplemente marcamos dirty general, pero aquí unificamos).
-            let mut union = rect;
-            for d in &self.damage {
-                union = union_rects(&union, d);
-            }
-            self.damage.clear();
-            let _ = self.damage.push(union);
-        }
-        self.dirty = true;
-    }
 
     pub fn new() -> Option<Self> {
         let mut backend = Backend::new()?;
@@ -165,9 +148,6 @@ impl SmithayState {
             dirty: true,
             log_buf: [0; 512],
             log_len: 0,
-            damage: heapless::Vec::new(),
-            prev_damage: heapless::Vec::new(),
-            prev_prev_damage: heapless::Vec::new(),
         })
 
     }
@@ -193,7 +173,7 @@ impl SmithayState {
             CompositorEvent::SideWind(sw, sender_pid) => {
                 let fb_w = self.backend.fb.info.width as i32;
                 let fb_h = self.backend.fb.info.height as i32;
-                let damage_result = handle_sidewind_message(
+                handle_sidewind_message(
                     sw, 
                     *sender_pid, 
                     &mut self.surfaces, 
@@ -203,7 +183,6 @@ impl SmithayState {
                     fb_w,
                     fb_h,
                 );
-                let _ = damage_result; // Damage tracking desactivado: siempre full redraw
                 self.dirty = true;
             }
             CompositorEvent::NetStats(rx, tx) => {
@@ -258,19 +237,23 @@ impl SmithayState {
         }
     }
 
-    #[inline(never)]
     pub fn update(&mut self) -> bool {
         self.counter = self.counter.wrapping_add(1);
         self.handle_requests();
         let window_count_before = self.space.window_count;
+        let fb_w = self.backend.fb.info.width as i32;
+        let fb_h = self.backend.fb.info.height as i32;
+        let busy_animations = self.update_animations_and_layout(fb_w, fb_h, window_count_before);
+        let busy_metrics = self.update_metrics_if_needed();
+        busy_animations || busy_metrics || self.dirty
+    }
+
+    /// Actualiza animaciones (ventanas, overlays, logo/sidebar/HUD) y devuelve
+    /// true si el frame debe considerarse "busy" (necesita seguir avanzando).
+    fn update_animations_and_layout(&mut self, fb_w: i32, fb_h: i32, window_count_before: usize) -> bool {
         // Optimize animation tracking by using a bitmask of changed windows
         let animating_mask = self.space.update_animations(&mut self.surfaces);
         let mut busy = animating_mask != 0;
-        
-        // Damage tracking desactivado: animaciones marcan dirty para full redraw
-        
-        let fb_w = self.backend.fb.info.width as i32;
-        let fb_h = self.backend.fb.info.height as i32;
 
         // Re-apply tiled layout if a window was closed
         if self.input.tiling_active && self.space.window_count < window_count_before {
@@ -284,7 +267,6 @@ impl SmithayState {
         }
 
         // Handle global busy states (workspace shifts, etc.) - dirty ya marcado si busy
-        
         const EPSILON: f32 = 0.5;
 
         let target_notif_x = if self.input.notifications_active { (fb_w - 300) as f32 } else { fb_w as f32 };
@@ -323,33 +305,25 @@ impl SmithayState {
             self.input.search_curr_y = target_search_y;
         }
 
-        // Drive desktop logo and sidebar animations every frame when in normal desktop mode.
-        // The logo and sidebar tech-card icons use `counter` for animation; without marking
-        // their regions as damaged each frame they would only update on forced 500 ms redraws.
+        // Animaciones de logo/sidebar/HUD: marcar daño solo cada N frames para reducir
+        // trabajo cuando el sistema está idle (especialmente bajo TCG en QEMU).
         if !self.input.dashboard_active && !self.input.system_central_active && !self.input.lock_active {
-            // Logo: draw_eclipse_logo renders rings out to ~280 px radius; use 300 px margin.
-            let logo_damage_r = 300i32;
-            let cx = fb_w / 2;
-            let cy = fb_h / 2;
-            let lx = (cx - logo_damage_r).max(0);
-            let ly = (cy - logo_damage_r).max(0);
-            let lw = ((logo_damage_r * 2).min(fb_w - lx)) as u32;
-            let lh = ((logo_damage_r * 2).min(fb_h - ly)) as u32;
-            self.damage_rect(Rectangle::new(Point::new(lx, ly), Size::new(lw, lh)));
-            // Sidebar (left panel with animated tech-card icons)
-            let sidebar_w = (fb_w / 10).clamp(140, 220) as u32;
-            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(sidebar_w, fb_h as u32)));
-            // HUD top-right status box (blinking dot + kernel logs)
-            let hud_x = (fb_w - 415).max(0);
-            self.damage_rect(Rectangle::new(Point::new(hud_x, 15), Size::new(400, 110)));
-            busy = true;
+            if self.counter % 3 == 0 {
+                // Logo: draw_eclipse_logo renders rings out to ~280 px radius; use 300 px margin.
+                // Damage tracking removed: self.damage_rect(...) calls here removed.
+                busy = true;
+            }
         } else if self.input.lock_active {
-            // Lock screen is fully animated (logo + clock); mark full screen damaged every frame.
-            self.damage_rect(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
+            // Lock screen is fully animated (logo + clock); damage tracking removed.
             busy = true;
         }
 
-        // Métricas basadas en tiempo real (Instant) en lugar de contadores de bucle
+        busy
+    }
+
+    /// Actualiza métricas de sistema/procesos cuando corresponde; devuelve true si se ha
+    /// actualizado algo que debería disparar un render (dirty).
+    fn update_metrics_if_needed(&mut self) -> bool {
         let now = std::time::Instant::now();
         let metrics_elapsed = self.last_metrics_update.elapsed();
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
@@ -365,42 +339,42 @@ impl SmithayState {
                     if let Some(prev) = self.prev_stats {
                         let total_delta = current.uptime_ticks.saturating_sub(prev.uptime_ticks);
                         let idle_delta = current.idle_ticks.saturating_sub(prev.idle_ticks);
-                        
+
                         if total_delta > 0 {
                             let busy_delta = total_delta.saturating_sub(idle_delta);
                             self.cpu_usage = (busy_delta as f32) / (total_delta as f32);
                         }
                     }
-                    
+
                     if current.total_mem_frames > 0 {
                         self.mem_usage = (current.used_mem_frames as f32) / (current.total_mem_frames as f32);
                     }
                 }
             }
-            
+
             if need_metrics {
-            if let Some(pid) = self.network_pid {
-                let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0) }; // MSG_TYPE_NETWORK = 0x08
-                
-                let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
-                let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
-                let total_delta = rx_delta + tx_delta;
-                
-                let max_bytes_per_sec = 5_000_000.0;
-                let bytes_per_sec = (total_delta as f32) * 2.0;
-                self.net_usage = (bytes_per_sec / max_bytes_per_sec).clamp(0.0, 1.0);
-                
-                self.prev_net_rx = self.net_rx;
-                self.prev_net_tx = self.net_tx;
+                if let Some(pid) = self.network_pid {
+                    let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0) }; // MSG_TYPE_NETWORK = 0x08
+
+                    let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
+                    let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
+                    let total_delta = rx_delta + tx_delta;
+
+                    let max_bytes_per_sec = 5_000_000.0;
+                    let bytes_per_sec = (total_delta as f32) * 2.0;
+                    self.net_usage = (bytes_per_sec / max_bytes_per_sec).clamp(0.0, 1.0);
+
+                    self.prev_net_rx = self.net_rx;
+                    self.prev_net_tx = self.net_tx;
+                }
             }
-            }
-            
+
             if self.input.system_central_active {
                 let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
                 let count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) };
                 if count >= 0 {
                     self.process_count = count as usize;
-                    
+
                     let current_uptime = current.uptime_ticks;
                     let total_delta = current_uptime.saturating_sub(prev_uptime);
 
@@ -416,7 +390,7 @@ impl SmithayState {
 
                     for i in 0..self.process_count {
                         let p = &self.process_list[i];
-                        
+
                         // Calcular CPU %
                         let mut prev_ticks = 0;
                         for j in 0..32 {
@@ -425,14 +399,14 @@ impl SmithayState {
                                 break;
                             }
                         }
-                        
+
                         if total_delta > 0 {
                             let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
                             self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
                         } else {
                             self.process_cpu_usage[i] = 0.0;
                         }
-                        
+
                         // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
                         self.process_mem_kb[i] = p.mem_frames * 4;
 
@@ -456,7 +430,7 @@ impl SmithayState {
                         }
                     }
                 }
-                
+
                 // Pedir info de servicios a systemd (PID 1)
                 let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
             }
@@ -464,11 +438,11 @@ impl SmithayState {
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
             self.prev_stats = Some(current);
             self.dirty = true;
+            true
+        } else {
+            false
         }
-
-        busy || self.dirty
     }
-
 
     #[inline(never)]
     fn handle_requests(&mut self) {
@@ -639,62 +613,9 @@ impl SmithayState {
 
     #[inline(never)]
     pub fn render(&mut self) {
-        // Buffer Age / Multiple Frame Damage: combinar damage + prev_damage
-        // Límite 8 rects para reducir copias; si excede, unificar en uno
-        const MAX_DAMAGE_RECTS: usize = 8;
-        let mut total_damage = heapless::Vec::<Rectangle, MAX_DAMAGE_RECTS>::new();
-        for d in &self.damage {
-            if total_damage.push(*d).is_err() {
-                break;
-            }
-        }
-        for d in &self.prev_damage {
-            if total_damage.len() >= MAX_DAMAGE_RECTS { break; }
-            let mut skip = false;
-            for t in &total_damage {
-                if rect_contains(t, d) { skip = true; break; }
-            }
-            if !skip {
-                if total_damage.push(*d).is_err() { break; }
-            }
-        }
-        for d in &self.prev_prev_damage {
-            if total_damage.len() >= MAX_DAMAGE_RECTS { break; }
-            let mut skip = false;
-            for t in &total_damage {
-                if rect_contains(t, d) { skip = true; break; }
-            }
-            if !skip {
-                if total_damage.push(*d).is_err() { break; }
-            }
-        }
-        if total_damage.len() >= MAX_DAMAGE_RECTS {
-            let mut union = total_damage[0];
-            for i in 1..total_damage.len() {
-                union = union_rects(&union, &total_damage[i]);
-            }
-            total_damage.clear();
-            let _ = total_damage.push(union);
-        }
-        // Merge overlapping rects (estilo cosmic-comp) para reducir blits
-        merge_overlapping_rects(&mut total_damage);
-
         let fb_w = self.backend.fb.info.width as i32;
         let fb_h = self.backend.fb.info.height as i32;
         let full_rect = Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32));
-
-        // When total_damage is empty (first frame, forced periodic render, or idle state)
-        // perform a full-screen redraw so that all static/animated UI elements are visible.
-        // push() cannot fail here: total_damage is empty (len=0) and capacity is MAX_DAMAGE_RECTS=8.
-        if total_damage.is_empty() {
-            let _ = total_damage.push(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
-        }
-
-        // Overlays full-screen: asegurar damage completo para present correcto
-        if self.input.dashboard_active || self.input.system_central_active {
-            total_damage.clear();
-            let _ = total_damage.push(Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32)));
-        }
 
         if !self.input.lock_active {
             render::draw_desktop_shell(
@@ -704,13 +625,9 @@ impl SmithayState {
                 self.counter, 
                 self.input.cursor_x, 
                 self.input.cursor_y,
-                core::slice::from_ref(&full_rect),
                 &mut self.log_buf,
                 &mut self.log_len,
             );
-            
-            // Prototype hardware acceleration
-            render::gpu_test_render(&self.backend.fb, self.counter);
 
             if !self.input.dashboard_active && !self.input.system_central_active {
                 render::draw_shell_windows(
@@ -724,7 +641,6 @@ impl SmithayState {
                     self.input.cursor_x, 
                     self.input.cursor_y, 
                     self.counter,
-                    core::slice::from_ref(&full_rect),
                 );
             } else if self.input.dashboard_active {
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
@@ -749,22 +665,13 @@ impl SmithayState {
             if self.input.alt_tab_active { 
                 render::draw_alt_tab_hud(&mut self.backend.fb, &self.space.windows, self.space.window_count, self.input.focused_window); 
             }
-            
-            // Desktop "Stroke" drawing
-            if self.input.mouse_buttons & 1 != 0 && self.input.dragging_window.is_none() {
-                render::draw_stroke(&mut self.backend.fb, self.input.cursor_x, self.input.cursor_y, self.input.stroke_color);
-            }
         } else {
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
 
         render::draw_cursor(&mut self.backend.fb, embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y));
 
-        if self.input.lock_active {
-            self.backend.fb.present();
-        } else {
-            self.backend.fb.present_damaged(core::slice::from_ref(&full_rect));
-        }
+        self.backend.fb.present();
 
         self.dirty = false;
     }

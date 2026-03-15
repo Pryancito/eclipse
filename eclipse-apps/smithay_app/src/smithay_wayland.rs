@@ -146,14 +146,6 @@ impl App {
     pub fn draw_desktop(&mut self) {
         self.counter = self.counter.wrapping_add(1);
         
-        // Full frame damage for now as we are doing the whole desktop
-        let fb_w = self.desktop_fb.info.width as i32;
-        let fb_h = self.desktop_fb.info.height as i32;
-        let damage = [embedded_graphics::primitives::Rectangle::new(
-            embedded_graphics::geometry::Point::new(0, 0),
-            embedded_graphics::geometry::Size::new(fb_w as u32, fb_h as u32),
-        )];
-
         crate::render::draw_desktop_shell(
             &mut self.desktop_fb,
             &[],
@@ -161,7 +153,6 @@ impl App {
             self.counter,
             self.cursor_x,
             self.cursor_y,
-            &damage,
             &mut self.log_buf,
             &mut self.log_len,
         );
@@ -326,13 +317,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => (),
         });
 
-        match status {
-            PumpStatus::Continue => (),
-            PumpStatus::Exit(_) => return Ok(()),
-        }
-
         let size = backend.window_size();
-        let damage = Rectangle::from_size(size);
 
         // 1. Draw UI elements into the desktop software framebuffer
         state.draw_desktop();
@@ -400,11 +385,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Transform::Flipped180: winit presenta el buffer con Y invertido
                 // respecto a la convención OpenGL; el flip compensa esa diferencia.
                 .render(&mut framebuffer, size, Transform::Flipped180)?;
-            frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage])?;
+            frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[])?;
 
             // Draw background first, then Wayland windows on top
-            draw_render_elements::<GlesRenderer, Scale<f64>, TextureRenderElement<GlesTexture>>(&mut frame, Scale::from(1.0), &[desktop_element], &[damage])?;
-            draw_render_elements::<GlesRenderer, Scale<f64>, WaylandSurfaceRenderElement<GlesRenderer>>(&mut frame, Scale::from(1.0), &elements, &[damage])?;
+            draw_render_elements::<GlesRenderer, Scale<f64>, TextureRenderElement<GlesTexture>>(&mut frame, Scale::from(1.0), &[desktop_element], &[])?;
+            draw_render_elements::<GlesRenderer, Scale<f64>, WaylandSurfaceRenderElement<GlesRenderer>>(&mut frame, Scale::from(1.0), &elements, &[])?;
 
             let _ = frame.finish()?;
 
@@ -424,7 +409,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             display.flush_clients()?;
         }
 
-        backend.submit(Some(&[damage]))?;
+        backend.submit(None)?;
     }
 }
 

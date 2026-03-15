@@ -27,6 +27,8 @@ fn main() {
 use std::prelude::v1::*;
 #[cfg(not(target_os = "linux"))]
 use smithay_app::libc;
+#[cfg(not(target_os = "linux"))]
+use std::env;
 
 // ---- Entry point Eclipse: compositor propio ----
 #[cfg(not(target_os = "linux"))]
@@ -73,32 +75,13 @@ fn main() {
 
     let mut last_render = std::time::Instant::now();
 
+    // Main loop: procesa eventos IPC, actualiza estado, renderiza si es necesario (dirty, busy, o vsync ~16ms).
     loop {
+        // Procesa eventos IPC o del backend
         state.handle_ipc();
-        let is_busy = state.update();
-        let elapsed_since_render = last_render.elapsed();
-        if is_busy || state.dirty || elapsed_since_render >= std::time::Duration::from_millis(500) {
-            state.render();
-            state.dirty = false;
-            last_render = std::time::Instant::now();
-        }
-
-        let frame_target = std::time::Duration::from_millis(16);
-        let elapsed = last_render.elapsed();
-        if !is_busy && !state.dirty {
-            std::thread::sleep(std::time::Duration::from_millis(4));
-        } else if elapsed < frame_target {
-            std::thread::sleep(frame_target - elapsed);
-        }
-
-        #[cfg(feature = "trace-frames")]
-        if state.counter > 0 && state.counter % 600 == 0 {
-            println!(
-                "[SMITHAY] heartbeat counter={} messages={}",
-                state.counter,
-                state.backend.ipc.message_count
-            );
-        }
+        state.update();
+        state.render();
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }
 

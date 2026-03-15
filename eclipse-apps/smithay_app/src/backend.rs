@@ -9,7 +9,7 @@ use libc::{open, read, InputEvent, O_RDONLY, O_NONBLOCK,
 #[cfg(target_os = "linux")]
 use eclipse_syscall::InputEvent;
 #[cfg(target_os = "linux")]
-use libc::{open, read, O_RDONLY};
+use libc::{open, read, O_RDONLY, O_NONBLOCK};
 #[cfg(test)]
 use alloc::collections::VecDeque;
 
@@ -39,7 +39,7 @@ impl Backend {
             #[cfg(not(target_os = "linux"))]
             let fd = unsafe { open(b"input:\0".as_ptr() as *const core::ffi::c_char, O_RDONLY | O_NONBLOCK, 0) };
             #[cfg(target_os = "linux")]
-            let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY, 0) };
+            let fd = unsafe { open("input:".as_ptr() as *const i8, O_RDONLY | O_NONBLOCK, 0) };
             if fd >= 0 { Some(fd) } else { None }
         };
         #[cfg(test)]

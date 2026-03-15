@@ -11,18 +11,8 @@ use core::matches;
 #[cfg(not(target_os = "linux"))]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
 #[cfg(target_os = "linux")]
-use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR};
+use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
 
-/// Resultado de damage granular para SideWind: (x, y, w, h, workspace).
-pub struct SideWindDamageResult {
-    pub rects: heapless::Vec<(i32, i32, u32, u32, u8), 4>,
-}
-
-impl SideWindDamageResult {
-    pub const fn new() -> Self {
-        Self { rects: heapless::Vec::new() }
-    }
-}
 
 pub struct IpcHandler {
     channel: IpcChannel,
@@ -126,17 +116,16 @@ pub fn handle_sidewind_message(
     input_state: &mut InputState,
     fb_width: i32,
     fb_height: i32,
-) -> SideWindDamageResult {
-    let mut damage = SideWindDamageResult::new();
+) {
     match msg.op {
         SWND_OP_CREATE => {
             if msg.w == 0 || msg.h == 0 || msg.w > MAX_SURFACE_DIM || msg.h > MAX_SURFACE_DIM {
-                return damage;
+                return;
             }
             
             let buffer_size = (msg.w as usize).saturating_mul(msg.h as usize).saturating_mul(4);
             if buffer_size > MAX_SURFACE_BYTES as usize {
-                return damage;
+                return;
             }
 
             let surface_idx = surfaces.iter().position(|s| !s.active);
@@ -157,11 +146,11 @@ pub fn handle_sidewind_message(
                     #[cfg(not(target_os = "linux"))]
                     let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
                     #[cfg(target_os = "linux")]
-                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR, 0) };
+                    let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
 
                     if fd < 0 {
                         println!("[SMITHAY] Error: Failed to open SHM file {:?}", unsafe { core::str::from_utf8_unchecked(&path[..5+name_len]) });
-                        return damage;
+                        return;
                     }
 
                     let vaddr = unsafe { mmap(core::ptr::null_mut(), buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
@@ -169,7 +158,7 @@ pub fn handle_sidewind_message(
 
                     if vaddr.is_null() || vaddr == (-1isize as *mut core::ffi::c_void) {
                         println!("[SMITHAY] Error: mmap failed for surface");
-                        return damage;
+                        return;
                     }
 
                     surfaces[s_idx] = ExternalSurface {
@@ -195,8 +184,7 @@ pub fn handle_sidewind_message(
                     };
                     let new_idx = *window_count;
                     *window_count += 1;
-                    let w = &windows[new_idx];
-                    let _ = damage.rects.push((w.x, w.y, w.w as u32, w.h as u32, input_state.current_workspace));
+                    // Damage tracking removed
                 }
             }
         }
@@ -206,8 +194,7 @@ pub fn handle_sidewind_message(
                 if let Some(w_idx) = windows[..count].iter().position(|w| {
                     matches!(w.content, WindowContent::External(idx) if idx == s_idx as u32)
                 }) {
-                    let w = &windows[w_idx];
-                    let _ = damage.rects.push((w.x, w.y, w.w as u32, w.h as u32, w.workspace));
+                    // Damage tracking removed
                     surfaces[s_idx].unmap();
                     if count > 1 && w_idx < count - 1 {
                         for i in w_idx..(count - 1) {
@@ -230,9 +217,7 @@ pub fn handle_sidewind_message(
                 matches!(w.content, WindowContent::External(idx)
                     if (idx as usize) < surfaces.len() && surfaces[idx as usize].pid == sender_pid)
             }) {
-                let w = &windows[w_idx];
-                let ws = w.workspace;
-                let _ = damage.rects.push((w.x, w.y, w.w as u32, w.h as u32, ws));
+                // Damage tracking removed
                 if msg.op == SWND_OP_UPDATE {
                     windows[w_idx].x = msg.x;
                     windows[w_idx].y = msg.y;
@@ -244,8 +229,7 @@ pub fn handle_sidewind_message(
                             surfaces[s_idx as usize].ready_to_flip = false; // Need a new commit
                         }
                     }
-                    let w2 = &windows[w_idx];
-                    let _ = damage.rects.push((w2.x, w2.y, w2.w as u32, w2.h as u32, w2.workspace));
+                    // Damage tracking removed
                 } else if msg.op == SWND_OP_COMMIT {
                     if let WindowContent::External(s_idx) = windows[w_idx].content {
                         surfaces[s_idx as usize].ready_to_flip = true;
@@ -255,7 +239,6 @@ pub fn handle_sidewind_message(
         }
         _ => {}
     }
-    damage
 }
 
 #[cfg(test)]

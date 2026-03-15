@@ -84,6 +84,16 @@ impl FramebufferState {
 
             let addr1 = syscall::drm_map_handle(handle1).ok()?;
             let addr2 = syscall::drm_map_handle(handle2).ok()?;
+            // Algunas rutas de error devuelven valores "canónicos" de kernel (p. ej. 0xffffffff00000000)
+            // como si fueran direcciones válidas. En userspace eso debe tratarse como fallo.
+            let addr_invalid = |a: usize| {
+                a == 0
+                    || a == usize::MAX
+                    || (a & 0xffff_ffff_0000_0000) == 0xffff_ffff_0000_0000
+            };
+            if addr_invalid(addr1) || addr_invalid(addr2) {
+                return None;
+            }
 
             let _ = syscall::drm_page_flip(fb1_id);
 
@@ -190,7 +200,6 @@ impl FramebufferState {
         #[cfg(target_os = "linux")] { true }
     }
 
-    pub fn present_damaged(&mut self, _rects: &[Rectangle]) -> bool { self.present() }
 
     pub fn pre_render_background(&mut self) {
         if self.background_addr == 0 { return; }
@@ -210,31 +219,6 @@ impl FramebufferState {
         unsafe { core::ptr::copy_nonoverlapping(self.background_addr as *const u8, self.back_addr as *mut u8, size_bytes); }
     }
 
-    pub fn blit_background_damaged(&self, rects: &[Rectangle]) {
-        if self.back_addr == 0 || self.background_addr == 0 || rects.is_empty() { return; }
-        let pitch = self.info.pitch as usize;
-        let fb_w = self.info.width as i32;
-        let fb_h = self.info.height as i32;
-
-        for r in rects {
-            let rx = r.top_left.x.max(0);
-            let ry = r.top_left.y.max(0);
-            let rw = (r.size.width as i32).min(fb_w - rx);
-            let rh = (r.size.height as i32).min(fb_h - ry);
-            if rw <= 0 || rh <= 0 { continue; }
-
-            for y in ry..ry + rh {
-                let offset = (y as usize * pitch) + (rx as usize * 4);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (self.background_addr + offset) as *const u8,
-                        (self.back_addr + offset) as *mut u8,
-                        rw as usize * 4,
-                    );
-                }
-            }
-        }
-    }
 
     pub fn blit_buffer(&mut self, x: i32, y: i32, w: u32, h: u32, src: *const u32, src_size: usize) {
         if self.back_addr == 0 || src.is_null() || w == 0 || h == 0 { return; }
@@ -243,8 +227,11 @@ impl FramebufferState {
         let pitch_px = (self.info.pitch / 4) as usize;
         let dst_ptr = self.back_addr as *mut u32;
 
-        let required_bytes = (w as usize) * (h as usize) * 4;
-        if required_bytes > src_size { return; }
+        let required_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if required_bytes == 0 || required_bytes > src_size { return; }
+        // Evitar overflow: comprobar que el último pixel leído cabe en src_size.
+        let max_src_offset_pixels = (w as usize).saturating_mul(h as usize);
+        if max_src_offset_pixels.saturating_mul(4) > src_size { return; }
 
         for iy in 0..h as i32 {
             let dy = y + iy;
@@ -571,26 +558,14 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
     if cursor_x >= min_x && cursor_x < min_x + btn_size { return Some(WindowButton::Minimize); }
     None
 }
-fn intersects_any(rect: &Rectangle, damage: &[Rectangle]) -> bool {
-    for d in damage {
-        let x1 = d.top_left.x; let y1 = d.top_left.y;
-        let x2 = x1 + d.size.width as i32; let y2 = y1 + d.size.height as i32;
-        let x3 = rect.top_left.x; let y3 = rect.top_left.y;
-        let x4 = x3 + rect.size.width as i32; let y4 = y3 + rect.size.height as i32;
-        
-        if x1 < x4 && x2 > x3 && y1 < y4 && y2 > y3 {
-            return true;
-        }
-    }
-    false
-}
 
 #[inline(never)]
-pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64, damage_rects: &[Rectangle]) {
+pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
 
+    // First pass: find hovered window/button
     for (i, w) in windows.iter().take(window_count).enumerate().rev() {
         if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
@@ -608,63 +583,22 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
         }
     }
 
-    let mut visible_damage = heapless::Vec::<Rectangle, 16>::new();
-    let mut next_pass = heapless::Vec::<Rectangle, 16>::new();
-    let mut sub_out = heapless::Vec::<Rectangle, 4>::new();
-
+    // Second pass: draw windows (painter's algorithm)
     for (i, w) in windows.iter().take(window_count).enumerate() {
         if matches!(w.content, WindowContent::None) { continue; }
         let effective_x = w.curr_x as i32 + (w.workspace as i32 * fb_w) - ws_offset as i32;
-        let wy = w.curr_y as i32;
         let ww = w.curr_w as i32;
-        let wh = w.curr_h as i32;
-        
         if effective_x + ww <= 0 || effective_x >= fb_w { continue; }
         if w.minimized && ww < 50 { continue; }
 
-        let window_rect = Rectangle::new(Point::new(effective_x, wy), Size::new(ww as u32, wh as u32));
-
-        visible_damage.clear();
-        for &dr in damage_rects {
-            if let Some(inter) = crate::damage::rect_intersection(&window_rect, &dr) {
-                let _ = visible_damage.push(inter);
-            }
-        }
-        if visible_damage.is_empty() { continue; }
-
-        // FIX: Prevenir panic index out of bounds limitando j al menor valor seguro
-        let safe_upper_bound = window_count.min(windows.len());
-        for j in i + 1..safe_upper_bound {
-            let upper = &windows[j];
-            if upper.is_opaque(surfaces) {
-                let ux = upper.curr_x as i32 + (upper.workspace as i32 * fb_w) - ws_offset as i32;
-                let upper_rect = Rectangle::new(Point::new(ux, upper.curr_y as i32), Size::new(upper.curr_w as u32, upper.curr_h as u32));
-
-                next_pass.clear();
-                for &vr in &visible_damage {
-                    crate::damage::subtract_rect(&vr, &upper_rect, &mut sub_out);
-                    for s in &sub_out {
-                        if next_pass.len() < 16 { let _ = next_pass.push(*s); }
-                    }
-                }
-                core::mem::swap(&mut visible_damage, &mut next_pass);
-                if visible_damage.is_empty() { break; }
-            }
-        }
-        if visible_damage.is_empty() { continue; }
-
         let focused = Some(i) == focused_window;
         let btn_hover = if hovered_win_idx == Some(i) { hovered_button.clone() } else { None };
-        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks, &visible_damage);
+        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks);
     }
 }
 
-pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64, damage: &[Rectangle]) -> Result<(), ()> {
-    let _window_rect = Rectangle::new(Point::new(x, w.curr_y as i32), Size::new(w.curr_w as u32, w.curr_h as u32));
-    
-    // Draw window decoration (blur, shadow, glass card, title bar, buttons) whenever
-    // any part of the window is in damage.  `damage` is already the visible subset
-    // of damage that overlaps this window, so it is always non-empty here.
+pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
+    // Damage tracking removed; draw decoration fully if visible.
     draw_window_decoration_at(fb, w, is_focused, x, button_hover);
 
     if w.curr_w > 100.0 {
@@ -698,7 +632,15 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
             WindowContent::External(idx) => {
                 if (idx as usize) < surfaces.len() && surfaces[idx as usize].active {
                     let s = &surfaces[idx as usize];
-                    if s.vaddr != 0 && s.vaddr != 0x1000 && s.buffer_size != 0 {
+                    // Evitar Page Fault (#14): rechazar vaddr fuera de rango plausible de mmap.
+                    // CR2=0x2bf086ff9e5 (~280 GiB) indica puntero corrupto o mapping ya liberado.
+                    const MAX_PLAUSIBLE_VADDR: usize = 0x20_0000_0000; // 128 GiB
+                    let vaddr_ok = s.vaddr != 0
+                        && s.vaddr != 0x1000
+                        && s.vaddr <= MAX_PLAUSIBLE_VADDR
+                        && s.buffer_size != 0
+                        && s.vaddr.saturating_add(s.buffer_size) <= MAX_PLAUSIBLE_VADDR;
+                    if vaddr_ok {
                         let wx = x;
                         let wy = w.curr_y as i32;
                         let ww = (w.curr_w as i32).max(0);
@@ -709,14 +651,7 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                             let needed = (content_w as usize).saturating_mul(content_h as usize).saturating_mul(4);
                             if needed <= s.buffer_size {
                                 let content_rect = Rectangle::new(Point::new(wx + 5, wy + ShellWindow::TITLE_H + 5), Size::new(content_w, content_h));
-                                
-                                for d in damage {
-                                    let overlap = d.intersection(&content_rect);
-                                    if overlap.size.width > 0 && overlap.size.height > 0 {
-                                        fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
-                                        break;
-                                    }
-                                }
+                                fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
                             }
                         }
                     }
@@ -796,30 +731,23 @@ pub fn draw_desktop_shell(
     counter: u64,
     cursor_x: i32,
     cursor_y: i32,
-    damage: &[Rectangle],
     log_buf: &mut [u8; 512],
     log_len: &mut usize,
 ) {
-    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, damage, log_buf, log_len);
+    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len);
 }
 
-pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32, damage: &[Rectangle], log_buf: &mut [u8; 512], log_len: &mut usize) {
+pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32, log_buf: &mut [u8; 512], log_len: &mut usize) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
 
-    if damage.is_empty() {
-        fb.blit_background();
-    } else {
-        fb.blit_background_damaged(damage);
-    }
+    fb.blit_background();
 
 
     let center = Point::new(w / 2, h / 2);
     let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
     let logo_rect = Rectangle::new(Point::new(center.x - logo_r, center.y - logo_r), Size::new(logo_r as u32 * 2, logo_r as u32 * 2));
-    if intersects_any(&logo_rect, damage) {
-        let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
-    }
+    let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
 
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
     let sidebar_width = (fb.info.width as i32 / 10).clamp(140, 220);
@@ -829,12 +757,9 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     
     for (i, icon_type) in SIDEBAR_ICON_TYPES.iter().enumerate() {
         let py = sidebar_y_start + (i as i32 * icon_slot_h);
-        let icon_rect = Rectangle::new(Point::new(sidebar_x, py), Size::new(sidebar_width as u32, icon_slot_h as u32));
-        if intersects_any(&icon_rect, damage) {
-            let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
-                     && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
-            let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
-        }
+        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
+                 && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
+        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
     }
 
     let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
@@ -844,7 +769,6 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let rx = w - box_w - 15;
     let hud_h = 110;
     let hud_rect = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32));
-    if !intersects_any(&hud_rect, damage) { return; }
 
     let _ = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
     let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
