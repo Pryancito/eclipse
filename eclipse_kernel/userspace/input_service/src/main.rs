@@ -145,8 +145,13 @@ const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
 /// Contador de eventos enviados al display (debug: si se congela input, ver si este deja de subir).
 static DISPLAY_SENT: AtomicU64 = AtomicU64::new(0);
+/// Contador de fallos de send_ipc al display (buzón lleno = backpressure).
+/// Si sube mientras DISPLAY_SENT se estanca, el compositor no consume el buzón suficientemente rápido.
+static DISPLAY_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11)
+/// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11).
+/// Los fallos de IPC (buzón lleno) se registran en DISPLAY_SEND_FAILURES y se loguean
+/// periódicamente; el llamador no necesita inspeccionar el resultado.
 fn send_event_to_client(pid: u32, ev: &InputEvent) {
     if pid == 0 {
         return;
@@ -165,7 +170,20 @@ fn send_event_to_client(pid: u32, ev: &InputEvent) {
     buf[8..12].copy_from_slice(&ev.value.to_le_bytes());
     // buf[12..16] = 0; // implicit padding bytes, kept as 0
     buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
-    let _ = send_ipc(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
+    let ret = send_ipc(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
+    if ret < 0 {
+        // El buzon del compositor esta lleno: el evento se pierde. Registrar el
+        // fallo para que el heartbeat indique backpressure sin saturar la consola.
+        let f = DISPLAY_SEND_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        // Loguear solo en la primera ocurrencia y despues cada 100 para no saturar logs.
+        if f == 1 || f % 100 == 0 {
+            println!(
+                "[INPUT-SERVICE] WARN: send_ipc->PID {} fallo (buzon lleno?): ret={} fallos_total={}",
+                pid, ret, f
+            );
+        }
+        return;
+    }
     let n = DISPLAY_SENT.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 500 == 0 {
         println!("[INPUT-SERVICE] sent {} to display", n);
@@ -429,6 +447,11 @@ fn main() {
     let mut keyboard_events = 0u64;
     let mut mouse_events = 0u64;
     let mut tablet_events = 0u64;
+    // Cuántas iteraciones consecutivas del bucle no generaron ningún paquete de ratón.
+    // Si supera un umbral, probablemente el hardware o el driver del kernel dejó de
+    // producir eventos (bug de driver, overflow de buffer, etc.).
+    let mut consecutive_idle_mouse_iters: u64 = 0;
+    const IDLE_MOUSE_WARN_THRESHOLD: u64 = 2000; // ~2 s a 1 kHz de bucle
     
     loop {
         heartbeat_counter += 1;
@@ -544,6 +567,24 @@ fn main() {
             }
         }
 
+        // Watchdog: detectar si read_mouse_packet ha dejado de producir eventos durante
+        // muchas iteraciones consecutivas (posible bug de driver o hardware bloqueado).
+        if mouse_drained == 0 {
+            consecutive_idle_mouse_iters = consecutive_idle_mouse_iters.saturating_add(1);
+            if consecutive_idle_mouse_iters == IDLE_MOUSE_WARN_THRESHOLD
+                || (consecutive_idle_mouse_iters > IDLE_MOUSE_WARN_THRESHOLD
+                    && consecutive_idle_mouse_iters % IDLE_MOUSE_WARN_THRESHOLD == 0)
+            {
+                println!(
+                    "[INPUT-SERVICE] WARN: sin paquetes de ratón en {} iteraciones consecutivas \
+                     (cursor=({},{}) total_mouse={}). ¿Driver bloqueado?",
+                    consecutive_idle_mouse_iters, cursor_x, cursor_y, mouse_events
+                );
+            }
+        } else {
+            consecutive_idle_mouse_iters = 0;
+        }
+
         // Send ONE coalesced motion event after draining all packets this iteration.
         // Clamp to i16 range so the compositor can unpack each axis with a simple `as i16`.
         // Contract: value = (coalesced_dy as i16 as i32) << 16 | (coalesced_dx as i16 as u16 as i32)
@@ -627,16 +668,19 @@ fn main() {
 
         // Debug: cada ~500 iteraciones (~500 ms) volcar contadores básicos para ver si
         // el ratón sigue generando eventos aunque el cursor de smithay parezca congelado.
+        // Ahora incluye disp_failures para detectar backpressure IPC.
         if heartbeat_counter % 500 == 0 {
             let sent = DISPLAY_SENT.load(Ordering::Relaxed);
+            let failures = DISPLAY_SEND_FAILURES.load(Ordering::Relaxed);
             println!(
-                "[INPUT-SERVICE] hb={} total={} kbd={} mouse={} tablet={} disp_sent={} cursor=({},{})",
+                "[INPUT-SERVICE] hb={} total={} kbd={} mouse={} tablet={} disp_sent={} ipc_failures={} cursor=({},{})",
                 heartbeat_counter,
                 total_events,
                 keyboard_events,
                 mouse_events,
                 tablet_events,
                 sent,
+                failures,
                 cursor_x,
                 cursor_y
             );

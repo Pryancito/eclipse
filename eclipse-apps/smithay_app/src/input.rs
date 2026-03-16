@@ -185,24 +185,26 @@ impl InputState {
                 1 => {
                     // Mouse move: valor codifica dx/dy si code == 0xFFFF.
                     if ev.code == 0xFFFF {
+                        // Unpack coalesced dx (lower i16) and dy (upper i16).
+                        // Clamp each axis to i8 range after unpacking so that a malformed or
+                        // accumulated-overflow event cannot cause an unbounded cursor jump.
+                        // This matches the identical clamp in the non-debug path below.
                         let dx = (ev.value as i16) as i32;
                         let dy = ((ev.value >> 16) as i16) as i32;
+                        let dx = dx.clamp(i8::MIN as i32, i8::MAX as i32);
+                        let dy = dy.clamp(i8::MIN as i32, i8::MAX as i32);
                         let ddx = (dx * self.mouse_sensitivity) / 100;
-                        let mut ddy = (dy * self.mouse_sensitivity) / 100;
-                        if self.invert_y {
-                            ddy = -ddy;
-                        }
+                        let ddy = (dy * self.mouse_sensitivity) / 100;
+                        let dy_effective = if self.invert_y { -ddy } else { ddy };
                         self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
-                        self.cursor_y = (self.cursor_y + ddy).clamp(0, (fb_height - 1).max(0));
+                        self.cursor_y = (self.cursor_y + dy_effective).clamp(0, (fb_height - 1).max(0));
                     } else if ev.code == 0 {
-                        let ddx = (ev.value * self.mouse_sensitivity) / 100;
-                        self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
+                        let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
+                        self.cursor_x = (self.cursor_x + d).clamp(0, (fb_width - 1).max(0));
                     } else if ev.code == 1 {
-                        let mut ddy = (ev.value * self.mouse_sensitivity) / 100;
-                        if self.invert_y {
-                            ddy = -ddy;
-                        }
-                        self.cursor_y = (self.cursor_y + ddy).clamp(0, (fb_height - 1).max(0));
+                        let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
+                        let dy = if self.invert_y { -d } else { d };
+                        self.cursor_y = (self.cursor_y + dy).clamp(0, (fb_height - 1).max(0));
                     }
                 }
                 2 => {
