@@ -84,6 +84,10 @@ pub struct SmithayState {
     /// Buffer para logs del kernel (evita static mut en draw_static_ui).
     pub log_buf: [u8; 512],
     pub log_len: usize,
+    /// Valor de `counter` la última vez que se procesó un evento Input.
+    /// Sirve de watchdog: si el main loop sigue avanzando pero este valor no cambia,
+    /// los eventos de ratón han dejado de llegar (IPC muerto o input_service bloqueado).
+    pub last_input_tick: u64,
     pub wayland_connections: [Option<sidewind::wayland::WaylandConnection>; 32],
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
 }
@@ -158,6 +162,7 @@ impl SmithayState {
             dirty: true,
             log_buf: [0; 512],
             log_len: 0,
+            last_input_tick: 0,
             wayland_connections: [const { None }; 32],
             wayland_pool_maps: Vec::new(),
         })
@@ -168,6 +173,8 @@ impl SmithayState {
         match event {
             CompositorEvent::Input(ev) => {
                 self.input_event_count += 1;
+                // Registrar el tick del contador para el watchdog de inanición de input.
+                self.last_input_tick = self.counter;
                 println!(
                     "[SMITHAY] Input: type={} code={} value={}",
                     ev.event_type, ev.code, ev.value
@@ -443,8 +450,23 @@ impl SmithayState {
         let busy_metrics = self.update_metrics_if_needed();
         let busy = busy_animations || busy_metrics || self.dirty;
         if self.counter % 120 == 0 {
+            // Watchdog: detectar inanición de input.  Si llevamos >500 frames sin recibir
+            // ningún evento de input mientras el bucle sigue corriendo, es probable que el
+            // canal IPC esté muerto o que input_service haya dejado de enviar eventos.
+            const INPUT_STARVATION_FRAMES: u64 = 500;
+            let frames_since_input = self.counter.wrapping_sub(self.last_input_tick);
+            if self.last_input_tick > 0 && frames_since_input > INPUT_STARVATION_FRAMES {
+                println!(
+                    "[SMITHAY] WARN: sin eventos de input en {} frames (last_input_tick={} counter={} total_events={}). \
+                     ¿IPC muerto o input_service bloqueado?",
+                    frames_since_input,
+                    self.last_input_tick,
+                    self.counter,
+                    self.input_event_count,
+                );
+            }
             println!(
-                "[SMITHAY] update: counter={} busy={} anim={} metrics={} dirty={} windows={} input_events={}",
+                "[SMITHAY] update: counter={} busy={} anim={} metrics={} dirty={} windows={} input_events={} cursor=({},{})",
                 self.counter,
                 busy,
                 busy_animations,
@@ -452,6 +474,8 @@ impl SmithayState {
                 self.dirty,
                 self.space.window_count,
                 self.input_event_count,
+                self.input.cursor_x,
+                self.input.cursor_y,
             );
         }
         busy
