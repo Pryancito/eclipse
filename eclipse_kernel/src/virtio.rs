@@ -284,13 +284,14 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
     fn page_flip(&self, fb_id: u32) -> bool {
         let fb = if let Some(fb) = crate::drm::get_fb(fb_id) { fb } else { return false; };
         
-        // fb_id es el Sequential DRM ID, que coincide con el resource_id de VirtIO
+        // Use gem_handle_id as VirtIO resource_id (the resource was created with handle_id, not fb_id)
+        let resource_id = fb.gem_handle_id;
         let mut devices = GPU_DEVICES.lock();
         if let Some(gpu) = devices.first_mut() {
             // Set scanout to this resource before presenting
-            let _ = gpu.set_scanout(0, fb_id, 0, 0, fb.width, fb.height);
+            let _ = gpu.set_scanout(0, resource_id, 0, 0, fb.width, fb.height);
             drop(devices);
-            return gpu_present(fb_id, 0, 0, fb.width, fb.height);
+            return gpu_present(resource_id, 0, 0, fb.width, fb.height);
         }
         false
     }
@@ -925,9 +926,6 @@ impl VirtIOBlockDeviceInner {
         // Reset device
         write_volatile(&mut (*regs).status, 0);
 
-        // Register as DRM driver
-        crate::drm::register_driver(alloc::sync::Arc::new(VirtioDrmDriver));
-        
         // Set ACKNOWLEDGE status bit
         write_volatile(&mut (*regs).status, VIRTIO_STATUS_ACKNOWLEDGE);
         
@@ -2998,10 +2996,17 @@ pub fn gpu_alloc_display_buffer(width: u32, height: u32) -> Option<(u64, u32, u3
 /// Present display buffer to screen: transfer guest memory to GPU and flush.
 pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // Flush CPU cache so GPU DMA sees userspace writes
+        // Flush CPU cache so GPU DMA sees userspace writes.
+        // resource_id is the gem_handle_id / VirtIO resource_id for DRM-allocated buffers.
+        // Priority: (1) kernel boot display buffer, (2) DRM GEM-backed FB by gem_handle_id,
+        // (3) DRM FB by sequential fb_id (used by sys_gpu_present syscall from userspace,
+        //     which receives the DRM fb_id returned by drm_create_fb()).
         let (fb_phys, pitch) = if resource_id == DISPLAY_BUFFER_RESOURCE_ID {
             (*DISPLAY_FB_PHYS.lock(), *DISPLAY_FB_PITCH.lock() as u64)
+        } else if let Some(fb) = crate::drm::get_fb_by_gem_handle(resource_id) {
+            (fb.phys_addr, fb.pitch as u64)
         } else if let Some(fb) = crate::drm::get_fb(resource_id) {
+            // sys_gpu_present passes the DRM fb_id (sequential) as resource_id; handle it here.
             (fb.phys_addr, fb.pitch as u64)
         } else {
             (0, 0)
