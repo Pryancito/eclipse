@@ -21,6 +21,8 @@ pub struct DrmCaps {
 #[derive(Debug, Clone, Copy)]
 pub struct DrmFramebuffer {
     pub id: u32,
+    /// GEM handle that backs this framebuffer (equals the hardware resource_id used by drivers)
+    pub gem_handle_id: u32,
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
@@ -123,6 +125,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
     // Store metadata for the syscalls
     let fb = DrmFramebuffer {
         id: fb_id,
+        gem_handle_id: handle_id,
         width,
         height,
         pitch,
@@ -137,6 +140,11 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 /// Get framebuffer info
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE.lock().framebuffers.iter().find(|fb| fb.id == fb_id).cloned()
+}
+
+/// Get framebuffer info by the backing GEM handle id (VirtIO resource_id)
+pub fn get_fb_by_gem_handle(gem_handle_id: u32) -> Option<DrmFramebuffer> {
+    DRM_STATE.lock().framebuffers.iter().find(|fb| fb.gem_handle_id == gem_handle_id).cloned()
 }
 
 /// Page flip implementation via DRM subsystem

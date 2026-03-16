@@ -698,8 +698,11 @@ fn sys_drm_map_handle(handle_id: u64) -> u64 {
         }
         
         // Map the physical frames of the GEM handle directly to the found userspace address.
+        // Use Write-Combining (WC) caching: PWT=1, PCD=0 selects PAT index 1 which is
+        // configured as WC in memory::init_pat() (see eclipse_kernel/src/memory.rs).
+        // WC is optimal for write-only framebuffer access patterns (avoids cache thrashing).
         use x86_64::structures::paging::PageTableFlags;
-        let flags = (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE).bits();
+        let flags = (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITE_THROUGH).bits();
         
         crate::memory::map_physical_range(
             r.page_table_phys,
