@@ -466,6 +466,11 @@ fn main() {
         const MAX_MOUSE_PER_ITER: u32 = 64;
         let mut mouse_batch = 0u32;
         let mut mouse_drained = 0u32;
+        // Accumulate all motion deltas within this iteration so we can send ONE coalesced
+        // IPC event instead of one per packet.  This keeps the compositor mailbox from
+        // filling up during rapid mouse movement.
+        let mut coalesced_dx: i32 = 0;
+        let mut coalesced_dy: i32 = 0;
         while mouse_drained < MAX_MOUSE_PER_ITER {
             let packed = match read_mouse_packet() {
                 Some(p) => p,
@@ -486,30 +491,11 @@ fn main() {
                 cursor_x = (cursor_x + dx).max(0).min(screen_width - 1);
                 cursor_y = (cursor_y + dy).max(0).min(screen_height - 1);
                 set_cursor_position(cursor_x as u32, cursor_y as u32);
-            }
-
-            // Eventos de movimiento: coalescer dx+dy en UN solo mensaje (code=0xFFFF,
-            // value = (dy as i16 as i32) << 16 | (dx as i16 as u16 as i32)).
-            // Esto reduce a la mitad el número de mensajes IPC por paquete de ratón,
-            // evitando que el mailbox de smithay (256 slots) se llene durante movimientos
-            // rápidos del ratón, lo que causaba el cuelgue.
-            if dx != 0 || dy != 0 {
-                let packed_value = ((dy as i16 as i32) << 16) | (dx as i16 as u16 as i32);
-                let ev = InputEvent {
-                    device_id: 1,
-                    event_type: 1,
-                    code: 0xFFFF, // código especial: movimiento coalesced dx+dy
-                    value: packed_value,
-                    timestamp: heartbeat_counter,
-                };
-                mouse_events += 1;
-                total_events += 1;
-                for i in 0..display_client_count {
-                    let pid = display_clients[i];
-                    send_event_to_client(pid, &ev);
-                }
-                write_input_event_to_scheme(input_fd, &ev);
-                let _ = event_queue.push(ev);
+                // Accumulate using saturating_add so repeated small-but-same-sign movements
+                // never silently wrap around (i32 overflow with 64 * 127 = 8128, well within
+                // i16 range, so this is extra safety for unusual kernel values).
+                coalesced_dx = coalesced_dx.saturating_add(dx);
+                coalesced_dy = coalesced_dy.saturating_add(dy);
             }
 
             // Eventos de botones (code 0=left, 1=right, 2=middle; value 0=release, 1=press)
@@ -556,6 +542,30 @@ fn main() {
                 write_input_event_to_scheme(input_fd, &ev);
                 let _ = event_queue.push(ev);
             }
+        }
+
+        // Send ONE coalesced motion event after draining all packets this iteration.
+        // Clamp to i16 range so the compositor can unpack each axis with a simple `as i16`.
+        // Contract: value = (coalesced_dy as i16 as i32) << 16 | (coalesced_dx as i16 as u16 as i32)
+        if coalesced_dx != 0 || coalesced_dy != 0 {
+            let cdx = coalesced_dx.clamp(i16::MIN as i32, i16::MAX as i32);
+            let cdy = coalesced_dy.clamp(i16::MIN as i32, i16::MAX as i32);
+            let packed_value = ((cdy as i16 as i32) << 16) | (cdx as i16 as u16 as i32);
+            let ev = InputEvent {
+                device_id: 1,
+                event_type: 1,
+                code: 0xFFFF, // código especial: movimiento coalesced dx+dy
+                value: packed_value,
+                timestamp: heartbeat_counter,
+            };
+            mouse_events += 1;
+            total_events += 1;
+            for i in 0..display_client_count {
+                let pid = display_clients[i];
+                send_event_to_client(pid, &ev);
+            }
+            write_input_event_to_scheme(input_fd, &ev);
+            let _ = event_queue.push(ev);
         }
 
         // Drenar teclado PS/2 real (kernel buffer vía syscall read_key).

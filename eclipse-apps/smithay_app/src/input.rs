@@ -279,11 +279,14 @@ impl InputState {
                 if !pressed && ev.code == 0x0F { self.alt_tab_active = false; }
             }
             1 => { // Mouse move
-                let d = (ev.value * self.mouse_sensitivity) / 100;
                 if ev.code == 0xFFFF {
-                    // Coalesced dx+dy event: dx = lower i16, dy = upper i16
+                    // Coalesced dx+dy event: dx = lower i16, dy = upper i16.
+                    // Clamp each axis to i8 range after unpacking so that a malformed or
+                    // accumulated-overflow event cannot cause unbounded cursor jumps.
                     let dx = (ev.value as i16) as i32;
                     let dy = ((ev.value >> 16) as i16) as i32;
+                    let dx = dx.clamp(i8::MIN as i32, i8::MAX as i32);
+                    let dy = dy.clamp(i8::MIN as i32, i8::MAX as i32);
                     let ddx = (dx * self.mouse_sensitivity) / 100;
                     let ddy = (dy * self.mouse_sensitivity) / 100;
                     self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
@@ -302,6 +305,7 @@ impl InputState {
                         }
                     }
                 } else if ev.code == 0 {
+                    let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
                     self.cursor_x = (self.cursor_x + d).clamp(0, (fb_width - 1).max(0));
                     if let Some(idx) = self.dragging_window { 
                         if idx < *window_count {
@@ -314,6 +318,7 @@ impl InputState {
                         }
                     }
                 } else if ev.code == 1 {
+                    let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
                     let dy = if self.invert_y { -d } else { d };
                     self.cursor_y = (self.cursor_y + dy).clamp(0, (fb_height - 1).max(0));
                     if let Some(idx) = self.dragging_window { 
@@ -542,6 +547,85 @@ mod tests {
         let _ = state.search_query.push_str("lock");
         state.execute_search();
         assert!(state.lock_active);
+    }
+
+    /// Helper: pack (dx, dy) as i8 values into the coalesced event value field,
+    /// matching the formula used by input_service.
+    fn pack_mouse_delta(dx: i8, dy: i8) -> i32 {
+        ((dy as i16 as i32) << 16) | (dx as i16 as u16 as i32)
+    }
+
+    #[test]
+    fn test_coalesced_mouse_move_positive() {
+        let mut state = InputState::new(200, 200); // cursor starts at (100, 100)
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 1,
+            code: 0xFFFF,
+            value: pack_mouse_delta(10, 5),
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 200, 200, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.cursor_x, 110); // 100 + 10
+        assert_eq!(state.cursor_y, 105); // 100 + 5
+    }
+
+    #[test]
+    fn test_coalesced_mouse_move_negative_dy() {
+        // Validates that the upper-16-bit arithmetic shift extracts dy correctly
+        // (a comparison `> 16` instead of right-shift `>> 16` would always yield 0 or 1).
+        let mut state = InputState::new(200, 200); // cursor starts at (100, 100)
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 1,
+            code: 0xFFFF,
+            value: pack_mouse_delta(0, -20),
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 200, 200, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.cursor_x, 100); // unchanged
+        assert_eq!(state.cursor_y, 80);  // 100 - 20
+    }
+
+    #[test]
+    fn test_coalesced_mouse_move_both_negative() {
+        let mut state = InputState::new(200, 200); // cursor starts at (100, 100)
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 1,
+            code: 0xFFFF,
+            value: pack_mouse_delta(-30, -40),
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 200, 200, &mut windows, &mut 0, &surfaces);
+        assert_eq!(state.cursor_x, 70); // 100 - 30
+        assert_eq!(state.cursor_y, 60); // 100 - 40
+    }
+
+    #[test]
+    fn test_coalesced_mouse_move_extreme_clamped() {
+        // A malformed/accumulation-overflow value whose lower i16 is -128 and upper i16 is 127.
+        let mut state = InputState::new(200, 200); // cursor at (100, 100), sensitivity=100
+        let ev = InputEvent {
+            device_id: 1,
+            event_type: 1,
+            code: 0xFFFF,
+            value: pack_mouse_delta(i8::MIN, i8::MAX), // dx=-128, dy=127
+            timestamp: 0,
+        };
+        let mut windows = [];
+        let surfaces = [];
+        state.apply_event(&ev, 200, 200, &mut windows, &mut 0, &surfaces);
+        // cursor_x = clamp(100 + (-128), 0, 199) = 0 (100-128 = -28, clamped to 0)
+        assert_eq!(state.cursor_x, 0);
+        // cursor_y = clamp(100 + 127, 0, 199) = 199 (100+127 = 227, clamped to fb_height-1=199)
+        assert_eq!(state.cursor_y, 199);
     }
 
     /// Stress: scancode_to_action y scancode_to_char en bucle.
