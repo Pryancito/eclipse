@@ -10,6 +10,7 @@ use spin::Mutex;
 use crate::process::ProcessId;
 
 use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
 
 /// Error codes matching POSIX/Redox
 pub mod error {
@@ -22,6 +23,9 @@ pub mod error {
     pub const ESPIPE: usize = 29;  // Illegal seek
     pub const ENOSYS: usize = 38;  // Function not implemented
     pub const EFAULT: usize = 14;  // Bad address
+    pub const EISCONN: usize = 106; // Transport endpoint is already connected
+    pub const ENOTCONN: usize = 107; // Transport endpoint is not connected
+    pub const EPIPE: usize = 32;   // Broken pipe
 }
 
 /// Stat information for a resource
@@ -95,6 +99,11 @@ pub trait Scheme: Send + Sync {
     fn unlink(&self, _path: &str) -> Result<usize, usize> {
         Err(error::ENOSYS)
     }
+
+    /// Change the size of a resource
+    fn ftruncate(&self, _id: usize, _len: usize) -> Result<usize, usize> {
+        Err(error::ENOSYS)
+    }
 }
 
 /// Registry for all system schemes
@@ -148,6 +157,7 @@ impl Scheme for LogScheme {
 
 pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
+    register_scheme("shm", Arc::new(ShmScheme::new()));
 }
 
 /// Register a new scheme
@@ -221,6 +231,15 @@ pub fn fmap(scheme_idx: usize, id: usize, offset: usize, len: usize) -> Result<u
     scheme.fmap(id, offset, len)
 }
 
+/// Truncate or extend a resource in a specific scheme
+pub fn ftruncate(scheme_idx: usize, id: usize, len: usize) -> Result<usize, usize> {
+    let scheme = {
+        let reg = REGISTRY.lock();
+        Arc::clone(&reg.schemes.get(scheme_idx).ok_or(error::EBADF)?.1)
+    };
+    scheme.ftruncate(id, len)
+}
+
 /// Perform an ioctl on a resource in a specific scheme
 pub fn ioctl(scheme_idx: usize, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
     let scheme = {
@@ -262,4 +281,263 @@ pub fn unlink(path: &str) -> Result<usize, usize> {
     };
 
     scheme.unlink(relative_path)
+}
+
+// --- SHM Scheme ---
+
+pub struct ShmRegion {
+    pub phys_addr: u64,
+    pub size: usize,
+    pub ref_count: usize,
+    pub unlinked: bool,
+}
+
+pub struct ShmScheme {
+    regions: Mutex<BTreeMap<String, ShmRegion>>,
+    handles: Mutex<Vec<Option<String>>>,
+}
+
+impl ShmScheme {
+    pub fn new() -> Self {
+        Self {
+            regions: Mutex::new(BTreeMap::new()),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Scheme for ShmScheme {
+    fn open(&self, path: &str, flags: usize, _mode: u32) -> Result<usize, usize> {
+        // Flags from POSIX (subset used here)
+        const O_CREAT: usize = 0x200;
+        const O_EXCL: usize = 0x800;
+        const O_TRUNC: usize = 0x400;
+
+        let mut regions = self.regions.lock();
+        let mut handles = self.handles.lock();
+
+        let name = path.trim_start_matches('/');
+        if name.is_empty() {
+            return Err(error::EINVAL);
+        }
+
+        if (flags & O_CREAT) != 0 {
+            if regions.contains_key(name) {
+                if (flags & O_EXCL) != 0 {
+                    return Err(error::EEXIST);
+                }
+                // If not O_EXCL, we just open it (TRUNC handled if specified, but usually not for SHM)
+            } else {
+                // Create new region. Size is usually determined by ftruncate, but for now 
+                // we might need a way to specify initial size or just allocate on first write/mmap.
+                // Wayland usually does: open(SHM_NAME, O_CREAT|O_RDWR) -> ftruncate(size) -> mmap.
+                // Since our Scheme doesn't have ftruncate yet, we'll use a hack or just allocate 4MB by default
+                // and allow resizing if we add a resize method.
+                // Actually, let's just create an empty region and use write or a special ioctl to set size.
+                // Or better: for Wayland SHM, the client creates a pool with a certain size.
+                
+                // For now, let's default to a reasonably large size (e.g. 16MB) to keep it simple
+                // until we have ftruncate.
+                let size: usize = 16 * 1024 * 1024; 
+                
+                #[cfg(not(test))]
+                let phys_addr_opt = crate::memory::alloc_phys_frames_contig((size / 4096) as u64);
+                #[cfg(test)]
+                let phys_addr_opt = Some(0x1234000); // Dummy addr for tests
+
+                if let Some(phys_addr) = phys_addr_opt {
+                    // Zero the memory
+                    #[cfg(not(test))]
+                    {
+                        let virt = crate::memory::PHYS_MEM_OFFSET + phys_addr;
+                        unsafe { core::ptr::write_bytes(virt as *mut u8, 0, size); }
+                    }
+                    
+                    regions.insert(String::from(name), ShmRegion {
+                        phys_addr,
+                        size,
+                        ref_count: 0,
+                        unlinked: false,
+                    });
+                } else {
+                    return Err(error::EIO); // Out of memory
+                }
+            }
+        }
+
+        if let Some(region) = regions.get_mut(name) {
+            region.ref_count += 1;
+        } else {
+            return Err(error::ENOENT);
+        }
+
+        // Find or create a handle
+        for (i, handle) in handles.iter_mut().enumerate() {
+            if handle.is_none() {
+                *handle = Some(String::from(name));
+                return Ok(i);
+            }
+        }
+
+        let id = handles.len();
+        handles.push(Some(String::from(name)));
+        Ok(id)
+    }
+
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let handles = self.handles.lock();
+        let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
+        let regions = self.regions.lock();
+        let region = regions.get(name).ok_or(error::EIO)?;
+
+        // For SHM, read/write might be used, but mmap is preferred.
+        // We'll implement a simple read at offset 0 (since we don't track offset per handle yet)
+        let to_copy = core::cmp::min(buffer.len(), region.size);
+        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr;
+        unsafe {
+            core::ptr::copy_nonoverlapping(virt as *const u8, buffer.as_mut_ptr(), to_copy);
+        }
+        Ok(to_copy)
+    }
+
+    fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
+        let handles = self.handles.lock();
+        let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
+        let regions = self.regions.lock();
+        let region = regions.get(name).ok_or(error::EIO)?;
+
+        let to_copy = core::cmp::min(buffer.len(), region.size);
+        let virt = crate::memory::PHYS_MEM_OFFSET + region.phys_addr;
+        unsafe {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr(), virt as *mut u8, to_copy);
+        }
+        Ok(to_copy)
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        // Shared memory objects are treated as non-seekable via this interface for now.
+        // Callers should use mmap and explicit offsets instead of lseek on shm handles.
+        Err(error::ESPIPE)
+    }
+
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut handles = self.handles.lock();
+        if id < handles.len() {
+            if let Some(name) = handles[id].take() {
+                let mut regions = self.regions.lock();
+                if let Some(region) = regions.get_mut(&name) {
+                    region.ref_count = region.ref_count.saturating_sub(1);
+                    if region.ref_count == 0 && region.unlinked {
+                        regions.remove(&name);
+                    }
+                }
+                return Ok(0);
+            }
+        }
+        Err(error::EBADF)
+    }
+
+    fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
+        let handles = self.handles.lock();
+        let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
+        let regions = self.regions.lock();
+        let region = regions.get(name).ok_or(error::EIO)?;
+
+        stat.size = region.size as u64;
+        stat.mode = 0o666 | 0x8000; // Regular file, readable/writable
+        Ok(0)
+    }
+
+    fn fmap(&self, id: usize, offset: usize, len: usize) -> Result<usize, usize> {
+        let handles = self.handles.lock();
+        let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
+        let regions = self.regions.lock();
+        let region = regions.get(name).ok_or(error::EIO)?;
+
+        if offset + len > region.size {
+            return Err(error::EINVAL);
+        }
+
+        Ok((region.phys_addr as usize) + offset)
+    }
+
+    fn unlink(&self, path: &str) -> Result<usize, usize> {
+        let name = path.trim_start_matches('/');
+        let mut regions = self.regions.lock();
+        if let Some(region) = regions.get_mut(name) {
+            region.unlinked = true;
+            if region.ref_count == 0 {
+                regions.remove(name);
+            }
+            Ok(0)
+        } else {
+            Err(error::ENOENT)
+        }
+    }
+
+    fn ftruncate(&self, id: usize, len: usize) -> Result<usize, usize> {
+        let handles = self.handles.lock();
+        let name = handles.get(id).and_then(|h| h.as_ref()).ok_or(error::EBADF)?;
+        let mut regions = self.regions.lock();
+        let region = regions.get_mut(name).ok_or(error::EIO)?;
+
+        // For now, our prototype allocator fixes the region to 16MB. 
+        // We only allow logical truncation within this physical allocation.
+        if len > 16 * 1024 * 1024 {
+             return Err(error::EINVAL);
+        }
+        region.size = len;
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+
+    #[test]
+    fn test_shm_refcount_unlink() {
+        let shm = ShmScheme::new();
+        // 1. Open region "test"
+        let fd1 = shm.open("test", 0x200, 0).expect("failed to open shm"); // O_CREAT
+        {
+            let regions = shm.regions.lock();
+            let reg = regions.get("test").expect("region not found");
+            assert_eq!(reg.ref_count, 1);
+            assert_eq!(reg.unlinked, false);
+        }
+
+        // 2. Open region "test" again
+        let fd2 = shm.open("test", 0, 0).expect("failed to open shm again");
+        {
+            let regions = shm.regions.lock();
+            let reg = regions.get("test").expect("region not found");
+            assert_eq!(reg.ref_count, 2);
+        }
+
+        // 3. Unlink "test"
+        shm.unlink("test").expect("failed to unlink");
+        {
+            let regions = shm.regions.lock();
+            let reg = regions.get("test").expect("region should still exist");
+            assert_eq!(reg.unlinked, true);
+            assert_eq!(reg.ref_count, 2);
+        }
+
+        // 4. Close first handle
+        shm.close(fd1).expect("failed to close fd1");
+        {
+            let regions = shm.regions.lock();
+            let reg = regions.get("test").expect("region should still exist");
+            assert_eq!(reg.ref_count, 1);
+        }
+
+        // 5. Close second handle
+        shm.close(fd2).expect("failed to close fd2");
+        {
+            let regions = shm.regions.lock();
+            assert!(regions.get("test").is_none(), "region should be removed after last close");
+        }
+    }
 }

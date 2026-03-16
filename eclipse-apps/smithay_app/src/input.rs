@@ -1,7 +1,7 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{InputEvent, eclipse_send};
+use libc::{InputEvent, eclipse_send};
 #[cfg(target_os = "linux")]
 use eclipse_syscall::InputEvent;
 #[cfg(target_os = "linux")]

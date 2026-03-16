@@ -1,5 +1,5 @@
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::gpu_command;
+use libc::gpu_command;
 #[cfg(target_os = "linux")]
 pub unsafe fn gpu_command(_kind: usize, _command: usize, _payload: &[u8]) -> isize { -1 }
 use core::fmt::Debug;

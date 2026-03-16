@@ -237,6 +237,11 @@ pub fn futex_wake(uaddr: *const core::sync::atomic::AtomicI32, count: u32) -> Re
     unsafe { cvt(syscall3(SYS_FUTEX, uaddr as usize, FUTEX_WAKE, count as usize)) }
 }
 
+/// ftruncate(fd, length) - change the size of a file
+pub fn ftruncate(fd: usize, length: usize) -> Result<()> {
+    unsafe { cvt_unit(syscall2(SYS_FTRUNCATE, fd, length)) }
+}
+
 /// Send a generic command to the GPU backend (VirtIO or NVIDIA)
 pub fn gpu_command(kind: usize, command: usize, payload: &[u8]) -> Result<usize> {
     unsafe {

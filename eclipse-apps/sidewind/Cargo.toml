@@ -17,11 +17,11 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
+libc = { version = "0.2", default-features = false }
 
 [features]
 default = []
-host-testing = ["eclipse-libc/host-testing"]
+host-testing = ["libc/host-testing"]
 
 [dev-dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }
+libc = { version = "0.2", default-features = false, features = ["host-testing"] }

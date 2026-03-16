@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 eclipse-syscall = { path = "../../eclipse-syscall" }
-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
+# Usar directamente la libc local (eclipse-relibc), cuyo paquete se llama `libc`.
+libc = { path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 
 [features]
 default = ["panic-handler", "alloc-error-handler"]

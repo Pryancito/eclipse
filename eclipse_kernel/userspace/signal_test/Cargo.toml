@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 std = { package = "eclipse_std", path = "../../../eclipse-apps/eclipse_std" }
-eclipse-libc = { package = "eclipse-libc", path = "../../../eclipse-relibc", default-features = false }
+eclipse-libc = { package = "libc", path = "../../../eclipse-relibc", default-features = false }
 eclipse-syscall = { path = "../../../eclipse-syscall" }
 
 [profile.release]

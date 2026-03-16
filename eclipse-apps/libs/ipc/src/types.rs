@@ -20,6 +20,7 @@ pub const GET_NETWORK_PID_MSG: &[u8; 15] = b"GET_NETWORK_PID";
 pub const TAG_NSTA: &[u8; 4] = b"NSTA";
 pub const GET_NET_STATS_MSG: &[u8; 13] = b"GET_NET_STATS";
 pub const TAG_SVCS: &[u8; 4] = b"SVCS";
+pub const TAG_WAYL: &[u8; 4] = b"WAYL";
 /// Línea de log del kernel (HUD). Enviada con from=0 cuando el logo ya está dibujado.
 pub const TAG_KLOG: &[u8; 4] = b"KLOG";
 
@@ -79,6 +80,10 @@ pub enum EclipseMessage {
 
     /// Línea de log del kernel para el HUD (from=0, prefijo KLOG). Llega cuando el logo ya está dibujado.
     Log { line: [u8; 252], len: usize },
+
+    /// Mensaje del protocolo Wayland (id: u32, size+op: u32, args...).
+    /// Llega con prefijo "WAYL".
+    Wayland { data: [u8; MAX_MSG_LEN - 4], len: usize },
 
     /// Mensaje desconocido/raw (fallback para extensibilidad futura).
     Raw { data: [u8; MAX_MSG_LEN], len: usize, from: u32 },
@@ -185,6 +190,12 @@ mod impl_parse {
             let copy_len = len.min(MAX_MSG_LEN);
             data[..copy_len].copy_from_slice(&buf[..copy_len]);
             return Some(EclipseMessage::ServiceInfoResponse { data, len: copy_len });
+        }
+        if len >= 4 && buf[0..4] == *TAG_WAYL {
+            let mut data = [0u8; MAX_MSG_LEN - 4];
+            let payload_len = len.saturating_sub(4).min(MAX_MSG_LEN - 4);
+            data[..payload_len].copy_from_slice(&buf[4..4 + payload_len]);
+            return Some(EclipseMessage::Wayland { data, len: payload_len });
         }
         if from == 0 && len >= 4 && buf[0..4] == *TAG_KLOG {
             let mut line = [0u8; 252];

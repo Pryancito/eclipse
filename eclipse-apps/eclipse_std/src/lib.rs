@@ -28,6 +28,34 @@ pub mod ffi {
 }
 
 pub use core::ptr;
+
+// Re-exportar módulos de core para compatibilidad con crates que usan std::result, std::iter, etc.
+pub mod result {
+    pub use core::result::*;
+}
+pub mod option {
+    pub use core::option::*;
+}
+pub mod iter {
+    pub use core::iter::*;
+}
+pub mod marker {
+    pub use core::marker::*;
+}
+pub mod ops {
+    pub use core::ops::*;
+}
+pub mod mem {
+    pub use core::mem::*;
+}
+pub mod convert {
+    pub use core::convert::*;
+}
+
+pub mod any {
+    pub use core::any::*;
+}
+
 pub mod heap;
 #[macro_use]
 pub mod macros;
@@ -53,17 +81,31 @@ pub mod collections {
     pub use alloc::collections::*;
 }
 
+/// Compatibilidad con std::string (p. ej. bitflags con feature std)
+pub mod string {
+    pub use alloc::string::*;
+}
+
 pub mod prelude {
-    //! Prelude - common imports for Eclipse OS applications
+    //! Prelude - compatible con std::prelude::v1 para que dependencias (bitflags, wayland-*, etc.) compilen.
     pub mod v1 {
         pub use core::prelude::v1::*;
         pub use core::cmp::{PartialEq, PartialOrd, Eq, Ord};
         pub use core::convert::{TryInto, TryFrom};
-        pub use core::iter::IntoIterator;
         pub use core::option::Option::{self, Some, None};
         pub use core::result::Result::{self, Ok, Err};
         pub use core::matches;
-        
+
+        // Mismos re-exports que std::prelude::v1 (marker, ops, iter, mem, convert)
+        pub use crate::marker::{Send, Sized, Sync, Unpin};
+        pub use crate::ops::{Drop, Fn, FnMut, FnOnce};
+        pub use crate::mem::drop;
+        pub use crate::mem::{align_of, align_of_val, size_of, size_of_val};
+        pub use crate::convert::{AsMut, AsRef, From, Into};
+        pub use crate::iter::{
+            DoubleEndedIterator, ExactSizeIterator, Extend, IntoIterator, Iterator,
+        };
+
         pub use crate::heap::init_heap;
         pub use crate::{print, println, eprint, eprintln};
         pub use crate::rt::argc;
@@ -71,7 +113,7 @@ pub mod prelude {
         pub use alloc::vec::Vec;
         pub use alloc::format;
         pub use alloc::boxed::Box;
-        
+
         pub use crate::io::{Read, Write, stdin, stdout, stderr};
         pub use crate::fs::{self, File};
         pub use crate::path::{self, Path, PathBuf};

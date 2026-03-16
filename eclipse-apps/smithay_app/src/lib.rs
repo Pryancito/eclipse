@@ -5,7 +5,7 @@ extern crate alloc;
 #[cfg(not(target_os = "linux"))]
 pub extern crate eclipse_std as std;
 #[cfg(not(target_os = "linux"))]
-pub extern crate eclipse_libc as libc;
+pub use libc;
 
 pub mod backend;
 pub mod compositor;

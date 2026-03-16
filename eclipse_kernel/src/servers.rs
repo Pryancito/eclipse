@@ -438,7 +438,6 @@ use spin::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
@@ -456,26 +455,60 @@ pub struct Socket {
     pub protocol: u32,
     pub state: SocketState,
     pub path: Option<String>,
+    /// When Connected, this socket is one end of a connection (client or server).
+    pub connection_id: Option<usize>,
+}
+
+/// Maximum bytes buffered per direction per connection (avoid OOM).
+const CONNECTION_BUFFER_CAP: usize = 256 * 1024;
+
+/// One bidirectional connection between a listener (server) and a client.
+struct Connection {
+    id: usize,
+    /// Data written by server, read by client.
+    buffer_to_client: VecDeque<u8>,
+    /// Data written by client, read by server.
+    buffer_to_server: VecDeque<u8>,
+    client_socket_id: usize,
+    server_socket_id: Option<usize>,
+    /// True when one side has closed; the other will see EOF on read.
+    closed_by_client: bool,
+    closed_by_server: bool,
+}
+
+/// Pending connections: listener socket id -> queue of connection ids waiting for accept().
+type PendingQueue = BTreeMap<usize, VecDeque<usize>>;
+
+struct SocketSchemeState {
+    sockets: BTreeMap<usize, Socket>,
+    connections: BTreeMap<usize, Connection>,
+    pending: PendingQueue,
+    next_socket_id: usize,
+    next_connection_id: usize,
 }
 
 // --- Socket Scheme ---
 
 pub struct SocketScheme {
-    sockets: Mutex<BTreeMap<usize, Socket>>,
+    state: Mutex<SocketSchemeState>,
 }
-
-static NEXT_SOCKET_ID: Mutex<usize> = Mutex::new(1);
 
 impl SocketScheme {
     pub fn new() -> Self {
         Self {
-            sockets: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(SocketSchemeState {
+                sockets: BTreeMap::new(),
+                connections: BTreeMap::new(),
+                pending: BTreeMap::new(),
+                next_socket_id: 1,
+                next_connection_id: 1,
+            }),
         }
     }
 
     pub fn bind(&self, id: usize, path: String) -> Result<(), usize> {
-        let mut sockets = self.sockets.lock();
-        if let Some(socket) = sockets.get_mut(&id) {
+        let mut st = self.state.lock();
+        if let Some(socket) = st.sockets.get_mut(&id) {
             socket.path = Some(path);
             socket.state = SocketState::Bound;
             Ok(())
@@ -485,9 +518,10 @@ impl SocketScheme {
     }
 
     pub fn listen(&self, id: usize) -> Result<(), usize> {
-        let mut sockets = self.sockets.lock();
-        if let Some(socket) = sockets.get_mut(&id) {
+        let mut st = self.state.lock();
+        if let Some(socket) = st.sockets.get_mut(&id) {
             socket.state = SocketState::Listening;
+            st.pending.entry(id).or_default();
             Ok(())
         } else {
             Err(scheme_error::EBADF)
@@ -495,84 +529,203 @@ impl SocketScheme {
     }
 
     pub fn accept(&self, id: usize) -> Result<usize, usize> {
-        let sockets = self.sockets.lock();
-        if let Some(socket) = sockets.get(&id) {
-            if socket.state == SocketState::Listening {
-                // Return EAGAIN for now to indicate no pending connections
-                return Err(scheme_error::EAGAIN);
-            }
-            return Err(scheme_error::EINVAL);
+        let mut st = self.state.lock();
+        let (domain, type_, protocol) = match st.sockets.get(&id) {
+            Some(s) if s.state == SocketState::Listening => (s.domain, s.type_, s.protocol),
+            Some(_) => return Err(scheme_error::EINVAL),
+            None => return Err(scheme_error::EBADF),
+        };
+        let conn_id = match st.pending.get_mut(&id).and_then(|q| q.pop_front()) {
+            Some(cid) => cid,
+            None => return Err(scheme_error::EAGAIN),
+        };
+        let new_id = st.next_socket_id;
+        st.next_socket_id += 1;
+        if let Some(conn) = st.connections.get_mut(&conn_id) {
+            conn.server_socket_id = Some(new_id);
         }
-        Err(scheme_error::EBADF)
+        st.sockets.insert(new_id, Socket {
+            id: new_id,
+            domain,
+            type_,
+            protocol,
+            state: SocketState::Connected,
+            path: None,
+            connection_id: Some(conn_id),
+        });
+        Ok(new_id)
     }
 
     pub fn connect(&self, id: usize, path: &str) -> Result<(), usize> {
-        let mut sockets = self.sockets.lock();
-        
-        // Find if any listening socket matches this path
-        let mut matched = false;
-        for s in sockets.values() {
-            if s.path.as_deref() == Some(path) && s.state == SocketState::Listening {
-                matched = true;
-                break;
-            }
+        let mut st = self.state.lock();
+        if !st.sockets.contains_key(&id) {
+            return Err(scheme_error::EBADF);
         }
-
-        if matched {
-            if let Some(socket) = sockets.get_mut(&id) {
-                socket.state = SocketState::Connected;
-                return Ok(());
-            }
+        match st.sockets.get(&id) {
+            Some(s) if s.state != SocketState::Created && s.state != SocketState::Bound => return Err(scheme_error::EISCONN),
+            Some(_) => {}
+            None => return Err(scheme_error::EBADF),
         }
+        let listener_id = match st.sockets.iter().find(|(_, s)| {
+            s.path.as_deref() == Some(path) && s.state == SocketState::Listening
+        }) {
+            Some((&lid, _)) => lid,
+            None => return Err(scheme_error::ENOENT),
+        };
+        let conn_id = st.next_connection_id;
+        st.next_connection_id += 1;
+        st.connections.insert(conn_id, Connection {
+            id: conn_id,
+            buffer_to_client: VecDeque::new(),
+            buffer_to_server: VecDeque::new(),
+            client_socket_id: id,
+            server_socket_id: None,
+            closed_by_client: false,
+            closed_by_server: false,
+        });
+        st.pending.entry(listener_id).or_default().push_back(conn_id);
+        if let Some(socket) = st.sockets.get_mut(&id) {
+            socket.state = SocketState::Connected;
+            socket.connection_id = Some(conn_id);
+        }
+        Ok(())
+    }
+}
 
-        Err(scheme_error::ENOENT)
+impl SocketScheme {
+    /// Read from the connection buffer for this socket (peer's written data).
+    fn read_connection(st: &mut SocketSchemeState, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let conn_id = match st.sockets.get(&id).and_then(|s| s.connection_id) {
+            Some(cid) => cid,
+            None => return Ok(0),
+        };
+        let conn = match st.connections.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return Err(scheme_error::EBADF),
+        };
+        let (buf, closed) = if Some(id) == conn.server_socket_id {
+            (&mut conn.buffer_to_server, conn.closed_by_client)
+        } else if id == conn.client_socket_id {
+            (&mut conn.buffer_to_client, conn.closed_by_server)
+        } else {
+            return Err(scheme_error::EBADF);
+        };
+        if buf.is_empty() {
+            return if closed { Ok(0) } else { Err(scheme_error::EAGAIN) };
+        }
+        let n = core::cmp::min(buffer.len(), buf.len());
+        for i in 0..n {
+            buffer[i] = buf.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+
+    /// Write into the connection buffer for the peer to read.
+    fn write_connection(st: &mut SocketSchemeState, id: usize, buf: &[u8]) -> Result<usize, usize> {
+        let conn_id = match st.sockets.get(&id).and_then(|s| s.connection_id) {
+            Some(cid) => cid,
+            None => return Err(scheme_error::ENOTCONN),
+        };
+        let conn = match st.connections.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return Err(scheme_error::EPIPE),
+        };
+        let (target, closed) = if Some(id) == conn.server_socket_id {
+            (&mut conn.buffer_to_client, conn.closed_by_client)
+        } else if id == conn.client_socket_id {
+            (&mut conn.buffer_to_server, conn.closed_by_server)
+        } else {
+            return Err(scheme_error::EBADF);
+        };
+        if closed {
+            return Err(scheme_error::EPIPE);
+        }
+        let space = CONNECTION_BUFFER_CAP.saturating_sub(target.len());
+        let n = core::cmp::min(buf.len(), space);
+        target.extend(buf[..n].iter().copied());
+        Ok(n)
+    }
+
+    /// Mark this end of the connection as closed; remove connection when both sides closed.
+    fn close_connection(st: &mut SocketSchemeState, id: usize) {
+        let conn_id = match st.sockets.get(&id).and_then(|s| s.connection_id) {
+            Some(cid) => cid,
+            None => {
+                st.sockets.remove(&id);
+                return;
+            }
+        };
+        let both_closed = if let Some(conn) = st.connections.get_mut(&conn_id) {
+            if Some(id) == conn.server_socket_id {
+                conn.closed_by_server = true;
+            } else if id == conn.client_socket_id {
+                conn.closed_by_client = true;
+            }
+            conn.closed_by_server && conn.closed_by_client
+        } else {
+            false
+        };
+        st.sockets.remove(&id);
+        if both_closed {
+            st.connections.remove(&conn_id);
+        }
     }
 }
 
 impl Scheme for SocketScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
-        // Allow opening "socket:" or "socket:unix", etc.
-        let mut next_id = NEXT_SOCKET_ID.lock();
-        let id = *next_id;
-        *next_id += 1;
-
+        let mut st = self.state.lock();
+        let id = st.next_socket_id;
+        st.next_socket_id += 1;
         let domain = if path.contains("unix") { 1 } else { 0 };
-
-        let mut sockets = self.sockets.lock();
-        sockets.insert(id, Socket {
+        st.sockets.insert(id, Socket {
             id,
             domain,
-            type_: 0, // Should be passed via flags?
+            type_: 0,
             protocol: 0,
             state: SocketState::Created,
             path: None,
+            connection_id: None,
         });
-
         Ok(id)
     }
 
-    fn read(&self, _id: usize, _buffer: &mut [u8]) -> Result<usize, usize> {
-        // Socket read: blocking or non-blocking
-        // For now, return 0 (EOF) or EAGAIN
-        Ok(0)
+    fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        if !st.sockets.contains_key(&id) {
+            return Err(scheme_error::EBADF);
+        }
+        if st.sockets.get(&id).and_then(|s| s.connection_id).is_none() {
+            return Err(scheme_error::ENOTCONN);
+        }
+        Self::read_connection(&mut st, id, buffer)
     }
 
-    fn write(&self, _id: usize, buf: &[u8]) -> Result<usize, usize> {
-        // Socket write
-        Ok(buf.len())
+    fn write(&self, id: usize, buf: &[u8]) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        if !st.sockets.contains_key(&id) {
+            return Err(scheme_error::EBADF);
+        }
+        if st.sockets.get(&id).and_then(|s| s.connection_id).is_some() {
+            return Self::write_connection(&mut st, id, buf);
+        }
+        Err(scheme_error::ENOTCONN)
     }
 
     fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
-        Err(scheme_error::ESPIPE) // Sockets are not seekable
+        Err(scheme_error::ESPIPE)
     }
 
-    fn close(&self, _id: usize) -> Result<usize, usize> {
+    fn close(&self, id: usize) -> Result<usize, usize> {
+        let mut st = self.state.lock();
+        if st.sockets.contains_key(&id) {
+            Self::close_connection(&mut st, id);
+        }
         Ok(0)
     }
 
     fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
-        // S_IFSOCK = 0o140000 = 49152 (decimal)
-        _stat.mode = 0o140000; 
+        _stat.mode = 0o140000;
         Ok(0)
     }
 }

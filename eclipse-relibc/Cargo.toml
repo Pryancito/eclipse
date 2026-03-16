@@ -2,8 +2,8 @@
 # Estilo relibc (Redox) — implementación POSIX/libc sobre el microkernel Eclipse.
 
 [package]
-name = "eclipse-libc"
-# 0.2.999 para satisfacer libc "0.2" de drm-sys y otras crates vía [patch.crates-io]
+# name = "libc" para que [patch.crates-io] libc = { path = "..." } aplique (Cargo exige que el paquete en path se llame libc).
+name = "libc"
 version = "0.2.999"
 edition = "2021"
 description = "C Library in Rust for Eclipse OS (relibc-style)"

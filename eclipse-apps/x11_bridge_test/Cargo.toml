@@ -13,7 +13,7 @@ path = "examples/x11_bridge_test.rs"
 required-features = ["std"]
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
+eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 sidewind = { path = "../sidewind" }
 std = { package = "eclipse_std", path = "../eclipse_std", optional = true }
 

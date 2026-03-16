@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
+eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false }
 eclipse_ipc = { path = "../libs/ipc", features = ["async"] }
 sidewind_core = { path = "../sidewind_core" }
 embedded-graphics = "0.8.1"
@@ -16,4 +16,4 @@ sidewind-opengl = { path = "../sidewind_opengl" }
 host-testing = ["eclipse-libc/host-testing"]
 
 [dev-dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }
+eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false, features = ["host-testing"] }

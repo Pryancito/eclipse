@@ -69,3 +69,4 @@ pub const SYS_DRM_CREATE_FB: usize = 64;
 pub const SYS_DRM_MAP_HANDLE: usize = 65;
 pub const SYS_SCHED_SETAFFINITY: usize = 66;
 pub const SYS_REGISTER_LOG_HUD: usize = 67;
+pub const SYS_FTRUNCATE: usize = 68;

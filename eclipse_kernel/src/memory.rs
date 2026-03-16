@@ -1051,6 +1051,34 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     Some(frame_phys)
 }
 
+/// Allocate a contiguous run of physical frames from the same userspace pool.
+/// Returns the physical base address of the run, or None if there is no space.
+pub fn alloc_phys_frames_contig(num_pages: u64) -> Option<u64> {
+    if num_pages == 0 {
+        return None;
+    }
+    let bytes = num_pages * 4096;
+
+    loop {
+        let current = ANON_MMAP_NEXT.load(Ordering::SeqCst);
+        let start_phys = ANON_MMAP_PHYS_START + current;
+        let end_phys = start_phys + bytes;
+
+        if end_phys > ANON_MMAP_PHYS_END {
+            return None;
+        }
+
+        // Reserve the range atomically.
+        if ANON_MMAP_NEXT
+            .compare_exchange(current, current + bytes, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(start_phys);
+        }
+        // If CAS fails, another thread reserved space; retry with updated cursor.
+    }
+}
+
 /// Returns (total_frames, used_frames) for the userspace physical pool.
 pub fn get_memory_stats() -> (u64, u64) {
     let total = (ANON_MMAP_PHYS_END - ANON_MMAP_PHYS_START) / 4096;

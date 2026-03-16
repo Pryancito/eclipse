@@ -8,6 +8,7 @@
     "os": "none",
     "env": "",
     "vendor": "eclipse",
+    "target-family": "unix",
     "linker-flavor": "gnu-lld",
     "linker": "rust-lld",
     "pre-link-args": {

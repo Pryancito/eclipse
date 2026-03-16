@@ -7,7 +7,7 @@
 extern crate alloc;
 
 pub mod opengl;
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 pub mod wayland;
 #[cfg(not(target_os = "linux"))]
 pub mod xwayland;
@@ -27,7 +27,7 @@ pub use gpu::{GpuBackend, GpuCommandEncoder, GpuDevice, SurfaceGpuExt};
 
 use eclipse_ipc::prelude::IpcChannel;
 #[cfg(not(target_os = "linux"))]
-use eclipse_libc::{
+use libc::{
     close, eclipse_send as send, mmap, munmap, open, receive, yield_cpu, MAP_SHARED, O_RDWR,
     PROT_READ, PROT_WRITE,
 };

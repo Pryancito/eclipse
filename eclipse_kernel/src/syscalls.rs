@@ -302,6 +302,7 @@ pub extern "C" fn syscall_handler(
         65 => sys_drm_map_handle(arg1),
         66 => sys_sched_setaffinity(arg1, arg2),
         67 => sys_register_log_hud(arg1),
+        68 => sys_ftruncate(arg1, arg2),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -1073,6 +1074,23 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
                      crate::serial::serial_print("\n");
                      return -(e as isize) as u64;
                 }
+            }
+        }
+    }
+    -(crate::scheme::error::EBADF as isize) as u64
+}
+
+/// sys_ftruncate - Change the length of a file
+fn sys_ftruncate(fd: u64, length: u64) -> u64 {
+    if let Some(pid) = current_process_id() {
+        if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
+            match crate::scheme::ftruncate(
+                fd_entry.scheme_id,
+                fd_entry.resource_id,
+                length as usize,
+            ) {
+                Ok(ret) => return ret as u64,
+                Err(e) => return -(e as isize) as u64,
             }
         }
     }
@@ -2480,30 +2498,47 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
             target_addr = candidate;
         }
 
-        // Map pages with real physical frames.  For file-backed mappings each
-        // frame is populated with the corresponding file content via the scheme
-        // layer so that the caller can use the mapped region as a contiguous
-        // ELF/data buffer without a separate read() step.
+        // Map pages with real physical frames. For shared file-backed mappings, we attempt
+        // to use fmap to get the direct physical address. For private mappings (anonymous 
+        // or file-backed), we allocate new frames and copy data if needed.
         let mut current = target_addr;
         let end = target_addr + aligned_length;
         let file_len = length as usize;
         let mut file_offset: usize = 0;
+
+        const MAP_SHARED: u64 = 0x01;
+        let is_shared = (flags & MAP_SHARED) != 0;
+
+        // Try to use fmap for shared mappings
+        let mut fmap_phys_base = None;
+        if is_shared {
+            if let Some(ref fde) = fd_entry {
+                if let Ok(phys) = crate::scheme::fmap(
+                    fde.scheme_id,
+                    fde.resource_id,
+                    0,
+                    aligned_length as usize,
+                ) {
+                    fmap_phys_base = Some(phys as u64);
+                    serial::serial_printf(format_args!("[SYSCALL] mmap: using shared fmap phys_base={:#x}\n", phys));
+                }
+            }
+        }
+
         while current < end {
-            if let Some(frame_phys) = memory::alloc_phys_frame_for_anon_mmap() {
+            let frame_phys = if let Some(base) = fmap_phys_base {
+                // Use physical frame directly from fmap
+                base + (current - target_addr)
+            } else if let Some(phys) = memory::alloc_phys_frame_for_anon_mmap() {
                 // Zero the frame via the higher-half direct mapping.
-                let frame_virt = memory::PHYS_MEM_OFFSET + frame_phys;
+                let frame_virt = memory::PHYS_MEM_OFFSET + phys;
                 unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
 
-                // For file-backed mappings read the next 4 KB of file data.
+                // For private file-backed mappings, read the next 4 KB of file data into the private frame.
                 if let Some(ref fde) = fd_entry {
                     let remaining = file_len.saturating_sub(file_offset);
                     if remaining > 0 {
                         let to_read = remaining.min(4096);
-                        // SAFETY: `frame_virt` is the kernel HHDM address of a freshly
-                        // allocated physical frame.  The frame is not aliased (it was just
-                        // returned by alloc_phys_frame_for_anon_mmap) and the HHDM covers
-                        // the entire physical memory, so the pointer is valid for `to_read`
-                        // bytes.
                         let frame_slice = unsafe {
                             core::slice::from_raw_parts_mut(frame_virt as *mut u8, to_read)
                         };
@@ -2514,19 +2549,18 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                                     "[SYSCALL] mmap: file read error at offset {}: {}\n",
                                     file_offset, e
                                 ));
-                                // Advance by the bytes we attempted so subsequent pages
-                                // do not attempt to read the same range.
                                 file_offset += to_read;
                             }
                         }
                     }
                 }
-
-                memory::map_user_page_4kb(page_table_phys, current, frame_phys, prot);
+                phys
             } else {
                 serial::serial_print("[SYSCALL] mmap: physical frame pool exhausted\n");
-                memory::map_user_page_4kb(page_table_phys, current, 0, prot);
-            }
+                0 // map to 0 as fallback
+            };
+
+            memory::map_user_page_4kb(page_table_phys, current, frame_phys, prot);
             current += 4096;
         }
 

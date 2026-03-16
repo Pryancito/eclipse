@@ -95,6 +95,15 @@ impl IpcHandler {
                     let _ = v.extend_from_slice(&line[..len.min(252)]);
                     return Some(CompositorEvent::KernelLog(v));
                 }
+                Some(EclipseMessage::Wayland { data, len }) => {
+                    self.message_count += 1;
+                    let mut vec = heapless::Vec::new();
+                    let _ = vec.extend_from_slice(&data[..len]);
+                    // Kernel fast-path Wayland messages currently do not carry the sender PID,
+                    // so we pass 0 as a placeholder. SmithayState uses the PID only as a
+                    // coarse index into the connection table.
+                    return Some(CompositorEvent::Wayland(vec, 0));
+                }
                 Some(_) => {
                     // Mensaje no reconocido o no procesado por el compositor:
                     // Continuamos el bucle interno para intentar sacar el siguiente.
@@ -181,8 +190,9 @@ pub fn handle_sidewind_message(
                         stored_rect: (clamped_x, clamped_y, msg.w as i32, msg.h as i32 + 26),
                         workspace: input_state.current_workspace,
                         content: WindowContent::External(s_idx as u32),
+                        damage: alloc::vec::Vec::new(),
                     };
-                    let new_idx = *window_count;
+                    let _new_idx = *window_count;
                     *window_count += 1;
                     // Damage tracking removed
                 }
@@ -198,7 +208,7 @@ pub fn handle_sidewind_message(
                     surfaces[s_idx].unmap();
                     if count > 1 && w_idx < count - 1 {
                         for i in w_idx..(count - 1) {
-                            windows[i] = windows[i + 1];
+                            windows[i] = windows[i + 1].clone();
                         }
                     }
                     *window_count = count - 1;

@@ -25,14 +25,17 @@ micromath = "2.1.0"
 bitflags = "2.4"
 eclipse-syscall = { path = "../../eclipse-syscall" }
 # Dependencias solo para target Eclipse (no linux).
-# No usamos la crate smithay ni wayland-server aquí: requieren std.
-# El compositor Eclipse usa patrones portados (backend, compositor, damage, etc.).
+# wayland-server/wayland-protocols: detrás de feature "wayland"; sin ella el build Eclipse no los incluye
+# (evita errno/wayland_sys/downcast_rs que esperan std del sysroot; ver docs/WAYLAND_RS_ECLIPSE.md).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
 eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
-eclipse_libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false }
+# Misma versión que el [patch.crates-io] del workspace → eclipse-relibc.
+libc = { version = "0.2", default-features = false }
+wayland-server = { version = "0.31", default-features = false, optional = true }
+wayland-protocols = { version = "0.31", default-features = false, optional = true }
 
 # Dependencias solo para target Linux (host) — compositor Wayland con Smithay
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -47,6 +50,8 @@ smithay = { version = "0.7", default-features = false, features = ["backend_wini
 [features]
 default = []
 trace-frames = []
+# Para target Eclipse: incluye wayland-server/wayland-protocols (requiere resolver std/sysroot).
+wayland = ["wayland-server", "wayland-protocols"]
 
 # [[bin]]
 # name = "bin_ui_test"

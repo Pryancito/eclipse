@@ -2,10 +2,8 @@ use crate::render::FramebufferState;
 use crate::ipc::IpcHandler;
 use crate::input::CompositorEvent;
 use core::option::Option::{self, Some};
-use core::matches;
 #[cfg(not(target_os = "linux"))]
-use libc::{open, read, InputEvent, O_RDONLY, O_NONBLOCK,
-    get_system_stats, get_process_list};
+use libc::{open, read, InputEvent, O_RDONLY, O_NONBLOCK};
 #[cfg(target_os = "linux")]
 use eclipse_syscall::InputEvent;
 #[cfg(target_os = "linux")]

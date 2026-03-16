@@ -77,6 +77,27 @@ static mut FS: Filesystem = Filesystem {
     partition_offset: 0,
 };
 
+/// Read a range of bytes directly from disk, potentially spanning block boundaries.
+fn read_bytes_at(abs_offset: u64, dest: &mut [u8]) -> Result<(), &'static str> {
+    let mut bytes_read = 0;
+    let mut block_buffer = vec![0u8; BLOCK_SIZE];
+    
+    while bytes_read < dest.len() {
+        let current_pos = abs_offset + bytes_read as u64;
+        let block_num = current_pos / BLOCK_SIZE as u64;
+        let offset_in_block = (current_pos % BLOCK_SIZE as u64) as usize;
+        
+        read_block_from_device(block_num, &mut block_buffer)?;
+        
+        let chunk_size = min(dest.len() - bytes_read, BLOCK_SIZE - offset_in_block);
+        dest[bytes_read..bytes_read + chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block + chunk_size]);
+        
+        bytes_read += chunk_size;
+    }
+    
+    Ok(())
+}
+
 impl Filesystem {
     /// Partition offset in 4096-byte blocks.
     /// - When mounted as disk:NpM the DiskScheme already applies the partition
@@ -203,21 +224,19 @@ impl Filesystem {
             // inode indices are 1-based, table is 0-indexed (inode 1 is at index 0)
             let index = (inode - 1) as u64;
             let entry_offset = FS.inode_table_offset + (index * 8);
+            let abs_disk_offset = entry_offset + (FS.partition_offset * BLOCK_SIZE as u64);
             
-            let block_num = (entry_offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-            let offset_in_block = (entry_offset % BLOCK_SIZE as u64) as usize;
-            
-            let mut buffer = vec![0u8; 4096];
-            read_block_from_device(block_num, &mut buffer)?;
+            let mut entry_buffer = [0u8; 8];
+            read_bytes_at(abs_disk_offset, &mut entry_buffer)?;
             
             let inode_num = u32::from_le_bytes([
-                buffer[offset_in_block], buffer[offset_in_block+1], 
-                buffer[offset_in_block+2], buffer[offset_in_block+3]
+                entry_buffer[0], entry_buffer[1], 
+                entry_buffer[2], entry_buffer[3]
             ]) as u64;
             
             let rel_offset = u32::from_le_bytes([
-                buffer[offset_in_block+4], buffer[offset_in_block+5], 
-                buffer[offset_in_block+6], buffer[offset_in_block+7]
+                entry_buffer[4], entry_buffer[5], 
+                entry_buffer[6], entry_buffer[7]
             ]) as u64;
              
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
@@ -266,46 +285,29 @@ impl Filesystem {
             e
         })?;
         
-        // Read the first block of the node record to find CONTENT TLV
-        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        // Read the first 8 bytes of the node record to find record_size
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
         
-        let mut block_buffer = vec![0u8; 4096];
-        read_block_from_device(block_num, &mut block_buffer).map_err(|e| {
-            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(1) failed inode=");
-            serial::serial_print_dec(inode as u64);
-            serial::serial_print(" block=");
-            serial::serial_print_dec(block_num);
-            serial::serial_print("\n");
-            e
-        })?;
-        
-        if offset_in_block + 8 > 4096 {
-             return Err("Node header crosses block boundary");
-        }
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
         
         let record_size = u32::from_le_bytes([
-            block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
-            block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
+            header_buf[4], header_buf[5],
+            header_buf[6], header_buf[7]
         ]) as usize;
 
         // Parse TLVs to find CONTENT.
-        // Read two consecutive blocks into a contiguous buffer to correctly handle
-        // TLV headers that may span a block boundary.  All metadata TLVs before
-        // CONTENT are at most ~111 bytes into the record, so two blocks (8 KiB)
-        // are always sufficient to locate the CONTENT TLV header.
+        // TLV metadata we care about usually fits in the first few blocks.
+        let scan_len = min(record_size, 2 * BLOCK_SIZE);
+        let mut scan_buf = vec![0u8; scan_len];
+        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
+        
+        let record_data = &scan_buf;
+        let mut tlv_pos = 8usize; // Skip 8-byte record header
+
         let mut content_start_offset_rel = 0usize;
         let mut content_length = 0usize;
         let mut found = false;
-
-        let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
-        scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
-        if let Err(_) = read_block_from_device(block_num + 1, &mut scan_buf[BLOCK_SIZE..]) {
-            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(second) failed, TLV scan limited to first block\n");
-        }
-        // Record data begins at offset_in_block within scan_buf.
-        let record_data = &scan_buf[offset_in_block..];
-        let mut tlv_pos = 8usize; // Skip 8-byte record header
 
         while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
             let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
@@ -314,7 +316,7 @@ impl Filesystem {
                 record_data[tlv_pos + 4], record_data[tlv_pos + 5],
             ]) as usize;
             if tag == tlv_tags::CONTENT {
-                content_start_offset_rel = tlv_pos + 6;
+                content_start_offset_rel = (tlv_pos + 6) as usize;
                 content_length = length;
                 found = true;
                 break;
@@ -338,29 +340,9 @@ impl Filesystem {
         // precise byte offset on disk where requested data starts
         let absolute_data_start = entry.offset + content_start_offset_rel as u64 + offset;
         
-        // Read data from disk block by block
-        let mut bytes_read = 0;
-        let mut current_abs_pos = absolute_data_start;
-        
-        while bytes_read < read_len {
-            let current_block = (current_abs_pos / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-            let current_off = (current_abs_pos % BLOCK_SIZE as u64) as usize;
-            
-            read_block_from_device(current_block, &mut block_buffer).map_err(|e| {
-                serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_block(2) failed inode=");
-                serial::serial_print_dec(inode as u64);
-                serial::serial_print(" block=");
-                serial::serial_print_dec(current_block);
-                serial::serial_print("\n");
-                e
-            })?;
-            
-            let chunk_size = min(read_len - bytes_read, 4096 - current_off);
-            buffer[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[current_off..current_off+chunk_size]);
-            
-            bytes_read += chunk_size;
-            current_abs_pos += chunk_size as u64;
-        }
+        // Read data from disk
+        let abs_disk_data_offset = absolute_data_start + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+        read_bytes_at(abs_disk_data_offset, &mut buffer[..read_len])?;
         
         Ok(read_len)
     }
@@ -378,29 +360,23 @@ impl Filesystem {
         let _lock = FILESYSTEM_LOCK.lock();
         let entry = Self::read_inode_entry(inode)?;
 
-        // Leer el primer bloque del record para obtener record_size y escanear TLVs.
-        let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-        let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
-        let mut block_buffer = vec![0u8; BLOCK_SIZE];
-        read_block_from_device(block_num, &mut block_buffer)?;
-
-        if offset_in_block + 8 > BLOCK_SIZE {
-            return Err("Node header crosses block boundary");
-        }
-
+        // Read the first 8 bytes of the node record to find record_size
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+        
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
+        
         let record_size = u32::from_le_bytes([
-            block_buffer[offset_in_block + 4],
-            block_buffer[offset_in_block + 5],
-            block_buffer[offset_in_block + 6],
-            block_buffer[offset_in_block + 7],
+            header_buf[4], header_buf[5],
+            header_buf[6], header_buf[7]
         ]) as usize;
 
-        // Escaneo robusto: leer dos bloques contiguos para TLVs que crucen límite.
-        let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
-        scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
-        let _ = read_block_from_device(block_num + 1, &mut scan_buf[BLOCK_SIZE..]);
+        // Escaneo robusto: leer hasta dos bloques para TLVs.
+        let scan_len = min(record_size, 2 * BLOCK_SIZE);
+        let mut scan_buf = vec![0u8; scan_len];
+        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
 
-        let record_data = &scan_buf[offset_in_block..];
+        let record_data = &scan_buf;
         let mut tlv_pos = 8usize;
         while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
             let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
@@ -439,20 +415,17 @@ impl Filesystem {
         let _lock = FILESYSTEM_LOCK.lock();
         let entry = Self::read_inode_entry(inode)?;
         
-        // Read the full node record first
+        // Read the full node record
         let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
         let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
         
-        let mut block_buffer = vec![0u8; 4096];
-        read_block_from_device(block_num, &mut block_buffer)?;
-        
-        if offset_in_block + 8 > 4096 {
-            return Err("Node header crosses block boundary");
-        }
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
         
         let record_size = u32::from_le_bytes([
-            block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
-            block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
+            header_buf[4], header_buf[5],
+            header_buf[6], header_buf[7]
         ]) as usize;
         
         // OOM Protection
@@ -460,23 +433,8 @@ impl Filesystem {
             return Err("File record too large (exceeds MAX_RECORD_SIZE)");
         }
         
-        // Read full record
         let mut record_data = vec![0u8; record_size];
-        let first_chunk_size = min(record_size, 4096 - offset_in_block);
-        record_data[0..first_chunk_size].copy_from_slice(
-            &block_buffer[offset_in_block..offset_in_block+first_chunk_size]
-        );
-        
-        let mut bytes_read = first_chunk_size;
-        let mut current_block = block_num + 1;
-        
-        while bytes_read < record_size {
-            let chunk_size = min(4096, record_size - bytes_read);
-            read_block_from_device(current_block, &mut block_buffer)?;
-            record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
-            bytes_read += chunk_size;
-            current_block += 1;
-        }
+        read_bytes_at(abs_disk_offset, &mut record_data)?;
         
         // Find CONTENT TLV and modify it
         let mut tlv_offset = 8; // Skip 8-byte header
@@ -626,39 +584,22 @@ impl Filesystem {
         
         // Read the inode entry from the inode table
         let entry = Self::read_inode_entry(inode)?;
-        
         // Calculate record location
-        let record_block_start = unsafe {
-            FS.partition_offset + (entry.offset / BLOCK_SIZE as u64)
-        };
-        let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
         
-        // Read first block
-        let mut block_buffer = vec![0u8; BLOCK_SIZE];
-        read_block_from_device(record_block_start, &mut block_buffer)?;
-        
-        // Parse record size from header (first 4 bytes after offset)
-        // Note: The inode points to the start of the record. The first 4 bytes are undefined/padding?
-        // Actually, based on lookup_path:
-        // offset_in_block+4..8 is the record size.
-        // Let's verify this structure.
-        
-        if offset_in_first_block + 8 > BLOCK_SIZE {
-             return Err("Node header crosses block boundary");
+        let mut header_buf = [0u8; 8];
+        if let Err(e) = read_bytes_at(abs_disk_offset, &mut header_buf) {
+            return Err(e);
         }
         
         // Get record total size
         let mut record_size = u32::from_le_bytes([
-            block_buffer[offset_in_first_block+4], block_buffer[offset_in_first_block+5],
-            block_buffer[offset_in_first_block+6], block_buffer[offset_in_first_block+7]
+            header_buf[4], header_buf[5],
+            header_buf[6], header_buf[7]
         ]) as usize;
         
         let mut explicit_record_scan = false;
 
-        // Fallback: If record_size is 0 (seen in some file inodes that seem to start with [ID][Offset]),
-        // or very small, Use manual scan mode on the first block.
-        // Also if record_size is suspiciously large (> MAX), it's likely garbage/header mismatch.
-        // Dump showed header matches logical 16-byte [ID][Offset] pattern.
         if record_size < 8 || record_size > MAX_RECORD_SIZE {
              crate::serial::serial_print("[FS] get_file_size: Suspicious record size (");
              crate::serial::serial_print_dec(record_size as u64);
@@ -668,38 +609,18 @@ impl Filesystem {
              explicit_record_scan = true;
         }
         
-        // Removed the error check here since we handle > MAX by falling back to block scan
-        
         // Read the record data
-        let mut record_data = if explicit_record_scan {
-            // Just use the block buffer we already have
-            vec![] 
-        } else {
-             vec![0u8; record_size]
-        };
-        
-        if !explicit_record_scan {
-            let first_chunk_size = min(record_size, BLOCK_SIZE - offset_in_first_block);
-            record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_first_block..offset_in_first_block+first_chunk_size]);
-            
-            let mut bytes_read = first_chunk_size;
-            let mut current_block = record_block_start + 1;
-            
-            while bytes_read < record_size {
-                let chunk_size = min(BLOCK_SIZE, record_size - bytes_read);
-                read_block_from_device(current_block, &mut block_buffer)?;
-                record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
-                bytes_read += chunk_size;
-                current_block += 1;
-            }
+        let mut record_data = vec![0u8; record_size];
+        if let Err(e) = read_bytes_at(abs_disk_offset, &mut record_data) {
+            return Err(e);
         }
         
         // Parse TLVs
-        // If explicit scan, use block_buffer directly, starting after 16 bytes (suspected header)
+        // If explicit scan, use record_data directly, starting after 16 bytes (suspected header)
         // If normal, use record_data, starting after 8 bytes (standard header)
         
         let (buffer_to_scan, buffer_offset) = if explicit_record_scan {
-            (&block_buffer, offset_in_first_block)
+            (&record_data, 0) // read_bytes_at already read from abs_disk_offset
         } else {
             (&record_data, 0)
         };
@@ -777,29 +698,20 @@ impl Filesystem {
             // Read directory inode
              // Reuse read logic but we need the raw record to find children
              let entry = Self::read_inode_entry(current_inode)?;
-             
-             // Load whole record (same logic as read_file_by_inode basically)
-             // TODO: Refactor duplication
-             let block_num = (entry.offset / BLOCK_SIZE as u64) + unsafe { FS.partition_offset };
-             let offset_in_block = (entry.offset % BLOCK_SIZE as u64) as usize;
-             
-             let mut block_buffer = vec![0u8; 4096];
-             read_block_from_device(block_num, &mut block_buffer)?;
-             
-             if offset_in_block + 8 > 4096 {
-                return Err("Node header crosses block boundary");
-             }
-             
-             let record_size = u32::from_le_bytes([
-                block_buffer[offset_in_block+4], block_buffer[offset_in_block+5],
-                block_buffer[offset_in_block+6], block_buffer[offset_in_block+7]
-             ]) as usize;
+                 // Load whole record (same logic as read_file_by_inode basically)
+              let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+              
+              let mut header_buf = [0u8; 8];
+              read_bytes_at(abs_disk_offset, &mut header_buf)?;
+              
+              let record_size = u32::from_le_bytes([
+                 header_buf[4], header_buf[5],
+                 header_buf[6], header_buf[7]
+              ]) as usize;
             
             serial::serial_printf(format_args!("[FS] Dir record size: {}\n", record_size));
 
             if record_size < 8 {
-                // This might be a padding byte or end of directory marker if 0, 
-                // but for now let's treat it as an error/not found to avoid panic
                 serial::serial_print("[FS] Error: Record too small (<8)\n");
                 return Err("Invalid directory record size (too small)");
             }
@@ -811,20 +723,8 @@ impl Filesystem {
             }
             
             let mut record_data = vec![0u8; record_size];
-            // Read first chunk
-            let first_chunk_size = min(record_size, 4096 - offset_in_block);
-            record_data[0..first_chunk_size].copy_from_slice(&block_buffer[offset_in_block..offset_in_block+first_chunk_size]);
-            
-            let mut bytes_read = first_chunk_size;
-            let mut current_block = block_num + 1;
-            while bytes_read < record_size {
-                 let chunk_size = min(4096, record_size - bytes_read);
-                 read_block_from_device(current_block, &mut block_buffer)?;
-                 record_data[bytes_read..bytes_read+chunk_size].copy_from_slice(&block_buffer[0..chunk_size]);
-                 bytes_read += chunk_size;
-                 current_block += 1;
-            }
-            
+            read_bytes_at(abs_disk_offset, &mut record_data)?;
+         
             // Search in record
             // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
             // Searching in record

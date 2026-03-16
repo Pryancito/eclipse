@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eclipse-libc = { package = "eclipse-libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
+eclipse-libc = { package = "libc", path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 sidewind = { path = "../sidewind" }
 std = { package = "eclipse_std", path = "../eclipse_std", optional = true }
 

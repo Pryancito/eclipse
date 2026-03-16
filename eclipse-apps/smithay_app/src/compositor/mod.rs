@@ -20,6 +20,7 @@ pub enum WindowContent {
     None,
     InternalDemo,
     External(u32),
+    Wayland { surface_id: u32, conn_idx: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,7 +31,7 @@ pub enum WindowButton {
     Close,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShellWindow {
     pub x: i32,
     pub y: i32,
@@ -46,6 +47,7 @@ pub struct ShellWindow {
     pub stored_rect: (i32, i32, i32, i32),
     pub workspace: u8,
     pub content: WindowContent,
+    pub damage: alloc::vec::Vec<(i32, i32, i32, i32)>,
 }
 
 impl Default for ShellWindow {
@@ -57,11 +59,24 @@ impl Default for ShellWindow {
             stored_rect: (0, 0, 0, 0),
             workspace: 0,
             content: WindowContent::None,
+            damage: alloc::vec::Vec::new(),
         }
     }
 }
 
 impl ShellWindow {
+    pub const fn new_empty() -> Self {
+        Self {
+            x: 0, y: 0, w: 0, h: 0,
+            curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0,
+            minimized: false, maximized: false, closing: false,
+            stored_rect: (0, 0, 0, 0),
+            workspace: 0,
+            content: WindowContent::None,
+            damage: alloc::vec::Vec::new(),
+        }
+    }
+
     pub const TITLE_H: i32 = 26;
 
     pub fn title_bar_contains(&self, px: i32, py: i32) -> bool {
@@ -109,6 +124,7 @@ impl ShellWindow {
                     false
                 }
             }
+            WindowContent::Wayland { .. } => true, // Assuming Wayland buffers are opaque for now
             WindowContent::None => false,
         }
     }
@@ -135,7 +151,7 @@ impl ExternalSurface {
         if self.vaddr != 0 && self.vaddr != 0x1000 {
             unsafe {
                 #[cfg(not(target_os = "linux"))]
-                eclipse_libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
+                libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
                 #[cfg(target_os = "linux")]
                 libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
             }
@@ -172,8 +188,7 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
     None
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(test)]mod tests {
     use super::*;
 
     #[test]
@@ -184,6 +199,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         };
         assert!(win.contains(50, 50));
         assert!(!win.contains(9, 50));
@@ -197,6 +213,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         };
         assert!(win.title_bar_contains(50, 20));
         assert!(!win.title_bar_contains(50, 50));
@@ -210,6 +227,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 200, 100), workspace: 0,
             content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         };
         assert_eq!(win.check_button_click(285, 110), WindowButton::Close);
         assert_eq!(win.check_button_click(264, 110), WindowButton::Maximize);
@@ -224,6 +242,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (10, 20, 100, 50), workspace: 0,
             content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         };
         assert!(win.contains(10, 20));
         assert!(win.contains(109, 69));
@@ -233,8 +252,8 @@ mod tests {
     #[test]
     fn test_focus_under_cursor_empty() {
         let windows: [ShellWindow; 2] = [
-            ShellWindow { content: WindowContent::None, ..Default::default() },
-            ShellWindow { content: WindowContent::None, ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), ..Default::default() },
         ];
         assert_eq!(focus_under_cursor(50, 50, &windows, 0), None);
     }
@@ -248,6 +267,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 200, 200), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
             ShellWindow {
                 x: 50, y: 50, w: 100, h: 100,
@@ -255,6 +275,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (50, 50, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
         ];
         assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(1));
@@ -262,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_next_visible_empty() {
-        let windows: [ShellWindow; 1] = [ShellWindow::default()];
+        let windows: [ShellWindow; 1] = [ShellWindow { damage: alloc::vec::Vec::new(), ..Default::default() }];
         assert_eq!(next_visible(0, true, &windows, 0), None);
     }
 
@@ -275,6 +296,7 @@ mod tests {
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
             ShellWindow {
                 x: 200, y: 0, w: 100, h: 100,
@@ -282,6 +304,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 2), Some(1));
@@ -296,6 +319,7 @@ mod tests {
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
             ShellWindow {
                 x: 200, y: 0, w: 100, h: 100,
@@ -303,6 +327,7 @@ mod tests {
                 minimized: true, maximized: false, closing: false,
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 2), None);
@@ -317,6 +342,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 1), Some(0));
@@ -331,6 +357,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
             ShellWindow {
                 x: 100, y: 0, w: 100, h: 100,
@@ -338,6 +365,7 @@ mod tests {
                 minimized: false, maximized: false, closing: false,
                 stored_rect: (100, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             },
         ];
         const ITERS: u32 = 50_000;

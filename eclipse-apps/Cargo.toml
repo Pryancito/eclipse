@@ -41,4 +41,10 @@ panic = "abort"
 
 [patch.crates-io]
 std = { package = "eclipse_std", path = "eclipse_std" }
-libc = { package = "eclipse-libc", path = "../eclipse-relibc" }
+# Sustituir libc de crates.io por eclipse-relibc (clave debe ser "libc" para que aplique).
+libc = { path = "../eclipse-relibc" }
+# Con feature "wayland" (smithay_app): descomentar para intentar build con --features wayland.
+# bitflags = { path = "vendor/bitflags-2.11" }
+# errno = { path = "vendor/errno-0.3.14" }
+# downcast-rs = { path = "vendor/downcast-rs-1.2.1" }
+# wayland-sys = { path = "vendor/wayland-sys-0.31.10" }

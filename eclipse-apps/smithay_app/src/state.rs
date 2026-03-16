@@ -16,7 +16,7 @@ use core::default::Default;
 use core::iter::Iterator;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
-use heapless::Vec as HVec;
+use eclipse_ipc::types::TAG_WAYL;
 
 #[cfg(target_os = "linux")]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
@@ -47,6 +47,14 @@ impl ServiceInfo {
 /// SmithayState is the central state of the compositor.
 
 /// It orchestrates the Backend, Space, and Input.
+#[derive(Debug, Clone, Copy)]
+pub struct WaylandPoolMap {
+    pub conn_idx: usize,
+    pub pool_id: u32,
+    pub vaddr: usize,
+    pub size: usize,
+}
+
 pub struct SmithayState {
     pub backend: Backend,
     pub space: Space,
@@ -76,6 +84,8 @@ pub struct SmithayState {
     /// Buffer para logs del kernel (evita static mut en draw_static_ui).
     pub log_buf: [u8; 512],
     pub log_len: usize,
+    pub wayland_connections: [Option<sidewind::wayland::WaylandConnection>; 32],
+    pub wayland_pool_maps: Vec<WaylandPoolMap>,
 }
 
 impl SmithayState {
@@ -148,6 +158,8 @@ impl SmithayState {
             dirty: true,
             log_buf: [0; 512],
             log_len: 0,
+            wayland_connections: [const { None }; 32],
+            wayland_pool_maps: Vec::new(),
         })
 
     }
@@ -233,7 +245,42 @@ impl SmithayState {
                 }
                 self.dirty = true;
             }
-            _ => {} // Handle Wayland/X11 if needed
+            CompositorEvent::Wayland(data, sender_pid) => {
+                // Find or create connection for this PID
+                let conn_idx = self.wayland_connections.iter().position(|c| {
+                    if let Some(_conn) = c {
+                        // We need a way to associate connection with PID.
+                        // For now, let's assume one client per PID and use a simple search or index.
+                        // Actually, wayland_connections doesn't store the PID yet.
+                        // Let's use a simpler mapping for now.
+                        false // TODO: Fix mapping
+                    } else { false }
+                });
+
+                // Since we don't have a good mapping yet, let's just use the first available or a hash.
+                let idx = (*sender_pid as usize) % 32;
+                if self.wayland_connections[idx].is_none() {
+                    self.wayland_connections[idx] = Some(sidewind::wayland::WaylandConnection::new());
+                }
+
+                if let Some(conn) = self.wayland_connections[idx].as_mut() {
+                    let _ = conn.process_message(&data);
+                }
+                self.process_wayland_events(idx);
+                
+                // Process any pending events and send them back
+                if let Some(conn) = self.wayland_connections[idx].as_mut() {
+                    while let Some(msg_payload) = conn.pending_events.pop_front() {
+                        let mut tagged_msg = [0u8; 256];
+                        tagged_msg[0..4].copy_from_slice(TAG_WAYL);
+                        let p_len = msg_payload.len().min(252);
+                        tagged_msg[4..4+p_len].copy_from_slice(&msg_payload[..p_len]);
+                        let _ = unsafe { eclipse_send(*sender_pid, sidewind::MSG_TYPE_WAYLAND, tagged_msg.as_ptr() as *const core::ffi::c_void, 4 + p_len, 0) };
+                    }
+                }
+                self.dirty = true;
+            }
+            _ => {} // Handle X11 if needed
         }
     }
 
@@ -247,6 +294,107 @@ impl SmithayState {
                     self.handle_event(&event);
                 }
             }
+        }
+    }
+
+    fn process_wayland_events(&mut self, conn_idx: usize) {
+        loop {
+            let ev = if let Some(conn) = self.wayland_connections[conn_idx].as_mut() {
+                conn.internal_events.pop_front()
+            } else {
+                None
+            };
+            
+            let ev = if let Some(ev) = ev { ev } else { break };
+
+            match ev {
+                sidewind::wayland::WaylandInternalEvent::ShellSurfaceCreated { surface_id, .. } => {
+                    if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
+                        let win_idx = self.space.window_count;
+                        let win = crate::compositor::ShellWindow {
+                            x: 100 + (win_idx as i32) * 20,
+                            y: 100 + (win_idx as i32) * 20,
+                            w: 640,
+                            h: 480 + crate::compositor::ShellWindow::TITLE_H,
+                            workspace: self.input.current_workspace,
+                            content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
+                            ..Default::default()
+                        };
+                        self.space.map_window(win);
+                        self.input.focused_window = Some(win_idx);
+                        self.dirty = true;
+                    }
+                }
+                sidewind::wayland::WaylandInternalEvent::SurfaceCommitted { surface_id, buffer_id, damage } => {
+                    // Ensure the buffer's pool is mapped
+                    if let Some(buf_id) = buffer_id {
+                        self.ensure_wayland_pool_mapped(conn_idx, buf_id);
+                    }
+                    // Find the window for this surface and append damage
+                    for i in 0..self.space.window_count {
+                        let w = &mut self.space.windows[i];
+                        if let crate::compositor::WindowContent::Wayland { surface_id: s_id, conn_idx: c_idx } = w.content {
+                            if s_id == surface_id && c_idx == conn_idx {
+                                w.damage.extend(damage);
+                                break;
+                            }
+                        }
+                    }
+                    // Trigger repaint
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    fn ensure_wayland_pool_mapped(&mut self, conn_idx: usize, buffer_id: u32) {
+        let info = {
+            let conn = if let Some(c) = &mut self.wayland_connections[conn_idx] { c } else { return };
+            if let Some(obj) = conn.registry.get_mut(buffer_id) {
+                obj.as_buffer()
+            } else { None }
+        };
+        
+        let info = if let Some(i) = info { i } else { return };
+        
+        if self.wayland_pool_maps.iter().any(|m| m.conn_idx == conn_idx && m.pool_id == info.pool_id) {
+            return;
+        }
+
+        let mut vaddr = 0usize;
+        let mut size = 0usize;
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On Eclipse OS, we use the shm_pool_fd as a handle to open the shm region.
+            // In our prototype, the client passes an ID that we use as a filename in shm: scheme.
+            let path = format!("shm:/{}", info.shm_pool_fd);
+            if let Ok(fd) = eclipse_syscall::open(&path, eclipse_syscall::flag::O_RDWR) {
+                let mut st = eclipse_syscall::Stat::default();
+                if let Ok(()) = eclipse_syscall::fstat(fd, &mut st) {
+                    size = st.size as usize;
+                    if let Ok(mapped) = eclipse_syscall::mmap(
+                        0, 
+                        size, 
+                        eclipse_syscall::flag::PROT_READ | eclipse_syscall::flag::PROT_WRITE, 
+                        eclipse_syscall::flag::MAP_SHARED, 
+                        fd as isize, 
+                        0
+                    ) {
+                        vaddr = mapped;
+                    }
+                }
+                let _ = eclipse_syscall::close(fd);
+            }
+        }
+
+        if vaddr != 0 {
+            self.wayland_pool_maps.push(WaylandPoolMap {
+                conn_idx,
+                pool_id: info.pool_id,
+                vaddr,
+                size,
+            });
         }
     }
 
@@ -478,6 +626,7 @@ impl SmithayState {
                 stored_rect: (0, 0, 0, 0),
                 workspace: self.input.current_workspace,
                 content: crate::compositor::WindowContent::InternalDemo,
+                damage: alloc::vec::Vec::new(),
             };
             self.space.map_window(win);
             self.input.focused_window = Some(idx);
@@ -639,14 +788,20 @@ impl SmithayState {
                     &mut self.backend.fb, 
                     &self.space.windows, 
                     self.space.window_count, 
-            self.input.focused_window, 
-                    &self.surfaces, 
+                    self.input.focused_window, 
+                    &self.surfaces,
+                    &self.wayland_connections,
+                    &self.wayland_pool_maps,
                     self.input.workspace_offset, 
                     self.input.current_workspace,
                     self.input.cursor_x, 
                     self.input.cursor_y, 
                     self.counter,
                 );
+                // Clear damage after drawing
+                for i in 0..self.space.window_count {
+                    self.space.windows[i].damage.clear();
+                }
             } else if self.input.dashboard_active {
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
             } else if self.input.system_central_active {
@@ -700,6 +855,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         });
         
         state.input.focused_window = Some(0);
@@ -732,6 +888,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         });
         
         state.input.focused_window = Some(0);
@@ -751,6 +908,7 @@ mod tests {
             minimized: false, maximized: false, closing: false,
             stored_rect: (50, 50, 200, 150), workspace: 0,
             content: WindowContent::InternalDemo,
+            damage: alloc::vec::Vec::new(),
         });
         state.input.focused_window = Some(0);
         state.input.request_close_window = true;
@@ -763,5 +921,39 @@ mod tests {
         let info = ServiceInfo::new();
         assert_eq!(info.state, 0);
         assert_eq!(info.pid, 0);
+    }
+
+    #[test]
+    fn test_wayland_surface_commit_and_damage() {
+        let mut state = SmithayState::new().unwrap();
+        let surface_id = 42;
+        let conn_idx = 0;
+        
+        // 1. Map a Wayland window
+        state.space.map_window(ShellWindow {
+            content: WindowContent::Wayland { surface_id, conn_idx },
+            ..Default::default()
+        });
+        
+        // 2. Mock a connection
+        state.wayland_connections[conn_idx] = Some(sidewind::wayland::WaylandConnection::new());
+        state.dirty = false;
+
+        // 3. Simulate SurfaceCommitted with damage
+        let damage = vec![(10, 10, 100, 100)];
+        let ev = sidewind::wayland::WaylandInternalEvent::SurfaceCommitted {
+            surface_id,
+            buffer_id: None,
+            damage: damage.clone(),
+        };
+        state.wayland_connections[conn_idx].as_mut().unwrap().internal_events.push_back(ev);
+        
+        // 4. Process events
+        state.process_wayland_events(conn_idx);
+        
+        // 5. Verify damage propagation
+        assert!(state.dirty, "state should be dirty after commit");
+        assert_eq!(state.space.windows[0].damage.len(), 1);
+        assert_eq!(state.space.windows[0].damage[0], (10, 10, 100, 100));
     }
 }

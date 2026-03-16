@@ -22,7 +22,7 @@ pub struct FramebufferInfo {
 fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
 use micromath::F32Ext;
-use sidewind::ui::{self, icons, colors, Widget};
+use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -30,7 +30,7 @@ use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line};
 use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle};
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
-use crate::state::ServiceInfo;
+use crate::state::{ServiceInfo, WaylandPoolMap};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -245,6 +245,47 @@ impl FramebufferState {
                     unsafe {
                         let color = core::ptr::read_unaligned(src.add(src_row + ix as usize));
                         core::ptr::write_volatile(dst_ptr.add(dst_off), color);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn blit_buffer_subregion(
+        &mut self, 
+        dst_x: i32, 
+        dst_y: i32, 
+        w: u32, 
+        h: u32, 
+        src: *const u32, 
+        src_stride: u32,
+        src_ox: u32, 
+        src_oy: u32,
+        src_size: usize
+    ) {
+        if self.back_addr == 0 || src.is_null() || w == 0 || h == 0 { return; }
+        let fb_w = self.info.width as i32;
+        let fb_h = self.info.height as i32;
+        let pitch_px = (self.info.pitch / 4) as usize;
+        let dst_ptr = self.back_addr as *mut u32;
+
+        for iy in 0..h as i32 {
+            let dy = dst_y + iy;
+            if dy < 0 || dy >= fb_h { continue; }
+            let sy = src_oy as i32 + iy;
+            let src_row_start = (sy as usize) * (src_stride as usize);
+            
+            for ix in 0..w as i32 {
+                let dx = dst_x + ix;
+                if dx >= 0 && dx < fb_w {
+                    let sx = src_ox as i32 + ix;
+                    let src_idx = src_row_start + sx as usize;
+                    if (src_idx + 1) * 4 <= src_size {
+                        let dst_off = (dy as usize * pitch_px) + dx as usize;
+                        unsafe {
+                            let color = core::ptr::read_unaligned(src.add(src_idx));
+                            core::ptr::write_volatile(dst_ptr.add(dst_off), color);
+                        }
                     }
                 }
             }
@@ -506,7 +547,20 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
 }
 
 #[inline(never)]
-pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64) {
+pub fn draw_shell_windows(
+    fb: &mut FramebufferState,
+    windows: &[ShellWindow],
+    window_count: usize,
+    focused_window: Option<usize>,
+    surfaces: &[ExternalSurface],
+    wayland_conns: &[Option<sidewind::wayland::WaylandConnection>; 32],
+    wayland_pools: &[WaylandPoolMap],
+    ws_offset: f32,
+    _current_ws: u8,
+    cursor_x: i32,
+    cursor_y: i32,
+    uptime_ticks: u64
+) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
@@ -539,11 +593,21 @@ pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], wi
 
         let focused = Some(i) == focused_window;
         let btn_hover = if hovered_win_idx == Some(i) { hovered_button.clone() } else { None };
-        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks);
+        let _ = draw_window_advanced(fb, w, focused, surfaces, wayland_conns, wayland_pools, effective_x, btn_hover, uptime_ticks);
     }
 }
 
-pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
+pub fn draw_window_advanced(
+    fb: &mut FramebufferState,
+    w: &ShellWindow,
+    is_focused: bool,
+    surfaces: &[ExternalSurface],
+    wayland_conns: &[Option<sidewind::wayland::WaylandConnection>; 32],
+    wayland_pools: &[WaylandPoolMap],
+    x: i32,
+    button_hover: Option<WindowButton>,
+    uptime_ticks: u64
+) -> Result<(), ()> {
     // Damage tracking removed; draw decoration fully if visible.
     draw_window_decoration_at(fb, w, is_focused, x, button_hover);
 
@@ -598,6 +662,45 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                             if needed <= s.buffer_size {
                                 let content_rect = Rectangle::new(Point::new(wx + 5, wy + ShellWindow::TITLE_H + 5), Size::new(content_w, content_h));
                                 fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
+                            }
+                        }
+                    }
+                }
+            }
+            WindowContent::Wayland { surface_id, conn_idx } => {
+                if conn_idx < wayland_conns.len() {
+                    if let Some(conn) = &wayland_conns[conn_idx] {
+                        if let Some(surface_obj) = conn.registry.get(surface_id) {
+                            if let Some(buf_id) = surface_obj.as_surface_pending_buffer() {
+                                if let Some(buf_obj) = conn.registry.get(buf_id) {
+                                    if let Some(info) = buf_obj.as_buffer() {
+                                        if let Some(m) = wayland_pools.iter().find(|m| m.conn_idx == conn_idx && m.pool_id == info.pool_id) {
+                                            if m.vaddr != 0 {
+                                                let src_ptr = (m.vaddr + info.offset as usize) as *const u32;
+                                                let src_size = m.size.saturating_sub(info.offset as usize);
+                                                
+                                                if w.damage.is_empty() {
+                                                    // Full redraw if no specific damage
+                                                    fb.blit_buffer(x + 5, w.curr_y as i32 + ShellWindow::TITLE_H + 5, info.width as u32, info.height as u32, src_ptr, src_size);
+                                                } else {
+                                                    for &(dx, dy, dw, dh) in &w.damage {
+                                                        fb.blit_buffer_subregion(
+                                                            x + 5 + dx, 
+                                                            w.curr_y as i32 + ShellWindow::TITLE_H + 5 + dy,
+                                                            dw as u32, 
+                                                            dh as u32,
+                                                            src_ptr,
+                                                            info.width as u32,
+                                                            dx as u32,
+                                                            dy as u32,
+                                                            src_size
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -758,7 +861,7 @@ pub fn draw_system_central(
     _counter: u64, 
     services: &[ServiceInfo], 
     #[cfg(not(target_os = "linux"))]
-    processes: &[eclipse_libc::ProcessInfo],
+    processes: &[libc::ProcessInfo],
     #[cfg(target_os = "linux")]
     processes: &[eclipse_syscall::ProcessInfo],
     process_cpu: &[f32; 32],

@@ -236,6 +236,70 @@ impl ObjectRegistry {
     }
 }
 
+/// Transporte abstracto para una conexión Wayland.
+///
+/// Implementaciones típicas serán sockets (Eclipse), pipes, buffers de prueba, etc.
+pub trait WaylandTransport {
+    /// Intenta leer datos del cliente.
+    ///
+    /// Devuelve el número de bytes leídos. Un valor de 0 indica EOF o error.
+    fn recv(&mut self, buf: &mut [u8]) -> usize;
+
+    /// Intenta enviar datos al cliente.
+    ///
+    /// Devuelve el número de bytes enviados. Un valor de 0 puede interpretarse
+    /// como error por la capa superior.
+    fn send(&mut self, buf: &[u8]) -> usize;
+}
+
+/// Cliente Wayland genérico sobre un transporte arbitrario `T`.
+pub struct WaylandClient<T: WaylandTransport> {
+    pub conn: WaylandConnection,
+    pub transport: T,
+    read_buf: Vec<u8>,
+}
+
+impl<T: WaylandTransport> WaylandClient<T> {
+    /// Crea un nuevo cliente Wayland con un transporte dado.
+    pub fn new(transport: T) -> Self {
+        Self {
+            conn: WaylandConnection::new(),
+            transport,
+            read_buf: Vec::with_capacity(4096),
+        }
+    }
+
+    /// Procesa una iteración de la conexión:
+    ///  - lee del transporte;
+    ///  - pasa el mensaje a `WaylandConnection::process_message`;
+    ///  - envía cualquier respuesta directa;
+    ///  - envía todos los eventos pendientes.
+    ///
+    /// Devuelve `false` si el cliente debe cerrarse (EOF o error).
+    pub fn step(&mut self) -> bool {
+        // Leer datos del transporte.
+        self.read_buf.resize(4096, 0);
+        let n = self.transport.recv(&mut self.read_buf);
+        if n == 0 {
+            // EOF o error.
+            return false;
+        }
+        self.read_buf.truncate(n);
+
+        // Procesar un mensaje Wayland.
+        if let Some(reply) = self.conn.process_message(&self.read_buf) {
+            let _ = self.transport.send(&reply);
+        }
+
+        // Enviar todos los eventos pendientes.
+        while let Some(ev) = self.conn.pending_events.pop_front() {
+            let _ = self.transport.send(&ev);
+        }
+
+        true
+    }
+}
+
 pub mod objects {
     use super::*;
     
