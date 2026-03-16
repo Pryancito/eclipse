@@ -35,6 +35,12 @@ codegen-units = 1
 debug = false
 strip = "symbols"
 
+# Para debuggear smithay_app en Eclipse OS sin afectar al resto de binarios:
+# desactivamos el strip y activamos símbolos solo para ese paquete.
+[profile.release.package.smithay_app]
+strip = "none"
+debug = true
+
 [profile.dev]
 opt-level = "s"
 panic = "abort"

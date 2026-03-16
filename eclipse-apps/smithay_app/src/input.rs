@@ -175,6 +175,53 @@ impl InputState {
 
     #[inline(never)]
     pub fn apply_event(&mut self, ev: &InputEvent, fb_width: i32, fb_height: i32, windows: &mut [ShellWindow], window_count: &mut usize, surfaces: &[ExternalSurface]) {
+        // Modo ultra simplificado de ratón: si sólo queremos depurar el cursor,
+        // podemos activar este flag para ignorar toda la lógica de ventanas/HUD
+        // y limitar el procesamiento a mover el cursor y botones básicos.
+        const DEBUG_SIMPLE_MOUSE: bool = true;
+
+        if DEBUG_SIMPLE_MOUSE {
+            match ev.event_type {
+                1 => {
+                    // Mouse move: valor codifica dx/dy si code == 0xFFFF.
+                    if ev.code == 0xFFFF {
+                        let dx = (ev.value as i16) as i32;
+                        let dy = ((ev.value >> 16) as i16) as i32;
+                        let ddx = (dx * self.mouse_sensitivity) / 100;
+                        let mut ddy = (dy * self.mouse_sensitivity) / 100;
+                        if self.invert_y {
+                            ddy = -ddy;
+                        }
+                        self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
+                        self.cursor_y = (self.cursor_y + ddy).clamp(0, (fb_height - 1).max(0));
+                    } else if ev.code == 0 {
+                        let ddx = (ev.value * self.mouse_sensitivity) / 100;
+                        self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
+                    } else if ev.code == 1 {
+                        let mut ddy = (ev.value * self.mouse_sensitivity) / 100;
+                        if self.invert_y {
+                            ddy = -ddy;
+                        }
+                        self.cursor_y = (self.cursor_y + ddy).clamp(0, (fb_height - 1).max(0));
+                    }
+                }
+                2 => {
+                    // Mouse buttons: sólo actualizamos el bitmask, sin más lógica.
+                    let btn = ev.code as u8;
+                    let pressed = ev.value != 0;
+                    if btn < 8 {
+                        if pressed {
+                            self.mouse_buttons |= 1 << btn;
+                        } else {
+                            self.mouse_buttons &= !(1 << btn);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match ev.event_type {
             0 => { // Keyboard
                 let pressed = ev.value == 1;

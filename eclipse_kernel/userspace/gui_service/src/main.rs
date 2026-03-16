@@ -80,12 +80,10 @@ fn main() {
     let ppid = unsafe { std::libc::getppid() };
     println!("[GUI-SERVICE] PID={}, PPID={}", pid, ppid);
 
-    if ppid > 0 {
-        println!("[GUI-SERVICE] Sending READY to init (PID {})...", ppid);
-        let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
-    } else {
-        println!("[GUI-SERVICE] WARNING: No parent process found to signal READY!");
-    }
+    // En Eclipse init siempre es PID 1; no dependemos de getppid() para READY.
+    let init_pid: u32 = 1;
+    println!("[GUI-SERVICE] Sending READY to init (PID {})...", init_pid);
+    let _ = std::libc::send_ipc(init_pid, 255, b"READY");
 
     // Proceso one-shot: intenta lanzar smithay_app y sale.
     let child_pid = unsafe { spawn_compositor() };

@@ -168,6 +168,10 @@ impl SmithayState {
         match event {
             CompositorEvent::Input(ev) => {
                 self.input_event_count += 1;
+                println!(
+                    "[SMITHAY] Input: type={} code={} value={}",
+                    ev.event_type, ev.code, ev.value
+                );
                 self.input.apply_event(
                     ev,
                     self.backend.fb.info.width as i32,
@@ -291,13 +295,32 @@ impl SmithayState {
                 None => break,
                 Some(event) => {
                     events_processed += 1;
+                    if events_processed == 1 {
+                        println!("[SMITHAY] handle_ipc: start batch (counter={})", self.counter);
+                    }
                     self.handle_event(&event);
+                    if events_processed == 64 {
+                        let kind = match &event {
+                            CompositorEvent::Input(_) => "Input",
+                            CompositorEvent::SideWind(_, _) => "SideWind",
+                            CompositorEvent::Wayland(_, _) => "Wayland",
+                            CompositorEvent::X11(_, _) => "X11",
+                            CompositorEvent::NetStats(_, _) => "NetStats",
+                            CompositorEvent::ServiceInfo(_) => "ServiceInfo",
+                            CompositorEvent::KernelLog(_) => "KernelLog",
+                        };
+                        println!("[SMITHAY] handle_ipc: hit 64-event cap, last event kind={}", kind);
+                    }
                 }
             }
+        }
+        if events_processed > 0 {
+            println!("[SMITHAY] handle_ipc: processed {} events in batch", events_processed);
         }
     }
 
     fn process_wayland_events(&mut self, conn_idx: usize) {
+        let mut count = 0usize;
         loop {
             let ev = if let Some(conn) = self.wayland_connections[conn_idx].as_mut() {
                 conn.internal_events.pop_front()
@@ -309,6 +332,7 @@ impl SmithayState {
 
             match ev {
                 sidewind::wayland::WaylandInternalEvent::ShellSurfaceCreated { surface_id, .. } => {
+                    println!("[SMITHAY] WaylandInternalEvent::ShellSurfaceCreated surface_id={} conn_idx={}", surface_id, conn_idx);
                     if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
                         let win_idx = self.space.window_count;
                         let win = crate::compositor::ShellWindow {
@@ -326,6 +350,13 @@ impl SmithayState {
                     }
                 }
                 sidewind::wayland::WaylandInternalEvent::SurfaceCommitted { surface_id, buffer_id, damage } => {
+                    println!(
+                        "[SMITHAY] WaylandInternalEvent::SurfaceCommitted surface_id={} conn_idx={} buffer_id={:?} damage_len={}",
+                        surface_id,
+                        conn_idx,
+                        buffer_id,
+                        damage.len()
+                    );
                     // Ensure the buffer's pool is mapped
                     if let Some(buf_id) = buffer_id {
                         self.ensure_wayland_pool_mapped(conn_idx, buf_id);
@@ -344,6 +375,10 @@ impl SmithayState {
                     self.dirty = true;
                 }
             }
+            count += 1;
+        }
+        if count > 0 {
+            println!("[SMITHAY] process_wayland_events: processed {} events for conn_idx={}", count, conn_idx);
         }
     }
 
@@ -406,7 +441,20 @@ impl SmithayState {
         let fb_h = self.backend.fb.info.height as i32;
         let busy_animations = self.update_animations_and_layout(fb_w, fb_h, window_count_before);
         let busy_metrics = self.update_metrics_if_needed();
-        busy_animations || busy_metrics || self.dirty
+        let busy = busy_animations || busy_metrics || self.dirty;
+        if self.counter % 120 == 0 {
+            println!(
+                "[SMITHAY] update: counter={} busy={} anim={} metrics={} dirty={} windows={} input_events={}",
+                self.counter,
+                busy,
+                busy_animations,
+                busy_metrics,
+                self.dirty,
+                self.space.window_count,
+                self.input_event_count,
+            );
+        }
+        busy
     }
 
     /// Actualiza animaciones (ventanas, overlays, logo/sidebar/HUD) y devuelve
@@ -522,70 +570,98 @@ impl SmithayState {
                 }
             }
 
-            if self.input.system_central_active {
-                let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
-                let count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) };
-                if count >= 0 {
-                    self.process_count = count as usize;
+            // Siempre refrescamos la lista de procesos para poder logear memoria de smithay_app,
+            // aunque el overlay de System Central no esté activo.
+            let prev_uptime = self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0);
+            let count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) };
+            if count >= 0 {
+                self.process_count = count as usize;
 
-                    let current_uptime = current.uptime_ticks;
-                    let total_delta = current_uptime.saturating_sub(prev_uptime);
+                let current_uptime = current.uptime_ticks;
+                let total_delta = current_uptime.saturating_sub(prev_uptime);
 
-                    // Evict tick entries whose PID no longer appears in the active list.
-                    // Use the process_list slice directly to avoid a separate copy.
-                    let active = &self.process_list[..self.process_count];
+                // Evict tick entries whose PID no longer appears in the active list.
+                // Use the process_list slice directly to avoid a separate copy.
+                let active = &self.process_list[..self.process_count];
+                for j in 0..32 {
+                    let stored_pid = self.prev_process_ticks[j].0;
+                    if stored_pid != 0 && !active.iter().any(|p| p.pid == stored_pid) {
+                        self.prev_process_ticks[j] = (0, 0);
+                    }
+                }
+
+                for i in 0..self.process_count {
+                    let p = &self.process_list[i];
+
+                    // Calcular CPU %
+                    let mut prev_ticks = 0;
                     for j in 0..32 {
-                        let stored_pid = self.prev_process_ticks[j].0;
-                        if stored_pid != 0 && !active.iter().any(|p| p.pid == stored_pid) {
-                            self.prev_process_ticks[j] = (0, 0);
+                        if self.prev_process_ticks[j].0 == p.pid {
+                            prev_ticks = self.prev_process_ticks[j].1;
+                            break;
                         }
                     }
 
-                    for i in 0..self.process_count {
-                        let p = &self.process_list[i];
+                    if total_delta > 0 {
+                        let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
+                        self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
+                    } else {
+                        self.process_cpu_usage[i] = 0.0;
+                    }
 
-                        // Calcular CPU %
-                        let mut prev_ticks = 0;
+                    // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
+                    self.process_mem_kb[i] = p.mem_frames * 4;
+
+                    // Actualizar histórico de ticks.
+                    let mut found = false;
+                    for j in 0..32 {
+                        if self.prev_process_ticks[j].0 == p.pid {
+                            self.prev_process_ticks[j].1 = p.cpu_ticks;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        // Buscar slot vacío (PID 0)
                         for j in 0..32 {
-                            if self.prev_process_ticks[j].0 == p.pid {
-                                prev_ticks = self.prev_process_ticks[j].1;
+                            if self.prev_process_ticks[j].0 == 0 {
+                                self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
                                 break;
-                            }
-                        }
-
-                        if total_delta > 0 {
-                            let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
-                            self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
-                        } else {
-                            self.process_cpu_usage[i] = 0.0;
-                        }
-
-                        // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
-                        self.process_mem_kb[i] = p.mem_frames * 4;
-
-                        // Actualizar histórico de ticks.
-                        let mut found = false;
-                        for j in 0..32 {
-                            if self.prev_process_ticks[j].0 == p.pid {
-                                self.prev_process_ticks[j].1 = p.cpu_ticks;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            // Buscar slot vacío (PID 0)
-                            for j in 0..32 {
-                                if self.prev_process_ticks[j].0 == 0 {
-                                    self.prev_process_ticks[j] = (p.pid, p.cpu_ticks);
-                                    break;
-                                }
                             }
                         }
                     }
                 }
 
-                // Pedir info de servicios a systemd (PID 1)
-                let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
+                // Log de diagnóstico: memoria y CPU de smithay_app y contadores internos, SIEMPRE.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let self_pid = unsafe { libc::getpid() as u32 };
+                    let mut self_mem_kb = 0u64;
+                    let mut self_cpu = 0.0f32;
+                    for i in 0..self.process_count {
+                        let p = &self.process_list[i];
+                        if p.pid == self_pid {
+                            self_mem_kb = self.process_mem_kb[i];
+                            self_cpu = self.process_cpu_usage[i];
+                            break;
+                        }
+                    }
+                    println!(
+                        "[SMITHAY][METRICS] pid={} mem_kb={} cpu={:.1}% wayland_conns_active={} wayland_pools={} windows={} input_events={}",
+                        self_pid,
+                        self_mem_kb,
+                        self_cpu,
+                        self.wayland_connections.iter().filter(|c| c.is_some()).count(),
+                        self.wayland_pool_maps.len(),
+                        self.space.window_count,
+                        self.input_event_count,
+                    );
+                }
+
+                // Sólo pedimos info de servicios cuando System Central está activo.
+                if self.input.system_central_active {
+                    let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
+                }
             }
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
@@ -771,7 +847,33 @@ impl SmithayState {
         let fb_h = self.backend.fb.info.height as i32;
         let full_rect = Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32));
 
+        println!("[SMITHAY] render: begin counter={} windows={}", self.counter, self.space.window_count);
+
+        // Modo de diagnóstico: dibujar SOLO el cursor sobre un fondo sólido,
+        // sin escritorio, sin ventanas, sin HUD. Sirve para aislar cuelgues.
+        const DEBUG_CURSOR_ONLY: bool = true;
+        if DEBUG_CURSOR_ONLY {
+            // Fondo sencillo para visualizar que el framebuffer se actualiza.
+            self.backend
+                .fb
+                .clear_back_buffer_raw(embedded_graphics::pixelcolor::Rgb888::new(5, 10, 25));
+
+            render::draw_cursor(
+                &mut self.backend.fb,
+                embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
+            );
+
+            self.backend.fb.present();
+            self.dirty = false;
+            println!(
+                "[SMITHAY] render: DEBUG_CURSOR_ONLY frame={} cursor=({}, {})",
+                self.counter, self.input.cursor_x, self.input.cursor_y
+            );
+            return;
+        }
+
         if !self.input.lock_active {
+            println!("[SMITHAY] render: before draw_desktop_shell counter={}", self.counter);
             render::draw_desktop_shell(
                 &mut self.backend.fb, 
                 &self.space.windows, 
@@ -784,6 +886,7 @@ impl SmithayState {
             );
 
             if !self.input.dashboard_active && !self.input.system_central_active {
+                println!("[SMITHAY] render: before draw_shell_windows counter={}", self.counter);
                 render::draw_shell_windows(
                     &mut self.backend.fb, 
                     &self.space.windows, 
@@ -798,13 +901,16 @@ impl SmithayState {
                     self.input.cursor_y, 
                     self.counter,
                 );
+                println!("[SMITHAY] render: after draw_shell_windows counter={}", self.counter);
                 // Clear damage after drawing
                 for i in 0..self.space.window_count {
                     self.space.windows[i].damage.clear();
                 }
             } else if self.input.dashboard_active {
+                println!("[SMITHAY] render: before draw_dashboard counter={}", self.counter);
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
             } else if self.input.system_central_active {
+                println!("[SMITHAY] render: before draw_system_central counter={}", self.counter);
                 render::draw_system_central(
                     &mut self.backend.fb, 
                     self.counter, 
@@ -820,14 +926,28 @@ impl SmithayState {
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
         } else {
+            println!("[SMITHAY] render: before draw_lock_screen counter={}", self.counter);
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
 
-        render::draw_cursor(&mut self.backend.fb, embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y));
+        println!(
+            "[SMITHAY] render: before draw_cursor counter={} cursor_pos=({}, {})",
+            self.counter,
+            self.input.cursor_x,
+            self.input.cursor_y
+        );
+        // Cursor de software reactivado; el DrawTarget del framebuffer ya recorta por bounds,
+        // así que cualquier coordenada fuera de pantalla debería ignorarse sin provocar fallos.
+        render::draw_cursor(
+            &mut self.backend.fb,
+            embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
+        );
+        println!("[SMITHAY] render: before present counter={}", self.counter);
 
         self.backend.fb.present();
 
         self.dirty = false;
+        println!("[SMITHAY] render: end counter={}", self.counter);
     }
 }
 

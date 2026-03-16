@@ -625,13 +625,30 @@ fn main() {
             }
         }
 
-        // Watchdog heartbeat to init (PID 1): cada 200 iteraciones para no ser
+        // Debug: cada ~500 iteraciones (~500 ms) volcar contadores básicos para ver si
+        // el ratón sigue generando eventos aunque el cursor de smithay parezca congelado.
+        if heartbeat_counter % 500 == 0 {
+            let sent = DISPLAY_SENT.load(Ordering::Relaxed);
+            println!(
+                "[INPUT-SERVICE] hb={} total={} kbd={} mouse={} tablet={} disp_sent={} cursor=({},{})",
+                heartbeat_counter,
+                total_events,
+                keyboard_events,
+                mouse_events,
+                tablet_events,
+                sent,
+                cursor_x,
+                cursor_y
+            );
+        }
+
+        // Watchdog heartbeat para init (PID 1): cada 200 iteraciones para no ser
         // marcado HUNG si el bucle tarda (p. ej. drenando muchos eventos en QEMU).
         if heartbeat_counter % 200 == 0 {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
         }
         
-        unsafe { std::libc::sleep_ms(1); }
+        unsafe { std::libc::yield_cpu(); }
     }
 }
 

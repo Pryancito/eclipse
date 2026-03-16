@@ -46,17 +46,28 @@ fn main() {
 
     match query_input_service_pid() {
         Some(input_pid) => {
-            if !state.backend.input_scheme_available() {
-                let self_pid = unsafe { libc::getpid() as u32 };
-                if subscribe_to_input(input_pid, self_pid) {
-                    println!("[SMITHAY] Subscribed to input service (PID {}) via IPC", input_pid);
-                } else {
-                    println!("[SMITHAY] Warning: subscription to input service PID {} failed", input_pid);
-                }
+            let self_pid = unsafe { libc::getpid() as u32 };
+            println!(
+                "[SMITHAY] input_service PID reported by init: {}, self_pid={}",
+                input_pid, self_pid
+            );
+            // Siempre nos suscribimos vía IPC, aunque exista el esquema input:
+            if subscribe_to_input(input_pid, self_pid) {
+                println!(
+                    "[SMITHAY] Subscribed to input service (PID {}) via IPC",
+                    input_pid
+                );
+            } else {
+                println!(
+                    "[SMITHAY] Warning: subscription to input service PID {} failed",
+                    input_pid
+                );
             }
         }
         None => {
-            println!("[SMITHAY] Warning: input service PID not available, input events may not work");
+            println!(
+                "[SMITHAY] Warning: input service PID not available, input events may not work"
+            );
         }
     }
 
@@ -76,9 +87,19 @@ fn main() {
     // Main loop: procesa eventos IPC, actualiza estado, renderiza si es necesario (dirty, busy, o vsync ~16ms).
     loop {
         // Procesa eventos IPC o del backend
+        println!("[SMITHAY] loop: begin iteration counter={}", state.counter);
         state.handle_ipc();
-        if state.update() {
+        println!("[SMITHAY] loop: after handle_ipc counter={}", state.counter);
+        let need_render = state.update();
+        println!(
+            "[SMITHAY] loop: after update counter={} need_render={}",
+            state.counter,
+            need_render
+        );
+        if need_render {
+            println!("[SMITHAY] loop: before render counter={}", state.counter);
             state.render();
+            println!("[SMITHAY] loop: after render counter={}", state.counter);
         }
         // Throttle para evitar saturar la CPU; 16ms ≈ 60 FPS.
         // El kernel de Eclipse permite sleep() sin bloquear otros procesos.
