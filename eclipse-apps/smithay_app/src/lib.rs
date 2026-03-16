@@ -1,10 +1,10 @@
-#![cfg_attr(not(target_os = "linux"), no_std)]
+#![cfg_attr(target_vendor = "eclipse", no_std)]
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 extern crate alloc;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 pub extern crate eclipse_std as std;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 pub use libc;
 
 pub mod backend;
@@ -12,11 +12,12 @@ pub mod compositor;
 pub mod input;
 pub mod ipc;
 pub mod render;
-#[cfg(target_os = "linux")]
+pub mod display;
+#[cfg(not(target_vendor = "eclipse"))]
 pub mod smithay_wayland;
 pub mod state;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 pub mod getrandom_shim {
     use eclipse_syscall::syscall3;
     use eclipse_syscall::SYS_GETRANDOM;

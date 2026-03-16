@@ -2,20 +2,20 @@
 //! - Linux (host): compositor Wayland con Smithay + winit.
 //! - Eclipse: compositor propio (DRM, SideWind, IPC).
 
-#![cfg_attr(not(target_os = "linux"), no_std)]
+#![cfg_attr(target_vendor = "eclipse", no_std)]
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 extern crate alloc;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 extern crate eclipse_std as std;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 extern crate eclipse_syscall;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 use smithay_app::smithay_wayland;
 
 // ---- Entry point Linux: Smithay Wayland ----
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 fn main() {
     if let Err(e) = smithay_wayland::run() {
         eprintln!("[SMITHAY] Error: {}", e);
@@ -23,58 +23,31 @@ fn main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use std::prelude::v1::*;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use smithay_app::libc;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use std::env;
 
 // ---- Entry point Eclipse: compositor propio ----
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 #[cfg(not(test))]
 fn main() {
     use smithay_app::state::SmithayState;
     use smithay_app::ipc::{query_input_service_pid, subscribe_to_input};
-    use core::matches;
-
-    println!("[SMITHAY] Starting via Eclipse Runtime...");
 
     // Stack allocation: evita fallo del heap allocator (GPF CR2=0 en Box::new).
     // La pila de userspace es 1MB; SmithayState cabe. Si hace falta heap después, mmap directo funciona.
     let mut state = SmithayState::new().expect("Failed to initialize Smithay State");
 
-    match query_input_service_pid() {
-        Some(input_pid) => {
-            let self_pid = unsafe { libc::getpid() as u32 };
-            println!(
-                "[SMITHAY] input_service PID reported by init: {}, self_pid={}",
-                input_pid, self_pid
-            );
-            // Siempre nos suscribimos vía IPC, aunque exista el esquema input:
-            if subscribe_to_input(input_pid, self_pid) {
-                println!(
-                    "[SMITHAY] Subscribed to input service (PID {}) via IPC",
-                    input_pid
-                );
-            } else {
-                println!(
-                    "[SMITHAY] Warning: subscription to input service PID {} failed",
-                    input_pid
-                );
-            }
-        }
-        None => {
-            println!(
-                "[SMITHAY] Warning: input service PID not available, input events may not work"
-            );
-        }
+    if let Some(input_pid) = query_input_service_pid() {
+        let self_pid = unsafe { libc::getpid() as u32 };
+        let _ = subscribe_to_input(input_pid, self_pid);
     }
 
     let self_pid = unsafe { libc::getpid() as u32 };
-    if eclipse_syscall::call::register_log_hud(self_pid).is_err() {
-        println!("[SMITHAY] Warning: register_log_hud failed (kernel may not support it yet)");
-    }
+    let _ = eclipse_syscall::call::register_log_hud(self_pid);
 
     #[cfg(feature = "trace-frames")]
     let _stats_before = libc::SystemStats {
@@ -84,22 +57,11 @@ fn main() {
         used_mem_frames: 0,
     };
 
-    // Main loop: procesa eventos IPC, actualiza estado, renderiza si es necesario (dirty, busy, o vsync ~16ms).
     loop {
-        // Procesa eventos IPC o del backend
-        println!("[SMITHAY] loop: begin iteration counter={}", state.counter);
         state.handle_ipc();
-        println!("[SMITHAY] loop: after handle_ipc counter={}", state.counter);
         let need_render = state.update();
-        println!(
-            "[SMITHAY] loop: after update counter={} need_render={}",
-            state.counter,
-            need_render
-        );
         if need_render {
-            println!("[SMITHAY] loop: before render counter={}", state.counter);
             state.render();
-            println!("[SMITHAY] loop: after render counter={}", state.counter);
         }
         // Throttle para evitar saturar la CPU; 16ms ≈ 60 FPS.
         // El kernel de Eclipse permite sleep() sin bloquear otros procesos.
@@ -108,7 +70,7 @@ fn main() {
 }
 
 #[cfg(test)]
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 mod tests {
     use smithay_app::state::SmithayState;
 

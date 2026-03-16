@@ -1,14 +1,14 @@
 use std::prelude::v1::*;
 use core::matches;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use libc::{
     mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
     FramebufferInfo,
 };
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 use libc::{mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FramebufferInfo {
     pub address: u64,
@@ -18,10 +18,14 @@ pub struct FramebufferInfo {
     pub bpp: u8,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 fn get_logs(_buf: *mut u8, _max: usize) -> usize { 0 }
 
 use micromath::F32Ext;
+#[cfg(target_vendor = "eclipse")]
+use libc::ProcessInfo;
+#[cfg(not(target_vendor = "eclipse"))]
+use eclipse_syscall::ProcessInfo;
 use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
@@ -30,7 +34,9 @@ use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line};
 use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle};
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
-use crate::state::{ServiceInfo, WaylandPoolMap};
+use crate::state::ServiceInfo;
+#[cfg(target_vendor = "eclipse")]
+use crate::display::{DisplayDevice, FramebufferDesc, DisplayError};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -65,53 +71,54 @@ pub struct FramebufferState {
 
 impl FramebufferState {
     pub fn init() -> Option<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "eclipse")]
         {
-            println!("[SMITHAY] Initializing display via DRM...");
-            use eclipse_syscall as syscall;
+            let dev = DisplayDevice::open().ok()?;
+            let fb_front = dev.create_framebuffer().ok()?;
+            let fb_back  = dev.create_framebuffer().ok()?;
 
-            let caps = syscall::drm_get_caps().ok()?;
-            let width = if caps.max_width > 0 { caps.max_width } else { DEFAULT_WIDTH };
-            let height = if caps.max_height > 0 { caps.max_height } else { DEFAULT_HEIGHT };
-            let pitch = width * 4;
-            let fb_size = (pitch as usize) * (height as usize);
+            let fb_size = (dev.caps.pitch as usize) * (dev.caps.height as usize);
 
-            let handle1 = syscall::drm_alloc_buffer(fb_size).ok()?;
-            let handle2 = syscall::drm_alloc_buffer(fb_size).ok()?;
-
-            let fb1_id = syscall::drm_create_fb(handle1, width, height, pitch).ok()?;
-            let fb2_id = syscall::drm_create_fb(handle2, width, height, pitch).ok()?;
-
-            let addr1 = syscall::drm_map_handle(handle1).ok()?;
-            let addr2 = syscall::drm_map_handle(handle2).ok()?;
-            // Algunas rutas de error devuelven valores "canónicos" de kernel (p. ej. 0xffffffff00000000)
-            // como si fueran direcciones válidas. En userspace eso debe tratarse como fallo.
-            let addr_invalid = |a: usize| {
-                a == 0
-                    || a == usize::MAX
-                    || (a & 0xffff_ffff_0000_0000) == 0xffff_ffff_0000_0000
+            let bg_buffer = unsafe {
+                mmap(
+                    core::ptr::null_mut(),
+                    fb_size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
             };
-            if addr_invalid(addr1) || addr_invalid(addr2) {
-                return None;
-            }
+            let background_addr = if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
+                0
+            } else {
+                bg_buffer as usize
+            };
 
-            let _ = syscall::drm_page_flip(fb1_id);
-
-            let bg_buffer = unsafe { mmap(core::ptr::null_mut(), fb_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-            let background_addr = if bg_buffer.is_null() || bg_buffer as usize == usize::MAX { 0 } else { bg_buffer as usize };
-
-            let info = FramebufferInfo { address: addr1 as u64, width, height, pitch, bpp: 32, ..Default::default() };
+            let info = FramebufferInfo {
+                address: fb_front.addr as u64,
+                width: dev.caps.width,
+                height: dev.caps.height,
+                pitch: dev.caps.pitch,
+                bpp: 32,
+                ..Default::default()
+            };
 
             Some(FramebufferState {
-                info, back_fb_id: fb2_id, front_fb_id: fb1_id, back_addr: addr2, front_addr: addr1, background_addr,
+                info,
+                back_fb_id: fb_back.fb_id,
+                front_fb_id: fb_front.fb_id,
+                back_addr: fb_back.addr,
+                front_addr: fb_front.addr,
+                background_addr,
                 gpu: Some(sidewind::gpu::GpuDevice::new()),
             })
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_vendor = "eclipse"))]
         { None }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_vendor = "eclipse"))]
     pub fn init_software(width: u32, height: u32) -> Option<Self> {
         let pitch = width * 4;
         let fb_size = (pitch as usize) * (height as usize);
@@ -189,36 +196,20 @@ impl FramebufferState {
 
     pub fn present(&mut self) -> bool {
         if self.back_addr == 0 { return true; }
-        // Modo diagnóstico: si está activo, evitamos llamar a drm_page_flip para
-        // descartar cuelgues en la ruta de DRM/kernel. No habrá flips reales,
-        // pero el compositor seguirá avanzando frames.
-        const DEBUG_SKIP_PAGE_FLIP: bool = false;
-        if DEBUG_SKIP_PAGE_FLIP {
-            // Simulamos un flip exitoso sin tocar el kernel.
-            return true;
-        }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "eclipse")]
         {
+            // Por ahora seguimos llamando directamente a la syscall de page_flip.
+            // Más adelante podremos canalizar esto también a través de DisplayDevice.
             match eclipse_syscall::drm_page_flip(self.back_fb_id) {
-                Ok(_ret) => {
-                    // Swap buffers after successful flip
+                Ok(_) => {
                     core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
                     core::mem::swap(&mut self.back_addr, &mut self.front_addr);
                     true
                 }
-                Err(e) => {
-                    // Log flip failures to detect when display stops updating
-                    println!(
-                        "[SMITHAY] drm_page_flip failed for fb_id={} (front_fb_id={}): err={:?}",
-                        self.back_fb_id,
-                        self.front_fb_id,
-                        e
-                    );
-                    false
-                }
+                Err(_) => false,
             }
         }
-        #[cfg(target_os = "linux")] { true }
+        #[cfg(not(target_vendor = "eclipse"))] { true }
     }
 
 
@@ -266,47 +257,6 @@ impl FramebufferState {
                     unsafe {
                         let color = core::ptr::read_unaligned(src.add(src_row + ix as usize));
                         core::ptr::write_volatile(dst_ptr.add(dst_off), color);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn blit_buffer_subregion(
-        &mut self, 
-        dst_x: i32, 
-        dst_y: i32, 
-        w: u32, 
-        h: u32, 
-        src: *const u32, 
-        src_stride: u32,
-        src_ox: u32, 
-        src_oy: u32,
-        src_size: usize
-    ) {
-        if self.back_addr == 0 || src.is_null() || w == 0 || h == 0 { return; }
-        let fb_w = self.info.width as i32;
-        let fb_h = self.info.height as i32;
-        let pitch_px = (self.info.pitch / 4) as usize;
-        let dst_ptr = self.back_addr as *mut u32;
-
-        for iy in 0..h as i32 {
-            let dy = dst_y + iy;
-            if dy < 0 || dy >= fb_h { continue; }
-            let sy = src_oy as i32 + iy;
-            let src_row_start = (sy as usize) * (src_stride as usize);
-            
-            for ix in 0..w as i32 {
-                let dx = dst_x + ix;
-                if dx >= 0 && dx < fb_w {
-                    let sx = src_ox as i32 + ix;
-                    let src_idx = src_row_start + sx as usize;
-                    if (src_idx + 1) * 4 <= src_size {
-                        let dst_off = (dy as usize * pitch_px) + dx as usize;
-                        unsafe {
-                            let color = core::ptr::read_unaligned(src.add(src_idx));
-                            core::ptr::write_volatile(dst_ptr.add(dst_off), color);
-                        }
                     }
                 }
             }
@@ -450,41 +400,54 @@ impl FramebufferState {
 }
 
 pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f32, net: f32, uptime_ticks: u64) {
-    // Dashboard desactivado temporalmente para aislar cuelgues.
-    // Mostramos sólo un panel muy simple sin blur ni widgets complejos.
     let cpu = if cpu.is_nan() { 0.0 } else { cpu };
     let mem = if mem.is_nan() { 0.0 } else { mem };
     let net = if net.is_nan() { 0.0 } else { net };
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(5, 10, 25)).build())
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
         .draw(fb);
+    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
+    use sidewind::ui::{Panel, Gauge, Terminal, Widget};
+    let p_w = 600;
+    let p_h = 400;
+    let px = (w - p_w) / 2;
+    let py = (h - p_h) / 2;
+    let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
+    
+    fb.blur_rect(&Rectangle::new(main_panel.position, main_panel.size), 4);
+    let _ = main_panel.draw(fb);
+    
+    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };
+    let _ = g1.draw(fb);
+    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: mem, label: "MEMORIA RAM" };
+    let _ = g2.draw(fb);
+    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: net, label: "RED INT" };
+    let _ = g3.draw(fb);
 
-    let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_CYAN);
-    let text_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-
-    let _ = Text::new("DASHBOARD TEMPORALMENTE SIMPLIFICADO", Point::new(40, 80), label_style).draw(fb);
-
-    let mut line = heapless::String::<64>::new();
-    let _ = core::fmt::write(&mut line, format_args!("CPU: {}%", (cpu * 100.0) as u32));
-    let _ = Text::new(&line, Point::new(60, 140), text_style).draw(fb);
-
-    line.clear();
-    let _ = core::fmt::write(&mut line, format_args!("MEM: {}%", (mem * 100.0) as u32));
-    let _ = Text::new(&line, Point::new(60, 170), text_style).draw(fb);
-
-    line.clear();
-    let _ = core::fmt::write(&mut line, format_args!("NET: {}%", (net * 100.0) as u32));
-    let _ = Text::new(&line, Point::new(60, 200), text_style).draw(fb);
-
-    line.clear();
+    let mut cpu_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}%", (cpu * 100.0) as u32));
+    let mut mem_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut mem_line, format_args!("MEM: {}%", (mem * 100.0) as u32));
+    let mut net_line = heapless::String::<32>::new();
+    let _ = core::fmt::write(&mut net_line, format_args!("NET: {}%", (net * 100.0) as u32));
+    let mut uptime_line = heapless::String::<32>::new();
     let uptime_secs = uptime_ticks / 1000;
-    let _ = core::fmt::write(&mut line, format_args!("UPTIME: {}h {}m", uptime_secs / 3600, (uptime_secs / 60) % 60));
-    let _ = Text::new(&line, Point::new(60, 230), text_style).draw(fb);
+    let _ = core::fmt::write(&mut uptime_line, format_args!("UPTIME: {}h {}m", uptime_secs / 3600, (uptime_secs / 60) % 60));
 
-    let _ = Text::new("PULSE SUPER PARA VOLVER AL ESCRITORIO", Point::new(40, h - 80), label_style).draw(fb);
+    let term_lines: &[&str] = &[ 
+        "eclipse@os:~$ sysinfo --live", 
+        &cpu_line,
+        &mem_line,
+        &net_line,
+        &uptime_line,
+        "> system status nominal" 
+    ];
+    let term = Terminal { position: main_panel.position + Point::new(30, 220), size: Size::new(p_w as u32 - 60, 150), lines: term_lines };
+    let _ = term.draw(fb);
+    let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
+    let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 100), label_style).draw(fb);
 }
 
 pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
@@ -555,20 +518,7 @@ pub fn window_button_hover_at(cursor_x: i32, cursor_y: i32, wx: i32, wy: i32, ww
 }
 
 #[inline(never)]
-pub fn draw_shell_windows(
-    fb: &mut FramebufferState,
-    windows: &[ShellWindow],
-    window_count: usize,
-    focused_window: Option<usize>,
-    surfaces: &[ExternalSurface],
-    wayland_conns: &[Option<sidewind::wayland::WaylandConnection>; 32],
-    wayland_pools: &[WaylandPoolMap],
-    ws_offset: f32,
-    _current_ws: u8,
-    cursor_x: i32,
-    cursor_y: i32,
-    uptime_ticks: u64
-) {
+pub fn draw_shell_windows(fb: &mut FramebufferState, windows: &[ShellWindow], window_count: usize, focused_window: Option<usize>, surfaces: &[ExternalSurface], ws_offset: f32, _current_ws: u8, cursor_x: i32, cursor_y: i32, uptime_ticks: u64) {
     let fb_w = fb.info.width as i32;
     let mut hovered_win_idx: Option<usize> = None;
     let mut hovered_button: Option<WindowButton> = None;
@@ -601,21 +551,11 @@ pub fn draw_shell_windows(
 
         let focused = Some(i) == focused_window;
         let btn_hover = if hovered_win_idx == Some(i) { hovered_button.clone() } else { None };
-        let _ = draw_window_advanced(fb, w, focused, surfaces, wayland_conns, wayland_pools, effective_x, btn_hover, uptime_ticks);
+        let _ = draw_window_advanced(fb, w, focused, surfaces, effective_x, btn_hover, uptime_ticks);
     }
 }
 
-pub fn draw_window_advanced(
-    fb: &mut FramebufferState,
-    w: &ShellWindow,
-    is_focused: bool,
-    surfaces: &[ExternalSurface],
-    wayland_conns: &[Option<sidewind::wayland::WaylandConnection>; 32],
-    wayland_pools: &[WaylandPoolMap],
-    x: i32,
-    button_hover: Option<WindowButton>,
-    uptime_ticks: u64
-) -> Result<(), ()> {
+pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focused: bool, surfaces: &[ExternalSurface], x: i32, button_hover: Option<WindowButton>, uptime_ticks: u64) -> Result<(), ()> {
     // Damage tracking removed; draw decoration fully if visible.
     draw_window_decoration_at(fb, w, is_focused, x, button_hover);
 
@@ -675,44 +615,10 @@ pub fn draw_window_advanced(
                     }
                 }
             }
-            WindowContent::Wayland { surface_id, conn_idx } => {
-                if conn_idx < wayland_conns.len() {
-                    if let Some(conn) = &wayland_conns[conn_idx] {
-                        if let Some(surface_obj) = conn.registry.get(surface_id) {
-                            if let Some(buf_id) = surface_obj.as_surface_pending_buffer() {
-                                if let Some(buf_obj) = conn.registry.get(buf_id) {
-                                    if let Some(info) = buf_obj.as_buffer() {
-                                        if let Some(m) = wayland_pools.iter().find(|m| m.conn_idx == conn_idx && m.pool_id == info.pool_id) {
-                                            if m.vaddr != 0 {
-                                                let src_ptr = (m.vaddr + info.offset as usize) as *const u32;
-                                                let src_size = m.size.saturating_sub(info.offset as usize);
-                                                
-                                                if w.damage.is_empty() {
-                                                    // Full redraw if no specific damage
-                                                    fb.blit_buffer(x + 5, w.curr_y as i32 + ShellWindow::TITLE_H + 5, info.width as u32, info.height as u32, src_ptr, src_size);
-                                                } else {
-                                                    for &(dx, dy, dw, dh) in &w.damage {
-                                                        fb.blit_buffer_subregion(
-                                                            x + 5 + dx, 
-                                                            w.curr_y as i32 + ShellWindow::TITLE_H + 5 + dy,
-                                                            dw as u32, 
-                                                            dh as u32,
-                                                            src_ptr,
-                                                            info.width as u32,
-                                                            dx as u32,
-                                                            dy as u32,
-                                                            src_size
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            // Ventanas Wayland se dibujan a través del pipeline de sidewind/wayland y damage;
+            // aquí solo mantenemos la decoración y dejamos el contenido como está.
+            WindowContent::Wayland { .. } => {
+                // No hacemos nada especial en el cuerpo: el contenido ya debería estar en el framebuffer.
             }
             WindowContent::None => {}
         }
@@ -799,81 +705,62 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
     let h = fb.info.height as i32;
 
     fb.blit_background();
-    // HUD desactivado temporalmente: no dibujamos logo, sidebar ni caja de logs.
-    // Esto sirve para aislar posibles cuelgues relacionados con el HUD.
-    *log_len = 0;
+
+
+    let center = Point::new(w / 2, h / 2);
+    let logo_r = ((w.min(h) / 2) - 120).min(280).max(120);
+    let logo_rect = Rectangle::new(Point::new(center.x - logo_r, center.y - logo_r), Size::new(logo_r as u32 * 2, logo_r as u32 * 2));
+    let _ = ui::draw_eclipse_logo(fb, center, counter, logo_r);
+
+    let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+    let sidebar_width = (fb.info.width as i32 / 10).clamp(140, 220);
+    let sidebar_x = 0; 
+    let icon_slot_h = h / SIDEBAR_ICON_TYPES.len() as i32;
+    let sidebar_y_start = 0;
+    
+    for (i, icon_type) in SIDEBAR_ICON_TYPES.iter().enumerate() {
+        let py = sidebar_y_start + (i as i32 * icon_slot_h);
+        let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
+                 && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
+        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
+    }
+
+    let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
+    let hud_bg = colors::GLASS_PANEL;
+
+    let box_w = 400;
+    let rx = w - box_w - 15;
+    let hud_h = 110;
+    let hud_rect = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32));
+
+    let _ = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
+    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx + 20, 15 + hud_h)).into_styled(hud_line_style).draw(fb);
+    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx, 15 + hud_h - 20)).into_styled(hud_line_style).draw(fb);
+    
+    let dot = if (counter / 15) % 2 == 0 { "*" } else { " " };
+    let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 42), label_style).draw(fb);
+    let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
+
+    // Logs are now updated via IPC events in SmithayState::handle_event,
+    // so we don't need to poll get_logs() syscall here anymore.
+
+    const MAX_LOG_LINES: usize = 8;
+    if *log_len > 0 && *log_len <= log_buf.len() {
+        let slice = &log_buf[..*log_len];
+        let logs_str = core::str::from_utf8(slice).unwrap_or("");
+        let mut y_off = 60;
+        let log_text_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
+        for line in logs_str.lines().take(MAX_LOG_LINES) {
+            let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
+            y_off += 12;
+        }
+    }
 }
 
 pub fn draw_cursor(fb: &mut FramebufferState, pos: Point) {
-    // Cursor de software estilo "bitmap" muy parecido al de orbital:
-    // una pequeña punta de flecha blanca con borde negro. Todo el dibujo
-    // se hace desde una tabla constante, sin asignaciones dinámicas.
-
-    const CUR_W: i32 = 16;
-    const CUR_H: i32 = 16;
-    // 0 = transparente, 1 = borde negro, 2 = relleno blanco
-    const CUR_DATA: [u8; (CUR_W * CUR_H) as usize] = [
-        1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        1,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0,
-        1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,
-        1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,
-        1,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0,
-        1,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0,
-        1,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0,
-        1,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0,
-        1,2,2,2,2,2,2,2,2,2,1,0,0,0,0,0,
-        1,2,2,2,2,2,2,2,2,2,2,1,0,0,0,0,
-        1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0,
-        1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    ];
-
-    let fb_w = fb.info.width as i32;
-    let fb_h = fb.info.height as i32;
-    let base_x = pos.x;
-    let base_y = pos.y;
-
-    // Si el cursor está completamente fuera de pantalla, no hacemos nada.
-    if base_x <= -CUR_W || base_x >= fb_w || base_y <= -CUR_H || base_y >= fb_h {
-        return;
-    }
-
-    let pitch_px = (fb.info.pitch / 4) as usize;
-    let ptr = fb.back_addr as *mut u32;
-    if ptr.is_null() {
-        return;
-    }
-
-    // Colores en formato ARGB (como en el resto del código de framebuffer).
-    let white = 0xFF_FF_FF_FF;
-    let black = 0xFF_00_00_00;
-
-    for dy in 0..CUR_H {
-        let y = base_y + dy;
-        if y < 0 || y >= fb_h {
-            continue;
-        }
-        let row_off = (y as usize) * pitch_px;
-        for dx in 0..CUR_W {
-            let x = base_x + dx;
-            if x < 0 || x >= fb_w {
-                continue;
-            }
-            let idx = (dy * CUR_W + dx) as usize;
-            let v = CUR_DATA[idx];
-            if v == 0 {
-                continue;
-            }
-            let color = if v == 1 { black } else { white };
-            let off = row_off + x as usize;
-            unsafe {
-                core::ptr::write_volatile(ptr.add(off), color);
-            }
-        }
-    }
+    let _ = ui::draw_hud_cursor(fb, pos, colors::ACCENT_CYAN);
 }
 
 pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
@@ -887,10 +774,7 @@ pub fn draw_system_central(
     fb: &mut FramebufferState, 
     _counter: u64, 
     services: &[ServiceInfo], 
-    #[cfg(not(target_os = "linux"))]
-    processes: &[libc::ProcessInfo],
-    #[cfg(target_os = "linux")]
-    processes: &[eclipse_syscall::ProcessInfo],
+    processes: &[ProcessInfo],
     process_cpu: &[f32; 32],
     process_mem: &[u64; 32],
     uptime_ticks: u64,

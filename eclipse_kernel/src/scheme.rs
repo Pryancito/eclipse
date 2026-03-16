@@ -158,6 +158,7 @@ impl Scheme for LogScheme {
 pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
     register_scheme("shm", Arc::new(ShmScheme::new()));
+    register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
 }
 
 /// Register a new scheme

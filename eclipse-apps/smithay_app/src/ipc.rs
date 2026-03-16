@@ -8,9 +8,9 @@ use sidewind::{SWND_OP_CREATE, SWND_OP_DESTROY, SWND_OP_UPDATE, SWND_OP_COMMIT};
 use crate::input::{CompositorEvent, InputState};
 use crate::compositor::{ExternalSurface, ShellWindow, WindowContent, MAX_SURFACE_DIM, MAX_SURFACE_BYTES};
 use core::matches;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 use libc::{open, mmap, close, PROT_READ, PROT_WRITE, MAP_SHARED, O_RDWR, O_NONBLOCK};
 
 
@@ -152,9 +152,9 @@ pub fn handle_sidewind_message(
                     path[5+name_len] = 0; // Null terminator for C string
 
                     // 2. Open and mmap the surface buffer
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(target_vendor = "eclipse")]
                     let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
-                    #[cfg(target_os = "linux")]
+                    #[cfg(not(target_vendor = "eclipse"))]
                     let fd = unsafe { open(path.as_ptr() as *const core::ffi::c_char, O_RDWR | O_NONBLOCK, 0) };
 
                     if fd < 0 {

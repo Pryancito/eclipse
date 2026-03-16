@@ -1494,10 +1494,31 @@ impl XhciControllerState {
                     let buf_size = find_hid_buf_size(slot_id, ep_id);
                     if buf_phys != 0 {
                         let normal = build_normal_trb(buf_phys, buf_size as u16, true);
-                        if tr.submit(normal).is_ok() {
-                            fence(Ordering::SeqCst);
-                            if let Some(ref mmio) = self.mmio {
-                                mmio.ring_doorbell(slot_id, ep_id);
+                        match tr.submit(normal) {
+                            Ok(_phys) => {
+                                fence(Ordering::SeqCst);
+                                if let Some(ref mmio) = self.mmio {
+                                    mmio.ring_doorbell(slot_id, ep_id);
+                                }
+                            }
+                            Err(_) => {
+                                // En condiciones extremas el transfer ring podría seguir marcado
+                                // como "lleno" si el dequeue_index no acompaña al patrón real de
+                                // consumos del xHC. Intentamos adelantar un slot extra y
+                                // re-intentamos una vez más antes de rendirnos.
+                                tr.ring.advance_transfer_dequeue();
+                                let retry = build_normal_trb(buf_phys, buf_size as u16, true);
+                                if tr.submit(retry).is_ok() {
+                                    fence(Ordering::SeqCst);
+                                    if let Some(ref mmio) = self.mmio {
+                                        mmio.ring_doorbell(slot_id, ep_id);
+                                    }
+                                } else {
+                                    serial::serial_print(&alloc::format!(
+                                        "[USB-HID] WARNING: TransferRing full for slot={} ep={}, HID polling may stall\n",
+                                        slot_id, ep_id
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1701,6 +1722,10 @@ pub fn register_usb_irq_handler(irq: u8) -> Result<(), &'static str> {
 pub(crate) static USB_POLL_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Transfer events procesados desde el event ring en los últimos 5s. Si usb_xfer=0 y mueves ratón, el device no envía o el ring está vacío.
 pub(crate) static USB_TRANSFER_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Último valor observado de USB_TRANSFER_EVENTS por el watchdog de poll().
+static USB_WATCH_LAST_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Ticks en los que el watchdog observó por última vez un cambio en USB_TRANSFER_EVENTS.
+static USB_WATCH_LAST_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Poll the XHCI event ring for pending HID events.
 /// Called from the timer interrupt as a fallback when IRQ-based delivery is unavailable.
@@ -1717,6 +1742,7 @@ pub fn poll() {
                     serial::serial_print("\n");
                 }
             }
+
             xhci.process_events();
         }
     }

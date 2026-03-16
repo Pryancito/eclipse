@@ -1,10 +1,10 @@
 use std::prelude::v1::*;
 use embedded_graphics::prelude::*;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use libc::{InputEvent, eclipse_send};
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 use eclipse_syscall::InputEvent;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
 use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use crate::compositor::{
@@ -175,54 +175,7 @@ impl InputState {
 
     #[inline(never)]
     pub fn apply_event(&mut self, ev: &InputEvent, fb_width: i32, fb_height: i32, windows: &mut [ShellWindow], window_count: &mut usize, surfaces: &[ExternalSurface]) {
-        // Modo ultra simplificado de ratón: si sólo queremos depurar el cursor,
-        // podemos activar este flag para ignorar toda la lógica de ventanas/HUD
-        // y limitar el procesamiento a mover el cursor y botones básicos.
-        const DEBUG_SIMPLE_MOUSE: bool = true;
-
-        if DEBUG_SIMPLE_MOUSE {
-            match ev.event_type {
-                1 => {
-                    // Mouse move: valor codifica dx/dy si code == 0xFFFF.
-                    if ev.code == 0xFFFF {
-                        // Unpack coalesced dx (lower i16) and dy (upper i16).
-                        // Clamp each axis to i8 range after unpacking so that a malformed or
-                        // accumulated-overflow event cannot cause an unbounded cursor jump.
-                        // This matches the identical clamp in the non-debug path below.
-                        let dx = (ev.value as i16) as i32;
-                        let dy = ((ev.value >> 16) as i16) as i32;
-                        let dx = dx.clamp(i8::MIN as i32, i8::MAX as i32);
-                        let dy = dy.clamp(i8::MIN as i32, i8::MAX as i32);
-                        let ddx = (dx * self.mouse_sensitivity) / 100;
-                        let ddy = (dy * self.mouse_sensitivity) / 100;
-                        let dy_effective = if self.invert_y { -ddy } else { ddy };
-                        self.cursor_x = (self.cursor_x + ddx).clamp(0, (fb_width - 1).max(0));
-                        self.cursor_y = (self.cursor_y + dy_effective).clamp(0, (fb_height - 1).max(0));
-                    } else if ev.code == 0 {
-                        let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
-                        self.cursor_x = (self.cursor_x + d).clamp(0, (fb_width - 1).max(0));
-                    } else if ev.code == 1 {
-                        let d = (ev.value.clamp(i8::MIN as i32, i8::MAX as i32) * self.mouse_sensitivity) / 100;
-                        let dy = if self.invert_y { -d } else { d };
-                        self.cursor_y = (self.cursor_y + dy).clamp(0, (fb_height - 1).max(0));
-                    }
-                }
-                2 => {
-                    // Mouse buttons: sólo actualizamos el bitmask, sin más lógica.
-                    let btn = ev.code as u8;
-                    let pressed = ev.value != 0;
-                    if btn < 8 {
-                        if pressed {
-                            self.mouse_buttons |= 1 << btn;
-                        } else {
-                            self.mouse_buttons &= !(1 << btn);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
+        // Modo normal: usa toda la lógica de ventanas, HUD y atajos.
 
         match ev.event_type {
             0 => { // Keyboard

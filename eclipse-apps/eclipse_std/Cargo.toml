@@ -9,6 +9,10 @@ eclipse-syscall = { path = "../../eclipse-syscall" }
 libc = { path = "../../eclipse-relibc", default-features = false, features = ["std", "allocator"] }
 
 [features]
+# Por defecto, eclipse_std proporciona panic_handler y alloc_error_handler
+# para binarios Eclipse OS "normales". Los consumidores que coexistan con
+# otra std/handler (como smithay_app) deben activar explícitamente `std_compat`
+# para desactivar estos lang items.
 default = ["panic-handler", "alloc-error-handler"]
 panic-handler = []
 alloc-error-handler = []

@@ -24,21 +24,21 @@ embedded-graphics = "0.8.1"
 micromath = "2.1.0"
 bitflags = "2.4"
 eclipse-syscall = { path = "../../eclipse-syscall" }
-# Dependencias solo para target Eclipse (no linux).
+# Dependencias solo para target Eclipse (vendor eclipse).
 # wayland-server/wayland-protocols: detrás de feature "wayland"; sin ella el build Eclipse no los incluye
 # (evita errno/wayland_sys/downcast_rs que esperan std del sysroot; ver docs/WAYLAND_RS_ECLIPSE.md).
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(target_vendor = "eclipse")'.dependencies]
 eclipse_ipc = { path = "../libs/ipc", features = ["testable", "async"] }
 sidewind = { path = "../sidewind" }
 eclipse-syscall = { path = "../../eclipse-syscall" }
-eclipse_std = { package = "eclipse_std", path = "../eclipse_std" }
+# Usamos eclipse_std en modo compatibilidad con std para que NO registre su
+# propio panic_handler/alloc_error_handler; dejamos que eclipse-relibc lo haga.
+eclipse_std = { package = "eclipse_std", path = "../eclipse_std", features = ["std_compat"] }
 # Misma versión que el [patch.crates-io] del workspace → eclipse-relibc.
 libc = { version = "0.2", default-features = false }
-wayland-server = { version = "0.31", default-features = false, optional = true }
-wayland-protocols = { version = "0.31", default-features = false, optional = true }
 
 # Dependencias solo para target Linux (host) — compositor Wayland con Smithay
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(not(target_vendor = "eclipse"))'.dependencies]
 # smithay = { version = "0.7", default-features = false, features = ["backend_winit", "renderer_gl", "wayland_frontend", "desktop"] }
 # tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sidewind = { path = "../sidewind" }
@@ -50,8 +50,6 @@ smithay = { version = "0.7", default-features = false, features = ["backend_wini
 [features]
 default = []
 trace-frames = []
-# Para target Eclipse: incluye wayland-server/wayland-protocols (requiere resolver std/sysroot).
-wayland = ["wayland-server", "wayland-protocols"]
 
 # [[bin]]
 # name = "bin_ui_test"

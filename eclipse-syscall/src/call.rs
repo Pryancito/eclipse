@@ -255,3 +255,8 @@ pub fn gpu_command(kind: usize, command: usize, payload: &[u8]) -> Result<usize>
     }
 }
 
+/// ioctl(fd, request, arg) - device control
+pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
+    unsafe { cvt(syscall3(SYS_IOCTL, fd, request, arg)) }
+}
+

@@ -150,9 +150,9 @@ impl ExternalSurface {
     pub fn unmap(&mut self) {
         if self.vaddr != 0 && self.vaddr != 0x1000 {
             unsafe {
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_vendor = "eclipse")]
                 libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
-                #[cfg(target_os = "linux")]
+                #[cfg(not(target_vendor = "eclipse"))]
                 libc::munmap(self.vaddr as *mut core::ffi::c_void, self.buffer_size);
             }
         }

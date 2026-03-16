@@ -55,6 +55,22 @@ impl File {
             })
         }
     }
+
+    pub fn as_raw_fd(&self) -> crate::os::unix::io::RawFd {
+        unsafe { crate::libc::fileno(self.ptr) }
+    }
+}
+
+impl crate::os::unix::io::AsRawFd for File {
+    fn as_raw_fd(&self) -> crate::os::unix::io::RawFd {
+        self.as_raw_fd()
+    }
+}
+
+impl crate::os::unix::io::AsFd for File {
+    fn as_fd(&self) -> crate::os::unix::io::BorrowedFd<'_> {
+        unsafe { crate::os::unix::io::BorrowedFd::borrow_raw(self.as_raw_fd()) }
+    }
 }
 
 impl Read for File {

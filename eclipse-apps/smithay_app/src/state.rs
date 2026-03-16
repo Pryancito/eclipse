@@ -6,9 +6,9 @@ use crate::ipc::handle_sidewind_message;
 use crate::render;
 use std::prelude::v1::*;
 use core::matches;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "eclipse")]
 use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 use eclipse_syscall::{ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
 use core::convert::TryInto;
@@ -18,11 +18,11 @@ use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
 use eclipse_ipc::types::TAG_WAYL;
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 fn get_system_stats(_stats: &mut SystemStats) -> i32 { 0 }
-#[cfg(target_os = "linux")]
+#[cfg(not(target_vendor = "eclipse"))]
 fn get_process_list(_buf: *mut ProcessInfo, _max: usize) -> usize { 0 }
 
 #[derive(Clone, Copy, Default)]
@@ -88,7 +88,9 @@ pub struct SmithayState {
     /// Sirve de watchdog: si el main loop sigue avanzando pero este valor no cambia,
     /// los eventos de ratón han dejado de llegar (IPC muerto o input_service bloqueado).
     pub last_input_tick: u64,
+    #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_connections: [Option<sidewind::wayland::WaylandConnection>; 32],
+    #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
 }
 
@@ -163,7 +165,9 @@ impl SmithayState {
             log_buf: [0; 512],
             log_len: 0,
             last_input_tick: 0,
+            #[cfg(any(not(target_os = "linux"), test))]
             wayland_connections: [const { None }; 32],
+            #[cfg(any(not(target_os = "linux"), test))]
             wayland_pool_maps: Vec::new(),
         })
 
@@ -175,10 +179,6 @@ impl SmithayState {
                 self.input_event_count += 1;
                 // Registrar el tick del contador para el watchdog de inanición de input.
                 self.last_input_tick = self.counter;
-                println!(
-                    "[SMITHAY] Input: type={} code={} value={}",
-                    ev.event_type, ev.code, ev.value
-                );
                 self.input.apply_event(
                     ev,
                     self.backend.fb.info.width as i32,
@@ -256,6 +256,7 @@ impl SmithayState {
                 }
                 self.dirty = true;
             }
+            #[cfg(any(not(target_os = "linux"), test))]
             CompositorEvent::Wayland(data, sender_pid) => {
                 // Find or create connection for this PID
                 let conn_idx = self.wayland_connections.iter().position(|c| {
@@ -302,30 +303,13 @@ impl SmithayState {
                 None => break,
                 Some(event) => {
                     events_processed += 1;
-                    if events_processed == 1 {
-                        println!("[SMITHAY] handle_ipc: start batch (counter={})", self.counter);
-                    }
                     self.handle_event(&event);
-                    if events_processed == 64 {
-                        let kind = match &event {
-                            CompositorEvent::Input(_) => "Input",
-                            CompositorEvent::SideWind(_, _) => "SideWind",
-                            CompositorEvent::Wayland(_, _) => "Wayland",
-                            CompositorEvent::X11(_, _) => "X11",
-                            CompositorEvent::NetStats(_, _) => "NetStats",
-                            CompositorEvent::ServiceInfo(_) => "ServiceInfo",
-                            CompositorEvent::KernelLog(_) => "KernelLog",
-                        };
-                        println!("[SMITHAY] handle_ipc: hit 64-event cap, last event kind={}", kind);
-                    }
                 }
             }
         }
-        if events_processed > 0 {
-            println!("[SMITHAY] handle_ipc: processed {} events in batch", events_processed);
-        }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     fn process_wayland_events(&mut self, conn_idx: usize) {
         let mut count = 0usize;
         loop {
@@ -338,6 +322,7 @@ impl SmithayState {
             let ev = if let Some(ev) = ev { ev } else { break };
 
             match ev {
+                #[cfg(any(not(target_os = "linux"), test))]
                 sidewind::wayland::WaylandInternalEvent::ShellSurfaceCreated { surface_id, .. } => {
                     println!("[SMITHAY] WaylandInternalEvent::ShellSurfaceCreated surface_id={} conn_idx={}", surface_id, conn_idx);
                     if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
@@ -356,6 +341,7 @@ impl SmithayState {
                         self.dirty = true;
                     }
                 }
+                #[cfg(any(not(target_os = "linux"), test))]
                 sidewind::wayland::WaylandInternalEvent::SurfaceCommitted { surface_id, buffer_id, damage } => {
                     println!(
                         "[SMITHAY] WaylandInternalEvent::SurfaceCommitted surface_id={} conn_idx={} buffer_id={:?} damage_len={}",
@@ -384,11 +370,9 @@ impl SmithayState {
             }
             count += 1;
         }
-        if count > 0 {
-            println!("[SMITHAY] process_wayland_events: processed {} events for conn_idx={}", count, conn_idx);
-        }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     fn ensure_wayland_pool_mapped(&mut self, conn_idx: usize, buffer_id: u32) {
         let info = {
             let conn = if let Some(c) = &mut self.wayland_connections[conn_idx] { c } else { return };
@@ -396,9 +380,7 @@ impl SmithayState {
                 obj.as_buffer()
             } else { None }
         };
-        
         let info = if let Some(i) = info { i } else { return };
-        
         if self.wayland_pool_maps.iter().any(|m| m.conn_idx == conn_idx && m.pool_id == info.pool_id) {
             return;
         }
@@ -406,7 +388,7 @@ impl SmithayState {
         let mut vaddr = 0usize;
         let mut size = 0usize;
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "eclipse")]
         {
             // On Eclipse OS, we use the shm_pool_fd as a handle to open the shm region.
             // In our prototype, the client passes an ID that we use as a filename in shm: scheme.
@@ -449,35 +431,6 @@ impl SmithayState {
         let busy_animations = self.update_animations_and_layout(fb_w, fb_h, window_count_before);
         let busy_metrics = self.update_metrics_if_needed();
         let busy = busy_animations || busy_metrics || self.dirty;
-        if self.counter % 120 == 0 {
-            // Watchdog: detectar inanición de input.  Si llevamos >500 frames sin recibir
-            // ningún evento de input mientras el bucle sigue corriendo, es probable que el
-            // canal IPC esté muerto o que input_service haya dejado de enviar eventos.
-            const INPUT_STARVATION_FRAMES: u64 = 500;
-            let frames_since_input = self.counter.wrapping_sub(self.last_input_tick);
-            if self.last_input_tick > 0 && frames_since_input > INPUT_STARVATION_FRAMES {
-                println!(
-                    "[SMITHAY] WARN: sin eventos de input en {} frames (last_input_tick={} counter={} total_events={}). \
-                     ¿IPC muerto o input_service bloqueado?",
-                    frames_since_input,
-                    self.last_input_tick,
-                    self.counter,
-                    self.input_event_count,
-                );
-            }
-            println!(
-                "[SMITHAY] update: counter={} busy={} anim={} metrics={} dirty={} windows={} input_events={} cursor=({},{})",
-                self.counter,
-                busy,
-                busy_animations,
-                busy_metrics,
-                self.dirty,
-                self.space.window_count,
-                self.input_event_count,
-                self.input.cursor_x,
-                self.input.cursor_y,
-            );
-        }
         busy
     }
 
@@ -657,7 +610,7 @@ impl SmithayState {
                 }
 
                 // Log de diagnóstico: memoria y CPU de smithay_app y contadores internos, SIEMPRE.
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_vendor = "eclipse")]
                 {
                     let self_pid = unsafe { libc::getpid() as u32 };
                     let mut self_mem_kb = 0u64;
@@ -670,16 +623,6 @@ impl SmithayState {
                             break;
                         }
                     }
-                    println!(
-                        "[SMITHAY][METRICS] pid={} mem_kb={} cpu={:.1}% wayland_conns_active={} wayland_pools={} windows={} input_events={}",
-                        self_pid,
-                        self_mem_kb,
-                        self_cpu,
-                        self.wayland_connections.iter().filter(|c| c.is_some()).count(),
-                        self.wayland_pool_maps.len(),
-                        self.space.window_count,
-                        self.input_event_count,
-                    );
                 }
 
                 // Sólo pedimos info de servicios cuando System Central está activo.
@@ -871,33 +814,7 @@ impl SmithayState {
         let fb_h = self.backend.fb.info.height as i32;
         let full_rect = Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32));
 
-        println!("[SMITHAY] render: begin counter={} windows={}", self.counter, self.space.window_count);
-
-        // Modo de diagnóstico: dibujar SOLO el cursor sobre un fondo sólido,
-        // sin escritorio, sin ventanas, sin HUD. Sirve para aislar cuelgues.
-        const DEBUG_CURSOR_ONLY: bool = true;
-        if DEBUG_CURSOR_ONLY {
-            // Fondo sencillo para visualizar que el framebuffer se actualiza.
-            self.backend
-                .fb
-                .clear_back_buffer_raw(embedded_graphics::pixelcolor::Rgb888::new(5, 10, 25));
-
-            render::draw_cursor(
-                &mut self.backend.fb,
-                embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
-            );
-
-            self.backend.fb.present();
-            self.dirty = false;
-            println!(
-                "[SMITHAY] render: DEBUG_CURSOR_ONLY frame={} cursor=({}, {})",
-                self.counter, self.input.cursor_x, self.input.cursor_y
-            );
-            return;
-        }
-
         if !self.input.lock_active {
-            println!("[SMITHAY] render: before draw_desktop_shell counter={}", self.counter);
             render::draw_desktop_shell(
                 &mut self.backend.fb, 
                 &self.space.windows, 
@@ -910,31 +827,25 @@ impl SmithayState {
             );
 
             if !self.input.dashboard_active && !self.input.system_central_active {
-                println!("[SMITHAY] render: before draw_shell_windows counter={}", self.counter);
                 render::draw_shell_windows(
                     &mut self.backend.fb, 
                     &self.space.windows, 
                     self.space.window_count, 
                     self.input.focused_window, 
                     &self.surfaces,
-                    &self.wayland_connections,
-                    &self.wayland_pool_maps,
                     self.input.workspace_offset, 
                     self.input.current_workspace,
                     self.input.cursor_x, 
                     self.input.cursor_y, 
                     self.counter,
                 );
-                println!("[SMITHAY] render: after draw_shell_windows counter={}", self.counter);
                 // Clear damage after drawing
                 for i in 0..self.space.window_count {
                     self.space.windows[i].damage.clear();
                 }
             } else if self.input.dashboard_active {
-                println!("[SMITHAY] render: before draw_dashboard counter={}", self.counter);
                 render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
             } else if self.input.system_central_active {
-                println!("[SMITHAY] render: before draw_system_central counter={}", self.counter);
                 render::draw_system_central(
                     &mut self.backend.fb, 
                     self.counter, 
@@ -950,28 +861,18 @@ impl SmithayState {
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
         } else {
-            println!("[SMITHAY] render: before draw_lock_screen counter={}", self.counter);
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
-
-        println!(
-            "[SMITHAY] render: before draw_cursor counter={} cursor_pos=({}, {})",
-            self.counter,
-            self.input.cursor_x,
-            self.input.cursor_y
-        );
         // Cursor de software reactivado; el DrawTarget del framebuffer ya recorta por bounds,
         // así que cualquier coordenada fuera de pantalla debería ignorarse sin provocar fallos.
         render::draw_cursor(
             &mut self.backend.fb,
             embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
         );
-        println!("[SMITHAY] render: before present counter={}", self.counter);
 
         self.backend.fb.present();
 
         self.dirty = false;
-        println!("[SMITHAY] render: end counter={}", self.counter);
     }
 }
 

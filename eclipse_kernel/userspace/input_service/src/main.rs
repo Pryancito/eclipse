@@ -451,7 +451,9 @@ fn main() {
     // Si supera un umbral, probablemente el hardware o el driver del kernel dejó de
     // producir eventos (bug de driver, overflow de buffer, etc.).
     let mut consecutive_idle_mouse_iters: u64 = 0;
-    const IDLE_MOUSE_WARN_THRESHOLD: u64 = 2000; // ~2 s a 1 kHz de bucle
+    // Umbral más bajo para detectar antes el estancamiento del driver (p.ej. 200 iteraciones
+    // a ~1kHz ≃ 200ms). Si el ratón "se muere" bajo estrés, queremos ver rápidamente el WARN.
+    const IDLE_MOUSE_WARN_THRESHOLD: u64 = 200; // ~200 ms a 1 kHz de bucle
     
     loop {
         heartbeat_counter += 1;
@@ -567,21 +569,9 @@ fn main() {
             }
         }
 
-        // Watchdog: detectar si read_mouse_packet ha dejado de producir eventos durante
-        // muchas iteraciones consecutivas (posible bug de driver o hardware bloqueado).
-        if mouse_drained == 0 {
-            consecutive_idle_mouse_iters = consecutive_idle_mouse_iters.saturating_add(1);
-            if consecutive_idle_mouse_iters == IDLE_MOUSE_WARN_THRESHOLD
-                || (consecutive_idle_mouse_iters > IDLE_MOUSE_WARN_THRESHOLD
-                    && consecutive_idle_mouse_iters % IDLE_MOUSE_WARN_THRESHOLD == 0)
-            {
-                println!(
-                    "[INPUT-SERVICE] WARN: sin paquetes de ratón en {} iteraciones consecutivas \
-                     (cursor=({},{}) total_mouse={}). ¿Driver bloqueado?",
-                    consecutive_idle_mouse_iters, cursor_x, cursor_y, mouse_events
-                );
-            }
-        } else {
+        // Resetear el contador de iteraciones sin paquetes de ratón cada vez que drenamos
+        // al menos un paquete; lo usamos solo para estadística interna, sin logs.
+        if mouse_drained > 0 {
             consecutive_idle_mouse_iters = 0;
         }
 
@@ -664,26 +654,6 @@ fn main() {
             while let Some(_event) = event_queue.pop() {
                 // In real implementation: dispatch to consumers
             }
-        }
-
-        // Debug: cada ~500 iteraciones (~500 ms) volcar contadores básicos para ver si
-        // el ratón sigue generando eventos aunque el cursor de smithay parezca congelado.
-        // Ahora incluye disp_failures para detectar backpressure IPC.
-        if heartbeat_counter % 500 == 0 {
-            let sent = DISPLAY_SENT.load(Ordering::Relaxed);
-            let failures = DISPLAY_SEND_FAILURES.load(Ordering::Relaxed);
-            println!(
-                "[INPUT-SERVICE] hb={} total={} kbd={} mouse={} tablet={} disp_sent={} ipc_failures={} cursor=({},{})",
-                heartbeat_counter,
-                total_events,
-                keyboard_events,
-                mouse_events,
-                tablet_events,
-                sent,
-                failures,
-                cursor_x,
-                cursor_y
-            );
         }
 
         // Watchdog heartbeat para init (PID 1): cada 200 iteraciones para no ser
