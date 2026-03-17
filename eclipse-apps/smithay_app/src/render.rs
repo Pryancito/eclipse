@@ -2,7 +2,7 @@ use std::prelude::v1::*;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
 use libc::{
-    mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+    mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
     FramebufferInfo,
 };
 #[cfg(not(target_vendor = "eclipse"))]
@@ -36,7 +36,7 @@ use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::ServiceInfo;
 #[cfg(target_vendor = "eclipse")]
-use crate::display::{DisplayDevice, FramebufferDesc, DisplayError};
+use crate::display::{self, DisplayDevice, FramebufferDesc, DisplayError, ControlDevice, DisplayCaps};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
@@ -61,12 +61,19 @@ pub const STROKE_COLORS: [Rgb888; 5] = [
 
 pub struct FramebufferState {
     pub info: FramebufferInfo,
-    pub back_fb_id: u32,
-    pub front_fb_id: u32,
+    pub back_fb_id: display::control::framebuffer::Handle,
+    pub front_fb_id: display::control::framebuffer::Handle,
     pub back_addr: usize,
     pub front_addr: usize,
     pub background_addr: usize,
+    pub drm_fd: usize,
+    pub drm_crtc: display::control::CrtcHandle,
     pub gpu: Option<sidewind::gpu::GpuDevice>,
+    pub cursor_handle: display::buffer::Handle,
+    pub planes: Vec<display::control::PlaneInfo>,
+    pub hud_fb_id: display::control::framebuffer::Handle,
+    pub hud_handle: display::buffer::Handle,
+    pub hud_addr: usize,
 }
 
 impl FramebufferState {
@@ -104,20 +111,120 @@ impl FramebufferState {
                 ..Default::default()
             };
 
-            Some(FramebufferState {
+            let mut fb_state = Self {
                 info,
                 back_fb_id: fb_back.fb_id,
                 front_fb_id: fb_front.fb_id,
                 back_addr: fb_back.addr,
                 front_addr: fb_front.addr,
                 background_addr,
+                drm_fd: dev.fd as usize,
+                drm_crtc: dev.crtc,
                 gpu: Some(sidewind::gpu::GpuDevice::new()),
-            })
+                cursor_handle: display::buffer::Handle(0),
+                planes: Vec::new(),
+                hud_fb_id: display::control::framebuffer::Handle(0),
+                hud_handle: display::buffer::Handle(0),
+                hud_addr: 0,
+            };
+
+            // Discover planes
+            if let Ok(plane_handles) = dev.plane_resources() {
+                for ph in plane_handles {
+                    if let Ok(info) = dev.get_plane(ph) {
+                        fb_state.planes.push(info);
+                    }
+                }
+            }
+
+            fb_state.init_cursor();
+            fb_state.init_hud();
+            Some(fb_state)
         }
         #[cfg(not(target_vendor = "eclipse"))]
-        { None }
+        {
+            None
+        }
     }
 
+    /// Initialize hardware cursor image (64x64)
+    pub fn init_cursor(&mut self) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            if self.drm_fd == 0 { return; }
+            
+            // Allocate 64x64x4 buffer
+            let dev = DisplayDevice {
+                fd: self.drm_fd,
+                caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                crtc: self.drm_crtc,
+                connector: display::control::ConnectorHandle(0),
+            };
+
+            let size = 64 * 64 * 4;
+            if let Ok(db) = dev.create_dumb_buffer(64, 64, 32) {
+                self.cursor_handle = db.handle;
+                
+                // Map and draw cursor image
+                if let Ok(addr) = dev.map_buffer(db.handle, size as usize) {
+                    let ptr = addr as *mut u32;
+                    unsafe {
+                        for i in 0..(64 * 64) {
+                            // Simple white arrow with outline
+                            let x = i % 64;
+                            let y = i / 64;
+                            
+                            let mut color = 0x00000000; // Transparent
+                            
+                            // Cheap arrow tip
+                            if x < 16 && y < 16 && x <= y {
+                                if x == y || x == 0 || y == 15 {
+                                    color = 0xFF000000; // Black outline
+                                } else {
+                                    color = 0xFFFFFFFF; // White fill
+                                }
+                            }
+                            
+                            core::ptr::write_volatile(ptr.add(i as usize), color);
+                        }
+                    }
+                    unsafe { let _ = munmap(addr as *mut core::ffi::c_void, size); }
+                }
+                
+                // Set cursor (flags=0x01 | 0x02: SET | MOVE)
+                // We set it at (0,0) initially
+                let _ = dev.set_cursor(self.drm_crtc, 0, 0, db.handle);
+            }
+        }
+    }
+
+    /// Initialize HUD secondary framebuffer
+    pub fn init_hud(&mut self) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            if self.drm_fd == 0 { return; }
+            let dev = DisplayDevice {
+                fd: self.drm_fd,
+                caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                crtc: self.drm_crtc,
+                connector: display::control::ConnectorHandle(0),
+            };
+
+            // Allocate 400x110 buffer for HUD
+            if let Ok(db) = dev.create_dumb_buffer(400, 110, 32) {
+                if let Ok(fb_id) = dev.add_framebuffer(db.handle, db.width, db.height, db.pitch) {
+                    if let Ok(addr) = dev.map_buffer(db.handle, db.size) {
+                        self.hud_fb_id = fb_id;
+                        self.hud_handle = db.handle;
+                        self.hud_addr = addr as usize;
+                        
+                        // Clear to transparent
+                        unsafe { core::ptr::write_bytes(addr, 0, 400 * 110 * 4); }
+                    }
+                }
+            }
+        }
+    }
     #[cfg(not(target_vendor = "eclipse"))]
     pub fn init_software(width: u32, height: u32) -> Option<Self> {
         let pitch = width * 4;
@@ -128,7 +235,13 @@ impl FramebufferState {
         let bg_ptr = Box::leak(vec![0u8; fb_size].into_boxed_slice()).as_mut_ptr();
         Some(FramebufferState {
             info: FramebufferInfo { address: ptr as u64, width, height, pitch, bpp: 32 },
-            back_fb_id: 0, front_fb_id: 0, back_addr: ptr as usize, front_addr: ptr as usize, background_addr: bg_ptr as usize,
+            back_fb_id: display::control::framebuffer::Handle(0),
+            front_fb_id: display::control::framebuffer::Handle(0),
+            back_addr: ptr as usize,
+            front_addr: ptr as usize,
+            background_addr: bg_ptr as usize,
+            drm_fd: 0,
+            drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
         })
     }
@@ -138,7 +251,9 @@ impl FramebufferState {
         Self {
             // FIX: Removidos red_mask_size y otros campos inexistentes para que compile el mock
             info: FramebufferInfo { address: 0, width: 1024, height: 768, pitch: 4096, bpp: 32 },
-            back_fb_id: 0, front_fb_id: 0, back_addr: 0, front_addr: 0, background_addr: 0, gpu: None,
+            back_fb_id: display::control::framebuffer::Handle(0),
+            front_fb_id: display::control::framebuffer::Handle(0),
+            back_addr: 0, front_addr: 0, background_addr: 0, drm_fd: 0, gpu: None,
         }
     }
 
@@ -198,18 +313,69 @@ impl FramebufferState {
         if self.back_addr == 0 { return true; }
         #[cfg(target_vendor = "eclipse")]
         {
-            // Por ahora seguimos llamando directamente a la syscall de page_flip.
-            // Más adelante podremos canalizar esto también a través de DisplayDevice.
-            match eclipse_syscall::drm_page_flip(self.back_fb_id) {
+            // Perform the page flip.
+            match eclipse_syscall::drm_page_flip(self.back_fb_id.0) {
                 Ok(_) => {
                     core::mem::swap(&mut self.back_fb_id, &mut self.front_fb_id);
                     core::mem::swap(&mut self.back_addr, &mut self.front_addr);
+                    let dev = DisplayDevice { 
+                        fd: self.drm_fd, 
+                        caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                        crtc: self.drm_crtc,
+                        connector: display::control::ConnectorHandle(0),
+                    };
+                    
+                    // Wait for VBlank to synchronize and throttle.
+                    let _ = dev.wait_vblank(self.drm_crtc);
+                    
                     true
                 }
                 Err(_) => false,
             }
         }
         #[cfg(not(target_vendor = "eclipse"))] { true }
+    }
+
+    /// Move hardware cursor
+    pub fn set_cursor_position(&self, x: i32, y: i32) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            if self.drm_fd > 0 {
+                let dev = DisplayDevice {
+                    fd: self.drm_fd,
+                    caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                    crtc: self.drm_crtc,
+                    connector: display::control::ConnectorHandle(0),
+                };
+                // DRM_CURSOR_MOVE is 0x02
+                // Since we already have cursor_handle set, we might not need it for MOVE, 
+                // but passing 0 (or previous handle) should work.
+                let _ = dev.set_cursor(self.drm_crtc, x, y, display::buffer::Handle(0));
+            }
+        }
+    }
+
+    /// Set an overlay plane configuration
+    pub fn set_overlay_plane(&self, fb_id: display::control::framebuffer::Handle, x: i32, y: i32, w: u32, h: u32) {
+        #[cfg(target_vendor = "eclipse")]
+        {
+            // Find an overlay plane (plane_type 0)
+            if let Some(plane) = self.planes.iter().find(|p| p.plane_type == 0) {
+                let dev = DisplayDevice {
+                    fd: self.drm_fd,
+                    caps: DisplayCaps { width: 0, height: 0, max_width: 0, max_height: 0, pitch: 0 },
+                    crtc: self.drm_crtc,
+                    connector: display::control::ConnectorHandle(0),
+                };
+                let _ = dev.set_plane(
+                    plane.handle,
+                    self.drm_crtc,
+                    fb_id,
+                    x, y, w, h,
+                    0, 0, w << 16, h << 16, // Source coordinates in 16.16 fixed point
+                );
+            }
+        }
     }
 
 
@@ -261,6 +427,38 @@ impl FramebufferState {
                 }
             }
         }
+    }
+}
+
+#[repr(C)]
+pub struct OverlayDrawTarget {
+    pub addr: usize,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+}
+
+impl DrawTarget for OverlayDrawTarget {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+    
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where I: IntoIterator<Item = Pixel<Self::Color>> {
+        for Pixel(coord, color) in pixels.into_iter() {
+            if coord.x >= 0 && coord.x < self.width as i32 && coord.y >= 0 && coord.y < self.height as i32 {
+                let offset = (coord.y as usize * self.pitch as usize) + (coord.x as usize * 4);
+                let ptr = (self.addr + offset) as *mut u32;
+                let c = 0xFF000000 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+                unsafe { core::ptr::write_volatile(ptr, c); }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OriginDimensions for OverlayDrawTarget {
+    fn size(&self) -> Size {
+        Size::new(self.width, self.height)
     }
 }
 
@@ -470,6 +668,57 @@ pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
     let _ = core::fmt::write(&mut time_str, format_args!("{:02}:{:02}:{:02}", hrs, mins, secs));
     let time_pos = center + Point::new(-45, -280);
     let _ = Text::new(&time_str, time_pos, MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE)).draw(fb);
+}
+
+pub fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {
+    let w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    let ly = curr_y as i32;
+
+    let panel_w = 320;
+    let panel_h = 350;
+    let rect = Rectangle::new(Point::new(10, ly), Size::new(panel_w, panel_h));
+    let _ = ui::draw_glass_card(fb, rect, "DRIVE // LANZADOR", colors::ACCENT_CYAN);
+
+    let title_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
+    let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(31, ly + 39), title_glow).draw(fb);
+    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(30, ly + 38), title_style).draw(fb);
+
+    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let items = [("Terminal", icons::SYSTEM), ("Archivos", icons::FILES), ("Red", icons::NETWORK), ("Ajustes", icons::APPS)];
+    for (i, (name, icon)) in items.iter().enumerate() {
+        let py = ly + 75 + (i as i32 * 62);
+        let _ = ui::draw_glowing_hexagon(fb, Point::new(50, py + 20), 22, colors::ACCENT_CYAN);
+        let _ = ui::draw_standard_icon(fb, Point::new(50, py + 20), *icon);
+        let _ = Text::new(name, Point::new(85, py + 28), item_style).draw(fb);
+    }
+}
+
+pub fn draw_alt_tab_hud(fb: &mut FramebufferState, _windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
+    let w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    let panel_w = 600;
+    let panel_h = 240;
+    let px = w / 2 - panel_w / 2;
+    let py = h / 2 - panel_h / 2;
+    let rect = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32));
+    let _ = ui::draw_glass_card(fb, rect, "CONMUTADOR // SISTEMA", colors::ACCENT_CYAN);
+    let _ = ui::draw_glowing_hexagon(fb, Point::new(px + 40, py + 25), 18, colors::ACCENT_CYAN);
+    let title_glow = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, Rgb888::new(40, 120, 180));
+    let title_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
+    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
+    let focus_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::ACCENT_CYAN);
+    let title_pos = Point::new(w / 2 - 130, py + 35);
+    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos + Point::new(1, 1), title_glow).draw(fb);
+    let _ = Text::new("CONMUTADOR // VENTANAS", title_pos, title_style).draw(fb);
+    for i in 0..window_count {
+        let iy = h / 2 - panel_h / 2 + 70 + (i as i32 * 30);
+        let style = if Some(i) == focused { focus_style } else { item_style };
+        let prefix = if Some(i) == focused { "> " } else { "  " };
+        let _ = Text::new(prefix, Point::new(w / 2 - 180, iy), style).draw(fb);
+        let _ = Text::new("Shell Window", Point::new(w / 2 - 150, iy), style).draw(fb);
+    }
 }
 
 pub fn draw_quick_settings(fb: &mut FramebufferState) {
@@ -725,35 +974,61 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
         let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
     }
 
-    let hud_line_style = PrimitiveStyleBuilder::new().stroke_color(colors::GLASS_BORDER).stroke_width(1).build();
+}
+
+pub fn draw_hud_overlay(
+    target: &mut OverlayDrawTarget,
+    counter: u32,
+    log_buf: &[u8],
+    log_len: &usize,
+) {
+    let w = target.width as i32;
+    let h = target.height as i32;
+
+    let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+    let hud_line_style = PrimitiveStyleBuilder::new()
+        .stroke_color(colors::GLASS_BORDER)
+        .stroke_width(1)
+        .build();
     let hud_bg = colors::GLASS_PANEL;
 
-    let box_w = 400;
-    let rx = w - box_w - 15;
-    let hud_h = 110;
-    let hud_rect = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32));
+    // Este HUD replica el diseño de v0.1.6 pero dibujado dentro del overlay:
+    // caja de 400x110 px, con esquinas recortadas y título "SISTEMA ONLINE".
 
-    let _ = Rectangle::new(Point::new(rx, 15), Size::new(box_w as u32, hud_h as u32)).into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build()).draw(fb);
-    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 35, 15)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(w - 15, 15), Point::new(w - 15, 35)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx + 20, 15 + hud_h)).into_styled(hud_line_style).draw(fb);
-    let _ = Line::new(Point::new(rx, 15 + hud_h), Point::new(rx, 15 + hud_h - 20)).into_styled(hud_line_style).draw(fb);
-    
+    // Fondo de la caja
+    let hud_rect = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32));
+    let _ = hud_rect
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(hud_bg).build())
+        .draw(target);
+
+    // Esquinas "recortadas" como en la versión antigua
+    let _ = Line::new(Point::new(w - 1, 0), Point::new(w - 21, 0))
+        .into_styled(hud_line_style)
+        .draw(target);
+    let _ = Line::new(Point::new(w - 1, 0), Point::new(w - 1, 20))
+        .into_styled(hud_line_style)
+        .draw(target);
+    let _ = Line::new(Point::new(0, h - 1), Point::new(20, h - 1))
+        .into_styled(hud_line_style)
+        .draw(target);
+    let _ = Line::new(Point::new(0, h - 1), Point::new(0, h - 21))
+        .into_styled(hud_line_style)
+        .draw(target);
+
+    // Título y estado "SISTEMA ONLINE" como en 0.1.6
     let dot = if (counter / 15) % 2 == 0 { "*" } else { " " };
-    let _ = Text::new("SISTEMA ONLINE ", Point::new(rx + 20, 42), label_style).draw(fb);
-    let _ = Text::new(dot, Point::new(rx + 210, 42), label_style).draw(fb);
+    let _ = Text::new("SISTEMA ONLINE ", Point::new(20, 27), label_style).draw(target);
+    let _ = Text::new(dot, Point::new(210, 27), label_style).draw(target);
 
-    // Logs are now updated via IPC events in SmithayState::handle_event,
-    // so we don't need to poll get_logs() syscall here anymore.
-
+    // Logs: mismas fuentes/espaciado que en v0.1.6
     const MAX_LOG_LINES: usize = 8;
     if *log_len > 0 && *log_len <= log_buf.len() {
         let slice = &log_buf[..*log_len];
         let logs_str = core::str::from_utf8(slice).unwrap_or("");
-        let mut y_off = 60;
+        let mut y_off = 45;
         let log_text_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
         for line in logs_str.lines().take(MAX_LOG_LINES) {
-            let _ = Text::new(line, Point::new(rx + 20, 15 + y_off), log_text_style).draw(fb);
+            let _ = Text::new(line, Point::new(20, y_off), log_text_style).draw(target);
             y_off += 12;
         }
     }

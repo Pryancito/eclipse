@@ -518,22 +518,28 @@ impl Filesystem {
     /// Helper to find child inode in directory data
     fn find_child_in_dir(data: &[u8], target_name: &str) -> Option<u32> {
         let mut offset = 0;
-        // Skip header 8 bytes if passing raw record, but here we pass TLV value
+        let mut records_scanned = 0;
+        
         while offset + 6 <= data.len() {
              let tag = u16::from_le_bytes([data[offset], data[offset+1]]);
              let length = u32::from_le_bytes([
                 data[offset+2], data[offset+3], data[offset+4], data[offset+5]
             ]) as usize;
+            
+            // Loop Guard: Prevent infinite loops on corrupted disk data
+            if length == 0 && tag != tlv_tags::DIRECTORY_ENTRIES {
+                serial::serial_print("[FS] find_child_in_dir: Zero-length TLV found, stopping scan\n");
+                break;
+            }
+
             offset += 6;
             
             if offset + length > data.len() {
-                serial::serial_print("[FS] find_child_in_dir: TLV length exceeds data size\n");
+                serial::serial_printf(format_args!("[FS] find_child_in_dir: TLV length {} exceeds remaining data size {}\n", length, data.len() - (offset - 6)));
                 break; 
             }
 
             if tag == tlv_tags::DIRECTORY_ENTRIES {
-                // Parse dir entries
-                // Format: NameLen(4) + Inode(4) + Name(Len)
                 let dir_data = &data[offset..offset+length];
                 let mut dir_offset = 0;
                 while dir_offset + 8 <= dir_data.len() {
@@ -554,20 +560,19 @@ impl Filesystem {
                     
                     let name_bytes = &dir_data[dir_offset+8..dir_offset+8+name_len];
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
-                        /* 
-                        serial::serial_print("  [DIR] Entry: '");
-                        serial::serial_print(name);
-                        serial::serial_print("' -> Inode ");
-                        serial::serial_print_dec(child_inode as u64);
-                        serial::serial_print("\n");
-                        */
-
                         if name == target_name {
+                            serial::serial_printf(format_args!("[FS] find_child_in_dir: Found '{}' after {} records\n", target_name, records_scanned));
                             return Some(child_inode);
                         }
                     }
                     
-                    dir_offset += 8 + name_len;
+                    if name_len == 0 && dir_data.len() > dir_offset + 8 {
+                        // Avoid infinite loop if name_len is 0 but we aren't at the end
+                        dir_offset += 8;
+                    } else {
+                        dir_offset += 8 + name_len;
+                    }
+                    records_scanned += 1;
                 }
             }
             offset += length;
@@ -659,7 +664,9 @@ impl Filesystem {
     pub fn lookup_path(path: &str) -> Result<u32, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
         unsafe {
-            let _ = FS.header.as_ref().ok_or("FS not mounted")?;
+            if !FS.mounted {
+                return Err("Filesystem not mounted during lookup");
+            }
         }
         
         serial::serial_printf(format_args!("[FS] lookup_path('{}')\n", path));
@@ -675,11 +682,6 @@ impl Filesystem {
             }
             if let Some(dev_name) = parse_device_name(path) {
                 if let Some(_node) = lookup_device(dev_name) {
-                    // Return a "virtual" inode for the device
-                    // We hash the name to get a semi-stable ID or just use a high number
-                    // For now, let's use a simple hashing or just return a dummy high ID.
-                    // A proper implementation would map name -> stable ID.
-                    // hack: simple hash
                     let mut hash: u32 = 0xF0000000;
                     for b in dev_name.bytes() {
                         hash = hash.wrapping_add(b as u32);
@@ -695,40 +697,34 @@ impl Filesystem {
         for part in parts {
             serial::serial_printf(format_args!("[FS] Looking up '{}' in inode {}\n", part, current_inode));
 
-            // Read directory inode
-             // Reuse read logic but we need the raw record to find children
-             let entry = Self::read_inode_entry(current_inode)?;
-                 // Load whole record (same logic as read_file_by_inode basically)
-              let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-              
-              let mut header_buf = [0u8; 8];
-              read_bytes_at(abs_disk_offset, &mut header_buf)?;
-              
-              let record_size = u32::from_le_bytes([
-                 header_buf[4], header_buf[5],
-                 header_buf[6], header_buf[7]
-              ]) as usize;
+            let entry = Self::read_inode_entry(current_inode)?;
+            let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
             
-            serial::serial_printf(format_args!("[FS] Dir record size: {}\n", record_size));
+            let mut header_buf = [0u8; 8];
+            read_bytes_at(abs_disk_offset, &mut header_buf)?;
+            
+            let record_size = u32::from_le_bytes([
+                header_buf[4], header_buf[5],
+                header_buf[6], header_buf[7]
+            ]) as usize;
+            
+            serial::serial_printf(format_args!("[FS] Dir record={} offset=0x{:x} size={}\n", current_inode, abs_disk_offset, record_size));
 
             if record_size < 8 {
-                serial::serial_print("[FS] Error: Record too small (<8)\n");
+                serial::serial_printf(format_args!("[FS] Error: Record {} too small ({})\n", current_inode, record_size));
                 return Err("Invalid directory record size (too small)");
             }
             
-            // OOM Protection
             if record_size > MAX_RECORD_SIZE {
-                 serial::serial_print("[FS] Error: Record too large (>MAX)\n");
-                 return Err("Directory record too large (exceeds MAX_RECORD_SIZE)");
+                 serial::serial_printf(format_args!("[FS] Error: Record {} too large ({})\n", current_inode, record_size));
+                 return Err("Directory record too large");
             }
             
             let mut record_data = vec![0u8; record_size];
+            serial::serial_printf(format_args!("[FS] Reading directory data ({} bytes)...\n", record_size));
             read_bytes_at(abs_disk_offset, &mut record_data)?;
+            serial::serial_print("[FS] Data read complete\n");
          
-            // Search in record
-            // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
-            // Searching in record
-            // Safety: We verified record_size >= 8 above, and record_data.len() == record_size
             if let Some(inode) = Self::find_child_in_dir(&record_data[8..], part) {
                 serial::serial_printf(format_args!("[FS] Found '{}' -> inode {}\n", part, inode));
                 current_inode = inode;

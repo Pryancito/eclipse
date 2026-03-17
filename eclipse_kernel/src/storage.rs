@@ -300,6 +300,8 @@ fn gpt_partition_range(disk_idx: usize, part_num: usize) -> Option<(u64, u64)> {
             let end_lba   = u64::from_le_bytes([e[40],e[41],e[42],e[43],e[44],e[45],e[46],e[47]]);
             let start_byte = start_lba * 512;
             let size_bytes = (end_lba - start_lba + 1) * 512;
+            crate::serial::serial_printf(format_args!("[STORAGE] GPT disk:{}p{} -> start_blk={} size_mib={}\n", 
+                disk_idx, part_num, start_byte / 4096, size_bytes / 1024 / 1024));
             return Some((start_byte, size_bytes));
         }
     }

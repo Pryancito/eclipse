@@ -98,7 +98,57 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         // will still do its CPU blit if it has a front_addr.
         true
     }
-    fn set_cursor(&self, _x: u32, _y: u32) -> bool {
+    fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
+        false
+    }
+    fn wait_vblank(&self, _crtc_id: u32) -> bool {
+        // Simplified: wait_vblank currently just yields if the driver doesn't have 
+        // a real hardware vblank interrupt implemented yet.
+        crate::scheduler::yield_cpu();
+        true
+    }
+    fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        if NVIDIA_FB_INFO.lock().is_some() {
+            (Vec::new(), alloc::vec![7000], alloc::vec![6000])
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+    fn get_connector(&self, id: u32) -> Option<crate::drm::DrmConnector> {
+        if id == 6000 {
+            Some(crate::drm::DrmConnector { id, connected: true, mm_width: 0, mm_height: 0 })
+        } else { None }
+    }
+    fn get_crtc(&self, id: u32) -> Option<crate::drm::DrmCrtc> {
+        if id == 7000 {
+            Some(crate::drm::DrmCrtc { id, fb_id: 0, x: 0, y: 0 })
+        } else { None }
+    }
+    fn get_plane(&self, id: u32) -> Option<crate::drm::DrmPlane> {
+        if id == 8000 {
+            Some(crate::drm::DrmPlane {
+                id,
+                crtc_id: 7000,
+                fb_id: 0,
+                possible_crtcs: 1, // Bitmask for CRTC 7000 (first CRTC)
+                plane_type: 1, // Primary
+            })
+        } else {
+            None
+        }
+    }
+    fn get_planes(&self) -> Vec<u32> {
+        if NVIDIA_FB_INFO.lock().is_some() {
+            alloc::vec![8000]
+        } else {
+            Vec::new()
+        }
+    }
+    fn set_plane(&self, plane_id: u32, crtc_id: u32, fb_id: u32, _x: i32, _y: i32, _w: u32, _h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
+        // For now, only handle the primary plane by performing a page flip
+        if plane_id == 8000 && crtc_id == 7000 {
+            return self.page_flip(fb_id);
+        }
         false
     }
 }

@@ -739,6 +739,7 @@ pub fn get_socket_scheme() -> Option<Arc<SocketScheme>> {
 pub fn init() {
     init_servers();
     crate::scheme::register_scheme("display", Arc::new(DisplayScheme));
+    crate::scheme::register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
     crate::scheme::register_scheme("input", Arc::new(InputScheme::new()));
     crate::scheme::register_scheme("snd", Arc::new(AudioScheme));
     crate::scheme::register_scheme("net", Arc::new(NetworkScheme));

@@ -1792,9 +1792,10 @@ extern "C" fn syscall_handler_rust(
     arg3: u64,
     arg4: u64,
     arg5: u64,
+    arg6: u64,
     context: &mut SyscallContext,
 ) -> u64 {
-    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, context)
+    crate::syscalls::syscall_handler(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6, context)
 }
 
 #[unsafe(naked)]
@@ -1836,14 +1837,14 @@ unsafe extern "C" fn syscall_int80() {
         "mov r8, [rbp - 72]",   // arg4 = saved r10
         "mov r9, [rbp - 56]",   // arg5 = saved r8
         
-        // Pasar puntero al contexto (RSP apunta a r15, que es el inicio de la estructura)
-        // La estructura SyscallContext mapea exactamente el layout del stack desde r15 hasta ss
-        "lea rax, [rbp - 112]", // Dirección de r15
-        "push rax",      // 7º argumento en el stack
+        // Pasar puntero al contexto y arg6 en el stack
+        "lea rax, [rbp - 112]", // Dirección de r15 (Context)
+        "push rax",             // 8º argumento
+        "push qword ptr [rbp - 64]", // 7º argumento (arg6 = saved r9)
         
         "call {}",
         
-        "add rsp, 8", // Limpiar 7º arg
+        "add rsp, 16", // Limpiar args en stack
         
         // Restaurar registros GP (ojo: RSP original está en RBP)
         "mov rsp, rbp",
@@ -1958,11 +1959,12 @@ unsafe extern "C" fn syscall_entry() {
         "mov r9, [rbp - 56]",   // arg5 = saved r8
         
         "lea rax, [rbp - 112]", // Context Ptr (address of r15)
-        "push rax",      // 7th arg
+        "push rax",             // 8th arg (context)
+        "push qword ptr [rbp - 64]", // 7th arg (arg6 = saved r9)
         
         "call {handler}",
         
-        "add rsp, 8", // Pop 7th arg
+        "add rsp, 16", // Pop args
         "mov rsp, rbp", // Restore stack to just after RBP push
         "sub rsp, 112", // Move to start of GPRs (r15)
         

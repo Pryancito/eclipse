@@ -8,9 +8,8 @@ members = [
     "x11_bridge_test",
     "eclipse_std",
     "libs/ipc",
-    "std_test",
 ]
-exclude = ["libs/ipc_tests"]
+exclude = ["libs/ipc_tests", "std_test"]
 
 [workspace.dependencies]
 eclipse_ipc = { path = "libs/ipc" }

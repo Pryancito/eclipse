@@ -436,6 +436,7 @@ impl AhciPort {
 
         // Poll until the HBA clears the bit in PxCI (command consumed)
         let mut i = CMD_POLL_ITERATIONS;
+        let mut warned_slow = false;
         loop {
             if self.preg(PORT_CI) & (1 << slot) == 0 { break; }
 
@@ -453,6 +454,11 @@ impl AhciPort {
                 self.pwreg(PORT_IS,   0xFFFF_FFFF);
                 self.pwreg(PORT_SERR, 0xFFFF_FFFF);
                 return false;
+            }
+
+            if i < CMD_POLL_ITERATIONS / 2 && !warned_slow {
+                serial::serial_printf(format_args!("[AHCI] Slow command poll: slot={} iterations={}\n", slot, CMD_POLL_ITERATIONS - i));
+                warned_slow = true;
             }
 
             if i == 0 {
@@ -487,6 +493,12 @@ impl AhciPort {
         if sector_count == 0 || sector_count > 65535 {
             return false;
         }
+
+        // AHCI Tracing
+        /*
+        serial::serial_printf(format_args!("[AHCI] {}(lba={}, len={})\n", 
+            if write { "WRITE" } else { "READ" }, lba, buf_len));
+        */
 
         let slot = match self.free_slot() {
             Some(s) => s,

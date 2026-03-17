@@ -666,6 +666,10 @@ where
     let size = target.size();
     let w = size.width as i32;
     let h = size.height as i32;
+    // Evitar pánicos por módulo con 0 cuando el target tiene tamaño degenerado.
+    if w <= 0 || h <= 0 {
+        return Ok(());
+    }
     for _ in 0..900 {
         *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
         let mut x = ((*seed % w as u32) as i32 + offset.x) % w;

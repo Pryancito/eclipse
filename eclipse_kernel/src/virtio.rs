@@ -9,6 +9,7 @@ use core::arch::asm;
 
 use crate::serial;
 use crate::storage::BlockDevice;
+use alloc::vec::Vec;
 
 /// Read time stamp counter
 #[inline]
@@ -295,8 +296,144 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
         }
         false
     }
-    fn set_cursor(&self, x: u32, y: u32) -> bool {
-        set_cursor_position(x, y)
+    fn set_cursor(&self, _crtc_id: u32, x: i32, y: i32, handle: u32, flags: u32) -> bool {
+        const DRM_CURSOR_SET: u32 = 0x01;
+        const DRM_CURSOR_MOVE: u32 = 0x02;
+
+        if (flags & DRM_CURSOR_SET) != 0 {
+            if let Some(h) = crate::drm::get_handle(handle) {
+                let mut devices = GPU_DEVICES.lock();
+                if let Some(gpu) = devices.first_mut() {
+                    // Re-create cursor resource with the new backing memory
+                    let _ = gpu.resource_unref(CURSOR_RESOURCE_ID);
+                    if gpu.resource_create_2d(CURSOR_RESOURCE_ID, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, 64, 64).is_ok() {
+                        if gpu.resource_attach_backing(CURSOR_RESOURCE_ID, &[(h.phys_addr, 64*64*4)]).is_ok() {
+                            let _ = gpu.update_cursor(0, x.max(0) as u32, y.max(0) as u32, 0, 0);
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+        
+        if (flags & DRM_CURSOR_MOVE) != 0 {
+            set_cursor_position(x.max(0) as u32, y.max(0) as u32);
+        }
+        true
+    }
+    fn wait_vblank(&self, _crtc_id: u32) -> bool {
+        crate::scheduler::yield_cpu();
+        true
+    }
+    fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut devices = GPU_DEVICES.lock();
+        if let Some(gpu) = devices.first_mut() {
+            if let Ok(scanouts) = gpu.get_scanout_info() {
+                let mut crtcs = Vec::new();
+                let mut connectors = Vec::new();
+                for s in scanouts {
+                    crtcs.push(2000 + s.id);
+                    connectors.push(1000 + s.id);
+                }
+                return (Vec::new(), crtcs, connectors);
+            }
+        }
+        (Vec::new(), alloc::vec![2000], alloc::vec![1000])
+    }
+    fn get_connector(&self, id: u32) -> Option<crate::drm::DrmConnector> {
+        if id >= 1000 && id < 1016 {
+            Some(crate::drm::DrmConnector { id, connected: true, mm_width: 0, mm_height: 0 })
+        } else { None }
+    }
+    fn get_crtc(&self, id: u32) -> Option<crate::drm::DrmCrtc> {
+        if id >= 2000 && id < 2016 {
+            Some(crate::drm::DrmCrtc { id, fb_id: 0, x: 0, y: 0 })
+        } else { None }
+    }
+    fn get_plane(&self, id: u32) -> Option<crate::drm::DrmPlane> {
+        if id >= 3000 && id < 3016 {
+            // Primary Plane
+            let scanout_id = id - 3000;
+            Some(crate::drm::DrmPlane {
+                id,
+                crtc_id: 2000 + scanout_id,
+                fb_id: 0,
+                possible_crtcs: 1 << scanout_id,
+                plane_type: 1, // Primary
+            })
+        } else if id >= 4000 && id < 4016 {
+            // Cursor Plane
+            let scanout_id = id - 4000;
+            Some(crate::drm::DrmPlane {
+                id,
+                crtc_id: 2000 + scanout_id,
+                fb_id: 0,
+                possible_crtcs: 1 << scanout_id,
+                plane_type: 2, // Cursor
+            })
+        } else if id >= 5000 && id < 5016 {
+            // Overlay Plane
+            let scanout_id = id - 5000;
+            Some(crate::drm::DrmPlane {
+                id,
+                crtc_id: 2000 + scanout_id,
+                fb_id: 0,
+                possible_crtcs: 1 << scanout_id,
+                plane_type: 0, // Overlay
+            })
+        } else {
+            None
+        }
+    }
+    fn get_planes(&self) -> Vec<u32> {
+        let mut planes = Vec::new();
+        let mut devices = GPU_DEVICES.lock();
+        if let Some(gpu) = devices.first_mut() {
+            if let Ok(scanouts) = gpu.get_scanout_info() {
+                for s in scanouts {
+                    planes.push(3000 + s.id); // Primary
+                    planes.push(4000 + s.id); // Cursor
+                    planes.push(5000 + s.id); // Overlay
+                }
+            }
+        }
+        if planes.is_empty() {
+            planes.extend(&[3000, 4000, 5000]);
+        }
+        planes
+    }
+    fn set_plane(&self, plane_id: u32, _crtc_id: u32, fb_id: u32, x: i32, y: i32, w: u32, h: u32, _src_x: u32, _src_y: u32, _src_w: u32, _src_h: u32) -> bool {
+        let fb = if let Some(fb) = crate::drm::get_fb(fb_id) { fb } else { return false; };
+        let resource_id = fb.gem_handle_id;
+        
+        if plane_id >= 3000 && plane_id < 3016 {
+            // Primary Plane
+            let scanout_id = plane_id - 3000;
+            let mut devices = GPU_DEVICES.lock();
+            if let Some(gpu) = devices.first_mut() {
+                let _ = gpu.set_scanout(scanout_id, resource_id, 0, 0, fb.width, fb.height);
+                drop(devices);
+                return gpu_present(resource_id, 0, 0, fb.width, fb.height);
+            }
+        } else if plane_id >= 4000 && plane_id < 4016 {
+            // Cursor Plane
+            let scanout_id = plane_id - 4000;
+            let mut devices = GPU_DEVICES.lock();
+            if let Some(gpu) = devices.first_mut() {
+                let _ = gpu.update_cursor(scanout_id, x.max(0) as u32, y.max(0) as u32, 0, 0);
+                return true;
+            }
+        } else if plane_id >= 5000 && plane_id < 5016 {
+            // Overlay Plane (Mocked as secondary scanout if hardware allows)
+            let scanout_id = plane_id - 5000;
+            let mut devices = GPU_DEVICES.lock();
+            if let Some(gpu) = devices.first_mut() {
+                let _ = gpu.set_scanout(scanout_id, resource_id, x.max(0) as u32, y.max(0) as u32, w, h);
+                drop(devices);
+                return gpu_present(resource_id, x.max(0) as u32, y.max(0) as u32, w, h);
+            }
+        }
+        false
     }
 }
 
@@ -345,6 +482,15 @@ struct VirtioGpuDisplayOne {
 struct VirtioGpuRespDisplayInfo {
     hdr: VirtioGpuCtrlHdr,
     pmodes: [VirtioGpuDisplayOne; VIRTIO_GPU_MAX_SCANOUTS],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VirtioScanoutInfo {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub x: u32,
+    pub y: u32,
 }
 
 /// VirtIO GPU MOVE_CURSOR/UPDATE_CURSOR request
@@ -2042,6 +2188,71 @@ impl VirtIOGpuDevice {
             crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
         }
         Ok((width, height))
+    }
+
+    /// Get all enabled scanouts
+    pub fn get_scanout_info(&mut self) -> Result<alloc::vec::Vec<VirtioScanoutInfo>, &'static str> {
+        let queue = self.control_queue.as_mut().ok_or("No control queue")?;
+        let req_size = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        let resp_size = core::mem::size_of::<VirtioGpuRespDisplayInfo>();
+
+        let (req_ptr, req_phys) = crate::memory::alloc_dma_buffer(req_size, 64).ok_or("alloc req failed")?;
+        let (resp_ptr, resp_phys) = crate::memory::alloc_dma_buffer(resp_size, 64).ok_or_else(|| {
+            unsafe { crate::memory::free_dma_buffer(req_ptr, req_size, 64) };
+            "alloc resp failed"
+        })?;
+
+        unsafe {
+            core::ptr::write_bytes(req_ptr, 0, req_size);
+            core::ptr::write_bytes(resp_ptr, 0, resp_size);
+            core::ptr::write_unaligned(
+                req_ptr.add(core::mem::offset_of!(VirtioGpuCtrlHdr, ctrl_type)) as *mut u32,
+                VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
+            );
+            for i in (0..req_size).step_by(64) { clflush((req_ptr as u64) + i as u64); }
+            sfence();
+        }
+
+        let buffers = [
+            (req_phys, req_size as u32, 0u16),
+            (resp_phys, resp_size as u32, VIRTQ_DESC_F_WRITE),
+        ];
+
+        let head = unsafe { queue.add_buf(&buffers).ok_or("add_buf failed")? };
+        unsafe { Self::gpu_notify_queue(self.io_base, self.mmio_base, self.modern_notify_addr, 0); }
+
+        let mut timeout = 1_000_000;
+        while unsafe { !queue.has_used() } {
+            if timeout == 0 { return Err("timeout"); }
+            timeout -= 1;
+            crate::cpu::pause();
+        }
+        let (used_head, _) = unsafe { queue.get_used().unwrap_or((0, 0)) };
+        unsafe { queue.free_desc(used_head); }
+
+        let resp_base = resp_ptr as *const u8;
+        let pmodes_offset = core::mem::offset_of!(VirtioGpuRespDisplayInfo, pmodes);
+        let mode_size = core::mem::size_of::<VirtioGpuDisplayOne>();
+        let enabled_offset = core::mem::offset_of!(VirtioGpuDisplayOne, enabled);
+
+        let mut scanouts = alloc::vec::Vec::new();
+        for i in 0..VIRTIO_GPU_MAX_SCANOUTS {
+            let mode_base = pmodes_offset + i * mode_size;
+            let enabled = unsafe { core::ptr::read_unaligned(resp_base.add(mode_base + enabled_offset) as *const u32) };
+            if enabled != 0 {
+                let rx = unsafe { core::ptr::read_unaligned(resp_base.add(mode_base + core::mem::offset_of!(VirtioGpuDisplayOne, r_x)) as *const u32) };
+                let ry = unsafe { core::ptr::read_unaligned(resp_base.add(mode_base + core::mem::offset_of!(VirtioGpuDisplayOne, r_y)) as *const u32) };
+                let rw = unsafe { core::ptr::read_unaligned(resp_base.add(mode_base + core::mem::offset_of!(VirtioGpuDisplayOne, r_width)) as *const u32) };
+                let rh = unsafe { core::ptr::read_unaligned(resp_base.add(mode_base + core::mem::offset_of!(VirtioGpuDisplayOne, r_height)) as *const u32) };
+                scanouts.push(VirtioScanoutInfo { id: i as u32, x: rx, y: ry, width: rw, height: rh });
+            }
+        }
+
+        unsafe {
+            crate::memory::free_dma_buffer(req_ptr, req_size, 64);
+            crate::memory::free_dma_buffer(resp_ptr, resp_size, 64);
+        }
+        Ok(scanouts)
     }
 
     /// Initialize cursor with image: RESOURCE_CREATE_2D, ATTACH_BACKING, UPDATE_CURSOR

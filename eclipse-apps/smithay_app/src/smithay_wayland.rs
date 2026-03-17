@@ -188,8 +188,6 @@ struct App {
     dashboard_active: bool,
     launcher_active: bool,
     tiling_active: bool,
-    search_active: bool,
-    search_query: std::string::String,
     
     // Performance metrics
     cpu_usage: f32,
@@ -236,8 +234,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         dashboard_active: false,
         launcher_active: false,
         tiling_active: false,
-        search_active: false,
-        search_query: std::string::String::new(),
         cpu_usage: 0.0,
         mem_usage: 0.0,
         net_usage: 0.0,

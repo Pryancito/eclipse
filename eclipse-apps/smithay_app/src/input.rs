@@ -29,10 +29,9 @@ pub enum CompositorEvent {
 pub enum KeyAction {
     None, Clear, SetColor(u8), CycleStrokeSize, SensitivityPlus, SensitivityMinus,
     InvertY, CenterCursor, NewWindow, CloseWindow, CycleForward, CycleBackward,
+    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual,
     Minimize, Maximize, Restore, ToggleDashboard, ToggleLock, ToggleLauncher,
-    SnapLeft, SnapRight, SwitchWorkspace(u8), CycleWindowVisual, ToggleSearch, ToggleSystemCentral,
-    ToggleTiling,
-    ArrowUp, ArrowDown, Input(char), Enter, Backspace,
+    ToggleSystemCentral, ToggleTiling, ToggleSearch, ArrowUp, ArrowDown, Input(char), Enter, Backspace,
 }
 
 pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
@@ -58,10 +57,10 @@ pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
         0x26 => KeyAction::ToggleLock,
         0x1E => KeyAction::ToggleLauncher,
         0x1F => if (modifiers & 8) != 0 { KeyAction::ToggleSystemCentral } else { KeyAction::None },
+        0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None },
         0x4B => KeyAction::SnapLeft,
 
         0x4D => KeyAction::SnapRight,
-        0x39 => if (modifiers & 8) != 0 { KeyAction::ToggleSearch } else { KeyAction::None },
         0x14 => if (modifiers & 8) != 0 { KeyAction::ToggleTiling } else { KeyAction::None },
         0x48 => if (modifiers & 8) != 0 { KeyAction::Maximize } else { KeyAction::ArrowUp },
         0x50 => KeyAction::ArrowDown,
@@ -141,12 +140,10 @@ pub struct InputState {
     pub tiling_active: bool,
     pub request_toggle_tiling: bool,
     pub alt_tab_active: bool,
-    pub search_active: bool,
-    pub search_query: heapless::String<32>,
-    pub search_selected_idx: usize,
-    pub search_curr_y: f32,
     pub system_central_active: bool,
     pub system_central_curr_y: f32,
+    pub search_active: bool,
+    pub search_curr_y: f32,
 }
 
 
@@ -166,9 +163,9 @@ impl InputState {
             context_menu_pos: Point::new(0, 0),
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
             tiling_active: false, request_toggle_tiling: false,
-            alt_tab_active: false, search_active: false, search_query: heapless::String::<32>::new(),
-            search_selected_idx: 0, search_curr_y: 0.0,
+            alt_tab_active: false,
             system_central_active: false, system_central_curr_y: 0.0,
+            search_active: false, search_curr_y: -(height as f32 / 2.0),
         }
 
     }
@@ -188,16 +185,7 @@ impl InputState {
                     0x5B => { if pressed { self.modifiers |= 8; } else { self.modifiers &= !8; } }
                     _ => {}
                 }
-                let action = if self.search_active {
-                    match code {
-                        0x01 => KeyAction::ToggleSearch,
-                        0x1C => KeyAction::Enter,
-                        0x0E => KeyAction::Backspace,
-                        0x48 => KeyAction::ArrowUp,
-                        0x50 => KeyAction::ArrowDown,
-                        _ => { if let Some(c) = scancode_to_char(code as u16, (self.modifiers & 1) != 0) { KeyAction::Input(c) } else { KeyAction::None } }
-                    }
-                } else if self.modifiers & (4 | 8) != 0 {
+                let action = if self.modifiers & (4 | 8) != 0 {
                     scancode_to_action(ev.code, self.modifiers)
                 } else {
                     KeyAction::None
@@ -240,10 +228,7 @@ impl InputState {
                     KeyAction::ToggleDashboard => if pressed && self.modifiers == 8 { self.request_dashboard = true; },
                     KeyAction::ToggleLock => if pressed && (self.modifiers & 8 != 0) { self.lock_active = !self.lock_active; },
                     KeyAction::ToggleLauncher => if pressed && (self.modifiers & 8 != 0) { self.launcher_active = !self.launcher_active; },
-                    KeyAction::ToggleSearch => if pressed { 
-                        self.search_active = !self.search_active; 
-                        if self.search_active { self.search_query.clear(); self.dashboard_active = false; } 
-                    },
+                    KeyAction::ToggleSearch => if pressed && (self.modifiers & 8 != 0) { self.search_active = !self.search_active; },
                     KeyAction::SnapLeft => if pressed && (self.modifiers & 8 != 0) {
                         if let Some(idx) = self.focused_window {
                             if idx < *window_count {
@@ -266,17 +251,11 @@ impl InputState {
                     },
                     KeyAction::SwitchWorkspace(w) => if pressed && (self.modifiers & 8 != 0) { self.current_workspace = w; },
                     KeyAction::CycleWindowVisual => if pressed && (self.modifiers & 4 != 0) { self.alt_tab_active = true; self.request_cycle_forward = true; },
-                    KeyAction::ArrowUp => if pressed && self.search_active { self.search_selected_idx = self.search_selected_idx.saturating_sub(1); },
-                    KeyAction::ArrowDown => if pressed && self.search_active { self.search_selected_idx += 1; },
-                    KeyAction::Backspace => if pressed && self.search_active { self.search_query.pop(); },
-                    KeyAction::Enter => if pressed && self.search_active { self.execute_search(); self.search_active = false; },
-                    KeyAction::ToggleSystemCentral => if pressed { 
-                        self.system_central_active = !self.system_central_active; 
-                        if self.system_central_active { self.dashboard_active = false; self.search_active = false; }
-                    },
-                    KeyAction::ToggleTiling => if pressed { self.request_toggle_tiling = true; },
-                    KeyAction::Input(c) => if pressed && self.search_active { if self.search_query.len() < 32 { let _ = self.search_query.push(c); } },
-
+                    KeyAction::ToggleSystemCentral => if pressed && (self.modifiers & 8 != 0) { self.system_central_active = !self.system_central_active; },
+                    KeyAction::ToggleTiling => if pressed && (self.modifiers & 8 != 0) { self.request_toggle_tiling = true; },
+                    KeyAction::ArrowUp | KeyAction::ArrowDown => {},
+                    KeyAction::Input(_) => {},
+                    KeyAction::Enter | KeyAction::Backspace => {},
                 }
                 if !pressed && ev.code == 0x0F { self.alt_tab_active = false; }
             }
@@ -370,7 +349,7 @@ impl InputState {
                             0 => self.request_dashboard = true,
                             1 => {
                                 self.system_central_active = !self.system_central_active;
-                                if self.system_central_active { self.dashboard_active = false; self.search_active = false; }
+                                if self.system_central_active { self.dashboard_active = false; }
                             },
                             2 => {
                                 self.launcher_active = !self.launcher_active;
@@ -439,8 +418,6 @@ impl InputState {
     }
 
     pub fn execute_search(&mut self) {
-        if self.search_query == "term" { self.request_new_window = true; }
-        else if self.search_query == "lock" { self.lock_active = true; }
     }
 }
 

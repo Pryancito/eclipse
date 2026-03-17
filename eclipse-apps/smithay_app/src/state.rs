@@ -188,6 +188,11 @@ impl SmithayState {
                     &self.surfaces,
                 );
                 
+                // If it was a mouse move, update hardware cursor position immediately
+                if ev.event_type == 1 {
+                    self.backend.fb.set_cursor_position(self.input.cursor_x, self.input.cursor_y);
+                }
+                
                 // If we are dragging a window or cursor moved, full redraw
                 // For now, if anything but move happened, we might need more.
                 // Move is the most common.
@@ -296,9 +301,14 @@ impl SmithayState {
         }
     }
 
+    /// Procesa IPC sin colgar el frame: drena el buzón del kernel (evita "buzon lleno")
+    /// pero limita eventos procesados por frame para seguir haciendo render/update a ~60 FPS.
     pub fn handle_ipc(&mut self) {
+        #[cfg(not(test))]
+        self.backend.drain_ipc_into_pending(128);
+        const EVENTS_PER_FRAME: usize = 64;
         let mut events_processed = 0usize;
-        while events_processed < 64 {
+        while events_processed < EVENTS_PER_FRAME {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
@@ -815,12 +825,14 @@ impl SmithayState {
         let full_rect = Rectangle::new(Point::new(0, 0), Size::new(fb_w as u32, fb_h as u32));
 
         if !self.input.lock_active {
+            // Fondo de escritorio + logo + sidebar + HUD de logs
+            // Igual que en v0.1.6: el HUD forma parte del fondo, no de un overlay separado.
             render::draw_desktop_shell(
-                &mut self.backend.fb, 
-                &self.space.windows, 
-                self.space.window_count, 
-                self.counter, 
-                self.input.cursor_x, 
+                &mut self.backend.fb,
+                &self.space.windows,
+                self.space.window_count,
+                self.counter,
+                self.input.cursor_x,
                 self.input.cursor_y,
                 &mut self.log_buf,
                 &mut self.log_len,
@@ -860,15 +872,26 @@ impl SmithayState {
 
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
+
+            if self.input.launcher_curr_y < fb_h as f32 {
+                render::draw_launcher(&mut self.backend.fb, self.input.launcher_curr_y);
+            }
+
+            if self.input.alt_tab_active {
+                render::draw_alt_tab_hud(&mut self.backend.fb, &self.space.windows, self.space.window_count, self.input.focused_window);
+            }
         } else {
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
         // Cursor de software reactivado; el DrawTarget del framebuffer ya recorta por bounds,
         // así que cualquier coordenada fuera de pantalla debería ignorarse sin provocar fallos.
-        render::draw_cursor(
-            &mut self.backend.fb,
-            embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
-        );
+        // Solo dibujamos cursor de software si no tenemos uno de hardware activo.
+        if self.backend.fb.cursor_handle.0 == 0 {
+            render::draw_cursor(
+                &mut self.backend.fb,
+                embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
+            );
+        }
 
         self.backend.fb.present();
 

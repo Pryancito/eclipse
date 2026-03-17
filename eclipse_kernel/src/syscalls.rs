@@ -157,6 +157,7 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     arg4: u64,
     arg5: u64,
+    arg6: u64,
     context: &mut crate::interrupts::SyscallContext,
 ) -> u64 {
     let pid = crate::process::current_process_id().unwrap_or(0);
@@ -222,16 +223,14 @@ pub extern "C" fn syscall_handler(
          }
     }
 
-    let (syscall_num, arg1, arg2, arg3, arg4, arg5) = if is_linux {
-        match translate_linux_abi_unique(syscall_num, arg1, arg2, arg3, arg4, arg5) {
+    let (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) = if is_linux {
+        match translate_linux_abi_unique(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) {
             Some(t) => t,
-            None => (syscall_num, arg1, arg2, arg3, arg4, arg5),
+            None => (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6),
         }
     } else {
-        (syscall_num, arg1, arg2, arg3, arg4, arg5)
+        (syscall_num, arg1, arg2, arg3, arg4, arg5, arg6)
     };
-    let _arg4 = arg4;
-    let _arg5 = arg5;
 
     let ret = match syscall_num {
         0 => sys_exit(arg1),
@@ -256,11 +255,11 @@ pub extern "C" fn syscall_handler(
         17 => sys_pci_enum_devices(arg1, arg2, arg3),
         18 => sys_pci_read_config(arg1, arg2, arg3),
         19 => sys_pci_write_config(arg1, arg2, arg3),
-        20 => sys_mmap(arg1, arg2, arg3, _arg4, _arg5),
+        20 => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         21 => sys_munmap(arg1, arg2),
         22 => sys_clone(arg1, arg2, arg3),
         23 => sys_gettid(),
-        24 => sys_futex(arg1, arg2, arg3, _arg4),
+        24 => sys_futex(arg1, arg2, arg3, arg4),
         25 => sys_nanosleep(arg1),
         26 => sys_brk(arg1),
         27 => sys_register_device(arg1, arg2, arg3),
@@ -799,44 +798,45 @@ fn translate_linux_abi_unique(
     arg3: u64,
     arg4: u64,
     arg5: u64,
-) -> Option<(u64, u64, u64, u64, u64, u64)> {
-    let (eclipse_num, a1, a2, a3, a4, a5) = match num {
-        0 => (2, arg1, arg2, arg3, arg4, arg5),           // read -> 2
-        1 => (1, arg1, arg2, arg3, arg4, arg5),           // write -> 1
+    arg6: u64,
+) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
+    let (eclipse_num, a1, a2, a3, a4, a5, a6) = match num {
+        0 => (2, arg1, arg2, arg3, arg4, arg5, arg6),           // read -> 2
+        1 => (1, arg1, arg2, arg3, arg4, arg5, arg6),           // write -> 1
         2 => {
             let path_len = strlen_user_unique(arg1, 4096);
-            (11, arg1, path_len, arg2, arg4, arg5)        // open(path, flags, mode) -> 11(path, len, flags)
+            (11, arg1, path_len, arg2, arg4, arg5, arg6)        // open(path, flags, mode) -> 11(path, len, flags)
         }
-        3 => (12, arg1, arg2, arg3, arg4, arg5),          // close -> 12
-        5 => (30, arg1, arg2, arg3, arg4, arg5),          // fstat -> 30
-        8 => (14, arg1, arg2, arg3, arg4, arg5),          // lseek -> 14
-        9 => (20, arg1, arg2, arg3, arg4, arg5),          // mmap -> 20
-        11 => (21, arg1, arg2, arg3, arg4, arg5),         // munmap -> 21
-        12 => (26, arg1, arg2, arg3, arg4, arg5),         // brk -> 26
-        16 => (34, arg1, arg2, arg3, arg4, arg5),        // ioctl -> 34
-        39 => (6, arg1, arg2, arg3, arg4, arg5),          // getpid -> 6
-        60 => (0, arg1, arg2, arg3, arg4, arg5),         // exit -> 0
-        41 => (100, arg1, arg2, arg3, arg4, arg5),        // socket -> 100
-        42 => (104, arg1, arg2, arg3, arg4, arg5),        // connect -> 104
-        43 => (103, arg1, arg2, arg3, arg4, arg5),        // accept -> 103
-        49 => (101, arg1, arg2, arg3, arg4, arg5),        // bind -> 101
-        50 => (102, arg1, arg2, arg3, arg4, arg5),        // listen -> 102
-        83 => (105, arg1, arg2, arg3, arg4, arg5),        // mkdir -> 105
-        87 => (109, arg1, arg2, arg3, arg4, arg5),        // unlink -> 109
-        54 => (107, arg1, arg2, arg3, arg4, arg5),        // setsockopt -> 107
-        55 => (108, arg1, arg2, arg3, arg4, arg5),        // getsockopt -> 108
-        158 => (32, arg1, arg2, arg3, arg4, arg5),       // arch_prctl (TLS: ARCH_SET_FS etc.) -> 32
-        186 => (23, arg1, arg2, arg3, arg4, arg5),       // gettid -> 23
-        231 => (0, arg1, arg2, arg3, arg4, arg5),        // exit_group -> 0 (exit)
-        262 => (106, arg1, arg2, arg3, arg4, arg5),       // fstatat -> 106
-        35 => (25, arg1, arg2, arg3, arg4, arg5),          // nanosleep -> 25
-        318 => (33, arg1, arg2, arg3, arg4, arg5),         // getrandom -> sys_getrandom (33)
-        56 => (22, arg1, arg2, arg3, arg4, arg5),          // clone  -> sys_clone (22)
-        57 => (7,  arg1, arg2, arg3, arg4, arg5),          // fork   -> sys_fork  (7)
-        61 => (9,  arg1, arg2, arg3, arg4, arg5),          // wait4  -> sys_wait  (9)
+        3 => (12, arg1, arg2, arg3, arg4, arg5, arg6),          // close -> 12
+        5 => (30, arg1, arg2, arg3, arg4, arg5, arg6),          // fstat -> 30
+        8 => (14, arg1, arg2, arg3, arg4, arg5, arg6),          // lseek -> 14
+        9 => (20, arg1, arg2, arg3, arg4, arg5, arg6),          // mmap -> 20
+        11 => (21, arg1, arg2, arg3, arg4, arg5, arg6),         // munmap -> 21
+        12 => (26, arg1, arg2, arg3, arg4, arg5, arg6),         // brk -> 26
+        16 => (34, arg1, arg2, arg3, arg4, arg5, arg6),        // ioctl -> 34
+        39 => (6, arg1, arg2, arg3, arg4, arg5, arg6),          // getpid -> 6
+        60 => (0, arg1, arg2, arg3, arg4, arg5, arg6),         // exit -> 0
+        41 => (100, arg1, arg2, arg3, arg4, arg5, arg6),        // socket -> 100
+        42 => (104, arg1, arg2, arg3, arg4, arg5, arg6),        // connect -> 104
+        43 => (103, arg1, arg2, arg3, arg4, arg5, arg6),        // accept -> 103
+        49 => (101, arg1, arg2, arg3, arg4, arg5, arg6),        // bind -> 101
+        50 => (102, arg1, arg2, arg3, arg4, arg5, arg6),        // listen -> 102
+        83 => (105, arg1, arg2, arg3, arg4, arg5, arg6),        // mkdir -> 105
+        87 => (109, arg1, arg2, arg3, arg4, arg5, arg6),        // unlink -> 109
+        54 => (107, arg1, arg2, arg3, arg4, arg5, arg6),        // setsockopt -> 107
+        55 => (108, arg1, arg2, arg3, arg4, arg5, arg6),        // getsockopt -> 108
+        158 => (32, arg1, arg2, arg3, arg4, arg5, arg6),       // arch_prctl (TLS: ARCH_SET_FS etc.) -> 32
+        186 => (23, arg1, arg2, arg3, arg4, arg5, arg6),       // gettid -> 23
+        231 => (0, arg1, arg2, arg3, arg4, arg5, arg6),        // exit_group -> 0 (exit)
+        262 => (106, arg1, arg2, arg3, arg4, arg5, arg6),       // fstatat -> 106
+        35 => (25, arg1, arg2, arg3, arg4, arg5, arg6),          // nanosleep -> 25
+        318 => (33, arg1, arg2, arg3, arg4, arg5, arg6),         // getrandom -> sys_getrandom (33)
+        56 => (22, arg1, arg2, arg3, arg4, arg5, arg6),          // clone  -> sys_clone (22)
+        57 => (7,  arg1, arg2, arg3, arg4, arg5, arg6),          // fork   -> sys_fork  (7)
+        61 => (9,  arg1, arg2, arg3, arg4, arg5, arg6),          // wait4  -> sys_wait  (9)
         _ => return None,
     };
-    Some((eclipse_num, a1, a2, a3, a4, a5))
+    Some((eclipse_num, a1, a2, a3, a4, a5, a6))
 }
 
 /// Verify if a pointer range points to valid user memory
@@ -2441,7 +2441,7 @@ fn sys_pci_write_config(device_location: u64, offset: u64, value: u64) -> u64 {
 ///   fd: File descriptor (ignored for anonymous mappings)
 /// 
 /// Returns: Address of mapped region, or u64::MAX on error
-fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
+fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
     use crate::process::{self, VMARegion};
     use crate::memory;
     use crate::serial;
@@ -2516,7 +2516,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> u64 {
                 if let Ok(phys) = crate::scheme::fmap(
                     fde.scheme_id,
                     fde.resource_id,
-                    0,
+                    offset as usize,
                     aligned_length as usize,
                 ) {
                     fmap_phys_base = Some(phys as u64);

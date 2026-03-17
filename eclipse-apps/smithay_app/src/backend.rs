@@ -10,6 +10,8 @@ use eclipse_syscall::InputEvent;
 use libc::{open, read, O_RDONLY, O_NONBLOCK};
 #[cfg(test)]
 use alloc::collections::VecDeque;
+#[cfg(not(test))]
+use heapless::Deque;
 
 /// Backend represents the hardware/OS interface.
 /// It encapsulates the Framebuffer and IPC capabilities.
@@ -19,6 +21,9 @@ pub struct Backend {
     input_fd: Option<i32>,
     #[cfg(test)]
     input_queue: VecDeque<InputEvent>,
+    /// Eventos IPC drenados al inicio del frame para no llenar el buzón del kernel (PID 9).
+    #[cfg(not(test))]
+    ipc_pending: Deque<CompositorEvent, 256>,
 }
 
 impl Backend {
@@ -49,6 +54,8 @@ impl Backend {
             input_fd,
             #[cfg(test)]
             input_queue: VecDeque::new(),
+            #[cfg(not(test))]
+            ipc_pending: Deque::new(),
         })
     }
 
@@ -56,7 +63,27 @@ impl Backend {
         if let Some(ev) = self.poll_input_scheme_event() {
             return Some(ev);
         }
+        #[cfg(not(test))]
+        if let Some(ev) = self.ipc_pending.pop_front() {
+            return Some(ev);
+        }
         self.ipc.process_messages()
+    }
+
+    /// Drena el buzón IPC al inicio del frame para evitar "buzon lleno" (send_ipc falla al display).
+    /// Cuando el compositor prioriza el scheme de input, casi no llama a process_messages; así
+    /// el buzón se vacía cada frame y el input-service no recibe ret=-1.
+    #[cfg(not(test))]
+    pub fn drain_ipc_into_pending(&mut self, max: usize) {
+        for _ in 0..max {
+            if let Some(ev) = self.ipc.process_messages() {
+                if self.ipc_pending.push_back(ev).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     fn poll_input_scheme_event(&mut self) -> Option<CompositorEvent> {
@@ -93,10 +120,8 @@ impl Backend {
         let _ = self.fb.present();
     }
 
-    /// Returns true if the `input:` scheme was successfully opened and can be
-    /// used to read hardware input events directly.  When false, the compositor
-    /// should fall back to subscribing for IPC input events from the
-    /// input_service instead.
+    /// Returns true if the `input:` scheme was successfully opened; ratón y teclado
+    /// se leen solo por este scheme, no por IPC.
     pub fn input_scheme_available(&self) -> bool {
         self.input_fd.is_some()
     }

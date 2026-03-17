@@ -355,17 +355,22 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
 
     serial::serial_print("[INIT] Initializing Filesystem...\n");
     filesystem::init();
-    progress::bar(90);
-    
-    serial::serial_print("[INIT] Initialization Complete. Signaling APs.\n");
+    // Notify APs that system boot is complete, so they can start their scheduler loops.
+    // We do this BEFORE loading the init process to ensure all cores are ready.
+    serial::serial_print("[BOOT] Releasing APs for scheduler...\n");
     crate::cpu::SYSTEM_BOOT_COMPLETE.store(true, core::sync::atomic::Ordering::SeqCst);
+    
+    // Small delay to allow APs to enter their respective loops and print their names
+    // before we start hitting the filesystem heavily.
+    for _ in 0..1_000_000 { crate::cpu::pause(); }
+    serial::serial_print("[BOOT] APs released, proceeding to init\n");
     
     // Final Stage: Jump to main loop
     kernel_main(boot_info);
 }
 
 /// Función principal del kernel
-pub fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
+extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // Framebuffer info is now handled centrally by boot::get_framebuffer_info()
     // No need to store it manually
     
