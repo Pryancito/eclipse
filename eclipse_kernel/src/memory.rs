@@ -26,10 +26,9 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// Size of the kernel region with offset-based mapping (256MB)
 const KERNEL_REGION_SIZE: u64 = 0x10000000;
 
-/// Kernel heap size (64 MB)
-/// Reduced from 128MB to avoid physical memory conflict with the 3GB PCI hole
-/// (Kernel starts at ~2.87GB, so a 128MB heap would cross the 3GB limit).
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
+/// Kernel heap size (256 MB)
+/// Increased from 64MB to provide more space for DMA buffers.
+const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 /// Static kernel heap
 #[repr(align(4096))]

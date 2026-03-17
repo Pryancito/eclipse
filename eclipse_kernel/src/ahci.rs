@@ -581,7 +581,7 @@ impl AhciPort {
     /// Read `buffer.len()` bytes (must be a multiple of 512) starting at `lba`.
     pub fn read_sectors(&self, lba: u64, buffer: &mut [u8]) -> bool {
         if buffer.len() % SECTOR_SIZE != 0 { return false; }
-        serial::serial_printf(format_args!("[AHCI] read_sectors: lba={} count={}\n", lba, buffer.len() / SECTOR_SIZE));
+        // serial::serial_printf(format_args!("[AHCI] read_sectors: lba={} count={}\n", lba, buffer.len() / SECTOR_SIZE));
         let phys = memory::virt_to_phys(buffer.as_ptr() as u64);
         self.rw_dma(lba, phys, buffer.len(), false)
     }

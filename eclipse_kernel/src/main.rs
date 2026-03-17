@@ -118,7 +118,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let pitch = *pitch_ptr;
         
         if fb_base != 0 && fb_base != 0xDEADBEEF {
-            let fb = fb_base as *mut u32;
+            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
             for y in 0..10 {
                 for x in 30..40 {
                     *fb.add(y * pitch as usize + x) = 0xFF0000;
@@ -167,7 +167,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // DIAGNÓSTICO: CYAN SQUARE (40,0) después de boot::init
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32;
+            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
             for y in 0..10 {
                 for x in 40..50 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0x00FFFF; // Cyan
@@ -179,7 +179,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // DIAGNÓSTICO: YELLOW SQUARE (50,0) antes de progress::bar(42)
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32; // Identity (physical)
+            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32; // HHDM (Virtual)
             for y in 0..10 {
                 for x in 50..60 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0xFFFF00; // Yellow
@@ -207,7 +207,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32;
+            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
             for y in 0..10 {
                 for x in 60..70 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF; // White
@@ -418,7 +418,7 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     let cpu_id = crate::process::get_cpu_id();
     serial::serial_printf(format_args!("\n[C{}] [KERNEL] System initialization complete!\n\n", cpu_id));
     progress::bar(100);
-    progress::stop_logging();
+    //progress::stop_logging();
 
     loop {
         // Heartbeat IPC (solo un núcleo lo imprimirá cada 5s)

@@ -36,7 +36,7 @@
 //! - Nova: https://docs.kernel.org/next/gpu/nova/index.html
 //! - open-gpu-kernel-modules: https://github.com/NVIDIA/open-gpu-kernel-modules
 
-use crate::pci::{PciDevice, find_nvidia_gpus, get_bar};
+use crate::pci::{PciDevice, find_nvidia_gpus, get_bar, get_bar_size};
 use crate::memory::{map_mmio_range, map_framebuffer_kernel, PHYS_MEM_OFFSET, GPU_FW_PHYS_BASE, GPU_FW_MAX_SIZE, GPU_RPC_PHYS_BASE, GPU_RPC_MAX_SIZE};
 use crate::serial;
 use crate::filesystem;
@@ -61,6 +61,36 @@ struct NvidiaFbInfo {
 
 static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
 
+/// Simple chunk-based VRAM allocator for BAR1 aperture
+struct NvidiaVramAllocator {
+    base_phys: u64,
+    total_size: u64,
+    next_offset: u64,
+}
+
+impl NvidiaVramAllocator {
+    fn new(base_phys: u64, total_size: u64) -> Self {
+        Self {
+            base_phys,
+            total_size,
+            next_offset: 0,
+        }
+    }
+
+    fn alloc(&mut self, size: usize, align: usize) -> Option<u64> {
+        let align = align as u64;
+        let size = size as u64;
+        let start = (self.next_offset + align - 1) & !(align - 1);
+        if start + size > self.total_size {
+            return None;
+        }
+        self.next_offset = start + size;
+        Some(self.base_phys + start)
+    }
+}
+
+static VRAM_ALLOCATOR: Mutex<Option<NvidiaVramAllocator>> = Mutex::new(None);
+
 /// Kernel mapping of BAR1 framebuffer (size mapped) so we only map once.
 static NVIDIA_BAR1_MAPPED_SIZE: Mutex<Option<usize>> = Mutex::new(None);
 
@@ -82,6 +112,17 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         }
     }
     fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
+        // Try to allocate from VRAM first (BAR1 aperture)
+        {
+            let mut allocator = VRAM_ALLOCATOR.lock();
+            if let Some(ref mut a) = *allocator {
+                if let Some(phys) = a.alloc(size, 4096) {
+                    return Some(crate::drm::GemHandle { id: phys as u32, size, phys_addr: phys });
+                }
+            }
+        }
+
+        // Fallback to system DMA memory
         unsafe {
             let (_ptr, phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
             Some(crate::drm::GemHandle { id: phys as u32, size, phys_addr: phys })
@@ -89,13 +130,39 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
     }
     fn create_fb(&self, handle_id: u32, _width: u32, _height: u32, _pitch: u32) -> Option<u32> {
         // Simple case: just treat the handle as the FB ID.
-        // On real NVIDIA hardware, we'd notify GSP here.
         Some(handle_id)
     }
-    fn page_flip(&self, _fb_id: u32) -> bool {
-        // Placeholder for hardware page flip.
-        // For now, if we're not using hardware flipping, the backend
-        // will still do its CPU blit if it has a front_addr.
+    fn page_flip(&self, fb_id: u32) -> bool {
+        let fb_phys = fb_id as u64;
+        let (phys, _width, height, pitch) = match get_nvidia_fb_info() {
+            Some(i) => i,
+            None => return false,
+        };
+
+        if fb_phys == phys {
+            return true;
+        }
+
+        // Shadow blit: copy from GEM buffer (fb_phys) to active scanout base (phys)
+        let size = (pitch as usize) * (height as usize);
+        
+        // Ensure BAR1 is mapped in kernel space
+        {
+            let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
+            if guard.is_none() || guard.unwrap() < (fb_phys - phys + size as u64) as usize {
+                // Determine a safe mapping size (at least 32MB for Turing+)
+                let map_size = core::cmp::max(32 * 1024 * 1024, (fb_phys - phys + size as u64) as usize);
+                map_framebuffer_kernel(phys, map_size);
+                *guard = Some(map_size);
+            }
+        }
+
+        let src_vaddr = crate::memory::FB_VADDR_BASE + fb_phys;
+        let dst_vaddr = crate::memory::FB_VADDR_BASE + phys;
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_vaddr as *const u8, dst_vaddr as *mut u8, size);
+        }
         true
     }
     fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
@@ -821,18 +888,31 @@ pub fn init() {
             if bar1_phys != 0 {
                 let mut guard = NVIDIA_FB_INFO.lock();
                 if guard.is_none() {
-                    // Use 1920×1080 as a conservative default resolution.
-                    // The VBIOS programs the actual display mode before the OS boots;
-                    // userspace renderers use the full BAR1 aperture and are not
-                    // constrained to this size – they simply write pixels at the
-                    // correct pitch for whatever mode the hardware is in.  If the
-                    // physical display differs (e.g. 4K), the image will appear in
-                    // the top-left corner until a real mode-set is implemented.
                     let width  = 1920u32;
                     let height = 1080u32;
                     let pitch  = width * 4;
                     *guard = Some(NvidiaFbInfo { phys: bar1_phys, width, height, pitch });
+                    
+                    // Initialize VRAM allocator for BAR1
+                    let bar1_size = unsafe { get_bar_size(gpu, 1) };
+                    // Default to 32MB if size unknown, clamp to 256MB max for now to avoid overmapping
+                    let alloc_size = if bar1_size == 0 { 32 * 1024 * 1024 } else { bar1_size.min(256 * 1024 * 1024) };
+                    
+                    let mut vram_guard = VRAM_ALLOCATOR.lock();
+                    *vram_guard = Some(NvidiaVramAllocator::new(bar1_phys, alloc_size));
+                    
+                    serial::serial_print("[NVIDIA]   ✓ BAR1 size detected: ");
+                    serial::serial_print_dec(alloc_size / (1024 * 1024));
+                    serial::serial_print(" MB\n");
                     serial::serial_print("[NVIDIA]   ✓ BAR1 stored as display fallback (1920×1080)\n");
+                    serial::serial_print("[NVIDIA]   ✓ VRAM allocator initialized\n");
+
+                    // Pre-map BAR1 in kernel for shadow blit
+                    let mut map_guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
+                    if map_guard.is_none() {
+                        map_framebuffer_kernel(bar1_phys, alloc_size as usize);
+                        *map_guard = Some(alloc_size as usize);
+                    }
                 }
             }
         }

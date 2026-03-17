@@ -10,8 +10,8 @@ use eclipsefs_lib::NodeKind;
 /// Block size for filesystem operations
 pub const BLOCK_SIZE: usize = 4096;
 
-/// Maximum record size to prevent OOM (16 MiB)
-pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum record size to prevent OOM (32 MiB)
+pub const MAX_RECORD_SIZE: usize = 32 * 1024 * 1024;
 
 const INODE_CACHE_SIZE: usize = 64;
 
@@ -106,7 +106,7 @@ static mut FS: Filesystem = Filesystem {
 /// Read a range of bytes directly from disk, potentially spanning block boundaries.
 fn read_bytes_at(abs_offset: u64, dest: &mut [u8]) -> Result<(), &'static str> {
     let mut bytes_read = 0;
-    let mut block_buffer = [0u8; BLOCK_SIZE];
+    let mut block_buffer = vec![0u8; BLOCK_SIZE];
     
     while bytes_read < dest.len() {
         let current_pos = abs_offset + bytes_read as u64;

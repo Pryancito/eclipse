@@ -963,7 +963,7 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     stats.read_calls += 1;
     drop(stats);
     
-    if buf_ptr == 0 || len == 0 || len > 1024 * 1024 {
+    if buf_ptr == 0 || len == 0 || len > 32 * 1024 * 1024 {
         return u64::MAX;
     }
     

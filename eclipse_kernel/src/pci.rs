@@ -575,6 +575,48 @@ pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
     }
 }
 
+/// Get the size of a BAR (Base Address Register) by writing all 1s and reading back
+/// how many bits the device actually implements.
+pub unsafe fn get_bar_size(dev: &PciDevice, bar_index: u8) -> u64 {
+    let offset = PCI_REG_BAR0 + (bar_index * 4);
+    
+    // Save current BAR value
+    let original = pci_config_read_u32(dev.bus, dev.device, dev.function, offset);
+    
+    // Write all 1s to the BAR
+    pci_config_write_u32(dev.bus, dev.device, dev.function, offset, 0xFFFF_FFFF);
+    
+    // Read back bits implemented by the device
+    let mask = pci_config_read_u32(dev.bus, dev.device, dev.function, offset);
+    
+    // Restore original value
+    pci_config_write_u32(dev.bus, dev.device, dev.function, offset, original);
+    
+    if (original & 0x1) != 0 {
+        // I/O space BAR: size is ~mask + 1
+        let size_mask = mask & !0x3;
+        if size_mask == 0 { return 0; }
+        (!(size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF
+    } else {
+        // Memory space BAR: check for 64-bit bits 2:1 = 0b10
+        if (original & 0x6) == 0x4 {
+            let original_hi = pci_config_read_u32(dev.bus, dev.device, dev.function, offset + 4);
+            pci_config_write_u32(dev.bus, dev.device, dev.function, offset + 4, 0xFFFF_FFFF);
+            let mask_hi = pci_config_read_u32(dev.bus, dev.device, dev.function, offset + 4);
+            pci_config_write_u32(dev.bus, dev.device, dev.function, offset + 4, original_hi);
+            
+            let full_mask = ((mask_hi as u64) << 32) | (mask as u64);
+            let size_mask = full_mask & !0xF;
+            if size_mask == 0 { return 0; }
+            (!size_mask).wrapping_add(1)
+        } else {
+            let size_mask = mask & !0xF;
+            if size_mask == 0 { return 0; }
+            ((!size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF
+        }
+    }
+}
+
 /// Find first capability with given ID. Returns offset in config space (0 = not found).
 pub unsafe fn pci_find_capability(dev: &PciDevice, cap_id: u8) -> u8 {
     let mut pos = pci_config_read_u8(dev.bus, dev.device, dev.function, PCI_REG_CAP_PTR);
