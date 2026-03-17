@@ -492,8 +492,8 @@ fn load_elf64_segments(bs: &BootServices, file: &mut RegularFile) -> Result<(u64
     
     let total_pages = ((total_size + 0xFFF) / 0x1000) as usize;
 
-    // Reservar memoria física - usar BOOT_SERVICES_CODE para que UEFI no la reutilice después de exit
-    if let Err(st) = bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::BOOT_SERVICES_CODE, total_pages) {
+    // Reservar memoria física - usar LOADER_DATA para que persista después de exit_boot_services
+    if let Err(st) = bs.allocate_pages(AllocateType::Address(kernel_phys_base), MemoryType::LOADER_DATA, total_pages) {
         return Err(BootError::LoadSegment { status: st.status(), seg_index: 0, addr: kernel_phys_base, pages: total_pages });
     }
 
@@ -735,7 +735,7 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
     
     let mut allocated_addr;
     
-    match bs.allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_CODE, allocation_pages) {
+    match bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, allocation_pages) {
         Ok(addr) => {
             // Calcular dirección alineada a 2MB
             let addr_u64 = addr;
@@ -922,7 +922,7 @@ fn prepare_page_tables_only(bs: &BootServices, handle: Handle) -> core::result::
     // Reservar stack (64 KiB)
     let stack_pages: usize = 16;
     let stack_base = bs
-        .allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, stack_pages)
+        .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, stack_pages)
         .map_err(|e| BootError::AllocStack(e.status()))?;
     let stack_top = stack_base + (stack_pages as u64) * 4096u64;
 
@@ -1574,7 +1574,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         let out = system_table.stdout();
         let _ = out.write_str("Saliendo de servicios UEFI y saltando al kernel...\n");
-        let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::BOOT_SERVICES_CODE);
+        let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 
         // DIAGNÓSTICO: BLUE SQUARE (10,0) después de ExitBootServices
         if framebuffer_info.base_address != 0 {
