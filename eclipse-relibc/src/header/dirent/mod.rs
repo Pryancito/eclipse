@@ -15,19 +15,19 @@ pub struct DIR {
     pub fd: c_int,
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn opendir(_name: *const c_char) -> *mut DIR {
     core::ptr::null_mut()
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn readdir(_dirp: *mut DIR) -> *mut dirent {
     core::ptr::null_mut()
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn closedir(_dirp: *mut DIR) -> c_int {
     -1

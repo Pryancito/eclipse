@@ -26,7 +26,7 @@ pub const CLOCK_MONOTONIC: clockid_t = 1;
 
 static TIME_COUNTER: AtomicI64 = AtomicI64::new(0);
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) -> c_int {
     if tp.is_null() {
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) ->
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn gmtime_r(timer: *const time_t, result: *mut tm) -> *mut tm {
     if timer.is_null() || result.is_null() {
@@ -48,13 +48,13 @@ pub unsafe extern "C" fn gmtime_r(timer: *const time_t, result: *mut tm) -> *mut
     result
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn localtime_r(timer: *const time_t, result: *mut tm) -> *mut tm {
     gmtime_r(timer, result)
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_int {
     if !_tv.is_null() {
@@ -64,13 +64,13 @@ pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn setitimer(_which: c_int, _new_value: *const itimerval, _old_value: *mut itimerval) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) -> c_int {
     if !curr_value.is_null() {
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) ->
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
     let t = TIME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -92,19 +92,19 @@ pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
     t as time_t
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn clock() -> clock_t {
     (TIME_COUNTER.load(Ordering::Relaxed) * 1000) as clock_t
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn difftime(time1: time_t, time0: time_t) -> c_double {
     (time1 - time0) as c_double
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
     if timeptr.is_null() {
@@ -116,13 +116,13 @@ pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
     t
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn timegm(timeptr: *mut tm) -> time_t {
     mktime(timeptr)
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn gmtime(timer: *const time_t) -> *mut tm {
     if timer.is_null() {
@@ -131,20 +131,20 @@ pub unsafe extern "C" fn gmtime(timer: *const time_t) -> *mut tm {
     core::ptr::null_mut()
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn localtime(timer: *const time_t) -> *mut tm {
     gmtime(timer)
 }
 
-#[cfg(any(test, feature = "host-testing"))]
+#[cfg(any(test, feature = "host-testing", target_os = "linux"))]
 extern "C" {
     pub fn nanosleep(req: *const timespec, rem: *mut timespec) -> c_int;
     pub fn clock_gettime(clk_id: clockid_t, tp: *mut timespec) -> c_int;
     pub fn time(tloc: *mut time_t) -> time_t;
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> c_int {
     if req.is_null() {
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn ctime(_timep: *const time_t) -> *mut c_char {
     #[thread_local]

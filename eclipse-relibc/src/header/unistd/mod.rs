@@ -4,11 +4,11 @@ use crate::internal_alloc::{malloc, free};
 use eclipse_syscall::call::{write as sys_write, read as sys_read, close as sys_close, open as sys_open, lseek as sys_lseek, exit as sys_exit, getpid as sys_getpid, spawn as sys_spawn, mkdir as sys_mkdir, fstat as sys_fstat, Stat as sys_Stat};
 use crate::header::time::nanosleep;
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 static mut FORCE_KEEP: i32 = 0;
 
-#[cfg(any(test, feature = "host-testing"))]
+#[cfg(any(test, feature = "host-testing", target_os = "linux"))]
 extern "C" {
     pub fn open(path: *const c_char, flags: c_int, mode: mode_t) -> c_int;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
@@ -22,13 +22,13 @@ extern "C" {
     pub fn setgid(gid: gid_t) -> c_int;
 }
 
-#[cfg(any(test, feature = "host-testing"))]
+#[cfg(any(test, feature = "host-testing", target_os = "linux"))]
 #[no_mangle]
 pub unsafe extern "C" fn spawn(_path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> 
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
     let slice = core::slice::from_raw_parts(buf as *const u8, count);
@@ -48,7 +48,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: size_t) -> 
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     let slice = core::slice::from_raw_parts_mut(buf as *mut u8, count);
@@ -58,7 +58,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssi
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     match sys_close(fd as usize) {
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t {
     match sys_lseek(fd as usize, offset as isize, whence as usize) {
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getpid() -> pid_t {
     sys_getpid() as pid_t
@@ -117,7 +117,7 @@ pub unsafe extern "C" fn getpid() -> pid_t {
         -1 // Stub
     }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pipe2(_pipefd: *mut c_int, _flags: c_int) -> c_int {
     unsafe {
@@ -127,37 +127,37 @@ pub unsafe extern "C" fn pipe2(_pipefd: *mut c_int, _flags: c_int) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getuid() -> uid_t {
     0 // Root
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getgid() -> gid_t {
     0 // Root
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn setuid(_uid: uid_t) -> c_int {
     0 // Stub
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn setgid(_gid: gid_t) -> c_int {
     0 // Stub
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn unlink(_pathname: *const c_char) -> c_int {
     -1 // Stub
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn sysconf(name: c_int) -> c_long {
     match name {
@@ -166,13 +166,13 @@ pub unsafe extern "C" fn sysconf(name: c_int) -> c_long {
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getdtablesize() -> c_int {
     1024
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     let req = crate::types::timespec {
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     let req = crate::types::timespec {
@@ -193,20 +193,20 @@ pub unsafe extern "C" fn usleep(usec: useconds_t) -> c_int {
     nanosleep(&req, core::ptr::null_mut())
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _exit(status: c_int) -> ! {
     let _ = sys_exit(status);
     loop {}
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn dup2(_old: c_int, _new: c_int) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn gethostname(name: *mut c_char, len: size_t) -> c_int {
     let s = b"eclipse\0";
@@ -215,13 +215,13 @@ pub unsafe extern "C" fn gethostname(name: *mut c_char, len: size_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn chdir(_path: *const c_char) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char {
     if size < 2 { return core::ptr::null_mut(); }
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char {
     buf
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn isatty(fd: c_int) -> c_int {
     if fd >= 0 && fd <= 2 {
@@ -242,67 +242,67 @@ pub unsafe extern "C" fn isatty(fd: c_int) -> c_int {
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn geteuid() -> uid_t {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getegid() -> gid_t {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn seteuid(_euid: uid_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn setegid(_egid: gid_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getppid() -> pid_t {
     1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn getpgrp() -> pid_t {
     1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn setpgid(_pid: pid_t, _pgid: pid_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn link(_oldpath: *const c_char, _newpath: *const c_char) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn chown(_path: *const c_char, _owner: uid_t, _group: gid_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn fchown(_fd: c_int, _owner: uid_t, _group: gid_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char, _envp: *const *const c_char) -> pid_t {
     // For now, our sys_spawn only takes an ELF buffer. 
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn spawn(path: *const c_char, _argv: *const *const c_char,
     }
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn readlink(_path: *const c_char, _buf: *mut c_char, _bufsiz: size_t) -> ssize_t {
     -1
