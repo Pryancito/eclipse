@@ -190,8 +190,6 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
-    // 4. Initial progress (distinguish from bootloader's 40%)
-    progress::init();
     progress::bar(42);
     
     // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)

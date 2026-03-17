@@ -181,26 +181,10 @@ impl DrawTarget for KernelFramebuffer {
 }
 
 pub fn bar(progress: u32) {
-    if !LOGGING_ENABLED.load(Ordering::SeqCst) {
-        return;
-    }
-
-    // Only render once the framebuffer has been explicitly mapped by progress::init().
-    // Using the phys_to_virt HHDM fallback before that point can hang real hardware:
-    // on systems with a discrete GPU the framebuffer BAR lives above the HHDM limit
-    // and the write would cause a triple fault (no IDT installed at this stage).
-    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-    if mapped == 0 {
-        return;
-    }
-
-    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else {
-        return;
-    };
-    //let virt = mapped as *mut u8;
+    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
     let virt = crate::memory::phys_to_virt(phys) as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
+    
     let progress = progress.min(100);
 
     let bar_width = 400;
@@ -208,10 +192,6 @@ pub fn bar(progress: u32) {
     let x = (width as i32 - bar_width as i32) / 2;
     let y = (height as i32 - bar_height as i32) / 2;
 
-    // Clear background (optional as per request, but good for redrawing)
-    // Actually, user said "white bar on black background", so let's clear at least the area if needed.
-    // However, if it's a "progress bar", we might just want to draw the bar itself.
-    
     // Draw outer border
     let _ = Rectangle::new(Point::new(x - 2, y - 2), Size::new(bar_width + 4, bar_height + 4))
         .into_styled(PrimitiveStyleBuilder::new()
@@ -230,7 +210,7 @@ pub fn bar(progress: u32) {
             .draw(&mut fb);
     }
     
-    // Fill remaining with black (to handle decreasing progress or just clean refresh)
+    // Fill remaining with black
     if fill_width < bar_width {
          let _ = Rectangle::new(Point::new(x + fill_width as i32, y), Size::new(bar_width - fill_width, bar_height))
             .into_styled(PrimitiveStyleBuilder::new()
@@ -240,42 +220,37 @@ pub fn bar(progress: u32) {
     }
 
     // Text "XX%" below the bar, fixed width to avoid jumping
-    let mut buf = [b' '; 4];
-    buf[3] = b'%';
+    let mut s_buf = [b' '; 4];
+    s_buf[3] = b'%';
+    
     if progress == 100 {
-        buf[0] = b'1';
-        buf[1] = b'0';
-        buf[2] = b'0';
+        s_buf[0] = b'1'; s_buf[1] = b'0'; s_buf[2] = b'0';
     } else if progress >= 10 {
-        buf[1] = b'0' + (progress / 10) as u8;
-        buf[2] = b'0' + (progress % 10) as u8;
+        s_buf[1] = b'0' + (progress / 10) as u8;
+        s_buf[2] = b'0' + (progress % 10) as u8;
     } else {
-        buf[2] = b'0' + progress as u8;
+        s_buf[2] = b'0' + progress as u8;
     }
     
-    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    let s = core::str::from_utf8(&s_buf).unwrap_or(" ? %");
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(Rgb888::WHITE)
         .background_color(Rgb888::BLACK)
         .build();
-    let text_width = s.len() as i32 * 6;
+    let text_width = 4 * 6;
     let _ = Text::new(s, Point::new(x + (bar_width as i32 - text_width) / 2, y + bar_height as i32 + 15), text_style)
         .draw(&mut fb);
+
+    // VirtIO GPU requires explicit present
+    if source == FbSource::VirtIO {
+        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, width, height);
+    }
 }
 
 /// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
-/// Only called after MAPPED_FB_VIRT has been set by progress::init().
-fn render_log_line(line: &str, _source: FbSource, _width: u32, _height: u32, _pitch: u32, _phys: u64) {
-    let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
-    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
-    //let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-    // Caller (log()) already checks mapped != 0; guard again for safety.
-    //if mapped == 0 {
-    //    return;
-    //}
-    //let virt = mapped as *mut u8;
+fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
     let virt = crate::memory::phys_to_virt(phys) as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
