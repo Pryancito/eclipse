@@ -306,13 +306,6 @@ impl SmithayState {
 
     /// Procesa IPC sin colgar el frame: drena el buzón del kernel (evita "buzon lleno")
     /// pero limita eventos procesados por frame para seguir haciendo render/update a ~60 FPS.
-    ///
-    /// # Garantías de no-bloqueo
-    /// - `drain_ipc_into_pending` llama a `process_messages()` que tiene un límite de 32 intentos
-    ///   por llamada y solo llama a syscalls no bloqueantes (`receive_fast` / `receive`).
-    /// - El bucle de procesamiento está acotado a EVENTS_PER_FRAME iteraciones.
-    /// - `last_ipc_activity` se actualiza una sola vez al final (en lugar de una syscall
-    ///   `Instant::now()` por evento) para reducir la presión sobre el kernel.
     pub fn handle_ipc(&mut self) {
         #[cfg(not(test))]
         self.backend.drain_ipc_into_pending(128);
@@ -322,15 +315,11 @@ impl SmithayState {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
+                    self.last_ipc_activity = std::time::Instant::now();
                     events_processed += 1;
                     self.handle_event(&event);
                 }
             }
-        }
-        // Actualizar timestamp de actividad IPC una sola vez por frame, no por evento:
-        // Instant::now() hace una syscall (get_system_stats) que es costosa en hot-paths.
-        if events_processed > 0 {
-            self.last_ipc_activity = std::time::Instant::now();
         }
     }
 
@@ -647,21 +636,6 @@ impl SmithayState {
                             self_cpu = self.process_cpu_usage[i];
                             break;
                         }
-                    }
-                    // IPC stall diagnostic: log when consecutive_empty is high (IPC appears inactive).
-                    // Threshold: si lleva más de 1000 calls consecutivos sin mensajes útiles, es posible
-                    // que el IPC esté bloqueado o que el buzón no esté recibiendo nada del kernel.
-                    let consecutive_empty = self.backend.ipc.consecutive_empty;
-                    if consecutive_empty > 1000 && consecutive_empty % 1000 == 0 {
-                        println!(
-                            "[IPC-WATCHDOG] pid={} mem={}KB cpu={:.1}% recv_attempts={} msg_count={} consecutive_empty={}",
-                            self_pid,
-                            self_mem_kb,
-                            self_cpu,
-                            self.backend.ipc.recv_attempts,
-                            self.backend.ipc.message_count,
-                            consecutive_empty,
-                        );
                     }
                 }
 
