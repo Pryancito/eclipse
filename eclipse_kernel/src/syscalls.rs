@@ -2325,6 +2325,9 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     } else if class_code == 0x0C {
         // Serial Bus Controllers (USB, etc.)
         crate::pci::find_usb_controllers()
+    } else if class_code == 0x02 {
+        // Network Controllers (Ethernet, etc.)
+        crate::pci::find_network_controllers()
     } else if class_code == 0x03 {
         // Display Controllers (NVIDIA, etc.)
         crate::pci::find_nvidia_gpus()

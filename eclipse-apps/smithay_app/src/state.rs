@@ -7,7 +7,7 @@ use crate::render;
 use std::prelude::v1::*;
 use core::matches;
 #[cfg(target_vendor = "eclipse")]
-use libc::{eclipse_send, ProcessInfo, SystemStats, get_system_stats, get_process_list};
+use libc::{eclipse_send, write, ProcessInfo, SystemStats, get_system_stats, get_process_list};
 #[cfg(not(target_vendor = "eclipse"))]
 use eclipse_syscall::{ProcessInfo, SystemStats};
 use sidewind::{SideWindEvent, SWND_EVENT_TYPE_RESIZE};
@@ -92,6 +92,8 @@ pub struct SmithayState {
     pub wayland_connections: [Option<sidewind::wayland::WaylandConnection>; 32],
     #[cfg(any(not(target_os = "linux"), test))]
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
+    /// Última vez que se recibió un mensaje IPC (para el heartbeat).
+    pub last_ipc_activity: std::time::Instant,
 }
 
 impl SmithayState {
@@ -169,6 +171,7 @@ impl SmithayState {
             wayland_connections: [const { None }; 32],
             #[cfg(any(not(target_os = "linux"), test))]
             wayland_pool_maps: Vec::new(),
+            last_ipc_activity: std::time::Instant::now(),
         })
 
     }
@@ -312,6 +315,7 @@ impl SmithayState {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
+                    self.last_ipc_activity = std::time::Instant::now();
                     events_processed += 1;
                     self.handle_event(&event);
                 }
@@ -515,7 +519,7 @@ impl SmithayState {
         let now = std::time::Instant::now();
         let metrics_elapsed = self.last_metrics_update.elapsed();
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
-        let metrics_interval = if need_metrics { 500u64 } else { 3000u64 };
+        let metrics_interval = if need_metrics { 1500u64 } else { 4000u64 };
 
         if metrics_elapsed.as_millis() as u64 >= metrics_interval {
             self.last_metrics_update = now;

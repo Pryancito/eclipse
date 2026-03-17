@@ -62,12 +62,10 @@ fn main() {
 
     loop {
         state.handle_ipc();
-        while let Some(event) = state.backend.poll_event() {
-            state.handle_event(&event);
+        if state.update() {
+            state.render();
         }
-        state.update();
-        state.render();
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }
 

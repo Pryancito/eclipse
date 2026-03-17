@@ -9,6 +9,7 @@ use core::arch::asm;
 
 use crate::serial;
 use crate::storage::BlockDevice;
+use crate::boot::VIRTIO_DISPLAY_RESOURCE_ID;
 use alloc::vec::Vec;
 
 /// Read time stamp counter
@@ -2801,8 +2802,17 @@ pub fn init() {
             unsafe {
                 crate::pci::enable_device(&dev, true);
 
-                // virtio-vga / virtio-vga-gl may have VGA at BAR0, virtio config at BAR2
+                // virtio-vga / virtio-vga-gl may have VGA at BAR0, virtio config at BAR2.
+                // For VGA-compatible devices (Class 03, Subclass 00), BAR0 is the linear FB aperture,
+                // NOT the VirtIO registers. Probing it as MMIO/Registers will fail and may corrupt FB.
+                let is_vga = dev.class_code == 0x03 && dev.subclass == 0x00;
+                
                 for bar_idx in [0u8, 2u8] {
+                    if is_vga && bar_idx == 0 {
+                        serial::serial_print("[VirtIO-GPU] Skipping BAR0 (VGA FB aperture) for registers\n");
+                        continue;
+                    }
+                    
                     let raw_bar = crate::pci::pci_config_read_u32(dev.bus, dev.device, dev.function, 0x10 + (bar_idx * 4));
                     if raw_bar == 0 { continue; }
 
@@ -2851,6 +2861,19 @@ pub fn init() {
                                 serial::serial_print("x");
                                 serial::serial_print_dec(h as u64);
                                 serial::serial_print("\n");
+                                
+                                // Sync with boot resolution if GOP is active
+                                if let Some((_, boot_w, boot_h, _, _)) = crate::boot::get_fb_info() {
+                                    if w != boot_w || h != boot_h {
+                                        serial::serial_print("[VirtIO-GPU] Resizing to match boot: ");
+                                        serial::serial_print_dec(boot_w as u64);
+                                        serial::serial_print("x");
+                                        serial::serial_print_dec(boot_h as u64);
+                                        serial::serial_print("\n");
+                                        let _ = gpu.set_scanout(0, VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, boot_w, boot_h);
+                                        let _ = gpu.resource_flush(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, boot_w, boot_h);
+                                    }
+                                }
                             }
                             GPU_DEVICES.lock().push(gpu);
                             gpu_initialized = true;
@@ -3246,5 +3269,17 @@ pub fn gpu_present(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
         dev.transfer_to_host_2d(resource_id, x, y, w, h, 0).is_ok()
             && dev.resource_flush(resource_id, x, y, w, h).is_ok()
     })
+}
+
+/// Perform a flush on the primary VirtIO display if it exists.
+/// Used by progress::bar to ensure kernel graphics are visible on VirtIO-GPU hosts.
+pub fn gpu_flush_primary() {
+    if let Some(mut devices) = GPU_DEVICES.try_lock() {
+        if let Some(gpu) = devices.get_mut(0) {
+            if let Some((_, w, h, _, _)) = crate::boot::get_fb_info() {
+                let _ = gpu.resource_flush(VIRTIO_DISPLAY_RESOURCE_ID, 0, 0, w, h);
+            }
+        }
+    }
 }
 

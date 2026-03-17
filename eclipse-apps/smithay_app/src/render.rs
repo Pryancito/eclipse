@@ -288,8 +288,8 @@ impl FramebufferState {
 
         for y in 0..h {
             let row = y * pitch_px;
-            for x in 0..w {
-                unsafe { core::ptr::write_volatile(ptr.add(row + x), raw); }
+            unsafe {
+                core::slice::from_raw_parts_mut(ptr.add(row), w).fill(raw);
             }
         }
     }
@@ -417,24 +417,25 @@ impl FramebufferState {
 
         let required_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         if required_bytes == 0 || required_bytes > src_size { return; }
-        // Evitar overflow: comprobar que el último pixel leído cabe en src_size.
-        let max_src_offset_pixels = (w as usize).saturating_mul(h as usize);
-        if max_src_offset_pixels.saturating_mul(4) > src_size { return; }
+
+        let ix_start = (0).max(-x) as usize;
+        let ix_end = (w as i32).min(fb_w - x) as usize;
+        if ix_start >= ix_end { return; }
+        let row_copy_len = ix_end - ix_start;
 
         for iy in 0..h as i32 {
             let dy = y + iy;
             if dy < 0 || dy >= fb_h { continue; }
-            let src_row = (iy as usize) * (w as usize);
             
-            for ix in 0..w as i32 {
-                let dx = x + ix;
-                if dx >= 0 && dx < fb_w {
-                    let dst_off = (dy as usize * pitch_px) + dx as usize;
-                    unsafe {
-                        let color = core::ptr::read_unaligned(src.add(src_row + ix as usize));
-                        core::ptr::write_volatile(dst_ptr.add(dst_off), color);
-                    }
-                }
+            let src_row_off = (iy as usize) * (w as usize) + ix_start;
+            let dst_row_off = (dy as usize * pitch_px) + (x + ix_start as i32) as usize;
+            
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.add(src_row_off),
+                    dst_ptr.add(dst_row_off),
+                    row_copy_len
+                );
             }
         }
     }
@@ -515,8 +516,8 @@ impl DrawTarget for FramebufferState {
 
         for y in y_start..y_end {
             let row_base = (y * pitch_px + x_start) as usize;
-            for i in 0..row_width {
-                unsafe { core::ptr::write_volatile(fb_ptr.add(row_base + i), raw_color); }
+            unsafe {
+                core::slice::from_raw_parts_mut(fb_ptr.add(row_base), row_width).fill(raw_color);
             }
         }
         Ok(())
@@ -530,6 +531,7 @@ impl OriginDimensions for FramebufferState {
 impl FramebufferState {
     #[inline]
     pub fn blur_rect(&mut self, rect: &Rectangle, radius: i32) {
+        if true { return; } // Disabled for performance stability
         if self.back_addr == 0 || radius <= 0 { return; }
         let w = self.info.width as i32;
         let h = self.info.height as i32;
@@ -569,6 +571,7 @@ impl FramebufferState {
 
     #[inline]
     fn draw_sdf_effect(&mut self, rect: &Rectangle, radius: i32, color: Rgb888, intensity: u32, corner_radius: f32) {
+        if true { return; } // Disabled for performance stability
         if self.back_addr == 0 || radius <= 0 { return; }
         let w = self.info.width as i32;
         let h = self.info.height as i32;
@@ -624,7 +627,7 @@ pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f
     let py = (h - p_h) / 2;
     let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
     
-    fb.blur_rect(&Rectangle::new(main_panel.position, main_panel.size), 4);
+    // fb.blur_rect(&Rectangle::new(main_panel.position, main_panel.size), 4);
     let _ = main_panel.draw(fb);
     
     let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };

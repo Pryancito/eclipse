@@ -56,23 +56,31 @@ impl<T> ReentrantMutex<T> {
 
     /// Get the current CPU's id for ownership tracking.
     pub fn current_cpu() -> i32 {
-        let mut id: u32;
-        unsafe {
-            core::arch::asm!(
-                "mov {0:e}, gs:[16]",
-                out(reg) id,
-                options(nomem, nostack, preserves_flags)
-            );
+        #[cfg(test)]
+        {
+            return 0; // Host tests always single-core for now
         }
-        
-        // Sanity check: if gs is not set up (long mode transition/early AP),
-        // it will read 0xFFFF_FFFF (uninitialized value in CPU_DATA).
-        // Fallback to the reliable (but slower) get_cpu_id to avoid lock owner collisions.
-        if id == 0xFFFF_FFFF {
-            return crate::boot::get_cpu_id() as i32;
+
+        #[cfg(not(test))]
+        {
+            let mut id: u32;
+            unsafe {
+                core::arch::asm!(
+                    "mov {0:e}, gs:[16]",
+                    out(reg) id,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+            
+            // Sanity check: if gs is not set up (long mode transition/early AP),
+            // it will read 0xFFFF_FFFF (uninitialized value in CPU_DATA).
+            // Fallback to the reliable (but slower) get_cpu_id to avoid lock owner collisions.
+            if id == 0xFFFF_FFFF || id >= 128 { // MAX_SMP_CPUS
+                return crate::boot::get_cpu_id() as i32;
+            }
+            
+            id as i32
         }
-        
-        id as i32
     }
 
     pub fn lock(&self) -> ReentrantMutexGuard<'_, T> {

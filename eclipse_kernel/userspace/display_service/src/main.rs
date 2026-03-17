@@ -345,6 +345,7 @@ fn create_framebuffer_device_node(fb_info: &FramebufferInfoFromKernel, fb_base: 
 enum GraphicsDriver {
     None,
     NVIDIA,
+    VirtIOGPU,
     VESA,
 }
 
@@ -936,14 +937,45 @@ fn main() {
         println!("[DISPLAY-SERVICE] No NVIDIA GPU detected");
     }
     
-    // Fallback to VESA if NVIDIA not available
+    // Try VirtIO-GPU next
     if active_driver == GraphicsDriver::None {
-        println!("[DISPLAY-SERVICE] Falling back to VESA driver");
+        let mut dims = [0u32, 0u32];
+        let result: u64;
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("rax") SYS_GET_GPU_DISPLAY_INFO,
+                in("rdi") dims.as_mut_ptr() as u64,
+                lateout("rax") result,
+                options(nostack)
+            );
+        }
+        if result == 0 && (dims[0] > 0 || dims[1] > 0) {
+            println!("[DISPLAY-SERVICE] VirtIO-GPU detected via kernel info!");
+            // We reuse the VESA initializer because it uses the 'display:' scheme
+            // which the kernel has already optimized for VirtIO.
+            match init_vesa_driver() {
+                Ok(fb) => {
+                    active_driver = GraphicsDriver::VirtIOGPU;
+                    framebuffer = Some(fb);
+                    println!("[DISPLAY-SERVICE] Using VirtIO-GPU driver");
+                }
+                Err(e) => {
+                    println!("[DISPLAY-SERVICE] VirtIO-GPU driver initialization failed: {}", e);
+                    stats.driver_errors += 1;
+                }
+            }
+        }
+    }
+
+    // Fallback to VESA as last resort
+    if active_driver == GraphicsDriver::None {
+        println!("[DISPLAY-SERVICE] Falling back to generic VESA driver");
         match init_vesa_driver() {
             Ok(fb) => {
                 active_driver = GraphicsDriver::VESA;
                 framebuffer = Some(fb);
-                println!("[DISPLAY-SERVICE] Using VESA driver");
+                println!("[DISPLAY-SERVICE] Using generic VESA driver");
             }
             Err(e) => {
                 println!("[DISPLAY-SERVICE] VESA driver initialization failed: {}", e);
@@ -956,6 +988,9 @@ fn main() {
     match active_driver {
         GraphicsDriver::NVIDIA => {
             println!("[DISPLAY-SERVICE] Graphics initialized with NVIDIA driver");
+        }
+        GraphicsDriver::VirtIOGPU => {
+            println!("[DISPLAY-SERVICE] Graphics initialized with VirtIO-GPU driver");
         }
         GraphicsDriver::VESA => {
             println!("[DISPLAY-SERVICE] Graphics initialized with VESA driver");

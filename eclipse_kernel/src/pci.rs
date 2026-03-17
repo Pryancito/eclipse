@@ -737,3 +737,12 @@ pub fn find_ohci_controllers() -> alloc::vec::Vec<PciDevice> {
 pub fn find_uhci_controllers() -> alloc::vec::Vec<PciDevice> {
     find_usb_by_type(PCI_PROGIF_USB_UHCI)
 }
+
+/// Find all network controllers (Ethernet, WiFi, etc.)
+pub fn find_network_controllers() -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .filter(|dev| dev.class_code == 0x02)
+        .copied()
+        .collect()
+}

@@ -13,7 +13,7 @@ use std::prelude::v1::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::prelude::*;
-use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info};
+use std::libc::{getpid, getppid, yield_cpu, sleep_ms, send_ipc, receive_ipc, read_key_scancode, read_mouse_packet, pci_enum_devices, PciDeviceInfo, InputEvent, set_cursor_position, get_framebuffer_info, get_system_stats, SystemStats};
 use input_service::EventQueue;
 
 const SYS_REGISTER_DEVICE: usize = eclipse_syscall::number::SYS_REGISTER_DEVICE;
@@ -45,13 +45,18 @@ fn sys_write(fd: usize, buf: &[u8]) -> usize {
 
 fn write_input_event_to_scheme(input_fd: Option<usize>, ev: &InputEvent) {
     if let Some(fd) = input_fd {
-        let buf = unsafe {
-            core::slice::from_raw_parts(
-                ev as *const _ as *const u8,
-                core::mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = sys_write(fd, buf);
+        // Zero-initialize the buffer and copy each field individually at its repr(C) offset.
+        // This avoids undefined padding bytes that the kernel IPC sanitizer might zero out
+        // if they look like kernel pointers, preventing field corruption.
+        let mut buf = [0u8; INPUT_EVENT_SIZE];
+        buf[0..4].copy_from_slice(&ev.device_id.to_le_bytes());
+        buf[4] = ev.event_type;
+        // buf[5] = 0; // implicit padding byte
+        buf[6..8].copy_from_slice(&ev.code.to_le_bytes());
+        buf[8..12].copy_from_slice(&ev.value.to_le_bytes());
+        // buf[12..16] = 0; // implicit padding bytes
+        buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
+        let _ = sys_write(fd, &buf);
     }
 }
 
@@ -143,52 +148,6 @@ struct InputDevice {
 /// Tamaño fijo (InputEvent viene de eclipse_libc)
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<InputEvent>();
 
-/// Contador de eventos enviados al display (debug: si se congela input, ver si este deja de subir).
-static DISPLAY_SENT: AtomicU64 = AtomicU64::new(0);
-/// Contador de fallos de send_ipc al display (buzón lleno = backpressure).
-/// Si sube mientras DISPLAY_SENT se estanca, el compositor no consume el buzón suficientemente rápido.
-static DISPLAY_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
-
-/// Envía un evento a un cliente; usa buffer local para evitar punteros corruptos (crash 0x11).
-/// Los fallos de IPC (buzón lleno) se registran en DISPLAY_SEND_FAILURES y se loguean
-/// periódicamente; el llamador no necesita inspeccionar el resultado.
-fn send_event_to_client(pid: u32, ev: &InputEvent) {
-    if pid == 0 {
-        return;
-    }
-    // Zero-initialize the buffer and copy each field individually at its repr(C) offset.
-    // Copying the raw struct bytes would include undefined implicit padding bytes (offset 5
-    // and offsets 12-15 in the repr(C) layout), which the kernel's IPC sanitizer can mistake
-    // for kernel pointers (>= 0xFFFF_8000_0000_0000) and zero out - corrupting the 'value'
-    // field and making all key-press events (value=1) look like key-release events (value=0)
-    // to the compositor.
-    let mut buf = [0u8; INPUT_EVENT_SIZE];
-    buf[0..4].copy_from_slice(&ev.device_id.to_le_bytes());
-    buf[4] = ev.event_type;
-    // buf[5] = 0; // implicit padding byte, kept as 0
-    buf[6..8].copy_from_slice(&ev.code.to_le_bytes());
-    buf[8..12].copy_from_slice(&ev.value.to_le_bytes());
-    // buf[12..16] = 0; // implicit padding bytes, kept as 0
-    buf[16..24].copy_from_slice(&ev.timestamp.to_le_bytes());
-    let ret = send_ipc(pid, 0x40, &buf[..INPUT_EVENT_SIZE]);
-    if ret < 0 {
-        // El buzon del compositor esta lleno: el evento se pierde. Registrar el
-        // fallo para que el heartbeat indique backpressure sin saturar la consola.
-        let f = DISPLAY_SEND_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-        // Loguear solo en la primera ocurrencia y despues cada 100 para no saturar logs.
-        if f == 1 || f % 100 == 0 {
-            println!(
-                "[INPUT-SERVICE] WARN: send_ipc->PID {} fallo (buzon lleno?): ret={} fallos_total={}",
-                pid, ret, f
-            );
-        }
-        return;
-    }
-    let n = DISPLAY_SENT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 500 == 0 {
-        println!("[INPUT-SERVICE] sent {} to display", n);
-    }
-}
 
 /// Detect USB controllers via PCI
 fn detect_usb_controllers() -> usize {
@@ -424,13 +383,11 @@ fn main() {
     println!("[INPUT-SERVICE]     - Mechanical gaming keyboard (1000Hz, N-key rollover)");
     println!("[INPUT-SERVICE] Waiting for input events...");
 
-    // Clientes de display suscritos (máx 8)
-    const MAX_DISPLAY_CLIENTS: usize = 8;
-    let mut display_clients: [u32; MAX_DISPLAY_CLIENTS] = [0; MAX_DISPLAY_CLIENTS];
-    let mut display_client_count: usize = 0;
 
     // Estado previo de botones del ratón PS/2 para detectar cambios (bit0=left, bit1=right, bit2=middle)
     let mut prev_mouse_buttons: u8 = 0;
+    // Estado previo de scancode extendido (0xE0)
+    let mut has_e0 = false;
 
     // Cursor position (absolute, clamped to screen bounds)
     let (screen_width, screen_height) = unsafe { get_framebuffer_info() }
@@ -442,7 +399,7 @@ fn main() {
     set_cursor_position(cursor_x as u32, cursor_y as u32);
 
     // Main loop - process input events
-    let mut heartbeat_counter = 0u64;
+    let mut heartbeat_last_ticks = 0u64;
     let mut total_events = 0u64;
     let mut keyboard_events = 0u64;
     let mut mouse_events = 0u64;
@@ -456,35 +413,9 @@ fn main() {
     const IDLE_MOUSE_WARN_THRESHOLD: u64 = 200; // ~200 ms a 1 kHz de bucle
     
     loop {
-        heartbeat_counter += 1;
+        let mut stats = SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+        let _ = unsafe { get_system_stats(&mut stats) };
 
-        // Procesar mensajes IPC de control (por ejemplo, registro de cliente de display)
-        {
-            let mut buf = [0u8; 32];
-            let (len, sender_pid) = std::libc::receive_ipc(&mut buf);
-            if len >= 8 && &buf[0..4] == b"SUBS" {
-                let mut id_bytes = [0u8; 4];
-                id_bytes.copy_from_slice(&buf[4..8]);
-                let client_pid = u32::from_le_bytes(id_bytes);
-                let mut added = false;
-                for i in 0..MAX_DISPLAY_CLIENTS {
-                    if display_clients[i] == 0 || display_clients[i] == client_pid {
-                        display_clients[i] = client_pid;
-                        if i >= display_client_count {
-                            display_client_count = i + 1;
-                        }
-                        added = true;
-                        break;
-                    }
-                }
-                if added {
-                    println!(
-                        "[INPUT-SERVICE] Display client registrado: PID {} ({} clientes)",
-                        client_pid, display_client_count
-                    );
-                }
-            }
-        }
         
         // Drenar ratón PS/2 real (kernel buffer vía syscall read_mouse_packet).
         // Límite por iteración para no bloquear el bucle y poder enviar heartbeat al init.
@@ -534,14 +465,10 @@ fn main() {
                         event_type: 2, // mouse_button
                         code: i as u16,
                         value: if now { 1 } else { 0 },
-                        timestamp: heartbeat_counter,
+                        timestamp: stats.uptime_ticks,
                     };
                     mouse_events += 1;
                     total_events += 1;
-                    for i in 0..display_client_count {
-                        let pid = display_clients[i];
-                        send_event_to_client(pid, &ev);
-                    }
                     write_input_event_to_scheme(input_fd, &ev);
                     let _ = event_queue.push(ev);
                 }
@@ -556,14 +483,10 @@ fn main() {
                     event_type: 3, // mouse_scroll
                     code: 0,       // vertical
                     value: scroll,
-                    timestamp: heartbeat_counter,
+                    timestamp: stats.uptime_ticks,
                 };
                 mouse_events += 1;
                 total_events += 1;
-                for i in 0..display_client_count {
-                    let pid = display_clients[i];
-                    send_event_to_client(pid, &ev);
-                }
                 write_input_event_to_scheme(input_fd, &ev);
                 let _ = event_queue.push(ev);
             }
@@ -587,14 +510,10 @@ fn main() {
                 event_type: 1,
                 code: 0xFFFF, // código especial: movimiento coalesced dx+dy
                 value: packed_value,
-                timestamp: heartbeat_counter,
+                timestamp: stats.uptime_ticks,
             };
             mouse_events += 1;
             total_events += 1;
-            for i in 0..display_client_count {
-                let pid = display_clients[i];
-                send_event_to_client(pid, &ev);
-            }
             write_input_event_to_scheme(input_fd, &ev);
             let _ = event_queue.push(ev);
         }
@@ -604,7 +523,6 @@ fn main() {
         const MAX_KBD_PER_ITER: u32 = 64;
         let mut kbd_batch = 0u32;
         let mut kbd_drained = 0u32;
-        let mut has_e0 = false;
         while kbd_drained < MAX_KBD_PER_ITER {
             let sc = match read_key_scancode() {
                 Some(s) => s,
@@ -635,31 +553,28 @@ fn main() {
                 event_type: 0,
                 code: final_code,
                 value,
-                timestamp: heartbeat_counter,
+                timestamp: stats.uptime_ticks,
             };
             keyboard_events += 1;
             total_events += 1;
-            for i in 0..display_client_count {
-                let pid = display_clients[i];
-                send_event_to_client(pid, &kbd_event);
-            }
             write_input_event_to_scheme(input_fd, &kbd_event);
             let _ = event_queue.push(kbd_event);
         }
 
         // No simulate occasional input events - removes fake jumpiness
         
-        // Process events from queue (simulate consumption)
-        if heartbeat_counter % 250 == 0 {
+        // Process events from queue (simulate consumption) every ~250ms
+        if stats.uptime_ticks % 250 == 0 {
             while let Some(_event) = event_queue.pop() {
                 // In real implementation: dispatch to consumers
             }
         }
 
-        // Watchdog heartbeat para init (PID 1): cada 200 iteraciones para no ser
-        // marcado HUNG si el bucle tarda (p. ej. drenando muchos eventos en QEMU).
-        if heartbeat_counter % 200 == 0 {
+        // Watchdog heartbeat para init (PID 1): cada 500ms para reducir tráfico IPC.
+        // Se usa uptime_ticks para que sea independiente de la carga o velocidad del bucle.
+        if stats.uptime_ticks >= heartbeat_last_ticks + 500 {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
+            heartbeat_last_ticks = stats.uptime_ticks;
         }
         
         unsafe { std::libc::yield_cpu(); }

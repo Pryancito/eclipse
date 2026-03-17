@@ -225,6 +225,10 @@ impl Scheme for DisplayScheme {
         let fb_ptr = (crate::memory::PHYS_MEM_OFFSET + fb_phys) as *mut u8;
         let to_copy = buf.len().min(fb_size);
         unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), fb_ptr, to_copy); }
+        
+        // Ensure changes are visible on VirtIO-GPU
+        crate::virtio::gpu_flush_primary();
+        
         Ok(to_copy)
     }
 

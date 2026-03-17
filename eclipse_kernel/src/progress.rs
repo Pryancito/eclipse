@@ -161,6 +161,15 @@ impl KernelFramebuffer {
             *p.offset(3) = 0xFF;
         }
     }
+
+    /// Fill a rectangle with a solid color.
+    fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Rgb888) {
+        for dy in 0..h {
+            for dx in 0..w {
+                self.write_pixel(x + dx as i32, y + dy as i32, color);
+            }
+        }
+    }
 }
 
 impl OriginDimensions for KernelFramebuffer {
