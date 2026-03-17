@@ -1041,13 +1041,36 @@ pub const GPU_FW_MAX_SIZE: u64 = 32 * 1024 * 1024; // 32MB
 pub const GPU_RPC_PHYS_BASE: u64 = 0x2200_0000; // 544MB
 pub const GPU_RPC_MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB for queues
 
+static mut FREE_FRAMES_STACK: [u64; 1024] = [0; 1024];
+static mut FREE_FRAMES_COUNT: usize = 0;
+
 pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
+    unsafe {
+        if FREE_FRAMES_COUNT > 0 {
+            FREE_FRAMES_COUNT -= 1;
+            return Some(FREE_FRAMES_STACK[FREE_FRAMES_COUNT]);
+        }
+    }
     let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
     let frame_phys = ANON_MMAP_PHYS_START + next;
     if frame_phys >= ANON_MMAP_PHYS_END {
         return None;
     }
     Some(frame_phys)
+}
+
+pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
+    if phys_addr < ANON_MMAP_PHYS_START || phys_addr >= ANON_MMAP_PHYS_END {
+        return;
+    }
+    unsafe {
+        if FREE_FRAMES_COUNT < 1024 {
+            FREE_FRAMES_STACK[FREE_FRAMES_COUNT] = phys_addr;
+            FREE_FRAMES_COUNT += 1;
+        }
+        // If stack is full, we just leak the frame (better than crashing).
+        // In a real OS we'd use a bitmap or a larger list.
+    }
 }
 
 /// Allocate a contiguous run of physical frames from the same userspace pool.
@@ -1228,6 +1251,10 @@ pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
                 }
 
                 let pt = &mut *(phys_to_virt(pd.entries[pd_idx].get_addr()) as *mut PageTable);
+                let phys_addr = pt.entries[pt_idx].get_addr();
+                if phys_addr != 0 {
+                    free_phys_frame_for_anon_mmap(phys_addr);
+                }
                 pt.entries[pt_idx].set_entry(0, 0);
                 x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page));
             }

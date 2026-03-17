@@ -137,7 +137,15 @@ pub fn handle_sidewind_message(
                 return;
             }
 
-            let surface_idx = surfaces.iter().position(|s| !s.active);
+            let surface_idx = if let Some(existing_idx) = surfaces.iter().position(|s| s.active && s.pid == sender_pid) {
+                // If the process already has an active surface, reuse that slot (cleanup old one)
+                println!("[SIDEWIND] Reusing surface slot for PID {}", sender_pid);
+                surfaces[existing_idx].unmap();
+                Some(existing_idx)
+            } else {
+                surfaces.iter().position(|s| !s.active)
+            };
+
             if let Some(s_idx) = surface_idx {
                 if *window_count < windows.len() {
                     // 1. Construct path to shared memory file

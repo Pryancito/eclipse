@@ -358,9 +358,8 @@ impl FramebufferState {
                     connector: display::control::ConnectorHandle(0),
                 };
                 // DRM_CURSOR_MOVE is 0x02
-                // Since we already have cursor_handle set, we might not need it for MOVE, 
-                // but passing 0 (or previous handle) should work.
-                let _ = dev.set_cursor(self.drm_crtc, x, y, display::buffer::Handle(0));
+                // Passing the actual handle ensures the cursor stays visible on some drivers.
+                let _ = dev.set_cursor(self.drm_crtc, x, y, self.cursor_handle);
             }
         }
     }

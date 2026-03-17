@@ -593,7 +593,7 @@ impl SmithayState {
                         }
                     }
 
-                    if total_delta > 0 {
+                    if total_delta > 0 && prev_ticks > 0 {
                         let delta_ticks = p.cpu_ticks.saturating_sub(prev_ticks);
                         self.process_cpu_usage[i] = (delta_ticks as f32 / total_delta as f32) * 100.0;
                     } else {
@@ -620,6 +620,34 @@ impl SmithayState {
                                 break;
                             }
                         }
+                    }
+                }
+
+                // Periodically cleanup surfaces of dead processes to avoid the 1GB memory leak
+                if self.counter % 60 == 0 { // Every ~1 second (assuming 60fps)
+                    let mut i = 0;
+                    while i < self.space.window_count {
+                        if let crate::compositor::WindowContent::External(s_idx) = self.space.windows[i].content {
+                            if (s_idx as usize) < self.surfaces.len() {
+                                let pid = self.surfaces[s_idx as usize].pid;
+                                if pid != 0 && pid != 1 && pid != unsafe { libc::getpid() as u32 } {
+                                    let mut alive = false;
+                                    for p in self.process_list.iter().take(self.process_count) {
+                                        if p.pid == pid {
+                                            alive = true;
+                                            break;
+                                        }
+                                    }
+                                    if !alive {
+                                        println!("[SMITHAY] Auto-cleaning dead surface for PID {}", pid);
+                                        self.space.unmap_window(i, &mut self.surfaces);
+                                        // unmap_window shifts the rest of the windows, so we don't increment i
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        i += 1;
                     }
                 }
 
@@ -883,15 +911,11 @@ impl SmithayState {
         } else {
             render::draw_lock_screen(&mut self.backend.fb, self.counter);
         }
-        // Cursor de software reactivado; el DrawTarget del framebuffer ya recorta por bounds,
-        // así que cualquier coordenada fuera de pantalla debería ignorarse sin provocar fallos.
-        // Solo dibujamos cursor de software si no tenemos uno de hardware activo.
-        if self.backend.fb.cursor_handle.0 == 0 {
-            render::draw_cursor(
-                &mut self.backend.fb,
-                embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
-            );
-        }
+        // Draw software cursor (forced for visibility until DRM hardware cursor is confirmed stable)
+        render::draw_cursor(
+            &mut self.backend.fb,
+            embedded_graphics::prelude::Point::new(self.input.cursor_x, self.input.cursor_y),
+        );
 
         self.backend.fb.present();
 
