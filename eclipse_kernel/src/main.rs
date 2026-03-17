@@ -176,7 +176,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
-    // DIAGNÓSTICO: YELLOW SQUARE (50,0) antes de progress::bar(42)
+    // DIAGNÓSTICO: YELLOW SQUARE (50,0)
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
             let fb = crate::memory::phys_to_virt(fb_base) as *mut u32; // HHDM (Virtual)
@@ -201,20 +201,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
-    // 4. Initial progress (distinguish from bootloader's 40%)
-    progress::bar(42);
-    
-    // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
-    unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
-            for y in 0..10 {
-                for x in 60..70 {
-                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF; // White
-                }
-            }
-        }
-    }
+    // NOTE: progress::bar() is intentionally NOT called here.
+    // VIDEO_HARDWARE_LOCK is a ReentrantMutex whose current_cpu() reads gs:[16].
+    // Before boot::load_gdt() sets up the GDT and GSBASE, that read targets
+    // whatever address UEFI left in the GSBASE MSR.  On firmware that leaves
+    // GSBASE pointing outside the kernel's new page tables this causes a #PF
+    // or #GP which triple-faults (no IDT yet) and freezes the machine.
+    // The first safe progress::bar() call is after boot::load_gdt() in
+    // kernel_bootstrap().
 
     serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
 
