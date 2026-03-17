@@ -47,7 +47,7 @@ pub struct AcpiInfo {
     pub lapic_addr: u64,
     pub cpu_count: usize,
     pub ioapic_addr: u64,
-    pub apic_ids: [u32; 128], // Support up to 128 CPUs (u32 to support x2APIC IDs > 255)
+    pub apic_ids: [u32; 32], // Support up to 32 CPUs (u32 to support x2APIC IDs > 255)
 }
 
 static mut ACPI_INFO: Option<AcpiInfo> = None;
@@ -139,7 +139,7 @@ pub fn init(rsdp_phys: u64) {
         let mut lapic_phys: u64 = 0;
         let mut ioapic_phys: u64 = 0;
         let mut cpu_count = 0;
-        let mut apic_ids = [0u32; 128];
+        let mut apic_ids = [0u32; 32];
 
         for i in 0..entry_count {
             let table_phys = if is_xsdt {
@@ -171,7 +171,7 @@ pub fn init(rsdp_phys: u64) {
                             let apic_id = *current_entry.add(3);
                             let flags = *(current_entry.add(4) as *const u32);
                             if flags & 1 != 0 { // Enabled
-                                if cpu_count < 128 {
+                                if cpu_count < 32 {
                                     apic_ids[cpu_count] = apic_id as u32;
                                     cpu_count += 1;
                                 }
@@ -190,7 +190,7 @@ pub fn init(rsdp_phys: u64) {
                             let flags = *(current_entry.add(8) as *const u32);
                             let acpi_uid = *(current_entry.add(12) as *const u32);
                             if flags & 1 != 0 { // Enabled
-                                if cpu_count < 128 {
+                                if cpu_count < 32 {
                                     apic_ids[cpu_count] = x2apic_id;
                                     cpu_count += 1;
                                 }

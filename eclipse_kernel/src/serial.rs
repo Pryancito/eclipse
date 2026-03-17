@@ -229,7 +229,7 @@ pub fn serial_printf(args: core::fmt::Arguments) {
 }
 
 /// Registro de si cada CPU necesita un prefijo (AtomicBool para SMP safety)
-static CPU_NEEDS_PREFIX: [AtomicBool; 128] = [const { AtomicBool::new(true) }; 128];
+static CPU_NEEDS_PREFIX: [AtomicBool; 32] = [const { AtomicBool::new(true) }; 32];
 
 /// Seguimiento global de qué CPU escribió por última vez y estado de la línea física
 static GLOBAL_LAST_CPU: AtomicI32 = AtomicI32::new(-1);

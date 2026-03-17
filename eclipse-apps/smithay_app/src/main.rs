@@ -64,9 +64,8 @@ fn main() {
 
     loop {
         state.handle_ipc();
-        if state.update() {
-            state.render();
-        }
+        state.update();
+        state.render();
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }

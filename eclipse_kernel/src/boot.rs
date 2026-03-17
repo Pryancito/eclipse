@@ -186,7 +186,7 @@ impl TaskStateSegment {
 }
 
 /// Maximum number of CPUs supported (indexed by APIC ID % MAX_SMP_CPUS)
-pub const MAX_SMP_CPUS: usize = 128;
+pub const MAX_SMP_CPUS: usize = 32;
 
 /// Per-CPU data accessible via GS segment during SYSCALL handling.
 /// Field offsets are part of the ABI used in syscall_entry (interrupts.rs):

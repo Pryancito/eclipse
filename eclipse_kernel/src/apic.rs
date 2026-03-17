@@ -432,6 +432,12 @@ pub fn broadcast_reschedule_ipi() {
     }
 }
 
+/// Send a reschedule IPI to a specific CPU.
+pub fn send_reschedule_ipi(target_apic_id: u32) {
+    let vector = crate::interrupts::RESCHEDULE_IPI_VECTOR;
+    send_ipi_exact(target_apic_id, vector, 0, true, false);
+}
+
 unsafe fn clear_esr() {
     if !IS_X2APIC.load(Ordering::Relaxed) {
         // xAPIC: Must write to ESR to clear/update it before read

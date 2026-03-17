@@ -75,7 +75,7 @@ impl<T> ReentrantMutex<T> {
             // Sanity check: if gs is not set up (long mode transition/early AP),
             // it will read 0xFFFF_FFFF (uninitialized value in CPU_DATA).
             // Fallback to the reliable (but slower) get_cpu_id to avoid lock owner collisions.
-            if id == 0xFFFF_FFFF || id >= 128 { // MAX_SMP_CPUS
+            if id == 0xFFFF_FFFF || id >= 32 { // MAX_SMP_CPUS
                 return crate::boot::get_cpu_id() as i32;
             }
             

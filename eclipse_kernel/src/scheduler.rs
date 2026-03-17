@@ -5,7 +5,7 @@ use crate::process::{ProcessId, ProcessState, get_process, update_process, curre
 use spin::Mutex;
 
 /// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
-pub const MAX_CPUS: usize = 128;
+pub const MAX_CPUS: usize = 32;
 
 /// Estructura de cola para una CPU
 struct RunQueue {
@@ -153,13 +153,17 @@ pub fn enqueue_process(pid: ProcessId) {
             }
         };
 
-        // crate::serial::serial_printf(format_args!("[SCHED] Enqueueing PID {} to CPU {}\n", pid, target_cpu));
         let mut queue = READY_QUEUES[target_cpu].lock();
         if !queue.push(pid) {
             // crate::serial::serial_print("[SCHED] WARNING: RunQueue full\n");
         }
 
-        crate::apic::broadcast_reschedule_ipi();
+        // Notify only the target CPU if it's not the current one.
+        if target_cpu != crate::process::get_cpu_id() {
+            let apic_ids = crate::acpi::get_info().apic_ids;
+            let target_apic_id = apic_ids[target_cpu];
+            crate::apic::send_reschedule_ipi(target_apic_id);
+        }
     });
 }
 
@@ -178,13 +182,18 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
         }
 
         // 2. Work Stealing: si mi cola está vacía, buscar en otras.
-        // Empezamos la búsqueda en cpu_id + 1 de forma circular.
-        for offset in 1..MAX_CPUS {
-            let victim_cpu = (cpu_id + offset) % MAX_CPUS;
+        let active_cpus = crate::cpu::get_active_cpu_count();
+        if active_cpus <= 1 {
+            return None;
+        }
+
+        // Límite de robos para evitar O(N) excesivo en sistemas muy grandes
+        let steal_limit = core::cmp::min(active_cpus, 8); 
+
+        for offset in 1..steal_limit {
+            let victim_cpu = (cpu_id + offset) % active_cpus;
             let mut victim_q = READY_QUEUES[victim_cpu].lock();
             
-            // Miramos el primer proceso de la cola de la víctima.
-            // Solo lo robamos si NO tiene afinidad estricta con esa CPU.
             if victim_q.head != victim_q.tail {
                 let pid = victim_q.buffer[victim_q.head].unwrap();
                 
@@ -196,7 +205,6 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
                         } else { false }
                     } else { false }
                 } else {
-                    // crate::serial::serial_printf(format_args!("[SCHED] C{} failed to try_lock PROCESS_TABLE for stealing from C{}\n", cpu_id, victim_cpu));
                     false // Avoid deadlock, skip this victim for now
                 };
 
@@ -239,18 +247,7 @@ pub fn local_tick() {
     let current_pid = crate::process::current_process_id();
     if current_pid == Some(0) {
         STATS_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-    } else if let Some(pid) = current_pid {
-        // Incrementar ticks del proceso actual (requiere lock PROCESS_TABLE breve)
-        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
-            x86_64::instructions::interrupts::without_interrupts(|| {
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(p) = table[slot].as_mut() {
-                    if p.id == pid {
-                        p.cpu_ticks += 1;
-                    }
-                }
-            });
-        }
+    // Note: p.cpu_ticks is now updated in schedule() to avoid global lock contention here.
     }
 
     unsafe {
@@ -362,27 +359,26 @@ pub fn schedule() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let cpu_id = crate::process::get_cpu_id();
         let current_pid = current_process_id();
-
+        let mut should_requeue = false;
         // Paso 1: Si hay un proceso usuario en ejecución (Running), preemptarlo
         // y meterlo en la cola ready. PID 0 NUNCA se encola globalmente.
         if let Some(pid) = current_pid {
             if pid != 0 {
-                let mut should_requeue = false;
                 {
                     let mut table = crate::process::PROCESS_TABLE.lock();
-                    // Use pid_to_slot_fast: after slot reuse, pid can exceed 63 so
-                    // table[pid as usize] would panic with an OOB index.
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(process) = table[slot].as_mut() {
                             if process.id == pid && process.state == ProcessState::Running && process.current_cpu == cpu_id as u32 {
                                 should_requeue = true;
+                                // Update ticks here instead of every local_tick
+                                let consumed = unsafe { 10 - CPU_QUANTUM[cpu_id] };
+                                process.cpu_ticks += consumed as u64;
                             }
                         }
                     }
                 }
 
                 if should_requeue {
-                    // Lo metemos en la cola; el core que lo saque ignorará el PID si `current_cpu` sigue siendo Some(A).
                     enqueue_process(pid);
                 }
             }
@@ -451,6 +447,7 @@ pub fn schedule() {
                         // Mismo proceso (único en cola), continúa sin cambio de contexto.
                     }
                     Some(cur) => {
+                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = 10; }
                         perform_context_switch(cur, next_pid);
                     }
                     None => {

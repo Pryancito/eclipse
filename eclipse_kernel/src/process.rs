@@ -150,7 +150,7 @@ pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 
 /// Máximo número de CPUs soportadas
-const MAX_CPUS: usize = 128;
+const MAX_CPUS: usize = 32;
 /// Proceso actual por cada CPU
 
 /// Obtener ID de la CPU actual (O(1) vía GS segment)
