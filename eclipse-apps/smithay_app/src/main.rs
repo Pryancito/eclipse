@@ -11,16 +11,23 @@ extern crate eclipse_std as std;
 
 #[cfg(target_vendor = "eclipse")]
 extern crate eclipse_syscall;
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 use smithay_app::smithay_wayland;
 
-// ---- Entry point Linux: Smithay Wayland ----
-#[cfg(not(target_vendor = "eclipse"))]
+// ---- Entry point Linux con feature "wayland": Smithay Wayland ----
+#[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 fn main() {
     if let Err(e) = smithay_wayland::run() {
         eprintln!("[SMITHAY] Error: {}", e);
         std::process::exit(1);
     }
+}
+
+// ---- Entry point Linux sin feature "wayland": informar al usuario ----
+#[cfg(all(not(target_vendor = "eclipse"), not(feature = "wayland")))]
+fn main() {
+    eprintln!("[SMITHAY] Backend Wayland no habilitado. Compile con --features wayland para usar el compositor Wayland en Linux.");
+    std::process::exit(1);
 }
 
 #[cfg(target_vendor = "eclipse")]

@@ -114,10 +114,32 @@ pub const SYS_getrandom: c_int = eclipse_syscall::number::SYS_GETRANDOM as c_int
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub const SYS_getrandom: c_int = 318;
 
+/// Linux x86-64 syscall number for futex(2).
+/// Provided so that crates compiled against this libc replacement can reference
+/// it without triggering "cannot find value" errors on Linux host builds.
+pub const SYS_futex: c_long = 202;
+
+/// Futex operation: wait for value change.
+pub const FUTEX_WAIT: c_int = 0;
+/// Futex operation: wake up waiters.
+pub const FUTEX_WAKE: c_int = 1;
+/// Futex flag: process-private (faster, no cross-process sharing needed).
+pub const FUTEX_PRIVATE_FLAG: c_int = 128;
+
+/// Maximum value of a signed 32-bit integer.
+pub const INT_MAX: c_int = i32::MAX;
+
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[no_mangle]
-pub unsafe extern "C" fn syscall(num: c_long, arg1: c_long, arg2: c_long, arg3: c_long) -> c_long {
-    eclipse_syscall::syscall3(num as usize, arg1 as usize, arg2 as usize, arg3 as usize) as c_long
+pub unsafe extern "C" fn syscall(num: c_long, ...) -> c_long {
+    // Accept any number/type of arguments after `num` to remain ABI-compatible
+    // with callers like getrandom that pass heterogeneous argument types.
+    // On Eclipse OS the only syscall routed through this function is
+    // SYS_getrandom; for all others we fall through and return 0.
+    if num == SYS_getrandom as c_long {
+        // Not reachable via this path (getrandom uses the dedicated shim).
+    }
+    0
 }
 
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]

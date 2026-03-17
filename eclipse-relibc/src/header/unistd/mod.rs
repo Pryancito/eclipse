@@ -30,7 +30,7 @@ pub unsafe extern "C" fn spawn(_path: *const c_char, _argv: *const *const c_char
 
 #[cfg(not(any(test, feature = "host-testing")))]
 #[no_mangle]
-pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: mode_t) -> c_int {
+pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _args: ...) -> c_int {
     let path_str = core::ffi::CStr::from_ptr(path).to_str().unwrap_or("");
     match sys_open(path_str, flags as usize) {
         Ok(fd) => fd as c_int,

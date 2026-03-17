@@ -144,6 +144,8 @@ pub struct InputState {
     pub system_central_curr_y: f32,
     pub search_active: bool,
     pub search_curr_y: f32,
+    /// Current text typed in the search/run bar (max 64 chars).
+    pub search_query: heapless::String<64>,
 }
 
 
@@ -166,6 +168,7 @@ impl InputState {
             alt_tab_active: false,
             system_central_active: false, system_central_curr_y: 0.0,
             search_active: false, search_curr_y: -(height as f32 / 2.0),
+            search_query: heapless::String::new(),
         }
 
     }
@@ -418,6 +421,21 @@ impl InputState {
     }
 
     pub fn execute_search(&mut self) {
+        let query = self.search_query.as_str().trim();
+        if query.is_empty() {
+            return;
+        }
+        match query {
+            "lock" => {
+                self.lock_active = true;
+            }
+            _ => {
+                // Treat any non-empty query as a request to open a new window / run a command.
+                self.request_new_window = true;
+            }
+        }
+        self.search_query.clear();
+        self.search_active = false;
     }
 }
 

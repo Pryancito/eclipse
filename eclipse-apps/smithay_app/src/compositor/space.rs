@@ -127,11 +127,13 @@ impl Space {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::MAX_EXTERNAL_SURFACES;
 
     #[test]
     fn test_space_map_unmap() {
         let mut space = Space::new();
-        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; MAX_EXTERNAL_SURFACES];
+        let mut surfaces: [ExternalSurface; MAX_EXTERNAL_SURFACES] =
+            core::array::from_fn(|_| ExternalSurface::default());
         let win = ShellWindow {
             x: 0, y: 0, w: 100, h: 100,
             curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
@@ -201,7 +203,8 @@ mod tests {
     #[test]
     fn test_unmap_invalid_index() {
         let mut space = Space::new();
-        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; MAX_EXTERNAL_SURFACES];
+        let mut surfaces: [ExternalSurface; MAX_EXTERNAL_SURFACES] =
+            core::array::from_fn(|_| ExternalSurface::default());
         space.map_window(ShellWindow { x: 0, y: 0, w: 100, h: 100, curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,100,100), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() });
         space.unmap_window(5, &mut surfaces);
         assert_eq!(space.window_count, 1);
@@ -212,10 +215,10 @@ mod tests {
         let mut space = Space::new();
         let win = ShellWindow { x: 0, y: 0, w: 1, h: 1, curr_x: 0.0, curr_y: 0.0, curr_w: 1.0, curr_h: 1.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,1,1), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
         for _ in 0..MAX_WINDOWS_COUNT {
-            space.map_window(win);
+            space.map_window(win.clone());
         }
         assert_eq!(space.window_count, MAX_WINDOWS_COUNT);
-        space.map_window(win);
+        space.map_window(win.clone());
         assert_eq!(space.window_count, MAX_WINDOWS_COUNT);
     }
 
@@ -223,7 +226,8 @@ mod tests {
     fn test_stress_map_unmap_cycle() {
         const CYCLES: u32 = 5_000;
         let mut space = Space::new();
-        let mut surfaces = [ExternalSurface { id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false }; MAX_EXTERNAL_SURFACES];
+        let mut surfaces: [ExternalSurface; MAX_EXTERNAL_SURFACES] =
+            core::array::from_fn(|_| ExternalSurface::default());
         let win = ShellWindow {
             x: 0, y: 0, w: 100, h: 100,
             curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0,
