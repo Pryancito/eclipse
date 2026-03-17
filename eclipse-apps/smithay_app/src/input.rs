@@ -421,12 +421,14 @@ impl InputState {
     }
 
     pub fn execute_search(&mut self) {
+        const CMD_LOCK: &str = "lock";
+
         let query = self.search_query.as_str().trim();
         if query.is_empty() {
             return;
         }
         match query {
-            "lock" => {
+            CMD_LOCK => {
                 self.lock_active = true;
             }
             _ => {

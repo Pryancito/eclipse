@@ -131,14 +131,12 @@ pub const INT_MAX: c_int = i32::MAX;
 
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[no_mangle]
-pub unsafe extern "C" fn syscall(num: c_long, ...) -> c_long {
-    // Accept any number/type of arguments after `num` to remain ABI-compatible
-    // with callers like getrandom that pass heterogeneous argument types.
-    // On Eclipse OS the only syscall routed through this function is
-    // SYS_getrandom; for all others we fall through and return 0.
-    if num == SYS_getrandom as c_long {
-        // Not reachable via this path (getrandom uses the dedicated shim).
-    }
+pub unsafe extern "C" fn syscall(_num: c_long, ...) -> c_long {
+    // Accept any number/type of arguments after `_num` to remain ABI-compatible
+    // with callers like getrandom that pass heterogeneous argument types
+    // (e.g. `&AtomicI32`, `i32`, `*const timespec`).
+    // On Eclipse OS, all targeted syscalls go through dedicated shims; this
+    // generic fallback simply returns 0 (success) for unhandled numbers.
     0
 }
 
