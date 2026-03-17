@@ -189,18 +189,30 @@ pub fn bar(progress: u32) {
         return;
     }
 
-    // Only render once the framebuffer has been explicitly mapped by progress::init().
-    // Using the phys_to_virt HHDM fallback before that point can hang real hardware:
-    // on systems with a discrete GPU the framebuffer BAR lives above the HHDM limit
-    // and the write would cause a triple fault (no IDT installed at this stage).
-    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
-    if mapped == 0 {
-        return;
-    }
+    // Validate the dedicated WC framebuffer mapping set by progress::init().
+    // Only trust the value if it falls in the known FB virtual range; any other
+    // non-zero value indicates un-zeroed BSS and must be ignored.
+    let raw_mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let validated_mapped = if raw_mapped >= crate::memory::FB_VADDR_BASE { raw_mapped } else { 0 };
 
     let _hw_lock = VIDEO_HARDWARE_LOCK.lock();
-    let Some((_phys, width, height, pitch, source)) = get_fb_info() else { return };
-    let virt = mapped as *mut u8;
+    let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
+
+    // Maximum physical address reachable via the HHDM (512 GiB, matching the
+    // 512 page-directory entries the bootloader sets up).
+    const HHDM_PHYS_LIMIT: u64 = 0x80_0000_0000u64; // 512 GiB
+
+    // Use the dedicated WC mapping when available (post-init), otherwise fall back
+    // to the HHDM direct mapping that the bootloader already set up.
+    // The HHDM covers physical addresses 0..HHDM_PHYS_LIMIT; skip rendering if the
+    // framebuffer BAR sits above that limit (discrete GPU with high VRAM aperture).
+    let virt = if validated_mapped != 0 {
+        validated_mapped as *mut u8
+    } else if phys < HHDM_PHYS_LIMIT {
+        crate::memory::phys_to_virt(phys) as *mut u8
+    } else {
+        return;
+    };
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
     let progress = progress.min(100);
 
