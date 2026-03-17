@@ -1496,7 +1496,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 
                 {
                     let out = system_table.stdout();
-                    let _ = out.write_str("Kernel relocalizado. Prepando framebuffer...\n");
+                    let _ = out.write_str("Kernel relocalizado. Preparando framebuffer...\n");
                 }
 
                 kernel_entry_phys = entry_point_virt;
