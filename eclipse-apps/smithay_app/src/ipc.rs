@@ -19,6 +19,10 @@ pub struct IpcHandler {
     pub message_count: u64,
     /// Intentos de recv (cada poll_event); si sube pero message_count no, el kernel no nos da mensajes.
     pub recv_attempts: u64,
+    /// Número de llamadas consecutivas a process_messages() que no entregaron ningún evento
+    /// reconocido. Si sube indefinidamente indica que el buzón está vacío o lleno de mensajes
+    /// desconocidos y el IPC es funcional pero sin eventos útiles.
+    pub consecutive_empty: u64,
     #[cfg(test)]
     pub mock_events: alloc::vec::Vec<CompositorEvent>,
 }
@@ -29,6 +33,7 @@ impl IpcHandler {
             channel: IpcChannel::new(),
             message_count: 0,
             recv_attempts: 0,
+            consecutive_empty: 0,
             #[cfg(test)]
             mock_events: alloc::vec::Vec::new(),
         }
@@ -39,13 +44,17 @@ impl IpcHandler {
     pub fn process_messages(&mut self) -> Option<CompositorEvent> {
         #[cfg(test)]
         if !self.mock_events.is_empty() {
+            self.consecutive_empty = 0;
             return Some(self.mock_events.remove(0));
         }
 
-        // Procesar hasta 16 mensajes seguidos si son ignorados por el compositor,
+        // Procesar hasta MAX_SKIP=32 mensajes seguidos si son ignorados por el compositor,
         // para dar oportunidad al renderizado y no morir en un bucle infinito
         // si recibimos basura o un flood de eventos desconocidos.
-        for _ in 0..16 {
+        // El límite de 32 evita que process_messages() sea un punto de bloqueo:
+        // siempre retorna en tiempo acotado independientemente del contenido del buzón.
+        const MAX_SKIP: usize = 32;
+        for _ in 0..MAX_SKIP {
             self.recv_attempts += 1;
             #[cfg(not(test))]
             let recv_res = self.channel.recv();
@@ -53,9 +62,14 @@ impl IpcHandler {
             let recv_res: Option<eclipse_ipc::types::EclipseMessage> = None;
 
             match recv_res {
-                None => return None, // Buzón vacío: salir
+                None => {
+                    // Buzón vacío: no hay más mensajes que procesar.
+                    self.consecutive_empty = self.consecutive_empty.saturating_add(1);
+                    return None;
+                }
                 Some(EclipseMessage::Input(ev)) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     // En Eclipse OS (`target_os = "none"`) el tipo del fast-path (`eclipse_syscall::InputEvent`)
                     // difiere del usado en `CompositorEvent::Input` (definido en `eclipse_libc`). Las dos
                     // structs tienen la misma representación, así que copiamos campo a campo.
@@ -77,26 +91,31 @@ impl IpcHandler {
                 }
                 Some(EclipseMessage::SideWind(sw, pid)) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     return Some(CompositorEvent::SideWind(sw, pid));
                 }
                 Some(EclipseMessage::NetStatsResponse { rx, tx }) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     return Some(CompositorEvent::NetStats(rx, tx));
                 }
                 Some(EclipseMessage::ServiceInfoResponse { data, len }) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     let mut heap_data = heapless::Vec::<u8, 256>::new();
                     let _ = heap_data.extend_from_slice(&data[..len.min(256)]);
                     return Some(CompositorEvent::ServiceInfo(heap_data));
                 }
                 Some(EclipseMessage::Log { line, len }) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     let mut v = heapless::Vec::<u8, 252>::new();
                     let _ = v.extend_from_slice(&line[..len.min(252)]);
                     return Some(CompositorEvent::KernelLog(v));
                 }
                 Some(EclipseMessage::Wayland { data, len }) => {
                     self.message_count += 1;
+                    self.consecutive_empty = 0;
                     let mut vec = heapless::Vec::new();
                     let _ = vec.extend_from_slice(&data[..len]);
                     // Kernel fast-path Wayland messages currently do not carry the sender PID,
@@ -107,12 +126,17 @@ impl IpcHandler {
                 Some(_) => {
                     // Mensaje no reconocido o no procesado por el compositor:
                     // Continuamos el bucle interno para intentar sacar el siguiente.
+                    // No incrementamos consecutive_empty: hay actividad en el buzón, aunque no
+                    // sea útil para el compositor. Esto evita falsos positivos de "IPC muerto".
                     continue;
                 }
             }
         }
-        
-        None // Límite de intentos alcanzado, volver en la próxima iteración del main loop
+
+        // Límite de intentos alcanzado: el buzón tiene muchos mensajes no reconocidos.
+        // Retornamos None para que el compositor pueda hacer render y no quedar bloqueado.
+        // El siguiente frame continuará vaciando el buzón.
+        None
     }
 }
 
@@ -324,5 +348,51 @@ mod tests {
         };
         handle_sidewind_message(&msg, 123, &mut surfaces, &mut windows, &mut window_count, &mut input_state, 1920, 1080);
         assert_eq!(window_count, 0);
+    }
+
+    #[test]
+    fn test_consecutive_empty_increments_on_empty_mailbox() {
+        let mut handler = IpcHandler::new();
+        // No mock events → recv returns None → consecutive_empty should increment
+        let result = handler.process_messages();
+        assert!(result.is_none());
+        assert_eq!(handler.consecutive_empty, 1);
+        // Second call also empty: consecutive_empty should keep growing
+        let _ = handler.process_messages();
+        assert_eq!(handler.consecutive_empty, 2);
+    }
+
+    #[test]
+    fn test_consecutive_empty_resets_on_message() {
+        let mut handler = IpcHandler::new();
+        use eclipse_syscall::InputEvent;
+        // Simulate a few empty polls
+        let _ = handler.process_messages();
+        let _ = handler.process_messages();
+        assert_eq!(handler.consecutive_empty, 2);
+        // Now push a real event: consecutive_empty should reset to 0
+        handler.mock_events.push(CompositorEvent::Input(InputEvent {
+            device_id: 1,
+            event_type: 0,
+            code: 0x1E,
+            value: 1,
+            timestamp: 0,
+        }));
+        let result = handler.process_messages();
+        assert!(result.is_some());
+        assert_eq!(handler.consecutive_empty, 0);
+    }
+
+    #[test]
+    fn test_process_messages_is_bounded_no_infinite_loop() {
+        let mut handler = IpcHandler::new();
+        // Verify that process_messages() always returns in bounded time:
+        // with no mock events, it returns None immediately.
+        for _ in 0..1000 {
+            let res = handler.process_messages();
+            assert!(res.is_none());
+        }
+        // recv_attempts grows linearly (1 per call when mailbox is empty)
+        assert_eq!(handler.recv_attempts, 1000);
     }
 }
