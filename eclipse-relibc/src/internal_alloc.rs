@@ -29,9 +29,10 @@ fn round_up_page(size: usize) -> usize {
 
 /// Estructura de control para un bloque de memoria
 /// [SIZE (usize)][USER DATA...]
-#[repr(C)]
+#[repr(C, align(16))]
 struct BlockHeader {
     size: usize,
+    _padding: usize, // Ensure header is 16 bytes so base+16 is 16-byte aligned
 }
 
 pub struct Allocator {

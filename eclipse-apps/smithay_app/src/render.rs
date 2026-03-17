@@ -827,11 +827,8 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
             WindowContent::External(idx) => {
                 if (idx as usize) < surfaces.len() && surfaces[idx as usize].active {
                     let s = &surfaces[idx as usize];
-                    // Evitar Page Fault (#14): rechazar vaddr fuera de rango plausible de mmap.
-                    // CR2=0x2bf086ff9e5 (~280 GiB) indica puntero corrupto o mapping ya liberado.
-                    const MAX_PLAUSIBLE_VADDR: usize = 0x20_0000_0000; // 128 GiB
-                    let vaddr_ok = s.vaddr != 0
-                        && s.vaddr != 0x1000
+                    const MAX_PLAUSIBLE_VADDR: usize = 0x1_0000_0000; // 4 GiB
+                    let vaddr_ok = s.vaddr >= 0x1000_0000 // Above binary base
                         && s.vaddr <= MAX_PLAUSIBLE_VADDR
                         && s.buffer_size != 0
                         && s.vaddr.saturating_add(s.buffer_size) <= MAX_PLAUSIBLE_VADDR;
@@ -849,6 +846,9 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                                 fb.blit_buffer(wx + 5, wy + ShellWindow::TITLE_H + 5, content_w, content_h, s.vaddr as *const u32, s.buffer_size);
                             }
                         }
+                    } else if s.active {
+                        // Log only if it was supposed to be active but has a weird address
+                        println!("[SMITHAY] Skip render: PID {} has invalid vaddr 0x{:x}", s.pid, s.vaddr);
                     }
                 }
             }

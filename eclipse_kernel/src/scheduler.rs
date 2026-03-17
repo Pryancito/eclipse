@@ -7,11 +7,48 @@ use spin::Mutex;
 /// Número máximo de CPUs soportadas (debe coincidir con process::MAX_CPUS)
 pub const MAX_CPUS: usize = 128;
 
-/// Cola de procesos ready (ampliada para SMP)
-const READY_QUEUE_SIZE: usize = 512;
-static READY_QUEUE: Mutex<[Option<ProcessId>; READY_QUEUE_SIZE]> = Mutex::new([None; READY_QUEUE_SIZE]);
-static QUEUE_HEAD: Mutex<usize> = Mutex::new(0);
-static QUEUE_TAIL: Mutex<usize> = Mutex::new(0);
+/// Estructura de cola para una CPU
+struct RunQueue {
+    buffer: [Option<ProcessId>; 64],
+    head: usize,
+    tail: usize,
+}
+
+impl RunQueue {
+    const fn new() -> Self {
+        Self {
+            buffer: [None; 64],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    fn push(&mut self, pid: ProcessId) -> bool {
+        let next_tail = (self.tail + 1) % 64;
+        if next_tail == self.head {
+            return false;
+        }
+        self.buffer[self.tail] = Some(pid);
+        self.tail = next_tail;
+        true
+    }
+
+    fn pop(&mut self) -> Option<ProcessId> {
+        if self.head == self.tail {
+            return None;
+        }
+        let pid = self.buffer[self.head].take();
+        self.head = (self.head + 1) % 64;
+        pid
+    }
+}
+
+/// Colas de procesos ready, una por cada CPU para evitar contención de locks.
+static READY_QUEUES: [Mutex<RunQueue>; MAX_CPUS] =
+    [const { Mutex::new(RunQueue::new()) }; MAX_CPUS];
+
+/// Contador round-robin para distribuir procesos nuevos entre CPUs.
+static NEW_PROC_RR_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// Contextos idle por CPU para APs.
 /// CPU 0 (BSP) utiliza el contexto del proceso kernel (PID 0) como idle.
@@ -65,62 +102,63 @@ pub fn take_run_counts() -> [u32; MAX_PIDS] {
 /// acquisitions were separate (a second CPU could pass the dedup check before
 /// the first one set the state to Ready, inserting the same PID twice).
 pub fn enqueue_process(pid: ProcessId) {
-    // Resolve the PID to its PROCESS_TABLE slot index.  After slot reuse, a
-    // process can have PID ≥ MAX_PROCESSES (256) while occupying a recycled slot
-    // index ≤ 63.  Using the raw PID as an index would be out-of-bounds; using
-    // pid_to_slot_fast() gives the correct slot regardless of the PID value.
     let slot = match crate::ipc::pid_to_slot_fast(pid) {
         Some(s) => s,
-        None => return, // PID not registered in table — drop silently.
+        None => return,
     };
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut queue = READY_QUEUE.lock();
-        let head = QUEUE_HEAD.lock();
-        let mut tail = QUEUE_TAIL.lock();
-
-        let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-        if next_tail == *head {
-            // Queue full — drop the enqueue request rather than spinning.
-            return;
-        }
-
-        // Single atomic check-and-set while READY_QUEUE is held.
-        // This prevents two CPUs from both passing the dedup check and
-        // both inserting the same PID into the queue.
-        {
+        let (target_cpu, already_ready) = {
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(p) = table[slot].as_mut() {
-                // Verify the slot still belongs to this PID (slot may have been reused).
                 if p.id != pid { return; }
-                // Dedup: already in the ready queue or running on ANOTHER CPU — skip.
-                // If it's already Ready, it's already in the queue.
-                // If it's Running on another CPU, it's already active, no need to enqueue.
-                // If it's Running on the current CPU, we allow it (for preemption in schedule()).
                 if p.state == ProcessState::Ready {
-                    return;
+                    return; // Already in a queue
                 }
                 if p.state == ProcessState::Running && p.current_cpu != crate::process::get_cpu_id() as u32 {
-                    return;
+                    return; // Running on another CPU
                 }
-
-                // Do not enqueue terminated processes.
                 if p.state == ProcessState::Terminated {
                     return;
                 }
-                // Blocked → Ready  or  Running → Ready (preemption from schedule()).
+
                 p.state = ProcessState::Ready;
-                // NOTE: current_cpu is intentionally NOT cleared here.
-                // The owning CPU will clear it atomically in switch_context().
+                
+                let active_cpus = crate::cpu::get_active_cpu_count();
+                let current_cpu = crate::process::get_cpu_id();
+
+                let target = if let Some(aff) = p.cpu_affinity {
+                    aff as usize % MAX_CPUS
+                } else if p.last_cpu != crate::process::NO_CPU {
+                    // Cache affinity
+                    p.last_cpu as usize % MAX_CPUS
+                } else {
+                    // New process or first time enqueuing:
+                    // Use Round-Robin but bias AWAY from current CPU if more than 1 CPU exists.
+                    let next = NEW_PROC_RR_CPU.fetch_add(1, Ordering::Relaxed) as usize;
+                    if active_cpus > 1 {
+                        let rr_target = next % active_cpus;
+                        if rr_target == current_cpu {
+                            (rr_target + 1) % active_cpus
+                        } else {
+                            rr_target
+                        }
+                    } else {
+                        0
+                    }
+                };
+                (target, false)
             } else {
-                return; // Process not in table.
+                return;
             }
+        };
+
+        // crate::serial::serial_printf(format_args!("[SCHED] Enqueueing PID {} to CPU {}\n", pid, target_cpu));
+        let mut queue = READY_QUEUES[target_cpu].lock();
+        if !queue.push(pid) {
+            // crate::serial::serial_print("[SCHED] WARNING: RunQueue full\n");
         }
 
-        queue[*tail] = Some(pid);
-        *tail = next_tail;
-
-        // Notify other CPUs that a new process is ready.
         crate::apic::broadcast_reschedule_ipi();
     });
 }
@@ -130,66 +168,54 @@ pub fn enqueue_process(pid: ProcessId) {
 /// Si cpu_affinity = None, cualquier CPU puede ejecutarlo.
 fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut queue = READY_QUEUE.lock();
-        let mut head = QUEUE_HEAD.lock();
-        let mut tail = QUEUE_TAIL.lock();
-        
-        let mut checked = 0;
-        let initial_head = *head;
-        
-        while checked < READY_QUEUE_SIZE {
-            if *head == *tail {
-                return None;
+        // 1. Intentar sacar de la cola local (Cache Affinity)
+        {
+            let mut local_q = READY_QUEUES[cpu_id].lock();
+            if let Some(pid) = local_q.pop() {
+                // crate::serial::serial_printf(format_args!("[SCHED] C{} dequeued PID {} (LOCAL)\n", cpu_id, pid));
+                return Some(pid);
             }
+        }
+
+        // 2. Work Stealing: si mi cola está vacía, buscar en otras.
+        // Empezamos la búsqueda en cpu_id + 1 de forma circular.
+        for offset in 1..MAX_CPUS {
+            let victim_cpu = (cpu_id + offset) % MAX_CPUS;
+            let mut victim_q = READY_QUEUES[victim_cpu].lock();
             
-            let pid_opt = queue[*head].take();
-            *head = (*head + 1) % READY_QUEUE_SIZE;
-            checked += 1;
-            
-            if let Some(pid) = pid_opt {
-                let matches_affinity = {
-                    let table = crate::process::PROCESS_TABLE.lock();
+            // Miramos el primer proceso de la cola de la víctima.
+            // Solo lo robamos si NO tiene afinidad estricta con esa CPU.
+            if victim_q.head != victim_q.tail {
+                let pid = victim_q.buffer[victim_q.head].unwrap();
+                
+                // DEADLOCK PREVENTION: Use try_lock when holding another lock.
+                let can_steal = if let Some(table) = crate::process::PROCESS_TABLE.try_lock() {
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(p) = table[slot].as_ref() {
-                            p.id == pid && match p.cpu_affinity {
-                                None => true,
-                                Some(aff) => aff == cpu_id as u32,
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
+                            p.id == pid && p.cpu_affinity.is_none()
+                        } else { false }
+                    } else { false }
+                } else {
+                    // crate::serial::serial_printf(format_args!("[SCHED] C{} failed to try_lock PROCESS_TABLE for stealing from C{}\n", cpu_id, victim_cpu));
+                    false // Avoid deadlock, skip this victim for now
                 };
-                
-                if matches_affinity {
-                    return Some(pid);
+
+                if can_steal {
+                    let pid = victim_q.pop();
+                    // crate::serial::serial_printf(format_args!("[SCHED] C{} STOLE PID {:?} from C{}\n", cpu_id, pid, victim_cpu));
+                    return pid;
                 }
-                
-                // No coincide afinidad: devolver al final de la cola
-                let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-                if next_tail == *head {
-                    // Cola llena - dejar el proceso fuera sería incorrecto.
-                    // Reinsertar en head (deshacer el take) y abortar búsqueda.
-                    *head = (*head + READY_QUEUE_SIZE - 1) % READY_QUEUE_SIZE;
-                    queue[*head] = Some(pid);
-                    return None;
-                }
-                queue[*tail] = Some(pid);
-                *tail = next_tail;
             }
         }
         None
     })
 }
 
-/// Returns the virtual address of the ready queue tail pointer.
-/// Used for MONITOR/MWAIT idle optimization.
 pub fn ready_queue_tail_addr() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let tail = QUEUE_TAIL.lock();
-        &*tail as *const usize as usize
+        let cpu_id = crate::process::get_cpu_id();
+        let q = READY_QUEUES[cpu_id].lock();
+        &q.tail as *const usize as usize
     })
 }
 
@@ -391,6 +417,7 @@ pub fn schedule() {
                         } else {
                             next_process.state = ProcessState::Running;
                             next_process.current_cpu = cpu_id as u32;
+                            next_process.last_cpu = cpu_id as u32; // Update cache affinity
                             true
                         }
                     } else {
@@ -412,18 +439,8 @@ pub fn schedule() {
                 // consistent with enqueue_process's lock order, so there is no TOCTOU
                 // window between the state check and the insertion.
                 x86_64::instructions::interrupts::without_interrupts(|| {
-                    let mut queue = READY_QUEUE.lock();
-                    let head = *QUEUE_HEAD.lock();
-                    let mut tail = QUEUE_TAIL.lock();
-                    let next_tail = (*tail + 1) % READY_QUEUE_SIZE;
-                    if next_tail != head {
-                        // State is already Ready — no change needed.
-                        queue[*tail] = Some(next_pid);
-                        *tail = next_tail;
-                    }
-                    // If the queue is full, skip re-insertion.  The process retains
-                    // state=Ready; the next timer tick will dequeue another entry and
-                    // a subsequent should_requeue attempt will succeed.
+                    let mut queue = READY_QUEUES[cpu_id].lock();
+                    queue.push(next_pid);
                 });
             }
 

@@ -128,6 +128,10 @@ pub fn has_tsc_deadline() -> bool {
     TSC_DEADLINE_SUPPORTED.load(Ordering::Relaxed)
 }
 
+pub fn get_active_cpu_count() -> usize {
+    AP_READY.load(Ordering::Relaxed) + 1
+}
+
 pub fn start_aps() {
     let acpi = crate::acpi::get_info();
     let bsp_id = crate::apic::get_id();

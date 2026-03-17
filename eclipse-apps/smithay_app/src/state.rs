@@ -125,7 +125,7 @@ impl SmithayState {
     }
 
 
-    pub fn new() -> Option<Self> {
+    pub fn new() -> Option<Box<Self>> {
         let mut backend = Backend::new()?;
         // Render the static cosmic background once into the background buffer so that
         // blit_background / blit_background_damaged have valid content to copy from.
@@ -139,7 +139,7 @@ impl SmithayState {
             id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false, ready_to_flip: false
         } }; MAX_EXTERNAL_SURFACES];
 
-        Some(Self {
+        Some(Box::new(Self {
             backend,
             space,
             input,
@@ -172,7 +172,7 @@ impl SmithayState {
             #[cfg(any(not(target_os = "linux"), test))]
             wayland_pool_maps: Vec::new(),
             last_ipc_activity: std::time::Instant::now(),
-        })
+        }))
 
     }
 

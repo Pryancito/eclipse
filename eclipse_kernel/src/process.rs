@@ -106,6 +106,7 @@ pub struct Process {
     pub cpu_ticks: u64,                   // Total CPU ticks consumed
     pub mem_frames: u64,                  // Approximate physical memory usage in frames
     pub current_cpu: u32,                 // CPU currently executing this process (SMP safety); NO_CPU = not running
+    pub last_cpu: u32,                    // Last CPU that executed this process (for cache affinity)
     pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
     pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
 }
@@ -135,6 +136,7 @@ impl Process {
             cpu_ticks: 0,
             mem_frames: 0,
             current_cpu: NO_CPU,
+            last_cpu: NO_CPU,
             exit_code: 0,
             cpu_affinity: None,
         }
@@ -182,6 +184,7 @@ pub fn init_kernel_process() {
         process.id = 0;
         process.state = ProcessState::Running;
         process.current_cpu = 0;
+        process.last_cpu = 0;
         process.priority = 0;
         process.time_slice = 10;
         process.kernel_stack_top = kernel_stack_top_aligned;
@@ -689,6 +692,7 @@ pub fn fork_process(parent_context: &Context) -> Option<ProcessId> {
                 child.id = child_pid;
                 child.state = ProcessState::Blocked;
                 child.current_cpu = NO_CPU;
+                child.last_cpu = NO_CPU;
                 child.parent_pid = Some(current_pid);
                 child.kernel_stack_top = kernel_stack_top_aligned;
                 

@@ -224,7 +224,7 @@ pub fn load_elf(elf_data: &[u8]) -> Option<ProcessId> {
 
     // Default user stack at 512MB
     let stack_base = 0x20000000; // 512MB
-    let stack_size = 0x40000;  // 256KB
+    let stack_size = 0x100000;  // 1MB (previously 256KB)
 
     // Map the user stack into the SAME cr3 before creating the process entry.
     if let Err(e) = setup_user_stack(cr3, stack_base, stack_size) {

@@ -60,6 +60,8 @@ fn main() {
         used_mem_frames: 0,
     };
 
+    let mut frame_count = 0;
+
     loop {
         state.handle_ipc();
         if state.update() {
