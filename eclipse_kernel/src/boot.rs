@@ -3,7 +3,7 @@
 use crate::memory::PHYS_MEM_OFFSET;
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 /// Información del framebuffer recibida del bootloader UEFI
 #[repr(C)]
@@ -61,6 +61,15 @@ static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
     kernel_phys_base: 0,
     rsdp_addr: 0,
 });
+
+/// True once `load_gdt()` has initialized GS base to point at valid per-CPU data.
+/// Using `gs:[..]` before this can fault if the null page is unmapped.
+static GS_BASE_READY: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+pub fn gs_base_ready() -> bool {
+    GS_BASE_READY.load(Ordering::Relaxed)
+}
 
 /// Initialize boot info from the pointer passed by the bootloader
 pub fn init(boot_info_ptr: u64) {
@@ -447,6 +456,9 @@ pub fn load_gdt() {
             in("edx") gs_high,
             options(nomem, nostack, preserves_flags),
         );
+
+        // GS base is now valid for get_cpu_id_gs() / per-CPU accesses.
+        GS_BASE_READY.store(true, Ordering::SeqCst);
     }
 }
 

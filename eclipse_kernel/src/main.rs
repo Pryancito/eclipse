@@ -104,35 +104,22 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
-    // Ensure interrupts are disabled immediately upon entering the kernel.
-    // UEFI may leave them enabled, and calling init_pat() will restore the IF
-    // flag, causing a triple-fault if an interrupt fires before the IDT is ready.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
-
-    // DIAGNÓSTICO: RED SQUARE (30,0) al entrar en el kernel
-    // El framebuffer info está al inicio de BootInfo
+    // 1. Raw serial diagnostic (High Priority)
+    // Write 'K' to COM1 (0x3f8) immediately to signal kernel entry.
     unsafe {
-        let base_ptr = boot_info_ptr as *const u64;
-        let fb_base = *base_ptr;
-        let pitch_ptr = (boot_info_ptr + 16) as *const u32; // base(8) + width(4) + height(4)
-        let pitch = *pitch_ptr;
-        
-        if fb_base != 0 && fb_base != 0xDEADBEEF {
-            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
-            for y in 0..10 {
-                for x in 30..40 {
-                    *fb.add(y * pitch as usize + x) = 0xFF0000;
-                }
-            }
-        }
+        core::arch::asm!(
+            "mov dx, 0x3f8",
+            "mov al, 'K'",
+            "out dx, al",
+            options(nomem, nostack, preserves_flags)
+        );
     }
 
     // 1. Initialize serial for diagnostics immediately
-    
     // Explicit raw asm for early confirmation (COM1)
     unsafe {
         for &b in b"[KERNEL] _start reached via COM1\n" {
-            let mut timeout = 1_000_000;
+            let mut timeout = 1_000;
             let mut status: u8;
             while timeout > 0 {
                 core::arch::asm!("in al, dx", in("dx") 0x3F8u16 + 5, out("al") status);
@@ -143,31 +130,33 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
+    // 1. Initialize serial for diagnostics immediately
     serial::init();
-    
-    // VERIFICACIÓN MANUAL DE DIRECCIONES
-    serial::serial_print("[KERNEL] FB Phys Base: ");
-    serial::serial_print_hex(boot_info_ptr); // This is just the ptr, let's get the base from it
-    serial::serial_print("\n");
-    
-    let fb_base_val: u64 = unsafe { *(boot_info_ptr as *const u64) };
-    serial::serial_print("[KERNEL] FB Base Value: ");
-    serial::serial_print_hex(fb_base_val);
-    serial::serial_print("\n");
 
-    let cr3_val: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val); }
-    serial::serial_print("[KERNEL] Current CR3: ");
-    serial::serial_print_hex(cr3_val);
-    serial::serial_print("\n");
+    // 1.5 Enable SSE early (embedded-graphics requires it)
+    boot::enable_sse();
 
-    // 2. Initialize boot info (Necessary for bar() to find the framebuffer)
+    // 1.6 Zero BSS (linker symbols __bss_start, __bss_end)
+    extern "C" {
+        static mut __bss_start: u8;
+        static mut __bss_end: u8;
+    }
+    unsafe {
+        let mut curr = &raw mut __bss_start;
+        let end = &raw mut __bss_end;
+        while curr < end {
+            curr.write_volatile(0);
+            curr = curr.add(1);
+        }
+    }
+
+    // 2. Initialize boot info
     boot::init(boot_info_ptr);
     
     // DIAGNÓSTICO: CYAN SQUARE (40,0) después de boot::init
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
+            let fb = fb_base as *mut u32;
             for y in 0..10 {
                 for x in 40..50 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0x00FFFF; // Cyan
@@ -179,7 +168,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // DIAGNÓSTICO: YELLOW SQUARE (50,0) antes de progress::bar(42)
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32; // HHDM (Virtual)
+            let fb = fb_base as *mut u32; // Identity (physical)
             for y in 0..10 {
                 for x in 50..60 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0xFFFF00; // Yellow
@@ -202,12 +191,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     // 4. Initial progress (distinguish from bootloader's 40%)
+    progress::init();
     progress::bar(42);
     
     // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
     unsafe {
         if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = crate::memory::phys_to_virt(fb_base) as *mut u32;
+            let fb = fb_base as *mut u32;
             for y in 0..10 {
                 for x in 60..70 {
                     *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF; // White
@@ -269,10 +259,11 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     memory::init_paging(kernel_phys_base);
     progress::bar(60);
     
-    serial::serial_print("Initializing memory system...\n");
+    serial::serial_print("DEBUG: init memory system...\n");
     memory::init();
-    progress::init();
+    serial::serial_print("DEBUG: init progress system...\n");
     progress::bar(65);
+    serial::serial_print("DEBUG: init interrupts...\n");
 
     interrupts::init();
     

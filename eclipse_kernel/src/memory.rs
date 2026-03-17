@@ -1181,25 +1181,23 @@ pub fn map_framebuffer_for_process(page_table_phys: u64, fb_phys_addr: u64, fb_s
 /// Map framebuffer for kernel use with Write-Combining (WC)
 /// Returns virtual address in the FB_VADDR_BASE range (0xFFFFFB0000000000+)
 pub fn map_framebuffer_kernel(paddr: u64, size: usize) -> u64 {
-    let virt_addr = FB_VADDR_BASE + paddr;
-    
-    // WC flags: PWT=1, PCD=0 (PAT Index 1 set in init_pat)
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH;
+    // En hardware real el bootloader ya proporciona un mapeo HHDM completo
+    // (0xFFFF9000_0000_0000 + phys). Para evitar fallos de página tempranos
+    // al intentar crear tablas nuevas con alloc_dma_buffer (todavía frágil
+    // durante el arranque), reutilizamos directamente ese mapeo en lugar de
+    // crear una región dedicada en FB_VADDR_BASE.
+    let virt_addr = phys_to_virt(paddr);
 
-    let kernel_cr3 = {
-        let k = KERNEL_CR3.load(Ordering::Relaxed);
-        if k == 0 { get_cr3() } else { k }
-    };
-
-    crate::serial::serial_print("[MEM] map_fb_kernel: cr3=");
-    crate::serial::serial_print_hex(kernel_cr3);
+    crate::serial::serial_print("[MEM] map_fb_kernel (HHDM reuse): p=");
+    crate::serial::serial_print_hex(paddr);
     crate::serial::serial_print(" v=");
     crate::serial::serial_print_hex(virt_addr);
+    crate::serial::serial_print(" size=");
+    crate::serial::serial_print_dec(size as u64);
     crate::serial::serial_print("\n");
 
-    mmio_map_kernel_range(kernel_cr3, paddr, size as u64, virt_addr, flags);
-    flush_tlb();
-
+    // No necesitamos tocar las tablas de páginas aquí; el bootloader ya ha
+    // mapeado toda la RAM física en PHYS_MEM_OFFSET.
     virt_addr
 }
 /// Map a physical memory range into a process's page table using 4KB pages

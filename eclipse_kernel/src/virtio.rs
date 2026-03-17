@@ -1807,19 +1807,18 @@ impl VirtIOGpuDevice {
     unsafe fn init_mmio(&mut self) -> bool {
         let regs = self.mmio_base as *mut VirtIOMMIORegs;
         let magic = read_volatile(&(*regs).magic_value);
-        crate::serial::serial_print("[VirtIO-GPU] MMIO magic=");
-        crate::serial::serial_print_hex(magic as u64);
         if magic != VIRTIO_MAGIC {
-            crate::serial::serial_print(" (expected 0x74726976)\n");
             return false;
         }
         let device_id = read_volatile(&(*regs).device_id);
-        crate::serial::serial_print(" device_id=");
-        crate::serial::serial_print_hex(device_id as u64);
         if device_id != VIRTIO_ID_GPU {
-            crate::serial::serial_print(" (expected 0x10 GPU)\n");
             return false;
         }
+
+        crate::serial::serial_print("[VirtIO-GPU] MMIO magic=");
+        crate::serial::serial_print_hex(magic as u64);
+        crate::serial::serial_print(" device_id=");
+        crate::serial::serial_print_hex(device_id as u64);
         crate::serial::serial_print("\n");
 
         write_volatile(&mut (*regs).status, 0);

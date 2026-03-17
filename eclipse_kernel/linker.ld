@@ -53,8 +53,10 @@ SECTIONS
     /* Datos no inicializados (BSS) */
     .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_BASE)
     {
+        __bss_start = .;
         *(COMMON)
         *(.bss*)
+        __bss_end = .;
     }
 
     /* Símbolos de fin de kernel */

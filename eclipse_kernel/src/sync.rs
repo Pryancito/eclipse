@@ -13,7 +13,7 @@ pub struct ReentrantMutex<T> {
     data: core::cell::UnsafeCell<T>,
 }
 
-const NO_CPU: i32 = -1;
+const NO_CPU: i32 = 0;
 
 unsafe impl<T: Send> Send for ReentrantMutex<T> {}
 unsafe impl<T: Send> Sync for ReentrantMutex<T> {}
@@ -84,20 +84,21 @@ impl<T> ReentrantMutex<T> {
     }
 
     pub fn lock(&self) -> ReentrantMutexGuard<'_, T> {
-        let me = Self::current_cpu();
+        let me = (Self::current_cpu() as u32) + 1; // 1-indexed to allow 0 as NO_CPU
         loop {
             let current = self.state.load(Ordering::Acquire);
-            let (owner, depth) = Self::unpack(current);
+            let (owner_raw, depth) = Self::unpack(current);
+            let owner = owner_raw as u32;
 
             if owner == me {
                 // Same CPU re-entering: increment depth atomically.
-                let next = Self::pack(me, depth + 1);
+                let next = Self::pack(me as i32, depth + 1);
                 if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                     return ReentrantMutexGuard { lock: self };
                 }
-            } else if owner == NO_CPU {
+            } else if owner == 0 {
                 // Try to acquire ownership.
-                let next = Self::pack(me, 1);
+                let next = Self::pack(me as i32, 1);
                 if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                     return ReentrantMutexGuard { lock: self };
                 }
@@ -109,17 +110,18 @@ impl<T> ReentrantMutex<T> {
     }
 
     pub fn try_lock(&self) -> Option<ReentrantMutexGuard<'_, T>> {
-        let me = Self::current_cpu();
+        let me = (Self::current_cpu() as u32) + 1;
         let current = self.state.load(Ordering::Acquire);
-        let (owner, depth) = Self::unpack(current);
+        let (owner_raw, depth) = Self::unpack(current);
+        let owner = owner_raw as u32;
 
         if owner == me {
-            let next = Self::pack(me, depth + 1);
+            let next = Self::pack(me as i32, depth + 1);
             if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 return Some(ReentrantMutexGuard { lock: self });
             }
-        } else if owner == NO_CPU {
-            let next = Self::pack(me, 1);
+        } else if owner == 0 {
+            let next = Self::pack(me as i32, 1);
             if self.state.compare_exchange_weak(current, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 return Some(ReentrantMutexGuard { lock: self });
             }

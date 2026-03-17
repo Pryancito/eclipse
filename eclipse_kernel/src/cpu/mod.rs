@@ -450,73 +450,16 @@ pub fn wait_for_change(addr: *const u32) {
 /// AP Entry point (called from trampoline)
 #[no_mangle]
 pub extern "C" fn ap_entry() -> ! {
-    // Trace '[[RUST]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x52", "out dx, al", // 'R'
-            "mov al, 0x55", "out dx, al", // 'U'
-            "mov al, 0x53", "out dx, al", // 'S'
-            "mov al, 0x54", "out dx, al", // 'T'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    
     // 1. Load per-CPU GDT and set up IA32_KERNEL_GS_BASE for syscall_entry
     crate::boot::load_gdt();
     
-    // Trace '[[GDTOK]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x47", "out dx, al", // 'G'
-            "mov al, 0x44", "out dx, al", // 'D'
-            "mov al, 0x54", "out dx, al", // 'T'
-            "mov al, 0x4F", "out dx, al", // 'O'
-            "mov al, 0x4B", "out dx, al", // 'K'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
+    // We can now safely use serial_printf as the GDT/GS base are initialized.
 
     // 2. Load the shared IDT (populated by the BSP in interrupts::init())
     crate::interrupts::load_idt();
     
-    // Trace '[[IDTOK]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x49", "out dx, al", // 'I'
-            "mov al, 0x44", "out dx, al", // 'D'
-            "mov al, 0x54", "out dx, al", // 'T'
-            "mov al, 0x4F", "out dx, al", // 'O'
-            "mov al, 0x4B", "out dx, al", // 'K'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
     // 3. Enable the Local APIC for this AP
     crate::apic::init();
-    
-    // Trace '[[APCOK]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x41", "out dx, al", // 'A'
-            "mov al, 0x50", "out dx, al", // 'P'
-            "mov al, 0x43", "out dx, al", // 'C'
-            "mov al, 0x4F", "out dx, al", // 'O'
-            "mov al, 0x4B", "out dx, al", // 'K'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
 
     // 4. Enable SSE (per-CPU CR0/CR4 bits; must mirror boot::enable_sse() on BSP)
     crate::boot::enable_sse();
@@ -524,21 +467,6 @@ pub extern "C" fn ap_entry() -> ! {
     // 5. Program the Page Attribute Table MSR (IA32_PAT) – this is a per-CPU MSR
     crate::memory::init_pat();
     
-    // Trace '[[PATOK]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x50", "out dx, al", // 'P'
-            "mov al, 0x41", "out dx, al", // 'A'
-            "mov al, 0x54", "out dx, al", // 'T'
-            "mov al, 0x4F", "out dx, al", // 'O'
-            "mov al, 0x4B", "out dx, al", // 'K'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
     // 6. Enable SYSCALL/SYSRET and set up STAR/LSTAR/SFMASK – per-CPU MSRs
     crate::interrupts::init_ap();
 
@@ -555,21 +483,6 @@ pub extern "C" fn ap_entry() -> ! {
     let cpu_id = crate::apic::get_id();
     wait_ms((cpu_id as u64 % 8) * 2); // Small jitter before starting timer
     crate::apic::init_timer(crate::interrupts::APIC_TIMER_VECTOR);
-
-    // Trace '[[TMROK]]'
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x5B", "out dx, al", "out dx, al",
-            "mov al, 0x54", "out dx, al", // 'T'
-            "mov al, 0x4D", "out dx, al", // 'M'
-            "mov al, 0x52", "out dx, al", // 'R'
-            "mov al, 0x4F", "out dx, al", // 'O'
-            "mov al, 0x4B", "out dx, al", // 'K'
-            "mov al, 0x5D", "out dx, al", "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
 
     serial_printf(format_args!("[CPU] AP (APIC ID {}) ready, switching to main loop\n", cpu_id));
     

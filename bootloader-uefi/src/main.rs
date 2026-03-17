@@ -702,7 +702,18 @@ fn load_kernel_from_data(bs: &BootServices, kernel_data: &[u8]) -> Result<(u64, 
         return Err(BootError::LoadElf(Status::LOAD_ERROR));
     }
 
+    // Tamaño real necesario según los segmentos cargables
     let mut total_size = (max_offset + 0xFFF) & !0xFFF; // alinear hacia arriba a página
+
+    // En hardware real puede haber secciones adicionales del kernel (p. ej. .init,
+    // .bss grandes o datos alineados a 2MiB) que queden justo fuera del rango
+    // calculado por max_offset. Para evitar que la primera llamada a funciones
+    // adicionales (como boot::init) salte a una página sin mapear, garantizamos
+    // un mínimo holgado de 64 MiB mapeados para el kernel.
+    let min_kernel_map: u64 = 64 * 1024 * 1024;
+    if total_size < min_kernel_map {
+        total_size = min_kernel_map;
+    }
     if total_size > MAX_KERNEL_ALLOCATION {
         unsafe {
             serial_write_str("DEBUG: total_size excede MAX_KERNEL_ALLOCATION, truncando\r\n");

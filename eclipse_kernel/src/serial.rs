@@ -22,16 +22,15 @@
 //! - Configurable baud rates
 //! - Hardware flow control (RTS/CTS)
 
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::arch::asm;
-use core::fmt::Write;
+use spin::Mutex;
 
 const SERIAL_PORT: u16 = 0x3F8; // COM1
 
-/// Estado del puerto serial (Atomic para SMP safety)
-static SERIAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Estado del puerto serial
+static mut SERIAL_INITIALIZED: bool = false;
 /// Lock para acceso al hardware del puerto serial (multicore stability)
-static SERIAL_PORT_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
+static SERIAL_PORT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Inicializar el puerto serial
 pub fn init() {
@@ -55,7 +54,7 @@ pub fn init() {
         // IRQs habilitadas, RTS/DSR set
         outb(SERIAL_PORT + 4, 0x0F);
         
-        SERIAL_INITIALIZED.store(true, Ordering::Release);
+        SERIAL_INITIALIZED = true;
     }
 }
 
@@ -72,12 +71,12 @@ fn is_data_available() -> bool {
 /// Leer un byte del puerto serial (blocking)
 /// Retorna None si no hay datos disponibles
 pub fn read_byte() -> Option<u8> {
-    if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
-        return None;
+    unsafe {
+        if !SERIAL_INITIALIZED {
+            return None;
+        }
     }
     
-    // LOCK OBLIGATORIO en lectura para SMP
-    let _lock = SERIAL_PORT_LOCK.lock();
     if is_data_available() {
         Some(unsafe { inb(SERIAL_PORT) })
     } else {
@@ -87,58 +86,50 @@ pub fn read_byte() -> Option<u8> {
 
 /// Leer un byte del puerto serial (blocking - espera hasta que haya datos)
 pub fn read_byte_blocking() -> u8 {
-    // Spin *outside* the lock so other CPUs can still transmit while we wait.
-    // Once data is detected, claim it under the lock (re-check to handle races).
-    loop {
-        while !is_data_available() {
-            crate::cpu::pause();
-        }
-        let _lock = SERIAL_PORT_LOCK.lock();
-        if is_data_available() {
-            return unsafe { inb(SERIAL_PORT) };
-        }
-        // Another CPU grabbed the byte; retry the outer loop.
+    while !is_data_available() {
+        core::hint::spin_loop();
     }
+    unsafe { inb(SERIAL_PORT) }
 }
 
 /// Leer múltiples bytes del serial hasta llenar el buffer o timeout
 /// Retorna el número de bytes leídos
 pub fn read_bytes(buffer: &mut [u8], timeout_iterations: u32) -> usize {
-    if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
-        return 0;
+    unsafe {
+        if !SERIAL_INITIALIZED {
+            return 0;
+        }
     }
-
-    // Hold the lock for the entire read so bytes are not interleaved between CPUs.
-    let _lock = SERIAL_PORT_LOCK.lock();
+    
     let mut count = 0;
     let mut timeout = timeout_iterations;
-
+    
     for byte in buffer.iter_mut() {
         if timeout == 0 {
             break;
         }
-
-        if is_data_available() {
-            *byte = unsafe { inb(SERIAL_PORT) };
+        
+        if let Some(b) = read_byte() {
+            *byte = b;
             count += 1;
             timeout = timeout_iterations; // Reset timeout on successful read
         } else {
             timeout -= 1;
-            crate::cpu::pause();
+            core::hint::spin_loop();
         }
     }
-
+    
     count
 }
 
 /// Escribir un byte al puerto serial (versión pública)
 pub fn serial_print_byte(byte: u8) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
+    unsafe {
+        if !SERIAL_INITIALIZED {
             return;
         }
-        write_byte(byte);
-    });
+    }
+    write_byte(byte);
 }
 
 /// Escribir un caracter al puerto serial
@@ -148,174 +139,88 @@ pub fn serial_print_char(c: char) {
 
 /// Escribir un byte al puerto serial (interno)
 fn write_byte(byte: u8) {
-    let _lock = SERIAL_PORT_LOCK.lock();
-    // Reduce timeout to avoid long hangs on failing hardware
-    let mut timeout = 100_000;
+    // Esperar a que el buffer de transmisión esté vacío con un timeout de seguridad
+    // En hardware real sin puerto serie, esto evitará que el kernel se cuelgue
+    let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
-        crate::cpu::pause();
+        core::hint::spin_loop();
         timeout -= 1;
     }
     
     if timeout > 0 {
         unsafe {
             outb(SERIAL_PORT, byte);
-            io_wait();
         }
-    } else {
-        // Optional: record serial timeout if it happens too often
     }
 }
 
-/// Escribir una cadena al puerto serial (con prefijos por línea y lock único)
+/// Escribir una cadena al puerto serial (y al framebuffer si está inicializado)
 pub fn serial_print(s: &str) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        {
-            let _lock = SERIAL_PORT_LOCK.lock();
-            if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
-                return;
+        let _lock = SERIAL_PORT_LOCK.lock();
+        unsafe {
+            if SERIAL_INITIALIZED {
+                for byte in s.bytes() {
+                    write_byte(byte);
+                }
             }
-
-            let me = crate::sync::ReentrantMutex::<()>::current_cpu();
-            let mut writer = PrefixedWriter::new(me);
-            let _ = writer.write_str(s);
         }
-        // Registrar en pantalla fuera del lock serial para evitar contención y recursión
-        crate::progress::log(s);
+        // Also log to screen once GS base is ready (early boot may not have it yet).
+        if crate::boot::gs_base_ready() {
+            crate::progress::log(s);
+        }
     });
+}
+
+/// Writer para fmt::Write que usa el puerto serial con lock sincronizado
+pub struct SerialWriter;
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        serial_print(s);
+        Ok(())
+    }
 }
 
 /// Imprimir con formato de forma sincronizada y atómica
 pub fn serial_printf(args: core::fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut screen_log_buf = [0u8; 128];
-        let mut screen_log_len = 0;
-
-        {
-            let _lock = SERIAL_PORT_LOCK.lock();
-            if !SERIAL_INITIALIZED.load(Ordering::Acquire) {
-                return;
-            }
-
-            let me = crate::sync::ReentrantMutex::<()>::current_cpu();
-            let mut writer = PrefixedWriter::new(me);
-            let _ = core::fmt::write(&mut writer, args);
-
-            // También capturamos para el log de pantalla si hay espacio
-            struct StubWriter<'a> {
-                buf: &'a mut [u8],
-                len: &'a mut usize,
-            }
-            impl core::fmt::Write for StubWriter<'_> {
-                fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    let bytes = s.as_bytes();
-                    let space = self.buf.len() - *self.len;
-                    let to_copy = core::cmp::min(bytes.len(), space);
-                    self.buf[*self.len..*self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
-                    *self.len += to_copy;
-                    Ok(())
-                }
-            }
-            let mut sw = StubWriter { buf: &mut screen_log_buf, len: &mut screen_log_len };
-            let _ = core::fmt::write(&mut sw, args);
-        }
-        
-        // Registrar en pantalla fuera del lock serial
-        if screen_log_len > 0 {
-            if let Ok(s) = core::str::from_utf8(&screen_log_buf[..screen_log_len]) {
-                crate::progress::log(s);
-            }
-        }
+        let _lock = SERIAL_PORT_LOCK.lock();
+        let mut writer = RawSerialWriter;
+        let _ = core::fmt::write(&mut writer, args);
     });
 }
 
-/// Registro de si cada CPU necesita un prefijo (AtomicBool para SMP safety)
-static CPU_NEEDS_PREFIX: [AtomicBool; 32] = [const { AtomicBool::new(true) }; 32];
-
-/// Seguimiento global de qué CPU escribió por última vez y estado de la línea física
-static GLOBAL_LAST_CPU: AtomicI32 = AtomicI32::new(-1);
-static GLOBAL_AT_LINE_START: AtomicBool = AtomicBool::new(true);
-
-/// Writer que añade prefijo [Cn] al inicio de cada línea y delega al hardware.
-/// Se usa dentro de un lock ya adquirido.
-struct PrefixedWriter {
-    cpu_id: i32,
-}
-
-impl PrefixedWriter {
-    fn new(cpu_id: i32) -> Self {
-        Self { cpu_id }
-    }
-
-    fn write_prefix(&mut self) {
-        // --- COHERENCIA GLOBAL ---
-        // Si otra CPU dejó la línea a medias, forzamos un \n antes de nuestro prefijo
-        let last_cpu = GLOBAL_LAST_CPU.load(Ordering::Acquire);
-        if last_cpu != -1 && last_cpu != self.cpu_id && !GLOBAL_AT_LINE_START.load(Ordering::Acquire) {
-            write_byte_internal(b'\n');
-            GLOBAL_AT_LINE_START.store(true, Ordering::Release);
-        }
-        GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
-
-        write_byte_internal(b'[');
-        write_byte_internal(b'C');
-        // Simple 0-9 for now (common in QEMU -smp 4/8)
-        let id_byte = if self.cpu_id >= 0 && self.cpu_id <= 9 {
-            (self.cpu_id as u8) + b'0'
-        } else {
-            b'?'
-        };
-        write_byte_internal(id_byte);
-        write_byte_internal(b']');
-        write_byte_internal(b' ');
-        GLOBAL_AT_LINE_START.store(false, Ordering::Release);
-    }
-}
-
-impl core::fmt::Write for PrefixedWriter {
+struct RawSerialWriter;
+impl core::fmt::Write for RawSerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let cpu_idx = (self.cpu_id as usize).min(127);
-        
-        for byte in s.bytes() {
-            if CPU_NEEDS_PREFIX[cpu_idx].load(Ordering::Relaxed) && byte != b'\n' {
-                self.write_prefix();
-                CPU_NEEDS_PREFIX[cpu_idx].store(false, Ordering::Relaxed);
+        unsafe {
+            if SERIAL_INITIALIZED {
+                for byte in s.bytes() {
+                    write_byte_internal(byte);
+                }
             }
-            
-            write_byte_internal(byte);
-            
-            if byte == b'\n' {
-                CPU_NEEDS_PREFIX[cpu_idx].store(true, Ordering::Relaxed);
-                GLOBAL_AT_LINE_START.store(true, Ordering::Release);
-                GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
-            } else {
-                GLOBAL_AT_LINE_START.store(false, Ordering::Release);
-                GLOBAL_LAST_CPU.store(self.cpu_id, Ordering::Release);
-            }
+        }
+        // Also log to screen once GS base is ready (early boot may not have it yet).
+        if crate::boot::gs_base_ready() {
+            crate::progress::log(s);
         }
         Ok(())
     }
 }
 
 fn write_byte_internal(byte: u8) {
-    // Reduce timeout to avoid long hangs on failing hardware
-    let mut timeout = 100_000;
+    let mut timeout = 1_000_000;
     while !is_transmit_empty() && timeout > 0 {
-        crate::cpu::pause();
+        core::hint::spin_loop();
         timeout -= 1;
     }
     
     if timeout > 0 {
         unsafe {
             outb(SERIAL_PORT, byte);
-            io_wait();
         }
     }
-}
-
-/// Forcedly unlock the serial port mutex.
-/// Danger: should ONLY be used in fork_child_setup to clear inherited locks.
-pub unsafe fn force_unlock_serial() {
-    SERIAL_PORT_LOCK.force_unlock();
 }
 
 /// Escribir un número en hexadecimal (a serial y framebuffer)
@@ -361,13 +266,6 @@ unsafe fn outb(port: u16, value: u8) {
         in("al") value,
         options(nomem, nostack, preserves_flags)
     );
-}
-
-/// Pequeño retardo para dar tiempo al hardware de I/O
-#[inline]
-unsafe fn io_wait() {
-    // Escribir a un puerto no utilizado (costumbre de Linux/BSD)
-    outb(0x80, 0);
 }
 
 /// Leer de un puerto de I/O
