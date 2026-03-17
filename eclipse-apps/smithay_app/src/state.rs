@@ -873,10 +873,6 @@ impl SmithayState {
             if self.input.quick_settings_active { render::draw_quick_settings(&mut self.backend.fb); }
             if self.input.context_menu_active { render::draw_context_menu(&mut self.backend.fb, self.input.context_menu_pos); }
 
-            if self.input.launcher_curr_y < fb_h as f32 {
-                render::draw_launcher(&mut self.backend.fb, self.input.launcher_curr_y);
-            }
-
             if self.input.alt_tab_active {
                 render::draw_alt_tab_hud(&mut self.backend.fb, &self.space.windows, self.space.window_count, self.input.focused_window);
             }

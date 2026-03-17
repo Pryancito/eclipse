@@ -55,11 +55,12 @@ fn main() {
 
     loop {
         state.handle_ipc();
-        if state.update() {
-            state.render();
-            state.backend.swap_buffers();
+        while let Some(event) = state.backend.poll_event() {
+            state.handle_event(&event);
         }
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        state.update();
+        state.render();
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
 
@@ -76,9 +77,9 @@ mod tests {
             while let Some(_event) = state.backend.poll_event() {
                 state.handle_event(&_event);
             }
-            state.update();
-            state.render();
-            state.backend.swap_buffers();
+            if state.update() {
+                state.render();
+            }
         }
         assert!(state.counter >= N, "counter should advance each update");
     }

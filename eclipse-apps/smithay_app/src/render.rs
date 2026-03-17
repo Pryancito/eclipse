@@ -670,31 +670,6 @@ pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {
     let _ = Text::new(&time_str, time_pos, MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE)).draw(fb);
 }
 
-pub fn draw_launcher(fb: &mut FramebufferState, curr_y: f32) {
-    let w = fb.info.width as i32;
-    let h = fb.info.height as i32;
-    let ly = curr_y as i32;
-
-    let panel_w = 320;
-    let panel_h = 350;
-    let rect = Rectangle::new(Point::new(10, ly), Size::new(panel_w, panel_h));
-    let _ = ui::draw_glass_card(fb, rect, "DRIVE // LANZADOR", colors::ACCENT_CYAN);
-
-    let title_glow = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, Rgb888::new(40, 120, 180));
-    let title_style = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
-    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(31, ly + 39), title_glow).draw(fb);
-    let _ = Text::new("EJECUTAR // SERVICIOS", Point::new(30, ly + 38), title_style).draw(fb);
-
-    let item_style = MonoTextStyle::new(&font_terminus_20::FONT_TERMINUS_20, colors::WHITE);
-    let items = [("Terminal", icons::SYSTEM), ("Archivos", icons::FILES), ("Red", icons::NETWORK), ("Ajustes", icons::APPS)];
-    for (i, (name, icon)) in items.iter().enumerate() {
-        let py = ly + 75 + (i as i32 * 62);
-        let _ = ui::draw_glowing_hexagon(fb, Point::new(50, py + 20), 22, colors::ACCENT_CYAN);
-        let _ = ui::draw_standard_icon(fb, Point::new(50, py + 20), *icon);
-        let _ = Text::new(name, Point::new(85, py + 28), item_style).draw(fb);
-    }
-}
-
 pub fn draw_alt_tab_hud(fb: &mut FramebufferState, _windows: &[ShellWindow], window_count: usize, focused: Option<usize>) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
