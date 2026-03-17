@@ -104,32 +104,6 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
-    // 1. Raw serial diagnostic (High Priority)
-    // Write 'K' to COM1 (0x3f8) immediately to signal kernel entry.
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3f8",
-            "mov al, 'K'",
-            "out dx, al",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    // 1. Initialize serial for diagnostics immediately
-    // Explicit raw asm for early confirmation (COM1)
-    unsafe {
-        for &b in b"[KERNEL] _start reached via COM1\n" {
-            let mut timeout = 1_000;
-            let mut status: u8;
-            while timeout > 0 {
-                core::arch::asm!("in al, dx", in("dx") 0x3F8u16 + 5, out("al") status);
-                if (status & 0x20) != 0 { break; }
-                timeout -= 1;
-            }
-            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
-        }
-    }
-
     // 1. Initialize serial for diagnostics immediately
     serial::init();
 
