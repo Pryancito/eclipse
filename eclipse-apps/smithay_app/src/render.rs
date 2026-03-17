@@ -35,7 +35,6 @@ use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::ServiceInfo;
-#[cfg(target_vendor = "eclipse")]
 use crate::display::{self, DisplayDevice, FramebufferDesc, DisplayError, ControlDevice, DisplayCaps};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -243,17 +242,28 @@ impl FramebufferState {
             drm_fd: 0,
             drm_crtc: display::control::CrtcHandle(0),
             gpu: None,
+            cursor_handle: display::buffer::Handle(0),
+            planes: alloc::vec::Vec::new(),
+            hud_fb_id: display::control::framebuffer::Handle(0),
+            hud_handle: display::buffer::Handle(0),
+            hud_addr: 0,
         })
     }
 
     #[cfg(test)]
     pub fn mock() -> Self {
         Self {
-            // FIX: Removidos red_mask_size y otros campos inexistentes para que compile el mock
             info: FramebufferInfo { address: 0, width: 1024, height: 768, pitch: 4096, bpp: 32 },
             back_fb_id: display::control::framebuffer::Handle(0),
             front_fb_id: display::control::framebuffer::Handle(0),
-            back_addr: 0, front_addr: 0, background_addr: 0, drm_fd: 0, gpu: None,
+            back_addr: 0, front_addr: 0, background_addr: 0, drm_fd: 0,
+            drm_crtc: display::control::CrtcHandle(0),
+            gpu: None,
+            cursor_handle: display::buffer::Handle(0),
+            planes: alloc::vec::Vec::new(),
+            hud_fb_id: display::control::framebuffer::Handle(0),
+            hud_handle: display::buffer::Handle(0),
+            hud_addr: 0,
         }
     }
 

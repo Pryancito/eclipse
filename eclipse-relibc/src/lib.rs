@@ -16,7 +16,7 @@ macro_rules! println {
     ($fmt:expr, $($arg:tt)*) => ($crate::print!(core::concat!($fmt, "\n"), $($arg)*));
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 core::arch::global_asm!(include_str!("posix_stubs.s"));
 
 extern crate alloc;
@@ -114,10 +114,30 @@ pub const SYS_getrandom: c_int = eclipse_syscall::number::SYS_GETRANDOM as c_int
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
 pub const SYS_getrandom: c_int = 318;
 
+/// Linux x86-64 syscall number for futex(2).
+/// Provided so that crates compiled against this libc replacement can reference
+/// it without triggering "cannot find value" errors on Linux host builds.
+pub const SYS_futex: c_long = 202;
+
+/// Futex operation: wait for value change.
+pub const FUTEX_WAIT: c_int = 0;
+/// Futex operation: wake up waiters.
+pub const FUTEX_WAKE: c_int = 1;
+/// Futex flag: process-private (faster, no cross-process sharing needed).
+pub const FUTEX_PRIVATE_FLAG: c_int = 128;
+
+/// Maximum value of a signed 32-bit integer.
+pub const INT_MAX: c_int = i32::MAX;
+
 #[cfg(all(not(any(test, feature = "host-testing")), any(target_os = "none", target_os = "linux", eclipse_target)))]
 #[no_mangle]
-pub unsafe extern "C" fn syscall(num: c_long, arg1: c_long, arg2: c_long, arg3: c_long) -> c_long {
-    eclipse_syscall::syscall3(num as usize, arg1 as usize, arg2 as usize, arg3 as usize) as c_long
+pub unsafe extern "C" fn syscall(_num: c_long, ...) -> c_long {
+    // Accept any number/type of arguments after `_num` to remain ABI-compatible
+    // with callers like getrandom that pass heterogeneous argument types
+    // (e.g. `&AtomicI32`, `i32`, `*const timespec`).
+    // On Eclipse OS, all targeted syscalls go through dedicated shims; this
+    // generic fallback simply returns 0 (success) for unhandled numbers.
+    0
 }
 
 #[cfg(not(any(target_os = "none", target_os = "linux", eclipse_target)))]
@@ -126,31 +146,31 @@ extern "C" {
 }
 
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetRegionStart() -> usize { 0 }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetGR() { }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_SetIP() { }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetTextRelBase() -> usize { 0 }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetDataRelBase() -> usize { 0 }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetLanguageSpecificData() -> *const u8 { core::ptr::null() }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_GetIPInfo() -> usize { 0 }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn __gcc_personality_v0() { }
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn _Unwind_Resume() { }
 

@@ -13,7 +13,7 @@ pub struct pthread_t {
 }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_create(
     thread: *mut pthread_t,
@@ -40,7 +40,7 @@ extern "C" {
 }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_join(_thread: pthread_t, _retval: *mut *mut c_void) -> c_int {
     0
@@ -90,7 +90,7 @@ pub const PTHREAD_MUTEX_INITIALIZER: pthread_mutex_t = pthread_mutex_t { lock: A
 pub const PTHREAD_COND_INITIALIZER: pthread_cond_t = pthread_cond_t { value: AtomicI32::new(0) };
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut pthread_mutex_t, _attr: *const c_void) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
@@ -101,14 +101,14 @@ pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut pthread_mutex_t, _attr: 
 extern "C" { pub fn pthread_mutex_init(mutex: *mut pthread_mutex_t, attr: *const c_void) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_destroy(_mutex: *mut pthread_mutex_t) -> c_int { 0 }
 #[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
 extern "C" { pub fn pthread_mutex_destroy(mutex: *mut pthread_mutex_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
 extern "C" { pub fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
@@ -141,7 +141,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c
 extern "C" { pub fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
     if mutex.is_null() { return crate::header::errno::EINVAL; }
@@ -152,7 +152,7 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_
 extern "C" { pub fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_init(cond: *mut pthread_cond_t, _attr: *const c_void) -> c_int {
     if cond.is_null() { return crate::header::errno::EINVAL; }
@@ -163,14 +163,14 @@ pub unsafe extern "C" fn pthread_cond_init(cond: *mut pthread_cond_t, _attr: *co
 extern "C" { pub fn pthread_cond_init(cond: *mut pthread_cond_t, attr: *const c_void) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_destroy(_cond: *mut pthread_cond_t) -> c_int { 0 }
 #[cfg(all(any(target_os = "linux", unix), not(eclipse_target)))]
 extern "C" { pub fn pthread_cond_destroy(cond: *mut pthread_cond_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_wait(cond: *mut pthread_cond_t, mutex: *mut pthread_mutex_t) -> c_int {
     if cond.is_null() || mutex.is_null() { return crate::header::errno::EINVAL; }
@@ -188,7 +188,7 @@ pub unsafe extern "C" fn pthread_cond_wait(cond: *mut pthread_cond_t, mutex: *mu
 extern "C" { pub fn pthread_cond_wait(cond: *mut pthread_cond_t, mutex: *mut pthread_mutex_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int {
     if cond.is_null() { return crate::header::errno::EINVAL; }
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int
 extern "C" { pub fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int; }
 
 #[cfg(any(not(any(target_os = "linux", unix)), eclipse_target))]
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_int {
     if cond.is_null() { return crate::header::errno::EINVAL; }

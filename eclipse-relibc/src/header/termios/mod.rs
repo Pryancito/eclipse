@@ -18,25 +18,25 @@ pub struct termios {
     pub c_ospeed: speed_t,
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcgetattr(_fd: c_int, _termios_p: *mut termios) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn tcsetattr(_fd: c_int, _optional_actions: c_int, _termios_p: *const termios) -> c_int {
     -1
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfsetispeed(_termios_p: *mut termios, _speed: speed_t) -> c_int {
     0
 }
 
-#[cfg(not(any(test, feature = "host-testing")))]
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn cfsetospeed(_termios_p: *mut termios, _speed: speed_t) -> c_int {
     0

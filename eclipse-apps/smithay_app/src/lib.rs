@@ -2,6 +2,9 @@
 
 #[cfg(target_vendor = "eclipse")]
 extern crate alloc;
+// Make `alloc::` paths work on std targets too (needed by compositor, ipc, render).
+#[cfg(not(target_vendor = "eclipse"))]
+extern crate alloc;
 #[cfg(target_vendor = "eclipse")]
 pub extern crate eclipse_std as std;
 #[cfg(target_vendor = "eclipse")]
@@ -13,7 +16,7 @@ pub mod input;
 pub mod ipc;
 pub mod render;
 pub mod display;
-#[cfg(not(target_vendor = "eclipse"))]
+#[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 pub mod smithay_wayland;
 pub mod state;
 

@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_handle_sidewind_create_invalid() {
         let mut surfaces = [ExternalSurface::default(); 32];
-        let mut windows = [ShellWindow::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
         let mut window_count = 0;
         let mut input_state = InputState::new(1920, 1080);
         
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_handle_sidewind_create_invalid_height() {
         let mut surfaces = [ExternalSurface::default(); 32];
-        let mut windows = [ShellWindow::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
         let mut window_count = 0;
         let mut input_state = InputState::new(1920, 1080);
 
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn test_handle_sidewind_destroy_no_panic() {
         let mut surfaces = [ExternalSurface::default(); 32];
-        let mut windows = [ShellWindow::default(); 32];
+        let mut windows: [ShellWindow; 32] = core::array::from_fn(|_| ShellWindow::default());
         let mut window_count = 0;
         let mut input_state = InputState::new(1920, 1080);
 
