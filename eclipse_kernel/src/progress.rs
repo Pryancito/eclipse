@@ -97,6 +97,10 @@ static LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
 /// PID del proceso HUD (p. ej. smithay_app) que recibe líneas de log por IPC cuando el kernel ya no dibuja en FB.
 static LOG_HUD_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Per-CPU recursion guard for log() to prevent deadlocks when logging triggers more logs
+/// (e.g. via IPC send_message or serial print).
+static LOG_RECURSION_GUARDS: [AtomicBool; MAX_SMP_CPUS] = [const { AtomicBool::new(false) }; MAX_SMP_CPUS];
+
 /// Initialize the dedicated WC framebuffer mapping.
 /// Should be called AFTER memory::init() so the heap is available for page tables.
 pub fn init() {
@@ -323,6 +327,12 @@ pub fn log(msg: &str) {
             return;
         }
 
+        // Recursion guard: if we are already logging on this CPU, ignore nested logs
+        // to avoid infinite recursion (e.g. if ipc::send_message or serial_print trigger logs).
+        if LOG_RECURSION_GUARDS[cpu_id].swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         if let Some(mut buf) = LOG_BUFFERS[cpu_id].try_lock() {
             let got_newline: Option<usize> = buf.push_str(msg);
 
@@ -363,6 +373,8 @@ pub fn log(msg: &str) {
                 }
             }
         }
+        
+        LOG_RECURSION_GUARDS[cpu_id].store(false, Ordering::SeqCst);
     });
 }
 

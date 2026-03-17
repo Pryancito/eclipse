@@ -218,7 +218,7 @@ impl FramebufferState {
                         self.hud_addr = addr as usize;
                         
                         // Clear to transparent
-                        unsafe { core::ptr::write_bytes(addr, 0, 400 * 110 * 4); }
+                        unsafe { core::ptr::write_bytes(addr as *mut u8, 0, 400 * 110 * 4); }
                     }
                 }
             }

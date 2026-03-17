@@ -9,7 +9,7 @@ use spin::Mutex;
 use alloc::vec::Vec;
 use alloc::vec;
 
-const CACHE_SIZE: usize = 128; // 128 * 4KB = 512KB cache
+const CACHE_SIZE: usize = 512; // 512 * 4KB = 2MB cache
 const BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]

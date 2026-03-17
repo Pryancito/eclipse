@@ -187,8 +187,10 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
 /// Returns the virtual address of the ready queue tail pointer.
 /// Used for MONITOR/MWAIT idle optimization.
 pub fn ready_queue_tail_addr() -> usize {
-    let tail = QUEUE_TAIL.lock();
-    &*tail as *const usize as usize
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let tail = QUEUE_TAIL.lock();
+        &*tail as *const usize as usize
+    })
 }
 
 /// Tick del scheduler (llamado desde timer interrupt - solo en el BSP)

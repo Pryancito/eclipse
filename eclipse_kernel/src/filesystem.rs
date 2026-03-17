@@ -13,6 +13,30 @@ pub const BLOCK_SIZE: usize = 4096;
 /// Maximum record size to prevent OOM (16 MiB)
 pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
+const INODE_CACHE_SIZE: usize = 64;
+
+#[derive(Clone, Copy)]
+pub struct InodeCacheEntry {
+    inode_id: u32,
+    offset: u64,
+    valid: bool,
+    last_access: u64,
+}
+
+struct InodeCache {
+    entries: [InodeCacheEntry; INODE_CACHE_SIZE],
+    access_counter: u64,
+}
+
+impl InodeCache {
+    const fn new() -> Self {
+        Self {
+            entries: [InodeCacheEntry { inode_id: 0, offset: 0, valid: false, last_access: 0 }; INODE_CACHE_SIZE],
+            access_counter: 0,
+        }
+    }
+}
+
 /// Global lock for filesystem operations to prevent SMP race conditions.
 /// This protects the static `FS` state and ensures atomicity of `lseek` + `read/write` sequences.
 static FILESYSTEM_LOCK: crate::sync::ReentrantMutex<()> = crate::sync::ReentrantMutex::new(());
@@ -66,6 +90,7 @@ pub struct Filesystem {
     disk_scheme_id: usize,
     disk_resource_id: usize,
     partition_offset: u64,
+    inode_cache: InodeCache,
 }
 
 static mut FS: Filesystem = Filesystem {
@@ -75,18 +100,20 @@ static mut FS: Filesystem = Filesystem {
     disk_scheme_id: 0,
     disk_resource_id: 0,
     partition_offset: 0,
+    inode_cache: InodeCache::new(),
 };
 
 /// Read a range of bytes directly from disk, potentially spanning block boundaries.
 fn read_bytes_at(abs_offset: u64, dest: &mut [u8]) -> Result<(), &'static str> {
     let mut bytes_read = 0;
-    let mut block_buffer = vec![0u8; BLOCK_SIZE];
+    let mut block_buffer = [0u8; BLOCK_SIZE];
     
     while bytes_read < dest.len() {
         let current_pos = abs_offset + bytes_read as u64;
         let block_num = current_pos / BLOCK_SIZE as u64;
         let offset_in_block = (current_pos % BLOCK_SIZE as u64) as usize;
         
+        // serial::serial_printf(format_args!("[FS] read_bytes_at: block={} offset_in_block={}\n", block_num, offset_in_block));
         read_block_from_device(block_num, &mut block_buffer)?;
         
         let chunk_size = min(dest.len() - bytes_read, BLOCK_SIZE - offset_in_block);
@@ -211,6 +238,7 @@ impl Filesystem {
     
     /// Read an inode entry from the table
     pub fn read_inode_entry(inode: u32) -> Result<InodeTableEntry, &'static str> {
+        // serial::serial_printf(format_args!("[FS] read_inode_entry({})\n", inode));
         unsafe {
             let header = FS.header.as_ref().ok_or("FS not mounted")?;
             
@@ -218,6 +246,15 @@ impl Filesystem {
                 return Err("Inode out of range");
             }
             
+            // 1. Check Inode Cache
+            for i in 0..INODE_CACHE_SIZE {
+                if FS.inode_cache.entries[i].valid && FS.inode_cache.entries[i].inode_id == inode {
+                    FS.inode_cache.access_counter += 1;
+                    FS.inode_cache.entries[i].last_access = FS.inode_cache.access_counter;
+                    return Ok(InodeTableEntry::new(inode as u64, FS.inode_cache.entries[i].offset));
+                }
+            }
+
             // Calculate sector for inode entry
             // Inode table starts at inode_table_offset
             // Each entry is 8 bytes.
@@ -241,6 +278,30 @@ impl Filesystem {
              
             let absolute_offset = header.inode_table_offset + header.inode_table_size + rel_offset;
             
+            // 2. Update Inode Cache (LRU)
+            let mut victim_idx = 0;
+            let mut min_access = u64::MAX;
+            let mut found_invalid = false;
+            for i in 0..INODE_CACHE_SIZE {
+                if !FS.inode_cache.entries[i].valid {
+                    victim_idx = i;
+                    found_invalid = true;
+                    break;
+                }
+                if FS.inode_cache.entries[i].last_access < min_access {
+                    min_access = FS.inode_cache.entries[i].last_access;
+                    victim_idx = i;
+                }
+            }
+            
+            FS.inode_cache.access_counter += 1;
+            FS.inode_cache.entries[victim_idx] = InodeCacheEntry {
+                inode_id: inode,
+                offset: absolute_offset,
+                valid: true,
+                last_access: FS.inode_cache.access_counter,
+            };
+
             Ok(InodeTableEntry::new(inode_num, absolute_offset))
         }
     }
@@ -278,71 +339,17 @@ impl Filesystem {
     /// Does NOT buffer the entire file. Reads directly for the requested range.
     pub fn read_file_by_inode_at(inode: u32, buffer: &mut [u8], offset: u64) -> Result<usize, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
-        let entry = Self::read_inode_entry(inode).map_err(|e| {
-            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: read_inode_entry failed inode=");
-            serial::serial_print_dec(inode as u64);
-            serial::serial_print("\n");
-            e
-        })?;
+        let (data_start_abs, content_length) = Self::get_file_metadata(inode)?;
         
-        // Read the first 8 bytes of the node record to find record_size
-        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-        
-        let mut header_buf = [0u8; 8];
-        read_bytes_at(abs_disk_offset, &mut header_buf)?;
-        
-        let record_size = u32::from_le_bytes([
-            header_buf[4], header_buf[5],
-            header_buf[6], header_buf[7]
-        ]) as usize;
-
-        // Parse TLVs to find CONTENT.
-        // TLV metadata we care about usually fits in the first few blocks.
-        let scan_len = min(record_size, 2 * BLOCK_SIZE);
-        let mut scan_buf = vec![0u8; scan_len];
-        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
-        
-        let record_data = &scan_buf;
-        let mut tlv_pos = 8usize; // Skip 8-byte record header
-
-        let mut content_start_offset_rel = 0usize;
-        let mut content_length = 0usize;
-        let mut found = false;
-
-        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
-            let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
-            let length = u32::from_le_bytes([
-                record_data[tlv_pos + 2], record_data[tlv_pos + 3],
-                record_data[tlv_pos + 4], record_data[tlv_pos + 5],
-            ]) as usize;
-            if tag == tlv_tags::CONTENT {
-                content_start_offset_rel = (tlv_pos + 6) as usize;
-                content_length = length;
-                found = true;
-                break;
-            }
-            tlv_pos += 6 + length;
-        }
-        
-        if !found {
-            serial::serial_print("[FS-DEBUG] read_file_by_inode_at: CONTENT TLV not found inode=");
-            serial::serial_print_dec(inode as u64);
-            serial::serial_print("\n");
-            return Err("CONTENT TLV not found");
-        }
-        
-        if offset >= content_length as u64 {
+        if offset >= content_length {
             return Ok(0); // EOF
         }
         
-        let read_len = min(buffer.len(), content_length - offset as usize);
+        let read_len = min(buffer.len(), (content_length - offset) as usize);
         
         // precise byte offset on disk where requested data starts
-        let absolute_data_start = entry.offset + content_start_offset_rel as u64 + offset;
-        
-        // Read data from disk
-        let abs_disk_data_offset = absolute_data_start + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-        read_bytes_at(abs_disk_data_offset, &mut buffer[..read_len])?;
+        let absolute_data_start = data_start_abs + offset;
+        read_bytes_at(absolute_data_start, &mut buffer[..read_len])?;
         
         Ok(read_len)
     }
@@ -358,41 +365,8 @@ impl Filesystem {
     /// depender de binarios embebidos en el kernel.
     pub fn content_len_by_inode(inode: u32) -> Result<usize, &'static str> {
         let _lock = FILESYSTEM_LOCK.lock();
-        let entry = Self::read_inode_entry(inode)?;
-
-        // Read the first 8 bytes of the node record to find record_size
-        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
-        
-        let mut header_buf = [0u8; 8];
-        read_bytes_at(abs_disk_offset, &mut header_buf)?;
-        
-        let record_size = u32::from_le_bytes([
-            header_buf[4], header_buf[5],
-            header_buf[6], header_buf[7]
-        ]) as usize;
-
-        // Escaneo robusto: leer hasta dos bloques para TLVs.
-        let scan_len = min(record_size, 2 * BLOCK_SIZE);
-        let mut scan_buf = vec![0u8; scan_len];
-        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
-
-        let record_data = &scan_buf;
-        let mut tlv_pos = 8usize;
-        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= record_data.len() {
-            let tag = u16::from_le_bytes([record_data[tlv_pos], record_data[tlv_pos + 1]]);
-            let length = u32::from_le_bytes([
-                record_data[tlv_pos + 2],
-                record_data[tlv_pos + 3],
-                record_data[tlv_pos + 4],
-                record_data[tlv_pos + 5],
-            ]) as usize;
-            if tag == tlv_tags::CONTENT {
-                return Ok(length);
-            }
-            tlv_pos += 6 + length;
-        }
-
-        Err("CONTENT TLV not found")
+        let (_, length) = Self::get_file_metadata(inode)?;
+        Ok(length as usize)
     }
 
     /// Write data to file by inode
@@ -540,6 +514,7 @@ impl Filesystem {
             }
 
             if tag == tlv_tags::DIRECTORY_ENTRIES {
+                serial::serial_printf(format_args!("[FS] find_child_in_dir: Found DIRECTORY_ENTRIES tag (len={})\n", length));
                 let dir_data = &data[offset..offset+length];
                 let mut dir_offset = 0;
                 while dir_offset + 8 <= dir_data.len() {
@@ -578,6 +553,42 @@ impl Filesystem {
             offset += length;
         }
         None
+    }
+
+    /// Get absolute disk offset and size of the file's content
+    pub fn get_file_metadata(inode: u32) -> Result<(u64, u64), &'static str> {
+        let _lock = FILESYSTEM_LOCK.lock();
+        let entry = Self::read_inode_entry(inode)?;
+        let abs_disk_offset = entry.offset + (unsafe { FS.partition_offset } * BLOCK_SIZE as u64);
+        
+        let mut header_buf = [0u8; 8];
+        read_bytes_at(abs_disk_offset, &mut header_buf)?;
+        
+        let record_size = u32::from_le_bytes([
+            header_buf[4], header_buf[5],
+            header_buf[6], header_buf[7]
+        ]) as usize;
+
+        let scan_len = min(record_size, 2 * BLOCK_SIZE);
+        let mut scan_buf = vec![0u8; scan_len];
+        read_bytes_at(abs_disk_offset, &mut scan_buf)?;
+        
+        let mut tlv_pos = 8usize;
+        while tlv_pos + 6 <= record_size && tlv_pos + 6 <= scan_buf.len() {
+            let tag = u16::from_le_bytes([scan_buf[tlv_pos], scan_buf[tlv_pos + 1]]);
+            let length = u32::from_le_bytes([
+                scan_buf[tlv_pos + 2], scan_buf[tlv_pos + 3],
+                scan_buf[tlv_pos + 4], scan_buf[tlv_pos + 5],
+            ]) as usize;
+            if tag == tlv_tags::CONTENT {
+                // data_start_abs is the absolute disk offset where CONTENT data begins
+                let data_start_abs = abs_disk_offset + (tlv_pos + 6) as u64;
+                return Ok((data_start_abs, length as u64));
+            }
+            tlv_pos += 6 + length;
+        }
+        
+        Err("CONTENT TLV not found")
     }
 
     /// Returns the content length from the CONTENT TLV
@@ -1036,7 +1047,12 @@ const O_EXCL: usize = 0x0080;
 static VIRTUAL_TMP: Mutex<BTreeMap<String, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 
 enum OpenFile {
-    Real { inode: u32, offset: u64 },
+    Real { 
+        inode: u32, 
+        offset: u64,
+        data_start_abs: u64,
+        size: u64,
+    },
     Virtual { path: String, offset: u64 },
     Framebuffer,
 }
@@ -1101,15 +1117,16 @@ impl Scheme for FileSystemScheme {
                 }
                 match Filesystem::lookup_path(clean_path) {
                     Ok(inode) => {
+                        let (data_start, size) = Filesystem::get_file_metadata(inode).map_err(|_| scheme_error::EIO)?;
                         let mut open_files = OPEN_FILES_SCHEME.lock();
                         for (i, slot) in open_files.iter_mut().enumerate() {
                             if slot.is_none() {
-                                *slot = Some(OpenFile::Real { inode, offset: 0 });
+                                *slot = Some(OpenFile::Real { inode, offset: 0, data_start_abs: data_start, size });
                                 return Ok(i);
                             }
                         }
                         let id = open_files.len();
-                        open_files.push(Some(OpenFile::Real { inode, offset: 0 }));
+                        open_files.push(Some(OpenFile::Real { inode, offset: 0, data_start_abs: data_start, size }));
                         Ok(id)
                     }
                     Err(_) => Err(scheme_error::ENOENT)
@@ -1123,11 +1140,22 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode, offset } => {
-                match Filesystem::read_file_by_inode_at(*inode, buffer, *offset) {
-                    Ok(bytes_read) => {
-                        *offset += bytes_read as u64;
-                        Ok(bytes_read)
+            OpenFile::Real { inode: _, offset, data_start_abs, size } => {
+                let current_off = *offset;
+                let file_size = *size;
+                
+                if current_off >= file_size {
+                    return Ok(0);
+                }
+                
+                let read_len = core::cmp::min(buffer.len(), (file_size - current_off) as usize);
+                let abs_disk_read_offset = *data_start_abs + current_off;
+                
+                // Read directly bypassing TLV scan
+                match read_bytes_at(abs_disk_read_offset, &mut buffer[..read_len]) {
+                    Ok(_) => {
+                        *offset += read_len as u64;
+                        Ok(read_len)
                     }
                     Err(_) => Err(scheme_error::EIO),
                 }
@@ -1160,7 +1188,7 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode, offset } => {
+            OpenFile::Real { inode, offset, .. } => {
                 match Filesystem::write_file_by_inode(*inode, buffer, *offset) {
                     Ok(bytes_written) => {
                         *offset += bytes_written as u64;
@@ -1197,12 +1225,12 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
         
         let new_offset = match open_file {
-            OpenFile::Real { inode, offset } => {
-                let size = Filesystem::get_file_size(*inode).map_err(|_| scheme_error::EIO)? as u64;
+            OpenFile::Real { inode: _, offset, data_start_abs: _, size } => {
+                let file_size = *size;
                 let no = match whence {
                     0 => seek_offset as u64,
                     1 => (*offset as isize + seek_offset) as u64,
-                    2 => (size as isize + seek_offset) as u64,
+                    2 => (file_size as isize + seek_offset) as u64,
                     _ => return Err(scheme_error::EINVAL),
                 };
                 *offset = no;
@@ -1249,83 +1277,12 @@ impl Scheme for FileSystemScheme {
         let open_file = open_files.get(id).and_then(|s| s.as_ref()).ok_or(scheme_error::EBADF)?;
         
         match open_file {
-            OpenFile::Real { inode, .. } => {
-                // Initial default stat
+            OpenFile::Real { inode, offset: _, data_start_abs: _, size } => {
                 stat.ino = *inode as u64;
+                stat.size = *size;
                 stat.mode = 0o100644; // Default regular file
                 stat.blksize = BLOCK_SIZE as u32;
-                stat.blocks = 0; // Will be updated if size is known
-
-                // Read the inode record to get full metadata
-                match Filesystem::read_inode_entry(*inode) {
-                    Ok(entry) => {
-                        let record_block_start = unsafe {
-                            FS.partition_offset + (entry.offset / BLOCK_SIZE as u64)
-                        };
-                        let offset_in_first_block = (entry.offset % BLOCK_SIZE as u64) as usize;
-                        let mut block_buffer = vec![0u8; BLOCK_SIZE];
-                        
-                        if let Ok(_) = read_block_from_device(record_block_start, &mut block_buffer) {
-                             // Read two blocks into a contiguous buffer to handle TLV headers
-                             // that may span a block boundary.
-                             let mut scan_buf = vec![0u8; 2 * BLOCK_SIZE];
-                             scan_buf[..BLOCK_SIZE].copy_from_slice(&block_buffer);
-                             if let Err(_) = read_block_from_device(record_block_start + 1, &mut scan_buf[BLOCK_SIZE..]) {
-                                 serial::serial_print("[FS-DEBUG] fstat: read_block(second) failed, TLV scan limited to first block\n");
-                             }
-                             // Record data begins at offset_in_first_block within scan_buf.
-                             let record_data = &scan_buf[offset_in_first_block..];
-                             let mut scan_offset = 8usize; // Skip record header
-                             while scan_offset + 6 <= record_data.len() {
-                                 let tag = u16::from_le_bytes([record_data[scan_offset], record_data[scan_offset+1]]);
-                                 let length = u32::from_le_bytes([
-                                     record_data[scan_offset+2], record_data[scan_offset+3],
-                                     record_data[scan_offset+4], record_data[scan_offset+5]
-                                 ]) as usize;
-
-                                 match tag {
-                                     tlv_tags::SIZE => {
-                                          if scan_offset + 6 + 8 <= record_data.len() {
-                                              stat.size = u64::from_le_bytes([
-                                                  record_data[scan_offset+6], record_data[scan_offset+7],
-                                                  record_data[scan_offset+8], record_data[scan_offset+9],
-                                                  record_data[scan_offset+10], record_data[scan_offset+11],
-                                                  record_data[scan_offset+12], record_data[scan_offset+13]
-                                              ]);
-                                              stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-                                          }
-                                     }
-                                     tlv_tags::MODE => {
-                                          if scan_offset + 6 + 4 <= record_data.len() {
-                                              stat.mode = u32::from_le_bytes([
-                                                  record_data[scan_offset+6], record_data[scan_offset+7],
-                                                  record_data[scan_offset+8], record_data[scan_offset+9]
-                                              ]);
-                                          }
-                                     }
-                                     tlv_tags::MTIME => {
-                                          if scan_offset + 6 + 8 <= record_data.len() {
-                                              stat.mtime = i64::from_le_bytes([
-                                                  record_data[scan_offset+6], record_data[scan_offset+7],
-                                                  record_data[scan_offset+8], record_data[scan_offset+9],
-                                                  record_data[scan_offset+10], record_data[scan_offset+11],
-                                                  record_data[scan_offset+12], record_data[scan_offset+13]
-                                              ]);
-                                          }
-                                     }
-                                     tlv_tags::CONTENT => {
-                                         stat.size = length as u64;
-                                         stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
-                                         break; // CONTENT is the last TLV we care about
-                                     }
-                                     _ => {}
-                                 }
-                                 scan_offset += 6 + length;
-                             }
-                        }
-                    }
-                    Err(_) => {}
-                }
+                stat.blocks = (stat.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
                 Ok(0)
             }
             OpenFile::Virtual { path, .. } => {

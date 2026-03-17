@@ -440,20 +440,22 @@ impl AhciPort {
         loop {
             if self.preg(PORT_CI) & (1 << slot) == 0 { break; }
 
-            let is = self.preg(PORT_IS);
-            if is & IS_ERRORS != 0 {
-                serial::serial_print("[AHCI] Port ");
-                serial::serial_print_dec(self.port_index as u64);
-                serial::serial_print(" error IS=");
-                serial::serial_print_hex(is as u64);
-                serial::serial_print(" TFD=");
-                serial::serial_print_hex(self.preg(PORT_TFD) as u64);
-                serial::serial_print(" SERR=");
-                serial::serial_print_hex(self.preg(PORT_SERR) as u64);
-                serial::serial_print("\n");
-                self.pwreg(PORT_IS,   0xFFFF_FFFF);
-                self.pwreg(PORT_SERR, 0xFFFF_FFFF);
-                return false;
+            if i % 10000 == 0 {
+                let is = self.preg(PORT_IS);
+                if is & IS_ERRORS != 0 {
+                    serial::serial_print("[AHCI] Port ");
+                    serial::serial_print_dec(self.port_index as u64);
+                    serial::serial_print(" error IS=");
+                    serial::serial_print_hex(is as u64);
+                    serial::serial_print(" TFD=");
+                    serial::serial_print_hex(self.preg(PORT_TFD) as u64);
+                    serial::serial_print(" SERR=");
+                    serial::serial_print_hex(self.preg(PORT_SERR) as u64);
+                    serial::serial_print("\n");
+                    self.pwreg(PORT_IS,   0xFFFF_FFFF);
+                    self.pwreg(PORT_SERR, 0xFFFF_FFFF);
+                    return false;
+                }
             }
 
             if i < CMD_POLL_ITERATIONS / 2 && !warned_slow {
@@ -579,6 +581,7 @@ impl AhciPort {
     /// Read `buffer.len()` bytes (must be a multiple of 512) starting at `lba`.
     pub fn read_sectors(&self, lba: u64, buffer: &mut [u8]) -> bool {
         if buffer.len() % SECTOR_SIZE != 0 { return false; }
+        serial::serial_printf(format_args!("[AHCI] read_sectors: lba={} count={}\n", lba, buffer.len() / SECTOR_SIZE));
         let phys = memory::virt_to_phys(buffer.as_ptr() as u64);
         self.rw_dma(lba, phys, buffer.len(), false)
     }
@@ -1021,6 +1024,11 @@ fn init_controller(dev: &pci::PciDevice) {
         // FIS receive buffer: 256 bytes
         let (fis_virt, fis_phys) = alloc_dma(256, 256);
         // CMD_SLOTS Command Tables, each CMD_TABLE_STRIDE bytes, aligned to 128
+        // Total = 32 * 256 = 8192 bytes (8 KiB).
+        // On real hardware, we MUST ensure this 8KB is physically contiguous.
+        // The current heap allocator (linked_list_allocator) works on a 
+        // contiguous block of memory, so small allocations are fine, but
+        // large ones crossing 4KB boundaries can be risky if paging isn't identity.
         let total_ct_size = CMD_SLOTS * CMD_TABLE_STRIDE;
         let (ct_virt, ct_phys)   = alloc_dma(total_ct_size, 128);
 

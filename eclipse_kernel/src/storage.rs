@@ -141,7 +141,7 @@ impl Scheme for DiskScheme {
         let block_num = abs_offset / 4096;
         let offset_in_block = (abs_offset % 4096) as usize;
 
-        let mut temp = alloc::vec![0u8; 4096];
+        let mut temp = [0u8; 4096];
         let ok = crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_ok();
 
         if !ok {
@@ -182,7 +182,7 @@ impl Scheme for DiskScheme {
 
         // Read-modify-write for partial blocks
         if offset_in_block != 0 || to_copy != 4096 {
-            let mut temp = alloc::vec![0u8; 4096];
+            let mut temp = [0u8; 4096];
             if crate::bcache::read_block(disk.disk_idx, block_num, &mut temp).is_err() {
                 return Err(scheme_error::EIO);
             }
