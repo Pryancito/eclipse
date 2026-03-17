@@ -306,6 +306,8 @@ impl SmithayState {
 
     /// Procesa IPC sin colgar el frame: drena el buzón del kernel (evita "buzon lleno")
     /// pero limita eventos procesados por frame para seguir haciendo render/update a ~60 FPS.
+    /// `last_ipc_activity` se actualiza una sola vez por frame (no por evento) para evitar
+    /// una llamada a `get_system_stats` (syscall cara) en cada mensaje recibido.
     pub fn handle_ipc(&mut self) {
         #[cfg(not(test))]
         self.backend.drain_ipc_into_pending(128);
@@ -315,11 +317,15 @@ impl SmithayState {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
-                    self.last_ipc_activity = std::time::Instant::now();
                     events_processed += 1;
                     self.handle_event(&event);
                 }
             }
+        }
+        // Actualizar last_ipc_activity una vez por frame (no por evento) para evitar N
+        // syscalls get_system_stats cuando se reciben rafagas de mensajes IPC.
+        if events_processed > 0 {
+            self.last_ipc_activity = std::time::Instant::now();
         }
     }
 
@@ -517,7 +523,9 @@ impl SmithayState {
     /// actualizado algo que debería disparar un render (dirty).
     fn update_metrics_if_needed(&mut self) -> bool {
         let now = std::time::Instant::now();
-        let metrics_elapsed = self.last_metrics_update.elapsed();
+        // Usar duration_since en lugar de elapsed() para evitar una segunda llamada a
+        // get_system_stats (syscall cara): elapsed() llama a Instant::now() internamente.
+        let metrics_elapsed = now.duration_since(self.last_metrics_update);
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
         let metrics_interval = if need_metrics { 1500u64 } else { 4000u64 };
 

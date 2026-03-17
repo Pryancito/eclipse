@@ -70,4 +70,12 @@ impl Instant {
         let now = Instant::now();
         Duration::from_millis(now.ticks.saturating_sub(self.ticks))
     }
+
+    /// Returns the duration from an earlier `Instant` to `self`, without
+    /// performing a new `get_system_stats` syscall.  Use this together with a
+    /// single `Instant::now()` call when you need to compare several instants
+    /// in the same frame to avoid one syscall per comparison.
+    pub fn duration_since(&self, earlier: Instant) -> Duration {
+        Duration::from_millis(self.ticks.saturating_sub(earlier.ticks))
+    }
 }

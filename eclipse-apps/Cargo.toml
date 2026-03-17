@@ -27,9 +27,13 @@ sidewind_core = { path = "sidewind_core" }
 #   - Esto evita que mprotect() falle con ENOMEM al configurar el alt-signal-stack
 #     del runtime de Rust (stack_overflow.rs), que se manifestaba como:
 #       "failed to set up alternative stack guard page: Cannot allocate memory"
+# opt-level = 2 en lugar de "s" (tamaño): el tamaño del binario lo controlan
+# strip="symbols" y debug=false, no el nivel de optimización; usar opt-level = 2
+# mejora significativamente el rendimiento del compositor sin aumentar el número
+# de segmentos PT_LOAD ni el tamaño del ELF final.
 panic = "abort"
 lto = "off"
-opt-level = "s"
+opt-level = 2
 codegen-units = 1
 debug = false
 strip = "symbols"
