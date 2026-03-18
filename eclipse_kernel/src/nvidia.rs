@@ -48,6 +48,8 @@ use spin::Mutex;
 use sidewind_nvidia::registers::*;
 use sidewind_nvidia::gsp::*;
 
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 /// Stored NVIDIA framebuffer info for display fallback (BAR1 / linear VRAM aperture).
 /// Populated during nvidia::init() and used by sys_get_framebuffer_info /
 /// sys_map_framebuffer when neither EFI GOP nor VirtIO is available.
@@ -60,6 +62,12 @@ struct NvidiaFbInfo {
 }
 
 static NVIDIA_FB_INFO: Mutex<Option<NvidiaFbInfo>> = Mutex::new(None);
+
+/// Kernel virtual address of the BAR1 mapping created by map_framebuffer_kernel().
+/// All kernel-side VRAM access (fill_rect, blit_rect, page_flip shadow-blit) uses
+/// this base instead of PHYS_MEM_OFFSET + phys, which only works when the HHDM
+/// covers the physical address (it does NOT for high-address BARs ≥ top-of-RAM).
+static NVIDIA_BAR1_KERNEL_VADDR: AtomicU64 = AtomicU64::new(0);
 
 /// Simple chunk-based VRAM allocator for BAR1 aperture
 struct NvidiaVramAllocator {
@@ -133,32 +141,45 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         Some(handle_id)
     }
     fn page_flip(&self, fb_id: u32) -> bool {
-        let fb_phys = fb_id as u64;
-        let (phys, _width, height, pitch) = match get_nvidia_fb_info() {
+        // Look up the DrmFramebuffer to get the actual physical address of the
+        // GEM buffer that userspace rendered into.  Using `fb_id as u64`
+        // directly was wrong because fb_id is a sequential DRM id (1, 2, …),
+        // not a physical address.
+        let fb = match crate::drm::get_fb(fb_id) {
+            Some(fb) => fb,
+            None => return false,
+        };
+        let fb_phys = fb.phys_addr;
+
+        let (bar1_phys, _width, height, pitch) = match get_nvidia_fb_info() {
             Some(i) => i,
             None => return false,
         };
 
-        if fb_phys == phys {
+        // If the GEM buffer IS the scanout base, nothing to blit.
+        if fb_phys == bar1_phys {
             return true;
         }
 
-        // Shadow blit: copy from GEM buffer (fb_phys) to active scanout base (phys)
+        // Shadow blit: copy rendered GEM buffer → scanout via the kernel
+        // BAR1 mapping.  We cannot use PHYS_MEM_OFFSET + phys here because
+        // the HHDM may not cover the high physical address of NVIDIA VRAM.
         let size = (pitch as usize) * (height as usize);
-        
-        // Ensure BAR1 is mapped in kernel space
-        {
-            let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
-            if guard.is_none() || guard.unwrap() < (fb_phys - phys + size as u64) as usize {
-                // Determine a safe mapping size (at least 32MB for Turing+)
-                let map_size = core::cmp::max(32 * 1024 * 1024, (fb_phys - phys + size as u64) as usize);
-                map_framebuffer_kernel(phys, map_size);
-                *guard = Some(map_size);
-            }
+
+        let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
+        if vbase == 0 {
+            // BAR1 not yet mapped in kernel space – skip silently.
+            return false;
         }
 
-        let src_vaddr = crate::memory::PHYS_MEM_OFFSET + fb_phys;
-        let dst_vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
+        // Offset of the GEM buffer from the start of BAR1.
+        let src_offset = fb_phys.saturating_sub(bar1_phys) as usize;
+        if src_offset == 0 {
+            return true; // src == dst
+        }
+
+        let src_vaddr = vbase as usize + src_offset;
+        let dst_vaddr = vbase as usize; // scanout starts at bar1_phys + 0
 
         unsafe {
             core::ptr::copy_nonoverlapping(src_vaddr as *const u8, dst_vaddr as *mut u8, size);
@@ -232,7 +253,7 @@ pub fn fill_rect(payload: &[u8]) -> bool {
     if payload.len() < 20 {
         return false;
     }
-    let (phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -250,18 +271,14 @@ pub fn fill_rect(payload: &[u8]) -> bool {
         return true;
     }
 
-    let size = (pitch as usize).saturating_mul(height as usize);
-    {
-        let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
-        if guard.is_none() {
-            map_framebuffer_kernel(phys, size);
-            *guard = Some(size);
-        }
+    // Use the kernel BAR1 mapping created during nvidia::init().
+    let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
+    if vbase == 0 {
+        return false;
     }
 
-    let vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
     let pitch_usize = pitch as usize;
-    let ptr = (vaddr as *mut u32);
+    let ptr = vbase as *mut u32;
     let pitch_u32 = (pitch_usize / 4).max(1);
     for py in 0..h {
         let row_start = (y + py) as usize * pitch_u32 + (x as usize);
@@ -281,7 +298,7 @@ pub fn blit_rect(payload: &[u8]) -> bool {
     if payload.len() < 24 {
         return false;
     }
-    let (phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -298,18 +315,14 @@ pub fn blit_rect(payload: &[u8]) -> bool {
         return true;
     }
 
-    let size = (pitch as usize).saturating_mul(height as usize);
-    {
-        let mut guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
-        if guard.is_none() {
-            map_framebuffer_kernel(phys, size);
-            *guard = Some(size);
-        }
+    // Use the kernel BAR1 mapping created during nvidia::init().
+    let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
+    if vbase == 0 {
+        return false;
     }
 
-    let vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
     let pitch_u32 = ((pitch as usize) / 4).max(1);
-    let ptr = (vaddr as *mut u32);
+    let ptr = vbase as *mut u32;
 
     let same_row_overlap = dst_y == src_y && dst_x > src_x && dst_x < src_x + w;
     let overlap_down = dst_y > src_y && dst_y < src_y + h;
@@ -359,7 +372,7 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     let w = u32::from_le_bytes(payload[20..24].try_into().unwrap_or([0; 4]));
     let h = u32::from_le_bytes(payload[24..28].try_into().unwrap_or([0; 4]));
 
-    let (dst_phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -375,13 +388,18 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
         return true;
     }
 
-    // Assumptions for MVP: 
-    // 1. Source and destination use the same pitch (standard for full-screen or aligned buffers).
-    // 2. Both are accessible via BAR1 (true for NvidiaDrmDriver allocations).
-    
+    // Use the kernel BAR1 mapping; src_handle.phys_addr is a BAR1 offset
+    // from bar1_phys (because NvidiaDrmDriver::alloc_buffer allocates from the
+    // VRAM allocator whose base is bar1_phys).
+    let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
+    if vbase == 0 {
+        return false;
+    }
+
     let pitch_u32 = ((pitch as usize) / 4).max(1);
-    let src_ptr = (crate::memory::PHYS_MEM_OFFSET + src_handle.phys_addr) as *const u32;
-    let dst_ptr = (crate::memory::PHYS_MEM_OFFSET + dst_phys) as *mut u32;
+    let src_offset = src_handle.phys_addr.saturating_sub(bar1_phys) as usize;
+    let src_ptr = (vbase as usize + src_offset) as *const u32; // GEM buffer in BAR1
+    let dst_ptr = vbase as *mut u32;                           // scanout at BAR1 base
 
     // Boundary checks to avoid kernel panic on out-of-bounds blit
     let src_max_pixels = src_handle.size / 4;
@@ -971,10 +989,21 @@ pub fn init() {
                     serial::serial_print("[NVIDIA]   ✓ BAR1 stored as display fallback (1920×1080)\n");
                     serial::serial_print("[NVIDIA]   ✓ VRAM allocator initialized\n");
 
-                    // Pre-map BAR1 in kernel for shadow blit
+                    // Map the full BAR1 range in kernel virtual space so that
+                    // fill_rect / blit_rect / page_flip shadow-blit can access
+                    // VRAM without relying on the HHDM (which only covers RAM,
+                    // not PCI BARs located above top-of-RAM).
                     let mut map_guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
                     if map_guard.is_none() {
-                        map_framebuffer_kernel(bar1_phys, alloc_size as usize);
+                        let vaddr = map_framebuffer_kernel(bar1_phys, alloc_size as usize);
+                        if vaddr != 0 {
+                            NVIDIA_BAR1_KERNEL_VADDR.store(vaddr, AtomicOrdering::Relaxed);
+                            serial::serial_print("[NVIDIA]   ✓ BAR1 mapped in kernel at ");
+                            serial::serial_print_hex(vaddr);
+                            serial::serial_print("\n");
+                        } else {
+                            serial::serial_print("[NVIDIA]   WARNING: BAR1 kernel mapping failed\n");
+                        }
                         *map_guard = Some(alloc_size as usize);
                     }
                 }
