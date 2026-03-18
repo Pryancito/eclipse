@@ -105,6 +105,27 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
+    // 0. Emit a raw serial byte before ANY initialization to confirm the kernel
+    //    is executing.  This bypasses SERIAL_INITIALIZED and does not touch any
+    //    static variable, so it is safe even before BSS has been zeroed.
+    unsafe {
+        core::arch::asm!(
+            // Wait until COM1 Transmitter Holding Register is empty (LSR bit 5)
+            "2:",
+            "mov dx, 0x3FD",       // COM1 Line Status Register
+            "in al, dx",
+            "test al, 0x20",
+            "jz 2b",
+            // Send 'K' to indicate kernel entry
+            "mov dx, 0x3F8",
+            "mov al, 0x4B",        // 'K'
+            "out dx, al",
+            out("dx") _,
+            out("al") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
     // 1. Zero BSS first (before serial::init so SERIAL_INITIALIZED is not erased)
     // BSS must be zeroed before any static variable is written, because BSS
     // zeroing resets every zero-initialized static (including SERIAL_INITIALIZED).
@@ -131,62 +152,42 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 3. Initialize boot info
     boot::init(boot_info_ptr);
-    
-    // DIAGNÓSTICO: CYAN SQUARE (40,0) después de boot::init
-    unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32;
-            for y in 0..10 {
-                for x in 40..50 {
-                    *fb.add(y * (pitch as usize / 4) + x) = 0x00FFFF; // Cyan
-                }
-            }
-        }
-    }
 
-    // DIAGNÓSTICO: YELLOW SQUARE (50,0) antes de progress::bar(42)
-    unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32; // Identity (physical)
-            for y in 0..10 {
-                for x in 50..60 {
-                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFF00; // Yellow
-                }
-            }
-        }
-    }
-
-    // DIAGNÓSTICO: ORANGE SQUARE (60,0) usando HHDM (Virtual)
-    // Esto verifica si el mapeo 0xFFFF9000... es válido
-    unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let virt = crate::memory::phys_to_virt(fb_base) as *mut u32;
-            for y in 0..10 {
-                for x in 60..70 {
-                    *virt.add(y * (pitch as usize / 4) + x) = 0xFFA500; // Orange
-                }
-            }
-        }
-    }
-    
-    // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
-    unsafe {
-        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
-            let fb = fb_base as *mut u32;
-            for y in 0..10 {
-                for x in 60..70 {
-                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF; // White
-                }
-            }
-        }
-    }
-
+    // Confirm kernel is running with serial output before any framebuffer access
     serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
 
     unsafe {
         serial::serial_print("[KERNEL] BOOT_STACK addr: ");
         serial::serial_print_hex(&raw const BOOT_STACK as u64);
         serial::serial_print("\n");
+    }
+
+    // Diagnostic framebuffer squares using identity-mapped (physical) address only.
+    // NOTE: HHDM-based framebuffer access (phys_to_virt) is intentionally NOT done
+    // here because no IDT is loaded yet; a page fault would triple-fault and freeze
+    // the system with no serial output.
+    unsafe {
+        if let Some((fb_base, _, _, pitch, _)) = boot::get_fb_info() {
+            let fb = fb_base as *mut u32;
+            // CYAN square at x=40
+            for y in 0..10 {
+                for x in 40..50 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0x00FFFF;
+                }
+            }
+            // YELLOW square at x=50
+            for y in 0..10 {
+                for x in 50..60 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFF00;
+                }
+            }
+            // WHITE square at x=60
+            for y in 0..10 {
+                for x in 60..70 {
+                    *fb.add(y * (pitch as usize / 4) + x) = 0xFFFFFF;
+                }
+            }
+        }
     }
 
     // Switch to Higher Half Boot Stack immediately to allow removing identity mapping later

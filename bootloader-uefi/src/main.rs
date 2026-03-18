@@ -1587,6 +1587,11 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let _ = out.write_str("Saliendo de servicios UEFI y saltando al kernel...\n");
         let (_rt_st, _final_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 
+        // Disable interrupts immediately after ExitBootServices.  UEFI's timer
+        // and other interrupt handlers are no longer valid; a spurious interrupt
+        // before we switch to our own IDT would triple-fault and freeze the machine.
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+
         // DIAGNÓSTICO: BLUE SQUARE (10,0) después de ExitBootServices
         if framebuffer_info.base_address != 0 {
             let fb_ptr = framebuffer_info.base_address as *mut u32;
