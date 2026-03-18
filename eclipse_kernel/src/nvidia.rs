@@ -157,8 +157,8 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
             }
         }
 
-        let src_vaddr = crate::memory::FB_VADDR_BASE + fb_phys;
-        let dst_vaddr = crate::memory::FB_VADDR_BASE + phys;
+        let src_vaddr = crate::memory::PHYS_MEM_OFFSET + fb_phys;
+        let dst_vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
 
         unsafe {
             core::ptr::copy_nonoverlapping(src_vaddr as *const u8, dst_vaddr as *mut u8, size);
@@ -259,7 +259,7 @@ pub fn fill_rect(payload: &[u8]) -> bool {
         }
     }
 
-    let vaddr = crate::memory::FB_VADDR_BASE + phys;
+    let vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
     let pitch_usize = pitch as usize;
     let ptr = (vaddr as *mut u32);
     let pitch_u32 = (pitch_usize / 4).max(1);
@@ -307,7 +307,7 @@ pub fn blit_rect(payload: &[u8]) -> bool {
         }
     }
 
-    let vaddr = crate::memory::FB_VADDR_BASE + phys;
+    let vaddr = crate::memory::PHYS_MEM_OFFSET + phys;
     let pitch_u32 = ((pitch as usize) / 4).max(1);
     let ptr = (vaddr as *mut u32);
 
@@ -380,12 +380,21 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     // 2. Both are accessible via BAR1 (true for NvidiaDrmDriver allocations).
     
     let pitch_u32 = ((pitch as usize) / 4).max(1);
-    let src_ptr = (crate::memory::FB_VADDR_BASE + src_handle.phys_addr) as *const u32;
-    let dst_ptr = (crate::memory::FB_VADDR_BASE + dst_phys) as *mut u32;
+    let src_ptr = (crate::memory::PHYS_MEM_OFFSET + src_handle.phys_addr) as *const u32;
+    let dst_ptr = (crate::memory::PHYS_MEM_OFFSET + dst_phys) as *mut u32;
+
+    // Boundary checks to avoid kernel panic on out-of-bounds blit
+    let src_max_pixels = src_handle.size / 4;
+    let dst_max_pixels = ((pitch as usize) * (height as usize)) / 4;
 
     for py in 0..h {
         let src_row_off = (src_y + py) as usize * pitch_u32 + (src_x as usize);
         let dst_row_off = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+        
+        if src_row_off + (w as usize) > src_max_pixels || dst_row_off + (w as usize) > dst_max_pixels {
+            continue; // Skip out of bounds row
+        }
+
         unsafe {
             core::ptr::copy_nonoverlapping(src_ptr.add(src_row_off), dst_ptr.add(dst_row_off), w as usize);
         }

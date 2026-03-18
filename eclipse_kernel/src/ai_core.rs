@@ -405,7 +405,11 @@ pub fn audit_syscall(pid: u32, _syscall_num: u64) -> bool {
         let history_sum: u64 = proc.ai_profile.syscall_history.iter().sum();
         let avg_syscalls = history_sum / 8;
         
-        let limit = (avg_syscalls * 15).max(200);
+        // Aumentamos el límite base y permitimos más ráfaga para PIDs del sistema (< 16)
+        let mut limit = (avg_syscalls * 20).max(500);
+        if pid < 16 {
+            limit *= 4; // Los procesos del sistema pueden ser muy ruidosos legítimamente (E/S, Render)
+        }
         
         if proc.ai_profile.last_tick_syscalls > limit {
             blocked = true;

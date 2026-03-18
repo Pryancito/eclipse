@@ -157,6 +157,11 @@ pub fn read_block(device_idx: usize, block_num: u64, buffer: &mut [u8]) -> Resul
             
             // Copy to user buffer
             buffer.copy_from_slice(&cache.data[victim_idx]);
+
+            // Trigger AI pre-fetching for subsequent likely blocks
+            drop(cache);
+            prefetch_ai(device_idx);
+
             Ok(())
         },
         Err(e) => Err(e)
@@ -249,4 +254,39 @@ pub fn flush() {
         }
     }
     crate::serial::serial_print("[BCACHE] Flush complete\n");
+}
+
+/// AI-Core: Predict and pre-load likely next blocks into the cache
+pub fn prefetch_ai(device_idx: usize) {
+    if let Some(pid) = crate::process::current_process_id() {
+        // We use pid_to_slot_fast + direct PROCESS_TABLE access to avoid expensive cloning
+        if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = &table[slot] {
+                let predictions = p.ai_profile.predict_next_blocks();
+                drop(table);
+
+                for block_num in predictions {
+                    // Check if already in cache (optimized check)
+                    let in_cache = {
+                        let cache = CACHE.lock();
+                        let mut found = false;
+                        for i in 0..CACHE_SIZE {
+                            if cache.entries[i].valid && cache.entries[i].device_idx == device_idx && cache.entries[i].block_num == block_num {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    };
+
+                    if !in_cache {
+                        let mut dummy = [0u8; BLOCK_SIZE];
+                        // read_block will perform the actual fetch and cache insertion
+                        let _ = read_block(device_idx, block_num, &mut dummy);
+                    }
+                }
+            }
+        }
+    }
 }

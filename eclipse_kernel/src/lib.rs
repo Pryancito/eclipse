@@ -10,6 +10,7 @@ use core::panic::PanicInfo;
 extern crate alloc;
 
 pub mod boot;
+pub mod ai_core;
 pub mod memory;
 pub mod interrupts;
 pub mod drm;

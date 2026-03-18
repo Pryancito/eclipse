@@ -109,6 +109,7 @@ pub struct Process {
     pub last_cpu: u32,                    // Last CPU that executed this process (for cache affinity)
     pub exit_code: u64,                   // Exit code passed to sys_exit; read by sys_wait
     pub cpu_affinity: Option<u32>,        // None = any CPU; Some(cpu_id) = pin to that CPU
+    pub ai_profile: crate::ai_core::ProcessProfile, // AI Behavior statistics
 }
 
 /// Sentinel value for current_cpu meaning "not owned by any CPU"
@@ -139,6 +140,7 @@ impl Process {
             last_cpu: NO_CPU,
             exit_code: 0,
             cpu_affinity: None,
+            ai_profile: crate::ai_core::ProcessProfile::new(),
         }
     }
 }
@@ -440,6 +442,41 @@ pub fn update_process(pid: ProcessId, mut new_process: Process) {
             }
         }
     });
+}
+
+/// Modify process state (callback-based, safe for SMP)
+pub fn modify_process<F>(pid: ProcessId, f: F) -> Result<(), &'static str>
+where
+    F: FnOnce(&mut Process),
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        if (pid as usize) < table.len() {
+            if let Some(p) = table[pid as usize].as_mut() {
+                if p.id == pid {
+                    let real_cpu = p.current_cpu;
+                    let real_state = p.state;
+                    f(p);
+                    p.current_cpu = real_cpu;
+                    p.state = real_state;
+                    return Ok(());
+                }
+            }
+        }
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == pid {
+                    let real_cpu = p.current_cpu;
+                    let real_state = p.state;
+                    f(p);
+                    p.current_cpu = real_cpu;
+                    p.state = real_state;
+                    return Ok(());
+                }
+            }
+        }
+        Err("Process not found")
+    })
 }
 
 /// Cambiar de contexto entre procesos

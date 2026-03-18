@@ -373,8 +373,13 @@ pub fn schedule() {
                                 let consumed = unsafe { 10u32.saturating_sub(CPU_QUANTUM[cpu_id]) };
                                 process.cpu_ticks += consumed as u64;
                                 
+                                // Update AI profile burst duration
+                                process.ai_profile.update_burst(consumed as u64);
+
                                 // Reset quantum here so we don't count the same ticks twice.
-                                unsafe { CPU_QUANTUM[cpu_id] = 10; }
+                                // Default is 10, but AI can suggest a different one.
+                                let next_q = process.ai_profile.predict_burst().max(5).min(50) as u32;
+                                unsafe { CPU_QUANTUM[cpu_id] = next_q; }
                                 
                                 if process.state == ProcessState::Running {
                                     should_requeue = true;
@@ -451,17 +456,37 @@ pub fn schedule() {
                 match current_pid {
                     Some(cur) if cur == next_pid => {
                         // Mismo proceso (único en cola), continúa sin cambio de contexto.
-                        // Reset quantum here too for the next 10ms slice.
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = 10; }
+                        // Reset quantum based on AI prediction
+                        let next_q = {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
+                                table[slot].as_ref().map(|p| p.ai_profile.predict_burst()).unwrap_or(10)
+                            } else { 10 }
+                        }.max(5).min(50) as u32;
+
+                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
                     }
                     Some(cur) => {
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = 10; }
+                        let next_q = {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
+                                table[slot].as_ref().map(|p| p.ai_profile.predict_burst()).unwrap_or(10)
+                            } else { 10 }
+                        }.max(5).min(50) as u32;
+
+                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
                         perform_context_switch(cur, next_pid);
                     }
                     None => {
                         // AP transitioning from idle to first user process.
-                        // Reset quantum for the new slice.
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = 10; }
+                        let next_q = {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
+                                table[slot].as_ref().map(|p| p.ai_profile.predict_burst()).unwrap_or(10)
+                            } else { 10 }
+                        }.max(5).min(50) as u32;
+
+                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
                         // Don't set current_process here; perform_context_switch_to will do it.
                         if cpu_id < MAX_CPUS {
                             // Guardar el contexto idle de este AP para poder volver más tarde.

@@ -545,6 +545,15 @@ pub fn find_nvidia_gpu() -> Option<PciDevice> {
         .copied()
 }
 
+/// Find all display-class devices (GPUs, including VirtIO, Intel, etc.)
+pub fn find_all_gpus() -> alloc::vec::Vec<PciDevice> {
+    let devices = PCI_DEVICES.lock();
+    devices.iter()
+        .filter(|dev| dev.class_code == PCI_CLASS_DISPLAY)
+        .copied()
+        .collect()
+}
+
 /// Enable PCI device (set command register)
 pub unsafe fn enable_device(dev: &PciDevice, enable_bus_master: bool) {
     let mut command = pci_config_read_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND);

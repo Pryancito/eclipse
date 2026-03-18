@@ -1048,7 +1048,9 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     unsafe {
         if FREE_FRAMES_COUNT > 0 {
             FREE_FRAMES_COUNT -= 1;
-            return Some(FREE_FRAMES_STACK[FREE_FRAMES_COUNT]);
+            let frame = FREE_FRAMES_STACK[FREE_FRAMES_COUNT];
+            notify_ai_memory_stats();
+            return Some(frame);
         }
     }
     let next = ANON_MMAP_NEXT.fetch_add(4096, Ordering::SeqCst);
@@ -1056,6 +1058,7 @@ pub fn alloc_phys_frame_for_anon_mmap() -> Option<u64> {
     if frame_phys >= ANON_MMAP_PHYS_END {
         return None;
     }
+    notify_ai_memory_stats();
     Some(frame_phys)
 }
 
@@ -1067,10 +1070,19 @@ pub fn free_phys_frame_for_anon_mmap(phys_addr: u64) {
         if FREE_FRAMES_COUNT < 1024 {
             FREE_FRAMES_STACK[FREE_FRAMES_COUNT] = phys_addr;
             FREE_FRAMES_COUNT += 1;
+            notify_ai_memory_stats();
         }
         // If stack is full, we just leak the frame (better than crashing).
         // In a real OS we'd use a bitmap or a larger list.
     }
+}
+
+/// Notify AI-Core about current memory status
+fn notify_ai_memory_stats() {
+    let next = ANON_MMAP_NEXT.load(Ordering::Relaxed);
+    let remaining_bump = (ANON_MMAP_PHYS_END.saturating_sub(ANON_MMAP_PHYS_START).saturating_sub(next)) / 4096;
+    let free_count = unsafe { FREE_FRAMES_COUNT };
+    crate::ai_core::update_memory_stats(remaining_bump + free_count as u64);
 }
 
 /// Allocate a contiguous run of physical frames from the same userspace pool.
@@ -1366,4 +1378,43 @@ fn mmio_map_kernel_page(pml4_phys: u64, vaddr: u64, paddr: u64, flags: u64) {
             pt.entries[pt_idx].set_entry(paddr, flags);
         }
     });
+}
+
+/// Estimate the number of present 4KB pages in a process's page table.
+pub fn update_working_set(pml4_phys: u64) -> u64 {
+    let mut count = 0;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _lock = PAGING_LOCK.lock();
+        unsafe {
+            let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
+            for i in 0..256 { // Scan user-space
+                if pml4.entries[i].present() {
+                    let pdpt_phys = pml4.entries[i].get_addr();
+                    let pdpt = &mut *(phys_to_virt(pdpt_phys) as *mut PageTable);
+                    for j in 0..512 {
+                        if pdpt.entries[j].present() && !pdpt.entries[j].is_huge() {
+                            let pd_phys = pdpt.entries[j].get_addr();
+                            let pd = &mut *(phys_to_virt(pd_phys) as *mut PageTable);
+                            for k in 0..512 {
+                                if pd.entries[k].present() {
+                                    if pd.entries[k].is_huge() {
+                                        count += 512;
+                                    } else {
+                                        let pt_phys = pd.entries[k].get_addr();
+                                        let pt = &mut *(phys_to_virt(pt_phys) as *mut PageTable);
+                                        for l in 0..512 {
+                                            if pt.entries[l].present() {
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    count
 }

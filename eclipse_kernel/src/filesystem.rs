@@ -57,6 +57,14 @@ fn read_block_from_device(block_num: u64, buffer: &mut [u8]) -> Result<(), &'sta
             return Err("Disk seek error");
         }
         
+        // AI-Core: Record block access in current process profile
+        if let Some(pid) = crate::process::current_process_id() {
+             if let Some(mut proc) = crate::process::get_process(pid) {
+                 proc.ai_profile.record_block_access(block_num);
+                 crate::process::update_process(pid, proc);
+             }
+        }
+
         match crate::scheme::read(FS.disk_scheme_id, FS.disk_resource_id, buffer) {
             Ok(_) => Ok(()),
             Err(e) => {

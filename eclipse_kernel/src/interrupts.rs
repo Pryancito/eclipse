@@ -1393,6 +1393,11 @@ extern "C" fn apic_timer_handler() {
         if ticks % 2 == 0 {
             crate::usb_hid::poll();
         }
+
+        // Update AI thermal and power model every 10ms
+        if ticks % 10 == 0 {
+            crate::ai_core::update_thermal_model();
+        }
         
         // Process global IPC messages
         crate::ipc::process_messages();

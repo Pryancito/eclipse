@@ -82,10 +82,18 @@ pub enum SyscallNumber {
     GetProcessList = 52,
     Kill = 53,
     SetProcessName = 54,
+    SpawnService = 55,
     StopProgress = 57,
     GetGpuBackend = 58,
+    SigAction = 60,
+    DrmPageFlip = 61,
+    DrmGetCaps = 62,
+    DrmAllocBuffer = 63,
+    DrmCreateFb = 64,
+    DrmMapHandle = 65,
+    SchedSetAffinity = 66,
     RegisterLogHud = 67,
-    DrmPageFlip = 60,
+    Ftruncate = 68,
 }
 
 
@@ -164,6 +172,14 @@ pub extern "C" fn syscall_handler(
     let pid = crate::process::current_process_id().unwrap_or(0);
     LAST_SYSCALL_PID.store(pid as u32, Ordering::Relaxed);
     LAST_SYSCALL_NUM.store(syscall_num, Ordering::Relaxed);
+
+    // AI-Core: Audit syscall for anomalies (DoS detection)
+    if pid != 0 {
+        if !crate::ai_core::audit_syscall(pid as u32, syscall_num) {
+            // Syscall blocked by AI policy
+            return 0xFFFF_FFFF_FFFF_FFFF; // -1 Error
+        }
+    }
 
     // Log Syscall 27 (register_device) to catch corruption.
     // Nota: Para yield (5) y otros, arg1/arg2 son registros del usuario (rdi/rsi);
@@ -363,7 +379,7 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
     };
 
     unsafe {
-        *(stats_ptr as *mut SystemStats) = stats;
+        core::ptr::write_unaligned(stats_ptr as *mut SystemStats, stats);
     }
 
     0
@@ -395,7 +411,7 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
                 };
                 
                 unsafe {
-                    *((buf_ptr as *mut ProcessInfo).add(count)) = info;
+                    core::ptr::write_unaligned((buf_ptr as *mut ProcessInfo).add(count), info);
                 }
                 count += 1;
             }
@@ -1958,7 +1974,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
             blue_mask_size: 8,
             blue_mask_shift: 0,
         };
-        core::ptr::write(user_buffer as *mut FramebufferInfo, syscall_fb);
+        core::ptr::write_unaligned(user_buffer as *mut FramebufferInfo, syscall_fb);
     }
     0
 }
@@ -1977,9 +1993,8 @@ fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
         return u64::MAX;
     };
     unsafe {
-        let buf = user_buffer as *mut [u32; 2];
-        (*buf)[0] = width;
-        (*buf)[1] = height;
+        core::ptr::write_unaligned(user_buffer as *mut u32, width);
+        core::ptr::write_unaligned((user_buffer + 4) as *mut u32, height);
     }
     0
 }

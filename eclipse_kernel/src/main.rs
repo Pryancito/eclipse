@@ -14,6 +14,7 @@ use core::panic::PanicInfo;
 use x86_64;
 
 // Módulos del microkernel
+mod ai_core;
 mod boot;
 mod memory;
 mod memory_builtins;
