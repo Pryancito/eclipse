@@ -53,6 +53,15 @@ pub enum WaylandInternalEvent {
         surface_id: u32,
         shell_surface_id: u32,
     },
+    XdgSurfaceCreated {
+        surface_id: u32,
+        xdg_surface_id: u32,
+    },
+    XdgToplevelCreated {
+        xdg_surface_id: u32,
+        toplevel_id: u32,
+        surface_id: u32,
+    },
 }
 
 impl WaylandConnection {
@@ -305,6 +314,16 @@ pub mod objects {
                         while ev.len() % 4 != 0 { ev.push(0); }
                         ev.extend_from_slice(&1u32.to_le_bytes()); // version
                         conn.send_event(id, 0, &ev);
+                        
+                        // 4. xdg_wm_base
+                        let mut ev = Vec::new();
+                        ev.extend_from_slice(&4u32.to_le_bytes()); // name
+                        let ifname = b"xdg_wm_base\0";
+                        ev.extend_from_slice(&(ifname.len() as u32).to_le_bytes());
+                        ev.extend_from_slice(ifname);
+                        while ev.len() % 4 != 0 { ev.push(0); }
+                        ev.extend_from_slice(&1u32.to_le_bytes()); // version
+                        conn.send_event(id, 0, &ev);
                     }
                 }
                 _ => return Err(WaylandError::UnknownOpcode(opcode)),
@@ -347,6 +366,9 @@ pub mod objects {
                             }
                             b"wl_shell" => {
                                 conn.registry.set(*new_id, Box::new(WlShell));
+                            }
+                            b"xdg_wm_base" => {
+                                conn.registry.set(*new_id, Box::new(XdgWmBase));
                             }
                             _ => {}
                         }
@@ -521,6 +543,121 @@ pub mod objects {
                     // nothing to do here, but we could trigger a "Map" event
                 }
                 _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    pub struct XdgWmBase;
+    impl WaylandObject for XdgWmBase {
+        fn interface_name(&self) -> &'static str { "xdg_wm_base" }
+        fn version(&self) -> u32 { 1 }
+        fn handle_request(&mut self, conn: &mut WaylandConnection, _id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => { // destroy
+                    // handled by registry removal if needed
+                }
+                1 => { // create_positioner(id)
+                }
+                2 => { // get_xdg_surface(id, wl_surface)
+                    let (decoded, _) = decode_args("no", args);
+                    if let (Some(WaylandArg::NewId(new_id)), Some(WaylandArg::Object(surface_id))) =
+                        (decoded.get(0), decoded.get(1))
+                    {
+                        conn.registry.set(*new_id, Box::new(XdgSurface { surface_id: *surface_id }));
+                        conn.internal_events.push_back(WaylandInternalEvent::XdgSurfaceCreated {
+                            surface_id: *surface_id,
+                            xdg_surface_id: *new_id,
+                        });
+                    }
+                }
+                3 => { // pong(serial)
+                }
+                _ => return Err(WaylandError::UnknownOpcode(opcode)),
+            }
+            Ok(())
+        }
+    }
+
+    pub struct XdgSurface { pub surface_id: u32 }
+    impl WaylandObject for XdgSurface {
+        fn interface_name(&self) -> &'static str { "xdg_surface" }
+        fn version(&self) -> u32 { 1 }
+        fn handle_request(&mut self, conn: &mut WaylandConnection, id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => { // destroy
+                }
+                1 => { // get_toplevel(id)
+                    let (decoded, _) = decode_args("n", args);
+                    if let Some(WaylandArg::NewId(new_id)) = decoded.get(0) {
+                        conn.registry.set(*new_id, Box::new(XdgToplevel { xdg_surface_id: id }));
+                        conn.internal_events.push_back(WaylandInternalEvent::XdgToplevelCreated {
+                            xdg_surface_id: id,
+                            toplevel_id: *new_id,
+                            surface_id: self.surface_id,
+                        });
+                        
+                        // Enviar configure inmediatamente para que la app sepa su tamaño inicial
+                        let mut ev = Vec::new();
+                        ev.extend_from_slice(&0i32.to_le_bytes()); // width (0 = compositor choice)
+                        ev.extend_from_slice(&0i32.to_le_bytes()); // height
+                        ev.extend_from_slice(&1u32.to_le_bytes()); // array length for states
+                        ev.extend_from_slice(&0u32.to_le_bytes()); // dummy state
+                        conn.send_event(*new_id, 0, &ev); // xdg_toplevel.configure
+                        
+                        // xdg_surface.configure(serial)
+                        let mut ev = Vec::new();
+                        ev.extend_from_slice(&0u32.to_le_bytes()); // serial
+                        conn.send_event(id, 0, &ev);
+                    }
+                }
+                2 => { // get_popup
+                }
+                3 => { // set_window_geometry
+                }
+                4 => { // ack_configure(serial)
+                }
+                _ => return Err(WaylandError::UnknownOpcode(opcode)),
+            }
+            Ok(())
+        }
+    }
+
+    pub struct XdgToplevel { pub xdg_surface_id: u32 }
+    impl WaylandObject for XdgToplevel {
+        fn interface_name(&self) -> &'static str { "xdg_toplevel" }
+        fn version(&self) -> u32 { 1 }
+        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => { // destroy
+                }
+                1 => { // set_parent
+                }
+                2 => { // set_title
+                }
+                3 => { // set_app_id
+                }
+                4 => { // show_window_menu
+                }
+                5 => { // move
+                }
+                6 => { // resize
+                }
+                7 => { // set_max_size
+                }
+                8 => { // set_min_size
+                }
+                9 => { // set_maximized
+                }
+                10 => { // unset_maximized
+                }
+                11 => { // set_fullscreen
+                }
+                12 => { // unset_fullscreen
+                }
+                13 => { // set_minimized
+                }
+                _ => {} // Ignore others for now
             }
             Ok(())
         }

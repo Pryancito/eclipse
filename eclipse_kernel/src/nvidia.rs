@@ -165,7 +165,12 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         }
         true
     }
-    fn set_cursor(&self, _crtc_id: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
+    fn set_cursor(&self, _crtc_id: u32, x: i32, y: i32, _handle: u32, flags: u32) -> bool {
+        const DRM_CURSOR_MOVE: u32 = 0x02;
+        if (flags & DRM_CURSOR_MOVE) != 0 {
+            crate::sw_cursor::update(x as u32, y as u32);
+            return true;
+        }
         false
     }
     fn wait_vblank(&self, _crtc_id: u32) -> bool {

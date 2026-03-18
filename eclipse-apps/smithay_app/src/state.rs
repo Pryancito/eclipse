@@ -346,6 +346,39 @@ impl SmithayState {
                             y: 100 + (win_idx as i32) * 20,
                             w: 640,
                             h: 480 + crate::compositor::ShellWindow::TITLE_H,
+                            curr_x: (100 + (win_idx as i32) * 20 + 320) as f32, // Start at center
+                            curr_y: (100 + (win_idx as i32) * 20 + 240) as f32,
+                            curr_w: 0.0,
+                            curr_h: 0.0,
+                            workspace: self.input.current_workspace,
+                            content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
+                            ..Default::default()
+                        };
+                        self.space.map_window(win);
+                        self.input.focused_window = Some(win_idx);
+                        self.dirty = true;
+                    }
+                }
+                #[cfg(any(not(target_os = "linux"), test))]
+                sidewind::wayland::WaylandInternalEvent::XdgSurfaceCreated { surface_id, xdg_surface_id } => {
+                    println!("[SMITHAY] WaylandInternalEvent::XdgSurfaceCreated surface_id={} xdg_surface_id={} conn_idx={}", surface_id, xdg_surface_id, conn_idx);
+                    // No mapeamos todavía, esperamos a que sea un toplevel o popup.
+                }
+                #[cfg(any(not(target_os = "linux"), test))]
+                sidewind::wayland::WaylandInternalEvent::XdgToplevelCreated { xdg_surface_id, toplevel_id, surface_id } => {
+                    println!("[SMITHAY] WaylandInternalEvent::XdgToplevelCreated xdg_surface_id={} toplevel_id={} surface_id={} conn_idx={}", xdg_surface_id, toplevel_id, surface_id, conn_idx);
+                    
+                    if self.space.window_count < crate::compositor::MAX_WINDOWS_COUNT {
+                        let win_idx = self.space.window_count;
+                        let win = crate::compositor::ShellWindow {
+                            x: 100 + (win_idx as i32) * 20,
+                            y: 100 + (win_idx as i32) * 20,
+                            w: 640,
+                            h: 480 + crate::compositor::ShellWindow::TITLE_H,
+                            curr_x: (100 + (win_idx as i32) * 20 + 320) as f32, // Pop-in start
+                            curr_y: (100 + (win_idx as i32) * 20 + 240) as f32,
+                            curr_w: 0.0,
+                            curr_h: 0.0,
                             workspace: self.input.current_workspace,
                             content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
                             ..Default::default()
@@ -868,6 +901,8 @@ impl SmithayState {
                 self.input.cursor_y,
                 &mut self.log_buf,
                 &mut self.log_len,
+                self.input.dashboard_active,
+                self.input.system_central_active,
             );
 
             if !self.input.dashboard_active && !self.input.system_central_active {

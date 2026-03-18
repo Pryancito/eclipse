@@ -163,8 +163,6 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
     }
-
-    progress::bar(42);
     
     // DIAGNÓSTICO: WHITE SQUARE (60,0) después de progress::bar(42)
     unsafe {
@@ -225,7 +223,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     boot::enable_sse();
     memory::init_pat();
     cpu::detect_features();
-
+    progress::init();
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);

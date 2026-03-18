@@ -30,8 +30,8 @@ use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line};
-use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20}, MonoTextStyle};
+use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line, Circle, Polyline, RoundedRectangle, CornerRadii};
+use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20, FONT_6X10}, MonoTextStyle};
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::ServiceInfo;
@@ -501,11 +501,25 @@ impl DrawTarget for FramebufferState {
         let height = self.info.height as i32;
         let pitch_px = (self.info.pitch / 4).max(width as u32) as i32;
         let fb_ptr = self.back_addr as *mut u32;
-        
+
         let intersection = area.intersection(&Rectangle::new(Point::zero(), Size::new(width as u32, height as u32)));
         if intersection.is_zero_sized() { return Ok(()); }
-        
+
         let raw_color = 0xFF_00_00_00 | ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32);
+
+        // Attempt GPU acceleration if available
+        if let Some(gpu) = self.gpu.as_ref() {
+            let mut encoder = sidewind::gpu::GpuCommandEncoder::new(gpu);
+            if encoder.fill_rect(
+                intersection.top_left.x as u32,
+                intersection.top_left.y as u32,
+                intersection.size.width,
+                intersection.size.height,
+                raw_color
+            ).is_ok() {
+                return Ok(());
+            }
+        }
         
         let x_start = intersection.top_left.x;
         let x_end = x_start + intersection.size.width as i32;
@@ -570,7 +584,6 @@ impl FramebufferState {
 
     #[inline]
     fn draw_sdf_effect(&mut self, rect: &Rectangle, radius: i32, color: Rgb888, intensity: u32, corner_radius: f32) {
-        if true { return; } // Disabled for performance stability
         if self.back_addr == 0 || radius <= 0 { return; }
         let w = self.info.width as i32;
         let h = self.info.height as i32;
@@ -585,22 +598,30 @@ impl FramebufferState {
         let half_h = rect.size.height as f32 / 2.0 - corner_radius;
         let cx = rect.top_left.x as f32 + rect.size.width as f32 / 2.0;
         let cy = rect.top_left.y as f32 + rect.size.height as f32 / 2.0;
+        let r_inv = 1.0 / (radius as f32);
 
         for y in inter.top_left.y..inter.top_left.y + inter.size.height as i32 {
+            let row_off = y as usize * pitch_px;
             for x in inter.top_left.x..inter.top_left.x + inter.size.width as i32 {
                 let dx = (x as f32 - cx).abs() - half_w;
                 let dy = (y as f32 - cy).abs() - half_h;
-                let dist = dx.max(0.0).hypot(dy.max(0.0)) + dx.min(0.0).max(dy.min(0.0)) - corner_radius;
+                
+                // Rounded Rect SDF approximation (O(1) per pixel)
+                // dist is distance to the rounded box
+                let d_max_x = dx.max(0.0);
+                let d_max_y = dy.max(0.0);
+                let dist = (d_max_x * d_max_x + d_max_y * d_max_y).sqrt() + dx.min(0.0).max(dy.min(0.0)) - corner_radius;
                 
                 if dist > 0.0 && dist < radius as f32 {
-                    let alpha = 1.0 - (dist / radius as f32);
+                    let alpha = 1.0 - (dist * r_inv);
                     let a_scaled = (alpha * alpha * intensity as f32) as u32; 
                     if a_scaled > 0 {
-                        let off = (y as usize * pitch_px) + x as usize;
+                        let off = row_off + x as usize;
                         let bg = unsafe { core::ptr::read_volatile(fb_ptr.add(off)) };
-                        let r = (((bg >> 16) & 0xFF) * (255 - a_scaled) + (color.r() as u32) * a_scaled) / 255;
-                        let g = (((bg >> 8) & 0xFF) * (255 - a_scaled) + (color.g() as u32) * a_scaled) / 255;
-                        let b = ((bg & 0xFF) * (255 - a_scaled) + (color.b() as u32) * a_scaled) / 255;
+                        let inv_a = 255 - a_scaled;
+                        let r = (((bg >> 16) & 0xFF) * inv_a + (color.r() as u32) * a_scaled) / 255;
+                        let g = (((bg >> 8) & 0xFF) * inv_a + (color.g() as u32) * a_scaled) / 255;
+                        let b = ((bg & 0xFF) * inv_a + (color.b() as u32) * a_scaled) / 255;
                         unsafe { core::ptr::write_volatile(fb_ptr.add(off), 0xFF_00_00_00 | (r << 16) | (g << 8) | b); }
                     }
                 }
@@ -610,9 +631,9 @@ impl FramebufferState {
 }
 
 pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f32, net: f32, uptime_ticks: u64) {
-    let cpu = if cpu.is_nan() { 0.0 } else { cpu };
-    let mem = if mem.is_nan() { 0.0 } else { mem };
-    let net = if net.is_nan() { 0.0 } else { net };
+    let cpu = if cpu.is_finite() { cpu } else { 0.0 };
+    let mem = if mem.is_finite() { mem } else { 0.0 };
+    let net = if net.is_finite() { net } else { 0.0 };
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
     let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
@@ -868,8 +889,13 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
     let ww = w.curr_w as i32;
     let wh = w.curr_h as i32;
     let rect = Rectangle::new(Point::new(wx, wy), Size::new(ww as u32, wh as u32));
-    let accent = if is_focused { colors::ACCENT_CYAN } else { colors::GLOW_DIM };
-    // Sin blur/SDF para estabilidad y menor uso de memoria (mismo estilo que smithay_wayland)
+    let accent = if is_focused { 
+        fb.draw_sdf_glow(&rect, 10, colors::ACCENT_CYAN);
+        colors::ACCENT_CYAN 
+    } else { 
+        fb.draw_sdf_shadow(&rect, 8);
+        colors::GLOW_DIM 
+    };
 
     let _ = ui::draw_glass_card(fb, rect, "ECLIPSE // TERMINAL", accent);
 
@@ -932,11 +958,24 @@ pub fn draw_desktop_shell(
     cursor_y: i32,
     log_buf: &mut [u8; 512],
     log_len: &mut usize,
+    dashboard_active: bool,
+    sys_central_active: bool,
 ) {
-    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len);
+    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len, dashboard_active, sys_central_active);
 }
 
-pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _window_count: usize, counter: u64, _cursor_x: i32, _cursor_y: i32, log_buf: &mut [u8; 512], log_len: &mut usize) {
+pub fn draw_static_ui(
+    fb: &mut FramebufferState, 
+    _windows: &[ShellWindow], 
+    _window_count: usize, 
+    counter: u64, 
+    _cursor_x: i32, 
+    _cursor_y: i32, 
+    log_buf: &mut [u8; 512], 
+    log_len: &mut usize,
+    dashboard_active: bool,
+    sys_central_active: bool,
+) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
 
@@ -958,7 +997,21 @@ pub fn draw_static_ui(fb: &mut FramebufferState, _windows: &[ShellWindow], _wind
         let py = sidebar_y_start + (i as i32 * icon_slot_h);
         let hover = _cursor_x >= sidebar_x && _cursor_x <= sidebar_x + sidebar_width 
                  && _cursor_y >= py && _cursor_y <= py + icon_slot_h;
-        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, hover, sidebar_width, icon_slot_h, counter);
+        
+        // Active view highlight bar
+        let active = match icon_type {
+            ui::TechCardIconType::ControlPanel => dashboard_active,
+            ui::TechCardIconType::System => sys_central_active,
+            _ => false,
+        };
+        
+        let draw_hover = hover || active;
+        if draw_hover {
+             let _ = Rectangle::new(Point::new(sidebar_x, py + 10), Size::new(4, (icon_slot_h - 20) as u32))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::ACCENT_CYAN).build()).draw(fb);
+        }
+
+        let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, draw_hover, sidebar_width, icon_slot_h, counter);
     }
 
 }
@@ -1031,6 +1084,25 @@ pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
     let _ = Rectangle::new(Point::new(x, y), Size::new(d, d))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build()).draw(fb);
 }
+
+pub fn draw_pill_button<D>(target: &mut D, pos: Point, width: u32, text: &str, color: Rgb888) -> Result<(), D::Error>
+where D: DrawTarget<Color = Rgb888> {
+    let rect = Rectangle::new(pos, Size::new(width, 18));
+    let radius = CornerRadii::new(Size::new(9, 9));
+    let pill = RoundedRectangle::new(rect, radius);
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_color(color)
+        .stroke_width(1)
+        .build();
+    let _ = pill.into_styled(style).draw(target)?;
+    
+    let text_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, color);
+    let tw = text.len() as i32 * 6;
+    let tx = pos.x + (width as i32 - tw) / 2;
+    let ty = pos.y + 13;
+    let _ = Text::new(text, Point::new(tx, ty), text_style).draw(target)?;
+    Ok(())
+}
 #[inline(never)]
 pub fn draw_system_central(
     fb: &mut FramebufferState, 
@@ -1053,11 +1125,17 @@ pub fn draw_system_central(
         .draw(fb);
     let _ = ui::draw_grid(fb, Rgb888::new(20, 40, 80), 64, Point::new(panel_x, 0));
 
-    let half_h = (h - 60) / 2;
+    let panel_w = (fb.info.width as i32) - sidebar_width - 80;
+    let panel_h = (fb.info.height as i32) - 80;
+    let half_h = panel_h / 2;
+    let panel_x = sidebar_width + 40;
     
-    let uptime_secs = uptime_ticks / 1000;
+    let total_secs = uptime_ticks / 1000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
     let mut title_buf = heapless::String::<64>::new();
-    let _ = core::fmt::write(&mut title_buf, format_args!("SISTEMA CENTRAL // SERVICIOS [UPTIME: {}h {}m]", uptime_secs / 3600, (uptime_secs / 60) % 60));
+    let _ = core::fmt::write(&mut title_buf, format_args!("SISTEMA CENTRAL // SERVICIOS [UPTIME: {}h {}m]", hours, mins));
+
     let svc_rect = Rectangle::new(Point::new(panel_x + 20, 20), Size::new(panel_w as u32 - 40, half_h as u32));
     let _ = ui::draw_glass_card(fb, svc_rect, &title_buf, colors::ACCENT_CYAN);
     
@@ -1076,11 +1154,13 @@ pub fn draw_system_central(
     let col_restarts = panel_x + 490;
     let col_options = panel_x + 590;
 
-    let cols = [("ID", col_id), ("NOMBRE", col_name), ("ESTADO", col_state), ("CPU", col_cpu), ("MEM", col_mem), ("REINICIOS", col_restarts), ("OPCIONES", col_options)];
-    // FIX: Uso de iteración sin referencias para evitar tipos complejos en arrays
-    for (name, x) in cols {
-        let _ = Text::new(name, Point::new(x, start_y), header_style).draw(fb);
-    }
+    Text::new("ID", Point::new(col_id, start_y), header_style).draw(fb).ok();
+    Text::new("NOMBRE", Point::new(col_name, start_y), header_style).draw(fb).ok();
+    Text::new("ESTADO", Point::new(col_state, start_y), header_style).draw(fb).ok();
+    Text::new("CPU", Point::new(col_cpu, start_y), header_style).draw(fb).ok();
+    Text::new("MEM", Point::new(col_mem, start_y), header_style).draw(fb).ok();
+    Text::new("REINICIOS", Point::new(col_restarts, start_y), header_style).draw(fb).ok();
+    Text::new("OPCIONES", Point::new(col_options, start_y), header_style).draw(fb).ok();
     
     let mut buf = heapless::String::<16>::new();
 
@@ -1111,11 +1191,15 @@ pub fn draw_system_central(
             4 => "Stopping",
             _ => "Unknown",
         };
-        let state_color = match svc.state {
-            2 => colors::ACCENT_GREEN,
-            3 => colors::ACCENT_RED,
-            _ => colors::ACCENT_YELLOW,
+        let (state_color, dot_color) = match svc.state {
+            2 => (colors::WHITE, colors::ACCENT_GREEN),
+            3 => (colors::ACCENT_RED, colors::ACCENT_RED),
+            0 => (colors::GLOW_DIM, colors::GLOW_DIM),
+            _ => (colors::ACCENT_YELLOW, colors::ACCENT_YELLOW),
         };
+        
+        // Target state dot like screenshot
+        let _ = ui::draw_glowing_circle(fb, Point::new(col_state - 10, y - 5), 3, dot_color);
         let _ = Text::new(state_str, Point::new(col_state, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, state_color)).draw(fb);
         
         let mut svc_cpu: f32 = 0.0;
@@ -1131,7 +1215,7 @@ pub fn draw_system_central(
         }
 
         buf.clear();
-        let svc_cpu_f = if svc_cpu.is_nan() { 0.0 } else { svc_cpu };
+        let svc_cpu_f = if svc_cpu.is_finite() { svc_cpu } else { 0.0 };
         let _ = core::fmt::write(&mut buf, format_args!("{:.1}%", svc_cpu_f));
         let _ = Text::new(&buf, Point::new(col_cpu, y), text_style).draw(fb);
 
@@ -1145,7 +1229,9 @@ pub fn draw_system_central(
 
         buf.clear();
         if svc_mem_kb > 1024 {
-            let _ = core::fmt::write(&mut buf, format_args!("{:.1} MB", svc_mem_kb as f32 / 1024.0));
+            let svc_mem_mb = svc_mem_kb as f32 / 1024.0;
+            let svc_mem_mb_f = if svc_mem_mb.is_finite() { svc_mem_mb } else { 0.0 };
+            let _ = core::fmt::write(&mut buf, format_args!("{:.1} MB", svc_mem_mb_f));
         } else {
             let _ = core::fmt::write(&mut buf, format_args!("{} KB", svc_mem_kb));
         }
@@ -1164,8 +1250,8 @@ pub fn draw_system_central(
         let _ = core::fmt::write(&mut buf, format_args!("{}", svc.restart_count));
         let _ = Text::new(&buf, Point::new(col_restarts, y), text_style).draw(fb);
         
-        let _ = Text::new("[REINICIAR]", Point::new(col_options, y), header_style).draw(fb);
-        let _ = Text::new("[PARAR]", Point::new(col_options + 100, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
+        let _ = draw_pill_button(fb, Point::new(col_options, y - 12), 80, "REINICIAR", colors::ACCENT_CYAN);
+        let _ = draw_pill_button(fb, Point::new(col_options + 90, y - 12), 60, "PARAR", colors::ACCENT_RED);
     }
     
     let prog_rect = Rectangle::new(Point::new(panel_x + 20, 40 + half_h), Size::new(panel_w as u32 - 40, half_h as u32));
@@ -1179,11 +1265,12 @@ pub fn draw_system_central(
     let col_prog_red = panel_x + 440;
     let col_prog_options = panel_x + 590;
 
-    let cols_prog = [("PID", col_prog_pid), ("NOMBRE", col_prog_name), ("CPU", col_prog_cpu), ("MEM", col_prog_mem), ("RED", col_prog_red), ("OPCIONES", col_prog_options)];
-    // FIX: Uso de iteración sin referencias
-    for (name, x) in cols_prog {
-        let _ = Text::new(name, Point::new(x, start_y_prog), header_style).draw(fb);
-    }
+    Text::new("PID", Point::new(col_prog_pid, start_y_prog), header_style).draw(fb).ok();
+    Text::new("NOMBRE", Point::new(col_prog_name, start_y_prog), header_style).draw(fb).ok();
+    Text::new("CPU", Point::new(col_prog_cpu, start_y_prog), header_style).draw(fb).ok();
+    Text::new("MEM", Point::new(col_prog_mem, start_y_prog), header_style).draw(fb).ok();
+    Text::new("RED", Point::new(col_prog_red, start_y_prog), header_style).draw(fb).ok();
+    Text::new("OPCIONES", Point::new(col_prog_options, start_y_prog), header_style).draw(fb).ok();
 
     let mut display_idx = 0;
     for (p_idx, p) in processes.iter().enumerate() {
@@ -1223,7 +1310,7 @@ pub fn draw_system_central(
             cpu_val = process_cpu[p_idx];
         }
         buf.clear();
-        let cpu_val_f = if cpu_val.is_nan() { 0.0 } else { cpu_val };
+        let cpu_val_f = if cpu_val.is_finite() { cpu_val } else { 0.0 };
         let _ = core::fmt::write(&mut buf, format_args!("{:.1}%", cpu_val_f));
         let _ = Text::new(&buf, Point::new(col_prog_cpu, y), text_style).draw(fb);
 
@@ -1241,7 +1328,9 @@ pub fn draw_system_central(
             mem_kb = process_mem[p_idx];
         }
         if mem_kb > 1024 {
-            let _ = core::fmt::write(&mut buf, format_args!("{:.1} MB", mem_kb as f32 / 1024.0));
+            let mem_mb = mem_kb as f32 / 1024.0;
+            let mem_mb_f = if mem_mb.is_finite() { mem_mb } else { 0.0 };
+            let _ = core::fmt::write(&mut buf, format_args!("{:.1} MB", mem_mb_f));
         } else {
             let _ = core::fmt::write(&mut buf, format_args!("{} KB", mem_kb));
         }
@@ -1265,8 +1354,15 @@ pub fn draw_system_central(
             counter.wrapping_add((display_idx as u64).wrapping_mul(11)),
             colors::ACCENT_CYAN,
         );
+        let _ = ui::draw_technical_heartbeat(
+            fb,
+            Point::new(col_prog_red + 56, y - 4),
+            Size::new(84, 14),
+            counter.wrapping_add((display_idx as u64).wrapping_mul(11)).wrapping_add(30),
+            colors::ACCENT_VIOLET,
+        );
         
-        let _ = Text::new("[MATAR]", Point::new(col_prog_options, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
+        let _ = draw_pill_button(fb, Point::new(col_prog_options, y - 12), 65, "MATAR", colors::ACCENT_RED);
         
         display_idx += 1;
     }

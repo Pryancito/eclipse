@@ -293,6 +293,7 @@ pub extern "C" fn syscall_handler(
         53 => sys_kill(arg1),
         54 => sys_set_process_name(arg1, arg2),
         55 => sys_spawn_service(arg1, arg2, arg3),
+        56 => sys_gpu_command(arg1, arg2, arg3, arg4),
         57 => sys_stop_progress(),
         61 => sys_drm_page_flip(arg1),
         62 => sys_drm_get_caps(arg1),
@@ -1986,11 +1987,14 @@ fn sys_get_gpu_display_info(user_buffer: u64) -> u64 {
 /// On real hardware (EFI GOP): renders a software cursor into the framebuffer.
 /// arg1: x (u32), arg2: y (u32). Always returns 0.
 fn sys_set_cursor_position(arg1: u64, arg2: u64) -> u64 {
-    let x = arg1 as u32;
-    let y = arg2 as u32;
-    if !crate::virtio::set_cursor_position(x, y) {
-        // No VirtIO GPU — fall back to software cursor painted into EFI GOP framebuffer.
-        crate::sw_cursor::update(x, y);
+    let x = arg1 as i32;
+    let y = arg2 as i32;
+    
+    // Try via unified DRM subsystem first (handles VirtIO hardware cursor and future drivers)
+    // Flags 0x02 = DRM_CURSOR_MOVE
+    if !crate::drm::set_cursor(0, x, y, 0, 0x02) {
+        // Fall back to legacy / software cursor if DRM failed or no driver supports it
+        crate::sw_cursor::update(x as u32, y as u32);
     }
     0
 }

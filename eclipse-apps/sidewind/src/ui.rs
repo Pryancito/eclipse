@@ -304,11 +304,8 @@ where
                 continue;
             }
 
-            // Dibujamos relativo al centro pasado por parámetro
-            target.draw_iter(core::iter::once(Pixel(
-                Point::new(center.x + ox, center.y + oy), 
-                Rgb888::new(r, g, b)
-            )))?;
+            // Direct pixel draw is faster than draw_iter(once)
+            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target).ok();
         }
     }
     Ok(())
@@ -349,7 +346,7 @@ where
             if r < TRANSPARENT_THRESH && g < TRANSPARENT_THRESH && b < TRANSPARENT_THRESH {
                 continue;
             }
-            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target)?;
+            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target).ok();
         }
     }
     Ok(())
@@ -371,22 +368,30 @@ where
     let src_size: i32 = if is_logo { 600 } else { 64 };
     const TRANSPARENT_THRESH: u8 = 24;
     
-    let time = counter as f32 * 0.15;
+    // Use modulo to keep counter manageable for f32 precision
+    let time = ((counter % 360000) as f32) * 0.15;
     
     // 1. Procedural Wave Distortion & Scaling
-    let scale_mod = 1.0 + 0.03 * (time * 0.5).sin();
+    let s_val = (time * 0.5).sin();
+    let scale_mod = 1.0 + 0.03 * (if s_val.is_finite() { s_val } else { 0.0 });
     let current_radius = (radius as f32 * scale_mod) as i32;
     let current_r2 = current_radius * current_radius;
 
+    if current_radius <= 0 { return Ok(()); }
+
     for oy in -current_radius..=current_radius {
+        // Wave X only depends on OY
+        let wave_x_val = (oy as f32 * 0.1 + time).sin();
+        let wave_x = (if wave_x_val.is_finite() { wave_x_val } else { 0.0 }) * 1.5;
+        
         for ox in -current_radius..=current_radius {
             if ox * ox + oy * oy > current_r2 {
                 continue;
             }
             
             // Mathematical distortion: Wave effect on UV coordinates
-            let wave_x = (oy as f32 * 0.1 + time).sin() * 1.5;
-            let wave_y = (ox as f32 * 0.1 + time * 1.2).cos() * 1.5;
+            let wave_y_val = (ox as f32 * 0.1 + time * 1.2).cos();
+            let wave_y = (if wave_y_val.is_finite() { wave_y_val } else { 0.0 }) * 1.5;
             
             let ux = ((ox as f32 + wave_x + current_radius as f32) * src_size as f32) / (2.0 * current_radius as f32);
             let uy = ((oy as f32 + wave_y + current_radius as f32) * src_size as f32) / (2.0 * current_radius as f32);
@@ -415,7 +420,7 @@ where
                 b = b.saturating_add((boost * 2) as u8); // Blueish tint for tech-scan
             }
 
-            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target)?;
+            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target).ok();
         }
     }
 
@@ -425,11 +430,13 @@ where
         let orb_radius_x = radius as f32 + 5.0 + (i as f32 * 3.0);
         let orb_radius_y = radius as f32 * 0.7 + (i as f32 * 2.0);
         
-        let ox = (orb_time.cos() * orb_radius_x) as i32;
-        let oy = (orb_time.sin() * orb_radius_y) as i32;
+        let c_val = orb_time.cos();
+        let s_val = orb_time.sin();
+        let ox = (if c_val.is_finite() { c_val } else { 0.0 } * orb_radius_x) as i32;
+        let oy = (if s_val.is_finite() { s_val } else { 0.0 } * orb_radius_y) as i32;
         
         let color = if i == 0 { colors::ACCENT_CYAN } else if i == 1 { colors::ACCENT_VIOLET } else { colors::WHITE };
-        let _ = draw_glowing_circle(target, center + Point::new(ox, oy), 2, color)?;
+        let _ = draw_glowing_circle(target, center + Point::new(ox, oy), 2, color).ok();
     }
 
     Ok(())
@@ -542,7 +549,7 @@ where
             if r < TRANSPARENT_THRESH && g < TRANSPARENT_THRESH && b < TRANSPARENT_THRESH {
                 continue;
             }
-            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target)?;
+            let _ = Pixel(Point::new(center.x + ox, center.y + oy), Rgb888::new(r, g, b)).draw(target).ok();
         }
     }
     Ok(())
