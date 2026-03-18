@@ -85,20 +85,10 @@ impl FramebufferState {
 
             let fb_size = (dev.caps.pitch as usize) * (dev.caps.height as usize);
 
-            let bg_buffer = unsafe {
-                mmap(
-                    core::ptr::null_mut(),
-                    fb_size,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            let background_addr = if bg_buffer.is_null() || bg_buffer as usize == usize::MAX {
-                0
+            let background_addr = if let Ok(db) = dev.create_dumb_buffer(dev.caps.width, dev.caps.height, 32) {
+                dev.map_buffer(db.handle, db.size).unwrap_or(core::ptr::null_mut()) as usize
             } else {
-                bg_buffer as usize
+                0
             };
 
             let info = FramebufferInfo {
@@ -402,6 +392,15 @@ impl FramebufferState {
 
     pub fn blit_background(&self) {
         if self.back_addr == 0 || self.background_addr == 0 { return; }
+        
+        // Try GPU blit if available (internal VRAM to VRAM copy)
+        if let Some(ref gpu) = self.gpu {
+            let mut encoder = sidewind::gpu::GpuCommandEncoder::new(gpu);
+            if encoder.blit(0, 0, 0, 0, self.info.width, self.info.height).is_ok() {
+                return;
+            }
+        }
+
         let size_bytes = (self.info.pitch as usize) * (self.info.height as usize);
         unsafe { core::ptr::copy_nonoverlapping(self.background_addr as *const u8, self.back_addr as *mut u8, size_bytes); }
     }

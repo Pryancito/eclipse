@@ -83,6 +83,7 @@ pub enum SyscallNumber {
     Kill = 53,
     SetProcessName = 54,
     StopProgress = 57,
+    GetGpuBackend = 58,
     RegisterLogHud = 67,
     DrmPageFlip = 60,
 }
@@ -295,6 +296,7 @@ pub extern "C" fn syscall_handler(
         55 => sys_spawn_service(arg1, arg2, arg3),
         56 => sys_gpu_command(arg1, arg2, arg3, arg4),
         57 => sys_stop_progress(),
+        58 => sys_gpu_get_backend(),
         61 => sys_drm_page_flip(arg1),
         62 => sys_drm_get_caps(arg1),
         63 => sys_drm_alloc_buffer(arg1),
@@ -2212,6 +2214,17 @@ fn sys_gpu_command(kind: u64, command: u64, payload_ptr: u64, payload_len: u64) 
         }
         _ => u64::MAX,
     }
+}
+
+fn sys_gpu_get_backend() -> u64 {
+    if let Some(driver) = crate::drm::get_primary_driver() {
+        if driver.name() == "nvidia" {
+            return 1;
+        } else if driver.name() == "virtio-gpu" {
+            return 0;
+        }
+    }
+    2 // Software fallback
 }
 
 /// sys_map_framebuffer - Map framebuffer physical memory into process virtual space

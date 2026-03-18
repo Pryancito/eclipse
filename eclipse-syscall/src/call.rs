@@ -259,4 +259,8 @@ pub fn gpu_command(kind: usize, command: usize, payload: &[u8]) -> Result<usize>
 pub fn ioctl(fd: usize, request: usize, arg: usize) -> Result<usize> {
     unsafe { cvt(syscall3(SYS_IOCTL, fd, request, arg)) }
 }
+/// Get the active GPU backend type (0=VirtIO, 1=NVIDIA, 2=Software)
+pub fn gpu_get_backend() -> Result<usize> {
+    unsafe { cvt(syscall0(SYS_GET_GPU_BACKEND)) }
+}
 

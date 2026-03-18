@@ -1,7 +1,11 @@
 #[cfg(not(target_os = "linux"))]
-use libc::gpu_command;
+use eclipse_syscall::call::{gpu_command, gpu_get_backend};
+
 #[cfg(target_os = "linux")]
-pub unsafe fn gpu_command(_kind: usize, _command: usize, _payload: &[u8]) -> isize { -1 }
+pub unsafe fn gpu_command(_kind: usize, _command: usize, _payload: &[u8]) -> Result<usize, ()> { Err(()) }
+#[cfg(target_os = "linux")]
+pub fn gpu_get_backend() -> Result<usize, ()> { Ok(2) }
+
 use core::fmt::Debug;
 
 /// SideWind GPU Backend Types
@@ -30,11 +34,12 @@ pub type GpuResult<T> = Result<T, GpuError>;
 impl GpuDevice {
     /// Create a new GPU device by detecting available hardware.
     pub fn new() -> Self {
-        // Autodetection logic could go here (asking kernel or checking PCI)
-        // For now, default to VirtIO-GPU (backend 0)
-        Self {
-            backend: GpuBackend::VirtioGpu,
-        }
+        let backend = match gpu_get_backend() {
+            Ok(0) => GpuBackend::VirtioGpu,
+            Ok(1) => GpuBackend::Nvidia,
+            _ => GpuBackend::Software,
+        };
+        Self { backend }
     }
 
     /// Create a GPU device for a specific backend (e.g. for NVIDIA testing)
@@ -48,7 +53,7 @@ impl GpuDevice {
 
     /// Submit a command buffer to the GPU.
     pub fn submit(&self, command_id: usize, payload: &[u8]) -> GpuResult<()> {
-        if unsafe { gpu_command(self.backend as usize, command_id, payload) } == 0 {
+        if unsafe { gpu_command(self.backend as usize, command_id, payload) }.is_ok() {
             Ok(())
         } else {
             Err(GpuError::CommandFailed)
@@ -112,8 +117,8 @@ impl<'a> GpuCommandEncoder<'a> {
                 self.device.submit(1, &p)
             }
             GpuBackend::VirtioGpu => {
-                // VirtIO 2D: could use resource transfer or VirGL; placeholder
-                Ok(())
+                // Return error to fallback to software blit until VirtIO 2D resources or VirGL are used
+                Err(GpuError::BackendNotSupported)
             }
             _ => Err(GpuError::BackendNotSupported),
         }

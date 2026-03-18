@@ -57,6 +57,7 @@ pub const SYS_KILL: usize = 53;
 pub const SYS_SET_PROCESS_NAME: usize = 54;
 pub const SYS_SPAWN_SERVICE: usize = 55;
 pub const SYS_GET_STORAGE_DEVICE_COUNT: usize = 50;
+pub const SYS_GET_GPU_BACKEND: usize = 58;
 pub const SYS_PCI_ENUM_DEVICES: usize = 17;
 pub const SYS_STOP_PROGRESS: usize = 57;
 pub const SYS_PCI_READ_CONFIG: usize = 18;
