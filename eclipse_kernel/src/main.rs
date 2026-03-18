@@ -105,13 +105,11 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[no_mangle]
 #[link_section = ".init"]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
-    // 1. Initialize serial for diagnostics immediately
-    serial::init();
-
-    // 1.5 Enable SSE early (embedded-graphics requires it)
-    boot::enable_sse();
-
-    // 1.6 Zero BSS (linker symbols __bss_start, __bss_end)
+    // 1. Zero BSS first (before serial::init so SERIAL_INITIALIZED is not erased)
+    // BSS must be zeroed before any static variable is written, because BSS
+    // zeroing resets every zero-initialized static (including SERIAL_INITIALIZED).
+    // If serial::init() runs first it sets SERIAL_INITIALIZED=true, but then BSS
+    // zeroing immediately clears it back to false, silencing all serial output.
     extern "C" {
         static mut __bss_start: u8;
         static mut __bss_end: u8;
@@ -125,7 +123,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
-    // 2. Initialize boot info
+    // 2. Initialize serial for diagnostics (after BSS zeroing so the init sticks)
+    serial::init();
+
+    // 2.5 Enable SSE early (embedded-graphics requires it)
+    boot::enable_sse();
+
+    // 3. Initialize boot info
     boot::init(boot_info_ptr);
     
     // DIAGNÓSTICO: CYAN SQUARE (40,0) después de boot::init
