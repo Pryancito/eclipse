@@ -817,6 +817,19 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
 
     if w.curr_w > 100.0 {
         match w.content {
+            WindowContent::Wayland { .. } if w.is_dmabuf => {
+                if let Some(handle) = w.buffer_handle {
+                    if let Some(ref gpu) = fb.gpu {
+                        let mut encoder = sidewind::gpu::GpuCommandEncoder::new(gpu);
+                        let _ = encoder.blit_from_handle(
+                            handle,
+                            0, 0, // src_x, src_y
+                            x as u32, (w.curr_y as i32 + ShellWindow::TITLE_H) as u32, // dst_x, dst_y
+                            w.curr_w as u32, (w.curr_h as i32 - ShellWindow::TITLE_H).max(0) as u32
+                        );
+                    }
+                }
+            }
             WindowContent::InternalDemo => {
                 let wx = x;
                 let wy = w.curr_y as i32;

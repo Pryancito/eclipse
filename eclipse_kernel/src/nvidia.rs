@@ -344,6 +344,56 @@ pub fn blit_rect(payload: &[u8]) -> bool {
     true
 }
 
+/// Blit from a specific GEM handle to the primary framebuffer (sys_gpu_command(1, 2, ...)).
+/// Payload: src_handle:u32, src_x:u32, src_y:u32, dst_x:u32, dst_y:u32, w:u32, h:u32 (7×u32 = 28 bytes).
+pub fn blit_from_handle(payload: &[u8]) -> bool {
+    if payload.len() < 28 {
+        return false;
+    }
+    
+    let src_handle_id = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+    let src_x = u32::from_le_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+    let src_y = u32::from_le_bytes(payload[8..12].try_into().unwrap_or([0; 4]));
+    let dst_x = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4]));
+    let dst_y = u32::from_le_bytes(payload[16..20].try_into().unwrap_or([0; 4]));
+    let w = u32::from_le_bytes(payload[20..24].try_into().unwrap_or([0; 4]));
+    let h = u32::from_le_bytes(payload[24..28].try_into().unwrap_or([0; 4]));
+
+    let (dst_phys, width, height, pitch) = match get_nvidia_fb_info() {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let src_handle = match crate::drm::get_handle(src_handle_id) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    let w = w.min(width.saturating_sub(src_x)).min(width.saturating_sub(dst_x));
+    let h = h.min(height.saturating_sub(src_y)).min(height.saturating_sub(dst_y));
+    if w == 0 || h == 0 {
+        return true;
+    }
+
+    // Assumptions for MVP: 
+    // 1. Source and destination use the same pitch (standard for full-screen or aligned buffers).
+    // 2. Both are accessible via BAR1 (true for NvidiaDrmDriver allocations).
+    
+    let pitch_u32 = ((pitch as usize) / 4).max(1);
+    let src_ptr = (crate::memory::FB_VADDR_BASE + src_handle.phys_addr) as *const u32;
+    let dst_ptr = (crate::memory::FB_VADDR_BASE + dst_phys) as *mut u32;
+
+    for py in 0..h {
+        let src_row_off = (src_y + py) as usize * pitch_u32 + (src_x as usize);
+        let dst_row_off = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_ptr.add(src_row_off), dst_ptr.add(dst_row_off), w as usize);
+        }
+    }
+    
+    true
+}
+
 /// Return (phys, width, height, pitch) of the NVIDIA BAR1 linear aperture,
 /// or None if no NVIDIA GPU was detected / BAR1 is not accessible.
 pub fn get_nvidia_fb_info() -> Option<(u64, u32, u32, u32)> {

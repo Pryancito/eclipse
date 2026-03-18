@@ -123,6 +123,25 @@ impl<'a> GpuCommandEncoder<'a> {
             _ => Err(GpuError::BackendNotSupported),
         }
     }
+
+    /// Blit from a specific GEM handle (DMABUF) to the primary framebuffer.
+    /// NVIDIA: command 2, payload 28 bytes.
+    pub fn blit_from_handle(&mut self, src_handle: u32, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32, w: u32, h: u32) -> GpuResult<()> {
+        match self.device.backend {
+            GpuBackend::Nvidia => {
+                let mut p = [0u8; 28];
+                p[0..4].copy_from_slice(&src_handle.to_le_bytes());
+                p[4..8].copy_from_slice(&src_x.to_le_bytes());
+                p[8..12].copy_from_slice(&src_y.to_le_bytes());
+                p[12..16].copy_from_slice(&dst_x.to_le_bytes());
+                p[16..20].copy_from_slice(&dst_y.to_le_bytes());
+                p[20..24].copy_from_slice(&w.to_le_bytes());
+                p[24..28].copy_from_slice(&h.to_le_bytes());
+                self.device.submit(2, &p)
+            }
+            _ => Err(GpuError::BackendNotSupported),
+        }
+    }
 }
 
 /// Integration with SideWind Surfaces

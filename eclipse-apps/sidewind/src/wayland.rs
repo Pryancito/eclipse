@@ -129,7 +129,16 @@ pub trait WaylandObject {
     fn handle_request(&mut self, conn: &mut WaylandConnection, id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError>;
 
     fn as_buffer(&self) -> Option<ShmBufferInfo> { None }
+    fn as_dmabuf_buffer(&self) -> Option<DmabufBufferInfo> { None }
     fn as_surface_pending_buffer(&self) -> Option<u32> { None }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DmabufBufferInfo {
+    pub handle: u32,
+    pub width: i32,
+    pub height: i32,
+    pub format: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -369,6 +378,24 @@ pub mod objects {
                             }
                             b"xdg_wm_base" => {
                                 conn.registry.set(*new_id, Box::new(XdgWmBase));
+                            }
+                            b"zwp_linux_dmabuf_v1" => {
+                                conn.registry.set(*new_id, Box::new(ZwpLinuxDmabufV1));
+                                // Anunciar formatos soportados (modifier_hi=0, modifier_lo=0 para linear)
+                                let format_xrgb: u32 = 0x34325258; // XRGB8888 (Little Endian 'XR24')
+                                let format_argb: u32 = 0x34325241; // ARGB8888 ('AR24')
+                                
+                                let mut args = Vec::new();
+                                args.extend_from_slice(&format_argb.to_le_bytes());
+                                args.extend_from_slice(&0u32.to_le_bytes()); // mod_hi
+                                args.extend_from_slice(&0u32.to_le_bytes()); // mod_lo
+                                conn.send_event(*new_id, 0, &args); // format event
+                                
+                                let mut args = Vec::new();
+                                args.extend_from_slice(&format_xrgb.to_le_bytes());
+                                args.extend_from_slice(&0u32.to_le_bytes()); // mod_hi
+                                args.extend_from_slice(&0u32.to_le_bytes()); // mod_lo
+                                conn.send_event(*new_id, 0, &args);
                             }
                             _ => {}
                         }
@@ -660,6 +687,100 @@ pub mod objects {
                 _ => {} // Ignore others for now
             }
             Ok(())
+        }
+    }
+
+    pub struct ZwpLinuxDmabufV1;
+    impl WaylandObject for ZwpLinuxDmabufV1 {
+        fn interface_name(&self) -> &'static str { "zwp_linux_dmabuf_v1" }
+        fn version(&self) -> u32 { 3 }
+        fn handle_request(&mut self, conn: &mut WaylandConnection, _id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => {} // destroy
+                1 => { // create_params(id = new_id)
+                    let (decoded, _) = decode_args("n", args);
+                    if let Some(WaylandArg::NewId(new_id)) = decoded.get(0) {
+                        conn.registry.set(*new_id, Box::new(ZwpLinuxBufferParamsV1::new()));
+                    }
+                }
+                _ => return Err(WaylandError::UnknownOpcode(opcode)),
+            }
+            Ok(())
+        }
+    }
+
+    pub struct ZwpLinuxBufferParamsV1 {
+        pub planes: Vec<(u32, u32, u32, u32, u32, u32)>, // handle, idx, offset, stride, mod_hi, mod_lo
+    }
+    impl ZwpLinuxBufferParamsV1 {
+        pub fn new() -> Self { Self { planes: Vec::new() } }
+    }
+    impl WaylandObject for ZwpLinuxBufferParamsV1 {
+        fn interface_name(&self) -> &'static str { "zwp_linux_buffer_params_v1" }
+        fn version(&self) -> u32 { 3 }
+        fn handle_request(&mut self, conn: &mut WaylandConnection, _id: u32, opcode: u16, args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => {} // destroy
+                1 => { // add(fd, idx, offset, stride, mod_hi, mod_lo)
+                    let (decoded, _) = decode_args("huuuu", args); // Note: Wayland 'h' is Fd, we use it as handle ID in Eclipse
+                    if let (Some(WaylandArg::Fd(fd)), Some(WaylandArg::Uint(idx)), Some(WaylandArg::Uint(off)), Some(WaylandArg::Uint(stride)), Some(WaylandArg::Uint(mhi)), Some(WaylandArg::Uint(mlo))) =
+                        (decoded.get(0), decoded.get(1), decoded.get(2), decoded.get(3), decoded.get(4), decoded.get(5))
+                    {
+                        self.planes.push((*fd as u32, *idx, *off, *stride, *mhi, *mlo));
+                    }
+                }
+                2 | 3 => { // create / create_immed (id, width, height, format, flags)
+                    let sig = if opcode == 2 { "iiuu" } else { "niiuu" };
+                    let (decoded, _) = decode_args(sig, args);
+                    let (new_id, w, h, fmt) = if opcode == 3 {
+                        (decoded.get(0), decoded.get(1), decoded.get(2), decoded.get(3))
+                    } else {
+                        // create (opcode 2) expects event 'created' with new buffer, but for MVP we prefer immed
+                        (None, decoded.get(0), decoded.get(1), decoded.get(2))
+                    };
+                    
+                    if let (Some(WaylandArg::NewId(id)), Some(WaylandArg::Int(width)), Some(WaylandArg::Int(height)), Some(WaylandArg::Uint(format))) =
+                        (new_id, w, h, fmt)
+                    {
+                        if let Some(plane) = self.planes.get(0) {
+                            conn.registry.set(*id, Box::new(DmabufBuffer {
+                                handle: plane.0,
+                                width: *width,
+                                height: *height,
+                                format: *format,
+                            }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    pub struct DmabufBuffer {
+        pub handle: u32,
+        pub width: i32,
+        pub height: i32,
+        pub format: u32,
+    }
+    impl WaylandObject for DmabufBuffer {
+        fn interface_name(&self) -> &'static str { "wl_buffer" }
+        fn version(&self) -> u32 { 1 }
+        fn handle_request(&mut self, _conn: &mut WaylandConnection, _id: u32, opcode: u16, _args: &[u8]) -> Result<(), WaylandError> {
+            match opcode {
+                0 => {} // destroy
+                _ => {}
+            }
+            Ok(())
+        }
+        fn as_dmabuf_buffer(&self) -> Option<DmabufBufferInfo> {
+            Some(DmabufBufferInfo {
+                handle: self.handle,
+                width: self.width,
+                height: self.height,
+                format: self.format,
+            })
         }
     }
 }

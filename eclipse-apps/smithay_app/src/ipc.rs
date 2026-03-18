@@ -199,6 +199,8 @@ pub fn handle_sidewind_message(
                         workspace: input_state.current_workspace,
                         content: WindowContent::External(s_idx as u32),
                         damage: alloc::vec::Vec::new(),
+                        buffer_handle: None,
+                        is_dmabuf: false,
                     };
                     let _new_idx = *window_count;
                     *window_count += 1;

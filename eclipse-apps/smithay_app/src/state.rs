@@ -352,6 +352,8 @@ impl SmithayState {
                             curr_h: 0.0,
                             workspace: self.input.current_workspace,
                             content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
+                            buffer_handle: None,
+                            is_dmabuf: false,
                             ..Default::default()
                         };
                         self.space.map_window(win);
@@ -381,6 +383,8 @@ impl SmithayState {
                             curr_h: 0.0,
                             workspace: self.input.current_workspace,
                             content: crate::compositor::WindowContent::Wayland { surface_id, conn_idx },
+                            buffer_handle: None,
+                            is_dmabuf: false,
                             ..Default::default()
                         };
                         self.space.map_window(win);
@@ -397,16 +401,31 @@ impl SmithayState {
                         buffer_id,
                         damage.len()
                     );
-                    // Ensure the buffer's pool is mapped
+                    // Ensure the buffer's pool is mapped (for SHM) or record handle (for DMABUF)
+                    let mut is_dmabuf = false;
+                    let mut gem_handle = None;
+
                     if let Some(buf_id) = buffer_id {
-                        self.ensure_wayland_pool_mapped(conn_idx, buf_id);
+                        let dmabuf_info = self.wayland_connections[conn_idx].as_ref()
+                            .and_then(|c| c.registry.get(buf_id))
+                            .and_then(|obj| obj.as_dmabuf_buffer());
+
+                        if let Some(info) = dmabuf_info {
+                            is_dmabuf = true;
+                            gem_handle = Some(info.handle);
+                        } else {
+                            self.ensure_wayland_pool_mapped(conn_idx, buf_id);
+                        }
                     }
-                    // Find the window for this surface and append damage
+
+                    // Find the window for this surface and update it
                     for i in 0..self.space.window_count {
                         let w = &mut self.space.windows[i];
                         if let crate::compositor::WindowContent::Wayland { surface_id: s_id, conn_idx: c_idx } = w.content {
                             if s_id == surface_id && c_idx == conn_idx {
                                 w.damage.extend(damage);
+                                w.is_dmabuf = is_dmabuf;
+                                w.buffer_handle = gem_handle;
                                 break;
                             }
                         }
@@ -745,6 +764,8 @@ impl SmithayState {
                 workspace: self.input.current_workspace,
                 content: crate::compositor::WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             };
             self.space.map_window(win);
             self.input.focused_window = Some(idx);

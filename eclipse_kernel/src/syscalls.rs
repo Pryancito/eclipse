@@ -2209,6 +2209,7 @@ fn sys_gpu_command(kind: u64, command: u64, payload_ptr: u64, payload_len: u64) 
             match command {
                 0 => if crate::nvidia::fill_rect(&buf[..len]) { 0 } else { u64::MAX },
                 1 => if crate::nvidia::blit_rect(&buf[..len]) { 0 } else { u64::MAX },
+                2 => if crate::nvidia::blit_from_handle(&buf[..len]) { 0 } else { u64::MAX },
                 _ => u64::MAX,
             }
         }

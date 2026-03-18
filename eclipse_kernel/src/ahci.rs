@@ -385,7 +385,7 @@ impl AhciPort {
         serial::serial_print_hex(tfd_initial as u64);
         serial::serial_print(")...\n");
 
-        let mut tfd_timeout = 50_000_000u32; // ~500 ms on 3 GHz
+        let mut tfd_timeout = 50_000u32; // ~500 ms on 3 GHz
         loop {
             let tfd = self.preg(PORT_TFD);
             if tfd & ((ATA_DEV_BUSY | ATA_DEV_DRQ) as u32) == 0 {
