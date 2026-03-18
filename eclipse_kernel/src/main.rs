@@ -208,9 +208,20 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Redundant but safe: ensure interrupts stay disabled after stack switch.
     unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
     serial::serial_print("[KERNEL] kernel_bootstrap entry\n");
+
+    // Stage 2: Basic hardware initialization.
+    // IMPORTANT: boot::load_gdt() MUST be called before any code that reads
+    // gs:[16] (e.g. process::get_cpu_id(), ReentrantMutex::current_cpu()).
+    // Until load_gdt() sets GS base to our per-CPU data, GSBASE still points
+    // at UEFI firmware memory that is not present in the kernel's page tables,
+    // causing a triple fault on the first gs:[16] access.
+    boot::load_gdt();
+    boot::enable_sse();
+
     let cpu_id = crate::process::get_cpu_id();
     serial::serial_printf(format_args!("\n\n!!! KERNEL BOOT START v3 !!! CPU ID: {} (Raw APIC info in get_cpu_id)\n\n", cpu_id));
     // Stage 1: Get BootInfo from centralized storage (already initialized in _start)
+    // (Accessed after load_gdt() so that gs:[16] reads are safe.)
     let boot_info = boot::get_boot_info();
     
     let pml4_phys = boot_info.pml4_addr;
@@ -218,10 +229,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
 
     // progress::bar(60) will be called after paging init
     serial::serial_print("Switched to Higher Half Stack successfully\n");
-
-    // Stage 2: Basic hardware initialization
-    boot::load_gdt();
-    boot::enable_sse();
     memory::init_pat();
     cpu::detect_features();
     progress::init();
