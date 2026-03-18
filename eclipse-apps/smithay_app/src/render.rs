@@ -1034,7 +1034,7 @@ pub fn draw_stroke(fb: &mut FramebufferState, x: i32, y: i32, color_idx: u8) {
 #[inline(never)]
 pub fn draw_system_central(
     fb: &mut FramebufferState, 
-    _counter: u64, 
+    counter: u64, 
     services: &[ServiceInfo], 
     processes: &[ProcessInfo],
     process_cpu: &[f32; 32],
@@ -1063,8 +1063,10 @@ pub fn draw_system_central(
     
     let header_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_CYAN);
     let text_style = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::WHITE);
+    let text_style_cyan = MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_CYAN);
     let row_h = 24;
     let start_y = 65;
+    const MAX_MEM_KB: u64 = 2 * 1024 * 1024; // 2 GB in KB
     
     let col_id = panel_x + 40;
     let col_name = panel_x + 80;
@@ -1133,6 +1135,14 @@ pub fn draw_system_central(
         let _ = core::fmt::write(&mut buf, format_args!("{:.1}%", svc_cpu_f));
         let _ = Text::new(&buf, Point::new(col_cpu, y), text_style).draw(fb);
 
+        let _ = ui::draw_technical_heartbeat(
+            fb,
+            Point::new(col_cpu + 36, y - 9),
+            Size::new(44, 12),
+            counter.wrapping_add((i as u64).wrapping_mul(13)),
+            colors::ACCENT_CYAN,
+        );
+
         buf.clear();
         if svc_mem_kb > 1024 {
             let _ = core::fmt::write(&mut buf, format_args!("{:.1} MB", svc_mem_kb as f32 / 1024.0));
@@ -1140,6 +1150,15 @@ pub fn draw_system_central(
             let _ = core::fmt::write(&mut buf, format_args!("{} KB", svc_mem_kb));
         }
         let _ = Text::new(&buf, Point::new(col_mem, y), text_style).draw(fb);
+
+        let mem_frac = (svc_mem_kb as f32 / MAX_MEM_KB as f32).clamp(0.0, 1.0);
+        let _ = ui::draw_technical_bar(
+            fb,
+            Point::new(col_mem + 50, y - 8),
+            Size::new(32, 8),
+            mem_frac,
+            colors::ACCENT_CYAN,
+        );
 
         buf.clear();
         let _ = core::fmt::write(&mut buf, format_args!("{}", svc.restart_count));
@@ -1207,6 +1226,14 @@ pub fn draw_system_central(
         let cpu_val_f = if cpu_val.is_nan() { 0.0 } else { cpu_val };
         let _ = core::fmt::write(&mut buf, format_args!("{:.1}%", cpu_val_f));
         let _ = Text::new(&buf, Point::new(col_prog_cpu, y), text_style).draw(fb);
+
+        let _ = ui::draw_technical_heartbeat(
+            fb,
+            Point::new(col_prog_cpu + 36, y - 9),
+            Size::new(58, 12),
+            counter.wrapping_add((display_idx as u64).wrapping_mul(17)),
+            colors::ACCENT_GREEN,
+        );
         
         buf.clear();
         let mut mem_kb = 0u64;
@@ -1219,8 +1246,25 @@ pub fn draw_system_central(
             let _ = core::fmt::write(&mut buf, format_args!("{} KB", mem_kb));
         }
         let _ = Text::new(&buf, Point::new(col_prog_mem, y), text_style).draw(fb);
+
+        let prog_mem_frac = (mem_kb as f32 / MAX_MEM_KB as f32).clamp(0.0, 1.0);
+        let _ = ui::draw_technical_bar(
+            fb,
+            Point::new(col_prog_mem + 62, y - 8),
+            Size::new(30, 8),
+            prog_mem_frac,
+            colors::ACCENT_GREEN,
+        );
         
-        let _ = Text::new("0 bps", Point::new(col_prog_red, y), text_style).draw(fb);
+        let _ = Text::new("0.0 bps", Point::new(col_prog_red, y - 6), text_style).draw(fb);
+        let _ = Text::new("0.0 bps", Point::new(col_prog_red, y + 6), text_style_cyan).draw(fb);
+        let _ = ui::draw_technical_heartbeat(
+            fb,
+            Point::new(col_prog_red + 56, y - 9),
+            Size::new(84, 14),
+            counter.wrapping_add((display_idx as u64).wrapping_mul(11)),
+            colors::ACCENT_CYAN,
+        );
         
         let _ = Text::new("[MATAR]", Point::new(col_prog_options, y), MonoTextStyle::new(&font_terminus_12::FONT_TERMINUS_12, colors::ACCENT_RED)).draw(fb);
         
