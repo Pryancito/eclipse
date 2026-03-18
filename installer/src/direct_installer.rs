@@ -51,7 +51,7 @@ impl DirectInstaller {
 
     pub fn install_eclipse_os(&self, disk: &DiskInfo, auto_install: bool) -> Result<(), String> {
         println!("DEBUG: Iniciando install_eclipse_os con disco: {}", disk.name);
-        println!("Instalador de Eclipse OS v0.1.0");
+        println!("Instalador de Eclipse OS v0.2.0");
         println!("================================");
         println!();
 
@@ -144,7 +144,7 @@ impl DirectInstaller {
         println!("  - Particion EFI: {} (FAT32)", self.get_partition_name(&disk.name, 1));
         println!("  - Particion root: {} (EclipseFS)", self.get_partition_name(&disk.name, 2));
         println!("  - Bootloader: UEFI");
-        println!("  - Kernel: Eclipse OS v0.1.0");
+        println!("  - Kernel: Eclipse OS v0.2.0");
         println!("  - Sistema de archivos: EclipseFS v2.0 (RAM-based)");
         println!("  - Eclipse-systemd: Instalado en /usr/sbin/eclipse-systemd");
         println!("  - Wayland Compositor: smithay_app en /usr/bin");
@@ -662,12 +662,12 @@ impl DirectInstaller {
         }
 
         // Crear configuración de userland
-        let config_content = r#"# Eclipse OS Userland Configuration v0.1.0
+        let config_content = r#"# Eclipse OS Userland Configuration v0.2.0
 # =========================================
 
 [system]
 name = "Eclipse OS"
-version = "0.1.0"
+version = "0.2.0"
 kernel = "/eclipse_kernel"
 
 [modules]
@@ -713,7 +713,7 @@ userland_memory = "256M"
         uefi_config.create_system_info(&self.efi_mount_point)?;
 
         // Configuración del bootloader (compatibilidad)
-        let boot_conf = r#"# Eclipse OS Boot Configuration v0.1.0
+        let boot_conf = r#"# Eclipse OS Boot Configuration v0.2.0
 # ===================================
 
 TIMEOUT=5
@@ -722,7 +722,7 @@ SHOW_MENU=true
 
 [entry:eclipse]
 title=Eclipse OS
-description=Sistema Operativo Eclipse v0.1.0
+description=Sistema Operativo Eclipse v0.2.0
 kernel=/eclipse_microkernel
 initrd=
 args=quiet splash
@@ -735,7 +735,7 @@ args=quiet splash
         let readme_content = r#"Eclipse OS - Sistema Operativo en Rust
 =====================================
 
-Version: 0.1.0
+Version: 0.2.0
 Arquitectura: x86_64
 Tipo: Instalacion en disco
 
@@ -1613,7 +1613,7 @@ tmpfs           /tmp            tmpfs   defaults        0       0
             .map_err(|e| format!("Error creando /etc/fstab: {}", e))?;
         
         // Crear /proc/version
-        fs::write(format!("{}/proc/version", temp_root), "Eclipse OS Kernel v0.1.0\n")
+        fs::write(format!("{}/proc/version", temp_root), "Eclipse OS Kernel v0.2.0\n")
             .map_err(|e| format!("Error creando /proc/version: {}", e))?;
         
         // Crear /proc/cpuinfo
@@ -1665,7 +1665,7 @@ model name	: Eclipse CPU
     /// Crear archivos de log iniciales
     fn create_initial_log_files(&self, temp_root: &str) -> Result<(), String> {
         // Log de arranque del kernel
-        let boot_log = r#"Eclipse OS Kernel v0.1.0 - Boot Log
+        let boot_log = r#"Eclipse OS Kernel v0.2.0 - Boot Log
 =====================================
 
 [KERNEL] Iniciando kernel Eclipse OS...
@@ -1713,7 +1713,7 @@ model name	: Eclipse CPU
         let systemd_log = r#"Eclipse OS Systemd Log
 ======================
 
-[SYSTEMD] Iniciando sistema de init Eclipse OS v0.1.0
+[SYSTEMD] Iniciando sistema de init Eclipse OS v0.2.0
 [SYSTEMD] Cargando configuración desde /etc/eclipse/systemd/
 [SYSTEMD] Inicializando sistema de logging
 [SYSTEMD] Creando directorios del sistema

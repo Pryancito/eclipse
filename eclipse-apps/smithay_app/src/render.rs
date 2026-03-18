@@ -848,7 +848,7 @@ pub fn draw_window_advanced(fb: &mut FramebufferState, w: &ShellWindow, is_focus
                 let prompt = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::ACCENT_CYAN);
                 let text = MonoTextStyle::new(&font_terminus_14::FONT_TERMINUS_14, colors::WARM_WHITE);
                 let _ = Text::new("> eclipse --version", Point::new(cx + 10, cy + 22), prompt).draw(fb);
-                let _ = Text::new("Eclipse OS 0.1.0 // kernel 6.x", Point::new(cx + 10, cy + 42), text).draw(fb);
+                let _ = Text::new("Eclipse OS 0.2.0 // kernel 6.x", Point::new(cx + 10, cy + 42), text).draw(fb);
                 let _ = Text::new("> status --active", Point::new(cx + 10, cy + 62), prompt).draw(fb);
                 let mut uptime_line = heapless::String::<64>::new();
                 let uptime_secs = uptime_ticks / 1000;

@@ -28,9 +28,9 @@ pub fn init_userland() -> Result<(), &'static str> {
 /// Obtiene información del sistema
 pub fn get_system_info() -> SystemInfo {
     SystemInfo {
-        kernel_version: "Eclipse OS 0.1.0",
+        kernel_version: "Eclipse OS 0.2.0",
         wayland_version: "1.0",
-        userland_version: "0.1.0",
+        userland_version: "0.2.0",
         architecture: "x86_64",
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "eclipse_kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Eclipse OS Team"]
 description = "Microkernel nativo de Eclipse OS escrito desde cero en Rust"

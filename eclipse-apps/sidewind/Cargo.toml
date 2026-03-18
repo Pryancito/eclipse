@@ -1,6 +1,6 @@
 [package]
 name = "sidewind"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Stack unificada de ventanas, IPC, OpenGL, Wayland y X11 para el compositor Eclipse OS"
 

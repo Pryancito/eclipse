@@ -18,11 +18,11 @@ pub unsafe extern "C" fn uname(buf: *mut utsname) -> c_int {
         return -1;
     }
     
-    // Stub: "EclipseOS", "eclipse", "0.1.0", "0.1.0", "x86_64"
+    // Stub: "EclipseOS", "eclipse", "0.2.0", "0.2.0", "x86_64"
     let sysname = b"EclipseOS\0";
     let nodename = b"eclipse\0";
-    let release = b"0.1.0\0";
-    let version = b"0.1.0\0";
+    let release = b"0.2.0\0";
+    let version = b"0.2.0\0";
     let machine = b"x86_64\0";
     
     ptr_copy(sysname.as_ptr(), (*buf).sysname.as_mut_ptr() as *mut u8, sysname.len());

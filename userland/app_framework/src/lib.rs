@@ -480,7 +480,7 @@ impl AppFramework {
     pub async fn initialize(&mut self) -> Result<()> {
         println!("╔══════════════════════════════════════════════════════════════╗");
         println!("║                ECLIPSE OS APP FRAMEWORK                      ║");
-        println!("║                        v0.1.0                                ║");
+        println!("║                        v0.2.0                                ║");
         println!("╚══════════════════════════════════════════════════════════════╝");
         println!("\n🦀 APP FRAMEWORK TOMANDO CONTROL...");
         println!("===================================");

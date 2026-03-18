@@ -185,7 +185,7 @@ fn show_main_menu() {
     println!("Menú Principal");
     println!("===============");
     println!("0. [NUEVO] Instalar Eclipse OS v0.2.0 (Recomendado)");
-    println!("1. Instalar Eclipse OS v0.1.0 (Legado)");
+    println!("1. Instalar Eclipse OS v0.2.0 (Legado)");
     println!("2. Mostrar información de discos");
     println!("3. Ayuda");
     println!("4. Salir");

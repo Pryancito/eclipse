@@ -29,7 +29,7 @@ pub mod server;
 pub mod protocol;
 
 /// Wayland integration version
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 
 /// Check if libwayland is available at compile time
 pub const HAS_LIBWAYLAND: bool = cfg!(has_libwayland);

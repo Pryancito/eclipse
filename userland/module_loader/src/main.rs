@@ -114,7 +114,7 @@ impl ModuleLoader {
 async fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                ECLIPSE OS MODULE LOADER                      ║");
-    println!("║                        v0.1.0                                ║");
+    println!("║                        v0.2.0                                ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("\n🦀 MODULE LOADER TOMANDO CONTROL...");
     println!("===================================");

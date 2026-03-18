@@ -1,6 +1,6 @@
 [package]
 name = "eclipse_ipc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Eclipse OS Team"]
 description = "Biblioteca IPC tipada no_std para Eclipse OS"

@@ -43,7 +43,7 @@ BASE_DIR=$(pwd)
 mkdir -p "$BUILD_DIR"
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.1.0 ║"
+echo "║ ECLIPSE OS - SCRIPT DE CONSTRUCCIÓN COMPLETO v0.2.0 ║"
 echo "║ EclipseFS + Kernel + Bootloader + Userland + Aplicaciones Wayland + Instalador ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
@@ -423,7 +423,7 @@ build_userspace_services() {
 
 # Función para compilar el kernel
 build_kernel() {
-    print_step "Compilando kernel Eclipse OS v0.1.0..."
+    print_step "Compilando kernel Eclipse OS v0.2.0..."
     
     # Compilar el kernel directamente con cargo (forzar uso de linker.ld absoluto)
     print_status "Compilando kernel para target $KERNEL_TARGET..."
@@ -1050,7 +1050,7 @@ create_basic_distribution() {
         cat > "$BUILD_DIR/userland/config/system.conf" << EOF
 [system]
 name = "Eclipse OS"
-version = "0.1.0"
+version = "0.2.0"
 kernel = "/boot/eclipse_kernel"
 init_system = "systemd"
 
@@ -1259,7 +1259,7 @@ tooltip_format = "Volume: {volume}%"
 [bar.custom]
 position = "right"
 format = "🌙 Eclipse OS"
-tooltip_format = "Eclipse OS v0.1.0 - Desktop Environment"
+tooltip_format = "Eclipse OS v0.2.0 - Desktop Environment"
 EOF
     print_status "Configuración de rwaybar creada"
         
@@ -1322,7 +1322,7 @@ EOF
     
     # Crear configuración UEFI básica (no GRUB ya que usamos bootloader UEFI personalizado)
     cat > "$BUILD_DIR/efi/boot/uefi_config.txt" << EOF
-# Configuración UEFI para Eclipse OS v0.1.0
+# Configuración UEFI para Eclipse OS v0.2.0
 # Bootloader personalizado - no requiere GRUB
 
 [system]
@@ -1485,7 +1485,7 @@ show_build_summary() {
     fi
     
     echo ""
-    echo "Eclipse OS v0.1.0 está listo para usar!"
+    echo "Eclipse OS v0.2.0 está listo para usar!"
 }
 
 # Función para compilar eclipse-apps (IPC + systemd)

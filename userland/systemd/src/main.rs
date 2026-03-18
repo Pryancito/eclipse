@@ -167,7 +167,7 @@ pub extern "C" fn _start() -> ! {
 /// Print startup banner
 fn print_banner() {
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║           ECLIPSE-SYSTEMD v0.1.0 - Init System                ║");
+    println!("║           ECLIPSE-SYSTEMD v0.2.0 - Init System                ║");
     println!("║              Modern Service Manager for Microkernel            ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
