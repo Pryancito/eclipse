@@ -23,8 +23,11 @@ pub const FB_VADDR_BASE: u64 = 0xFFFFFB0000000000;
 /// Physical offset for virtual-to-physical address translation
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-/// Size of the kernel region with offset-based mapping (256MB)
-const KERNEL_REGION_SIZE: u64 = 0x10000000;
+/// Size of the kernel region with offset-based mapping.
+/// Must be large enough to cover the entire kernel virtual extent from KERNEL_OFFSET,
+/// including the .bss section that contains the 256 MiB static HEAP.  The total kernel
+/// virtual footprint is approximately 280+ MiB, so 512 MiB gives a safe margin.
+const KERNEL_REGION_SIZE: u64 = 0x20000000; // 512 MiB
 
 /// Kernel heap size (256 MB)
 /// Increased from 64MB to provide more space for DMA buffers.
