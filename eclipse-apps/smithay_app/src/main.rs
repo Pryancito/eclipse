@@ -67,8 +67,11 @@ fn main() {
 
     loop {
         state.handle_ipc();
-        state.update();
-        state.render();
+        // Solo renderizar si hubo cambios (animaciones, marcas dirty, métricas).
+        // Evita escribir el framebuffer completo 60 veces/s cuando no hay nada nuevo.
+        if state.update() {
+            state.render();
+        }
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }
