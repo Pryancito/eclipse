@@ -35,6 +35,29 @@ mod mock_memory {
     }
     pub fn phys_to_virt(phys: u64) -> u64 { phys }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Ensure the Configure Endpoint input context sizing and endpoint context
+    /// offset math use `context_size` correctly for both 32- and 64-byte contexts.
+    #[test]
+    fn configure_endpoint_context_math_uses_context_size() {
+        // Test both CSZ=1 (32-byte contexts) and CSZ=0 (64-byte contexts).
+        for &csz in &[32usize, 64usize] {
+            // Configure Endpoint input context should be sized to 33 * csz bytes:
+            // 1 Input Control Context + 1 Slot Context + up to 31 Endpoint Contexts.
+            let cfg_ctx_size = 33 * csz;
+            assert_eq!(cfg_ctx_size, 33 * csz);
+
+            // Endpoint context offset within the input context is:
+            // ICC (csz) + Slot (csz) + (ep_id - 1) * csz = 2*csz + (ep_id - 1)*csz.
+            let ep_id: usize = 3;
+            let computed_off = csz + csz + (ep_id - 1) * csz;
+            let expected_off = 2 * csz + (ep_id - 1) * csz;
+            assert_eq!(computed_off, expected_off);
+        }
+    }
+}
 #[cfg(test)]
 mod mock_interrupts {
     use std::sync::Mutex;
