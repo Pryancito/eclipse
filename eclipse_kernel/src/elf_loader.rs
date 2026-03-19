@@ -178,7 +178,7 @@ pub fn load_elf_into_space(page_table_phys: u64, elf_data: &[u8]) -> Result<(u64
     // Align max_vaddr to next 4KB page
     let max_vaddr_aligned = (max_vaddr + 0xFFF) & !0xFFF;
     serial::serial_printf(format_args!("[load_elf] successfully loaded: entry=0x{:x} max_v=0x{:x} mapped_pages={}\n", header.e_entry, max_vaddr_aligned, mapped_count));
-    Ok((header.e_entry, max_vaddr_aligned, (mapped_count as u64) * 512))
+    Ok((header.e_entry, max_vaddr_aligned, (mapped_count as u64)))
 }
 
 /// Preparar el stack de usuario
