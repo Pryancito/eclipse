@@ -55,7 +55,8 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 /// sys_map_framebuffer when neither EFI GOP nor VirtIO is available.
 #[derive(Clone, Copy)]
 struct NvidiaFbInfo {
-    phys: u64,
+    phys: u64,      // Actual screen scanout address (may be at an offset)
+    bar1_phys: u64, // Base address of the PCI BAR1 aperture
     bar1_size: u64,
     width: u32,
     height: u32,
@@ -208,37 +209,27 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         Some(handle_id)
     }
     fn page_flip(&self, fb_id: u32) -> bool {
-        // Look up the DrmFramebuffer to get the actual physical address of the
-        // GEM buffer that userspace rendered into.  Using `fb_id as u64`
-        // directly was wrong because fb_id is a sequential DRM id (1, 2, …),
-        // not a physical address.
         let fb = match crate::drm::get_fb(fb_id) {
             Some(fb) => fb,
             None => return false,
         };
         let fb_phys = fb.phys_addr;
 
-        let (bar1_phys, _width, height, pitch) = match get_nvidia_fb_info() {
-            Some(i) => i,
-            None => return false,
-        };
-
-        // If the GEM buffer IS the scanout base, nothing to blit.
-        if fb_phys == bar1_phys {
-            return true;
-        }
-
         // Shadow blit: copy rendered GEM buffer → scanout via the kernel
-        // BAR1 mapping.  If the GEM buffer is in System RAM, we use phys_to_virt.
-        // If it's in VRAM (BAR1), we use the kernel BAR1 mapping.
-        let (bar1_phys, bar1_size, _width, height, pitch) = {
+        // BAR1 mapping.
+        let (scanout_phys, bar1_phys, bar1_size, width, height, pitch) = {
             let info = NVIDIA_FB_INFO.lock();
             if let Some(i) = info.as_ref() {
-                (i.phys, i.bar1_size, i.width, i.height, i.pitch)
+                (i.phys, i.bar1_phys, i.bar1_size, i.width, i.height, i.pitch)
             } else {
                 return false;
             }
         };
+
+        // If the GEM buffer IS the scanout base, nothing to blit.
+        if fb_phys == scanout_phys {
+            return true;
+        }
 
         let src_vaddr = if fb_phys >= bar1_phys && fb_phys < bar1_phys + bar1_size {
             // Source is in VRAM (BAR1)
@@ -253,13 +244,21 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         let dst_vaddr = {
             let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
             if vbase == 0 { return false; }
-            vbase as *mut u8 // scanout starts at bar1_phys + 0
+            // CRITICAL FIX: Add offset from BAR1 base to scanout actual phys
+            let offset = scanout_phys.saturating_sub(bar1_phys);
+            (vbase + offset) as *mut u8
         };
 
-        let size = (pitch as usize) * (height as usize);
+        let src_pitch = fb.pitch as usize;
+        let dst_pitch = pitch as usize;
+        let copy_width = (width as usize * 4).min(src_pitch).min(dst_pitch);
 
-        unsafe {
-            core::ptr::copy_nonoverlapping(src_vaddr, dst_vaddr, size);
+        for py in 0..height as usize {
+            unsafe {
+                let src_row = src_vaddr.add(py * src_pitch);
+                let dst_row = dst_vaddr.add(py * dst_pitch);
+                core::ptr::copy_nonoverlapping(src_row, dst_row, copy_width);
+            }
         }
         true
     }
@@ -330,7 +329,7 @@ pub fn fill_rect(payload: &[u8]) -> bool {
     if payload.len() < 20 {
         return false;
     }
-    let (_phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (fb_phys, bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -354,9 +353,19 @@ pub fn fill_rect(payload: &[u8]) -> bool {
         return false;
     }
 
-    let pitch_usize = pitch as usize;
-    let ptr = vbase as *mut u32;
-    let pitch_u32 = (pitch_usize / 4).max(1);
+    // CRITICAL FIX: Apply offset from BAR1 base to the actual framebuffer phys
+    let (fb_phys, bar1_p) = {
+        let info = NVIDIA_FB_INFO.lock();
+        if let Some(i) = info.as_ref() {
+            (i.phys, i.bar1_phys)
+        } else {
+            return false;
+        }
+    };
+    let offset = fb_phys.saturating_sub(bar1_p);
+    let ptr = (vbase + offset) as *mut u32;
+
+    let pitch_u32 = (pitch as usize / 4).max(1);
     for py in 0..h {
         let row_start = (y + py) as usize * pitch_u32 + (x as usize);
         for px in 0..w {
@@ -375,7 +384,7 @@ pub fn blit_rect(payload: &[u8]) -> bool {
     if payload.len() < 24 {
         return false;
     }
-    let (_phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (fb_phys, bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -398,9 +407,11 @@ pub fn blit_rect(payload: &[u8]) -> bool {
         return false;
     }
 
-    let pitch_u32 = ((pitch as usize) / 4).max(1);
-    let ptr = vbase as *mut u32;
+    // CRITICAL FIX: Apply offset from BAR1 base to the actual framebuffer phys
+    let offset = fb_phys.saturating_sub(bar1_phys);
+    let ptr = (vbase + offset) as *mut u32;
 
+    let pitch_u32 = (pitch as usize / 4).max(1);
     let same_row_overlap = dst_y == src_y && dst_x > src_x && dst_x < src_x + w;
     let overlap_down = dst_y > src_y && dst_y < src_y + h;
 
@@ -449,7 +460,7 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     let w = u32::from_le_bytes(payload[20..24].try_into().unwrap_or([0; 4]));
     let h = u32::from_le_bytes(payload[24..28].try_into().unwrap_or([0; 4]));
 
-    let (bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
+    let (fb_phys, bar1_phys, width, height, pitch) = match get_nvidia_fb_info() {
         Some(t) => t,
         None => return false,
     };
@@ -465,18 +476,18 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
         return true;
     }
 
-    // Map the source GEM buffer (could be in RAM or VRAM)
-    let (bar1_phys, bar1_size, pitch, height) = {
+    // We already have all info from get_nvidia_fb_info() at the start of the function
+    let bar1_size = {
         let info = NVIDIA_FB_INFO.lock();
-        if let Some(i) = info.as_ref() {
-            (i.phys, i.bar1_size, i.pitch, i.height)
-        } else {
-            return false;
-        }
+        info.as_ref().map(|i| i.bar1_size).unwrap_or(0)
     };
 
-    let pitch_u32 = (pitch / 4).max(1) as usize;
-
+    // We need the source pitch. Try to find the framebuffer for this handle.
+    let src_pitch = if let Some(fb) = crate::drm::get_fb_by_gem_handle(src_handle_id) {
+        fb.pitch as usize
+    } else {
+        width as usize * 4 // Fallback
+    };
     let src_ptr = if src_handle.phys_addr >= bar1_phys && src_handle.phys_addr < bar1_phys + bar1_size {
         let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
         if vbase == 0 { return false; }
@@ -488,19 +499,23 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     let dst_ptr = {
         let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
         if vbase == 0 { return false; }
-        vbase as *mut u32
+        // CRITICAL FIX: Offset from BAR1 to actual scanout
+        let offset = fb_phys.saturating_sub(bar1_phys);
+        (vbase + offset) as *mut u32
     };
 
     // Boundary checks to avoid kernel panic on out-of-bounds blit
     let src_max_pixels = src_handle.size / 4;
     let dst_max_pixels = ((pitch as usize) * (height as usize)) / 4;
 
+    let dst_pitch = pitch as usize;
+
     for py in 0..h {
-        let src_row_off = (src_y + py) as usize * pitch_u32 + (src_x as usize);
-        let dst_row_off = (dst_y + py) as usize * pitch_u32 + (dst_x as usize);
+        let src_row_off = (src_y + py) as usize * (src_pitch / 4) + (src_x as usize);
+        let dst_row_off = (dst_y + py) as usize * (dst_pitch / 4) + (dst_x as usize);
         
         if src_row_off + (w as usize) > src_max_pixels || dst_row_off + (w as usize) > dst_max_pixels {
-            continue; // Skip out of bounds row
+            continue;
         }
 
         unsafe {
@@ -511,11 +526,11 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     true
 }
 
-/// Return (phys, width, height, pitch) of the NVIDIA BAR1 linear aperture,
+/// Return (phys, bar1_phys, width, height, pitch) of the NVIDIA BAR1 linear aperture,
 /// or None if no NVIDIA GPU was detected / BAR1 is not accessible.
-pub fn get_nvidia_fb_info() -> Option<(u64, u32, u32, u32)> {
+pub fn get_nvidia_fb_info() -> Option<(u64, u64, u32, u32, u32)> {
     let guard = NVIDIA_FB_INFO.lock();
-    guard.as_ref().map(|i| (i.phys, i.width, i.height, i.pitch))
+    guard.as_ref().map(|i| (i.phys, i.bar1_phys, i.width, i.height, i.pitch))
 }
 
 /// NVIDIA GPU Architecture Types
@@ -892,6 +907,26 @@ pub fn init() {
     serial::serial_print_dec(gpus.len() as u64);
     serial::serial_print(" NVIDIA GPU(s)\n");
     
+    // Pre-identify the primary GPU by matching BAR1 with UEFI GOP address.
+    // If no match is found, default to the first GPU (index 0).
+    let gop_phys = crate::boot::get_fb_info().and_then(|(phys, _, _, _, source)| {
+        if source == crate::boot::FbSource::Uefi { Some(phys) } else { None }
+    });
+
+    let mut primary_index = 0;
+    if let Some(target_phys) = gop_phys {
+        for (i, gpu) in gpus.iter().enumerate() {
+            let bar1 = unsafe { get_bar(gpu, 1) };
+            if bar1 != 0 && bar1 == target_phys {
+                primary_index = i;
+                serial::serial_print("[NVIDIA]   Primary display identified on GPU ");
+                serial::serial_print_dec(i as u64);
+                serial::serial_print("\n");
+                break;
+            }
+        }
+    }
+
     for (index, gpu) in gpus.iter().enumerate() {
         let gpu_info = NvidiaGpuInfo::from_pci_device(*gpu);
         
@@ -1048,85 +1083,80 @@ pub fn init() {
 
         // --- Phase 2b: BAR1 (linear VRAM aperture) as display fallback ---
         // BAR1 is the CPU-visible linear aperture over VRAM on Turing+ GPUs.
-        // We store it once so that sys_get_framebuffer_info / sys_map_framebuffer
-        // can fall back to it when no EFI GOP framebuffer and no VirtIO GPU are
-        // available (i.e. real hardware with discrete NVIDIA graphics).
-        // Only the first GPU with a valid BAR1 is stored.
         {
             let bar1_phys = unsafe { get_bar(gpu, 1) };
             serial::serial_print("[NVIDIA]   BAR1 (VRAM aperture) phys: 0x");
             serial::serial_print_hex(bar1_phys);
             serial::serial_print("\n");
-            if bar1_phys != 0 {
+            
+            if bar1_phys != 0 && index == primary_index {
+                let mut width = 1920u32;
+                let mut height = 1080u32;
+                let mut pitch = 1920u32 * 4;
+
+                let mut fb_phys = bar1_phys;
+                
+                // Inherit from GOP if possible
+                if let Some((phys, w, h, p, source)) = crate::boot::get_fb_info() {
+                    if source == crate::boot::FbSource::Uefi {
+                        width = w;
+                        height = h;
+                        pitch = p;
+                        fb_phys = phys;
+                        serial::serial_print("[NVIDIA]   Inheriting native resolution (GOP): ");
+                        serial::serial_print_dec(width as u64);
+                        serial::serial_print("x");
+                        serial::serial_print_dec(height as u64);
+                        serial::serial_print(" @ 0x");
+                        serial::serial_print_hex(fb_phys);
+                        serial::serial_print(" (Pitch: ");
+                        serial::serial_print_dec(pitch as u64);
+                        serial::serial_print(")\n");
+                    }
+                } else {
+                    // Only align pitch if we are NOT inheriting a valid hardware state
+                    let mut safe_pitch = pitch.max(width * 4);
+                    safe_pitch = (safe_pitch + 255) & !255;
+                    if safe_pitch != pitch {
+                        serial::serial_print("[NVIDIA]   Adjusted pitch for alignment: ");
+                        serial::serial_print_dec(pitch as u64);
+                        serial::serial_print(" -> ");
+                        serial::serial_print_dec(safe_pitch as u64);
+                        serial::serial_print("\n");
+                        pitch = safe_pitch;
+                    }
+                }
+
+                let bar1_size = unsafe { crate::pci::get_bar_size(&gpu, 1) };
+                
                 let mut guard = NVIDIA_FB_INFO.lock();
-                if guard.is_none() {
-                    // Attempt to inherit resolution from existing EFI GOP (which reads monitor EDID)
-                    let mut width = 1920u32;
-                    let mut height = 1080u32;
-                    let mut pitch = 1920u32 * 4;
-                    
-                    if let Some((gop_phys, gop_w, gop_h, gop_p, source)) = crate::boot::get_fb_info() {
-                        if source == crate::boot::FbSource::Uefi {
-                            // Hardware (VBIOS) already read EDID and set this resolution.
-                            // Inherit it unconditionally to prevent double vision / stretching.
-                            width = gop_w;
-                            height = gop_h;
-                            pitch = gop_p; // This is in bytes
-                            
-                            serial::serial_print("[NVIDIA]   Inheriting native hardware resolution (GOP): ");
-                            serial::serial_print_dec(width as u64);
-                            serial::serial_print("x");
-                            serial::serial_print_dec(height as u64);
-                            serial::serial_print(" (Pitch: ");
-                            serial::serial_print_dec(pitch as u64);
-                            serial::serial_print(")\n");
-                        }
-                    } else {
-                        // Only align pitch if we are falling back to defaults
-                        let original_pitch = pitch;
-                        pitch = (pitch + 255) & !255;
-                        if pitch != original_pitch {
-                            serial::serial_print("[NVIDIA]   Adjusted pitch for alignment: ");
-                            serial::serial_print_dec(original_pitch as u64);
-                            serial::serial_print(" -> ");
-                            serial::serial_print_dec(pitch as u64);
-                            serial::serial_print("\n");
-                        }
-                    }
+                *guard = Some(NvidiaFbInfo { 
+                    phys: fb_phys, 
+                    bar1_phys, 
+                    bar1_size, 
+                    width, 
+                    height, 
+                    pitch 
+                });
+                
+                // Initialize VRAM allocator for BAR1
+                let alloc_size = if bar1_size == 0 { 32 * 1024 * 1024 } else { bar1_size.min(256 * 1024 * 1024) };
+                
+                let mut vram_guard = VRAM_ALLOCATOR.lock();
+                *vram_guard = Some(NvidiaVramAllocator::new(bar1_phys, alloc_size));
+                
+                serial::serial_print("[NVIDIA]   ✓ Primary Display initialized (GPU ");
+                serial::serial_print_dec(index as u64);
+                serial::serial_print(")\n");
 
-                    let bar1_size = unsafe { crate::pci::get_bar_size(&gpu, 1) };
-                    *guard = Some(NvidiaFbInfo { phys: bar1_phys, bar1_size, width, height, pitch });
-                    
-                    // Initialize VRAM allocator for BAR1
-                    // Default to 32MB if size unknown, clamp to 256MB max for now to avoid overmapping
-                    let alloc_size = if bar1_size == 0 { 32 * 1024 * 1024 } else { bar1_size.min(256 * 1024 * 1024) };
-                    
-                    let mut vram_guard = VRAM_ALLOCATOR.lock();
-                    *vram_guard = Some(NvidiaVramAllocator::new(bar1_phys, alloc_size));
-                    
-                    serial::serial_print("[NVIDIA]   ✓ BAR1 size detected: ");
-                    serial::serial_print_dec(alloc_size / (1024 * 1024));
-                    serial::serial_print(" MB\n");
-                    serial::serial_print("[NVIDIA]   ✓ BAR1 stored as display fallback (1920×1080)\n");
-                    serial::serial_print("[NVIDIA]   ✓ VRAM allocator initialized\n");
-
-                    // Map the full BAR1 range in kernel virtual space so that
-                    // fill_rect / blit_rect / page_flip shadow-blit can access
-                    // VRAM without relying on the HHDM (which only covers RAM,
-                    // not PCI BARs located above top-of-RAM).
-                    let mut map_guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
-                    if map_guard.is_none() {
-                        let vaddr = map_framebuffer_kernel(bar1_phys, alloc_size as usize);
-                        if vaddr != 0 {
-                            NVIDIA_BAR1_KERNEL_VADDR.store(vaddr, AtomicOrdering::Relaxed);
-                            serial::serial_print("[NVIDIA]   ✓ BAR1 mapped in kernel at ");
-                            serial::serial_print_hex(vaddr);
-                            serial::serial_print("\n");
-                        } else {
-                            serial::serial_print("[NVIDIA]   WARNING: BAR1 kernel mapping failed\n");
-                        }
-                        *map_guard = Some(alloc_size as usize);
+                // Map the full BAR1 range in kernel virtual space
+                let mut map_guard = NVIDIA_BAR1_MAPPED_SIZE.lock();
+                if map_guard.is_none() {
+                    let vaddr = map_framebuffer_kernel(bar1_phys, alloc_size as usize);
+                    if vaddr != 0 {
+                        NVIDIA_BAR1_KERNEL_VADDR.store(vaddr, AtomicOrdering::Relaxed);
                     }
+                    *map_guard = Some(alloc_size as usize);
                 }
             }
         }
@@ -1196,9 +1226,6 @@ pub fn init() {
             serial::serial_print_hex(confirmed as u64);
             serial::serial_print("\n");
         }
-
-        // Register with DRM subsystem
-        crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
 
         // --- Phase 6: OpenGL context initialization ---
         // PGRAPH (bit 13) is already active via NV_PMC_ENABLE_DEFAULT.
@@ -1315,51 +1342,15 @@ pub fn init() {
                             }
                         }
 
-                        // Step 6g: Display setup via RPC (from GspOpcode::DisplaySetup)
+                        /* 
+                        // Step 6g: Disable DisplaySetup temporarily as the set_mode helper is a stub.
+                        // Calling GSP DisplaySetup without a proper set_mode following it can 
+                        // reset the VBIOS/GOP state and cause screen corruption or "double vision".
                         if let Ok(seq) = rpc.send_command(GspOpcode::DisplaySetup, &[]) {
-                            serial::serial_print("[NVIDIA]   DisplaySetup RPC sent (Seq: ");
-                            serial::serial_print_dec(seq as u64);
-                            serial::serial_print(")\n");
-                            
-                            // Detect monitors and set up the primary one
-                            let connectors = sidewind_nvidia::features::display::DisplayConnector::detect_all();
-                            if let Some(connector) = connectors.first() {
-                                serial::serial_print("[NVIDIA]   Primary Monitor detected: ");
-                                match connector.connector_type {
-                                    sidewind_nvidia::features::display::ConnectorType::DisplayPort => serial::serial_print("DisplayPort"),
-                                    sidewind_nvidia::features::display::ConnectorType::HDMI => serial::serial_print("HDMI"),
-                                    sidewind_nvidia::features::display::ConnectorType::DVI => serial::serial_print("DVI"),
-                                    sidewind_nvidia::features::display::ConnectorType::VGA => serial::serial_print("VGA"),
-                                    sidewind_nvidia::features::display::ConnectorType::Unknown => serial::serial_print("Unknown"),
-                                }
-                                serial::serial_print("\n");
-                                
-                                // Use the resolution detected/inherited during Phase 2b
-                                let (target_w, target_h) = {
-                                    let guard = NVIDIA_FB_INFO.lock();
-                                    if let Some(info) = *guard {
-                                        (info.width, info.height)
-                                    } else {
-                                        (1920, 1080)
-                                    }
-                                };
-                                
-                                serial::serial_print("[NVIDIA]   Setting mode: ");
-                                serial::serial_print_dec(target_w as u64);
-                                serial::serial_print("x");
-                                serial::serial_print_dec(target_h as u64);
-                                serial::serial_print("\n");
-
-                                let mode = sidewind_nvidia::features::display::DisplayMode {
-                                    width: target_w,
-                                    height: target_h,
-                                    refresh_rate: 60,
-                                    pixel_clock: 0,
-                                };
-                                let _ = connector.set_mode(mode);
-                            }
-                            serial::serial_print("[NVIDIA]   Display initialization sequence complete\n");
+                            // ... (deshabilitado hasta v0.2.2)
                         }
+                        */
+                        serial::serial_print("[NVIDIA]   GSP initialization complete (Preserving VBIOS Display State)\n");
                     } else {
                         let mb0 = core::ptr::read_volatile(
                             (bar0_virt + NV_GSP_MAILBOX0 as u64) as *const u32,
@@ -1385,6 +1376,11 @@ pub fn init() {
                 serial::serial_print("[NVIDIA]   ℹ (from open-gpu-kernel-modules or linux-firmware package)\n");
             }
         }
+    }
+    
+    // Register with DRM subsystem exactly once if any GPU was detected
+    if find_nvidia_gpus().len() > 0 {
+        crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
     }
     
     serial::serial_print("[NVIDIA] Initialization complete\n");

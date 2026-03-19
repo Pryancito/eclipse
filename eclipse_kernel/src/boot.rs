@@ -137,7 +137,7 @@ pub fn get_fb_info() -> Option<(u64, u32, u32, u32, FbSource)> {
         }
     }
     // 3. NVIDIA BAR1 (linear VRAM aperture) – real hardware without EFI GOP
-    if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+    if let Some((phys, _bar1_phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
         if phys != 0 && w > 0 && h > 0 {
             return Some((phys, w, h, pitch, FbSource::Nvidia));
         }

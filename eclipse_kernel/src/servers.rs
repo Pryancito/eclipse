@@ -216,7 +216,7 @@ impl Scheme for DisplayScheme {
             (fi.base_address, (fi.pixels_per_scan_line * fi.height * 4) as usize)
         } else if let Some((phys, _w, _h, pitch, size)) = crate::virtio::get_primary_virtio_display() {
             (phys, size)
-        } else if let Some((phys, _w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        } else if let Some((phys, _bar_phys, _w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             (phys, (pitch * h) as usize)
         } else {
             return Err(scheme_error::EIO);
@@ -252,7 +252,7 @@ impl Scheme for DisplayScheme {
             _stat.size = (fi.pixels_per_scan_line * fi.height * 4) as u64;
         } else if let Some((_phys, _w, _h, _pitch, size)) = crate::virtio::get_primary_virtio_display() {
             _stat.size = size as u64;
-        } else if let Some((_phys, _w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        } else if let Some((_phys, _bar_phys, _w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             _stat.size = (pitch * h) as u64;
         } else {
             return Err(scheme_error::EIO);
@@ -270,7 +270,7 @@ impl Scheme for DisplayScheme {
                 return Ok(phys as usize);
             }
         }
-        if let Some((phys, _w, _h, _pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        if let Some((phys, _bar_phys, _w, _h, _pitch)) = crate::nvidia::get_nvidia_fb_info() {
             // BAR1 is a large VRAM aperture (typically ≥256 MB on Turing+), so any
             // reasonable framebuffer mapping fits.  Return the base address directly
             // without a size guard, consistent with how the EFI GOP path is handled.

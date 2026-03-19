@@ -1953,7 +1953,7 @@ fn sys_get_framebuffer_info(user_buffer: u64) -> u64 {
             (addr, k.width, k.height, pitch)
         } else if let Some((phys, w, h, p, _size)) = crate::virtio::get_primary_virtio_display() {
             (phys, w, h, p)
-        } else if let Some((phys, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        } else if let Some((phys, _bar1, w, h, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             (phys, w, h, pitch)
         } else {
             return u64::MAX;
@@ -2256,7 +2256,7 @@ fn sys_map_framebuffer() -> u64 {
 
     if !gop_valid {
         // Try NVIDIA BAR1 as fallback for real hardware without EFI GOP
-        if let Some((bar1_phys, width, height, pitch)) = crate::nvidia::get_nvidia_fb_info() {
+        if let Some((_fb_phys, bar1_phys, width, height, pitch)) = crate::nvidia::get_nvidia_fb_info() {
             let single_frame_size = (pitch as u64) * (height as u64);
             let mut fb_size = single_frame_size * 2;
             fb_size = (fb_size + 0xFFF) & !0xFFF;
