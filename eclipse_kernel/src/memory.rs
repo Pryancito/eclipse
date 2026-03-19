@@ -1310,25 +1310,32 @@ pub fn unmap_user_range(pml4_phys: u64, vaddr: u64, length: u64) {
 /// the next context switch.  On real hardware this reliably prevents the
 /// AHCI controller from ever being accessible.
 pub fn map_mmio_range(paddr: u64, length: usize) -> u64 {
-    let virt_addr = MMIO_VADDR_BASE + paddr;
+    // DIAGNOSTIC: Log huge physical BARs
+    if paddr > 0x100_0000_0000 { // > 1 TB
+        crate::serial::serial_print("[MMIO] ALERT: Mapping huge physical address: ");
+        crate::serial::serial_print_hex(paddr);
+        crate::serial::serial_print("\n");
+    }
+
+    let virt_addr = MMIO_VADDR_BASE.wrapping_add(paddr);
+    
+    // SAFETY: Ensure we don't overflow into PML4[511] (Recursive Mapping)
+    // MMIO_VADDR_BASE is index 500. Each index is 512GB.
+    // Index 511 starts at MMIO_VADDR_BASE + (11 * 512GB) = 0xFFFFFA00... + 0x16000000000
+    if paddr >= (11 * 512 * 1024 * 1024 * 1024) {
+        crate::serial::serial_print("[MMIO] ERROR: Physical address too high for static mapping, would collide with recursive PTEs\n");
+        return 0;
+    }
 
     // UC flags: PWT + PCD guarantee Uncacheable on all x86_64 CPUs.
     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE;
 
-    // Use the saved kernel CR3. Falls back to the current CR3 only if
-    // save_kernel_cr3() has not been called yet (early boot).
     let kernel_cr3 = {
         let k = KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed);
         if k == 0 { get_cr3() } else { k }
     };
 
-    // Walk/create 4-level page table entries with kernel-only flags.
-    // We cannot use map_physical_range / map_user_page_4kb here because
-    // those helpers forcibly add USER_ACCESSIBLE and remove NX, which is
-    // wrong for kernel MMIO mappings.
     mmio_map_kernel_range(kernel_cr3, paddr, length as u64, virt_addr, flags);
-
-    // Flush the entire TLB so the new mapping is visible on this CPU.
     flush_tlb();
 
     virt_addr

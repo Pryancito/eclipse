@@ -96,6 +96,7 @@ pub struct UsbController {
     pub vendor_id: u16,
     pub device_id: u16,
     pub bar0: u64,
+    pub bar_size: u64,
     pub interrupt_line: u8,
 }
 
@@ -320,20 +321,33 @@ pub struct XhciMmio {
 }
 
 impl XhciMmio {
-    pub fn from_bar0(bar0: u64) -> Result<Self, &'static str> {
-        let cap = MmioRegion::new(bar0, 256)?;
+    pub fn from_bar0(bar0: u64, bar_size: u64) -> Result<Self, &'static str> {
+        // Map the entire BAR once to ensure all offsets (including xECP) are reachable.
+        // On real hardware, xECP can be at offsets like 0x8000, which would fault if we only map 256 bytes.
+        let vbase = memory::map_mmio_range(bar0, bar_size as usize);
+        if vbase == 0 { return Err("MMIO range mapping failed"); }
+
+        // capability covers the whole BAR so that extended capabilities can be read at any offset.
+        let cap = MmioRegion { base_virt: vbase, size: bar_size as usize };
+
         let caplength = (cap.read_u32(0x00) & 0xFF) as u64;
         let rtsoff    = cap.read_u32(0x18) as u64;
         let dboff     = cap.read_u32(0x14) as u64;
 
-        let operational = MmioRegion::new(bar0 + caplength, 0x1000)?;
-        let runtime     = MmioRegion::new(bar0 + rtsoff,    8192)?;
-        let doorbell    = MmioRegion::new(bar0 + dboff,     1024)?;
+        // Ensure these offsets are actually within our mapped BAR before creating sub-regions.
+        if caplength > bar_size || rtsoff > bar_size || dboff > bar_size {
+            return Err("XHCI register offsets exceed BAR size");
+        }
+
+        let operational = MmioRegion { base_virt: vbase + caplength, size: 0x1000 };
+        let runtime     = MmioRegion { base_virt: vbase + rtsoff,    size: 8192 };
+        let doorbell    = MmioRegion { base_virt: vbase + dboff,     size: 4096 };
 
         Ok(Self { capability: cap, operational, runtime, doorbell })
     }
 
-    #[inline] pub fn read_capability (&self, off: usize) -> u32 { self.capability .read_u32(off) }
+    #[inline] pub fn write_capability (&self, off: usize, v: u32) { self.capability .write_u32(off, v) }
+    #[inline] pub fn read_capability  (&self, off: usize) -> u32 { self.capability .read_u32(off) }
     #[inline] pub fn read_operational (&self, off: usize) -> u32 { self.operational.read_u32(off) }
     #[inline] pub fn write_operational(&self, off: usize, v: u32) { self.operational.write_u32(off, v) }
     #[inline] pub fn read_runtime     (&self, off: usize) -> u32 { self.runtime    .read_u32(off) }
@@ -869,6 +883,55 @@ impl XhciControllerState {
             context_size: 32, // Default to 32
             fb_width: 1024,
             fb_height: 768,
+        }
+    }
+
+    /// Perform OS-to-BIOS handoff for XHCI.
+    pub fn perform_bios_handoff(&mut self) {
+        let mmio = match self.mmio.as_ref() { Some(m) => m, None => return };
+        let hccparams1 = mmio.read_capability(0x10);
+        let xecp = (hccparams1 >> 16) as usize;
+        if xecp == 0 { return; }
+
+        let mut cap_ptr = xecp << 2;
+        while cap_ptr != 0 {
+            let cap_val = mmio.read_capability(cap_ptr);
+            let cap_id = (cap_val & 0xFF) as u8;
+            
+            if cap_id == 1 { // USB Legacy Support
+                serial::serial_print("[XHCI] Found USB Legacy Support Capability\n");
+                let mut legsup = mmio.read_capability(cap_ptr);
+                
+                // Check if BIOS owns it (bit 16)
+                if (legsup & (1 << 16)) != 0 {
+                    serial::serial_print("[XHCI] BIOS owns the controller, requesting handoff...\n");
+                    // Set OS Owned Semaphore (bit 24)
+                    legsup |= 1 << 24;
+                    mmio.write_capability(cap_ptr, legsup);
+                    
+                    // Wait for BIOS to release (max 1s)
+                    let mut timeout = 1000;
+                    while (mmio.read_capability(cap_ptr) & (1 << 16)) != 0 && timeout > 0 {
+                        timeout -= 1;
+                        for _ in 0..10_000 { crate::cpu::pause(); }
+                    }
+                    
+                    if timeout == 0 {
+                        serial::serial_print("[XHCI] BIOS handoff timeout! Forcing...\n");
+                    } else {
+                        serial::serial_print("[XHCI] BIOS handoff successful\n");
+                    }
+                }
+                
+                // Disable SMIs via USBLEGCTLSTS (offset 4)
+                let legctlsts = mmio.read_capability(cap_ptr + 4);
+                mmio.write_capability(cap_ptr + 4, legctlsts & 0xFFFF0000); 
+                return;
+            }
+            
+            let next = ((cap_val >> 8) & 0xFF) as usize;
+            if next == 0 { break; }
+            cap_ptr += next << 2;
         }
     }
 
@@ -1697,7 +1760,7 @@ fn process_tablet_report(dev: &mut HidEndpoint, report: &HidTabletReport) {
 pub static mut XHCI: Option<XhciControllerState> = None;
 
 /// USB IRQ handler – processes the XHCI event ring and dispatches HID reports.
-fn usb_irq_handler() {
+pub fn usb_irq_handler() {
     unsafe {
         let xhci = match XHCI.as_mut() { Some(x) => x, None => return };
         let mmio = match xhci.mmio.as_ref() { Some(m) => m, None => return };
@@ -1724,8 +1787,7 @@ pub(crate) static USB_POLL_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USB_TRANSFER_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Último valor observado de USB_TRANSFER_EVENTS por el watchdog de poll().
 static USB_WATCH_LAST_EVENTS: AtomicU64 = AtomicU64::new(0);
-/// Ticks en los que el watchdog observó por última vez un cambio en USB_TRANSFER_EVENTS.
-static USB_WATCH_LAST_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static USB_MSI_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Poll the XHCI event ring for pending HID events.
 /// Called from the timer interrupt as a fallback when IRQ-based delivery is unavailable.
@@ -1775,13 +1837,17 @@ pub fn init() {
             UsbControllerType::XHCI => {
                 let state = init_xhci_controller(ctrl);
                 if state == UsbControllerState::Ready {
-                    // Register IRQ handler for the controller's IRQ line
-                    let irq = ctrl.interrupt_line;
-                    if irq < 16 {
-                        match register_usb_irq_handler(irq) {
-                            Ok(_)  => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} handler registered\n", irq)),
-                            Err(e) => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} registration failed: {}\n", irq, e)),
+                    if !USB_MSI_ENABLED.load(Ordering::Relaxed) {
+                        // Register IRQ handler for the controller's IRQ line
+                        let irq = ctrl.interrupt_line;
+                        if irq < 16 {
+                            match register_usb_irq_handler(irq) {
+                                Ok(_)  => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} handler registered\n", irq)),
+                                Err(e) => serial::serial_print(&alloc::format!("[USB-HID] IRQ {} registration failed: {}\n", irq, e)),
+                            }
                         }
+                    } else {
+                        serial::serial_print("[USB-HID] Using MSI (vector 0x41), skipping legacy IRQ registration\n");
                     }
                     break; // Only one XHCI controller for now
                 }
@@ -1811,6 +1877,7 @@ fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
             vendor_id:      pci_dev.vendor_id,
             device_id:      pci_dev.device_id,
             bar0:           pci_dev.bar0,
+            bar_size:       unsafe { crate::pci::get_bar_size(&pci_dev, 0) },
             interrupt_line: pci_dev.interrupt_line,
         });
     }
@@ -1832,6 +1899,14 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
             bar0: ctrl.bar0, interrupt_line: ctrl.interrupt_line,
         };
         crate::pci::enable_device(&pci_dev, true);
+
+        // Try to enable MSI (vector 0x41, CPU 0)
+        if crate::pci::pci_enable_msi(&pci_dev, 0x41, 0) {
+            serial::serial_print("[USB-HID] Enabled MSI on vector 0x41\n");
+            USB_MSI_ENABLED.store(true, Ordering::Relaxed);
+        } else {
+            serial::serial_print("[USB-HID] MSI not supported, will use legacy IRQ if available\n");
+        }
     }
 
     let bar0 = ctrl.bar0 & !0xF;
@@ -1840,7 +1915,7 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
         return UsbControllerState::Error;
     }
 
-    let mmio = match XhciMmio::from_bar0(bar0) {
+    let mmio = match XhciMmio::from_bar0(bar0, ctrl.bar_size) {
         Ok(m)  => m,
         Err(e) => { serial::serial_print(&alloc::format!("[USB-HID] MMIO map failed: {}\n", e)); return UsbControllerState::Error; }
     };
@@ -1866,6 +1941,9 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
         state.fb_width  = fb_w;
         state.fb_height = fb_h;
     }
+
+    // Perform BIOS handoff before any other initialization
+    state.perform_bios_handoff();
 
     if let Err(e) = state.initialize() {
         serial::serial_print(&alloc::format!("[XHCI] initialize() failed: {}\n", e));

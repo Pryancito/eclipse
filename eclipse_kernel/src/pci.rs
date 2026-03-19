@@ -639,7 +639,9 @@ pub unsafe fn pci_find_capability(dev: &PciDevice, cap_id: u8) -> u8 {
         if id == cap_id {
             return pos;
         }
-        pos = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+        let next = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+        if next == pos { break; } // Prevent infinite loops
+        pos = next;
         if pos < 0x40 && pos != 0 { break; } // Sanity check for malformed lists
     }
     0
@@ -664,9 +666,9 @@ pub unsafe fn pci_enable_msi(dev: &PciDevice, vector: u8, cpu_id: u32) -> bool {
     pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 4, addr);
     if is_64bit {
         pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 8, 0); // Addr HI
-        pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 12, data);
+        pci_config_write_u16(dev.bus, dev.device, dev.function, pos + 12, data as u16);
     } else {
-        pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 8, data);
+        pci_config_write_u16(dev.bus, dev.device, dev.function, pos + 8, data as u16);
     }
 
     // Enable MSI in Message Control register (bit 0)

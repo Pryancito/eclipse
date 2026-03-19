@@ -246,15 +246,6 @@ fn draw_logo_via_dev_fb0(fb: &Framebuffer) -> bool {
     };
     println!("[DISPLAY-SERVICE] Drawing logo via /dev/fb0 (fd={}, vaddr=0x{:X}, {}x{})", fd, vaddr, fb.mode.width, fb.mode.height);
     
-    // Stop kernel boot logs exactly when we start drawing the logo
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("rax") SYS_STOP_PROGRESS,
-            options(nostack)
-        );
-    }
-
     logo::draw(vaddr, fb.pitch, fb.mode.bpp, fb.mode.width, fb.mode.height);
     close_fd(fd);
     true
@@ -1071,6 +1062,15 @@ fn main() {
     
     if let Some(ref fb) = framebuffer {
         println!("[DISPLAY-SERVICE] Final screen clear before starting...");
+        // Stop kernel boot logs exactly when we start drawing the logo
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("rax") SYS_STOP_PROGRESS,
+                options(nostack)
+            );
+        }
+
         let _ = clear_screen(fb, 0xFFFFFFFF);
 
         println!("[DISPLAY-SERVICE] Drawing startup logo via /dev/fb0...");
