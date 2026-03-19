@@ -576,8 +576,12 @@ fn main() {
             let _ = std::libc::send_ipc(1, 0x40, b"HEART");
             heartbeat_last_ticks = stats.uptime_ticks;
         }
-        
-        unsafe { std::libc::yield_cpu(); }
+
+        // Sleep 1 ms so the kernel can HLT between polls.  A plain yield_cpu() returns
+        // immediately when this is the only ready process, turning the loop into a
+        // busy-wait that consumes ~100% CPU on real hardware.  1 ms gives ~1 kHz
+        // polling (well above PS/2 and USB HID rates) while keeping CPU usage near 0%.
+        unsafe { std::libc::sleep_ms(1); }
     }
 }
 
