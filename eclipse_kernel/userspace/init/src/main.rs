@@ -333,7 +333,7 @@ fn main_loop() -> ! {
         
         // Sleep briefly to avoid a busy-loop; this blocks init for 1 ms
         // so the kernel can HLT and CPU usage drops from ~100% to near 0%.
-        unsafe {sleep_ms(1);}
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

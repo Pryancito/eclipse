@@ -381,7 +381,7 @@ fn main() {
             }
         }
         
-        unsafe { std::libc::sleep_ms(1); }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

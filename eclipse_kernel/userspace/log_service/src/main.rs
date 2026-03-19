@@ -104,7 +104,7 @@ pub extern "Rust" fn main() {
             flush_log_buffer(&mut state);
         }
 
-        unsafe { std::libc::sleep_ms(1); }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
