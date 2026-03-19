@@ -69,6 +69,9 @@ static AP_IDLE_CONTEXT_VALID: [AtomicBool; MAX_CPUS] =
 /// Quantum restante por CPU (en ms/ticks). Se inicializa en 10.
 static mut CPU_QUANTUM: [u32; MAX_CPUS] = [10; MAX_CPUS];
 
+/// Quantum inicial asignado al proceso actual (para calcular 'consumed' correctamente).
+static mut CPU_INITIAL_QUANTUM: [u32; MAX_CPUS] = [10; MAX_CPUS];
+
 /// Estadísticas del scheduler (atómicas para SMP)
 pub struct SchedulerStats {
     pub context_switches: u64,
@@ -367,23 +370,25 @@ pub fn schedule() {
                     let mut table = crate::process::PROCESS_TABLE.lock();
                     if let Some(slot) = crate::ipc::pid_to_slot_fast(pid) {
                         if let Some(process) = table[slot].as_mut() {
-                            if process.id == pid && process.current_cpu == cpu_id as u32 {
-                                // Update ticks for any process that was running on this CPU,
-                                // even if it just blocked or terminated.
-                                let consumed = unsafe { 10u32.saturating_sub(CPU_QUANTUM[cpu_id]) };
-                                process.cpu_ticks += consumed as u64;
-                                
-                                // Update AI profile burst duration
-                                process.ai_profile.update_burst(consumed as u64);
+                            if process.id == pid && process.current_cpu == cpu_id as u32 {                                 // Update ticks for any process that was running on this CPU,
+                                 // even if it just blocked or terminated.
+                                 let consumed = unsafe { CPU_INITIAL_QUANTUM[cpu_id].saturating_sub(CPU_QUANTUM[cpu_id]) };
+                                 process.cpu_ticks += consumed as u64;
+                                 
+                                 // Update AI profile burst duration
+                                 process.ai_profile.update_burst(consumed as u64);
 
-                                // Reset quantum here so we don't count the same ticks twice.
-                                // Default is 10, but AI can suggest a different one.
-                                let next_q = process.ai_profile.predict_burst().max(5).min(50) as u32;
-                                unsafe { CPU_QUANTUM[cpu_id] = next_q; }
-                                
-                                if process.state == ProcessState::Running {
-                                    should_requeue = true;
-                                }
+                                 // Reset quantum here so we don't count the same ticks twice.
+                                 // Default is 10, but AI can suggest a different one.
+                                 let next_q = process.ai_profile.predict_burst().max(5).min(50) as u32;
+                                 unsafe { 
+                                     CPU_QUANTUM[cpu_id] = next_q;
+                                     CPU_INITIAL_QUANTUM[cpu_id] = next_q;
+                                 }
+                                 
+                                 if process.state == ProcessState::Running {
+                                     should_requeue = true;
+                                 }
                             }
                         }
                     }
@@ -464,7 +469,10 @@ pub fn schedule() {
                             } else { 10 }
                         }.max(5).min(50) as u32;
 
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
+                        unsafe { 
+                            crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
+                            crate::scheduler::CPU_INITIAL_QUANTUM[cpu_id] = next_q;
+                        }
                     }
                     Some(cur) => {
                         let next_q = {
@@ -474,7 +482,10 @@ pub fn schedule() {
                             } else { 10 }
                         }.max(5).min(50) as u32;
 
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
+                        unsafe { 
+                            crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
+                            crate::scheduler::CPU_INITIAL_QUANTUM[cpu_id] = next_q;
+                        }
                         perform_context_switch(cur, next_pid);
                     }
                     None => {
@@ -486,7 +497,10 @@ pub fn schedule() {
                             } else { 10 }
                         }.max(5).min(50) as u32;
 
-                        unsafe { crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; }
+                        unsafe { 
+                            crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
+                            crate::scheduler::CPU_INITIAL_QUANTUM[cpu_id] = next_q;
+                        }
                         // Don't set current_process here; perform_context_switch_to will do it.
                         if cpu_id < MAX_CPUS {
                             // Guardar el contexto idle de este AP para poder volver más tarde.

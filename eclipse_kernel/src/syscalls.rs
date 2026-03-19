@@ -120,11 +120,19 @@ pub struct SyscallStats {
     pub lseek_calls: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct SystemStats {
     pub uptime_ticks: u64,
     pub idle_ticks: u64,
     pub total_mem_frames: u64,
     pub used_mem_frames: u64,
+    // AI-CORE Vitals
+    pub cpu_temp: [u32; 16],
+    pub gpu_load: [u32; 4],
+    pub gpu_temp: [u32; 4],
+    pub anomaly_count: u32,
+    pub heap_fragmentation: u32,
 }
 
 #[repr(C)]
@@ -370,12 +378,18 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
 
     let sched_stats = crate::scheduler::get_stats();
     let (total_mem, used_mem) = crate::memory::get_memory_stats();
+    let vitals = crate::ai_core::get_vitals();
 
     let stats = SystemStats {
         uptime_ticks: sched_stats.total_ticks,
         idle_ticks: sched_stats.idle_ticks,
         total_mem_frames: total_mem,
         used_mem_frames: used_mem,
+        cpu_temp: vitals.cpu_temp,
+        gpu_load: vitals.gpu_load,
+        gpu_temp: vitals.gpu_temp,
+        anomaly_count: vitals.anomaly_count,
+        heap_fragmentation: vitals.heap_fragmentation,
     };
 
     unsafe {
@@ -2661,6 +2675,7 @@ fn sys_brk(addr: u64) -> u64 {
                             let frame_virt = memory::PHYS_MEM_OFFSET + frame_phys;
                             unsafe { core::ptr::write_bytes(frame_virt as *mut u8, 0, 4096); }
                             memory::map_user_page_4kb(r.page_table_phys, curr, frame_phys, 0x7);
+                            proc.mem_frames += 1;
                         }
                         None => {
                             serial::serial_print("[SYSCALL] brk: physical frame pool exhausted\n");
@@ -2669,7 +2684,6 @@ fn sys_brk(addr: u64) -> u64 {
                     }
                     curr += 4096;
                 }
-                proc.mem_frames += (new_page_end - old_page_end) / 4096;
             } else if new_page_end < old_page_end {
                 let mut curr = new_page_end;
                 while curr < old_page_end {

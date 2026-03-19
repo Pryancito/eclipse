@@ -680,15 +680,6 @@ impl SmithayState {
                     // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
                     self.process_mem_kb[i] = p.mem_frames * 4;
 
-                    // [STRESS TEST] Inyectar valores exorbitados para smithay_app o proceso principal
-                    // como solicitó el usuario ("volver a aplicar lo del consumo de memoria").
-                    let self_pid = unsafe { libc::getpid() as u32 };
-                    if p.pid == self_pid {
-                        // Valores exorbitados: 99.7% CPU y 1.4 GB de RAM
-                        self.process_cpu_usage[i] = 99.7;
-                        self.process_mem_kb[i] = 1_450_000; 
-                    }
-
                     // Actualizar histórico de ticks.
                     let mut found = false;
                     for j in 0..32 {
@@ -741,22 +732,22 @@ impl SmithayState {
                 #[cfg(target_vendor = "eclipse")]
                 {
                     let self_pid = unsafe { libc::getpid() as u32 };
-                    let mut self_mem_kb = 0u64;
-                    let mut self_cpu = 0.0f32;
+                    let mut _self_mem_kb = 0u64;
+                    let mut _self_cpu = 0.0f32;
                     for i in 0..self.process_count {
                         let p = &self.process_list[i];
                         if p.pid == self_pid {
-                            self_mem_kb = self.process_mem_kb[i];
-                            self_cpu = self.process_cpu_usage[i];
+                            _self_mem_kb = self.process_mem_kb[i];
+                            _self_cpu = self.process_cpu_usage[i];
                             break;
                         }
                     }
                 }
+            }
 
-                // Sólo pedimos info de servicios cuando System Central está activo.
-                if self.input.system_central_active {
-                    let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
-                }
+            // Sólo pedimos info de servicios cuando System Central está activo.
+            if self.input.system_central_active {
+                let _ = unsafe { eclipse_send(1, 0, b"GET_SERVICES_INFO\0".as_ptr() as *const core::ffi::c_void, 18, 0) };
             }
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
