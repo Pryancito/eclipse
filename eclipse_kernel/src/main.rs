@@ -396,14 +396,17 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         // Heartbeat IPC (solo un núcleo lo imprimirá cada 5s)
         ipc::p2p_heartbeat();
 
-        // Procesar mensajes IPC mientras haya pendientes
+        // Procesar mensajes IPC pendientes. El timer APIC también los procesa cada 1ms,
+        // pero procesarlos aquí reduce la latencia cuando llegan entre ticks del timer.
         if crate::ipc::has_pending_messages() {
             ipc::process_messages();
-        } else {
-            // Si no hay mensajes ni otros procesos listos, "dormir" hasta la siguiente interrupción
-            crate::cpu::idle();
         }
-        
+
+        // Siempre dormir hasta la siguiente interrupción, incluso si había mensajes
+        // pendientes. Esto evita que el núcleo consuma el 100% de la CPU en un
+        // bucle activo cuando llegan mensajes IPC de forma continua.
+        crate::cpu::idle();
+
         // Intentar planificar otros procesos (p.ej. tras recibir un mensaje o una interrupción)
         crate::scheduler::schedule();
     }
