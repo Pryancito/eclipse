@@ -923,9 +923,13 @@ impl XhciControllerState {
                     }
                 }
                 
-                // Disable SMIs via USBLEGCTLSTS (offset 4)
-                let legctlsts = mmio.read_capability(cap_ptr + 4);
-                mmio.write_capability(cap_ptr + 4, legctlsts & 0xFFFF0000); 
+                // Disable SMIs via USBLEGCTLSTS (offset 4):
+                // - Clear all SMI enable bits [7:0] by writing 0 to them.
+                // - Acknowledge all pending SMI status bits [31:16] by writing 1 to them
+                //   (RW1C semantics: writing 1 clears the bit).
+                // Writing 0xFFFF0000 zeros the enable bits and sets all status bits to 1
+                // to clear any pending SMI conditions left by the BIOS.
+                mmio.write_capability(cap_ptr + 4, 0xFFFF0000);
                 return;
             }
             
@@ -947,7 +951,10 @@ impl XhciControllerState {
 
         // 2. Scratchpad buffers if required
         let hcsparams2 = mmio.read_capability(0x08);
-        // Max Scratchpad Buffers = Lo (bits 31:27) | (Hi (bits 25:21) << 5)
+        // xHCI spec Table 5-9: Max Scratchpad Buffers is a 10-bit field split into two 5-bit halves:
+        //   Lo = HCSPARAMS2[31:27]  (the lower 5 bits of the count)
+        //   Hi = HCSPARAMS2[25:21]  (the upper 5 bits of the count, shifted left by 5)
+        // Total count = (Hi << 5) | Lo  (matches Linux kernel HCS_MAX_SCRATCHPAD macro)
         let sb_lo = (hcsparams2 >> 27) & 0x1F;
         let sb_hi = (hcsparams2 >> 21) & 0x1F;
         let sb_count = sb_lo | (sb_hi << 5);
@@ -989,25 +996,43 @@ impl XhciControllerState {
         serial::serial_print("[XHCI] Starting controller\n");
         let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
 
-        // Wait for CNR
-        let mut timeout = 10000;
+        // xHCI spec §4.2.1: USBSTS.HCH must be 1 (controller halted) before setting HCRST.
+        // The BIOS may have left the controller running (USBCMD.R/S = 1); stop it first.
+        let usbcmd = mmio.read_operational(0x00);
+        if (usbcmd & 1) != 0 {
+            serial::serial_print("[XHCI] Controller running, halting before reset\n");
+            mmio.write_operational(0x00, usbcmd & !1); // Clear R/S bit
+            // Wait for USBSTS.HCH (bit 0) to become 1 (controller halted).
+            let mut timeout = 100_000;
+            while (mmio.read_operational(0x04) & 1) == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    serial::serial_print("[XHCI] WARNING: Controller did not halt; proceeding with reset\n");
+                    break;
+                }
+                crate::cpu::pause();
+            }
+        }
+
+        // Wait for CNR (bit 11 of USBSTS) to clear before issuing HCRST.
+        let mut timeout = 100_000;
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout before reset"); }
             crate::cpu::pause();
         }
 
-        // HCRST
+        // Issue HCRST (bit 1 of USBCMD). The controller self-clears this bit when done.
         mmio.write_operational(0x00, mmio.read_operational(0x00) | (1 << 1));
-        timeout = 10000;
+        timeout = 100_000;
         while (mmio.read_operational(0x00) & (1 << 1)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("HCRST timeout"); }
             crate::cpu::pause();
         }
 
-        // CNR clear again
-        timeout = 10000;
+        // Wait for CNR to clear again after reset (spec §4.2.1).
+        timeout = 100_000;
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout after reset"); }
