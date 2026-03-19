@@ -28,8 +28,9 @@ unsafe fn read_argc_from_stack(rsp: *const u64) -> u64 {
 pub fn init_runtime() {
     crate::heap::init_heap();
     unsafe {
-        let _ = crate::libc::send(1, b"READY\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
-        let _ = crate::libc::send(1, b"HEART\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
+        // En Eclipse OS, SYS_SEND (3) requiere un msg_type. Usamos 0 para READY/HEART.
+        let _ = crate::libc::eclipse_send(1, 0, b"READY\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
+        let _ = crate::libc::eclipse_send(1, 0, b"HEART\0".as_ptr() as *const crate::ffi::c_void, 6, 0);
     }
 }
 

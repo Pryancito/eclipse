@@ -4,7 +4,7 @@ use eclipse_syscall::InputEvent;
 use sidewind_core::{SideWindMessage, SIDEWIND_TAG};
 
 /// Tamaño máximo de un mensaje IPC (buffer y Raw). Única constante para no desincronizar.
-pub const MAX_MSG_LEN: usize = 256;
+pub const MAX_MSG_LEN: usize = 512;
 
 // ============================================================================
 // Tags y payloads de mensajes de control (origen único para parse y envío)

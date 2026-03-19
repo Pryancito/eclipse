@@ -141,6 +141,8 @@ mod tests {
             stored_rect: (0, 0, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         space.map_window(win);
         assert_eq!(space.window_count, 1);
@@ -151,8 +153,8 @@ mod tests {
     #[test]
     fn test_space_raise_window() {
         let mut space = Space::new();
-        let win1 = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
-        let win2 = ShellWindow { x: 2, y: 2, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
+        let win1 = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false };
+        let win2 = ShellWindow { x: 2, y: 2, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false };
         space.map_window(win1);
         space.map_window(win2);
         assert_eq!(space.windows[0].x, 1);
@@ -170,6 +172,8 @@ mod tests {
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         space.map_window(win);
         assert_eq!(space.window_under_cursor(50, 50), Some(0));
@@ -186,6 +190,8 @@ mod tests {
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         space.map_window(win);
         assert_eq!(space.window_under_cursor(50, 50), None);
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn test_raise_window_last_is_noop() {
         let mut space = Space::new();
-        let win = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
+        let win = ShellWindow { x: 1, y: 1, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 0.0, curr_h: 0.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,0,0), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false };
         space.map_window(win);
         space.raise_window(0);
         assert_eq!(space.windows[0].x, 1);
@@ -205,7 +211,7 @@ mod tests {
         let mut space = Space::new();
         let mut surfaces: [ExternalSurface; MAX_EXTERNAL_SURFACES] =
             core::array::from_fn(|_| ExternalSurface::default());
-        space.map_window(ShellWindow { x: 0, y: 0, w: 100, h: 100, curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,100,100), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() });
+        space.map_window(ShellWindow { x: 0, y: 0, w: 100, h: 100, curr_x: 0.0, curr_y: 0.0, curr_w: 100.0, curr_h: 100.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,100,100), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false });
         space.unmap_window(5, &mut surfaces);
         assert_eq!(space.window_count, 1);
     }
@@ -213,7 +219,7 @@ mod tests {
     #[test]
     fn test_map_window_at_capacity() {
         let mut space = Space::new();
-        let win = ShellWindow { x: 0, y: 0, w: 1, h: 1, curr_x: 0.0, curr_y: 0.0, curr_w: 1.0, curr_h: 1.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,1,1), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
+        let win = ShellWindow { x: 0, y: 0, w: 1, h: 1, curr_x: 0.0, curr_y: 0.0, curr_w: 1.0, curr_h: 1.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,1,1), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false };
         for _ in 0..MAX_WINDOWS_COUNT {
             space.map_window(win.clone());
         }
@@ -235,6 +241,8 @@ mod tests {
             stored_rect: (0, 0, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         for _ in 0..CYCLES {
             space.map_window(win.clone());
@@ -245,7 +253,7 @@ mod tests {
     #[test]
     fn test_stress_raise_rotation() {
         let mut space = Space::new();
-        let win = ShellWindow { x: 0, y: 0, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 10.0, curr_h: 10.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,10,10), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new() };
+        let win = ShellWindow { x: 0, y: 0, w: 10, h: 10, curr_x: 0.0, curr_y: 0.0, curr_w: 10.0, curr_h: 10.0, minimized: false, maximized: false, closing: false, stored_rect: (0,0,10,10), workspace: 0, content: WindowContent::InternalDemo, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false };
         for _ in 0..4 { space.map_window(win.clone()); }
         for _ in 0..10_000 {
             space.raise_window(0);

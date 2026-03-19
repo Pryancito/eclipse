@@ -24,7 +24,7 @@ fn main() {
         println!("[PARENT] Child PID is: {}", pid);
         
         // Wait a bit for child to finish
-        unsafe { std::libc::sleep_ms(100); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
         
         println!("[PARENT] Test complete!");
         unsafe { std::libc::exit(0); }

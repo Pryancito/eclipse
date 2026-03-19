@@ -26,6 +26,12 @@ pub struct SystemStats {
     pub idle_ticks: u64,
     pub total_mem_frames: u64,
     pub used_mem_frames: u64,
+    // AI-CORE Vitals
+    pub cpu_temp: [u32; 16],
+    pub gpu_load: [u32; 4],
+    pub gpu_temp: [u32; 4],
+    pub anomaly_count: u32,
+    pub heap_fragmentation: u32,
 }
 
 #[repr(C)]

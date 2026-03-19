@@ -14,7 +14,7 @@ fn main() {
     // Yield CPU some times
     for i in 0..5 {
         println!("Loop iteration: {}", i);
-        unsafe { std::libc::sleep_ms(1); }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     
     println!("Goodbye from userspace!");

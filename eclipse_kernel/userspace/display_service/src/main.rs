@@ -770,7 +770,7 @@ fn wait_for_vsync() {
     // Sleep for ~16 ms to target 60 Hz refresh rate.
     // On real hardware this frees the CPU for other processes instead of
     // burning cycles with 10 consecutive yield_cpu() calls.
-    unsafe { std::libc::sleep_ms(16); }
+    std::thread::sleep(std::time::Duration::from_millis(16));
 }
 
 /// 2D Acceleration: Hardware-accelerated block transfer (BitBLT)
@@ -1016,6 +1016,15 @@ fn main() {
             println!("[DISPLAY-SERVICE]   - 2D Acceleration: SOFTWARE ONLY");
         }
         
+        // Stop kernel boot logs exactly when we start drawing the logo
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("rax") SYS_STOP_PROGRESS,
+                options(nostack)
+            );
+        }
+
         // Demonstrate 2D acceleration with test operations
         if fb.supports_hw_accel {
             println!("[DISPLAY-SERVICE] Testing 2D acceleration...");
@@ -1062,14 +1071,6 @@ fn main() {
     
     if let Some(ref fb) = framebuffer {
         println!("[DISPLAY-SERVICE] Final screen clear before starting...");
-        // Stop kernel boot logs exactly when we start drawing the logo
-        unsafe {
-            core::arch::asm!(
-                "int 0x80",
-                in("rax") SYS_STOP_PROGRESS,
-                options(nostack)
-            );
-        }
 
         let _ = clear_screen(fb, 0xFFFFFFFF);
 

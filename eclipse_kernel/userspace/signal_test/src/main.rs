@@ -22,7 +22,7 @@ fn main() {
     // Give some time for the signal to be delivered.
     // Signal delivery happens on return from syscall (e.g. yield_cpu or sleep_ms).
     for _ in 0..10 {
-        unsafe { std::libc::sleep_ms(1); }
+        std::thread::sleep(std::time::Duration::from_millis(1));
         if SIGNAL_RECEIVED.load(Ordering::Acquire) {
             break;
         }

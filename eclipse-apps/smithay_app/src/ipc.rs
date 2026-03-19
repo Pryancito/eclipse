@@ -85,8 +85,8 @@ impl IpcHandler {
                 }
                 Some(EclipseMessage::ServiceInfoResponse { data, len }) => {
                     self.message_count += 1;
-                    let mut heap_data = heapless::Vec::<u8, 256>::new();
-                    let _ = heap_data.extend_from_slice(&data[..len.min(256)]);
+                    let mut heap_data = heapless::Vec::<u8, 512>::new();
+                    let _ = heap_data.extend_from_slice(&data[..len.min(512)]);
                     return Some(CompositorEvent::ServiceInfo(heap_data));
                 }
                 Some(EclipseMessage::Log { line, len }) => {

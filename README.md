@@ -10,13 +10,13 @@ Eclipse OS es un sistema operativo moderno escrito en Rust, diseñado para ser e
 
 ### 🚀 Microkernel Moderno
 - **Arquitectura x86_64**: Soporte completo para procesadores de 64 bits
+- **Higher Half Kernel**: Ejecución en el espacio superior de la memoria virtual (`0xFFFF800000000000`)
 - **Arquitectura Microkernel**: Servicios del sistema ejecutándose en espacio de usuario
 - **Sistema de Mensajes**: Comunicación IPC eficiente entre servidores
-- **Multiboot2**: Compatible con bootloaders estándar
-- **UEFI**: Soporte nativo para firmware UEFI moderno
-- **Gestión de memoria**: Sistema de memoria avanzado con paginación
-- **Interrupciones**: Manejo completo de interrupciones del sistema
-- **Drivers de Hardware**: XHCI (USB 3.0+), NVIDIA GPU, VGA
+- **UEFI**: Soporte nativo para firmware UEFI moderno con relocación dinámica
+- **Gestión de memoria**: Paginación avanzada, estimación de working set y protección de memoria
+- **Interrupciones**: Manejo completo de interrupciones, incluyendo soporte inicial para MSI (Message Signaled Interrupts)
+- **Drivers de Hardware**: XHCI (USB 3.0+), NVIDIA GPU (Detección y CUDA), NVMe, AHCI, Intel HDA
 - **Servidores del Sistema**: FileSystem, Graphics, Network, Input, Audio, AI, Security
 
 ### 🖥️ Sistema de Display Avanzado
@@ -214,13 +214,34 @@ primary_device = "/dev/dri/card0"  # Dispositivo DRM principal
 multi_gpu = true            # Habilitar soporte multi-GPU
 compositor = true           # Habilitar compositor de ventanas
 
+## 🧠 AI-CORE: Inteligencia Artificial Nativa del Kernel
+
+Eclipse OS integra un motor de inferencia y optimización nativo directamente en el kernel para maximizar el rendimiento y la eficiencia del sistema.
+
+### Capacidades del AI-CORE
+- 🚀 **Scheduler Inteligente**: Predicción de ráfagas de CPU mediante EWMA para una planificación de procesos más fluida.
+- 🌡️ **Gestión Térmica Proactiva**: Modelo térmico en tiempo real y DVFS (Dynamic Voltage and Frequency Scaling) basado en IA para prevenir picos de calor.
+- 🔋 **Optimización de Energía**: Ajuste dinámico de estados de energía por núcleo según la carga predicha.
+- 🛡️ **Seguridad Predictiva**: Detección de anomalías en syscalls para mitigar ataques de DoS o comportamientos erráticos.
+- 🎮 **Orquestación Multi-GPU**: Asignación inteligente de tareas de renderizado basada en la carga y temperatura de las GPUs disponibles.
+- 💾 **Memoria Adaptativa**: Predicción de amenazas de OOM (Out Of Memory) y sugerencias de compactación del heap basadas en fragmentación.
+- 📂 **Pre-fetching Inteligente**: Detección de patrones de acceso a disco (secuencial, stride) para pre-cargar bloques en el cache.
+
+### Métricas del Sistema (Vitals)
+El kernel expone métricas avanzadas procesadas por la IA:
+- Carga y temperatura por núcleo en tiempo real.
+- Estado de salud y rendimiento de múltiples GPUs.
+- Tasa de fragmentación del kernel heap y presión de memoria.
+- Detección de procesos invasivos o anómalos.
+
 ## ⌨️ USB & Input Devices (XHCI)
 
 Eclipse OS incluye un stack USB moderno centrado en XHCI para un rendimiento óptimo en hardware actual.
 
 ### Características del Stack USB
 - ✅ **XHCI Core**: Implementación completa de registros Capability, Operational y Runtime.
-- ✅ **Rings Natas**: Gestión de Command, Event y Transfer Rings con alineación de 64 bits.
+- ✅ **Rings Nativos**: Gestión de Command, Event y Transfer Rings con alineación de 64 bits.
+- ✅ **Estabilidad en Hardware Real**: Handoff de BIOS/OS, soporte de MSI y mapeo robusto de MMIO/BARs.
 - ✅ **Enumeración Automática**: Detección de dispositivos, reset de puertos y asignación de direcciones.
 - ✅ **Control Transfers**: Intercambio de descriptores USB (Device, Configuration, Interface).
 - ✅ **Soporte HID**: Infraestructura para teclados y ratones USB.
@@ -230,7 +251,6 @@ El sistema de entrada (`input_service`) unifica múltiples fuentes:
 - **USB HID**: Soporte nativo para periféricos USB modernos.
 - **PS/2**: Fallback para hardware legacy.
 - **VirtIO-Input**: Optimizado para entornos virtualizados (QEMU).
-```
 
 ## 🎮 Soporte para GPUs NVIDIA
 
@@ -295,23 +315,17 @@ Para más información sobre el soporte NVIDIA, consulta [docs/NVIDIA_SUPPORT.md
 
 ```
 eclipse-os/
-├── eclipse_kernel/          # Kernel principal
-│   ├── src/
-│   │   ├── main.rs         # Punto de entrada del kernel
-│   │   ├── vga_centered_display.rs  # Sistema VGA
-│   │   ├── boot_messages.rs        # Mensajes de arranque
-│   │   └── ...             # Otros módulos del kernel
-│   └── Cargo.toml
-├── userland/                # Sistema userland
-│   ├── src/
-│   │   ├── drm_display.rs  # Sistema DRM
-│   │   ├── framebuffer_display.rs  # Sistema framebuffer
-│   │   └── ...             # Otros módulos userland
-│   ├── drm_display/        # Módulo DRM independiente
-│   └── Cargo.toml
-├── bootloader-uefi/         # Bootloader UEFI personalizado
-├── installer/               # Instalador del sistema
-├── eclipse-apps/            # Aplicaciones del sistema
+├── eclipse_kernel/          # Kernel principal (Microkernel)
+│   ├── src/                 # Código fuente del kernel (Memory, AI, PCI, etc.)
+│   ├── userspace/           # Servicios del Microkernel (Init, Display, Filesystem, Audio)
+│   └── linker.ld            # Script de enlace para Higher Half
+├── userland/                # Entorno de usuario avanzado
+│   ├── app_framework/       # Framework para aplicaciones nativas
+│   ├── cosmic/              # Entorno de escritorio COSMIC (port)
+│   └── wayland_compositor/  # Compositor Wayland nativo
+├── bootloader-uefi/         # Bootloader UEFI personalizado para Higher Half
+├── installer/               # Instalador del sistema para hardware real
+├── eclipse-apps/            # Aplicaciones del sistema (Shell, Terminal, Editor)
 ├── build.sh                 # Script de construcción principal
 └── README.md               # Este archivo
 ```
@@ -409,15 +423,14 @@ Eclipse OS está licenciado bajo la Licencia MIT. Ver `LICENSE` para más detall
 
 ## Estado del Proyecto
 
-- **Versión**: 0.2.0
-- **Estado**: En desarrollo activo
-- **Kernel**: Funcional con VGA, UEFI y XHCI
-- **USB**: Stack XHCI funcional con enumeración de dispositivos
-- **Userland**: Sistema DRM implementado
-- **Gráficos**: Sistema de 6 fases con soporte Multi-GPU
-- **Sistema de Ventanas**: En integración (Wayland/wlroots)
-- **Aplicaciones**: En desarrollo
-- **Hardware**: Probado en QEMU (Intel XHCI) y hardware real
+- **Versión**: 0.2.5
+- **Estado**: En desarrollo activo (Alpha)
+- **Kernel**: Estable en Higher Half (x86_64)
+- **IA**: AI-CORE integrado con scheduler reactivo y gestión térmica
+- **USB**: Stack XHCI estable en QEMU y hardware real (MSI enabled)
+- **Gráficos**: Soporte completo NVIDIA (Turing+) y DRM genérico
+- **Sistema de Ventanas**: Integración de Wayland con soporte wlroots
+- **Hardware**: Probado exitosamente en diversas plataformas x86_64 modernas
 
 ## Roadmap
 

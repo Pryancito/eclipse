@@ -58,6 +58,11 @@ fn main() {
         idle_ticks: 0,
         total_mem_frames: 0,
         used_mem_frames: 0,
+        cpu_temp: [0; 16],
+        gpu_load: [0; 4],
+        gpu_temp: [0; 4],
+        anomaly_count: 0,
+        heap_fragmentation: 0,
     };
 
     loop {

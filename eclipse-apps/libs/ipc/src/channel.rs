@@ -47,7 +47,7 @@ impl IpcChannel {
             
             // Mensaje pequeño no reconocido (p. ej. señal desconocida):
             // Fallback a Raw para no perder el mensaje de la cola.
-            let mut raw_data = [0u8; 256];
+            let mut raw_data = [0u8; MAX_MSG_LEN];
             raw_data[..24].copy_from_slice(&data);
             self.message_count += 1;
             return Some(EclipseMessage::Raw { data: raw_data, len, from });

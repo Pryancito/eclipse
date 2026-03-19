@@ -629,7 +629,19 @@ impl FramebufferState {
     }
 }
 
-pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f32, net: f32, uptime_ticks: u64) {
+pub fn draw_dashboard(
+    fb: &mut FramebufferState, 
+    counter: u64, 
+    cpu: f32, 
+    mem: f32, 
+    net: f32, 
+    cpu_temp: u32,
+    gpu_load: u32,
+    gpu_temp: u32,
+    anomalies: u32,
+    frag: u32,
+    uptime_ticks: u64
+) {
     let cpu = if cpu.is_finite() { cpu } else { 0.0 };
     let mem = if mem.is_finite() { mem } else { 0.0 };
     let net = if net.is_finite() { net } else { 0.0 };
@@ -640,44 +652,57 @@ pub fn draw_dashboard(fb: &mut FramebufferState, _counter: u64, cpu: f32, mem: f
         .draw(fb);
     let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
     use sidewind::ui::{Panel, Gauge, Terminal, Widget};
-    let p_w = 600;
-    let p_h = 400;
+    let p_w = 640;
+    let p_h = 420;
     let px = (w - p_w) / 2;
     let py = (h - p_h) / 2;
     let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
     
-    // fb.blur_rect(&Rectangle::new(main_panel.position, main_panel.size), 4);
     let _ = main_panel.draw(fb);
     
-    let g1 = Gauge { center: main_panel.position + Point::new(120, 180), radius: 70, value: cpu, label: "CARGA CPU" };
-    let _ = g1.draw(fb);
-    let g2 = Gauge { center: main_panel.position + Point::new(300, 180), radius: 70, value: mem, label: "MEMORIA RAM" };
-    let _ = g2.draw(fb);
-    let g3 = Gauge { center: main_panel.position + Point::new(480, 180), radius: 70, value: net, label: "RED INT" };
-    let _ = g3.draw(fb);
+    // Gauges principales (CPU, RAM, RED)
+    let _ = Gauge { center: main_panel.position + Point::new(100, 160), radius: 60, value: cpu, label: "CARGA CPU", unit: "%" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(320, 160), radius: 60, value: mem, label: "MEMORIA RAM", unit: "%" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(540, 160), radius: 60, value: net, label: "RED INT", unit: "%" }.draw(fb);
 
-    let mut cpu_line = heapless::String::<32>::new();
-    let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}%", (cpu * 100.0) as u32));
-    let mut mem_line = heapless::String::<32>::new();
-    let _ = core::fmt::write(&mut mem_line, format_args!("MEM: {}%", (mem * 100.0) as u32));
-    let mut net_line = heapless::String::<32>::new();
-    let _ = core::fmt::write(&mut net_line, format_args!("NET: {}%", (net * 100.0) as u32));
-    let mut uptime_line = heapless::String::<32>::new();
+    // Mini Gauges de Temperatura y GPU
+    let cpu_t_f = (cpu_temp as f32 / 1000.0).clamp(0.0, 1.0); // 0-100 C
+    let _ = Gauge { center: main_panel.position + Point::new(100, 270), radius: 35, value: cpu_t_f, label: "TEMP CPU", unit: "C" }.draw(fb);
+    
+    let gpu_l_f = (gpu_load as f32 / 100.0).clamp(0.0, 1.0);
+    let _ = Gauge { center: main_panel.position + Point::new(210, 270), radius: 35, value: gpu_l_f, label: "CARGA GPU", unit: "%" }.draw(fb);
+    
+    let gpu_t_f = (gpu_temp as f32 / 1000.0).clamp(0.0, 1.0);
+    let _ = Gauge { center: main_panel.position + Point::new(320, 270), radius: 35, value: gpu_t_f, label: "TEMP GPU", unit: "C" }.draw(fb);
+
+    let mut cpu_line = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}% @ {:.1}C", (cpu * 100.0) as u32, cpu_temp as f32 / 10.0));
+    let mut gpu_line = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut gpu_line, format_args!("GPU: {}% @ {:.1}C", gpu_load, gpu_temp as f32 / 10.0));
+    
+    let mut anomaly_line = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut anomaly_line, format_args!("AI-CORE SECURITY: {} ANOMALIES", anomalies));
+    let mut heap_line = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut heap_line, format_args!("HEAP FRAG: {}%", frag));
+
+    let mut uptime_line = heapless::String::<64>::new();
     let uptime_secs = uptime_ticks / 1000;
     let _ = core::fmt::write(&mut uptime_line, format_args!("UPTIME: {}h {}m", uptime_secs / 3600, (uptime_secs / 60) % 60));
 
     let term_lines: &[&str] = &[ 
-        "eclipse@os:~$ sysinfo --live", 
+        "eclipse@os:~$ ai-core --vitals", 
         &cpu_line,
-        &mem_line,
-        &net_line,
+        &gpu_line,
+        &anomaly_line,
+        &heap_line,
         &uptime_line,
         "> system status nominal" 
     ];
-    let term = Terminal { position: main_panel.position + Point::new(30, 220), size: Size::new(p_w as u32 - 60, 150), lines: term_lines };
+    let term = Terminal { position: main_panel.position + Point::new(380, 220), size: Size::new(240, 160), lines: term_lines };
     let _ = term.draw(fb);
+    
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
-    let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 100), label_style).draw(fb);
+    let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 80), label_style).draw(fb);
 }
 
 pub fn draw_lock_screen(fb: &mut FramebufferState, counter: u64) {

@@ -62,7 +62,7 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("input", true),
     Service::new("display", false),
     Service::new("audio", false),
-    Service::new("network", false),
+    Service::new("network_service", false),
     // gui_service is a one-shot launcher: it starts smithay_app and then exits.
     // Don't enable heartbeat watchdog for it.
     Service::new("gui", false),
@@ -207,7 +207,7 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
             }
             unsafe { yield_cpu(); }
         }
-        unsafe {sleep_ms(1);}
+        std::thread::sleep(std::time::Duration::from_millis(1));
         attempts += 1;
     }
 
@@ -234,7 +234,7 @@ fn start_service(service: &mut Service) {
             "input" => 3,
             "display" => 4,
             "audio" => 5,
-            "network" => 6,
+            "network_service" => 6,
             "gui" => 7,
             _ => {
                 println!("  [CHILD] ERROR: Unknown service: {}", service.name);
@@ -277,7 +277,17 @@ fn start_service(service: &mut Service) {
         service.state = ServiceState::Running;
         
         // Initialize heartbeat timestamp to current uptime to prevent immediate timeout
-        let mut stats = eclipse_libc::SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+        let mut stats = eclipse_libc::SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+            cpu_temp: [0; 16],
+            gpu_load: [0; 4],
+            gpu_temp: [0; 4],
+            anomaly_count: 0,
+            heap_fragmentation: 0,
+        };
         unsafe { eclipse_libc::get_system_stats(&mut stats); }
         service.last_heartbeat = stats.uptime_ticks;
         
@@ -308,7 +318,17 @@ fn main_loop() -> ! {
             
             // Active Watchdog: Check for heartbeat timeouts every CHECK_INTERVAL
             if counter % HEARTBEAT_CHECK_INTERVAL == 0 {
-                let mut stats = eclipse_libc::SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+                let mut stats = eclipse_libc::SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+            cpu_temp: [0; 16],
+            gpu_load: [0; 4],
+            gpu_temp: [0; 4],
+            anomaly_count: 0,
+            heap_fragmentation: 0,
+        };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
                 let now = stats.uptime_ticks;
                 
@@ -363,7 +383,17 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
         let mut matched = false;
         for service in svc.iter_mut() {
             if service.pid == sender as i32 {
-                let mut stats = eclipse_libc::SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+                let mut stats = eclipse_libc::SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+            cpu_temp: [0; 16],
+            gpu_load: [0; 4],
+            gpu_temp: [0; 4],
+            anomaly_count: 0,
+            heap_fragmentation: 0,
+        };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
                 service.last_heartbeat = stats.uptime_ticks;
                 matched = true;
@@ -422,14 +452,14 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
             let svc = SERVICES.lock();
             svc_count = svc.len();
             reply[4..8].copy_from_slice(&(svc_count as u32).to_le_bytes());
-            // Format: [name: 12 bytes][state: u32][pid: u32][restart_count: u32] = 24 bytes per service
-            // Reduced from 16-byte name to 12 to fit within the 256-byte IPC message limit
+            // Format: [name: 16 bytes][state: u32][pid: u32][restart_count: u32] = 28 bytes per service
+            // 10 services * 28 bytes = 280 bytes, fits within the 512-byte buffer.
             for s in svc.iter() {
-                if offset + 24 > 256 { break; }
+                if offset + 28 > 512 { break; }
                 let name_bytes = s.name.as_bytes();
-                let name_len = name_bytes.len().min(12);
+                let name_len = name_bytes.len().min(16);
                 reply[offset..offset + name_len].copy_from_slice(&name_bytes[..name_len]);
-                offset += 12;
+                offset += 16;
                 reply[offset..offset + 4].copy_from_slice(&(s.state as u32).to_le_bytes());
                 offset += 4;
                 reply[offset..offset + 4].copy_from_slice(&(s.pid as u32).to_le_bytes());
@@ -486,7 +516,17 @@ fn check_services() {
     let mut n_restart = 0;
     {
         let svc = SERVICES.lock();
-        let mut stats = eclipse_libc::SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+        let mut stats = eclipse_libc::SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+            cpu_temp: [0; 16],
+            gpu_load: [0; 4],
+            gpu_temp: [0; 4],
+            anomaly_count: 0,
+            heap_fragmentation: 0,
+        };
         unsafe { eclipse_libc::get_system_stats(&mut stats); }
         let now = stats.uptime_ticks;
 

@@ -413,7 +413,17 @@ fn main() {
     const IDLE_MOUSE_WARN_THRESHOLD: u64 = 200; // ~200 ms a 1 kHz de bucle
     
     loop {
-        let mut stats = SystemStats { uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0 };
+        let mut stats = SystemStats {
+            uptime_ticks: 0,
+            idle_ticks: 0,
+            total_mem_frames: 0,
+            used_mem_frames: 0,
+            cpu_temp: [0; 16],
+            gpu_load: [0; 4],
+            gpu_temp: [0; 4],
+            anomaly_count: 0,
+            heap_fragmentation: 0,
+        };
         let _ = unsafe { get_system_stats(&mut stats) };
 
         

@@ -67,6 +67,11 @@ pub struct SmithayState {
     pub last_metrics_update: std::time::Instant,
     pub cpu_usage: f32,
     pub mem_usage: f32,
+    pub cpu_temp: u32,
+    pub gpu_load: u32,
+    pub gpu_temp: u32,
+    pub anomaly_count: u32,
+    pub heap_fragmentation: u32,
     pub network_pid: Option<u32>,
     pub net_rx: u64,
     pub net_tx: u64,
@@ -150,6 +155,11 @@ impl SmithayState {
             last_metrics_update: std::time::Instant::now(),
             cpu_usage: 0.0,
             mem_usage: 0.0,
+            cpu_temp: 0,
+            gpu_load: 0,
+            gpu_temp: 0,
+            anomaly_count: 0,
+            heap_fragmentation: 0,
             network_pid: None,
             net_rx: 0,
             net_tx: 0,
@@ -246,10 +256,10 @@ impl SmithayState {
                     let mut offset = 8;
                     for i in 0..count {
                         if i >= 32 { break; }
-                        if data.len() >= offset + 24 {
+                        if data.len() >= offset + 28 {
                             let mut svc = ServiceInfo::new();
-                            svc.name[..12].copy_from_slice(&data[offset..offset+12]);
-                            offset += 12;
+                            svc.name[..16].copy_from_slice(&data[offset..offset+16]);
+                            offset += 16;
                             svc.state = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
                             offset += 4;
                             svc.pid = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap_or([0; 4]));
@@ -576,7 +586,15 @@ impl SmithayState {
         if metrics_elapsed.as_millis() as u64 >= metrics_interval {
             self.last_metrics_update = now;
             let mut current = SystemStats {
-                uptime_ticks: 0, idle_ticks: 0, total_mem_frames: 0, used_mem_frames: 0
+                uptime_ticks: 0,
+                idle_ticks: 0,
+                total_mem_frames: 0,
+                used_mem_frames: 0,
+                cpu_temp: [0; 16],
+                gpu_load: [0; 4],
+                gpu_temp: [0; 4],
+                anomaly_count: 0,
+                heap_fragmentation: 0,
             };
             unsafe {
                 if get_system_stats(&mut current) == 0 {
@@ -611,6 +629,13 @@ impl SmithayState {
                     self.prev_net_rx = self.net_rx;
                     self.prev_net_tx = self.net_tx;
                 }
+
+                // AI-CORE Vitals
+                self.cpu_temp = current.cpu_temp[0]; // BSP Temp
+                self.gpu_load = current.gpu_load[0];
+                self.gpu_temp = current.gpu_temp[0];
+                self.anomaly_count = current.anomaly_count;
+                self.heap_fragmentation = current.heap_fragmentation;
             }
 
             // Siempre refrescamos la lista de procesos para poder logear memoria de smithay_app,
@@ -654,6 +679,15 @@ impl SmithayState {
 
                     // Calcular Memoria (KB) - p.mem_frames son páginas de 4KB
                     self.process_mem_kb[i] = p.mem_frames * 4;
+
+                    // [STRESS TEST] Inyectar valores exorbitados para smithay_app o proceso principal
+                    // como solicitó el usuario ("volver a aplicar lo del consumo de memoria").
+                    let self_pid = unsafe { libc::getpid() as u32 };
+                    if p.pid == self_pid {
+                        // Valores exorbitados: 99.7% CPU y 1.4 GB de RAM
+                        self.process_cpu_usage[i] = 99.7;
+                        self.process_mem_kb[i] = 1_450_000; 
+                    }
 
                     // Actualizar histórico de ticks.
                     let mut found = false;
@@ -944,7 +978,19 @@ impl SmithayState {
                     self.space.windows[i].damage.clear();
                 }
             } else if self.input.dashboard_active {
-                render::draw_dashboard(&mut self.backend.fb, self.counter, self.cpu_usage, self.mem_usage, self.net_usage, self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0));
+                render::draw_dashboard(
+                    &mut self.backend.fb, 
+                    self.counter, 
+                    self.cpu_usage, 
+                    self.mem_usage, 
+                    self.net_usage, 
+                    self.cpu_temp,
+                    self.gpu_load,
+                    self.gpu_temp,
+                    self.anomaly_count,
+                    self.heap_fragmentation,
+                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0)
+                );
             } else if self.input.system_central_active {
                 render::draw_system_central(
                     &mut self.backend.fb, 
@@ -1004,6 +1050,8 @@ mod tests {
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         });
         
         state.input.focused_window = Some(0);
@@ -1037,6 +1085,8 @@ mod tests {
             stored_rect: (100, 100, 400, 300),
             workspace: 0, content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         });
         
         state.input.focused_window = Some(0);
@@ -1057,6 +1107,8 @@ mod tests {
             stored_rect: (50, 50, 200, 150), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         });
         state.input.focused_window = Some(0);
         state.input.request_close_window = true;

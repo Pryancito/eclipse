@@ -16,10 +16,10 @@ use crate::compositor::{
 pub enum CompositorEvent {
     Input(InputEvent),
     SideWind(SideWindMessage, u32), // message, sender_pid
-    Wayland(heapless::Vec<u8, 256>, u32), // data, sender_pid
-    X11(heapless::Vec<u8, 256>, u32), // data, sender_pid
+    Wayland(heapless::Vec<u8, 512>, u32), // data, sender_pid
+    X11(heapless::Vec<u8, 512>, u32), // data, sender_pid
     NetStats(u64, u64), // rx, tx
-    ServiceInfo(heapless::Vec<u8, 256>),
+    ServiceInfo(heapless::Vec<u8, 512>),
     /// Línea de log del kernel para el HUD (cuando el logo ya está dibujado).
     KernelLog(heapless::Vec<u8, 252>),
 }

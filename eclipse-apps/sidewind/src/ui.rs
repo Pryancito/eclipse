@@ -1455,6 +1455,7 @@ pub struct Gauge {
     pub radius: u32,
     pub value: f32, // 0.0 to 1.0
     pub label: &'static str,
+    pub unit: &'static str, // e.g. "%", "C", " MB"
 }
 
 impl Widget for Gauge {
@@ -1483,7 +1484,7 @@ impl Widget for Gauge {
         let mut lbl = String::<16>::new();
         let val_pct = (self.value * 100.0) as u32;
         use core::fmt::Write;
-        let _ = write!(&mut lbl, "{}%", val_pct);
+        let _ = write!(&mut lbl, "{}{}", val_pct, self.unit);
         let _ = Text::new(lbl.as_str(), self.center + Point::new(-10, 5), label_style).draw(target)?;
 
         Ok(())

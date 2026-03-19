@@ -206,6 +206,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         assert!(win.contains(50, 50));
         assert!(!win.contains(9, 50));
@@ -220,6 +222,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             stored_rect: (10, 10, 100, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         assert!(win.title_bar_contains(50, 20));
         assert!(!win.title_bar_contains(50, 50));
@@ -234,6 +238,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             stored_rect: (100, 100, 200, 100), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         assert_eq!(win.check_button_click(285, 110), WindowButton::Close);
         assert_eq!(win.check_button_click(264, 110), WindowButton::Maximize);
@@ -249,6 +255,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
             stored_rect: (10, 20, 100, 50), workspace: 0,
             content: WindowContent::InternalDemo,
             damage: alloc::vec::Vec::new(),
+            buffer_handle: None,
+            is_dmabuf: false,
         };
         assert!(win.contains(10, 20));
         assert!(win.contains(109, 69));
@@ -258,8 +266,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
     #[test]
     fn test_focus_under_cursor_empty() {
         let windows: [ShellWindow; 2] = [
-            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), ..Default::default() },
-            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
+            ShellWindow { content: WindowContent::None, damage: alloc::vec::Vec::new(), buffer_handle: None, is_dmabuf: false, ..Default::default() },
         ];
         assert_eq!(focus_under_cursor(50, 50, &windows, 0), None);
     }
@@ -274,6 +282,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (0, 0, 200, 200), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
             ShellWindow {
                 x: 50, y: 50, w: 100, h: 100,
@@ -282,6 +292,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (50, 50, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
         ];
         assert_eq!(focus_under_cursor(75, 75, &windows, 2), Some(1));
@@ -303,6 +315,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
             ShellWindow {
                 x: 200, y: 0, w: 100, h: 100,
@@ -311,6 +325,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 2), Some(1));
@@ -326,6 +342,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
             ShellWindow {
                 x: 200, y: 0, w: 100, h: 100,
@@ -334,6 +352,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (200, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 2), None);
@@ -349,6 +369,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
         ];
         assert_eq!(next_visible(0, true, &windows, 1), Some(0));
@@ -364,6 +386,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (0, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
             ShellWindow {
                 x: 100, y: 0, w: 100, h: 100,
@@ -372,6 +396,8 @@ pub fn next_visible(from: usize, forward: bool, windows: &[ShellWindow], count: 
                 stored_rect: (100, 0, 100, 100), workspace: 0,
                 content: WindowContent::InternalDemo,
                 damage: alloc::vec::Vec::new(),
+                buffer_handle: None,
+                is_dmabuf: false,
             },
         ];
         const ITERS: u32 = 50_000;

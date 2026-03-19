@@ -352,7 +352,7 @@ fn main() {
         // Do NOT signal READY — the rest of the system must not start without a filesystem.
         println!("[FS-SERVICE] Halting — filesystem not mounted.");
         loop {
-            unsafe { std::libc::sleep_ms(100); }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -362,7 +362,7 @@ fn main() {
         let _ = std::libc::send_ipc(ppid as u32, 255, b"READY");
     }
     loop {
-        unsafe { std::libc::sleep_ms(100); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
