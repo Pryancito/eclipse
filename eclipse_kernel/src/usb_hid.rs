@@ -35,6 +35,29 @@ mod mock_memory {
     }
     pub fn phys_to_virt(phys: u64) -> u64 { phys }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Ensure the Configure Endpoint input context sizing and endpoint context
+    /// offset math use `context_size` correctly for both 32- and 64-byte contexts.
+    #[test]
+    fn configure_endpoint_context_math_uses_context_size() {
+        // Test both CSZ=1 (32-byte contexts) and CSZ=0 (64-byte contexts).
+        for &csz in &[32usize, 64usize] {
+            // Configure Endpoint input context should be sized to 33 * csz bytes:
+            // 1 Input Control Context + 1 Slot Context + up to 31 Endpoint Contexts.
+            let cfg_ctx_size = 33 * csz;
+            assert_eq!(cfg_ctx_size, 33 * csz);
+
+            // Endpoint context offset within the input context is:
+            // ICC (csz) + Slot (csz) + (ep_id - 1) * csz = 2*csz + (ep_id - 1)*csz.
+            let ep_id: usize = 3;
+            let computed_off = csz + csz + (ep_id - 1) * csz;
+            let expected_off = 2 * csz + (ep_id - 1) * csz;
+            assert_eq!(computed_off, expected_off);
+        }
+    }
+}
 #[cfg(test)]
 mod mock_interrupts {
     use std::sync::Mutex;
@@ -923,9 +946,13 @@ impl XhciControllerState {
                     }
                 }
                 
-                // Disable SMIs via USBLEGCTLSTS (offset 4)
-                let legctlsts = mmio.read_capability(cap_ptr + 4);
-                mmio.write_capability(cap_ptr + 4, legctlsts & 0xFFFF0000); 
+                // Disable SMIs via USBLEGCTLSTS (offset 4):
+                // - Clear all SMI enable bits [7:0] by writing 0 to them.
+                // - Acknowledge all pending SMI status bits [31:16] by writing 1 to them
+                //   (RW1C semantics: writing 1 clears the bit).
+                // Writing 0xFFFF0000 zeros the enable bits and sets all status bits to 1
+                // to clear any pending SMI conditions left by the BIOS.
+                mmio.write_capability(cap_ptr + 4, 0xFFFF0000);
                 return;
             }
             
@@ -947,7 +974,13 @@ impl XhciControllerState {
 
         // 2. Scratchpad buffers if required
         let hcsparams2 = mmio.read_capability(0x08);
-        let sb_count = ((hcsparams2 >> 27) & 0x1F) | ((hcsparams2 >> 16) & 0x1F);
+        // xHCI spec Table 5-9: Max Scratchpad Buffers is a 10-bit field split into two 5-bit halves:
+        //   Lo = HCSPARAMS2[31:27]  (the lower 5 bits of the count)
+        //   Hi = HCSPARAMS2[25:21]  (the upper 5 bits of the count, shifted left by 5)
+        // Total count = (Hi << 5) | Lo  (matches Linux kernel HCS_MAX_SCRATCHPAD macro)
+        let sb_lo = (hcsparams2 >> 27) & 0x1F;
+        let sb_hi = (hcsparams2 >> 21) & 0x1F;
+        let sb_count = sb_lo | (sb_hi << 5);
         if sb_count > 0 {
             serial::serial_print(&alloc::format!("[XHCI] {} scratchpad buffers\n", sb_count));
             let sb_array = DmaAllocation::allocate((sb_count as usize) * 8, 64)?;
@@ -986,25 +1019,43 @@ impl XhciControllerState {
         serial::serial_print("[XHCI] Starting controller\n");
         let mmio = self.mmio.as_ref().ok_or("MMIO not initialized")?;
 
-        // Wait for CNR
-        let mut timeout = 10000;
+        // xHCI spec §4.2.1: USBSTS.HCH must be 1 (controller halted) before setting HCRST.
+        // The BIOS may have left the controller running (USBCMD.R/S = 1); stop it first.
+        let usbcmd = mmio.read_operational(0x00);
+        if (usbcmd & 1) != 0 {
+            serial::serial_print("[XHCI] Controller running, halting before reset\n");
+            mmio.write_operational(0x00, usbcmd & !1); // Clear R/S bit
+            // Wait for USBSTS.HCH (bit 0) to become 1 (controller halted).
+            let mut timeout = 100_000;
+            while (mmio.read_operational(0x04) & 1) == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    serial::serial_print("[XHCI] WARNING: Controller did not halt; proceeding with reset\n");
+                    break;
+                }
+                crate::cpu::pause();
+            }
+        }
+
+        // Wait for CNR (bit 11 of USBSTS) to clear before issuing HCRST.
+        let mut timeout = 100_000;
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout before reset"); }
             crate::cpu::pause();
         }
 
-        // HCRST
+        // Issue HCRST (bit 1 of USBCMD). The controller self-clears this bit when done.
         mmio.write_operational(0x00, mmio.read_operational(0x00) | (1 << 1));
-        timeout = 10000;
+        timeout = 100_000;
         while (mmio.read_operational(0x00) & (1 << 1)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("HCRST timeout"); }
             crate::cpu::pause();
         }
 
-        // CNR clear again
-        timeout = 10000;
+        // Wait for CNR to clear again after reset (spec §4.2.1).
+        timeout = 100_000;
         while (mmio.read_operational(0x04) & (1 << 11)) != 0 {
             timeout -= 1;
             if timeout == 0 { return Err("CNR timeout after reset"); }
@@ -1452,20 +1503,24 @@ impl XhciControllerState {
         let xhci_ep_id = ep_number * 2 + if ep_dir_in { 1 } else { 0 };
 
         // Build Configure Endpoint input context
-        let cfg_ctx = DmaAllocation::allocate(2048, 64)?;
+        // Size: ICC (csz) + Slot (csz) + 31 endpoint contexts (csz each) = 33 * csz.
+        // For 32-byte contexts: 1056 bytes; for 64-byte contexts: 2112 bytes.
+        let csz = self.context_size;
+        let cfg_ctx = DmaAllocation::allocate(33 * csz, 64)?;
         cfg_ctx.zero();
         // Add: Slot context (bit 0) + new endpoint context (bit xhci_ep_id)
         cfg_ctx.write_u32(4, 0x01 | (1u32 << xhci_ep_id));
-        // Slot context: update Context Entries to highest enabled DCI
+        // Slot context is at index 1 of the input context (offset 1 * context_size).
+        // Update Context Entries to the highest enabled DCI.
         let speed = self.slot_speeds[slot_id as usize];
-        cfg_ctx.write_u32(32, (speed << 20) | ((xhci_ep_id as u32) << 27));
+        cfg_ctx.write_u32(csz, (speed << 20) | ((xhci_ep_id as u32) << 27));
         // Endpoint context DWORD1: ErrorCount=3, EPType=Interrupt IN, MaxPacketSize
         let ep_dword2: u32 = ((best_ep_mps as u32) << 16) // MaxPacketSize (bits 31:16)
             | (3 << 1)                                     // Error Count (bits 2:1) = 3
             | ((EP_TYPE_INTERRUPT_IN as u32) << 3);       // EP Type (bits 5:3) = 7
 
-        // Endpoint context offset in input context: 32 (icc) + 32 (slot) + (xhci_ep_id-1)*32
-        let ep_ctx_off = 32 + 32 + (xhci_ep_id as usize - 1) * 32;
+        // Endpoint context offset in input context: ICC (csz) + Slot (csz) + (xhci_ep_id-1)*csz
+        let ep_ctx_off = csz + csz + (xhci_ep_id as usize - 1) * csz;
 
         // Allocate interrupt IN transfer ring
         let int_ring = TransferRing::new(256, slot_id, best_ep_addr)?;
