@@ -83,6 +83,10 @@ static STATS_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static STATS_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static STATS_IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Per-CPU tick counts for detailed load analysis
+static CPU_TOTAL_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static CPU_IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// Cuántas veces se dio CPU a cada PID en la última ventana (se lee y resetea en el heartbeat).
 const MAX_PIDS: usize = 256;
 static RUN_COUNTS: [AtomicU32; MAX_PIDS] = [const { AtomicU32::new(0) }; MAX_PIDS];
@@ -221,6 +225,16 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
         None
     })
 }
+pub fn has_runnable_threads_local() -> bool {
+    // Check ONLY the current CPU's ready queue.
+    // This allows other idle cores to stay in HLT/MWAIT even if one core is busy.
+    let cpu_id = crate::process::get_cpu_id();
+    if cpu_id >= MAX_CPUS { return false; }
+    
+    let queue = READY_QUEUES[cpu_id].lock();
+    queue.head != queue.tail
+}
+
 
 pub fn ready_queue_tail_addr() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -246,10 +260,12 @@ pub fn local_tick() {
 
     // Actualizar estadísticas de este CPU (atómico - sin lock global de stats)
     STATS_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
+    CPU_TOTAL_TICKS[cpu_id].fetch_add(1, Ordering::Relaxed);
     
     let current_pid = crate::process::current_process_id();
     if current_pid == Some(0) {
         STATS_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+        CPU_IDLE_TICKS[cpu_id].fetch_add(1, Ordering::Relaxed);
     // Note: p.cpu_ticks is now updated in schedule() to avoid global lock contention here.
     }
 
@@ -717,6 +733,15 @@ pub fn get_stats() -> SchedulerStats {
         total_ticks: STATS_TOTAL_TICKS.load(Ordering::Relaxed),
         idle_ticks: STATS_IDLE_TICKS.load(Ordering::Relaxed),
     }
+}
+
+/// Returns (total_ticks, idle_ticks) for a specific CPU
+pub fn get_cpu_ticks(cpu_id: usize) -> (u64, u64) {
+    if cpu_id >= MAX_CPUS { return (0, 0); }
+    (
+        CPU_TOTAL_TICKS[cpu_id].load(Ordering::Relaxed),
+        CPU_IDLE_TICKS[cpu_id].load(Ordering::Relaxed),
+    )
 }
 
 /// Inicializar scheduler

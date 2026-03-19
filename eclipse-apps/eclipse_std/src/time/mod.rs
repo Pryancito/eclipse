@@ -72,7 +72,16 @@ impl Instant {
     }
     
     pub fn elapsed(&self) -> Duration {
-        let now = Instant::now();
-        Duration::from_millis(now.ticks.saturating_sub(self.ticks))
+        Duration::from_millis(Instant::now().ticks.saturating_sub(self.ticks))
+    }
+}
+
+impl core::ops::Sub<Duration> for Instant {
+    type Output = Instant;
+
+    fn sub(self, rhs: Duration) -> Instant {
+        Instant {
+            ticks: self.ticks.saturating_sub(rhs.as_millis())
+        }
     }
 }

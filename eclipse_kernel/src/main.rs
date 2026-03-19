@@ -393,21 +393,23 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     //progress::stop_logging();
 
     loop {
-        // Heartbeat IPC (solo un núcleo lo imprimirá cada 5s)
+        // 1. Prioridad: ¿Hay tareas listas en este núcleo? 
+        crate::scheduler::schedule();
+
+        // 2. Heartbeat IPC (solo un núcleo lo imprimirá, por defecto cada 60s)
         ipc::p2p_heartbeat();
 
-        // Procesar mensajes IPC pendientes. El timer APIC también los procesa cada 1ms,
-        // pero procesarlos aquí reduce la latencia cuando llegan entre ticks del timer.
-        if crate::ipc::has_pending_messages() {
-            ipc::process_messages();
+        // 3. Verificación de última hora antes de dormir (Sección Crítica)
+        // Deshabilitamos interrupciones para evitar que llegue un mensaje justo
+        // entre el check y el HLT/MWAIT (evita el "Lost Wakeup").
+        x86_64::instructions::interrupts::disable();
+        
+        if !crate::ipc::has_pending_messages() && !crate::scheduler::has_runnable_threads_local() {
+            // cpu::idle() habilita interrupciones y duerme el núcleo eficientemente.
+            crate::cpu::idle();
+        } else {
+            // Si llegó algo, no dormimos, volvemos a intentar el loop.
+            x86_64::instructions::interrupts::enable();
         }
-
-        // Siempre dormir hasta la siguiente interrupción, incluso si había mensajes
-        // pendientes. Esto evita que el núcleo consuma el 100% de la CPU en un
-        // bucle activo cuando llegan mensajes IPC de forma continua.
-        crate::cpu::idle();
-
-        // Intentar planificar otros procesos (p.ej. tras recibir un mensaje o una interrupción)
-        crate::scheduler::schedule();
     }
 }

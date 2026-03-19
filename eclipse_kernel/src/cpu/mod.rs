@@ -268,6 +268,8 @@ pub fn start_aps() {
                 if rdtsc().wrapping_sub(tsc_start) >= tsc_ceiling {
                     break;
                 }
+                // This line is not part of cpu/mod.rs and seems to be from another file (nvidia.rs)
+                // crate::ai_core::update_gpu_metrics(i, load, 0, (temp as u32) * 10);
                 crate::cpu::pause();
             }
             
@@ -301,6 +303,33 @@ fn delay_us(us: u64) {
     while rdtsc() - start < wait_cycles {
         crate::cpu::pause();
     }
+}
+
+/// Read from a Model Specific Register (MSR)
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") msr,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Write to a Model Specific Register (MSR)
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") low,
+        in("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
 }
 
 fn delay_ms(ms: u64) {
@@ -349,6 +378,24 @@ pub fn is_running_under_hypervisor() -> bool {
     // Usa CPUID leaf 1, ECX[31] = Hypervisor Present.
     let result = unsafe { core::arch::x86_64::__cpuid(1) };
     (result.ecx & (1 << 31)) != 0
+}
+
+/// Detectar si la CPU es Intel y soporta MSRs térmicos (DTS)
+pub fn has_thermal_msrs() -> bool {
+    // 1. ¿Es Intel? (CPUID leaf 0)
+    let leaf0 = unsafe { core::arch::x86_64::__cpuid(0) };
+    // Check for "Genu" "ineI" "ntel" in EBX, EDX, ECX
+    if leaf0.ebx != 0x756e6547 || leaf0.edx != 0x49656e69 || leaf0.ecx != 0x6c65746e {
+        return false;
+    }
+
+    // 2. ¿Soporta DTS? (CPUID leaf 6, EAX[0])
+    // Primero verificar que el leaf 6 sea válido (EAX >= 6 en leaf 0)
+    if leaf0.eax < 6 {
+        return false;
+    }
+    let leaf6 = unsafe { core::arch::x86_64::__cpuid(6) };
+    (leaf6.eax & 0x1) != 0
 }
 
 static MONITOR_MWAIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -508,7 +555,17 @@ extern "C" fn ap_main_loop() -> ! {
     unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
 
     loop {
-        crate::cpu::idle();
+        // 1. Intentar planificar procesos en este núcleo.
         crate::scheduler::schedule();
+
+        // 2. Verificación antes de dormir.
+        x86_64::instructions::interrupts::disable();
+        
+        if !crate::scheduler::has_runnable_threads_local() {
+            // cpu::idle() habilita interrupciones y duerme el núcleo.
+            crate::cpu::idle();
+        } else {
+            x86_64::instructions::interrupts::enable();
+        }
     }
 }

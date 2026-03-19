@@ -141,6 +141,7 @@ pub struct InputState {
     pub request_toggle_tiling: bool,
     pub alt_tab_active: bool,
     pub system_central_active: bool,
+    pub request_system_central: bool,
     pub system_central_curr_y: f32,
     pub search_active: bool,
     pub search_curr_y: f32,
@@ -166,7 +167,7 @@ impl InputState {
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
             tiling_active: false, request_toggle_tiling: false,
             alt_tab_active: false,
-            system_central_active: false, system_central_curr_y: 0.0,
+            system_central_active: false, request_system_central: false, system_central_curr_y: 0.0,
             search_active: false, search_curr_y: -(height as f32 / 2.0),
             search_query: heapless::String::new(),
         }
@@ -254,7 +255,7 @@ impl InputState {
                     },
                     KeyAction::SwitchWorkspace(w) => if pressed && (self.modifiers & 8 != 0) { self.current_workspace = w; },
                     KeyAction::CycleWindowVisual => if pressed && (self.modifiers & 4 != 0) { self.alt_tab_active = true; self.request_cycle_forward = true; },
-                    KeyAction::ToggleSystemCentral => if pressed && (self.modifiers & 8 != 0) { self.system_central_active = !self.system_central_active; },
+                    KeyAction::ToggleSystemCentral => if pressed && (self.modifiers & 8 != 0) { self.request_system_central = true; },
                     KeyAction::ToggleTiling => if pressed && (self.modifiers & 8 != 0) { self.request_toggle_tiling = true; },
                     KeyAction::ArrowUp | KeyAction::ArrowDown => {},
                     KeyAction::Input(_) => {},
@@ -351,8 +352,7 @@ impl InputState {
                         match slot_idx {
                             0 => self.request_dashboard = true,
                             1 => {
-                                self.system_central_active = !self.system_central_active;
-                                if self.system_central_active { self.dashboard_active = false; }
+                                self.request_system_central = true;
                             },
                             2 => {
                                 self.launcher_active = !self.launcher_active;

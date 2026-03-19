@@ -581,7 +581,7 @@ impl SmithayState {
         let now = std::time::Instant::now();
         let metrics_elapsed = self.last_metrics_update.elapsed();
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
-        let metrics_interval = if need_metrics { 1500u64 } else { 4000u64 };
+        let metrics_interval = if need_metrics { 800u64 } else { 4000u64 };
 
         if metrics_elapsed.as_millis() as u64 >= metrics_interval {
             self.last_metrics_update = now;
@@ -917,6 +917,20 @@ impl SmithayState {
             self.input.dashboard_active = !self.input.dashboard_active;
             self.input.request_dashboard = false;
             if self.input.dashboard_active {
+                self.input.system_central_active = false;
+                // Force immediate metrics update
+                self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
+            }
+            self.dirty = true;
+        }
+
+        if self.input.request_system_central {
+            self.input.system_central_active = !self.input.system_central_active;
+            self.input.request_system_central = false;
+            if self.input.system_central_active {
+                self.input.dashboard_active = false;
+                // Force immediate metrics update
+                self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
             }
             self.dirty = true;
         }

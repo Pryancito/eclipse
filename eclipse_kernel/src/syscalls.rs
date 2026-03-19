@@ -378,6 +378,7 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
 
     let sched_stats = crate::scheduler::get_stats();
     let (total_mem, used_mem) = crate::memory::get_memory_stats();
+    crate::nvidia::update_all_gpu_vitals();
     let vitals = crate::ai_core::get_vitals();
 
     let stats = SystemStats {

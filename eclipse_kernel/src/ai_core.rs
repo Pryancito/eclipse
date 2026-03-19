@@ -248,36 +248,93 @@ pub static CPU_LOAD: Mutex<[u32; 16]> = Mutex::new([0; 16]);
 /// Temperatura estimada por CPU (Celsius * 10)
 pub static CPU_TEMP: Mutex<[u32; 16]> = Mutex::new([400; 16]); // Inicia a 40°C
 
+/// Historial de ticks para calcular carga delta
+static LAST_CPU_TICKS: Mutex<[(u64, u64); 16]> = Mutex::new([(0, 0); 16]);
+
+/// Actualiza la carga de CPU basada en ticks reales del scheduler
+pub fn update_cpu_load_metrics() {
+    let mut load = CPU_LOAD.lock();
+    let mut last = LAST_CPU_TICKS.lock();
+    
+    for i in 0..16 {
+        let (total, idle) = crate::scheduler::get_cpu_ticks(i);
+        let (prev_total, prev_idle) = last[i];
+        
+        let delta_total = total.saturating_sub(prev_total);
+        let delta_idle = idle.saturating_sub(prev_idle);
+        
+        if delta_total > 0 {
+            let busy = delta_total.saturating_sub(delta_idle);
+            load[i] = (busy * 100 / delta_total) as u32;
+        }
+        
+        last[i] = (total, idle);
+    }
+}
+
 /// Estado de energía por CPU (0-100, 100=Max Performance)
 pub static POWER_STATE: Mutex<[u8; 16]> = Mutex::new([100; 16]);
 
 /// Historial de marcos de página libres para predicción de OOM
 pub static FREE_FRAMES_HISTORY: Mutex<[u64; 8]> = Mutex::new([100000; 8]);
 
+/// Contador total de anomalías detectadas por IA
+pub static ANOMALY_COUNT: Mutex<u32> = Mutex::new(0);
+
 /// Actualiza el modelo térmico y de energía del sistema
 pub fn update_thermal_model() {
-    let mut load = CPU_LOAD.lock();
+    // 1. Actualizar carga de CPU real (delta de ticks)
+    update_cpu_load_metrics();
+
+    let load = CPU_LOAD.lock();
     let mut temp = CPU_TEMP.lock();
     let mut power = POWER_STATE.lock();
 
+    let has_thermal = crate::cpu::has_thermal_msrs();
+
     for i in 0..16 {
+        let mut tcc = 100;
+        let mut digital_readout = 0;
+        let mut msr_ok = false;
+
+        if has_thermal {
+            // Tcc Activation Temperature (Intel default is 100C, but we read it from MSR 0x1A2)
+            // IA32_TEMPERATURE_TARGET [23:16]
+            let target_msr = unsafe { crate::cpu::rdmsr(0x1A2) };
+            let tcc_activation = ((target_msr >> 16) & 0xFF) as u32;
+            tcc = if tcc_activation == 0 { 100 } else { tcc_activation };
+
+            // IA32_THERM_STATUS [22:16] is the digital readout (offset from Tcc)
+            let status_msr = unsafe { crate::cpu::rdmsr(0x19C) };
+            digital_readout = ((status_msr >> 16) & 0x7F) as u32;
+            msr_ok = true;
+        }
+        
+        // Real Temp in Celsius
+        let mut real_temp = if msr_ok { tcc.saturating_sub(digital_readout) } else { 0 };
+        
+        // Fallback to simulation if MSR reading is invalid or unsupported
+        if !msr_ok || real_temp == 0 || real_temp == tcc {
+            // Simulación Térmica:
+            // 1. Ganancia: Proporcional a la carga y al estado de energía actual
+            let heat_gain = (load[i] * power[i] as u32) / 20;
+
+            // 2. Disipación (Enfriamiento): Ley de enfriamiento de Newton
+            let ambient_temp = 35; // 35°C ambiente
+            let current_sim_temp = temp[i] / 10;
+            let heat_loss = if current_sim_temp > ambient_temp {
+                (current_sim_temp - ambient_temp) / 3
+            } else { 0 };
+
+            real_temp = (current_sim_temp as i32 + heat_gain as i32 - heat_loss as i32).max(ambient_temp as i32) as u32;
+        }
+
+        // Report in Tenths of Celsius (450 = 45.0 C)
+        temp[i] = real_temp * 10;
+        
+        // Power/Load simulation for other internal logic if needed
         let cpu_load = load[i];
         
-        // Simulación Térmica:
-        // 1. Ganancia: Proporcional a la carga y al estado de energía actual
-        // delta_heat = (load * power / 100) / constante
-        let heat_gain = (cpu_load * power[i] as u32) / 20;
-
-        // 2. Disipación (Enfriamiento): Ley de enfriamiento de Newton
-        // delta_cool = (Temp - Temp_Ambiente) / constante
-        let ambient_temp = 350; // 35°C ambiente dentro del chasis
-        let heat_loss = if temp[i] > ambient_temp {
-            (temp[i] - ambient_temp) / 30
-        } else { 0 };
-
-        // 3. Update Temp
-        temp[i] = (temp[i] as i32 + heat_gain as i32 - heat_loss as i32).max(ambient_temp as i32) as u32;
-
         // Gestión Inteligente de Energía (DVFS AI Hints):
         // Si la CPU está muy caliente (>80°C), bajar potencia preventivamente
         if temp[i] > 800 {
@@ -417,6 +474,10 @@ pub fn audit_syscall(pid: u32, _syscall_num: u64) -> bool {
     });
 
     if blocked {
+        {
+            let mut count = ANOMALY_COUNT.lock();
+            *count += 1;
+        }
         serial::serial_print("[AI-CORE] ANOMALY DETECTED: PID ");
         serial::serial_print_dec(pid as u64);
         serial::serial_print(" blocked.\n");
@@ -448,6 +509,10 @@ pub fn audit_memory_allocation(pid: u32, size: u64) -> bool {
         let pf_sum: u64 = proc.ai_profile.page_fault_history.iter().sum();
         
         if size > 16 * 1024 * 1024 {
+             {
+                 let mut count = ANOMALY_COUNT.lock();
+                 *count += 1;
+             }
              serial::serial_print("[AI-CORE] MEMORY ANOMALY: PID ");
              serial::serial_print_dec(pid as u64);
              serial::serial_print(" requesting massive allocation (");
@@ -600,7 +665,7 @@ pub fn get_vitals() -> SystemVitals {
         gpu_temp: gpu_t,
         free_memory_kb: (memory_history[7] * 4096) / 1024,
         oom_threat: predict_oom_threat_internal(&*memory_history),
-        anomaly_count: 0, 
+        anomaly_count: *ANOMALY_COUNT.lock(), 
         heap_fragmentation: heap.fragmentation_p,
     }
 }
