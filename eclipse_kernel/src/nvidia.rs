@@ -218,10 +218,11 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         };
         let fb_phys = fb.phys_addr;
 
-        let (bar1_phys, _width, height, pitch) = match get_nvidia_fb_info() {
-            Some(i) => i,
-            None => return false,
-        };
+        let (bar1_phys, bar1_size, _width, height, display_pitch) =
+            match get_nvidia_fb_info_full() {
+                Some(i) => i,
+                None => return false,
+            };
 
         // If the GEM buffer IS the scanout base, nothing to blit.
         if fb_phys == bar1_phys {
@@ -231,15 +232,6 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
         // Shadow blit: copy rendered GEM buffer → scanout via the kernel
         // BAR1 mapping.  If the GEM buffer is in System RAM, we use phys_to_virt.
         // If it's in VRAM (BAR1), we use the kernel BAR1 mapping.
-        let (bar1_phys, bar1_size, _width, height, pitch) = {
-            let info = NVIDIA_FB_INFO.lock();
-            if let Some(i) = info.as_ref() {
-                (i.phys, i.bar1_size, i.width, i.height, i.pitch)
-            } else {
-                return false;
-            }
-        };
-
         let src_vaddr = if fb_phys >= bar1_phys && fb_phys < bar1_phys + bar1_size {
             // Source is in VRAM (BAR1)
             let vbase = NVIDIA_BAR1_KERNEL_VADDR.load(AtomicOrdering::Relaxed);
@@ -256,10 +248,34 @@ impl crate::drm::DrmDriver for NvidiaDrmDriver {
             vbase as *mut u8 // scanout starts at bar1_phys + 0
         };
 
-        let size = (pitch as usize) * (height as usize);
+        // The GEM buffer pitch (fb.pitch = width * 4) may differ from the hardware
+        // scanout pitch (display_pitch = pixels_per_scan_line * 4) on systems where
+        // the EFI GOP stride includes padding or spans multiple monitors.
+        // A raw memcpy of display_pitch*height bytes would read past the GEM buffer
+        // (which is only fb.pitch*height bytes) causing a double-image or corruption.
+        // Use a row-by-row copy so source and destination strides are handled correctly.
+        let src_pitch = fb.pitch as usize;
+        let dst_pitch = display_pitch as usize;
+        let rows = height as usize;
+        let copy_per_row = src_pitch.min(dst_pitch);
 
         unsafe {
-            core::ptr::copy_nonoverlapping(src_vaddr, dst_vaddr, size);
+            if src_pitch == dst_pitch {
+                // Fast path: pitches match, single bulk copy
+                core::ptr::copy_nonoverlapping(src_vaddr, dst_vaddr, src_pitch * rows);
+            } else {
+                // Slow path: row-by-row copy to handle stride difference.
+                // Covers the case where display_pitch > src_pitch (e.g. dual-GPU
+                // EFI GOP with pixels_per_scan_line > width), which previously
+                // caused an OOB read and a double-image on the screen.
+                for row in 0..rows {
+                    core::ptr::copy_nonoverlapping(
+                        src_vaddr.add(row * src_pitch),
+                        dst_vaddr.add(row * dst_pitch),
+                        copy_per_row,
+                    );
+                }
+            }
         }
         true
     }
@@ -466,13 +482,9 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
     }
 
     // Map the source GEM buffer (could be in RAM or VRAM)
-    let (bar1_phys, bar1_size, pitch, height) = {
-        let info = NVIDIA_FB_INFO.lock();
-        if let Some(i) = info.as_ref() {
-            (i.phys, i.bar1_size, i.pitch, i.height)
-        } else {
-            return false;
-        }
+    let (bar1_phys, bar1_size, _, _, _) = match get_nvidia_fb_info_full() {
+        Some(i) => i,
+        None => return false,
     };
 
     let pitch_u32 = (pitch / 4).max(1) as usize;
@@ -516,6 +528,14 @@ pub fn blit_from_handle(payload: &[u8]) -> bool {
 pub fn get_nvidia_fb_info() -> Option<(u64, u32, u32, u32)> {
     let guard = NVIDIA_FB_INFO.lock();
     guard.as_ref().map(|i| (i.phys, i.width, i.height, i.pitch))
+}
+
+/// Internal helper: returns all NvidiaFbInfo fields at once, avoiding
+/// multiple lock acquisitions within the same hot path.
+/// Returns `(bar1_phys, bar1_size, width, height, pitch)`.
+fn get_nvidia_fb_info_full() -> Option<(u64, u64, u32, u32, u32)> {
+    let guard = NVIDIA_FB_INFO.lock();
+    guard.as_ref().map(|i| (i.phys, i.bar1_size, i.width, i.height, i.pitch))
 }
 
 /// NVIDIA GPU Architecture Types
@@ -1197,8 +1217,14 @@ pub fn init() {
             serial::serial_print("\n");
         }
 
-        // Register with DRM subsystem
-        crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
+        // Register with DRM subsystem – only register the primary driver once.
+        // With multiple GPUs the loop runs several times but NvidiaDrmDriver is
+        // a unit-struct that delegates everything through the global NVIDIA_FB_INFO
+        // statics, so a second registration would just add a duplicate entry that
+        // is never used (get_primary_driver always returns the first entry).
+        if crate::drm::get_primary_driver().is_none() {
+            crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
+        }
 
         // --- Phase 6: OpenGL context initialization ---
         // PGRAPH (bit 13) is already active via NV_PMC_ENABLE_DEFAULT.
