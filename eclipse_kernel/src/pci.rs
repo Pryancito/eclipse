@@ -83,6 +83,8 @@ const PCI_REG_INTERRUPT_LINE: u8 = 0x3C;
 
 /// PCI Capability IDs
 const PCI_CAP_ID_VNDR: u8 = 0x09;
+const PCI_CAP_ID_MSI: u8 = 0x05;
+const PCI_CAP_ID_MSIX: u8 = 0x11;
 
 /// VirtIO PCI capability types (VIRTIO_PCI_CAP_*)
 pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -638,8 +640,43 @@ pub unsafe fn pci_find_capability(dev: &PciDevice, cap_id: u8) -> u8 {
             return pos;
         }
         pos = pci_config_read_u8(dev.bus, dev.device, dev.function, pos + 1);
+        if pos < 0x40 && pos != 0 { break; } // Sanity check for malformed lists
     }
     0
+}
+
+/// Enable MSI (Message Signaled Interrupts) for a device.
+/// On x86_64, this writes the vector to the MSI data register and the
+/// target CPU to the MSI address register.
+pub unsafe fn pci_enable_msi(dev: &PciDevice, vector: u8, cpu_id: u32) -> bool {
+    let pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
+    if pos == 0 {
+        return false;
+    }
+
+    let msg_ctrl = pci_config_read_u16(dev.bus, dev.device, dev.function, pos + 2);
+    let is_64bit = (msg_ctrl & 0x80) != 0;
+
+    // x86 MSI Address: 0xFEE00000 | (dest_id << 12)
+    let addr: u32 = 0xFEE00000 | (cpu_id << 12);
+    let data: u32 = vector as u32;
+
+    pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 4, addr);
+    if is_64bit {
+        pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 8, 0); // Addr HI
+        pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 12, data);
+    } else {
+        pci_config_write_u32(dev.bus, dev.device, dev.function, pos + 8, data);
+    }
+
+    // Enable MSI in Message Control register (bit 0)
+    pci_config_write_u16(dev.bus, dev.device, dev.function, pos + 2, msg_ctrl | 0x01);
+    
+    // Also ensure Bus Master is enabled in Command register
+    let cmd = pci_config_read_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND);
+    pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, cmd | PCI_COMMAND_BUS_MASTER);
+
+    true
 }
 
 /// Find VirtIO capability by cfg_type. Returns (bar, offset, length).

@@ -150,11 +150,37 @@ impl KernelFramebuffer {
         }
         let offset = (y as u32 * self.pitch + x as u32 * 4) as isize;
         unsafe {
-            let p = self.ptr.offset(offset);
-            *p = color.b();
-            *p.offset(1) = color.g();
-            *p.offset(2) = color.r();
-            *p.offset(3) = 0xFF;
+            let p = self.ptr.offset(offset) as *mut u32;
+            let val = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32) | 0xFF000000;
+            *p = val;
+        }
+    }
+
+    /// Clear the framebuffer with a single color
+    pub fn clear(&mut self, color: Rgb888) {
+        let val = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | (color.b() as u32) | 0xFF000000;
+        let mut ptr = self.ptr as *mut u32;
+        
+        if self.pitch == self.width * 4 {
+            let total_pixels = (self.width * self.height) as usize;
+            for _ in 0..total_pixels {
+                unsafe {
+                    core::ptr::write_volatile(ptr, val);
+                    ptr = ptr.add(1);
+                }
+            }
+        } else {
+            let pitch_u32 = (self.pitch / 4) as usize;
+            for _ in 0..self.height {
+                for x in 0..self.width {
+                    unsafe {
+                        core::ptr::write_volatile(ptr.add(x as usize), val);
+                    }
+                }
+                unsafe {
+                    ptr = ptr.add(pitch_u32);
+                }
+            }
         }
     }
 }
@@ -176,6 +202,11 @@ impl DrawTarget for KernelFramebuffer {
         for Pixel(coord, color) in pixels {
             self.write_pixel(coord.x, coord.y, color);
         }
+        Ok(())
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        self.clear(color);
         Ok(())
     }
 }
