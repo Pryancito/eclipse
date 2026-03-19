@@ -236,14 +236,12 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     serial::serial_print("Switched to Higher Half Stack successfully\n");
     memory::init_pat();
     cpu::detect_features();
-    progress::init();
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
-    progress::bar(60);
-    
     serial::serial_print("DEBUG: init memory system...\n");
     memory::init();
+    progress::init();
     serial::serial_print("DEBUG: init progress system...\n");
     progress::bar(65);
     serial::serial_print("DEBUG: init interrupts...\n");

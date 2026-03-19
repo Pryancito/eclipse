@@ -182,7 +182,8 @@ impl DrawTarget for KernelFramebuffer {
 
 pub fn bar(progress: u32) {
     let Some((phys, width, height, pitch, source)) = get_fb_info() else { return };
-    let virt = crate::memory::phys_to_virt(phys) as *mut u8;
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
     
     let progress = progress.min(100);
@@ -251,7 +252,8 @@ pub fn bar(progress: u32) {
 
 /// Renderiza en pantalla el contenido del buffer. Llamar solo con el buffer ya completado.
 fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch: u32, phys: u64) {
-    let virt = crate::memory::phys_to_virt(phys) as *mut u8;
+    let mapped = MAPPED_FB_VIRT.load(Ordering::SeqCst);
+    let virt = if mapped != 0 { mapped } else { crate::memory::phys_to_virt(phys) } as *mut u8;
     let mut fb = KernelFramebuffer::new(virt, width, height, pitch);
 
     let bar_width = 400u32;
@@ -259,8 +261,7 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
     let x = (width as i32 - bar_width as i32) / 2;
     let y = (height as i32 - bar_height) / 2;
 
-    // Posición del texto: ENCIMA de la barra
-    let log_y = y - 10;
+    let log_y = y - 12;
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -268,8 +269,8 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
         .background_color(Rgb888::BLACK)
         .build();
 
-    // Limpiar área del mensaje anterior
-    let _ = Rectangle::new(Point::new(x, log_y - 10), Size::new(bar_width, 12))
+    // Limpiar área del mensaje anterior para evitar restos
+    let _ = Rectangle::new(Point::new(x, log_y), Size::new(bar_width, 10))
         .into_styled(PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::BLACK)
             .build())
@@ -285,9 +286,9 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
     let _ = Text::new(truncated, Point::new(x, log_y), text_style)
         .draw(&mut fb);
 
-    // VirtIO GPU requiere present explícito
+    // VirtIO GPU requiere present explícito. Solo refrescamos la zona de la línea de log.
     if source == FbSource::VirtIO {
-        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, 0, (log_y - 12) as u32, bar_width, 24);
+        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, x as u32, log_y as u32, bar_width, 10);
     }
 }
 
