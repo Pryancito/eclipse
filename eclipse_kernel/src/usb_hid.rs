@@ -947,7 +947,10 @@ impl XhciControllerState {
 
         // 2. Scratchpad buffers if required
         let hcsparams2 = mmio.read_capability(0x08);
-        let sb_count = ((hcsparams2 >> 27) & 0x1F) | ((hcsparams2 >> 16) & 0x1F);
+        // Max Scratchpad Buffers = Lo (bits 31:27) | (Hi (bits 25:21) << 5)
+        let sb_lo = (hcsparams2 >> 27) & 0x1F;
+        let sb_hi = (hcsparams2 >> 21) & 0x1F;
+        let sb_count = sb_lo | (sb_hi << 5);
         if sb_count > 0 {
             serial::serial_print(&alloc::format!("[XHCI] {} scratchpad buffers\n", sb_count));
             let sb_array = DmaAllocation::allocate((sb_count as usize) * 8, 64)?;
@@ -1452,20 +1455,24 @@ impl XhciControllerState {
         let xhci_ep_id = ep_number * 2 + if ep_dir_in { 1 } else { 0 };
 
         // Build Configure Endpoint input context
-        let cfg_ctx = DmaAllocation::allocate(2048, 64)?;
+        // Size: ICC (csz) + Slot (csz) + 31 endpoint contexts (csz each) = 33 * csz.
+        // For 32-byte contexts: 1056 bytes; for 64-byte contexts: 2112 bytes.
+        let csz = self.context_size;
+        let cfg_ctx = DmaAllocation::allocate(33 * csz, 64)?;
         cfg_ctx.zero();
         // Add: Slot context (bit 0) + new endpoint context (bit xhci_ep_id)
         cfg_ctx.write_u32(4, 0x01 | (1u32 << xhci_ep_id));
-        // Slot context: update Context Entries to highest enabled DCI
+        // Slot context is at index 1 of the input context (offset 1 * context_size).
+        // Update Context Entries to the highest enabled DCI.
         let speed = self.slot_speeds[slot_id as usize];
-        cfg_ctx.write_u32(32, (speed << 20) | ((xhci_ep_id as u32) << 27));
+        cfg_ctx.write_u32(csz, (speed << 20) | ((xhci_ep_id as u32) << 27));
         // Endpoint context DWORD1: ErrorCount=3, EPType=Interrupt IN, MaxPacketSize
         let ep_dword2: u32 = ((best_ep_mps as u32) << 16) // MaxPacketSize (bits 31:16)
             | (3 << 1)                                     // Error Count (bits 2:1) = 3
             | ((EP_TYPE_INTERRUPT_IN as u32) << 3);       // EP Type (bits 5:3) = 7
 
-        // Endpoint context offset in input context: 32 (icc) + 32 (slot) + (xhci_ep_id-1)*32
-        let ep_ctx_off = 32 + 32 + (xhci_ep_id as usize - 1) * 32;
+        // Endpoint context offset in input context: ICC (csz) + Slot (csz) + (xhci_ep_id-1)*csz
+        let ep_ctx_off = csz + csz + (xhci_ep_id as usize - 1) * csz;
 
         // Allocate interrupt IN transfer ring
         let int_ring = TransferRing::new(256, slot_id, best_ep_addr)?;
