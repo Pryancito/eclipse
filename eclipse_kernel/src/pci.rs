@@ -222,11 +222,15 @@ impl PciDevice {
     }
 }
 
+/// Global lock for PCI configuration space access (0xCF8/0xCFC)
+static PCI_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
 /// Global list of discovered PCI devices
 static PCI_DEVICES: Mutex<Vec<PciDevice>> = Mutex::new(Vec::new());
 
 /// Read from PCI configuration space (8-bit)
 pub unsafe fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
+    let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     let data = inl(PCI_CONFIG_DATA);
@@ -235,6 +239,7 @@ pub unsafe fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) 
 
 /// Read from PCI configuration space (16-bit)
 pub unsafe fn pci_config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
+    let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     let data = inl(PCI_CONFIG_DATA);
@@ -243,6 +248,7 @@ pub unsafe fn pci_config_read_u16(bus: u8, device: u8, function: u8, offset: u8)
 
 /// Read from PCI configuration space (32-bit)
 pub unsafe fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     inl(PCI_CONFIG_DATA)
@@ -250,6 +256,7 @@ pub unsafe fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8)
 
 /// Write to PCI configuration space (16-bit)
 pub unsafe fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     let shift = (offset & 2) * 8;
@@ -260,6 +267,7 @@ pub unsafe fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8
 
 /// Write to PCI configuration space (32-bit)
 unsafe fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let _lock = PCI_CONFIG_LOCK.lock();
     let address = pci_config_address(bus, device, function, offset);
     outl(PCI_CONFIG_ADDRESS, address);
     outl(PCI_CONFIG_DATA, value);
@@ -591,6 +599,13 @@ pub unsafe fn get_bar(dev: &PciDevice, bar_index: u8) -> u64 {
 pub unsafe fn get_bar_size(dev: &PciDevice, bar_index: u8) -> u64 {
     let offset = PCI_REG_BAR0 + (bar_index * 4);
     
+    // Safety for real hardware: disable Memory and IO decoding before probing BAR size.
+    // Probing involves writing 0xFFFFFFFF, which causes the device to temporarily 
+    // respond to a massive address range, potentially conflicting with others.
+    let original_cmd = pci_config_read_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND);
+    pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, 
+                        original_cmd & !(PCI_COMMAND_IO | PCI_COMMAND_MEMORY));
+
     // Save current BAR value
     let original = pci_config_read_u32(dev.bus, dev.device, dev.function, offset);
     
@@ -603,11 +618,11 @@ pub unsafe fn get_bar_size(dev: &PciDevice, bar_index: u8) -> u64 {
     // Restore original value
     pci_config_write_u32(dev.bus, dev.device, dev.function, offset, original);
     
-    if (original & 0x1) != 0 {
+    let size = if (original & 0x1) != 0 {
         // I/O space BAR: size is ~mask + 1
         let size_mask = mask & !0x3;
-        if size_mask == 0 { return 0; }
-        (!(size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF
+        if size_mask == 0 { 0 }
+        else { (!(size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF }
     } else {
         // Memory space BAR: check for 64-bit bits 2:1 = 0b10
         if (original & 0x6) == 0x4 {
@@ -618,14 +633,17 @@ pub unsafe fn get_bar_size(dev: &PciDevice, bar_index: u8) -> u64 {
             
             let full_mask = ((mask_hi as u64) << 32) | (mask as u64);
             let size_mask = full_mask & !0xF;
-            if size_mask == 0 { return 0; }
-            (!size_mask).wrapping_add(1)
+            if size_mask == 0 { 0 }
+            else { (!size_mask).wrapping_add(1) }
         } else {
             let size_mask = mask & !0xF;
-            if size_mask == 0 { return 0; }
-            ((!size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF
+            if size_mask == 0 { 0 }
+            else { ((!size_mask) as u64).wrapping_add(1) & 0xFFFF_FFFF }
         }
-    }
+    };
+
+    pci_config_write_u16(dev.bus, dev.device, dev.function, PCI_REG_COMMAND, original_cmd);
+    size
 }
 
 /// Find first capability with given ID. Returns offset in config space (0 = not found).

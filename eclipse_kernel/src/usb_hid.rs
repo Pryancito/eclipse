@@ -24,6 +24,8 @@ use crate::memory;
 use crate::interrupts;
 #[cfg(not(test))]
 use crate::serial;
+#[cfg(not(test))]
+use crate::sync::ReentrantMutex;
 
 #[cfg(test)]
 mod mock_memory {
@@ -145,7 +147,7 @@ pub const HID_REQUEST_SET_IDLE: u8     = 0x0A;
 
 /// USB HID boot-protocol keyboard report (8 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HidKeyboardReport {
     pub modifiers: u8,   // Modifier keys bitmask
     pub reserved: u8,    // Reserved (always 0)
@@ -154,7 +156,7 @@ pub struct HidKeyboardReport {
 
 /// USB HID boot-protocol mouse report (4 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HidMouseReport {
     pub buttons: u8,  // Button bitmask (bit0=L, bit1=R, bit2=M)
     pub x: i8,        // X displacement
@@ -165,7 +167,7 @@ pub struct HidMouseReport {
 /// USB HID generic absolute pointer report (e.g. QEMU usb-tablet, 6 bytes).
 /// Format: buttons(1) + x_lo(1) + x_hi(1) + y_lo(1) + y_hi(1) + wheel(1)
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HidTabletReport {
     pub buttons: u8,
     pub x_lo:    u8,
@@ -821,7 +823,7 @@ pub fn build_normal_trb(buf_ptr: u64, length: u16, ioc: bool) -> Trb {
 // HID Device Tracking
 // ===========================================================================
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum HidLastReport {
     Keyboard(HidKeyboardReport),
     Mouse(HidMouseReport),
@@ -830,6 +832,7 @@ pub enum HidLastReport {
 }
 
 /// Info about an active HID device's interrupt IN endpoint.
+#[derive(Debug, Clone, Copy)]
 pub struct HidEndpoint {
     pub slot_id:      u8,
     pub endpoint_id:  u8,   // XHCI endpoint ID (1-indexed, 2*ep_num+dir)
@@ -840,32 +843,11 @@ pub struct HidEndpoint {
     pub last_report:  HidLastReport,
 }
 
-const MAX_HID_DEVICES: usize = 8;
+#[cfg(test)]
 static mut HID_DEVICES: [Option<HidEndpoint>; MAX_HID_DEVICES] = [
     None, None, None, None, None, None, None, None,
 ];
 
-fn find_hid_buf_phys(slot_id: u8, ep_id: u8) -> u64 {
-    unsafe {
-        for dev in HID_DEVICES.iter().flatten() {
-            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
-                return dev.buf_phys;
-            }
-        }
-    }
-    0
-}
-
-fn find_hid_buf_size(slot_id: u8, ep_id: u8) -> usize {
-    unsafe {
-        for dev in HID_DEVICES.iter().flatten() {
-            if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
-                return dev.buf_size;
-            }
-        }
-    }
-    0
-}
 
 // ===========================================================================
 // XHCI Controller State
@@ -887,6 +869,11 @@ pub struct XhciControllerState {
     /// Framebuffer dimensions for tablet absolute → relative conversion
     pub fb_width:        u32,
     pub fb_height:       u32,
+    /// HID devices attached to this controller
+    pub hid_devices: [Option<HidEndpoint>; 8],
+    /// Last tablet cursor position (absolute, in tablet units)
+    pub tablet_last_x: u16,
+    pub tablet_last_y: u16,
 }
 
 impl XhciControllerState {
@@ -906,6 +893,9 @@ impl XhciControllerState {
             context_size: 32, // Default to 32
             fb_width: 1024,
             fb_height: 768,
+            hid_devices: [None; 8],
+            tablet_last_x: 0xFFFF,
+            tablet_last_y: 0xFFFF,
         }
     }
 
@@ -953,6 +943,7 @@ impl XhciControllerState {
                 // Writing 0xFFFF0000 zeros the enable bits and sets all status bits to 1
                 // to clear any pending SMI conditions left by the BIOS.
                 mmio.write_capability(cap_ptr + 4, 0xFFFF0000);
+                serial::serial_print("[XHCI] USB Legacy Support disabled (SMIs cleared)\n");
                 return;
             }
             
@@ -1146,14 +1137,22 @@ impl XhciControllerState {
                          USB_TRANSFER_EVENTS.fetch_add(1, Ordering::Relaxed);
                          let slot_id = ((ev.control >> 24) & 0xFF) as u8;
                          let ep_id   = ((ev.control >> 16) & 0x1F) as u8;
-                         process_hid_transfer_event(slot_id, ep_id);
+                         self.process_hid_transfer_event(slot_id, ep_id);
 
                          // Re-submit
                          let ring_idx = slot_id as usize * 32 + ep_id as usize;
                          if let Some(Some(ref mut tr)) = self.transfer_rings.get_mut(ring_idx) {
                              tr.ring.advance_transfer_dequeue();
-                             let buf_phys = find_hid_buf_phys(slot_id, ep_id);
-                             let buf_size = find_hid_buf_size(slot_id, ep_id);
+                             let (buf_phys, buf_size) = {
+                                 let mut found = (0, 0);
+                                 for dev in self.hid_devices.iter().flatten() {
+                                     if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
+                                         found = (dev.buf_phys, dev.buf_size);
+                                         break;
+                                     }
+                                 }
+                                 found
+                             };
                              if buf_phys != 0 {
                                  let normal = build_normal_trb(buf_phys, buf_size as u16, true);
                                  if tr.submit(normal).is_ok() {
@@ -1560,11 +1559,11 @@ impl XhciControllerState {
         if let Some(ref mmio) = self.mmio { mmio.ring_doorbell(slot_id, xhci_ep_id); }
 
         // Register HID device
-        register_hid_device(HidEndpoint {
+        self.register_hid_device(HidEndpoint {
             slot_id,
             endpoint_id: xhci_ep_id,
             protocol: best_protocol,
-            buf_virt: report_buf.phys_addr, // intentionally using phys here for simplicity; virt = HHDM + phys
+            buf_virt: report_buf.phys_addr, 
             buf_phys: report_buf.phys_addr,
             buf_size: report_buf_size,
             last_report: HidLastReport::None,
@@ -1601,15 +1600,23 @@ impl XhciControllerState {
                 // Transfer Event: find which HID device completed
                 let slot_id   = ((ev.control >> 24) & 0xFF) as u8;
                 let ep_id     = ((ev.control >> 16) & 0x1F) as u8;
-                process_hid_transfer_event(slot_id, ep_id);
+                self.process_hid_transfer_event(slot_id, ep_id);
 
                 // Re-submit the Normal TRB for continuous polling.
                 // Liberar el slot que el controlador acaba de completar; si no, el ring se llena tras ~63 eventos.
                 let ring_idx = slot_id as usize * 32 + ep_id as usize;
+                let (buf_phys, buf_size) = {
+                    let mut found = (0, 0);
+                    for dev in self.hid_devices.iter().flatten() {
+                        if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
+                            found = (dev.buf_phys, dev.buf_size);
+                            break;
+                        }
+                    }
+                    found
+                };
                 if let Some(Some(ref mut tr)) = self.transfer_rings.get_mut(ring_idx) {
                     tr.ring.advance_transfer_dequeue();
-                    let buf_phys = find_hid_buf_phys(slot_id, ep_id);
-                    let buf_size = find_hid_buf_size(slot_id, ep_id);
                     if buf_phys != 0 {
                         let normal = build_normal_trb(buf_phys, buf_size as u16, true);
                         match tr.submit(normal) {
@@ -1648,66 +1655,6 @@ impl XhciControllerState {
 
 
 
-fn register_hid_device(mut dev: HidEndpoint) {
-    serial::serial_print(&alloc::format!("[XHCI] Registering HID device (slot={} ep={} proto={} size={})\n", dev.slot_id, dev.endpoint_id, dev.protocol, dev.buf_size));
-    unsafe {
-        for slot in HID_DEVICES.iter_mut() {
-            if slot.is_none() {
-                dev.last_report = HidLastReport::None;
-                *slot = Some(dev);
-                return;
-            }
-        }
-    }
-}
-
-
-fn process_hid_transfer_event(slot_id: u8, ep_id: u8) {
-    unsafe {
-        for dev in HID_DEVICES.iter_mut().flatten() {
-            if dev.slot_id != slot_id || dev.endpoint_id != ep_id { continue; }
-
-            // Read report from buffer (phys addr → virt via HHDM)
-            let virt = memory::phys_to_virt(dev.buf_phys);
-
-            // En hardware real, el dispositivo escribe el informe vía DMA; la CPU puede
-            // seguir viendo datos antiguos en caché. Invalidamos la caché de este
-            // rango antes de leer el informe.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut addr = virt;
-                let end = virt + dev.buf_size as u64;
-                while addr < end {
-                    _mm_clflush(addr as *const u8);
-                    addr += 64;
-                }
-                fence(Ordering::SeqCst);
-            }
-
-            // Determine protocol if unknown or unassigned
-            let mut proto = dev.protocol;
-            if proto == 0 || proto == 255 {
-                if dev.buf_size >= 8 { proto = HID_PROTOCOL_KEYBOARD; }
-                else if dev.buf_size >= 6 { proto = HID_PROTOCOL_TABLET; }
-                else if dev.buf_size >= 3 { proto = HID_PROTOCOL_MOUSE; }
-            }
-
-            if proto == HID_PROTOCOL_KEYBOARD && dev.buf_size >= 8 {
-                let report = core::ptr::read_volatile(virt as *const HidKeyboardReport);
-                process_keyboard_report(dev, &report);
-            } else if proto == HID_PROTOCOL_MOUSE && dev.buf_size >= 3 {
-                let report = core::ptr::read_volatile(virt as *const HidMouseReport);
-                process_mouse_report(dev, &report);
-            } else if proto == HID_PROTOCOL_TABLET && dev.buf_size >= 6 {
-                let report = core::ptr::read_volatile(virt as *const HidTabletReport);
-                process_tablet_report(dev, &report);
-            } else {
-                serial::serial_print(&alloc::format!("[XHCI] Unknown HID protocol/size (slot={} ep={} proto={} size={})\n", slot_id, ep_id, proto, dev.buf_size));
-            }
-            return;
-        }
-    }
-}
 
 // ===========================================================================
 // HID Report Processing – keyboard and mouse
@@ -1762,72 +1709,111 @@ fn process_mouse_report(dev: &mut HidEndpoint, report: &HidMouseReport) {
     dev.last_report = HidLastReport::Mouse(*report);
 }
 
-/// Last tablet cursor position (absolute, in tablet units)
-static mut TABLET_LAST_X: u16 = 0xFFFF; // sentinel: not yet initialised
-static mut TABLET_LAST_Y: u16 = 0xFFFF;
 
-/// Convert a USB tablet HID absolute report to relative mouse deltas.
-/// The tablet sends 16-bit absolute X/Y in range 0..TABLET_MAX.
-/// We scale to the current framebuffer size and push a relative packet.
-fn process_tablet_report(dev: &mut HidEndpoint, report: &HidTabletReport) {
-    let abs_x = report.x() as u32;
-    let abs_y = report.y() as u32;
-
-    // Get framebuffer size from XHCI state
-    let (fb_w, fb_h) = unsafe {
-        if let Some(ref xhci) = XHCI {
-            (xhci.fb_width, xhci.fb_height)
-        } else {
-            (1024, 768)
+impl XhciControllerState {
+    fn register_hid_device(&mut self, mut dev: HidEndpoint) {
+        serial::serial_print(&alloc::format!("[XHCI] Registering HID device (slot={} ep={} proto={} size={})\n", dev.slot_id, dev.endpoint_id, dev.protocol, dev.buf_size));
+        for slot in self.hid_devices.iter_mut() {
+            if slot.is_none() {
+                dev.last_report = HidLastReport::None;
+                *slot = Some(dev);
+                return;
+            }
         }
-    };
-
-    // Convert absolute tablet coord to absolute screen pixel
-    let screen_x = ((abs_x * fb_w) / (TABLET_MAX + 1)).min(fb_w - 1) as i32;
-    let screen_y = ((abs_y * fb_h) / (TABLET_MAX + 1)).min(fb_h - 1) as i32;
-
-    // On first packet just store position without emitting a move
-    let (last_x, last_y) = unsafe { (TABLET_LAST_X, TABLET_LAST_Y) };
-    if last_x == 0xFFFF {
-        unsafe { TABLET_LAST_X = screen_x as u16; TABLET_LAST_Y = screen_y as u16; }
-        return;
     }
 
-    let prev_x = last_x as i32;
-    let prev_y = last_y as i32;
-    let dx = (screen_x - prev_x).clamp(-127, 127) as i8;
-    let dy = (screen_y - prev_y).clamp(-127, 127) as i8;
+    fn process_hid_transfer_event(&mut self, slot_id: u8, ep_id: u8) {
+        // Encontrar el dispositivo en self.hid_devices
+        let mut dev_idx = None;
+        for (i, d) in self.hid_devices.iter().enumerate() {
+            if let Some(dev) = d {
+                if dev.slot_id == slot_id && dev.endpoint_id == ep_id {
+                    dev_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        
+        let idx = match dev_idx { Some(i) => i, None => return };
+        // We need a unique reference to dev to update its last_report.
+        // Since self is already &mut, we can just grab it.
+        let dev = self.hid_devices[idx].as_mut().unwrap();
 
-    unsafe { TABLET_LAST_X = screen_x as u16; TABLET_LAST_Y = screen_y as u16; }
+        // Read report from buffer (phys addr → virt via HHDM)
+        let virt = memory::phys_to_virt(dev.buf_phys);
 
-    // Push relative packet (same format as PS/2 mouse)
-    let packet: u32 = (report.buttons as u32)
-        | ((dx as u8 as u32) << 8)
-        | ((dy as u8 as u32) << 16);
-    interrupts::push_mouse_packet(packet);
-    dev.last_report = HidLastReport::Tablet(*report);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut addr = virt;
+            let end = virt + dev.buf_size as u64;
+            while addr < end {
+                unsafe { _mm_clflush(addr as *const u8); }
+                addr += 64;
+            }
+            fence(Ordering::SeqCst);
+        }
+
+        let mut proto = dev.protocol;
+        if proto == 0 || proto == 255 {
+            if dev.buf_size >= 8 { proto = HID_PROTOCOL_KEYBOARD; }
+            else if dev.buf_size >= 6 { proto = HID_PROTOCOL_TABLET; }
+            else if dev.buf_size >= 3 { proto = HID_PROTOCOL_MOUSE; }
+        }
+
+        if proto == HID_PROTOCOL_KEYBOARD && dev.buf_size >= 8 {
+            let report = unsafe { core::ptr::read_volatile(virt as *const HidKeyboardReport) };
+            process_keyboard_report(dev, &report);
+        } else if proto == HID_PROTOCOL_MOUSE && dev.buf_size >= 3 {
+            let report = unsafe { core::ptr::read_volatile(virt as *const HidMouseReport) };
+            process_mouse_report(dev, &report);
+        } else if proto == HID_PROTOCOL_TABLET && dev.buf_size >= 6 {
+            let report = unsafe { core::ptr::read_volatile(virt as *const HidTabletReport) };
+            
+            let abs_x = report.x() as u32;
+            let abs_y = report.y() as u32;
+            let fb_w = self.fb_width;
+            let fb_h = self.fb_height;
+
+            let screen_x = ((abs_x as u64 * fb_w as u64) / (TABLET_MAX as u64 + 1)).min(fb_w as u64 - 1) as i32;
+            let screen_y = ((abs_y as u64 * fb_h as u64) / (TABLET_MAX as u64 + 1)).min(fb_h as u64 - 1) as i32;
+
+            if self.tablet_last_x == 0xFFFF {
+                self.tablet_last_x = screen_x as u16; 
+                self.tablet_last_y = screen_y as u16;
+            } else {
+                let dx = (screen_x - self.tablet_last_x as i32).clamp(-127, 127) as i8;
+                let dy = (screen_y - self.tablet_last_y as i32).clamp(-127, 127) as i8;
+
+                self.tablet_last_x = screen_x as u16; 
+                self.tablet_last_y = screen_y as u16;
+
+                let packet: u32 = (report.buttons as u32)
+                    | ((dx as u8 as u32) << 8)
+                    | ((dy as u8 as u32) << 16);
+                interrupts::push_mouse_packet(packet);
+            }
+            dev.last_report = HidLastReport::Tablet(report);
+        } else {
+            serial::serial_print(&alloc::format!("[XHCI] Unknown HID protocol/size (slot={} ep={} proto={} size={})\n", slot_id, ep_id, proto, dev.buf_size));
+        }
+    }
 }
 
-// ===========================================================================
-// Global Controller State and IRQ Handler
-// ===========================================================================
-
-pub static mut XHCI: Option<XhciControllerState> = None;
+pub static XHCI: ReentrantMutex<Option<XhciControllerState>> = ReentrantMutex::new(None);
 
 /// USB IRQ handler – processes the XHCI event ring and dispatches HID reports.
 pub fn usb_irq_handler() {
-    unsafe {
-        let xhci = match XHCI.as_mut() { Some(x) => x, None => return };
-        let mmio = match xhci.mmio.as_ref() { Some(m) => m, None => return };
-
-        // Check EINT in USBSTS (offset 0x04)
-        let usbsts = mmio.read_operational(0x04);
-        if (usbsts & 0x08) == 0 { return; } // not our interrupt
-        // Clear EINT (write-1-to-clear)
-        mmio.write_operational(0x04, 0x08);
-        // Clear IP in IMAN (interrupter 0)
-        mmio.write_runtime(0x20, 0x03); // IP + IE
-
+    let mut guard = XHCI.lock();
+    if let Some(ref mut xhci) = *guard {
+        if let Some(ref mmio) = xhci.mmio {
+            // Check EINT in USBSTS (offset 0x04)
+            let usbsts = mmio.read_operational(0x04);
+            if (usbsts & 0x08) == 0 { return; } // not our interrupt
+            // Clear EINT (write-1-to-clear)
+            mmio.write_operational(0x04, 0x08);
+            // Clear IP in IMAN (interrupter 0)
+            mmio.write_runtime(0x20, 0x03); // IP + IE
+        }
         xhci.process_events();
     }
 }
@@ -1848,20 +1834,18 @@ pub(crate) static USB_MSI_ENABLED: core::sync::atomic::AtomicBool = core::sync::
 /// Called from the timer interrupt as a fallback when IRQ-based delivery is unavailable.
 pub fn poll() {
     USB_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
-    unsafe {
-        if let Some(ref mut xhci) = XHCI {
-            // Check if controller halted (USBSTS bit 0)
-            if let Some(ref mmio) = xhci.mmio {
-                let sts = mmio.read_operational(0x04);
-                if (sts & 1) != 0 {
-                    serial::serial_print("[XHCI] Controller HALTED! Status: ");
-                    serial::serial_print_hex(sts as u64);
-                    serial::serial_print("\n");
-                }
+    let mut guard = XHCI.lock();
+    if let Some(ref mut xhci) = *guard {
+        // Check if controller halted (USBSTS bit 0)
+        if let Some(ref mmio) = xhci.mmio {
+            let sts = mmio.read_operational(0x04);
+            if (sts & 1) != 0 {
+                serial::serial_print("[XHCI] Controller HALTED! Status: ");
+                serial::serial_print_hex(sts as u64);
+                serial::serial_print("\n");
             }
-
-            xhci.process_events();
         }
+        xhci.process_events();
     }
 }
 
@@ -1917,6 +1901,14 @@ pub fn init() {
 fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
     let mut list = alloc::vec::Vec::new();
     for pci_dev in crate::pci::find_usb_controllers() {
+        let bar_size = unsafe { crate::pci::get_bar_size(&pci_dev, 0) };
+        serial::serial_print(&alloc::format!(
+            "[USB-HID] Found {} at {:02X}:{:02X}.{} (BAR0=0x{:08X}, Size=0x{:X})\n",
+            pci_dev.usb_controller_type().unwrap_or("USB"),
+            pci_dev.bus, pci_dev.device, pci_dev.function,
+            pci_dev.bar0, bar_size
+        ));
+
         let controller_type = match pci_dev.prog_if {
             0x00 => UsbControllerType::UHCI,
             0x10 => UsbControllerType::OHCI,
@@ -1932,7 +1924,7 @@ fn detect_usb_controllers() -> alloc::vec::Vec<UsbController> {
             vendor_id:      pci_dev.vendor_id,
             device_id:      pci_dev.device_id,
             bar0:           pci_dev.bar0,
-            bar_size:       unsafe { crate::pci::get_bar_size(&pci_dev, 0) },
+            bar_size,
             interrupt_line: pci_dev.interrupt_line,
         });
     }
@@ -1965,8 +1957,11 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
     }
 
     let bar0 = ctrl.bar0 & !0xF;
-    if bar0 == 0 {
-        serial::serial_print("[USB-HID] Invalid BAR0\n");
+    if bar0 == 0 || ctrl.bar_size == 0 {
+        serial::serial_print(&alloc::format!(
+            "[USB-HID] Invalid BAR configuration (BAR0=0x{:08X}, Size=0x{:X})\n",
+            bar0, ctrl.bar_size
+        ));
         return UsbControllerState::Error;
     }
 
@@ -2004,18 +1999,20 @@ fn init_xhci_controller(ctrl: &UsbController) -> UsbControllerState {
         serial::serial_print(&alloc::format!("[XHCI] initialize() failed: {}\n", e));
         return UsbControllerState::Error;
     }
+    serial::serial_print("[XHCI] Controller initialized successfully\n");
 
     if let Err(e) = state.start_controller() {
         serial::serial_print(&alloc::format!("[XHCI] start_controller() failed: {}\n", e));
         return UsbControllerState::Error;
     }
+    serial::serial_print("[XHCI] Controller started\n");
 
     if let Err(e) = state.enumerate_ports() {
         serial::serial_print(&alloc::format!("[XHCI] enumerate_ports() error: {}\n", e));
         // Non-fatal: controller is still running
     }
 
-    unsafe { XHCI = Some(state); }
+    *XHCI.lock() = Some(state);
 
     serial::serial_print("[USB-HID] XHCI controller ready\n");
     UsbControllerState::Ready
