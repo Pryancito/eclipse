@@ -62,14 +62,8 @@ fn main() {
 
     loop {
         state.handle_ipc();
-        // Only render when something changed: events arrived, animations are
-        // running, or metrics were refreshed.  Skipping the render on truly
-        // idle frames avoids a full framebuffer blit + present at 60 Hz when
-        // the desktop is static, which was the main source of high CPU usage
-        // on real hardware.
-        if state.update() {
-            state.render();
-        }
+        state.update();
+        state.render();
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }
