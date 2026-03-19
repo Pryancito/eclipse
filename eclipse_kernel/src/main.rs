@@ -46,7 +46,7 @@ mod acpi;    // ACPI discovery
 mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod sync;    // Synchronization primitives
-mod drm_scheme; // DRM scheme for ioctl
+pub mod drm_scheme; // DRM scheme for ioctl
 
 #[cfg(not(test))]
 #[global_allocator]

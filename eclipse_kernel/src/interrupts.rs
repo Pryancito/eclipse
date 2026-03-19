@@ -127,6 +127,7 @@ pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFD;
 /// Sent by a CPU when it enqueues a process to notify other CPUs (e.g. idle ones)
 /// that they should call schedule() to pick up the new task.
 pub const RESCHEDULE_IPI_VECTOR: u8 = 0xFC;
+pub const GPU_INTERRUPT_VECTOR: u8 = 0x40;
 
 /// Flags para descriptores de interrupción
 const IDT_PRESENT: u8 = 0b10000000;
@@ -176,6 +177,11 @@ pub fn init() {
         // Reschedule IPI (vector 0xFC) – sent to notify cores of new ready processes
         KERNEL_IDT.entries[RESCHEDULE_IPI_VECTOR as usize].set_handler(
             reschedule_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
+        );
+
+        // GPU Interrupt (MSI vector 0x40)
+        KERNEL_IDT.entries[GPU_INTERRUPT_VECTOR as usize].set_handler(
+            gpu_irq as *const () as u64, 0x08, IDT_PRESENT | IDT_RING_0 | IDT_INTERRUPT_GATE,
         );
 
         // Configurar syscall handler (int 0x80)
@@ -992,6 +998,60 @@ unsafe extern "C" fn exception_12() {
 // IRQ Handlers
 // ============================================================================
 
+
+extern "C" fn gpu_interrupt_handler() {
+    if let Some(mut stats) = INTERRUPT_STATS.try_lock() {
+        stats.irqs += 1;
+    }
+    // Call the NVIDIA driver's interrupt handler
+    crate::nvidia::handle_interrupt();
+    
+    // Final de interrupción (EOI) para el Local APIC
+    crate::apic::eoi();
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn gpu_irq() {
+    core::arch::naked_asm!(
+        "push 0", // Dummy error code
+        "push 0x40", // Vector num
+        "push rbp",
+        "mov rbp, rsp",
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "call {handler}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "pop rbp",
+        "add rsp, 16",
+        "iretq",
+        handler = sym gpu_interrupt_handler,
+    );
+}
 
 extern "C" fn timer_handler() {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);

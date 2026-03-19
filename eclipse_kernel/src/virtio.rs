@@ -261,9 +261,15 @@ impl crate::drm::DrmDriver for VirtioDrmDriver {
     }
     fn alloc_buffer(&self, size: usize) -> Option<crate::drm::GemHandle> {
         unsafe {
-            let (ptr, phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
+            let (_ptr, phys) = crate::memory::alloc_dma_buffer(size, 4096)?;
             // El ID sera asignado por drm::alloc_buffer
             Some(crate::drm::GemHandle { id: 0, size, phys_addr: phys })
+        }
+    }
+    fn free_buffer(&self, handle: crate::drm::GemHandle) {
+        unsafe {
+            let ptr = crate::memory::phys_to_virt(handle.phys_addr) as *mut u8;
+            crate::memory::free_dma_buffer(ptr, handle.size, 4096);
         }
     }
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {

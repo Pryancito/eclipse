@@ -178,21 +178,13 @@ pub mod display {
     impl DisplayConnector {
         pub fn detect_all() -> Vec<Self> {
             let mut connectors = Vec::new();
-            // Primary Monitor (e.g. built-in or primary DP)
+            // Primary Monitor (Only return the first DP connector to avoid phantom mirroring)
             connectors.push(Self {
                 connector_type: ConnectorType::DisplayPort,
                 connected: true,
                 edid_available: true,
                 max_width: 3840,
                 max_height: 2160,
-            });
-            // Secondary Monitor for mirroring (e.g. HDMI output)
-            connectors.push(Self {
-                connector_type: ConnectorType::HDMI,
-                connected: true,
-                edid_available: true,
-                max_width: 1920,
-                max_height: 1080,
             });
             connectors
         }
@@ -370,7 +362,7 @@ pub mod opengl {
     }
 
     impl GlKernelContext {
-        pub fn init(bar0_virt: u64, vram_size_mb: u32) -> Option<Self> {
+        pub fn init(bar0_virt: u64, vram_phys: u64, vram_size_mb: u32) -> Option<Self> {
             let pmc_en = unsafe {
                 core::ptr::read_volatile((bar0_virt + NV_PMC_ENABLE as u64) as *const u32)
             };
@@ -383,7 +375,6 @@ pub mod opengl {
                     );
                 }
             }
-            let vram_phys = 0x10000000 + 64 * 1024 * 1024;
 
             Some(Self {
                 bar0_virt,
@@ -413,10 +404,10 @@ pub mod opengl {
         }
     }
 
-    pub fn init_all_gpus(bar0_virt: u64, vram_size_mb: u32) {
-        match GlKernelContext::init(bar0_virt, vram_size_mb) {
+    pub fn init_all_gpus(bar0_virt: u64, bar1_phys: u64, vram_size_mb: u32, width: u32, height: u32) {
+        match GlKernelContext::init(bar0_virt, bar1_phys, vram_size_mb) {
             Some(mut ctx) => {
-                let _ = ctx.alloc_surface(1920, 1080);
+                let _ = ctx.alloc_surface(width, height);
             }
             None => {}
         }

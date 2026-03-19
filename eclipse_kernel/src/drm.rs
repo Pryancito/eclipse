@@ -74,6 +74,9 @@ pub trait DrmDriver: Send + Sync {
     /// Allocate a buffer (GEM object)
     fn alloc_buffer(&self, size: usize) -> Option<GemHandle>;
     
+    /// Free a buffer (GEM object)
+    fn free_buffer(&self, handle: GemHandle);
+    
     /// Create a framebuffer from a GEM handle
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32>;
     
@@ -214,9 +217,14 @@ pub fn get_caps() -> Option<DrmCaps> {
 pub fn gem_close(handle_id: u32) -> bool {
     let mut state = DRM_STATE.lock();
     if let Some(pos) = state.handles.iter().position(|h| h.id == handle_id) {
+        let handle = state.handles[pos];
+        let driver = state.drivers.first().cloned();
         state.handles.remove(pos);
-        // Nota: El driver físico debería liberar el recurso también, pero por ahora
-        // nos centramos en la gestión de handles del subsistema.
+        drop(state); // Unlock before calling driver
+        
+        if let Some(d) = driver {
+            d.free_buffer(handle);
+        }
         true
     } else {
         false
