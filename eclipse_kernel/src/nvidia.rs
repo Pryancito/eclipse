@@ -1447,7 +1447,7 @@ pub fn update_all_gpu_vitals() {
 
                 // Report temperature in Tenths of Celsius (450 = 45.0 C)
                 let mem_used = if i == 0 { used_vram_bytes_primary } else { 0 };
-                crate::ai_core::update_gpu_metrics(i, load, mem_used, (temp as u32) * 10);
+                crate::ai_core::update_gpu_metrics_by_bus(pci_dev.bus, load, mem_used, (temp as u32) * 10);
             }
         }
     }
