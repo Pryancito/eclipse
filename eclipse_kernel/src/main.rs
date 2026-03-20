@@ -349,16 +349,16 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     // reported by the filesystem, avoiding truncation for binaries > 2 MiB.
     if !filesystem::is_mounted() {
         serial::serial_print("[KERNEL] ERROR: Root not mounted, cannot load /sbin/eclipse-init\n");
-        loop { crate::cpu::idle(); }
+        loop { crate::cpu::idle(100); }
     }
     let init_data: alloc::vec::Vec<u8> = match filesystem::read_file_alloc("/sbin/eclipse-init") {
         Err(e) => {
             serial::serial_printf(format_args!("[KERNEL] ERROR: Cannot read /sbin/eclipse-init: {}\n", e));
-            loop { crate::cpu::idle(); }
+            loop { crate::cpu::idle(100); }
         }
         Ok(data) if data.is_empty() => {
             serial::serial_print("[KERNEL] ERROR: /sbin/eclipse-init is empty\n");
-            loop { crate::cpu::idle(); }
+            loop { crate::cpu::idle(100); }
         }
         Ok(data) => {
             serial::serial_printf(format_args!("[KERNEL] Loaded /sbin/eclipse-init ({} bytes)\n", data.len()));
@@ -376,7 +376,7 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         }
         Err(e) => {
             serial::serial_printf(format_args!("[KERNEL] Failed to spawn init process: {}\n", e));
-            loop { crate::cpu::idle(); }
+            loop { crate::cpu::idle(100); }
         }
     }
     
@@ -386,19 +386,9 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     //progress::stop_logging();
 
     loop {
-        crate::scheduler::schedule();
-        // Heartbeat IPC (solo un núcleo lo imprimirá cada 5s)
-
-        // Procesar mensajes IPC pendientes. El timer APIC también los procesa cada 1ms,
-        // pero procesarlos aquí reduce la latencia cuando llegan entre ticks del timer.
-        if crate::ipc::has_pending_messages() {
-            ipc::process_messages();
-            ipc::p2p_heartbeat();
-        }
-
-        // 2. Verificación antes de dormir.
-        x86_64::instructions::interrupts::disable();
-        crate::cpu::idle();
-        x86_64::instructions::interrupts::enable();
+        ipc::process_messages();
+        crate::scheduler::tick();
+        let sleep_ms = crate::scheduler::schedule();
+        crate::cpu::idle(sleep_ms);
     }
 }

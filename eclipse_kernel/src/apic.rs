@@ -157,6 +157,24 @@ pub fn set_timer_tsc(deadline: u64) {
     }
 }
 
+pub fn set_timer_ms(ms: u64) {
+    let mode = get_timer_mode();
+    match mode {
+        ApicTimerMode::TSCDeadline => {
+            let tsc_per_ms = crate::cpu::get_tsc_frequency() * 1000;
+            set_timer_tsc(crate::cpu::rdtsc() + ms * tsc_per_ms);
+        }
+        ApicTimerMode::OneShot => {
+            let count_per_ms = LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed);
+            set_timer_oneshot((ms as u32).saturating_mul(count_per_ms));
+        }
+        ApicTimerMode::Periodic => {
+            // Periodic mode cannot be easily adjusted for a single shot
+        }
+    }
+}
+
+
 pub fn get_timer_count_1ms() -> u32 {
     LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed)
 }

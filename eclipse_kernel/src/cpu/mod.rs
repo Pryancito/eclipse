@@ -430,22 +430,31 @@ use core::sync::atomic::AtomicBool;
 /// Dormir el núcleo de forma eficiente.
 /// Intenta usar MONITOR/MWAIT (Nivel 4) si está disponible, 
 /// de lo contrario usa HLT (Nivel 3).
-pub fn idle() {
+pub fn idle(duration_ms: u64) {
+    if duration_ms == 0 {
+        pause();
+        return;
+    }
+
+    // Set the APIC timer to wake the core after the duration.
+    if duration_ms > 1 {
+        crate::apic::set_timer_ms(duration_ms);
+    }
+
     let cpu_id = crate::process::get_cpu_id();
     let mode = crate::ai_core::suggest_idle_mode(cpu_id);
     
-    let start = rdtsc();
+    let start_tsc = rdtsc();
 
+    // Perform the requested idle action once. 
+    // Mwait and Hlt will wait for an interrupt (or memory change).
     match mode {
         crate::ai_core::IdleMode::Poll => {
-            // Adaptive polling: espera activa corta con pause.
-            // Habilitamos interrupciones para que el timer u otros IRQs puedan despertar procesos.
+            // Adaptive polling: enable interrupts and spin with pause.
             unsafe { x86_64::instructions::interrupts::enable(); }
-            
+            // Poll for a fixed short period or until something is ready.
             let addr = crate::scheduler::ready_queue_tail_addr() as *const usize;
             let initial_tail = unsafe { core::ptr::read_volatile(addr) };
-            
-            // Poll por aproximadamente 50-100 microsegundos máximo
             for _ in 0..2000 {
                 if unsafe { core::ptr::read_volatile(addr) } != initial_tail {
                     break;
@@ -457,7 +466,7 @@ pub fn idle() {
             if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
                 let addr = crate::scheduler::ready_queue_tail_addr();
                 unsafe {
-                    // 1. Armar el hardware de monitoreo sobre la cola del scheduler.
+                    // 1. Arm hardware monitoring on the scheduler queue.
                     core::arch::asm!(
                         "monitor",
                         in("rax") addr,
@@ -466,12 +475,12 @@ pub fn idle() {
                         options(nomem, nostack, preserves_flags)
                     );
                     
-                    // 2. Entrar en estado de bajo consumo.
+                    // 2. Low-power sleep. Returns on memory change OR interrupt.
                     x86_64::instructions::interrupts::enable();
                     core::arch::asm!(
                         "mwait",
-                        in("rax") hint, // AI-driven hints (C-states)
-                        in("rcx") 0,    // extensions
+                        in("rax") hint, // C-state hints
+                        in("rcx") 0,
                         options(nomem, nostack, preserves_flags)
                     );
                 }
@@ -486,11 +495,11 @@ pub fn idle() {
         }
     }
 
-    let end = rdtsc();
+    let end_tsc = rdtsc();
     let freq = TSC_COUNTS_PER_US.load(Ordering::Relaxed).max(1);
-    let duration_us = (end - start) / freq;
+    let final_duration_us = (end_tsc.saturating_sub(start_tsc)) / freq;
     
-    crate::ai_core::record_idle_duration(cpu_id, duration_us);
+    crate::ai_core::record_idle_duration(cpu_id, final_duration_us);
 }
 
 /// Nivel 2: Pause.
@@ -587,11 +596,7 @@ extern "C" fn ap_main_loop() -> ! {
 
     loop {
         // 1. Intentar planificar procesos en este núcleo.
-        crate::scheduler::schedule();
-
-        // 2. Verificación antes de dormir.
-        x86_64::instructions::interrupts::disable();
-        crate::cpu::idle();
-        x86_64::instructions::interrupts::enable();
+        let sleep_ms = crate::scheduler::schedule();
+        crate::cpu::idle(sleep_ms);
     }
 }

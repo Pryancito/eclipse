@@ -387,7 +387,9 @@ fn wake_sleeping_processes(current_tick: u64) {
 ///   idle; al volver (proceso bloqueado y cola vacía) se restaura.
 /// - Cuando el proceso actual está bloqueado y no hay siguiente proceso:
 ///   BSP vuelve a PID 0; AP vuelve a su contexto idle.
-pub fn schedule() {
+pub fn schedule() -> u64 {
+    let mut sleep_duration = 0;
+
     x86_64::instructions::interrupts::without_interrupts(|| {
         let cpu_id = crate::process::get_cpu_id();
         let current_pid = current_process_id();
@@ -410,7 +412,7 @@ pub fn schedule() {
 
                                  // Reset quantum here so we don't count the same ticks twice.
                                  // Default is 10, but AI can suggest a different one.
-                                 let next_q = process.ai_profile.predict_burst().max(5).min(50) as u32;
+                                 let next_q = process.ai_profile.predict_burst().max(10).min(50) as u32;
                                  unsafe { 
                                      CPU_QUANTUM[cpu_id] = next_q;
                                      CPU_INITIAL_QUANTUM[cpu_id] = next_q;
@@ -499,7 +501,7 @@ pub fn schedule() {
                             if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
                                 table[slot].as_ref().map(|p| p.ai_profile.predict_burst()).unwrap_or(10)
                             } else { 10 }
-                        }.max(5).min(50) as u32;
+                        }.max(10).min(50) as u32;
 
                         unsafe { 
                             crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
@@ -527,7 +529,7 @@ pub fn schedule() {
                             if let Some(slot) = crate::ipc::pid_to_slot_fast(next_pid) {
                                 table[slot].as_ref().map(|p| p.ai_profile.predict_burst()).unwrap_or(10)
                             } else { 10 }
-                        }.max(5).min(50) as u32;
+                        }.max(10).min(50) as u32;
 
                         unsafe { 
                             crate::scheduler::CPU_QUANTUM[cpu_id] = next_q; 
@@ -553,58 +555,79 @@ pub fn schedule() {
                 }
             }
         } else {
-            // Paso 3: No hay proceso listo. Si el proceso actual está bloqueado
-            // debemos cambiar a un contexto idle para no continuar ejecutándolo.
-            let is_blocked = current_pid
-                .and_then(|pid| get_process(pid))
-                .map(|p| p.state == ProcessState::Blocked)
-                .unwrap_or(false);
-
-            if is_blocked {
-                let blocked_pid = current_pid.unwrap();
-
-                if cpu_id == 0 {
-                    // BSP: volver al proceso kernel (PID 0) que actúa como idle.
-                    x86_64::instructions::interrupts::without_interrupts(|| {
-                        {
-                            let mut table = crate::process::PROCESS_TABLE.lock();
-                            if let Some(p0) = table[0].as_mut() {
-                                p0.state = ProcessState::Running;
-                                p0.current_cpu = 0;
+            // Paso 3: No hay procesos listos.
+            if let Some(pid) = current_pid {
+                if pid != 0 {
+                    // Estamos ejecutando un proceso de usuario, pero no hay nada más que hacer.
+                    // Debemos sacarlo de la CPU para que el núcleo pueda entrar en modo idle (HLT/MWAIT).
+                    
+                    if cpu_id == 0 {
+                        // BSP: volver al proceso kernel (PID 0) que actúa como idle.
+                        x86_64::instructions::interrupts::without_interrupts(|| {
+                            {
+                                let mut table = crate::process::PROCESS_TABLE.lock();
+                                if let Some(p0) = table[0].as_mut() {
+                                    p0.state = ProcessState::Running;
+                                    p0.current_cpu = 0;
+                                }
                             }
-                        }
-                        perform_context_switch(blocked_pid, 0);
-                    });
-                } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
-                    // AP: restaurar el contexto idle guardado.
-                    x86_64::instructions::interrupts::without_interrupts(|| {
-                        set_current_process(None);
-                        let (from_ptr, clear_ptr) = {
-                            let mut table = crate::process::PROCESS_TABLE.lock();
-                            let slot = match crate::ipc::pid_to_slot_fast(blocked_pid) {
-                                Some(s) => s,
-                                None => return,
+                            perform_context_switch(pid, 0);
+                        });
+                    } else if cpu_id < MAX_CPUS && AP_IDLE_CONTEXT_VALID[cpu_id].load(Ordering::SeqCst) {
+                        // AP: restaurar el contexto idle guardado.
+                        x86_64::instructions::interrupts::without_interrupts(|| {
+                            set_current_process(None);
+                            let (from_ptr, clear_ptr) = {
+                                let mut table = crate::process::PROCESS_TABLE.lock();
+                                let slot = match crate::ipc::pid_to_slot_fast(pid) {
+                                    Some(s) => s,
+                                    None => return,
+                                };
+                                match table[slot].as_mut() {
+                                    Some(p) if p.id == pid => {
+                                        let ctx_ptr = &mut p.context as *mut crate::process::Context;
+                                        let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
+                                        (ctx_ptr, cpu_ptr)
+                                    },
+                                    _ => return,
+                                }
                             };
-                            match table[slot].as_mut() {
-                                Some(p) if p.id == blocked_pid => {
-                                    let ctx_ptr = &mut p.context as *mut crate::process::Context;
-                                    let cpu_ptr = &mut p.current_cpu as *mut u32 as u64;
-                                    (ctx_ptr, cpu_ptr)
-                                },
-                                _ => return,
+                            let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
+                            unsafe {
+                                crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
                             }
-                        };
-                        let to_ctx = unsafe { &AP_IDLE_CONTEXTS[cpu_id] };
-                        unsafe {
-                            crate::process::switch_context(&mut *from_ptr, to_ctx, 0, clear_ptr);
-                        }
-                    });
+                        });
+                    }
                 }
             }
-            // Si no está bloqueado (yield normal sin otros procesos), el proceso
-            // actual simplemente continúa (se usa como idle implícito).
+            // Si ya estamos en el kernel (pid == 0 o None), simplemente salimos.
+            // Esto permite que el loop principal (en main.rs o ap_main_loop) continúe y ejecute idle().
+            
+            // Calcular el tiempo hasta el próximo despertar si no hay nada que ejecutar.
+            let current_tick = crate::interrupts::ticks();
+            let mut min_wake = None;
+            {
+                let q = SLEEP_QUEUE.lock();
+                for entry in q.iter() {
+                    if entry.valid {
+                        if min_wake.is_none() || entry.wake_tick < min_wake.unwrap() {
+                            min_wake = Some(entry.wake_tick);
+                        }
+                    }
+                }
+            }
+
+            sleep_duration = match min_wake {
+                Some(tick) if tick > current_tick => {
+                    // Limitar a un máximo de 50ms para mantener el sistema reactivo
+                    (tick - current_tick).min(50)
+                },
+                Some(_) => 0, // Debería haber despertado ya
+                None => 10,   // Valor por defecto (10ms) si no hay nada pendiente
+            };
         }
     });
+    sleep_duration
 }
 
 fn perform_context_switch(from_pid: ProcessId, to_pid: ProcessId) {
