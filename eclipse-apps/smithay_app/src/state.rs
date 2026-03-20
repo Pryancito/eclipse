@@ -325,11 +325,15 @@ impl SmithayState {
             match self.backend.poll_event() {
                 None => break,
                 Some(event) => {
-                    self.last_ipc_activity = std::time::Instant::now();
                     events_processed += 1;
                     self.handle_event(&event);
                 }
             }
+        }
+        // Update last_ipc_activity once per handle_ipc() call (not per event) to
+        // avoid N calls to Instant::now() = SYS_GET_SYSTEM_STATS per frame.
+        if events_processed > 0 {
+            self.last_ipc_activity = std::time::Instant::now();
         }
     }
 
@@ -578,8 +582,10 @@ impl SmithayState {
     /// Actualiza métricas de sistema/procesos cuando corresponde; devuelve true si se ha
     /// actualizado algo que debería disparar un render (dirty).
     fn update_metrics_if_needed(&mut self) -> bool {
+        // Single Instant::now() call (= 1 SYS_GET_SYSTEM_STATS syscall) shared for
+        // both the elapsed check and the update of last_metrics_update.
         let now = std::time::Instant::now();
-        let metrics_elapsed = self.last_metrics_update.elapsed();
+        let metrics_elapsed = now.duration_since(self.last_metrics_update);
         let need_metrics = self.input.dashboard_active || self.input.system_central_active;
         let metrics_interval = if need_metrics { 800u64 } else { 4000u64 };
 

@@ -74,6 +74,13 @@ impl Instant {
     pub fn elapsed(&self) -> Duration {
         Duration::from_millis(Instant::now().ticks.saturating_sub(self.ticks))
     }
+
+    /// Duration between `self` and an earlier Instant, without an extra syscall.
+    /// Returns `Duration::from_millis(0)` if `earlier` is ahead of `self`
+    /// (saturating, same contract as `elapsed()`).
+    pub fn duration_since(self, earlier: Instant) -> Duration {
+        Duration::from_millis(self.ticks.saturating_sub(earlier.ticks))
+    }
 }
 
 impl core::ops::Sub<Duration> for Instant {

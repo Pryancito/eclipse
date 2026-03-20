@@ -432,12 +432,15 @@ use core::sync::atomic::AtomicBool;
 /// de lo contrario usa HLT (Nivel 3).
 pub fn idle(duration_ms: u64) {
     if duration_ms == 0 {
-        pause();
+        // No duration specified: HLT until the next interrupt (APIC timer fires in ≤1ms).
+        // Using pause() here causes a tight busy-loop; enable_and_hlt() lets the CPU
+        // actually rest and allows QEMU to yield the host thread, dropping guest CPU to ~0%.
+        unsafe { x86_64::instructions::interrupts::enable_and_hlt(); }
         return;
     }
 
     // Set the APIC timer to wake the core after the duration.
-    if duration_ms > 1 {
+    if duration_ms >= 1 {
         crate::apic::set_timer_ms(duration_ms);
     }
 
@@ -450,17 +453,10 @@ pub fn idle(duration_ms: u64) {
     // Mwait and Hlt will wait for an interrupt (or memory change).
     match mode {
         crate::ai_core::IdleMode::Poll => {
-            // Adaptive polling: enable interrupts and spin with pause.
-            unsafe { x86_64::instructions::interrupts::enable(); }
-            // Poll for a fixed short period or until something is ready.
-            let addr = crate::scheduler::ready_queue_tail_addr() as *const usize;
-            let initial_tail = unsafe { core::ptr::read_volatile(addr) };
-            for _ in 0..2000 {
-                if unsafe { core::ptr::read_volatile(addr) } != initial_tail {
-                    break;
-                }
-                pause();
-            }
+            // The timer is about to fire (< 30µs). Use HLT instead of a busy-spin
+            // so the CPU enters a low-power state; the interrupt wakes it immediately.
+            // This prevents the 2000×pause() busy-wait from contributing to CPU load.
+            unsafe { x86_64::instructions::interrupts::enable_and_hlt(); }
         }
         crate::ai_core::IdleMode::Mwait(hint) => {
             if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
@@ -595,6 +591,10 @@ extern "C" fn ap_main_loop() -> ! {
     unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)); }
 
     loop {
+        // Wake any sleeping processes whose timer has expired.
+        // Without this, APs see stale expired sleep-queue entries and return
+        // sleep_ms=0 from schedule(), which previously caused a busy-spin.
+        crate::scheduler::tick();
         // 1. Intentar planificar procesos en este núcleo.
         let sleep_ms = crate::scheduler::schedule();
         crate::cpu::idle(sleep_ms);

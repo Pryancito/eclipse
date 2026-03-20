@@ -351,9 +351,11 @@ fn main_loop() -> ! {
         // Handle zombie processes - reap terminated children
         reap_zombies();
         
-        // Sleep briefly to avoid a busy-loop; this blocks init for 1 ms
-        // so the kernel can HLT and CPU usage drops from ~100% to near 0%.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Sleep briefly to avoid a busy-loop; 5ms gives a 200 Hz monitoring rate
+        // which is more than enough for service health checks while keeping CPU
+        // usage near 0%.  IPC requests (GET_INPUT_PID, heartbeats, etc.) are
+        // processed at the start of each iteration so latency is still low.
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
