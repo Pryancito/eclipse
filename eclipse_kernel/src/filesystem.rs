@@ -1325,16 +1325,11 @@ impl Scheme for FileSystemScheme {
     }
 
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
-        unsafe { serial::serial_print("DEBUG: ioctl entry\n"); }
         let mut open_files = OPEN_FILES_SCHEME.lock();
         let open_file = open_files.get_mut(id).and_then(|s| s.as_mut()).ok_or(scheme_error::EBADF)?;
-        
-        serial::serial_print("[FS-SCHEME] ioctl request: ");
-        serial::serial_print_hex(request as u64);
-        serial::serial_print(" for ");
+
         match open_file {
             OpenFile::Framebuffer => {
-                serial::serial_print("Framebuffer\n");
                 match request as u32 {
                     0x4600 => { // FBIOGET_VSCREENINFO
                         let fb_info = &crate::boot::get_boot_info().framebuffer;
@@ -1355,7 +1350,6 @@ impl Scheme for FileSystemScheme {
                         Ok(0)
                     }
                     0x4601 => { // FBIOPUT_VSCREENINFO
-                        crate::serial::serial_print("[FS-SCHEME] FBIOPUT_VSCREENINFO called (stub)\n");
                         Ok(0)
                     }
                     0x4602 => { // FBIOGET_FSCREENINFO
@@ -1368,13 +1362,9 @@ impl Scheme for FileSystemScheme {
                         Ok(0)
                     }
                     0x4611 => { // FBIOPAN_DISPLAY — stub OK
-                        crate::serial::serial_print("[FS-SCHEME] FBIOPAN_DISPLAY (stub OK)\n");
                         Ok(0)
                     }
                     _ => {
-                        crate::serial::serial_print("[FS-SCHEME] Unknown FB ioctl: ");
-                        crate::serial::serial_print_hex(request as u64);
-                        crate::serial::serial_print("\n");
                         Err(scheme_error::EINVAL)
                     }
                 }
