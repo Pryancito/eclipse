@@ -222,8 +222,18 @@ pub fn get_cpu_id() -> usize {
 
 pub fn next_pid() -> ProcessId {
     let mut next_pid = NEXT_PID.lock();
-    let pid = *next_pid;
-    *next_pid += 1;
+    let mut pid = *next_pid;
+    // PID 0 está reservado para el proceso kernel. Si por cualquier
+    // corrupción/condición inicial el contador cae en 0, forzamos
+    // a arrancar desde 1 para que el scheduler/CR3 no se queden en
+    // el espacio de direcciones del kernel.
+    if pid == 0 {
+        pid = 1;
+        *next_pid = 2;
+        return pid;
+    }
+
+    *next_pid = pid.wrapping_add(1);
     pid
 }
 

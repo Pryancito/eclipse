@@ -1201,6 +1201,15 @@ pub fn draw_system_central(
     
     let mut buf = heapless::String::<16>::new();
 
+    // The kernel treats the `gui` service as a one-shot launcher and clears its pid/state
+    // after `exec()` into `smithay_app`. For the overlay we still want to show `gui` as
+    // active when this compositor process is alive.
+    #[cfg(target_vendor = "eclipse")]
+    let self_pid: u32 = unsafe { libc::getpid() as u32 };
+    #[cfg(not(target_vendor = "eclipse"))]
+    let self_pid: u32 = 0;
+    let gui_running = self_pid != 0 && processes.iter().any(|p| p.pid == self_pid);
+
     for (i, svc) in services.iter().enumerate() {
         let y = start_y + 25 + (i as i32 * row_h);
         if y > half_h + 20 - 20 { break; }
@@ -1212,15 +1221,23 @@ pub fn draw_system_central(
         }.trim();
         let _ = Text::new(name_str, Point::new(col_name, y), text_style).draw(fb);
 
+        // Override displayed state/pid for the `gui` service row.
+        let mut svc_state = svc.state;
+        let mut svc_pid = svc.pid;
+        if name_str == "gui" {
+            svc_state = if gui_running { 2 } else { 0 };
+            svc_pid = if gui_running { self_pid } else { 0 };
+        }
+
         buf.clear();
-        if svc.state == 0 || (svc.pid == 0 && name_str != "kernel") {
+        if svc_state == 0 || (svc_pid == 0 && name_str != "kernel") {
             let _ = buf.push_str("---");
         } else {
-            let _ = core::fmt::write(&mut buf, format_args!("{}", svc.pid));
+            let _ = core::fmt::write(&mut buf, format_args!("{}", svc_pid));
         }
         let _ = Text::new(&buf, Point::new(col_id, y), text_style).draw(fb);
         
-        let state_str = match svc.state {
+        let state_str = match svc_state {
             0 => "Inactive",
             1 => "Activating",
             2 => "Active",
@@ -1228,7 +1245,7 @@ pub fn draw_system_central(
             4 => "Stopping",
             _ => "Unknown",
         };
-        let (state_color, dot_color) = match svc.state {
+        let (state_color, dot_color) = match svc_state {
             2 => (colors::WHITE, colors::ACCENT_GREEN),
             3 => (colors::ACCENT_RED, colors::ACCENT_RED),
             0 => (colors::GLOW_DIM, colors::GLOW_DIM),
@@ -1243,7 +1260,7 @@ pub fn draw_system_central(
         let mut svc_mem_kb = 0;
         for (j, p) in processes.iter().enumerate() {
             if j < process_cpu.len() && j < process_mem.len() {
-                if p.pid == svc.pid && svc.pid != 0 {
+                if p.pid == svc_pid && svc_pid != 0 {
                     svc_cpu = process_cpu[j];
                     svc_mem_kb = process_mem[j];
                     break;

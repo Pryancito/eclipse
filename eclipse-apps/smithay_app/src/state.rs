@@ -252,6 +252,8 @@ impl SmithayState {
             CompositorEvent::ServiceInfo(data) => {
                 if data.len() >= 8 && &data[0..4] == b"SVCS" {
                     let count = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4])) as usize;
+                    // Debug: helps to see why a service is missing from the UI.
+                    // Print only when System Central is active to limit spam.
                     let mut parsed = 0usize;
                     let mut offset = 8;
                     for i in 0..count {
@@ -268,6 +270,14 @@ impl SmithayState {
                             offset += 4;
                             self.service_list[i] = svc;
                             parsed += 1;
+
+                            if self.input.system_central_active {
+                                let name_raw = core::str::from_utf8(&self.service_list[i].name).unwrap_or("?");
+                                let name_str = match name_raw.find('\0') {
+                                    Some(pos) => &name_raw[..pos],
+                                    None => name_raw,
+                                }.trim();
+                            }
                         }
                     }
                     self.service_count = parsed;

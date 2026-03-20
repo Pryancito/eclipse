@@ -527,7 +527,19 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
             _ => return None,
         };
 
-        if slot.is_none() {
+        // Si el cache está vacío (Vec len=0) tratamos el slot como inválido.
+        // En hardware real puede ocurrir que un arranque anterior deje un slot en estado
+        // inconsistente (por ejemplo por cargas parciales) y entonces `spawn_service`
+        // falla sin intentar el fallback a disco.
+        let cached_len = slot.as_ref().map(|v| v.len()).unwrap_or(0);
+        serial::serial_printf(format_args!(
+            "[SYSCALL] get_service_slice({}, path={}) cached_len={}\n",
+            service_id,
+            path,
+            cached_len
+        ));
+
+        if slot.is_none() || cached_len == 0 {
             match crate::filesystem::read_file_alloc(path) {
                 Ok(buf) => {
                     serial::serial_printf(format_args!(
@@ -1144,9 +1156,9 @@ fn sys_send(server_id: u64, msg_type: u64, data_ptr: u64, data_len: u64) -> u64 
             _ => MessageType::User,
         };
         
-        const MAX_MSG: usize = 256;
+        const MAX_MSG: usize = 512;
         let len = core::cmp::min(data_len as usize, MAX_MSG);
-        let mut data = [0u8; 256];
+        let mut data = [0u8; 512];
         if len > 0 && data_ptr != 0 {
             if is_user_pointer(data_ptr, len as u64) {
                 unsafe {

@@ -20,7 +20,7 @@ pub type ServerId = u32;
 pub type ClientId = u32;
 
 /// Tamaño máximo de datos en un mensaje
-const MAX_MESSAGE_DATA: usize = 256;
+const MAX_MESSAGE_DATA: usize = 512;
 
 /// Tipos de mensaje
 #[repr(u32)]
