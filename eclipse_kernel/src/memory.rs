@@ -1033,8 +1033,11 @@ pub unsafe fn free_dma_buffer(ptr: *mut u8, size: usize, align: usize) {
 /// Physical address is accessible at phys_to_virt(phys_addr).
 static ANON_MMAP_NEXT: AtomicU64 = AtomicU64::new(0);
 
-const ANON_MMAP_PHYS_START: u64 = 0x4000_0000;  // 1GB - leaves 0.25-1GB for GPU/DMA pools
-const ANON_MMAP_PHYS_END: u64 = 0xB000_0000;    // Stop before 2.75GB (PCI hole ~3GB)
+// Start at 4GiB to reduce collision with the typical PCI/MMIO hole (3-4GiB)
+// on real x86_64 systems. Bootloader HHDM pages cover a much larger physical range.
+const ANON_MMAP_PHYS_START: u64 = 0x1_0000_0000; // 4GiB
+// Allow up to 256GiB of anon mmap frames.
+const ANON_MMAP_PHYS_END: u64 = ANON_MMAP_PHYS_START + (256u64 * 1024u64 * 1024u64 * 1024u64);
 
 /// Dedicated physical memory region for GPU Firmware (Phase 3)
 pub const GPU_FW_PHYS_BASE: u64 = 0x2000_0000;  // 512MB

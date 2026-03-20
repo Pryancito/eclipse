@@ -144,6 +144,19 @@ impl NvidiaVramAllocator {
             }
         }
     }
+
+    fn used_pages(&self) -> u64 {
+        // Bitmap: 0 = free, 1 = used (1 bit per 4KB page).
+        let mut used: u64 = 0;
+        for &w in self.bitmap.iter() {
+            used += w.count_ones() as u64;
+        }
+        used
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.used_pages().saturating_mul(4096)
+    }
 }
 
 static VRAM_ALLOCATOR: Mutex<Option<NvidiaVramAllocator>> = Mutex::new(None);
@@ -1396,24 +1409,31 @@ pub fn get_nvidia_gpus() -> Vec<NvidiaGpuInfo> {
 
 /// Refresh metrics for all active NVIDIA GPUs and update the AI core.
 pub fn update_all_gpu_vitals() {
+    // Update VRAM stats for dashboard (sum of all detected GPUs + used from our BAR1 allocator).
+    let gpu_infos = get_nvidia_gpus();
+    let total_vram_bytes_all: u64 = gpu_infos
+        .iter()
+        .map(|g| (g.memory_size_mb as u64).saturating_mul(1024 * 1024))
+        .sum();
+
+    let used_vram_bytes_primary = {
+        let mut allocator = VRAM_ALLOCATOR.lock();
+        allocator
+            .as_ref()
+            .map(|a| a.used_bytes())
+            .unwrap_or(0)
+    };
+
+    crate::ai_core::set_gpu_vram_stats(total_vram_bytes_all, used_vram_bytes_primary);
+
     let gpus = find_nvidia_gpus();
     for (i, pci_dev) in gpus.iter().enumerate().take(4) {
-        // We need BAR0 to read registers. 
-        // find_nvidia_gpus only returns PciDevice info.
-        // We need to find the mapped NvidiaGpu instance to get bar0_virt.
+        // We need BAR0 to read registers (temperature/engine heuristic).
+        // Here we rely on the HHDM phys->virt mapping.
         let mut bar0 = 0u64;
-        
-        // This is a bit inefficient (re-scanning or looking up in a global list)
-        // but for now let's use the first BAR0 if it was initialized.
-        // In a real multi-GPU setup we'd have a list of NvidiaGpu instances.
-        if i == 0 {
-            // Check if we have a BAR0 mapping (from GSP loader or similar)
-            // For now, let's use the architectural constant if it's set or re-read from PCI.
-            let pci_bar0 = pci_dev.bar0;
-            if pci_bar0 != 0 {
-                // In our kernel, we identity map or use a fixed virtual range for BAR0.
-                bar0 = crate::memory::phys_to_virt(pci_bar0 & !0xF);
-            }
+        let pci_bar0 = pci_dev.bar0;
+        if pci_bar0 != 0 {
+            bar0 = crate::memory::phys_to_virt(pci_bar0 & !0xF);
         }
 
         if bar0 != 0 {
@@ -1426,7 +1446,8 @@ pub fn update_all_gpu_vitals() {
                 let load = if raw_pmc & 0x1 != 0 { 45 } else { 2 }; // Heuristic/Mock for now
 
                 // Report temperature in Tenths of Celsius (450 = 45.0 C)
-                crate::ai_core::update_gpu_metrics(i, load, 0, (temp as u32) * 10);
+                let mem_used = if i == 0 { used_vram_bytes_primary } else { 0 };
+                crate::ai_core::update_gpu_metrics(i, load, mem_used, (temp as u32) * 10);
             }
         }
     }

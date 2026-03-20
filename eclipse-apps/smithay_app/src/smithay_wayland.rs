@@ -164,7 +164,15 @@ impl App {
                 self.cpu_usage, 
                 self.mem_usage, 
                 self.net_usage, 
-                0 // TODO: Uptime
+                0, // cpu_temp
+                0, // gpu_load
+                0, // gpu_temp
+                0, // anomalies
+                0, // heap fragmentation
+                0, // uptime_ticks
+                0, // cpu_count
+                0, // mem_total_kb
+                0, // gpu_vram_total_kb
             );
         }
 

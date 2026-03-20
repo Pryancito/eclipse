@@ -277,10 +277,13 @@ pub fn local_tick() {
     CPU_TOTAL_TICKS[cpu_id].fetch_add(1, Ordering::Relaxed);
     
     let current_pid = crate::process::current_process_id();
-    if current_pid == Some(0) {
+    // PID 0 actúa como idle del BSP, pero los APs usan un idle propio
+    // guardando `set_current_process(None)`. Para que el % CPU sea correcto,
+    // contamos ambos como "idle".
+    if current_pid == Some(0) || current_pid.is_none() {
         STATS_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
         CPU_IDLE_TICKS[cpu_id].fetch_add(1, Ordering::Relaxed);
-    // Note: p.cpu_ticks is now updated in schedule() to avoid global lock contention here.
+        // Note: p.cpu_ticks is now updated in schedule() to avoid global lock contention here.
     }
 
     unsafe {

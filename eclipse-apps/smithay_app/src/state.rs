@@ -67,9 +67,12 @@ pub struct SmithayState {
     pub last_metrics_update: std::time::Instant,
     pub cpu_usage: f32,
     pub mem_usage: f32,
+    pub cpu_count: u64,
+    pub mem_total_kb: u64,
     pub cpu_temp: u32,
     pub gpu_load: u32,
     pub gpu_temp: u32,
+    pub gpu_vram_total_kb: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
     pub network_pid: Option<u32>,
@@ -155,9 +158,12 @@ impl SmithayState {
             last_metrics_update: std::time::Instant::now(),
             cpu_usage: 0.0,
             mem_usage: 0.0,
+            cpu_count: 0,
+            mem_total_kb: 0,
             cpu_temp: 0,
             gpu_load: 0,
             gpu_temp: 0,
+            gpu_vram_total_kb: 0,
             anomaly_count: 0,
             heap_fragmentation: 0,
             network_pid: None,
@@ -600,9 +606,12 @@ impl SmithayState {
                 idle_ticks: 0,
                 total_mem_frames: 0,
                 used_mem_frames: 0,
+                cpu_count: 0,
                 cpu_temp: [0; 16],
                 gpu_load: [0; 4],
                 gpu_temp: [0; 4],
+                gpu_vram_total_bytes: 0,
+                gpu_vram_used_bytes: 0,
                 anomaly_count: 0,
                 heap_fragmentation: 0,
             };
@@ -621,6 +630,10 @@ impl SmithayState {
                     if current.total_mem_frames > 0 {
                         self.mem_usage = (current.used_mem_frames as f32) / (current.total_mem_frames as f32);
                     }
+
+                    // Para etiquetas del dashboard (CPU total y RAM total).
+                    self.cpu_count = current.cpu_count;
+                    self.mem_total_kb = current.total_mem_frames.saturating_mul(4);
                 }
             }
 
@@ -642,8 +655,29 @@ impl SmithayState {
 
                 // AI-CORE Vitals
                 self.cpu_temp = current.cpu_temp[0]; // BSP Temp
-                self.gpu_load = current.gpu_load[0];
-                self.gpu_temp = current.gpu_temp[0];
+
+                // GPU VRAM: gauge = VRAM usada / VRAM total (en todas las GPUs).
+                let total_vram_kb = current.gpu_vram_total_bytes / 1024;
+                let used_vram_kb = current.gpu_vram_used_bytes / 1024;
+                self.gpu_vram_total_kb = total_vram_kb;
+                if total_vram_kb > 0 {
+                    let pct = (used_vram_kb.saturating_mul(100) / total_vram_kb).min(100);
+                    self.gpu_load = pct as u32;
+                } else {
+                    self.gpu_load = 0;
+                }
+
+                // Temperatura promedio de todas las GPUs (ignoramos ceros en GPUs no detectadas).
+                let mut t_sum: u64 = 0;
+                let mut t_cnt: u64 = 0;
+                for &t in current.gpu_temp.iter() {
+                    if t > 0 {
+                        t_sum = t_sum.saturating_add(t as u64);
+                        t_cnt += 1;
+                    }
+                }
+                self.gpu_temp = if t_cnt > 0 { (t_sum / t_cnt) as u32 } else { 0 };
+
                 self.anomaly_count = current.anomaly_count;
                 self.heap_fragmentation = current.heap_fragmentation;
             }
@@ -1004,7 +1038,10 @@ impl SmithayState {
                     self.gpu_temp,
                     self.anomaly_count,
                     self.heap_fragmentation,
-                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0)
+                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0),
+                    self.cpu_count,
+                    self.mem_total_kb,
+                    self.gpu_vram_total_kb,
                 );
             } else if self.input.system_central_active {
                 render::draw_system_central(

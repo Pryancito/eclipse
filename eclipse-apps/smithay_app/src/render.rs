@@ -640,7 +640,10 @@ pub fn draw_dashboard(
     gpu_temp: u32,
     anomalies: u32,
     frag: u32,
-    uptime_ticks: u64
+    uptime_ticks: u64,
+    cpu_count: u64,
+    mem_total_kb: u64,
+    gpu_vram_total_kb: u64,
 ) {
     let cpu = if cpu.is_finite() { cpu } else { 0.0 };
     let mem = if mem.is_finite() { mem } else { 0.0 };
@@ -660,21 +663,74 @@ pub fn draw_dashboard(
     
     let _ = main_panel.draw(fb);
     
-    // Gauges principales (CPU, RAM, RED)
-    let _ = Gauge { center: main_panel.position + Point::new(100, 160), radius: 60, value: cpu, label: "CARGA CPU", unit: "%" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(320, 160), radius: 60, value: mem, label: "MEMORIA RAM", unit: "%" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(540, 160), radius: 60, value: net, label: "RED INT", unit: "%" }.draw(fb);
+    // Gauges uniformes en 2 filas x 3 columnas (mismo tamaño/espaciado).
+    // Panel: p_w=640. Usamos centros con margen simétrico.
+    let gauge_r: u32 = 50;
+    let top_y: i32 = 160;
+    let bot_y: i32 = 290;
+    let x0: i32 = 100;
+    let x1: i32 = 320;
+    let x2: i32 = 540;
 
-    // Mini Gauges de Temperatura y GPU
-    let cpu_t_f = (cpu_temp as f32 / 1000.0).clamp(0.0, 1.0); // 0-100 C
-    let _ = Gauge { center: main_panel.position + Point::new(100, 270), radius: 35, value: cpu_t_f, label: "TEMP CPU", unit: "C" }.draw(fb);
-    
+    // Labels dinámicas para los gauges (Gauge.label requiere &'static str).
+    // Usamos buffers estáticos y `from_utf8_unchecked` porque solo escribimos ASCII.
+    static mut CPU_LABEL_BUF: [u8; 64] = [0; 64];
+    static mut RAM_LABEL_BUF: [u8; 64] = [0; 64];
+    static mut GPU_VRAM_LABEL_BUF: [u8; 64] = [0; 64];
+
+    let cpu_label: &'static str = {
+        let mut tmp = heapless::String::<64>::new();
+        let _ = core::fmt::write(&mut tmp, format_args!("{} CPU", cpu_count));
+        unsafe {
+            CPU_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
+            core::str::from_utf8_unchecked(&CPU_LABEL_BUF[..tmp.len()])
+        }
+    };
+
+    let (ram_val, ram_unit) = if mem_total_kb >= 1024 * 1024 {
+        (mem_total_kb / (1024 * 1024), "GB")
+    } else {
+        (mem_total_kb / 1024, "MB")
+    };
+
+    let ram_label: &'static str = {
+        let mut tmp = heapless::String::<64>::new();
+        let _ = core::fmt::write(&mut tmp, format_args!("{} {} RAM", ram_val, ram_unit));
+        unsafe {
+            RAM_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
+            core::str::from_utf8_unchecked(&RAM_LABEL_BUF[..tmp.len()])
+        }
+    };
+
+    let (vram_val, vram_unit) = if gpu_vram_total_kb >= 1024 * 1024 {
+        (gpu_vram_total_kb / (1024 * 1024), "GB")
+    } else {
+        (gpu_vram_total_kb / 1024, "MB")
+    };
+
+    let gpu_vram_label: &'static str = {
+        let mut tmp = heapless::String::<64>::new();
+        let _ = core::fmt::write(&mut tmp, format_args!("TOTAL: {} {}", vram_val, vram_unit));
+        unsafe {
+            GPU_VRAM_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
+            core::str::from_utf8_unchecked(&GPU_VRAM_LABEL_BUF[..tmp.len()])
+        }
+    };
+
+    // Fila 1: CPU, RAM, RED
+    let _ = Gauge { center: main_panel.position + Point::new(x0, top_y), radius: gauge_r, value: cpu, label: cpu_label, unit: "%" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(x1, top_y), radius: gauge_r, value: mem, label: ram_label, unit: "%" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(x2, top_y), radius: gauge_r, value: net, label: "RED INT", unit: "%" }.draw(fb);
+
+    // Fila 2: Temperatura CPU, Carga GPU, Temperatura GPU
+    let cpu_t_f = (cpu_temp as f32 / 1000.0).clamp(0.0, 1.0); // ~0-100C
     let gpu_l_f = (gpu_load as f32 / 100.0).clamp(0.0, 1.0);
-    let _ = Gauge { center: main_panel.position + Point::new(210, 270), radius: 35, value: gpu_l_f, label: "CARGA GPU", unit: "%" }.draw(fb);
-    
     let gpu_t_f = (gpu_temp as f32 / 1000.0).clamp(0.0, 1.0);
-    let _ = Gauge { center: main_panel.position + Point::new(320, 270), radius: 35, value: gpu_t_f, label: "TEMP GPU", unit: "C" }.draw(fb);
 
+    let _ = Gauge { center: main_panel.position + Point::new(x0, bot_y), radius: gauge_r, value: cpu_t_f, label: "TEMP CPU", unit: "C" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(x1, bot_y), radius: gauge_r, value: gpu_l_f, label: gpu_vram_label, unit: "%" }.draw(fb);
+    let _ = Gauge { center: main_panel.position + Point::new(x2, bot_y), radius: gauge_r, value: gpu_t_f, label: "TEMP GPU AVG", unit: "C" }.draw(fb);
+/*
     let mut cpu_line = heapless::String::<64>::new();
     let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}% @ {:.1}C", (cpu * 100.0) as u32, cpu_temp as f32 / 10.0));
     let mut gpu_line = heapless::String::<64>::new();
@@ -700,7 +756,7 @@ pub fn draw_dashboard(
     ];
     let term = Terminal { position: main_panel.position + Point::new(380, 220), size: Size::new(240, 160), lines: term_lines };
     let _ = term.draw(fb);
-    
+    */
     let label_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_BLUE);
     let _ = Text::new("PRESIONE 'SUPER' PARA VOLVER AL ESCRITORIO", Point::new(w / 2 - 200, h - 80), label_style).draw(fb);
 }

@@ -667,6 +667,16 @@ impl GPUPerfProfile {
 /// Estado de hasta 4 GPUs en el sistema
 pub static GPU_PERF: Mutex<alloc::vec::Vec<GPUPerfProfile>> = Mutex::new(alloc::vec::Vec::new());
 
+// Cached VRAM stats for the system dashboard. These are filled by the GPU drivers.
+static GPU_VRAM_TOTAL_BYTES: Mutex<u64> = Mutex::new(0);
+static GPU_VRAM_USED_BYTES: Mutex<u64> = Mutex::new(0);
+
+/// Called by the GPU driver to refresh system-wide VRAM totals for the dashboard.
+pub fn set_gpu_vram_stats(total_bytes: u64, used_bytes: u64) {
+    *GPU_VRAM_TOTAL_BYTES.lock() = total_bytes;
+    *GPU_VRAM_USED_BYTES.lock() = used_bytes;
+}
+
 /// Sugiere qué GPU debe manejar una tarea específica
 pub fn suggest_gpu_affinity(task: RenderTask) -> usize {
     let perf = GPU_PERF.lock();
@@ -748,6 +758,8 @@ pub struct SystemVitals {
     pub cpu_temp: [u32; 16],
     pub gpu_load: [u32; 4],
     pub gpu_temp: [u32; 4],
+    pub gpu_vram_total_bytes: u64,
+    pub gpu_vram_used_bytes: u64,
     pub free_memory_kb: u64,
     pub oom_threat: f32,
     pub anomaly_count: u32,
@@ -768,11 +780,16 @@ pub fn get_vitals() -> SystemVitals {
         gpu_t[i] = gpu.temperature;
     }
 
+    let gpu_vram_total_bytes = *GPU_VRAM_TOTAL_BYTES.lock();
+    let gpu_vram_used_bytes = *GPU_VRAM_USED_BYTES.lock();
+
     SystemVitals {
         cpu_load: *load,
         cpu_temp: *temp,
         gpu_load: gpu_l,
         gpu_temp: gpu_t,
+        gpu_vram_total_bytes,
+        gpu_vram_used_bytes,
         free_memory_kb: (memory_history[7] * 4096) / 1024,
         oom_threat: predict_oom_threat_internal(&*memory_history),
         anomaly_count: *ANOMALY_COUNT.lock(), 

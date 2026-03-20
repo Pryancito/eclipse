@@ -28,6 +28,9 @@ pub struct BootInfo {
     pub pml4_addr: u64,
     pub kernel_phys_base: u64,
     pub rsdp_addr: u64,
+    /// Total bytes of UEFI "conventional" RAM (MemoryType::CONVENTIONAL_MEMORY).
+    /// Used to report RAM total in system statistics.
+    pub conventional_mem_total_bytes: u64,
 }
 
 /// Framebuffer source for gpu_present
@@ -60,6 +63,7 @@ static mut BOOT_INFO: Option<BootInfo> = Some(BootInfo {
     pml4_addr: 0,
     kernel_phys_base: 0,
     rsdp_addr: 0,
+    conventional_mem_total_bytes: 0,
 });
 
 /// True once `load_gdt()` has initialized GS base to point at valid per-CPU data.

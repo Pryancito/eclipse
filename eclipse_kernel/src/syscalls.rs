@@ -127,10 +127,13 @@ pub struct SystemStats {
     pub idle_ticks: u64,
     pub total_mem_frames: u64,
     pub used_mem_frames: u64,
+    pub cpu_count: u64,
     // AI-CORE Vitals
     pub cpu_temp: [u32; 16],
     pub gpu_load: [u32; 4],
     pub gpu_temp: [u32; 4],
+    pub gpu_vram_total_bytes: u64,
+    pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
 }
@@ -377,7 +380,17 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
     }
 
     let sched_stats = crate::scheduler::get_stats();
-    let (total_mem, used_mem) = crate::memory::get_memory_stats();
+    let (pool_total_mem, pool_used_mem) = crate::memory::get_memory_stats();
+
+    // Report "RAM total" from UEFI conventional memory computed by the bootloader.
+    // This fixes the dashboard label showing the pool capacity instead of real RAM.
+    let boot_bi = crate::boot::get_boot_info();
+    let total_mem = if boot_bi.conventional_mem_total_bytes > 0 {
+        (boot_bi.conventional_mem_total_bytes / 4096).max(1)
+    } else {
+        pool_total_mem
+    };
+    let used_mem = pool_used_mem.min(total_mem);
     crate::nvidia::update_all_gpu_vitals();
     let vitals = crate::ai_core::get_vitals();
 
@@ -386,9 +399,12 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
         idle_ticks: sched_stats.idle_ticks,
         total_mem_frames: total_mem,
         used_mem_frames: used_mem,
+        cpu_count: crate::cpu::get_active_cpu_count() as u64,
         cpu_temp: vitals.cpu_temp,
         gpu_load: vitals.gpu_load,
         gpu_temp: vitals.gpu_temp,
+        gpu_vram_total_bytes: vitals.gpu_vram_total_bytes,
+        gpu_vram_used_bytes: vitals.gpu_vram_used_bytes,
         anomaly_count: vitals.anomaly_count,
         heap_fragmentation: vitals.heap_fragmentation,
     };

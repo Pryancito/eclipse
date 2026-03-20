@@ -36,6 +36,9 @@ pub struct BootInfo {
     pub pml4_addr: u64,
     pub kernel_phys_base: u64,
     pub rsdp_addr: u64,
+    /// Total bytes of UEFI "conventional" RAM (MemoryType::CONVENTIONAL_MEMORY).
+    /// Used by the kernel to report RAM total in system statistics.
+    pub conventional_mem_total_bytes: u64,
 }
 
 static mut GLOBAL_FB_INFO: Option<FramebufferInfo> = None;
@@ -1308,6 +1311,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     let dst = phys as *mut BootInfo;
                     (*dst).framebuffer = framebuffer_info;
                     (*dst).rsdp_addr = rsdp_addr;
+                    (*dst).conventional_mem_total_bytes = 0;
                     // PML4 y PhysBase se rellenarán después
                 }
             }
@@ -1418,9 +1422,50 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     let dst = phys as *mut BootInfo;
                     (*dst).framebuffer = framebuffer_info; // base_address=0, kernel usará VirtIO
                     (*dst).rsdp_addr = rsdp_addr;
+                    (*dst).conventional_mem_total_bytes = 0;
                 }
             }
         }
+    }
+    // Obtener RAM convencional total desde el memory map UEFI (antes de ExitBootServices).
+    // Así el kernel puede reportar "RAM total" real, no la capacidad de un pool fijo.
+    let mut conventional_mem_total_bytes: u64 = 0;
+    {
+        let bs = system_table.boot_services();
+        let mmap_size = bs.memory_map_size();
+        let extra_descs: usize = 16;
+        let buf_bytes = mmap_size.map_size + mmap_size.entry_size * extra_descs;
+        let pages = (buf_bytes + 0xFFF) / 0x1000;
+        if let Ok(mmap_phys) = bs.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+            // En la fase actual aún estamos bajo contexto UEFI (sus page tables).
+            // Para evitar page-faults, usamos la misma estrategia que con `kernel_data`:
+            // interpretar la dirección física como memoria direccionable en modo virtual.
+            let buf_virt = mmap_phys as *mut u8;
+            let buf_len = pages * 0x1000;
+            unsafe {
+                let buf = core::slice::from_raw_parts_mut(buf_virt, buf_len);
+                if let Ok(mmap_iter) = bs.memory_map(buf) {
+                    for desc in mmap_iter.entries() {
+                        if desc.ty == MemoryType::CONVENTIONAL {
+                            conventional_mem_total_bytes = conventional_mem_total_bytes
+                                .saturating_add(desc.page_count.saturating_mul(4096));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if boot_info_ptr != 0 {
+        unsafe {
+            let dst = boot_info_ptr as *mut BootInfo;
+            (*dst).conventional_mem_total_bytes = conventional_mem_total_bytes;
+        }
+    }
+    // DEBUG: confirmar RAM convencional calculada
+    unsafe {
+        serial_write_str("BL: conventional_mem_total_bytes=0x");
+        serial_write_hex64(conventional_mem_total_bytes);
+        serial_write_str("\r\n");
     }
     // Logs de depuración ANTES de salir de Boot Services
     {
