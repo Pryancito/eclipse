@@ -192,17 +192,6 @@ pub extern "C" fn syscall_handler(
         }
     }
 
-    // Log Syscall 27 (register_device) to catch corruption.
-    // Nota: Para yield (5) y otros, arg1/arg2 son registros del usuario (rdi/rsi);
-    // el kernel no los usa. Valores como 0xFFFF8000... indican contenido residual.
-    if syscall_num == 27 {
-        serial::serial_printf(format_args!(
-            "[SYSCALL] PID {} syscall 27 (register_device) arg1={:#018X} arg2={:#018X}\n",
-            crate::process::current_process_id().unwrap_or(0),
-            arg1,
-            arg2
-        ));
-    }
 
     // Read user context directly from the struct passed by assembly
     let process_context = crate::process::Context {
@@ -238,7 +227,6 @@ pub extern "C" fn syscall_handler(
 
     // Auto-detection: if it calls a high Linux-specific syscall, mark it as Linux permanently
     if !is_linux && (syscall_num == 158 || syscall_num == 231 || syscall_num == 41 || syscall_num == 202) {
-         serial::serial_printf(format_args!("[SYSCALL] Auto-detected Linux binary via syscall {}\n", syscall_num));
          if let Some(pid) = crate::process::current_process_id() {
              if let Some(mut proc) = crate::process::get_process(pid) {
                  proc.is_linux = true;
@@ -451,8 +439,6 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
 
 /// sys_kill - Terminar un proceso por su PID
 fn sys_kill(pid: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] kill() called for PID {}\n", pid));
-
     if pid == 0 || pid == 1 {
         return u64::MAX; // Cannot kill kernel or init
     }
@@ -543,21 +529,10 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
         // inconsistente (por ejemplo por cargas parciales) y entonces `spawn_service`
         // falla sin intentar el fallback a disco.
         let cached_len = slot.as_ref().map(|v| v.len()).unwrap_or(0);
-        serial::serial_printf(format_args!(
-            "[SYSCALL] get_service_slice({}, path={}) cached_len={}\n",
-            service_id,
-            path,
-            cached_len
-        ));
 
         if slot.is_none() || cached_len == 0 {
             match crate::filesystem::read_file_alloc(path) {
                 Ok(buf) => {
-                    serial::serial_printf(format_args!(
-                        "[SYSCALL] Loaded service {} from disk ({} bytes)\n",
-                        path,
-                        buf.len()
-                    ));
                     *slot = Some(buf);
                 }
                 Err(e) => {
@@ -576,8 +551,6 @@ fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
 }
 
 fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] spawn_service({})\n", service_id));
-
     let elf_slice: &[u8] = match get_service_slice(service_id) {
         Some(s) => s,
         None => {
@@ -624,8 +597,6 @@ fn sys_spawn_service(service_id: u64, name_ptr: u64, name_len: u64) -> u64 {
             }
 
             crate::scheduler::enqueue_process(pid);
-
-            serial::serial_printf(format_args!("[SYSCALL] spawn_service: spawned PID {}\n", pid));
 
             pid as u64
         }
@@ -816,11 +787,6 @@ fn sys_sched_setaffinity(pid: u64, cpu_id: u64) -> u64 {
             if let Some(p) = table[slot].as_mut() {
                 if p.id == target_pid {
                     p.cpu_affinity = affinity;
-                    serial::serial_printf(format_args!(
-                        "[SYSCALL] sched_setaffinity: PID {} -> CPU {:?}\n",
-                        target_pid,
-                        affinity
-                    ));
                     return 0u64;
                 }
             }
@@ -932,8 +898,7 @@ fn sys_exit(exit_code: u64) -> u64 {
     drop(stats);
     
     let pid = current_process_id().unwrap_or(0);
-    serial::serial_printf(format_args!("Process ID: {} exiting with code: {:#018X}\n", pid, exit_code));
-    
+
     // Store the exit code in the PCB so sys_wait() can report it to the parent.
     if let Some(mut proc) = crate::process::get_process(pid) {
         proc.exit_code = exit_code;
@@ -1305,10 +1270,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     let mut stats = SYSCALL_STATS.lock();
     stats.fork_calls += 1;
     drop(stats);
-    
-    let current_pid = process::current_process_id().unwrap_or(0);
-    serial::serial_printf(format_args!("[SYSCALL] fork() called from PID {}\n", current_pid));
-    
+
     // Create child process with modified context
     // The child needs to see RAX=0 (return value of fork)
     let mut child_context = *context;
@@ -1317,11 +1279,6 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     // Create child process
     match process::fork_process(&child_context) {
         Some(child_pid) => {
-            serial::serial_printf(format_args!(
-                "[SYSCALL] fork() created child PID: {}, parent PID: {}, returning {} to parent\n",
-                child_pid, current_pid, child_pid
-            ));
-            
             // Add child to scheduler
             crate::scheduler::enqueue_process(child_pid);
             
@@ -1388,7 +1345,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
         }
         copy
     } else {
-        serial::serial_print("[SYSCALL] exec: Copying from user space\n");
         // Validate the user-supplied pointer before touching it.  Without this check
         // a process could pass a canonical kernel-space address (>= 0xFFFF_8000_0000_0000)
         // that also happens to be below KERNEL_HALF (e.g. very high but not higher-half)
@@ -1415,11 +1371,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     let current_pid = current_process_id().expect("exec called without current process");
     match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
         Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames)) => {
-            serial::serial_printf(format_args!(
-                "[SYSCALL] exec() replacing process image, entry: {:#018X}, brk: {:#018X}\n",
-                entry_point, max_vaddr
-            ));
-            
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
                 if let Some(mut proc) = crate::process::get_process(pid) {
@@ -1472,8 +1423,6 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
 /// arg3: pointer to process name string (optional)
 /// Returns: PID of new process on success, -1 on error
 fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] spawn() called with buffer at {:#x}, size: {}\n", elf_ptr, elf_size));
-    
     if elf_ptr == 0 || elf_size == 0 || elf_size > 32 * 1024 * 1024 {
         serial::serial_print("[SYSCALL] spawn() invalid parameters\n");
         return u64::MAX;
@@ -1505,8 +1454,6 @@ fn sys_spawn(elf_ptr: u64, elf_size: u64, name_ptr: u64) -> u64 {
     // Spawn the new process
     match crate::process::spawn_process(elf_data, name_trimmed) {
         Ok(pid) => {
-            serial::serial_printf(format_args!("[SYSCALL] spawn() success, PID: {}\n", pid));
-
             // Set parent_pid so the spawning process can wait() for the child.
             let caller_pid = crate::process::current_process_id();
             if let Some(cpid) = caller_pid {
@@ -1646,8 +1593,6 @@ fn sys_wait(status_ptr: u64) -> u64 {
 /// 6 = network_service (Network Server)
 /// 7 = gui_service (GUI Launcher)
 fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] get_service_binary({})\n", service_id));
-    
     // Validate pointers
     if out_ptr == 0 || out_size == 0 {
         return u64::MAX;
@@ -1676,19 +1621,12 @@ fn sys_get_service_binary(service_id: u64, out_ptr: u64, out_size: u64) -> u64 {
         *(out_size as *mut u64) = bin_size;
     }
     
-    serial::serial_printf(format_args!(
-        "[SYSCALL] Service binary: ptr={:#X}, size={}\n",
-        bin_ptr, bin_size
-    ));
-    
     0 // Success
 }
 
 /// sys_register_device - Register a new device node (Syscall 27)
 #[inline(never)]
 fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
-    serial::serial_print("[SYSCALL] register_device called\n");
-    
     if name_ptr == 0 || name_len == 0 || name_len > 256 {
         return u64::MAX;
     }
@@ -1705,14 +1643,6 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
         let slice = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
         core::str::from_utf8(slice).unwrap_or("")
     };
-    
-    // Stack check
-    let stack_var = 0;
-    serial::serial_printf(format_args!(
-        "[SYSCALL] register_device stack approx: {:#018X}, name: '{}'\n",
-        &stack_var as *const i32 as u64,
-        name
-    ));
     
     let device_type = match type_id {
         0 => crate::filesystem::DeviceType::Block,
@@ -1755,7 +1685,6 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         core::str::from_utf8(slice).unwrap_or("")
     };
     
-    serial::serial_printf(format_args!("[SYSCALL] open(\"{}\")\n", path));
 
     // Route through scheme system
     // /dev/xxx -> dev:xxx (framebuffer, etc.); other /paths -> file:path
@@ -1789,7 +1718,6 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     if let Some(pid) = current_process_id() {
         match crate::fd::fd_open(pid, scheme_id, resource_id, flags as u32) {
             Some(fd) => {
-                serial::serial_printf(format_args!("[SYSCALL] open() -> FD {}\n", fd));
                 fd as u64
             }
             None => {
@@ -1851,17 +1779,8 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
 
 /// sys_fmap - Map a resource into memory via its scheme
 fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
-    serial::serial_printf(format_args!("SYS_FMAP: Called with FD {}, offset {}, len {}\n", fd, offset, len));
-    
     if let Some(pid) = current_process_id() {
-        serial::serial_printf(format_args!("SYS_FMAP: PID {}\n", pid));
-        
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_printf(format_args!(
-                "SYS_FMAP: FD entry found, scheme_id={}, resource_id={}\n",
-                fd_entry.scheme_id, fd_entry.resource_id
-            ));
-
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(addr) => {
                     // Convertir dirección kernel a física si aplica (evita crash 0xffff8000...)
@@ -1883,14 +1802,9 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
                     return u64::MAX;
                 }
             }
-        } else {
-            serial::serial_print("SYS_FMAP: FD entry not found\n");
         }
-    } else {
-        serial::serial_print("SYS_FMAP: No current process\n");
     }
     
-    serial::serial_print("SYS_FMAP: Returning error\n");
     u64::MAX
 }
 
@@ -1916,8 +1830,6 @@ pub fn get_stats() -> SyscallStats {
 
 /// sys_mount - Mount the root filesystem
 fn sys_mount(path_ptr: u64, path_len: u64) -> u64 {
-    serial::serial_print("[SYSCALL] mount() called\n");
-    
     // Default to disk:0 if no path provided (backward compatibility)
     let device_path = if path_ptr != 0 && path_len != 0 && path_len <= 1024 {
         if !is_user_pointer(path_ptr, path_len) {
@@ -1930,10 +1842,6 @@ fn sys_mount(path_ptr: u64, path_len: u64) -> u64 {
     } else {
         "disk:0"
     };
-
-    serial::serial_print("[SYSCALL] mount(\"");
-    serial::serial_print(device_path);
-    serial::serial_print("\")\n");
 
     match crate::filesystem::mount_root(device_path) {
         Ok(_) => 0,
@@ -2061,10 +1969,6 @@ fn sys_gpu_alloc_display_buffer(width: u64, height: u64, out_ptr: u64) -> u64 {
     if vaddr == 0 {
         return u64::MAX;
     }
-    crate::serial::serial_printf(format_args!(
-        "[GPU-ALLOC] phys={:#018X} vaddr={:#018X} resource={} pitch={} size={}\n",
-        phys_addr, vaddr, resource_id, pitch, size
-    ));
     unsafe {
         let buf = out_ptr as *mut u8;
         core::ptr::write_unaligned(buf as *mut u64, vaddr);
@@ -2282,10 +2186,6 @@ fn sys_map_framebuffer() -> u64 {
             let mut fb_size = single_frame_size * 2;
             fb_size = (fb_size + 0xFFF) & !0xFFF;
             fb_size = fb_size.saturating_add(0x400000);
-            serial::serial_printf(format_args!(
-                "MAP_FB: Using NVIDIA BAR1 as framebuffer\n  Phys addr: {:#018X}\n  Size: {:#018X}\n",
-                bar1_phys, fb_size
-            ));
             let current_pid = crate::process::current_process_id();
             let page_table_phys = crate::process::get_process_page_table(current_pid);
             if page_table_phys == 0 {
@@ -2293,10 +2193,8 @@ fn sys_map_framebuffer() -> u64 {
                 return 0;
             }
             let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, bar1_phys, fb_size);
-            serial::serial_printf(format_args!("MAP_FB: Done. Returning v={:#018X}\n", vaddr));
             return vaddr;
         }
-        serial::serial_print("MAP_FB: No framebuffer info available\n");
         return 0;
     }
     
@@ -2320,11 +2218,6 @@ fn sys_map_framebuffer() -> u64 {
     // Add 4MB padding for stride/alignment quirks (evita Page Fault al escribir en regiones adyacentes)
     fb_size = fb_size.saturating_add(0x400000);
     
-    serial::serial_printf(format_args!(
-        "MAP_FB: Framebuffer mapping request (Double Buffered)\n  Phys addr: {:#018X}\n  Size: {:#018X}\n",
-        fb_phys, fb_size
-    ));
-    
     // Get current process page table
     let current_pid = crate::process::current_process_id();
     let page_table_phys = crate::process::get_process_page_table(current_pid);
@@ -2336,7 +2229,6 @@ fn sys_map_framebuffer() -> u64 {
     
     // Map framebuffer into process address space (identity mapping: vaddr = phys)
     let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, fb_phys, fb_size);
-    serial::serial_printf(format_args!("MAP_FB: Done. Returning v={:#018X}\n", vaddr));
     vaddr
 }
 
@@ -2347,8 +2239,6 @@ fn sys_map_framebuffer() -> u64 {
 ///   arg3: buffer size (max number of devices)
 /// Returns: number of devices found, or u64::MAX on error
 fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] pci_enum_devices(class={:#X})\n", class_code));
-    
     // Validate parameters
     if buffer_ptr == 0 || max_devices == 0 || max_devices > 256 {
         serial::serial_print("[SYSCALL] pci_enum_devices - invalid parameters\n");
@@ -2385,8 +2275,6 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     };
     
     let count = core::cmp::min(devices.len(), max_devices as usize);
-    
-    serial::serial_printf(format_args!("[SYSCALL] pci_enum_devices - found {} device(s)\n", count));
     
     // Copy device info to userspace buffer
     // Each device is represented as: bus, device, function, vendor_id, device_id, class, subclass, bar0
@@ -2498,10 +2386,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
     let num_pages = aligned_length / 4096;
 
     let current_pid = match process::current_process_id() {
-        Some(pid) => {
-            serial::serial_printf(format_args!("[SYSCALL] mmap: pid={} addr={:#x} length={} prot={} flags={}\n", pid, addr, length, prot, flags));
-            pid
-        },
+        Some(pid) => pid,
         None => return u64::MAX,
     };
 
@@ -2565,7 +2450,6 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64)
                     aligned_length as usize,
                 ) {
                     fmap_phys_base = Some(phys as u64);
-                    serial::serial_printf(format_args!("[SYSCALL] mmap: using shared fmap phys_base={:#x}\n", phys));
                 }
             }
         }
@@ -2651,7 +2535,6 @@ fn sys_brk(addr: u64) -> u64 {
     use crate::memory;
     use crate::serial;
     if let Some(pid) = process::current_process_id() {
-        serial::serial_printf(format_args!("[SYSCALL] brk: pid={} addr={:#x}\n", pid, addr));
         if let Some(mut proc) = process::get_process(pid) {
             let mut r = proc.resources.lock();
             let current_brk = r.brk_current;
@@ -2942,25 +2825,15 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
             // Call scheme fstat
             match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat) {
                 Ok(_) => {
-                    serial::serial_printf(format_args!(
-                        "[FSTAT] fd={} size={} mode={:#X} mtime={}\n",
-                        fd, stat.size, stat.mode, stat.mtime
-                    ));
                     // Copy to user memory
                     unsafe {
                         *(stat_ptr as *mut crate::scheme::Stat) = stat;
                     }
                     return 0;
                 }
-                Err(e) => {
-                    serial::serial_printf(format_args!(
-                        "[FSTAT] fd={} FAILED err={} scheme_id={} resource_id={}\n",
-                        fd, e, fd_entry.scheme_id, fd_entry.resource_id
-                    ));
+                Err(_) => {
                 }
             }
-        } else {
-            serial::serial_printf(format_args!("[FSTAT] fd={} NO FD ENTRY\n", fd));
         }
     }
     u64::MAX
@@ -2984,11 +2857,8 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    serial::serial_printf(format_args!("[SYSCALL] arch_prctl(code={:#018X}, addr={:#018X})\n", code, addr));
-
     match code {
         ARCH_SET_FS => {
-            serial::serial_printf(format_args!("[SYSCALL] arch_prctl setting FS_BASE to {:#018X}\n", addr));
             // Validate address (canonical, user-space)
             if addr > 0x0000_7FFF_FFFF_F000 {
                 return u64::MAX;
@@ -3183,11 +3053,6 @@ fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
 /// addr: pointer to sockaddr structure
 /// addrlen: size of sockaddr structure
 fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    serial::serial_printf(format_args!(
-        "[SYSCALL] bind(fd={}, addr={:#018X}, len={})\n",
-        fd, addr, addrlen
-    ));
-    
     // Validate arguments
     if addr == 0 || addrlen < 2 {
         return u64::MAX; // EINVAL
@@ -3247,17 +3112,6 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
             }
         }
         
-        serial::serial_printf(format_args!("[SYSCALL] bind AF_UNIX path: '{}'\n", final_path_str));
-        
-        if final_path_str.is_empty() {
-             serial::serial_print("[SYSCALL] bind: path is empty! Checking first 16 bytes of addr...\n");
-             for i in 0..16 {
-                 let b = unsafe { *((addr + i) as *const u8) };
-                 serial::serial_printf(format_args!("{:#04X} ", b));
-             }
-             serial::serial_print("\n");
-        }
-        
         // Create the file node (only for non-abstract)
         if !is_abstract {
             if let Ok((_scheme_id, _resource_id)) = crate::scheme::open(&final_path_str, 0x40 | 0x80, 0o777) {
@@ -3283,8 +3137,6 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
 
 /// sys_listen - Listen for connections on a socket
 fn sys_listen(fd: u64, backlog: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] listen(fd={})\n", fd));
-    
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             if scheme.listen(fd_info.resource_id).is_ok() {
@@ -3297,8 +3149,6 @@ fn sys_listen(fd: u64, backlog: u64) -> u64 {
 
 /// sys_accept - Accept a connection on a socket
 fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] accept(fd={})\n", fd));
-
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
             match scheme.accept(fd_info.resource_id) {
@@ -3319,8 +3169,6 @@ fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
 }
 
 fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    serial::serial_printf(format_args!("[SYSCALL] connect(fd={})\n", fd));
-
     if addr == 0 || addrlen < 2 { return u64::MAX; }
     if !is_user_pointer(addr, addrlen) { return u64::MAX; }
     let family = unsafe { *(addr as *const u16) };
@@ -3425,10 +3273,6 @@ fn sys_mkdir(path_ptr: u64, mode: u64) -> u64 {
         Err(_) => return u64::MAX,
     };
     
-    serial::serial_print("[SYSCALL] mkdir('");
-    serial::serial_print(path_str);
-    serial::serial_print("')\n");
-    
     match crate::scheme::mkdir(path_str, mode as u32) {
         Ok(_) => 0,
         Err(_) => u64::MAX,
@@ -3451,10 +3295,6 @@ fn sys_unlink(path_ptr: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    
-    serial::serial_print("[SYSCALL] unlink('");
-    serial::serial_print(path_str);
-    serial::serial_print("')\n");
     
     match crate::scheme::unlink(path_str) {
         Ok(_) => 0,
