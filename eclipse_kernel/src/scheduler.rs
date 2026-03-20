@@ -491,7 +491,6 @@ pub fn schedule() -> u64 {
             }
 
             if next_process_exists {
-
                 match current_pid {
                     Some(cur) if cur == next_pid => {
                         // Mismo proceso (único en cola), continúa sin cambio de contexto.
@@ -600,8 +599,6 @@ pub fn schedule() -> u64 {
                     }
                 }
             }
-            // Si ya estamos en el kernel (pid == 0 o None), simplemente salimos.
-            // Esto permite que el loop principal (en main.rs o ap_main_loop) continúe y ejecute idle().
             
             // Calcular el tiempo hasta el próximo despertar si no hay nada que ejecutar.
             let current_tick = crate::interrupts::ticks();

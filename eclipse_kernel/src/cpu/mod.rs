@@ -455,7 +455,7 @@ pub fn idle(duration_ms: u64) {
 
     // Perform the idle wait once. Mwait and Hlt will return on ANY interrupt or memory change.
     // We MUST NOT loop here, otherwise we block the main loop from processing IPC and other events.
-    while rdtsc() < target_tsc {
+    while rdtsc() < target_tsc && !crate::ipc::has_pending_messages() {
         if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
             let hint = crate::ai_core::suggest_mwait_hint(cpu_id);
             unsafe {

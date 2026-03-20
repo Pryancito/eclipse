@@ -388,7 +388,7 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
     loop {
         ipc::process_messages();
         crate::scheduler::tick();
-        let sleep_ms = crate::scheduler::schedule();
-        crate::cpu::idle(sleep_ms);
+        let sleep = crate::scheduler::schedule();
+        crate::cpu::idle(sleep);
     }
 }
