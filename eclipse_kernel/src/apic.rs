@@ -429,7 +429,6 @@ pub fn broadcast_sipi(vector: u8) {
 pub fn send_tlb_shootdown_ipi() {
     unsafe {
         if LAPIC_BASE == 0 && !IS_X2APIC.load(Ordering::Relaxed) { return; }
-        crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Start\n"));
         clear_esr();
 
         let vector = crate::interrupts::TLB_SHOOTDOWN_VECTOR as u32;
@@ -442,10 +441,8 @@ pub fn send_tlb_shootdown_ipi() {
         } else {
             write_reg(LAPIC_REG_ICRH, 0);
             write_reg(LAPIC_REG_ICRL, icrl);
-            crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Waiting for delivery...\n"));
             wait_icr_idle();
         }
-        crate::serial::serial_printf(format_args!("DEBUG: send_tlb_shootdown_ipi: Delivered\n"));
     }
 }
 

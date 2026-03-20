@@ -1006,22 +1006,11 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     }
     
     if let Some(pid) = current_process_id() {
-        let is_linux = crate::process::get_process(pid).map(|p| p.is_linux).unwrap_or(false);
-        if is_linux && len > 64 {
-             serial::serial_printf(format_args!(
-                 "[DEBUG-READ] PID {} fd={} len={}\n",
-                 pid, fd, len
-             ));
-        }
-
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
             unsafe {
                 let slice = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
                 match crate::scheme::read(fd_entry.scheme_id, fd_entry.resource_id, slice) {
                     Ok(bytes_read) => {
-                        if is_linux && len > 64 {
-                            serial::serial_printf(format_args!("[DEBUG-READ]   -> read {} bytes\n", bytes_read));
-                        }
                         return bytes_read as u64
                     },
                     Err(e) => {
@@ -1584,6 +1573,8 @@ fn sys_wait(status_ptr: u64) -> u64 {
                             unsafe { core::ptr::write_unaligned(status_ptr as *mut u32, wait_status); }
                         }
 
+                        // Ensure we are removed from the wait-waiter table before returning.
+                        process::unregister_child_waiter(current_pid);
                         proc.parent_pid = None;
                         process::update_process(*pid, proc);
                         return *pid as u64;
@@ -1593,6 +1584,7 @@ fn sys_wait(status_ptr: u64) -> u64 {
         }
         
         if !has_children {
+            process::unregister_child_waiter(current_pid);
             return u64::MAX; // -1 indicates no children (ECHILD)
         }
 
@@ -1601,8 +1593,34 @@ fn sys_wait(status_ptr: u64) -> u64 {
         if status_ptr == 0 {
             return u64::MAX;
         }
-        
+
+        // Block the parent process properly instead of spinning.
+        // register_child_waiter() must be called before marking as Blocked to avoid a race
+        // where the child exits between the list_processes() scan and the block.  Since
+        // exit_process() uses wake_parent_from_wait() which checks the waiter table, if the
+        // child exits just after we register but before we block, wake_parent_from_wait()
+        // will still set the state back to Ready before we enter Blocked state.
+        process::register_child_waiter(current_pid);
+
+        // Mark the parent as Blocked so the scheduler will not re-schedule it
+        // until a child exits and calls wake_parent_from_wait().
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let slot = crate::ipc::pid_to_slot_fast(current_pid);
+            let mut table = process::PROCESS_TABLE.lock();
+            if let Some(slot_idx) = slot {
+                if let Some(p) = table[slot_idx].as_mut() {
+                    if p.id == current_pid {
+                        p.state = process::ProcessState::Blocked;
+                    }
+                }
+            }
+        });
+
+        // Yield: since state is Blocked, the scheduler will switch away and
+        // not re-schedule this process until exit_process() wakes us.
         crate::scheduler::yield_cpu();
+        // When we resume here, a child has exited (or a spurious wake occurred).
+        // Loop back to re-scan the process table.
     }
 }
 

@@ -151,6 +151,66 @@ pub const MAX_PROCESSES: usize = 256;
 pub static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 
+/// Tabla de procesos bloqueados en sys_wait() esperando que algún hijo termine.
+/// Cada entrada es el PID del proceso padre bloqueado.
+/// Cuando un proceso termina, se desbloquea el padre (si está en esta tabla).
+pub static CHILD_WAIT_WAITERS: Mutex<[Option<ProcessId>; MAX_PROCESSES]> =
+    Mutex::new([None; MAX_PROCESSES]);
+
+/// Registra un proceso padre como bloqueado esperando a un hijo.
+pub fn register_child_waiter(parent_pid: ProcessId) {
+    let mut waiters = CHILD_WAIT_WAITERS.lock();
+    for slot in waiters.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(parent_pid);
+            return;
+        }
+    }
+}
+
+/// Elimina un proceso de la tabla de espera de hijos (al reanudar o cancelar).
+pub fn unregister_child_waiter(parent_pid: ProcessId) {
+    let mut waiters = CHILD_WAIT_WAITERS.lock();
+    for slot in waiters.iter_mut() {
+        if *slot == Some(parent_pid) {
+            *slot = None;
+            return;
+        }
+    }
+}
+
+/// Despierta al proceso `parent_pid` si está bloqueado en sys_wait().
+/// Llamado por exit_process() cuando un proceso hijo termina.
+pub fn wake_parent_from_wait(parent_pid: ProcessId) {
+    {
+        let mut waiters = CHILD_WAIT_WAITERS.lock();
+        let mut found = false;
+        for slot in waiters.iter_mut() {
+            if *slot == Some(parent_pid) {
+                *slot = None;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return; // Parent was not blocked in sys_wait
+        }
+    }
+    // Re-enqueue the parent so it can re-check in sys_wait's loop
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESS_TABLE.lock();
+        for slot in table.iter_mut() {
+            if let Some(p) = slot {
+                if p.id == parent_pid && p.state == ProcessState::Blocked {
+                    p.state = ProcessState::Ready;
+                    break;
+                }
+            }
+        }
+    });
+    crate::scheduler::enqueue_process(parent_pid);
+}
+
 /// Máximo número de CPUs soportadas
 const MAX_CPUS: usize = 32;
 /// Proceso actual por cada CPU
@@ -640,6 +700,22 @@ pub fn exit_process() {
                 }
             }
         });
+
+        // Wake any parent blocked in sys_wait() waiting for this child.
+        // We call wake_parent_from_wait outside the PROCESS_TABLE lock to avoid
+        // deadlock (wake_parent_from_wait re-acquires it).
+        // We read parent_pid while we still have the process info cached.
+        let parent_pid = {
+            let table = PROCESS_TABLE.lock();
+            table.iter().find_map(|slot| {
+                slot.as_ref().and_then(|p| {
+                    if p.id == pid { p.parent_pid } else { None }
+                })
+            })
+        };
+        if let Some(ppid) = parent_pid {
+            wake_parent_from_wait(ppid);
+        }
     }
 }
 

@@ -154,7 +154,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     boot::init(boot_info_ptr);
 
     // Confirm kernel is running with serial output before any framebuffer access
-    serial::serial_print("DEBUG: Entered _start (Higher Half)\n");
+    serial::serial_print("[KERNEL] Entered _start (Higher Half)\n");
 
     unsafe {
         serial::serial_print("[KERNEL] BOOT_STACK addr: ");
@@ -239,12 +239,9 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     // Stage 4: Subsystem initialization
     serial::serial_print("Verifying paging...\n");
     memory::init_paging(kernel_phys_base);
-    serial::serial_print("DEBUG: init memory system...\n");
     memory::init();
     progress::init();
-    serial::serial_print("DEBUG: init progress system...\n");
     progress::bar(65);
-    serial::serial_print("DEBUG: init interrupts...\n");
 
     interrupts::init();
     
@@ -270,14 +267,10 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     progress::bar(71);
     serial::serial_print("Starting secondary CPUs...\n");
     cpu::start_aps();
-    serial::serial_print("DEBUG: AP discovery complete. Calling progress::bar(75)...\n");
     progress::bar(75);
-    serial::serial_print("DEBUG: progress::bar(75) done. Calling memory::remove_identity_mapping()...\n");
 
     // Stage 3: Strict User/Kernel Separation - Moved after AP startup
-    serial::serial_print("DEBUG: Removing identity mapping...\n");
     memory::remove_identity_mapping();
-    serial::serial_print("DEBUG: memory::remove_identity_mapping() done.\n");
     progress::bar(80);
     serial::serial_print("✓ Identity mapping removed (Strict User/Kernel Separation active)\n");
      

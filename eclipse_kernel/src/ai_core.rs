@@ -421,25 +421,35 @@ pub fn suggest_idle_mode(cpu_id: usize) -> IdleMode {
     };
     drop(profiles);
 
-    // 2. Consciencia de Timers: Obtener tiempo real hasta la próxima interrupción
+    // Consciencia de Timers: Obtener tiempo real hasta la próxima interrupción del hardware
     let timer_remaining = crate::apic::get_timer_remaining_us();
-    
-    // El periodo idle real será el mínimo de la predicción estadística y el hardware timer
-    let final_prediction = ai_prediction.min(timer_remaining);
 
     // Heurística de decisión:
-    
-    // 1. Adaptive Polling: Si el idle es muy corto (< 30us), mejor no dormir.
-    // El coste de entrar/salir de C1 es bajo, pero el polling es instantáneo.
-    if final_prediction < 30 {
+
+    // 1. Adaptive Polling: SOLO si el hardware timer está a punto de dispararse (< 30µs).
+    //
+    // IMPORTANTE: usamos `timer_remaining` directamente en lugar de
+    // `ai_prediction.min(timer_remaining)`. Si usáramos el mínimo, un instante en
+    // que `timer_remaining == 0` (deadline TSC ya expirado, interrupción aún no servida)
+    // forzaría el modo Poll, registrando ~20 µs de idle. Eso corrompe la EWMA de
+    // `ai_prediction`, que converge a < 30 µs en solo ~7 iteraciones y bloquea el
+    // modo Poll de forma permanente, causando un uso de CPU del 100%.
+    // Usando `timer_remaining` como único criterio, el modo Poll solo se activa cuando
+    // el temporizador va a dispararse en < 30 µs, y la EWMA refleja los periodos de
+    // reposo reales (≈ 1 ms) sin contaminación.
+    if timer_remaining < 30 {
         return IdleMode::Poll;
     }
 
-    // 2. MWAIT Hints basados en latencia (Microsegundos):
-    // < 1ms: C1 (Responsive)
-    // 1-10ms: C2/C3 (Balanced)
-    // > 50ms: C6 (Power Save)
-    
+    // 2. MWAIT/HLT: el periodo idle esperado es el mínimo entre la predicción
+    //    estadística y el tiempo restante del timer de hardware.
+    //    Seleccionar el C-state óptimo según la latencia esperada (Microsegundos):
+    //    < 1ms:  C1 (Latencia mínima)
+    //    1-10ms: C2 (Balanceado)
+    //    10-50ms: C3 (Ahorro moderado)
+    //    > 50ms: C6 (Máximo ahorro de energía)
+    let final_prediction = ai_prediction.min(timer_remaining);
+
     if final_prediction < 1_000 {
         IdleMode::Mwait(0x00) // C1
     } else if final_prediction < 10_000 {
