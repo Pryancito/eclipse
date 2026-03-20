@@ -620,7 +620,7 @@ pub fn schedule() -> u64 {
             sleep_duration = match min_wake {
                 Some(tick) if tick > current_tick => {
                     // Limitar a un máximo de 50ms para mantener el sistema reactivo
-                    (tick - current_tick).min(50)
+                    (tick - current_tick).min(50).max(1)
                 },
                 Some(_) => 0, // Debería haber despertado ya
                 None => 10,   // Valor por defecto (10ms) si no hay nada pendiente
