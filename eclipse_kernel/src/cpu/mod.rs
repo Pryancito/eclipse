@@ -583,6 +583,7 @@ extern "C" fn ap_main_loop() -> ! {
 
     loop {
         // 1. Intentar planificar procesos en este núcleo.
+        crate::scheduler::tick();
         let sleep_ms = crate::scheduler::schedule();
         crate::cpu::idle(sleep_ms);
     }

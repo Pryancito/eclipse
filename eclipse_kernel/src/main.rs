@@ -387,6 +387,7 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
 
     loop {
         ipc::process_messages();
+        crate::scheduler::tick();
         let sleep = crate::scheduler::schedule();
         if !ipc::has_pending_messages() {
             crate::cpu::idle(sleep);
