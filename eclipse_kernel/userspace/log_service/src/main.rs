@@ -1,6 +1,3 @@
-#![no_main]
-//! Log Service / Console - Central logging for all system services
-
 use std::prelude::v1::*;
 
 /// Log buffer for storing messages before filesystem is ready
@@ -56,8 +53,7 @@ fn log_message(msg: &str) {
     }
 }
 
-#[no_mangle]
-pub extern "Rust" fn main() {
+fn main() {
     let pid = unsafe { std::libc::getpid() };
 
     write_line(b"+--------------------------------------------------------------+");

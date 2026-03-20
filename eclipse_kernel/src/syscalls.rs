@@ -510,7 +510,14 @@ static mut SERVICE_AUDIO_BIN: Option<Vec<u8>> = None;
 static mut SERVICE_NET_BIN: Option<Vec<u8>> = None;
 static mut SERVICE_GUI_BIN: Option<Vec<u8>> = None;
 
+static SERVICE_BIN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 fn get_service_slice(service_id: u64) -> Option<&'static [u8]> {
+    // Acquire a global lock during the load check/filesystem read to prevent
+    // race conditions on SMP systems where multiple CPUs try to load the
+    // same service binary simultaneously.
+    let _guard = SERVICE_BIN_LOCK.lock();
+
     unsafe {
         let (slot, path) = match service_id {
             0 => (&mut SERVICE_LOG_BIN, "/sbin/log_service"),

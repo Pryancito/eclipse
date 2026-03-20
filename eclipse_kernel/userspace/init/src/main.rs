@@ -114,13 +114,19 @@ fn start_essential_services() {
     // Start log server first - critical for debugging
     let log_pid = start_essential_service(0); // log
     wait_for_ready(log_pid, "log", 5000);
-
+    std::thread::sleep(std::time::Duration::from_millis(5000));
     let devfs_pid = start_essential_service(1); // devfs
     wait_for_ready(devfs_pid, "devfs", 5000);
+    std::thread::sleep(std::time::Duration::from_millis(5000));
 }
 
 fn start_essential_service(service_id: u32) -> u32 {
-    let pid = unsafe { eclipse_libc::spawn_service(service_id, core::ptr::null(), 0) };
+    let name = match service_id {
+        0 => "log",
+        1 => "devfs",
+        _ => "service",
+    };
+    let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
     if pid != u64::MAX {
         let mut svc = SERVICES.lock();
         let idx = (service_id + 2) as usize; // log=2, devfs=3
@@ -141,8 +147,9 @@ fn start_system_services() {
     for i in 5..=9 {
         let (name, pid) = {
             let mut svc = SERVICES.lock();
+            let name = svc[i].name;
             let service_id = (i - 2) as u32; // Map index to sys_spawn_service ID
-            let pid = unsafe { eclipse_libc::spawn_service(service_id, core::ptr::null(), 0) };
+            let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
             
             if pid != u64::MAX {
                 svc[i].pid = pid as i32;
@@ -157,19 +164,10 @@ fn start_system_services() {
         if pid > 0 {
             let timeout = if name == "filesystem" { 15000 } else { 5000 };
             wait_for_ready(pid, name, timeout);
-            // gui_service es un lanzador one-shot: después de enviar READY lanza smithay_app y sale.
-            // Para que no aparezca como proceso pesado en System Central, limpiamos su PID y estado.
-            if name == "gui" {
-                let mut svc = SERVICES.lock();
-                for s in svc.iter_mut() {
-                    if s.name == "gui" {
-                        s.pid = 0;
-                        s.state = ServiceState::Stopped;
-                        break;
-                    }
-                }
-            }
+            // gui_service is a one-shot launcher, but we keep its PID to track heartbeats
+            // until it exits naturally.
         }
+        std::thread::sleep(std::time::Duration::from_millis(5000));
     }
 }
 
@@ -214,94 +212,6 @@ fn wait_for_ready(expected_pid: u32, name: &str, timeout_ms: u32) {
     println!("[INIT] WARNING: Timeout waiting for service '{}' (PID {}) to signal READY", name, expected_pid);
 }
 
-/// Start a service (must be called with the SERVICES lock held)
-fn start_service(service: &mut Service) {
-    println!("  [SERVICE] Starting {}...", service.name);
-    
-    service.state = ServiceState::Starting;
-    
-    // Fork a new process for the service
-    let pid = unsafe { fork() };
-    
-    if pid == 0 {
-        // Child process - execute the service
-        
-        // Determine which service binary to load
-        let service_id = match service.name {
-            "log" => 0,
-            "devfs" => 1,
-            "filesystem" => 2,
-            "input" => 3,
-            "display" => 4,
-            "audio" => 5,
-            "network_service" => 6,
-            "gui" => 7,
-            _ => {
-                println!("  [CHILD] ERROR: Unknown service: {}", service.name);
-                unsafe { exit(1); }
-            }
-        };
-        
-        // Get service binary from kernel
-        let (bin_ptr, bin_size) = get_service_binary(service_id);
-        
-        if bin_ptr.is_null() || bin_size == 0 {
-            println!("  [CHILD] ERROR: Failed to get service binary for: {} (ID {})", service.name, service_id);
-            unsafe { exit(1); }
-        }
-        
-        // Create slice from pointer
-        let service_binary = unsafe {
-            core::slice::from_raw_parts(bin_ptr, bin_size)
-        };
-        
-        // Execute the service binary
-        let _result = exec(service_binary);
-        
-        // If exec succeeds, it should not return
-        println!("  [CHILD] ERROR: exec() failed for service: {}", service.name);
-        
-        // Try to get failure reason from kernel
-        let mut errbuf = [0u8; 80];
-        let n = get_last_exec_error(&mut errbuf);
-        if n > 0 {
-            if let Ok(s) = core::str::from_utf8(&errbuf[..n]) {
-                println!("  [CHILD] Failure reason: {}", s);
-            }
-        }
-        
-        unsafe { exit(1); }
-    } else if pid > 0 {
-        // Parent process - track the service
-        service.pid = pid;
-        service.state = ServiceState::Running;
-        
-        // Initialize heartbeat timestamp to current uptime to prevent immediate timeout
-        let mut stats = eclipse_libc::SystemStats {
-            uptime_ticks: 0,
-            idle_ticks: 0,
-            total_mem_frames: 0,
-            used_mem_frames: 0,
-            cpu_count: 0,
-            cpu_temp: [0; 16],
-            gpu_load: [0; 4],
-            gpu_temp: [0; 4],
-            gpu_vram_total_bytes: 0,
-            gpu_vram_used_bytes: 0,
-            anomaly_count: 0,
-            heap_fragmentation: 0,
-        };
-        unsafe { eclipse_libc::get_system_stats(&mut stats); }
-        service.last_heartbeat = stats.uptime_ticks;
-        
-        println!("  [SERVICE] {} started with PID: {}", service.name, pid);
-    } else {
-        // Fork failed
-        println!("  [ERROR] Failed to fork service: {}", service.name);
-        service.state = ServiceState::Failed;
-        service.pid = 0;
-    }
-}
 
 /// Main loop - monitor services and handle system events
 fn main_loop() -> ! {
@@ -382,6 +292,10 @@ fn handle_ipc_requests(buffer: &mut [u8; 128]) {
 /// Helper function to process a single IPC request.
 /// This allows processing messages directly from wait_for_ready's receive loop.
 fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
+    // Recognize and ignore "READY" messages in the main loop to avoid noise.
+    if len >= 5 && &buffer[..5] == b"READY" {
+        return;
+    }
 
     // Heartbeat message ("HEART")
     if len >= 5 && &buffer[..5] == b"HEART" {
@@ -568,8 +482,19 @@ fn check_services() {
         // not re-enter init's IPC path), so it is safe to hold the lock here.
         {
             let mut svc = SERVICES.lock();
-            start_service(&mut svc[idx]);
-            svc[idx].restart_count += 1;
+            let service_id = (idx - 2) as u32;
+            let name = svc[idx].name;
+            let pid = unsafe { eclipse_libc::spawn_service(service_id, name.as_ptr(), name.len()) };
+            
+            if pid != u64::MAX {
+                svc[idx].pid = pid as i32;
+                svc[idx].state = ServiceState::Running;
+                svc[idx].restart_count += 1;
+                println!("[INIT] Service {} restarted with PID: {}", name, pid);
+            } else {
+                println!("[INIT] ERROR: Failed to restart service: {}", name);
+                svc[idx].state = ServiceState::Failed;
+            }
         }
     }
 }
