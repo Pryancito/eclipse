@@ -371,19 +371,19 @@ extern "C" fn kernel_main(_boot_info: &boot::BootInfo) -> ! {
         Ok(pid) => {
             serial::serial_printf(format_args!("[KERNEL] Init process loaded with PID: {}\n", pid));
             progress::bar(95);
-            scheduler::enqueue_process(pid);
+            // Write completion messages BEFORE enqueuing so that APs cannot start running init
+            // and interleave its serial output with these kernel messages.
             serial::serial_print("[KERNEL] Init process scheduled for execution\n");
+            let cpu_id = crate::process::get_cpu_id();
+            serial::serial_printf(format_args!("\n[C{}] [KERNEL] System initialization complete!\n\n", cpu_id));
+            progress::bar(100);
+            scheduler::enqueue_process(pid);
         }
         Err(e) => {
             serial::serial_printf(format_args!("[KERNEL] Failed to spawn init process: {}\n", e));
             loop { crate::cpu::idle(100); }
         }
     }
-    
-    let cpu_id = crate::process::get_cpu_id();
-    serial::serial_printf(format_args!("\n[C{}] [KERNEL] System initialization complete!\n\n", cpu_id));
-    progress::bar(100);
-    //progress::stop_logging();
 
     loop {
         ipc::process_messages();

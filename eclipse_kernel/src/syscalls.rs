@@ -196,13 +196,12 @@ pub extern "C" fn syscall_handler(
     // Nota: Para yield (5) y otros, arg1/arg2 son registros del usuario (rdi/rsi);
     // el kernel no los usa. Valores como 0xFFFF8000... indican contenido residual.
     if syscall_num == 27 {
-        serial::serial_print("[SYSCALL] PID ");
-        serial::serial_print_dec(crate::process::current_process_id().unwrap_or(0) as u64);
-        serial::serial_print(" syscall 27 (register_device) arg1=");
-        serial::serial_print_hex(arg1);
-        serial::serial_print(" arg2=");
-        serial::serial_print_hex(arg2);
-        serial::serial_print("\n");
+        serial::serial_printf(format_args!(
+            "[SYSCALL] PID {} syscall 27 (register_device) arg1={:#018X} arg2={:#018X}\n",
+            crate::process::current_process_id().unwrap_or(0),
+            arg1,
+            arg2
+        ));
     }
 
     // Read user context directly from the struct passed by assembly
@@ -239,9 +238,7 @@ pub extern "C" fn syscall_handler(
 
     // Auto-detection: if it calls a high Linux-specific syscall, mark it as Linux permanently
     if !is_linux && (syscall_num == 158 || syscall_num == 231 || syscall_num == 41 || syscall_num == 202) {
-         serial::serial_print("[SYSCALL] Auto-detected Linux binary via syscall ");
-         serial::serial_print_dec(syscall_num);
-         serial::serial_print("\n");
+         serial::serial_printf(format_args!("[SYSCALL] Auto-detected Linux binary via syscall {}\n", syscall_num));
          if let Some(pid) = crate::process::current_process_id() {
              if let Some(mut proc) = crate::process::get_process(pid) {
                  proc.is_linux = true;
@@ -454,9 +451,7 @@ fn sys_get_process_list(buf_ptr: u64, max_count: u64) -> u64 {
 
 /// sys_kill - Terminar un proceso por su PID
 fn sys_kill(pid: u64) -> u64 {
-    serial::serial_print("[SYSCALL] kill() called for PID ");
-    serial::serial_print_dec(pid);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("[SYSCALL] kill() called for PID {}\n", pid));
 
     if pid == 0 || pid == 1 {
         return u64::MAX; // Cannot kill kernel or init
@@ -937,11 +932,7 @@ fn sys_exit(exit_code: u64) -> u64 {
     drop(stats);
     
     let pid = current_process_id().unwrap_or(0);
-    serial::serial_print("Process ID: ");
-    serial::serial_print_dec(pid as u64);
-    serial::serial_print(" exiting with code: ");
-    serial::serial_print_hex(exit_code);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("Process ID: {} exiting with code: {:#018X}\n", pid, exit_code));
     
     // Store the exit code in the PCB so sys_wait() can report it to the parent.
     if let Some(mut proc) = crate::process::get_process(pid) {
@@ -1116,13 +1107,10 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
             ) {
                 Ok(ret) => return ret as u64,
                 Err(e) => {
-                     crate::serial::serial_print("[SYSCALL] sys_ioctl failed: ");
-                     crate::serial::serial_print_dec(e as u64);
-                     crate::serial::serial_print(" for fd ");
-                     crate::serial::serial_print_dec(fd);
-                     crate::serial::serial_print(" req ");
-                     crate::serial::serial_print_hex(request);
-                     crate::serial::serial_print("\n");
+                     serial::serial_printf(format_args!(
+                         "[SYSCALL] sys_ioctl failed: {} for fd {} req {:#018X}\n",
+                         e, fd, request
+                     ));
                      return -(e as isize) as u64;
                 }
             }
@@ -1319,9 +1307,7 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     drop(stats);
     
     let current_pid = process::current_process_id().unwrap_or(0);
-    serial::serial_print("[SYSCALL] fork() called from PID ");
-    serial::serial_print_dec(current_pid as u64);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("[SYSCALL] fork() called from PID {}\n", current_pid));
     
     // Create child process with modified context
     // The child needs to see RAX=0 (return value of fork)
@@ -1331,19 +1317,14 @@ fn sys_fork(context: &crate::process::Context) -> u64 {
     // Create child process
     match process::fork_process(&child_context) {
         Some(child_pid) => {
-            serial::serial_print("[SYSCALL] fork() created child process with PID: ");
-            serial::serial_print_dec(child_pid as u64);
-            serial::serial_print(", returning to parent PID ");
-            serial::serial_print_dec(current_pid as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!(
+                "[SYSCALL] fork() created child PID: {}, parent PID: {}, returning {} to parent\n",
+                child_pid, current_pid, child_pid
+            ));
             
             // Add child to scheduler
             crate::scheduler::enqueue_process(child_pid);
             
-            // Return child PID to parent
-            serial::serial_print("[SYSCALL] fork() returning ");
-            serial::serial_print_dec(child_pid as u64);
-            serial::serial_print(" to parent\n");
             child_pid as u64
         }
         None => {
@@ -1434,11 +1415,10 @@ fn sys_exec(elf_ptr: u64, elf_size: u64) -> u64 {
     let current_pid = current_process_id().expect("exec called without current process");
     match crate::elf_loader::replace_process_image(current_pid, elf_data.as_slice()) {
         Ok((entry_point, max_vaddr, phdr_va, phnum, phentsize, segment_frames)) => {
-            serial::serial_print("[SYSCALL] exec() replacing process image, entry: ");
-            serial::serial_print_hex(entry_point);
-            serial::serial_print(", brk: ");
-            serial::serial_print_hex(max_vaddr);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!(
+                "[SYSCALL] exec() replacing process image, entry: {:#018X}, brk: {:#018X}\n",
+                entry_point, max_vaddr
+            ));
             
             // Initialize heap (brk) for the new process
             if let Some(pid) = current_process_id() {
@@ -1714,11 +1694,10 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     }
     
     if !is_user_pointer(name_ptr, name_len) {
-        serial::serial_print("[SYSCALL] register_device validation FAILED: ptr=");
-        serial::serial_print_hex(name_ptr);
-        serial::serial_print(", len=");
-        serial::serial_print_dec(name_len);
-        serial::serial_print("\n");
+        serial::serial_printf(format_args!(
+            "[SYSCALL] register_device validation FAILED: ptr={:#018X}, len={}\n",
+            name_ptr, name_len
+        ));
         return u64::MAX;
     }
     
@@ -1729,12 +1708,11 @@ fn sys_register_device(name_ptr: u64, name_len: u64, type_id: u64) -> u64 {
     
     // Stack check
     let stack_var = 0;
-    serial::serial_print("[SYSCALL] register_device stack approx: ");
-    serial::serial_print_hex(&stack_var as *const i32 as u64);
-    serial::serial_print("\n");
-    serial::serial_print("[SYSCALL] register_device name: '");
-    serial::serial_print(name);
-    serial::serial_print("'\n");
+    serial::serial_printf(format_args!(
+        "[SYSCALL] register_device stack approx: {:#018X}, name: '{}'\n",
+        &stack_var as *const i32 as u64,
+        name
+    ));
     
     let device_type = match type_id {
         0 => crate::filesystem::DeviceType::Block,
@@ -1794,9 +1772,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_print("[SYSCALL] open() failed: error ");
-                serial::serial_print_dec(e as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
                 return u64::MAX;
             }
         }
@@ -1804,9 +1780,7 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(path, flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_print("[SYSCALL] open() failed: error ");
-                serial::serial_print_dec(e as u64);
-                serial::serial_print("\n");
+                serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
                 return u64::MAX;
             }
         }
@@ -1860,13 +1834,10 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
     
     if let Some(pid) = current_process_id() {
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_print("[SYSCALL] lseek(fd=");
-            serial::serial_print_dec(fd);
-            serial::serial_print(", offset=");
-            serial::serial_print_dec(offset as u64);
-            serial::serial_print(", whence=");
-            serial::serial_print_dec(whence as u64);
-            serial::serial_print(")\n");
+            serial::serial_printf(format_args!(
+                "[SYSCALL] lseek(fd={}, offset={}, whence={})\n",
+                fd, offset, whence
+            ));
 
             match crate::scheme::lseek(fd_entry.scheme_id, fd_entry.resource_id, offset as isize, whence) {
                 Ok(new_offset) => return new_offset as u64,
@@ -1880,25 +1851,16 @@ fn sys_lseek(fd: u64, offset: i64, whence: usize) -> u64 {
 
 /// sys_fmap - Map a resource into memory via its scheme
 fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
-    serial::serial_print("SYS_FMAP: Called with FD ");
-    serial::serial_print_dec(fd);
-    serial::serial_print(", offset ");
-    serial::serial_print_dec(offset);
-    serial::serial_print(", len ");
-    serial::serial_print_dec(len);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("SYS_FMAP: Called with FD {}, offset {}, len {}\n", fd, offset, len));
     
     if let Some(pid) = current_process_id() {
-        serial::serial_print("SYS_FMAP: PID ");
-        serial::serial_print_dec(pid as u64);
-        serial::serial_print("\n");
+        serial::serial_printf(format_args!("SYS_FMAP: PID {}\n", pid));
         
         if let Some(fd_entry) = crate::fd::fd_get(pid, fd as usize) {
-            serial::serial_print("SYS_FMAP: FD entry found, scheme_id=");
-            serial::serial_print_dec(fd_entry.scheme_id as u64);
-            serial::serial_print(", resource_id=");
-            serial::serial_print_dec(fd_entry.resource_id as u64);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!(
+                "SYS_FMAP: FD entry found, scheme_id={}, resource_id={}\n",
+                fd_entry.scheme_id, fd_entry.resource_id
+            ));
 
             match crate::scheme::fmap(fd_entry.scheme_id, fd_entry.resource_id, offset as usize, len as usize) {
                 Ok(addr) => {
@@ -1917,9 +1879,7 @@ fn sys_fmap(fd: u64, offset: u64, len: u64) -> u64 {
                     return vaddr;
                 }
                 Err(e) => {
-                    serial::serial_print("SYS_FMAP: scheme::fmap failed with error ");
-                    serial::serial_print_dec(e as u64);
-                    serial::serial_print("\n");
+                    serial::serial_printf(format_args!("SYS_FMAP: scheme::fmap failed with error {}\n", e));
                     return u64::MAX;
                 }
             }
@@ -2322,12 +2282,10 @@ fn sys_map_framebuffer() -> u64 {
             let mut fb_size = single_frame_size * 2;
             fb_size = (fb_size + 0xFFF) & !0xFFF;
             fb_size = fb_size.saturating_add(0x400000);
-            serial::serial_print("MAP_FB: Using NVIDIA BAR1 as framebuffer\n");
-            serial::serial_print("  Phys addr: ");
-            serial::serial_print_hex(bar1_phys);
-            serial::serial_print("\n  Size: ");
-            serial::serial_print_hex(fb_size);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!(
+                "MAP_FB: Using NVIDIA BAR1 as framebuffer\n  Phys addr: {:#018X}\n  Size: {:#018X}\n",
+                bar1_phys, fb_size
+            ));
             let current_pid = crate::process::current_process_id();
             let page_table_phys = crate::process::get_process_page_table(current_pid);
             if page_table_phys == 0 {
@@ -2335,9 +2293,7 @@ fn sys_map_framebuffer() -> u64 {
                 return 0;
             }
             let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, bar1_phys, fb_size);
-            serial::serial_print("MAP_FB: Done. Returning v=");
-            serial::serial_print_hex(vaddr);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("MAP_FB: Done. Returning v={:#018X}\n", vaddr));
             return vaddr;
         }
         serial::serial_print("MAP_FB: No framebuffer info available\n");
@@ -2364,12 +2320,10 @@ fn sys_map_framebuffer() -> u64 {
     // Add 4MB padding for stride/alignment quirks (evita Page Fault al escribir en regiones adyacentes)
     fb_size = fb_size.saturating_add(0x400000);
     
-    serial::serial_print("MAP_FB: Framebuffer mapping request (Double Buffered)\n");
-    serial::serial_print("  Phys addr: ");
-    serial::serial_print_hex(fb_phys);
-    serial::serial_print("\n  Size: ");
-    serial::serial_print_hex(fb_size);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!(
+        "MAP_FB: Framebuffer mapping request (Double Buffered)\n  Phys addr: {:#018X}\n  Size: {:#018X}\n",
+        fb_phys, fb_size
+    ));
     
     // Get current process page table
     let current_pid = crate::process::current_process_id();
@@ -2382,9 +2336,7 @@ fn sys_map_framebuffer() -> u64 {
     
     // Map framebuffer into process address space (identity mapping: vaddr = phys)
     let vaddr = crate::memory::map_framebuffer_for_process(page_table_phys, fb_phys, fb_size);
-    serial::serial_print("MAP_FB: Done. Returning v=");
-    serial::serial_print_hex(vaddr);
-    serial::serial_print("\n");
+    serial::serial_printf(format_args!("MAP_FB: Done. Returning v={:#018X}\n", vaddr));
     vaddr
 }
 
@@ -2395,9 +2347,7 @@ fn sys_map_framebuffer() -> u64 {
 ///   arg3: buffer size (max number of devices)
 /// Returns: number of devices found, or u64::MAX on error
 fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u64 {
-    serial::serial_print("[SYSCALL] pci_enum_devices(class=");
-    serial::serial_print_hex(class_code);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] pci_enum_devices(class={:#X})\n", class_code));
     
     // Validate parameters
     if buffer_ptr == 0 || max_devices == 0 || max_devices > 256 {
@@ -2436,9 +2386,7 @@ fn sys_pci_enum_devices(class_code: u64, buffer_ptr: u64, max_devices: u64) -> u
     
     let count = core::cmp::min(devices.len(), max_devices as usize);
     
-    serial::serial_print("[SYSCALL] pci_enum_devices - found ");
-    serial::serial_print_dec(count as u64);
-    serial::serial_print(" device(s)\n");
+    serial::serial_printf(format_args!("[SYSCALL] pci_enum_devices - found {} device(s)\n", count));
     
     // Copy device info to userspace buffer
     // Each device is represented as: bus, device, function, vendor_id, device_id, class, subclass, bar0
@@ -2994,15 +2942,10 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
             // Call scheme fstat
             match crate::scheme::fstat(fd_entry.scheme_id, fd_entry.resource_id, &mut stat) {
                 Ok(_) => {
-                    serial::serial_print("[FSTAT] fd=");
-                    serial::serial_print_dec(fd);
-                    serial::serial_print(" size=");
-                    serial::serial_print_dec(stat.size);
-                    serial::serial_print(" mode=");
-                    serial::serial_print_hex(stat.mode as u64);
-                    serial::serial_print(" mtime=");
-                    serial::serial_print_dec(stat.mtime as u64);
-                    serial::serial_print("\n");
+                    serial::serial_printf(format_args!(
+                        "[FSTAT] fd={} size={} mode={:#X} mtime={}\n",
+                        fd, stat.size, stat.mode, stat.mtime
+                    ));
                     // Copy to user memory
                     unsafe {
                         *(stat_ptr as *mut crate::scheme::Stat) = stat;
@@ -3010,21 +2953,14 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> u64 {
                     return 0;
                 }
                 Err(e) => {
-                    serial::serial_print("[FSTAT] fd=");
-                    serial::serial_print_dec(fd);
-                    serial::serial_print(" FAILED err=");
-                    serial::serial_print_dec(e as u64);
-                    serial::serial_print(" scheme_id=");
-                    serial::serial_print_dec(fd_entry.scheme_id as u64);
-                    serial::serial_print(" resource_id=");
-                    serial::serial_print_dec(fd_entry.resource_id as u64);
-                    serial::serial_print("\n");
+                    serial::serial_printf(format_args!(
+                        "[FSTAT] fd={} FAILED err={} scheme_id={} resource_id={}\n",
+                        fd, e, fd_entry.scheme_id, fd_entry.resource_id
+                    ));
                 }
             }
         } else {
-            serial::serial_print("[FSTAT] fd=");
-            serial::serial_print_dec(fd);
-            serial::serial_print(" NO FD ENTRY\n");
+            serial::serial_printf(format_args!("[FSTAT] fd={} NO FD ENTRY\n", fd));
         }
     }
     u64::MAX
@@ -3048,17 +2984,11 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    serial::serial_print("[SYSCALL] arch_prctl(code=");
-    serial::serial_print_hex(code);
-    serial::serial_print(", addr=");
-    serial::serial_print_hex(addr);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] arch_prctl(code={:#018X}, addr={:#018X})\n", code, addr));
 
     match code {
         ARCH_SET_FS => {
-            serial::serial_print("[SYSCALL] arch_prctl setting FS_BASE to ");
-            serial::serial_print_hex(addr);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] arch_prctl setting FS_BASE to {:#018X}\n", addr));
             // Validate address (canonical, user-space)
             if addr > 0x0000_7FFF_FFFF_F000 {
                 return u64::MAX;
@@ -3099,9 +3029,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             u64::MAX
         }
         _ => {
-            serial::serial_print("[SYSCALL] arch_prctl: Unsupported code ");
-            serial::serial_print_hex(code);
-            serial::serial_print("\n");
+            serial::serial_printf(format_args!("[SYSCALL] arch_prctl: Unsupported code {:#018X}\n", code));
             u64::MAX
         }
     }
@@ -3241,11 +3169,10 @@ fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
             }
         }
         Err(_) => {
-            serial::serial_print("[SYSCALL] socket(domain=");
-            serial::serial_print_dec(domain);
-            serial::serial_print(", type=");
-            serial::serial_print_dec(type_);
-            serial::serial_print(") -> failed\n");
+            serial::serial_printf(format_args!(
+                "[SYSCALL] socket(domain={}, type={}) -> failed\n",
+                domain, type_
+            ));
         }
     }
     u64::MAX
@@ -3256,13 +3183,10 @@ fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
 /// addr: pointer to sockaddr structure
 /// addrlen: size of sockaddr structure
 fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    serial::serial_print("[SYSCALL] bind(fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(", addr=");
-    serial::serial_print_hex(addr);
-    serial::serial_print(", len=");
-    serial::serial_print_dec(addrlen);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!(
+        "[SYSCALL] bind(fd={}, addr={:#018X}, len={})\n",
+        fd, addr, addrlen
+    ));
     
     // Validate arguments
     if addr == 0 || addrlen < 2 {
@@ -3323,16 +3247,13 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
             }
         }
         
-        serial::serial_print("[SYSCALL] bind AF_UNIX path: '");
-        serial::serial_print(&final_path_str);
-        serial::serial_print("'\n");
+        serial::serial_printf(format_args!("[SYSCALL] bind AF_UNIX path: '{}'\n", final_path_str));
         
         if final_path_str.is_empty() {
              serial::serial_print("[SYSCALL] bind: path is empty! Checking first 16 bytes of addr...\n");
              for i in 0..16 {
                  let b = unsafe { *((addr + i) as *const u8) };
-                 serial::serial_print_hex(b as u64);
-                 serial::serial_print(" ");
+                 serial::serial_printf(format_args!("{:#04X} ", b));
              }
              serial::serial_print("\n");
         }
@@ -3362,9 +3283,7 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
 
 /// sys_listen - Listen for connections on a socket
 fn sys_listen(fd: u64, backlog: u64) -> u64 {
-    serial::serial_print("[SYSCALL] listen(fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] listen(fd={})\n", fd));
     
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
@@ -3378,9 +3297,7 @@ fn sys_listen(fd: u64, backlog: u64) -> u64 {
 
 /// sys_accept - Accept a connection on a socket
 fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
-    serial::serial_print("[SYSCALL] accept(fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] accept(fd={})\n", fd));
 
     if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
         if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
@@ -3402,9 +3319,7 @@ fn sys_accept(fd: u64, _addr: u64, _addrlen: u64) -> u64 {
 }
 
 fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    serial::serial_print("[SYSCALL] connect(fd=");
-    serial::serial_print_dec(fd);
-    serial::serial_print(")\n");
+    serial::serial_printf(format_args!("[SYSCALL] connect(fd={})\n", fd));
 
     if addr == 0 || addrlen < 2 { return u64::MAX; }
     if !is_user_pointer(addr, addrlen) { return u64::MAX; }
