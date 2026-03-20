@@ -431,35 +431,66 @@ use core::sync::atomic::AtomicBool;
 /// Intenta usar MONITOR/MWAIT (Nivel 4) si está disponible, 
 /// de lo contrario usa HLT (Nivel 3).
 pub fn idle() {
-    if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
-        let addr = crate::scheduler::ready_queue_tail_addr();
-        unsafe {
-            // 1. Armar el hardware de monitoreo sobre la cola del scheduler.
-            //    Si alguien escribe en esta dirección, el próximo MWAIT retornará.
-            core::arch::asm!(
-                "monitor",
-                in("rax") addr,
-                in("rcx") 0,
-                in("rdx") 0,
-                options(nomem, nostack, preserves_flags)
-            );
+    let cpu_id = crate::process::get_cpu_id();
+    let mode = crate::ai_core::suggest_idle_mode(cpu_id);
+    
+    let start = rdtsc();
+
+    match mode {
+        crate::ai_core::IdleMode::Poll => {
+            // Adaptive polling: espera activa corta con pause.
+            // Habilitamos interrupciones para que el timer u otros IRQs puedan despertar procesos.
+            unsafe { x86_64::instructions::interrupts::enable(); }
             
-            // 2. Entrar en estado de bajo consumo.
-            //    Habilitamos interrupciones justo antes para que también puedan despertarnos.
-            x86_64::instructions::interrupts::enable();
-            core::arch::asm!(
-                "mwait",
-                in("rax") 0, // hints
-                in("rcx") 0, // extensions
-                options(nomem, nostack, preserves_flags)
-            );
+            let addr = crate::scheduler::ready_queue_tail_addr() as *const usize;
+            let initial_tail = unsafe { core::ptr::read_volatile(addr) };
+            
+            // Poll por aproximadamente 50-100 microsegundos máximo
+            for _ in 0..2000 {
+                if unsafe { core::ptr::read_volatile(addr) } != initial_tail {
+                    break;
+                }
+                pause();
+            }
         }
-    } else {
-        // Fallback: HLT tradicional
-        unsafe {
-            x86_64::instructions::interrupts::enable_and_hlt();
+        crate::ai_core::IdleMode::Mwait(hint) => {
+            if MONITOR_MWAIT_SUPPORTED.load(Ordering::Relaxed) {
+                let addr = crate::scheduler::ready_queue_tail_addr();
+                unsafe {
+                    // 1. Armar el hardware de monitoreo sobre la cola del scheduler.
+                    core::arch::asm!(
+                        "monitor",
+                        in("rax") addr,
+                        in("rcx") 0,
+                        in("rdx") 0,
+                        options(nomem, nostack, preserves_flags)
+                    );
+                    
+                    // 2. Entrar en estado de bajo consumo.
+                    x86_64::instructions::interrupts::enable();
+                    core::arch::asm!(
+                        "mwait",
+                        in("rax") hint, // AI-driven hints (C-states)
+                        in("rcx") 0,    // extensions
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+            } else {
+                unsafe { x86_64::instructions::interrupts::enable_and_hlt(); }
+            }
+        }
+        crate::ai_core::IdleMode::Hlt => {
+            unsafe {
+                x86_64::instructions::interrupts::enable_and_hlt();
+            }
         }
     }
+
+    let end = rdtsc();
+    let freq = TSC_COUNTS_PER_US.load(Ordering::Relaxed).max(1);
+    let duration_us = (end - start) / freq;
+    
+    crate::ai_core::record_idle_duration(cpu_id, duration_us);
 }
 
 /// Nivel 2: Pause.
@@ -560,12 +591,7 @@ extern "C" fn ap_main_loop() -> ! {
 
         // 2. Verificación antes de dormir.
         x86_64::instructions::interrupts::disable();
-        
-        if !crate::scheduler::has_runnable_threads_local() {
-            // cpu::idle() habilita interrupciones y duerme el núcleo.
-            crate::cpu::idle();
-        } else {
-            x86_64::instructions::interrupts::enable();
-        }
+        crate::cpu::idle();
+        x86_64::instructions::interrupts::enable();
     }
 }

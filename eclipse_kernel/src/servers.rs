@@ -113,7 +113,7 @@ extern "C" fn filesystem_server() -> ! {
             }
         }
         
-        yield_cpu();
+        crate::cpu::idle();
     }
 }
 
@@ -181,7 +181,7 @@ extern "C" fn graphics_server() -> ! {
             }
         }
         
-        yield_cpu();
+        crate::cpu::idle();
     }
 }
 

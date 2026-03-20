@@ -50,6 +50,9 @@ static READY_QUEUES: [Mutex<RunQueue>; MAX_CPUS] =
 /// Contador round-robin para distribuir procesos nuevos entre CPUs.
 static NEW_PROC_RR_CPU: AtomicU32 = AtomicU32::new(0);
 
+/// Contador global de procesos en colas de Ready (para optimizar bucles idle).
+static RUNNABLE_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Contextos idle por CPU para APs.
 /// CPU 0 (BSP) utiliza el contexto del proceso kernel (PID 0) como idle.
 /// CPUs 1..MAX_CPUS guardan aquí su contexto idle inicial para poder volver
@@ -161,7 +164,9 @@ pub fn enqueue_process(pid: ProcessId) {
         };
 
         let mut queue = READY_QUEUES[target_cpu].lock();
-        if !queue.push(pid) {
+        if queue.push(pid) {
+            RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
+        } else {
             // crate::serial::serial_print("[SCHED] WARNING: RunQueue full\n");
         }
 
@@ -183,6 +188,7 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
         {
             let mut local_q = READY_QUEUES[cpu_id].lock();
             if let Some(pid) = local_q.pop() {
+                RUNNABLE_COUNT.fetch_sub(1, Ordering::SeqCst);
                 // crate::serial::serial_printf(format_args!("[SCHED] C{} dequeued PID {} (LOCAL)\n", cpu_id, pid));
                 return Some(pid);
             }
@@ -217,6 +223,9 @@ fn dequeue_for_cpu(cpu_id: usize) -> Option<ProcessId> {
 
                 if can_steal {
                     let pid = victim_q.pop();
+                    if pid.is_some() {
+                        RUNNABLE_COUNT.fetch_sub(1, Ordering::SeqCst);
+                    }
                     // crate::serial::serial_printf(format_args!("[SCHED] C{} STOLE PID {:?} from C{}\n", cpu_id, pid, victim_cpu));
                     return pid;
                 }
@@ -233,6 +242,11 @@ pub fn has_runnable_threads_local() -> bool {
     
     let queue = READY_QUEUES[cpu_id].lock();
     queue.head != queue.tail
+}
+
+/// Indica si hay ALGÚN proceso listo en alguna cola del sistema.
+pub fn has_runnable_threads() -> bool {
+    RUNNABLE_COUNT.load(Ordering::SeqCst) > 0
 }
 
 
@@ -468,7 +482,9 @@ pub fn schedule() {
                 // window between the state check and the insertion.
                 x86_64::instructions::interrupts::without_interrupts(|| {
                     let mut queue = READY_QUEUES[cpu_id].lock();
-                    queue.push(next_pid);
+                    if queue.push(next_pid) {
+                        RUNNABLE_COUNT.fetch_add(1, Ordering::SeqCst);
+                    }
                 });
             }
 

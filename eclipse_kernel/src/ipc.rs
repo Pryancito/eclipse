@@ -140,7 +140,6 @@ impl Client {
     }
 }
 
-/// Sistema IPC global
 struct IpcSystem {
     servers: [Option<Server>; 32],
     clients: [Option<Client>; 256],
@@ -148,10 +147,11 @@ struct IpcSystem {
     server_id_counter: AtomicU32,
     client_id_counter: AtomicU32,
     global_message_queue: [Option<Message>; 1024],
-    global_queue_head: usize,
-    global_queue_tail: usize,
     total_messages: u64,
 }
+
+static GLOBAL_QUEUE_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static GLOBAL_QUEUE_TAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl IpcSystem {
     const fn new() -> Self {
@@ -166,8 +166,6 @@ impl IpcSystem {
             server_id_counter: AtomicU32::new(1),
             client_id_counter: AtomicU32::new(1),
             global_message_queue: [NONE_MESSAGE; 1024],
-            global_queue_head: 0,
-            global_queue_tail: 0,
             total_messages: 0,
         }
     }
@@ -312,6 +310,8 @@ pub fn init() {
         ipc.message_id_counter.store(1, Ordering::SeqCst);
         ipc.server_id_counter.store(1, Ordering::SeqCst);
         ipc.client_id_counter.store(1, Ordering::SeqCst);
+        GLOBAL_QUEUE_HEAD.store(0, Ordering::SeqCst);
+        GLOBAL_QUEUE_TAIL.store(0, Ordering::SeqCst);
         ipc.total_messages = 0;
     });
     // Reset mailboxes por separado (sin IPC_SYSTEM)
@@ -458,11 +458,11 @@ pub fn send_message(from: ClientId, to: ServerId, msg_type: MessageType, data: &
     run_critical(|| {
         let mut ipc = IPC_SYSTEM.lock();
         msg.id = ipc.message_id_counter.fetch_add(1, Ordering::SeqCst) as u64;
-        let tail = ipc.global_queue_tail;
+        let tail = GLOBAL_QUEUE_TAIL.load(Ordering::Relaxed);
         let next_tail = (tail + 1) % 1024;
-        if next_tail == ipc.global_queue_head { return false; }
+        if next_tail == GLOBAL_QUEUE_HEAD.load(Ordering::Relaxed) { return false; }
         ipc.global_message_queue[tail] = Some(msg);
-        ipc.global_queue_tail = next_tail;
+        GLOBAL_QUEUE_TAIL.store(next_tail, Ordering::Release);
         ipc.total_messages += 1;
         true
     })
@@ -475,7 +475,19 @@ pub fn process_messages() {
     // causing the mouse IRQ to be delayed long enough to lose PS/2 bytes.
     // Fix: extract each message under IPC_SYSTEM alone, release it, then deliver
     // P2P messages to the mailbox under PROCESS_MAILBOXES alone.
-    for _ in 0..256 {
+    let pending = {
+        let head = GLOBAL_QUEUE_HEAD.load(Ordering::Relaxed);
+        let tail = GLOBAL_QUEUE_TAIL.load(Ordering::Relaxed);
+        if head == tail {
+            0
+        } else if tail > head {
+            tail - head
+        } else {
+            1024 - head + tail
+        }
+    };
+
+    for _ in 0..pending {
         // Phase 1: Extract one message from the global queue (IPC_SYSTEM only).
         // Returns: Some(Some((pid, msg))) = P2P for mailbox delivery
         //          Some(None)             = message delivered to server (or dropped)
@@ -483,11 +495,11 @@ pub fn process_messages() {
         let p2p = run_critical(|| {
             let mut ipc = IPC_SYSTEM.lock();
 
-            if ipc.global_queue_head == ipc.global_queue_tail {
+            let head = GLOBAL_QUEUE_HEAD.load(Ordering::Acquire);
+            if head == GLOBAL_QUEUE_TAIL.load(Ordering::Relaxed) {
                 return None; // Queue empty - stop the outer loop
             }
 
-            let head = ipc.global_queue_head;
             if let Some(msg) = ipc.global_message_queue[head] {
                 // Signal and Input (P2P): route to Process Mailbox
                 let is_p2p = msg.msg_type == MessageType::Signal
@@ -503,7 +515,7 @@ pub fn process_messages() {
                     }
 
                     ipc.global_message_queue[head] = None;
-                    ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                    GLOBAL_QUEUE_HEAD.store((head + 1) % 1024, Ordering::Release);
                     if slot != 0xFF {
                         return Some(Some((slot as usize, msg))); // deliver to mailbox in Phase 2
                     }
@@ -545,9 +557,9 @@ pub fn process_messages() {
                     // No server found – clear slot so it isn't processed again
                     ipc.global_message_queue[head] = None;
                 }
-                ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                GLOBAL_QUEUE_HEAD.store((head + 1) % 1024, Ordering::Release);
             } else {
-                ipc.global_queue_head = (ipc.global_queue_head + 1) % 1024;
+                GLOBAL_QUEUE_HEAD.store((head + 1) % 1024, Ordering::Release);
             }
             Some(None) // continue outer loop
         });
@@ -575,10 +587,7 @@ pub fn process_messages() {
 
 /// ¿Hay mensajes pendientes por procesar?
 pub fn has_pending_messages() -> bool {
-    run_critical(|| {
-        let ipc = IPC_SYSTEM.lock();
-        ipc.global_queue_head != ipc.global_queue_tail
-    })
+    GLOBAL_QUEUE_HEAD.load(Ordering::Relaxed) != GLOBAL_QUEUE_TAIL.load(Ordering::Relaxed)
 }
 
 /// Obtener estadísticas del sistema IPC

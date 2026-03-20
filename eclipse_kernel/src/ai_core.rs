@@ -42,6 +42,39 @@ pub struct ProcessProfile {
     pub last_cpu: u32,             // Última CPU donde corrió (afinidad suave)
 }
 
+/// Per-CPU AI Profile for Idle Management and Thermal Prediction
+#[derive(Debug, Clone, Copy)]
+pub struct CpuProfile {
+    pub idle_ewma: u64,           // Proverbio de duración de idle (MICROSEGUNDOS escalados x1024)
+    pub last_idle_start: u64,      // TSC del inicio del último periodo idle
+    pub last_idle_duration: u64,   // Duración en µs del último idle
+    pub interrupt_frequency: u64,  // Ticks entre interrupciones
+}
+
+impl CpuProfile {
+    pub const fn new() -> Self {
+        Self {
+            idle_ewma: 100_000 << 10, // Default a 100ms (long idle)
+            last_idle_start: 0,
+            last_idle_duration: 100_000,
+            interrupt_frequency: 10,
+        }
+    }
+
+    /// Predicts the duration of the next idle period in MICROSECONDS
+    pub fn predict_idle_duration(&self) -> u64 {
+        self.idle_ewma >> 10
+    }
+
+    /// Updates the idle EWMA with a new real duration (in µs)
+    pub fn update_idle_duration(&mut self, duration_us: u64) {
+        // alpha = 0.5 for fast adaptation
+        let duration_scaled = duration_us << 10;
+        self.idle_ewma = (self.idle_ewma + duration_scaled) / 2;
+        self.last_idle_duration = duration_us;
+    }
+}
+
 impl ProcessProfile {
     pub const fn new() -> Self {
         Self {
@@ -248,6 +281,9 @@ pub static CPU_LOAD: Mutex<[u32; 16]> = Mutex::new([0; 16]);
 /// Temperatura estimada por CPU (Celsius * 10)
 pub static CPU_TEMP: Mutex<[u32; 16]> = Mutex::new([400; 16]); // Inicia a 40°C
 
+/// Per-CPU Profile storage (Sync via Mutex)
+pub static CPU_PROFILES: Mutex<[CpuProfile; 16]> = Mutex::new([CpuProfile::new(); 16]);
+
 /// Historial de ticks para calcular carga delta
 static LAST_CPU_TICKS: Mutex<[(u64, u64); 16]> = Mutex::new([(0, 0); 16]);
 
@@ -357,6 +393,70 @@ pub fn predict_thermal_spike(cpu_id: usize) -> bool {
     
     // Si la temperatura es > 75°C y la carga es > 90%, predecir pico
     temp[cpu_id] > 750 && load[cpu_id] > 90
+}
+
+/// Registra la duración del último periodo idle (llamado por el scheduler)
+pub fn record_idle_duration(cpu_id: usize, duration: u64) {
+    if cpu_id < 16 {
+        let mut profiles = CPU_PROFILES.lock();
+        profiles[cpu_id].update_idle_duration(duration);
+    }
+}
+
+/// Idle Strategy decided by AI
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IdleMode {
+    Poll,        // Adaptive polling (active wait with pause)
+    Mwait(u32),  // MWAIT with specific hint (C-state)
+    Hlt,         // Traditional HLT
+}
+
+/// Sugiere un modo de idle basado en la predicción de la IA y el tiempo hasta el próximo evento.
+pub fn suggest_idle_mode(cpu_id: usize) -> IdleMode {
+    let profiles = CPU_PROFILES.lock();
+    let ai_prediction = if cpu_id < 16 {
+         profiles[cpu_id].predict_idle_duration()
+    } else {
+         100_000 // Safe default
+    };
+    drop(profiles);
+
+    // 2. Consciencia de Timers: Obtener tiempo real hasta la próxima interrupción
+    let timer_remaining = crate::apic::get_timer_remaining_us();
+    
+    // El periodo idle real será el mínimo de la predicción estadística y el hardware timer
+    let final_prediction = ai_prediction.min(timer_remaining);
+
+    // Heurística de decisión:
+    
+    // 1. Adaptive Polling: Si el idle es muy corto (< 30us), mejor no dormir.
+    // El coste de entrar/salir de C1 es bajo, pero el polling es instantáneo.
+    if final_prediction < 30 {
+        return IdleMode::Poll;
+    }
+
+    // 2. MWAIT Hints basados en latencia (Microsegundos):
+    // < 1ms: C1 (Responsive)
+    // 1-10ms: C2/C3 (Balanced)
+    // > 50ms: C6 (Power Save)
+    
+    if final_prediction < 1_000 {
+        IdleMode::Mwait(0x00) // C1
+    } else if final_prediction < 10_000 {
+        IdleMode::Mwait(0x10) // C2
+    } else if final_prediction < 50_000 {
+        IdleMode::Mwait(0x20) // C3
+    } else {
+        IdleMode::Mwait(0x30) // C6
+    }
+}
+
+/// Sugiere un hint para MWAIT basado en la predicción de idle (legacy wrapper)
+pub fn suggest_mwait_hint(cpu_id: usize) -> u32 {
+    match suggest_idle_mode(cpu_id) {
+        IdleMode::Mwait(hint) => hint,
+        _ => 0x00,
+    }
 }
 
 /// Predice la probabilidad de una amenaza de OOM (0.0 a 1.0)

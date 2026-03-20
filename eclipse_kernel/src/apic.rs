@@ -161,6 +161,45 @@ pub fn get_timer_count_1ms() -> u32 {
     LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed)
 }
 
+/// Returns the estimated time remaining until the next timer interrupt in MICROSECONDS.
+pub fn get_timer_remaining_us() -> u64 {
+    let mode = get_timer_mode();
+    match mode {
+        ApicTimerMode::TSCDeadline => {
+            unsafe {
+                let low: u32;
+                let high: u32;
+                // Read the current deadline from the MSR
+                core::arch::asm!("rdmsr", in("ecx") MSR_IA32_TSC_DEADLINE, out("eax") low, out("edx") high,
+                    options(nomem, nostack, preserves_flags));
+                let deadline = (high as u64) << 32 | (low as u64);
+                let now = crate::cpu::rdtsc();
+                if deadline <= now {
+                    return 0;
+                }
+                let tsc_freq = crate::cpu::get_tsc_frequency(); // counts per us
+                (deadline - now) / tsc_freq.max(1)
+            }
+        }
+        ApicTimerMode::OneShot => {
+            unsafe {
+                let current_count = read_reg(LAPIC_REG_TMRCURR) as u64;
+                let count_per_ms = LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed) as u64;
+                if count_per_ms == 0 { return 1000; }
+                (current_count * 1000) / count_per_ms
+            }
+        }
+        ApicTimerMode::Periodic => {
+            // Hard to tell exactly without more state, return 1ms as safe default
+            1000
+        }
+    }
+}
+
+pub fn get_timer_count_1ms_original() -> u32 {
+    LAPIC_TIMER_COUNT_1MS.load(Ordering::Relaxed)
+}
+
 /// Initialize Local APIC for the current CPU.
 /// Detects x2APIC mode and uses MSR-based access when active.
 pub fn init() {
