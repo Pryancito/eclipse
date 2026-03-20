@@ -300,8 +300,19 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
         .background_color(Rgb888::BLACK)
         .build();
 
+    // With Baseline::Alphabetic (the default for Text::new), characters render
+    // *above* the given y coordinate: the top of the character cell is at
+    // log_y - FONT_6X10.baseline (7 pixels above log_y for FONT_6X10).
+    // The clear rectangle must cover this full region so that ghost tops from a
+    // previous longer message are completely erased before drawing the new text.
+    // i32 arithmetic is used because log_y is already i32 and the subtraction
+    // can momentarily go negative on very small screens (height < 58px).
+    let font_baseline = FONT_6X10.baseline as i32;
+    let char_height = FONT_6X10.character_size.height; // 10 for FONT_6X10
+    let clear_y = log_y - font_baseline; // top of the character cell
+
     // Limpiar área del mensaje anterior para evitar restos
-    let _ = Rectangle::new(Point::new(x, log_y), Size::new(bar_width, 10))
+    let _ = Rectangle::new(Point::new(x, clear_y), Size::new(bar_width, char_height))
         .into_styled(PrimitiveStyleBuilder::new()
             .fill_color(Rgb888::BLACK)
             .build())
@@ -318,8 +329,10 @@ fn render_log_line(line: &str, source: FbSource, width: u32, height: u32, pitch:
         .draw(&mut fb);
 
     // VirtIO GPU requiere present explícito. Solo refrescamos la zona de la línea de log.
-    if source == FbSource::VirtIO {
-        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, x as u32, log_y as u32, bar_width, 10);
+    // Guard clear_y >= 0: on extremely small screens (height < 58px) the character
+    // area could sit above row 0; skip the present call rather than wrapping to u32::MAX.
+    if source == FbSource::VirtIO && clear_y >= 0 {
+        let _ = crate::virtio::gpu_present(VIRTIO_DISPLAY_RESOURCE_ID, x as u32, clear_y as u32, bar_width, char_height);
     }
 }
 
