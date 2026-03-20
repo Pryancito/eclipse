@@ -658,7 +658,7 @@ impl GPUPerfProfile {
             vendor_id,
             load: 0,
             memory_used: 0,
-            temperature: 450, // 45°C idle
+            temperature: 0, // unknown until driver reads it
             is_discrete,
         }
     }
@@ -725,6 +725,18 @@ pub fn suggest_gpu_affinity(task: RenderTask) -> usize {
 pub fn update_gpu_metrics(idx: usize, load: u32, mem: u64, temp: u32) {
     let mut perf = GPU_PERF.lock();
     if let Some(gpu) = perf.get_mut(idx) {
+        gpu.load = load;
+        gpu.memory_used = mem;
+        gpu.temperature = temp;
+    }
+}
+
+/// Actualiza estadísticos de una GPU buscando por bus PCI (llamado por los drivers).
+/// Evita desajustes de índice cuando GPU_PERF contiene GPUs integradas antes de la
+/// GPU discreta: se localiza la ranura correcta comparando bus_id == pci_dev.bus.
+pub fn update_gpu_metrics_by_bus(bus_id: u8, load: u32, mem: u64, temp: u32) {
+    let mut perf = GPU_PERF.lock();
+    if let Some(gpu) = perf.iter_mut().find(|gpu| gpu.bus_id == bus_id) {
         gpu.load = load;
         gpu.memory_used = mem;
         gpu.temperature = temp;
