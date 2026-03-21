@@ -26,6 +26,7 @@ pub mod error {
     pub const EISCONN: usize = 106; // Transport endpoint is already connected
     pub const ENOTCONN: usize = 107; // Transport endpoint is not connected
     pub const EPIPE: usize = 32;   // Broken pipe
+    pub const EAFNOSUPPORT: usize = 97; // Address family not supported
 }
 
 /// Stat information for a resource
@@ -159,6 +160,7 @@ pub fn init() {
     register_scheme("log", Arc::new(LogScheme));
     register_scheme("shm", Arc::new(ShmScheme::new()));
     register_scheme("drm", Arc::new(crate::drm_scheme::DrmScheme));
+    register_scheme("eth", Arc::new(crate::eth::EthScheme));
 }
 
 /// Register a new scheme

@@ -62,7 +62,7 @@ static SERVICES: Spinlock<[Service; 10]> = Spinlock::new([
     Service::new("input", true),
     Service::new("display", false),
     Service::new("audio", false),
-    Service::new("network_service", false),
+    Service::new("network", false),
     // gui_service is a one-shot launcher: it starts smithay_app and then exits.
     // Don't enable heartbeat watchdog for it.
     Service::new("gui", false),

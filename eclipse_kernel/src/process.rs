@@ -443,6 +443,25 @@ pub fn get_process(pid: ProcessId) -> Option<Process> {
     })
 }
 
+/// Obtener PID de un proceso por su nombre
+pub fn get_process_by_name(name: &str) -> Option<ProcessId> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let table = PROCESS_TABLE.lock();
+        let name_bytes = name.as_bytes();
+        let name_len = core::cmp::min(name_bytes.len(), 16);
+        
+        for slot in table.iter() {
+            if let Some(p) = slot {
+                let p_name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
+                if p_name_len == name_len && &p.name[..name_len] == &name_bytes[..name_len] {
+                    return Some(p.id);
+                }
+            }
+        }
+        None
+    })
+}
+
 /// Obtener el índice de slot (0..MAX_PROCESSES) de un proceso por su PID.
 /// A diferencia del PID (que es monotónico), el slot index es reutilizable
 /// y siempre cabe en el array de mailboxes IPC (también de 64 entradas).

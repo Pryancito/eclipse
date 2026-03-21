@@ -1005,7 +1005,9 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                         return bytes_read as u64
                     },
                     Err(e) => {
-                        serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
+                        if e != crate::scheme::error::EAGAIN {
+                            serial::serial_printf(format_args!("[SYSCALL] read() scheme error: {}\n", e));
+                        }
                         return u64::MAX;
                     }
                 }
@@ -1079,10 +1081,12 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
             ) {
                 Ok(ret) => return ret as u64,
                 Err(e) => {
-                     serial::serial_printf(format_args!(
-                         "[SYSCALL] sys_ioctl failed: {} for fd {} req {:#018X}\n",
-                         e, fd, request
-                     ));
+                     if e != crate::scheme::error::EAGAIN {
+                         serial::serial_printf(format_args!(
+                             "[SYSCALL] sys_ioctl failed: {} for fd {} req {:#018X}\n",
+                             e, fd, request
+                         ));
+                     }
                      return -(e as isize) as u64;
                 }
             }
@@ -1700,7 +1704,9 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(&dev_path, flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_printf(format_args!("[SYSCALL] open() dev failed: error {}\n", e));
+                if e != crate::scheme::error::EAGAIN {
+                    serial::serial_printf(format_args!("[SYSCALL] open() dev failed: error {}\n", e));
+                }
                 return u64::MAX;
             }
         }
@@ -1708,7 +1714,9 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(&format!("file:{}", path), flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                if e != crate::scheme::error::EAGAIN {
+                    serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                }
                 return u64::MAX;
             }
         }
@@ -1716,7 +1724,9 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
         match crate::scheme::open(path, flags as usize, 0) {
             Ok(res) => res,
             Err(e) => {
-                serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                if e != crate::scheme::error::EAGAIN {
+                    serial::serial_printf(format_args!("[SYSCALL] open() failed: error {}\n", e));
+                }
                 return u64::MAX;
             }
         }
@@ -3035,9 +3045,8 @@ fn fill_random_rdtsc(buf: &mut [u8]) {
 /// type: SOCK_STREAM=1, SOCK_DGRAM=2
 /// protocol: 0
 fn sys_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
-    let path = if domain == 1 { "socket:unix" } else { "socket:" };
-
-    match crate::scheme::open(path, 0, 0) {
+    let path = alloc::format!("socket:{}/{}/{}", domain, type_, protocol);
+    match crate::scheme::open(&path, 0, 0) {
         Ok((scheme_id, resource_id)) => {
             if let Some(pid) = current_process_id() {
                 if let Some(fd) = crate::fd::fd_open(pid, scheme_id, resource_id, 0) {
@@ -3128,18 +3137,31 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
             }
         }
 
-        // Tell SocketScheme about it.
         if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
             if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
                 scheme.bind(fd_info.resource_id, final_path_str).ok();
                 return 0;
             }
         }
-        u64::MAX
-    } else {
-        serial::serial_print("[SYSCALL] bind: unsupported family\n");
-        0 // Pretend success for other families (AF_INET) if we just want to run
+    } else if family == 2 { // AF_INET
+        // sockaddr_in: offset 2 is port (2 bytes, big endian), offset 4 is IP (4 bytes)
+        let port_ptr = addr + 2;
+        let ip_ptr = addr + 4;
+        let port = unsafe { u16::from_be(*(port_ptr as *const u16)) };
+        let ip = unsafe { *(ip_ptr as *const [u8; 4]) };
+        
+        let path = alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+
+        if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+            if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+                if scheme.bind(fd_info.resource_id, path).is_ok() {
+                    return 0;
+                }
+            }
+        }
     }
+    
+    u64::MAX
 }
 
 /// sys_listen - Listen for connections on a socket
@@ -3197,6 +3219,21 @@ fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
         if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
             if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
                 if scheme.connect(fd_info.resource_id, path_str).is_ok() {
+                    return 0;
+                }
+            }
+        }
+    } else if family == 2 { // AF_INET
+        let port_ptr = addr + 2;
+        let ip_ptr = addr + 4;
+        let port = unsafe { u16::from_be(*(port_ptr as *const u16)) };
+        let ip = unsafe { *(ip_ptr as *const [u8; 4]) };
+        
+        let path = alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+
+        if let (Some(pid), Some(scheme)) = (current_process_id(), crate::servers::get_socket_scheme()) {
+            if let Some(fd_info) = crate::fd::fd_get(pid, fd as usize) {
+                if scheme.connect(fd_info.resource_id, &path).is_ok() {
                     return 0;
                 }
             }

@@ -6,6 +6,7 @@ use crate::serial;
 use crate::scheduler::yield_cpu;
 use crate::scheme::{Scheme, Stat, error as scheme_error};
 use alloc::boxed::Box;
+use crate::net_ipc::*;
 
 /// Framebuffer information from bootloader
 #[repr(C)]
@@ -495,6 +496,7 @@ struct SocketSchemeState {
 
 pub struct SocketScheme {
     state: Mutex<SocketSchemeState>,
+    network_pid: Mutex<Option<u32>>,
 }
 
 impl SocketScheme {
@@ -507,92 +509,215 @@ impl SocketScheme {
                 next_socket_id: 1,
                 next_connection_id: 1,
             }),
+            network_pid: Mutex::new(None),
+        }
+    }
+
+    fn get_network_pid(&self) -> Option<u32> {
+        let mut pid_opt = self.network_pid.lock();
+        if let Some(pid) = *pid_opt {
+             if let Some(p) = crate::process::get_process(pid) {
+                 let name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
+                 if &p.name[..name_len] == b"network" {
+                     return Some(pid);
+                 }
+             }
+        }
+        if let Some(pid) = crate::process::get_process_by_name("network") {
+            *pid_opt = Some(pid);
+            return Some(pid);
+        }
+        None
+    }
+
+    fn send_request_and_wait(&self, net_pid: u32, op: NetOp, resource_id: u64, data: &[u8]) -> Result<(i64, Option<crate::ipc::Message>), usize> {
+        static NEXT_REQUEST_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        let client_pid = crate::process::current_process_id().unwrap_or(0);
+        
+        let mut msg_data = [0u8; 512];
+        let header = NetRequestHeader {
+            magic: *NET_MAGIC,
+            op,
+            request_id,
+            client_pid,
+            resource_id,
+        };
+        
+        unsafe {
+            let header_ptr = &header as *const NetRequestHeader as *const u8;
+            core::ptr::copy_nonoverlapping(header_ptr, msg_data.as_mut_ptr(), core::mem::size_of::<NetRequestHeader>());
+            
+            let payload_offset = core::mem::size_of::<NetRequestHeader>();
+            let payload_len = core::cmp::min(data.len(), 512 - payload_offset);
+            if payload_len > 0 {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), msg_data.as_mut_ptr().add(payload_offset), payload_len);
+            }
+        }
+        
+        if !crate::ipc::send_message(0, net_pid, MessageType::Network, &msg_data) {
+            return Err(scheme_error::EIO);
+        }
+        
+        let start_ticks = crate::interrupts::ticks();
+        loop {
+            if let Some(msg) = crate::ipc::receive_message(client_pid) {
+                if msg.msg_type == MessageType::Network && msg.data_size >= core::mem::size_of::<NetResponseHeader>() as u32 {
+                    let resp = unsafe { &*(msg.data.as_ptr() as *const NetResponseHeader) };
+                    if resp.magic == *NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id {
+                        return Ok((resp.status, Some(msg)));
+                    }
+                }
+            }
+            if crate::interrupts::ticks() > start_ticks + 5000 {
+                return Err(scheme_error::EAGAIN);
+            }
+            crate::scheduler::yield_cpu();
         }
     }
 
     pub fn bind(&self, id: usize, path: String) -> Result<(), usize> {
         let mut st = self.state.lock();
-        if let Some(socket) = st.sockets.get_mut(&id) {
+        let socket = st.sockets.get_mut(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+        
+        if domain == 1 {
             socket.path = Some(path);
             socket.state = SocketState::Bound;
-            Ok(())
-        } else {
-            Err(scheme_error::EBADF)
+            return Ok(());
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Bind, id as u64, path.as_bytes())?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                return Ok(());
+            }
         }
+        Err(scheme_error::EAFNOSUPPORT)
     }
 
     pub fn listen(&self, id: usize) -> Result<(), usize> {
         let mut st = self.state.lock();
-        if let Some(socket) = st.sockets.get_mut(&id) {
+        let socket = st.sockets.get_mut(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+
+        if domain == 1 {
             socket.state = SocketState::Listening;
             st.pending.entry(id).or_default();
-            Ok(())
-        } else {
-            Err(scheme_error::EBADF)
+            return Ok(());
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Listen, id as u64, &[])?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                return Ok(());
+            }
         }
+        Err(scheme_error::EAFNOSUPPORT)
     }
 
     pub fn accept(&self, id: usize) -> Result<usize, usize> {
         let mut st = self.state.lock();
-        let (domain, type_, protocol) = match st.sockets.get(&id) {
-            Some(s) if s.state == SocketState::Listening => (s.domain, s.type_, s.protocol),
-            Some(_) => return Err(scheme_error::EINVAL),
-            None => return Err(scheme_error::EBADF),
-        };
-        let conn_id = match st.pending.get_mut(&id).and_then(|q| q.pop_front()) {
-            Some(cid) => cid,
-            None => return Err(scheme_error::EAGAIN),
-        };
-        let new_id = st.next_socket_id;
-        st.next_socket_id += 1;
-        if let Some(conn) = st.connections.get_mut(&conn_id) {
-            conn.server_socket_id = Some(new_id);
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+        let type_ = socket.type_;
+        let protocol = socket.protocol;
+
+        if domain == 1 {
+            if socket.state != SocketState::Listening {
+                return Err(scheme_error::EINVAL);
+            }
+            let conn_id = match st.pending.get_mut(&id).and_then(|q| q.pop_front()) {
+                Some(cid) => cid,
+                None => return Err(scheme_error::EAGAIN),
+            };
+            let new_id = st.next_socket_id;
+            st.next_socket_id += 1;
+            if let Some(conn) = st.connections.get_mut(&conn_id) {
+                conn.server_socket_id = Some(new_id);
+            }
+            st.sockets.insert(new_id, Socket {
+                id: new_id,
+                domain,
+                type_,
+                protocol,
+                state: SocketState::Connected,
+                path: None,
+                connection_id: Some(conn_id),
+            });
+            return Ok(new_id);
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Accept, id as u64, &[])?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                let new_id = res as usize;
+                let mut st = self.state.lock();
+                st.sockets.insert(new_id, Socket {
+                    id: new_id,
+                    domain: 2,
+                    type_,
+                    protocol,
+                    state: SocketState::Connected,
+                    path: None,
+                    connection_id: None,
+                });
+                return Ok(new_id);
+            }
         }
-        st.sockets.insert(new_id, Socket {
-            id: new_id,
-            domain,
-            type_,
-            protocol,
-            state: SocketState::Connected,
-            path: None,
-            connection_id: Some(conn_id),
-        });
-        Ok(new_id)
+        Err(scheme_error::EAFNOSUPPORT)
     }
 
     pub fn connect(&self, id: usize, path: &str) -> Result<(), usize> {
         let mut st = self.state.lock();
-        if !st.sockets.contains_key(&id) {
-            return Err(scheme_error::EBADF);
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+
+        if domain == 1 {
+            if socket.state != SocketState::Created && socket.state != SocketState::Bound {
+                return Err(scheme_error::EISCONN);
+            }
+            let listener_id = match st.sockets.iter().find(|(_, s)| {
+                s.path.as_deref() == Some(path) && s.state == SocketState::Listening
+            }) {
+                Some((&lid, _)) => lid,
+                None => return Err(scheme_error::ENOENT),
+            };
+            let conn_id = st.next_connection_id;
+            st.next_connection_id += 1;
+            st.connections.insert(conn_id, Connection {
+                id: conn_id,
+                buffer_to_client: VecDeque::new(),
+                buffer_to_server: VecDeque::new(),
+                client_socket_id: id,
+                server_socket_id: None,
+                closed_by_client: false,
+                closed_by_server: false,
+            });
+            st.pending.entry(listener_id).or_default().push_back(conn_id);
+            if let Some(socket) = st.sockets.get_mut(&id) {
+                socket.state = SocketState::Connected;
+                socket.connection_id = Some(conn_id);
+            }
+            return Ok(());
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                // Parsing target IP/Port from path "IP:Port"
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Connect, id as u64, path.as_bytes())?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                return Ok(());
+            }
         }
-        match st.sockets.get(&id) {
-            Some(s) if s.state != SocketState::Created && s.state != SocketState::Bound => return Err(scheme_error::EISCONN),
-            Some(_) => {}
-            None => return Err(scheme_error::EBADF),
-        }
-        let listener_id = match st.sockets.iter().find(|(_, s)| {
-            s.path.as_deref() == Some(path) && s.state == SocketState::Listening
-        }) {
-            Some((&lid, _)) => lid,
-            None => return Err(scheme_error::ENOENT),
-        };
-        let conn_id = st.next_connection_id;
-        st.next_connection_id += 1;
-        st.connections.insert(conn_id, Connection {
-            id: conn_id,
-            buffer_to_client: VecDeque::new(),
-            buffer_to_server: VecDeque::new(),
-            client_socket_id: id,
-            server_socket_id: None,
-            closed_by_client: false,
-            closed_by_server: false,
-        });
-        st.pending.entry(listener_id).or_default().push_back(conn_id);
-        if let Some(socket) = st.sockets.get_mut(&id) {
-            socket.state = SocketState::Connected;
-            socket.connection_id = Some(conn_id);
-        }
-        Ok(())
+        Err(scheme_error::EAFNOSUPPORT)
     }
 }
 
@@ -678,52 +803,123 @@ impl SocketScheme {
 
 impl Scheme for SocketScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
-        let mut st = self.state.lock();
-        let id = st.next_socket_id;
-        st.next_socket_id += 1;
-        let domain = if path.contains("unix") { 1 } else { 0 };
-        st.sockets.insert(id, Socket {
-            id,
-            domain,
-            type_: 0,
-            protocol: 0,
-            state: SocketState::Created,
-            path: None,
-            connection_id: None,
-        });
-        Ok(id)
+        let mut parts = path.split('/');
+        let domain_str = parts.next().unwrap_or("0");
+        let type_str = parts.next().unwrap_or("0");
+        let proto_str = parts.next().unwrap_or("0");
+
+        let domain = domain_str.parse::<u32>().unwrap_or(0);
+        let type_ = type_str.parse::<u32>().unwrap_or(0);
+        let proto = proto_str.parse::<u32>().unwrap_or(0);
+
+        if domain == 1 || domain_str == "unix" {
+            let mut st = self.state.lock();
+            let id = st.next_socket_id;
+            st.next_socket_id += 1;
+            st.sockets.insert(id, Socket {
+                id,
+                domain: 1,
+                type_,
+                protocol: proto,
+                state: SocketState::Created,
+                path: None,
+                connection_id: None,
+            });
+            return Ok(id);
+        } else if domain == 2 {
+            // AF_INET: delegate to network service
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Socket, 0, path.as_bytes())?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                let id = res as usize;
+                let mut st = self.state.lock();
+                // Store a local entry to track it
+                st.sockets.insert(id, Socket {
+                    id,
+                    domain: 2,
+                    type_,
+                    protocol: proto,
+                    state: SocketState::Created,
+                    path: None,
+                    connection_id: None, // We don't use this for domain 2
+                });
+                return Ok(id);
+            }
+        }
+
+        Err(scheme_error::EAFNOSUPPORT)
     }
 
     fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
         let mut st = self.state.lock();
-        if !st.sockets.contains_key(&id) {
-            return Err(scheme_error::EBADF);
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
+        
+        if domain == 1 {
+            if socket.connection_id.is_none() {
+                return Err(scheme_error::ENOTCONN);
+            }
+            return Self::read_connection(&mut st, id, buffer);
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, msg_opt) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Recv, id as u64, &[])?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                if let Some(msg) = msg_opt {
+                    let header_size = core::mem::size_of::<crate::net_ipc::NetResponseHeader>();
+                    let data_start = &msg.data[header_size..];
+                    let to_copy = core::cmp::min(buffer.len(), (msg.data_size as usize).saturating_sub(header_size));
+                    buffer[..to_copy].copy_from_slice(&data_start[..to_copy]);
+                    return Ok(to_copy);
+                }
+            }
         }
-        if st.sockets.get(&id).and_then(|s| s.connection_id).is_none() {
-            return Err(scheme_error::ENOTCONN);
-        }
-        Self::read_connection(&mut st, id, buffer)
+        
+        Err(scheme_error::ENOSYS)
     }
 
     fn write(&self, id: usize, buf: &[u8]) -> Result<usize, usize> {
         let mut st = self.state.lock();
-        if !st.sockets.contains_key(&id) {
-            return Err(scheme_error::EBADF);
-        }
-        if st.sockets.get(&id).and_then(|s| s.connection_id).is_some() {
-            return Self::write_connection(&mut st, id, buf);
-        }
-        Err(scheme_error::ENOTCONN)
-    }
+        let socket = st.sockets.get(&id).ok_or(scheme_error::EBADF)?;
+        let domain = socket.domain;
 
-    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
-        Err(scheme_error::ESPIPE)
+        if domain == 1 {
+            if socket.connection_id.is_some() {
+                return Self::write_connection(&mut st, id, buf);
+            }
+            return Err(scheme_error::ENOTCONN);
+        } else if domain == 2 {
+            drop(st);
+            if let Some(net_pid) = self.get_network_pid() {
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Send, id as u64, buf)?;
+                if res < 0 {
+                    return Err((-res) as usize);
+                }
+                return Ok(res as usize);
+            }
+        }
+        
+        Err(scheme_error::ENOTCONN)
     }
 
     fn close(&self, id: usize) -> Result<usize, usize> {
         let mut st = self.state.lock();
-        if st.sockets.contains_key(&id) {
-            Self::close_connection(&mut st, id);
+        if let Some(socket) = st.sockets.get(&id) {
+            let domain = socket.domain;
+            if domain == 2 {
+                drop(st);
+                if let Some(net_pid) = self.get_network_pid() {
+                    let _ = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Close, id as u64, &[]);
+                }
+                let mut st = self.state.lock();
+                st.sockets.remove(&id);
+            } else {
+                Self::close_connection(&mut st, id);
+            }
         }
         Ok(0)
     }
@@ -731,6 +927,10 @@ impl Scheme for SocketScheme {
     fn fstat(&self, _id: usize, _stat: &mut Stat) -> Result<usize, usize> {
         _stat.mode = 0o140000;
         Ok(0)
+    }
+
+    fn lseek(&self, _id: usize, _offset: isize, _whence: usize) -> Result<usize, usize> {
+        Err(scheme_error::ESPIPE)
     }
 }
 

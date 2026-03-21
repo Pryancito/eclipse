@@ -81,6 +81,7 @@ const VIRTIO_MAGIC: u32 = 0x74726976;
 /// VirtIO device IDs
 const VIRTIO_ID_BLOCK: u32 = 2;
 const VIRTIO_ID_GPU: u32 = 16;
+const VIRTIO_ID_NET: u32 = 1;
 
 /// VirtIO 1.0 feature bit (must be negotiated for modern devices)
 /// In common config: feature_select 0 = bits 0-31, 1 = bits 32-63. VERSION_1 = bit 32.
@@ -116,6 +117,29 @@ const STATUS_CHANGE_DELAY_CYCLES: u32 = 1000;
 /// Delay cycles after notifying device
 /// Gives device time to process notification before we start polling
 const DEVICE_NOTIFY_DELAY_CYCLES: u32 = 1000;
+
+#[repr(C, packed)]
+struct VirtioNetConfig {
+    mac: [u8; 6],
+    status: u16,
+    max_virtqueue_pairs: u16,
+    mtu: u16,
+}
+
+#[repr(C, packed)]
+struct VirtioNetHdr {
+    flags: u8,
+    gso_type: u8,
+    hdr_len: u16,
+    gso_size: u16,
+    csum_start: u16,
+    csum_offset: u16,
+    num_buffers: u16,
+}
+
+const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+const VIRTIO_NET_F_MTU: u64 = 1 << 3;
 
 /// VirtIO MMIO register offsets
 #[repr(C)]
@@ -670,6 +694,12 @@ struct Virtqueue {
     last_used_idx: u16,
 }
 
+impl Virtqueue {
+    pub fn phys_addr(&self) -> u64 {
+        self.desc_phys
+    }
+}
+
 // Safety: Virtqueue uses raw pointers but manages them correctly
 unsafe impl Send for Virtqueue {}
 
@@ -890,7 +920,229 @@ pub struct VirtIOBlockDevice {
     inner: Mutex<VirtIOBlockDeviceInner>,
 }
 
+/// VirtIO network device driver inner state
+struct VirtIONetDeviceInner {
+    mmio_base: u64,
+    io_base: u16,
+    queue_rx: Option<Virtqueue>,
+    queue_tx: Option<Virtqueue>,
+    mac_address: [u8; 6],
+}
+
+/// VirtIO network device driver
+pub struct VirtIONetDevice {
+    inner: Mutex<VirtIONetDeviceInner>,
+}
+
 static BLOCK_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIOBlockDevice>>> = Mutex::new(alloc::vec::Vec::new());
+static NET_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIONetDevice>>> = Mutex::new(alloc::vec::Vec::new());
+
+impl VirtIONetDevice {
+    /// Create a new VirtIO network device from PCI BAR address
+    pub unsafe fn new_from_pci(bar_addr: u64) -> Option<Self> {
+        Some(VirtIONetDevice {
+            inner: Mutex::new(VirtIONetDeviceInner {
+                mmio_base: bar_addr,
+                io_base: 0,
+                queue_rx: None,
+                queue_tx: None,
+                mac_address: [0; 6],
+            }),
+        })
+    }
+    
+    /// Create a new VirtIO network device from PCI I/O ports
+    pub unsafe fn new_from_pci_io(io_base: u16) -> Option<Self> {
+        Some(VirtIONetDevice {
+            inner: Mutex::new(VirtIONetDeviceInner {
+                mmio_base: 0,
+                io_base,
+                queue_rx: None,
+                queue_tx: None,
+                mac_address: [0; 6],
+            }),
+        })
+    }
+    
+    /// Initialize the VirtIO network device
+    pub unsafe fn init(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.io_base != 0 {
+            return inner.init_legacy_pci();
+        }
+        inner.init_mmio()
+    }
+
+    pub fn get_mac_address(&self) -> [u8; 6] {
+        self.inner.lock().mac_address
+    }
+
+    pub fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
+        let mut inner = self.inner.lock();
+        unsafe { inner.send_packet(data) }
+    }
+
+    pub fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize> {
+        let mut inner = self.inner.lock();
+        unsafe { inner.receive_packet(buffer) }
+    }
+}
+
+impl VirtIONetDeviceInner {
+    unsafe fn send_packet(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        let queue = self.queue_tx.as_mut().ok_or("TX queue not initialized")?;
+        
+        // Allocate header
+        let hdr_size = core::mem::size_of::<VirtioNetHdr>();
+        let (hdr_ptr, hdr_phys) = crate::memory::alloc_dma_buffer(hdr_size, 16).ok_or("Failed to alloc DMA for TX header")?;
+        core::ptr::write_bytes(hdr_ptr, 0, hdr_size);
+
+        // Allocate data buffer
+        let (pkt_ptr, pkt_phys) = crate::memory::alloc_dma_buffer(data.len(), 16).ok_or("Failed to alloc DMA for TX data")?;
+        core::ptr::copy_nonoverlapping(data.as_ptr(), pkt_ptr, data.len());
+
+        // Add to queue
+        if queue.add_buf(&[
+            (hdr_phys, hdr_size as u32, 0),
+            (pkt_phys, data.len() as u32, 0)
+        ]).is_none() {
+            crate::memory::free_dma_buffer(hdr_ptr, hdr_size, 16);
+            crate::memory::free_dma_buffer(pkt_ptr, data.len(), 16);
+            return Err("Queue full");
+        }
+
+        // Notify
+        if self.io_base != 0 {
+            outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 1); // Queue 1 is TX
+        }
+        
+        Ok(())
+    }
+
+    unsafe fn fill_rx_queue(&mut self) -> Result<(), &'static str> {
+        let queue = self.queue_rx.as_mut().ok_or("RX queue not initialized")?;
+        let hdr_size = core::mem::size_of::<VirtioNetHdr>();
+        let pkt_size = 1520;
+        let total_size = hdr_size + pkt_size;
+
+        while queue.num_free >= 2 {
+            let (buf_ptr, buf_phys) = crate::memory::alloc_dma_buffer(total_size, 16).ok_or("Failed to alloc DMA for RX")?;
+            core::ptr::write_bytes(buf_ptr, 0, total_size);
+
+            if queue.add_buf(&[
+                (buf_phys, hdr_size as u32, 2), // VIRTQ_DESC_F_WRITE
+                (buf_phys + hdr_size as u64, pkt_size as u32, 2)
+            ]).is_none() {
+                crate::memory::free_dma_buffer(buf_ptr, total_size, 16);
+                break;
+            }
+        }
+
+        if self.io_base != 0 {
+            outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0); // Queue 0 is RX
+        }
+
+        Ok(())
+    }
+
+    unsafe fn receive_packet(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        let queue = self.queue_rx.as_mut()?;
+        let used = &*queue.used;
+        
+        let used_idx = read_volatile(&used.idx);
+        if queue.last_used_idx == used_idx {
+            return None; // No new packets
+        }
+
+        let ring_idx = queue.last_used_idx as usize % queue.queue_size as usize;
+        let used_elem = used.ring[ring_idx];
+        let head_idx = used_elem.id as u16;
+        let total_len = used_elem.len as usize;
+
+        // The packet is in the second descriptor of the chain
+        let hdr_desc = &*queue.descriptors.add(head_idx as usize);
+        let pkt_desc_idx = read_volatile(&raw const hdr_desc.next);
+        let pkt_desc = &*queue.descriptors.add(pkt_desc_idx as usize);
+        
+        let pkt_phys = read_volatile(&raw const pkt_desc.addr);
+        let pkt_len = (total_len as usize).saturating_sub(core::mem::size_of::<VirtioNetHdr>());
+        let copy_len = core::cmp::min(pkt_len, buffer.len());
+
+        let pkt_virt = crate::memory::phys_to_virt(pkt_phys) as *const u8;
+        core::ptr::copy_nonoverlapping(pkt_virt, buffer.as_mut_ptr(), copy_len);
+
+        // Free the descriptor chain
+        queue.free_desc(head_idx);
+        queue.last_used_idx = queue.last_used_idx.wrapping_add(1);
+
+        // Refill the queue
+        let _ = self.fill_rx_queue();
+
+        Some(copy_len)
+    }
+    unsafe fn init_mmio(&mut self) -> bool {
+        // TODO: Implement MMIO initialization for modern devices
+        false
+    }
+
+    unsafe fn init_legacy_pci(&mut self) -> bool {
+        // Reset device
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, 0);
+        
+        // Set ACKNOWLEDGE
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+        
+        // Set DRIVER
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER as u8));
+        
+        // Read device features
+        let features = inl(self.io_base + VIRTIO_PCI_DEVICE_FEATURES);
+        
+        // Negotiate MAC feature
+        if (features & (VIRTIO_NET_F_MAC as u32)) != 0 {
+            // Read MAC address from config space (offset 20 in legacy PCI)
+            for i in 0..6 {
+                self.mac_address[i] = inb(self.io_base + 20 + i as u16);
+            }
+        }
+        
+        // Write driver features (just accept MAC for now)
+        outl(self.io_base + VIRTIO_PCI_DRIVER_FEATURES, features & (VIRTIO_NET_F_MAC as u32));
+        
+        // Set FEATURES_OK
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_FEATURES_OK as u8));
+
+        // Initialize RX queue (0)
+        outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 0);
+        let rx_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        if rx_size > 0 {
+            if let Some(mut q) = Virtqueue::new(rx_size) {
+                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q.phys_addr() >> 12) as u32);
+                self.queue_rx = Some(q);
+            }
+        }
+
+        // Initialize TX queue (1)
+        outw(self.io_base + VIRTIO_PCI_QUEUE_SEL, 1);
+        let tx_size = inw(self.io_base + VIRTIO_PCI_QUEUE_SIZE);
+        if tx_size > 0 {
+            if let Some(mut q) = Virtqueue::new(tx_size) {
+                outl(self.io_base + VIRTIO_PCI_QUEUE_ADDR, (q.phys_addr() >> 12) as u32);
+                self.queue_tx = Some(q);
+            }
+        }
+        
+        // Set DRIVER_OK
+        let status = inb(self.io_base + VIRTIO_PCI_DEVICE_STATUS);
+        outb(self.io_base + VIRTIO_PCI_DEVICE_STATUS, status | (VIRTIO_STATUS_DRIVER_OK as u8));
+        
+        let _ = self.fill_rx_queue();
+        
+        true
+    }
+}
 
 impl VirtIOBlockDevice {
     /// Create a new VirtIO block device from MMIO base
@@ -2794,6 +3046,58 @@ pub fn init() {
         }
     }
 
+    // Search for VirtIO network devices (0x1000 legacy, 0x1041 modern)
+    for dev in crate::pci::get_all_devices() {
+        if dev.is_virtio() && (dev.device_id == 0x1000 || dev.device_id == 0x1041) {
+            serial::serial_print("[VirtIO-Net] Found network device on PCI! Bus=");
+            serial::serial_print_dec(dev.bus as u64);
+            serial::serial_print(" Dev=");
+            serial::serial_print_dec(dev.device as u64);
+            serial::serial_print("\n");
+            
+            unsafe {
+                crate::pci::enable_device(&dev, true);
+                
+                for bar_idx in 0..6u8 {
+                    let raw_bar = crate::pci::pci_config_read_u32(dev.bus, dev.device, dev.function, 0x10 + (bar_idx * 4));
+                    if raw_bar == 0 { continue; }
+
+                    let is_io = (raw_bar & 1) != 0;
+                    let bar_addr = crate::pci::get_bar(&dev, bar_idx);
+                    
+                    let mut net_dev = None;
+                    if is_io {
+                        let io_base = bar_addr as u16;
+                        if io_base != 0 {
+                            net_dev = VirtIONetDevice::new_from_pci_io(io_base);
+                        }
+                    } else {
+                        if bar_addr != 0 {
+                            let mmio_base = crate::memory::map_mmio_range(bar_addr, 0x1000);
+                            net_dev = VirtIONetDevice::new_from_pci(mmio_base);
+                        }
+                    }
+
+                    if let Some(virt_dev) = net_dev {
+                        if virt_dev.init() {
+                            let mac = virt_dev.get_mac_address();
+                            serial::serial_print("[VirtIO-Net] Network device initialized. MAC: ");
+                            for i in 0..6 {
+                                serial::serial_print_hex(mac[i] as u64);
+                                if i < 5 { serial::serial_print(":"); }
+                            }
+                            serial::serial_print("\n");
+                            
+                            let arc_dev = alloc::sync::Arc::new(virt_dev);
+                            NET_DEVICES.lock().push(arc_dev);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Search for VirtIO GPU devices (PCI 0x1050 = virtio-gpu, virtio-vga, virtio-vga-gl)
     for dev in crate::pci::get_all_devices() {
         if dev.is_virtio() && dev.device_id == 0x1050 {
@@ -3286,5 +3590,10 @@ pub fn gpu_flush_primary() {
             }
         }
     }
+}
+
+pub fn get_net_device(id: usize) -> Option<alloc::sync::Arc<VirtIONetDevice>> {
+    let devices = NET_DEVICES.lock();
+    devices.get(id).cloned()
 }
 
