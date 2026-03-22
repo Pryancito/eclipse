@@ -106,6 +106,7 @@ const E1000E_DEVICE_IDS: &[u16] = &[
 // ───────────────────────────────────────────────────────────────────────────
 const REG_CTRL:     u32 = 0x0000_0; // Device control
 const REG_STATUS:   u32 = 0x0000_8; // Device status
+const REG_FEXTNVM6: u32 = 0x0001_0; // Future Extended NVM 6 (I21x)
 const REG_EERD:     u32 = 0x0001_4; // EEPROM read
 const REG_CTRL_EXT: u32 = 0x0001_8; // Extended device control
 const REG_MDIC:     u32 = 0x0002_0; // MDI (PHY) control
@@ -140,8 +141,15 @@ const REG_TDT:      u32 = 0x0381_8; // TX Descriptor Tail
 const REG_FCRTL:    u32 = 0x0292_0; // Flow Control Receive Threshold Low
 const REG_FCRTH:    u32 = 0x0292_4; // Flow Control Receive Threshold High
 const REG_MTA:      u32 = 0x0520_0; // Multicast Table Array (128 × u32)
+const REG_RFCTL:    u32 = 0x0500_8; // Receive Filter Control (I21x)
 const REG_RAL0:     u32 = 0x0540_0; // Receive Address Low  (filter 0)
 const REG_RAH0:     u32 = 0x0540_4; // Receive Address High (filter 0)
+const REG_IPCNFG:   u32 = 0x0E38;   // Internal PHY Configuration (EEE)
+const REG_EEER:     u32 = 0x0E30;   // EEE Register
+const REG_WUC:      u32 = 0x5800;   // Wake-up Control
+const REG_WUFC:     u32 = 0x5808;   // Wake-up Filter Control
+const REG_WUS:      u32 = 0x5810;   // Wake-up Status
+const REG_FEXTNVM7: u32 = 0x5BB4;   // Future Extended NVM 7
 const REG_RXCSUM:   u32 = 0x5000;   // Receive Checksum Offload Control
 // Statistics registers (read-on-clear, 32-bit unless noted)
 const REG_CRCERRS:  u32 = 0x4000;   // CRC Error Count
@@ -168,19 +176,27 @@ const REG_TPT:      u32 = 0x40D4;   // Total Packets Transmitted
 const REG_MPTC:     u32 = 0x40F0;   // Multicast Packets Transmitted Count
 const REG_BPTC:     u32 = 0x40F4;   // Broadcast Packets Transmitted Count
 
+const REG_SWSM:      u32 = 0x05B50; // Software Semaphore
+const SWSM_SMBI:     u32 = 1 << 0;  // Semaphore Bit
+const SWSM_SWESMBI:  u32 = 1 << 1;  // Software EEPROM Semaphore Bit
+
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL register bits
 // ───────────────────────────────────────────────────────────────────────────
-const CTRL_FD:   u32 = 1 << 0;  // Full-duplex
-const CTRL_ASDE: u32 = 1 << 5;  // Auto-speed detection enable
-const CTRL_SLU:  u32 = 1 << 6;  // Set link up
-const CTRL_RST:  u32 = 1 << 26; // Device reset
+const CTRL_FD:      u32 = 1 << 0;  // Full-duplex
+const CTRL_ASDE:    u32 = 1 << 5;  // Auto-speed detection enable
+const CTRL_SLU:     u32 = 1 << 6;  // Set link up
+const CTRL_RST:     u32 = 1 << 26; // Device reset
+const CTRL_PHY_RST: u32 = 1 << 31; // PHY reset
+const CTRL_RFCE:    u32 = 1 << 27; // RX flow control enable
+const CTRL_TFCE:    u32 = 1 << 28; // TX flow control enable
 
 // ───────────────────────────────────────────────────────────────────────────
 // STATUS register bits
 // ───────────────────────────────────────────────────────────────────────────
 const STATUS_FD:          u32 = 1 << 0; // Full-duplex
 const STATUS_LU:          u32 = 1 << 1; // Link Up
+const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19; // GIO Master Enable Status
 const STATUS_SPEED_MASK:  u32 = 3 << 6; // Speed bits [7:6]
 const STATUS_SPEED_10:    u32 = 0 << 6; // 10 Mb/s
 const STATUS_SPEED_100:   u32 = 1 << 6; // 100 Mb/s
@@ -189,6 +205,7 @@ const STATUS_SPEED_1000:  u32 = 2 << 6; // 1000 Mb/s (GbE)
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL_EXT register bits
 // ───────────────────────────────────────────────────────────────────────────
+const CTRL_EXT_GIO_MASTER_DISABLE: u32 = 1 << 2; // Disable GIO master
 /// PHY Power-Down Enable — when set, the MAC holds the PHY in power-down.
 /// Must be CLEARED to allow the I219-V's internal PHY to power up.
 const CTRL_EXT_PHYPDEN: u32 = 1 << 30;
@@ -245,6 +262,12 @@ const PHY_REG_1KTCTL:  u32 = 9;
 const TCTL_1KT_FDX:    u16 = 1 << 9;   // Advertise 1000BASE-T full-duplex
 #[allow(dead_code)]
 const TCTL_1KT_HDX:    u16 = 1 << 8;   // Advertise 1000BASE-T half-duplex
+
+// MII register 16 = PHY Specific Control Register
+const PHY_REG_PSCR:    u32 = 16;
+const PSCR_LPLU_NON_D0: u16 = 1 << 10; // Low Power Link Up in non-D0 states
+const PSCR_LPLU_D0:     u16 = 1 << 11; // Low Power Link Up in D0 state
+const PSCR_SPD:        u16 = 1 << 12;  // Smart Power Down
 
 // ───────────────────────────────────────────────────────────────────────────
 // RCTL register bits
@@ -398,6 +421,10 @@ struct TxDesc {
 struct E1000EInner {
     /// Virtual base address of the MMIO BAR
     mmio_base: u64,
+    device_id: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
     mac: [u8; 6],
     phy_addr: u8, // Dynamically discovered MDIO address of the PHY
 
@@ -438,9 +465,28 @@ pub struct E1000EDevice {
 static E1000E_DEVICES: Mutex<Vec<Arc<E1000EDevice>>> = Mutex::new(Vec::new());
 
 // ───────────────────────────────────────────────────────────────────────────
-// Register read/write helpers
+// Register read/write and memory helpers
 // ───────────────────────────────────────────────────────────────────────────
 impl E1000EInner {
+    #[inline]
+    fn clflush(&self, addr: u64) {
+        unsafe {
+            core::arch::asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+        }
+    }
+
+    /// Flush a range of memory from the CPU cache to RAM.
+    /// Operates in 64-byte chunks (standard x86 cache line size).
+    fn flush_cache_range(&self, start: u64, len: usize) {
+        let end = start + len as u64;
+        let mut cur = start & !63;
+        while cur < end {
+            self.clflush(cur);
+            cur += 64;
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
     #[inline]
     fn read32(&self, reg: u32) -> u32 {
         unsafe { read_volatile((self.mmio_base + reg as u64) as *const u32) }
@@ -483,12 +529,87 @@ impl E1000EInner {
         None
     }
 
+    /// Returns true if this is a PCH-family NIC (I217/I218/I219).
+    fn is_pch(&self) -> bool {
+        // PCH-integrated Ethernet IDs are not strictly sequential (e.g. Comet Lake/Raptor Lake
+        // have IDs < 0x153A). We check against our exhaustive PCH subset of E1000E_DEVICE_IDS.
+        match self.device_id {
+            0x153A | 0x153B | // I217
+            0x155A | 0x1559 | 0x15A0 | 0x15A1 | 0x15A2 | 0x15A3 | // I218
+            0x156F | 0x1570 | 0x15B7 | 0x15B8 | 0x15BB | 0x15BC | 0x15D7 | 0x15D8 | // I219 gen 1-4
+            0x15E3 | 0x15D6 | 0x15BD | 0x15BE | 0x15DF | 0x15E0 | 0x15E1 | 0x15E2 | // I219 gen 5-8
+            0x0DC5 | 0x0DC6 | 0x0DC7 | 0x0DC8 | 0x15F9 | 0x15FA | 0x15FB | 0x15FC | // I219 gen 9-12
+            0x1DC2 | 0x1DC3 | 0x1A1C | 0x1A1D | 0x1A1E | 0x1A1F | 0x0D9F | 0x1DC5 | // I219 gen 13-21
+            0x1DC6 | 0x0D4E | 0x0D4F | 0x0D53 | 0x0D55 => true, // I219 gen 22-24
+            _ => false,
+        }
+    }
+
+    /// Returns true if this is an I218 or I219 (LPT/SPT and later PCH).
+    fn is_pch_lpt(&self) -> bool {
+        self.device_id >= 0x155A // Minimal I218-LM ID
+    }
+
+    /// Acquire the software semaphore for PHY/EEPROM access on PCH systems.
+    /// This is necessary because the Management Engine (ME) may also be
+    /// accessing the PHY.
+    fn acquire_phy_semaphore(&self) -> bool {
+        if !self.is_pch() { return true; }
+
+        // 1. Wait for SMBI (Semaphore Bit) to be clear.
+        //    This bit is used for BIOS/OS handoff.
+        for _ in 0..10_000 {
+            let swsm = self.read32(REG_SWSM);
+            if swsm & SWSM_SMBI == 0 {
+                // Try to take it
+                self.write32(REG_SWSM, swsm | SWSM_SMBI);
+                if self.read32(REG_SWSM) & SWSM_SMBI != 0 {
+                    break;
+                }
+            }
+            core::hint::spin_loop();
+        }
+
+        // 2. Now wait for SWESMBI (Software EEPROM Semaphore Bit).
+        //    This bit controls access to the PHY/MDIO interface.
+        let mut acquired = false;
+        for _ in 0..10_000 {
+            let swsm = self.read32(REG_SWSM);
+            self.write32(REG_SWSM, swsm | SWSM_SWESMBI);
+            if self.read32(REG_SWSM) & SWSM_SWESMBI != 0 {
+                acquired = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if !acquired {
+            // Release SMBI if we failed to get SWESMBI
+            let swsm = self.read32(REG_SWSM);
+            self.write32(REG_SWSM, swsm & !SWSM_SMBI);
+        }
+        acquired
+    }
+
+    /// Release the software semaphore.
+    fn release_phy_semaphore(&self) {
+        if !self.is_pch() { return; }
+        let swsm = self.read32(REG_SWSM);
+        self.write32(REG_SWSM, swsm & !(SWSM_SWESMBI | SWSM_SMBI));
+    }
+
     fn mdic_read(&self, phy_reg: u32) -> Option<u16> {
-        self.mdic_read_raw(self.phy_addr, phy_reg)
+        if !self.acquire_phy_semaphore() { return None; }
+        let res = self.mdic_read_raw(self.phy_addr, phy_reg);
+        self.release_phy_semaphore();
+        res
     }
 
     fn mdic_write(&self, phy_reg: u32, data: u16) -> bool {
-        self.mdic_write_raw(self.phy_addr, phy_reg, data)
+        if !self.acquire_phy_semaphore() { return false; }
+        let res = self.mdic_write_raw(self.phy_addr, phy_reg, data);
+        self.release_phy_semaphore();
+        res
     }
 
     /// Read a PHY register directly given a specific PHY address
@@ -521,14 +642,17 @@ impl E1000EInner {
 
     /// Scan MDIO addresses to discover the PHY
     fn detect_phy_addr(&self) -> Option<u8> {
+        if !self.acquire_phy_semaphore() { return None; }
         for addr in 1..=32 {
             let phy_addr = (addr % 32) as u8;
             if let Some(val) = self.mdic_read_raw(phy_addr, PHY_REG_BMCR) {
-                if val != 0xFFFF {
+                if val != 0xFFFF && val != 0 {
+                    self.release_phy_semaphore();
                     return Some(phy_addr);
                 }
             }
         }
+        self.release_phy_semaphore();
         None
     }
 
@@ -548,6 +672,18 @@ impl E1000EInner {
         } else {
             0
         };
+
+        // Fallback: if STATUS_LU is clear, check PHY BMSR as a backup.
+        // On some I219-V revisions, the MAC link bit can be transiently clear
+        // during auto-negotiation transitions even if the PHY has carrier.
+        if !self.link_up {
+            if let Some(bmsr) = self.mdic_read(PHY_REG_BMSR) {
+                if bmsr & BMSR_LINK_STATUS != 0 {
+                    self.link_up = true;
+                    // Duplex/speed still come from STATUS or we assume defaults
+                }
+            }
+        }
     }
 
     /// Read and clear the hardware statistics registers, accumulating their
@@ -596,20 +732,70 @@ impl E1000EInner {
 
     /// Full hardware initialisation.  Returns `true` on success.
     unsafe fn init(&mut self) -> bool {
-        // 1. Disable all interrupt sources; then read ICR to clear any
-        //    pending interrupt causes left by UEFI or a previous driver
-        //    instance.  On real hardware (I217/I218/I219) the ME firmware
-        //    can leave stale pending-interrupt state in ICR even after the
-        //    device reset below, and those stale flags can interfere with
-        //    the receive path.  Reading ICR auto-clears it.
+        // 1a. Disable PCIe ASPM (Active State Power Management) L1.1 and L1.2.
+        //     On Intel I219-V, ASPM can cause severe DMA instability and "fatal RX errors"
+        //     when the CPU enters low-power C-states. Disabling it in the PCIe Link
+        //     Control register is required for stable bare-metal operation.
+        if self.is_pch() {
+            serial::serial_print("[e1000e] Disabling PCIe ASPM L1.1/L1.2...\n");
+            // PCIe Capability ID = 0x10
+            let pci_dev = crate::pci::PciDevice {
+                bus: self.bus,
+                device: self.dev,
+                function: self.func,
+                vendor_id: INTEL_VENDOR_ID,
+                device_id: self.device_id,
+                class_code: 0, subclass: 0, prog_if: 0, header_type: 0, bar0: 0, interrupt_line: 0,
+            };
+            let cap_pos = crate::pci::pci_find_capability(&pci_dev, 0x10);
+            if cap_pos != 0 {
+                // Link Control Register is at offset 0x10 from capability base.
+                // ASPM Control is bits 1:0. We clear them to disable ASPM.
+                let link_ctrl = crate::pci::pci_config_read_u16(self.bus, self.dev, self.func, cap_pos + 0x10);
+                if link_ctrl & 0x3 != 0 {
+                    serial::serial_print("[e1000e]   Current Link Control: 0x");
+                    serial::serial_print_hex(link_ctrl as u64);
+                    serial::serial_print(" -> Disabling ASPM\n");
+                    crate::pci::pci_config_write_u16(self.bus, self.dev, self.func, cap_pos + 0x10, link_ctrl & !0x3);
+                }
+            }
+        }
+
         self.write32(REG_IMC, 0xFFFF_FFFF);
         let _ = self.read32(REG_ICR); // clear any pending causes
 
-        // 2. Issue a device reset and wait for it to clear
-        let ctrl = self.read32(REG_CTRL);
+        // 1b. GIO Master Disable Handshake (recommended for all Intel NICs).
+        //     This ensures any pending DMA transactions from a previous OS or 
+        //     UEFI session are terminated before we global-reset the card.
+        //     Failing to do this can cause PCIe bus hangs or corrupted init.
+        serial::serial_print("[e1000e] Disabling GIO Master...\n");
+        let mut ctrl_ext = self.read32(REG_CTRL_EXT);
+        self.write32(REG_CTRL_EXT, ctrl_ext | CTRL_EXT_GIO_MASTER_DISABLE);
+        let mut master_disabled = false;
+        for _ in 0..20_000 {
+            if self.read32(REG_STATUS) & STATUS_GIO_MASTER_ENABLE == 0 {
+                master_disabled = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !master_disabled {
+            serial::serial_print("[e1000e] WARN: GIO Master Disable bit did not clear, forcing reset anyway\n");
+        } else {
+            serial::serial_print("[e1000e] GIO Master disabled\n");
+        }
+
+        // 2. Issue a device reset and wait for it to clear.
+        //    For I217/I218/I219 we also set PHY_RST to ensure the integrated
+        //    PHY is power-cycled and any UEFI-stale state is cleared.
+        let mut ctrl = self.read32(REG_CTRL);
+        if self.is_pch() {
+            ctrl |= CTRL_PHY_RST;
+        }
         self.write32(REG_CTRL, ctrl | CTRL_RST);
+        
+        // Wait for RST to clear
         for _ in 0..200_000 { core::hint::spin_loop(); }
-        // Spin until RST self-clears (hardware clears it when done)
         let mut waited = 0u32;
         loop {
             if self.read32(REG_CTRL) & CTRL_RST == 0 { break; }
@@ -623,18 +809,53 @@ impl E1000EInner {
 
         // Allow the NVM autoload and PLL to fully stabilise after the Global
         // Reset.  Intel I217/I218/I219 datasheets recommend a minimum of 20 ms
-        // before accessing any device registers after RST clears.  Without
-        // this wait, registers (including CTRL_EXT and the MAC address receive
-        // address registers) may still be in the process of being written by
-        // the hardware's NVM reload sequencer.
-        // 3_000_000 × PAUSE ≈ 20–30 ms at 2–3 GHz (PAUSE ≈ 7–10 ns each).
+        // before accessing any device registers after RST clears.
         for _ in 0..3_000_000u32 { core::hint::spin_loop(); }
+
+        // After reset, verify GIO master is re-enabled for DMA
+        let mut master_enabled = false;
+        for _ in 0..10_000 {
+            if self.read32(REG_STATUS) & STATUS_GIO_MASTER_ENABLE != 0 {
+                master_enabled = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !master_enabled {
+            serial::serial_print("[e1000e] WARN: GIO Master still disabled after reset!\n");
+        }
 
         // 3. Disable interrupts again (reset re-enables them) and clear ICR
         self.write32(REG_IMC, 0xFFFF_FFFF);
-        let _ = self.read32(REG_ICR); // clear any causes asserted during reset
+        let _ = self.read32(REG_ICR);
 
-        // 3a. PCH / I219-V PHY power-up sequence.
+        // 3a. PCH / I219-V specific hardware quirks.
+        if self.is_pch() {
+            // Disable K1 power state (Future Extended NVM 6 register).
+            let fextnvm6 = self.read32(REG_FEXTNVM6);
+            if fextnvm6 & (1 << 11) == 0 {
+                serial::serial_print("[e1000e] Disabling K1 power state in FEXTNVM6\n");
+                self.write32(REG_FEXTNVM6, fextnvm6 | (1 << 11));
+            }
+
+            // I219-V Quirk: Clear all Wake-up filters.
+            // These filters can be left active by a previous boot session (e.g. Windows)
+            // and can silently drop broadcast DHCP traffic.
+            serial::serial_print("[e1000e] Clearing Wake-up and Management filters\n");
+            self.write32(REG_WUC, 0);
+            self.write32(REG_WUFC, 0);
+            self.write32(REG_WUS, 0);
+
+            // I219-V Quirk: Set bit 18 of FEXTNVM7 (Side clock ungate).
+            // Prevents link drops and DMA hangs on some Silicon revisions.
+            let fextnvm7 = self.read32(REG_FEXTNVM7);
+            if fextnvm7 & (1 << 18) == 0 {
+                serial::serial_print("[e1000e] Setting bit 18 in FEXTNVM7 (Side clock ungate)\n");
+                self.write32(REG_FEXTNVM7, fextnvm7 | (1 << 18));
+            }
+        }
+
+        // 3b. PCH / I219-V PHY power-up sequence.
         //     UEFI firmware may leave CTRL_EXT.PHYPDEN set (bit 30), which
         //     forces the integrated PHY into power-down and prevents link.
         //     Clear it unconditionally so the PHY can auto-negotiate.
@@ -656,16 +877,22 @@ impl E1000EInner {
         //     intercepting or re-directing received traffic, which on
         //     I217/I218/I219 controllers can silently block DHCP replies.
         //
-        //     After setting DRV_LOAD we wait ~1 ms to give the ME firmware
+        //     After setting DRV_LOAD we wait ~10 ms to give the ME firmware
         //     time to complete the handoff before we continue.  Without
         //     this delay, on some real I219-V systems the ME may still
         //     intercept the very first received frames (including DHCP
         //     OFFERs) even though DRV_LOAD has been written.
         {
-            let ctrl_ext2 = self.read32(REG_CTRL_EXT);
-            self.write32(REG_CTRL_EXT, ctrl_ext2 | CTRL_EXT_DRV_LOAD);
-            // ~1 ms ME-handoff settling time (100_000 × PAUSE ≈ 1 ms @ 3 GHz)
-            for _ in 0..100_000 { core::hint::spin_loop(); }
+            serial::serial_print("[e1000e] Synchronizing DRV_LOAD with Intel ME...\n");
+            // Toggle DRV_LOAD to ensure the ME notices the transition
+            let ctrl_ext_tmp = self.read32(REG_CTRL_EXT);
+            self.write32(REG_CTRL_EXT, ctrl_ext_tmp & !CTRL_EXT_DRV_LOAD);
+            for _ in 0..10_000 { core::hint::spin_loop(); }
+            
+            self.write32(REG_CTRL_EXT, ctrl_ext_tmp | CTRL_EXT_DRV_LOAD);
+            // Increased ME-handoff settling time (10_000_000 × PAUSE ≈ 100 ms @ 3 GHz)
+            // Some I219-V systems need more than 20ms to release DHCP filters.
+            for _ in 0..10_000_000 { core::hint::spin_loop(); }
         }
 
         // 3c. Scan for the PHY address, then check and clear the Power-Down
@@ -678,11 +905,86 @@ impl E1000EInner {
             serial::serial_print("\n");
 
             if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
+                // Issue a PHY Software Reset (bit 15) to ensure a clean state
+                serial::serial_print("[e1000e] Resetting PHY via BMCR...\n");
+                self.mdic_write(PHY_REG_BMCR, bmcr | BMCR_RESET);
+                // PHY reset takes ~10ms; 100_000 iterations is plenty
+                for _ in 0..100_000 { core::hint::spin_loop(); }
+
                 if bmcr & BMCR_POWER_DOWN != 0 {
                     serial::serial_print("[e1000e] PHY BMCR power-down bit set — clearing\n");
-                    self.mdic_write(PHY_REG_BMCR, bmcr & !BMCR_POWER_DOWN);
+                    self.mdic_write(PHY_REG_BMCR, (bmcr & !BMCR_POWER_DOWN) | BMCR_RESET);
                     // Give the PHY ~500 µs to exit power-down before configuring
                     for _ in 0..50_000 { core::hint::spin_loop(); }
+                }
+
+                // I219-V Quirk: Disable Smart Power Down (SPD)
+                if let Some(pscr) = self.mdic_read(PHY_REG_PSCR) {
+                    if pscr & PSCR_SPD != 0 {
+                        serial::serial_print("[e1000e] Disabling PHY Smart Power Down (SPD)\n");
+                        self.mdic_write(PHY_REG_PSCR, pscr & !PSCR_SPD);
+                    }
+                }
+
+                // I219-V Quirk: Clear bit 2 of PHY register 18 (0x12) - Configuration Register 1.
+                // This is a documented fix in Intel/Linux drivers for I219-V link instability.
+                if let Some(reg18) = self.mdic_read(0x12) {
+                    if reg18 & (1 << 2) != 0 {
+                        serial::serial_print("[e1000e] Clearing bit 2 in PHY register 18 (I219 quirk)\n");
+                        self.mdic_write(0x12, reg18 & !(1 << 2));
+                    }
+                }
+
+                // I219-V Quirk: Set bit 10 of PHY register 26 (0x1A).
+                // Required for stable DMA operation on some PCH-family NICs to prevent RX hangs.
+                if let Some(reg26) = self.mdic_read(0x1A) {
+                    if reg26 & (1 << 10) == 0 {
+                        serial::serial_print("[e1000e] Setting bit 10 in PHY register 26 (I219 quirk)\n");
+                        self.mdic_write(0x1A, reg26 | (1 << 10));
+                    }
+                }
+
+                // I219-V Quirk: Ensure PHY power management doesn't aggressively power-down
+                // the PHY in non-D0 states if bit 11 of register 17 is set.
+                if let Some(reg17) = self.mdic_read(0x11) {
+                    if reg17 & (1 << 11) == 0 {
+                        serial::serial_print("[e1000e] Setting bit 11 in PHY register 17 (I219 power quirk)\n");
+                        self.mdic_write(0x11, reg17 | (1 << 11));
+                    }
+                }
+
+                // I219-V Quirk: Set bit 14 of PHY register 25 (0x19).
+                // Required for reliable clock gating during link transitions on PCH-based NICs.
+                if let Some(reg25) = self.mdic_read(0x19) {
+                    if reg25 & (1 << 14) == 0 {
+                        serial::serial_print("[e1000e] Setting bit 14 in PHY register 25 (I219 quirk)\n");
+                        self.mdic_write(0x19, reg25 | (1 << 14));
+                    }
+                }
+
+                // Explicit Auto-Negotiation Advertisement.
+                // Ensure we advertise all speeds: 10/100/1000 Full Duplex.
+                // Register 4: ANAR
+                if let Some(anar) = self.mdic_read(PHY_REG_ANAR) {
+                    let new_anar = anar | ANAR_10_FDX | ANAR_100_FDX | ANAR_SELECTOR | ANAR_PAUSE | ANAR_ASM_DIR;
+                    self.mdic_write(PHY_REG_ANAR, new_anar);
+                }
+                // Register 9: 1000BASE-T Control (1KTCTL)
+                if let Some(msctl) = self.mdic_read(PHY_REG_1KTCTL) {
+                    self.mdic_write(PHY_REG_1KTCTL, msctl | TCTL_1KT_FDX);
+                }
+
+                // Restart Auto-Negotiation
+                if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
+                    self.mdic_write(PHY_REG_BMCR, bmcr | (1 << 9) | (1 << 12)); // Restart Auto-Neg + Enable Auto-Neg
+                }
+
+                // I219-V Quirk: Disable Low Power Link Up (LPLU)
+                if let Some(pscr) = self.mdic_read(PHY_REG_PSCR) {
+                    if pscr & (PSCR_LPLU_D0 | PSCR_LPLU_NON_D0) != 0 {
+                        serial::serial_print("[e1000e] Disabling PHY Low Power Link Up (LPLU)\n");
+                        self.mdic_write(PHY_REG_PSCR, pscr & !(PSCR_LPLU_D0 | PSCR_LPLU_NON_D0));
+                    }
                 }
             } else {
                 serial::serial_print("[e1000e] WARN: MDIC read of PHY BMCR failed\n");
@@ -726,8 +1028,29 @@ impl E1000EInner {
         //    from PHY auto-negotiation), but we set it anyway so the MAC
         //    defaults to full-duplex if ASDE is ever cleared.
         {
-            let ctrl = self.read32(REG_CTRL);
-            self.write32(REG_CTRL, ctrl | CTRL_SLU | CTRL_ASDE | CTRL_FD);
+            let mut ctrl = self.read32(REG_CTRL);
+            ctrl |= CTRL_SLU | CTRL_ASDE | CTRL_FD;
+            if self.is_pch() {
+                // Enable Flow Control bits in CTRL for PCH controllers
+                ctrl |= CTRL_RFCE | CTRL_TFCE;
+            }
+            self.write32(REG_CTRL, ctrl);
+        }
+
+        // 5a. Disable Energy Efficient Ethernet (EEE) on PCH-family NICs.
+        //     EEE can cause link drops and latency issues that break DHCP on
+        //     certain I219-V hardware revisions.
+        if self.is_pch() {
+            let ipcnfg = self.read32(REG_IPCNFG);
+            serial::serial_print("[e1000e] Applying IPCNFG DMA quirk (bit 3) and disabling EEE (bit 0)\n");
+            // Set bit 3 for DMA timing stability, clear bit 0 for EEE disable
+            self.write32(REG_IPCNFG, (ipcnfg | (1 << 3)) & !(1 << 0));
+
+            let eeer = self.read32(REG_EEER);
+            if eeer & (1 << 0 | 1 << 1) != 0 {
+                serial::serial_print("[e1000e] Disabling EEE in EEER (bits 0, 1)\n");
+                self.write32(REG_EEER, eeer & !(1 << 0 | 1 << 1));
+            }
         }
 
         // 6. Zero the Multicast Table Array (MTA) — 128 × 32-bit entries
@@ -737,7 +1060,8 @@ impl E1000EInner {
 
         // 7. Initialise the RX descriptor ring
         let rx_ring_bytes = RX_RING_SIZE * core::mem::size_of::<RxDesc>();
-        let (rx_desc_ptr, rx_desc_phys) = match memory::alloc_dma_buffer(rx_ring_bytes, 16) {
+        // Intel RDBAL must be 128-byte aligned.
+        let (rx_desc_ptr, rx_desc_phys) = match memory::alloc_dma_buffer(rx_ring_bytes, 128) {
             Some(p) => p,
             None => {
                 serial::serial_print("[e1000e] ERROR: RX descriptor ring alloc failed\n");
@@ -761,6 +1085,8 @@ impl E1000EInner {
             let desc = (self.rx_descs_virt as *mut RxDesc).add(i);
             write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
             write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
+            // Flush initial descriptor state
+            self.clflush(desc as u64);
         }
 
         // Programme the ring registers
@@ -780,6 +1106,15 @@ impl E1000EInner {
         // prevents the hardware from reporting those checksum results.
         self.write32(REG_RXCSUM, 0);
 
+        // 7b. I219-V Quirk: Force Legacy descriptors by clearing RFCTL.EXTEN (bit 15).
+        //     UEFI/UEFI-PXE firmware often leaves the NIC in "Extended Descriptor"
+        //     mode (32 bytes). Resetting the MAC (CTRL_RST) does not always clear this.
+        //     Forcing RFCTL=0 ensures the NIC expects our 16-byte RxDesc structs.
+        if self.is_pch() {
+            serial::serial_print("[e1000e] Forcing Legacy descriptors (RFCTL=0)\n");
+            self.write32(REG_RFCTL, 0);
+        }
+
         // Enable RX: unicast+broadcast+multicast accept, strip CRC, 2 KiB buffers.
         // RCTL_UPE (Unicast Promiscuous) is included to ensure that unicast DHCP
         // OFFERs from DHCP servers that do not honor the BROADCAST flag are
@@ -788,7 +1123,8 @@ impl E1000EInner {
 
         // 8. Initialise the TX descriptor ring
         let tx_ring_bytes = TX_RING_SIZE * core::mem::size_of::<TxDesc>();
-        let (tx_desc_ptr, tx_desc_phys) = match memory::alloc_dma_buffer(tx_ring_bytes, 16) {
+        // Intel TDBAL must be 128-byte aligned.
+        let (tx_desc_ptr, tx_desc_phys) = match memory::alloc_dma_buffer(tx_ring_bytes, 128) {
             Some(p) => p,
             None => {
                 serial::serial_print("[e1000e] ERROR: TX descriptor ring alloc failed\n");
@@ -813,6 +1149,8 @@ impl E1000EInner {
             write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
             // Mark slot as done so software can use it immediately
             write_volatile(core::ptr::addr_of_mut!((*desc).status), TXD_STA_DD);
+            // Flush initial descriptor state
+            self.clflush(desc as u64);
         }
 
         self.write32(REG_TDBAL, tx_desc_phys as u32);
@@ -848,8 +1186,17 @@ impl E1000EInner {
         self.write32(REG_FCAH,  FLOW_CTRL_ADDR_HI);
         self.write32(REG_FCT,   FLOW_CTRL_TYPE);
         self.write32(REG_FCTTV, FCTTV_DEFAULT);
-        self.write32(REG_FCRTH, FCRTH_DEFAULT);
-        self.write32(REG_FCRTL, FCRTL_DEFAULT);
+        
+        if self.is_pch() {
+            // I219-V specific watermarks for 4 KB RX FIFO.
+            // FCRTH (High Water Mark) = 0x1000 (4 KB) - 0x600 = 0xA00
+            // FCRTL (Low Water Mark)  = 0x1000 (4 KB) - 0x800 = 0x800
+            self.write32(REG_FCRTH, 0x0A00);
+            self.write32(REG_FCRTL, 0x0800);
+        } else {
+            self.write32(REG_FCRTH, FCRTH_DEFAULT);
+            self.write32(REG_FCRTL, FCRTL_DEFAULT);
+        }
 
         // 11. Set up interrupt coalescing timers.
         //     Even though this driver operates in polling mode (no interrupt
@@ -941,6 +1288,9 @@ impl E1000EInner {
         let slot = self.tx_tail;
         let desc = (self.tx_descs_virt as *mut TxDesc).add(slot);
 
+        // Invalidate (flush) descriptor before checking status bit to ensure we see hardware updates
+        self.clflush(desc as u64);
+
         // Descriptor must be free (DD bit set by hardware after transmission)
         let sta = read_volatile(core::ptr::addr_of!((*desc).status));
         if sta & TXD_STA_DD == 0 {
@@ -953,6 +1303,9 @@ impl E1000EInner {
         let buf_phys = self.tx_bufs[slot].1;
         core::ptr::copy_nonoverlapping(data.as_ptr(), buf_virt, data.len());
 
+        // Flush the packet data to physical RAM
+        self.flush_cache_range(buf_virt as u64, data.len());
+
         // Fill the descriptor
         write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
         write_volatile(core::ptr::addr_of_mut!((*desc).length), data.len() as u16);
@@ -964,6 +1317,14 @@ impl E1000EInner {
         write_volatile(core::ptr::addr_of_mut!((*desc).status), 0); // Clear DD
         write_volatile(core::ptr::addr_of_mut!((*desc).css), 0);
         write_volatile(core::ptr::addr_of_mut!((*desc).special), 0);
+
+        // Flush the descriptor itself to ensure the hardware sees our updates
+        self.clflush(desc as u64);
+
+        // Hardware memory fence to ensure descriptor and buffer data are
+        // physically committed to RAM before the hardware sees the doorbell (TDT).
+        // On x86-64, Release fence ensures previous stores are visible.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 
         // Advance the tail and ring the doorbell
         self.tx_tail = (slot + 1) % TX_RING_SIZE;
@@ -982,14 +1343,29 @@ impl E1000EInner {
         let slot = self.rx_tail;
         let desc = (self.rx_descs_virt as *mut RxDesc).add(slot);
 
+        // Invalidate cache for this descriptor so we see hardware updates (DD bit)
+        self.clflush(desc as u64);
+
         let status = read_volatile(core::ptr::addr_of!((*desc).status));
         if status & RXD_STA_DD == 0 {
             return None; // Hardware has not written a frame here yet
         }
 
-        // Memory barrier to ensure that hardware has finished writing the
-        // packet data before we read from the DMA buffer.
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+        // Debug: Log packet reception (first few bytes to identify type)
+        let frame_len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
+        let buf_virt = self.rx_bufs[slot].0 as *const u8;
+        serial::serial_print("[e1000e] RX packet length=");
+        serial::serial_print_dec(frame_len as u64);
+        serial::serial_print(" Type=");
+        unsafe {
+            let eth_type = u16::from_be(core::ptr::read_unaligned(buf_virt.add(12) as *const u16));
+            serial::serial_print_hex(eth_type as u64);
+        }
+        serial::serial_print("\n");
+
+        // Hardware memory fence to ensure that the CPU reads the packet data
+        // from RAM after the hardware has finished its DMA write.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         let buf_phys = self.rx_bufs[slot].1;
 
@@ -1042,6 +1418,10 @@ impl E1000EInner {
         let copy_len  = core::cmp::min(frame_len, buffer.len());
 
         let src = self.rx_bufs[slot].0 as *const u8;
+        
+        // Invalidate cache for receive buffer before reading packet data
+        self.flush_cache_range(src as u64, frame_len);
+
         core::ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), copy_len);
 
         // Return the descriptor to hardware: clear status, restore buffer addr,
@@ -1158,8 +1538,16 @@ pub fn init() {
                 continue;
             }
 
+            // mmio_base must include the page offset if map_mmio_range returns
+            // the start of the mapped virtual page range.
+            let mmio_base = mmio_virt + page_offset as u64;
+
             let inner = E1000EInner {
-                mmio_base: mmio_virt,
+                mmio_base,
+                device_id: dev.device_id,
+                bus: dev.bus,
+                dev: dev.device,
+                func: dev.function,
                 mac: [0u8; 6],
                 phy_addr: 1, // Default, will be updated during init()
                 rx_descs_virt: 0,
