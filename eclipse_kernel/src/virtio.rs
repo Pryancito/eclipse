@@ -1154,10 +1154,6 @@ impl crate::net::NetworkDevice for VirtIONetDevice {
         let mut inner = self.inner.lock();
         unsafe { inner.receive_packet(buffer) }
     }
-
-    fn name(&self) -> &'static str {
-        "VirtIO-Net"
-    }
 }
 
 impl VirtIONetDeviceInner {
