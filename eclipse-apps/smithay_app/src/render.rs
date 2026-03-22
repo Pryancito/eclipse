@@ -35,6 +35,7 @@ use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20, FONT_6X10}, Mo
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::ServiceInfo;
+use eclipse_ipc::types::NetExtendedStats;
 use crate::display::{self, DisplayDevice, FramebufferDesc, DisplayError, ControlDevice, DisplayCaps};
 
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -625,7 +626,149 @@ impl FramebufferState {
                     }
                 }
             }
-        }
+    }
+}
+}
+
+pub fn draw_network_dashboard(
+    fb: &mut FramebufferState,
+    counter: u64,
+    stats: Option<&NetExtendedStats>,
+) {
+    let w = fb.info.width as i32;
+    let h = fb.info.height as i32;
+    
+    // Background dim/grid (reusing dashboard style)
+    let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
+        .draw(fb);
+    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
+
+    use sidewind::ui::{Panel, Widget};
+    let p_w = 700;
+    let p_h = 480;
+    let px = (w - p_w) / 2;
+    let py = (h - p_h) / 2;
+    let main_panel = Panel { 
+        position: Point::new(px, py), 
+        size: Size::new(p_w as u32, p_h as u32), 
+        title: "ESTADO DE RED // CONNECTIVITY CORE" 
+    };
+    let _ = main_panel.draw(fb);
+
+    if let Some(s) = stats {
+        // Draw Interfaces (lo and eth0)
+        let card_w = 320;
+        let card_h = 160;
+        let card_y = py + 60;
+        
+        // Loopback Card
+        let lo_pos = Point::new(px + 20, card_y);
+        draw_network_interface_card(fb, lo_pos, "lo (Loopback)", s.lo_up != 0, &s.lo_ipv4, &s.lo_ipv6, counter);
+        
+        // Ethernet Card
+        let eth_pos = Point::new(px + p_w - card_w - 20, card_y);
+        draw_network_interface_card(fb, eth_pos, "eth0 (Physical)", s.eth0_up != 0, &s.eth0_ipv4, &s.eth0_ipv6, counter);
+
+        // Stats Panel (Traffic)
+        let stats_y = card_y + card_h + 20;
+        draw_traffic_monitor(fb, Point::new(px + 20, stats_y), p_w - 40, 180, s.rx_bytes, s.tx_bytes, counter);
+        
+        // Bottom details
+        let details_y = py + p_h - 60;
+        let mut details = heapless::String::<128>::new();
+        let _ = core::fmt::write(&mut details, format_args!("GW: {}.{}.{}.{}  |  DNS: {}.{}.{}.{}", 
+            s.eth0_gateway[0], s.eth0_gateway[1], s.eth0_gateway[2], s.eth0_gateway[3],
+            s.eth0_dns[0], s.eth0_dns[1], s.eth0_dns[2], s.eth0_dns[3]
+        ));
+        let text_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+        let _ = Text::new(&details, Point::new(px + 40, details_y), text_style).draw(fb);
+    } else {
+        let text_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_RED);
+        let _ = Text::new("ESPERANDO DATOS DEL SERVICIO DE RED...", Point::new(px + 60, py + 200), text_style).draw(fb);
+    }
+}
+
+fn draw_network_interface_card(
+    fb: &mut FramebufferState,
+    pos: Point,
+    name: &str,
+    is_up: bool,
+    ipv4: &[u8; 4],
+    ipv6: &[u8; 16],
+    counter: u64,
+) {
+    let w = 320;
+    let h = 160;
+    let color = if is_up { colors::ACCENT_CYAN } else { colors::ACCENT_RED };
+    
+    // Glass card effect
+    let _ = RoundedRectangle::with_equal_corners(
+        Rectangle::new(pos, Size::new(w as u32, h as u32)),
+        Size::new(8, 8)
+    ).into_styled(PrimitiveStyleBuilder::new().fill_color(colors::GLASS_FROSTED).stroke_color(color).stroke_width(2).build()).draw(fb);
+    
+    // Title
+    let title_style = MonoTextStyle::new(&FONT_10X20, color);
+    let _ = Text::new(name, pos + Point::new(20, 30), title_style).draw(fb);
+    
+    // Status indicator
+    let status_text = if is_up { "● ONLINE" } else { "○ OFFLINE" };
+    let _ = Text::new(status_text, pos + Point::new(w as i32 - 120, 30), title_style).draw(fb);
+    
+    // IPs
+    let info_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
+    let mut ip_str = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut ip_str, format_args!("IPv4: {}.{}.{}.{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3]));
+    let _ = Text::new(&ip_str, pos + Point::new(20, 70), info_style).draw(fb);
+    
+    let mut ipv6_str = heapless::String::<128>::new();
+    let _ = core::fmt::write(&mut ipv6_str, format_args!("IPv6: {:02x}{:02x}:{:02x}{:02x}...", ipv6[0], ipv6[1], ipv6[2], ipv6[3]));
+    let _ = Text::new(&ipv6_str, pos + Point::new(20, 95), info_style).draw(fb);
+
+    // Decorative bits
+    if is_up && (counter / 30) % 2 == 0 {
+        let _ = Circle::with_center(pos + Point::new(w as i32 - 30, h as i32 - 30), 6)
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::ACCENT_CYAN).build()).draw(fb);
+    }
+}
+
+fn draw_traffic_monitor(
+    fb: &mut FramebufferState,
+    pos: Point,
+    w: i32,
+    h: i32,
+    rx: u64,
+    tx: u64,
+    counter: u64,
+) {
+    let _ = Rectangle::new(pos, Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(colors::BACKGROUND_DEEP).stroke_color(colors::GLASS_BORDER).stroke_width(1).build()).draw(fb);
+    
+    let text_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
+    let mut rx_str = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut rx_str, format_args!("RX TOTAL: {} KB", rx / 1024));
+    let _ = Text::new(&rx_str, pos + Point::new(20, 30), text_style).draw(fb);
+    
+    let mut tx_str = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut tx_str, format_args!("TX TOTAL: {} KB", tx / 1024));
+    let _ = Text::new(&tx_str, pos + Point::new(20, 50), text_style).draw(fb);
+
+    // Mini graph (simulated)
+    let graph_x = pos.x + 20;
+    let graph_y = pos.y + 70;
+    let graph_w = w - 40;
+    let graph_h = h - 90;
+    
+    let line_style = PrimitiveStyleBuilder::new().stroke_color(colors::ACCENT_BLUE).stroke_width(1).build();
+    let _ = Rectangle::new(Point::new(graph_x, graph_y), Size::new(graph_w as u32, graph_h as u32))
+        .into_styled(PrimitiveStyleBuilder::new().stroke_color(Rgb888::new(20, 40, 80)).stroke_width(1).build()).draw(fb);
+
+    for i in 0..graph_w/4 {
+        let x = graph_x + i * 4;
+        let h_val = (((counter as i32 + i * 10) as f32 * 0.1).sin().abs() * graph_h as f32 * 0.7) as i32;
+        let _ = Line::new(Point::new(x, graph_y + graph_h), Point::new(x, graph_y + graph_h - h_val))
+            .into_styled(line_style).draw(fb);
     }
 }
 
@@ -1053,8 +1196,20 @@ pub fn draw_desktop_shell(
     log_len: &mut usize,
     dashboard_active: bool,
     sys_central_active: bool,
+    network_active: bool,
+    cpu: f32, mem: f32, net: f32,
+    cpu_temp: u32, gpu_load: u32, gpu_temp: u32,
+    anomalies: u32, frag: u32, uptime_ticks: u64,
+    cpu_count: u64, mem_total_kb: u64, gpu_vram_total_kb: u64,
+    services: &[ServiceInfo],
+    processes: &[ProcessInfo],
+    process_cpu: &[f32; 32],
+    process_mem: &[u64; 32],
 ) {
-    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len, dashboard_active, sys_central_active);
+    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len, 
+        dashboard_active, sys_central_active, network_active,
+        cpu, mem, net, cpu_temp, gpu_load, gpu_temp, anomalies, frag, uptime_ticks,
+        cpu_count, mem_total_kb, gpu_vram_total_kb, services, processes, process_cpu, process_mem);
 }
 
 pub fn draw_static_ui(
@@ -1065,9 +1220,18 @@ pub fn draw_static_ui(
     _cursor_x: i32, 
     _cursor_y: i32, 
     log_buf: &mut [u8; 512], 
-    log_len: &mut usize,
+    _log_len: &mut usize,
     dashboard_active: bool,
     sys_central_active: bool,
+    network_active: bool,
+    cpu: f32, mem: f32, net: f32,
+    cpu_temp: u32, gpu_load: u32, gpu_temp: u32,
+    anomalies: u32, frag: u32, uptime_ticks: u64,
+    cpu_count: u64, mem_total_kb: u64, gpu_vram_total_kb: u64,
+    services: &[ServiceInfo],
+    processes: &[ProcessInfo],
+    process_cpu: &[f32; 32],
+    process_mem: &[u64; 32],
 ) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
@@ -1095,6 +1259,7 @@ pub fn draw_static_ui(
         let active = match icon_type {
             ui::TechCardIconType::ControlPanel => dashboard_active,
             ui::TechCardIconType::System => sys_central_active,
+            ui::TechCardIconType::Network => network_active,
             _ => false,
         };
         
@@ -1107,6 +1272,14 @@ pub fn draw_static_ui(
         let _ = ui::draw_tech_card_icon(fb, Point::new(sidebar_x, py), *icon_type, draw_hover, sidebar_width, icon_slot_h, counter);
     }
 
+    if dashboard_active {
+        draw_dashboard(fb, counter, cpu, mem, net, cpu_temp, gpu_load, gpu_temp, 
+            anomalies, frag, uptime_ticks, cpu_count, mem_total_kb, gpu_vram_total_kb);
+    }
+
+    if sys_central_active {
+        draw_system_central(fb, counter, services, processes, process_cpu, process_mem, uptime_ticks);
+    }
 }
 
 pub fn draw_hud_overlay(

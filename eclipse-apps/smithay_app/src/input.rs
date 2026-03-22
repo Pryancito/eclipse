@@ -10,6 +10,7 @@ use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
+use eclipse_ipc::types::NetExtendedStats;
 
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub enum CompositorEvent {
     Wayland(heapless::Vec<u8, 512>, u32), // data, sender_pid
     X11(heapless::Vec<u8, 512>, u32), // data, sender_pid
     NetStats(u64, u64), // rx, tx
+    NetExtendedStats(NetExtendedStats),
     ServiceInfo(heapless::Vec<u8, 512>),
     /// Línea de log del kernel para el HUD (cuando el logo ya está dibujado).
     KernelLog(heapless::Vec<u8, 252>),
@@ -128,10 +130,12 @@ pub struct InputState {
     pub focused_window: Option<usize>,
     pub modifiers: u32,
     pub request_dashboard: bool,
+    pub launcher_active: bool,
     pub dashboard_active: bool,
     pub lock_active: bool,
-    pub launcher_active: bool,
     pub quick_settings_active: bool,
+    pub system_central_active: bool,
+    pub network_active: bool,
     pub context_menu_active: bool,
     pub context_menu_pos: Point,
     pub launcher_curr_y: f32,
@@ -140,8 +144,8 @@ pub struct InputState {
     pub tiling_active: bool,
     pub request_toggle_tiling: bool,
     pub alt_tab_active: bool,
-    pub system_central_active: bool,
     pub request_system_central: bool,
+    pub request_network: bool,
     pub system_central_curr_y: f32,
     pub search_active: bool,
     pub search_curr_y: f32,
@@ -161,13 +165,16 @@ impl InputState {
             request_minimize: false, request_maximize: false, request_restore: false,
             dragging_window: None, resizing_window: None, drag_offset_x: 0, drag_offset_y: 0,
             focused_window: None, modifiers: 0, request_dashboard: false,
-            dashboard_active: false, lock_active: false,
-            launcher_active: false, quick_settings_active: false, context_menu_active: false,
+            launcher_active: false, dashboard_active: false, lock_active: false, quick_settings_active: false, 
+            network_active: false,
+            context_menu_active: false,
             context_menu_pos: Point::new(0, 0),
             launcher_curr_y: height as f32, current_workspace: 0, workspace_offset: 0.0,
             tiling_active: false, request_toggle_tiling: false,
             alt_tab_active: false,
-            system_central_active: false, request_system_central: false, system_central_curr_y: 0.0,
+            system_central_active: false, request_system_central: false, 
+            request_network: false,
+            system_central_curr_y: 0.0,
             search_active: false, search_curr_y: -(height as f32 / 2.0),
             search_query: heapless::String::new(),
         }
@@ -355,8 +362,10 @@ impl InputState {
                                 self.request_system_central = true;
                             },
                             2 => {
-                                self.launcher_active = !self.launcher_active;
-                                if self.launcher_active { self.dashboard_active = false; self.system_central_active = false; }
+                                if self.launcher_active { self.dashboard_active = false; self.system_central_active = false; self.network_active = false; }
+                            },
+                            4 => {
+                                self.request_network = true;
                             },
                             _ => {}
                         }

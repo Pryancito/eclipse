@@ -16,7 +16,7 @@ use core::default::Default;
 use core::iter::Iterator;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::geometry::{Point, Size};
-use eclipse_ipc::types::TAG_WAYL;
+use eclipse_ipc::types::{TAG_WAYL, NetExtendedStats};
 
 #[cfg(not(target_vendor = "eclipse"))]
 unsafe fn eclipse_send(_dest: u32, _msg_type: u32, _buf: *const core::ffi::c_void, _len: usize, _flags: usize) -> usize { 0 }
@@ -81,6 +81,7 @@ pub struct SmithayState {
     pub prev_net_rx: u64,
     pub prev_net_tx: u64,
     pub net_usage: f32,
+    pub net_extended_stats: Option<NetExtendedStats>,
     pub process_list: [ProcessInfo; 32],
     pub process_count: usize,
     pub service_list: [ServiceInfo; 32],
@@ -172,6 +173,7 @@ impl SmithayState {
             prev_net_rx: 0,
             prev_net_tx: 0,
             net_usage: 0.0,
+            net_extended_stats: None,
             process_list: [ProcessInfo { pid: 0, name: [0; 16], state: 0, cpu_ticks: 0, mem_frames: 0 }; 32],
             process_count: 0,
             service_list: [ServiceInfo::new(); 32],
@@ -235,6 +237,10 @@ impl SmithayState {
             CompositorEvent::NetStats(rx, tx) => {
                 self.net_rx = *rx;
                 self.net_tx = *tx;
+                self.dirty = true;
+            }
+            CompositorEvent::NetExtendedStats(stats) => {
+                self.net_extended_stats = Some(*stats);
                 self.dirty = true;
             }
             CompositorEvent::KernelLog(line) => {
@@ -649,6 +655,10 @@ impl SmithayState {
                     let bytes_per_sec = (total_delta as f32) * 2.0;
                     self.net_usage = (bytes_per_sec / max_bytes_per_sec).clamp(0.0, 1.0);
 
+                    if self.input.network_active {
+                        let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_EXT_STATS".as_ptr() as *const core::ffi::c_void, 17, 0) };
+                    }
+
                     self.prev_net_rx = self.net_rx;
                     self.prev_net_tx = self.net_tx;
                 }
@@ -688,6 +698,16 @@ impl SmithayState {
             let count = unsafe { get_process_list(self.process_list.as_mut_ptr(), 32) };
             if count >= 0 {
                 self.process_count = count as usize;
+
+                // Descubrir PID del servicio de red
+                for p in &self.process_list[..self.process_count] {
+                    let name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
+                    let name = &p.name[..name_len];
+                    if name.ends_with(b"network_service") || name == b"network_service" || name.windows(11).any(|w| w == b"network_ser") {
+                        self.network_pid = Some(p.pid);
+                        break;
+                    }
+                }
 
                 let current_uptime = current.uptime_ticks;
                 let total_delta = current_uptime.saturating_sub(prev_uptime);
@@ -962,6 +982,7 @@ impl SmithayState {
             self.input.request_dashboard = false;
             if self.input.dashboard_active {
                 self.input.system_central_active = false;
+                self.input.network_active = false;
                 // Force immediate metrics update
                 self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
             }
@@ -973,6 +994,19 @@ impl SmithayState {
             self.input.request_system_central = false;
             if self.input.system_central_active {
                 self.input.dashboard_active = false;
+                self.input.network_active = false;
+                // Force immediate metrics update
+                self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
+            }
+            self.dirty = true;
+        }
+
+        if self.input.request_network {
+            self.input.network_active = !self.input.network_active;
+            self.input.request_network = false;
+            if self.input.network_active {
+                self.input.dashboard_active = false;
+                self.input.system_central_active = false;
                 // Force immediate metrics update
                 self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
             }
@@ -996,6 +1030,12 @@ impl SmithayState {
         if !self.input.lock_active {
             // Fondo de escritorio + logo + sidebar + HUD de logs
             // Igual que en v0.1.6: el HUD forma parte del fondo, no de un overlay separado.
+            let uptime_ticks = if let Some(stats) = &self.prev_stats {
+                stats.uptime_ticks
+            } else {
+                0
+            };
+
             render::draw_desktop_shell(
                 &mut self.backend.fb,
                 &self.space.windows,
@@ -1007,9 +1047,34 @@ impl SmithayState {
                 &mut self.log_len,
                 self.input.dashboard_active,
                 self.input.system_central_active,
+                self.input.network_active,
+                self.cpu_usage,
+                self.mem_usage,
+                self.net_usage,
+                self.cpu_temp,
+                self.gpu_load,
+                self.gpu_temp,
+                self.anomaly_count,
+                self.heap_fragmentation,
+                uptime_ticks,
+                self.cpu_count,
+                self.mem_total_kb,
+                self.gpu_vram_total_kb,
+                &self.service_list,
+                &self.process_list,
+                &self.process_cpu_usage,
+                &self.process_mem_kb,
             );
 
-            if !self.input.dashboard_active && !self.input.system_central_active {
+            if self.input.network_active {
+                render::draw_network_dashboard(
+                    &mut self.backend.fb,
+                    self.counter,
+                    self.net_extended_stats.as_ref(),
+                );
+            }
+
+            if !self.input.dashboard_active && !self.input.system_central_active && !self.input.network_active {
                 render::draw_shell_windows(
                     &mut self.backend.fb, 
                     &self.space.windows, 

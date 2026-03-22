@@ -83,6 +83,10 @@ impl IpcHandler {
                     self.message_count += 1;
                     return Some(CompositorEvent::NetStats(rx, tx));
                 }
+                Some(EclipseMessage::NetExtendedStatsResponse(stats)) => {
+                    self.message_count += 1;
+                    return Some(CompositorEvent::NetExtendedStats(stats));
+                }
                 Some(EclipseMessage::ServiceInfoResponse { data, len }) => {
                     self.message_count += 1;
                     let mut heap_data = heapless::Vec::<u8, 512>::new();

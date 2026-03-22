@@ -15,6 +15,7 @@ pub enum NetOp {
     Close = 7,
     Ioctl = 8,
     Resolve = 9,
+    GetExtendedStats = 10,
     Response = 255,
 }
 

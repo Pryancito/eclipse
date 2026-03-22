@@ -15,7 +15,23 @@ pub enum NetOp {
     Close = 7,
     Ioctl = 8,
     Resolve = 9,
+    GetExtendedStats = 10,
     Response = 255,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetExtendedStats {
+    pub lo_ipv4: [u8; 4],
+    pub lo_ipv6: [u8; 16],
+    pub lo_up: u8,
+    pub eth0_ipv4: [u8; 4],
+    pub eth0_ipv6: [u8; 16],
+    pub eth0_up: u8,
+    pub eth0_gateway: [u8; 4],
+    pub eth0_dns: [u8; 4],
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 #[repr(C)]

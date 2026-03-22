@@ -19,6 +19,8 @@ pub const TAG_NETW: &[u8; 4] = b"NETW";
 pub const GET_NETWORK_PID_MSG: &[u8; 15] = b"GET_NETWORK_PID";
 pub const TAG_NSTA: &[u8; 4] = b"NSTA";
 pub const GET_NET_STATS_MSG: &[u8; 13] = b"GET_NET_STATS";
+pub const TAG_NEXS: &[u8; 4] = b"NEXS";
+pub const GET_NET_EXT_STATS_MSG: &[u8; 17] = b"GET_NET_EXT_STATS";
 pub const TAG_SVCS: &[u8; 4] = b"SVCS";
 pub const TAG_WAYL: &[u8; 4] = b"WAYL";
 /// Línea de log del kernel (HUD). Enviada con from=0 cuando el logo ya está dibujado.
@@ -39,6 +41,21 @@ pub fn build_input_pid_response_payload(pid: u32) -> [u8; 8] {
     buf[0..4].copy_from_slice(TAG_INPT);
     buf[4..8].copy_from_slice(&pid.to_le_bytes());
     buf
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetExtendedStats {
+    pub lo_ipv4: [u8; 4],
+    pub lo_ipv6: [u8; 16],
+    pub lo_up: u8,
+    pub eth0_ipv4: [u8; 4],
+    pub eth0_ipv6: [u8; 16],
+    pub eth0_up: u8,
+    pub eth0_gateway: [u8; 4],
+    pub eth0_dns: [u8; 4],
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 /// Mensaje IPC de Eclipse OS tipado y comprobado en compilación.
@@ -74,6 +91,9 @@ pub enum EclipseMessage {
 
     /// Respuesta al GetNetStats con rx y tx.
     NetStatsResponse { rx: u64, tx: u64 },
+
+    /// Respuesta al GetNetExtStats con detalles completos.
+    NetExtendedStatsResponse(NetExtendedStats),
 
     /// Respuesta con información de servicios desde SystemD.
     ServiceInfoResponse { data: [u8; MAX_MSG_LEN], len: usize },
@@ -184,6 +204,10 @@ mod impl_parse {
                 rx: u64::from_le_bytes(rx_bytes),
                 tx: u64::from_le_bytes(tx_bytes),
             });
+        }
+        if len >= 4 + core::mem::size_of::<NetExtendedStats>() && buf[0..4] == *TAG_NEXS {
+            let stats = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(4) as *const NetExtendedStats) };
+            return Some(EclipseMessage::NetExtendedStatsResponse(stats));
         }
         if len >= 8 && buf[0..4] == *TAG_SVCS {
             let mut data = [0u8; MAX_MSG_LEN];

@@ -15,6 +15,10 @@ log = "0.4"
 name = "network_service"
 path = "src/main.rs"
 
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
 [profile.release]
 panic = "abort"
 lto = true

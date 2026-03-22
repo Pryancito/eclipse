@@ -190,8 +190,7 @@ fi
 
 # Configuración de red
 if [ "$USE_NET" = "1" ]; then
-    QEMU_CMD="$QEMU_CMD -netdev user,id=net0,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"
-    QEMU_CMD="$QEMU_CMD -device virtio-net-pci,netdev=net0"
+    QEMU_CMD="$QEMU_CMD -netdev user,id=net0 -device e1000,netdev=net0"
     print_info "Red configurada: SLIRP (User mode) con port forwarding (8080->80, 2222->22)"
 fi
 QEMU_CMD="$QEMU_CMD -m $MEMORY"

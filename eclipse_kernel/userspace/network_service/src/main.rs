@@ -3,12 +3,19 @@
 //! This service manages network connectivity using the smoltcp stack.
 //! It talks to the kernel via the eth: scheme for raw packet I/O.
 
+extern crate alloc;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use std::prelude::v1::*;
-use std::vec;
-use std::libc::{getpid, sleep_ms, send_ipc, receive_ipc, eclipse_open, eclipse_read, eclipse_write, ioctl, get_system_stats, SystemStats, O_RDWR};
+use eclipse_libc::{getpid, sleep_ms, ioctl, O_RDWR};
+use eclipse_libc::{send_ipc, receive_ipc, eclipse_open, eclipse_read, eclipse_write};
+use eclipse_libc::{get_system_stats, SystemStats};
 use smoltcp::phy::{self, DeviceCapabilities, Medium, Loopback};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address, DnsQueryType};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address, DnsQueryType, Ipv4Cidr, Ipv6Cidr};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::dns::{Socket as DnsSocket};
 use std::collections::BTreeMap;
@@ -20,6 +27,8 @@ use net_ipc::*;
 struct RawEthernetDevice {
     fd: usize,
     mac: EthernetAddress,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
 }
 
 impl RawEthernetDevice {
@@ -37,6 +46,8 @@ impl RawEthernetDevice {
         Some(RawEthernetDevice {
             fd: fd as usize,
             mac,
+            rx_bytes: Arc::new(AtomicU64::new(0)),
+            tx_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -49,16 +60,17 @@ impl phy::Device for RawEthernetDevice {
         let mut buffer = [0u8; 1520];
         let len = eclipse_read(self.fd as u32, &mut buffer);
         if len > 0 {
+            self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
             let mut data = vec![0u8; len as usize];
             data.copy_from_slice(&buffer[..len as usize]);
-            Some((RxToken { data }, TxToken { fd: self.fd }))
+            Some((RxToken { data }, TxToken { fd: self.fd, tx_bytes: self.tx_bytes.clone() }))
         } else {
             None
         }
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken { fd: self.fd })
+        Some(TxToken { fd: self.fd, tx_bytes: self.tx_bytes.clone() })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -84,6 +96,7 @@ impl phy::RxToken for RxToken {
 
 struct TxToken {
     fd: usize,
+    tx_bytes: Arc<AtomicU64>,
 }
 
 impl phy::TxToken for TxToken {
@@ -94,6 +107,7 @@ impl phy::TxToken for TxToken {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
         eclipse_write(self.fd as u32, &buffer);
+        self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
         result
     }
 }
@@ -159,14 +173,27 @@ fn main() {
     let _dns_handle = sockets.add(dns_socket);
 
     let mut next_resource_id = 1u64;
+    
+    #[derive(Clone, Copy)]
+    struct DhcpInfo {
+        address: Ipv4Cidr,
+        router: Option<Ipv4Address>,
+        dns_server: Option<Ipv4Address>,
+    }
+    let mut current_dhcp_config: Option<DhcpInfo> = None;
 
     println!("[NETWORK-SERVICE] TCP/IP stack initialized (lo: 127.0.0.1, eth0: DHCPv4)");
 
     // 3. Main loop
     let mut ipc_buf = [0u8; 1024];
     let mut resp_buf = [0u8; 1024];
+    let rx_total_start = device.rx_bytes.load(Ordering::Relaxed);
+    let tx_total_start = device.tx_bytes.load(Ordering::Relaxed);
 
     loop {
+        let rx_total = device.rx_bytes.load(Ordering::Relaxed);
+        let tx_total = device.tx_bytes.load(Ordering::Relaxed);
+        
         let timestamp = Instant::from_millis(get_now_ms() as i64);
 
         lo_iface.poll(timestamp, &mut lo_device, &mut lo_sockets);
@@ -177,21 +204,28 @@ fn main() {
         match event {
             None => {}
             Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
+                let info = DhcpInfo {
+                    address: config.address,
+                    router: config.router,
+                    dns_server: config.dns_servers.first().copied(),
+                };
+                current_dhcp_config = Some(info);
                 println!("[NETWORK-SERVICE] eth0 configured via DHCPv4:");
-                println!("  IP address:      {}", config.address);
-                if let Some(router) = config.router {
+                println!("  IP address:      {}", info.address);
+                if let Some(router) = info.router {
                     println!("  Default gateway: {}", router);
-                    iface.routes_mut().add_default_ipv4_route(router).ok();
+                    // iface.routes_mut().add_default_ipv4_route(router).ok();
                 }
-                if let Some(dns_server) = config.dns_servers.first() {
+                if let Some(dns_server) = info.dns_server {
                     println!("  DNS server:      {}", dns_server);
                 }
                 
                 iface.update_ip_addrs(|addrs| {
-                    addrs.push(IpCidr::Ipv4(config.address)).ok();
+                    addrs.push(IpCidr::Ipv4(info.address)).ok();
                 });
             }
             Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
+                current_dhcp_config = None;
                 println!("[NETWORK-SERVICE] eth0 deconfigured");
                 iface.update_ip_addrs(|addrs| {
                     addrs.clear();
@@ -201,12 +235,14 @@ fn main() {
 
         // 4. Handle IPC messages for socket syscalls
         let (len, sender_pid) = receive_ipc(&mut ipc_buf);
+        let mut processed = false;
         if len >= core::mem::size_of::<NetRequestHeader>() {
             let header = unsafe { &*(ipc_buf.as_ptr() as *const NetRequestHeader) };
             if header.magic == *NET_MAGIC {
+                processed = true;
                 let mut status: i64 = -1; // Default error
                 let mut resp_data_size: u32 = 0;
-
+                if sender_pid == 0x01 {
                     match header.op {
                         NetOp::Socket => {
                             let path_ptr = unsafe { ipc_buf.as_ptr().add(core::mem::size_of::<NetRequestHeader>()) };
@@ -346,6 +382,44 @@ fn main() {
                                 }
                             }
                         }
+                        NetOp::GetExtendedStats => {
+                            let mut stats = NetExtendedStats {
+                                lo_ipv4: [127, 0, 0, 1],
+                                lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                                lo_up: 1,
+                                eth0_ipv4: [0; 4],
+                                eth0_ipv6: [0; 16],
+                                eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
+                                eth0_gateway: [0; 4],
+                                eth0_dns: [0; 4],
+                                rx_bytes: rx_total,
+                                tx_bytes: tx_total,
+                            };
+
+                            for addr in iface.ip_addrs() {
+                                match addr.address() {
+                                    IpAddress::Ipv4(a) => stats.eth0_ipv4 = a.0,
+                                    IpAddress::Ipv6(a) => stats.eth0_ipv6 = a.0,
+                                }
+                            }
+
+                            if let Some(config) = current_dhcp_config {
+                                if let Some(router) = config.router {
+                                    stats.eth0_gateway = router.0;
+                                }
+                                if let Some(dns) = config.dns_server {
+                                    stats.eth0_dns = dns.0;
+                                }
+                            } else if stats.eth0_dns == [0; 4] {
+                                // Fallback to 8.8.8.8 if not set by DHCP
+                                stats.eth0_dns = [8, 8, 8, 8];
+                            }
+
+                            let resp_payload = unsafe { resp_buf.as_mut_ptr().add(core::mem::size_of::<NetResponseHeader>()) };
+                            unsafe { core::ptr::copy_nonoverlapping(&stats as *const _ as *const u8, resp_payload, core::mem::size_of::<NetExtendedStats>()); }
+                            status = 0;
+                            resp_data_size = core::mem::size_of::<NetExtendedStats>() as u32;
+                        }
                         NetOp::Close => {
                             if let Some(handle) = kernel_sockets.remove(&header.resource_id) {
                                 sockets.remove(handle);
@@ -368,6 +442,59 @@ fn main() {
                     }
                     let total_resp_size = core::mem::size_of::<NetResponseHeader>() + resp_data_size as usize;
                     send_ipc(sender_pid, 0x08, &resp_buf[..total_resp_size]);
+                }
+            }
+        }
+
+        if !processed && len > 0 {
+            let msg_data = &ipc_buf[..len];
+            if msg_data.starts_with(b"GET_NET_EXT_STATS") {
+                let mut stats = NetExtendedStats {
+                        lo_ipv4: [127, 0, 0, 1],
+                        lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                        lo_up: 1,
+                        eth0_ipv4: [0; 4],
+                        eth0_ipv6: [0; 16],
+                        eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
+                        eth0_gateway: [0; 4],
+                        eth0_dns: [0; 4],
+                        rx_bytes: rx_total,
+                        tx_bytes: tx_total,
+                    };
+                    for addr in iface.ip_addrs() {
+                        match addr.address() {
+                            IpAddress::Ipv4(a) => stats.eth0_ipv4 = a.0,
+                            IpAddress::Ipv6(a) => stats.eth0_ipv6 = a.0,
+                        }
+                    }
+                if let Some(config) = current_dhcp_config {
+                    stats.eth0_gateway = config.router.unwrap_or(Ipv4Address::UNSPECIFIED).0;
+                    if let Some(dns) = config.dns_server {
+                        stats.eth0_dns = dns.0;
+                    } else {
+                        stats.eth0_dns = [8, 8, 8, 8];
+                    }
+                } else if stats.eth0_dns == [0; 4] {
+                    stats.eth0_dns = [8, 8, 8, 8];
+                }
+                    let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
+                    resp[0..4].copy_from_slice(b"NEXS");
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &stats as *const _ as *const u8,
+                            resp.as_mut_ptr().add(4),
+                            core::mem::size_of::<NetExtendedStats>()
+                        );
+                    }
+                    send_ipc(sender_pid, 0x08, &resp);
+                } else if msg_data.starts_with(b"GET_NET_STATS") {
+                    let mut resp = [0u8; 20];
+                    resp[0..4].copy_from_slice(b"NSTA");
+                    let rx = rx_total;
+                    let tx = tx_total;
+                    resp[4..12].copy_from_slice(&rx.to_le_bytes());
+                    resp[12..20].copy_from_slice(&tx.to_le_bytes());
+                    send_ipc(sender_pid, 0x08, &resp);
                 }
             }
 
