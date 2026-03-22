@@ -788,7 +788,11 @@ fn draw_network_interface_card(
     // IPs
     let info_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
     let mut ip_str = heapless::String::<64>::new();
-    let _ = core::fmt::write(&mut ip_str, format_args!("IPv4: {}.{}.{}.{}/{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3], ipv4_prefix));
+    if *ipv4 == [0u8; 4] {
+        let _ = ip_str.push_str("IPv4: Not assigned");
+    } else {
+        let _ = core::fmt::write(&mut ip_str, format_args!("IPv4: {}.{}.{}.{}/{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3], ipv4_prefix));
+    }
     let _ = Text::new(&ip_str, pos + Point::new(20, 70), info_style).draw(fb);
     
     use core::fmt::Write;
@@ -801,23 +805,33 @@ fn draw_network_interface_card(
         
         // Gateway Section
         let _ = Text::new("Gateway:", pos + Point::new(20, 150), label_style).draw(fb);
-        let mut gw4_str = heapless::String::<64>::new();
-        let _ = core::fmt::write(&mut gw4_str, format_args!("IPv4: {}.{}.{}.{}", gw4[0], gw4[1], gw4[2], gw4[3]));
-        let _ = Text::new(&gw4_str, pos + Point::new(20, 170), info_style).draw(fb);
-        
-        let mut gw6_str = heapless::String::<128>::new();
-        let _ = write!(&mut gw6_str, "IPv6: {}", format_ipv6(gw6, None));
-        let _ = Text::new(&gw6_str, pos + Point::new(20, 195), info_style).draw(fb);
+        let mut gw_y = 170i32;
+        if *gw4 != [0u8; 4] {
+            let mut gw4_str = heapless::String::<64>::new();
+            let _ = core::fmt::write(&mut gw4_str, format_args!("IPv4: {}.{}.{}.{}", gw4[0], gw4[1], gw4[2], gw4[3]));
+            let _ = Text::new(&gw4_str, pos + Point::new(20, gw_y), info_style).draw(fb);
+            gw_y += 25;
+        }
+        if *gw6 != [0u8; 16] {
+            let mut gw6_str = heapless::String::<128>::new();
+            let _ = write!(&mut gw6_str, "IPv6: {}", format_ipv6(gw6, None));
+            let _ = Text::new(&gw6_str, pos + Point::new(20, gw_y), info_style).draw(fb);
+        }
 
         // DNS Section
         let _ = Text::new("DNS Server:", pos + Point::new(20, 250), label_style).draw(fb);
-        let mut dns4_str = heapless::String::<64>::new();
-        let _ = core::fmt::write(&mut dns4_str, format_args!("IPv4: {}.{}.{}.{}", dns4[0], dns4[1], dns4[2], dns4[3]));
-        let _ = Text::new(&dns4_str, pos + Point::new(20, 270), info_style).draw(fb);
-        
-        let mut dns6_str = heapless::String::<128>::new();
-        let _ = write!(&mut dns6_str, "IPv6: {}", format_ipv6(dns6, None));
-        let _ = Text::new(&dns6_str, pos + Point::new(20, 295), info_style).draw(fb);
+        let mut dns_y = 270i32;
+        if *dns4 != [0u8; 4] {
+            let mut dns4_str = heapless::String::<64>::new();
+            let _ = core::fmt::write(&mut dns4_str, format_args!("IPv4: {}.{}.{}.{}", dns4[0], dns4[1], dns4[2], dns4[3]));
+            let _ = Text::new(&dns4_str, pos + Point::new(20, dns_y), info_style).draw(fb);
+            dns_y += 25;
+        }
+        if *dns6 != [0u8; 16] {
+            let mut dns6_str = heapless::String::<128>::new();
+            let _ = write!(&mut dns6_str, "IPv6: {}", format_ipv6(dns6, None));
+            let _ = Text::new(&dns6_str, pos + Point::new(20, dns_y), info_style).draw(fb);
+        }
     }
 
     // Decorative bits

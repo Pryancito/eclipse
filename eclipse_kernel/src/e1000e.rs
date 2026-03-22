@@ -621,6 +621,15 @@ impl E1000EInner {
             }
         }
 
+        // Allow the NVM autoload and PLL to fully stabilise after the Global
+        // Reset.  Intel I217/I218/I219 datasheets recommend a minimum of 20 ms
+        // before accessing any device registers after RST clears.  Without
+        // this wait, registers (including CTRL_EXT and the MAC address receive
+        // address registers) may still be in the process of being written by
+        // the hardware's NVM reload sequencer.
+        // 3_000_000 × PAUSE ≈ 20–30 ms at 2–3 GHz (PAUSE ≈ 7–10 ns each).
+        for _ in 0..3_000_000u32 { core::hint::spin_loop(); }
+
         // 3. Disable interrupts again (reset re-enables them) and clear ICR
         self.write32(REG_IMC, 0xFFFF_FFFF);
         let _ = self.read32(REG_ICR); // clear any causes asserted during reset
@@ -869,11 +878,13 @@ impl E1000EInner {
         //     Actual elapsed time varies with CPU speed and SMT state; the inner
         //     loop provides "enough" delay between STATUS reads without burning
         //     through all 32 TX slots as link comes up.
-        serial::serial_print("[e1000e] Waiting for link (up to ~2s)...\n");
+        serial::serial_print("[e1000e] Waiting for link (up to ~5s)...\n");
         let mut link_up = false;
         // Poll STATUS_LU every ~50 000 PAUSE iterations (varies by CPU speed).
-        // 4 000 outer iterations gives ample time for GbE auto-negotiation.
-        for _ in 0..4_000u32 {
+        // 10 000 outer iterations gives ample time for GbE auto-negotiation;
+        // on real hardware (I217/I218/I219) auto-negotiation can take up to
+        // 3–5 seconds, especially on X299/Z370 platforms.
+        for _ in 0..10_000u32 {
             if self.read32(REG_STATUS) & STATUS_LU != 0 {
                 link_up = true;
                 break;

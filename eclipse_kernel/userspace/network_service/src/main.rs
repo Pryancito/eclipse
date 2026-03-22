@@ -262,7 +262,13 @@ fn main() {
     let rx_total_start = device.rx_bytes.load(Ordering::Relaxed);
     let tx_total_start = device.tx_bytes.load(Ordering::Relaxed);
     let mut last_activity_log = get_now_ms();
-    let mut dhcp_deconfigured_since: Option<u64> = None;
+    // Arm the DHCP watchdog from service start so it fires even if DHCP was
+    // never configured (e.g. when the physical link comes up after boot).
+    let mut dhcp_deconfigured_since: Option<u64> = Some(get_now_ms());
+    // Track the previous link state so we can detect UP transitions and
+    // immediately trigger a DHCP re-discovery instead of waiting for smoltcp's
+    // exponential backoff timer.
+    let mut prev_link_up = false;
 
     loop {
         let rx_total = device.rx_bytes.load(Ordering::Relaxed);
@@ -274,6 +280,20 @@ fn main() {
         iface.poll(timestamp, &mut device, &mut sockets);
 
         let link_up = device.get_link_status();
+
+        // Detect a DOWN → UP link transition.  When the physical link comes up
+        // after the service has already started (e.g. because the PHY needed
+        // more than the driver's init-time wait to finish auto-negotiation),
+        // smoltcp's DHCP socket may be stuck in a long exponential-backoff
+        // wait from its previous failed DISCOVERs.  Resetting the socket here
+        // forces an immediate new DISCOVER the next time iface.poll() runs,
+        // without waiting for the backoff timer to expire.
+        if link_up && !prev_link_up {
+            println!("[NETWORK-SERVICE] Link UP detected — resetting DHCP for immediate retry");
+            sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+            dhcp_deconfigured_since = Some(get_now_ms());
+        }
+        prev_link_up = link_up;
 
         // Handle DHCP events
         let event = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).poll();
