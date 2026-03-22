@@ -927,6 +927,10 @@ struct VirtIONetDeviceInner {
     queue_rx: Option<Virtqueue>,
     queue_tx: Option<Virtqueue>,
     mac_address: [u8; 6],
+    /// VirtIO 1.0 modern PCI: virtual address of the RX queue notify register (0 = not used)
+    notify_rx_addr: u64,
+    /// VirtIO 1.0 modern PCI: virtual address of the TX queue notify register (0 = not used)
+    notify_tx_addr: u64,
 }
 
 /// VirtIO network device driver
@@ -947,6 +951,8 @@ impl VirtIONetDevice {
                 queue_rx: None,
                 queue_tx: None,
                 mac_address: [0; 6],
+                notify_rx_addr: 0,
+                notify_tx_addr: 0,
             }),
         })
     }
@@ -960,6 +966,8 @@ impl VirtIONetDevice {
                 queue_rx: None,
                 queue_tx: None,
                 mac_address: [0; 6],
+                notify_rx_addr: 0,
+                notify_tx_addr: 0,
             }),
         })
     }
@@ -971,6 +979,163 @@ impl VirtIONetDevice {
             return inner.init_legacy_pci();
         }
         inner.init_mmio()
+    }
+
+    /// Initialize a VirtIO 1.0 PCI modern network device using capability structures.
+    /// Returns Some(device) on success, None on failure.
+    pub unsafe fn init_from_pci_modern(dev: &crate::pci::PciDevice) -> Option<Self> {
+        use crate::pci::{
+            pci_find_virtio_cap, pci_find_virtio_notify_cap,
+            VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_DEVICE_CFG,
+        };
+
+        let (common_bar, common_off, common_len) = pci_find_virtio_cap(dev, VIRTIO_PCI_CAP_COMMON_CFG)?;
+        let (isr_bar, isr_off, _) = pci_find_virtio_cap(dev, VIRTIO_PCI_CAP_ISR_CFG)?;
+        let (notify_bar, notify_off, notify_len, notify_mult) = pci_find_virtio_notify_cap(dev)?;
+        // Device-specific config (MAC address lives here)
+        let dev_cfg = pci_find_virtio_cap(dev, VIRTIO_PCI_CAP_DEVICE_CFG);
+
+        let bar_common = crate::pci::get_bar(dev, common_bar) & 0xFFFFFFFFFFFFFFF0u64;
+        let bar_isr    = crate::pci::get_bar(dev, isr_bar)    & 0xFFFFFFFFFFFFFFF0u64;
+        let bar_notify = crate::pci::get_bar(dev, notify_bar) & 0xFFFFFFFFFFFFFFF0u64;
+        if bar_common == 0 || bar_isr == 0 || bar_notify == 0 {
+            return None;
+        }
+
+        let common_virt      = crate::memory::map_mmio_range(bar_common + common_off as u64, common_len as usize);
+        let _isr_virt        = crate::memory::map_mmio_range(bar_isr + isr_off as u64, 1);
+        let notify_base_virt = crate::memory::map_mmio_range(bar_notify + notify_off as u64, notify_len as usize);
+
+        // Map device-specific config region for MAC address
+        let dev_cfg_virt = if let Some((dc_bar, dc_off, _dc_len)) = dev_cfg {
+            let bar_dc = crate::pci::get_bar(dev, dc_bar) & 0xFFFFFFFFFFFFFFF0u64;
+            if bar_dc != 0 { crate::memory::map_mmio_range(bar_dc + dc_off as u64, 16) } else { 0 }
+        } else { 0 };
+
+        // MMIO helpers
+        let cw8  = |off: usize, v: u8|  { core::ptr::write_volatile((common_virt + off as u64) as *mut u8,  v); };
+        let cw16 = |off: usize, v: u16| { core::ptr::write_volatile((common_virt + off as u64) as *mut u16, v.to_le()); };
+        let cw32 = |off: usize, v: u32| { core::ptr::write_volatile((common_virt + off as u64) as *mut u32, v.to_le()); };
+        let cr8  = |off: usize| -> u8  { core::ptr::read_volatile((common_virt + off as u64) as *const u8) };
+        let cr16 = |off: usize| -> u16 { u16::from_le(core::ptr::read_volatile((common_virt + off as u64) as *const u16)) };
+
+        // Reset device
+        cw8(VIRTIO_PCI_COMMON_STATUS, 0);
+        for _ in 0..100 { crate::cpu::pause(); }
+        cw8(VIRTIO_PCI_COMMON_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+        let st = cr8(VIRTIO_PCI_COMMON_STATUS);
+        cw8(VIRTIO_PCI_COMMON_STATUS, st | VIRTIO_STATUS_DRIVER as u8);
+
+        // Feature negotiation: accept VIRTIO_NET_F_MAC (bit 5) + VIRTIO_F_VERSION_1 (bit 32)
+        cw32(VIRTIO_PCI_COMMON_DFSELECT, 0);
+        let dev_feat_lo = {
+            let raw = u32::from_le(core::ptr::read_volatile((common_virt + VIRTIO_PCI_COMMON_DF as u64) as *const u32));
+            raw
+        };
+        cw32(VIRTIO_PCI_COMMON_DFSELECT, 1);
+        let dev_feat_hi = {
+            let raw = u32::from_le(core::ptr::read_volatile((common_virt + VIRTIO_PCI_COMMON_DF as u64) as *const u32));
+            raw
+        };
+
+        let guest_lo = dev_feat_lo & (VIRTIO_NET_F_MAC as u32);
+        let guest_hi = if (dev_feat_hi & VIRTIO_F_VERSION_1_HI) != 0 { VIRTIO_F_VERSION_1_HI } else { 0 };
+
+        cw32(VIRTIO_PCI_COMMON_GFSELECT, 0);
+        cw32(VIRTIO_PCI_COMMON_GF, guest_lo);
+        cw32(VIRTIO_PCI_COMMON_GFSELECT, 1);
+        cw32(VIRTIO_PCI_COMMON_GF, guest_hi);
+
+        cw8(VIRTIO_PCI_COMMON_STATUS, cr8(VIRTIO_PCI_COMMON_STATUS) | VIRTIO_STATUS_FEATURES_OK as u8);
+        if (cr8(VIRTIO_PCI_COMMON_STATUS) & VIRTIO_STATUS_FEATURES_OK as u8) == 0 {
+            serial::serial_print("[VirtIO-Net] Modern: FEATURES_OK rejected\n");
+            return None;
+        }
+
+        // Read MAC from device-specific config (offset 0)
+        let mut mac = [0u8; 6];
+        if dev_cfg_virt != 0 && (guest_lo & VIRTIO_NET_F_MAC as u32) != 0 {
+            for i in 0..6usize {
+                mac[i] = core::ptr::read_volatile((dev_cfg_virt + i as u64) as *const u8);
+            }
+        }
+
+        // Queue 0 (RX)
+        cw16(VIRTIO_PCI_COMMON_Q_SELECT, 0);
+        let q0_size = cr16(VIRTIO_PCI_COMMON_Q_SIZE);
+        let q_rx = if q0_size > 0 {
+            let actual = q0_size.min(256);
+            Virtqueue::new(actual).map(|q| {
+                cw16(VIRTIO_PCI_COMMON_Q_SIZE, actual);
+                cw32(VIRTIO_PCI_COMMON_Q_DESCLO,  (q.desc_phys  & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_DESCHI,  (q.desc_phys  >> 32) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_AVAILLO, (q.avail_phys & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_AVAILHI, (q.avail_phys >> 32) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_USEDLO,  (q.used_phys  & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_USEDHI,  (q.used_phys  >> 32) as u32);
+                let q0_notify_off = cr16(VIRTIO_PCI_COMMON_Q_NOFF);
+                cw16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
+                let notify_addr = notify_base_virt + (q0_notify_off as u64 * notify_mult as u64);
+                (q, notify_addr)
+            })
+        } else { None };
+
+        // Queue 1 (TX)
+        cw16(VIRTIO_PCI_COMMON_Q_SELECT, 1);
+        let q1_size = cr16(VIRTIO_PCI_COMMON_Q_SIZE);
+        let q_tx = if q1_size > 0 {
+            let actual = q1_size.min(256);
+            Virtqueue::new(actual).map(|q| {
+                cw16(VIRTIO_PCI_COMMON_Q_SIZE, actual);
+                cw32(VIRTIO_PCI_COMMON_Q_DESCLO,  (q.desc_phys  & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_DESCHI,  (q.desc_phys  >> 32) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_AVAILLO, (q.avail_phys & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_AVAILHI, (q.avail_phys >> 32) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_USEDLO,  (q.used_phys  & 0xFFFFFFFF) as u32);
+                cw32(VIRTIO_PCI_COMMON_Q_USEDHI,  (q.used_phys  >> 32) as u32);
+                let q1_notify_off = cr16(VIRTIO_PCI_COMMON_Q_NOFF);
+                cw16(VIRTIO_PCI_COMMON_Q_ENABLE, 1);
+                let notify_addr = notify_base_virt + (q1_notify_off as u64 * notify_mult as u64);
+                (q, notify_addr)
+            })
+        } else { None };
+
+        if q_rx.is_none() {
+            serial::serial_print("[VirtIO-Net] Modern: failed to initialize RX queue\n");
+            return None;
+        }
+
+        cw8(VIRTIO_PCI_COMMON_STATUS, cr8(VIRTIO_PCI_COMMON_STATUS) | VIRTIO_STATUS_DRIVER_OK as u8);
+
+        let (queue_rx, notify_rx_addr) = q_rx.map(|(q, a)| (Some(q), a)).unwrap_or((None, 0));
+        let (queue_tx, notify_tx_addr) = q_tx.map(|(q, a)| (Some(q), a)).unwrap_or((None, 0));
+
+        let mut dev = VirtIONetDevice {
+            inner: Mutex::new(VirtIONetDeviceInner {
+                mmio_base: common_virt,
+                io_base: 0,
+                queue_rx,
+                queue_tx,
+                mac_address: mac,
+                notify_rx_addr,
+                notify_tx_addr,
+            }),
+        };
+
+        // Fill RX queue with initial buffers
+        {
+            let mut inner = dev.inner.lock();
+            let _ = inner.fill_rx_queue();
+        }
+
+        serial::serial_print("[VirtIO-Net] Modern (VirtIO 1.0 PCI) initialized. MAC: ");
+        for i in 0..6 {
+            serial::serial_print_hex(mac[i] as u64);
+            if i < 5 { serial::serial_print(":"); }
+        }
+        serial::serial_print("\n");
+
+        Some(dev)
     }
 
     pub fn get_mac_address(&self) -> [u8; 6] {
@@ -1014,6 +1179,8 @@ impl VirtIONetDeviceInner {
         // Notify
         if self.io_base != 0 {
             outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 1); // Queue 1 is TX
+        } else if self.notify_tx_addr != 0 {
+            core::ptr::write_volatile(self.notify_tx_addr as *mut u16, 1u16.to_le()); // Queue 1 is TX
         }
         
         Ok(())
@@ -1040,6 +1207,8 @@ impl VirtIONetDeviceInner {
 
         if self.io_base != 0 {
             outw(self.io_base + VIRTIO_PCI_QUEUE_NOTIFY, 0); // Queue 0 is RX
+        } else if self.notify_rx_addr != 0 {
+            core::ptr::write_volatile(self.notify_rx_addr as *mut u16, 0u16.to_le()); // Queue 0 is RX
         }
 
         Ok(())
@@ -3057,7 +3226,20 @@ pub fn init() {
             
             unsafe {
                 crate::pci::enable_device(&dev, true);
-                
+
+                // For modern devices (VirtIO 1.0, device_id 0x1041), use the capability-based
+                // modern PCI initialization path which locates BARs via the capabilities list.
+                if dev.device_id == 0x1041 {
+                    if let Some(virt_dev) = VirtIONetDevice::init_from_pci_modern(&dev) {
+                        let arc_dev = alloc::sync::Arc::new(virt_dev);
+                        NET_DEVICES.lock().push(arc_dev);
+                    } else {
+                        serial::serial_print("[VirtIO-Net] Modern init failed\n");
+                    }
+                    continue;
+                }
+
+                // Legacy device (0x1000): scan BARs for the I/O or MMIO control region
                 for bar_idx in 0..6u8 {
                     let raw_bar = crate::pci::pci_config_read_u32(dev.bus, dev.device, dev.function, 0x10 + (bar_idx * 4));
                     if raw_bar == 0 { continue; }
