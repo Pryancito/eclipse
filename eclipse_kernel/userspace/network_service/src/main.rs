@@ -136,7 +136,44 @@ fn main() {
         }
         None => {
             println!("[NETWORK-SERVICE] ERROR: Could not open eth:0. Offline mode.");
-            loop { unsafe { sleep_ms(1000); } }
+            // Still handle IPC so the compositor doesn't wait forever for stats.
+            let mut offline_buf = [0u8; 1024];
+            loop {
+                let (len, sender_pid) = receive_ipc(&mut offline_buf);
+                if len > 0 {
+                    let msg = &offline_buf[..len];
+                    if msg.starts_with(b"GET_NET_EXT_STATS") {
+                        let stats = NetExtendedStats {
+                            lo_ipv4: [127, 0, 0, 1],
+                            lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                            lo_up: 1,
+                            eth0_ipv4: [0; 4],
+                            eth0_ipv6: [0; 16],
+                            eth0_up: 0,
+                            eth0_gateway: [0; 4],
+                            eth0_dns: [0; 4],
+                            rx_bytes: 0,
+                            tx_bytes: 0,
+                        };
+                        let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
+                        resp[0..4].copy_from_slice(b"NEXS");
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                &stats as *const _ as *const u8,
+                                resp.as_mut_ptr().add(4),
+                                core::mem::size_of::<NetExtendedStats>(),
+                            );
+                        }
+                        send_ipc(sender_pid, 0x08, &resp);
+                    } else if msg.starts_with(b"GET_NET_STATS") {
+                        let mut resp = [0u8; 20];
+                        resp[0..4].copy_from_slice(b"NSTA");
+                        // rx and tx are both zero in offline mode
+                        send_ipc(sender_pid, 0x08, &resp);
+                    }
+                }
+                unsafe { sleep_ms(10); }
+            }
         }
     };
 
