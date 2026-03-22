@@ -637,17 +637,18 @@ pub fn draw_network_dashboard(
 ) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
+    let sidebar_width = (w / 10).clamp(140, 220);
+    let right_area_w = w - sidebar_width;
     
-    // Background dim/grid (reusing dashboard style)
-    let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
+    // Background dim
+    let _ = Rectangle::new(Point::new(sidebar_width, 0), Size::new(right_area_w as u32, h as u32))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
         .draw(fb);
-    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
 
     use sidewind::ui::{Panel, Widget};
     let p_w = 700;
     let p_h = 480;
-    let px = (w - p_w) / 2;
+    let px = sidebar_width + (right_area_w - p_w) / 2;
     let py = (h - p_h) / 2;
     let main_panel = Panel { 
         position: Point::new(px, py), 
@@ -658,35 +659,90 @@ pub fn draw_network_dashboard(
 
     if let Some(s) = stats {
         // Draw Interfaces (lo and eth0)
-        let card_w = 320;
-        let card_h = 160;
+        let card_w = 330;
+        let card_h = 360;
         let card_y = py + 60;
         
         // Loopback Card
-        let lo_pos = Point::new(px + 20, card_y);
-        draw_network_interface_card(fb, lo_pos, "lo (Loopback)", s.lo_up != 0, &s.lo_ipv4, &s.lo_ipv6, counter);
+        let lo_pos = Point::new(px + 10, card_y);
+        draw_network_interface_card(
+            fb, lo_pos, "lo (Loopback)", s.lo_up != 0, 
+            &s.lo_ipv4, s.lo_ipv4_prefix, &s.lo_ipv6, s.lo_ipv6_prefix, 
+            None, None, None, None, counter
+        );
         
         // Ethernet Card
-        let eth_pos = Point::new(px + p_w - card_w - 20, card_y);
-        draw_network_interface_card(fb, eth_pos, "eth0 (Physical)", s.eth0_up != 0, &s.eth0_ipv4, &s.eth0_ipv6, counter);
+        let eth_pos = Point::new(px + p_w - card_w - 10, card_y);
+        draw_network_interface_card(
+            fb, eth_pos, "eth0 (Physical)", s.eth0_up != 0, 
+            &s.eth0_ipv4, s.eth0_ipv4_prefix, &s.eth0_ipv6, s.eth0_ipv6_prefix, 
+            Some(&s.eth0_gateway), Some(&s.eth0_gateway_ipv6), 
+            Some(&s.eth0_dns), Some(&s.eth0_dns_ipv6), counter
+        );
 
-        // Stats Panel (Traffic)
-        let stats_y = card_y + card_h + 20;
-        draw_traffic_monitor(fb, Point::new(px + 20, stats_y), p_w - 40, 180, s.rx_bytes, s.tx_bytes, counter);
+        // Add RENOVAR IP (DHCP) Button at the bottom center of the panel
+        let btn_w = 200;
+        let btn_h = 30;
+        let btn_x = px + p_w / 2 - btn_w / 2;
+        let btn_y = py + p_h - btn_h - 20;
+
+        let btn_rect = Rectangle::new(Point::new(btn_x, btn_y), Size::new(btn_w as u32, btn_h as u32));
+        let fill = if (counter / 30) % 2 == 0 { colors::ACCENT_CYAN } else { colors::ACCENT_BLUE };
         
-        // Bottom details
-        let details_y = py + p_h - 60;
-        let mut details = heapless::String::<128>::new();
-        let _ = core::fmt::write(&mut details, format_args!("GW: {}.{}.{}.{}  |  DNS: {}.{}.{}.{}", 
-            s.eth0_gateway[0], s.eth0_gateway[1], s.eth0_gateway[2], s.eth0_gateway[3],
-            s.eth0_dns[0], s.eth0_dns[1], s.eth0_dns[2], s.eth0_dns[3]
-        ));
-        let text_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
-        let _ = Text::new(&details, Point::new(px + 40, details_y), text_style).draw(fb);
+        let _ = RoundedRectangle::with_equal_corners(btn_rect, Size::new(4, 4))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(colors::WHITE).stroke_width(1).build()).draw(fb);
+        let btn_text_style = MonoTextStyle::new(&FONT_10X20, colors::BACKGROUND_DEEP);
+        let text_w = 17 * 10; 
+        let _ = Text::new("RENOVAR IP (DHCP)", Point::new(btn_x + (btn_w - text_w) / 2, btn_y + 20), btn_text_style).draw(fb);
+
     } else {
         let text_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_RED);
         let _ = Text::new("ESPERANDO DATOS DEL SERVICIO DE RED...", Point::new(px + 60, py + 200), text_style).draw(fb);
     }
+}
+
+fn format_ipv6(ipv6: &[u8; 16], prefix: Option<u8>) -> heapless::String<128> {
+    use core::fmt::Write;
+    let mut ipv6_str = heapless::String::<128>::new();
+    let mut words = [0u16; 8];
+    for i in 0..8 {
+        words[i] = u16::from_be_bytes([ipv6[i*2], ipv6[i*2+1]]);
+    }
+    let mut zero_start = -1;
+    let mut zero_len = 0;
+    let mut best_start = -1;
+    let mut best_len = 0;
+    for i in 0..8 {
+        if words[i] == 0 {
+            if zero_start == -1 { zero_start = i as i32; zero_len = 1; }
+            else { zero_len += 1; }
+        } else {
+            if zero_len > best_len { best_len = zero_len; best_start = zero_start; }
+            zero_start = -1; zero_len = 0;
+        }
+    }
+    if zero_len > best_len { best_len = zero_len; best_start = zero_start; }
+
+    if best_len >= 2 {
+        for i in 0..8 {
+            if i as i32 == best_start {
+                let _ = write!(&mut ipv6_str, "::");
+            } else if i as i32 > best_start && (i as i32) < best_start + best_len {
+                continue;
+            } else {
+                let show_sep = i < 7 && (i as i32 + 1 != best_start);
+                let _ = write!(&mut ipv6_str, "{:x}{}", words[i], if show_sep { ":" } else { "" });
+            }
+        }
+    } else {
+        for i in 0..8 {
+            let _ = write!(&mut ipv6_str, "{:x}{}", words[i], if i < 7 { ":" } else { "" });
+        }
+    }
+    if let Some(p) = prefix {
+        let _ = write!(&mut ipv6_str, "/{}", p);
+    }
+    ipv6_str
 }
 
 fn draw_network_interface_card(
@@ -695,11 +751,17 @@ fn draw_network_interface_card(
     name: &str,
     is_up: bool,
     ipv4: &[u8; 4],
+    ipv4_prefix: u8,
     ipv6: &[u8; 16],
+    ipv6_prefix: u8,
+    gw_v4: Option<&[u8; 4]>,
+    gw_v6: Option<&[u8; 16]>,
+    dns_v4: Option<&[u8; 4]>,
+    dns_v6: Option<&[u8; 16]>,
     counter: u64,
 ) {
-    let w = 320;
-    let h = 160;
+    let w = 330;
+    let h = 360;
     let color = if is_up { colors::ACCENT_CYAN } else { colors::ACCENT_RED };
     
     // Glass card effect
@@ -719,12 +781,37 @@ fn draw_network_interface_card(
     // IPs
     let info_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
     let mut ip_str = heapless::String::<64>::new();
-    let _ = core::fmt::write(&mut ip_str, format_args!("IPv4: {}.{}.{}.{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3]));
+    let _ = core::fmt::write(&mut ip_str, format_args!("IPv4: {}.{}.{}.{}/{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3], ipv4_prefix));
     let _ = Text::new(&ip_str, pos + Point::new(20, 70), info_style).draw(fb);
     
+    use core::fmt::Write;
     let mut ipv6_str = heapless::String::<128>::new();
-    let _ = core::fmt::write(&mut ipv6_str, format_args!("IPv6: {:02x}{:02x}:{:02x}{:02x}...", ipv6[0], ipv6[1], ipv6[2], ipv6[3]));
+    let _ = write!(&mut ipv6_str, "IPv6: {}", format_ipv6(ipv6, Some(ipv6_prefix)));
     let _ = Text::new(&ipv6_str, pos + Point::new(20, 95), info_style).draw(fb);
+
+    if let (Some(gw4), Some(gw6), Some(dns4), Some(dns6)) = (gw_v4, gw_v6, dns_v4, dns_v6) {
+        let label_style = MonoTextStyle::new(&FONT_6X12, colors::ACCENT_CYAN);
+        
+        // Gateway Section
+        let _ = Text::new("Gateway:", pos + Point::new(20, 150), label_style).draw(fb);
+        let mut gw4_str = heapless::String::<64>::new();
+        let _ = core::fmt::write(&mut gw4_str, format_args!("IPv4: {}.{}.{}.{}", gw4[0], gw4[1], gw4[2], gw4[3]));
+        let _ = Text::new(&gw4_str, pos + Point::new(20, 170), info_style).draw(fb);
+        
+        let mut gw6_str = heapless::String::<128>::new();
+        let _ = write!(&mut gw6_str, "IPv6: {}", format_ipv6(gw6, None));
+        let _ = Text::new(&gw6_str, pos + Point::new(20, 195), info_style).draw(fb);
+
+        // DNS Section
+        let _ = Text::new("DNS Server:", pos + Point::new(20, 250), label_style).draw(fb);
+        let mut dns4_str = heapless::String::<64>::new();
+        let _ = core::fmt::write(&mut dns4_str, format_args!("IPv4: {}.{}.{}.{}", dns4[0], dns4[1], dns4[2], dns4[3]));
+        let _ = Text::new(&dns4_str, pos + Point::new(20, 270), info_style).draw(fb);
+        
+        let mut dns6_str = heapless::String::<128>::new();
+        let _ = write!(&mut dns6_str, "IPv6: {}", format_ipv6(dns6, None));
+        let _ = Text::new(&dns6_str, pos + Point::new(20, 295), info_style).draw(fb);
+    }
 
     // Decorative bits
     if is_up && (counter / 30) % 2 == 0 {

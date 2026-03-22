@@ -23,13 +23,19 @@ pub enum NetOp {
 #[derive(Debug, Clone, Copy)]
 pub struct NetExtendedStats {
     pub lo_ipv4: [u8; 4],
+    pub lo_ipv4_prefix: u8,
     pub lo_ipv6: [u8; 16],
+    pub lo_ipv6_prefix: u8,
     pub lo_up: u8,
     pub eth0_ipv4: [u8; 4],
+    pub eth0_ipv4_prefix: u8,
     pub eth0_ipv6: [u8; 16],
+    pub eth0_ipv6_prefix: u8,
     pub eth0_up: u8,
     pub eth0_gateway: [u8; 4],
+    pub eth0_gateway_ipv6: [u8; 16],
     pub eth0_dns: [u8; 4],
+    pub eth0_dns_ipv6: [u8; 16],
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }

@@ -47,7 +47,8 @@ mod acpi;    // ACPI discovery
 mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod sync;    // Synchronization primitives
-mod net_ipc;
+mod net;
+mod e1000;
 pub mod drm_scheme; // DRM scheme for ioctl
 
 #[cfg(not(test))]
@@ -309,6 +310,8 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     nvidia::init();
     serial::serial_print("[INIT] Initializing VirtIO...\n");
     virtio::init();
+    serial::serial_print("[INIT] Initializing E1000...\n");
+    e1000::init();
     serial::serial_print("[INIT] Initializing NVMe...\n");
     nvme::init();
     serial::serial_print("[INIT] Initializing AHCI...\n");

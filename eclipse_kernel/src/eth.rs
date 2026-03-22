@@ -4,14 +4,14 @@
 
 use alloc::sync::Arc;
 use crate::scheme::{Scheme, Stat, error};
-use crate::virtio::{VirtIONetDevice, get_net_device};
+use crate::net::{NetworkDevice, get_device};
 
 pub struct EthScheme;
 
 impl Scheme for EthScheme {
     fn open(&self, path: &str, _flags: usize, _mode: u32) -> Result<usize, usize> {
         let id = path.parse::<usize>().map_err(|_| error::EINVAL)?;
-        if get_net_device(id).is_some() {
+        if get_device(id).is_some() {
             Ok(id)
         } else {
             Err(error::ENOENT)
@@ -19,7 +19,7 @@ impl Scheme for EthScheme {
     }
 
     fn read(&self, id: usize, buffer: &mut [u8]) -> Result<usize, usize> {
-        let dev = get_net_device(id).ok_or(error::EBADF)?;
+        let dev = get_device(id).ok_or(error::EBADF)?;
         match dev.receive_packet(buffer) {
             Some(len) => Ok(len),
             None => Err(error::EAGAIN),
@@ -27,7 +27,7 @@ impl Scheme for EthScheme {
     }
 
     fn write(&self, id: usize, buffer: &[u8]) -> Result<usize, usize> {
-        let dev = get_net_device(id).ok_or(error::EBADF)?;
+        let dev = get_device(id).ok_or(error::EBADF)?;
         dev.send_packet(buffer).map(|_| buffer.len()).map_err(|_| error::EIO)
     }
 
@@ -40,7 +40,7 @@ impl Scheme for EthScheme {
     }
 
     fn fstat(&self, id: usize, stat: &mut Stat) -> Result<usize, usize> {
-        let _dev = get_net_device(id).ok_or(error::EBADF)?;
+        let _dev = get_device(id).ok_or(error::EBADF)?;
         
         stat.size = 0;
         stat.mode = 0o666 | 0x2000; // Character device
@@ -48,7 +48,7 @@ impl Scheme for EthScheme {
     }
 
     fn ioctl(&self, id: usize, request: usize, arg: usize) -> Result<usize, usize> {
-        let dev = get_net_device(id).ok_or(error::EBADF)?;
+        let dev = get_device(id).ok_or(error::EBADF)?;
         match request {
             0x8001 => { // ETH_GET_MAC
                 let mac = dev.get_mac_address();

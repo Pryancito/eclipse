@@ -703,7 +703,7 @@ impl SmithayState {
                 for p in &self.process_list[..self.process_count] {
                     let name_len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
                     let name = &p.name[..name_len];
-                    if name.ends_with(b"network_service") || name == b"network_service" || name.windows(11).any(|w| w == b"network_ser") {
+                    if name == b"network" || name.ends_with(b"network_service") || name == b"network_service" || name.windows(11).any(|w| w == b"network_ser") {
                         self.network_pid = Some(p.pid);
                         break;
                     }
@@ -1009,6 +1009,14 @@ impl SmithayState {
                 self.input.system_central_active = false;
                 // Force immediate metrics update
                 self.last_metrics_update = std::time::Instant::now() - std::time::Duration::from_millis(5000);
+            }
+            self.dirty = true;
+        }
+
+        if self.input.renew_dhcp {
+            self.input.renew_dhcp = false;
+            if let Some(pid) = self.network_pid {
+                let _ = unsafe { eclipse_send(pid as u32, 0x08, b"RENEW_DHCP".as_ptr() as *const core::ffi::c_void, 10, 0) };
             }
             self.dirty = true;
         }

@@ -190,8 +190,8 @@ fi
 
 # Configuración de red
 if [ "$USE_NET" = "1" ]; then
-    QEMU_CMD="$QEMU_CMD -netdev user,id=net0 -device e1000,netdev=net0"
-    print_info "Red configurada: SLIRP (User mode) con port forwarding (8080->80, 2222->22)"
+    QEMU_CMD="$QEMU_CMD -netdev user,id=net0 -device e1000e,netdev=net0"
+    print_info "Red configurada: SLIRP (User mode) con port forwarding (8080->80, 2222->22), dispositivo e1000e"
 fi
 QEMU_CMD="$QEMU_CMD -m $MEMORY"
 QEMU_CMD="$QEMU_CMD -smp $CPUS"
@@ -255,7 +255,7 @@ print_info "Comando QEMU:"
 echo "$QEMU_CMD"
 echo ""
 
-exec $QEMU_CMD
+exec $QEMU_CMD "$@"
 
 # Cleanup (se ejecuta cuando QEMU termina)
 cleanup() {
