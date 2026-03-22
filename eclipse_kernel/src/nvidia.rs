@@ -1396,6 +1396,9 @@ pub fn init() {
         crate::drm::register_driver(alloc::sync::Arc::new(NvidiaDrmDriver));
     }
     
+    // Actualizar el mapeo del framebuffer del progreso
+    crate::progress::update_fb_mapping();
+
     serial::serial_print("[NVIDIA] Initialization complete\n");
 }
 
