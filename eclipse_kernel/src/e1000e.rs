@@ -471,13 +471,35 @@ impl E1000EInner {
         self.write32(REG_RAL0, ral);
         self.write32(REG_RAH0, rah);
 
-        // 10. Log current link state (non-blocking; the PHY may still be
-        //     auto-negotiating — the network service will retransmit DHCP
-        //     until a lease is obtained).
-        if self.read32(REG_STATUS) & STATUS_LU != 0 {
+        // 10. Wait for the PHY to finish auto-negotiation (link-up), up to ~2 s.
+        //     On real hardware the I217/I218/I219 PHY can take 1–3 seconds to
+        //     establish a GbE link after powering up.  Without this wait, DHCP
+        //     DISCOVERs sent before link-up fill the 32-slot TX ring with frames
+        //     the hardware cannot yet transmit; by the time the link does come up
+        //     smoltcp's retry state may be confused.  A short active poll here
+        //     ensures the network service can start DHCP on a live link.
+        //
+        //     NOTE: This is a spin-poll because the scheduler is not yet running
+        //     at driver-init time (sleep_ms is unavailable).  The same pattern is
+        //     used by the MDIC and PHY power-up waits earlier in this function.
+        //     Actual elapsed time varies with CPU speed and SMT state; the inner
+        //     loop provides "enough" delay between STATUS reads without burning
+        //     through all 32 TX slots as link comes up.
+        serial::serial_print("[e1000e] Waiting for link (up to ~2s)...\n");
+        let mut link_up = false;
+        // Poll STATUS_LU every ~50 000 PAUSE iterations (varies by CPU speed).
+        // 4 000 outer iterations gives ample time for GbE auto-negotiation.
+        for _ in 0..4_000u32 {
+            if self.read32(REG_STATUS) & STATUS_LU != 0 {
+                link_up = true;
+                break;
+            }
+            for _ in 0..50_000u32 { core::hint::spin_loop(); }
+        }
+        if link_up {
             serial::serial_print("[e1000e] Link UP\n");
         } else {
-            serial::serial_print("[e1000e] Link not yet up (PHY may still be negotiating)\n");
+            serial::serial_print("[e1000e] Link not yet up after timeout (proceeding anyway)\n");
         }
 
         true
@@ -533,11 +555,25 @@ impl E1000EInner {
             return None; // Hardware has not written a frame here yet
         }
 
+        let buf_phys = self.rx_bufs[slot].1;
+
+        // Check the error byte before touching the payload.  On real hardware
+        // the PHY can produce frames with CRC / symbol / alignment errors
+        // during link negotiation.  Passing corrupted frames to the network
+        // stack corrupts DHCP state; discard them and return the slot.
+        let errors = read_volatile(core::ptr::addr_of!((*desc).errors));
+        if errors != 0 {
+            write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
+            write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
+            self.write32(REG_RDT, slot as u32);
+            self.rx_tail = (slot + 1) % RX_RING_SIZE;
+            return None; // Discard errored frame
+        }
+
         let frame_len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
         let copy_len  = core::cmp::min(frame_len, buffer.len());
 
         let src = self.rx_bufs[slot].0 as *const u8;
-        let buf_phys = self.rx_bufs[slot].1;
         core::ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), copy_len);
 
         // Return the descriptor to hardware: clear status, restore buffer addr,
