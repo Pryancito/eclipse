@@ -1163,7 +1163,43 @@ impl crate::net::NetworkDevice for VirtIONetDevice {
 impl VirtIONetDeviceInner {
     unsafe fn send_packet(&mut self, data: &[u8]) -> Result<(), &'static str> {
         let queue = self.queue_tx.as_mut().ok_or("TX queue not initialized")?;
-        
+
+        // Reclaim completed TX descriptors from the used ring to prevent the
+        // queue from filling up.  Without this, every packet permanently
+        // consumes two descriptor slots and the queue exhausts after
+        // queue_size/2 sends, breaking DHCP retries and all subsequent TX.
+        {
+            let used = &*queue.used;
+            while queue.last_used_idx != read_volatile(&used.idx) {
+                let ring_idx = queue.last_used_idx as usize % queue.queue_size as usize;
+                let head_idx = used.ring[ring_idx].id as u16;
+
+                // Walk the descriptor chain and free each DMA buffer.
+                let mut idx = head_idx;
+                loop {
+                    let desc = &*queue.descriptors.add(idx as usize);
+                    let buf_phys = read_volatile(&raw const desc.addr);
+                    let buf_len  = read_volatile(&raw const desc.len) as usize;
+                    let flags    = read_volatile(&raw const desc.flags);
+                    let next_idx = read_volatile(&raw const desc.next);
+
+                    if buf_phys != 0 && buf_len > 0 {
+                        let buf_virt = crate::memory::phys_to_virt(buf_phys) as *mut u8;
+                        crate::memory::free_dma_buffer(buf_virt, buf_len, 16);
+                    }
+
+                    if flags & VIRTQ_DESC_F_NEXT == 0 {
+                        break;
+                    }
+                    idx = next_idx;
+                }
+
+                // Return the whole chain to the free list.
+                queue.free_desc(head_idx);
+                queue.last_used_idx = queue.last_used_idx.wrapping_add(1);
+            }
+        }
+
         // Allocate header
         let hdr_size = core::mem::size_of::<VirtioNetHdr>();
         let (hdr_ptr, hdr_phys) = crate::memory::alloc_dma_buffer(hdr_size, 16).ok_or("Failed to alloc DMA for TX header")?;

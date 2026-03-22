@@ -277,27 +277,41 @@ fn main() {
                 println!("  IP address:      {}", info.address);
                 if let Some(router) = info.router {
                     println!("  Default gateway: {}", router);
-                    // iface.routes_mut().add_default_ipv4_route(router).ok();
+                    if iface.routes_mut().add_default_ipv4_route(router).is_err() {
+                        println!("[NETWORK-SERVICE] WARN: routing table full, default route not set");
+                    }
                 }
                 if let Some(dns_server) = info.dns_server {
                     println!("  DNS server:      {}", dns_server);
                 }
-                
+
                 iface.update_ip_addrs(|addrs| {
-                    addrs.push(IpCidr::Ipv4(info.address)).ok();
+                    // Replace any existing IPv4 address (e.g. from a prior lease)
+                    // to avoid duplicates on DHCP renewal.
+                    let mut i = 0;
+                    while i < addrs.len() {
+                        if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
+                            addrs.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if addrs.push(IpCidr::Ipv4(info.address)).is_err() {
+                        // This should never happen since we just cleared existing IPv4 entries.
+                        println!("[NETWORK-SERVICE] ERROR: addr list full, DHCP IP not applied");
+                    }
                 });
             }
             Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
                 current_dhcp_config = None;
                 println!("[NETWORK-SERVICE] eth0 DHCP deconfigured (lease expired or no response)");
+                // Clear the default route — it pointed to the now-expired lease's gateway.
+                iface.routes_mut().remove_default_ipv4_route();
                 iface.update_ip_addrs(|addrs| {
                     // Remove only IPv4 addresses; preserve the IPv6 link-local
                     // so that eth0 continues to show as online while DHCP
                     // retries.  addrs.clear() would also drop the link-local,
                     // causing the UI to show OFFLINE unnecessarily.
-                    //
-                    // Note: smoltcp uses heapless::Vec (0.8.x) which does not
-                    // provide retain(), so we use a manual index-walk instead.
                     let mut i = 0;
                     while i < addrs.len() {
                         if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
@@ -595,8 +609,8 @@ fn main() {
                     send_ipc(sender_pid, 0x08, &resp);
                 } else if msg_data.starts_with(b"RENEW_DHCP") {
                     println!("[NETWORK-SERVICE] RENEW_DHCP requested by PID {}", sender_pid);
-                    let socket = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle);
-                    socket.reset();
+                    sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+                    iface.routes_mut().remove_default_ipv4_route();
                     iface.update_ip_addrs(|addrs| {
                         // Keep IPv6 Link-Local but clear IPv4
                         addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
