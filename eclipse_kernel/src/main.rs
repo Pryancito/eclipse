@@ -31,6 +31,7 @@ mod pci;
 mod drm;
 mod nvidia;
 mod virtio;
+mod e1000e;
 mod eth;
 mod filesystem;
 mod binaries;
@@ -309,6 +310,8 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     nvidia::init();
     serial::serial_print("[INIT] Initializing VirtIO...\n");
     virtio::init();
+    serial::serial_print("[INIT] Initializing Intel e1000e Ethernet...\n");
+    e1000e::init();
     serial::serial_print("[INIT] Initializing NVMe...\n");
     nvme::init();
     serial::serial_print("[INIT] Initializing AHCI...\n");

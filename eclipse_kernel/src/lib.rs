@@ -25,6 +25,7 @@ pub mod binaries;
 pub mod pci;
 pub mod nvidia;
 pub mod virtio;
+pub mod e1000e;
 pub mod eth;
 
 pub mod filesystem;
