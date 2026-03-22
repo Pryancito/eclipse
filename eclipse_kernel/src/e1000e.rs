@@ -85,6 +85,7 @@ const REG_TDT:      u32 = 0x0381_8;
 const REG_MTA:      u32 = 0x0520_0; // Multicast Table Array (128 × u32)
 const REG_RAL0:     u32 = 0x0540_0; // Receive Address Low  (filter 0)
 const REG_RAH0:     u32 = 0x0540_4; // Receive Address High (filter 0)
+const REG_RXCSUM:   u32 = 0x5000;   // Receive Checksum Offload Control
 
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL register bits
@@ -105,6 +106,11 @@ const STATUS_LU: u32 = 1 << 1; // Link Up
 /// PHY Power-Down Enable — when set, the MAC holds the PHY in power-down.
 /// Must be CLEARED to allow the I219-V's internal PHY to power up.
 const CTRL_EXT_PHYPDEN: u32 = 1 << 30;
+/// Driver Loaded — signals to the PCH Management Engine (Intel ME) that the
+/// OS Ethernet driver has taken control of the device.  Without this, on
+/// I217/I218/I219 (PCH-based) controllers the ME may still intercept or
+/// redirect certain receive traffic, causing DHCP to silently fail.
+const CTRL_EXT_DRV_LOAD: u32 = 1 << 28;
 
 // ───────────────────────────────────────────────────────────────────────────
 // MDIC (MDI Control) register fields — used to access the PHY via MII
@@ -123,6 +129,7 @@ const BMCR_POWER_DOWN: u16 = 1 << 11; // PHY power-down bit in BMCR
 // RCTL register bits
 // ───────────────────────────────────────────────────────────────────────────
 const RCTL_EN:    u32 = 1 << 1;  // RX enable
+const RCTL_UPE:   u32 = 1 << 3;  // Unicast promiscuous (accept all unicast)
 const RCTL_MPE:   u32 = 1 << 4;  // Multicast promiscuous
 const RCTL_BAM:   u32 = 1 << 15; // Broadcast accept
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
@@ -141,6 +148,21 @@ const TXD_CMD_IFCS: u8 = 1 << 1; // Insert FCS
 const TXD_CMD_RS:   u8 = 1 << 3; // Report status
 const TXD_STA_DD:   u8 = 1 << 0; // Descriptor done
 const RXD_STA_DD:   u8 = 1 << 0; // Descriptor done
+const RXD_STA_EOP:  u8 = 1 << 1; // End of Packet (last descriptor for this frame)
+
+/// Error bits in the legacy RX descriptor errors byte that indicate the
+/// received frame data is corrupt and must be discarded.
+///
+/// * Bit 0 (CE)  — CRC Error or Alignment Error: frame CRC does not match.
+/// * Bit 1 (SE)  — Symbol Error: 8B/10B code violation on the link.
+/// * Bit 7 (RXE) — Rx Data Error: PCI bus or DMA error during write.
+///
+/// Bits 5 (TCPE) and 6 (IPE) are TCP/UDP and IP checksum offload results;
+/// they are only valid when checksum offload is enabled in RXCSUM. We always
+/// write RXCSUM = 0, so those bits will never be set by the hardware.
+/// Bits 2 (SEQ), 3 (reserved), and 4 (Carrier Extension) are either transient
+/// or not fatal to the frame data and are handled by the upper-layer stack.
+const RXD_ERR_FATAL: u8 = (1 << 0) | (1 << 1) | (1 << 7); // CE | SE | RXE
 
 // ───────────────────────────────────────────────────────────────────────────
 // Descriptor ring sizes — powers of two so modulo is cheap
@@ -326,7 +348,17 @@ impl E1000EInner {
             self.write32(REG_CTRL_EXT, ctrl_ext & !CTRL_EXT_PHYPDEN);
         }
 
-        // 3b. Check and clear the Power-Down bit in the PHY's BMCR register
+        // 3b. Signal to the Intel PCH Management Engine (ME) that the OS
+        //     driver has loaded and is taking ownership of the device.
+        //     Setting CTRL_EXT.DRV_LOAD (bit 28) prevents the ME from
+        //     intercepting or re-directing received traffic, which on
+        //     I217/I218/I219 controllers can silently block DHCP replies.
+        {
+            let ctrl_ext2 = self.read32(REG_CTRL_EXT);
+            self.write32(REG_CTRL_EXT, ctrl_ext2 | CTRL_EXT_DRV_LOAD);
+        }
+
+        // 3c. Check and clear the Power-Down bit in the PHY's BMCR register
         //     (MII register 0) via the MDIC interface.  Some firmware leaves
         //     the I219-V PHY in power-down mode after the OS hand-off.
         if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
@@ -413,8 +445,19 @@ impl E1000EInner {
         self.write32(REG_RDT, (RX_RING_SIZE - 1) as u32);
         self.rx_tail = 0;
 
-        // Enable RX: broadcast accept, multicast promiscuous, strip CRC, 2 KiB buffers
-        self.write32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
+        // Disable IP/TCP/UDP checksum offload.  On I219-V the NVM may leave
+        // RXCSUM non-zero, which causes the hardware to set TCPE (bit 5) and
+        // IPE (bit 6) in the descriptor errors byte for certain frames.  Our
+        // driver treats any non-zero errors byte as a discard signal, so
+        // DHCP OFFER packets can be silently dropped.  Clearing RXCSUM
+        // prevents the hardware from reporting those checksum results.
+        self.write32(REG_RXCSUM, 0);
+
+        // Enable RX: unicast+broadcast+multicast accept, strip CRC, 2 KiB buffers.
+        // RCTL_UPE (Unicast Promiscuous) is included to ensure that unicast DHCP
+        // OFFERs from DHCP servers that do not honor the BROADCAST flag are
+        // accepted even if there is any transient issue with the RAR[0] filter.
+        self.write32(REG_RCTL, RCTL_EN | RCTL_UPE | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
 
         // 8. Initialise the TX descriptor ring
         let tx_ring_bytes = TX_RING_SIZE * core::mem::size_of::<TxDesc>();
@@ -498,6 +541,15 @@ impl E1000EInner {
         }
         if link_up {
             serial::serial_print("[e1000e] Link UP\n");
+            // PHY settling delay (~2 ms at 3 GHz): after STATUS_LU asserts, the
+            // I219-V PHY can still be completing its auto-negotiation state
+            // transitions.  The 50 000 PAUSE iterations below correspond to
+            // roughly 1.7–5 ms depending on CPU speed (each PAUSE is ~35–100 ns
+            // on modern Intel cores).  This prevents the very first received
+            // frames from arriving with transient error bits that would cause
+            // early DHCP OFFERs to be silently discarded.  A timer-based sleep
+            // is not available here because the scheduler is not yet running.
+            for _ in 0..50_000u32 { core::hint::spin_loop(); }
         } else {
             serial::serial_print("[e1000e] Link not yet up after timeout (proceeding anyway)\n");
         }
@@ -557,17 +609,30 @@ impl E1000EInner {
 
         let buf_phys = self.rx_bufs[slot].1;
 
-        // Check the error byte before touching the payload.  On real hardware
-        // the PHY can produce frames with CRC / symbol / alignment errors
-        // during link negotiation.  Passing corrupted frames to the network
-        // stack corrupts DHCP state; discard them and return the slot.
-        let errors = read_volatile(core::ptr::addr_of!((*desc).errors));
-        if errors != 0 {
+        // Discard partial (multi-descriptor) frames.  With PACKET_BUF_SIZE = 2 KiB
+        // and MTU = 1514 bytes every frame must fit in exactly one descriptor, so
+        // EOP must always be set.  If EOP is missing the hardware is in an
+        // unexpected state; return the slot to hardware and skip it.
+        if status & RXD_STA_EOP == 0 {
             write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
             write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
             self.write32(REG_RDT, slot as u32);
             self.rx_tail = (slot + 1) % RX_RING_SIZE;
-            return None; // Discard errored frame
+            return None;
+        }
+
+        // Only discard frames with fatal receive errors (CRC, symbol, or DMA
+        // errors — bits CE, SE, RXE in the errors byte).  Sequence errors (SEQ),
+        // carrier extension errors, and checksum offload results (TCPE/IPE, which
+        // are suppressed by writing RXCSUM = 0 during init) are transient or
+        // informational and must not cause valid DHCP frames to be dropped.
+        let errors = read_volatile(core::ptr::addr_of!((*desc).errors));
+        if errors & RXD_ERR_FATAL != 0 {
+            write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
+            write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
+            self.write32(REG_RDT, slot as u32);
+            self.rx_tail = (slot + 1) % RX_RING_SIZE;
+            return None; // Discard frame with fatal hardware error
         }
 
         let frame_len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
