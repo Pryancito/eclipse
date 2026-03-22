@@ -602,7 +602,7 @@ impl SmithayState {
     fn update_metrics_if_needed(&mut self) -> bool {
         let now = std::time::Instant::now();
         let metrics_elapsed = self.last_metrics_update.elapsed();
-        let need_metrics = self.input.dashboard_active || self.input.system_central_active;
+        let need_metrics = self.input.dashboard_active || self.input.system_central_active || self.input.network_active;
         let metrics_interval = if need_metrics { 800u64 } else { 4000u64 };
 
         if metrics_elapsed.as_millis() as u64 >= metrics_interval {
@@ -645,7 +645,7 @@ impl SmithayState {
 
             if need_metrics {
                 if let Some(pid) = self.network_pid {
-                    let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS_MSG".as_ptr() as *const core::ffi::c_void, 17, 0) }; // MSG_TYPE_NETWORK = 0x08
+                    let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_STATS".as_ptr() as *const core::ffi::c_void, 13, 0) }; // MSG_TYPE_NETWORK = 0x08
 
                     let rx_delta = self.net_rx.saturating_sub(self.prev_net_rx);
                     let tx_delta = self.net_tx.saturating_sub(self.prev_net_tx);
