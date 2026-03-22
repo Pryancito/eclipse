@@ -30,6 +30,24 @@ pub trait NetworkDevice: Send + Sync {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// VirtIONetDevice blanket impl
+// ───────────────────────────────────────────────────────────────────────────
+
+impl NetworkDevice for crate::virtio::VirtIONetDevice {
+    fn get_mac_address(&self) -> [u8; 6] {
+        crate::virtio::VirtIONetDevice::get_mac_address(self)
+    }
+
+    fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
+        crate::virtio::VirtIONetDevice::send_packet(self, data)
+    }
+
+    fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize> {
+        crate::virtio::VirtIONetDevice::receive_packet(self, buffer)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // E1000EDevice blanket impl
 // ───────────────────────────────────────────────────────────────────────────
 
