@@ -579,7 +579,18 @@ pub fn audit_syscall(pid: u32, _syscall_num: u64) -> bool {
         }
         
         if proc.ai_profile.last_tick_syscalls > limit {
-            blocked = true;
+            if pid < 16 {
+                // For system processes, we only log but DO NOT block
+                serial::serial_print("[AI-CORE] SYSTEM ANOMALY WARNING: PID ");
+                serial::serial_print_dec(pid as u64);
+                serial::serial_print(" exceeded limit (");
+                serial::serial_print_dec(proc.ai_profile.last_tick_syscalls);
+                serial::serial_print("/");
+                serial::serial_print_dec(limit);
+                serial::serial_print(")\n");
+            } else {
+                blocked = true;
+            }
         }
     });
 

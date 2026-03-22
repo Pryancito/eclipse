@@ -201,7 +201,6 @@ const CTRL_EXT_DRV_LOAD: u32 = 1 << 28;
 // ───────────────────────────────────────────────────────────────────────────
 // MDIC (MDI Control) register fields — used to access the PHY via MII
 // ───────────────────────────────────────────────────────────────────────────
-const MDIC_PHY1:     u32 = 1 << 21; // PHY address = 1 (I217/I218/I219 internal PHY)
 const MDIC_OP_WRITE: u32 = 1 << 26; // Opcode 01 = write
 const MDIC_OP_READ:  u32 = 1 << 27; // Opcode 10 = read
 const MDIC_READY:    u32 = 1 << 28; // Transaction complete
@@ -362,8 +361,8 @@ const RXD_ERR_FATAL: u8 = (1 << 0) | (1 << 1) | (1 << 7); // CE | SE | RXE
 // ───────────────────────────────────────────────────────────────────────────
 // Descriptor ring sizes — powers of two so modulo is cheap
 // ───────────────────────────────────────────────────────────────────────────
-const RX_RING_SIZE: usize = 32;
-const TX_RING_SIZE: usize = 32;
+const RX_RING_SIZE: usize = 128;
+const TX_RING_SIZE: usize = 128;
 const PACKET_BUF_SIZE: usize = 2048;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -400,6 +399,7 @@ struct E1000EInner {
     /// Virtual base address of the MMIO BAR
     mmio_base: u64,
     mac: [u8; 6],
+    phy_addr: u8, // Dynamically discovered MDIO address of the PHY
 
     // RX ring
     rx_descs_virt: u64,             // virtual address of descriptor ring
@@ -483,14 +483,18 @@ impl E1000EInner {
         None
     }
 
-    /// Read a PHY register via the MDI Control (MDIC) interface.
-    ///
-    /// The I217/I218/I219 family exposes its integrated PHY at address 1 via
-    /// the standard IEEE 802.3 Clause-22 MII management frame format.
-    /// Returns `None` on timeout or MDIC error.
     fn mdic_read(&self, phy_reg: u32) -> Option<u16> {
+        self.mdic_read_raw(self.phy_addr, phy_reg)
+    }
+
+    fn mdic_write(&self, phy_reg: u32, data: u16) -> bool {
+        self.mdic_write_raw(self.phy_addr, phy_reg, data)
+    }
+
+    /// Read a PHY register directly given a specific PHY address
+    fn mdic_read_raw(&self, phy_addr: u8, phy_reg: u32) -> Option<u16> {
         self.write32(REG_MDIC,
-            MDIC_PHY1 | ((phy_reg & 0x1F) << 16) | MDIC_OP_READ);
+            ((phy_addr as u32 & 0x1F) << 21) | ((phy_reg & 0x1F) << 16) | MDIC_OP_READ);
         for _ in 0..100_000 {
             let v = self.read32(REG_MDIC);
             if v & MDIC_READY != 0 {
@@ -501,11 +505,10 @@ impl E1000EInner {
         None // timeout
     }
 
-    /// Write a PHY register via the MDI Control (MDIC) interface.
-    /// Returns `true` on success, `false` on timeout or error.
-    fn mdic_write(&self, phy_reg: u32, data: u16) -> bool {
+    /// Write a PHY register directly given a specific PHY address
+    fn mdic_write_raw(&self, phy_addr: u8, phy_reg: u32, data: u16) -> bool {
         self.write32(REG_MDIC,
-            MDIC_PHY1 | ((phy_reg & 0x1F) << 16) | MDIC_OP_WRITE | (data as u32));
+            ((phy_addr as u32 & 0x1F) << 21) | ((phy_reg & 0x1F) << 16) | MDIC_OP_WRITE | (data as u32));
         for _ in 0..100_000 {
             let v = self.read32(REG_MDIC);
             if v & MDIC_READY != 0 {
@@ -514,6 +517,19 @@ impl E1000EInner {
             for _ in 0..100 { core::hint::spin_loop(); }
         }
         false // timeout
+    }
+
+    /// Scan MDIO addresses to discover the PHY
+    fn detect_phy_addr(&self) -> Option<u8> {
+        for addr in 1..=32 {
+            let phy_addr = (addr % 32) as u8;
+            if let Some(val) = self.mdic_read_raw(phy_addr, PHY_REG_BMCR) {
+                if val != 0xFFFF {
+                    return Some(phy_addr);
+                }
+            }
+        }
+        None
     }
 
     /// Detect link speed and duplex from the STATUS register and update the
@@ -643,19 +659,27 @@ impl E1000EInner {
             for _ in 0..100_000 { core::hint::spin_loop(); }
         }
 
-        // 3c. Check and clear the Power-Down bit in the PHY's BMCR register
-        //     (MII register 0) via the MDIC interface.  Some firmware leaves
+        // 3c. Scan for the PHY address, then check and clear the Power-Down
+        //     bit in its BMCR register (MII register 0). Some firmware leaves
         //     the I219-V PHY in power-down mode after the OS hand-off.
-        if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
-            if bmcr & BMCR_POWER_DOWN != 0 {
-                serial::serial_print("[e1000e] PHY BMCR power-down bit set — clearing\n");
-                self.mdic_write(PHY_REG_BMCR, bmcr & !BMCR_POWER_DOWN);
-                // Give the PHY ~500 µs to exit power-down before configuring
-                // the MAC rings (50 000 × PAUSE ≈ 500 µs @ 3 GHz).
-                for _ in 0..50_000 { core::hint::spin_loop(); }
+        if let Some(addr) = self.detect_phy_addr() {
+            self.phy_addr = addr;
+            serial::serial_print("[e1000e] Found PHY at address: ");
+            serial::serial_print_dec(addr as u64);
+            serial::serial_print("\n");
+
+            if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
+                if bmcr & BMCR_POWER_DOWN != 0 {
+                    serial::serial_print("[e1000e] PHY BMCR power-down bit set — clearing\n");
+                    self.mdic_write(PHY_REG_BMCR, bmcr & !BMCR_POWER_DOWN);
+                    // Give the PHY ~500 µs to exit power-down before configuring
+                    for _ in 0..50_000 { core::hint::spin_loop(); }
+                }
+            } else {
+                serial::serial_print("[e1000e] WARN: MDIC read of PHY BMCR failed\n");
             }
         } else {
-            serial::serial_print("[e1000e] WARN: MDIC read of PHY BMCR timed out\n");
+            serial::serial_print("[e1000e] WARN: Could not detect PHY address! Link may stay offline.\n");
         }
 
         // 4. Read MAC address.
@@ -952,6 +976,10 @@ impl E1000EInner {
             return None; // Hardware has not written a frame here yet
         }
 
+        // Memory barrier to ensure that hardware has finished writing the
+        // packet data before we read from the DMA buffer.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+
         let buf_phys = self.rx_bufs[slot].1;
 
         // EOP (End of Packet) check.  With PACKET_BUF_SIZE = 2 KiB and
@@ -989,6 +1017,9 @@ impl E1000EInner {
         let errors = read_volatile(core::ptr::addr_of!((*desc).errors));
         if errors & RXD_ERR_FATAL != 0 {
             self.rx_errors += 1;
+            serial::serial_print("[e1000e] fatal RX error: 0x");
+            serial::serial_print_hex(errors as u64);
+            serial::serial_print("\n");
             write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
             write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
             self.write32(REG_RDT, slot as u32);
@@ -1119,6 +1150,7 @@ pub fn init() {
             let inner = E1000EInner {
                 mmio_base: mmio_virt,
                 mac: [0u8; 6],
+                phy_addr: 1, // Default, will be updated during init()
                 rx_descs_virt: 0,
                 rx_descs_phys: 0,
                 rx_bufs: [(0, 0); RX_RING_SIZE],

@@ -310,6 +310,7 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     nvidia::init();
     serial::serial_print("[INIT] Initializing VirtIO...\n");
     virtio::init();
+    progress::init();
     serial::serial_print("[INIT] Initializing Intel e1000e Ethernet...\n");
     e1000e::init();
     serial::serial_print("[INIT] Initializing NVMe...\n");

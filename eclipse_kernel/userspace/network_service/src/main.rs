@@ -50,6 +50,15 @@ impl RawEthernetDevice {
             tx_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
+
+    fn get_link_status(&self) -> bool {
+        let mut link_info = [0u8; 12];
+        if unsafe { ioctl(self.fd as i32, 0x8002, link_info.as_mut_ptr() as *mut _) } == 0 {
+            link_info[0] != 0
+        } else {
+            true // assume up if ioctl fails for backward compatibility
+        }
+    }
 }
 
 impl phy::Device for RawEthernetDevice {
@@ -252,6 +261,8 @@ fn main() {
     let mut resp_buf = [0u8; 1024];
     let rx_total_start = device.rx_bytes.load(Ordering::Relaxed);
     let tx_total_start = device.tx_bytes.load(Ordering::Relaxed);
+    let mut last_activity_log = get_now_ms();
+    let mut dhcp_deconfigured_since: Option<u64> = None;
 
     loop {
         let rx_total = device.rx_bytes.load(Ordering::Relaxed);
@@ -261,6 +272,8 @@ fn main() {
 
         lo_iface.poll(timestamp, &mut lo_device, &mut lo_sockets);
         iface.poll(timestamp, &mut device, &mut sockets);
+
+        let link_up = device.get_link_status();
 
         // Handle DHCP events
         let event = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).poll();
@@ -273,6 +286,7 @@ fn main() {
                     dns_server: config.dns_servers.first().copied(),
                 };
                 current_dhcp_config = Some(info);
+                dhcp_deconfigured_since = None;
                 println!("[NETWORK-SERVICE] eth0 configured via DHCPv4:");
                 println!("  IP address:      {}", info.address);
                 if let Some(router) = info.router {
@@ -304,6 +318,9 @@ fn main() {
             }
             Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
                 current_dhcp_config = None;
+                if dhcp_deconfigured_since.is_none() {
+                    dhcp_deconfigured_since = Some(get_now_ms());
+                }
                 println!("[NETWORK-SERVICE] eth0 DHCP deconfigured (lease expired or no response)");
                 // Clear the default route — it pointed to the now-expired lease's gateway.
                 iface.routes_mut().remove_default_ipv4_route();
@@ -322,6 +339,25 @@ fn main() {
                     }
                 });
             }
+        }
+
+        // DHCP Watchdog: if deconfigured for > 30s while link is UP, force a reset
+        if let Some(since) = dhcp_deconfigured_since {
+            if link_up && get_now_ms() - since > 30000 {
+                println!("[NETWORK-SERVICE] DHCP Watchdog: No IPv4 for 30s on active link. Resetting DHCP socket...");
+                sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+                dhcp_deconfigured_since = Some(get_now_ms()); // Reset timer to avoid spam
+            }
+        }
+
+        // Activity logging (every 10 seconds)
+        if get_now_ms() - last_activity_log > 10000 {
+            println!("[NETWORK-SERVICE] Stats: RX={} TX={} Link={} DHCP={}", 
+                rx_total, tx_total, 
+                if link_up { "UP" } else { "DOWN" },
+                if current_dhcp_config.is_some() { "BOUND" } else { "SEARCHING" }
+            );
+            last_activity_log = get_now_ms();
         }
 
         // 4. Handle IPC messages for socket syscalls
@@ -484,7 +520,7 @@ fn main() {
                                 eth0_ipv4_prefix: 0,
                                 eth0_ipv6: [0; 16],
                                 eth0_ipv6_prefix: 0,
-                                eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
+                                eth0_up: if link_up { 1 } else { 0 },
                                 eth0_gateway: [0; 4],
                                 eth0_gateway_ipv6: [0; 16],
                                 eth0_dns: [0; 4],
@@ -493,11 +529,13 @@ fn main() {
                                 tx_bytes: tx_total,
                             };
 
+                            let mut eth0_ipv4_found = false;
                             for addr in iface.ip_addrs() {
                                 match addr.address() {
                                     IpAddress::Ipv4(a) => {
                                         stats.eth0_ipv4 = a.0;
                                         stats.eth0_ipv4_prefix = addr.prefix_len();
+                                        eth0_ipv4_found = true;
                                     },
                                     IpAddress::Ipv6(a) => {
                                         stats.eth0_ipv6 = a.0;
@@ -513,9 +551,17 @@ fn main() {
                                 if let Some(dns) = config.dns_server {
                                     stats.eth0_dns = dns.0;
                                 }
-                            } else if stats.eth0_dns == [0; 4] {
-                                // Fallback to 8.8.8.8 if not set by DHCP
+                            }
+
+                            if stats.eth0_dns == [0; 4] {
                                 stats.eth0_dns = [8, 8, 8, 8];
+                            }
+
+                            if eth0_ipv4_found {
+                                println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (Syscall): Reporting Ipv4: {}.{}.{}.{}/{}", 
+                                    stats.eth0_ipv4[0], stats.eth0_ipv4[1], stats.eth0_ipv4[2], stats.eth0_ipv4[3], stats.eth0_ipv4_prefix);
+                            } else {
+                                println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (Syscall): No IPv4 found on eth0!");
                             }
 
                             let resp_payload = unsafe { resp_buf.as_mut_ptr().add(core::mem::size_of::<NetResponseHeader>()) };
@@ -562,20 +608,22 @@ fn main() {
                     eth0_ipv4_prefix: 0,
                     eth0_ipv6: [0; 16],
                     eth0_ipv6_prefix: 0,
-                    eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
-                    eth0_gateway: current_dhcp_config.map(|c| c.router.map(|r| r.0).unwrap_or([0; 4])).unwrap_or([0; 4]),
+                    eth0_up: if link_up { 1 } else { 0 },
+                    eth0_gateway: [0; 4],
                     eth0_gateway_ipv6: [0; 16],
-                    eth0_dns: current_dhcp_config.map(|c| c.dns_server.map(|s| s.0).unwrap_or([0; 4])).unwrap_or([0; 4]),
+                    eth0_dns: [0; 4],
                     eth0_dns_ipv6: [0; 16],
                     rx_bytes: rx_total,
                     tx_bytes: tx_total,
                 };
                 
+                let mut eth0_ipv4_found = false;
                 for addr in iface.ip_addrs() {
                     match addr.address() {
                         IpAddress::Ipv4(a) => {
                             stats.eth0_ipv4 = a.0;
                             stats.eth0_ipv4_prefix = addr.prefix_len();
+                            eth0_ipv4_found = true;
                         },
                         IpAddress::Ipv6(a) => {
                             stats.eth0_ipv6 = a.0;
@@ -584,21 +632,36 @@ fn main() {
                     }
                 }
 
-                let stats_ptr = &stats as *const _ as *const u8;
-                let stats_size = core::mem::size_of::<NetExtendedStats>();
+                if let Some(config) = current_dhcp_config {
+                    if let Some(router) = config.router {
+                        stats.eth0_gateway = router.0;
+                    }
+                    if let Some(dns) = config.dns_server {
+                        stats.eth0_dns = dns.0;
+                    }
+                }
+
                 if stats.eth0_dns == [0; 4] {
                     stats.eth0_dns = [8, 8, 8, 8];
                 }
-                    let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
-                    resp[0..4].copy_from_slice(b"NEXS");
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            &stats as *const _ as *const u8,
-                            resp.as_mut_ptr().add(4),
-                            core::mem::size_of::<NetExtendedStats>()
-                        );
-                    }
-                    send_ipc(sender_pid, 0x08, &resp);
+
+                if eth0_ipv4_found {
+                    println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (IPC): Reporting Ipv4: {}.{}.{}.{}/{}", 
+                        stats.eth0_ipv4[0], stats.eth0_ipv4[1], stats.eth0_ipv4[2], stats.eth0_ipv4[3], stats.eth0_ipv4_prefix);
+                } else {
+                    println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (IPC): No IPv4 found!");
+                }
+
+                let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
+                resp[0..4].copy_from_slice(b"NEXS");
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &stats as *const _ as *const u8,
+                        resp.as_mut_ptr().add(4),
+                        core::mem::size_of::<NetExtendedStats>()
+                    );
+                }
+                send_ipc(sender_pid, 0x08, &resp);
                 } else if msg_data.starts_with(b"GET_NET_STATS") {
                     let mut resp = [0u8; 20];
                     resp[0..4].copy_from_slice(b"NSTA");

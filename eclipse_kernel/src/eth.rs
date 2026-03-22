@@ -25,6 +25,7 @@ use crate::scheme::{Scheme, Stat, error};
 /// with a `Mutex`.
 pub trait NetworkDevice: Send + Sync {
     fn get_mac_address(&self) -> [u8; 6];
+    fn get_link_state(&self) -> (bool, u32, bool);
     fn send_packet(&self, data: &[u8]) -> Result<(), &'static str>;
     fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize>;
 }
@@ -36,6 +37,11 @@ pub trait NetworkDevice: Send + Sync {
 impl NetworkDevice for crate::virtio::VirtIONetDevice {
     fn get_mac_address(&self) -> [u8; 6] {
         crate::virtio::VirtIONetDevice::get_mac_address(self)
+    }
+
+    fn get_link_state(&self) -> (bool, u32, bool) {
+        // VirtIO-Net link is always assumed up for now
+        (true, 1000, true)
     }
 
     fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
@@ -54,6 +60,10 @@ impl NetworkDevice for crate::virtio::VirtIONetDevice {
 impl NetworkDevice for crate::e1000e::E1000EDevice {
     fn get_mac_address(&self) -> [u8; 6] {
         crate::e1000e::E1000EDevice::get_mac_address(self)
+    }
+
+    fn get_link_state(&self) -> (bool, u32, bool) {
+        crate::e1000e::E1000EDevice::get_link_state(self)
     }
 
     fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
@@ -141,6 +151,17 @@ impl Scheme for EthScheme {
                 let buf = arg as *mut u8;
                 unsafe {
                     core::ptr::copy_nonoverlapping(mac.as_ptr(), buf, 6);
+                }
+                Ok(0)
+            }
+            0x8002 => {
+                // ETH_GET_LINK — copy (up: u8, speed: u32, full_duplex: u8)
+                let (up, speed, fd) = dev.get_link_state();
+                let buf = arg as *mut u8;
+                unsafe {
+                    *buf = if up { 1 } else { 0 };
+                    core::ptr::write_unaligned(buf.add(4) as *mut u32, speed);
+                    *buf.add(8) = if fd { 1 } else { 0 };
                 }
                 Ok(0)
             }
