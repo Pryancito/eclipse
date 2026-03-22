@@ -3238,7 +3238,8 @@ pub fn init() {
                 if dev.device_id == 0x1041 {
                     if let Some(virt_dev) = VirtIONetDevice::init_from_pci_modern(&dev) {
                         let arc_dev = alloc::sync::Arc::new(virt_dev);
-                        crate::net::register_device(arc_dev);
+                        NET_DEVICES.lock().push(arc_dev.clone());
+                        crate::eth::eth_register_device(arc_dev);
                     } else {
                         serial::serial_print("[VirtIO-Net] Modern init failed\n");
                     }
@@ -3277,7 +3278,8 @@ pub fn init() {
                             serial::serial_print("\n");
                             
                             let arc_dev = alloc::sync::Arc::new(virt_dev);
-                            crate::net::register_device(arc_dev);
+                            NET_DEVICES.lock().push(arc_dev.clone());
+                            crate::eth::eth_register_device(arc_dev);
                             break;
                         }
                     }
