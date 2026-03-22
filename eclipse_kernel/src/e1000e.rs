@@ -25,6 +25,14 @@ const INTEL_VENDOR_ID: u16 = 0x8086;
 
 /// All PCI device IDs belonging to the I217/I218/I219 (e1000e PCH-based) family.
 const E1000E_DEVICE_IDS: &[u16] = &[
+    // Legacy e1000
+    0x100E, // 82540EM (QEMU e1000)
+    0x100F, // 82545EM
+    0x1015, // 82540EM Qemu
+    // PCIe e1000e
+    0x10D3, // 82574L (QEMU e1000e)
+    0x10EA, // 82577LM
+    0x10F5, // 82567LM
     // I217
     0x153A, // I217-LM
     0x153B, // I217-V

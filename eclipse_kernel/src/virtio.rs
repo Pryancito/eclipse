@@ -940,6 +940,7 @@ pub struct VirtIONetDevice {
 }
 
 static BLOCK_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIOBlockDevice>>> = Mutex::new(alloc::vec::Vec::new());
+static NET_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIONetDevice>>> = Mutex::new(alloc::vec::Vec::new());
 
 impl VirtIONetDevice {
     /// Create a new VirtIO network device from PCI BAR address
