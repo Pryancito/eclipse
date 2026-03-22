@@ -1154,10 +1154,6 @@ impl crate::net::NetworkDevice for VirtIONetDevice {
         let mut inner = self.inner.lock();
         unsafe { inner.receive_packet(buffer) }
     }
-
-    fn name(&self) -> &'static str {
-        "VirtIO-Net"
-    }
 }
 
 impl VirtIONetDeviceInner {
@@ -3447,9 +3443,13 @@ pub fn init() {
     serial::serial_print_dec(gpu_count as u64);
     serial::serial_print("\n");
 
-    // Si no hay GOP (boot framebuffer), asignar display primario VirtIO para display: scheme
-    let boot_fb = crate::boot::get_boot_info().framebuffer.base_address;
-    if boot_fb == 0 || boot_fb == 0xDEADBEEF {
+    // Allocate the primary VirtIO display buffer whenever a VirtIO GPU is present.
+    // Even when a UEFI GOP framebuffer exists, the VirtIO GPU will eventually take
+    // over the scanout (QEMU switches to virtio-gpu mode on the first GPU command),
+    // so we must set up the VirtIO resource and update MAPPED_FB_VIRT via a second
+    // call to progress::init() in the boot sequence.  Without this, writes to the
+    // old GOP mapping become invisible and progress::log() appears to freeze.
+    if gpu_count > 0 {
         if let Some((phys, _rid, pitch, size)) = alloc_primary_display_buffer_internal() {
             let w = (pitch / 4) as u32;
             let h = (size / pitch as usize) as u32;
@@ -3460,7 +3460,7 @@ pub fn init() {
                 pitch,
                 size,
             });
-            serial::serial_print("[VirtIO] Primary display allocated (no GOP): ");
+            serial::serial_print("[VirtIO] Primary display allocated: ");
             serial::serial_print_dec(w as u64);
             serial::serial_print("x");
             serial::serial_print_dec(h as u64);
