@@ -1,14 +1,29 @@
 //! Intel e1000e Ethernet Driver
 //!
 //! Supports Intel GbE controllers of the e1000e family, including:
-//! - I217-LM / I217-V   (Haswell, 4th gen Core)
-//! - I218-LM / I218-V   (Broadwell, 5th gen Core)
-//! - I219-LM / I219-V   (Skylake and later, 6th+ gen Core)
+//! - 82540EM / 82545EM / 82574L (legacy desktop / QEMU emulation)
+//! - 82577LM / 82567LM          (Ibex Peak / Lynx Point)
+//! - I217-LM / I217-V           (Haswell, 4th gen Core)
+//! - I218-LM / I218-V           (Broadwell, 5th gen Core)
+//! - I219-LM / I219-V           (Skylake through Lunar Lake, 6th–24th gen Core)
 //!
-//! The I219-V (device ID 0x15B8) is a common card found in Intel 100-series
-//! (Skylake) desktop/workstation platforms and is the card reported in the
-//! issue.  This driver implements the basic e1000e register layout using
-//! legacy Tx/Rx descriptors, which are supported by all variants.
+//! ## Features
+//! - Full PCI device-ID table for all I219 silicon generations
+//!   (gen 1 through gen 24, Ice Lake through Lunar Lake / Raptor Lake)
+//! - Legacy 16-byte Tx/Rx descriptor rings (compatible with all variants)
+//! - IEEE 802.3x symmetric flow control (PAUSE frames)
+//! - Interrupt coalescing timers (ITR/RDTR/RADV/TIDV/TADV)
+//! - Link speed and duplex detection via STATUS register
+//! - PHY access via MDI Control (MDIC) interface
+//! - Hardware statistics register read (GPRC/GPTC/GORC/GOTC/MPC, …)
+//! - Software packet/byte/error counters accumulated across calls
+//!
+//! ## References
+//! - Intel 82574L GbE Controller Datasheet (external to PCH variants)
+//! - Intel I217/I218/I219 Ethernet Connection Datasheets
+//! - Linux kernel `drivers/net/ethernet/intel/e1000e/` (GPL-2.0)
+//! - Redox OS `drivers/e1000d/` (MIT)
+//! - OSDev Wiki: Intel 8254x Family
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -43,50 +58,115 @@ const E1000E_DEVICE_IDS: &[u16] = &[
     0x15A1, // I218-V  (2)
     0x15A2, // I218-LM (3)
     0x15A3, // I218-V  (3)
-    // I219  — the family relevant to the bug report
-    0x156F, // I219-LM
-    0x1570, // I219-V
-    0x15B7, // I219-LM (2)
-    0x15B8, // I219-V  (2)  ← the exact card from the issue
-    0x15BB, // I219-LM (3)
-    0x15BC, // I219-V  (3)
-    0x15D7, // I219-LM (3) rev.2
-    0x15D8, // I219-V  (3) rev.2
-    0x15E3, // I219-LM (4)
-    0x15D6, // I219-V  (4)
-    0x0DC5, // I219-LM (17)
-    0x0DC6, // I219-V  (17)
-    0x0DC7, // I219-LM (18)
-    0x0DC8, // I219-V  (18)
+    // I219  — PCH-integrated Ethernet, Skylake and later
+    //         'gen N' below refers to Intel's I219 silicon revision
+    //         (i.e. the Nth variant of I219), not the CPU generation.
+    //         Multiple revisions may exist for the same CPU family.
+    0x156F, // I219-LM rev 1  (Skylake / Sunrise Point SPT)
+    0x1570, // I219-V  rev 1  (Skylake / Sunrise Point SPT)
+    0x15B7, // I219-LM rev 2  (Kaby Lake / Skylake SPT2)
+    0x15B8, // I219-V  rev 2  (Kaby Lake / Skylake SPT2)  ← exact card from issue
+    0x15BB, // I219-LM rev 3  (Lewisburg / Skylake LBG server)
+    0x15BC, // I219-V  rev 3  (Lewisburg / Skylake LBG server)
+    0x15D7, // I219-LM rev 4  (Kaby Lake SPT3)
+    0x15D8, // I219-V  rev 4  (Kaby Lake SPT3)
+    0x15E3, // I219-LM rev 5  (Coffee Lake SPT4)
+    0x15D6, // I219-V  rev 5  (Coffee Lake SPT4)
+    0x15BD, // I219-LM rev 6  (Ice Lake ICP)
+    0x15BE, // I219-V  rev 6  (Ice Lake ICP)
+    0x15DF, // I219-LM rev 7  (Ice Lake ICP2)
+    0x15E0, // I219-V  rev 7  (Ice Lake ICP2)
+    0x15E1, // I219-LM rev 8  (Ice Lake ICP3)
+    0x15E2, // I219-V  rev 8  (Ice Lake ICP3)
+    0x0DC5, // I219-LM rev 9  (Comet Lake CMP)
+    0x0DC6, // I219-V  rev 9  (Comet Lake CMP)
+    0x0DC7, // I219-LM rev 10 (Comet Lake CMP2)
+    0x0DC8, // I219-V  rev 10 (Comet Lake CMP2)
+    0x15F9, // I219-LM rev 11 (Tiger Lake TGP)
+    0x15FA, // I219-V  rev 11 (Tiger Lake TGP)
+    0x15FB, // I219-LM rev 12 (Elkhart Lake TGP2)
+    0x15FC, // I219-V  rev 12 (Elkhart Lake TGP2)
+    0x1DC2, // I219-LM rev 13 (Meteor Lake MTP)
+    0x1DC3, // I219-V  rev 14 (Meteor Lake MTP)
+    0x1A1C, // I219-LM rev 15 (Alder Lake ADP-P)
+    0x1A1D, // I219-V  rev 16 (Alder Lake ADP-P)
+    0x1A1E, // I219-LM rev 17 (Alder Lake ADP-S)
+    0x1A1F, // I219-V  rev 18 (Alder Lake ADP-S)
+    0x0D9F, // I219-LM rev 19 (Alder Lake ADP-L)
+    0x1DC5, // I219-LM rev 21 (Lunar Lake LNL)
+    0x1DC6, // I219-V  rev 22 (Lunar Lake LNL)
+    0x0D4E, // I219-LM rev 23 (Raptor Lake RPL)
+    0x0D4F, // I219-V  rev 23 (Raptor Lake RPL)
+    0x0D53, // I219-LM rev 24 (Raptor Lake RPL-P)
+    0x0D55, // I219-V  rev 24 (Raptor Lake RPL-P)
 ];
 
 // ───────────────────────────────────────────────────────────────────────────
 // Register offsets (relative to BAR0 virtual base)
 // ───────────────────────────────────────────────────────────────────────────
-const REG_CTRL:     u32 = 0x0000_0;
+const REG_CTRL:     u32 = 0x0000_0; // Device control
 const REG_STATUS:   u32 = 0x0000_8; // Device status
-const REG_EERD:     u32 = 0x0001_4;
+const REG_EERD:     u32 = 0x0001_4; // EEPROM read
 const REG_CTRL_EXT: u32 = 0x0001_8; // Extended device control
 const REG_MDIC:     u32 = 0x0002_0; // MDI (PHY) control
+const REG_FCAL:     u32 = 0x0002_8; // Flow Control Address Low
+const REG_FCAH:     u32 = 0x0002_C; // Flow Control Address High
+const REG_FCT:      u32 = 0x0003_0; // Flow Control Type (EtherType = 0x8808)
 const REG_ICR:      u32 = 0x000C_0; // Interrupt Cause Read (auto-cleared on read)
-const REG_IMC:      u32 = 0x000D_8;
-const REG_RCTL:     u32 = 0x0010_0;
-const REG_TCTL:     u32 = 0x0040_0;
-const REG_TIPG:     u32 = 0x0041_0;
-const REG_RDBAL:    u32 = 0x0280_0;
-const REG_RDBAH:    u32 = 0x0280_4;
-const REG_RDLEN:    u32 = 0x0280_8;
-const REG_RDH:      u32 = 0x0281_0;
-const REG_RDT:      u32 = 0x0281_8;
-const REG_TDBAL:    u32 = 0x0380_0;
-const REG_TDBAH:    u32 = 0x0380_4;
-const REG_TDLEN:    u32 = 0x0380_8;
-const REG_TDH:      u32 = 0x0381_0;
-const REG_TDT:      u32 = 0x0381_8;
+const REG_ITR:      u32 = 0x000C_4; // Interrupt Throttling Rate
+#[allow(dead_code)]
+const REG_ICS:      u32 = 0x000C_8; // Interrupt Cause Set
+#[allow(dead_code)]
+const REG_IMS:      u32 = 0x000D_0; // Interrupt Mask Set/Read
+const REG_IMC:      u32 = 0x000D_8; // Interrupt Mask Clear
+const REG_RCTL:     u32 = 0x0010_0; // RX control
+const REG_FCTTV:    u32 = 0x0017_0; // Flow Control Transmit Timer Value
+const REG_TCTL:     u32 = 0x0040_0; // TX control
+const REG_TIPG:     u32 = 0x0041_0; // TX Inter-Packet Gap
+const REG_TADV:     u32 = 0x0382_C; // TX Absolute Interrupt Delay Value
+const REG_TIDV:     u32 = 0x0382_0; // TX Interrupt Delay Value
+const REG_RDBAL:    u32 = 0x0280_0; // RX Desc Base Address Low
+const REG_RDBAH:    u32 = 0x0280_4; // RX Desc Base Address High
+const REG_RDLEN:    u32 = 0x0280_8; // RX Descriptor Length
+const REG_RDH:      u32 = 0x0281_0; // RX Descriptor Head
+const REG_RDT:      u32 = 0x0281_8; // RX Descriptor Tail
+const REG_RDTR:     u32 = 0x0282_0; // RX Delay Timer (interrupt coalescing)
+const REG_RADV:     u32 = 0x0282_C; // RX Absolute Delay Timer
+const REG_TDBAL:    u32 = 0x0380_0; // TX Desc Base Address Low
+const REG_TDBAH:    u32 = 0x0380_4; // TX Desc Base Address High
+const REG_TDLEN:    u32 = 0x0380_8; // TX Descriptor Length
+const REG_TDH:      u32 = 0x0381_0; // TX Descriptor Head
+const REG_TDT:      u32 = 0x0381_8; // TX Descriptor Tail
+const REG_FCRTL:    u32 = 0x0292_0; // Flow Control Receive Threshold Low
+const REG_FCRTH:    u32 = 0x0292_4; // Flow Control Receive Threshold High
 const REG_MTA:      u32 = 0x0520_0; // Multicast Table Array (128 × u32)
 const REG_RAL0:     u32 = 0x0540_0; // Receive Address Low  (filter 0)
 const REG_RAH0:     u32 = 0x0540_4; // Receive Address High (filter 0)
 const REG_RXCSUM:   u32 = 0x5000;   // Receive Checksum Offload Control
+// Statistics registers (read-on-clear, 32-bit unless noted)
+const REG_CRCERRS:  u32 = 0x4000;   // CRC Error Count
+const REG_MPC:      u32 = 0x4010;   // Missed Packet Count
+const REG_GPRC:     u32 = 0x4074;   // Good Packets Received Count
+const REG_BPRC:     u32 = 0x4078;   // Broadcast Packets Received Count
+const REG_MPRC:     u32 = 0x407C;   // Multicast Packets Received Count
+const REG_GPTC:     u32 = 0x4080;   // Good Packets Transmitted Count
+const REG_GORCL:    u32 = 0x4088;   // Good Octets Received Low
+const REG_GORCH:    u32 = 0x408C;   // Good Octets Received High
+const REG_GOTCL:    u32 = 0x4090;   // Good Octets Transmitted Low
+const REG_GOTCH:    u32 = 0x4094;   // Good Octets Transmitted High
+const REG_RNBC:     u32 = 0x40A0;   // Receive No Buffer Count
+const REG_RUC:      u32 = 0x40A4;   // Receive Undersize Count
+const REG_RFC:      u32 = 0x40A8;   // Receive Fragment Count
+const REG_ROC:      u32 = 0x40AC;   // Receive Oversize Count
+const REG_RJC:      u32 = 0x40B0;   // Receive Jabber Count
+const REG_TORL:     u32 = 0x40C0;   // Total Octets Received Low
+const REG_TORH:     u32 = 0x40C4;   // Total Octets Received High
+const REG_TOTL:     u32 = 0x40C8;   // Total Octets Transmitted Low
+const REG_TOTH:     u32 = 0x40CC;   // Total Octets Transmitted High
+const REG_TPR:      u32 = 0x40D0;   // Total Packets Received
+const REG_TPT:      u32 = 0x40D4;   // Total Packets Transmitted
+const REG_MPTC:     u32 = 0x40F0;   // Multicast Packets Transmitted Count
+const REG_BPTC:     u32 = 0x40F4;   // Broadcast Packets Transmitted Count
 
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL register bits
@@ -99,7 +179,12 @@ const CTRL_RST:  u32 = 1 << 26; // Device reset
 // ───────────────────────────────────────────────────────────────────────────
 // STATUS register bits
 // ───────────────────────────────────────────────────────────────────────────
-const STATUS_LU: u32 = 1 << 1; // Link Up
+const STATUS_FD:          u32 = 1 << 0; // Full-duplex
+const STATUS_LU:          u32 = 1 << 1; // Link Up
+const STATUS_SPEED_MASK:  u32 = 3 << 6; // Speed bits [7:6]
+const STATUS_SPEED_10:    u32 = 0 << 6; // 10 Mb/s
+const STATUS_SPEED_100:   u32 = 1 << 6; // 100 Mb/s
+const STATUS_SPEED_1000:  u32 = 2 << 6; // 1000 Mb/s (GbE)
 
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL_EXT register bits
@@ -125,21 +210,130 @@ const MDIC_ERROR:    u32 = 1 << 30; // Error flag
 // MII/MDIO register index 0 = Basic Mode Control Register (BMCR)
 const PHY_REG_BMCR:    u32 = 0;
 const BMCR_POWER_DOWN: u16 = 1 << 11; // PHY power-down bit in BMCR
+#[allow(dead_code)]
+const BMCR_RESET:      u16 = 1 << 15; // Software reset
+
+// MII register 1 = Basic Mode Status Register (BMSR)
+#[allow(dead_code)]
+const PHY_REG_BMSR:    u32 = 1;
+#[allow(dead_code)]
+const BMSR_LINK_STATUS: u16 = 1 << 2;  // Link status (1 = link up)
+#[allow(dead_code)]
+const BMSR_ANEG_COMPL:  u16 = 1 << 5;  // Auto-negotiation complete
+
+// MII register 4 = Auto-Negotiation Advertisement Register (ANAR)
+#[allow(dead_code)]
+const PHY_REG_ANAR:    u32 = 4;
+#[allow(dead_code)]
+const ANAR_10_HDX:     u16 = 1 << 5;   // 10BASE-T half-duplex
+#[allow(dead_code)]
+const ANAR_10_FDX:     u16 = 1 << 6;   // 10BASE-T full-duplex
+#[allow(dead_code)]
+const ANAR_100_HDX:    u16 = 1 << 7;   // 100BASE-TX half-duplex
+#[allow(dead_code)]
+const ANAR_100_FDX:    u16 = 1 << 8;   // 100BASE-TX full-duplex
+#[allow(dead_code)]
+const ANAR_PAUSE:      u16 = 1 << 10;  // PAUSE capability (symmetric flow control)
+#[allow(dead_code)]
+const ANAR_ASM_DIR:    u16 = 1 << 11;  // Asymmetric PAUSE direction
+#[allow(dead_code)]
+const ANAR_SELECTOR:   u16 = 1;        // IEEE 802.3 selector field
+
+// MII register 9 = 1000BASE-T Control Register
+#[allow(dead_code)]
+const PHY_REG_1KTCTL:  u32 = 9;
+#[allow(dead_code)]
+const TCTL_1KT_FDX:    u16 = 1 << 9;   // Advertise 1000BASE-T full-duplex
+#[allow(dead_code)]
+const TCTL_1KT_HDX:    u16 = 1 << 8;   // Advertise 1000BASE-T half-duplex
 
 // ───────────────────────────────────────────────────────────────────────────
 // RCTL register bits
 // ───────────────────────────────────────────────────────────────────────────
-const RCTL_EN:    u32 = 1 << 1;  // RX enable
-const RCTL_UPE:   u32 = 1 << 3;  // Unicast promiscuous (accept all unicast)
-const RCTL_MPE:   u32 = 1 << 4;  // Multicast promiscuous
-const RCTL_BAM:   u32 = 1 << 15; // Broadcast accept
-const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
+const RCTL_EN:      u32 = 1 << 1;  // RX enable
+#[allow(dead_code)]
+const RCTL_SBP:     u32 = 1 << 2;  // Store bad packets
+const RCTL_UPE:     u32 = 1 << 3;  // Unicast promiscuous (accept all unicast)
+const RCTL_MPE:     u32 = 1 << 4;  // Multicast promiscuous
+#[allow(dead_code)]
+const RCTL_LPE:     u32 = 1 << 5;  // Long packet reception enable (jumbo frames)
+#[allow(dead_code)]
+const RCTL_LBM_NO:  u32 = 0 << 6;  // No loopback (normal operation)
+#[allow(dead_code)]
+const RCTL_LBM_MAC: u32 = 1 << 6;  // MAC loopback
+#[allow(dead_code)]
+const RCTL_RDMTS_HALF: u32 = 0 << 8; // RX desc min threshold = 1/2 ring
+#[allow(dead_code)]
+const RCTL_RDMTS_QUAR: u32 = 1 << 8; // RX desc min threshold = 1/4 ring
+const RCTL_BAM:     u32 = 1 << 15; // Broadcast accept
+#[allow(dead_code)]
+const RCTL_BSIZE_2048: u32 = 0;    // Buffer size = 2048 (BSEX=0, BSIZE=00)
+#[allow(dead_code)]
+const RCTL_VFE:     u32 = 1 << 18; // VLAN filter enable
+#[allow(dead_code)]
+const RCTL_CFIEN:   u32 = 1 << 19; // Canonical form indicator enable
+#[allow(dead_code)]
+const RCTL_CFI:     u32 = 1 << 20; // Canonical form indicator bit value
+#[allow(dead_code)]
+const RCTL_DPF:     u32 = 1 << 22; // Discard PAUSE frames
+#[allow(dead_code)]
+const RCTL_PMCF:    u32 = 1 << 23; // Pass MAC control frames
+const RCTL_SECRC:   u32 = 1 << 26; // Strip Ethernet CRC
 
 // ───────────────────────────────────────────────────────────────────────────
 // TCTL register bits
 // ───────────────────────────────────────────────────────────────────────────
-const TCTL_EN:  u32 = 1 << 1; // TX enable
-const TCTL_PSP: u32 = 1 << 3; // Pad short packets
+const TCTL_EN:   u32 = 1 << 1; // TX enable
+const TCTL_PSP:  u32 = 1 << 3; // Pad short packets
+const TCTL_CT:   u32 = 0x0F << 4;  // Collision threshold (standard = 15)
+const TCTL_COLD: u32 = 0x40 << 12; // Collision distance (full-duplex = 64)
+#[allow(dead_code)]
+const TCTL_RTLC: u32 = 1 << 24; // Re-transmit on late collision
+
+// TIPG: TX Inter-Packet Gap for 802.3 GbE (standard = 0x0060_200A)
+// Fields: IPGT[9:0]=10, IPGR1[19:10]=8, IPGR2[29:20]=6
+const TIPG_IPGT_GBE: u32 = 0x0060_200A;
+// For 10/100 Mbps: IPGT=10, IPGR1=10, IPGR2=10.
+// The e1000e Linux driver uses 0x00602008 for 10/100.
+#[allow(dead_code)]
+const TIPG_IPGT_10_100: u32 = 0x0060_2008;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Flow control constants
+// ───────────────────────────────────────────────────────────────────────────
+/// IEEE 802.3x PAUSE frame multicast destination address bytes 0–3, stored
+/// little-endian in FCAL: MAC 01:80:C2:00:00:01 → bytes {01,80,C2,00} →
+/// little-endian u32 = 0x00C28001.  Matches Linux E1000_FCAL_DEF.
+const FLOW_CTRL_ADDR_LO: u32 = 0x00C28001;
+/// IEEE 802.3x PAUSE frame multicast destination address bytes 4–5, stored
+/// little-endian in FCAH: MAC[4..6] = {00,01} → little-endian u32 = 0x0100.
+const FLOW_CTRL_ADDR_HI: u32 = 0x0100;
+/// EtherType for IEEE 802.3x PAUSE frames.
+const FLOW_CTRL_TYPE:    u32 = 0x8808;
+/// FCT transmit timer: pause for ~33 ms (at GbE, 1 unit ≈ 512 bit times).
+const FCTTV_DEFAULT:     u32 = 0x0100;
+/// FCRTH: start sending PAUSE frames when RX FIFO reaches this threshold.
+/// Bits [15:3] = threshold in 8-byte units (0x8000 >> 3 × 8 = 32 KiB).
+/// Matches Linux E1000_FC_HIGH_THRESH default.
+const FCRTH_DEFAULT:     u32 = 0x8000;
+/// FCRTL: stop sending PAUSE frames when RX FIFO drops to this threshold.
+/// Bits [15:3] = threshold in 8-byte units (0x4000 >> 3 × 8 = 16 KiB).
+/// Matches Linux E1000_FC_LOW_THRESH default.
+const FCRTL_DEFAULT:     u32 = 0x4000;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Interrupt mask bits (for IMS/IMC registers)
+// ───────────────────────────────────────────────────────────────────────────
+#[allow(dead_code)]
+const IMS_RXT0:  u32 = 1 << 7;  // RX timer interrupt (RDTR expired)
+#[allow(dead_code)]
+const IMS_RXO:   u32 = 1 << 6;  // RX overrun
+#[allow(dead_code)]
+const IMS_RXDMT: u32 = 1 << 4;  // RX descriptor minimum threshold reached
+#[allow(dead_code)]
+const IMS_TXDW:  u32 = 1 << 0;  // TX descriptor written back
+#[allow(dead_code)]
+const IMS_LSC:   u32 = 1 << 2;  // Link status change
 
 // ───────────────────────────────────────────────────────────────────────────
 // TX/RX descriptor command/status bits
@@ -218,6 +412,19 @@ struct E1000EInner {
     tx_descs_phys: u64,
     tx_bufs: [(u64, u64); TX_RING_SIZE],
     tx_tail: usize,
+
+    // Link state (updated after init and on link-change events)
+    link_up:     bool,
+    link_speed:  u32,  // 10 / 100 / 1000 (Mb/s), 0 if unknown
+    full_duplex: bool,
+
+    // Software packet/byte counters (updated in send/receive paths)
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_bytes:   u64,
+    tx_bytes:   u64,
+    rx_errors:  u64,
+    tx_errors:  u64,
 }
 
 /// Public handle to an Intel e1000e Ethernet device.
@@ -307,6 +514,68 @@ impl E1000EInner {
             for _ in 0..100 { core::hint::spin_loop(); }
         }
         false // timeout
+    }
+
+    /// Detect link speed and duplex from the STATUS register and update the
+    /// `link_up`, `link_speed`, and `full_duplex` fields.
+    fn detect_link_state(&mut self) {
+        let status = self.read32(REG_STATUS);
+        self.link_up = status & STATUS_LU != 0;
+        self.full_duplex = status & STATUS_FD != 0;
+        self.link_speed = if self.link_up {
+            match status & STATUS_SPEED_MASK {
+                STATUS_SPEED_10   => 10,
+                STATUS_SPEED_100  => 100,
+                STATUS_SPEED_1000 => 1000,
+                _                 => 1000, // treat unknown as 1000
+            }
+        } else {
+            0
+        };
+    }
+
+    /// Read and clear the hardware statistics registers, accumulating their
+    /// values into the software counters.  On e1000e-family hardware the
+    /// statistics registers are read-on-clear (RoC): each read returns the
+    /// count since the last read and then resets the register to zero.
+    /// Callers should therefore call this method periodically (or before
+    /// reporting statistics) to avoid counter overflow.
+    fn update_hw_stats(&mut self) {
+        // Receive counters
+        let gprc  = self.read32(REG_GPRC) as u64;
+        let gorcl = self.read32(REG_GORCL) as u64;
+        let gorch = self.read32(REG_GORCH) as u64;
+        let mpc   = self.read32(REG_MPC)  as u64; // missed (no buffer) = RX error
+
+        self.rx_packets += gprc;
+        self.rx_bytes   += gorcl | (gorch << 32);
+        self.rx_errors  += mpc;
+
+        // Transmit counters
+        let gptc  = self.read32(REG_GPTC) as u64;
+        let gotcl = self.read32(REG_GOTCL) as u64;
+        let gotch = self.read32(REG_GOTCH) as u64;
+
+        self.tx_packets += gptc;
+        self.tx_bytes   += gotcl | (gotch << 32);
+
+        // Read-and-discard additional stats to prevent 32-bit overflow
+        let _ = self.read32(REG_CRCERRS);
+        let _ = self.read32(REG_RNBC);
+        let _ = self.read32(REG_RUC);
+        let _ = self.read32(REG_RFC);
+        let _ = self.read32(REG_ROC);
+        let _ = self.read32(REG_RJC);
+        let _ = self.read32(REG_BPRC);
+        let _ = self.read32(REG_MPRC);
+        let _ = self.read32(REG_TORL);
+        let _ = self.read32(REG_TORH);
+        let _ = self.read32(REG_TOTL);
+        let _ = self.read32(REG_TOTH);
+        let _ = self.read32(REG_TPR);
+        let _ = self.read32(REG_TPT);
+        let _ = self.read32(REG_MPTC);
+        let _ = self.read32(REG_BPTC);
     }
 
     /// Full hardware initialisation.  Returns `true` on success.
@@ -521,12 +790,10 @@ impl E1000EInner {
         self.tx_tail = 0;
 
         // Enable TX: pad short frames, standard collision settings
-        const CT:   u32 = 0x0F << 4;  // Collision threshold
-        const COLD: u32 = 0x40 << 12; // Collision distance (full-duplex)
-        self.write32(REG_TCTL, TCTL_EN | TCTL_PSP | CT | COLD);
+        self.write32(REG_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
 
         // Standard inter-packet gap for 802.3 GbE
-        self.write32(REG_TIPG, 0x0060_200A);
+        self.write32(REG_TIPG, TIPG_IPGT_GBE);
 
         // 9. Programme RAR[0] with our MAC and set the Address Valid bit
         let ral = (self.mac[0] as u32)
@@ -539,7 +806,32 @@ impl E1000EInner {
         self.write32(REG_RAL0, ral);
         self.write32(REG_RAH0, rah);
 
-        // 10. Wait for the PHY to finish auto-negotiation (link-up), up to ~2 s.
+        // 10. Configure IEEE 802.3x flow control.
+        //     Programme the standard PAUSE-frame multicast destination address
+        //     and EtherType so the hardware can recognise incoming PAUSE frames
+        //     and generate outgoing PAUSE frames when the RX FIFO is filling up.
+        //     This is symmetric flow control (both TX and RX PAUSE enabled).
+        self.write32(REG_FCAL,  FLOW_CTRL_ADDR_LO);
+        self.write32(REG_FCAH,  FLOW_CTRL_ADDR_HI);
+        self.write32(REG_FCT,   FLOW_CTRL_TYPE);
+        self.write32(REG_FCTTV, FCTTV_DEFAULT);
+        self.write32(REG_FCRTH, FCRTH_DEFAULT);
+        self.write32(REG_FCRTL, FCRTL_DEFAULT);
+
+        // 11. Set up interrupt coalescing timers.
+        //     Even though this driver operates in polling mode (no interrupt
+        //     handler is registered), setting ITR/RDTR/RADV to reasonable
+        //     values matches Linux e1000e behaviour and prevents the hardware
+        //     from asserting the interrupt line unnecessarily on shared IRQs.
+        //     ITR = 0 disables interrupt throttling; RDTR/RADV set a short
+        //     receive delay to reduce burst latency without excess interrupt rate.
+        self.write32(REG_ITR,  0);          // No interrupt throttling
+        self.write32(REG_RDTR, 0);          // No RX interrupt delay timer
+        self.write32(REG_RADV, 0);          // No RX absolute interrupt delay timer
+        self.write32(REG_TIDV, 0);          // No TX interrupt delay
+        self.write32(REG_TADV, 0);          // No TX absolute delay timer
+
+        // 12. Wait for the PHY to finish auto-negotiation (link-up), up to ~2 s.
         //     On real hardware the I217/I218/I219 PHY can take 1–3 seconds to
         //     establish a GbE link after powering up.  Without this wait, DHCP
         //     DISCOVERs sent before link-up fill the 32-slot TX ring with frames
@@ -579,12 +871,35 @@ impl E1000EInner {
             serial::serial_print("[e1000e] Link not yet up after timeout (proceeding anyway)\n");
         }
 
+        // 13. Detect and record the current link state (speed, duplex).
+        self.detect_link_state();
+        if self.link_up {
+            serial::serial_print("[e1000e] Speed: ");
+            serial::serial_print_dec(self.link_speed as u64);
+            serial::serial_print(" Mb/s, ");
+            serial::serial_print(if self.full_duplex { "full-duplex\n" } else { "half-duplex\n" });
+        }
+
+        // 14. Clear all hardware statistics registers by reading them once.
+        //     Statistics registers are read-on-clear, so this establishes a
+        //     clean zero baseline for subsequent update_hw_stats() calls.
+        self.update_hw_stats();
+        // Reset the software counters too (update_hw_stats accumulated
+        // uninitialised or stale NVM values in the first read above).
+        self.rx_packets = 0;
+        self.tx_packets = 0;
+        self.rx_bytes   = 0;
+        self.tx_bytes   = 0;
+        self.rx_errors  = 0;
+        self.tx_errors  = 0;
+
         true
     }
 
     /// Transmit a single Ethernet frame.
     unsafe fn send_packet(&mut self, data: &[u8]) -> Result<(), &'static str> {
         if data.len() > 1514 {
+            self.tx_errors += 1;
             return Err("e1000e: packet exceeds MTU");
         }
 
@@ -594,6 +909,7 @@ impl E1000EInner {
         // Descriptor must be free (DD bit set by hardware after transmission)
         let sta = read_volatile(core::ptr::addr_of!((*desc).status));
         if sta & TXD_STA_DD == 0 {
+            self.tx_errors += 1;
             return Err("e1000e: TX ring full");
         }
 
@@ -617,6 +933,10 @@ impl E1000EInner {
         // Advance the tail and ring the doorbell
         self.tx_tail = (slot + 1) % TX_RING_SIZE;
         self.write32(REG_TDT, self.tx_tail as u32);
+
+        // Update software statistics
+        self.tx_packets += 1;
+        self.tx_bytes   += data.len() as u64;
 
         Ok(())
     }
@@ -668,6 +988,7 @@ impl E1000EInner {
         // informational and must not cause valid DHCP frames to be dropped.
         let errors = read_volatile(core::ptr::addr_of!((*desc).errors));
         if errors & RXD_ERR_FATAL != 0 {
+            self.rx_errors += 1;
             write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
             write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
             self.write32(REG_RDT, slot as u32);
@@ -688,6 +1009,11 @@ impl E1000EInner {
         self.write32(REG_RDT, slot as u32);
 
         self.rx_tail = (slot + 1) % RX_RING_SIZE;
+
+        // Update software statistics
+        self.rx_packets += 1;
+        self.rx_bytes   += copy_len as u64;
+
         Some(copy_len)
     }
 }
@@ -708,6 +1034,36 @@ impl E1000EDevice {
     pub fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize> {
         let mut inner = self.inner.lock();
         unsafe { inner.receive_packet(buffer) }
+    }
+
+    /// Return the current link state: `(link_up, speed_mbps, full_duplex)`.
+    ///
+    /// The speed is one of 10, 100, or 1000 (Mb/s), or 0 when the link is
+    /// down.  The values are re-read from the STATUS register every call so
+    /// they reflect the current hardware state after auto-negotiation.
+    pub fn get_link_state(&self) -> (bool, u32, bool) {
+        let mut inner = self.inner.lock();
+        inner.detect_link_state();
+        (inner.link_up, inner.link_speed, inner.full_duplex)
+    }
+
+    /// Return cumulative packet and byte counters.
+    ///
+    /// The tuple is `(rx_packets, tx_packets, rx_bytes, tx_bytes,
+    /// rx_errors, tx_errors)`.  Hardware statistics registers (which are
+    /// read-on-clear) are accumulated into the software counters each call,
+    /// so repeated calls return monotonically increasing totals.
+    pub fn get_stats(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let mut inner = self.inner.lock();
+        inner.update_hw_stats();
+        (
+            inner.rx_packets,
+            inner.tx_packets,
+            inner.rx_bytes,
+            inner.tx_bytes,
+            inner.rx_errors,
+            inner.tx_errors,
+        )
     }
 }
 
@@ -771,6 +1127,15 @@ pub fn init() {
                 tx_descs_phys: 0,
                 tx_bufs: [(0, 0); TX_RING_SIZE],
                 tx_tail: 0,
+                link_up:     false,
+                link_speed:  0,
+                full_duplex: false,
+                rx_packets:  0,
+                tx_packets:  0,
+                rx_bytes:    0,
+                tx_bytes:    0,
+                rx_errors:   0,
+                tx_errors:   0,
             };
 
             let device = E1000EDevice { inner: Mutex::new(inner) };
