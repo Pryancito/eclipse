@@ -3471,6 +3471,9 @@ pub fn init() {
     if gpu_count > 0 {
         crate::drm::register_driver(alloc::sync::Arc::new(VirtioDrmDriver));
     }
+
+    // Actualizar el mapeo del framebuffer del progreso
+    crate::progress::update_fb_mapping();
 }
 
 /// Global wrapper to read a block from the first available VirtIO device

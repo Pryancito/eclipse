@@ -1029,18 +1029,6 @@ fn main() {
         if fb.supports_hw_accel {
             println!("[DISPLAY-SERVICE] Testing 2D acceleration...");
             
-            // Test screen clear
-            match clear_screen(fb, colors::WHITE) {
-                Ok(_) => {
-                    println!("[DISPLAY-SERVICE]   ✓ Screen clear successful");
-                    stats.fill_operations += 1;
-                }
-                Err(e) => {
-                    println!("[DISPLAY-SERVICE]   ✗ Screen clear failed: {}", e);
-                    stats.driver_errors += 1;
-                }
-            }
-            
             // Test rectangle fill
             match accel_fill_rect(fb, 100, 100, 200, 150, colors::BLUE) {
                 Ok(_) => {
