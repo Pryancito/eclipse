@@ -631,8 +631,21 @@ pub fn bsod(info: &BsodInfo) {
 /// Danger: should ONLY be used in fork_child_setup to clear inherited locks.
 pub unsafe fn force_unlock_all() {
     for i in 0..MAX_SMP_CPUS {
-        LOG_BUFFERS[i].force_unlock();
+    LOG_BUFFERS[i].force_unlock();
     }
     LOG_HISTORY.force_unlock();
     VIDEO_HARDWARE_LOCK.force_unlock();
+}
+
+/// Actualiza la caché del framebuffer mapeado si el driver gráfico cambia en caliente
+/// (ej. cuando VirtIOGPU o NVIDIA toman control del GOP UEFI).
+pub fn update_fb_mapping() {
+    if let Some((phys_addr, _w, _h, _pitch, _source)) = get_fb_info() {
+        let virt = if phys_addr >= crate::memory::PHYS_MEM_OFFSET {
+            phys_addr // Ya está mapeada en HH
+        } else {
+            crate::memory::phys_to_virt(phys_addr)
+        };
+        MAPPED_FB_VIRT.store(virt, Ordering::SeqCst);
+    }
 }

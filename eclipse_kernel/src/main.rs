@@ -49,7 +49,6 @@ mod apic;    // Local APIC
 mod sw_cursor; // Software cursor for real-hardware (non-VirtIO) EFI GOP framebuffer
 mod sync;    // Synchronization primitives
 mod net;
-mod e1000;
 pub mod drm_scheme; // DRM scheme for ioctl
 
 #[cfg(not(test))]

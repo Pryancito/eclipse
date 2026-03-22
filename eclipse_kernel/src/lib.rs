@@ -28,7 +28,6 @@ pub mod virtio;
 pub mod e1000e;
 pub mod eth;
 pub mod net;
-pub mod e1000;
 
 pub mod filesystem;
 pub mod ata;
