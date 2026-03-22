@@ -289,9 +289,23 @@ fn main() {
             }
             Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
                 current_dhcp_config = None;
-                println!("[NETWORK-SERVICE] eth0 deconfigured");
+                println!("[NETWORK-SERVICE] eth0 DHCP deconfigured (lease expired or no response)");
                 iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
+                    // Remove only IPv4 addresses; preserve the IPv6 link-local
+                    // so that eth0 continues to show as online while DHCP
+                    // retries.  addrs.clear() would also drop the link-local,
+                    // causing the UI to show OFFLINE unnecessarily.
+                    //
+                    // Note: smoltcp uses heapless::Vec (0.8.x) which does not
+                    // provide retain(), so we use a manual index-walk instead.
+                    let mut i = 0;
+                    while i < addrs.len() {
+                        if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
+                            addrs.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
                 });
             }
         }
