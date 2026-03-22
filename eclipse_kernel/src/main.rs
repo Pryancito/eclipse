@@ -310,12 +310,6 @@ extern "C" fn kernel_bootstrap(boot_info_ptr: u64) -> ! {
     nvidia::init();
     serial::serial_print("[INIT] Initializing VirtIO...\n");
     virtio::init();
-    // Re-initialize the progress framebuffer mapping now that VirtIO GPU is set up.
-    // virtio::init() allocates the primary VirtIO display buffer and registers the
-    // scanout, which causes QEMU to switch from the UEFI GOP display to virtio-gpu
-    // mode.  Without this second call, MAPPED_FB_VIRT still points to the old GOP
-    // physical address and subsequent progress::log() writes become invisible.
-    progress::init();
     serial::serial_print("[INIT] Initializing Intel e1000e Ethernet...\n");
     e1000e::init();
     serial::serial_print("[INIT] Initializing NVMe...\n");
