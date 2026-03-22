@@ -146,6 +146,7 @@ pub struct InputState {
     pub alt_tab_active: bool,
     pub request_system_central: bool,
     pub request_network: bool,
+    pub renew_dhcp: bool,
     pub system_central_curr_y: f32,
     pub search_active: bool,
     pub search_curr_y: f32,
@@ -173,7 +174,7 @@ impl InputState {
             tiling_active: false, request_toggle_tiling: false,
             alt_tab_active: false,
             system_central_active: false, request_system_central: false, 
-            request_network: false,
+            request_network: false, renew_dhcp: false,
             system_central_curr_y: 0.0,
             search_active: false, search_curr_y: -(height as f32 / 2.0),
             search_query: heapless::String::new(),
@@ -353,6 +354,22 @@ impl InputState {
                 if (self.mouse_buttons & 1 != 0) && (old & 1 == 0) {
                     self.launcher_active = false; self.context_menu_active = false;
                     let sidebar_width = (fb_width / 10).clamp(140, 220);
+                    
+                    if self.network_active {
+                        let w = fb_width; let h = fb_height;
+                        let right_area_w = w - sidebar_width;
+                        let p_w = 700; let p_h = 480;
+                        let px = sidebar_width + (right_area_w - p_w) / 2;
+                        let py = (h - p_h) / 2;
+                        let btn_w = 200; let btn_h = 30;
+                        let btn_x = px + p_w / 2 - btn_w / 2;
+                        let btn_y = py + p_h - btn_h - 20;
+                        if self.cursor_x >= btn_x && self.cursor_x <= btn_x + btn_w &&
+                           self.cursor_y >= btn_y && self.cursor_y <= btn_y + btn_h {
+                            self.renew_dhcp = true;
+                        }
+                    }
+                    
                     if self.cursor_x <= sidebar_width {
                         let icon_slot_h = fb_height / 5; // 5 icons
                         let slot_idx = self.cursor_y / icon_slot_h;

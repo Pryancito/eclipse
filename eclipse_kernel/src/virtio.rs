@@ -8,6 +8,7 @@ use spin::Mutex;
 use core::arch::asm;
 
 use crate::serial;
+use crate::net::NetworkDevice;
 use crate::storage::BlockDevice;
 use crate::boot::VIRTIO_DISPLAY_RESOURCE_ID;
 use alloc::vec::Vec;
@@ -939,7 +940,6 @@ pub struct VirtIONetDevice {
 }
 
 static BLOCK_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIOBlockDevice>>> = Mutex::new(alloc::vec::Vec::new());
-static NET_DEVICES: Mutex<alloc::vec::Vec<alloc::sync::Arc<VirtIONetDevice>>> = Mutex::new(alloc::vec::Vec::new());
 
 impl VirtIONetDevice {
     /// Create a new VirtIO network device from PCI BAR address
@@ -1137,19 +1137,25 @@ impl VirtIONetDevice {
 
         Some(dev)
     }
+}
 
-    pub fn get_mac_address(&self) -> [u8; 6] {
+impl crate::net::NetworkDevice for VirtIONetDevice {
+    fn get_mac_address(&self) -> [u8; 6] {
         self.inner.lock().mac_address
     }
 
-    pub fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
+    fn send_packet(&self, data: &[u8]) -> Result<(), &'static str> {
         let mut inner = self.inner.lock();
         unsafe { inner.send_packet(data) }
     }
 
-    pub fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize> {
+    fn receive_packet(&self, buffer: &mut [u8]) -> Option<usize> {
         let mut inner = self.inner.lock();
         unsafe { inner.receive_packet(buffer) }
+    }
+
+    fn name(&self) -> &'static str {
+        "VirtIO-Net"
     }
 }
 
@@ -3774,10 +3780,5 @@ pub fn gpu_flush_primary() {
             }
         }
     }
-}
-
-pub fn get_net_device(id: usize) -> Option<alloc::sync::Arc<VirtIONetDevice>> {
-    let devices = NET_DEVICES.lock();
-    devices.get(id).cloned()
 }
 

@@ -145,13 +145,19 @@ fn main() {
                     if msg.starts_with(b"GET_NET_EXT_STATS") {
                         let stats = NetExtendedStats {
                             lo_ipv4: [127, 0, 0, 1],
+                            lo_ipv4_prefix: 8,
                             lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                            lo_ipv6_prefix: 128,
                             lo_up: 1,
                             eth0_ipv4: [0; 4],
+                            eth0_ipv4_prefix: 0,
                             eth0_ipv6: [0; 16],
+                            eth0_ipv6_prefix: 0,
                             eth0_up: 0,
                             eth0_gateway: [0; 4],
+                            eth0_gateway_ipv6: [0; 16],
                             eth0_dns: [0; 4],
+                            eth0_dns_ipv6: [0; 16],
                             rx_bytes: 0,
                             tx_bytes: 0,
                         };
@@ -194,6 +200,22 @@ fn main() {
     let config = Config::new(device.mac.into());
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(get_now_ms() as i64));
     
+    // Add Link-Local IPv6 address
+    iface.update_ip_addrs(|addrs| {
+        let mut ll_bytes = [0u8; 16];
+        ll_bytes[0] = 0xfe;
+        ll_bytes[1] = 0x80;
+        let mac = device.mac.0;
+        ll_bytes[8] = mac[0] ^ 0x02;
+        ll_bytes[9] = mac[1];
+        ll_bytes[10] = mac[2];
+        ll_bytes[11] = 0xff;
+        ll_bytes[12] = 0xfe;
+        ll_bytes[13] = mac[3];
+        ll_bytes[14] = mac[4];
+        ll_bytes[15] = mac[5];
+        addrs.push(IpCidr::new(Ipv6Address::from_bytes(&ll_bytes).into(), 64)).ok();
+    });
     // Map kernel resource_id to smoltcp socket handles
     let mut kernel_sockets: BTreeMap<u64, smoltcp::iface::SocketHandle> = BTreeMap::new();
     let mut sockets = SocketSet::new(vec![]);
@@ -219,7 +241,11 @@ fn main() {
     }
     let mut current_dhcp_config: Option<DhcpInfo> = None;
 
-    println!("[NETWORK-SERVICE] TCP/IP stack initialized (lo: 127.0.0.1, eth0: DHCPv4)");
+    println!("[NETWORK-SERVICE] TCP/IP stack initialized:");
+    println!("  lo:   127.0.0.1, ::1");
+    if let Some(addr) = iface.ip_addrs().iter().find(|a| matches!(a.address(), IpAddress::Ipv6(_))) {
+        println!("  eth0: Link-Local IPv6: {}", addr.address());
+    }
 
     // 3. Main loop
     let mut ipc_buf = [0u8; 1024];
@@ -422,21 +448,33 @@ fn main() {
                         NetOp::GetExtendedStats => {
                             let mut stats = NetExtendedStats {
                                 lo_ipv4: [127, 0, 0, 1],
+                                lo_ipv4_prefix: 8,
                                 lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                                lo_ipv6_prefix: 128,
                                 lo_up: 1,
                                 eth0_ipv4: [0; 4],
+                                eth0_ipv4_prefix: 0,
                                 eth0_ipv6: [0; 16],
+                                eth0_ipv6_prefix: 0,
                                 eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
                                 eth0_gateway: [0; 4],
+                                eth0_gateway_ipv6: [0; 16],
                                 eth0_dns: [0; 4],
+                                eth0_dns_ipv6: [0; 16],
                                 rx_bytes: rx_total,
                                 tx_bytes: tx_total,
                             };
 
                             for addr in iface.ip_addrs() {
                                 match addr.address() {
-                                    IpAddress::Ipv4(a) => stats.eth0_ipv4 = a.0,
-                                    IpAddress::Ipv6(a) => stats.eth0_ipv6 = a.0,
+                                    IpAddress::Ipv4(a) => {
+                                        stats.eth0_ipv4 = a.0;
+                                        stats.eth0_ipv4_prefix = addr.prefix_len();
+                                    },
+                                    IpAddress::Ipv6(a) => {
+                                        stats.eth0_ipv6 = a.0;
+                                        stats.eth0_ipv6_prefix = addr.prefix_len();
+                                    },
                                 }
                             }
 
@@ -487,31 +525,40 @@ fn main() {
             let msg_data = &ipc_buf[..len];
             if msg_data.starts_with(b"GET_NET_EXT_STATS") {
                 let mut stats = NetExtendedStats {
-                        lo_ipv4: [127, 0, 0, 1],
-                        lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                        lo_up: 1,
-                        eth0_ipv4: [0; 4],
-                        eth0_ipv6: [0; 16],
-                        eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
-                        eth0_gateway: [0; 4],
-                        eth0_dns: [0; 4],
-                        rx_bytes: rx_total,
-                        tx_bytes: tx_total,
-                    };
-                    for addr in iface.ip_addrs() {
-                        match addr.address() {
-                            IpAddress::Ipv4(a) => stats.eth0_ipv4 = a.0,
-                            IpAddress::Ipv6(a) => stats.eth0_ipv6 = a.0,
-                        }
+                    lo_ipv4: [127, 0, 0, 1],
+                    lo_ipv4_prefix: 8,
+                    lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    lo_ipv6_prefix: 128,
+                    lo_up: 1,
+                    eth0_ipv4: [0; 4],
+                    eth0_ipv4_prefix: 0,
+                    eth0_ipv6: [0; 16],
+                    eth0_ipv6_prefix: 0,
+                    eth0_up: if !iface.ip_addrs().is_empty() { 1 } else { 0 },
+                    eth0_gateway: current_dhcp_config.map(|c| c.router.map(|r| r.0).unwrap_or([0; 4])).unwrap_or([0; 4]),
+                    eth0_gateway_ipv6: [0; 16],
+                    eth0_dns: current_dhcp_config.map(|c| c.dns_server.map(|s| s.0).unwrap_or([0; 4])).unwrap_or([0; 4]),
+                    eth0_dns_ipv6: [0; 16],
+                    rx_bytes: rx_total,
+                    tx_bytes: tx_total,
+                };
+                
+                for addr in iface.ip_addrs() {
+                    match addr.address() {
+                        IpAddress::Ipv4(a) => {
+                            stats.eth0_ipv4 = a.0;
+                            stats.eth0_ipv4_prefix = addr.prefix_len();
+                        },
+                        IpAddress::Ipv6(a) => {
+                            stats.eth0_ipv6 = a.0;
+                            stats.eth0_ipv6_prefix = addr.prefix_len();
+                        },
                     }
-                if let Some(config) = current_dhcp_config {
-                    stats.eth0_gateway = config.router.unwrap_or(Ipv4Address::UNSPECIFIED).0;
-                    if let Some(dns) = config.dns_server {
-                        stats.eth0_dns = dns.0;
-                    } else {
-                        stats.eth0_dns = [8, 8, 8, 8];
-                    }
-                } else if stats.eth0_dns == [0; 4] {
+                }
+
+                let stats_ptr = &stats as *const _ as *const u8;
+                let stats_size = core::mem::size_of::<NetExtendedStats>();
+                if stats.eth0_dns == [0; 4] {
                     stats.eth0_dns = [8, 8, 8, 8];
                 }
                     let mut resp = [0u8; 4 + core::mem::size_of::<NetExtendedStats>()];
@@ -531,6 +578,19 @@ fn main() {
                     let tx = tx_total;
                     resp[4..12].copy_from_slice(&rx.to_le_bytes());
                     resp[12..20].copy_from_slice(&tx.to_le_bytes());
+                    send_ipc(sender_pid, 0x08, &resp);
+                } else if msg_data.starts_with(b"RENEW_DHCP") {
+                    println!("[NETWORK-SERVICE] RENEW_DHCP requested by PID {}", sender_pid);
+                    let socket = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle);
+                    socket.reset();
+                    iface.update_ip_addrs(|addrs| {
+                        // Keep IPv6 Link-Local but clear IPv4
+                        addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
+                    });
+                    current_dhcp_config = None;
+                    
+                    let mut resp = [0u8; 4];
+                    resp.copy_from_slice(b"OK  ");
                     send_ipc(sender_pid, 0x08, &resp);
                 }
             }

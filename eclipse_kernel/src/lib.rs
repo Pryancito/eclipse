@@ -27,6 +27,8 @@ pub mod nvidia;
 pub mod virtio;
 pub mod e1000e;
 pub mod eth;
+pub mod net;
+pub mod e1000;
 
 pub mod filesystem;
 pub mod ata;
@@ -45,7 +47,6 @@ pub mod sw_cursor;   // Software cursor for real-hardware (non-VirtIO) EFI GOP f
 pub mod sync;        // Synchronization primitives
 mod memory_builtins;
 mod drm_scheme;
-pub mod net_ipc;
 
 // Re-exportar tipos importantes
 pub use ipc::{Message, MessageType, ServerId, ClientId};

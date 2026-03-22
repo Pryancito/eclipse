@@ -6,7 +6,7 @@ use crate::serial;
 use crate::scheduler::yield_cpu;
 use crate::scheme::{Scheme, Stat, error as scheme_error};
 use alloc::boxed::Box;
-use crate::net_ipc::*;
+use crate::net::*;
 
 /// Framebuffer information from bootloader
 #[repr(C)]
@@ -537,7 +537,7 @@ impl SocketScheme {
         
         let mut msg_data = [0u8; 512];
         let header = NetRequestHeader {
-            magic: *NET_MAGIC,
+            magic: NET_MAGIC,
             op,
             request_id,
             client_pid,
@@ -564,7 +564,7 @@ impl SocketScheme {
             if let Some(msg) = crate::ipc::receive_message(client_pid) {
                 if msg.msg_type == MessageType::Network && msg.data_size >= core::mem::size_of::<NetResponseHeader>() as u32 {
                     let resp = unsafe { &*(msg.data.as_ptr() as *const NetResponseHeader) };
-                    if resp.magic == *NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id {
+                    if resp.magic == NET_MAGIC && resp.op == NetOp::Response && resp.request_id == request_id {
                         return Ok((resp.status, Some(msg)));
                     }
                 }
@@ -588,7 +588,7 @@ impl SocketScheme {
         } else if domain == 2 {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Bind, id as u64, path.as_bytes())?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Bind, id as u64, path.as_bytes())?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -610,7 +610,7 @@ impl SocketScheme {
         } else if domain == 2 {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Listen, id as u64, &[])?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Listen, id as u64, &[])?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -653,7 +653,7 @@ impl SocketScheme {
         } else if domain == 2 {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Accept, id as u64, &[])?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Accept, id as u64, &[])?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -710,7 +710,7 @@ impl SocketScheme {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
                 // Parsing target IP/Port from path "IP:Port"
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Connect, id as u64, path.as_bytes())?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Connect, id as u64, path.as_bytes())?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -829,7 +829,7 @@ impl Scheme for SocketScheme {
         } else if domain == 2 {
             // AF_INET: delegate to network service
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Socket, 0, path.as_bytes())?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Socket, 0, path.as_bytes())?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -865,12 +865,12 @@ impl Scheme for SocketScheme {
         } else if domain == 2 {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, msg_opt) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Recv, id as u64, &[])?;
+                let (res, msg_opt) = self.send_request_and_wait(net_pid, crate::net::NetOp::Recv, id as u64, &[])?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
                 if let Some(msg) = msg_opt {
-                    let header_size = core::mem::size_of::<crate::net_ipc::NetResponseHeader>();
+                    let header_size = core::mem::size_of::<crate::net::NetResponseHeader>();
                     let data_start = &msg.data[header_size..];
                     let to_copy = core::cmp::min(buffer.len(), (msg.data_size as usize).saturating_sub(header_size));
                     buffer[..to_copy].copy_from_slice(&data_start[..to_copy]);
@@ -895,7 +895,7 @@ impl Scheme for SocketScheme {
         } else if domain == 2 {
             drop(st);
             if let Some(net_pid) = self.get_network_pid() {
-                let (res, _) = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Send, id as u64, buf)?;
+                let (res, _) = self.send_request_and_wait(net_pid, crate::net::NetOp::Send, id as u64, buf)?;
                 if res < 0 {
                     return Err((-res) as usize);
                 }
@@ -913,7 +913,7 @@ impl Scheme for SocketScheme {
             if domain == 2 {
                 drop(st);
                 if let Some(net_pid) = self.get_network_pid() {
-                    let _ = self.send_request_and_wait(net_pid, crate::net_ipc::NetOp::Close, id as u64, &[]);
+                    let _ = self.send_request_and_wait(net_pid, crate::net::NetOp::Close, id as u64, &[]);
                 }
                 let mut st = self.state.lock();
                 st.sockets.remove(&id);
