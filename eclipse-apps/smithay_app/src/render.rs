@@ -774,9 +774,16 @@ fn draw_network_interface_card(
     let title_style = MonoTextStyle::new(&FONT_10X20, color);
     let _ = Text::new(name, pos + Point::new(20, 30), title_style).draw(fb);
     
-    // Status indicator
-    let status_text = if is_up { "● ONLINE" } else { "○ OFFLINE" };
-    let _ = Text::new(status_text, pos + Point::new(w as i32 - 120, 30), title_style).draw(fb);
+    // Status indicator (draw circle + ASCII text to avoid ? from unsupported Unicode glyphs)
+    let dot_center = pos + Point::new(w as i32 - 115, 22);
+    let dot_style = if is_up {
+        PrimitiveStyleBuilder::new().fill_color(color).build()
+    } else {
+        PrimitiveStyleBuilder::new().stroke_color(color).stroke_width(2).build()
+    };
+    let _ = Circle::with_center(dot_center, 10).into_styled(dot_style).draw(fb);
+    let status_text = if is_up { "ONLINE" } else { "OFFLINE" };
+    let _ = Text::new(status_text, pos + Point::new(w as i32 - 102, 30), title_style).draw(fb);
     
     // IPs
     let info_style = MonoTextStyle::new(&FONT_6X12, colors::WHITE);
