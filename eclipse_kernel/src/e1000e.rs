@@ -64,7 +64,10 @@ const E1000E_DEVICE_IDS: &[u16] = &[
 // Register offsets (relative to BAR0 virtual base)
 // ───────────────────────────────────────────────────────────────────────────
 const REG_CTRL:     u32 = 0x0000_0;
+const REG_STATUS:   u32 = 0x0000_8; // Device status
 const REG_EERD:     u32 = 0x0001_4;
+const REG_CTRL_EXT: u32 = 0x0001_8; // Extended device control
+const REG_MDIC:     u32 = 0x0002_0; // MDI (PHY) control
 const REG_IMC:      u32 = 0x000D_8;
 const REG_RCTL:     u32 = 0x0010_0;
 const REG_TCTL:     u32 = 0x0040_0;
@@ -90,6 +93,31 @@ const CTRL_FD:   u32 = 1 << 0;  // Full-duplex
 const CTRL_ASDE: u32 = 1 << 5;  // Auto-speed detection enable
 const CTRL_SLU:  u32 = 1 << 6;  // Set link up
 const CTRL_RST:  u32 = 1 << 26; // Device reset
+
+// ───────────────────────────────────────────────────────────────────────────
+// STATUS register bits
+// ───────────────────────────────────────────────────────────────────────────
+const STATUS_LU: u32 = 1 << 1; // Link Up
+
+// ───────────────────────────────────────────────────────────────────────────
+// CTRL_EXT register bits
+// ───────────────────────────────────────────────────────────────────────────
+/// PHY Power-Down Enable — when set, the MAC holds the PHY in power-down.
+/// Must be CLEARED to allow the I219-V's internal PHY to power up.
+const CTRL_EXT_PHYPDEN: u32 = 1 << 30;
+
+// ───────────────────────────────────────────────────────────────────────────
+// MDIC (MDI Control) register fields — used to access the PHY via MII
+// ───────────────────────────────────────────────────────────────────────────
+const MDIC_PHY1:     u32 = 1 << 21; // PHY address = 1 (I217/I218/I219 internal PHY)
+const MDIC_OP_WRITE: u32 = 1 << 26; // Opcode 01 = write
+const MDIC_OP_READ:  u32 = 1 << 27; // Opcode 10 = read
+const MDIC_READY:    u32 = 1 << 28; // Transaction complete
+const MDIC_ERROR:    u32 = 1 << 30; // Error flag
+
+// MII/MDIO register index 0 = Basic Mode Control Register (BMCR)
+const PHY_REG_BMCR:    u32 = 0;
+const BMCR_POWER_DOWN: u16 = 1 << 11; // PHY power-down bit in BMCR
 
 // ───────────────────────────────────────────────────────────────────────────
 // RCTL register bits
@@ -225,6 +253,39 @@ impl E1000EInner {
         None
     }
 
+    /// Read a PHY register via the MDI Control (MDIC) interface.
+    ///
+    /// The I217/I218/I219 family exposes its integrated PHY at address 1 via
+    /// the standard IEEE 802.3 Clause-22 MII management frame format.
+    /// Returns `None` on timeout or MDIC error.
+    fn mdic_read(&self, phy_reg: u32) -> Option<u16> {
+        self.write32(REG_MDIC,
+            MDIC_PHY1 | ((phy_reg & 0x1F) << 16) | MDIC_OP_READ);
+        for _ in 0..100_000 {
+            let v = self.read32(REG_MDIC);
+            if v & MDIC_READY != 0 {
+                return if v & MDIC_ERROR != 0 { None } else { Some((v & 0xFFFF) as u16) };
+            }
+            for _ in 0..100 { core::hint::spin_loop(); }
+        }
+        None // timeout
+    }
+
+    /// Write a PHY register via the MDI Control (MDIC) interface.
+    /// Returns `true` on success, `false` on timeout or error.
+    fn mdic_write(&self, phy_reg: u32, data: u16) -> bool {
+        self.write32(REG_MDIC,
+            MDIC_PHY1 | ((phy_reg & 0x1F) << 16) | MDIC_OP_WRITE | (data as u32));
+        for _ in 0..100_000 {
+            let v = self.read32(REG_MDIC);
+            if v & MDIC_READY != 0 {
+                return v & MDIC_ERROR == 0;
+            }
+            for _ in 0..100 { core::hint::spin_loop(); }
+        }
+        false // timeout
+    }
+
     /// Full hardware initialisation.  Returns `true` on success.
     unsafe fn init(&mut self) -> bool {
         // 1. Disable all interrupt sources
@@ -248,6 +309,37 @@ impl E1000EInner {
 
         // 3. Disable interrupts again (reset re-enables them)
         self.write32(REG_IMC, 0xFFFF_FFFF);
+
+        // 3a. PCH / I219-V PHY power-up sequence.
+        //     UEFI firmware may leave CTRL_EXT.PHYPDEN set (bit 30), which
+        //     forces the integrated PHY into power-down and prevents link.
+        //     Clear it unconditionally so the PHY can auto-negotiate.
+        let ctrl_ext = self.read32(REG_CTRL_EXT);
+        if ctrl_ext & CTRL_EXT_PHYPDEN != 0 {
+            serial::serial_print("[e1000e] CTRL_EXT.PHYPDEN was set — powering up PHY\n");
+            self.write32(REG_CTRL_EXT, ctrl_ext & !CTRL_EXT_PHYPDEN);
+            // Allow the PHY a moment to wake from power-down (~500 µs on a
+            // 3 GHz CPU where PAUSE ≈ 10 ns → 50 000 × 10 ns = 500 µs).
+            for _ in 0..50_000 { core::hint::spin_loop(); }
+        } else {
+            // Always clear the bit on PCH-family (harmless if already clear)
+            self.write32(REG_CTRL_EXT, ctrl_ext & !CTRL_EXT_PHYPDEN);
+        }
+
+        // 3b. Check and clear the Power-Down bit in the PHY's BMCR register
+        //     (MII register 0) via the MDIC interface.  Some firmware leaves
+        //     the I219-V PHY in power-down mode after the OS hand-off.
+        if let Some(bmcr) = self.mdic_read(PHY_REG_BMCR) {
+            if bmcr & BMCR_POWER_DOWN != 0 {
+                serial::serial_print("[e1000e] PHY BMCR power-down bit set — clearing\n");
+                self.mdic_write(PHY_REG_BMCR, bmcr & !BMCR_POWER_DOWN);
+                // Give the PHY ~500 µs to exit power-down before configuring
+                // the MAC rings (50 000 × PAUSE ≈ 500 µs @ 3 GHz).
+                for _ in 0..50_000 { core::hint::spin_loop(); }
+            }
+        } else {
+            serial::serial_print("[e1000e] WARN: MDIC read of PHY BMCR timed out\n");
+        }
 
         // 4. Read MAC address.
         //    BIOS/UEFI firmware typically programs RAR[0]; if it looks valid
@@ -378,6 +470,15 @@ impl E1000EInner {
             | (1u32 << 31); // AV (Address Valid) bit
         self.write32(REG_RAL0, ral);
         self.write32(REG_RAH0, rah);
+
+        // 10. Log current link state (non-blocking; the PHY may still be
+        //     auto-negotiating — the network service will retransmit DHCP
+        //     until a lease is obtained).
+        if self.read32(REG_STATUS) & STATUS_LU != 0 {
+            serial::serial_print("[e1000e] Link UP\n");
+        } else {
+            serial::serial_print("[e1000e] Link not yet up (PHY may still be negotiating)\n");
+        }
 
         true
     }
