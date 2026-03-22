@@ -68,6 +68,7 @@ const REG_STATUS:   u32 = 0x0000_8; // Device status
 const REG_EERD:     u32 = 0x0001_4;
 const REG_CTRL_EXT: u32 = 0x0001_8; // Extended device control
 const REG_MDIC:     u32 = 0x0002_0; // MDI (PHY) control
+const REG_ICR:      u32 = 0x000C_0; // Interrupt Cause Read (auto-cleared on read)
 const REG_IMC:      u32 = 0x000D_8;
 const REG_RCTL:     u32 = 0x0010_0;
 const REG_TCTL:     u32 = 0x0040_0;
@@ -310,8 +311,14 @@ impl E1000EInner {
 
     /// Full hardware initialisation.  Returns `true` on success.
     unsafe fn init(&mut self) -> bool {
-        // 1. Disable all interrupt sources
+        // 1. Disable all interrupt sources; then read ICR to clear any
+        //    pending interrupt causes left by UEFI or a previous driver
+        //    instance.  On real hardware (I217/I218/I219) the ME firmware
+        //    can leave stale pending-interrupt state in ICR even after the
+        //    device reset below, and those stale flags can interfere with
+        //    the receive path.  Reading ICR auto-clears it.
         self.write32(REG_IMC, 0xFFFF_FFFF);
+        let _ = self.read32(REG_ICR); // clear any pending causes
 
         // 2. Issue a device reset and wait for it to clear
         let ctrl = self.read32(REG_CTRL);
@@ -329,8 +336,9 @@ impl E1000EInner {
             }
         }
 
-        // 3. Disable interrupts again (reset re-enables them)
+        // 3. Disable interrupts again (reset re-enables them) and clear ICR
         self.write32(REG_IMC, 0xFFFF_FFFF);
+        let _ = self.read32(REG_ICR); // clear any causes asserted during reset
 
         // 3a. PCH / I219-V PHY power-up sequence.
         //     UEFI firmware may leave CTRL_EXT.PHYPDEN set (bit 30), which
@@ -353,9 +361,17 @@ impl E1000EInner {
         //     Setting CTRL_EXT.DRV_LOAD (bit 28) prevents the ME from
         //     intercepting or re-directing received traffic, which on
         //     I217/I218/I219 controllers can silently block DHCP replies.
+        //
+        //     After setting DRV_LOAD we wait ~1 ms to give the ME firmware
+        //     time to complete the handoff before we continue.  Without
+        //     this delay, on some real I219-V systems the ME may still
+        //     intercept the very first received frames (including DHCP
+        //     OFFERs) even though DRV_LOAD has been written.
         {
             let ctrl_ext2 = self.read32(REG_CTRL_EXT);
             self.write32(REG_CTRL_EXT, ctrl_ext2 | CTRL_EXT_DRV_LOAD);
+            // ~1 ms ME-handoff settling time (100_000 × PAUSE ≈ 1 ms @ 3 GHz)
+            for _ in 0..100_000 { core::hint::spin_loop(); }
         }
 
         // 3c. Check and clear the Power-Down bit in the PHY's BMCR register
@@ -400,8 +416,17 @@ impl E1000EInner {
             }
         }
 
-        // 5. General device configuration: auto-speed, full-duplex, link up
-        self.write32(REG_CTRL, CTRL_SLU | CTRL_ASDE | CTRL_FD);
+        // 5. General device configuration: set SLU (Set Link Up) and ASDE
+        //    (Auto-Speed Detection).  Use a read-modify-write so that
+        //    NVM-auto-loaded fields (e.g. GIO-master-disable, reserved bits)
+        //    are preserved.  CTRL.RST must already be 0 here (we polled
+        //    above).  CTRL.FD is ignored when ASDE=1 (speed/duplex come
+        //    from PHY auto-negotiation), but we set it anyway so the MAC
+        //    defaults to full-duplex if ASDE is ever cleared.
+        {
+            let ctrl = self.read32(REG_CTRL);
+            self.write32(REG_CTRL, ctrl | CTRL_SLU | CTRL_ASDE | CTRL_FD);
+        }
 
         // 6. Zero the Multicast Table Array (MTA) — 128 × 32-bit entries
         for i in 0..128u32 {
@@ -541,15 +566,15 @@ impl E1000EInner {
         }
         if link_up {
             serial::serial_print("[e1000e] Link UP\n");
-            // PHY settling delay (~2 ms at 3 GHz): after STATUS_LU asserts, the
-            // I219-V PHY can still be completing its auto-negotiation state
-            // transitions.  The 50 000 PAUSE iterations below correspond to
-            // roughly 1.7–5 ms depending on CPU speed (each PAUSE is ~35–100 ns
-            // on modern Intel cores).  This prevents the very first received
-            // frames from arriving with transient error bits that would cause
-            // early DHCP OFFERs to be silently discarded.  A timer-based sleep
-            // is not available here because the scheduler is not yet running.
-            for _ in 0..50_000u32 { core::hint::spin_loop(); }
+            // PHY settling delay after STATUS_LU asserts: the I219-V PHY
+            // can still be completing auto-negotiation state transitions.
+            // A longer delay (≈ 5 ms @ 3 GHz) prevents transient receive
+            // errors in the very first frames from causing early DHCP
+            // OFFERs to be silently discarded, and also gives the Intel ME
+            // additional time to complete its DHCP traffic hand-off after
+            // the DRV_LOAD signal set above.
+            // 500_000 × PAUSE ≈ 5 ms at 3 GHz (PAUSE ≈ 10 ns).
+            for _ in 0..500_000u32 { core::hint::spin_loop(); }
         } else {
             serial::serial_print("[e1000e] Link not yet up after timeout (proceeding anyway)\n");
         }
@@ -609,16 +634,31 @@ impl E1000EInner {
 
         let buf_phys = self.rx_bufs[slot].1;
 
-        // Discard partial (multi-descriptor) frames.  With PACKET_BUF_SIZE = 2 KiB
-        // and MTU = 1514 bytes every frame must fit in exactly one descriptor, so
-        // EOP must always be set.  If EOP is missing the hardware is in an
-        // unexpected state; return the slot to hardware and skip it.
+        // EOP (End of Packet) check.  With PACKET_BUF_SIZE = 2 KiB and
+        // standard MTU = 1514 bytes every frame must fit in exactly one
+        // descriptor, so EOP should always be set by hardware.
+        //
+        // However, several I217/I218/I219-V hardware revisions have an errata
+        // where EOP is not set on valid, single-descriptor frames.  To avoid
+        // silently dropping legitimate DHCP OFFERs on affected silicon, we
+        // treat a descriptor with EOP=0 as complete when the written length
+        // is ≤ PACKET_BUF_SIZE (i.e. the frame genuinely fits in one buffer
+        // and no continuation descriptor is needed).  If the length were
+        // exactly PACKET_BUF_SIZE it *could* be a truncated multi-descriptor
+        // frame, so those are still discarded.
         if status & RXD_STA_EOP == 0 {
-            write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
-            write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
-            self.write32(REG_RDT, slot as u32);
-            self.rx_tail = (slot + 1) % RX_RING_SIZE;
-            return None;
+            let frame_len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
+            if frame_len >= PACKET_BUF_SIZE {
+                // Genuine first-segment of a multi-descriptor (jumbo) frame:
+                // discard and return the slot to hardware.
+                write_volatile(core::ptr::addr_of_mut!((*desc).status), 0);
+                write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
+                self.write32(REG_RDT, slot as u32);
+                self.rx_tail = (slot + 1) % RX_RING_SIZE;
+                return None;
+            }
+            // EOP=0 but frame fits in one buffer: hardware errata, fall through
+            // and process the frame as if EOP were set.
         }
 
         // Only discard frames with fatal receive errors (CRC, symbol, or DMA
