@@ -394,7 +394,7 @@ fn main() {
     // Track the previous link state so we can detect UP transitions and
     // immediately trigger a DHCP re-discovery instead of waiting for smoltcp's
     // exponential backoff timer.
-    let mut prev_link_up = false;
+    let mut prev_link_up = device.get_link_status();
 
     loop {
         // Ejecutar la tarea de red (poll + eventos DHCP)

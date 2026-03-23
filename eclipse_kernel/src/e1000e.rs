@@ -1380,18 +1380,6 @@ impl E1000EInner {
             return None; // Hardware has not written a frame here yet
         }
 
-        // Debug: Log packet reception (first few bytes to identify type)
-        let frame_len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
-        let buf_virt = self.rx_bufs[slot].0 as *const u8;
-        serial::serial_print("[e1000e] RX packet length=");
-        serial::serial_print_dec(frame_len as u64);
-        serial::serial_print(" Type=");
-        unsafe {
-            let eth_type = u16::from_be(core::ptr::read_unaligned(buf_virt.add(12) as *const u16));
-            serial::serial_print_hex(eth_type as u64);
-        }
-        serial::serial_print("\n");
-
         // Hardware memory fence to ensure that the CPU reads the packet data
         // from RAM after the hardware has finished its DMA write.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
