@@ -247,9 +247,7 @@ fn main_loop() -> ! {
             wall_clock_ms: 0,
         };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
-                let now = stats.uptime_ticks;
-                
-                let mut svc = SERVICES.lock();
+                let now = stats.wall_clock_ms;
                 for i in 0..svc.len() {
                     let service = &mut svc[i];
                     if service.state == ServiceState::Running && service.pid > 0 && service.watchdog_enabled {
@@ -320,7 +318,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
             wall_clock_ms: 0,
         };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
-                service.last_heartbeat = stats.uptime_ticks;
+                service.last_heartbeat = stats.wall_clock_ms;
                 matched = true;
                 break;
             }
@@ -457,7 +455,7 @@ fn check_services() {
             wall_clock_ms: 0,
         };
         unsafe { eclipse_libc::get_system_stats(&mut stats); }
-        let now = stats.uptime_ticks;
+        let now = stats.wall_clock_ms;
 
         for (i, service) in svc.iter().enumerate() {
             // Stable uptime reset: if a service has been running for > 60s, reset its restart count
