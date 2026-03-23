@@ -35,6 +35,12 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    /// True wall-clock milliseconds since boot (BSP APIC timer only).
+    /// Unlike `uptime_ticks` (which accumulates once per CPU per tick on SMP
+    /// systems and therefore grows N× faster than real time on an N-core
+    /// machine), this field always advances at 1 ms per real millisecond and
+    /// is safe to use as a monotonic clock for protocol stacks like smoltcp.
+    pub wall_clock_ms: u64,
 }
 
 #[repr(C)]

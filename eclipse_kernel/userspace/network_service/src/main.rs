@@ -144,10 +144,13 @@ impl phy::TxToken for TxToken {
 
 /// Obtiene los milisegundos desde el arranque del sistema.
 /// CRÍTICO: smoltcp depende de esto para saber cuándo reintentar DHCP (exponential backoff).
+/// Usa `wall_clock_ms` (contador BSP-only, 1 tick = 1 ms real) en lugar de `uptime_ticks`
+/// (que se incrementa en CADA CPU y avanza N veces más rápido que el tiempo real en sistemas
+/// multi-core, corrompiendo los temporizadores internos de smoltcp).
 fn get_now_ms() -> u64 {
     let mut stats = SystemStats::default();
     if unsafe { get_system_stats(&mut stats) } >= 0 {
-        stats.uptime_ticks
+        stats.wall_clock_ms
     } else {
         0
     }

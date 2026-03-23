@@ -136,6 +136,12 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    /// True wall-clock milliseconds since boot (BSP APIC timer only).
+    /// Unlike `uptime_ticks` (incremented once per CPU per tick on SMP systems,
+    /// growing N× faster than real time on N cores), this field always advances
+    /// at exactly 1 ms per real millisecond and is safe to use as a monotonic
+    /// clock source for protocol stacks (e.g. smoltcp DHCP backoff timers).
+    pub wall_clock_ms: u64,
 }
 
 #[repr(C)]
@@ -392,6 +398,7 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
         gpu_vram_used_bytes: vitals.gpu_vram_used_bytes,
         anomaly_count: vitals.anomaly_count,
         heap_fragmentation: vitals.heap_fragmentation,
+        wall_clock_ms: crate::interrupts::ticks(),
     };
 
     unsafe {

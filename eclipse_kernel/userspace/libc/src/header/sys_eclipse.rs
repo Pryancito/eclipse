@@ -17,6 +17,11 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    /// True wall-clock milliseconds since boot (BSP APIC timer only).
+    /// Unlike `uptime_ticks`, this always advances at exactly 1 ms per real
+    /// millisecond regardless of CPU count, making it suitable for protocol
+    /// stacks (e.g. smoltcp DHCP backoff) and real-time uptime display.
+    pub wall_clock_ms: u64,
 }
 
 #[no_mangle]

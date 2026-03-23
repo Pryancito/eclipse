@@ -66,6 +66,7 @@ fn main() {
         gpu_vram_used_bytes: 0,
         anomaly_count: 0,
         heap_fragmentation: 0,
+        wall_clock_ms: 0,
     };
 
     loop {
