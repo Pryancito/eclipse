@@ -91,7 +91,6 @@ impl phy::Device for RawEthernetDevice {
         let len = eclipse_read(self.fd as u32, &mut buffer);
         if len > 0 {
             self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-            println!("[NETWORK-SERVICE] eth:0 received packet: {} bytes", len);
             let mut data = vec![0u8; len as usize];
             data.copy_from_slice(&buffer[..len as usize]);
             Some((RxToken { data }, TxToken { fd: self.fd, tx_bytes: self.tx_bytes.clone() }))
@@ -137,7 +136,6 @@ impl phy::TxToken for TxToken {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        println!("[NETWORK-SERVICE] eth:0 sending packet: {} bytes", len);
         eclipse_write(self.fd as u32, &buffer);
         self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
         result
@@ -393,8 +391,10 @@ fn main() {
     let mut dhcp_deconfigured_since: Option<u64> = Some(get_now_ms());
     // Track the previous link state so we can detect UP transitions and
     // immediately trigger a DHCP re-discovery instead of waiting for smoltcp's
-    // exponential backoff timer.
-    let mut prev_link_up = false;
+    // exponential backoff timer.  Initialise from the actual current link state
+    // to avoid a spurious "DOWN→UP" detection (and DHCP socket reset) on the
+    // very first poll when the physical link is already up at service start.
+    let mut prev_link_up = device.get_link_status();
 
     loop {
         // Ejecutar la tarea de red (poll + eventos DHCP)
