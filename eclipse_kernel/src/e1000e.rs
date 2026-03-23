@@ -180,6 +180,8 @@ const REG_SWSM:      u32 = 0x05B50; // Software Semaphore
 const SWSM_SMBI:     u32 = 1 << 0;  // Semaphore Bit
 const SWSM_SWESMBI:  u32 = 1 << 1;  // Software EEPROM Semaphore Bit
 
+const REG_MANC:      u32 = 0x05820; // Management Control
+
 // ───────────────────────────────────────────────────────────────────────────
 // CTRL register bits
 // ───────────────────────────────────────────────────────────────────────────
@@ -1037,6 +1039,19 @@ impl E1000EInner {
             self.write32(REG_CTRL, ctrl);
         }
 
+        // 5b. Disable Intel Management Engine (ME) filters.
+        //     The MANC (Management Control) register controls filtering logic that
+        //     can intercept DHCP (UDP 68), ARP, and Neighbor Discovery traffic
+        //     even when DRV_LOAD is set. Disabling these filters ensures all
+        //     traffic reaches the host OS.
+        if self.is_pch() {
+            let manc = self.read32(REG_MANC);
+            // Bits 13, 14, 15: ARP, DHCP, and Neighbor Discovery filtering
+            // Bits 20, 21: IPv4 and IPv6 filtering redirection
+            self.write32(REG_MANC, manc & !((1 << 13) | (1 << 14) | (1 << 15) | (1 << 20) | (1 << 21)));
+            serial::serial_print("[e1000e] MANC filters disabled (Intel ME bypass)\n");
+        }
+
         // 5a. Disable Energy Efficient Ethernet (EEE) on PCH-family NICs.
         //     EEE can cause link drops and latency issues that break DHCP on
         //     certain I219-V hardware revisions.
@@ -1106,13 +1121,18 @@ impl E1000EInner {
         // prevents the hardware from reporting those checksum results.
         self.write32(REG_RXCSUM, 0);
 
-        // 7b. I219-V Quirk: Force Legacy descriptors by clearing RFCTL.EXTEN (bit 15).
+        // 7b. I219-V Quirk: Force Legacy descriptors and disable advanced offloads.
         //     UEFI/UEFI-PXE firmware often leaves the NIC in "Extended Descriptor"
         //     mode (32 bytes). Resetting the MAC (CTRL_RST) does not always clear this.
-        //     Forcing RFCTL=0 ensures the NIC expects our 16-byte RxDesc structs.
+        //     Forcing legacy mode ensures the NIC expects our 16-byte RxDesc structs.
+        //     We also clear IPv6 and NFS offload bits that can interfere with receive.
         if self.is_pch() {
-            serial::serial_print("[e1000e] Forcing Legacy descriptors (RFCTL=0)\n");
-            self.write32(REG_RFCTL, 0);
+            let rfctl = self.read32(REG_RFCTL);
+            // Bit 15: Extended descriptors
+            // Bit 14: IPv6 Xsum offload
+            // Bits 13-12: NFS write/read filtering
+            self.write32(REG_RFCTL, rfctl & !((1 << 15) | (1 << 14) | (1 << 13) | (1 << 12)));
+            serial::serial_print("[e1000e] Forcing Legacy descriptors (RFCTL logic adjusted)\n");
         }
 
         // Enable RX: unicast+broadcast+multicast accept, strip CRC, 2 KiB buffers.
@@ -1303,12 +1323,21 @@ impl E1000EInner {
         let buf_phys = self.tx_bufs[slot].1;
         core::ptr::copy_nonoverlapping(data.as_ptr(), buf_virt, data.len());
 
+        // PARCHE: Manual padding to 60 bytes (Ethernet minimum without FCS)
+        // Some I219-V revisions silenty fail to transmit DHCP discovers if they
+        // are shorter than 60 bytes, even when TCTL.PSP is set.
+        let mut frame_len = data.len();
+        if frame_len < 60 {
+            core::ptr::write_bytes(buf_virt.add(frame_len), 0, 60 - frame_len);
+            frame_len = 60;
+        }
+
         // Flush the packet data to physical RAM
-        self.flush_cache_range(buf_virt as u64, data.len());
+        self.flush_cache_range(buf_virt as u64, frame_len);
 
         // Fill the descriptor
         write_volatile(core::ptr::addr_of_mut!((*desc).buffer_addr), buf_phys);
-        write_volatile(core::ptr::addr_of_mut!((*desc).length), data.len() as u16);
+        write_volatile(core::ptr::addr_of_mut!((*desc).length), frame_len as u16);
         write_volatile(core::ptr::addr_of_mut!((*desc).cso), 0);
         write_volatile(
             core::ptr::addr_of_mut!((*desc).cmd),
