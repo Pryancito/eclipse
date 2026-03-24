@@ -659,6 +659,39 @@ impl SmithayState {
                         let _ = unsafe { eclipse_send(pid as u32, 0x08, b"GET_NET_EXT_STATS".as_ptr() as *const core::ffi::c_void, 17, 0) };
                     }
 
+                    if self.input.apply_static_config {
+                        self.input.apply_static_config = false;
+                        let mut msg = [0u8; 512];
+                        let header = eclipse_ipc::types::NetRequestHeader {
+                            magic: *eclipse_ipc::types::TAG_NETW,
+                            op: eclipse_ipc::types::NetOp::SetStaticConfig,
+                            request_id: 0,
+                            client_pid: pid as u32, // self pid or similar
+                            resource_id: 0,
+                        };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(&header as *const _ as *const u8, msg.as_mut_ptr(), core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>());
+                            let config_bytes = core::slice::from_raw_parts(&self.input.static_config as *const _ as *const u8, core::mem::size_of::<eclipse_ipc::types::NetStaticConfig>());
+                            core::ptr::copy_nonoverlapping(config_bytes.as_ptr(), msg.as_mut_ptr().add(core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>()), config_bytes.len());
+                            let total_len = core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>() + config_bytes.len();
+                            let _ = eclipse_send(pid as u32, 0x08, msg.as_ptr() as *const core::ffi::c_void, total_len, 0);
+                        }
+                    }
+
+                    if self.input.renew_dhcp {
+                        self.input.renew_dhcp = false;
+                        let header = eclipse_ipc::types::NetRequestHeader {
+                            magic: *eclipse_ipc::types::TAG_NETW,
+                            op: eclipse_ipc::types::NetOp::SetDhcpConfig,
+                            request_id: 0,
+                            client_pid: pid as u32,
+                            resource_id: 0,
+                        };
+                        unsafe {
+                            let _ = eclipse_send(pid as u32, 0x08, &header as *const _ as *const core::ffi::c_void, core::mem::size_of::<eclipse_ipc::types::NetRequestHeader>(), 0);
+                        }
+                    }
+
                     self.prev_net_rx = self.net_rx;
                     self.prev_net_tx = self.net_tx;
                 }
@@ -1079,6 +1112,7 @@ impl SmithayState {
                     &mut self.backend.fb,
                     self.counter,
                     self.net_extended_stats.as_ref(),
+                    &self.input,
                 );
             }
 

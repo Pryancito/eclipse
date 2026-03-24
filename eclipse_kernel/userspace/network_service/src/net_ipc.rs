@@ -16,7 +16,22 @@ pub enum NetOp {
     Ioctl = 8,
     Resolve = 9,
     GetExtendedStats = 10,
+    SetStaticConfig = 11,
+    SetDhcpConfig = 12,
     Response = 255,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetStaticConfig {
+    pub ipv4: [u8; 4],
+    pub ipv4_prefix: u8,
+    pub ipv6: [u8; 16],
+    pub ipv6_prefix: u8,
+    pub gateway_v4: [u8; 4],
+    pub gateway_v6: [u8; 16],
+    pub dns_v4: [u8; 4],
+    pub dns_v6: [u8; 16],
 }
 
 #[repr(C)]

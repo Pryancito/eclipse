@@ -138,8 +138,22 @@ impl phy::TxToken for TxToken {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
         println!("[NETWORK-SERVICE] eth:0 sending packet: {} bytes", len);
-        eclipse_write(self.fd as u32, &buffer);
-        self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        let written = eclipse_write(self.fd as u32, &buffer);
+        if written < 0 {
+            println!(
+                "[NETWORK-SERVICE] ERROR: eth:0 write failed while sending packet (len={})",
+                len
+            );
+        } else if written as usize != len {
+            println!(
+                "[NETWORK-SERVICE] WARN: eth:0 partial write (sent={} expected={})",
+                written,
+                len
+            );
+            self.tx_bytes.fetch_add(written as u64, Ordering::Relaxed);
+        } else {
+            self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        }
         result
     }
 }
@@ -170,6 +184,7 @@ fn network_task(
     current_dhcp_config: &mut Option<DhcpInfo>,
     dhcp_deconfigured_since: &mut Option<u64>,
     prev_link_up: &mut bool,
+    use_dhcp: bool,
 ) {
     // 1. Obtener tiempo monotónico del sistema (CRÍTICO para reintentos DHCP)
     let uptime_ms = get_now_ms();
@@ -185,83 +200,147 @@ fn network_task(
     // (smoltcp podría estar en backoff largo de intentos anteriores)
     if link_up && !*prev_link_up {
         println!("[NETWORK-SERVICE] Physical Link UP detected on eth0");
-        println!("[NETWORK-SERVICE]   Forcing DHCP reset for immediate discovery");
-        sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
-        *current_dhcp_config = None;
-        *dhcp_deconfigured_since = Some(uptime_ms);
-        iface.update_ip_addrs(|addrs| {
-            addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
-        });
-        iface.routes_mut().remove_default_ipv4_route();
+        if use_dhcp {
+            println!("[NETWORK-SERVICE]   Forcing DHCP reset for immediate discovery");
+            sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+            *current_dhcp_config = None;
+            *dhcp_deconfigured_since = Some(uptime_ms);
+            iface.update_ip_addrs(|addrs| {
+                addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
+            });
+            iface.routes_mut().remove_default_ipv4_route();
+        }
     }
     *prev_link_up = link_up;
 
     // 4. Procesar eventos DHCP de smoltcp
-    let event = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).poll();
-    match event {
-        None => {}
-        Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
-            *current_dhcp_config = Some(DhcpInfo {
-                address: config.address,
-                router: config.router,
-                dns_server: config.dns_servers.first().copied(),
-            });
-            *dhcp_deconfigured_since = None;
-            let info = current_dhcp_config.as_ref().unwrap();
-            println!("[NETWORK-SERVICE] eth0 configured via DHCPv4:");
-            println!("  IP address:      {}", info.address);
-            if let Some(router) = info.router {
-                println!("  Default gateway: {}", router);
-                if iface.routes_mut().add_default_ipv4_route(router).is_err() {
-                    println!("[NETWORK-SERVICE] WARN: routing table full, default route not set");
-                }
-            }
-            if let Some(dns_server) = info.dns_server {
-                println!("  DNS server:      {}", dns_server);
-            }
-            iface.update_ip_addrs(|addrs| {
-                let mut i = 0;
-                while i < addrs.len() {
-                    if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
-                        addrs.remove(i);
-                    } else {
-                        i += 1;
+    if use_dhcp {
+        let event = sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).poll();
+        match event {
+            None => {}
+            Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
+                *current_dhcp_config = Some(DhcpInfo {
+                    address: config.address,
+                    router: config.router,
+                    dns_server: config.dns_servers.first().copied(),
+                });
+                *dhcp_deconfigured_since = None;
+                let info = current_dhcp_config.as_ref().unwrap();
+                println!("[NETWORK-SERVICE] eth0 configured via DHCPv4:");
+                println!("  IP address:      {}", info.address);
+                if let Some(router) = info.router {
+                    println!("  Default gateway: {}", router);
+                    if iface.routes_mut().add_default_ipv4_route(router).is_err() {
+                        println!("[NETWORK-SERVICE] WARN: routing table full, default route not set");
                     }
                 }
-                if addrs.push(IpCidr::Ipv4(info.address)).is_err() {
-                    println!("[NETWORK-SERVICE] ERROR: addr list full, DHCP IP not applied");
+                if let Some(dns_server) = info.dns_server {
+                    println!("  DNS server:      {}", dns_server);
                 }
-            });
-        }
-        Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
-            *current_dhcp_config = None;
-            if dhcp_deconfigured_since.is_none() {
-                *dhcp_deconfigured_since = Some(uptime_ms);
-            }
-            println!("[NETWORK-SERVICE] eth0 DHCP deconfigured (lease expired or no response)");
-            iface.routes_mut().remove_default_ipv4_route();
-            iface.update_ip_addrs(|addrs| {
-                let mut i = 0;
-                while i < addrs.len() {
-                    if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
-                        addrs.remove(i);
-                    } else {
-                        i += 1;
+                iface.update_ip_addrs(|addrs| {
+                    let mut i = 0;
+                    while i < addrs.len() {
+                        if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
+                            addrs.remove(i);
+                        } else {
+                            i += 1;
+                        }
                     }
+                    if addrs.push(IpCidr::Ipv4(info.address)).is_err() {
+                        println!("[NETWORK-SERVICE] ERROR: addr list full, DHCP IP not applied");
+                    }
+                });
+            }
+            Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
+                *current_dhcp_config = None;
+                if dhcp_deconfigured_since.is_none() {
+                    *dhcp_deconfigured_since = Some(uptime_ms);
                 }
-            });
+                println!("[NETWORK-SERVICE] eth0 DHCP deconfigured (lease expired or no response)");
+                iface.routes_mut().remove_default_ipv4_route();
+                iface.update_ip_addrs(|addrs| {
+                    let mut i = 0;
+                    while i < addrs.len() {
+                        if matches!(addrs[i].address(), IpAddress::Ipv4(_)) {
+                            addrs.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                });
+            }
         }
     }
 
     // 5. DHCP Watchdog: si link UP y sin IPv4 > 12s, forzar reset
-    // (maneja STP "Learning" donde el switch tira los primeros DISCOVERs)
-    if let Some(since) = dhcp_deconfigured_since {
-        if link_up && uptime_ms - *since > 12000 {
-            println!("[NETWORK-SERVICE] DHCP Watchdog: No IPv4 for 12s on active link. Forcing DHCP reset...");
-            sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
-            *dhcp_deconfigured_since = Some(uptime_ms);
+    if use_dhcp {
+        if let Some(since) = dhcp_deconfigured_since {
+            if link_up && uptime_ms - *since > 12000 {
+                println!("[NETWORK-SERVICE] DHCP Watchdog: No IPv4 for 12s on active link. Forcing DHCP reset...");
+                sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+                *dhcp_deconfigured_since = Some(uptime_ms);
+            }
         }
     }
+}
+
+fn get_extended_stats(
+    iface: &Interface,
+    sockets: &SocketSet,
+    dns_handle: smoltcp::iface::SocketHandle,
+    rx_total: u64,
+    tx_total: u64,
+    link_up: bool,
+    static_dns_v4: Option<[u8; 4]>,
+    static_gateway_v4: Option<[u8; 4]>,
+) -> NetExtendedStats {
+    let mut stats = NetExtendedStats {
+        lo_ipv4: [127, 0, 0, 1],
+        lo_ipv4_prefix: 8,
+        lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        lo_ipv6_prefix: 128,
+        lo_up: 1,
+        eth0_ipv4: [0; 4],
+        eth0_ipv4_prefix: 0,
+        eth0_ipv6: [0; 16],
+        eth0_ipv6_prefix: 0,
+        eth0_up: if link_up { 1 } else { 0 },
+        eth0_gateway: [0; 4],
+        eth0_gateway_ipv6: [0; 16],
+        eth0_dns: [0; 4],
+        eth0_dns_ipv6: [0; 16],
+        rx_bytes: rx_total,
+        tx_bytes: tx_total,
+    };
+
+    for addr in iface.ip_addrs() {
+        match addr.address() {
+            IpAddress::Ipv4(a) => {
+                stats.eth0_ipv4 = a.octets();
+                stats.eth0_ipv4_prefix = addr.prefix_len();
+            }
+            IpAddress::Ipv6(a) => {
+                stats.eth0_ipv6 = a.octets();
+                stats.eth0_ipv6_prefix = addr.prefix_len();
+            }
+        }
+    }
+
+    if let Some(gw) = static_gateway_v4 {
+        stats.eth0_gateway = gw;
+    }
+
+    let dns_socket = sockets.get::<DnsSocket>(dns_handle);
+    // In smoltcp 0.13.0, servers is a private field. We use our tracked static_dns_v4.
+    if let Some(dns) = static_dns_v4 {
+        stats.eth0_dns = dns;
+    }
+
+    if stats.eth0_dns == [0; 4] {
+        stats.eth0_dns = [8, 8, 8, 8];
+    }
+
+    stats
 }
 
 fn main() {
@@ -373,10 +452,13 @@ fn main() {
         &[IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8))], 
         vec![]
     );
-    let _dns_handle = sockets.add(dns_socket);
+    let dns_handle = sockets.add(dns_socket);
 
     let mut next_resource_id = 1u64;
     let mut current_dhcp_config: Option<DhcpInfo> = None;
+    let mut use_dhcp = true;
+    let mut static_dns_v4: Option<[u8; 4]> = None;
+    let mut static_gateway_v4: Option<[u8; 4]> = None;
 
     println!("[NETWORK-SERVICE] TCP/IP stack initialized:");
     println!("  lo:   127.0.0.1, ::1");
@@ -409,6 +491,7 @@ fn main() {
             &mut current_dhcp_config,
             &mut dhcp_deconfigured_since,
             &mut prev_link_up,
+            use_dhcp,
         );
 
         let rx_total = device.rx_bytes.load(Ordering::Relaxed);
@@ -417,10 +500,10 @@ fn main() {
 
         // Activity logging (every 10 seconds)
         if get_now_ms() - last_activity_log > 10000 {
-            println!("[NETWORK-SERVICE] Stats: RX={} TX={} Link={} DHCP={}", 
+            println!("[NETWORK-SERVICE] Stats: RX={} TX={} Link={} Mode={}", 
                 rx_total, tx_total, 
                 if link_up { "UP" } else { "DOWN" },
-                if current_dhcp_config.is_some() { "BOUND" } else { "SEARCHING" }
+                if use_dhcp { if current_dhcp_config.is_some() { "BOUND" } else { "SEARCHING" } } else { "STATIC" }
             );
             last_activity_log = get_now_ms();
         }
@@ -539,7 +622,7 @@ fn main() {
                             let plen = len.saturating_sub(core::mem::size_of::<NetRequestHeader>());
                             let hostname = unsafe { core::str::from_utf8(core::slice::from_raw_parts(payload, plen)).unwrap_or("") };
                             
-                            let socket = sockets.get_mut::<DnsSocket>(_dns_handle);
+                            let socket = sockets.get_mut::<DnsSocket>(dns_handle);
                             if let Ok(handle) = socket.start_query(iface.context(), hostname, DnsQueryType::A) {
                                 // Simple blocking wait for PoC (max 5 seconds)
                                 let start_wait = get_now_ms();
@@ -547,7 +630,7 @@ fn main() {
                                     let now = Instant::from_millis(get_now_ms() as i64);
                                     iface.poll(now, &mut device, &mut sockets);
                                     
-                                    let socket = sockets.get_mut::<DnsSocket>(_dns_handle);
+                                    let socket = sockets.get_mut::<DnsSocket>(dns_handle);
                                     match socket.get_query_result(handle) {
                                         Ok(addrs) => {
                                             if let Some(ip) = addrs.first() {
@@ -581,54 +664,9 @@ fn main() {
                             }
                         }
                         NetOp::GetExtendedStats => {
-                            let mut stats = NetExtendedStats {
-                                lo_ipv4: [127, 0, 0, 1],
-                                lo_ipv4_prefix: 8,
-                                lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                                lo_ipv6_prefix: 128,
-                                lo_up: 1,
-                                eth0_ipv4: [0; 4],
-                                eth0_ipv4_prefix: 0,
-                                eth0_ipv6: [0; 16],
-                                eth0_ipv6_prefix: 0,
-                                eth0_up: if link_up { 1 } else { 0 },
-                                eth0_gateway: [0; 4],
-                                eth0_gateway_ipv6: [0; 16],
-                                eth0_dns: [0; 4],
-                                eth0_dns_ipv6: [0; 16],
-                                rx_bytes: rx_total,
-                                tx_bytes: tx_total,
-                            };
+                            let stats = get_extended_stats(&iface, &sockets, dns_handle, rx_total, tx_total, link_up, static_dns_v4, static_gateway_v4);
 
-                            let mut eth0_ipv4_found = false;
-                            for addr in iface.ip_addrs() {
-                                match addr.address() {
-                                    IpAddress::Ipv4(a) => {
-                                        stats.eth0_ipv4 = a.octets();
-                                        stats.eth0_ipv4_prefix = addr.prefix_len();
-                                        eth0_ipv4_found = true;
-                                    },
-                                    IpAddress::Ipv6(a) => {
-                                        stats.eth0_ipv6 = a.octets();
-                                        stats.eth0_ipv6_prefix = addr.prefix_len();
-                                    },
-                                }
-                            }
-
-                            if let Some(config) = current_dhcp_config {
-                                if let Some(router) = config.router {
-                                    stats.eth0_gateway = router.octets();
-                                }
-                                if let Some(dns) = config.dns_server {
-                                    stats.eth0_dns = dns.octets();
-                                }
-                            }
-
-                            if stats.eth0_dns == [0; 4] {
-                                stats.eth0_dns = [8, 8, 8, 8];
-                            }
-
-                            if eth0_ipv4_found {
+                            if stats.eth0_ipv4 != [0; 4] {
                                 println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (Syscall): Reporting Ipv4: {}.{}.{}.{}/{}", 
                                     stats.eth0_ipv4[0], stats.eth0_ipv4[1], stats.eth0_ipv4[2], stats.eth0_ipv4[3], stats.eth0_ipv4_prefix);
                             } else {
@@ -640,6 +678,81 @@ fn main() {
                             status = 0;
                             resp_data_size = core::mem::size_of::<NetExtendedStats>() as u32;
                         }
+                        _ => {}
+                    }
+                }
+
+                // Global / Non-restricted Ops (can come from compositor or other authorized services)
+                if status == -1 {
+                    match header.op {
+                        NetOp::SetStaticConfig => {
+                            let payload = unsafe { ipc_buf.as_ptr().add(core::mem::size_of::<NetRequestHeader>()) };
+                            let config = unsafe { &*(payload as *const NetStaticConfig) };
+                            
+                            println!("[NETWORK-SERVICE] SetStaticConfig received");
+                            use_dhcp = false;
+                            current_dhcp_config = None;
+                            
+                            // Apply IPv4
+                            iface.update_ip_addrs(|addrs| {
+                                // Keep IPv6 Link-Local but clear others
+                                addrs.retain(|a| {
+                                    if let IpAddress::Ipv6(a6) = a.address() {
+                                        a6.is_unicast_link_local()
+                                    } else {
+                                        false
+                                    }
+                                });
+                                let ipv4 = Ipv4Address::from_octets(config.ipv4);
+                                if !ipv4.is_unspecified() {
+                                    let _ = addrs.push(IpCidr::new(ipv4.into(), config.ipv4_prefix));
+                                }
+                            });
+                            
+                            // Apply IPv6
+                            if config.ipv6 != [0; 16] {
+                                iface.update_ip_addrs(|addrs| {
+                                    let ipv6 = Ipv6Address::from_octets(config.ipv6);
+                                    let _ = addrs.push(IpCidr::new(ipv6.into(), config.ipv6_prefix));
+                                });
+                            }
+                            
+                            // Apply Gateway
+                            iface.routes_mut().remove_default_ipv4_route();
+                            let gw_v4 = Ipv4Address::from_octets(config.gateway_v4);
+                            if !gw_v4.is_unspecified() {
+                                let _ = iface.routes_mut().add_default_ipv4_route(gw_v4);
+                                static_gateway_v4 = Some(config.gateway_v4);
+                            }
+                            
+                            // DNS update
+                            let dns_v4_val = Ipv4Address::from_octets(config.dns_v4);
+                            if !dns_v4_val.is_unspecified() {
+                                let dns_socket = sockets.get_mut::<DnsSocket>(dns_handle);
+                                dns_socket.update_servers(&[IpAddress::Ipv4(dns_v4_val)]);
+                                static_dns_v4 = Some(config.dns_v4);
+                            }
+                            
+                            status = 0;
+                        }
+                        NetOp::SetDhcpConfig => {
+                            println!("[NETWORK-SERVICE] SetDhcpConfig received from PID {}", sender_pid);
+                            use_dhcp = true;
+                            current_dhcp_config = None;
+                            sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+                            iface.routes_mut().remove_default_ipv4_route();
+                            iface.update_ip_addrs(|addrs| {
+                                // Keep IPv6 Link-Local but clear others
+                                addrs.retain(|a| {
+                                    if let IpAddress::Ipv6(a6) = a.address() {
+                                        a6.is_unicast_link_local()
+                                    } else {
+                                        false
+                                    }
+                                });
+                            });
+                            status = 0;
+                        }
                         NetOp::Close => {
                             if let Some(handle) = kernel_sockets.remove(&header.resource_id) {
                                 sockets.remove(handle);
@@ -648,6 +761,7 @@ fn main() {
                         }
                         _ => {}
                     }
+                }
 
                     // Send response
                     let resp_header = NetResponseHeader {
@@ -663,60 +777,14 @@ fn main() {
                     let total_resp_size = core::mem::size_of::<NetResponseHeader>() + resp_data_size as usize;
                     send_ipc(sender_pid, 0x08, &resp_buf[..total_resp_size]);
                 }
-            }
         }
 
         if !processed && len > 0 {
             let msg_data = &ipc_buf[..len];
             if msg_data.starts_with(b"GET_NET_EXT_STATS") {
-                let mut stats = NetExtendedStats {
-                    lo_ipv4: [127, 0, 0, 1],
-                    lo_ipv4_prefix: 8,
-                    lo_ipv6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                    lo_ipv6_prefix: 128,
-                    lo_up: 1,
-                    eth0_ipv4: [0; 4],
-                    eth0_ipv4_prefix: 0,
-                    eth0_ipv6: [0; 16],
-                    eth0_ipv6_prefix: 0,
-                    eth0_up: if link_up { 1 } else { 0 },
-                    eth0_gateway: [0; 4],
-                    eth0_gateway_ipv6: [0; 16],
-                    eth0_dns: [0; 4],
-                    eth0_dns_ipv6: [0; 16],
-                    rx_bytes: rx_total,
-                    tx_bytes: tx_total,
-                };
+                let stats = get_extended_stats(&iface, &sockets, dns_handle, rx_total, tx_total, link_up, static_dns_v4, static_gateway_v4);
                 
-                let mut eth0_ipv4_found = false;
-                for addr in iface.ip_addrs() {
-                    match addr.address() {
-                        IpAddress::Ipv4(a) => {
-                            stats.eth0_ipv4 = a.octets();
-                            stats.eth0_ipv4_prefix = addr.prefix_len();
-                            eth0_ipv4_found = true;
-                        },
-                        IpAddress::Ipv6(a) => {
-                            stats.eth0_ipv6 = a.octets();
-                            stats.eth0_ipv6_prefix = addr.prefix_len();
-                        },
-                    }
-                }
-
-                if let Some(config) = current_dhcp_config {
-                    if let Some(router) = config.router {
-                        stats.eth0_gateway = router.octets();
-                    }
-                    if let Some(dns) = config.dns_server {
-                        stats.eth0_dns = dns.octets();
-                    }
-                }
-
-                if stats.eth0_dns == [0; 4] {
-                    stats.eth0_dns = [8, 8, 8, 8];
-                }
-
-                if eth0_ipv4_found {
+                if stats.eth0_ipv4 != [0; 4] {
                     println!("[NETWORK-SERVICE] GET_NET_EXT_STATS (IPC): Reporting Ipv4: {}.{}.{}.{}/{}", 
                         stats.eth0_ipv4[0], stats.eth0_ipv4[1], stats.eth0_ipv4[2], stats.eth0_ipv4[3], stats.eth0_ipv4_prefix);
                 } else {
@@ -733,29 +801,21 @@ fn main() {
                     );
                 }
                 send_ipc(sender_pid, 0x08, &resp);
-                } else if msg_data.starts_with(b"GET_NET_STATS") {
-                    let mut resp = [0u8; 20];
-                    resp[0..4].copy_from_slice(b"NSTA");
-                    let rx = rx_total;
-                    let tx = tx_total;
-                    resp[4..12].copy_from_slice(&rx.to_le_bytes());
-                    resp[12..20].copy_from_slice(&tx.to_le_bytes());
-                    send_ipc(sender_pid, 0x08, &resp);
-                } else if msg_data.starts_with(b"RENEW_DHCP") {
-                    println!("[NETWORK-SERVICE] RENEW_DHCP requested by PID {}", sender_pid);
-                    sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
-                    iface.routes_mut().remove_default_ipv4_route();
-                    iface.update_ip_addrs(|addrs| {
-                        // Keep IPv6 Link-Local but clear IPv4
-                        addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
-                    });
-                    current_dhcp_config = None;
-                    
-                    let mut resp = [0u8; 4];
-                    resp.copy_from_slice(b"OK  ");
-                    send_ipc(sender_pid, 0x08, &resp);
-                }
+            } else if msg_data.starts_with(b"RENEW_DHCP") {
+                println!("[NETWORK-SERVICE] RENEW_DHCP requested by PID {}", sender_pid);
+                sockets.get_mut::<smoltcp::socket::dhcpv4::Socket>(dhcp_handle).reset();
+                iface.routes_mut().remove_default_ipv4_route();
+                iface.update_ip_addrs(|addrs| {
+                    // Keep IPv6 Link-Local but clear IPv4
+                    addrs.retain(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)));
+                });
+                current_dhcp_config = None;
+                
+                let mut resp = [0u8; 4];
+                resp.copy_from_slice(b"OK  ");
+                send_ipc(sender_pid, 0x08, &resp);
             }
+        }
 
         // Gestión de CPU: ceder tiempo en lugar de busy-wait al 100%
         unsafe { sleep_ms(1); }

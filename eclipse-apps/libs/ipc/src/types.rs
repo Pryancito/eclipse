@@ -26,6 +26,35 @@ pub const TAG_WAYL: &[u8; 4] = b"WAYL";
 /// Línea de log del kernel (HUD). Enviada con from=0 cuando el logo ya está dibujado.
 pub const TAG_KLOG: &[u8; 4] = b"KLOG";
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NetOp {
+    Socket = 0,
+    Bind = 1,
+    Listen = 2,
+    Accept = 3,
+    Connect = 4,
+    Send = 5,
+    Recv = 6,
+    Close = 7,
+    Ioctl = 8,
+    Resolve = 9,
+    GetExtendedStats = 10,
+    SetStaticConfig = 11,
+    SetDhcpConfig = 12,
+    Response = 255,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetRequestHeader {
+    pub magic: [u8; 4],
+    pub op: NetOp,
+    pub request_id: u32,
+    pub client_pid: u32,
+    pub resource_id: u64,
+}
+
 
 /// Construye el payload de suscripción (SUBS + self_pid little-endian).
 pub fn build_subscribe_payload(self_pid: u32) -> [u8; 8] {
@@ -62,6 +91,19 @@ pub struct NetExtendedStats {
     pub eth0_dns_ipv6: [u8; 16],
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetStaticConfig {
+    pub ipv4: [u8; 4],
+    pub ipv4_prefix: u8,
+    pub ipv6: [u8; 16],
+    pub ipv6_prefix: u8,
+    pub gateway_v4: [u8; 4],
+    pub gateway_v6: [u8; 16],
+    pub dns_v4: [u8; 4],
+    pub dns_v6: [u8; 16],
 }
 
 /// Mensaje IPC de Eclipse OS tipado y comprobado en compilación.

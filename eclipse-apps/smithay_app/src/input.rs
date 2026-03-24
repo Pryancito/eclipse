@@ -10,7 +10,7 @@ use sidewind::{SideWindMessage, SideWindEvent, SWND_EVENT_TYPE_MOUSE_BUTTON};
 use crate::compositor::{
     ShellWindow, WindowContent, ExternalSurface, WindowButton, focus_under_cursor, MAX_SURFACE_DIM,
 };
-use eclipse_ipc::types::NetExtendedStats;
+use eclipse_ipc::types::{NetExtendedStats, NetStaticConfig};
 
 
 #[derive(Clone)]
@@ -102,6 +102,8 @@ pub fn scancode_to_char(code: u16, shift: bool) -> Option<char> {
         (0x2C, false) => Some('z'), (0x2C, true) => Some('Z'),
         (0x39, _) => Some(' '),
         (0x02, _) => Some('1'), (0x03, _) => Some('2'), (0x04, _) => Some('3'), (0x05, _) => Some('4'), (0x06, _) => Some('5'),
+        (0x07, _) => Some('6'), (0x08, _) => Some('7'), (0x09, _) => Some('8'), (0x0A, _) => Some('9'), (0x0B, _) => Some('0'),
+        (0x34, false) => Some('.'),
         _ => None,
     }
 }
@@ -147,11 +149,18 @@ pub struct InputState {
     pub request_system_central: bool,
     pub request_network: bool,
     pub renew_dhcp: bool,
+    pub net_manual_mode: bool,
+    pub static_config: NetStaticConfig,
+    pub apply_static_config: bool,
     pub system_central_curr_y: f32,
     pub search_active: bool,
     pub search_curr_y: f32,
     /// Current text typed in the search/run bar (max 64 chars).
     pub search_query: heapless::String<64>,
+    /// Which field is currently being edited in manual network config (0=None, 1=IPv4, 2=Prefix, 3=GW, 4=DNS)
+    pub net_edit_field: u8,
+    /// Buffer for the field being edited
+    pub net_edit_buffer: heapless::String<16>,
 }
 
 
@@ -175,11 +184,60 @@ impl InputState {
             alt_tab_active: false,
             system_central_active: false, request_system_central: false, 
             request_network: false, renew_dhcp: false,
+            net_manual_mode: false,
+            static_config: NetStaticConfig {
+                ipv4: [192, 168, 1, 100],
+                ipv4_prefix: 24,
+                gateway_v4: [192, 168, 1, 1],
+                dns_v4: [8, 8, 8, 8],
+                ..Default::default()
+            },
+            apply_static_config: false,
             system_central_curr_y: 0.0,
             search_active: false, search_curr_y: -(height as f32 / 2.0),
             search_query: heapless::String::new(),
+            net_edit_field: 0,
+            net_edit_buffer: heapless::String::new(),
         }
 
+    }
+
+    fn parse_ipv4(&self, s: &str) -> Option<[u8; 4]> {
+        let mut octets = [0u8; 4];
+        let mut i = 0;
+        let mut current = 0u16;
+        let mut found_digit = false;
+        for c in s.chars() {
+            if c == '.' {
+                if i >= 3 || !found_digit { return None; }
+                if current > 255 { return None; }
+                octets[i] = current as u8;
+                i += 1;
+                current = 0;
+                found_digit = false;
+            } else if c.is_ascii_digit() {
+                current = current * 10 + (c as u16 - '0' as u16);
+                found_digit = true;
+            } else {
+                return None;
+            }
+        }
+        if i != 3 || !found_digit || current > 255 { return None; }
+        octets[3] = current as u8;
+        Some(octets)
+    }
+
+    fn commit_net_edit(&mut self) {
+        let buffer = self.net_edit_buffer.as_str();
+        match self.net_edit_field {
+            1 => { if let Some(ip) = self.parse_ipv4(buffer) { self.static_config.ipv4 = ip; } }
+            2 => { if let Ok(prefix) = buffer.parse::<u8>() { self.static_config.ipv4_prefix = prefix; } }
+            3 => { if let Some(gw) = self.parse_ipv4(buffer) { self.static_config.gateway_v4 = gw; } }
+            4 => { if let Some(dns) = self.parse_ipv4(buffer) { self.static_config.dns_v4 = dns; } }
+            _ => {}
+        }
+        self.net_edit_field = 0;
+        self.net_edit_buffer.clear();
     }
 
     #[inline(never)]
@@ -200,8 +258,25 @@ impl InputState {
                 let action = if self.modifiers & (4 | 8) != 0 {
                     scancode_to_action(ev.code, self.modifiers)
                 } else {
-                    KeyAction::None
+                    let a = scancode_to_action(ev.code, self.modifiers);
+                    match a {
+                        KeyAction::Enter | KeyAction::Backspace => a,
+                        _ => KeyAction::None
+                    }
                 };
+                
+                // If no action, try to get a char for search/network input
+                let input_char = if action == KeyAction::None && pressed {
+                    scancode_to_char(ev.code, (self.modifiers & 1) != 0)
+                } else {
+                    None
+                };
+
+                let mut action = action;
+                if let Some(c) = input_char {
+                    action = KeyAction::Input(c);
+                }
+
                 match action {
                     KeyAction::None => {
                         if let Some(f_idx) = self.focused_window {
@@ -266,8 +341,30 @@ impl InputState {
                     KeyAction::ToggleSystemCentral => if pressed && (self.modifiers & 8 != 0) { self.request_system_central = true; },
                     KeyAction::ToggleTiling => if pressed && (self.modifiers & 8 != 0) { self.request_toggle_tiling = true; },
                     KeyAction::ArrowUp | KeyAction::ArrowDown => {},
-                    KeyAction::Input(_) => {},
-                    KeyAction::Enter | KeyAction::Backspace => {},
+                    KeyAction::Input(c) => if pressed {
+                        if self.search_active {
+                            let _ = self.search_query.push(c);
+                        } else if self.network_active && self.net_edit_field > 0 {
+                            if (c.is_ascii_digit() || c == '.') && self.net_edit_buffer.len() < 15 {
+                                let _ = self.net_edit_buffer.push(c);
+                            }
+                        }
+                    },
+                    KeyAction::Enter => if pressed {
+                        if self.search_active {
+                            // Committing search - we'll just deactivate it for now as there's no request_run
+                            self.search_active = false;
+                        } else if self.network_active && self.net_edit_field > 0 {
+                            self.commit_net_edit();
+                        }
+                    },
+                    KeyAction::Backspace => if pressed {
+                        if self.search_active {
+                            self.search_query.pop();
+                        } else if self.network_active && self.net_edit_field > 0 {
+                            self.net_edit_buffer.pop();
+                        }
+                    },
                 }
                 if !pressed && ev.code == 0x0F { self.alt_tab_active = false; }
             }
@@ -361,12 +458,63 @@ impl InputState {
                         let p_w = 700; let p_h = 480;
                         let px = sidebar_width + (right_area_w - p_w) / 2;
                         let py = (h - p_h) / 2;
-                        let btn_w = 200; let btn_h = 30;
-                        let btn_x = px + p_w / 2 - btn_w / 2;
-                        let btn_y = py + p_h - btn_h - 20;
-                        if self.cursor_x >= btn_x && self.cursor_x <= btn_x + btn_w &&
-                           self.cursor_y >= btn_y && self.cursor_y <= btn_y + btn_h {
-                            self.renew_dhcp = true;
+                        
+                        // Mode Toggle (DHCP / MANUAL)
+                        let toggle_y = py + 45;
+                        let dhcp_btn_x = px + 200;
+                        let manual_btn_x = px + 350;
+                        let btn_w = 120; let btn_h = 25;
+                        
+                        if self.cursor_y >= toggle_y && self.cursor_y <= toggle_y + btn_h {
+                            if self.cursor_x >= dhcp_btn_x && self.cursor_x <= dhcp_btn_x + btn_w {
+                                self.net_manual_mode = false;
+                                self.renew_dhcp = true; // Switch back to DHCP
+                            } else if self.cursor_x >= manual_btn_x && self.cursor_x <= manual_btn_x + btn_w {
+                                self.net_manual_mode = true;
+                            }
+                        }
+
+                        if !self.net_manual_mode {
+                            let btn_w = 200; let btn_h = 30;
+                            let btn_x = px + p_w / 2 - btn_w / 2;
+                            let btn_y = py + p_h - btn_h - 20;
+                            if self.cursor_x >= btn_x && self.cursor_x <= btn_x + btn_w &&
+                               self.cursor_y >= btn_y && self.cursor_y <= btn_y + btn_h {
+                                self.renew_dhcp = true;
+                            }
+                        } else {
+                            // Manual fields and Apply button
+                            let btn_w = 200; let btn_h = 40;
+                            let btn_x = px + p_w / 2 - btn_w / 2;
+                            let btn_y = py + p_h - btn_h - 20;
+                            if self.cursor_x >= btn_x && self.cursor_x <= btn_x + btn_w &&
+                               self.cursor_y >= btn_y && self.cursor_y <= btn_y + btn_h {
+                                self.apply_static_config = true;
+                            }
+                            
+                            // Field selection
+                            let fields_x = px + 50;
+                            let fields_start_y = py + 100;
+                            let field_h = 45; // Matching render loop gap
+                            if self.cursor_x >= fields_x && self.cursor_x <= px + p_w - 50 {
+                                let f_idx = ((self.cursor_y - fields_start_y) / field_h) + 1;
+                                if f_idx >= 1 && f_idx <= 4 {
+                                    self.net_edit_field = f_idx as u8;
+                                    self.net_edit_buffer.clear();
+                                    use core::fmt::Write;
+                                    match f_idx {
+                                        1 => { let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", self.static_config.ipv4[0], self.static_config.ipv4[1], self.static_config.ipv4[2], self.static_config.ipv4[3]); }
+                                        2 => { let _ = write!(&mut self.net_edit_buffer, "{}", self.static_config.ipv4_prefix); }
+                                        3 => { let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", self.static_config.gateway_v4[0], self.static_config.gateway_v4[1], self.static_config.gateway_v4[2], self.static_config.gateway_v4[3]); }
+                                        4 => { let _ = write!(&mut self.net_edit_buffer, "{}.{}.{}.{}", self.static_config.dns_v4[0], self.static_config.dns_v4[1], self.static_config.dns_v4[2], self.static_config.dns_v4[3]); }
+                                        _ => {}
+                                    }
+                                } else {
+                                    self.net_edit_field = 0;
+                                }
+                            } else {
+                                self.net_edit_field = 0;
+                            }
                         }
                     }
                     

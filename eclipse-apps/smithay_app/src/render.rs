@@ -630,10 +630,13 @@ impl FramebufferState {
 }
 }
 
+use crate::input::InputState;
+
 pub fn draw_network_dashboard(
     fb: &mut FramebufferState,
     counter: u64,
     stats: Option<&NetExtendedStats>,
+    input: &InputState,
 ) {
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
@@ -657,43 +660,122 @@ pub fn draw_network_dashboard(
     };
     let _ = main_panel.draw(fb);
 
+    // DHCP / MANUAL Toggle
+    let toggle_y = py + 45;
+    let dhcp_btn_x = px + 200;
+    let manual_btn_x = px + 350;
+    let btn_w = 120; let btn_h = 25;
+    
+    // DHCP Button
+    let dhcp_color = if !input.net_manual_mode { colors::ACCENT_CYAN } else { colors::WHITE };
+    let _ = RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(dhcp_btn_x, toggle_y), Size::new(btn_w as u32, btn_h as u32)), Size::new(4, 4))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(if !input.net_manual_mode { colors::ACCENT_BLUE } else { colors::GLASS_FROSTED }).stroke_color(dhcp_color).stroke_width(1).build()).draw(fb);
+    let _ = Text::new("DHCP", Point::new(dhcp_btn_x + 35, toggle_y + 18), MonoTextStyle::new(&FONT_6X12, dhcp_color)).draw(fb);
+
+    // MANUAL Button
+    let manual_color = if input.net_manual_mode { colors::ACCENT_CYAN } else { colors::WHITE };
+    let _ = RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(manual_btn_x, toggle_y), Size::new(btn_w as u32, btn_h as u32)), Size::new(4, 4))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(if input.net_manual_mode { colors::ACCENT_BLUE } else { colors::GLASS_FROSTED }).stroke_color(manual_color).stroke_width(1).build()).draw(fb);
+    let _ = Text::new("MANUAL", Point::new(manual_btn_x + 30, toggle_y + 18), MonoTextStyle::new(&FONT_6X12, manual_color)).draw(fb);
+
     if let Some(s) = stats {
-        // Draw Interfaces (lo and eth0)
-        let card_w = 330;
-        let card_h = 360;
-        let card_y = py + 60;
-        
-        // Loopback Card
-        let lo_pos = Point::new(px + 10, card_y);
-        draw_network_interface_card(
-            fb, lo_pos, "lo (Loopback)", s.lo_up != 0, 
-            &s.lo_ipv4, s.lo_ipv4_prefix, &s.lo_ipv6, s.lo_ipv6_prefix, 
-            None, None, None, None, counter
-        );
-        
-        // Ethernet Card
-        let eth_pos = Point::new(px + p_w - card_w - 10, card_y);
-        draw_network_interface_card(
-            fb, eth_pos, "eth0 (Physical)", s.eth0_up != 0, 
-            &s.eth0_ipv4, s.eth0_ipv4_prefix, &s.eth0_ipv6, s.eth0_ipv6_prefix, 
-            Some(&s.eth0_gateway), Some(&s.eth0_gateway_ipv6), 
-            Some(&s.eth0_dns), Some(&s.eth0_dns_ipv6), counter
-        );
+        if !input.net_manual_mode {
+            // Draw Interfaces (lo and eth0)
+            let card_w = 330;
+            let card_h = 360;
+            let card_y = py + 80;
+            
+            // Loopback Card
+            let lo_pos = Point::new(px + 10, card_y);
+            draw_network_interface_card(
+                fb, lo_pos, "lo (Loopback)", s.lo_up != 0, 
+                &s.lo_ipv4, s.lo_ipv4_prefix, &s.lo_ipv6, s.lo_ipv6_prefix, 
+                None, None, None, None, counter
+            );
+            
+            // Ethernet Card
+            let eth_pos = Point::new(px + p_w - card_w - 10, card_y);
+            draw_network_interface_card(
+                fb, eth_pos, "eth0 (Physical)", s.eth0_up != 0, 
+                &s.eth0_ipv4, s.eth0_ipv4_prefix, &s.eth0_ipv6, s.eth0_ipv6_prefix, 
+                Some(&s.eth0_gateway), Some(&s.eth0_gateway_ipv6), 
+                Some(&s.eth0_dns), Some(&s.eth0_dns_ipv6), counter
+            );
 
-        // Add RENOVAR IP (DHCP) Button at the bottom center of the panel
-        let btn_w = 200;
-        let btn_h = 30;
-        let btn_x = px + p_w / 2 - btn_w / 2;
-        let btn_y = py + p_h - btn_h - 20;
+            // Add RENOVAR IP (DHCP) Button
+            let btn_w = 200;
+            let btn_h = 30;
+            let btn_x = px + p_w / 2 - btn_w / 2;
+            let btn_y = py + p_h - btn_h - 20;
 
-        let btn_rect = Rectangle::new(Point::new(btn_x, btn_y), Size::new(btn_w as u32, btn_h as u32));
-        let fill = if (counter / 30) % 2 == 0 { colors::ACCENT_CYAN } else { colors::ACCENT_BLUE };
-        
-        let _ = RoundedRectangle::with_equal_corners(btn_rect, Size::new(4, 4))
-            .into_styled(PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(colors::WHITE).stroke_width(1).build()).draw(fb);
-        let btn_text_style = MonoTextStyle::new(&FONT_10X20, colors::BACKGROUND_DEEP);
-        let text_w = 17 * 10; 
-        let _ = Text::new("RENOVAR IP (DHCP)", Point::new(btn_x + (btn_w - text_w) / 2, btn_y + 20), btn_text_style).draw(fb);
+            let btn_rect = Rectangle::new(Point::new(btn_x, btn_y), Size::new(btn_w as u32, btn_h as u32));
+            let fill = if (counter / 30) % 2 == 0 { colors::ACCENT_CYAN } else { colors::ACCENT_BLUE };
+            
+            let _ = RoundedRectangle::with_equal_corners(btn_rect, Size::new(4, 4))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(colors::WHITE).stroke_width(1).build()).draw(fb);
+            let btn_text_style = MonoTextStyle::new(&FONT_10X20, colors::BACKGROUND_DEEP);
+            let text_w = 17 * 10; 
+            let _ = Text::new("RENOVAR IP (DHCP)", Point::new(btn_x + (btn_w - text_w) / 2, btn_y + 20), btn_text_style).draw(fb);
+        } else {
+            // Manual Config Form
+            let form_x = px + 50;
+            let form_y = py + 100;
+            let title_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_CYAN);
+            let label_style = MonoTextStyle::new(&FONT_10X20, colors::WHITE);
+            let value_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_YELLOW);
+            
+            let _ = Text::new("CONFIGURACION ESTATICA (IPv4)", Point::new(form_x, form_y - 10), title_style).draw(fb);
+            
+            let fields = [
+                ("DIRECCION IP:", format_args!("{}.{}.{}.{}", input.static_config.ipv4[0], input.static_config.ipv4[1], input.static_config.ipv4[2], input.static_config.ipv4[3])),
+                ("MASCARA (PREF):", format_args!("/{}", input.static_config.ipv4_prefix)),
+                ("PUERTA ENLACE:", format_args!("{}.{}.{}.{}", input.static_config.gateway_v4[0], input.static_config.gateway_v4[1], input.static_config.gateway_v4[2], input.static_config.gateway_v4[3])),
+                ("DNS PRIMARIO :", format_args!("{}.{}.{}.{}", input.static_config.dns_v4[0], input.static_config.dns_v4[1], input.static_config.dns_v4[2], input.static_config.dns_v4[3])),
+            ];
+            
+            for (i, (label, value)) in fields.iter().enumerate() {
+                let fy = form_y + 40 + (i as i32 * 45);
+                let is_editing = input.net_edit_field == (i as u8 + 1);
+                
+                let _ = Text::new(label, Point::new(form_x, fy), label_style).draw(fb);
+                
+                let mut val_str = heapless::String::<64>::new();
+                if is_editing {
+                    let _ = core::fmt::write(&mut val_str, format_args!("{}", input.net_edit_buffer));
+                    // Draw a blinking cursor or just a suffix
+                    if (counter / 30) % 2 == 0 {
+                        let _ = val_str.push('|');
+                    }
+                } else {
+                    let _ = core::fmt::write(&mut val_str, *value);
+                }
+                
+                let style = if is_editing { MonoTextStyle::new(&FONT_10X20, colors::WHITE) } else { value_style };
+                let _ = Text::new(&val_str, Point::new(form_x + 220, fy), style).draw(fb);
+                
+                // Draw a highlight if editing
+                let stroke = if is_editing { colors::ACCENT_CYAN } else { colors::GLASS_FROSTED };
+                let _ = Rectangle::new(Point::new(form_x + 215, fy - 20), Size::new(260, 30))
+                    .into_styled(PrimitiveStyleBuilder::new().stroke_color(stroke).stroke_width(if is_editing { 2 } else { 1 }).build()).draw(fb);
+            }
+            
+            let _ = Text::new("(CLICK EN VALOR PARA CAMBIAR)", Point::new(form_x, form_y + 240), MonoTextStyle::new(&FONT_6X12, colors::WHITE)).draw(fb);
+
+            // APLICAR Button
+            let btn_w = 200;
+            let btn_h = 40;
+            let btn_x = px + p_w / 2 - btn_w / 2;
+            let btn_y = py + p_h - btn_h - 20;
+
+            let btn_rect = Rectangle::new(Point::new(btn_x, btn_y), Size::new(btn_w as u32, btn_h as u32));
+            let fill = if (counter / 15) % 2 == 0 { colors::ACCENT_CYAN } else { colors::ACCENT_BLUE };
+            
+            let _ = RoundedRectangle::with_equal_corners(btn_rect, Size::new(4, 4))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(fill).stroke_color(colors::WHITE).stroke_width(2).build()).draw(fb);
+            let btn_text_style = MonoTextStyle::new(&FONT_10X20, colors::BACKGROUND_DEEP);
+            let text_w = 15 * 10; 
+            let _ = Text::new("APLICAR CAMBIOS", Point::new(btn_x + (btn_w - text_w) / 2, btn_y + 25), btn_text_style).draw(fb);
+        }
 
     } else {
         let text_style = MonoTextStyle::new(&FONT_10X20, colors::ACCENT_RED);
