@@ -38,7 +38,18 @@ pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int {
 
 #[cfg(any(test, feature = "host-testing", target_os = "linux"))]
 #[no_mangle]
-pub unsafe extern "C" fn get_system_stats(_stats: *mut SystemStats) -> c_int { -1 }
+pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int { -1 }
+
+#[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
+#[no_mangle]
+pub unsafe extern "C" fn set_time(secs: u64) -> c_int {
+    let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_SET_TIME, secs as usize);
+    if res == 0 { 0 } else { -1 }
+}
+
+#[cfg(any(test, feature = "host-testing", target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn set_time(_secs: u64) -> c_int { -1 }
 
 #[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]

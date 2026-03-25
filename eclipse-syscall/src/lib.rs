@@ -35,6 +35,7 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    pub wall_time_offset: u64, // Unix timestamp offset (seconds)
 }
 
 #[repr(C)]

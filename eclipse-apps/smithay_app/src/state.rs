@@ -620,6 +620,7 @@ impl SmithayState {
                 gpu_vram_used_bytes: 0,
                 anomaly_count: 0,
                 heap_fragmentation: 0,
+                wall_time_offset: 0,
             };
             unsafe {
                 if get_system_stats(&mut current) == 0 {

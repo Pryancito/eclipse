@@ -32,9 +32,17 @@ pub unsafe extern "C" fn clock_gettime(_clk_id: clockid_t, tp: *mut timespec) ->
     if tp.is_null() {
         return -1;
     }
-    // Simple implementation
-    (*tp).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
-    (*tp).tv_nsec = 0;
+    let mut stats = eclipse_syscall::SystemStats::default();
+    if crate::header::sys_eclipse::get_system_stats(&mut stats) == 0 {
+        let uptime_secs = stats.uptime_ticks / 1000;
+        let uptime_ms = stats.uptime_ticks % 1000;
+        (*tp).tv_sec = (uptime_secs + stats.wall_time_offset) as time_t;
+        (*tp).tv_nsec = (uptime_ms * 1_000_000) as c_long;
+    } else {
+        // Fallback for early boot or errors
+        (*tp).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
+        (*tp).tv_nsec = 0;
+    }
     0
 }
 
@@ -58,8 +66,16 @@ pub unsafe extern "C" fn localtime_r(timer: *const time_t, result: *mut tm) -> *
 #[no_mangle]
 pub unsafe extern "C" fn gettimeofday(_tv: *mut timeval, _tz: *mut c_void) -> c_int {
     if !_tv.is_null() {
-        (*_tv).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
-        (*_tv).tv_usec = 0;
+        let mut stats = eclipse_syscall::SystemStats::default();
+        if crate::header::sys_eclipse::get_system_stats(&mut stats) == 0 {
+            let uptime_secs = stats.uptime_ticks / 1000;
+            let uptime_ms = stats.uptime_ticks % 1000;
+            (*_tv).tv_sec = (uptime_secs + stats.wall_time_offset) as time_t;
+            (*_tv).tv_usec = (uptime_ms * 1000) as suseconds_t;
+        } else {
+            (*_tv).tv_sec = TIME_COUNTER.load(Ordering::Relaxed) as time_t;
+            (*_tv).tv_usec = 0;
+        }
     }
     0
 }
@@ -85,7 +101,12 @@ pub unsafe extern "C" fn getitimer(_which: c_int, curr_value: *mut itimerval) ->
 #[cfg(all(not(any(test, feature = "host-testing")), not(target_os = "linux")))]
 #[no_mangle]
 pub unsafe extern "C" fn time(tloc: *mut time_t) -> time_t {
-    let t = TIME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut stats = eclipse_syscall::SystemStats::default();
+    let t = if crate::header::sys_eclipse::get_system_stats(&mut stats) == 0 {
+        (stats.uptime_ticks / 1000 + stats.wall_time_offset) as time_t
+    } else {
+        TIME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+    };
     if !tloc.is_null() {
         *tloc = t as time_t;
     }

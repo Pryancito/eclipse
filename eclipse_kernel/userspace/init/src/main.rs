@@ -244,6 +244,7 @@ fn main_loop() -> ! {
             gpu_vram_used_bytes: 0,
             anomaly_count: 0,
             heap_fragmentation: 0,
+            wall_time_offset: 0,
         };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
                 let now = stats.uptime_ticks;
@@ -316,6 +317,7 @@ fn process_single_ipc_request(buffer: &[u8], len: usize, sender: u32) {
             gpu_vram_used_bytes: 0,
             anomaly_count: 0,
             heap_fragmentation: 0,
+            wall_time_offset: 0,
         };
                 unsafe { eclipse_libc::get_system_stats(&mut stats); }
                 service.last_heartbeat = stats.uptime_ticks;
@@ -452,6 +454,7 @@ fn check_services() {
             gpu_vram_used_bytes: 0,
             anomaly_count: 0,
             heap_fragmentation: 0,
+            wall_time_offset: 0,
         };
         unsafe { eclipse_libc::get_system_stats(&mut stats); }
         let now = stats.uptime_ticks;

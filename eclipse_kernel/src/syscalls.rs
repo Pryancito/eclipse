@@ -21,6 +21,9 @@ pub(crate) static LAST_SYSCALL_NUM: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RECV_OK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 
+/// Offset global para el reloj de tiempo real (Unix timestamp - uptime_ticks/1000)
+pub(crate) static WALL_TIME_OFFSET: AtomicU64 = AtomicU64::new(0);
+
 /// Números de syscalls
 #[repr(u64)]
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +97,7 @@ pub enum SyscallNumber {
     SchedSetAffinity = 66,
     RegisterLogHud = 67,
     Ftruncate = 68,
+    SetTime = 69,
 }
 
 
@@ -136,6 +140,7 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    pub wall_time_offset: u64,
 }
 
 #[repr(C)]
@@ -317,6 +322,7 @@ pub extern "C" fn syscall_handler(
         66 => sys_sched_setaffinity(arg1, arg2),
         67 => sys_register_log_hud(arg1),
         68 => sys_ftruncate(arg1, arg2),
+        69 => sys_set_time(arg1),
         100 => sys_socket(arg1, arg2, arg3),
 
 
@@ -392,12 +398,21 @@ fn sys_get_system_stats(stats_ptr: u64) -> u64 {
         gpu_vram_used_bytes: vitals.gpu_vram_used_bytes,
         anomaly_count: vitals.anomaly_count,
         heap_fragmentation: vitals.heap_fragmentation,
+        wall_time_offset: WALL_TIME_OFFSET.load(Ordering::Relaxed),
     };
 
     unsafe {
         core::ptr::write_unaligned(stats_ptr as *mut SystemStats, stats);
     }
 
+    0
+}
+
+/// sys_set_time - Establecer el tiempo real del sistema (ajusta el offset)
+fn sys_set_time(secs: u64) -> u64 {
+    let uptime_ms = crate::scheduler::get_stats().total_ticks;
+    let offset = secs.saturating_sub(uptime_ms / 1000);
+    WALL_TIME_OFFSET.store(offset, Ordering::Relaxed);
     0
 }
 

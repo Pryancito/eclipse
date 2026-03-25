@@ -67,6 +67,7 @@ impl Instant {
             gpu_vram_used_bytes: 0,
             anomaly_count: 0,
             heap_fragmentation: 0,
+            wall_time_offset: 0,
         };
         unsafe {
             let _ = get_system_stats(&mut stats);

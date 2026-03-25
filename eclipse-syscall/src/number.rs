@@ -71,3 +71,4 @@ pub const SYS_DRM_MAP_HANDLE: usize = 65;
 pub const SYS_SCHED_SETAFFINITY: usize = 66;
 pub const SYS_REGISTER_LOG_HUD: usize = 67;
 pub const SYS_FTRUNCATE: usize = 68;
+pub const SYS_SET_TIME: usize = 69;

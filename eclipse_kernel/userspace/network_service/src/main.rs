@@ -44,6 +44,141 @@ struct DhcpInfo {
     dns_server: Option<Ipv4Address>,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum NtpState {
+    Idle,
+    Resolving,
+    Sending,
+    WaitingResponse,
+}
+
+struct NtpClient {
+    state: NtpState,
+    dns_query: Option<smoltcp::socket::dns::QueryHandle>,
+    server_addr: Option<IpAddress>,
+    last_sync: u64,
+}
+
+fn ntp_task(
+    ntp: &mut NtpClient,
+    sockets: &mut SocketSet,
+    iface: &mut Interface,
+    ntp_handle: smoltcp::iface::SocketHandle,
+    dns_handle: smoltcp::iface::SocketHandle,
+    now_ms: u64,
+    device: &mut RawEthernetDevice,
+) {
+    if !device.get_link_status() {
+         return;
+    }
+
+    match ntp.state {
+        NtpState::Idle => {
+            // Sincronizar cada 1 hora (3600s), o al arrancar si nunca se hizo (last_sync=0).
+            // Pero solo si tenemos IP configurada (para evitar fallos continuos sin red).
+            let has_ipv4 = iface.ip_addrs().iter().any(|a| matches!(a.address(), IpAddress::Ipv4(_)));
+            
+            if has_ipv4 && (ntp.last_sync == 0 || now_ms - ntp.last_sync > 3600_000) {
+                let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
+                match dns_socket.start_query(iface.context(), "pool.ntp.org", DnsQueryType::A) {
+                    Ok(handle) => {
+                        println!("[NETWORK-SERVICE] NTP: Resolving pool.ntp.org...");
+                        ntp.dns_query = Some(handle);
+                        ntp.state = NtpState::Resolving;
+                    }
+                    Err(_) => {
+                        ntp.last_sync = now_ms; // Reintentar después
+                    }
+                }
+            }
+        }
+        NtpState::Resolving => {
+            let dns_socket = sockets.get_mut::<smoltcp::socket::dns::Socket>(dns_handle);
+            if let Some(handle) = ntp.dns_query {
+                match dns_socket.get_query_result(handle) {
+                    Ok(addrs) => {
+                        if let Some(addr) = addrs.first() {
+                            println!("[NETWORK-SERVICE] NTP: Server resolved to {}", addr);
+                            ntp.server_addr = Some(*addr);
+                            ntp.state = NtpState::Sending;
+                        } else {
+                            ntp.state = NtpState::Idle;
+                            ntp.last_sync = now_ms;
+                        }
+                        ntp.dns_query = None;
+                    }
+                    Err(smoltcp::socket::dns::GetQueryResultError::Pending) => {}
+                    Err(_) => {
+                        println!("[NETWORK-SERVICE] NTP: DNS resolution failed");
+                        ntp.state = NtpState::Idle;
+                        ntp.last_sync = now_ms;
+                        ntp.dns_query = None;
+                    }
+                }
+            }
+        }
+        NtpState::Sending => {
+            let udp_socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(ntp_handle);
+            if udp_socket.can_send() {
+                if let Some(addr) = ntp.server_addr {
+                    let mut pkt = [0u8; 48];
+                    pkt[0] = 0x1B; // LI=0, VN=3, Mode=3 (Client)
+                    let endpoint = smoltcp::wire::IpEndpoint::new(addr, 123);
+                    match udp_socket.send_slice(&pkt, endpoint) {
+                        Ok(_) => {
+                            println!("[NETWORK-SERVICE] NTP: Request sent to {}", addr);
+                            ntp.state = NtpState::WaitingResponse;
+                        }
+                        Err(e) => {
+                            println!("[NETWORK-SERVICE] NTP: Send failed: {:?}", e);
+                            ntp.state = NtpState::Idle;
+                            ntp.last_sync = now_ms;
+                        }
+                    }
+                }
+            }
+        }
+        NtpState::WaitingResponse => {
+            let udp_socket = sockets.get_mut::<smoltcp::socket::udp::Socket>(ntp_handle);
+            if udp_socket.can_recv() {
+                match udp_socket.recv() {
+                    Ok((data, _)) => {
+                        if data.len() >= 48 {
+                            let seconds = u32::from_be_bytes(data[40..44].try_into().unwrap());
+                            // NTP epoch (1900) to Unix epoch (1970)
+                            if seconds >= 2_208_988_800 {
+                                let unix_time = seconds as u64 - 2_208_988_800;
+                                println!("[NETWORK-SERVICE] NTP: Synchronized! Real Time: {} (Unix Epoch)", unix_time);
+                                unsafe {
+                                    // SYS_SET_TIME = 69
+                                    eclipse_syscall::syscall1(69, unix_time as usize);
+                                }
+                                ntp.last_sync = now_ms;
+                                ntp.state = NtpState::Idle;
+                            } else {
+                                println!("[NETWORK-SERVICE] NTP: Invalid timestamp received");
+                                ntp.state = NtpState::Idle;
+                                ntp.last_sync = now_ms;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        ntp.state = NtpState::Idle;
+                        ntp.last_sync = now_ms;
+                    }
+                }
+            }
+            
+            // Timeout after 5 seconds
+            if ntp.state == NtpState::WaitingResponse && now_ms - ntp.last_sync > 5000 && ntp.last_sync != 0 {
+                 println!("[NETWORK-SERVICE] NTP: Response timeout");
+                 ntp.state = NtpState::Idle;
+                 ntp.last_sync = now_ms;
+            }
+        }
+    }
+}
+
 /// Raw Ethernet device using the kernel's eth: scheme
 struct RawEthernetDevice {
     fd: usize,
@@ -454,6 +589,19 @@ fn main() {
     );
     let dns_handle = sockets.add(dns_socket);
 
+    // Initialize NTP socket
+    let ntp_rx_buffer = smoltcp::socket::udp::PacketBuffer::new(vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 1], vec![0; 256]);
+    let ntp_tx_buffer = smoltcp::socket::udp::PacketBuffer::new(vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 1], vec![0; 256]);
+    let ntp_socket = smoltcp::socket::udp::Socket::new(ntp_rx_buffer, ntp_tx_buffer);
+    let ntp_handle = sockets.add(ntp_socket);
+
+    let mut ntp_client = NtpClient {
+        state: NtpState::Idle,
+        dns_query: None,
+        server_addr: None,
+        last_sync: 0,
+    };
+
     let mut next_resource_id = 1u64;
     let mut current_dhcp_config: Option<DhcpInfo> = None;
     let mut use_dhcp = true;
@@ -492,6 +640,17 @@ fn main() {
             &mut dhcp_deconfigured_since,
             &mut prev_link_up,
             use_dhcp,
+        );
+
+        // NTP Sync Task
+        ntp_task(
+            &mut ntp_client,
+            &mut sockets,
+            &mut iface,
+            ntp_handle,
+            dns_handle,
+            get_now_ms(),
+            &mut device,
         );
 
         let rx_total = device.rx_bytes.load(Ordering::Relaxed);

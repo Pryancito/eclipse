@@ -17,6 +17,7 @@ pub struct SystemStats {
     pub gpu_vram_used_bytes: u64,
     pub anomaly_count: u32,
     pub heap_fragmentation: u32,
+    pub wall_time_offset: u64,
 }
 
 #[no_mangle]
@@ -35,6 +36,12 @@ pub unsafe extern "C" fn get_system_stats(stats: *mut SystemStats) -> c_int {
     } else {
         -1
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn set_time(secs: u64) -> c_int {
+    let res = eclipse_syscall::syscall1(eclipse_syscall::number::SYS_SET_TIME, secs as usize);
+    if res == 0 { 0 } else { -1 }
 }
 
 pub use eclipse_syscall::ProcessInfo;
