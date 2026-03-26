@@ -16,6 +16,7 @@ pub mod input;
 pub mod ipc;
 pub mod render;
 pub mod display;
+pub mod painter;
 #[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 pub mod smithay_wayland;
 pub mod state;

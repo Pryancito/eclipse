@@ -3,6 +3,7 @@
 
 use std::prelude::v1::*;
 use super::{ShellWindow, WindowContent, MAX_WINDOWS_COUNT, ExternalSurface};
+use core::matches;
 use core::iter::Iterator;
 
 pub struct Space {

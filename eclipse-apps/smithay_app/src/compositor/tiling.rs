@@ -1,3 +1,4 @@
+use core::matches;
 use super::ShellWindow;
 use crate::compositor::WindowContent;
 use crate::compositor::MAX_WINDOWS_COUNT;
