@@ -11,6 +11,22 @@ members = [
 ]
 exclude = ["libs/ipc_tests", "std_test"]
 
+[workspace.package]
+version = "0.2.0"
+authors = ["Eclipse OS Team"]
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_results = "deny"
+
+[workspace.lints.clippy]
+type-complexity = "allow"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
+
 [workspace.dependencies]
 eclipse_ipc = { path = "libs/ipc" }
 sidewind = { path = "sidewind" }

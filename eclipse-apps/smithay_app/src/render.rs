@@ -1,9 +1,9 @@
 use std::prelude::v1::*;
 use core::{matches, format_args, write};
-use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(target_vendor = "eclipse")]
 use libc::{
-    mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+    munmap,
     FramebufferInfo,
 };
 #[cfg(not(target_vendor = "eclipse"))]
@@ -31,13 +31,14 @@ use sidewind::ui::{self, icons, colors};
 use sidewind::{font_terminus_12, font_terminus_14, font_terminus_20};
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line, Circle, Polyline, RoundedRectangle, CornerRadii};
-use embedded_graphics::mono_font::{ascii::{FONT_6X12, FONT_10X20, FONT_6X10}, MonoTextStyle};
+use embedded_graphics::primitives::{Rectangle, PrimitiveStyleBuilder, Line, Circle, RoundedRectangle, CornerRadii};
+use embedded_graphics::mono_font::{ascii::{FONT_10X20, FONT_6X12}, MonoTextStyle};
 use embedded_graphics::text::Text;
 use crate::compositor::{ShellWindow, WindowContent, ExternalSurface, WindowButton};
 use crate::state::ServiceInfo;
+use crate::style_engine::StyleEngine;
 use eclipse_ipc::types::NetExtendedStats;
-use crate::display::{self, DisplayDevice, FramebufferDesc, DisplayError, ControlDevice, DisplayCaps};
+use crate::display::{self, DisplayDevice, DisplayCaps, ControlDevice};
 use crate::painter::SkiaPainter;
 use tiny_skia::Color;
 
@@ -138,6 +139,11 @@ impl FramebufferState {
         {
             None
         }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let size = (self.info.pitch as usize) * (self.info.height as usize);
+        unsafe { core::slice::from_raw_parts_mut(self.back_addr as *mut u8, size) }
     }
 
     /// Initialize hardware cursor image (64x64)
@@ -673,6 +679,7 @@ pub fn draw_network_dashboard(
     let dhcp_color = if !input.net_manual_mode { colors::ACCENT_CYAN } else { colors::WHITE };
     let _ = RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(dhcp_btn_x, toggle_y), Size::new(btn_w as u32, btn_h as u32)), Size::new(4, 4))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(if !input.net_manual_mode { colors::ACCENT_BLUE } else { colors::GLASS_FROSTED }).stroke_color(dhcp_color).stroke_width(1).build()).draw(fb);
+    use embedded_graphics::mono_font::ascii::FONT_6X12;
     let _ = Text::new("DHCP", Point::new(dhcp_btn_x + 35, toggle_y + 18), MonoTextStyle::new(&FONT_6X12, dhcp_color)).draw(fb);
 
     // MANUAL Button
@@ -965,8 +972,11 @@ fn draw_traffic_monitor(
     }
 }
 
+
 pub fn draw_dashboard(
     fb: &mut FramebufferState, 
+    style_engine: &StyleEngine,
+    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
     counter: u64, 
     cpu: f32, 
     mem: f32, 
@@ -986,86 +996,47 @@ pub fn draw_dashboard(
     let net = if net.is_finite() { net } else { 0.0 };
     let w = fb.info.width as i32;
     let h = fb.info.height as i32;
-    let _ = Rectangle::new(Point::new(0, 0), Size::new(w as u32, h as u32))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(Rgb888::new(2, 4, 10)).build())
-        .draw(fb);
-    let _ = ui::draw_grid(fb, Rgb888::new(30, 60, 120), 64, Point::zero());
-    use sidewind::ui::{Panel, Gauge, Terminal, Widget};
-    let p_w = 640;
-    let p_h = 420;
-    let px = (w - p_w) / 2;
-    let py = (h - p_h) / 2;
-    let main_panel = Panel { position: Point::new(px, py), size: Size::new(p_w as u32, p_h as u32), title: "ANALISIS DE SISTEMA // DASHBOARD" };
     
-    let _ = main_panel.draw(fb);
+    // 1. Setup Skia Painter
+    let pix_slice = fb.as_mut_slice();
+    let mut painter = if let Some(p) = crate::painter::SkiaPainter::new(pix_slice, w as u32, h as u32) {
+        p
+    } else {
+        return;
+    };
+
+    // 2. Base Dashboard Area (Panel)
+    let p_w = 640.0;
+    let p_h = 420.0;
+    let px = (w as f32 - p_w) / 2.0;
+    let py = (h as f32 - p_h) / 2.0;
     
-    // Gauges uniformes en 2 filas x 3 columnas (mismo tamaño/espaciado).
-    // Panel: p_w=640. Usamos centros con margen simétrico.
-    let gauge_r: u32 = 50;
-    let top_y: i32 = 160;
-    let bot_y: i32 = 290;
-    let x0: i32 = 100;
-    let x1: i32 = 320;
-    let x2: i32 = 540;
+    style_engine.draw_panel(&mut painter, px, py, p_w, p_h, 16.0);
 
-    // Labels dinámicas para los gauges (Gauge.label requiere &'static str).
-    // Usamos buffers estáticos y `from_utf8_unchecked` porque solo escribimos ASCII.
-    static mut CPU_LABEL_BUF: [u8; 64] = [0; 64];
-    static mut RAM_LABEL_BUF: [u8; 64] = [0; 64];
-    static mut GPU_VRAM_LABEL_BUF: [u8; 64] = [0; 64];
+    // 3. Draw high-fidelity COSMIC Gauges using Stylus
+    let x_start = px + 40.0;
+    let x_spacing = 200.0;
+    let top_y = py + 120.0;
+    let bot_y = py + 240.0;
 
-    let cpu_label: &'static str = {
-        let mut tmp = heapless::String::<64>::new();
-        let _ = core::fmt::write(&mut tmp, format_args!("{} CPU", cpu_count));
-        unsafe {
-            CPU_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
-            core::str::from_utf8_unchecked(&CPU_LABEL_BUF[..tmp.len()])
-        }
-    };
+    if let Some(view) = dashboard_view {
+        let root_bounds = crate::stylus::Rect::new(px + 40.0, py + 120.0, p_w - 80.0, p_h - 160.0);
+        view.draw(&mut painter, style_engine, root_bounds);
+    }
 
-    let (ram_val, ram_unit) = if mem_total_kb >= 1024 * 1024 {
-        (mem_total_kb / (1024 * 1024), "GB")
-    } else {
-        (mem_total_kb / 1024, "MB")
-    };
+    // Labels (Legacy approach for now, integrated with embedded-graphics font)
+    use embedded_graphics::mono_font::{ascii::FONT_6X12, MonoTextStyle};
+    use embedded_graphics::text::Text;
+    use embedded_graphics::Drawable;
+    let label_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(150, 155, 165));
+    
+    let _ = Text::new("PROCESAMIENTO CENTRAL", Point::new((x_start) as i32, (top_y - 15.0) as i32), label_style).draw(fb);
+    let _ = Text::new("MEMORIA DINAMICA (RAM)", Point::new((x_start + x_spacing) as i32, (top_y - 15.0) as i32), label_style).draw(fb);
+    let _ = Text::new("TRAFICO DE RED (IPC)", Point::new((x_start + x_spacing * 2.0) as i32, (top_y - 15.0) as i32), label_style).draw(fb);
 
-    let ram_label: &'static str = {
-        let mut tmp = heapless::String::<64>::new();
-        let _ = core::fmt::write(&mut tmp, format_args!("{} {} RAM", ram_val, ram_unit));
-        unsafe {
-            RAM_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
-            core::str::from_utf8_unchecked(&RAM_LABEL_BUF[..tmp.len()])
-        }
-    };
-
-    let (vram_val, vram_unit) = if gpu_vram_total_kb >= 1024 * 1024 {
-        (gpu_vram_total_kb / (1024 * 1024), "GB")
-    } else {
-        (gpu_vram_total_kb / 1024, "MB")
-    };
-
-    let gpu_vram_label: &'static str = {
-        let mut tmp = heapless::String::<64>::new();
-        let _ = core::fmt::write(&mut tmp, format_args!("TOTAL: {} {}", vram_val, vram_unit));
-        unsafe {
-            GPU_VRAM_LABEL_BUF[..tmp.len()].copy_from_slice(tmp.as_bytes());
-            core::str::from_utf8_unchecked(&GPU_VRAM_LABEL_BUF[..tmp.len()])
-        }
-    };
-
-    // Fila 1: CPU, RAM, RED
-    let _ = Gauge { center: main_panel.position + Point::new(x0, top_y), radius: gauge_r, value: cpu, label: cpu_label, unit: "%" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(x1, top_y), radius: gauge_r, value: mem, label: ram_label, unit: "%" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(x2, top_y), radius: gauge_r, value: net, label: "RED INT", unit: "%" }.draw(fb);
-
-    // Fila 2: Temperatura CPU, Carga GPU, Temperatura GPU
-    let cpu_t_f = (cpu_temp as f32 / 1000.0).clamp(0.0, 1.0); // ~0-100C
-    let gpu_l_f = (gpu_load as f32 / 100.0).clamp(0.0, 1.0);
-    let gpu_t_f = (gpu_temp as f32 / 1000.0).clamp(0.0, 1.0);
-
-    let _ = Gauge { center: main_panel.position + Point::new(x0, bot_y), radius: gauge_r, value: cpu_t_f, label: "TEMP CPU", unit: "C" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(x1, bot_y), radius: gauge_r, value: gpu_l_f, label: gpu_vram_label, unit: "%" }.draw(fb);
-    let _ = Gauge { center: main_panel.position + Point::new(x2, bot_y), radius: gauge_r, value: gpu_t_f, label: "TEMP GPU AVG", unit: "C" }.draw(fb);
+    let _ = Text::new("TERMALES CPU (C)", Point::new((x_start) as i32, (bot_y - 15.0) as i32), label_style).draw(fb);
+    let _ = Text::new("CARGA GPU NUCLEOS", Point::new((x_start + x_spacing) as i32, (bot_y - 15.0) as i32), label_style).draw(fb);
+    let _ = Text::new("TERMALES GPU (C)", Point::new((x_start + x_spacing * 2.0) as i32, (bot_y - 15.0) as i32), label_style).draw(fb);
 /*
     let mut cpu_line = heapless::String::<64>::new();
     let _ = core::fmt::write(&mut cpu_line, format_args!("CPU: {}% @ {:.1}C", (cpu * 100.0) as u32, cpu_temp as f32 / 10.0));
@@ -1397,6 +1368,8 @@ pub fn draw_window_decoration_at(fb: &mut FramebufferState, w: &ShellWindow, is_
 /// Usado por smithay_wayland y Eclipse para unificar el pipeline.
 pub fn draw_desktop_shell(
     fb: &mut FramebufferState,
+    style_engine: &StyleEngine,
+    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
     windows: &[ShellWindow],
     window_count: usize,
     counter: u64,
@@ -1416,7 +1389,7 @@ pub fn draw_desktop_shell(
     process_cpu: &[f32; 32],
     process_mem: &[u64; 32],
 ) {
-    draw_static_ui(fb, windows, window_count, counter, cursor_x, cursor_y, log_buf, log_len, 
+    draw_static_ui(fb, style_engine, dashboard_view, counter, cursor_x, cursor_y, log_buf, log_len, 
         dashboard_active, sys_central_active, network_active,
         cpu, mem, net, cpu_temp, gpu_load, gpu_temp, anomalies, frag, uptime_ticks,
         cpu_count, mem_total_kb, gpu_vram_total_kb, services, processes, process_cpu, process_mem);
@@ -1424,8 +1397,8 @@ pub fn draw_desktop_shell(
 
 pub fn draw_static_ui(
     fb: &mut FramebufferState, 
-    _windows: &[ShellWindow], 
-    _window_count: usize, 
+    style_engine: &StyleEngine,
+    dashboard_view: Option<&alloc::boxed::Box<dyn crate::stylus::Widget>>,
     counter: u64, 
     _cursor_x: i32, 
     _cursor_y: i32, 
@@ -1494,7 +1467,7 @@ pub fn draw_static_ui(
     }
 
     if dashboard_active {
-        draw_dashboard(fb, counter, cpu, mem, net, cpu_temp, gpu_load, gpu_temp, 
+        draw_dashboard(fb, style_engine, dashboard_view, counter, cpu, mem, net, cpu_temp, gpu_load, gpu_temp, 
             anomalies, frag, uptime_ticks, cpu_count, mem_total_kb, gpu_vram_total_kb);
     }
 

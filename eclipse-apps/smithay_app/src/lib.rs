@@ -20,6 +20,8 @@ pub mod painter;
 #[cfg(all(not(target_vendor = "eclipse"), feature = "wayland"))]
 pub mod smithay_wayland;
 pub mod state;
+pub mod style_engine;
+pub mod stylus;
 
 #[cfg(target_vendor = "eclipse")]
 pub mod getrandom_shim {

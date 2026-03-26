@@ -103,6 +103,8 @@ pub struct SmithayState {
     pub wayland_pool_maps: Vec<WaylandPoolMap>,
     /// Última vez que se recibió un mensaje IPC (para el heartbeat).
     pub last_ipc_activity: std::time::Instant,
+    pub style_engine: crate::style_engine::StyleEngine,
+    pub dashboard_view: Option<alloc::boxed::Box<dyn crate::stylus::Widget>>,
 }
 
 impl SmithayState {
@@ -147,8 +149,10 @@ impl SmithayState {
         let surfaces = [const { ExternalSurface {
             id: 0, pid: 0, vaddr: 0, buffer_size: 0, active: false, ready_to_flip: false
         } }; MAX_EXTERNAL_SURFACES];
+        
+        let style_engine = crate::style_engine::StyleEngine::new();
 
-        Some(Box::new(Self {
+        let mut state = Box::new(Self {
             backend,
             space,
             input,
@@ -190,8 +194,46 @@ impl SmithayState {
             #[cfg(any(not(target_os = "linux"), test))]
             wayland_pool_maps: Vec::new(),
             last_ipc_activity: std::time::Instant::now(),
-        }))
+            style_engine,
+            dashboard_view: None,
+        });
 
+        state.rebuild_dashboard();
+        Some(state)
+
+    }
+
+    /// Reconstruye el árbol de widgets de Stylus para el dashboard
+    pub fn rebuild_dashboard(&mut self) {
+        use crate::stylus::{Column, Row, widgets::{Gauge, Button}};
+
+        let mut root = Column::new().spacing(40.0);
+
+        // Fila 1: Vitals (CPU, MEM, NET)
+        let row1 = Row::new().spacing(20.0)
+            .push(Gauge::new(self.cpu_usage * 100.0))
+            .push(Gauge::new(self.mem_usage * 100.0))
+            .push(Gauge::new(self.net_usage * 100.0));
+        
+        // Fila 2: Thermals
+        let cpu_t = (self.cpu_temp as f32 / 10.0).clamp(0.0, 100.0);
+        let gpu_l = (self.gpu_load as f32).clamp(0.0, 100.0);
+        let gpu_t = (self.gpu_temp as f32 / 10.0).clamp(0.0, 100.0);
+
+        let row2 = Row::new().spacing(20.0)
+            .push(Gauge::new(cpu_t))
+            .push(Gauge::new(gpu_l))
+            .push(Gauge::new(gpu_t));
+
+        // Fila 3: Actions
+        let row3 = Row::new().spacing(20.0)
+            .push(Button::new(1, "CONTROL"))
+            .push(Button::new(2, "NETWORK"))
+            .push(Button::new(3, "TERMINAL"));
+
+        root = root.push(row1).push(row2).push(row3);
+
+        self.dashboard_view = Some(alloc::boxed::Box::new(root));
     }
 
     pub fn handle_event(&mut self, event: &CompositorEvent) {
@@ -850,6 +892,7 @@ impl SmithayState {
 
             // Actualizar prev_stats AL FINAL para no invalidar el delta de procesos
             self.prev_stats = Some(current);
+            self.rebuild_dashboard();
             self.dirty = true;
             true
         } else {
@@ -1080,6 +1123,8 @@ impl SmithayState {
 
             render::draw_desktop_shell(
                 &mut self.backend.fb,
+                &self.style_engine,
+                self.dashboard_view.as_ref(),
                 &self.space.windows,
                 self.space.window_count,
                 self.counter,
@@ -1134,23 +1179,6 @@ impl SmithayState {
                 for i in 0..self.space.window_count {
                     self.space.windows[i].damage.clear();
                 }
-            } else if self.input.dashboard_active {
-                render::draw_dashboard(
-                    &mut self.backend.fb, 
-                    self.counter, 
-                    self.cpu_usage, 
-                    self.mem_usage, 
-                    self.net_usage, 
-                    self.cpu_temp,
-                    self.gpu_load,
-                    self.gpu_temp,
-                    self.anomaly_count,
-                    self.heap_fragmentation,
-                    self.prev_stats.map(|s| s.uptime_ticks).unwrap_or(0),
-                    self.cpu_count,
-                    self.mem_total_kb,
-                    self.gpu_vram_total_kb,
-                );
             } else if self.input.system_central_active {
                 render::draw_system_central(
                     &mut self.backend.fb, 
