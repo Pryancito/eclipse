@@ -109,7 +109,7 @@ pub fn taskbar_hit_test(
     for w_idx in 0..window_count {
         if win_x + win_item_w > tray_start - 10 { break; }
         let w = &windows[w_idx];
-        if w.content == WindowContent::None || w.minimized || w.closing { continue; }
+        if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != current_workspace { continue; }
 
         if px >= win_x && px < win_x + win_item_w && py >= bar_y + 8 && py < bar_y + 36 {
@@ -137,6 +137,57 @@ pub fn taskbar_hit_test(
     }
 
     TaskbarHit::None
+}
+
+/// Determine which launcher item is at position (px, py).
+/// Returns `Some(pinned_app_index)` if a launcher item was hit, `None` otherwise.
+/// This accounts for search filtering when the search is active.
+pub fn launcher_hit_test(
+    px: i32,
+    py: i32,
+    fb_height: i32,
+    pinned_count: usize,
+    pinned_apps: &[crate::desktop::PinnedApp],
+    search_active: bool,
+    search_query: &str,
+) -> Option<usize> {
+    use crate::render::{
+        LAUNCHER_PANEL_W, LAUNCHER_PANEL_H, LAUNCHER_PANEL_X,
+        LAUNCHER_ITEM_H, LAUNCHER_ITEMS_Y_OFFSET, LAUNCHER_MAX_VISIBLE,
+        TASKBAR_HEIGHT,
+    };
+
+    let panel_x = LAUNCHER_PANEL_X;
+    let panel_y = fb_height - TASKBAR_HEIGHT - LAUNCHER_PANEL_H - 10;
+    let panel_w = LAUNCHER_PANEL_W;
+
+    // Check if click is within the launcher panel
+    if px < panel_x || px >= panel_x + panel_w || py < panel_y || py >= panel_y + LAUNCHER_PANEL_H {
+        return None;
+    }
+
+    // Iterate visible items (applying the same filter as draw_launcher)
+    let mut visible_idx: i32 = 0;
+    for i in 0..pinned_count {
+        if visible_idx >= LAUNCHER_MAX_VISIBLE as i32 { break; }
+        let app_name = pinned_apps[i].name_str();
+
+        // Filter by search query
+        if search_active && !search_query.is_empty() {
+            let name_lower_matches = app_name.len() >= search_query.len()
+                && app_name[..search_query.len()].eq_ignore_ascii_case(search_query);
+            if !name_lower_matches { continue; }
+        }
+
+        let item_y = panel_y + LAUNCHER_ITEMS_Y_OFFSET + visible_idx * LAUNCHER_ITEM_H;
+        if py >= item_y - 10 && py < item_y - 10 + LAUNCHER_ITEM_H {
+            return Some(i);
+        }
+
+        visible_idx += 1;
+    }
+
+    None
 }
 
 pub fn scancode_to_action(scancode: u16, modifiers: u32) -> KeyAction {
@@ -254,6 +305,14 @@ pub struct InputState {
     pub volume_clicked: bool,
     /// Set when clock area is clicked (for the caller to act on).
     pub clock_clicked: bool,
+    /// Index of the launcher item currently hovered (for highlight rendering).
+    pub launcher_hovered_index: Option<usize>,
+    /// Index of the launcher app that was clicked (for the caller to launch).
+    pub launcher_app_click: Option<usize>,
+    /// Cursor position at click time when launcher is open (x, y), for hit-test in state.rs.
+    pub launcher_click_pos: Option<(i32, i32)>,
+    /// Set when notification panel is closed by clicking on it (for the caller to mark all read).
+    pub notifications_mark_read: bool,
 }
 
 impl InputState {
@@ -287,6 +346,10 @@ impl InputState {
             hovered_taskbar_element: TaskbarHit::None,
             volume_clicked: false,
             clock_clicked: false,
+            launcher_hovered_index: None,
+            launcher_app_click: None,
+            launcher_click_pos: None,
+            notifications_mark_read: false,
         }
     }
 
@@ -647,6 +710,30 @@ impl InputState {
                                 }
                             }
                         } else {
+                        // ── Launcher overlay click detection ──
+                        if self.launcher_active {
+                            // Record click position — state.rs will do the hit test
+                            // since it has access to desktop.pinned_apps
+                            self.launcher_click_pos = Some((self.cursor_x, self.cursor_y));
+                            dirty = true;
+                        }
+                        // ── Notification panel click → mark all read ──
+                        if self.notifications_visible {
+                            // Click anywhere closes notifications and marks them as read
+                            use crate::render::{TASKBAR_HEIGHT};
+                            let panel_w = 300;
+                            let panel_h = 250;
+                            let panel_x = self.fb_width - panel_w - 10;
+                            let panel_y = 10;
+                            if self.cursor_x >= panel_x && self.cursor_x < panel_x + panel_w
+                                && self.cursor_y >= panel_y && self.cursor_y < panel_y + panel_h
+                            {
+                                // Clicked inside notification panel — mark read
+                                self.notifications_visible = false;
+                                self.notifications_mark_read = true;
+                                dirty = true;
+                            }
+                        }
                         // ── Window focus / interaction ──
                         let focus = focus_under_cursor(self.cursor_x, self.cursor_y, windows, *window_count);
                         if let Some(idx) = focus {
@@ -958,5 +1045,89 @@ mod tests {
         state.cursor_y = 1080 - 20;
         let _ = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
         assert_eq!(state.hovered_taskbar_element, TaskbarHit::PinnedApp(0));
+    }
+
+    #[test]
+    fn test_launcher_hit_test_basic() {
+        use crate::desktop::PinnedApp;
+        let apps: [PinnedApp; 8] = core::array::from_fn(|_| PinnedApp::default());
+        let mut apps = apps;
+        apps[0] = PinnedApp::with_exec("Terminal", 0, 200, 100, "/bin/terminal");
+        apps[1] = PinnedApp::with_exec("Files", 100, 150, 255, "/bin/files");
+
+        let fb_height = 1080;
+        // Panel is at y = 1080 - 44 - 400 - 10 = 626, x=10, w=300
+        // First item at y = 626 + 50 + 0*36 = 676, items go from y-10 to y-10+36 = 666..702
+        let hit = launcher_hit_test(100, 680, fb_height, 2, &apps, false, "");
+        assert_eq!(hit, Some(0));
+
+        // Second item at y = 626 + 50 + 1*36 = 712, range 702..738
+        let hit = launcher_hit_test(100, 720, fb_height, 2, &apps, false, "");
+        assert_eq!(hit, Some(1));
+    }
+
+    #[test]
+    fn test_launcher_hit_test_outside() {
+        use crate::desktop::PinnedApp;
+        let apps: [PinnedApp; 8] = core::array::from_fn(|_| PinnedApp::default());
+        let mut apps = apps;
+        apps[0] = PinnedApp::new("Terminal", 0, 200, 100);
+
+        // Click outside launcher panel
+        let hit = launcher_hit_test(500, 500, 1080, 1, &apps, false, "");
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn test_launcher_hit_test_search_filter() {
+        use crate::desktop::PinnedApp;
+        let apps: [PinnedApp; 8] = core::array::from_fn(|_| PinnedApp::default());
+        let mut apps = apps;
+        apps[0] = PinnedApp::new("Terminal", 0, 200, 100);
+        apps[1] = PinnedApp::new("Files", 100, 150, 255);
+
+        let fb_height = 1080;
+        // With search "Fi" active, only Files matches; it becomes visible_idx=0
+        // First visible item position: y = 626 + 50 + 0*36 = 676
+        let hit = launcher_hit_test(100, 680, fb_height, 2, &apps, true, "Fi");
+        assert_eq!(hit, Some(1)); // Files is index 1 in pinned_apps
+
+        // Terminal is filtered out — hitting first slot should still be Files
+        let hit = launcher_hit_test(100, 680, fb_height, 2, &apps, true, "Te");
+        assert_eq!(hit, Some(0)); // Terminal is index 0
+    }
+
+    #[test]
+    fn test_taskbar_minimized_window_hit() {
+        let mut windows: [ShellWindow; 4] = core::array::from_fn(|_| ShellWindow::default());
+        // Create a minimized window
+        windows[0].content = WindowContent::InternalDemo;
+        windows[0].minimized = true;
+        windows[0].workspace = 0;
+
+        // Minimized windows should now appear in taskbar hit test
+        // Running windows area starts after pinned apps separator
+        // With 0 pinned apps: sep2_x = TASKBAR_APPS_START_X + 2 = 162, win_x = 170
+        let hit = taskbar_hit_test(180, 1080 - 20, 1920, 1080, 0, &windows, 1, 0);
+        assert_eq!(hit, TaskbarHit::WindowTask(0));
+    }
+
+    #[test]
+    fn test_launcher_click_records_position() {
+        let mut state = InputState::new(1920, 1080);
+        state.pinned_app_count = 5;
+        state.launcher_active = true;
+        let mut windows: [ShellWindow; 16] = core::array::from_fn(|_| ShellWindow::default());
+        let mut surfaces = [ExternalSurface::default(); 16];
+        let mut count = 0;
+
+        // Click inside launcher area (not on taskbar)
+        state.cursor_x = 100;
+        state.cursor_y = 700;
+
+        let ev = InputEvent { device_id: 0, event_type: 2, code: 0, value: 1, timestamp: 0 };
+        let dirty = state.apply_event(&ev, &mut windows, &mut count, &mut surfaces);
+        assert!(dirty);
+        assert_eq!(state.launcher_click_pos, Some((100, 700)));
     }
 }

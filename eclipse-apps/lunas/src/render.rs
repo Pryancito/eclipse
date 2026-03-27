@@ -309,7 +309,7 @@ pub fn draw_desktop_shell(
     }
 
     if input.launcher_active {
-        draw_launcher(fb, desktop);
+        draw_launcher(fb, desktop, input);
     }
 
     if input.search_active {
@@ -502,7 +502,7 @@ fn draw_taskbar(
     for w_idx in 0..window_count {
         if win_x + win_item_w > tray_start - 10 { break; }
         let w = &windows[w_idx];
-        if w.content == WindowContent::None || w.minimized || w.closing { continue; }
+        if w.content == WindowContent::None || w.closing { continue; }
         if w.workspace != input.current_workspace { continue; }
 
         // Skip windows whose titles match a pinned app (already shown above)
@@ -515,11 +515,14 @@ fn draw_taskbar(
 
         // Window task button
         let focused = input.focused_window == Some(w_idx);
+        let is_minimized = w.minimized;
         let is_hovered = input.hovered_taskbar_element == crate::input::TaskbarHit::WindowTask(w_idx);
         let task_bg = if is_hovered {
             Rgb888::new(45, 60, 95)
         } else if focused {
             Rgb888::new(35, 50, 80)
+        } else if is_minimized {
+            Rgb888::new(18, 22, 38)
         } else {
             Rgb888::new(25, 30, 50)
         };
@@ -529,7 +532,12 @@ fn draw_taskbar(
             .draw(fb);
 
         // Window title (truncated with ellipsis)
-        let task_text_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(180, 190, 210));
+        let title_color = if is_minimized {
+            Rgb888::new(100, 110, 130)
+        } else {
+            Rgb888::new(180, 190, 210)
+        };
+        let task_text_style = MonoTextStyle::new(&FONT_6X12, title_color);
         const MAX_TITLE_CHARS: usize = 16;
         const TRUNCATED_CHARS: usize = 14;
         const CHAR_WIDTH: i32 = 6;
@@ -933,14 +941,22 @@ fn draw_lock_screen(fb: &mut FramebufferState) {
     let _ = Text::new("Press L to unlock", Point::new(cx - 48, cy + 100), hint_style).draw(fb);
 }
 
+/// Launcher panel constants.
+pub const LAUNCHER_PANEL_W: i32 = 300;
+pub const LAUNCHER_PANEL_H: i32 = 400;
+pub const LAUNCHER_PANEL_X: i32 = 10;
+pub const LAUNCHER_ITEM_H: i32 = 36;
+pub const LAUNCHER_ITEMS_Y_OFFSET: i32 = 50;
+/// Maximum items visible in the launcher.
+pub const LAUNCHER_MAX_VISIBLE: usize = 9;
+
 /// Draw the app launcher panel.
-fn draw_launcher(fb: &mut FramebufferState, _desktop: &DesktopShell) {
-    let _fb_w = fb.info.width as i32;
+fn draw_launcher(fb: &mut FramebufferState, desktop: &DesktopShell, input: &InputState) {
     let fb_h = fb.info.height as i32;
-    let panel_w = 300;
-    let panel_h = 400;
-    let px = 10;
-    let py = fb_h - 44 - panel_h - 10;
+    let panel_w = LAUNCHER_PANEL_W;
+    let panel_h = LAUNCHER_PANEL_H;
+    let px = LAUNCHER_PANEL_X;
+    let py = fb_h - TASKBAR_HEIGHT - panel_h - 10;
 
     let bg_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(18, 22, 40)).build();
     let _ = Rectangle::new(Point::new(px, py), Size::new(panel_w as u32, panel_h as u32))
@@ -958,19 +974,76 @@ fn draw_launcher(fb: &mut FramebufferState, _desktop: &DesktopShell) {
     let title_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(0, 180, 255));
     let _ = Text::new("APPLICATIONS", Point::new(px + 90, py + 24), title_style).draw(fb);
 
-    // Application entries
-    let app_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
-    let apps = ["Terminal", "File Manager", "Text Editor", "Calculator", "Settings", "System Monitor", "Browser", "Network"];
-    for (i, app_name) in apps.iter().enumerate() {
-        let app_y = py + 50 + (i as i32) * 28;
+    // Search hint if search is active
+    if input.search_active && !input.search_query.is_empty() {
+        let search_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(100, 130, 180));
+        let _ = Text::new("Filter: ", Point::new(px + 10, py + 42), search_style).draw(fb);
+        let query_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 220, 255));
+        let _ = Text::new(input.search_query.as_str(), Point::new(px + 58, py + 42), query_style).draw(fb);
+    }
 
-        // App icon placeholder
-        let icon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(0, 100 + (i as u8 * 15), 200)).build();
-        let _ = Rectangle::new(Point::new(px + 12, app_y - 8), Size::new(20, 20))
+    // Render pinned apps from desktop (filtered by search query if active)
+    let app_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(200, 210, 230));
+    let hovered_launcher = input.launcher_hovered_index;
+
+    let mut visible_idx: i32 = 0;
+    for i in 0..desktop.pinned_count {
+        if visible_idx >= LAUNCHER_MAX_VISIBLE as i32 { break; }
+        let app = &desktop.pinned_apps[i];
+        let app_name = app.name_str();
+
+        // Filter by search query
+        if input.search_active && !input.search_query.is_empty() {
+            let query = input.search_query.as_str();
+            let name_lower_matches = app_name.len() >= query.len()
+                && app_name[..query.len()].eq_ignore_ascii_case(query);
+            if !name_lower_matches { continue; }
+        }
+
+        let app_y = py + LAUNCHER_ITEMS_Y_OFFSET + visible_idx * LAUNCHER_ITEM_H;
+        let (r, g, b) = app.icon_color;
+
+        // Hover highlight
+        let is_hovered = hovered_launcher == Some(i);
+        if is_hovered {
+            let hover_style = PrimitiveStyleBuilder::new()
+                .fill_color(Rgb888::new(30, 40, 70))
+                .build();
+            let _ = Rectangle::new(
+                Point::new(px + 4, app_y - 10),
+                Size::new((panel_w - 8) as u32, LAUNCHER_ITEM_H as u32),
+            )
+            .into_styled(hover_style)
+            .draw(fb);
+        }
+
+        // App icon (colored square with first letter)
+        let icon_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(r, g, b)).build();
+        let _ = Rectangle::new(Point::new(px + 12, app_y - 8), Size::new(24, 24))
             .into_styled(icon_style)
             .draw(fb);
+        let first_char = app_name.chars().next().unwrap_or('?');
+        let mut char_buf = [0u8; 4];
+        let char_str = first_char.encode_utf8(&mut char_buf);
+        let icon_letter_style = MonoTextStyle::new(&FONT_6X12, Rgb888::WHITE);
+        let _ = Text::new(char_str, Point::new(px + 18, app_y + 4), icon_letter_style).draw(fb);
 
-        let _ = Text::new(app_name, Point::new(px + 40, app_y + 4), app_style).draw(fb);
+        // App name
+        let _ = Text::new(app_name, Point::new(px + 44, app_y + 4), app_style).draw(fb);
+
+        // Exec path hint (dim)
+        let exec_str = app.exec_path_str();
+        if !exec_str.is_empty() {
+            let hint_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(70, 80, 110));
+            let _ = Text::new(exec_str, Point::new(px + 44, app_y + 16), hint_style).draw(fb);
+        }
+
+        visible_idx += 1;
+    }
+
+    if visible_idx == 0 {
+        let empty_style = MonoTextStyle::new(&FONT_6X12, Rgb888::new(80, 90, 110));
+        let _ = Text::new("No matching apps", Point::new(px + 80, py + 200), empty_style).draw(fb);
     }
 }
 
